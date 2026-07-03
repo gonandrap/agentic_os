@@ -34,6 +34,16 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
    worker *while it runs*, use the native agents view (third interaction path you
    listed).
 
+   **Known cost consideration (revisit if it hurts):** every feedback delivery starts
+   a new API turn that resends the worker's full conversation. Prompt-cache reuse is
+   prefix-based on content (not session id), so the fork per se doesn't break it, but
+   the Anthropic cache TTL is ~5 minutes — a worker idle longer than that reprocesses
+   all its context tokens on delivery, uncached. Acceptable for MVP (deliveries are
+   occasional and workers are short-lived); if work orders grow long-context and
+   feedback becomes chatty, revisit — options include delivering within the cache
+   window when possible, a ManagedBackend that keeps the worker process alive with
+   streaming stdin (no re-read), or summarize-and-restart instead of resume.
+
 4. **One central DB + one DB per project.** Work orders/events/messages/assumptions live
    in `<project>/.jarvis/jarvis.db` (per your #3, gitignored). Anything that must be
    unified — notification inbox, backlog, knowledge, project registry — lives centrally

@@ -280,7 +280,10 @@ shared_schedule → tesis_grado → the rest, with auto_heycrypto's telegram rer
 ## 6. Out of scope for MVP (backlogged)
 
 - Smarter knowledge retrieval (embeddings), cross-project learning summarization jobs.
-- ManagedBackend full implementation (only if bg-resume delivery proves flaky).
+- ManagedBackend full implementation (only if bg-resume delivery proves flaky, or if
+  feedback-delivery token cost becomes an issue: each delivery resends the worker's
+  full conversation, and cache reuse only applies within the ~5-minute prompt-cache
+  TTL — see ASSUMPTIONS.md §A.3).
 - Auth on the web UI (binds 127.0.0.1 only for now).
 - Windows support (Linux/macOS first).
 - Automatic migration of auto_heycrypto's monitor daemon (guide provided instead).
