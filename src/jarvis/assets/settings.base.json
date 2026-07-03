@@ -1,0 +1,36 @@
+{
+  "$comment": "Jarvis OS baseline Claude Code settings, injected into every managed project. Project-specific needs belong in the catalog's settings_overrides, not here and not in the project.",
+  "env": {
+    "JARVIS_MANAGED": "1"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "jarvis _hook", "timeout": 30 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "jarvis _hook", "timeout": 30 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "jarvis _hook", "timeout": 30 }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          { "type": "command", "command": "jarvis _hook", "timeout": 30 }
+        ]
+      }
+    ]
+  }
+}

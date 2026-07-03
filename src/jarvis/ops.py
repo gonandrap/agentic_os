@@ -1,0 +1,379 @@
+"""High-level operations shared by the CLI, the web UI, and the Jarvis persona.
+
+Every mutation of the OS goes through here, so all surfaces behave identically.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+from .bootstrap import BootstrapReport, bootstrap_project, settings_drift
+from .catalog import Catalog, CatalogError, ProjectSpec, load_catalog
+from .central_store import CentralStore
+from .daemon import daemon_running
+from .paths import daemon_pidfile, ensure_home, logs_dir
+from .project_store import OPEN_STATUSES, ProjectStore
+
+
+class OpsError(RuntimeError):
+    """User-facing operational error."""
+
+
+# -- catalog resolution ----------------------------------------------------------
+
+def resolve_catalog(catalog_path: str | None = None) -> Catalog:
+    """Load the catalog from an explicit path, or the one registered at start."""
+    if catalog_path:
+        return load_catalog(catalog_path)
+    central = CentralStore()
+    try:
+        stored = central.get_state("catalog_path")
+    finally:
+        central.close()
+    if not stored:
+        raise OpsError(
+            "no catalog registered — run `jarvis start --catalog <file>` first, "
+            "or pass --catalog explicitly"
+        )
+    return load_catalog(stored)
+
+
+def project_spec(catalog: Catalog, name: str) -> ProjectSpec:
+    try:
+        return catalog.project(name)
+    except CatalogError as e:
+        raise OpsError(str(e)) from e
+
+
+# -- OS lifecycle -------------------------------------------------------------------
+
+def start_os(catalog_path: str, force_config: bool = False,
+             foreground: bool = False, poll_interval: float = 5.0) -> dict[str, Any]:
+    """Validate the catalog, bootstrap every project, register them, start jarvisd."""
+    from . import claude_cli
+
+    catalog = load_catalog(catalog_path)
+    ensure_home()
+
+    if not claude_cli.available():
+        raise OpsError("`claude` CLI not found on PATH — install Claude Code first")
+
+    reports: list[BootstrapReport] = []
+    central = CentralStore()
+    try:
+        for project in catalog.projects:
+            report = bootstrap_project(project, force_config=force_config)
+            reports.append(report)
+            if not report.warnings or (project.path / ".jarvis").is_dir():
+                central.upsert_project(
+                    name=project.name,
+                    path=str(project.path),
+                    description=project.description,
+                    model=project.model,
+                    catalog_json=json.dumps(project.raw),
+                )
+        central.set_state("catalog_path", str(Path(catalog_path).expanduser().resolve()))
+    finally:
+        central.close()
+
+    pid = daemon_running()
+    if pid:
+        daemon_info = {"status": "already-running", "pid": pid}
+    elif foreground:
+        daemon_info = {"status": "foreground"}
+    else:
+        proc = _spawn_daemon(catalog_path, poll_interval)
+        time.sleep(1.0)
+        if proc.poll() is not None:
+            raise OpsError(
+                f"jarvisd exited immediately (rc={proc.returncode}) — "
+                f"check {logs_dir() / 'jarvisd.log'}"
+            )
+        daemon_info = {"status": "started", "pid": proc.pid}
+
+    return {
+        "projects": [
+            {"name": r.project, "actions": r.actions, "warnings": r.warnings}
+            for r in reports
+        ],
+        "daemon": daemon_info,
+    }
+
+
+def _spawn_daemon(catalog_path: str, poll_interval: float) -> subprocess.Popen:
+    logs_dir().mkdir(parents=True, exist_ok=True)
+    out = (logs_dir() / "jarvisd.out").open("a")
+    return subprocess.Popen(
+        [sys.executable, "-m", "jarvis.cli", "daemon", "run",
+         "--catalog", str(Path(catalog_path).expanduser().resolve()),
+         "--poll-interval", str(poll_interval)],
+        stdout=out, stderr=out, stdin=subprocess.DEVNULL,
+        start_new_session=True,  # detach from the terminal
+    )
+
+
+def stop_os() -> dict[str, Any]:
+    pid = daemon_running()
+    if not pid:
+        return {"status": "not-running"}
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(50):
+        if daemon_running() is None:
+            return {"status": "stopped", "pid": pid}
+        time.sleep(0.1)
+    return {"status": "still-stopping", "pid": pid}
+
+
+# -- status ------------------------------------------------------------------------------
+
+def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
+    central = CentralStore()
+    try:
+        pid = daemon_running()
+        projects = []
+        attention: list[dict[str, Any]] = []
+        for p in central.list_projects():
+            if p["status"] != "active":
+                continue
+            path = Path(p["path"])
+            if not path.is_dir():
+                projects.append({**p, "error": "path missing"})
+                continue
+            store = ProjectStore(path)
+            try:
+                summary = store.summary()
+                open_wos = store.list_work_orders(statuses=OPEN_STATUSES)
+                for wo in open_wos:
+                    if wo["needs_attention"]:
+                        attention.append({
+                            "project": p["name"], "wo_id": wo["id"],
+                            "title": wo["title"], "status": wo["status"],
+                            "reason": wo["attention_reason"],
+                        })
+                drift = settings_drift(path / ".claude" / "settings.json")
+                projects.append({
+                    "name": p["name"], "path": p["path"],
+                    "description": p["description"],
+                    "summary": summary,
+                    "open_work_orders": [
+                        {k: wo[k] for k in ("id", "title", "status", "origin",
+                                            "needs_attention", "attention_reason")}
+                        for wo in open_wos
+                    ],
+                    "settings_drift": drift,
+                })
+                if drift:
+                    attention.append({
+                        "project": p["name"], "wo_id": None,
+                        "title": "settings drift", "status": "config",
+                        "reason": f".claude/settings.json: {drift}",
+                    })
+            finally:
+                store.close()
+        inbox = central.unacked_inbox()
+        backlog_open = central.list_backlog(status="open")
+        return {
+            "daemon": {
+                "running": pid is not None,
+                "pid": pid,
+                "catalog": central.get_state("catalog_path"),
+            },
+            "projects": projects,
+            "attention": attention,
+            "inbox": {
+                "unacked": len(inbox),
+                "critical": sum(1 for i in inbox if i["level"] == "critical"),
+                "items": inbox[:10],
+            },
+            "backlog": {"open": len(backlog_open)},
+            "healthy": pid is not None and not attention,
+        }
+    finally:
+        central.close()
+
+
+# -- work orders -----------------------------------------------------------------------------
+
+def registered_project_paths() -> dict[str, Path]:
+    central = CentralStore()
+    try:
+        return {p["name"]: Path(p["path"]) for p in central.list_projects()
+                if p["status"] == "active"}
+    finally:
+        central.close()
+
+
+def create_work_order(project_name: str, title: str, description: str = "",
+                      origin: str = "jarvis", model: str | None = None,
+                      effort: str | None = None, permission_mode: str | None = None,
+                      append_system_prompt: str | None = None,
+                      backlog_id: str | None = None) -> dict[str, Any]:
+    paths = registered_project_paths()
+    if project_name not in paths:
+        raise OpsError(f"project {project_name!r} not registered "
+                       f"(known: {sorted(paths)}). Run `jarvis start` first.")
+    store = ProjectStore(paths[project_name])
+    try:
+        return store.create_work_order(
+            title=title, description=description, origin=origin, model=model,
+            effort=effort, permission_mode=permission_mode,
+            append_system_prompt=append_system_prompt, backlog_id=backlog_id,
+        )
+    finally:
+        store.close()
+
+
+def find_work_order(wo_id: str, project_name: str | None = None
+                    ) -> tuple[str, Path, dict[str, Any]]:
+    """Locate a work order across all registered projects."""
+    paths = registered_project_paths()
+    candidates = {project_name: paths[project_name]} if project_name else paths
+    if project_name and project_name not in paths:
+        raise OpsError(f"project {project_name!r} not registered")
+    for name, path in candidates.items():
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            wo = store.get_work_order(wo_id)
+            return name, path, wo
+        except KeyError:
+            continue
+        finally:
+            store.close()
+    raise OpsError(f"work order {wo_id!r} not found in any registered project")
+
+
+def send_message(wo_id: str, content: str, source: str = "jarvis",
+                 project_name: str | None = None) -> dict[str, Any]:
+    name, path, wo = find_work_order(wo_id, project_name)
+    if wo["status"] in ("completed", "failed", "cancelled"):
+        # Still allowed — resuming a finished session is fine — but tell the user.
+        note = f"note: work order is {wo['status']}; the session will be revived"
+    else:
+        note = None
+    store = ProjectStore(path)
+    try:
+        msg_id = store.queue_message(wo_id, content, source=source)
+        store.add_event(wo_id, "message_queued", {"msg_id": msg_id, "source": source})
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "msg_id": msg_id, "note": note,
+            "delivery": "jarvisd delivers when the worker is idle"}
+
+
+def assume(wo_id: str, content: str) -> dict[str, Any]:
+    """Record an assumption: DB row + ASSUMPTIONS.md append + review flag."""
+    name, path, wo = find_work_order(wo_id)
+    store = ProjectStore(path)
+    try:
+        store.add_assumption(wo_id, content)
+        store.flag_attention(wo_id, "assumptions pending review")
+    finally:
+        store.close()
+    md = path / "ASSUMPTIONS.md"
+    stamp = time.strftime("%Y-%m-%d")
+    entry = f"- [ ] ({stamp}, {wo_id}) {content}\n"
+    if md.exists():
+        with md.open("a") as f:
+            f.write(entry)
+    else:
+        md.write_text(
+            f"# ASSUMPTIONS — {name}\n\n"
+            "Assumptions made by worker agents, pending review. Managed by Jarvis.\n\n"
+            + entry
+        )
+    return {"project": name, "wo_id": wo_id, "recorded": content}
+
+
+def finish(wo_id: str, summary: str) -> dict[str, Any]:
+    name, path, wo = find_work_order(wo_id)
+    store = ProjectStore(path)
+    try:
+        store.update_work_order(wo_id, result_summary=summary)
+        if store.pending_assumptions(wo_id):
+            store.set_status(wo_id, "needs_review")
+            store.flag_attention(wo_id, "assumptions pending review")
+            status = "needs_review"
+        else:
+            store.set_status(wo_id, "completed")
+            store.clear_attention(wo_id)
+            status = "completed"
+        store.add_event(wo_id, "finished", {"summary": summary})
+    finally:
+        store.close()
+    if wo.get("backlog_id") and status == "completed":
+        central = CentralStore()
+        try:
+            central.mark_backlog(wo["backlog_id"], "done")
+        finally:
+            central.close()
+    return {"project": name, "wo_id": wo_id, "status": status}
+
+
+def cancel(wo_id: str) -> dict[str, Any]:
+    name, path, wo = find_work_order(wo_id)
+    store = ProjectStore(path)
+    try:
+        store.set_status(wo_id, "cancelled")
+        store.clear_attention(wo_id)
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "status": "cancelled",
+            "note": "session (if running) is not killed — stop it from the agents view"}
+
+
+def review_work_order(wo_id: str, accept: bool = True) -> dict[str, Any]:
+    """Accept (or reject) all pending assumptions and settle the work order."""
+    name, path, wo = find_work_order(wo_id)
+    store = ProjectStore(path)
+    try:
+        pending = store.pending_assumptions(wo_id)
+        for a in pending:
+            store.review_assumption(a["id"], "accepted" if accept else "rejected")
+        if wo["status"] == "needs_review":
+            if accept:
+                store.set_status(wo_id, "completed")
+                store.clear_attention(wo_id)
+            else:
+                store.flag_attention(wo_id, "assumptions rejected — send guidance with `jarvis wo send`")
+        store.add_event(wo_id, "reviewed", {"accepted": accept, "count": len(pending)})
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "reviewed": len(pending),
+            "accepted": accept}
+
+
+# -- backlog ------------------------------------------------------------------------------------
+
+def promote_backlog(item_id: str, force: bool = False) -> dict[str, Any]:
+    central = CentralStore()
+    try:
+        item = central.get_backlog(item_id)
+        if not item:
+            raise OpsError(f"backlog item {item_id!r} not found")
+        if item["status"] != "open":
+            raise OpsError(f"backlog item {item_id} is {item['status']}, not open")
+        blockers = central.unfinished_dependencies(item_id)
+        if blockers and not force:
+            raise OpsError(
+                f"backlog item {item_id} has unfinished dependencies: "
+                + ", ".join(f"{b['id']} ({b['status']})" for b in blockers)
+                + " — finish them first or use --force"
+            )
+        wo = create_work_order(
+            item["project"], item["title"], description=item["description"],
+            origin="jarvis", backlog_id=item_id,
+        )
+        central.mark_backlog(item_id, "promoted", promoted_wo_id=wo["id"])
+        return {"backlog_id": item_id, "wo_id": wo["id"], "project": item["project"],
+                "forced_over_blockers": [b["id"] for b in blockers] if force else []}
+    finally:
+        central.close()
