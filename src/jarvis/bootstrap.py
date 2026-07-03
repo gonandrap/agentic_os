@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -163,6 +164,36 @@ def ensure_operation_md(project: ProjectSpec, report: BootstrapReport) -> None:
     report.note("wrote OPERATION.md")
 
 
+def workspace_trusted(project_path: Path) -> bool | None:
+    """Whether Claude Code trusts this workspace (None = unknown / never opened).
+
+    Untrusted workspaces IGNORE permissions.allow entries (verified live), which
+    stalls unattended workers on their first tool call.
+    """
+    cfg = Path(os.environ.get("JARVIS_CLAUDE_JSON", "~/.claude.json")).expanduser()
+    if not cfg.exists():
+        return None
+    try:
+        data = json.loads(cfg.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    entry = (data.get("projects") or {}).get(str(project_path))
+    if entry is None:
+        return None
+    return bool(entry.get("hasTrustDialogAccepted"))
+
+
+def check_trust(project: ProjectSpec, report: BootstrapReport) -> None:
+    if workspace_trusted(project.path) is not True:
+        report.warn(
+            "workspace not trusted by Claude Code — permission rules are ignored "
+            "there and workers will stall on their first tool call. Run `claude` "
+            f"interactively in {project.path} once and accept the trust dialog "
+            f'(or set projects["{project.path}"].hasTrustDialogAccepted: true '
+            "in ~/.claude.json)"
+        )
+
+
 def ensure_state_dir(project: ProjectSpec, report: BootstrapReport) -> None:
     state = project.path / ".jarvis"
     if not state.exists():
@@ -191,4 +222,5 @@ def bootstrap_project(project: ProjectSpec, force_config: bool = False,
     ensure_state_dir(project, report)
     ensure_gitignore(project, report)
     inject_settings(project, report, force=force_config)
+    check_trust(project, report)
     return report

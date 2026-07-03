@@ -21,13 +21,15 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
    sessions found in a project are auto-registered as `adhoc` shadow work orders so the
    UI shows them with a warning badge.
 
-3. **Feedback routing** (`jarvis wo send`, UI) delivers queued messages via
-   `claude --resume <session-id> -p "<msg>"` when the worker isn't mid-turn. Answer to
-   your question #9: yes, Claude Code supports programmatic input to an existing session
-   this way (documented; messages append to the same transcript). Caveat: pushing into a
-   session *while it is actively running a turn* can interleave; jarvisd therefore
-   queues and delivers between turns. A `ManagedBackend` (stream-json stdin, guaranteed
-   mid-turn delivery) is designed as fallback but not the default.
+3. **Feedback routing** (`jarvis wo send`, UI): messages queue in the project DB and
+   jarvisd delivers them when the worker's session is idle, via `claude stop <bg-id>`
+   (release from the supervisor) followed by `claude --resume <session-id> -p "<msg>"`.
+   Answer to your question #9: **yes — verified live**: a message was delivered into a
+   finished worker's session and its reply captured back into the DB. Two constraints
+   discovered on the way: resume refuses sessions still owned by a live bg agent
+   (hence the stop-first), and mid-turn injection isn't supported — messages wait for
+   the worker to go idle. For chatting with a worker *while it runs*, use the native
+   agents view (third interaction path you listed).
 
 4. **One central DB + one DB per project.** Work orders/events/messages/assumptions live
    in `<project>/.jarvis/jarvis.db` (per your #3, gitignored). Anything that must be
@@ -120,10 +122,18 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
     The `cd X && jarvis …` pattern is likewise auto-allowed only for pure cd/jarvis
     chains with no other shell constructs.
 
-28. **Worker → OS plumbing confirmed end to end on the real CLI**: hooks fire from
-    worker sessions (SessionStart/Notification observed), `jarvis wo assume` executed
-    from inside a worker updates the project DB and ASSUMPTIONS.md, and blocked
-    workers surface as `waiting_input` + attention + a queued notification.
+28. **Worker → OS plumbing confirmed end to end on the real CLI** (8 verification
+    rounds with a haiku worker on a fixture repo): dispatch → worktree → hooks fire →
+    `jarvis wo assume`/`finish` from inside the worker → needs_review → `jarvis wo
+    review` → completed; feedback message delivered into the session and the reply
+    captured; blocked workers surface as `waiting_input` + attention + notification;
+    dead sessions detected and failed by the reconciler.
+
+28b. **Workspaces must be trusted by Claude Code** — untrusted workspaces silently
+    ignore `permissions.allow` (verified live; the CLI error names the fix). `jarvis
+    start`/`adopt` now warn per project with the exact remedy (open `claude` there
+    once, or set `hasTrustDialogAccepted` in ~/.claude.json). Your existing projects
+    are presumably fine; fresh clones need one interactive open.
 
 ## D. Migration
 

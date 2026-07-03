@@ -152,14 +152,21 @@ def test_message_delivery_when_idle(started, fake_claude, project):
     sid = bind_session(daemon, project, wo["id"])
 
     ops.send_message(wo["id"], "please also update the docs", source="ui")
-    daemon.tick()  # worker mid-turn (no turn_ended yet) → not delivered
+    daemon.tick_count = 0
+    daemon.tick()  # worker session still running → not deliverable
+    daemon.delivery_pool.shutdown(wait=True)
     assert [c for c in fake_claude.calls if "--resume" in c["argv"]] == []
+    from concurrent.futures import ThreadPoolExecutor
+    daemon.delivery_pool = ThreadPoolExecutor(max_workers=2)
 
-    env = {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)}
-    handle_hook({"hook_event_name": "Stop", "session_id": sid, "cwd": str(project)}, env)
+    fake_claude.set_session_state(sid, "done")  # worker went idle
+    daemon.tick_count = 0
     daemon.tick()
     daemon.delivery_pool.shutdown(wait=True)  # let the delivery thread finish
 
+    # bg session released first, then headless resume with the message
+    stops = [c for c in fake_claude.calls if c["argv"][:1] == ["stop"]]
+    assert len(stops) == 1
     resumes = [c for c in fake_claude.calls if "--resume" in c["argv"]]
     assert len(resumes) == 1
     argv = resumes[0]["argv"]

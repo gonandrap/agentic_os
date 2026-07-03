@@ -59,10 +59,21 @@ elif "--bg" in argv:
         "startedAt": 0,
     })
     save_sessions(sessions)
+elif argv[:1] == ["stop"]:
+    sessions = load_sessions()
+    remaining = [s for s in sessions if s["id"] != argv[1]]
+    if len(remaining) == len(sessions):
+        sys.stderr.write(f"no such session {argv[1]}\n"); sys.exit(1)
+    save_sessions(remaining)
 elif "--resume" in argv and "-p" in argv:
     behavior = os.environ.get("FAKE_CLAUDE_RESUME", "ok")
     if behavior == "fail":
         sys.stderr.write("resume failed\n"); sys.exit(1)
+    sid = argv[argv.index("--resume") + 1]
+    # like the real CLI: refuse to resume a session still owned by a bg agent
+    if any(s["sessionId"] == sid for s in load_sessions()):
+        sys.stderr.write(f"Error: Session {sid} is currently running as a background agent (bg).\n")
+        sys.exit(1)
     print(json.dumps({"result": f"ack: {argv[argv.index('-p') + 1][:40]}"}))
 else:
     sys.stderr.write(f"fake claude: unhandled argv {argv}\n"); sys.exit(2)
@@ -121,9 +132,26 @@ def make_git_project(root: Path, name: str, readme: str | None = "# proj\n") -> 
     return path
 
 
+@pytest.fixture(autouse=True)
+def claude_json(tmp_path, monkeypatch):
+    """Point trust checks at a scratch claude.json; tests opt paths in as trusted."""
+    path = tmp_path / "claude.json"
+    path.write_text(json.dumps({"projects": {}}))
+    monkeypatch.setenv("JARVIS_CLAUDE_JSON", str(path))
+
+    def trust(project_path):
+        data = json.loads(path.read_text())
+        data["projects"][str(project_path)] = {"hasTrustDialogAccepted": True}
+        path.write_text(json.dumps(data))
+
+    return trust
+
+
 @pytest.fixture()
-def project(tmp_path):
-    return make_git_project(tmp_path, "proj_a")
+def project(tmp_path, claude_json):
+    p = make_git_project(tmp_path, "proj_a")
+    claude_json(p)  # trusted, like a real project the user works in
+    return p
 
 
 @pytest.fixture()

@@ -108,9 +108,12 @@ class Daemon:
             try:
                 self.route_outbox(project, store)
                 self.dispatch_pending(project, store)
-                self.deliver_messages(project, store)
                 if reconcile:
                     self.reconcile_project(project, store, sessions_by_project)
+                    # Delivery needs fresh session states: a message can only be
+                    # injected once the worker's bg session is idle (state done)
+                    # or released — resume refuses live bg-owned sessions.
+                    self.deliver_messages(project, store, sessions_by_project)
                 self.central.touch_project(project.name)
             except Exception:  # noqa: BLE001
                 log.exception("project %s tick failed", project.name)
@@ -149,7 +152,15 @@ class Daemon:
 
     # -- 3. message delivery ----------------------------------------------------------
 
-    def deliver_messages(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def deliver_messages(self, project: ProjectSpec, store: ProjectStore,
+                         sessions_by_cwd: dict[str, list[claude_cli.BgSession]]) -> None:
+        proot = str(project.path)
+        by_sid = {
+            s.session_id: s
+            for cwd, group in sessions_by_cwd.items()
+            if cwd == proot or cwd.startswith(proot + "/")
+            for s in group if s.session_id
+        }
         for msg in store.queued_messages():
             if msg["id"] in self.in_flight_deliveries:
                 continue
@@ -160,29 +171,24 @@ class Daemon:
                 continue
             if not wo.get("session_id"):
                 continue  # not dispatched yet; prompt will pick it up when it runs
-            if wo["status"] in ("completed", "failed", "cancelled", "needs_review",
-                                "waiting_input"):
-                deliverable = True
-            elif wo["status"] == "running":
-                # Only deliver between turns to avoid interleaving a live turn:
-                # the worker must have gone idle (turn_ended) since our last delivery.
-                kinds = [e["kind"] for e in store.list_events(wo["id"], limit=500)
-                         if e["kind"] in ("turn_ended", "delivering")]
-                deliverable = bool(kinds) and kinds[-1] == "turn_ended"
-            else:
-                deliverable = False
-            if not deliverable:
+            sess = by_sid.get(wo["session_id"])
+            # Deliverable only when the session is idle (done) or already released:
+            # `claude --resume` refuses sessions owned by a live bg agent, and
+            # injecting into a mid-turn worker would interleave anyway.
+            if sess is not None and sess.state != "done":
                 continue
             self.in_flight_deliveries.add(msg["id"])
             store.add_event(wo["id"], "delivering", {"msg_id": msg["id"]})
-            self.delivery_pool.submit(self._deliver, project, wo, dict(msg))
+            bg_id = sess.id if sess is not None else None
+            self.delivery_pool.submit(self._deliver, project, wo, dict(msg), bg_id)
 
-    def _deliver(self, project: ProjectSpec, wo: dict, msg: dict) -> None:
+    def _deliver(self, project: ProjectSpec, wo: dict, msg: dict,
+                 bg_id: str | None = None) -> None:
         store = ProjectStore(project.path)  # thread-local connection
         try:
             log.info("[%s] delivering message %s to %s", project.name, msg["id"], wo["id"])
             result = claude_cli.send_to_session(
-                wo["session_id"], msg["content"], cwd=project.path,
+                wo["session_id"], msg["content"], cwd=project.path, bg_id=bg_id,
             )
             store.mark_message(msg["id"], "delivered")
             if result:

@@ -136,13 +136,30 @@ def spawn_background(
     _run(args, cwd=cwd, timeout=120)
 
 
+def stop_session(bg_id: str) -> bool:
+    """Release a background session from the supervisor (`claude stop <id>`).
+
+    Required before a headless resume: a session still owned by a live bg agent
+    refuses `--resume` (verified live). Safe on already-stopped sessions.
+    """
+    try:
+        _run(["stop", bg_id], timeout=30)
+        return True
+    except ClaudeCliError:
+        return False
+
+
 def send_to_session(session_id: str, message: str, cwd: Path,
-                    timeout: int = 900) -> str:
+                    bg_id: str | None = None, timeout: int = 900) -> str:
     """Deliver a user message to an existing session (headless resume).
 
     Runs a full turn: the session receives the message, processes it, and the
     result text is returned. The transcript is shared with the original session.
+    If the session is still attached to an (idle) background agent, it is released
+    first — resume refuses to run against bg-owned sessions.
     """
+    if bg_id:
+        stop_session(bg_id)
     args = ["--resume", session_id, "-p", message, "--output-format", "json"]
     out = _run(args, cwd=cwd, timeout=timeout)
     try:

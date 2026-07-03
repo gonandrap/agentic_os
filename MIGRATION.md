@@ -22,6 +22,11 @@ Try it safely first:
 jarvis adopt ~/workspace/shared_schedule --catalog catalogs/gonzalo.json --dry-run
 ```
 
+**Workspace trust:** each project must be trusted by Claude Code (open `claude` there
+once and accept the dialog) — untrusted workspaces ignore permission rules and workers
+stall. `jarvis start` warns per project if trust is missing. Projects you already work
+in are fine.
+
 **After adopting, commit the generated files** (`OPERATION.md`, `.gitignore` change,
 `README.md` if stubbed) — workers run in fresh worktrees checked out from git, so
 uncommitted files don't exist for them:
