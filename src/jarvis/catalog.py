@@ -42,6 +42,15 @@ class ProjectSpec:
 
 
 @dataclass
+class NeoConfig:
+    """Neo, the OS answerer agent (responds to worker questions as the user)."""
+    enabled: bool = True
+    model: str = "opus"
+    learnings_limit: int = 50
+    timeout: int = 300
+
+
+@dataclass
 class OsConfig:
     default_model: str = "sonnet"
     default_effort: str | None = None
@@ -51,6 +60,7 @@ class OsConfig:
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
     ui_port: int = 8787
     knowledge_inject_limit: int = 8
+    neo: NeoConfig = field(default_factory=NeoConfig)
 
 
 @dataclass
@@ -91,6 +101,16 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     telegram = notif.get("telegram", {})
     ui = os_raw.get("ui", {})
 
+    neo_raw = os_raw.get("neo", {})
+    if not isinstance(neo_raw, dict):
+        raise _err('"os.neo" must be an object')
+    neo_cfg = NeoConfig(
+        enabled=bool(neo_raw.get("enabled", True)),
+        model=neo_raw.get("model", "opus"),
+        learnings_limit=int(neo_raw.get("learnings_limit", 50)),
+        timeout=int(neo_raw.get("timeout", 300)),
+    )
+
     os_cfg = OsConfig(
         default_model=defaults.get("model", "sonnet"),
         default_effort=defaults.get("effort"),
@@ -100,6 +120,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         telegram_chat_id_env=telegram.get("chat_id_env", "JARVIS_TELEGRAM_CHAT_ID"),
         ui_port=ui.get("port", 8787),
         knowledge_inject_limit=os_raw.get("knowledge_inject_limit", 8),
+        neo=neo_cfg,
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")

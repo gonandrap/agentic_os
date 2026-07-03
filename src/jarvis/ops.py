@@ -179,6 +179,20 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 store.close()
         inbox = central.unacked_inbox()
         backlog_open = central.list_backlog(status="open")
+        from .neo_store import NeoStore
+        neo = NeoStore()
+        try:
+            neo_counts = neo.counts()
+            for q in neo.list_questions(statuses=("escalated", "failed")):
+                attention.append({
+                    "project": q["project"], "wo_id": q["wo_id"],
+                    "title": f"Neo escalated: {q['question'][:80]}",
+                    "status": "neo_escalated",
+                    "reason": q.get("answer_reason") or "Neo declined to answer for you",
+                    "neo_question_id": q["id"],
+                })
+        finally:
+            neo.close()
         return {
             "daemon": {
                 "running": pid is not None,
@@ -193,6 +207,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 "items": inbox[:10],
             },
             "backlog": {"open": len(backlog_open)},
+            "neo": neo_counts,
             "healthy": pid is not None and not attention,
         }
     finally:
@@ -349,6 +364,110 @@ def review_work_order(wo_id: str, accept: bool = True) -> dict[str, Any]:
         store.close()
     return {"project": name, "wo_id": wo_id, "reviewed": len(pending),
             "accepted": accept}
+
+
+# -- Neo (OS answerer agent) ---------------------------------------------------------------------
+
+def ask_question(wo_id: str, question: str, project_name: str | None = None) -> dict[str, Any]:
+    """(Workers) queue a question for Neo instead of stalling on the user.
+
+    The work order flips to waiting_input WITHOUT flagging user attention — Neo
+    exists precisely to keep these off the user's plate. The answer arrives as the
+    worker's next user turn via the normal message-delivery path.
+    """
+    from .neo_store import NeoStore
+
+    name, path, wo = find_work_order(wo_id, project_name)
+    context = f"{wo['title']}\n{(wo.get('description') or '')[:800]}"
+    neo = NeoStore()
+    try:
+        q = neo.ask(name, wo_id, question, context=context)
+    finally:
+        neo.close()
+    store = ProjectStore(path)
+    try:
+        store.add_event(wo_id, "question_asked", {"neo_question_id": q["id"]})
+        if wo["status"] == "running":
+            store.set_status(wo_id, "waiting_input")
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "question_id": q["id"],
+            "note": "queued for Neo — end your turn; the answer arrives as your next user turn"}
+
+
+def neo_status() -> dict[str, Any]:
+    from .neo_store import NeoStore
+    neo = NeoStore()
+    try:
+        return neo.counts()
+    finally:
+        neo.close()
+
+
+def neo_review(question_id: int, approved: bool, feedback: str = "") -> dict[str, Any]:
+    """Review one of Neo's answers. A correction becomes a learning (Neo's own DB)
+    and, when the work order is still open, is forwarded to the worker as guidance."""
+    from . import neo as neo_mod
+    from .neo_store import NeoStore
+
+    if not approved and not feedback.strip():
+        raise OpsError("a correction needs feedback — what should Neo have said?")
+    neo = NeoStore()
+    try:
+        q = neo.get(question_id)
+        if q is None:
+            raise OpsError(f"neo question {question_id} not found")
+        if q["status"] != "answered":
+            raise OpsError(f"neo question {question_id} is {q['status']}, not answered")
+        q = neo.review(question_id, approved, feedback)
+        learning = None
+        if not approved:
+            learning = neo.add_learning(
+                neo_mod.learning_from_review(q, feedback),
+                project=q["project"], source="review", question_id=question_id,
+            )
+    finally:
+        neo.close()
+    forwarded = False
+    if not approved:
+        try:
+            _, _, wo = find_work_order(q["wo_id"], q["project"])
+            if wo["status"] not in ("completed", "failed", "cancelled"):
+                send_message(
+                    q["wo_id"],
+                    f"Correction from the user on Neo's earlier answer "
+                    f"(\"{(q.get('answer') or '')[:120]}\"): {feedback}",
+                    source="jarvis", project_name=q["project"],
+                )
+                forwarded = True
+        except OpsError:
+            pass
+    return {"question_id": question_id,
+            "review": "approved" if approved else "corrected",
+            "learning_recorded": learning is not None,
+            "forwarded_to_worker": forwarded}
+
+
+def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
+    """The user answers a question Neo escalated; the answer flows to the worker
+    through the same delivery path Neo's answers use."""
+    from .neo_store import NeoStore
+
+    neo = NeoStore()
+    try:
+        q = neo.get(question_id)
+        if q is None:
+            raise OpsError(f"neo question {question_id} not found")
+        if q["status"] not in ("escalated", "failed", "queued"):
+            raise OpsError(f"neo question {question_id} is {q['status']} — "
+                           "only escalated/failed/queued questions take a user answer")
+        neo.record_answer(question_id, answer, answered_by="user")
+        neo.review(question_id, approved=True)  # user-authored ⇒ nothing to review
+    finally:
+        neo.close()
+    delivery = send_message(q["wo_id"], f"[Answer from the user] {answer}",
+                            project_name=q["project"])
+    return {"question_id": question_id, "delivery": delivery}
 
 
 # -- backlog ------------------------------------------------------------------------------------

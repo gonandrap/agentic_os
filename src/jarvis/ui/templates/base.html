@@ -104,6 +104,9 @@
   button.accept { border-color: color-mix(in srgb, var(--green) 45%, transparent); }
   button.danger { border-color: color-mix(in srgb, var(--red) 45%, transparent); }
 
+  .nav-badge { font-family: var(--mono); font-size: 10.5px; padding: 0 6px;
+               border-radius: 99px; background: color-mix(in srgb, var(--amber) 25%, var(--surface));
+               color: var(--amber-ink); }
   .error-flash { background: color-mix(in srgb, var(--red) 15%, var(--surface));
                  border: 1px solid var(--red); border-radius: 8px; padding: 10px 16px;
                  margin: 14px 0; }
@@ -130,6 +133,7 @@
     </span>
     <nav>
       <a href="/" class="{{ 'here' if active == 'dashboard' }}">dashboard</a>
+      <a href="/neo" class="{{ 'here' if active == 'neo' }}">neo{% if neo_badge %} <span class="nav-badge">{{ neo_badge }}</span>{% endif %}</a>
       <a href="/inbox" class="{{ 'here' if active == 'inbox' }}">inbox</a>
       <a href="/backlog" class="{{ 'here' if active == 'backlog' }}">backlog</a>
       <a href="/knowledge" class="{{ 'here' if active == 'knowledge' }}">knowledge</a>

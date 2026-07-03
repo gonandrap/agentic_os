@@ -22,6 +22,12 @@ def central_db_path() -> Path:
     return jarvis_home() / "os.db"
 
 
+def neo_db_path() -> Path:
+    """Neo (the OS answerer agent) keeps its own DB: questions, answers, reviews,
+    and the learnings distilled from them."""
+    return jarvis_home() / "neo.db"
+
+
 def logs_dir() -> Path:
     return jarvis_home() / "logs"
 

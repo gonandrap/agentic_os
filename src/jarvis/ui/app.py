@@ -56,8 +56,16 @@ def create_app() -> FastAPI:
 
     def render(request: Request, template: str, active: str = "dashboard",
                **ctx) -> HTMLResponse:
+        from ..neo_store import NeoStore
         ctx["active"] = active
         ctx["daemon_up"] = daemon_running() is not None
+        neo = NeoStore()
+        try:
+            c = neo.counts()
+        finally:
+            neo.close()
+        ctx["neo_badge"] = (c.get("escalated", 0) + c.get("failed", 0)
+                            + c.get("unreviewed", 0)) or None
         return templates.TemplateResponse(request, template, ctx)
 
     # -- pages ------------------------------------------------------------------
@@ -132,6 +140,27 @@ def create_app() -> FastAPI:
             central.close()
         return render(request, "knowledge.html", active="knowledge", rows=rows)
 
+    @app.get("/neo", response_class=HTMLResponse)
+    def neo_page(request: Request):
+        from ..neo_store import NeoStore
+        neo = NeoStore()
+        try:
+            counts = neo.counts()
+            escalated = neo.list_questions(statuses=("escalated", "failed"))
+            unreviewed = neo.list_questions(statuses=("answered",),
+                                            review_status="unreviewed")
+            unreviewed = [q for q in unreviewed if q["answered_by"] == "neo"]
+            history = [q for q in neo.list_questions(limit=100)
+                       if q["status"] == "answered"
+                       and not (q["answered_by"] == "neo"
+                                and q["review_status"] == "unreviewed")]
+            learnings = neo.all_learnings(limit=100)
+        finally:
+            neo.close()
+        return render(request, "neo.html", active="neo", counts=counts,
+                      escalated=escalated, unreviewed=unreviewed,
+                      history=history, learnings=learnings)
+
     @app.get("/api/status")
     def api_status():
         return JSONResponse(ops.os_status())
@@ -162,6 +191,34 @@ def create_app() -> FastAPI:
     def cancel_wo(name: str, wo_id: str):
         ops.cancel(wo_id)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
+
+    @app.post("/neo/{question_id}/review")
+    def neo_review(question_id: int, decision: str = Form(...),
+                   feedback: str = Form("")):
+        try:
+            ops.neo_review(question_id, approved=(decision == "approve"),
+                           feedback=feedback)
+        except ops.OpsError as e:
+            return RedirectResponse(f"/neo?error={e}", status_code=303)
+        return RedirectResponse("/neo", status_code=303)
+
+    @app.post("/neo/{question_id}/answer")
+    def neo_answer(question_id: int, text: str = Form(...)):
+        try:
+            ops.neo_answer_escalated(question_id, text)
+        except ops.OpsError as e:
+            return RedirectResponse(f"/neo?error={e}", status_code=303)
+        return RedirectResponse("/neo", status_code=303)
+
+    @app.post("/neo/learn")
+    def neo_learn(content: str = Form(...), project: str = Form("")):
+        from ..neo_store import NeoStore
+        neo = NeoStore()
+        try:
+            neo.add_learning(content, project=project, source="manual")
+        finally:
+            neo.close()
+        return RedirectResponse("/neo", status_code=303)
 
     @app.post("/inbox/ack")
     def ack(inbox_id: str = Form("")):

@@ -79,6 +79,21 @@ elif argv[:1] == ["stop"]:
     if len(remaining) == len(sessions):
         sys.stderr.write(f"no such session {argv[1]}\n"); sys.exit(1)
     save_sessions(remaining)
+elif "-p" in argv and "--resume" not in argv:
+    # headless one-shot (`claude -p ...`) — Neo's answering path. Deterministic
+    # verdict driven by the prompt so tests control escalation.
+    prompt = argv[argv.index("-p") + 1]
+    if "FORCE_ESCALATE" in prompt:
+        verdict = {"escalate": True, "answer": "",
+                   "reason": "test-forced escalation"}
+    elif "FORCE_GARBAGE" in prompt:
+        print(json.dumps({"result": "I think you should maybe do the thing?"}))
+        sys.exit(0)
+    else:
+        verdict = {"escalate": False,
+                   "answer": f"neo-decision for: {prompt.splitlines()[-1][:60]}",
+                   "reason": "test verdict"}
+    print(json.dumps({"result": json.dumps(verdict)}))
 elif "--resume" in argv and "-p" in argv:
     behavior = os.environ.get("FAKE_CLAUDE_RESUME", "ok")
     if behavior == "fail":

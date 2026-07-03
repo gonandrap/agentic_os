@@ -132,3 +132,57 @@ def test_api_status(client):
 def test_unknown_project_and_wo(client):
     assert "unknown project" in client.get("/project/nope").text
     assert "not found" in client.get("/wo/proj_a/wo-nope").text
+
+
+def test_neo_tab_review_flow(client, daemon, project):
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "CSV or JSON?")
+    r = client.get("/neo")
+    assert r.status_code == 200  # queued question renders in counts
+    assert "1 queued" in r.text
+
+    daemon._neo_drain()
+    r = client.get("/neo")
+    assert "CSV or JSON?" in r.text
+    assert "neo-decision" in r.text
+    assert "nav-badge" in r.text  # unreviewed answer badges the tab
+
+    # correct the answer from the UI → learning recorded
+    r = client.post("/neo/1/review", data={"decision": "correct",
+                                           "feedback": "CSV. Always CSV."})
+    assert r.status_code == 303
+    from jarvis.neo_store import NeoStore
+    neo = NeoStore()
+    try:
+        assert neo.get(1)["review_status"] == "corrected"
+        assert any("Always CSV" in l["content"] for l in neo.learnings("proj_a"))
+    finally:
+        neo.close()
+    page = client.get("/neo")
+    assert "corrected" in page.text
+    assert "Always CSV" in page.text
+
+
+def test_neo_tab_escalation_answer_flow(client, daemon, project):
+    wo = ops.create_work_order("proj_a", "prod thing")
+    daemon.tick()
+    ops.ask_question(wo["id"], "FORCE_ESCALATE: touch prod?")
+    daemon._neo_drain()
+    r = client.get("/neo")
+    assert "Escalated" in r.text and "touch prod?" in r.text
+    r = client.post("/neo/1/answer", data={"text": "No. Wait for the window."})
+    assert r.status_code == 303
+    store = ProjectStore(project)
+    try:
+        contents = [m["content"] for m in store.queued_messages(wo["id"])]
+        assert any("Wait for the window" in c for c in contents)
+    finally:
+        store.close()
+
+
+def test_neo_teach_directly(client):
+    r = client.post("/neo/learn", data={"content": "prefer uv over pip", "project": ""})
+    assert r.status_code == 303
+    page = client.get("/neo")
+    assert "prefer uv over pip" in page.text

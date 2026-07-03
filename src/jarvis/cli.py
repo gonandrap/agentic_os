@@ -2,7 +2,8 @@
 
 Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
-  jarvis wo create|list|show|send|assume|finish|review|cancel
+  jarvis wo create|list|show|send|ask|assume|finish|review|cancel
+  jarvis neo list|show|review|answer|learnings|learn
   jarvis backlog add|list|promote|done
   jarvis learn add|list|search
   jarvis notify / jarvis inbox
@@ -125,6 +126,11 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("wo_id")
     a.add_argument("content")
 
+    q = wo.add_parser("ask", help="(workers) ask a question — Neo answers as the user")
+    q.add_argument("wo_id")
+    q.add_argument("question")
+    q.add_argument("--project")
+
     f = wo.add_parser("finish", help="(workers) mark a work order finished")
     f.add_argument("wo_id")
     f.add_argument("--summary", required=True)
@@ -165,6 +171,26 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--project")
     k = kn.add_parser("search")
     k.add_argument("term")
+
+    # neo -----------------------------------------------------------------------------------
+    ne = sub.add_parser("neo", help="Neo: the OS answerer agent (answers workers as you)"
+                        ).add_subparsers(dest="neo_cmd", required=True)
+    n = ne.add_parser("list", help="questions Neo has handled or is handling")
+    n.add_argument("--all", action="store_true", help="include reviewed items")
+    n = ne.add_parser("show", help="one question with Neo's full answer")
+    n.add_argument("question_id", type=int)
+    n = ne.add_parser("review", help="approve or correct one of Neo's answers")
+    n.add_argument("question_id", type=int)
+    n.add_argument("--correct", metavar="FEEDBACK",
+                   help="reject the answer and teach Neo what you would have said")
+    n = ne.add_parser("answer", help="answer a question Neo escalated to you")
+    n.add_argument("question_id", type=int)
+    n.add_argument("text")
+    n = ne.add_parser("learnings", help="what Neo has learned from your reviews")
+    n.add_argument("--project", default="")
+    n = ne.add_parser("learn", help="teach Neo directly (no question needed)")
+    n.add_argument("content")
+    n.add_argument("--project", default="")
 
     # notifications ----------------------------------------------------------------------------
     n = sub.add_parser("notify", help="emit a notification into the OS pipeline")
@@ -242,6 +268,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     if st["inbox"]["unacked"]:
         print(f"\n📥 inbox: {st['inbox']['unacked']} unacked"
               f" ({st['inbox']['critical']} critical) — `jarvis inbox list`")
+    neo = st.get("neo", {})
+    if neo.get("queued") or neo.get("unreviewed") or neo.get("escalated"):
+        print(f"\n🕶 neo: {neo.get('queued', 0)} queued, "
+              f"{neo.get('escalated', 0)} escalated to you, "
+              f"{neo.get('unreviewed', 0)} answers awaiting your review — `jarvis neo list`")
     if args.attention:
         return 0
     print()
@@ -342,6 +373,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
                                 project_name=args.project), args.json)
     elif args.wo_cmd == "assume":
         _print(ops.assume(args.wo_id, args.content), args.json)
+    elif args.wo_cmd == "ask":
+        _print(ops.ask_question(args.wo_id, args.question,
+                                project_name=args.project), args.json)
     elif args.wo_cmd == "finish":
         _print(ops.finish(args.wo_id, args.summary), args.json)
     elif args.wo_cmd == "review":
@@ -398,6 +432,71 @@ def cmd_learn(args: argparse.Namespace) -> int:
             _print(central.search_knowledge(args.term), args.json)
     finally:
         central.close()
+    return 0
+
+
+def cmd_neo(args: argparse.Namespace) -> int:
+    from . import ops
+    from .neo_store import NeoStore
+
+    if args.neo_cmd == "list":
+        neo = NeoStore()
+        try:
+            qs = neo.list_questions()
+        finally:
+            neo.close()
+        if not args.all:
+            qs = [q for q in qs
+                  if q["status"] in ("queued", "answering", "escalated", "failed")
+                  or (q["status"] == "answered" and q["review_status"] == "unreviewed")]
+        if args.json:
+            _print(qs, True)
+        else:
+            icon = {"queued": "⏳", "answering": "🤔", "answered": "💬",
+                    "escalated": "🙋", "failed": "❌"}
+            for q in qs:
+                review = f" [{q['review_status']}]" if q["status"] == "answered" else ""
+                print(f"{icon.get(q['status'], '•')} #{q['id']} [{q['project']}] "
+                      f"{q['wo_id']} ({q['status']}{review}, {_age(q['ts'])}) "
+                      f"{q['question'][:80]}")
+            if not qs:
+                print("nothing pending for Neo ✨")
+    elif args.neo_cmd == "show":
+        neo = NeoStore()
+        try:
+            q = neo.get(args.question_id)
+        finally:
+            neo.close()
+        if q is None:
+            print(f"error: neo question {args.question_id} not found", file=sys.stderr)
+            return 1
+        _print(q, args.json)
+    elif args.neo_cmd == "review":
+        _print(ops.neo_review(args.question_id, approved=args.correct is None,
+                              feedback=args.correct or ""), args.json)
+    elif args.neo_cmd == "answer":
+        _print(ops.neo_answer_escalated(args.question_id, args.text), args.json)
+    elif args.neo_cmd == "learnings":
+        neo = NeoStore()
+        try:
+            rows = neo.learnings(args.project, limit=200)
+        finally:
+            neo.close()
+        if args.json:
+            _print(rows, True)
+        else:
+            for r in rows:
+                scope = r["project"] or "global"
+                print(f"• [{scope}] ({r['source']}) {r['content']}")
+            if not rows:
+                print("Neo has no learnings yet — review its answers to teach it")
+    elif args.neo_cmd == "learn":
+        neo = NeoStore()
+        try:
+            row = neo.add_learning(args.content, project=args.project, source="manual")
+        finally:
+            neo.close()
+        _print({"learned": row["id"], "project": args.project or "global"}, args.json)
     return 0
 
 
@@ -506,6 +605,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_backlog(args)
         if args.cmd == "learn":
             return cmd_learn(args)
+        if args.cmd == "neo":
+            return cmd_neo(args)
         if args.cmd == "notify":
             return cmd_notify(args)
         if args.cmd == "inbox":

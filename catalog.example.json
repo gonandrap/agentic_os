@@ -13,7 +13,13 @@
       }
     },
     "ui": { "port": 8787 },
-    "knowledge_inject_limit": 8
+    "knowledge_inject_limit": 8,
+    "neo": {
+      "$comment": "Neo answers worker questions on your behalf; review its answers in the UI's neo tab",
+      "enabled": true,
+      "model": "opus",
+      "learnings_limit": 50
+    }
   },
   "projects": [
     {

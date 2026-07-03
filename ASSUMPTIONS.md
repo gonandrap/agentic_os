@@ -176,6 +176,54 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
     the dashboard (15 s). Deliberate for reproducibility/self-containment; htmx or
     websockets can come later without changing routes.
 
+## F. Neo — the OS answerer agent
+
+31. **Neo is a sequence of headless calls with a byte-stable prefix, not a long-lived
+    session.** Each answer is one `claude -p` call whose system prompt (persona +
+    learnings) is identical across questions; the question rides in the user message
+    after it. The queue drains FIFO and back-to-back on one thread, so every call
+    after the first hits the Anthropic prompt cache (~5-min TTL) on the shared
+    prefix. A single resumed Neo session was rejected: its context would grow with
+    every answer, costing more per question over time and eventually needing
+    compaction — the stateless design has constant cost and gets cache reuse anyway.
+
+32. **Learnings render append-only (oldest first).** New feedback extends Neo's
+    prompt prefix instead of rewriting it, so cached prefix bytes stay valid. Over
+    the limit (default 50, catalog-tunable), the newest N win (a one-time prefix
+    shift per overflow). Learnings live in Neo's OWN db (`$JARVIS_HOME/neo.db`)
+    alongside the question queue and reviews, per your spec.
+
+33. **Question intake is explicit: workers run `jarvis wo ask <id> "…"` and end
+    their turn.** The contract tells them to prefer `wo assume` + continue for
+    reversible decisions and reserve `wo ask` for real blockers. Permission-prompt
+    blocks (Claude's own dialogs) still go to you — Neo can't answer those, only
+    real project questions. The answer arrives as the worker's next user turn via
+    the existing delivery path, prefixed `[Neo, answering for the user]` so the
+    session transcript is honest about who spoke.
+
+34. **`wo ask` parks the work order as waiting_input WITHOUT flagging your
+    attention.** Neo exists to absorb these; only its escalations reach the amber
+    strip. Unreviewed answers show as a count on the neo tab (and `jarvis status`),
+    deliberately quieter than attention items.
+
+35. **Neo escalates rather than guesses** on: production systems / live credentials,
+    spending money, deleting or publishing anything, legal/people matters, or a
+    preference it has no learning for. Escalations create an inbox item + work-order
+    attention; you answer with `jarvis neo answer <qid> "…"` (or the UI form), which
+    delivers to the worker through the same path. Unparseable Neo output is treated
+    as an escalation — garbage is never delivered to a worker.
+
+36. **Neo's default model is `opus`** (catalog `os.neo.model`), enabled by default.
+    Rationale: Neo's answers steer worker-hours; a wrong cheap answer costs more
+    than an expensive right one. Calls are short and mostly cached.
+
+37. **The review loop is the training signal.** Every Neo answer sits `unreviewed`
+    until you approve or correct it (UI neo tab or `jarvis neo review`). A
+    correction (a) records a learning in Neo's DB — injected into all future
+    answers — and (b) is forwarded to the worker as guidance when the work order is
+    still open. Approvals just confirm. You can also teach Neo directly
+    (`jarvis neo learn`). User-authored answers to escalations are auto-approved.
+
 ## E. Scope cuts (MVP)
 
 20. UI has no auth and no websockets (htmx polling refresh).

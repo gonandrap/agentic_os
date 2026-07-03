@@ -34,7 +34,7 @@ def test_bootstrap_creates_everything(project):
 
 
 def test_bootstrap_generates_readme_stub(tmp_path):
-    from tests.conftest import make_git_project
+    from conftest import make_git_project
     p = make_git_project(tmp_path, "noreadme", readme=None)
     report = bootstrap_project(spec(p, description="does things"))
     assert (p / "README.md").exists()

@@ -96,6 +96,10 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "- Work only inside your assigned worktree (you start in it). Commit your "
         "work and open a PR per this repo's conventions. Never push to main.",
         f"- Record EVERY assumption you make: `jarvis wo assume {wo['id']} \"...\"`",
+        f"- Blocked on a decision you cannot make? Ask the OS and END YOUR TURN: "
+        f"`jarvis wo ask {wo['id']} \"<your question>\"` — the answer arrives as "
+        f"your next user turn (from Neo, the user's delegate, or the user). Prefer "
+        f"recording an assumption and continuing when the decision is reversible.",
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"`",
         f"- Report reusable learnings: `jarvis learn add \"...\" --project {project.name}`",

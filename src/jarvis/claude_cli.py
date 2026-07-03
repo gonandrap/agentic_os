@@ -212,6 +212,28 @@ def send_to_session(session_id: str, message: str, cwd: Path,
         return out
 
 
+def run_headless(prompt: str, system_prompt: str | None = None,
+                 model: str | None = None, cwd: Path | None = None,
+                 timeout: int = 300) -> str:
+    """One-shot headless call (`claude -p`) returning the result text.
+
+    Used by Neo: the system prompt (persona + learnings) is byte-stable across
+    calls, so consecutive invocations within the Anthropic cache TTL share a
+    cached prefix — question-specific content rides in `prompt`, after it.
+    """
+    args: list[str] = ["-p", prompt, "--output-format", "json"]
+    if system_prompt:
+        args += ["--append-system-prompt", system_prompt]
+    if model:
+        args += ["--model", model]
+    out = _run(args, cwd=cwd, timeout=timeout)
+    try:
+        data = json.loads(out)
+        return data.get("result", "")
+    except json.JSONDecodeError:
+        return out
+
+
 def session_transcript_path(cwd: Path, session_id: str) -> Path:
     """Location of the session transcript (~/.claude/projects/<munged-cwd>/<id>.jsonl)."""
     config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()

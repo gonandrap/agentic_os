@@ -92,6 +92,7 @@ also watch and join them from `claude agents`.
 | **Origin badge** | `jarvis`/`ui` = framework-created; `manual`/`adhoc` = flagged ⚠ in UI and status |
 | **OPERATION.md** | Per-project contract every worker follows (assumptions, backlog, learnings, notify) |
 | **ASSUMPTIONS.md** | Per-project log of decisions workers made autonomously, pending your review |
+| **Neo** | OS-level answerer agent: workers ask (`jarvis wo ask`), Neo answers as you; you review its answers (UI neo tab) and corrections become its learnings |
 | **Inbox** | Central notification stream (`jarvis inbox`), fanned out to sinks |
 | **Backlog** | Central deferred-work list with dependencies (`jarvis backlog`) |
 | **Knowledge** | Central learnings injected into future work orders (`jarvis learn`) |
@@ -102,6 +103,7 @@ Every worker must (enforced by OPERATION.md + dispatch prompt):
 
 ```bash
 jarvis wo assume  <wo-id> "assumed X because Y"      # every autonomous decision
+jarvis wo ask     <wo-id> "blocking question"        # Neo (or you) answers next turn
 jarvis backlog add <project> "deferred thing"        # instead of "future work" notes
 jarvis learn add "reusable insight" --project <p>    # share with other projects
 jarvis notify --level critical "prod is down" "..."  # human attention

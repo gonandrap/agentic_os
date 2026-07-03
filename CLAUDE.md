@@ -33,6 +33,9 @@ jarvis start --catalog <path-to-catalog>   # boot the OS (user catalogs live unt
 jarvis stop
 jarvis wo create <project> "title" -d "details" [--model m]
 jarvis wo list [project] / show <id> / send <id> "msg" / review <id> / cancel <id>
+jarvis neo list                            # Neo's Q&A: pending reviews + escalations
+jarvis neo review <qid> [--correct "…"]    # approve or teach; corrections become learnings
+jarvis neo answer <qid> "…"                # answer a question Neo escalated to the user
 jarvis inbox / jarvis inbox ack [id]
 jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--force]
 jarvis learn add "insight" [--project p] / search <term>

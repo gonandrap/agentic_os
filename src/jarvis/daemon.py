@@ -4,7 +4,8 @@ One process, one poll loop over every project in the catalog. Per tick:
   1. dispatch pending work orders (respecting per-project concurrency)
   2. route project notification outboxes to the central inbox, then to sinks
   3. deliver queued user messages to idle worker sessions
-  4. reconcile work order states against `claude agents --json`
+  4. let Neo (the OS answerer agent) drain queued worker questions
+  5. reconcile work order states against `claude agents --json`
      (fix drift, adopt unknown background sessions as `adhoc` work orders)
 
 The daemon is an orchestrator, never a doer: all actual work happens inside the
@@ -43,6 +44,10 @@ class Daemon:
         self.tick_count = 0
         self.delivery_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="deliver")
         self.in_flight_deliveries: set[int] = set()
+        # Neo drains its queue on ONE thread: answering in FIFO order back-to-back
+        # keeps the shared persona+learnings prefix inside the prompt-cache TTL.
+        self.neo_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="neo")
+        self.neo_draining = False
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -69,6 +74,7 @@ class Daemon:
                 time.sleep(max(0.2, self.poll_interval - elapsed))
         finally:
             self.delivery_pool.shutdown(wait=False)
+            self.neo_pool.shutdown(wait=False)
             self._remove_pidfile()
             log.info("jarvisd stopped")
 
@@ -117,6 +123,8 @@ class Daemon:
                 self.central.touch_project(project.name)
             except Exception:  # noqa: BLE001
                 log.exception("project %s tick failed", project.name)
+
+        self.neo_tick()
 
         from .notify import route_new_inbox
         route_new_inbox(self.central, self.catalog)
@@ -238,7 +246,75 @@ class Daemon:
             self.in_flight_deliveries.discard(msg["id"])
             store.close()
 
-    # -- 4. reconcile -------------------------------------------------------------------
+    # -- 4. Neo (answer worker questions) --------------------------------------------
+
+    def neo_tick(self) -> None:
+        """Kick a queue drain when questions are waiting and none is running."""
+        if not self.catalog.os.neo.enabled or self.neo_draining:
+            return
+        from .neo_store import NeoStore
+        store = NeoStore()
+        try:
+            queued = store.counts().get("queued", 0)
+        finally:
+            store.close()
+        if not queued:
+            return
+        self.neo_draining = True
+        future = self.neo_pool.submit(self._neo_drain)
+        future.add_done_callback(lambda f: setattr(self, "neo_draining", False))
+
+    def _neo_drain(self) -> None:
+        """Answer every queued question in order (runs on the single neo thread)."""
+        from . import neo as neo_mod
+        from .neo_store import NeoStore
+
+        store = NeoStore()  # thread-local connection
+        central = CentralStore()
+        paths = {p.name: p.path for p in self.catalog.projects}
+        cfg = self.catalog.os.neo
+
+        def deliver(q: dict, verdict: dict) -> None:
+            ppath = paths.get(q["project"])
+            pstore = ProjectStore(ppath) if ppath and ppath.is_dir() else None
+            try:
+                if verdict["escalate"]:
+                    central.add_inbox(
+                        project=q["project"], level="warning",
+                        title=f"Neo escalated a question from {q['wo_id']}",
+                        body=f"Q: {q['question']}\nWhy: {verdict['reason']}\n"
+                             f"Answer it with: jarvis neo answer {q['id']} \"...\"",
+                        wo_id=q["wo_id"],
+                    )
+                    if pstore:
+                        pstore.flag_attention(
+                            q["wo_id"], f"question escalated by Neo: {q['question'][:80]}"
+                        )
+                elif pstore:
+                    pstore.queue_message(
+                        q["wo_id"], f"{neo_mod.ANSWER_PREFIX} {verdict['answer']}",
+                        source="neo",
+                    )
+                    pstore.add_event(q["wo_id"], "neo_answered",
+                                     {"neo_question_id": q["id"]})
+            finally:
+                if pstore:
+                    pstore.close()
+
+        try:
+            results = neo_mod.drain_queue(
+                store, model=cfg.model, learnings_limit=cfg.learnings_limit,
+                deliver=deliver,
+            )
+            if results:
+                log.info("neo drained %d question(s)", len(results))
+        except Exception:  # noqa: BLE001 — the drain must never kill the daemon
+            log.exception("neo drain failed")
+        finally:
+            store.close()
+            central.close()
+
+    # -- 5. reconcile -------------------------------------------------------------------
 
     def reconcile_project(
         self,

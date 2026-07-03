@@ -50,8 +50,9 @@ knowledge.
 │ jarvisd (daemon)    │                 │ Central state $JARVIS_HOME  │
 │ per-project pollers │                 │ os.db: projects, inbox,     │
 │ dispatcher          │                 │ backlog, knowledge          │
-│ message deliverer   │                 └─────────────────────────────┘
-│ notification router │
+│ message deliverer   │                 │ neo.db: Neo's questions,    │
+│ neo (answerer agent)│                 │ answers, reviews, learnings │
+│ notification router │                 └─────────────────────────────┘
 │ reconciler          │
 └──────┬──────────────┘
        │ spawns / observes
@@ -258,6 +259,28 @@ report; `--dry-run` shows what would change. `git init` is suggested (not auto-r
 non-repos. `PROJECT_ONBOARDING.md` (committed) documents the generic onboarding
 mechanics and rollout strategy; the user's own fleet plan lives in an untracked
 `MIGRATION.md`.
+
+### 3.9 Neo — the OS answerer agent
+
+Workers that hit a blocking decision run `jarvis wo ask <wo-id> "question"` and end
+their turn instead of stalling on the user. Questions queue in Neo's own DB
+(`$JARVIS_HOME/neo.db`). Each daemon tick, a single Neo thread drains the queue FIFO:
+one headless `claude -p` call per question, persona + accumulated learnings as a
+byte-stable system prompt (append-only rendering), the question last. Back-to-back
+ordering keeps the shared prefix inside the Anthropic prompt-cache TTL, so tokens are
+paid once per drain, not per question.
+
+Neo answers as the user, grounded in learnings distilled from the user's reviews.
+It escalates (inbox + attention) anything involving production, credentials, money,
+deletion/publication, legal matters, or unknown preferences — and any unparseable
+model output. Answers deliver to workers through the normal message path, prefixed
+`[Neo, answering for the user]`.
+
+Every answer is reviewable in the UI's **neo** tab (`jarvis neo` on the CLI):
+approve, or correct with feedback. Corrections become learnings (injected into all
+future Neo prompts — the more it's used, the more it answers like the user) and are
+forwarded to the still-open work order as guidance. Escalated questions take the
+user's answer via `jarvis neo answer`.
 
 ## 4. Error handling
 
