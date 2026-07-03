@@ -7,6 +7,14 @@
     "allow": ["Bash(jarvis *)"]
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "__JARVIS_HOOK_CMD__", "timeout": 30 }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [

@@ -94,6 +94,23 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
     (notify-send) optional. Existing project telegram scripts keep working until each
     project is migrated to call `jarvis notify` (migration guide included).
 
+## C2. Decisions forced by real-world verification (found during live e2e)
+
+24. **Worker settings travel as a file, not via the project's `.claude/settings.json`.**
+    Verified live: a `--bg --worktree` session runs in a fresh worktree checkout where
+    the (deliberately untracked) injected settings file doesn't exist — so hooks and
+    permissions silently didn't load and the worker blocked on its first `jarvis` call.
+    Dispatch now writes the merged settings (project settings + per-WO env) to
+    `.jarvis/worker-settings/<wo-id>.json` and passes `--settings <file>`. The
+    project-level injected settings remain for interactive sessions in the repo.
+
+25. **Injected hooks call jarvis by absolute path** (`shutil.which` at injection time),
+    and **workers get PATH + JARVIS_HOME injected**, because the Claude supervisor
+    daemon's environment doesn't necessarily include wherever jarvis is installed.
+
+26. **The OS baseline allows `Bash(jarvis *)`** in every managed project — workers
+    must be able to execute the contract commands without permission prompts.
+
 ## D. Migration
 
 17. **I did not modify any of your real projects.** `jarvis adopt` + `catalogs/

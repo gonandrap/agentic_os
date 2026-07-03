@@ -481,7 +481,11 @@ def cmd_ui(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # accept --json anywhere, not only before the subcommand
+    as_json = "--json" in argv
+    args = build_parser().parse_args([a for a in argv if a != "--json"])
+    args.json = as_json
     if args.cmd == "_hook":
         from .hooks import main_hook
         return main_hook()

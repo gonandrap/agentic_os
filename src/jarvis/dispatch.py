@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +22,40 @@ def _worker_path() -> str:
     if bindir not in path.split(os.pathsep):
         path = f"{bindir}{os.pathsep}{path}"
     return path
+
+
+def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
+    """Merge the project's injected settings with per-work-order env and persist
+    them for --settings.
+
+    The worker session lives in a fresh worktree where the (untracked)
+    .claude/settings.json doesn't exist, so hooks/permissions/env must travel with
+    the spawn. The file outlives the spawn call — Claude reloads settings from it —
+    so it is kept under the project's .jarvis dir for the work order's lifetime.
+    """
+    import json as _json
+
+    from .bootstrap import build_settings
+    from .paths import jarvis_home
+
+    settings = build_settings(project.settings_overrides)
+    settings.pop("_jarvis", None)
+    env = dict(settings.get("env") or {})
+    env.update({
+        "JARVIS_WO_ID": wo["id"],
+        "JARVIS_PROJECT": project.name,
+        "JARVIS_PROJECT_PATH": str(project.path),
+        # The worker's jarvis calls must hit the same central state as the daemon.
+        "JARVIS_HOME": str(jarvis_home()),
+        # Workers call `jarvis …` from Bash (contract); make sure it resolves even
+        # though the Claude supervisor daemon has its own PATH.
+        "PATH": _worker_path(),
+    })
+    settings["env"] = env
+    out = project.path / ".jarvis" / "worker-settings" / f"{wo['id']}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(_json.dumps(settings, indent=2))
+    return out
 
 
 def worker_name(wo: dict[str, Any]) -> str:
@@ -68,8 +101,7 @@ def dispatch_work_order(
     knowledge_limit: int = 8,
 ) -> dict[str, Any]:
     """Spawn the worker for a work order already in `dispatching` state."""
-    session_id = str(uuid.uuid4())
-    worktree = f"wo-{wo['id']}"
+    worktree = wo["id"]  # ids already carry the wo- prefix
     knowledge = central.relevant_knowledge(project.name, limit=knowledge_limit)
     prompt = build_worker_prompt(wo, project, knowledge)
 
@@ -78,25 +110,18 @@ def dispatch_work_order(
     permission_mode = wo.get("permission_mode") or project.worker.permission_mode
     extra_sp = wo.get("append_system_prompt") or project.worker.append_system_prompt
 
+    settings_file = _write_worker_settings(project, wo)
     try:
         claude_cli.spawn_background(
             prompt=prompt,
             cwd=project.path,
             name=worker_name(wo),
-            session_id=session_id,
             model=model,
             effort=effort,
             permission_mode=permission_mode,
             append_system_prompt=extra_sp,
             worktree=worktree,
-            env={
-                "JARVIS_WO_ID": wo["id"],
-                "JARVIS_PROJECT": project.name,
-                "JARVIS_PROJECT_PATH": str(project.path),
-                # Workers call `jarvis …` from Bash (contract); make sure it resolves
-                # even though the Claude supervisor daemon has its own PATH.
-                "PATH": _worker_path(),
-            },
+            settings_file=settings_file,
         )
     except claude_cli.ClaudeCliError as e:
         store.set_status(wo["id"], "failed")
@@ -112,7 +137,6 @@ def dispatch_work_order(
 
     store.update_work_order(
         wo["id"],
-        session_id=session_id,
         worktree=worktree,
         model=model,
         effort=effort,
@@ -120,10 +144,10 @@ def dispatch_work_order(
     )
     store.set_status(wo["id"], "running")
     store.add_event(wo["id"], "dispatched", {
-        "session_id": session_id,
         "worktree": worktree,
         "model": model,
         "permission_mode": permission_mode,
+        "note": "session id binds via SessionStart hook / name reconciliation",
     })
     central.touch_project(project.name)
     return store.get_work_order(wo["id"])

@@ -44,13 +44,17 @@ if "--version" in argv:
 elif argv[:1] == ["agents"]:
     print(json.dumps(load_sessions()))
 elif "--bg" in argv:
+    # like the real supervisor: assigns its own session id (ignores --session-id)
+    import hashlib
     sessions = load_sessions()
+    name = opt("--name", "")
+    sid = "sess-" + hashlib.sha1(name.encode()).hexdigest()[:12]
     sessions.append({
-        "id": (opt("--session-id") or "x")[:8],
-        "sessionId": opt("--session-id"),
+        "id": sid[:8],
+        "sessionId": sid,
         "cwd": os.getcwd(),
         "kind": "background",
-        "name": opt("--name", ""),
+        "name": name,
         "state": "running",
         "startedAt": 0,
     })

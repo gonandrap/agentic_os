@@ -100,21 +100,26 @@ def spawn_background(
     prompt: str,
     cwd: Path,
     name: str,
-    session_id: str,
     model: str | None = None,
     effort: str | None = None,
     permission_mode: str | None = None,
     append_system_prompt: str | None = None,
     worktree: str | None = None,
-    env: dict[str, str] | None = None,
+    settings_file: Path | None = None,
 ) -> None:
     """Spawn a native Claude Code background session for a work order.
 
-    The session id is chosen by us (UUID) so the work order row can reference it
-    before the process even starts. Extra env vars (JARVIS_WO_ID etc.) are passed
-    via --settings {"env": ...} so injected hooks can identify the work order.
+    The supervisor daemon assigns the session id (a --session-id flag is ignored for
+    --bg dispatches — verified empirically), so the work order is bound to its session
+    afterwards: the SessionStart hook reports the real id, and the reconciler falls
+    back to matching the unique `[WO <id>]` name.
+
+    settings_file carries the FULL settings for the worker (OS-injected project
+    settings merged with per-work-order env like JARVIS_WO_ID). It must be passed
+    explicitly: the worker runs in a fresh git worktree, and the project's
+    .claude/settings.json — being deliberately untracked — does not exist there.
     """
-    args: list[str] = ["--bg", "--session-id", session_id, "--name", name]
+    args: list[str] = ["--bg", "--name", name]
     if worktree:
         args += ["--worktree", worktree]
     if model:
@@ -125,8 +130,8 @@ def spawn_background(
         args += ["--permission-mode", permission_mode]
     if append_system_prompt:
         args += ["--append-system-prompt", append_system_prompt]
-    if env:
-        args += ["--settings", json.dumps({"env": env})]
+    if settings_file:
+        args += ["--settings", str(settings_file)]
     args.append(prompt)
     _run(args, cwd=cwd, timeout=120)
 

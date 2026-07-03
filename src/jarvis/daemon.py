@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -213,12 +214,30 @@ class Daemon:
             for s in group
         ]
         by_session_id = {s.session_id: s for s in sessions if s.session_id}
+        by_name_prefix: dict[str, claude_cli.BgSession] = {}
+        for s in sessions:
+            m = re.match(r"\[WO (wo-[0-9a-f]+)\]", s.name)
+            if m:
+                by_name_prefix[m.group(1)] = s
 
         # Settle framework work orders against live session states.
         for wo in store.list_work_orders(statuses=("running", "waiting_input", "dispatching")):
             sid = wo.get("session_id")
             if not sid:
-                continue
+                # --bg dispatch assigns its own session id; bind by unique name if the
+                # SessionStart hook hasn't reported yet.
+                sess = by_name_prefix.get(wo["id"])
+                if sess and sess.session_id:
+                    store.update_work_order(wo["id"], session_id=sess.session_id)
+                    store.add_event(wo["id"], "session_bound", {"via": "reconciler",
+                                                                "session_id": sess.session_id})
+                    sid = sess.session_id
+                else:
+                    age = time.time() - wo["updated_at"]
+                    if age > 300:
+                        store.set_status(wo["id"], "failed")
+                        store.flag_attention(wo["id"], "worker session never appeared")
+                    continue
             sess = by_session_id.get(sid)
             if sess is None:
                 if wo["status"] == "dispatching":

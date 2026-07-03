@@ -27,6 +27,26 @@ def started(jarvis_home, fake_claude, catalog_file, project):
     return daemon
 
 
+def bind_session(daemon, project, wo_id: str) -> str:
+    """Mirror reality: the SessionStart hook binds the supervisor-assigned session id.
+    Returns the bound session id."""
+    store = ProjectStore(project)
+    try:
+        import subprocess  # find the fake session by name via the daemon's own channel
+        from jarvis import claude_cli
+        sess = [s for s in claude_cli.list_background_sessions()
+                if s.name.startswith(f"[WO {wo_id}]")]
+        assert sess, f"no fake session named [WO {wo_id}]"
+        sid = sess[0].session_id
+        handle_hook(
+            {"hook_event_name": "SessionStart", "session_id": sid, "cwd": str(project)},
+            {"JARVIS_WO_ID": wo_id, "JARVIS_PROJECT_PATH": str(project)},
+        )
+        return sid
+    finally:
+        store.close()
+
+
 def test_start_bootstraps_and_registers(started, project, jarvis_home):
     assert (project / "OPERATION.md").exists()
     assert (project / ".jarvis" / "jarvis.db").parent.is_dir()
@@ -43,19 +63,30 @@ def test_dispatch_flow(started, fake_claude, project):
     store = ProjectStore(project)
     fresh = store.get_work_order(wo["id"])
     assert fresh["status"] == "running"
-    assert fresh["session_id"]
-    assert fresh["worktree"] == f"wo-{wo['id']}"
+    assert fresh["session_id"] is None  # bound later by hook/reconciler
+    assert fresh["worktree"] == wo["id"]
+
+    # the SessionStart hook binds the supervisor-assigned session id
+    sid = bind_session(daemon, project, wo["id"])
+    assert store.get_work_order(wo["id"])["session_id"] == sid
 
     # the fake claude recorded a --bg spawn with our conventions
     bg = [c for c in fake_claude.calls if "--bg" in c["argv"]]
     assert len(bg) == 1
     argv = bg[0]["argv"]
     assert argv[argv.index("--name") + 1].startswith(f"[WO {wo['id']}]")
-    assert argv[argv.index("--worktree") + 1] == f"wo-{wo['id']}"
+    assert argv[argv.index("--worktree") + 1] == wo["id"]
     assert argv[argv.index("--model") + 1] == "sonnet"
     assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
-    settings = json.loads(argv[argv.index("--settings") + 1])
+    # full settings (hooks + permissions + env) travel with the spawn as a file,
+    # because the worktree has no .claude/settings.json (it's untracked)
+    settings_path = argv[argv.index("--settings") + 1]
+    settings = json.loads(open(settings_path).read())
     assert settings["env"]["JARVIS_WO_ID"] == wo["id"]
+    assert settings["env"]["JARVIS_PROJECT_PATH"] == str(project)
+    assert "PATH" in settings["env"]
+    assert "Stop" in settings["hooks"]
+    assert "Bash(jarvis *)" in settings["permissions"]["allow"]
     prompt = argv[-1]
     assert "add feature X" in prompt and "OPERATION.md" in prompt
     # appears in the (fake) agents view
@@ -88,7 +119,7 @@ def test_hook_events_update_state(started, project):
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
-    sid = store.get_work_order(wo["id"])["session_id"]
+    sid = bind_session(daemon, project, wo["id"])
 
     env = {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)}
     handle_hook({"hook_event_name": "Notification", "session_id": sid,
@@ -118,7 +149,7 @@ def test_message_delivery_when_idle(started, fake_claude, project):
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
-    sid = store.get_work_order(wo["id"])["session_id"]
+    sid = bind_session(daemon, project, wo["id"])
 
     ops.send_message(wo["id"], "please also update the docs", source="ui")
     daemon.tick()  # worker mid-turn (no turn_ended yet) → not delivered
@@ -188,12 +219,25 @@ def test_notification_routing(started, project, jarvis_home):
     assert st["inbox"]["critical"] == 1
 
 
+def test_reconciler_binds_session_by_name(started, fake_claude, project):
+    """Without any hook, the reconciler binds the session via the [WO id] name."""
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    assert store.get_work_order(wo["id"])["session_id"] is None
+    daemon.tick_count = 0
+    daemon.tick()
+    bound = store.get_work_order(wo["id"])["session_id"]
+    assert bound and bound == fake_claude.sessions[0]["sessionId"]
+
+
 def test_reconciler_settles_done_worker(started, fake_claude, project):
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
-    sid = store.get_work_order(wo["id"])["session_id"]
+    sid = bind_session(daemon, project, wo["id"])
 
     # worker finished properly, then its session went idle
     ops.finish(wo["id"], "all good")
@@ -208,7 +252,7 @@ def test_reconciler_flags_unfinished_idle_worker(started, fake_claude, project):
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
-    sid = store.get_work_order(wo["id"])["session_id"]
+    sid = bind_session(daemon, project, wo["id"])
 
     fake_claude.set_session_state(sid, "done")  # idle but never called finish
     daemon.tick_count = 0
@@ -261,3 +305,22 @@ def test_backlog_promotion_with_dependencies(started, project):
 def test_wo_not_found(started):
     with pytest.raises(ops.OpsError, match="not found"):
         ops.find_work_order("wo-doesnotexist")
+
+
+def test_pretooluse_auto_allows_jarvis_chains():
+    from jarvis.hooks import is_jarvis_command_chain, preflight_decision
+
+    assert is_jarvis_command_chain('jarvis wo finish wo-1 --summary "done"')
+    assert is_jarvis_command_chain('cd /some/proj && jarvis wo assume wo-1 "x"')
+    assert not is_jarvis_command_chain("jarvis status && rm -rf /")
+    assert not is_jarvis_command_chain("jarvis status; whoami")
+    assert not is_jarvis_command_chain("echo jarvis")
+    assert not is_jarvis_command_chain("jarvis notify `whoami`")
+    assert not is_jarvis_command_chain("cd /p && git push")
+
+    d = preflight_decision({"tool_name": "Bash",
+                            "tool_input": {"command": "cd /p && jarvis status"}})
+    assert d["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert preflight_decision({"tool_name": "Bash",
+                               "tool_input": {"command": "git push"}}) is None
+    assert preflight_decision({"tool_name": "Edit", "tool_input": {}}) is None
