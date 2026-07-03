@@ -40,6 +40,22 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
 
     settings = build_settings(project.settings_overrides)
     settings.pop("_jarvis", None)
+
+    # Declarative worker permissions: full edit rights inside its own worktree,
+    # read rights over the whole project. (Verified live: acceptEdits alone still
+    # prompts inside --bg sessions, which would stall unattended work orders.)
+    proj_abs = str(project.path).lstrip("/")
+    wt_abs = f"{proj_abs}/.claude/worktrees/{wo['id']}"
+    allow = settings.setdefault("permissions", {}).setdefault("allow", [])
+    for rule in (
+        f"Edit(//{wt_abs}/**)",
+        f"Write(//{wt_abs}/**)",
+        f"NotebookEdit(//{wt_abs}/**)",
+        f"Read(//{proj_abs}/**)",
+    ):
+        if rule not in allow:
+            allow.append(rule)
+
     env = dict(settings.get("env") or {})
     env.update({
         "JARVIS_WO_ID": wo["id"],
