@@ -9,7 +9,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|Edit|Write|NotebookEdit",
         "hooks": [
           { "type": "command", "command": "__JARVIS_HOOK_CMD__", "timeout": 30 }
         ]

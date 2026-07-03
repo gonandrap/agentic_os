@@ -319,8 +319,33 @@ def test_pretooluse_auto_allows_jarvis_chains():
     assert not is_jarvis_command_chain("cd /p && git push")
 
     d = preflight_decision({"tool_name": "Bash",
-                            "tool_input": {"command": "cd /p && jarvis status"}})
+                            "tool_input": {"command": "cd /p && jarvis status"}}, {})
     assert d["hookSpecificOutput"]["permissionDecision"] == "allow"
     assert preflight_decision({"tool_name": "Bash",
-                               "tool_input": {"command": "git push"}}) is None
-    assert preflight_decision({"tool_name": "Edit", "tool_input": {}}) is None
+                               "tool_input": {"command": "git push"}}, {}) is None
+    assert preflight_decision({"tool_name": "Edit", "tool_input": {}}, {}) is None
+
+
+def test_pretooluse_allows_worker_edits_in_own_worktree(tmp_path):
+    from jarvis.hooks import preflight_decision
+
+    wt = tmp_path / "proj" / ".claude" / "worktrees" / "wo-1"
+    wt.mkdir(parents=True)
+    worker_env = {"JARVIS_WO_ID": "wo-1"}
+    inside = {"tool_name": "Write", "cwd": str(wt),
+              "tool_input": {"file_path": str(wt / "HELLO.txt")}}
+    outside = {"tool_name": "Write", "cwd": str(wt),
+               "tool_input": {"file_path": str(tmp_path / "proj" / "HELLO.txt")}}
+    escape = {"tool_name": "Write", "cwd": str(wt),
+              "tool_input": {"file_path": str(wt / ".." / ".." / ".." / "x.txt")}}
+
+    d = preflight_decision(inside, worker_env)
+    assert d["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert preflight_decision(outside, worker_env) is None
+    assert preflight_decision(escape, worker_env) is None
+    # interactive session (no JARVIS_WO_ID): never auto-allowed
+    assert preflight_decision(inside, {}) is None
+    # not in a worktree: never auto-allowed
+    not_wt = {"tool_name": "Write", "cwd": str(tmp_path),
+              "tool_input": {"file_path": str(tmp_path / "f.txt")}}
+    assert preflight_decision(not_wt, worker_env) is None

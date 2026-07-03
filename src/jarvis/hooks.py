@@ -42,21 +42,43 @@ def is_jarvis_command_chain(command: str) -> bool:
     return "jarvis" in command
 
 
-def preflight_decision(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """PreToolUse: auto-approve the worker contract commands (`jarvis …`), which
-    otherwise stall background sessions on a permission prompt when the model
-    prefixes them with `cd <dir> &&`."""
-    if payload.get("tool_name") != "Bash":
-        return None
-    command = (payload.get("tool_input") or {}).get("command", "")
-    if is_jarvis_command_chain(command):
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "permissionDecisionReason": "jarvis contract command",
-            }
+def _allow(reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": reason,
         }
+    }
+
+
+def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
+    """PreToolUse auto-approvals that keep autonomous workers unattended:
+
+    - `jarvis …` contract commands (also when prefixed with `cd <dir> &&`), which
+      otherwise stall background sessions on a permission prompt.
+    - File edits *inside the worker's own worktree* — the worktree exists solely for
+      this work order, so the worker owns it (verified live: acceptEdits alone still
+      prompted for Write in a background session). Only active for worker sessions
+      (JARVIS_WO_ID set), never for interactive sessions in managed projects.
+    """
+    tool = payload.get("tool_name")
+    tool_input = payload.get("tool_input") or {}
+
+    if tool == "Bash":
+        if is_jarvis_command_chain(tool_input.get("command", "")):
+            return _allow("jarvis contract command")
+        return None
+
+    if tool in ("Edit", "Write", "NotebookEdit") and env.get("JARVIS_WO_ID"):
+        cwd = payload.get("cwd") or ""
+        file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+        if cwd and "/.claude/worktrees/" in cwd:
+            try:
+                Path(file_path).resolve().relative_to(Path(cwd).resolve())
+            except ValueError:
+                return None
+            return _allow("worker edit inside its own worktree")
     return None
 
 
@@ -81,7 +103,7 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
     cwd = Path(payload.get("cwd") or env.get("PWD") or ".")
 
     if event == "PreToolUse":
-        return preflight_decision(payload)
+        return preflight_decision(payload, env)
 
     root_env = env.get("JARVIS_PROJECT_PATH")
     root = Path(root_env) if root_env else find_project_root(cwd)

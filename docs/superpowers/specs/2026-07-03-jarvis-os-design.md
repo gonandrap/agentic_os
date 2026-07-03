@@ -144,10 +144,15 @@ unified across projects (notifications, backlog, knowledge, registry).
      `jarvis backlog add`, report learnings via `jarvis learn add`, notify via
      `jarvis notify`, end with a result summary)
    - injects relevant knowledge-base entries (project + global, most recent N)
-   - spawns: `claude --bg --worktree wo-<id> --name "[WO <id>] <title>" --model <m>
-     --settings '{"env":{"JARVIS_WO_ID":..., "JARVIS_PROJECT":...}}' ...` in the project
-     directory
-   - records `bg_id`, `session_id`, `worktree`; status → `running`.
+   - writes the merged worker settings (project injected settings + per-WO env:
+     JARVIS_WO_ID, JARVIS_PROJECT, JARVIS_PROJECT_PATH, JARVIS_HOME, PATH) to
+     `.jarvis/worker-settings/<id>.json` — required because the fresh worktree lacks
+     the untracked `.claude/settings.json` (verified live)
+   - spawns: `claude --bg --worktree <id> --name "[WO <id>] <title>" --model <m>
+     --settings .jarvis/worker-settings/<id>.json` in the project directory
+   - status → `running`. The supervisor assigns the session id (`--session-id` is
+     ignored for `--bg`, verified live); it binds to the work order via the
+     SessionStart hook, with reconciler name-matching (`[WO <id>]`) as fallback.
 3. **Track** — two channels:
    - *Hooks (event-driven):* injected project settings add SessionStart / Stop /
      Notification / SessionEnd hooks running `jarvis _hook <event>`; the hook reads
@@ -175,8 +180,11 @@ fallback if `--resume`-based delivery to live bg sessions proves unreliable. Tes
 
 ### 3.5 Configuration injection
 
-- `config/settings.base.json` in this repo is the OS baseline (hooks, statusline-free,
-  sane permissions).
+- `src/jarvis/assets/settings.base.json` is the OS baseline: the `jarvis _hook`
+  lifecycle hooks (SessionStart/Stop/SessionEnd/Notification, by absolute path), a
+  PreToolUse hook that auto-approves Bash commands that are pure `cd`/`jarvis` chains
+  (workers must never stall on their own contract commands), and
+  `permissions.allow: ["Bash(jarvis *)"]`.
 - On `jarvis start` / `jarvis adopt`, per project: deep-merge base ← catalog
   `settings_overrides` → write `<project>/.claude/settings.json`.
 - First injection backs up any existing file to `.claude/settings.json.pre-jarvis`.
