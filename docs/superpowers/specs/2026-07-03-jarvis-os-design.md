@@ -97,8 +97,9 @@ knowledge.
 }
 ```
 
-Schema validated on load with clear errors. `catalog.example.json` ships in the repo;
-`catalogs/gonzalo.json` holds the real fleet.
+Schema validated on load with clear errors. `catalog.example.json` ships in the repo; real fleet
+catalogs are personal instantiations and stay untracked (e.g. under `catalogs/`,
+gitignored) — the repo is agnostic of any one fleet.
 
 ### 3.2 State stores
 
@@ -254,8 +255,9 @@ A project is OS-ready when it has: `README.md` (kept if present, stub generated 
 
 `jarvis adopt <path> [--name ...]` performs all of it idempotently and prints a diff-like
 report; `--dry-run` shows what would change. `git init` is suggested (not auto-run) for
-non-repos (vpn-setup). `MIGRATION.md` documents the per-project rollout order:
-shared_schedule → tesis_grado → the rest, with auto_heycrypto's telegram rerouting last.
+non-repos. `PROJECT_ONBOARDING.md` (committed) documents the generic onboarding
+mechanics and rollout strategy; the user's own fleet plan lives in an untracked
+`MIGRATION.md`.
 
 ## 4. Error handling
 

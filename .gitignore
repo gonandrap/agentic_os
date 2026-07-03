@@ -220,3 +220,7 @@ __marimo__/
 __pycache__/
 *.egg-info/
 .pytest_cache/
+
+# Jarvis: personal instantiation files stay local (repo is agnostic of any one fleet)
+MIGRATION.md
+catalogs/

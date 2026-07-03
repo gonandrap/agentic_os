@@ -111,9 +111,9 @@ jarvis wo finish  <wo-id> --summary "delivered ..."  # completion signal
 Assumptions flip the work order to `needs_review` — visible in `jarvis status`, the
 dashboard, and (if configured) Telegram.
 
-## Migrating existing projects
+## Onboarding existing projects
 
-See [MIGRATION.md](MIGRATION.md). Short version: add the project to the catalog, run
+See [PROJECT_ONBOARDING.md](PROJECT_ONBOARDING.md). Short version: add the project to the catalog, run
 `jarvis adopt <path>` (idempotent, backs up existing settings), replace any direct
 notification scripts with `jarvis notify`.
 

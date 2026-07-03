@@ -29,7 +29,7 @@ budget small.
 
 ```bash
 jarvis status [--json]                     # whole-OS pulse; --attention for the short list
-jarvis start --catalog catalogs/gonzalo.json   # boot the OS
+jarvis start --catalog <path-to-catalog>   # boot the OS (user catalogs live untracked under catalogs/)
 jarvis stop
 jarvis wo create <project> "title" -d "details" [--model m]
 jarvis wo list [project] / show <id> / send <id> "msg" / review <id> / cancel <id>
