@@ -124,8 +124,14 @@ notification scripts with `jarvis notify`.
 ```bash
 uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
-pytest
+pytest                                   # unit tests
+pytest evals -q                          # behavioral evals (scorecard; see evals/README.md)
+playwright install chromium && pytest tests_browser -q   # browser tests
+JARVIS_EVALS_LLM=1 pytest evals/llm -q   # LLM-graded evals (opt-in, spends tokens)
 ```
+
+All PRs must pass the three CI checks (unit, evals, browser); `main` only takes
+merges through PRs — direct pushes are blocked by a repository ruleset.
 
 Design doc: `docs/superpowers/specs/2026-07-03-jarvis-os-design.md`.
 Decisions made while building: [ASSUMPTIONS.md](ASSUMPTIONS.md).
