@@ -21,15 +21,18 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
    sessions found in a project are auto-registered as `adhoc` shadow work orders so the
    UI shows them with a warning badge.
 
-3. **Feedback routing** (`jarvis wo send`, UI): messages queue in the project DB and
-   jarvisd delivers them when the worker's session is idle, via `claude stop <bg-id>`
-   (release from the supervisor) followed by `claude --resume <session-id> -p "<msg>"`.
-   Answer to your question #9: **yes — verified live**: a message was delivered into a
-   finished worker's session and its reply captured back into the DB. Two constraints
-   discovered on the way: resume refuses sessions still owned by a live bg agent
-   (hence the stop-first), and mid-turn injection isn't supported — messages wait for
-   the worker to go idle. For chatting with a worker *while it runs*, use the native
-   agents view (third interaction path you listed).
+3. **Feedback routing** (`jarvis wo send`, UI): messages queue in the project DB and,
+   once the worker's session is idle, jarvisd delivers them by dispatching a NEW
+   background agent that resumes the worker's conversation
+   (`claude --bg --resume <session-id> "<msg>"`). Answer to your question #9: **yes —
+   verified live**: full context carries over (fork semantics under a fresh session
+   id, which the SessionStart hook rebinds to the work order), the feedback turn shows
+   up in the agents view like any worker, and the reply is captured back into the DB.
+   Constraints discovered: plain `--resume -p` refuses sessions owned by a live bg
+   agent (kept only as fallback, preceded by `claude stop`), and mid-turn injection
+   isn't supported — messages wait until the worker goes idle. For interrupting a
+   worker *while it runs*, use the native agents view (third interaction path you
+   listed).
 
 4. **One central DB + one DB per project.** Work orders/events/messages/assumptions live
    in `<project>/.jarvis/jarvis.db` (per your #3, gitignored). Anything that must be

@@ -164,19 +164,20 @@ def test_message_delivery_when_idle(started, fake_claude, project):
     daemon.tick()
     daemon.delivery_pool.shutdown(wait=True)  # let the delivery thread finish
 
-    # bg session released first, then headless resume with the message
-    stops = [c for c in fake_claude.calls if c["argv"][:1] == ["stop"]]
-    assert len(stops) == 1
-    resumes = [c for c in fake_claude.calls if "--resume" in c["argv"]]
+    # delivered as a NEW bg agent resuming the worker's session (stays in agents view)
+    resumes = [c for c in fake_claude.calls
+               if "--bg" in c["argv"] and "--resume" in c["argv"]]
     assert len(resumes) == 1
     argv = resumes[0]["argv"]
     assert argv[argv.index("--resume") + 1] == sid
-    assert "update the docs" in argv[argv.index("-p") + 1]
+    assert argv[argv.index("--name") + 1].startswith(f"[WO {wo['id']}]")
+    assert "update the docs" in argv[-1]
 
     msgs = store.list_messages(wo["id"])
     assert msgs[0]["status"] == "delivered"
-    # worker's reply recorded as agent_to_user
-    assert any(m["direction"] == "agent_to_user" for m in msgs)
+    # worker's reply (from the fork's job result) recorded as agent_to_user
+    replies = [m for m in msgs if m["direction"] == "agent_to_user"]
+    assert replies and "ack:" in replies[0]["content"]
 
 
 def test_finish_and_assumption_review(started, project):

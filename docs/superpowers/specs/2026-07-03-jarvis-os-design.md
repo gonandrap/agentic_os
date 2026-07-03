@@ -163,11 +163,13 @@ unified across projects (notifications, backlog, knowledge, registry).
      background sessions in a project cwd as `origin=adhoc` shadow work orders so ad-hoc
      agents are visible (and labeled) in the UI.
 4. **Interact** — `jarvis wo send <id> "msg"` (CLI or UI) enqueues a message; when the
-   worker's session goes idle (`done` in the agents roster) jarvisd releases it
-   (`claude stop <bg-id>`) and delivers with `claude --resume <session-id> -p`,
-   recording the worker's reply. Mid-turn injection is not supported by the CLI — for
-   live interaction users open the session in the agents view (native path). All
-   deliveries are logged to `wo_events`.
+   worker's session goes idle (`done` in the agents roster) jarvisd dispatches a new
+   background agent resuming that conversation (`claude --bg --resume`) — context
+   carries over, the turn is visible in the agents view, the SessionStart hook rebinds
+   the work order to the fork's session id, and the reply is captured from the job
+   result into the message thread. Fallback: stop + headless `--resume -p`. Mid-turn
+   injection is not supported by the CLI — for live interruption users open the
+   session in the agents view (native path). All deliveries are logged to `wo_events`.
 5. **Complete** — worker's Stop/SessionEnd hook flips status. If the worker recorded
    assumptions, status becomes `needs_review` and `needs_attention=1` until the user
    accepts. Workers ship their own branch/PR per repo conventions (OPERATION.md says to).

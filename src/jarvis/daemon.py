@@ -184,20 +184,52 @@ class Daemon:
 
     def _deliver(self, project: ProjectSpec, wo: dict, msg: dict,
                  bg_id: str | None = None) -> None:
+        """Deliver a queued user message to the worker's conversation.
+
+        Primary path: dispatch a NEW background agent resuming the worker's session
+        (`claude --bg --resume`) — full context carries over and the worker stays
+        visible in the agents view; the SessionStart hook rebinds the work order to
+        the fork's session id. Fallback: release the idle session and resume it
+        headlessly (stop + `--resume -p`).
+        """
+        from .dispatch import _write_worker_settings, worker_name
+
         store = ProjectStore(project.path)  # thread-local connection
         try:
             log.info("[%s] delivering message %s to %s", project.name, msg["id"], wo["id"])
-            result = claude_cli.send_to_session(
-                wo["session_id"], msg["content"], cwd=project.path, bg_id=bg_id,
-            )
-            store.mark_message(msg["id"], "delivered")
+            wt = project.path / ".claude" / "worktrees" / (wo.get("worktree") or "")
+            cwd = wt if wo.get("worktree") and wt.is_dir() else project.path
+            result: str | None = None
+            try:
+                job_id = claude_cli.spawn_background(
+                    prompt=msg["content"],
+                    cwd=cwd,
+                    name=worker_name(wo),
+                    model=wo.get("model"),
+                    permission_mode=wo.get("permission_mode"),
+                    settings_file=_write_worker_settings(project, wo),
+                    resume_session_id=wo["session_id"],
+                )
+                store.mark_message(msg["id"], "delivered")
+                store.add_event(wo["id"], "message_delivered",
+                                {"msg_id": msg["id"], "via": "bg-resume", "job": job_id})
+                if store.get_work_order(wo["id"])["status"] in ("waiting_input", "needs_review"):
+                    store.set_status(wo["id"], "running")
+                    store.clear_attention(wo["id"])
+                if job_id:
+                    result = claude_cli.wait_job_result(job_id)
+            except claude_cli.ClaudeCliError as e:
+                log.warning("[%s] bg-resume delivery failed (%s); falling back to headless resume",
+                            project.name, e)
+                result = claude_cli.send_to_session(
+                    wo["session_id"], msg["content"], cwd=project.path, bg_id=bg_id,
+                )
+                store.mark_message(msg["id"], "delivered")
+                store.add_event(wo["id"], "message_delivered",
+                                {"msg_id": msg["id"], "via": "headless-resume"})
             if result:
                 store.queue_message(wo["id"], result, source="worker",
                                     direction="agent_to_user", status="delivered")
-            store.add_event(wo["id"], "message_delivered", {"msg_id": msg["id"]})
-            if store.get_work_order(wo["id"])["status"] == "waiting_input":
-                store.set_status(wo["id"], "running")
-                store.clear_attention(wo["id"])
         except claude_cli.ClaudeCliError as e:
             log.error("[%s] delivery of message %s failed: %s", project.name, msg["id"], e)
             store.mark_message(msg["id"], "failed")

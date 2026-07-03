@@ -44,21 +44,35 @@ if "--version" in argv:
 elif argv[:1] == ["agents"]:
     print(json.dumps(load_sessions()))
 elif "--bg" in argv:
-    # like the real supervisor: assigns its own session id (ignores --session-id)
+    # like the real supervisor: assigns its own session id (ignores --session-id);
+    # with --resume it forks the conversation under a fresh session id
     import hashlib
     sessions = load_sessions()
     name = opt("--name", "")
-    sid = "sess-" + hashlib.sha1(name.encode()).hexdigest()[:12]
+    resumed = opt("--resume")
+    seed = name + (resumed or "") + str(len(sessions))
+    sid = "sess-" + hashlib.sha1(seed.encode()).hexdigest()[:12]
+    job_id = sid[5:13]
     sessions.append({
-        "id": sid[:8],
+        "id": job_id,
         "sessionId": sid,
         "cwd": os.getcwd(),
         "kind": "background",
         "name": name,
         "state": "running",
         "startedAt": 0,
+        "resumedFrom": resumed,
     })
     save_sessions(sessions)
+    # job state the daemon polls for the fork's reply (internal-format stand-in)
+    jobs_root = os.environ.get("JARVIS_CLAUDE_JOBS_DIR")
+    if jobs_root and resumed:
+        jdir = os.path.join(jobs_root, job_id)
+        os.makedirs(jdir, exist_ok=True)
+        with open(os.path.join(jdir, "state.json"), "w") as f:
+            json.dump({"state": "done",
+                       "output": {"result": f"ack: {argv[-1][:40]}"}}, f)
+    print(f"  claude stop {job_id}      stop this session")
 elif argv[:1] == ["stop"]:
     sessions = load_sessions()
     remaining = [s for s in sessions if s["id"] != argv[1]]
@@ -92,11 +106,13 @@ def fake_claude(tmp_path, monkeypatch):
     """Install a fake `claude` binary; returns a handle to its recorded state."""
     fdir = tmp_path / "fake-claude"
     fdir.mkdir()
+    (fdir / "jobs").mkdir()
     binpath = fdir / "claude"
     binpath.write_text(FAKE_CLAUDE)
     binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setenv("FAKE_CLAUDE_DIR", str(fdir))
     monkeypatch.setenv("JARVIS_CLAUDE_BIN", str(binpath))
+    monkeypatch.setenv("JARVIS_CLAUDE_JOBS_DIR", str(fdir / "jobs"))
 
     class Handle:
         dir = fdir

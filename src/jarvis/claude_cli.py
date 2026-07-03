@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -96,6 +98,9 @@ def list_background_sessions(cwd: Path | None = None, include_done: bool = True)
     return sessions
 
 
+_JOB_ID_RE = re.compile(r"claude stop ([0-9a-f]{6,})")
+
+
 def spawn_background(
     prompt: str,
     cwd: Path,
@@ -106,13 +111,20 @@ def spawn_background(
     append_system_prompt: str | None = None,
     worktree: str | None = None,
     settings_file: Path | None = None,
-) -> None:
-    """Spawn a native Claude Code background session for a work order.
+    resume_session_id: str | None = None,
+) -> str | None:
+    """Spawn a native Claude Code background session; returns the job id if the
+    CLI reported one.
 
     The supervisor daemon assigns the session id (a --session-id flag is ignored for
     --bg dispatches — verified empirically), so the work order is bound to its session
     afterwards: the SessionStart hook reports the real id, and the reconciler falls
     back to matching the unique `[WO <id>]` name.
+
+    With resume_session_id, the new background agent continues that conversation
+    (fork semantics: full context carried over, fresh session id — verified live).
+    This is how user feedback is delivered while keeping the worker visible in the
+    agents view.
 
     settings_file carries the FULL settings for the worker (OS-injected project
     settings merged with per-work-order env like JARVIS_WO_ID). It must be passed
@@ -120,6 +132,8 @@ def spawn_background(
     .claude/settings.json — being deliberately untracked — does not exist there.
     """
     args: list[str] = ["--bg", "--name", name]
+    if resume_session_id:
+        args += ["--resume", resume_session_id]
     if worktree:
         args += ["--worktree", worktree]
     if model:
@@ -133,7 +147,36 @@ def spawn_background(
     if settings_file:
         args += ["--settings", str(settings_file)]
     args.append(prompt)
-    _run(args, cwd=cwd, timeout=120)
+    out = _run(args, cwd=cwd, timeout=120)
+    m = _JOB_ID_RE.search(out or "")
+    return m.group(1) if m else None
+
+
+def jobs_dir() -> Path:
+    override = os.environ.get("JARVIS_CLAUDE_JOBS_DIR")
+    if override:
+        return Path(override)
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+    return config / "jobs"
+
+
+def wait_job_result(job_id: str, timeout: float = 900, poll: float = 5.0) -> str | None:
+    """Best-effort: wait for a background job to finish and return its result text.
+
+    Reads the supervisor's per-job state file (internal format — failures are
+    swallowed, returning None)."""
+    state_path = jobs_dir() / job_id / "state.json"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            state = json.loads(state_path.read_text())
+            if state.get("state") == "done":
+                output = state.get("output") or {}
+                return output.get("result") if isinstance(output, dict) else None
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+        time.sleep(poll)
+    return None
 
 
 def stop_session(bg_id: str) -> bool:
