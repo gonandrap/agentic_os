@@ -22,6 +22,16 @@ Try it safely first:
 jarvis adopt ~/workspace/shared_schedule --catalog catalogs/gonzalo.json --dry-run
 ```
 
+**After adopting, commit the generated files** (`OPERATION.md`, `.gitignore` change,
+`README.md` if stubbed) — workers run in fresh worktrees checked out from git, so
+uncommitted files don't exist for them:
+
+```bash
+git add OPERATION.md .gitignore README.md && git commit -m "Adopt Jarvis OS"
+```
+(`.claude/settings.json` stays uncommitted by design — Jarvis re-injects it and passes
+it to workers directly.)
+
 ## Rollout order for this fleet
 
 1. **shared_schedule** — small, clean, only a `settings.local.json` (untouched). Pilot.

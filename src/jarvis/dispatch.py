@@ -75,14 +75,20 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         wo.get("description") or "(no further description — the title is the task)",
         "",
         "# Operating contract",
-        "Read OPERATION.md at the project root and follow it exactly: work in your "
-        "worktree, commit and open a PR per repo conventions, record every assumption "
-        f"with `jarvis wo assume {wo['id']} \"...\"`, file deferred work with "
-        f"`jarvis backlog add {project.name} \"...\"`, report learnings with "
-        f"`jarvis learn add ... --project {project.name}`, and when done run "
-        f"`jarvis wo finish {wo['id']} --summary \"...\"`.",
+        "You MUST follow this contract (it mirrors the project's OPERATION.md — do "
+        "not go looking for that file, everything you need is here):",
+        "- Work only inside your assigned worktree (you start in it). Commit your "
+        "work and open a PR per this repo's conventions. Never push to main.",
+        f"- Record EVERY assumption you make: `jarvis wo assume {wo['id']} \"...\"`",
+        f"- File deferred work instead of leaving notes: `jarvis backlog add "
+        f"{project.name} \"...\"`",
+        f"- Report reusable learnings: `jarvis learn add \"...\" --project {project.name}`",
+        f"- Alert the human when needed: `jarvis notify --project {project.name} "
+        f"--level warning|critical \"title\" \"body\"`",
+        f"- When done, ALWAYS run: `jarvis wo finish {wo['id']} --summary \"...\"`",
         "Work autonomously toward a complete end-to-end solution unless this work "
-        "order says otherwise.",
+        "order says otherwise. User feedback may arrive as new user turns; treat it "
+        "as authoritative for this work order.",
     ]
     if knowledge:
         parts += ["", "# Knowledge base (learnings from this and other projects)"]

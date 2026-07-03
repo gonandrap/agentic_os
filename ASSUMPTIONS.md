@@ -111,6 +111,20 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
 26. **The OS baseline allows `Bash(jarvis *)`** in every managed project — workers
     must be able to execute the contract commands without permission prompts.
 
+27. **Workers may edit freely inside their own worktree, and nowhere else.** Verified
+    live: `acceptEdits` still prompted for a background worker's `Write`, which would
+    stall every unattended work order. The injected PreToolUse hook auto-allows
+    Edit/Write/NotebookEdit only when (a) the session is a Jarvis worker
+    (`JARVIS_WO_ID` set) and (b) the target path resolves inside the session's
+    worktree. Interactive sessions and out-of-worktree writes still prompt normally.
+    The `cd X && jarvis …` pattern is likewise auto-allowed only for pure cd/jarvis
+    chains with no other shell constructs.
+
+28. **Worker → OS plumbing confirmed end to end on the real CLI**: hooks fire from
+    worker sessions (SessionStart/Notification observed), `jarvis wo assume` executed
+    from inside a worker updates the project DB and ASSUMPTIONS.md, and blocked
+    workers surface as `waiting_input` + attention + a queued notification.
+
 ## D. Migration
 
 17. **I did not modify any of your real projects.** `jarvis adopt` + `catalogs/
@@ -127,6 +141,17 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
     production alerts through `jarvis notify` is a one-line change in
     `scripts/notify_telegram.sh` documented in MIGRATION.md, deliberately last in the
     rollout (production trading system — you flip it when you trust the OS pipeline).
+
+## D2. UI design choices
+
+29. **Dark-only "control room at dusk" console**: blue-slate dark background, amber
+    reserved for needs-you signals, cyan for active, green/red for outcomes; statuses
+    always icon + word (never color alone). The signature element is the attention
+    strip at the top — amber band listing exactly what needs you, collapsing to a
+    one-line green "all quiet" when nothing does.
+30. **Zero-JS, no CDNs, no build step**: server-rendered Jinja + `<meta refresh>` on
+    the dashboard (15 s). Deliberate for reproducibility/self-containment; htmx or
+    websockets can come later without changing routes.
 
 ## E. Scope cuts (MVP)
 
