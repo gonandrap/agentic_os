@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,15 @@ from .catalog import ProjectSpec
 
 TEMPLATE_VERSION = 1
 ASSETS = Path(__file__).parent / "assets"
+
+
+def jarvis_hook_command() -> str:
+    """Absolute command for injected hooks — the Claude daemon's PATH may not
+    include wherever jarvis is installed."""
+    exe = shutil.which("jarvis")
+    if exe:
+        return f"{exe} _hook"
+    return f"{sys.executable} -m jarvis.cli _hook"
 
 
 @dataclass
@@ -52,7 +63,8 @@ def _settings_hash(settings: dict[str, Any]) -> str:
 
 
 def build_settings(overrides: dict[str, Any]) -> dict[str, Any]:
-    base = json.loads((ASSETS / "settings.base.json").read_text())
+    text = (ASSETS / "settings.base.json").read_text()
+    base = json.loads(text.replace("__JARVIS_HOOK_CMD__", jarvis_hook_command()))
     base.pop("$comment", None)
     merged = deep_merge(base, overrides)
     merged["_jarvis"] = {"managed": True, "version": TEMPLATE_VERSION}

@@ -3,32 +3,35 @@
   "env": {
     "JARVIS_MANAGED": "1"
   },
+  "permissions": {
+    "allow": ["Bash(jarvis *)"]
+  },
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "jarvis _hook", "timeout": 30 }
+          { "type": "command", "command": "__JARVIS_HOOK_CMD__", "timeout": 30 }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "jarvis _hook", "timeout": 30 }
+          { "type": "command", "command": "__JARVIS_HOOK_CMD__", "timeout": 30 }
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          { "type": "command", "command": "jarvis _hook", "timeout": 30 }
+          { "type": "command", "command": "__JARVIS_HOOK_CMD__", "timeout": 30 }
         ]
       }
     ],
     "Notification": [
       {
         "hooks": [
-          { "type": "command", "command": "jarvis _hook", "timeout": 30 }
+          { "type": "command", "command": "__JARVIS_HOOK_CMD__", "timeout": 30 }
         ]
       }
     ]

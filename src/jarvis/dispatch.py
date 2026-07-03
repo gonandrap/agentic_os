@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
 from . import claude_cli
 from .catalog import ProjectSpec
 from .central_store import CentralStore
 from .project_store import ProjectStore
+
+
+def _worker_path() -> str:
+    """Daemon PATH, with the directory holding `jarvis` prepended."""
+    path = os.environ.get("PATH", "")
+    exe = shutil.which("jarvis") or sys.executable
+    bindir = str(Path(exe).parent)
+    if bindir not in path.split(os.pathsep):
+        path = f"{bindir}{os.pathsep}{path}"
+    return path
 
 
 def worker_name(wo: dict[str, Any]) -> str:
@@ -79,6 +93,9 @@ def dispatch_work_order(
                 "JARVIS_WO_ID": wo["id"],
                 "JARVIS_PROJECT": project.name,
                 "JARVIS_PROJECT_PATH": str(project.path),
+                # Workers call `jarvis …` from Bash (contract); make sure it resolves
+                # even though the Claude supervisor daemon has its own PATH.
+                "PATH": _worker_path(),
             },
         )
     except claude_cli.ClaudeCliError as e:
