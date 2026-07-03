@@ -1,0 +1,46 @@
+/* Jarvis promo scenes — tokens straight from brand/BRAND.md */
+:root {
+  --bg: #0e1420; --surface: #151d2c; --raised: #1b2437; --line: #253049;
+  --ink: #d9e0ec; --ink-2: #93a3ba; --ink-3: #5f6f88;
+  --amber: #f2a33c; --amber-ink: #ffd9a0;
+  --cyan: #56c8e8; --green: #46d69a; --red: #e85d5d;
+  --mono: ui-monospace, "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; margin: 0; }
+html, body { width: 1920px; height: 1080px; overflow: hidden; }
+body { background: var(--bg); color: var(--ink); font: 28px/1.5 var(--sans); position: relative; }
+.mono { font-family: var(--mono); }
+
+#veil { position: absolute; inset: 0; background: var(--bg); z-index: 99;
+        opacity: 0; pointer-events: none; }
+
+.caption { position: absolute; left: 90px; bottom: 70px; z-index: 5;
+           font-family: var(--mono); font-size: 30px; color: var(--ink-2);
+           letter-spacing: 0.02em; opacity: 0; }
+.caption b { color: var(--ink); font-weight: 600; }
+.caption .ok { color: var(--green); }
+.caption .warn { color: var(--amber); }
+
+.wordmark { font-family: var(--mono); font-weight: 700; letter-spacing: 0.18em;
+            color: var(--ink); }
+.wordmark .caret { color: var(--amber); }
+
+.chip { position: absolute; z-index: 6; font-family: var(--mono); font-size: 26px;
+        background: var(--raised); border: 1px solid var(--line); border-radius: 10px;
+        padding: 14px 22px; color: var(--ink); box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+        opacity: 0; white-space: nowrap; }
+.chip .prompt { color: var(--green); margin-right: 12px; }
+.chip .c { color: var(--amber-ink); }
+
+.node { position: absolute; background: var(--surface); border: 1px solid var(--line);
+        border-radius: 12px; font-family: var(--mono); text-align: center; }
+.node .nm { color: var(--ink); font-size: 26px; font-weight: 600; }
+.node .sub { color: var(--ink-3); font-size: 19px; }
+
+svg.rails { position: absolute; inset: 0; z-index: 1; }
+svg.rails path { fill: none; stroke: var(--line); stroke-width: 2.5; }
+svg.rails circle.pulse { fill: var(--cyan); r: 7;
+                         filter: drop-shadow(0 0 10px rgba(86,200,232,0.9)); }
+svg.rails circle.pulse.amber { fill: var(--amber);
+                               filter: drop-shadow(0 0 10px rgba(242,163,60,0.9)); }

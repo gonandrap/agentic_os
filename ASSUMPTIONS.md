@@ -262,6 +262,36 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
     `browser`). Approving-review count is 0 — requiring 1 approval would deadlock
     a solo maintainer; flip it on when a second person joins.
 
+## H. Promo video & brand system
+
+43. **The brand is the UI's own "control room at dusk", codified.** `brand/BRAND.md`
+    freezes palette, typography, motion language (data = light pulses on rails,
+    ignition, amber-only-when-needs-you, resolution-as-exhale), voice, and music
+    direction. Every future promotional piece derives from it — that's your
+    "persist the look and feel + instructions" requirement.
+
+44. **The video is fully generated from source, nothing hand-edited**: cinematic
+    scenes are HTML pages with a deterministic `seek(t)` API screenshotted at
+    30 fps (Playwright), interleaved with REAL dashboard screenshots from an
+    actual seeded OS run (real daemon, real stores, real UI — the fake `claude`
+    supervisor stands in for speed/determinism; a screenshot is always the real
+    product rendering real DB state, never a mockup). ffmpeg assembles at
+    1080p/H.264.
+
+45. **Music is synthesized in-repo (stdlib only)** — 104 BPM warm pad / plucks /
+    bass / brushed ticks per the brand's "productivity, not hype" direction —
+    because licensed tracks can't ship in an OSS repo and wouldn't be
+    reproducible. Swap it for a licensed track at upload time if you prefer;
+    BRAND.md notes how.
+
+46. **On-screen captions carry the story** (no voiceover): social feeds default
+    to muted playback, and TTS voices undercut the calm-operator brand. Every
+    beat is readable silent.
+
+47. **`promo/out/` (video, frames, screenshots, fixture) is gitignored** — large
+    binaries don't belong in git history; the pipeline regenerates them
+    identically. The rendered master lands at `promo/out/jarvis-os-60s.mp4`.
+
 ## E. Scope cuts (MVP)
 
 20. UI has no auth and no websockets (htmx polling refresh).

@@ -227,3 +227,6 @@ catalogs/
 
 # generated eval artifacts
 evals/results.json
+
+# promo build artifacts (video, frames, screenshots, fixture world)
+promo/out/

@@ -1,0 +1,80 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link rel="stylesheet" href="base.css">
+<style>
+  .node { padding: 20px 28px; }
+  .wnode { width: 300px; opacity: 0.95; }
+  #w1 { left: 130px; top: 210px; } #w2 { left: 130px; top: 470px; } #w3 { left: 130px; top: 730px; }
+  #neo { left: 1180px; top: 450px; width: 300px; padding: 26px 30px;
+         border-color: rgba(86,200,232,0.5); }
+  #neo .nm { letter-spacing: 0.2em; font-size: 34px; }
+  #you { left: 1560px; top: 150px; width: 310px; border-style: dashed; }
+  .q { position: absolute; z-index: 3; font-family: var(--mono); font-size: 20px;
+       background: var(--raised); border: 1px solid var(--line); border-radius: 999px;
+       padding: 10px 20px; color: var(--ink-2); opacity: 0; white-space: nowrap; }
+  .queue-lbl { position: absolute; left: 640px; top: 320px; font-family: var(--mono);
+               font-size: 20px; color: var(--ink-3); letter-spacing: 0.14em; opacity: 0; }
+</style></head>
+<body>
+  <svg class="rails" width="1920" height="1080">
+    <path id="q1r" d="M 440 260 C 700 300, 950 420, 1180 500"/>
+    <path id="q2r" d="M 440 520 C 700 530, 950 540, 1180 530"/>
+    <path id="q3r" d="M 440 780 C 700 740, 950 620, 1180 560"/>
+    <path id="a1r" d="M 1180 520 C 950 440, 700 320, 440 280"/>
+    <path id="a2r" d="M 1180 545 C 950 555, 700 545, 440 540"/>
+    <path id="esc" d="M 1330 450 C 1420 330, 1540 260, 1660 225"/>
+    <circle id="qd1" class="pulse" style="opacity:0"/>
+    <circle id="qd2" class="pulse" style="opacity:0"/>
+    <circle id="qd3" class="pulse" style="opacity:0"/>
+    <circle id="ad1" class="pulse" style="opacity:0"/>
+    <circle id="ad2" class="pulse" style="opacity:0"/>
+    <circle id="ed"  class="pulse amber" style="opacity:0"/>
+  </svg>
+
+  <div class="node wnode" id="w1"><div class="nm">webapp worker</div><div class="sub">"comma or semicolon?"</div></div>
+  <div class="node wnode" id="w2"><div class="nm">etl worker</div><div class="sub">"checkpoint layout?"</div></div>
+  <div class="node wnode" id="w3"><div class="nm">etl worker</div><div class="sub">"$40 of credits?"</div></div>
+  <div class="node" id="neo"><div class="nm">NEO</div><div class="sub">answers as you · learns from you</div></div>
+  <div class="node" id="you"><div class="nm">you</div><div class="sub" id="yousub">undisturbed</div></div>
+  <div class="queue-lbl" id="qlbl">QUEUE · FIFO · CACHE-WARM</div>
+
+  <div class="caption" id="cap1">workers ask — <b>Neo answers as you</b>, in order, on a warm cache</div>
+  <div class="caption" id="cap2" style="opacity:0">money, prod, deletions? <span class="warn">only real decisions escalate to you</span></div>
+  <div id="veil"></div>
+<script src="scene.js"></script>
+<script>
+  const TOTAL = 8.0;
+  window.seek = (t) => {
+    document.getElementById('qlbl').style.opacity = 0.9 * easeOut(seg(t, 1.4, 0.5));
+    // three questions ride to NEO staggered
+    [['q1r','qd1',0.8], ['q2r','qd2',1.3], ['q3r','qd3',1.8]].forEach(([r, d, t0]) =>
+      pulseAlong(document.getElementById(d), document.getElementById(r), seg(t, t0, 1.2), true));
+    // NEO breathes while answering (2.4s pulse — brand cap on speeds)
+    const neo = document.getElementById('neo');
+    const busy = t > 2.8 && t < 5.6;
+    neo.style.borderColor = busy
+      ? `rgba(86,200,232,${0.5 + 0.2 * Math.sin(t * 2 * Math.PI / 2.4)})`
+      : 'rgba(86,200,232,0.5)';
+    // two answers return fast, back-to-back (the drain)
+    [['a1r','ad1',3.1], ['a2r','ad2',3.7]].forEach(([r, d, t0]) =>
+      pulseAlong(document.getElementById(d), document.getElementById(r), seg(t, t0, 0.9)));
+    ['w1','w2'].forEach((id, i) => {
+      const done = t > 4.1 + i * 0.6;
+      document.getElementById(id).querySelector('.sub').style.color =
+        done ? 'var(--green)' : 'var(--ink-3)';
+      if (done) document.getElementById(id).querySelector('.sub').textContent = '✓ answered — moving on';
+    });
+    // the third question deflects UP to you in amber (escalation)
+    pulseAlong(document.getElementById('ed'), document.getElementById('esc'), seg(t, 4.9, 1.0));
+    const yousub = document.getElementById('yousub');
+    if (t > 5.9) { yousub.textContent = '1 decision for you'; yousub.style.color = 'var(--amber)'; }
+    document.getElementById('you').style.borderColor =
+      t > 5.9 ? 'rgba(242,163,60,0.6)' : 'var(--line)';
+    // captions swap
+    document.getElementById('cap1').style.opacity =
+      easeOut(seg(t, 0.7, 0.5)) * (1 - seg(t, 4.6, 0.4));
+    document.getElementById('cap2').style.opacity = easeOut(seg(t, 5.0, 0.5));
+    edgeFade(t, TOTAL);
+  };
+</script>
+</body></html>

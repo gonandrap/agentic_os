@@ -1,0 +1,78 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link rel="stylesheet" href="base.css">
+<style>
+  .node { padding: 22px 30px; z-index: 2; opacity: 0; }
+  #core { left: 810px; top: 470px; width: 300px; border-color: rgba(86,200,232,0.45); }
+  #core .nm { letter-spacing: 0.14em; }
+  .proj { width: 320px; }
+  #p1 { left: 200px;  top: 170px; }
+  #p2 { left: 1400px; top: 170px; }
+  #p3 { left: 200px;  top: 770px; }
+  .you { position: absolute; left: 1430px; top: 780px; z-index: 2;
+         font-family: var(--mono); font-size: 24px; color: var(--ink-3);
+         border: 1px dashed var(--line); border-radius: 999px; padding: 16px 30px;
+         opacity: 0; }
+  .wo-tag { position: absolute; z-index: 3; font-family: var(--mono); font-size: 19px;
+            color: var(--cyan); opacity: 0; }
+</style></head>
+<body>
+  <svg class="rails" width="1920" height="1080">
+    <path id="r1" d="M 880 500 C 700 420, 620 340, 520 265"/>
+    <path id="r2" d="M 1040 500 C 1220 420, 1300 340, 1400 265"/>
+    <path id="r3" d="M 880 580 C 700 660, 620 740, 520 815"/>
+    <circle id="d1" class="pulse" style="opacity:0"/>
+    <circle id="d2" class="pulse" style="opacity:0"/>
+    <circle id="d3" class="pulse" style="opacity:0"/>
+  </svg>
+
+  <div class="node" id="core"><div class="nm">jarvisd</div><div class="sub">the OS daemon</div></div>
+  <div class="node proj" id="p1"><div class="nm">webapp</div><div class="sub" id="s1">idle</div></div>
+  <div class="node proj" id="p2"><div class="nm">etl-pipeline</div><div class="sub" id="s2">idle</div></div>
+  <div class="node proj" id="p3"><div class="nm">docs-site</div><div class="sub" id="s3">idle</div></div>
+  <div class="you" id="you">you · undisturbed</div>
+
+  <div class="caption" id="cap1" style="opacity:0">one deterministic daemon, <b>your whole fleet</b></div>
+  <div class="caption" id="cap2" style="opacity:0">work orders dispatch into <b>isolated git worktrees</b></div>
+  <div id="veil"></div>
+<script src="scene.js"></script>
+<script>
+  const TOTAL = 8.0;
+  const routes = [
+    { rail: 'r1', dot: 'd1', node: 'p1', sub: 's1', t0: 2.2 },
+    { rail: 'r2', dot: 'd2', node: 'p2', sub: 's2', t0: 3.0 },
+    { rail: 'r3', dot: 'd3', node: 'p3', sub: 's3', t0: 3.8 },
+  ];
+  window.seek = (t) => {
+    // core then projects appear
+    const core = document.getElementById('core');
+    const cp = easeOut(seg(t, 0.4, 0.6));
+    core.style.opacity = cp; core.style.transform = `scale(${lerp(0.92, 1, cp)})`;
+    ['p1','p2','p3'].forEach((id, i) => {
+      const n = document.getElementById(id);
+      const p = easeOut(seg(t, 0.9 + i * 0.25, 0.5));
+      n.style.opacity = p; n.style.transform = `translateY(${lerp(16,0,p)}px)`;
+    });
+    document.getElementById('you').style.opacity = 0.85 * easeOut(seg(t, 1.6, 0.6));
+    // pulses ride the rails; workers ignite on arrival (brand motion rules 1–2)
+    routes.forEach(({rail, dot, node, sub, t0}) => {
+      const path = document.getElementById(rail), d = document.getElementById(dot);
+      const p = seg(t, t0, 1.1);
+      pulseAlong(d, path, p, true);
+      const el = document.getElementById(node), s = document.getElementById(sub);
+      if (p >= 1) {
+        const ip = seg(t, t0 + 1.1, 0.4);           // ignition: overshoot → settle
+        const glow = ip < 0.5 ? lerp(0, 0.65, ip * 2) : lerp(0.65, 0.45, (ip - 0.5) * 2);
+        el.style.borderColor = `rgba(86,200,232,${glow})`;
+        s.textContent = '● worker running';
+        s.style.color = 'var(--cyan)';
+      } else { s.textContent = 'idle'; s.style.color = 'var(--ink-3)'; el.style.borderColor = 'var(--line)'; }
+    });
+    // captions swap at 5.2s
+    document.getElementById('cap1').style.opacity =
+      easeOut(seg(t, 1.2, 0.5)) * (1 - seg(t, 4.9, 0.4));
+    document.getElementById('cap2').style.opacity = easeOut(seg(t, 5.3, 0.5));
+    edgeFade(t, TOTAL);
+  };
+</script>
+</body></html>

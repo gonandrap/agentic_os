@@ -1,0 +1,47 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link rel="stylesheet" href="base.css">
+<style>
+  .stage { position: absolute; inset: 0; display: grid; place-items: center; }
+  .stack { text-align: center; }
+  .wordmark { font-size: 120px; }
+  .tagline { margin-top: 34px; font-size: 40px; color: var(--ink-2);
+             font-family: var(--sans); opacity: 0; }
+  .promise { margin-top: 20px; font-family: var(--mono); font-size: 27px;
+             color: var(--ink-3); letter-spacing: 0.06em; opacity: 0; }
+  .scanline { position: absolute; left: 0; right: 0; height: 1px;
+              background: linear-gradient(90deg, transparent, rgba(86,200,232,0.25), transparent);
+              opacity: 0; }
+</style></head>
+<body>
+  <div class="stage">
+    <div class="stack">
+      <div class="wordmark"><span class="caret">&gt;</span> <span id="wm"></span><span class="caret" id="blink">▌</span></div>
+      <div class="tagline" id="tag">an agentic OS for your Claude Code fleet</div>
+      <div class="promise" id="promise">route the work · keep the context · own your attention</div>
+    </div>
+  </div>
+  <div class="scanline" id="scan"></div>
+  <div id="veil"></div>
+<script src="scene.js"></script>
+<script>
+  const TOTAL = 6.0, WM = "JARVIS";
+  window.seek = (t) => {
+    // wordmark types on 0.7→1.9s
+    const p = seg(t, 0.7, 1.2);
+    document.getElementById('wm').textContent =
+      WM.slice(0, Math.round(WM.length * easeOut(p))).split('').join(' ');
+    document.getElementById('blink').style.opacity = caretOn(t) ? 1 : 0;
+    // a single slow scanline drifts down (the room is alive)
+    const scan = document.getElementById('scan');
+    scan.style.opacity = 0.5 * seg(t, 0.3, 0.8) * (1 - seg(t, 5.0, 0.8));
+    scan.style.top = `${lerp(120, 960, easeInOut(seg(t, 0.3, 5.4)))}px`;
+    // tagline 2.4s, promise 3.4s — arrivals ease up 14px
+    const tag = document.getElementById('tag'), pr = document.getElementById('promise');
+    const tp = easeOut(seg(t, 2.4, 0.7)), pp = easeOut(seg(t, 3.4, 0.7));
+    tag.style.opacity = tp; tag.style.transform = `translateY(${lerp(14,0,tp)}px)`;
+    pr.style.opacity = pp; pr.style.transform = `translateY(${lerp(14,0,pp)}px)`;
+    edgeFade(t, TOTAL);
+  };
+</script>
+</body></html>
