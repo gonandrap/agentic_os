@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Inbox — Jarvis{% endblock %}
+{% block content %}
+
+<h2>Inbox
+  {% if items %}
+  <form class="inline" method="post" action="/inbox/ack" style="float: right;">
+    <button>Ack all</button>
+  </form>
+  {% endif %}
+</h2>
+<div class="panel">
+  {% for it in items %}
+  <div class="row">
+    <span class="st tone-{{ level_tone.get(it.level, 'muted') }}">
+      <span class="i">{{ '🚨' if it.level == 'critical' else '⚠' if it.level == 'warning' else 'ℹ' }}</span>{{ it.level }}</span>
+    <div class="grow">
+      <strong>{{ it.project }}</strong> — {{ it.title }}
+      {% if it.body %}<div class="sub" style="white-space: pre-wrap;">{{ it.body }}</div>{% endif %}
+      {% if it.wo_id %}<a class="mono sub" href="/wo/{{ it.project }}/{{ it.wo_id }}">{{ it.wo_id }}</a>{% endif %}
+    </div>
+    <span class="sub mono">{{ fmt_age(it.ts) }}</span>
+    <form class="inline" method="post" action="/inbox/ack">
+      <input type="hidden" name="inbox_id" value="{{ it.id }}">
+      <button>Ack</button>
+    </form>
+  </div>
+  {% else %}
+  <div class="empty">inbox empty — Jarvis will post here when something needs you</div>
+  {% endfor %}
+</div>
+
+{% endblock %}

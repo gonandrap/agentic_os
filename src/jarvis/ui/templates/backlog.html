@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Backlog — Jarvis{% endblock %}
+{% block content %}
+
+<h2>Backlog</h2>
+<div class="panel">
+  {% for it in items %}
+  <div class="row">
+    <span class="st tone-{{ 'muted' if it.status != 'open' else 'active' }}">
+      <span class="i">{{ '◌' if it.status == 'open' else '✓' if it.status == 'done' else '→' }}</span>{{ it.status }}</span>
+    <div class="grow">
+      <span class="mono">{{ it.id }}</span> <strong>{{ it.project }}</strong> — {{ it.title }}
+      {% if it.description %}<div class="sub">{{ it.description }}</div>{% endif %}
+      {% if it.status == 'open' and blockers.get(it.id) %}
+        <div class="sub tone-warn">◭ blocked by:
+          {% for b in blockers[it.id] %}{{ b.id }} ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}
+        </div>
+      {% endif %}
+      {% if it.promoted_wo_id %}
+        <div class="sub">promoted → <a class="mono" href="/wo/{{ it.project }}/{{ it.promoted_wo_id }}">{{ it.promoted_wo_id }}</a></div>
+      {% endif %}
+    </div>
+    {% if it.status == 'open' %}
+    <form class="inline" method="post" action="/backlog/promote/{{ it.id }}">
+      {% if blockers.get(it.id) %}
+        <label class="sub"><input type="checkbox" name="force" value="1"> force</label>
+      {% endif %}
+      <button {{ 'class=primary' if not blockers.get(it.id) }}>Promote</button>
+    </form>
+    {% endif %}
+  </div>
+  {% else %}
+  <div class="empty">backlog empty — workers file deferred work here automatically</div>
+  {% endfor %}
+</div>
+
+{% endblock %}

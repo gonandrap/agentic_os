@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}{{ project_name }} — Jarvis{% endblock %}
+{% block content %}
+
+<h2>{{ project_name }} <span class="kv mono">{{ path }}</span></h2>
+<div class="panel">
+  {% for wo in wos %}
+    {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
+    {% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
+    <div class="row">
+      <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
+      <div class="grow">
+        <a href="/wo/{{ project_name }}/{{ wo.id }}" class="mono">{{ wo.id }}</a> {{ wo.title }}
+        {% if wo.needs_attention %}<div class="sub tone-warn">◭ {{ wo.attention_reason }}</div>{% endif %}
+      </div>
+      <span class="badge {{ 'framework' if o.framework else 'outside' }}">
+        {{ '⚙ ' if o.framework else '⚠ ' }}{{ o.word }}</span>
+      <span class="sub mono">{{ fmt_age(wo.created_at) }}</span>
+    </div>
+  {% else %}
+    <div class="empty">no work orders yet</div>
+  {% endfor %}
+</div>
+
+{% if backlog %}
+<h2>Open backlog for this project</h2>
+<div class="panel">
+  {% for item in backlog %}
+  <div class="row">
+    <div class="grow"><span class="mono">{{ item.id }}</span> {{ item.title }}
+      {% if item.depends_on %}<span class="sub">deps: {{ item.depends_on | join(', ') }}</span>{% endif %}
+    </div>
+    <form class="inline" method="post" action="/backlog/promote/{{ item.id }}">
+      <button>Promote to work order</button>
+    </form>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% endblock %}
