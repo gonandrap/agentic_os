@@ -150,13 +150,18 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             try:
                 summary = store.summary()
                 open_wos = store.list_work_orders(statuses=OPEN_STATUSES)
-                for wo in open_wos:
+                # Attention isn't limited to open work orders: a FAILED worker
+                # (e.g. session disappeared) still needs the user until acted on.
+                flagged = {wo["id"]: wo for wo in open_wos if wo["needs_attention"]}
+                for wo in store.list_work_orders():
                     if wo["needs_attention"]:
-                        attention.append({
-                            "project": p["name"], "wo_id": wo["id"],
-                            "title": wo["title"], "status": wo["status"],
-                            "reason": wo["attention_reason"],
-                        })
+                        flagged.setdefault(wo["id"], wo)
+                for wo in flagged.values():
+                    attention.append({
+                        "project": p["name"], "wo_id": wo["id"],
+                        "title": wo["title"], "status": wo["status"],
+                        "reason": wo["attention_reason"],
+                    })
                 drift = settings_drift(path / ".claude" / "settings.json")
                 projects.append({
                     "name": p["name"], "path": p["path"],
@@ -467,6 +472,18 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
         neo.close()
     delivery = send_message(q["wo_id"], f"[Answer from the user] {answer}",
                             project_name=q["project"])
+    # The escalation is handled — release the work order from the attention list.
+    try:
+        _, path, _ = find_work_order(q["wo_id"], q["project"])
+        store = ProjectStore(path)
+        try:
+            store.clear_attention(q["wo_id"])
+            store.add_event(q["wo_id"], "escalation_answered",
+                            {"neo_question_id": question_id})
+        finally:
+            store.close()
+    except OpsError:
+        pass
     return {"question_id": question_id, "delivery": delivery}
 
 

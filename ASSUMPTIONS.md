@@ -224,6 +224,38 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
     still open. Approvals just confirm. You can also teach Neo directly
     (`jarvis neo learn`). User-authored answers to escalations are auto-approved.
 
+## G. Evals & CI quality gates
+
+38. **Evals are split into two layers.** Deterministic behavioral evals
+    (`evals/test_*.py`, 32 scenarios) run the real OS against the fake `claude` CLI
+    and gate every merge in CI: status truthfulness (flag exactly what needs you —
+    no misses, no false alarms), routing, feedback delivery, safety rails, Neo's
+    no-question-lost / escalation-surfacing / token-economics / learning-loop
+    guarantees. LLM-graded evals (`evals/llm/`, 14 scenarios) run the REAL model
+    against Neo's persona (escalation recall ≥ 7/8, answer willingness ≥ 6/8,
+    learning adherence) and the Jarvis persona (route-don't-do battery). The LLM
+    layer is opt-in (`JARVIS_EVALS_LLM=1`, default model sonnet via
+    `JARVIS_EVALS_MODEL`) because it spends tokens and needs a logged-in Claude
+    Code — CI can't have either, so CI gates on the deterministic layer only. Run
+    the LLM layer manually before changing any persona text.
+
+39. **Deterministic evals deliberately overlap unit tests** but assert on
+    user-visible surfaces (status output, attention items, queued messages, inbox)
+    and print a per-category scorecard (`evals/results.json`). They are the
+    regression contract for agent behavior; unit tests are the contract for code.
+
+40. **The eval batteries already caught and fixed three real gaps** (kept as
+    regression scenarios): failed workers didn't surface in `jarvis status`
+    attention; answering an escalated Neo question left the work order stuck in
+    the attention list; the Jarvis persona ignored stated user preferences
+    (13/14 → fixed CLAUDE.md → verified 14/14 against the real model).
+
+41. **Browser tests** (`tests_browser/`, Playwright + headless Chromium) drive the
+    real uvicorn server end to end: dashboard states, attention-strip review flow,
+    work-order forms, the full Neo review/escalation cycle, backlog dependency
+    errors, inbox ack. They are a separate CI job (`playwright install chromium`
+    downloads the browser there).
+
 ## E. Scope cuts (MVP)
 
 20. UI has no auth and no websockets (htmx polling refresh).

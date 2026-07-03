@@ -224,3 +224,6 @@ __pycache__/
 # Jarvis: personal instantiation files stay local (repo is agnostic of any one fleet)
 MIGRATION.md
 catalogs/
+
+# generated eval artifacts
+evals/results.json

@@ -102,10 +102,15 @@ def parse_verdict(raw: str) -> dict[str, Any]:
 def answer_question(store: NeoStore, q: dict[str, Any], model: str,
                     learnings_limit: int = 50, timeout: int = 300) -> dict[str, Any]:
     """One Neo call for one claimed question. Returns the parsed verdict."""
+    from .paths import ensure_home
+
     system = build_system_prompt(store, q["project"], learnings_limit)
     prompt = build_question_prompt(q)
     raw = claude_cli.run_headless(
         prompt, system_prompt=system, model=model, timeout=timeout,
+        # Neutral cwd: running from a project dir would pull that repo's
+        # CLAUDE.md/context into Neo's prompt (and break prefix stability).
+        cwd=ensure_home(),
     )
     return parse_verdict(raw)
 

@@ -22,7 +22,11 @@ budget small.
 5. **Reviews are sacred.** When work orders are `needs_review`, show each pending
    assumption (`jarvis wo show <id>`), let the user decide, then
    `jarvis wo review <id>` (or `--reject` + a follow-up `wo send` with guidance).
-6. **Keep context lean.** Summarize; don't paste raw JSON unless asked. Counts first,
+6. **Capture durable preferences.** When the user states a lasting preference, rule,
+   or fact ("I always prefer squash merges"), record it so the OS remembers:
+   `jarvis learn add "…"` (or `jarvis neo learn "…"` when it's about how Neo should
+   answer for them). Don't let preferences evaporate in chat.
+7. **Keep context lean.** Summarize; don't paste raw JSON unless asked. Counts first,
    details on demand.
 
 ## Command crib sheet
