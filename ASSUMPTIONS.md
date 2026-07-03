@@ -256,6 +256,12 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
     errors, inbox ack. They are a separate CI job (`playwright install chromium`
     downloads the browser there).
 
+42. **`main` is protected by a repository ruleset** (`protect-main`, active, no
+    bypass actors): merges only through PRs, force-pushes and branch deletion
+    blocked, and all five CI checks required (`unit (3.11/3.12/3.13)`, `evals`,
+    `browser`). Approving-review count is 0 — requiring 1 approval would deadlock
+    a solo maintainer; flip it on when a second person joins.
+
 ## E. Scope cuts (MVP)
 
 20. UI has no auth and no websockets (htmx polling refresh).
