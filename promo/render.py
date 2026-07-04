@@ -93,18 +93,25 @@ def render_frames() -> int:
 
 
 def assemble(total_frames: int) -> None:
-    track = OUT / "track.wav"
+    track, sfx = OUT / "track.wav", OUT / "sfx.wav"
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-framerate", str(FPS), "-i", str(FRAMES / "f_%05d.png"),
     ]
-    if track.exists():
-        cmd += ["-i", str(track)]
+    audio_inputs = [p for p in (track, sfx) if p.exists()]
+    for p in audio_inputs:
+        cmd += ["-i", str(p)]
     cmd += [
         "-c:v", "libx264", "-preset", "slow", "-crf", "18",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart",
     ]
-    if track.exists():
+    if len(audio_inputs) == 2:
+        # music + keystroke foley, summed then safety-limited
+        cmd += ["-filter_complex",
+                "[1:a][2:a]amix=inputs=2:duration=longest:normalize=0,"
+                "alimiter=limit=0.95[a]",
+                "-map", "0:v", "-map", "[a]"]
+    if audio_inputs:
         cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
     cmd += [str(FINAL)]
     subprocess.run(cmd, check=True)
@@ -121,8 +128,14 @@ def main(argv: list[str]) -> None:
     if "--skip-music" not in argv or not (OUT / "track.wav").exists():
         print("🎵 synthesizing track …")
         subprocess.run([sys.executable, str(HERE / "music.py")], check=True)
-    print("🎞  rendering scenes …")
-    frames = render_frames()
+        print("⌨️  synthesizing keystroke foley …")
+        subprocess.run([sys.executable, str(HERE / "sfx.py")], check=True, cwd=HERE)
+    if "--skip-frames" in argv and FRAMES.exists():
+        frames = len(list(FRAMES.glob("f_*.png")))
+        print(f"🎞  reusing {frames} existing frames (--skip-frames)")
+    else:
+        print("🎞  rendering scenes …")
+        frames = render_frames()
     print("📦 assembling with ffmpeg …")
     assemble(frames)
 

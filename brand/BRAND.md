@@ -61,13 +61,21 @@ every beat carries an on-screen caption (mono, `--ink-2`, bottom-left).
 
 ## Music direction
 
-Productivity, not hype: 100–108 BPM, warm pad chords (I–V–vi–IV family), soft
-sine/pluck arpeggios in 8ths, round sub-bass on roots, brushed tick on 2 & 4.
-Arrangement breathes with the story: sparse intro → elements stack while the OS
-works → thin out for the resolution beat → sustained chord under the outro.
-No risers, no drops, no vocal chops. The generated reference track lives in
-`promo/music.py` (deterministic, stdlib-only) — regenerate, don't swap in
-licensed music without updating this file.
+**Energetic productivity** — momentum, not drama: 118–126 BPM, soft
+four-on-the-floor kick, driving eighth-note bass with accent syncopation, bright
+pluck arpeggios, brushed off-beat hats; a warm pad (I–V–vi–IV family) underneath
+for the "dusk" color. Arrangement follows the story: pulsing intro → the groove
+locks in while the OS works → breakdown on the all-quiet payoff (kick and bass
+drop out, the room exhales) → light outro. No risers, no drops, no vocal chops.
+The generated reference track lives in `promo/music.py` (deterministic,
+stdlib-only) — regenerate, don't swap in licensed music without updating this file.
+
+**Signature audio device — keystroke foley.** Every command typed on screen is
+heard: synthesized key clicks per character (pitch/level micro-varied,
+deterministic) and a lower return-key *clack* when the command completes.
+`promo/sfx.py` derives the click times from the SAME timeline that renders the
+frames, so audio and pixels cannot drift. Any future content that types text on
+screen must carry this layer — it's part of the brand's sound.
 
 ## Video grammar (all promotional cuts)
 
