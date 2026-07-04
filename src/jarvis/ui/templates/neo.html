@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}Neo — Jarvis{% endblock %}
+{% block content %}
+
+<p class="kv" style="margin-top:18px">
+  Neo answers worker questions on your behalf. Review every answer below — approvals
+  confirm its instincts, corrections become learnings it applies next time.
+  <span class="counts">({{ counts.get('queued', 0) }} queued ·
+  {{ counts.get('escalated', 0) }} escalated ·
+  {{ counts.get('unreviewed', 0) }} awaiting review ·
+  {{ learnings|length }} learnings)</span>
+</p>
+
+{% if escalated %}
+<h2>Escalated — Neo wants you to decide</h2>
+<div class="panel">
+  {% for q in escalated %}
+  <div class="msg">
+    <div class="who tone-warn">#{{ q.id }} · {{ q.project }} ·
+      <a href="/wo/{{ q.project }}/{{ q.wo_id }}" class="mono">{{ q.wo_id }}</a> ·
+      {{ fmt_age(q.ts) }} ago
+      {% if q.status == 'failed' %} · <span class="tone-bad">✗ neo call failed</span>{% endif %}
+    </div>
+    <div style="margin:6px 0"><strong>Q:</strong> {{ q.question }}</div>
+    <div class="sub">Why escalated: {{ q.answer_reason or '—' }}</div>
+    <form method="post" action="/neo/{{ q.id }}/answer" style="margin-top:8px">
+      <textarea name="text" placeholder="Your answer — it goes straight to the worker" required></textarea>
+      <button class="primary" style="margin-top:6px">Send answer to worker</button>
+    </form>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<h2>Awaiting your review</h2>
+<div class="panel">
+  {% for q in unreviewed %}
+  <div class="msg">
+    <div class="who">#{{ q.id }} · {{ q.project }} ·
+      <a href="/wo/{{ q.project }}/{{ q.wo_id }}" class="mono">{{ q.wo_id }}</a> ·
+      answered {{ fmt_age(q.answered_at) }} ago</div>
+    <div style="margin:6px 0"><strong>Q:</strong> {{ q.question }}</div>
+    <div style="margin:6px 0"><strong>Neo:</strong> {{ q.answer }}</div>
+    {% if q.answer_reason %}<div class="sub">Reasoning: {{ q.answer_reason }}</div>{% endif %}
+    <div style="display:flex; gap:10px; margin-top:8px; align-items:flex-start">
+      <form method="post" action="/neo/{{ q.id }}/review" class="inline">
+        <input type="hidden" name="decision" value="approve">
+        <button class="accept">✓ That's what I'd say</button>
+      </form>
+      <form method="post" action="/neo/{{ q.id }}/review" style="flex:1; display:flex; gap:8px">
+        <input type="hidden" name="decision" value="correct">
+        <input type="text" name="feedback" placeholder="Correct Neo — what should it have said? (teaches it)">
+        <button class="danger">Correct</button>
+      </form>
+    </div>
+  </div>
+  {% else %}
+  <div class="empty">nothing awaiting review</div>
+  {% endfor %}
+</div>
+
+<h2>History</h2>
+<div class="panel">
+  <table>
+    <tr><th>#</th><th>project / wo</th><th>question</th><th>answer</th><th>by</th><th>review</th><th>age</th></tr>
+    {% for q in history %}
+    <tr>
+      <td class="mono">{{ q.id }}</td>
+      <td class="mono">{{ q.project }}<br><a href="/wo/{{ q.project }}/{{ q.wo_id }}">{{ q.wo_id }}</a></td>
+      <td>{{ q.question[:120] }}</td>
+      <td>{{ (q.answer or '—')[:120] }}</td>
+      <td class="mono">{{ q.answered_by or '—' }}</td>
+      <td>
+        {% if q.review_status == 'approved' %}<span class="st tone-ok"><span class="i">✓</span>approved</span>
+        {% elif q.review_status == 'corrected' %}<span class="st tone-warn"><span class="i">✎</span>corrected</span>
+        {% else %}<span class="st tone-muted">—</span>{% endif %}
+      </td>
+      <td class="mono">{{ fmt_age(q.ts) }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7" class="empty">Neo hasn't handled anything yet</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<h2>Learnings — how Neo becomes you</h2>
+<div class="panel">
+  {% for l in learnings %}
+  <div class="row">
+    <span class="badge {{ 'framework' if l.source == 'review' else '' }}">{{ l.source }}</span>
+    <span class="grow">{{ l.content }}</span>
+    <span class="sub mono">{{ l.project or 'global' }}</span>
+  </div>
+  {% else %}
+  <div class="empty">no learnings yet — correct an answer above to teach Neo</div>
+  {% endfor %}
+</div>
+<form method="post" action="/neo/learn" style="margin-top:10px; display:flex; gap:8px">
+  <input type="text" name="content" placeholder="Teach Neo directly: a preference, a rule, how you decide things…" required>
+  <input type="text" name="project" placeholder="project (blank = global)" style="max-width:220px">
+  <button class="primary">Teach</button>
+</form>
+
+{% endblock %}

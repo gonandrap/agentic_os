@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}Jarvis — dashboard{% endblock %}
+{% block head %}<meta http-equiv="refresh" content="{{ refresh }}">{% endblock %}
+{% block content %}
+
+<div class="attention {{ 'hot' if st.attention else '' }}">
+  {% if st.attention %}
+    <div class="strip-head">NEEDS YOU — {{ st.attention | length }} item{{ 's' if st.attention | length != 1 }}</div>
+    <ul>
+      {% for a in st.attention %}
+      <li>
+        {% if a.wo_id %}
+          <a href="/wo/{{ a.project }}/{{ a.wo_id }}" class="mono">{{ a.wo_id }}</a>
+        {% endif %}
+        <strong>{{ a.project }}</strong> — {{ a.title }}
+        <div class="sub">{{ a.reason }}</div>
+      </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    {% set running = st.projects | map(attribute='summary.by_status.running') | select | sum %}
+    <div class="quiet"><span class="dot">●</span> all quiet —
+      {{ running }} worker{{ 's' if running != 1 }} running,
+      nothing needs you{% if not st.daemon.running %} (but the daemon is down){% endif %}</div>
+  {% endif %}
+</div>
+
+{% if st.inbox.unacked %}
+<div class="panel" style="margin-bottom: 6px;">
+  <div class="row">
+    <span class="st tone-{{ 'bad' if st.inbox.critical else 'warn' }}">
+      <span class="i">✉</span>{{ st.inbox.unacked }} unacked notification{{ 's' if st.inbox.unacked != 1 }}
+      {% if st.inbox.critical %}({{ st.inbox.critical }} critical){% endif %}
+    </span>
+    <span class="grow"></span>
+    <a href="/inbox">open inbox →</a>
+  </div>
+</div>
+{% endif %}
+
+<h2>Projects</h2>
+<div class="panel">
+  {% for p in st.projects %}
+  <div class="row">
+    <div class="grow">
+      <a href="/project/{{ p.name }}"><strong>{{ p.name }}</strong></a>
+      {% if p.settings_drift %}<span class="badge outside">settings drift</span>{% endif %}
+      <div class="sub">{{ p.description or p.path }}</div>
+    </div>
+    <span class="counts">
+      {% for status, n in (p.summary.by_status or {}).items() %}
+        {% set m = status_meta.get(status, {'word': status, 'icon': '•', 'tone': 'muted'}) %}
+        <span class="st tone-{{ m.tone }}" title="{{ m.word }}"><span class="i">{{ m.icon }}</span>{{ n }} {{ m.word }}</span>&nbsp;
+      {% else %}
+        <span class="tone-muted">no work orders yet</span>
+      {% endfor %}
+    </span>
+  </div>
+  {% else %}
+  <div class="empty">No projects registered — run <code>jarvis start --catalog …</code></div>
+  {% endfor %}
+</div>
+
+<h2>Open work orders</h2>
+<div class="panel">
+  {% set open_any = namespace(v=false) %}
+  {% for p in st.projects %}{% for wo in p.open_work_orders %}
+    {% set open_any.v = true %}
+    {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
+    {% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
+    <div class="row">
+      <span class="st tone-{{ m.tone }} {{ 'pulse' if wo.status == 'running' }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
+      <div class="grow">
+        <a href="/wo/{{ p.name }}/{{ wo.id }}" class="mono">{{ wo.id }}</a>
+        {{ wo.title }}
+        <span class="sub">· {{ p.name }}</span>
+      </div>
+      <span class="badge {{ 'framework' if o.framework else 'outside' }}">
+        {{ '⚙ ' if o.framework else '⚠ ' }}{{ o.word }}</span>
+    </div>
+  {% endfor %}{% endfor %}
+  {% if not open_any.v %}<div class="empty">no open work orders</div>{% endif %}
+</div>
+
+<h2>New work order</h2>
+<div class="panel" style="padding: 14px 16px;">
+  <form method="post" action="/wo/create">
+    <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+      <select name="project" required style="max-width: 220px;">
+        {% for p in st.projects %}<option value="{{ p.name }}">{{ p.name }}</option>{% endfor %}
+      </select>
+      <input type="text" name="title" placeholder="what needs doing" required>
+      <input type="text" name="model" placeholder="model (default: catalog)" style="max-width: 180px;">
+    </div>
+    <div style="display: flex; gap: 10px; align-items: flex-start;">
+      <textarea name="description" placeholder="details, context, constraints (optional)"></textarea>
+      <button type="submit" class="primary">Create work order</button>
+    </div>
+  </form>
+</div>
+
+{% if st.backlog.open %}
+<h2>Backlog</h2>
+<div class="panel"><div class="row">
+  <span class="counts">{{ st.backlog.open }} open item{{ 's' if st.backlog.open != 1 }}</span>
+  <span class="grow"></span><a href="/backlog">open backlog →</a>
+</div></div>
+{% endif %}
+
+{% endblock %}

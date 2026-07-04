@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Knowledge — Jarvis{% endblock %}
+{% block content %}
+
+<h2>Knowledge base</h2>
+<div class="panel">
+  <table>
+    <tr><th>scope</th><th>topic</th><th>learning</th><th>age</th></tr>
+    {% for k in rows %}
+    <tr>
+      <td class="mono">{{ k.project or 'global' }}</td>
+      <td class="mono">{{ k.topic or '–' }}</td>
+      <td>{{ k.content }}</td>
+      <td class="mono sub">{{ fmt_age(k.ts) }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="4" class="empty">nothing learned yet — workers report with <code>jarvis learn add</code></td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+{% endblock %}

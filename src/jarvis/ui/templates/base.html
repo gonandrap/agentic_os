@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Jarvis{% endblock %}</title>
+{% block head %}{% endblock %}
+<style>
+  /* Jarvis console — control room at dusk. Dark by design: this is an ops surface. */
+  :root {
+    --bg: #0e1420; --surface: #151d2c; --raised: #1b2437; --line: #253049;
+    --ink: #d9e0ec; --ink-2: #93a3ba; --ink-3: #5f6f88;
+    --amber: #f2a33c; --amber-ink: #ffd9a0;
+    --cyan: #56c8e8; --green: #46d69a; --red: #e85d5d;
+    --mono: ui-monospace, "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 var(--sans);
+  }
+  a { color: var(--cyan); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, .mono { font-family: var(--mono); font-size: 0.92em; }
+
+  .shell { max-width: 1080px; margin: 0 auto; padding: 0 20px 80px; }
+
+  /* header: wordmark speaks CLI */
+  header {
+    display: flex; align-items: baseline; gap: 18px;
+    padding: 18px 0 14px; border-bottom: 1px solid var(--line);
+  }
+  .wordmark { font-family: var(--mono); font-size: 18px; font-weight: 700;
+              letter-spacing: 0.18em; color: var(--ink); }
+  .wordmark .caret { color: var(--amber); }
+  nav { display: flex; gap: 14px; margin-left: auto; }
+  nav a { color: var(--ink-2); font-size: 13.5px; }
+  nav a.here { color: var(--ink); border-bottom: 2px solid var(--amber); padding-bottom: 2px; }
+  .daemon { font-family: var(--mono); font-size: 12.5px; }
+  .daemon.up { color: var(--green); } .daemon.down { color: var(--red); }
+
+  /* the signature: attention strip */
+  .attention { border-radius: 8px; margin: 18px 0; overflow: hidden; }
+  .attention.hot { border: 1px solid color-mix(in srgb, var(--amber) 45%, transparent); }
+  .attention.hot .strip-head {
+    background: color-mix(in srgb, var(--amber) 14%, var(--surface));
+    color: var(--amber-ink); font-weight: 600; padding: 10px 16px;
+    font-family: var(--mono); font-size: 13px; letter-spacing: 0.06em;
+  }
+  .attention ul { list-style: none; margin: 0; padding: 6px 0; background: var(--surface); }
+  .attention li { padding: 8px 16px; border-top: 1px solid var(--line); }
+  .attention li:first-child { border-top: 0; }
+  .attention .quiet {
+    padding: 10px 16px; background: var(--surface); border: 1px solid var(--line);
+    border-radius: 8px; color: var(--ink-2); font-family: var(--mono); font-size: 13px;
+  }
+  .attention .quiet .dot { color: var(--green); }
+
+  h2 { font-size: 13px; font-family: var(--mono); font-weight: 600; color: var(--ink-3);
+       letter-spacing: 0.14em; text-transform: uppercase; margin: 34px 0 10px; }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+
+  /* rows scan better than cards for ops */
+  .row { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+         border-top: 1px solid var(--line); }
+  .row:first-child { border-top: 0; }
+  .row .grow { flex: 1; min-width: 0; }
+  .row .sub { color: var(--ink-2); font-size: 13px; }
+
+  /* status & origin are words with a mark — never color alone */
+  .st { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+  .st .i { margin-right: 5px; }
+  .tone-ok { color: var(--green); } .tone-bad { color: var(--red); }
+  .tone-warn { color: var(--amber); } .tone-active { color: var(--cyan); }
+  .tone-muted { color: var(--ink-3); }
+  .badge { font-family: var(--mono); font-size: 11px; padding: 1.5px 7px;
+           border-radius: 99px; border: 1px solid var(--line); color: var(--ink-2); }
+  .badge.framework { border-color: color-mix(in srgb, var(--cyan) 40%, transparent); }
+  .badge.outside { border-color: color-mix(in srgb, var(--amber) 55%, transparent);
+                   color: var(--amber-ink); }
+  .counts { font-family: var(--mono); font-size: 12.5px; color: var(--ink-2); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; font-family: var(--mono); font-size: 11.5px; color: var(--ink-3);
+       text-transform: uppercase; letter-spacing: 0.1em; padding: 8px 16px;
+       border-bottom: 1px solid var(--line); }
+  td { padding: 8px 16px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+
+  form.inline { display: inline; }
+  input[type=text], textarea, select {
+    background: var(--raised); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: 8px 10px; font: 14px var(--sans); width: 100%;
+  }
+  textarea { font-family: var(--mono); min-height: 70px; }
+  button {
+    background: var(--raised); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: 7px 14px; font: 13.5px var(--sans); cursor: pointer;
+  }
+  button:hover { border-color: var(--ink-3); }
+  button.primary { background: color-mix(in srgb, var(--cyan) 18%, var(--raised));
+                   border-color: color-mix(in srgb, var(--cyan) 45%, transparent); }
+  button.accept { border-color: color-mix(in srgb, var(--green) 45%, transparent); }
+  button.danger { border-color: color-mix(in srgb, var(--red) 45%, transparent); }
+
+  .nav-badge { font-family: var(--mono); font-size: 10.5px; padding: 0 6px;
+               border-radius: 99px; background: color-mix(in srgb, var(--amber) 25%, var(--surface));
+               color: var(--amber-ink); }
+  .error-flash { background: color-mix(in srgb, var(--red) 15%, var(--surface));
+                 border: 1px solid var(--red); border-radius: 8px; padding: 10px 16px;
+                 margin: 14px 0; }
+  .empty { color: var(--ink-3); padding: 14px 16px; font-style: italic; }
+  .timeline { list-style: none; margin: 0; padding: 0; font-family: var(--mono);
+              font-size: 12.5px; }
+  .timeline li { padding: 5px 16px; border-top: 1px solid var(--line); color: var(--ink-2); }
+  .msg { padding: 10px 16px; border-top: 1px solid var(--line); }
+  .msg .who { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
+  .msg.user .who { color: var(--cyan); }
+  .kv { color: var(--ink-2); font-size: 13px; }
+  @media (prefers-reduced-motion: no-preference) {
+    .pulse { animation: pulse 2.4s ease-in-out infinite; }
+    @keyframes pulse { 50% { opacity: 0.45; } }
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+  <header>
+    <span class="wordmark"><span class="caret">&gt;</span> JARVIS</span>
+    <span class="daemon {{ 'up' if daemon_up else 'down' }}">
+      {{ '● daemon up' if daemon_up else '○ daemon down' }}
+    </span>
+    <nav>
+      <a href="/" class="{{ 'here' if active == 'dashboard' }}">dashboard</a>
+      <a href="/neo" class="{{ 'here' if active == 'neo' }}">neo{% if neo_badge %} <span class="nav-badge">{{ neo_badge }}</span>{% endif %}</a>
+      <a href="/inbox" class="{{ 'here' if active == 'inbox' }}">inbox</a>
+      <a href="/backlog" class="{{ 'here' if active == 'backlog' }}">backlog</a>
+      <a href="/knowledge" class="{{ 'here' if active == 'knowledge' }}">knowledge</a>
+    </nav>
+  </header>
+  {% if request.query_params.get('error') %}
+    <div class="error-flash">{{ request.query_params.get('error') }}</div>
+  {% endif %}
+  {% block content %}{% endblock %}
+</div>
+</body>
+</html>

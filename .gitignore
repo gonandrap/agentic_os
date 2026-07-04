@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+
+# Jarvis: personal instantiation files stay local (repo is agnostic of any one fleet)
+MIGRATION.md
+catalogs/
+
+# generated eval artifacts
+evals/results.json
+
+# promo build artifacts (video, frames, screenshots, fixture world)
+promo/out/

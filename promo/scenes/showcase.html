@@ -1,0 +1,51 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link rel="stylesheet" href="base.css">
+<style>
+  /* gameplay shot: a real screenshot inside a browser frame, one slow camera move */
+  .frame { position: absolute; left: 160px; top: 80px; width: 1600px;
+           border-radius: 14px; overflow: hidden; border: 1px solid var(--line);
+           box-shadow: 0 30px 90px rgba(0,0,0,0.6); background: var(--surface); }
+  .bar { height: 46px; background: var(--raised); display: flex; align-items: center;
+         gap: 9px; padding: 0 18px; border-bottom: 1px solid var(--line); }
+  .bar i { width: 13px; height: 13px; border-radius: 50%; background: var(--line); }
+  .bar .url { margin-left: 14px; font-family: var(--mono); font-size: 17px;
+              color: var(--ink-3); }
+  .vp { height: 830px; overflow: hidden; position: relative; }
+  .vp img { width: 1598px; display: block; transform-origin: top left; }
+  .chip { left: 200px; top: 924px; }
+</style></head>
+<body>
+  <div class="frame">
+    <div class="bar"><i></i><i></i><i></i><span class="url">127.0.0.1:8787 — jarvis dashboard</span></div>
+    <div class="vp"><img id="shot" src=""></div>
+  </div>
+  <div class="chip" id="chip"><span class="prompt">$</span><span id="cmd" class="c"></span></div>
+  <div class="caption" id="cap" style="left: auto; right: 90px; bottom: 24px;"></div>
+  <div id="veil"></div>
+<script src="scene.js"></script>
+<script>
+  const q = new URLSearchParams(location.search);
+  const TOTAL = parseFloat(q.get('dur') || '7');
+  document.getElementById('shot').src = q.get('img');
+  document.getElementById('cap').innerHTML = q.get('caption') || '';
+  const CMD = q.get('cmd') || '';
+  const cmdEl = document.getElementById('cmd');
+  cmdEl.dataset.text = CMD;
+  const panY = parseFloat(q.get('pan') || '0');      // px to drift the page upward
+  const zoom = parseFloat(q.get('zoom') || '1.06');  // one slow move (brand rule 5)
+
+  window.seek = (t) => {
+    const img = document.getElementById('shot');
+    const p = easeInOut(seg(t, 0, TOTAL));
+    img.style.transform = `translateY(${-panY * p}px) scale(${lerp(1.0, zoom, p)})`;
+    const chip = document.getElementById('chip');
+    if (CMD) {
+      chip.style.opacity = easeOut(seg(t, 0.8, 0.4));
+      typeInto(cmdEl, seg(t, 1.1, Math.min(2.6, CMD.length * 0.065)));
+    }
+    document.getElementById('cap').style.opacity = easeOut(seg(t, 0.6, 0.6));
+    edgeFade(t, TOTAL);
+  };
+</script>
+</body></html>

@@ -1,0 +1,52 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# All three jobs are REQUIRED status checks on main (enforced by the repo ruleset):
+# unit tests, behavioral evals, and browser tests must pass before any merge.
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: pytest tests -q
+
+  evals:
+    # Deterministic behavioral scorecard for Jarvis + Neo (evals/README.md).
+    # The LLM-graded layer (evals/llm) is opt-in and NOT run here: it spends
+    # tokens and needs a logged-in Claude Code.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: pytest evals -q
+      - name: Upload scorecard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-scorecard
+          path: evals/results.json
+          if-no-files-found: ignore
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: playwright install --with-deps chromium
+      - run: pytest tests_browser -q

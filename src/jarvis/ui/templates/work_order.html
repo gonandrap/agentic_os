@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}{{ wo.id }} — Jarvis{% endblock %}
+{% block content %}
+
+{% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
+{% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
+
+<h2><a href="/project/{{ project }}">{{ project }}</a> / <span class="mono">{{ wo.id }}</span></h2>
+<div class="panel" style="padding: 14px 16px;">
+  <div style="display:flex; gap: 12px; align-items: baseline; flex-wrap: wrap;">
+    <strong style="font-size: 17px;">{{ wo.title }}</strong>
+    <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
+    <span class="badge {{ 'framework' if o.framework else 'outside' }}">
+      {{ '⚙ ' if o.framework else '⚠ ' }}{{ o.word }}</span>
+    <span class="grow"></span>
+    {% if wo.status not in ('completed', 'failed', 'cancelled') %}
+    <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/cancel">
+      <button class="danger">Cancel</button>
+    </form>
+    {% endif %}
+  </div>
+  {% if wo.description %}<p class="kv" style="white-space: pre-wrap;">{{ wo.description }}</p>{% endif %}
+  <p class="kv mono">
+    created {{ fmt_age(wo.created_at) }} ago · updated {{ fmt_age(wo.updated_at) }} ago
+    {% if wo.model %} · model {{ wo.model }}{% endif %}
+    {% if wo.worktree %} · worktree {{ wo.worktree }}{% endif %}
+    {% if wo.session_id %} · session {{ wo.session_id[:8] }}…{% endif %}
+  </p>
+  {% if wo.needs_attention %}
+    <p class="st tone-warn"><span class="i">◭</span>{{ wo.attention_reason }}</p>
+  {% endif %}
+  {% if wo.result_summary %}
+    <p class="kv"><strong>Result:</strong> {{ wo.result_summary }}</p>
+  {% endif %}
+</div>
+
+{% if assumptions %}
+<h2>Assumptions pending your review</h2>
+<div class="panel">
+  {% for a in assumptions %}
+  <div class="row"><div class="grow">{{ a.content }}</div>
+    <span class="sub mono">{{ fmt_age(a.ts) }} ago</span></div>
+  {% endfor %}
+  <div class="row">
+    <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/review">
+      <button name="decision" value="accept" class="accept">Accept all</button>
+      <button name="decision" value="reject" class="danger">Reject all</button>
+    </form>
+    <span class="sub">rejecting keeps the work order flagged — send guidance below</span>
+  </div>
+</div>
+{% endif %}
+
+<h2>Conversation</h2>
+<div class="panel">
+  {% for msg in messages %}
+  <div class="msg {{ 'user' if msg.direction == 'user_to_agent' }}">
+    <div class="who">{{ 'you → worker' if msg.direction == 'user_to_agent' else 'worker → you' }}
+      · via {{ msg.source }} · {{ msg.status }} · {{ fmt_age(msg.ts) }} ago</div>
+    <div style="white-space: pre-wrap;">{{ msg.content }}</div>
+  </div>
+  {% else %}
+  <div class="empty">no messages yet</div>
+  {% endfor %}
+  <div class="msg">
+    <form method="post" action="/wo/{{ project }}/{{ wo.id }}/send">
+      <textarea name="message" placeholder="feedback for the worker — delivered when it is idle" required></textarea>
+      <div style="margin-top: 8px;"><button type="submit" class="primary">Send to worker</button></div>
+    </form>
+  </div>
+</div>
+
+<h2>Timeline</h2>
+<div class="panel">
+  <ul class="timeline">
+    {% for e in events %}
+    <li>{{ fmt_age(e.ts) }} ago — {{ e.kind }} {{ e.payload if e.payload not in ('{}', none) else '' }}</li>
+    {% endfor %}
+  </ul>
+</div>
+
+{% endblock %}

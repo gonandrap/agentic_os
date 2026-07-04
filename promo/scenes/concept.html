@@ -1,0 +1,94 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link rel="stylesheet" href="base.css">
+<style>
+  /* the pitch: you ask once → jarvis routes it to the right claude session */
+  .avatar { position: absolute; left: 150px; top: 428px; width: 88px; height: 88px;
+            border-radius: 50%; background: var(--raised); border: 1px solid var(--line);
+            display: grid; place-items: center; font-family: var(--mono);
+            font-size: 22px; color: var(--ink); z-index: 2; }
+  .form { position: absolute; left: 310px; top: 290px; width: 540px; z-index: 2;
+          background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+          padding: 26px 30px; box-shadow: 0 20px 60px rgba(0,0,0,0.45); }
+  .form .lbl { font-family: var(--mono); font-size: 17px; letter-spacing: 0.16em;
+               color: var(--ink-3); margin-bottom: 18px; }
+  .form .proj { display: inline-block; font-family: var(--mono); font-size: 20px;
+                background: var(--raised); border: 1px solid var(--line);
+                border-radius: 8px; padding: 8px 16px; color: var(--cyan);
+                margin-bottom: 16px; }
+  .form .field { font-family: var(--mono); font-size: 22px; color: var(--ink);
+                 background: var(--bg); border: 1px solid var(--line);
+                 border-radius: 8px; padding: 14px 16px; min-height: 56px; }
+  .form .btn { margin-top: 18px; font-family: var(--mono); font-size: 20px;
+               display: inline-block; background: var(--raised);
+               border: 1px solid var(--line); border-radius: 8px;
+               padding: 12px 22px; color: var(--ink-2); }
+  .node { padding: 18px 24px; }
+  #jarvis { left: 1010px; top: 430px; width: 250px; }
+  .sess { left: 1520px; width: 330px; }
+  #s1 { top: 200px; } #s2 { top: 452px; } #s3 { top: 704px; }
+  .sess .sub { transition: none; }
+</style></head>
+<body>
+  <svg class="rails" width="1920" height="1080">
+    <path id="r-form" d="M 850 480 C 920 480, 950 485, 1010 490"/>
+    <path id="r-s1" d="M 1260 470 C 1360 420, 1430 330, 1520 265"/>
+    <path id="r-s2" d="M 1260 495 C 1360 500, 1430 505, 1520 508"/>
+    <path id="r-s3" d="M 1260 520 C 1360 580, 1430 680, 1520 755"/>
+    <path id="r-you" d="M 238 472 C 262 472, 286 474, 310 476"/>
+    <circle id="p1" class="pulse" style="opacity:0"/>
+    <circle id="p2" class="pulse" style="opacity:0"/>
+  </svg>
+
+  <div class="avatar">you</div>
+  <div class="form">
+    <div class="lbl">NEW WORK ORDER</div>
+    <div class="proj">webapp ▾</div>
+    <div class="field"><span id="ask"></span><span class="caret" id="fc" style="color:var(--amber)">▌</span></div>
+    <div class="btn" id="btn">Create work order</div>
+  </div>
+
+  <div class="node" id="jarvis"><div class="nm"><span style="color:var(--amber)">&gt;</span> JARVIS</div><div class="sub" id="jsub">routes it</div></div>
+  <div class="node sess" id="s1"><div class="nm">webapp</div><div class="sub" id="s1sub">claude session</div></div>
+  <div class="node sess" id="s2"><div class="nm">etl-pipeline</div><div class="sub">claude session</div></div>
+  <div class="node sess" id="s3"><div class="nm">docs-site</div><div class="sub">claude session</div></div>
+
+  <div class="caption" id="cap">you ask once — <b>jarvis routes it to the right claude session</b></div>
+  <div id="veil"></div>
+<script src="scene.js"></script>
+<script>
+  const TOTAL = 7.0;
+  const ASK = "Fix login: session expires early";
+  const askEl = document.getElementById('ask');
+  askEl.dataset.text = ASK;
+
+  window.seek = (t) => {
+    // beat 1: you type the ask into the form (65ms/char, brand pace)
+    typeInto(askEl, seg(t, 0.5, ASK.length * 0.065));
+    document.getElementById('fc').style.opacity = t < 3.4 && caretOn(t) ? 1 : 0;
+    // button press flash
+    const btn = document.getElementById('btn');
+    const pressed = t > 2.9 && t < 3.35;
+    btn.style.background = pressed ? 'rgba(86,200,232,0.18)' : 'var(--raised)';
+    btn.style.borderColor = pressed ? 'rgba(86,200,232,0.6)' : 'var(--line)';
+    btn.style.color = pressed ? 'var(--cyan)' : 'var(--ink-2)';
+    // beat 2: the work order rides to jarvis, then to the webapp session
+    pulseAlong(document.getElementById('p1'), document.getElementById('r-form'),
+               seg(t, 3.4, 1.0), true);
+    pulseAlong(document.getElementById('p2'), document.getElementById('r-s1'),
+               seg(t, 4.6, 1.1), true);
+    const j = document.getElementById('jarvis');
+    j.style.borderColor = (t > 4.3 && t < 4.9) ? 'rgba(86,200,232,0.7)' : 'var(--line)';
+    // beat 3: the session ignites (brand rule 2: flicker on like a monitor)
+    const on = seg(t, 5.7, 0.4);
+    const flick = on > 0 && on < 1 ? (0.3 + 0.7 * easeOut(on)) : (on >= 1 ? 1 : 0);
+    const s1 = document.getElementById('s1');
+    s1.style.borderColor = on > 0 ? `rgba(86,200,232,${0.15 + 0.45 * flick})` : 'var(--line)';
+    const s1sub = document.getElementById('s1sub');
+    if (t > 6.0) { s1sub.textContent = '● wo-3f21 running'; s1sub.style.color = 'var(--cyan)'; }
+    else { s1sub.textContent = 'claude session'; s1sub.style.color = 'var(--ink-3)'; }
+    document.getElementById('cap').style.opacity = easeOut(seg(t, 0.8, 0.6));
+    edgeFade(t, TOTAL);
+  };
+</script>
+</body></html>

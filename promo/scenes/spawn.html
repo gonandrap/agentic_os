@@ -1,0 +1,65 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link rel="stylesheet" href="base.css">
+<style>
+  .lane { position: absolute; left: 1010px; top: 200px; width: 730px; height: 620px;
+          border: 1px dashed var(--line); border-radius: 16px; padding: 26px 34px; }
+  .lane .lbl { font-family: var(--mono); font-size: 21px; color: var(--ink-3);
+               letter-spacing: 0.12em; }
+  .wocard { position: absolute; left: 150px; top: 300px; width: 560px; z-index: 3;
+            background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+            padding: 26px 30px; box-shadow: 0 18px 60px rgba(0,0,0,0.5); }
+  .wocard .id { font-family: var(--mono); font-size: 21px; color: var(--cyan); }
+  .wocard .tt { font-size: 30px; font-weight: 600; margin-top: 6px; }
+  .wocard .meta { font-family: var(--mono); font-size: 19px; color: var(--ink-3); margin-top: 10px; }
+  .worker { margin-top: 22px; display: flex; align-items: center; gap: 16px; opacity: 0; }
+  .worker .dot { width: 18px; height: 18px; border-radius: 50%; background: var(--cyan);
+                 box-shadow: 0 0 18px rgba(86,200,232,0.9); }
+  .worker .wn { font-family: var(--mono); font-size: 25px; color: var(--ink); }
+  .evt { font-family: var(--mono); font-size: 22px; color: var(--ink-2);
+         padding: 9px 0; border-top: 1px solid var(--line); opacity: 0; }
+  .evt .ok { color: var(--green); } .evt .cy { color: var(--cyan); }
+  .events { margin-top: 22px; }
+</style></head>
+<body>
+  <div class="wocard" id="card">
+    <div class="id">wo-1ee55b50 · webapp</div>
+    <div class="tt">Fix password reset link expiring after 5 minutes</div>
+    <div class="meta">model sonnet · acceptEdits · origin jarvis</div>
+  </div>
+
+  <div class="lane">
+    <div class="lbl">WORKTREE&nbsp;&nbsp;.claude/worktrees/wo-1ee55b50</div>
+    <div class="worker" id="wk"><div class="dot"></div><div class="wn">[WO wo-1ee55b50] worker</div></div>
+    <div class="events">
+      <div class="evt" id="e1"><span class="cy">◍</span> SessionStart — hooks bound, permissions scoped</div>
+      <div class="evt" id="e2"><span class="cy">●</span> reproduced: token TTL read from wrong config key</div>
+      <div class="evt" id="e3"><span class="ok">✓</span> jarvis wo assume — "TTL fix belongs in config, not mailer"</div>
+      <div class="evt" id="e4"><span class="ok">✓</span> jarvis wo finish — PR opened with regression test</div>
+    </div>
+  </div>
+
+  <div class="caption" id="cap">each work order: <b>fresh worktree, scoped permissions, full audit trail</b></div>
+  <div id="veil"></div>
+<script src="scene.js"></script>
+<script>
+  const TOTAL = 7.0;
+  window.seek = (t) => {
+    // the card slides toward the lane, then the worker ignites inside it
+    const card = document.getElementById('card');
+    const mv = easeInOut(seg(t, 0.9, 1.1));
+    card.style.transform = `translateX(${lerp(0, 260, mv)}px) scale(${lerp(1, 0.86, mv)})`;
+    card.style.opacity = lerp(1, 0.55, mv);
+    const wk = document.getElementById('wk');
+    const ig = seg(t, 2.2, 0.4);   // ignition flicker: bright overshoot → settle
+    wk.style.opacity = ig >= 1 ? 1 : (ig > 0 ? (ig < 0.5 ? ig * 2 : lerp(1, 0.85, (ig - 0.5) * 2)) : 0);
+    ['e1','e2','e3','e4'].forEach((id, i) => {
+      const el = document.getElementById(id);
+      const p = easeOut(seg(t, 3.0 + i * 0.85, 0.5));
+      el.style.opacity = p; el.style.transform = `translateY(${lerp(10,0,p)}px)`;
+    });
+    document.getElementById('cap').style.opacity = easeOut(seg(t, 1.4, 0.6));
+    edgeFade(t, TOTAL);
+  };
+</script>
+</body></html>

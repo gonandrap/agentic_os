@@ -1,0 +1,46 @@
+{
+  "$comment": "Example Jarvis catalog. Copy, adjust paths, then: jarvis start --catalog catalog.json",
+  "os": {
+    "defaults": {
+      "model": "sonnet",
+      "permission_mode": "acceptEdits"
+    },
+    "notifications": {
+      "sinks": ["log", "telegram"],
+      "telegram": {
+        "token_env": "JARVIS_TELEGRAM_TOKEN",
+        "chat_id_env": "JARVIS_TELEGRAM_CHAT_ID"
+      }
+    },
+    "ui": { "port": 8787 },
+    "knowledge_inject_limit": 8,
+    "neo": {
+      "$comment": "Neo answers worker questions on your behalf; review its answers in the UI's neo tab",
+      "enabled": true,
+      "model": "opus",
+      "learnings_limit": 50
+    }
+  },
+  "projects": [
+    {
+      "name": "my_webapp",
+      "path": "~/workspace/my_webapp",
+      "description": "Customer-facing web application",
+      "model": "sonnet",
+      "max_concurrent": 2,
+      "worker": {
+        "permission_mode": "acceptEdits",
+        "append_system_prompt": "Run the test suite before opening any PR."
+      },
+      "settings_overrides": {
+        "permissions": { "allow": ["Bash(npm run *)"] }
+      }
+    },
+    {
+      "name": "my_research",
+      "path": "~/workspace/my_research",
+      "description": "Data analysis scripts and notebooks",
+      "model": "haiku"
+    }
+  ]
+}
