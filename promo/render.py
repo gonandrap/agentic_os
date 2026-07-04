@@ -22,7 +22,7 @@ FRAMES = OUT / "frames"
 SCREENS = OUT / "screens"
 SCENES = HERE / "scenes"
 FPS = 30
-FINAL = OUT / "jarvis-os-60s.mp4"
+FINAL = OUT / "jarvis-os-promo.mp4"
 
 
 def scene_url(name: str, **params) -> str:
@@ -33,11 +33,15 @@ def shot(name: str) -> str:  # screenshots referenced relative to scenes/ dir
     return (SCREENS / f"{name}.png").resolve().as_uri()
 
 
-# The master timeline — 60.0s total. Captions live here so future cuts remix
-# without touching scene internals.
+# The master timeline — 73.0s total. Captions live here so future cuts remix
+# without touching scene internals. Keep music.py's story beats in sync.
 def timeline() -> list[tuple[str, float, dict]]:
     return [
         ("title.html", 6.0, {}),
+        # the pitch: what Jarvis IS, before any feature — you ask once,
+        # it routes to the right claude session, a worker picks it up
+        ("concept.html", 7.0, {}),
+        ("worker.html", 6.0, {}),
         ("fleet.html", 8.0, {}),
         ("showcase.html", 7.0, {
             "img": shot("dashboard_busy"), "dur": 7, "zoom": 1.07, "pan": 40,

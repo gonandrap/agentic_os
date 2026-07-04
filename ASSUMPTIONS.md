@@ -330,6 +330,17 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
     as a brand rule. If key sounds ever return, they should be licensed
     recordings, not synthesis.
 
+53. **A concept intro now precedes the features** (user feedback: the video
+    jumped into functionality without saying what Jarvis is). Two new scenes
+    at 6–19s: `concept.html` (you fill the new-work-order form → it rides to
+    Jarvis → routed to the right project's claude session) and `worker.html`
+    (a stylized claude-code terminal picks it up: reads, edits, tests pass).
+    The terminal is a *cinematic*, not a screenshot — it dramatizes a real
+    session's shape without claiming to be one, so the real-screenshots rule
+    still holds for gameplay shots. Video is now 73s (was 60); the final file
+    is `promo/out/jarvis-os-promo.mp4` and the music's story beats moved with
+    the timeline (groove drops exactly when "Create work order" is pressed).
+
 ## E. Scope cuts (MVP)
 
 20. UI has no auth and no websockets (htmx polling refresh).

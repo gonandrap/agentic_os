@@ -19,17 +19,17 @@ from array import array
 from pathlib import Path
 
 SR = 44100
-DUR = 60.0
+DUR = 73.0
 N = int(SR * DUR)
 OUT = Path(__file__).parent / "out" / "track.wav"
 
 # story beats (keep in sync with render.py timeline)
-GROOVE_IN = 6.0      # fleet scene: kick + sub enter
-FULL_IN = 14.0       # first gameplay shot: stabs + percussion
-ARP_IN = 22.0        # layer 2: pluck arp
-SPARK_IN = 38.0      # layer 3: 16th sparkle — the build
-BREAK_AT = 49.0      # all-quiet payoff: rhythm section out
-OUTRO_AT = 54.0
+GROOVE_IN = 9.0      # concept scene: "Create work order" pressed → beat drops
+FULL_IN = 19.0       # fleet scene: stabs + percussion
+ARP_IN = 27.0        # first gameplay shot: pluck arp
+SPARK_IN = 47.0      # neo scene: 16th sparkle — the build
+BREAK_AT = 62.0      # all-quiet payoff: rhythm section out
+OUTRO_AT = 67.0
 
 
 def hz(name: str) -> float:

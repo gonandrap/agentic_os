@@ -6,7 +6,7 @@ read that first; every future piece of content derives from it.
 
 ```bash
 uv sync --extra dev && uv run playwright install chromium   # once
-uv run python promo/render.py                               # → promo/out/jarvis-os-60s.mp4
+uv run python promo/render.py                               # → promo/out/jarvis-os-promo.mp4
 uv run python promo/render.py --skip-screens --skip-frames  # audio-only iteration (reuses frames)
 ```
 
@@ -22,19 +22,25 @@ uv run python promo/render.py --skip-screens --skip-frames  # audio-only iterati
 | 4. Music | `music.py` | Stdlib-only synth: 124 BPM deep house per BRAND.md, mapped to the story beats — groove in at 6s, layers stack at 14/22/38s, rhythm out on the all-quiet payoff at 49s. The only audio layer (no keystroke foley — see BRAND.md) |
 | 5. Assembly | `render.py` | ffmpeg: frames + track → H.264/AAC 1920×1080 |
 
-## The 60s timeline (edit in `render.py::timeline`)
+## The 73s timeline (edit in `render.py::timeline`)
+
+The first third is the pitch — what Jarvis *is* and where you sit — before any
+feature: you create a work order, Jarvis routes it, a Claude session starts
+working. Then the feature run.
 
 | t | scene | beat |
 |---|---|---|
 | 0–6 | `title.html` | wordmark types in; promise line |
-| 6–14 | `fleet.html` | jarvisd dispatches pulses; workers ignite per project |
-| 14–21 | `showcase` dashboard_busy | real dashboard; `jarvis wo create` chip |
-| 21–28 | `spawn.html` | work order → worktree; hooks/assume/finish audit trail |
-| 28–34 | `showcase` wo_detail | real WO page; `jarvis wo send` feedback chip |
-| 34–42 | `neo.html` | question queue drains FIFO; one amber escalation to you |
-| 42–49 | `showcase` neo_tab | real review UI; corrections teach Neo |
-| 49–54 | `showcase` dashboard_quiet | the payoff: ● all quiet |
-| 54–60 | `outro.html` | wordmark, tagline, repo URL |
+| 6–13 | `concept.html` | THE PITCH: you fill the new-work-order form → it rides to Jarvis → routed to the webapp claude session, which ignites |
+| 13–19 | `worker.html` | terminal: the claude session picks the WO up — reads, edits, tests pass |
+| 19–27 | `fleet.html` | jarvisd dispatches pulses; workers ignite per project |
+| 27–34 | `showcase` dashboard_busy | real dashboard; `jarvis wo create` chip |
+| 34–41 | `spawn.html` | work order → worktree; hooks/assume/finish audit trail |
+| 41–47 | `showcase` wo_detail | real WO page; `jarvis wo send` feedback chip |
+| 47–55 | `neo.html` | question queue drains FIFO; one amber escalation to you |
+| 55–62 | `showcase` neo_tab | real review UI; corrections teach Neo |
+| 62–67 | `showcase` dashboard_quiet | the payoff: ● all quiet |
+| 67–73 | `outro.html` | wordmark, tagline, repo URL |
 
 ## Making the next video
 
