@@ -1,10 +1,14 @@
 """Keystroke foley for the Jarvis promo — the brand's signature audio device.
 
-Every command typed on screen is heard: a synthesized key click per character
-(micro-varied pitch/level, deterministic) and a lower return-key *clack* when the
-command completes. Click times are derived from the SAME timeline and the SAME
-typing math the scenes use (`render.py::timeline`, `scene.js::typeInto`), so audio
-and pixels cannot drift.
+Every command typed on screen is heard. Each key is a *thock*: a short burst of
+band-limited noise (a bright 3ms transient, a mid-band body around 1–2 kHz, and
+a tiny low bump — the finger landing), not a tone. Space is duller and lower;
+return is a deeper, longer clack. All parameters micro-vary per key from a
+seeded RNG, so the take is deterministic yet never machine-gun identical.
+
+Click times are derived from the SAME timeline and the SAME typing math the
+scenes use (`render.py::timeline`, `scene.js::typeInto`), so audio and pixels
+cannot drift.
 
     uv run python promo/sfx.py   # → promo/out/sfx.wav
 """
@@ -12,6 +16,7 @@ and pixels cannot drift.
 from __future__ import annotations
 
 import math
+import random
 from array import array
 from pathlib import Path
 
@@ -79,26 +84,56 @@ def key_events() -> list[tuple[float, str, str]]:
     return events
 
 
-# -- synthesis -------------------------------------------------------------------
+# -- synthesis: a key press is noise, not a tone ----------------------------------
 
-def _rand(seed: float) -> float:
-    """Deterministic pseudo-random in [0, 1) (no random module — reproducible)."""
-    return math.sin(seed * 127.1 + 311.7) * 43758.5453 % 1.0
-
-
-def _click(buf, start, f0, body_f, amp, dur=0.028, pan=0.0):
+def _burst(buf, start, dur, amp, lp, hp, tau, pan, rng):
+    """Band-limited noise burst: white noise → one-pole LP → one-pole HP → decay."""
+    klp = 1 - math.exp(-2 * math.pi * lp / SR)
+    khp = 1 - math.exp(-2 * math.pi * hp / SR)
+    lp1 = hp1 = 0.0
     i0 = max(0, int(start * SR))
     i1 = min(N, int((start + dur) * SR))
-    gl, gr = min(1.0, 1 - pan), min(1.0, 1 + pan)
+    gl = min(1.0, 1.0 - pan)
+    gr = min(1.0, 1.0 + pan)
     for i in range(i0, i1):
         t = i / SR - start
-        env = math.exp(-t / (dur / 4))
-        s = (0.9 * math.sin(2 * math.pi * f0 * t)
-             + 0.5 * math.sin(2 * math.pi * f0 * 1.83 * t)
-             + 0.7 * math.sin(2 * math.pi * body_f * t) * math.exp(-t / 0.006))
-        v = amp * env * s
+        x = rng.uniform(-1, 1)
+        lp1 += klp * (x - lp1)
+        hp1 += khp * (lp1 - hp1)
+        env = math.exp(-t / tau) * min(1.0, (dur - t) / 0.004)
+        v = amp * env * (lp1 - hp1)
         buf[2 * i] += v * gl
         buf[2 * i + 1] += v * gr
+
+
+def _bump(buf, start, freq, amp, dur=0.016):
+    """The finger landing: one tiny damped low sine, both channels."""
+    i0 = max(0, int(start * SR))
+    i1 = min(N, int((start + dur) * SR))
+    for i in range(i0, i1):
+        t = i / SR - start
+        v = amp * math.exp(-t / 0.006) * math.sin(2 * math.pi * freq * t)
+        buf[2 * i] += v
+        buf[2 * i + 1] += v
+
+
+def _key(buf, t, rng, kind):
+    pan = rng.uniform(-0.35, 0.35)
+    v = rng.uniform(0.82, 1.18)          # per-key micro variation
+    if kind == "return":
+        # deeper, longer clack — the satisfying end of a command
+        _burst(buf, t, 0.010, 0.50, lp=6500, hp=1800, tau=0.003, pan=0.0, rng=rng)
+        _burst(buf, t, 0.075, 0.62, lp=1300 * v, hp=350, tau=0.020, pan=0.0, rng=rng)
+        _bump(buf, t, 115, 0.30, dur=0.024)
+    elif kind == "space":
+        _burst(buf, t, 0.006, 0.22 * v, lp=5200, hp=1600, tau=0.002, pan=pan, rng=rng)
+        _burst(buf, t, 0.042, 0.30 * v, lp=1100 * v, hp=380, tau=0.012, pan=pan, rng=rng)
+        _bump(buf, t, 130, 0.13 * v)
+    else:
+        # bright 3ms transient + mid body ~1–2 kHz + low bump
+        _burst(buf, t, 0.005, 0.30 * v, lp=9000, hp=3200, tau=0.0016, pan=pan, rng=rng)
+        _burst(buf, t, 0.034, 0.34 * v, lp=2100 * v, hp=750, tau=0.009, pan=pan, rng=rng)
+        _bump(buf, t, 170 * v, 0.10 * v)
 
 
 def build(min_gap: float = 0.034) -> array:
@@ -109,20 +144,11 @@ def build(min_gap: float = 0.034) -> array:
             continue
         if kind != "return" and t - last_t < min_gap:
             continue  # cap density: fast typing, not a buzz
-        r1, r2, r3 = _rand(k + 1), _rand(k + 101), _rand(k + 201)
-        if kind == "return":
-            # the satisfying end-of-command clack: lower, longer, both channels
-            _click(buf, t, f0=900 + 150 * r1, body_f=140, amp=0.34, dur=0.055)
-        elif kind == "space":
-            _click(buf, t, f0=1300 + 250 * r1, body_f=170, amp=0.16 + 0.05 * r2,
-                   dur=0.030, pan=(r3 - 0.5) * 0.5)
-        else:
-            _click(buf, t, f0=1900 + 700 * r1, body_f=230 + 60 * r2,
-                   amp=0.20 + 0.08 * r3, dur=0.026, pan=(r1 - 0.5) * 0.5)
+        _key(buf, t, random.Random(k * 7919 + 13), kind)
         last_t = t
     return buf
 
 
 if __name__ == "__main__":
-    write(build(), out=OUT, headroom=0.5)   # foley sits under the music
+    write(build(), out=OUT, headroom=0.42)   # foley sits under the music
     print(f"sfx → {OUT} ({len(key_events())} keystrokes)")

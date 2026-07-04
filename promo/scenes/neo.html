@@ -3,7 +3,7 @@
 <link rel="stylesheet" href="base.css">
 <style>
   .node { padding: 20px 28px; }
-  .wnode { width: 300px; opacity: 0.95; }
+  .wnode { width: 344px; opacity: 0.95; }
   #w1 { left: 130px; top: 210px; } #w2 { left: 130px; top: 470px; } #w3 { left: 130px; top: 730px; }
   #neo { left: 1180px; top: 450px; width: 300px; padding: 26px 30px;
          border-color: rgba(86,200,232,0.5); }
@@ -12,8 +12,10 @@
   .q { position: absolute; z-index: 3; font-family: var(--mono); font-size: 20px;
        background: var(--raised); border: 1px solid var(--line); border-radius: 999px;
        padding: 10px 20px; color: var(--ink-2); opacity: 0; white-space: nowrap; }
-  .queue-lbl { position: absolute; left: 640px; top: 320px; font-family: var(--mono);
-               font-size: 20px; color: var(--ink-3); letter-spacing: 0.14em; opacity: 0; }
+  .queue-lbl { position: absolute; left: 640px; top: 190px; z-index: 2;
+               font-family: var(--mono); font-size: 20px; color: var(--ink-3);
+               letter-spacing: 0.14em; opacity: 0;
+               background: var(--bg); padding: 8px 18px; border-radius: 999px; }
 </style></head>
 <body>
   <svg class="rails" width="1920" height="1080">

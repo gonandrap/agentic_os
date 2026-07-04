@@ -292,6 +292,24 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
     binaries don't belong in git history; the pipeline regenerates them
     identically. The rendered master lands at `promo/out/jarvis-os-60s.mp4`.
 
+48. **Soundtrack round 3 is an exploration, not a pick** (feedback: the 104 BPM
+    cut felt dramatic; the 122 BPM cut felt same-but-worse and too fast).
+    `music.py` now ships five deliberately different directions — lofi 88,
+    synthwave 100, acoustic 100, deephouse 112, keynote 92 BPM — rendered as
+    five full cuts via `render.py --versions`, all peak-normalized identically
+    so loudness doesn't bias the comparison. The winner sets `DEFAULT_STYLE`
+    and gets written into BRAND.md; the other builders stay as raw material.
+
+49. **Keystroke foley is noise-based** (feedback: sine clicks didn't sound like
+    keys). Each press is a band-limited noise thock (bright transient + mid
+    body + low finger bump), micro-varied per key from a seeded RNG. One shared
+    `sfx.wav` rides under all five cuts so only the music varies in the A/B.
+
+50. **Rails always render under node boxes and labels now** (`z-index` fix in
+    `base.css`, opaque pill behind the Neo queue label) — crossing rail lines
+    previously drew over text in the Neo scene ("arrows over letters"). Brand
+    rule made explicit: text is never overwritten by motion elements.
+
 ## E. Scope cuts (MVP)
 
 20. UI has no auth and no websockets (htmx polling refresh).

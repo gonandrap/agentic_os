@@ -33,7 +33,8 @@ body { background: var(--bg); color: var(--ink); font: 28px/1.5 var(--sans); pos
 .chip .prompt { color: var(--green); margin-right: 12px; }
 .chip .c { color: var(--amber-ink); }
 
-.node { position: absolute; background: var(--surface); border: 1px solid var(--line);
+.node { position: absolute; z-index: 2; background: var(--surface);
+        border: 1px solid var(--line);
         border-radius: 12px; font-family: var(--mono); text-align: center; }
 .node .nm { color: var(--ink); font-size: 26px; font-weight: 600; }
 .node .sub { color: var(--ink-3); font-size: 19px; }
