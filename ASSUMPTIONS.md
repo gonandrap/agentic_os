@@ -310,6 +310,18 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
     previously drew over text in the Neo scene ("arrows over letters"). Brand
     rule made explicit: text is never overwritten by motion elements.
 
+51. **Soundtrack round 4: tuned by measurement against the user's reference
+    video** (`~/Downloads/agentic-env-promo.mp4`, liked). Signal analysis of
+    that file drove every parameter, not taste: 124 BPM four-on-the-floor
+    (deephouse retuned from 112 — "a little slow"), kick decay ~97ms, offbeat
+    sub, mix density −12 dB mean (added tanh drive), and keystrokes rebuilt as
+    warm thocks — measured reference clicks: centroid ~600–800 Hz, energy
+    200–1500 Hz, ~1–2ms decay, near-full-scale loudness, ~100ms apart. Ours
+    now measures 662 Hz centroid, ≥55ms spacing, foley at 0.70 peak. On-screen
+    typing slowed 45→65 ms/char so each visible character is a distinct press.
+    If this still misses, the user can pull exact synth params from the session
+    that generated the reference.
+
 ## E. Scope cuts (MVP)
 
 20. UI has no auth and no websockets (htmx polling refresh).

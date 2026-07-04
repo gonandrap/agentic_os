@@ -32,7 +32,7 @@ DUR = 60.0
 N = int(SR * DUR)
 OUT = Path(__file__).parent / "out" / "track.wav"
 
-DEFAULT_STYLE = "keynote"
+DEFAULT_STYLE = "deephouse"
 
 # story beats (keep in sync with render.py timeline)
 GROOVE_IN = 6.0
@@ -378,10 +378,14 @@ def build_acoustic() -> array:
 
 
 def build_deephouse() -> array:
-    """112 BPM deep house: round kick, offbeat sub, dark EP stabs, tiny perc."""
+    """124 BPM deep house, tuned against the reference promo the user likes:
+    round four-on-the-floor (~97ms decay), offbeat sub, dark EP stabs, and
+    layers that keep stacking — arp at 22s, sparkle at 38s — so energy builds
+    instead of plateauing. Master is tanh-driven for a hotter, denser level."""
     buf = new_buf()
-    B = 60 / 112
+    B = 60 / 124
     bar = 4 * B
+    ARP_IN, SPARK_IN = 22.0, 38.0
     STAB = [["A2", "C3", "E3", "G3"], ["A2", "C3", "E3", "G3"],
             ["F2", "A2", "C3", "E3"], ["G2", "B2", "D3", "F3"]]
 
@@ -397,17 +401,17 @@ def build_deephouse() -> array:
         k += 2
         t += 2 * bar
 
-    # round four-on-the-floor
+    # round four-on-the-floor (reference: -20dB in ~97ms)
     t = GROOVE_IN
     while t < BREAK_AT:
-        add_kick(buf, t, 0.17, f_hi=115, f_lo=46, p_dec=0.035, a_dec=0.075, click=0.15)
+        add_kick(buf, t, 0.17, f_hi=120, f_lo=46, p_dec=0.030, a_dec=0.042, click=0.18)
         t += B
 
     # offbeat sub bass
     t, k = GROOVE_IN, 0
     while t < BREAK_AT:
         root = hz(STAB[(int(t // (2 * bar))) % 4][0]) / 2
-        add_tone(buf, t + B / 2, 0.17, root, 0.115, attack=0.006, release=0.07,
+        add_tone(buf, t + B / 2, 0.16, root, 0.115, attack=0.006, release=0.06,
                  partials=((1, 1.0), (2, 0.15)))
         k += 1
         t += B
@@ -424,6 +428,28 @@ def build_deephouse() -> array:
                          detune=0.0010, pan=-0.25 + 0.25 * j)
         k += 1
         t += bar
+
+    # layer 2 at 22s: pluck arp 8ths — motion on top of the groove
+    t, k = ARP_IN, 0
+    order = [0, 2, 1, 3, 2, 3, 1, 2]
+    while t < BREAK_AT:
+        notes = STAB[(int(t // (2 * bar))) % 4]
+        f = hz(notes[order[k % 8]]) * 2
+        add_tone(buf, t, 0.20, f, 0.026, attack=0.003, release=0.16,
+                 partials=((1, 1.0), (2, 0.30), (3, 0.08)),
+                 pan=0.3 if k % 2 else -0.3)
+        k += 1
+        t += B / 2
+
+    # layer 3 at 38s: 16th-offset sparkle echo an octave up — the build
+    t, k = SPARK_IN, 0
+    while t < BREAK_AT:
+        notes = STAB[(int(t // (2 * bar))) % 4]
+        f = hz(notes[order[k % 8]]) * 4
+        add_tone(buf, t + B / 4, 0.12, f, 0.012, attack=0.002, release=0.10,
+                 partials=((1, 1.0),), pan=-0.45 if k % 2 else 0.45)
+        k += 1
+        t += B / 2
 
     # rim 2 & 4, 16th shaker, open hat at bar turn
     t, k = FULL_IN, 0
@@ -451,7 +477,13 @@ def build_deephouse() -> array:
                  attack=1.0, release=2.0, partials=((1, 1.0), (2, 0.2)),
                  pan=-0.3 + 0.2 * j)
     sidechain(buf, GROOVE_IN, BREAK_AT, B, depth=0.22)
-    return master(buf)
+    master(buf)
+    # gentle tanh drive: raises RMS a few dB (the reference sits at −12dB mean,
+    # denser than a clean peak-normalized mix); write() re-normalizes the peak
+    peak = max(1e-9, max(abs(v) for v in buf))
+    for i in range(2 * N):
+        buf[i] = math.tanh(2.0 * buf[i] / peak)
+    return buf
 
 
 def build_keynote() -> array:

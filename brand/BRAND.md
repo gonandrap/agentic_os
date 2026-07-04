@@ -61,22 +61,27 @@ every beat carries an on-screen caption (mono, `--ink-2`, bottom-left).
 
 ## Music direction
 
-**Under exploration** — five candidate directions live in `promo/music.py`
-(`lofi`, `synthwave`, `acoustic`, `deephouse`, `keynote`), all deterministic and
-stdlib-only. Invariants that hold whichever direction wins: momentum without
-drama (no risers, no drops, no vocal chops), and the arrangement follows the
-story — intro → rhythm in while the OS works → breakdown on the all-quiet
-payoff (the room exhales) → settle home. Once a direction is picked, rewrite
-this section to describe it concretely and set `music.py::DEFAULT_STYLE`.
-Regenerate; don't swap in licensed music without updating this file.
+**Deep house, ~124 BPM** (matched against the reference promo the user liked):
+round four-on-the-floor kick (≈100ms decay), offbeat sub bass, dark EP stabs,
+tiny rim/shaker percussion, and layers that keep *stacking* — pluck arp joins
+at ~22s, a 16th sparkle at ~38s — so energy builds rather than plateaus.
+Mix is dense and hot (≈ −12 dB mean via gentle tanh drive), momentum without
+drama: no risers, no drops, no vocal chops. The arrangement follows the story:
+intro → groove in while the OS works → rhythm section out on the all-quiet
+payoff (the room exhales) → settle home. `music.py::DEFAULT_STYLE = "deephouse"`
+is the canonical build; four alternate style builders remain in the file as raw
+material. Regenerate; don't swap in licensed music without updating this file.
 
 **Signature audio device — keystroke foley.** Every command typed on screen is
-heard. A key press is *noise, not a tone*: a band-limited thock — bright ~3ms
-transient, mid-band body around 1–2 kHz, a tiny low finger-bump — micro-varied
-per key from a seeded RNG; space is duller and lower, return is a deeper,
-longer clack. `promo/sfx.py` derives the click times from the SAME timeline
-that renders the frames, so audio and pixels cannot drift. Any future content
-that types text on screen must carry this layer — it's part of the brand's sound.
+heard. A key press is *noise, not a tone*, and specifically a warm mechanical
+*thock*: spectral centroid ~650 Hz, energy concentrated 200–1500 Hz, a small
+dark transient and a low finger-knock, decay tight (a few ms) — no high fizz.
+Space is duller and lower; return is a deeper, louder clack. Keys ride close to
+the music's level (a foreground element, not an easter egg) and stay ≥55ms
+apart so each is a distinct press, never a buzz. On-screen typing runs at
+~65ms/char to match. `promo/sfx.py` derives the click times from the SAME
+timeline that renders the frames, so audio and pixels cannot drift. Any future
+content that types text on screen must carry this layer.
 
 ## Video grammar (all promotional cuts)
 

@@ -42,7 +42,7 @@
     const chip = document.getElementById('chip');
     if (CMD) {
       chip.style.opacity = easeOut(seg(t, 0.8, 0.4));
-      typeInto(cmdEl, seg(t, 1.1, Math.min(1.8, CMD.length * 0.045)));
+      typeInto(cmdEl, seg(t, 1.1, Math.min(2.6, CMD.length * 0.065)));
     }
     document.getElementById('cap').style.opacity = easeOut(seg(t, 0.6, 0.6));
     edgeFade(t, TOTAL);

@@ -71,7 +71,7 @@ def key_events() -> list[tuple[float, str, str]]:
         elif name == "showcase.html":
             cmd = params.get("cmd", "")
             if cmd:
-                d = min(1.8, len(cmd) * 0.045)
+                d = min(2.6, len(cmd) * 0.065)
                 evs = _increment_times(
                     lambda t, D=d, L=len(cmd): round(L * _seg(t, 1.1, D)),
                     (1.0, 1.2 + d), len(cmd))
@@ -118,37 +118,41 @@ def _bump(buf, start, freq, amp, dur=0.016):
 
 
 def _key(buf, t, rng, kind):
-    pan = rng.uniform(-0.35, 0.35)
-    v = rng.uniform(0.82, 1.18)          # per-key micro variation
+    """A mechanical-keyboard *thock*, matched to the reference promo's clicks:
+    spectral centroid ~600–800 Hz, energy concentrated 200–1500 Hz, very tight
+    decay. Warm body + small dark transient + low knock — no high fizz."""
+    pan = rng.uniform(-0.30, 0.30)
+    v = rng.uniform(0.85, 1.15)          # per-key micro variation
     if kind == "return":
-        # deeper, longer clack — the satisfying end of a command
-        _burst(buf, t, 0.010, 0.50, lp=6500, hp=1800, tau=0.003, pan=0.0, rng=rng)
-        _burst(buf, t, 0.075, 0.62, lp=1300 * v, hp=350, tau=0.020, pan=0.0, rng=rng)
-        _bump(buf, t, 115, 0.30, dur=0.024)
+        # deeper, louder clack — the satisfying end of a command
+        _burst(buf, t, 0.012, 0.45, lp=4200, hp=1500, tau=0.0018, pan=0.0, rng=rng)
+        _burst(buf, t, 0.055, 1.10, lp=750 * v, hp=240, tau=0.008, pan=0.0, rng=rng)
+        _bump(buf, t, 105, 0.55, dur=0.028)
     elif kind == "space":
-        _burst(buf, t, 0.006, 0.22 * v, lp=5200, hp=1600, tau=0.002, pan=pan, rng=rng)
-        _burst(buf, t, 0.042, 0.30 * v, lp=1100 * v, hp=380, tau=0.012, pan=pan, rng=rng)
-        _bump(buf, t, 130, 0.13 * v)
+        _burst(buf, t, 0.008, 0.28 * v, lp=3600, hp=1300, tau=0.0015, pan=pan, rng=rng)
+        _burst(buf, t, 0.040, 0.80 * v, lp=850 * v, hp=280, tau=0.006, pan=pan, rng=rng)
+        _bump(buf, t, 135, 0.30 * v)
     else:
-        # bright 3ms transient + mid body ~1–2 kHz + low bump
-        _burst(buf, t, 0.005, 0.30 * v, lp=9000, hp=3200, tau=0.0016, pan=pan, rng=rng)
-        _burst(buf, t, 0.034, 0.34 * v, lp=2100 * v, hp=750, tau=0.009, pan=pan, rng=rng)
-        _bump(buf, t, 170 * v, 0.10 * v)
+        _burst(buf, t, 0.007, 0.26 * v, lp=4200, hp=1600, tau=0.0014, pan=pan, rng=rng)
+        _burst(buf, t, 0.032, 0.95 * v, lp=1000 * v, hp=350, tau=0.005, pan=pan, rng=rng)
+        _bump(buf, t, 190 * v, 0.28 * v, dur=0.014)
 
 
-def build(min_gap: float = 0.034) -> array:
+def build(min_gap: float = 0.055) -> array:
     buf = array("d", bytes(8 * 2 * N))
     last_t = -1.0
     for k, (t, kind, _ch) in enumerate(key_events()):
         if t >= DUR:
             continue
         if kind != "return" and t - last_t < min_gap:
-            continue  # cap density: fast typing, not a buzz
+            continue  # each key stays a distinct thock, never a buzz
         _key(buf, t, random.Random(k * 7919 + 13), kind)
         last_t = t
     return buf
 
 
 if __name__ == "__main__":
-    write(build(), out=OUT, headroom=0.42)   # foley sits under the music
+    # foley rides close to the music's level — in the reference the keys are
+    # a foreground element, not an easter egg
+    write(build(), out=OUT, headroom=0.70)
     print(f"sfx → {OUT} ({len(key_events())} keystrokes)")
