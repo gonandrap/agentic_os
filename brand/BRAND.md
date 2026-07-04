@@ -68,20 +68,14 @@ at ~22s, a 16th sparkle at ~38s — so energy builds rather than plateaus.
 Mix is dense and hot (≈ −12 dB mean via gentle tanh drive), momentum without
 drama: no risers, no drops, no vocal chops. The arrangement follows the story:
 intro → groove in while the OS works → rhythm section out on the all-quiet
-payoff (the room exhales) → settle home. `music.py::DEFAULT_STYLE = "deephouse"`
-is the canonical build; four alternate style builders remain in the file as raw
-material. Regenerate; don't swap in licensed music without updating this file.
+payoff (the room exhales) → settle home. The generated track lives in
+`promo/music.py` (deterministic, stdlib-only). Regenerate; don't swap in
+licensed music without updating this file.
 
-**Signature audio device — keystroke foley.** Every command typed on screen is
-heard. A key press is *noise, not a tone*, and specifically a warm mechanical
-*thock*: spectral centroid ~650 Hz, energy concentrated 200–1500 Hz, a small
-dark transient and a low finger-knock, decay tight (a few ms) — no high fizz.
-Space is duller and lower; return is a deeper, louder clack. Keys ride close to
-the music's level (a foreground element, not an easter egg) and stay ≥55ms
-apart so each is a distinct press, never a buzz. On-screen typing runs at
-~65ms/char to match. `promo/sfx.py` derives the click times from the SAME
-timeline that renders the frames, so audio and pixels cannot drift. Any future
-content that types text on screen must carry this layer.
+The music is the only audio layer — **no keystroke foley, no UI sound
+effects**: synthesized clicks never read as real keys (tried and rejected
+three times), and half-real sound design is worse than none. On-screen typing
+runs at ~65ms/char so it reads naturally in silence.
 
 ## Video grammar (all promotional cuts)
 

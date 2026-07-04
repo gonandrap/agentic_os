@@ -92,35 +92,25 @@ def render_frames() -> int:
     return frame
 
 
-def assemble(total_frames: int, track: Path | None = None,
-             final: Path | None = None) -> None:
-    track = track or OUT / "track.wav"
-    final = final or FINAL
-    sfx = OUT / "sfx.wav"
+def assemble(total_frames: int) -> None:
+    track = OUT / "track.wav"
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-framerate", str(FPS), "-i", str(FRAMES / "f_%05d.png"),
     ]
-    audio_inputs = [p for p in (track, sfx) if p.exists()]
-    for p in audio_inputs:
-        cmd += ["-i", str(p)]
+    if track.exists():
+        cmd += ["-i", str(track)]
     cmd += [
         "-c:v", "libx264", "-preset", "slow", "-crf", "18",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart",
     ]
-    if len(audio_inputs) == 2:
-        # music + keystroke foley, summed then safety-limited
-        cmd += ["-filter_complex",
-                "[1:a][2:a]amix=inputs=2:duration=longest:normalize=0,"
-                "alimiter=limit=0.95[a]",
-                "-map", "0:v", "-map", "[a]"]
-    if audio_inputs:
+    if track.exists():
         cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
-    cmd += [str(final)]
+    cmd += [str(FINAL)]
     subprocess.run(cmd, check=True)
     dur = total_frames / FPS
-    size = final.stat().st_size / 1e6
-    print(f"  ✅ {final}  ({dur:.1f}s, {size:.1f} MB)")
+    size = FINAL.stat().st_size / 1e6
+    print(f"  ✅ {FINAL}  ({dur:.1f}s, {size:.1f} MB)")
 
 
 def main(argv: list[str]) -> None:
@@ -128,25 +118,12 @@ def main(argv: list[str]) -> None:
     if "--skip-screens" not in argv or not SCREENS.exists():
         print("📸 capturing real UI screenshots …")
         subprocess.run([sys.executable, str(HERE / "capture_screens.py")], check=True)
-    print("⌨️  synthesizing keystroke foley …")
-    subprocess.run([sys.executable, str(HERE / "sfx.py")], check=True, cwd=HERE)
     if "--skip-frames" in argv and FRAMES.exists():
         frames = len(list(FRAMES.glob("f_*.png")))
         print(f"🎞  reusing {frames} existing frames (--skip-frames)")
     else:
         print("🎞  rendering scenes …")
         frames = render_frames()
-    if "--versions" in argv:
-        # one cut per soundtrack direction: jarvis-os-60s-v1-lofi.mp4, …
-        from music import STYLES
-        for i, style in enumerate(STYLES, 1):
-            track = OUT / f"track-{style}.wav"
-            print(f"🎵 [{i}/{len(STYLES)}] synthesizing {style} …")
-            subprocess.run([sys.executable, str(HERE / "music.py"), style,
-                            str(track)], check=True)
-            assemble(frames, track=track,
-                     final=OUT / f"jarvis-os-60s-v{i}-{style}.mp4")
-        return
     print("🎵 synthesizing track …")
     subprocess.run([sys.executable, str(HERE / "music.py")], check=True)
     print("📦 assembling with ffmpeg …")

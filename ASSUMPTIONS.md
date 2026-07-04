@@ -322,6 +322,14 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
     If this still misses, the user can pull exact synth params from the session
     that generated the reference.
 
+52. **Keystroke foley removed entirely** (user call, 2026-07-04): three
+    synthesis approaches (sine clicks, filtered-noise bursts, modal
+    struck-object) never read as real keys. `sfx.py` deleted, the four
+    alternate soundtrack styles removed with it; `music.py` now builds only
+    the picked deep-house-124 track and BRAND.md records "no keystroke foley"
+    as a brand rule. If key sounds ever return, they should be licensed
+    recordings, not synthesis.
+
 ## E. Scope cuts (MVP)
 
 20. UI has no auth and no websockets (htmx polling refresh).

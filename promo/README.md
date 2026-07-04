@@ -8,14 +8,7 @@ read that first; every future piece of content derives from it.
 uv sync --extra dev && uv run playwright install chromium   # once
 uv run python promo/render.py                               # → promo/out/jarvis-os-60s.mp4
 uv run python promo/render.py --skip-screens --skip-frames  # audio-only iteration (reuses frames)
-uv run python promo/render.py --skip-screens --versions     # one cut per soundtrack style
 ```
-
-**Soundtrack direction is under exploration** — `music.py` ships five distinct
-styles (`lofi`, `synthwave`, `acoustic`, `deephouse`, `keynote`); `--versions`
-renders one cut per style (`out/jarvis-os-60s-v1-lofi.mp4`, …). Once a winner is
-picked, set `music.py::DEFAULT_STYLE` and update `brand/BRAND.md`'s music
-direction to describe it.
 
 `promo/out/` is gitignored — artifacts regenerate from source on demand.
 
@@ -26,9 +19,8 @@ direction to describe it.
 | 1. Gameplay | `capture_screens.py` | Boots the REAL OS over a seeded fixture fleet (fake `claude` supervisor for determinism), serves the real dashboard, photographs it at 2× (dashboard busy/quiet, work-order detail, neo tab, backlog) |
 | 2. Cinematics | `scenes/*.html` | Motion-graphics pages. Each exposes `window.seek(t)` — **fully deterministic per t**, no wall-clock animation — and obeys the brand motion language (pulses on rails, ignition, amber discipline, edge fades) |
 | 3. Frames | `render.py` | Walks the timeline, screenshots 30 fps per scene into `out/frames/` |
-| 4. Music | `music.py` | Stdlib-only synth, five style builders sharing one engine (additive tones, Karplus-Strong plucks, noise percussion) — every style follows the same story beats: groove in at 6s, full at 14s, breakdown on the all-quiet payoff at 49s |
-| 5. Keystroke foley | `sfx.py` | The brand's signature audio device: each key press is a band-limited noise *thock* (bright transient + mid body + low finger bump, micro-varied per key), timed by replicating the scenes' exact typing math over the timeline — audio and pixels cannot drift |
-| 6. Assembly | `render.py` | ffmpeg: frames + music + foley (mixed, safety-limited) → H.264/AAC 1920×1080 |
+| 4. Music | `music.py` | Stdlib-only synth: 124 BPM deep house per BRAND.md, mapped to the story beats — groove in at 6s, layers stack at 14/22/38s, rhythm out on the all-quiet payoff at 49s. The only audio layer (no keystroke foley — see BRAND.md) |
+| 5. Assembly | `render.py` | ffmpeg: frames + track → H.264/AAC 1920×1080 |
 
 ## The 60s timeline (edit in `render.py::timeline`)
 
