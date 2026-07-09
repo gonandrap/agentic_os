@@ -349,3 +349,56 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
     `JARVIS_E2E_REAL=1` (not run in CI to avoid token burn).
 23. Cross-project learning *synthesis* (summarizing learnings into curated docs) is
     backlogged; MVP only captures + injects.
+
+## I. Production monitoring (spec, 2026-07-04)
+
+Design doc: `docs/superpowers/specs/2026-07-04-prod-monitoring-design.md`. Spec only —
+no implementation yet. Decisions made autonomously:
+
+54. **The handshake is a committed manifest in the project repo**
+    (`monitoring/manifest.json`, `"interface": 1`, path overridable in the catalog),
+    plus project-owned probe instructions and playbooks as plain files. Rejected
+    alternatives: catalog-side probe definitions (project logic would leak into the
+    OS/user config) and a Python plugin API (imports project code into jarvisd; a file
+    contract keeps the boundary inspectable and language-agnostic).
+
+55. **Two probe kinds only**: `command` (deterministic script, exit code = verdict,
+    zero tokens — the workhorse) and `agent` (a native `claude --bg` session runs
+    project-authored instructions). Agent probes report through
+    `jarvis mon report <run-id> --healthy|--unhealthy`, never via parsed model prose —
+    same principle as `wo assume`/`finish`. A probe session that ends without
+    reporting is an *error*, not a verdict.
+
+56. **Incidents are first-class and deduped** by `(probe, fingerprint)`: repeated
+    failures bump a counter instead of spamming; lifecycle
+    `open → fixing → verifying → resolved | escalated | muted`, stored in the
+    per-project DB with central rollup via the existing inbox/attention (no new
+    central tables of truth).
+
+57. **Remediation reuses the work-order machinery unchanged** (`origin=monitor`):
+    worktree, assumptions, `needs_review`, PR. Prompt = incident evidence + project
+    playbook + OPERATION.md contract. Three per-probe modes: `alert`, `propose`
+    (user launches the prepared fix with `jarvis mon fix`), `auto`. After a fix, the
+    OS re-runs the originating probe to verify; still-unhealthy → escalate and stop
+    auto-fixing (no fix-fail-fix loops).
+
+58. **Error ≠ unhealthy, and the infra watches itself**: crashed/timed-out/silent
+    probes never open project incidents; 3 consecutive errors open a `probe_broken`
+    self-incident, and a probe overdue past 2× its interval opens `monitoring_stale`.
+    This targets the observed failure mode of the current per-project observers
+    (dying silently).
+
+59. **No auto-deploy in v1.** "New version" = reviewed branch/PR; deployment stays in
+    the playbook's instructions and behind human review. Circuit breakers
+    (`max_concurrent_fixes`, `max_auto_fixes_per_day`, `min_agent_interval` floor,
+    haiku default for probes) bound token burn; every breaker trip escalates rather
+    than silently stopping.
+
+60. **Neo is untouched**: fix workers reach it through the existing `jarvis wo ask`
+    path (incident id in the question metadata); its policy already escalates
+    production/credentials/money to the user. No second Q&A channel.
+
+61. **Migration is user-driven**: `jarvis mon adopt` scaffolds manifest + templates in
+    the project repo but never commits there; the user ports observer logic into
+    probes/playbooks and commits. painforwisdom first, auto_heycrypto last with the
+    settings-superset check, per the fleet plan.
