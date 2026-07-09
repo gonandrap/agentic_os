@@ -33,6 +33,27 @@ def test_bootstrap_creates_everything(project):
     assert "settings.json already up to date" in report2.actions
 
 
+def test_bootstrap_trusts_workspace(tmp_path, monkeypatch):
+    from jarvis.bootstrap import workspace_trusted
+    from jarvis.testing import make_git_project
+    p = make_git_project(tmp_path, "untrusted")
+    cfg = tmp_path / "claude.json"
+    # a pre-existing entry with other keys we must not clobber
+    cfg.write_text(json.dumps({
+        "numStartups": 7,
+        "projects": {str(p): {"hasTrustDialogAccepted": False, "lastCost": 1.5}},
+    }))
+    monkeypatch.setenv("JARVIS_CLAUDE_JSON", str(cfg))
+
+    assert workspace_trusted(p) is False
+    report = bootstrap_project(spec(p))
+    assert not report.warnings
+    assert workspace_trusted(p) is True
+    data = json.loads(cfg.read_text())
+    assert data["numStartups"] == 7                       # top-level key preserved
+    assert data["projects"][str(p)]["lastCost"] == 1.5    # sibling key preserved
+
+
 def test_bootstrap_generates_readme_stub(tmp_path):
     from jarvis.testing import make_git_project
     p = make_git_project(tmp_path, "noreadme", readme=None)

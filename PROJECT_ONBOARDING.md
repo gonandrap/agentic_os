@@ -16,8 +16,8 @@ entry per project:
     {
       "name": "my_project",
       "path": "~/workspace/my_project",
-      "worker": {"model": "sonnet", "permission_mode": "acceptEdits"},
-      "max_concurrent": 2,
+      "worker": {"model": "sonnet", "permission_mode": "auto"},
+      "max_concurrent": 5,
       "settings_overrides": {},
       "append_system_prompt": ""
     }
@@ -25,6 +25,13 @@ entry per project:
 }
 ```
 
+- `worker.permission_mode` — `auto` by default: workers run routine tools (grep,
+  edits, scripts, tests, git) without a prompt per action, which is the only way a
+  background worker can run unattended. Sensitive paths stay protected by
+  `settings_overrides` deny guards, which apply in every mode. Set a stricter mode
+  per project if you want (e.g. `acceptEdits`, `plan`).
+- `max_concurrent` — simultaneous work orders for this project; the rest queue.
+  Defaults to `5` (or the fleet-wide `os.defaults.max_concurrent`).
 - `settings_overrides` — project-specific hooks/permissions merged on top of the OS
   baseline (e.g. credential guards for a production repo).
 - `append_system_prompt` — hard constraints every worker must hear
@@ -39,6 +46,7 @@ entry per project:
 | `.jarvis/` | state dir with the project's queue DB | delete dir |
 | `.gitignore` | `.jarvis/` entry appended | remove line |
 | `.claude/settings.json` | replaced by OS baseline + catalog `settings_overrides`; original backed up to `settings.json.pre-jarvis` **the first time** | restore backup |
+| `~/.claude.json` | project path marked `hasTrustDialogAccepted: true` (workspace trusted); every other key preserved | set it back to `false` |
 
 `settings.local.json` is never touched — it stays your per-machine escape hatch.
 
@@ -52,9 +60,10 @@ jarvis adopt ~/workspace/my_project --catalog ~/.jarvis/catalog.json --dry-run
 
 - **A git repository.** Workers run in fresh worktrees; a project without git must be
   `git init`-ed first (adopt detects this and instructs rather than auto-initializing).
-- **Workspace trust.** Each project must be trusted by Claude Code (open `claude` there
-  once and accept the dialog) — untrusted workspaces ignore permission rules and
-  workers stall. `jarvis start` warns per project if trust is missing.
+- **Workspace trust.** Untrusted workspaces ignore permission rules and workers stall,
+  so Jarvis trusts every catalog project for you: adoption sets
+  `hasTrustDialogAccepted` for the project path in `~/.claude.json` (listing a project
+  in the catalog *is* the trust decision). No per-project trust dialog.
 
 ## 4. Commit the generated files
 

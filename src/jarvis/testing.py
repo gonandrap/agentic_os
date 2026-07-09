@@ -195,7 +195,7 @@ def project(tmp_path, claude_json):
 def catalog_file(tmp_path, project):
     data = {
         "os": {
-            "defaults": {"model": "sonnet", "permission_mode": "acceptEdits"},
+            "defaults": {"model": "sonnet"},  # permission_mode falls to default (auto)
             "notifications": {"sinks": ["log"]},
         },
         "projects": [

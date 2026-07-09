@@ -52,7 +52,7 @@ uv tool install --editable .
 ```json
 {
   "os": {
-    "defaults": { "model": "sonnet", "permission_mode": "acceptEdits" },
+    "defaults": { "model": "sonnet", "permission_mode": "auto", "max_concurrent": 5 },
     "notifications": { "sinks": ["log", "telegram"] }
   },
   "projects": [
@@ -69,7 +69,9 @@ jarvis start --catalog catalog.json
 ```
 
 This bootstraps every project (README check, OPERATION.md contract, `.jarvis/` state
-dir, injected `.claude/settings.json`) and starts the daemon.
+dir, injected `.claude/settings.json`, and workspace trust) and starts the daemon.
+Listing a project in the catalog trusts its workspace for you — no per-project trust
+dialog.
 
 3. Create work:
 

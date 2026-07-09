@@ -3,7 +3,8 @@
   "os": {
     "defaults": {
       "model": "sonnet",
-      "permission_mode": "acceptEdits"
+      "permission_mode": "auto",
+      "max_concurrent": 5
     },
     "notifications": {
       "sinks": ["log", "telegram"],
@@ -27,9 +28,9 @@
       "path": "~/workspace/my_webapp",
       "description": "Customer-facing web application",
       "model": "sonnet",
-      "max_concurrent": 2,
+      "max_concurrent": 3,
       "worker": {
-        "permission_mode": "acceptEdits",
+        "$comment": "inherits os.defaults.permission_mode (auto); override here to restrict a project",
         "append_system_prompt": "Run the test suite before opening any PR."
       },
       "settings_overrides": {
