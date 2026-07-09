@@ -4,8 +4,10 @@ on:
     branches: [main]
   pull_request:
 
-# All three jobs are REQUIRED status checks on main (enforced by the repo ruleset):
-# unit tests, behavioral evals, and browser tests must pass before any merge.
+# All three jobs are REQUIRED status checks on main (enforced by the repo ruleset
+# "protect-main"): unit tests, behavioral evals, and browser tests must pass before
+# any merge. The ruleset uses strict_required_status_checks_policy=true, so a PR
+# branch must also be up to date with main before it can merge.
 jobs:
   unit:
     runs-on: ubuntu-latest
