@@ -71,12 +71,21 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
 
 ## C. Behavior & policy
 
-9. **Default worker permission mode is `acceptEdits`** (not `bypassPermissions`) — safe
-   default for an OSS project; your catalog can set per-project
-   `worker.permission_mode` (e.g., auto/bypass for sandboxed projects). Blocked
-   permission prompts surface as `needs_attention`.
+9. **Default worker permission mode is `auto`** (revised 2026-07-08; was `acceptEdits`).
+   A `--bg` worker can't answer a permission prompt, so anything short of an autonomous
+   mode stalls it — `acceptEdits` still prompts on Bash (grep, tests, git, running
+   scripts), which are exactly what a real task needs. `auto` runs routine tools
+   without a prompt per action. Sensitive paths are NOT protected by prompts under
+   `auto`; they are protected by the project's PreToolUse **deny** guards (catalog
+   `settings_overrides`, e.g. auto_heycrypto's credential guards), which fire in every
+   mode. Per-project `worker.permission_mode` can still restrict (`acceptEdits`,
+   `plan`, …). Valid modes now mirror the CLI exactly (`acceptEdits`, `auto`,
+   `bypassPermissions`, `manual`, `dontAsk`, `plan`) — the old set wrongly included
+   `default` (which the CLI rejects) and omitted `manual`.
 
-10. **Per-project concurrency limit = 2 simultaneous work orders** (catalog-tunable).
+10. **Per-project concurrency default = 5 simultaneous work orders** (revised
+    2026-07-08; was 2). Configurable fleet-wide via `os.defaults.max_concurrent` and
+    per-project via `max_concurrent`; the rest queue (must be ≥ 1).
 
 11. **Work orders don't auto-merge anything.** Workers work in worktree `wo-<id>`,
     commit, push, open PRs per each repo's conventions; OPERATION.md instructs them.
@@ -142,11 +151,14 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
     captured; blocked workers surface as `waiting_input` + attention + notification;
     dead sessions detected and failed by the reconciler.
 
-28b. **Workspaces must be trusted by Claude Code** — untrusted workspaces silently
-    ignore `permissions.allow` (verified live; the CLI error names the fix). `jarvis
-    start`/`adopt` now warn per project with the exact remedy (open `claude` there
-    once, or set `hasTrustDialogAccepted` in ~/.claude.json). Your existing projects
-    are presumably fine; fresh clones need one interactive open.
+28b. **Workspaces are trusted automatically** (revised 2026-07-08; previously only
+    warned). Untrusted workspaces silently ignore `permissions.allow` (verified live),
+    stalling unattended workers on their first tool call. `jarvis start`/`adopt` now set
+    `hasTrustDialogAccepted: true` for each catalog project path in `~/.claude.json`
+    (atomic write, every other key preserved) — being in the catalog is the trust
+    decision, so the user never accepts a per-project dialog. `--dry-run` reports the
+    change without writing. Rationale: the whole point is unattended operation; making
+    the user open each project interactively defeats it.
 
 ## D. Migration
 

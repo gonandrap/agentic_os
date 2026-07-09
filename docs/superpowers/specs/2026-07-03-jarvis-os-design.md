@@ -76,7 +76,8 @@ knowledge.
     "defaults": {
       "model": "sonnet",             // default model for workers
       "effort": null,                 // optional
-      "permission_mode": "acceptEdits"
+      "permission_mode": "auto",     // workers run routine tools unattended
+      "max_concurrent": 5             // simultaneous work orders per project; rest queue
     },
     "notifications": {
       "sinks": ["log"],              // + "telegram", "desktop"
@@ -91,7 +92,7 @@ knowledge.
       "model": "sonnet",             // overrides os.defaults.model
       "description": "Family shared schedule web app",
       "settings_overrides": { },      // deep-merged into injected .claude/settings.json
-      "worker": { "permission_mode": "acceptEdits", "append_system_prompt": null },
+      "worker": { "permission_mode": "auto", "append_system_prompt": null },
       "notifications": { "level_threshold": "info" }
     }
   ]
@@ -140,7 +141,7 @@ unified across projects (notifications, backlog, knowledge, registry).
    (discouraged; picked up fine but marked `origin=manual`). Metadata defaults inherit
    catalog project → OS defaults.
 2. **Dispatch** — jarvisd poller claims `pending` orders (oldest first, per-project
-   concurrency limit, default 2). Dispatcher:
+   concurrency limit, default 5, catalog-tunable). Dispatcher:
    - builds the worker prompt: work order text + OPERATION.md contract (work in the
      worktree, record assumptions via `jarvis wo assume`, report leftovers via
      `jarvis backlog add`, report learnings via `jarvis learn add`, notify via
@@ -198,6 +199,11 @@ fallback if `--resume`-based delivery to live bg sessions proves unreliable. Tes
   Jarvis detect manual edits: if the file changed outside Jarvis, `start` warns and
   requires `--force-config` to overwrite (drift surfaces in `jarvis status`).
 - `settings.local.json` is left alone (user's per-machine escape hatch).
+- **Workspace trust is granted automatically.** Untrusted workspaces silently ignore
+  `permissions.allow` (verified live), stalling unattended workers on their first tool
+  call. On `start`/`adopt`, per project, Jarvis sets `hasTrustDialogAccepted: true` for
+  the project path in `~/.claude.json` (every other key preserved) — being in the
+  catalog is the trust decision, so there is no per-project dialog.
 
 ### 3.6 Notifications (two-way Jarvis)
 

@@ -7,14 +7,26 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
 VALID_PERMISSION_MODES = {
-    "default",
     "acceptEdits",
     "auto",
+    "bypassPermissions",
+    "manual",
     "dontAsk",
     "plan",
-    "bypassPermissions",
 }
+
+# Default worker mode. `auto` runs routine tools (grep, edits, scripts, tests, git)
+# without a prompt per action — the only way a `--bg` worker can run unattended, since
+# a background session can't answer a prompt. Sensitive paths stay protected by the
+# project's PreToolUse deny guards (catalog settings_overrides), which fire in every
+# mode; `auto` does not weaken those. See ASSUMPTIONS.md §9.
+DEFAULT_PERMISSION_MODE = "auto"
+
+# Default simultaneous work orders per project; the rest queue (catalog-tunable per
+# project, or fleet-wide via os.defaults.max_concurrent).
+DEFAULT_MAX_CONCURRENT = 5
 
 
 class CatalogError(ValueError):
@@ -25,7 +37,7 @@ class CatalogError(ValueError):
 class WorkerDefaults:
     model: str | None = None
     effort: str | None = None
-    permission_mode: str = "acceptEdits"
+    permission_mode: str = DEFAULT_PERMISSION_MODE
     append_system_prompt: str | None = None
 
 
@@ -37,7 +49,7 @@ class ProjectSpec:
     model: str | None = None
     worker: WorkerDefaults = field(default_factory=WorkerDefaults)
     settings_overrides: dict[str, Any] = field(default_factory=dict)
-    max_concurrent: int = 2
+    max_concurrent: int = DEFAULT_MAX_CONCURRENT
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -54,7 +66,8 @@ class NeoConfig:
 class OsConfig:
     default_model: str = "sonnet"
     default_effort: str | None = None
-    default_permission_mode: str = "acceptEdits"
+    default_permission_mode: str = DEFAULT_PERMISSION_MODE
+    default_max_concurrent: int = DEFAULT_MAX_CONCURRENT
     notification_sinks: list[str] = field(default_factory=lambda: ["log"])
     telegram_token_env: str = "JARVIS_TELEGRAM_TOKEN"
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
@@ -114,7 +127,8 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     os_cfg = OsConfig(
         default_model=defaults.get("model", "sonnet"),
         default_effort=defaults.get("effort"),
-        default_permission_mode=defaults.get("permission_mode", "acceptEdits"),
+        default_permission_mode=defaults.get("permission_mode", DEFAULT_PERMISSION_MODE),
+        default_max_concurrent=int(defaults.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),
         notification_sinks=notif.get("sinks", ["log"]),
         telegram_token_env=telegram.get("token_env", "JARVIS_TELEGRAM_TOKEN"),
         telegram_chat_id_env=telegram.get("chat_id_env", "JARVIS_TELEGRAM_CHAT_ID"),
@@ -124,6 +138,8 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")
+    if os_cfg.default_max_concurrent < 1:
+        raise _err("os.defaults.max_concurrent must be >= 1")
 
     projects_raw = data.get("projects")
     if not isinstance(projects_raw, list) or not projects_raw:
@@ -149,6 +165,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         pmode = w.get("permission_mode", os_cfg.default_permission_mode)
         if pmode not in VALID_PERMISSION_MODES:
             raise _err(f"project {name}: worker.permission_mode {pmode!r} invalid")
+        max_conc = int(p.get("max_concurrent", os_cfg.default_max_concurrent))
+        if max_conc < 1:
+            raise _err(f"project {name}: max_concurrent must be >= 1")
         worker = WorkerDefaults(
             model=w.get("model") or p.get("model") or os_cfg.default_model,
             effort=w.get("effort", os_cfg.default_effort),
@@ -163,7 +182,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 model=p.get("model") or os_cfg.default_model,
                 worker=worker,
                 settings_overrides=p.get("settings_overrides", {}),
-                max_concurrent=int(p.get("max_concurrent", 2)),
+                max_concurrent=max_conc,
                 raw=p,
             )
         )

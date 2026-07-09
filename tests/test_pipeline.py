@@ -77,7 +77,7 @@ def test_dispatch_flow(started, fake_claude, project):
     assert argv[argv.index("--name") + 1].startswith(f"[WO {wo['id']}]")
     assert argv[argv.index("--worktree") + 1] == wo["id"]
     assert argv[argv.index("--model") + 1] == "sonnet"
-    assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
+    assert argv[argv.index("--permission-mode") + 1] == "auto"
     # full settings (hooks + permissions + env) travel with the spawn as a file,
     # because the worktree has no .claude/settings.json (it's untracked)
     settings_path = argv[argv.index("--settings") + 1]
@@ -95,11 +95,11 @@ def test_dispatch_flow(started, fake_claude, project):
 
 def test_concurrency_limit(started, fake_claude):
     daemon = started
-    for i in range(4):
+    for i in range(7):
         ops.create_work_order("proj_a", f"task {i}")
     daemon.tick()
     bg = [c for c in fake_claude.calls if "--bg" in c["argv"]]
-    assert len(bg) == 2  # default max_concurrent = 2
+    assert len(bg) == 5  # default max_concurrent = 5; the other 2 stay queued
 
 
 def test_knowledge_injected_into_prompt(started, fake_claude):

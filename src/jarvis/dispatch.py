@@ -42,8 +42,11 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     settings.pop("_jarvis", None)
 
     # Declarative worker permissions: full edit rights inside its own worktree,
-    # read rights over the whole project. (Verified live: acceptEdits alone still
-    # prompts inside --bg sessions, which would stall unattended work orders.)
+    # read rights over the whole project. Workers default to `auto` mode (which runs
+    # routine tools unattended), so these are a safety net for projects that opt into
+    # a stricter mode — under `acceptEdits`/`default` a --bg session would otherwise
+    # prompt and stall (verified live). Sensitive-path deny guards from the project's
+    # settings_overrides still win in every mode.
     proj_abs = str(project.path).lstrip("/")
     wt_abs = f"{proj_abs}/.claude/worktrees/{wo['id']}"
     allow = settings.setdefault("permissions", {}).setdefault("allow", [])

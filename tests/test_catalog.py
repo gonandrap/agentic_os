@@ -12,7 +12,8 @@ def test_minimal_catalog(tmp_path):
     assert cat.os.default_model == "sonnet"
     assert cat.projects[0].name == "a"
     assert cat.projects[0].worker.model == "sonnet"
-    assert cat.projects[0].worker.permission_mode == "acceptEdits"
+    assert cat.projects[0].worker.permission_mode == "auto"
+    assert cat.projects[0].max_concurrent == 5
 
 
 def test_project_overrides_inherit():
@@ -30,6 +31,19 @@ def test_project_overrides_inherit():
     assert cat.projects[1].worker.permission_mode == "plan"
 
 
+def test_max_concurrent_config():
+    cat = parse_catalog({
+        "os": {"defaults": {"max_concurrent": 3}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},                     # inherits fleet default
+            {"name": "b", "path": "/tmp/b", "max_concurrent": 8},  # per-project override
+        ],
+    })
+    assert cat.os.default_max_concurrent == 3
+    assert cat.projects[0].max_concurrent == 3
+    assert cat.projects[1].max_concurrent == 8
+
+
 @pytest.mark.parametrize("bad,msg", [
     ({}, "projects"),
     ({"projects": []}, "projects"),
@@ -37,6 +51,7 @@ def test_project_overrides_inherit():
     ({"projects": [{"name": "a"}]}, "path"),
     ({"projects": [{"name": "a", "path": "/x"}, {"name": "a", "path": "/y"}]}, "duplicate"),
     ({"projects": [{"name": "a", "path": "/x", "worker": {"permission_mode": "yolo"}}]}, "permission_mode"),
+    ({"projects": [{"name": "a", "path": "/x", "max_concurrent": 0}]}, "max_concurrent"),
 ])
 def test_invalid_catalogs(bad, msg):
     with pytest.raises(CatalogError, match=msg):
