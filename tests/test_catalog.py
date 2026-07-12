@@ -45,8 +45,7 @@ def test_max_concurrent_config():
 
 
 @pytest.mark.parametrize("bad,msg", [
-    ({}, "projects"),
-    ({"projects": []}, "projects"),
+    ({"projects": "nope"}, "projects"),
     ({"projects": [{"path": "/x"}]}, "name"),
     ({"projects": [{"name": "a"}]}, "path"),
     ({"projects": [{"name": "a", "path": "/x"}, {"name": "a", "path": "/y"}]}, "duplicate"),
@@ -67,3 +66,14 @@ def test_unknown_project_lookup():
     cat = parse_catalog({"projects": [{"name": "a", "path": "/x"}]})
     with pytest.raises(CatalogError, match="unknown project"):
         cat.project("zzz")
+
+
+def test_empty_projects_allowed():
+    # A standby instance (e.g. a fresh production deployment) boots empty.
+    cat = parse_catalog({"projects": []})
+    assert cat.projects == []
+
+
+def test_missing_projects_defaults_empty():
+    cat = parse_catalog({"os": {"defaults": {"model": "sonnet"}}})
+    assert cat.projects == []
