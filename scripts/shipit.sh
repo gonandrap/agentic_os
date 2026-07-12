@@ -45,8 +45,8 @@ die()  { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 # --- 1. preconditions -----------------------------------------------------------
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [ "$BRANCH" = "main" ] || say "warning: shipping from '$BRANCH', not 'main'"
-if [ -n "$(git status --porcelain)" ]; then
-  die "working tree is dirty — commit or stash before shipping"
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  die "tracked changes present — commit or stash before shipping"
 fi
 
 cur_version() { grep -m1 -E '^version *= *"' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/'; }
