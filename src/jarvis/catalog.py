@@ -24,6 +24,19 @@ VALID_PERMISSION_MODES = {
 # mode; `auto` does not weaken those. See ASSUMPTIONS.md §9.
 DEFAULT_PERMISSION_MODE = "auto"
 
+# Modes in which a `--bg` worker never stalls waiting for a human: `auto` (classifier
+# vets each action), `bypassPermissions` (no checks), and `dontAsk` (unlisted tools are
+# denied, not prompted). Every OTHER mode — acceptEdits, manual/default, plan — prompts
+# on tool calls a real task needs (git, tests, scripts), and a background session can't
+# answer, so it hangs. `worker_stalls_on_prompts()` flags those for the user.
+AUTONOMOUS_PERMISSION_MODES = {"auto", "bypassPermissions", "dontAsk"}
+
+
+def worker_stalls_on_prompts(mode: str) -> bool:
+    """True when a background worker in this permission mode will block on a prompt."""
+    return mode not in AUTONOMOUS_PERMISSION_MODES
+
+
 # Default simultaneous work orders per project; the rest queue (catalog-tunable per
 # project, or fleet-wide via os.defaults.max_concurrent).
 DEFAULT_MAX_CONCURRENT = 5

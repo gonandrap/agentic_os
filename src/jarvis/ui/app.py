@@ -192,6 +192,11 @@ def create_app() -> FastAPI:
         ops.cancel(wo_id)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
+    @app.post("/wo/{name}/{wo_id}/resume-auto")
+    def resume_auto(name: str, wo_id: str):
+        ops.resume_in_auto(wo_id, project_name=name)
+        return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
+
     @app.post("/neo/{question_id}/review")
     def neo_review(question_id: int, decision: str = Form(...),
                    feedback: str = Form("")):

@@ -37,6 +37,7 @@ jarvis start --catalog <path-to-catalog>   # boot the OS (user catalogs live unt
 jarvis stop
 jarvis wo create <project> "title" -d "details" [--model m]
 jarvis wo list [project] / show <id> / send <id> "msg" / review <id> / cancel <id>
+jarvis wo resume-auto <id>                 # unstick a worker blocked on a permission prompt (flip to auto + resume)
 jarvis neo list                            # Neo's Q&A: pending reviews + escalations
 jarvis neo review <qid> [--correct "…"]    # approve or teach; corrections become learnings
 jarvis neo answer <qid> "…"                # answer a question Neo escalated to the user

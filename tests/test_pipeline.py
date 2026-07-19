@@ -135,6 +135,91 @@ def test_hook_events_update_state(started, project):
     assert "turn_ended" in kinds
 
 
+def test_user_reply_clears_attention(started, project):
+    """Regression (wo-f883d243): replying to a work order that is waiting on the
+    user must immediately drop it from the attention list. The user has responded,
+    so the OS must stop showing "needs input" even before the daemon delivers the
+    message. Previously the flag was only cleared on delivery, so a reply left the
+    WO stuck under "NEEDS YOU" (and acking the inbox notification never helped —
+    that's a separate signal)."""
+    daemon = started
+    wo = ops.create_work_order("proj_a", "give me a summary of the current status")
+    daemon.tick()
+    store = ProjectStore(project)
+    sid = bind_session(daemon, project, wo["id"])
+
+    # worker blocks on a permission prompt → flagged for the user
+    env = {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)}
+    handle_hook({"hook_event_name": "Notification", "session_id": sid,
+                 "cwd": str(project), "message": "Claude needs your permission"}, env)
+    assert store.get_work_order(wo["id"])["needs_attention"] == 1
+    assert any(a["wo_id"] == wo["id"] for a in ops.os_status()["attention"])
+
+    # the user replies — no daemon delivery has happened yet
+    ops.send_message(wo["id"], "permission for what?", source="ui")
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["needs_attention"] == 0
+    assert fresh["attention_reason"] is None
+    assert not any(a["wo_id"] == wo["id"] for a in ops.os_status()["attention"])
+    # the reply is still queued for the worker; delivery stays the daemon's job
+    assert store.list_messages(wo["id"])[0]["status"] == "queued"
+
+
+def test_status_warns_on_prompting_permission_mode(jarvis_home, fake_claude, project, tmp_path):
+    """Misconfig safeguard: a fleet running a prompting mode (acceptEdits/default/
+    plan/manual) will stall its --bg workers on the first permission prompt, so
+    `jarvis status` must flag it. `auto`/`bypassPermissions`/`dontAsk` never prompt."""
+    data = {
+        "os": {"defaults": {"model": "sonnet", "permission_mode": "acceptEdits"},
+               "notifications": {"sinks": ["log"]}},
+        "projects": [{"name": "proj_a", "path": str(project), "description": "t"}],
+    }
+    cf = tmp_path / "acceptedits-catalog.json"
+    cf.write_text(json.dumps(data))
+    ops.start_os(str(cf), foreground=True)
+
+    st = ops.os_status()
+    warn = [a for a in st["attention"]
+            if a["status"] == "config" and "permission mode" in a["title"].lower()]
+    assert warn, st["attention"]
+    assert warn[0]["project"] == "proj_a"
+    assert "acceptEdits" in warn[0]["reason"]
+    assert "auto" in warn[0]["reason"]  # tells the user what to switch to
+    assert st["healthy"] is False
+
+
+def test_status_quiet_under_autonomous_mode(started):
+    """The default fleet mode is `auto`; it must NOT produce a permission-mode warning."""
+    st = ops.os_status()
+    assert not [a for a in st["attention"]
+                if a["status"] == "config" and "permission mode" in a["title"].lower()]
+
+
+def test_resume_in_auto_flips_mode_and_unblocks(started, project):
+    """Resume-in-auto: recover a worker stalled on a permission prompt by flipping it
+    to `auto` and nudging it to continue — the daemon then resume-forks in auto mode."""
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task", permission_mode="acceptEdits")
+    daemon.tick()
+    store = ProjectStore(project)
+    bind_session(daemon, project, wo["id"])
+    env = {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)}
+    handle_hook({"hook_event_name": "Notification", "session_id":
+                 store.get_work_order(wo["id"])["session_id"], "cwd": str(project),
+                 "message": "Claude needs your permission"}, env)
+    assert store.get_work_order(wo["id"])["needs_attention"] == 1
+
+    ops.resume_in_auto(wo["id"])
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["permission_mode"] == "auto"
+    assert fresh["needs_attention"] == 0          # nudge clears the attention flag
+    assert store.queued_messages(wo["id"])        # a continue-nudge is queued for delivery
+    kinds = [e["kind"] for e in store.list_events(wo["id"])]
+    assert "permission_mode_changed" in kinds
+
+
 def test_hook_noop_for_non_worker_sessions(started, project):
     store = ProjectStore(project)
     before = store.list_work_orders()

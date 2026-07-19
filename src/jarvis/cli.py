@@ -142,6 +142,12 @@ def build_parser() -> argparse.ArgumentParser:
     x = wo.add_parser("cancel", help="cancel a work order")
     x.add_argument("wo_id")
 
+    ra = wo.add_parser("resume-auto",
+                       help="unstick a worker blocked on a permission prompt: flip it "
+                            "to auto mode and resume it")
+    ra.add_argument("wo_id")
+    ra.add_argument("--project")
+
     # backlog ---------------------------------------------------------------------------
     bl = sub.add_parser("backlog", help="unified deferred-work backlog").add_subparsers(
         dest="bl_cmd", required=True)
@@ -265,6 +271,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         for a in st["attention"]:
             wo = f" {a['wo_id']}" if a["wo_id"] else ""
             print(f"  • [{a['project']}]{wo} {a['title']} — {a['reason']}")
+            if a.get("attach"):
+                print(f"      approve it: {a['attach']}  ·  or `jarvis wo resume-auto {a['wo_id']}`")
     if st["inbox"]["unacked"]:
         print(f"\n📥 inbox: {st['inbox']['unacked']} unacked"
               f" ({st['inbox']['critical']} critical) — `jarvis inbox list`")
@@ -382,6 +390,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
         _print(ops.review_work_order(args.wo_id, accept=not args.reject), args.json)
     elif args.wo_cmd == "cancel":
         _print(ops.cancel(args.wo_id), args.json)
+    elif args.wo_cmd == "resume-auto":
+        _print(ops.resume_in_auto(args.wo_id, project_name=args.project), args.json)
     return 0
 
 
