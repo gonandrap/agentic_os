@@ -1,6 +1,6 @@
 [project]
 name = "jarvis-os"
-version = "0.1.1"
+version = "0.1.2"
 description = "Jarvis — an agentic OS layer that orchestrates Claude Code sessions across your projects"
 readme = "README.md"
 requires-python = ">=3.11"
