@@ -1,0 +1,23 @@
+[Unit]
+Description=Jarvis OS — production fleet daemon
+Documentation=file://@PROD_DIR@/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+# Never give up restarting (recovery): disable the start-rate limiter.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=@PROD_DIR@
+Environment=JARVIS_HOME=@PROD_ROOT@/state
+Environment=PRODUCTION_CODE=@PROD_ROOT@
+Environment=PATH=@PATH@
+# Leading '-' → optional: the daemon still starts if secrets are absent (Telegram just skips).
+EnvironmentFile=-@PROD_ROOT@/secrets/jarvis.env
+ExecStart=@PROD_DIR@/.venv/bin/jarvis start --catalog @PROD_CONFIG@ --foreground
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
