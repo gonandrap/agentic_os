@@ -135,6 +135,37 @@ def test_hook_events_update_state(started, project):
     assert "turn_ended" in kinds
 
 
+def test_user_reply_clears_attention(started, project):
+    """Regression (wo-f883d243): replying to a work order that is waiting on the
+    user must immediately drop it from the attention list. The user has responded,
+    so the OS must stop showing "needs input" even before the daemon delivers the
+    message. Previously the flag was only cleared on delivery, so a reply left the
+    WO stuck under "NEEDS YOU" (and acking the inbox notification never helped —
+    that's a separate signal)."""
+    daemon = started
+    wo = ops.create_work_order("proj_a", "give me a summary of the current status")
+    daemon.tick()
+    store = ProjectStore(project)
+    sid = bind_session(daemon, project, wo["id"])
+
+    # worker blocks on a permission prompt → flagged for the user
+    env = {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)}
+    handle_hook({"hook_event_name": "Notification", "session_id": sid,
+                 "cwd": str(project), "message": "Claude needs your permission"}, env)
+    assert store.get_work_order(wo["id"])["needs_attention"] == 1
+    assert any(a["wo_id"] == wo["id"] for a in ops.os_status()["attention"])
+
+    # the user replies — no daemon delivery has happened yet
+    ops.send_message(wo["id"], "permission for what?", source="ui")
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["needs_attention"] == 0
+    assert fresh["attention_reason"] is None
+    assert not any(a["wo_id"] == wo["id"] for a in ops.os_status()["attention"])
+    # the reply is still queued for the worker; delivery stays the daemon's job
+    assert store.list_messages(wo["id"])[0]["status"] == "queued"
+
+
 def test_hook_noop_for_non_worker_sessions(started, project):
     store = ProjectStore(project)
     before = store.list_work_orders()

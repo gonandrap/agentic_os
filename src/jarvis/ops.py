@@ -283,6 +283,11 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
     try:
         msg_id = store.queue_message(wo_id, content, source=source)
         store.add_event(wo_id, "message_queued", {"msg_id": msg_id, "source": source})
+        # A reply IS the response to whatever flagged the user — drop it from the
+        # attention list now, don't wait for the daemon to deliver. The message
+        # stays queued for the worker; if delivery later fails the daemon re-flags.
+        if wo["needs_attention"]:
+            store.clear_attention(wo_id)
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "msg_id": msg_id, "note": note,
