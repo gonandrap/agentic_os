@@ -3,13 +3,20 @@
 Jarvis OS runs in two isolated instances so that developing the OS never disturbs the
 running fleet.
 
+- **Production** is the instance you *actually use*: real dev work on your projects and
+  prod monitoring of your live projects. The **real fleet catalog lives here.** It runs
+  as always-on systemd services.
+- **Development** is only for building/testing Jarvis OS itself. Onboard throwaway test
+  projects to exercise the flow end-to-end — but **no real project work runs from dev.**
+
 | | **Development** | **Production** |
 |---|---|---|
+| Purpose | develop/test Jarvis OS itself | run the real fleet (dev work + prod monitoring) |
 | Location | `~/workspace/agentic_os` | `$PRODUCTION_CODE/jarvis_os` (default `~/workspace/production/jarvis_os`) |
 | Git | branch `main` (trunk) | detached at tag `jarvis-X.Y.Z` |
-| Run | `uv run jarvis …` (manual) | `systemctl --user … jarvis` (service) |
+| Run | `uv run jarvis …` (manual) | `systemctl --user … jarvis` / `jarvis-ui` (services) |
 | `JARVIS_HOME` | `~/.jarvis` (default) | `$PRODUCTION_CODE/state` |
-| Catalog | `catalogs/gonzalo.json` (gitignored, dev fleet) | `$PRODUCTION_CODE/config/catalog.json` |
+| Catalog | `catalogs/gonzalo.json` (empty / test projects) | `$PRODUCTION_CODE/config/catalog.json` (real fleet) |
 | Secrets | none | `$PRODUCTION_CODE/secrets/jarvis.env` |
 | UI port | 8788 | 8787 |
 
@@ -55,17 +62,21 @@ Start-on-boot needs user lingering (survives logout/reboot):
 sudo loginctl enable-linger "$USER"        # already enabled on this host
 ```
 
-## Managing the production service
+## Managing the production services
+
+Production runs **two** units: `jarvis.service` (the orchestrator daemon) and
+`jarvis-ui.service` (the dashboard at http://127.0.0.1:8787).
 
 ```bash
-systemctl --user status  jarvis            # health + recent logs
-systemctl --user restart jarvis
-systemctl --user stop    jarvis
-journalctl --user -u jarvis -f             # follow logs
+systemctl --user status  jarvis jarvis-ui   # health + recent logs
+systemctl --user restart jarvis jarvis-ui
+systemctl --user stop    jarvis jarvis-ui
+journalctl --user -u jarvis -f              # follow daemon logs
+journalctl --user -u jarvis-ui -f           # follow UI logs
 ```
 
-`Restart=always` + `RestartSec=5` + `StartLimitIntervalSec=0` means the daemon is
-brought back up whenever it exits, indefinitely (recovery).
+`Restart=always` + `RestartSec=5` + `StartLimitIntervalSec=0` means each is brought
+back up whenever it exits, indefinitely (recovery).
 
 ## Rollback
 
@@ -73,6 +84,6 @@ Redeploy a previous tag, or point production back and restart:
 
 ```bash
 git -C "$PRODUCTION_CODE/jarvis_os" checkout -f jarvis-<older>
-(cd "$PRODUCTION_CODE/jarvis_os" && uv sync --frozen)
-systemctl --user restart jarvis
+(cd "$PRODUCTION_CODE/jarvis_os" && uv sync --frozen --extra ui)
+systemctl --user restart jarvis jarvis-ui
 ```

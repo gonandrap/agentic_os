@@ -107,8 +107,8 @@ if [ ! -d "$PROD_DIR/.git" ]; then
 fi
 run "git -C '$PROD_DIR' fetch origin --tags --prune --force"
 run "git -C '$PROD_DIR' checkout -f '$TAG'"
-say "building production venv (uv sync --frozen)"
-run "(cd '$PROD_DIR' && uv sync --frozen)"
+say "building production venv (uv sync --frozen --extra ui)"
+run "(cd '$PROD_DIR' && uv sync --frozen --extra ui)"
 
 # default production catalog (empty fleet until prod onboarding lands)
 if [ ! -f "$PROD_CONFIG" ]; then
@@ -132,15 +132,20 @@ JSON
   fi
 fi
 
-# --- 5. restart service if installed --------------------------------------------
-if systemctl --user list-unit-files jarvis.service >/dev/null 2>&1 \
-   && systemctl --user list-unit-files jarvis.service | grep -q jarvis.service; then
-  say "restarting jarvis.service"
-  run "systemctl --user restart jarvis.service"
+# --- 5. restart services if installed -------------------------------------------
+restarted=0
+for svc in jarvis.service jarvis-ui.service; do
+  if systemctl --user list-unit-files "$svc" 2>/dev/null | grep -q "$svc"; then
+    say "restarting $svc"
+    run "systemctl --user restart '$svc'"
+    restarted=1
+  fi
+done
+if [ "$restarted" = 1 ]; then
   [ "$DRY_RUN" = 1 ] || sleep 2
-  run "systemctl --user --no-pager --lines=0 status jarvis.service || true"
+  run "systemctl --user --no-pager --lines=0 status jarvis.service jarvis-ui.service || true"
 else
-  say "jarvis.service not installed — run scripts/install_prod_service.sh once to enable it"
+  say "services not installed — run scripts/install_prod_service.sh once to enable them"
 fi
 
 say "shipped jarvis-$VERSION → $PROD_DIR"

@@ -22,7 +22,7 @@ dev to prod so that in-progress dev changes never touch the running fleet.
 4. Deploys that tag to `$PRODUCTION_CODE/jarvis_os` (clones the local repo on first run,
    then `git fetch` + `checkout <tag>` + `uv sync --frozen`), creating a default
    production catalog if none exists.
-5. Restarts `jarvis.service` if it is installed.
+5. Restarts the production services (`jarvis.service`, `jarvis-ui.service`) if installed.
 
 Production tracks the **local** dev repo (its git `origin` is the local path), so
 releases are offline and deterministic. Nothing is pushed to GitHub.
