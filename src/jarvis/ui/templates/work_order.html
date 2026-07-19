@@ -28,6 +28,18 @@
   </p>
   {% if wo.needs_attention %}
     <p class="st tone-warn"><span class="i">◭</span>{{ wo.attention_reason }}</p>
+    {% if wo.status == 'waiting_input' and wo.session_id %}
+    <div class="row" style="gap: 10px; flex-wrap: wrap; align-items: center;">
+      <span class="sub">Blocked on a permission prompt. A background worker can't be
+        approved from here — approve it natively:</span>
+      <code class="mono" style="user-select: all;">claude attach {{ wo.session_id }}</code>
+      <span class="sub">or</span>
+      <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/resume-auto">
+        <button class="primary" title="Flip this work order to auto mode and resume it">
+          Resume in auto mode</button>
+      </form>
+    </div>
+    {% endif %}
   {% endif %}
   {% if wo.result_summary %}
     <p class="kv"><strong>Result:</strong> {{ wo.result_summary }}</p>

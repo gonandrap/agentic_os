@@ -15,7 +15,13 @@ from pathlib import Path
 from typing import Any
 
 from .bootstrap import BootstrapReport, bootstrap_project, settings_drift
-from .catalog import Catalog, CatalogError, ProjectSpec, load_catalog
+from .catalog import (
+    Catalog,
+    CatalogError,
+    ProjectSpec,
+    load_catalog,
+    worker_stalls_on_prompts,
+)
 from .central_store import CentralStore
 from .daemon import daemon_running
 from .paths import daemon_pidfile, ensure_home, logs_dir
@@ -139,6 +145,13 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         pid = daemon_running()
         projects = []
         attention: list[dict[str, Any]] = []
+        # Best-effort map of each project's worker permission mode, to catch a fleet
+        # misconfigured into a mode that stalls background workers (see below).
+        try:
+            _cat = catalog or resolve_catalog()
+            mode_by_project = {ps.name: ps.worker.permission_mode for ps in _cat.projects}
+        except (OpsError, CatalogError):
+            mode_by_project = {}
         for p in central.list_projects():
             if p["status"] != "active":
                 continue
@@ -157,11 +170,17 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     if wo["needs_attention"]:
                         flagged.setdefault(wo["id"], wo)
                 for wo in flagged.values():
-                    attention.append({
+                    item = {
                         "project": p["name"], "wo_id": wo["id"],
                         "title": wo["title"], "status": wo["status"],
                         "reason": wo["attention_reason"],
-                    })
+                    }
+                    # A worker blocked on a permission prompt can't be approved from
+                    # jarvis (bg sessions take no programmatic approval) — surface the
+                    # native escape hatch instead.
+                    if wo["status"] == "waiting_input" and wo["session_id"]:
+                        item["attach"] = f"claude attach {wo['session_id']}"
+                    attention.append(item)
                 drift = settings_drift(path / ".claude" / "settings.json")
                 projects.append({
                     "name": p["name"], "path": p["path"],
@@ -179,6 +198,15 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         "project": p["name"], "wo_id": None,
                         "title": "settings drift", "status": "config",
                         "reason": f".claude/settings.json: {drift}",
+                    })
+                mode = mode_by_project.get(p["name"])
+                if mode and worker_stalls_on_prompts(mode):
+                    attention.append({
+                        "project": p["name"], "wo_id": None,
+                        "title": "worker permission mode", "status": "config",
+                        "reason": f"workers run in '{mode}' — a background worker can't "
+                                  "answer permission prompts and will stall; set "
+                                  "permission_mode to 'auto'",
                     })
             finally:
                 store.close()
@@ -292,6 +320,31 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
         store.close()
     return {"project": name, "wo_id": wo_id, "msg_id": msg_id, "note": note,
             "delivery": "jarvisd delivers when the worker is idle"}
+
+
+def resume_in_auto(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """Recover a worker stalled on a permission prompt: flip it to `auto` mode and
+    nudge it to continue. jarvisd delivers the nudge by resume-forking the worker's
+    session (reading the now-`auto` mode), so it stops re-prompting on routine tools.
+    The nudge clears the attention flag via the normal send path.
+    """
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        previous = wo["permission_mode"]
+        store.update_work_order(wo_id, permission_mode="auto")
+        store.add_event(wo_id, "permission_mode_changed",
+                        {"from": previous, "to": "auto", "by": "resume_in_auto"})
+    finally:
+        store.close()
+    send_message(
+        wo_id,
+        "Your permission mode is now `auto` — routine tools (reads, edits, tests, "
+        "git) run without asking. Please continue the work order.",
+        source="jarvis", project_name=name,
+    )
+    return {"project": name, "wo_id": wo_id, "permission_mode": "auto",
+            "note": "flipped to auto and nudged; jarvisd resumes the worker when idle"}
 
 
 def assume(wo_id: str, content: str) -> dict[str, Any]:
