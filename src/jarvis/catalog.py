@@ -141,9 +141,11 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     if os_cfg.default_max_concurrent < 1:
         raise _err("os.defaults.max_concurrent must be >= 1")
 
-    projects_raw = data.get("projects")
-    if not isinstance(projects_raw, list) or not projects_raw:
-        raise _err('"projects" must be a non-empty list')
+    projects_raw = data.get("projects", [])
+    if not isinstance(projects_raw, list):
+        raise _err('"projects" must be a list')
+    # An empty fleet is valid: a standby instance (e.g. a fresh production
+    # deployment) boots with no projects and has them onboarded later.
 
     projects: list[ProjectSpec] = []
     seen: set[str] = set()

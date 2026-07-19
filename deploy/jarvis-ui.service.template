@@ -1,0 +1,21 @@
+[Unit]
+Description=Jarvis OS — production dashboard (web UI)
+Documentation=file://@PROD_DIR@/docs/DEPLOYMENT.md
+After=network-online.target jarvis.service
+Wants=network-online.target
+# Never give up restarting (recovery): disable the start-rate limiter.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=@PROD_DIR@
+Environment=JARVIS_HOME=@PROD_ROOT@/state
+Environment=PRODUCTION_CODE=@PROD_ROOT@
+Environment=PATH=@PATH@
+ExecStart=@PROD_DIR@/.venv/bin/jarvis ui --host 127.0.0.1 --port @UI_PORT@
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target
