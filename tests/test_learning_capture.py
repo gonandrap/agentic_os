@@ -29,7 +29,7 @@ def memory_dir(tmp_path):
 
 
 @pytest.fixture()
-def wo(jarvis_home, catalog_file, project):
+def wo(jarvis_home, fake_claude, catalog_file, project):
     ops.start_os(str(catalog_file), foreground=True)
     return ops.create_work_order("proj_a", "do the thing", origin="jarvis")
 
