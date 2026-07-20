@@ -97,7 +97,13 @@ CREATE INDEX IF NOT EXISTS idx_notif_status ON notifications(status);
 # Columns added after the first release. `CREATE TABLE IF NOT EXISTS` is a no-op on an
 # existing database, so new columns must be ALTERed in on open.
 ADDED_COLUMNS = {
-    "work_orders": {"job_id": "TEXT", "reply_job_id": "TEXT"},
+    "work_orders": {
+        "job_id": "TEXT",
+        "reply_job_id": "TEXT",
+        # Hidden orders stay on the record but stop competing for the user's attention:
+        # out of listings, out of the summary, and never dispatched.
+        "hidden": "INTEGER NOT NULL DEFAULT 0",
+    },
 }
 
 
@@ -167,18 +173,20 @@ class ProjectStore:
         return dict(row) if row else None
 
     def list_work_orders(
-        self, statuses: tuple[str, ...] | None = None, limit: int = 200
+        self, statuses: tuple[str, ...] | None = None, limit: int = 200,
+        include_hidden: bool = False,
     ) -> list[dict[str, Any]]:
+        conds, params = [], []
         if statuses:
-            q = ",".join("?" for _ in statuses)
-            rows = self.conn.execute(
-                f"SELECT * FROM work_orders WHERE status IN ({q}) ORDER BY created_at DESC LIMIT ?",
-                (*statuses, limit),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT * FROM work_orders ORDER BY created_at DESC LIMIT ?", (limit,)
-            ).fetchall()
+            conds.append(f"status IN ({','.join('?' for _ in statuses)})")
+            params.extend(statuses)
+        if not include_hidden:
+            conds.append("hidden=0")
+        where = f" WHERE {' AND '.join(conds)}" if conds else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM work_orders{where} ORDER BY created_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
         return db.rows_to_dicts(rows)
 
     def work_orders_awaiting_reply(self) -> list[dict[str, Any]]:
@@ -200,7 +208,8 @@ class ProjectStore:
         """Atomically claim the oldest pending order (pending -> dispatching)."""
         cur = self.conn.execute(
             """UPDATE work_orders SET status='dispatching', updated_at=?
-               WHERE id = (SELECT id FROM work_orders WHERE status='pending'
+               WHERE id = (SELECT id FROM work_orders
+                           WHERE status='pending' AND hidden=0
                            ORDER BY created_at LIMIT 1)
                RETURNING *"""
             , (db.now(),),
@@ -234,6 +243,39 @@ class ProjectStore:
 
     def clear_attention(self, wo_id: str) -> None:
         self.update_work_order(wo_id, needs_attention=0, attention_reason=None)
+
+    def set_hidden(self, wo_id: str, hidden: bool = True) -> None:
+        """Hide (or unhide) a work order.
+
+        Hiding is non-destructive: the record and its whole history stay, they just
+        stop showing up in listings, summaries and the attention list, and a hidden
+        pending order is never dispatched.
+        """
+        self.get_work_order(wo_id)  # KeyError if it doesn't exist
+        self.update_work_order(wo_id, hidden=1 if hidden else 0)
+        self.add_event(wo_id, "hidden", {"hidden": bool(hidden)})
+
+    def delete_work_order(self, wo_id: str) -> dict[str, int]:
+        """Erase a work order and everything hanging off it. Returns the row counts.
+
+        Foreign keys are enforced (see db.connect), so children go first. The whole
+        cascade runs in one transaction: a half-deleted work order is worse than none.
+        """
+        self.get_work_order(wo_id)  # KeyError if it doesn't exist
+        deleted: dict[str, int] = {}
+        self.conn.execute("BEGIN")
+        try:
+            for key, table in (("events", "wo_events"), ("messages", "wo_messages"),
+                               ("assumptions", "assumptions"),
+                               ("notifications", "notifications")):
+                cur = self.conn.execute(f"DELETE FROM {table} WHERE wo_id=?", (wo_id,))
+                deleted[key] = cur.rowcount
+            self.conn.execute("DELETE FROM work_orders WHERE id=?", (wo_id,))
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return deleted
 
     # -- events --------------------------------------------------------------
 
@@ -336,8 +378,10 @@ class ProjectStore:
                 "SELECT * FROM assumptions WHERE status='pending' AND wo_id=? ORDER BY ts", (wo_id,)
             ).fetchall()
         else:
+            # Fleet-wide view: assumptions of hidden work orders aren't asking for review.
             rows = self.conn.execute(
-                "SELECT * FROM assumptions WHERE status='pending' ORDER BY ts"
+                """SELECT a.* FROM assumptions a JOIN work_orders w ON w.id = a.wo_id
+                   WHERE a.status='pending' AND w.hidden=0 ORDER BY a.ts"""
             ).fetchall()
         return db.rows_to_dicts(rows)
 
@@ -351,15 +395,13 @@ class ProjectStore:
         by_status = {
             r["status"]: r["c"]
             for r in self.conn.execute(
-                "SELECT status, COUNT(*) c FROM work_orders GROUP BY status"
+                "SELECT status, COUNT(*) c FROM work_orders WHERE hidden=0 GROUP BY status"
             ).fetchall()
         }
         attention = self.conn.execute(
-            "SELECT COUNT(*) c FROM work_orders WHERE needs_attention=1"
+            "SELECT COUNT(*) c FROM work_orders WHERE needs_attention=1 AND hidden=0"
         ).fetchone()["c"]
-        pending_assumptions = self.conn.execute(
-            "SELECT COUNT(*) c FROM assumptions WHERE status='pending'"
-        ).fetchone()["c"]
+        pending_assumptions = len(self.pending_assumptions())
         return {
             "by_status": by_status,
             "needs_attention": attention,

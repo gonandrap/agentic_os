@@ -106,6 +106,19 @@ class NeoStore:
             (status, reason, question_id),
         )
 
+    def purge_work_order(self, wo_id: str) -> int:
+        """Forget the questions asked by a deleted work order.
+
+        Learnings survive: what Neo learned is durable knowledge about the user, not
+        about the work order it happened to come from — only the back-link is cut.
+        """
+        self.conn.execute(
+            """UPDATE learnings SET question_id=NULL WHERE question_id IN
+               (SELECT id FROM questions WHERE wo_id=?)""",
+            (wo_id,),
+        )
+        return self.conn.execute("DELETE FROM questions WHERE wo_id=?", (wo_id,)).rowcount
+
     def list_questions(self, statuses: tuple[str, ...] | None = None,
                        review_status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
         q = "SELECT * FROM questions"

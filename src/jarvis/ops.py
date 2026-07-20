@@ -408,6 +408,53 @@ def cancel(wo_id: str) -> dict[str, Any]:
             "note": "session (if running) is not killed — stop it from the agents view"}
 
 
+def hide_work_order(wo_id: str, hidden: bool = True,
+                    project_name: str | None = None) -> dict[str, Any]:
+    """Hide a work order from listings, summaries and the attention list.
+
+    Nothing is destroyed and a running session is left alone — this is the user
+    saying "stop showing me this", not "stop this".
+    """
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        store.set_hidden(wo_id, hidden)
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "title": wo["title"],
+            "hidden": bool(hidden)}
+
+
+def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """Erase a work order everywhere: project DB, central inbox/backlog, Neo's questions.
+
+    Irreversible. A live session is not killed (nothing here can); the caller is told
+    so it can stop the session itself.
+    """
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        deleted = store.delete_work_order(wo_id)
+    finally:
+        store.close()
+    central = CentralStore()
+    try:
+        deleted.update(central.purge_work_order(wo_id))
+    finally:
+        central.close()
+    from .neo_store import NeoStore
+    neo = NeoStore()
+    try:
+        deleted["neo_questions"] = neo.purge_work_order(wo_id)
+    finally:
+        neo.close()
+    out = {"project": name, "wo_id": wo_id, "title": wo["title"], "deleted": deleted}
+    if wo["session_id"] and wo["status"] in OPEN_STATUSES:
+        out["note"] = (f"the worker's session ({wo['session_id']}) is still running — "
+                       "stop it from the agents view")
+    return out
+
+
 def review_work_order(wo_id: str, accept: bool = True) -> dict[str, Any]:
     """Accept (or reject) all pending assumptions and settle the work order."""
     name, path, wo = find_work_order(wo_id)

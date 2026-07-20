@@ -255,3 +255,38 @@ def test_timeline_hides_plumbing_until_debug_is_requested(client, daemon, projec
     for noise in ("turn_ended", "hook:Stop", "message_delivered"):
         assert noise in debug.text
     assert "Hide debug logs" in debug.text
+
+
+def test_hide_and_unhide_from_the_work_order_page(client, project):
+    wo = ops.create_work_order("proj_a", "shy task")
+
+    r = client.post(f"/wo/proj_a/{wo['id']}/hide")
+    assert r.status_code == 303
+    assert r.headers["location"] == "/project/proj_a"
+    assert wo["id"] not in client.get("/project/proj_a").text
+    assert wo["id"] in client.get("/project/proj_a?hidden=1").text
+
+    detail = client.get(f"/wo/proj_a/{wo['id']}")
+    assert "Unhide" in detail.text
+    r = client.post(f"/wo/proj_a/{wo['id']}/unhide")
+    assert r.status_code == 303
+    assert wo["id"] in client.get("/project/proj_a").text
+
+
+def test_delete_from_the_work_order_page_removes_it(client, project):
+    wo = ops.create_work_order("proj_a", "doomed task")
+    store = ProjectStore(project)
+    store.queue_message(wo["id"], "some feedback")
+    store.close()
+
+    r = client.post(f"/wo/proj_a/{wo['id']}/delete")
+    assert r.status_code == 303
+    assert r.headers["location"] == "/project/proj_a"
+
+    store = ProjectStore(project)
+    try:
+        assert store.list_work_orders(include_hidden=True) == []
+        assert store.list_messages(wo["id"]) == []
+    finally:
+        store.close()
+    assert "doomed task" not in client.get("/project/proj_a").text

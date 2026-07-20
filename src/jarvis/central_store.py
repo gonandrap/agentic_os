@@ -108,6 +108,21 @@ class CentralStore:
         )
         return int(cur.lastrowid)
 
+    def purge_work_order(self, wo_id: str) -> dict[str, int]:
+        """Drop every central trace of a deleted work order.
+
+        Inbox items about a work order that no longer exists are noise, and a backlog
+        item whose promoted order was deleted goes back to open rather than pointing
+        at a ghost.
+        """
+        inbox = self.conn.execute("DELETE FROM inbox WHERE wo_id=?", (wo_id,)).rowcount
+        backlog = self.conn.execute(
+            """UPDATE backlog SET status='open', promoted_wo_id=NULL
+               WHERE promoted_wo_id=? AND status='promoted'""",
+            (wo_id,),
+        ).rowcount
+        return {"inbox": inbox, "backlog_reopened": backlog}
+
     def unacked_inbox(self, level: str | None = None) -> list[dict[str, Any]]:
         if level:
             rows = self.conn.execute(

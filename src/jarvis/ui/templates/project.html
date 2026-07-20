@@ -3,6 +3,15 @@
 {% block content %}
 
 <h2>{{ project_name }} <span class="kv mono">{{ path }}</span></h2>
+<p class="sub">
+  {% if show_hidden %}
+    Showing hidden work orders too ·
+    <a href="/project/{{ project_name }}">hide them again</a>
+  {% elif hidden_count %}
+    {{ hidden_count }} hidden ·
+    <a href="/project/{{ project_name }}?hidden=1">show</a>
+  {% endif %}
+</p>
 <div class="panel">
   {% for wo in wos %}
     {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
@@ -11,6 +20,7 @@
       <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
       <div class="grow">
         <a href="/wo/{{ project_name }}/{{ wo.id }}" class="mono">{{ wo.id }}</a> {{ wo.title }}
+        {% if wo.hidden %}<span class="badge outside" title="hidden">🙈 hidden</span>{% endif %}
         {% if wo.needs_attention %}<div class="sub tone-warn">◭ {{ wo.attention_reason }}</div>{% endif %}
       </div>
       <span class="badge {{ 'framework' if o.framework else 'outside' }}">

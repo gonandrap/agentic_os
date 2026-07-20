@@ -21,7 +21,26 @@
       <button class="danger">Cancel</button>
     </form>
     {% endif %}
+    {% if wo.hidden %}
+    <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/unhide">
+      <button title="Show this work order in listings again">Unhide</button>
+    </form>
+    {% else %}
+    <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/hide">
+      <button title="Keep the record but take it out of listings and the attention list">
+        Hide</button>
+    </form>
+    {% endif %}
+    <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/delete"
+          onsubmit="return confirm('Delete {{ wo.id }} for good? Its timeline, messages and assumptions go with it. This cannot be undone.');">
+      <button class="danger" title="Permanently delete this work order and its history">
+        Delete</button>
+    </form>
   </div>
+  {% if wo.hidden %}
+    <p class="sub">🙈 Hidden — it stays on the record but is out of listings, the
+      summary and the attention list, and won't be dispatched.</p>
+  {% endif %}
   {% if wo.description %}<p class="kv" style="white-space: pre-wrap;">{{ wo.description }}</p>{% endif %}
   <p class="kv mono">
     created {{ fmt_age(wo.created_at) }} ago · updated {{ fmt_age(wo.updated_at) }} ago

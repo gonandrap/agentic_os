@@ -86,6 +86,8 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any]) -> tuple[str, st
         return f"Assumptions {verb}", f"{count} assumption(s)" if count else ""
     if kind == "finished":
         return "Finished", p.get("summary") or ""
+    if kind == "hidden":
+        return ("Hidden" if p.get("hidden") else "Unhidden"), ""
     # Unclassified or debug: show the kind and its raw payload.
     return kind, json.dumps(p, sort_keys=True) if p else ""
 

@@ -77,13 +77,17 @@ def create_app() -> FastAPI:
         return render(request, "dashboard.html", st=st, refresh=15)
 
     @app.get("/project/{name}", response_class=HTMLResponse)
-    def project(request: Request, name: str):
+    def project(request: Request, name: str, hidden: str = ""):
         paths = ops.registered_project_paths()
         if name not in paths:
             return render(request, "error.html", message=f"unknown project {name!r}")
+        show_hidden = hidden not in ("", "0", "false")
         store = ProjectStore(paths[name])
         try:
-            wos = store.list_work_orders()
+            wos = store.list_work_orders(include_hidden=show_hidden)
+            hidden_count = sum(
+                1 for wo in store.list_work_orders(include_hidden=True) if wo["hidden"]
+            )
         finally:
             store.close()
         central = CentralStore()
@@ -92,7 +96,8 @@ def create_app() -> FastAPI:
         finally:
             central.close()
         return render(request, "project.html", project_name=name, path=paths[name],
-                      wos=wos, backlog=backlog)
+                      wos=wos, backlog=backlog, show_hidden=show_hidden,
+                      hidden_count=hidden_count)
 
     @app.get("/wo/{name}/{wo_id}", response_class=HTMLResponse)
     def work_order(request: Request, name: str, wo_id: str, debug: str = ""):
@@ -196,6 +201,21 @@ def create_app() -> FastAPI:
     def cancel_wo(name: str, wo_id: str):
         ops.cancel(wo_id)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
+
+    @app.post("/wo/{name}/{wo_id}/hide")
+    def hide_wo(name: str, wo_id: str):
+        ops.hide_work_order(wo_id, hidden=True, project_name=name)
+        return RedirectResponse(f"/project/{name}", status_code=303)
+
+    @app.post("/wo/{name}/{wo_id}/unhide")
+    def unhide_wo(name: str, wo_id: str):
+        ops.hide_work_order(wo_id, hidden=False, project_name=name)
+        return RedirectResponse(f"/project/{name}", status_code=303)
+
+    @app.post("/wo/{name}/{wo_id}/delete")
+    def delete_wo(name: str, wo_id: str):
+        ops.delete_work_order(wo_id, project_name=name)
+        return RedirectResponse(f"/project/{name}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/resume-auto")
     def resume_auto(name: str, wo_id: str):

@@ -111,6 +111,8 @@ def build_parser() -> argparse.ArgumentParser:
     l = wo.add_parser("list", help="list work orders")
     l.add_argument("project", nargs="?", help="restrict to one project")
     l.add_argument("--all", action="store_true", help="include closed work orders")
+    l.add_argument("--include-hidden", action="store_true",
+                   help="include work orders you've hidden")
 
     s = wo.add_parser("show", help="show one work order with its timeline, messages "
                                    "and assumptions")
@@ -144,6 +146,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     x = wo.add_parser("cancel", help="cancel a work order")
     x.add_argument("wo_id")
+
+    h = wo.add_parser("hide", help="hide a work order from listings and the attention "
+                                   "list (nothing is deleted)")
+    h.add_argument("wo_id")
+    h.add_argument("--project")
+
+    uh = wo.add_parser("unhide", help="bring a hidden work order back")
+    uh.add_argument("wo_id")
+    uh.add_argument("--project")
+
+    dl = wo.add_parser("delete", help="permanently delete a work order and its whole "
+                                      "history — this cannot be undone")
+    dl.add_argument("wo_id")
+    dl.add_argument("--project")
+    dl.add_argument("--yes", "-y", action="store_true",
+                    help="confirm the deletion (required)")
 
     ra = wo.add_parser("resume-auto",
                        help="unstick a worker blocked on a permission prompt: flip it "
@@ -347,13 +365,16 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 continue
             store = ProjectStore(path)
             try:
-                wos = store.list_work_orders(statuses=None if args.all else OPEN_STATUSES)
+                wos = store.list_work_orders(
+                    statuses=None if args.all else OPEN_STATUSES,
+                    include_hidden=args.include_hidden,
+                )
             finally:
                 store.close()
             for wo in wos:
                 out.append({"project": name, **{k: wo[k] for k in (
                     "id", "title", "status", "origin", "needs_attention",
-                    "attention_reason", "created_at")}})
+                    "attention_reason", "created_at", "hidden")}})
         if args.json:
             _print(out, True)
         else:
@@ -361,8 +382,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 icon = STATUS_ICON.get(wo["status"], "•")
                 badge = ORIGIN_BADGE.get(wo["origin"], wo["origin"])
                 att = " ⚠" if wo["needs_attention"] else ""
+                hid = " 🙈" if wo["hidden"] else ""
                 print(f"{icon} {wo['id']} [{wo['project']}] [{badge}] "
-                      f"{wo['title']} ({wo['status']}, {_age(wo['created_at'])}){att}")
+                      f"{wo['title']} ({wo['status']}, {_age(wo['created_at'])}){att}{hid}")
             if not out:
                 print("no work orders")
 
@@ -396,6 +418,17 @@ def cmd_wo(args: argparse.Namespace) -> int:
         _print(ops.review_work_order(args.wo_id, accept=not args.reject), args.json)
     elif args.wo_cmd == "cancel":
         _print(ops.cancel(args.wo_id), args.json)
+    elif args.wo_cmd in ("hide", "unhide"):
+        _print(ops.hide_work_order(args.wo_id, hidden=args.wo_cmd == "hide",
+                                   project_name=args.project), args.json)
+    elif args.wo_cmd == "delete":
+        if not args.yes:
+            raise SystemExit(
+                f"refusing to delete {args.wo_id}: this erases the work order, its "
+                "timeline, messages and assumptions for good. Re-run with --yes "
+                "(or use `jarvis wo hide` to just get it out of the way)."
+            )
+        _print(ops.delete_work_order(args.wo_id, project_name=args.project), args.json)
     elif args.wo_cmd == "resume-auto":
         _print(ops.resume_in_auto(args.wo_id, project_name=args.project), args.json)
     return 0
