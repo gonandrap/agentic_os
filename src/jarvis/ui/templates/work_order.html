@@ -4,6 +4,9 @@
 
 {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
 {% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
+{# #pending is the deep-link target used by notifications: it lands on whatever
+   is actually waiting on the user, falling back to the reply box. #}
+{% set pending = 'assumptions' if assumptions else ('attention' if wo.needs_attention else 'reply') %}
 
 <h2><a href="/project/{{ project }}">{{ project }}</a> / <span class="mono">{{ wo.id }}</span></h2>
 <div class="panel" style="padding: 14px 16px;">
@@ -27,7 +30,8 @@
     {% if wo.session_id %} · session {{ wo.session_id[:8] }}…{% endif %}
   </p>
   {% if wo.needs_attention %}
-    <p class="st tone-warn"><span class="i">◭</span>{{ wo.attention_reason }}</p>
+    <p class="st tone-warn"{% if pending == 'attention' %} id="pending"{% endif %}>
+      <span class="i">◭</span>{{ wo.attention_reason }}</p>
     {% if wo.status == 'waiting_input' and wo.session_id %}
     <div class="row" style="gap: 10px; flex-wrap: wrap; align-items: center;">
       <span class="sub">Blocked on a permission prompt. A background worker can't be
@@ -47,7 +51,7 @@
 </div>
 
 {% if assumptions %}
-<h2>Assumptions pending your review</h2>
+<h2{% if pending == 'assumptions' %} id="pending"{% endif %}>Assumptions pending your review</h2>
 <div class="panel">
   {% for a in assumptions %}
   <div class="row"><div class="grow">{{ a.content }}</div>
@@ -74,7 +78,7 @@
   {% else %}
   <div class="empty">no messages yet</div>
   {% endfor %}
-  <div class="msg">
+  <div class="msg"{% if pending == 'reply' %} id="pending"{% endif %}>
     <form method="post" action="/wo/{{ project }}/{{ wo.id }}/send">
       <textarea name="message" placeholder="feedback for the worker — delivered when it is idle" required></textarea>
       <div style="margin-top: 8px;"><button type="submit" class="primary">Send to worker</button></div>

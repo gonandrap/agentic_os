@@ -82,6 +82,12 @@ jarvis wo send wo-1a2b3c4d "Use CSS variables, not a theme lib"   # talk to the 
 jarvis ui                         # dashboard on http://127.0.0.1:8787
 ```
 
+Telegram notifications carry the work order id as a link straight to that work
+order's page in the dashboard, anchored at whatever is waiting on you. The link is
+built from `os.ui.base_url` (falling back to `http://127.0.0.1:<os.ui.port>`) — set
+`base_url` when you read Telegram on your phone and reach the UI through a tunnel or
+LAN address.
+
 Workers run as native Claude Code background sessions named `[WO wo-…] …` — you can
 also watch and join them from `claude agents`.
 
