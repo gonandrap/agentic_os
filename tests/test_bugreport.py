@@ -27,8 +27,12 @@ def started_project_wo(jarvis_home, fake_claude, catalog_file, project):
 
 
 @pytest.fixture()
-def reporting(jarvis_home, fake_gh, catalog_file):
-    """A started OS with a fake `gh`, so reports have somewhere to go."""
+def reporting(jarvis_home, fake_claude, fake_gh, catalog_file):
+    """A started OS with a fake `gh`, so reports have somewhere to go.
+
+    `fake_claude` is required even though nothing here spawns a session: starting the
+    OS refuses to proceed without a `claude` binary on PATH.
+    """
     from jarvis import ops
     ops.start_os(str(catalog_file), foreground=True)
     return fake_gh
