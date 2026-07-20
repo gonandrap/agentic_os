@@ -66,16 +66,21 @@ elif "--bg" in argv:
         "state": "running",
         "startedAt": 0,
         "resumedFrom": resumed,
+        "prompt": argv[-1][:40],
     })
     save_sessions(sessions)
-    # job state the daemon polls for the fork's reply (internal-format stand-in)
+    # Job state the daemon polls for a turn's final assistant message (internal-format
+    # stand-in). The supervisor publishes one per bg job. A forked (--resume) turn is a
+    # single short exchange and lands right away; an initial dispatch stays running
+    # until the test flips the session to done via set_session_state.
     jobs_root = os.environ.get("JARVIS_CLAUDE_JOBS_DIR")
-    if jobs_root and resumed:
+    if jobs_root:
         jdir = os.path.join(jobs_root, job_id)
         os.makedirs(jdir, exist_ok=True)
+        state = ({"state": "done", "output": {"result": f"ack: {argv[-1][:40]}"}}
+                 if resumed else {"state": "running"})
         with open(os.path.join(jdir, "state.json"), "w") as f:
-            json.dump({"state": "done",
-                       "output": {"result": f"ack: {argv[-1][:40]}"}}, f)
+            json.dump(state, f)
     print(f"  claude stop {job_id}      stop this session")
 elif argv[:1] == ["stop"]:
     sessions = load_sessions()
@@ -150,11 +155,27 @@ def fake_claude(tmp_path, monkeypatch):
             path = fdir / "sessions.json"
             return json.loads(path.read_text()) if path.exists() else []
 
+        def job_state(self, job_id: str) -> dict:
+            path = fdir / "jobs" / job_id / "state.json"
+            return json.loads(path.read_text()) if path.exists() else {}
+
         def set_session_state(self, session_id: str, state: str) -> None:
+            """Move a session's state, keeping its job result file in step.
+
+            The supervisor publishes the turn's final assistant message when the job
+            reaches `done`; the daemon reads it from there, so the fake must too.
+            """
             sessions = self.sessions
             for s in sessions:
-                if s["sessionId"] == session_id:
-                    s["state"] = state
+                if s["sessionId"] != session_id:
+                    continue
+                s["state"] = state
+                payload: dict = {"state": state}
+                if state == "done":
+                    payload["output"] = {"result": f"final: {s.get('prompt', '')}"}
+                jdir = fdir / "jobs" / s["id"]
+                jdir.mkdir(parents=True, exist_ok=True)
+                (jdir / "state.json").write_text(json.dumps(payload))
             (fdir / "sessions.json").write_text(json.dumps(sessions))
 
     return Handle()

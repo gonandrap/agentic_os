@@ -11,7 +11,6 @@ import os
 import re
 import shutil
 import subprocess
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -160,23 +159,23 @@ def jobs_dir() -> Path:
     return config / "jobs"
 
 
-def wait_job_result(job_id: str, timeout: float = 900, poll: float = 5.0) -> str | None:
-    """Best-effort: wait for a background job to finish and return its result text.
+def job_result(job_id: str) -> tuple[str | None, str | None]:
+    """Read a background job's supervisor state file: `(state, result_text)`.
 
-    Reads the supervisor's per-job state file (internal format — failures are
-    swallowed, returning None)."""
-    state_path = jobs_dir() / job_id / "state.json"
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            state = json.loads(state_path.read_text())
-            if state.get("state") == "done":
-                output = state.get("output") or {}
-                return output.get("result") if isinstance(output, dict) else None
-        except (OSError, json.JSONDecodeError, AttributeError):
-            pass
-        time.sleep(poll)
-    return None
+    Non-blocking, so a poll loop (the daemon reconciler) can ask cheaply every tick.
+    Both values are None when the file is absent or unreadable — the format is
+    internal to the supervisor, so failures are swallowed rather than raised.
+    `result_text` is the session's final assistant message for that job.
+    """
+    try:
+        state = json.loads((jobs_dir() / job_id / "state.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(state, dict):
+        return None, None
+    output = state.get("output")
+    result = output.get("result") if isinstance(output, dict) else None
+    return state.get("state"), result
 
 
 def stop_session(bg_id: str) -> bool:

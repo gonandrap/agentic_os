@@ -101,14 +101,28 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"- Record EVERY assumption you make: `jarvis wo assume {wo['id']} \"...\"`",
         f"- Blocked on a decision you cannot make? Ask the OS and END YOUR TURN: "
         f"`jarvis wo ask {wo['id']} \"<your question>\"` — the answer arrives as "
-        f"your next user turn (from Neo, the user's delegate, or the user). Prefer "
-        f"recording an assumption and continuing when the decision is reversible.",
+        f"your next user turn (from Neo, the user's delegate, or the user). Put "
+        f"everything needed to decide INSIDE the question text: whoever answers sees "
+        f"only that text, never your session. Prefer recording an assumption and "
+        f"continuing when the decision is reversible.",
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"`",
         f"- Report reusable learnings: `jarvis learn add \"...\" --project {project.name}`",
         f"- Alert the human when needed: `jarvis notify --project {project.name} "
         f"--level warning|critical \"title\" \"body\"`",
-        f"- When done, ALWAYS run: `jarvis wo finish {wo['id']} --summary \"...\"`",
+        f"- When done, ALWAYS run: `jarvis wo finish {wo['id']} --summary \"...\"` and "
+        f"then write your full answer as the last thing you say.",
+        "",
+        "# What the outside world sees",
+        "The work order record IS this conversation, as far as anyone else is concerned. "
+        "The last message of every turn you take is captured verbatim into it, and the "
+        "user and Neo make their decisions from that record — neither will ever open "
+        "this session. So end every turn with the complete answer: findings, caveats, "
+        "uncertainties, what you did NOT do, and absolute paths. `--summary` is a "
+        "one-line headline for that answer, never a substitute for it — anything that "
+        "lives only in the summary is the only thing anyone reads, so a detail you drop "
+        "there is a detail that ceases to exist.",
+        "",
         "Work autonomously toward a complete end-to-end solution unless this work "
         "order says otherwise. User feedback may arrive as new user turns; treat it "
         "as authoritative for this work order.",
@@ -141,7 +155,7 @@ def dispatch_work_order(
 
     settings_file = _write_worker_settings(project, wo)
     try:
-        claude_cli.spawn_background(
+        job_id = claude_cli.spawn_background(
             prompt=prompt,
             cwd=project.path,
             name=worker_name(wo),
@@ -164,18 +178,23 @@ def dispatch_work_order(
         )
         raise
 
+    # job_id lets the reconciler recover this turn's final assistant message once the
+    # session goes idle; reply_job_id is cleared so that capture is still outstanding.
     store.update_work_order(
         wo["id"],
         worktree=worktree,
         model=model,
         effort=effort,
         permission_mode=permission_mode,
+        job_id=job_id,
+        reply_job_id=None,
     )
     store.set_status(wo["id"], "running")
     store.add_event(wo["id"], "dispatched", {
         "worktree": worktree,
         "model": model,
         "permission_mode": permission_mode,
+        "job": job_id,
         "note": "session id binds via SessionStart hook / name reconciliation",
     })
     central.touch_project(project.name)

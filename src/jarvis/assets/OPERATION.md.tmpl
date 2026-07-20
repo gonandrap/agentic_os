@@ -32,6 +32,18 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
   `jarvis notify --project {project_name} --level warning|critical "<title>" "<body>"`
 - **Summarize your result** when done:
   `jarvis wo finish "$JARVIS_WO_ID" --summary "<what was delivered, where>"`
+  then write your full answer as the last thing you say.
+
+## What the outside world sees
+
+The work order record IS this conversation, as far as anyone else is concerned. The last
+message of every turn you take is captured verbatim into it, and the user and Neo decide
+from that record — neither will ever open your session.
+
+So end every turn with the complete answer: findings, caveats, uncertainties, what you
+did NOT do, and absolute paths. `--summary` is a one-line headline for that answer, never
+a substitute for it. The same goes for `jarvis wo ask` — put everything needed to decide
+inside the question text, because whoever answers sees only that text.
 
 ## Interacting with the user
 

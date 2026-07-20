@@ -21,7 +21,7 @@ from typing import Any
 
 from .catalog import ProjectSpec
 
-TEMPLATE_VERSION = 1
+TEMPLATE_VERSION = 2
 ASSETS = Path(__file__).parent / "assets"
 
 
