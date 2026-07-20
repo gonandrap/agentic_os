@@ -27,20 +27,34 @@ secrets ever live in git.
 
 ## Releasing (dev → prod)
 
-Use the **shipit** skill, or run the script directly from the dev checkout on `main`:
+Releasing has two parts, and **shipit only does the second one**.
+
+**1. Land the code on `main` via a reviewed PR.** Work in a worktree, TDD, push the
+branch, open a PR against `main`, get CI green, merge. shipit never commits to `main`.
+
+**2. Cut and deploy the release** — from the dev checkout, on `main`, synced with origin:
 
 ```bash
 scripts/shipit.sh --dry-run        # preview
-scripts/shipit.sh                  # ship pyproject version if untagged, else patch bump
+scripts/shipit.sh                  # patch bump from the latest jarvis-* tag
 scripts/shipit.sh minor            # or patch | major
 scripts/shipit.sh 1.4.0            # explicit version
 ```
 
-This bumps `pyproject.toml` (if the version changes), commits on `main`, cuts
-`release/jarvis-X.Y.Z` + tag `jarvis-X.Y.Z`, deploys the tag to
-`$PRODUCTION_CODE/jarvis_os` (`git fetch` + `checkout` + `uv sync --frozen`), and
-restarts the service. Production's git `origin` is the **local** dev repo, so releases
-are offline and deterministic — nothing is pushed to GitHub.
+shipit cuts `release/jarvis-X.Y.Z` from `main`, bumps `pyproject.toml` + commits +
+tags `jarvis-X.Y.Z` **on that release branch** (via a throwaway worktree, so `main` is
+never modified), **pushes the branch and the tag to `origin`**, deploys the tag to
+`$PRODUCTION_CODE/jarvis_os` (`git fetch` + `checkout` + `uv sync --frozen`), restarts
+the services, and notifies Telegram.
+
+**Git is the source of truth.** shipit refuses to run unless `HEAD` is exactly
+`origin/main`, and it pushes every release ref before deploying — production's `origin`
+is the GitHub remote, so what runs in prod is exactly what is on the remote and any
+release is reproducible from a fresh clone.
+
+Version numbering comes from the latest `jarvis-*` **tag**, not from `pyproject.toml`
+on `main` — the bump lives only on release branches, so `main`'s version string
+intentionally lags behind the shipped one.
 
 > Git note: there is no bare `release` branch. Git cannot hold both a ref named
 > `release` and refs named `release/…` (a file/directory conflict), so the release line
