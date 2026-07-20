@@ -331,6 +331,35 @@ def test_missing_job_result_does_not_stall_the_work_order(started, fake_claude, 
     assert "worker_reply_lost" in [e["kind"] for e in store.list_events(wo["id"])]
 
 
+def test_delivery_retires_the_previous_session(started, fake_claude, project):
+    """Each delivered turn forks a fresh bg agent; the one it forked from is stopped
+    afterwards, so a multi-turn conversation keeps exactly one live agent per WO."""
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    sid = bind_session(daemon, project, wo["id"])
+
+    def turn(text: str, current_sid: str) -> str:
+        fake_claude.set_session_state(current_sid, "done")  # worker idle → deliverable
+        ops.send_message(wo["id"], text, source="ui")
+        daemon.tick_count = 0
+        daemon.tick()
+        daemon.delivery_pool.shutdown(wait=True)
+        from concurrent.futures import ThreadPoolExecutor
+        daemon.delivery_pool = ThreadPoolExecutor(max_workers=2)
+        return bind_session(daemon, project, wo["id"])
+
+    sid = turn("first follow-up", sid)
+    sid = turn("second follow-up", sid)
+
+    mine = [s for s in fake_claude.sessions if s["name"].startswith(f"[WO {wo['id']}]")]
+    assert len(mine) == 1, f"stale sessions accumulated: {[s['sessionId'] for s in mine]}"
+    assert mine[0]["sessionId"] == sid
+    # and the WO is bound to the survivor, not to a session that was stopped
+    assert store.get_work_order(wo["id"])["session_id"] == sid
+
+
 def test_finish_and_assumption_review(started, project):
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
