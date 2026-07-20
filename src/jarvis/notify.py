@@ -8,11 +8,13 @@ the unified pipeline existing per-project Telegram scripts migrate to.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import shutil
 import subprocess
 import time
+import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
@@ -21,6 +23,21 @@ from .central_store import CentralStore
 from .paths import logs_dir
 
 LEVEL_EMOJI = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}
+
+#: Anchor on the work-order page marking whatever is waiting on the user
+#: (pending assumptions, the attention banner, otherwise the reply box).
+PENDING_ANCHOR = "pending"
+
+
+def ui_base_url(catalog: Catalog) -> str:
+    """Root URL of the local dashboard, as a notification recipient should reach it."""
+    return catalog.os.ui_base_url or f"http://127.0.0.1:{catalog.os.ui_port}"
+
+
+def wo_url(catalog: Catalog, project: str, wo_id: str) -> str:
+    """Deep link to a work order's history, scrolled to what needs the user."""
+    quote = urllib.parse.quote
+    return f"{ui_base_url(catalog)}/wo/{quote(project)}/{quote(wo_id)}#{PENDING_ANCHOR}"
 
 
 def sink_log(item: dict[str, Any], catalog: Catalog) -> str:
@@ -43,14 +60,19 @@ def sink_telegram(item: dict[str, Any], catalog: Catalog) -> str:
     if not token or not chat_id:
         return f"skipped: {catalog.os.telegram_token_env}/{catalog.os.telegram_chat_id_env} not set"
     emoji = LEVEL_EMOJI.get(item["level"], "")
-    text = f"{emoji} *[{item['project']}]* {item['title']}"
+    esc = html.escape
+    # HTML (not Markdown): work order ids become tappable links into the local UI,
+    # and titles containing _ or * no longer break the parse.
+    text = f"{emoji} <b>[{esc(item['project'])}]</b> {esc(item['title'])}"
     if item["body"]:
-        text += f"\n{item['body']}"
+        text += f"\n{esc(item['body'])}"
     if item.get("wo_id"):
-        text += f"\n`{item['wo_id']}`"
+        url = wo_url(catalog, item["project"], item["wo_id"])
+        text += f'\n<a href="{esc(url, quote=True)}">{esc(item["wo_id"])}</a>'
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/sendMessage",
-        data=json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}).encode(),
+        data=json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                         "disable_web_page_preview": True}).encode(),
         headers={"Content-Type": "application/json"},
     )
     try:

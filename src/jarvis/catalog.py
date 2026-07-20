@@ -85,6 +85,9 @@ class OsConfig:
     telegram_token_env: str = "JARVIS_TELEGRAM_TOKEN"
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
     ui_port: int = 8787
+    # Where notification deep links point. Empty = http://127.0.0.1:<ui_port>;
+    # set it when the UI is reachable under another host (tunnel, LAN, reverse proxy).
+    ui_base_url: str = ""
     knowledge_inject_limit: int = 8
     neo: NeoConfig = field(default_factory=NeoConfig)
 
@@ -146,6 +149,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         telegram_token_env=telegram.get("token_env", "JARVIS_TELEGRAM_TOKEN"),
         telegram_chat_id_env=telegram.get("chat_id_env", "JARVIS_TELEGRAM_CHAT_ID"),
         ui_port=ui.get("port", 8787),
+        ui_base_url=str(ui.get("base_url", "") or "").rstrip("/"),
         knowledge_inject_limit=os_raw.get("knowledge_inject_limit", 8),
         neo=neo_cfg,
     )

@@ -13,7 +13,7 @@
         "chat_id_env": "JARVIS_TELEGRAM_CHAT_ID"
       }
     },
-    "ui": { "port": 8787 },
+    "ui": { "port": 8787, "base_url": "http://127.0.0.1:8787" },
     "knowledge_inject_limit": 8,
     "neo": {
       "$comment": "Neo answers worker questions on your behalf; review its answers in the UI's neo tab",

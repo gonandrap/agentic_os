@@ -69,6 +69,23 @@ def test_waiting_input_wo_shows_attach_hint_and_resume(client, daemon, project):
     assert fresh["needs_attention"] == 0
 
 
+def test_wo_page_anchors_pending_at_what_needs_the_user(client, daemon):
+    """Notifications deep-link to #pending; it must land on the live ask, and the
+    page must never emit two of them."""
+    wo = ops.create_work_order("proj_a", "risky change")
+    daemon.tick()
+
+    quiet = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert quiet.count('id="pending"') == 1  # falls back to the reply box
+    assert 'id="pending"' in quiet.split("Send to worker")[0].split("<h2>Conversation</h2>")[1]
+
+    ops.assume(wo["id"], "assumed the API is v2")
+    ops.finish(wo["id"], "done-ish")
+    review = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert review.count('id="pending"') == 1
+    assert '<h2 id="pending">Assumptions pending your review</h2>' in review
+
+
 def test_attention_strip_shows_review_items(client, daemon, project):
     wo = ops.create_work_order("proj_a", "risky change")
     daemon.tick()
