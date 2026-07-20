@@ -48,6 +48,10 @@ jarvis neo answer <qid> "…"                # answer a question Neo escalated t
 jarvis inbox / jarvis inbox ack [id]
 jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--force]
 jarvis learn add "insight" [--project p] / search <term>
+jarvis bug report "title" -d "..." -e "expected" -a "actual" [--steps "..."]
+                                           # a bug in the OS itself -> GitHub issue on
+                                           # the (PUBLIC) tracker + Telegram ping.
+                                           # Every agent has the report-jarvis-bug skill.
 jarvis adopt <path>                        # migrate a project into the OS
 jarvis ui                                  # dashboard at http://127.0.0.1:8787
 ```

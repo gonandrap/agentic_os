@@ -120,6 +120,59 @@ else:
 '''
 
 
+FAKE_GH = r'''#!/usr/bin/env python3
+"""Fake `gh` CLI for tests: records invocations, prints an issue URL."""
+import json, os, sys
+
+state_dir = os.environ["FAKE_GH_DIR"]
+argv = sys.argv[1:]
+stdin = "" if sys.stdin.isatty() else sys.stdin.read()
+with open(os.path.join(state_dir, "calls.jsonl"), "a") as f:
+    f.write(json.dumps({"argv": argv, "stdin": stdin}) + "\n")
+
+fail = os.environ.get("FAKE_GH_FAIL")
+if fail:
+    sys.stderr.write(fail + "\n")
+    sys.exit(1)
+if argv[:2] == ["issue", "create"]:
+    print(os.environ["FAKE_GH_ISSUE_URL"])
+else:
+    sys.stderr.write(f"fake gh: unhandled argv {argv}\n")
+    sys.exit(2)
+'''
+
+
+@pytest.fixture()
+def fake_gh(tmp_path, monkeypatch):
+    """Install a fake `gh` binary; returns a handle to its recorded state."""
+    gdir = tmp_path / "fake-gh"
+    gdir.mkdir()
+    binpath = gdir / "gh"
+    binpath.write_text(FAKE_GH)
+    binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+    url = "https://github.com/example/repo/issues/7"
+    monkeypatch.setenv("FAKE_GH_DIR", str(gdir))
+    monkeypatch.setenv("FAKE_GH_ISSUE_URL", url)
+    monkeypatch.setenv("JARVIS_GH_BIN", str(binpath))
+
+    class Handle:
+        dir = gdir
+        issue_url = url
+
+        @property
+        def calls(self) -> list[dict]:
+            path = gdir / "calls.jsonl"
+            if not path.exists():
+                return []
+            return [json.loads(l) for l in path.read_text().splitlines()]
+
+        def fail(self, message: str) -> None:
+            """Make every subsequent `gh` call fail with `message` on stderr."""
+            monkeypatch.setenv("FAKE_GH_FAIL", message)
+
+    return Handle()
+
+
 @pytest.fixture()
 def jarvis_home(tmp_path, monkeypatch):
     home = tmp_path / "jarvis-home"
