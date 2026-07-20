@@ -32,6 +32,9 @@ from .project_store import ProjectStore
 log = logging.getLogger("jarvisd")
 
 RECONCILE_EVERY_TICKS = 6  # reconcile via `claude agents --json` every N ticks
+# How many reconcile passes to keep waiting for a finished job's result file before
+# giving up on capturing that turn's reply (the supervisor writes it asynchronously).
+MAX_REPLY_CAPTURE_ATTEMPTS = 3
 
 
 class Daemon:
@@ -48,6 +51,8 @@ class Daemon:
         # keeps the shared persona+learnings prefix inside the prompt-cache TTL.
         self.neo_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="neo")
         self.neo_draining = False
+        # wo_id -> consecutive reconcile passes that found no result file for its job.
+        self.reply_capture_misses: dict[str, int] = {}
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -209,7 +214,6 @@ class Daemon:
             log.info("[%s] delivering message %s to %s", project.name, msg["id"], wo["id"])
             wt = project.path / ".claude" / "worktrees" / (wo.get("worktree") or "")
             cwd = wt if wo.get("worktree") and wt.is_dir() else project.path
-            result: str | None = None
             try:
                 job_id = claude_cli.spawn_background(
                     prompt=msg["content"],
@@ -233,8 +237,9 @@ class Daemon:
                 if store.get_work_order(wo["id"])["status"] in ("waiting_input", "needs_review"):
                     store.set_status(wo["id"], "running")
                     store.clear_attention(wo["id"])
-                if job_id:
-                    result = claude_cli.wait_job_result(job_id)
+                # Hand the reply off to the reconciler rather than blocking here: this
+                # runs on a 4-slot pool, and a worker turn can take many minutes.
+                store.update_work_order(wo["id"], job_id=job_id, reply_job_id=None)
             except claude_cli.ClaudeCliError as e:
                 log.warning("[%s] bg-resume delivery failed (%s); falling back to headless resume",
                             project.name, e)
@@ -244,9 +249,9 @@ class Daemon:
                 store.mark_message(msg["id"], "delivered")
                 store.add_event(wo["id"], "message_delivered",
                                 {"msg_id": msg["id"], "via": "headless-resume"})
-            if result:
-                store.queue_message(wo["id"], result, source="worker",
-                                    direction="agent_to_user", status="delivered")
+                # Headless resume returns the reply inline — no job to reconcile.
+                if result:
+                    store.record_agent_reply(wo["id"], result)
         except claude_cli.ClaudeCliError as e:
             log.error("[%s] delivery of message %s failed: %s", project.name, msg["id"], e)
             store.mark_message(msg["id"], "failed")
@@ -325,6 +330,44 @@ class Daemon:
 
     # -- 5. reconcile -------------------------------------------------------------------
 
+    def capture_worker_reply(self, store: ProjectStore, wo: dict) -> bool:
+        """Persist the final assistant message of the work order's latest turn.
+
+        A work order is the representation of its worker's conversation — the user and
+        Neo decide from the record alone and never open the session — so the worker's
+        full reply is stored alongside the `wo finish --summary` headline.
+
+        Returns True when the work order may settle: either the reply landed, or it is
+        established that none is coming.
+        """
+        job_id = wo.get("job_id")
+        if not job_id or job_id == wo.get("reply_job_id"):
+            return True  # nothing outstanding
+
+        state, result = claude_cli.job_result(job_id)
+        if result:
+            store.record_agent_reply(wo["id"], result)
+            store.update_work_order(wo["id"], reply_job_id=job_id)
+            store.add_event(wo["id"], "worker_reply",
+                            {"job": job_id, "chars": len(result)})
+            self.reply_capture_misses.pop(wo["id"], None)
+            return True
+        if state == "done":
+            store.update_work_order(wo["id"], reply_job_id=job_id)  # ran, said nothing
+            self.reply_capture_misses.pop(wo["id"], None)
+            return True
+
+        misses = self.reply_capture_misses.get(wo["id"], 0) + 1
+        self.reply_capture_misses[wo["id"]] = misses
+        if misses < MAX_REPLY_CAPTURE_ATTEMPTS:
+            return False
+        log.warning("no worker reply captured for %s (job %s, state %s) after %d passes",
+                    wo["id"], job_id, state, misses)
+        store.update_work_order(wo["id"], reply_job_id=job_id)
+        store.add_event(wo["id"], "worker_reply_lost", {"job": job_id, "state": state})
+        self.reply_capture_misses.pop(wo["id"], None)
+        return True
+
     def reconcile_project(
         self,
         project: ProjectSpec,
@@ -342,6 +385,14 @@ class Daemon:
             m = re.match(r"\[WO (wo-[0-9a-f]+)\]", s.name)
             if m:
                 by_name_prefix[m.group(1)] = s
+
+        # Recover the final assistant message of every turn that has ended. Runs ahead
+        # of (and independently from) settling: a worker that called `jarvis wo finish`
+        # is already `completed`, so the status-filtered loop below would never see it.
+        for wo in store.work_orders_awaiting_reply():
+            sess = by_session_id.get(wo.get("session_id") or "")
+            if sess is None or sess.state == "done":
+                self.capture_worker_reply(store, wo)
 
         # Settle framework work orders against live session states.
         for wo in store.list_work_orders(statuses=("running", "waiting_input", "dispatching")):
@@ -381,6 +432,8 @@ class Daemon:
                 store.set_status(wo["id"], "waiting_input")
                 store.flag_attention(wo["id"], "worker blocked (permission or input needed)")
             elif sess.state == "done":
+                if not self.capture_worker_reply(store, wo):
+                    continue  # settle only once the record holds what the worker said
                 fresh = store.get_work_order(wo["id"])
                 if fresh.get("result_summary"):
                     if store.pending_assumptions(wo["id"]):

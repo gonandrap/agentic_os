@@ -112,9 +112,12 @@ def build_parser() -> argparse.ArgumentParser:
     l.add_argument("project", nargs="?", help="restrict to one project")
     l.add_argument("--all", action="store_true", help="include closed work orders")
 
-    s = wo.add_parser("show", help="show one work order with events/messages/assumptions")
+    s = wo.add_parser("show", help="show one work order with its timeline, messages "
+                                   "and assumptions")
     s.add_argument("wo_id")
     s.add_argument("--project")
+    s.add_argument("--debug", action="store_true",
+                   help="include plumbing entries (message delivery, session hooks)")
 
     m = wo.add_parser("send", help="send feedback to the worker handling a work order")
     m.add_argument("wo_id")
@@ -321,6 +324,7 @@ def cmd_adopt(args: argparse.Namespace) -> int:
 def cmd_wo(args: argparse.Namespace) -> int:
     from . import ops
     from .project_store import OPEN_STATUSES, ProjectStore
+    from .timeline import build_timeline
 
     if args.wo_cmd == "create":
         wo = ops.create_work_order(
@@ -366,10 +370,12 @@ def cmd_wo(args: argparse.Namespace) -> int:
         name, path, wo = ops.find_work_order(args.wo_id, args.project)
         store = ProjectStore(path)
         try:
+            messages = store.list_messages(args.wo_id)
             detail = {
                 "project": name, **wo,
-                "events": store.list_events(args.wo_id),
-                "messages": store.list_messages(args.wo_id),
+                "timeline": build_timeline(wo, store.list_events(args.wo_id),
+                                           messages, include_debug=args.debug),
+                "messages": messages,
                 "assumptions": store.pending_assumptions(args.wo_id),
             }
         finally:

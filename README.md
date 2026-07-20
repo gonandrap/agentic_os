@@ -118,6 +118,12 @@ jarvis notify --level critical "prod is down" "..."  # human attention
 jarvis wo finish  <wo-id> --summary "delivered ..."  # completion signal
 ```
 
+A work order is the representation of its worker's conversation. The final assistant
+message of every worker turn is captured verbatim into the record, so `jarvis wo show`
+and the dashboard carry the full answer — you and Neo decide from that record and never
+have to open the session. `--summary` is the one-line headline for it, not a
+replacement.
+
 Assumptions flip the work order to `needs_review` — visible in `jarvis status`, the
 dashboard, and (if configured) Telegram.
 

@@ -14,6 +14,7 @@ from .. import ops
 from ..central_store import CentralStore
 from ..daemon import daemon_running
 from ..project_store import ProjectStore
+from ..timeline import build_timeline, count_debug
 
 TEMPLATES = Path(__file__).parent / "templates"
 
@@ -94,7 +95,7 @@ def create_app() -> FastAPI:
                       wos=wos, backlog=backlog)
 
     @app.get("/wo/{name}/{wo_id}", response_class=HTMLResponse)
-    def work_order(request: Request, name: str, wo_id: str):
+    def work_order(request: Request, name: str, wo_id: str, debug: str = ""):
         try:
             pname, path, wo = ops.find_work_order(wo_id, name)
         except ops.OpsError as e:
@@ -106,8 +107,12 @@ def create_app() -> FastAPI:
             assumptions = store.pending_assumptions(wo_id)
         finally:
             store.close()
+        show_debug = debug not in ("", "0", "false")
         return render(request, "work_order.html", project=pname, wo=wo,
-                      events=events, messages=messages, assumptions=assumptions)
+                      timeline=build_timeline(wo, events, messages,
+                                              include_debug=show_debug),
+                      debug=show_debug, debug_count=count_debug(events),
+                      messages=messages, assumptions=assumptions)
 
     @app.get("/inbox", response_class=HTMLResponse)
     def inbox(request: Request):
