@@ -12,6 +12,10 @@ from typing import Any
 from . import db
 from .paths import central_db_path, ensure_home
 
+# Tag marking knowledge mirrored out of a Claude Code memory file rather than typed
+# by a worker via `jarvis learn add`.
+MEMORY_TAG = "claude-memory"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
     name TEXT PRIMARY KEY,
@@ -222,6 +226,29 @@ class CentralStore:
             (kid, project, db.now(), topic, content, tags),
         )
         return {"id": kid, "project": project, "topic": topic, "content": content, "tags": tags}
+
+    def record_memory_file(self, content: str, project: str = "", topic: str = "",
+                           tags: str = MEMORY_TAG) -> bool:
+        """Mirror a mirrored-from-a-file memory into the knowledge base.
+
+        A memory file is a living document: the worker rewrites it, so the row is
+        replaced rather than appended — otherwise every edit would push older
+        learnings out of the recency window with near-duplicates of itself.
+        Returns False when nothing changed.
+        """
+        row = self.conn.execute(
+            "SELECT id, content FROM knowledge WHERE project=? AND topic=? AND tags=?"
+            " ORDER BY ts DESC LIMIT 1",
+            (project, topic, tags),
+        ).fetchone()
+        if row is not None and row["content"] == content:
+            return False
+        if row is not None:
+            self.conn.execute("UPDATE knowledge SET content=?, ts=? WHERE id=?",
+                              (content, db.now(), row["id"]))
+            return True
+        self.add_knowledge(content, project=project, topic=topic, tags=tags)
+        return True
 
     def relevant_knowledge(self, project: str, limit: int = 8) -> list[dict[str, Any]]:
         """Project-specific + global entries, most recent first."""

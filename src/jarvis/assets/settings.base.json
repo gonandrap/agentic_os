@@ -15,6 +15,15 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "$comment": "Mirrors Claude Code's own memory files into the OS knowledge base.",
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "__JARVIS_HOOK_CMD__", "timeout": 30 }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [
