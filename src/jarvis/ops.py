@@ -396,16 +396,61 @@ def finish(wo_id: str, summary: str) -> dict[str, Any]:
     return {"project": name, "wo_id": wo_id, "status": status}
 
 
+def stop_worker_session(wo: dict[str, Any]) -> dict[str, Any]:
+    """Release the background session a work order dispatched, if it still has one.
+
+    Cancelling or deleting a work order has to take the worker down with it: nobody
+    reads its output any more, but the agent keeps running — burning tokens, editing
+    its worktree and cluttering the agents view as an orphan.
+
+    Best effort by design: the caller's state change must never depend on the CLI
+    being reachable, so every failure (no claude binary, unparseable roster, session
+    already gone) comes back as `stopped: False` with a reason instead of raising.
+
+    The live roster is the source of truth for the bg id — `job_id` on the record can
+    lag behind (each resume-fork mints a new one), so it is only the fallback.
+    """
+    from . import claude_cli
+
+    if not claude_cli.available():
+        return {"stopped": False, "reason": "claude CLI not available"}
+    bg_id, reason = None, "no live session"
+    try:
+        for sess in claude_cli.list_background_sessions():
+            if (wo.get("session_id") and sess.session_id == wo["session_id"]) or \
+                    sess.name.startswith(f"[WO {wo['id']}]"):
+                bg_id = sess.id
+                break
+    except claude_cli.ClaudeCliError as e:
+        reason = f"could not list sessions: {e}"
+    if bg_id is None and wo.get("session_id"):
+        bg_id = wo.get("job_id")  # roster missed it; try the id we were handed at spawn
+    if not bg_id:
+        return {"stopped": False, "reason": reason}
+    if claude_cli.stop_session(bg_id):
+        return {"stopped": True, "bg_id": bg_id, "session_id": wo.get("session_id")}
+    return {"stopped": False, "bg_id": bg_id, "reason": "`claude stop` failed"}
+
+
 def cancel(wo_id: str) -> dict[str, Any]:
     name, path, wo = find_work_order(wo_id)
+    stopped = stop_worker_session(wo)
     store = ProjectStore(path)
     try:
         store.set_status(wo_id, "cancelled")
         store.clear_attention(wo_id)
+        if stopped["stopped"]:
+            store.add_event(wo_id, "session_stopped",
+                            {**{k: v for k, v in stopped.items() if k != "stopped"},
+                             "reason": "work order cancelled"})
     finally:
         store.close()
-    return {"project": name, "wo_id": wo_id, "status": "cancelled",
-            "note": "session (if running) is not killed — stop it from the agents view"}
+    out = {"project": name, "wo_id": wo_id, "status": "cancelled",
+           "session_stopped": stopped["stopped"]}
+    if not stopped["stopped"] and wo.get("session_id") and wo["status"] in OPEN_STATUSES:
+        out["note"] = (f"the worker's session ({wo['session_id']}) could not be stopped "
+                       f"({stopped.get('reason')}) — stop it from the agents view")
+    return out
 
 
 def hide_work_order(wo_id: str, hidden: bool = True,
@@ -428,10 +473,11 @@ def hide_work_order(wo_id: str, hidden: bool = True,
 def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """Erase a work order everywhere: project DB, central inbox/backlog, Neo's questions.
 
-    Irreversible. A live session is not killed (nothing here can); the caller is told
-    so it can stop the session itself.
+    Irreversible. The worker's session goes with it — once the record is gone there is
+    nothing left to reattach a running agent to.
     """
     name, path, wo = find_work_order(wo_id, project_name)
+    stopped = stop_worker_session(wo)
     store = ProjectStore(path)
     try:
         deleted = store.delete_work_order(wo_id)
@@ -448,10 +494,11 @@ def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, 
         deleted["neo_questions"] = neo.purge_work_order(wo_id)
     finally:
         neo.close()
-    out = {"project": name, "wo_id": wo_id, "title": wo["title"], "deleted": deleted}
-    if wo["session_id"] and wo["status"] in OPEN_STATUSES:
-        out["note"] = (f"the worker's session ({wo['session_id']}) is still running — "
-                       "stop it from the agents view")
+    out = {"project": name, "wo_id": wo_id, "title": wo["title"], "deleted": deleted,
+           "session_stopped": stopped["stopped"]}
+    if not stopped["stopped"] and wo["session_id"] and wo["status"] in OPEN_STATUSES:
+        out["note"] = (f"the worker's session ({wo['session_id']}) could not be stopped "
+                       f"({stopped.get('reason')}) — stop it from the agents view")
     return out
 
 
