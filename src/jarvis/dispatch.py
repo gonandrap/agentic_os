@@ -107,7 +107,12 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"continuing when the decision is reversible.",
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"`",
-        f"- Report reusable learnings: `jarvis learn add \"...\" --project {project.name}`",
+        f"- The OS knowledge base is the ONLY memory that survives you: "
+        f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`. "
+        f"Anything durable you learn — project state, gotchas, conventions, decisions "
+        f"— goes there. Your own memory files, notes and scratch docs are invisible to "
+        f"the user, to Neo and to the next worker (Jarvis mirrors any memory file you "
+        f"do write, but say it here and it lands intact).",
         f"- Alert the human when needed: `jarvis notify --project {project.name} "
         f"--level warning|critical \"title\" \"body\"`",
         "- Hit a bug in Jarvis OS itself (a `jarvis` command fails, hangs, or does the "
