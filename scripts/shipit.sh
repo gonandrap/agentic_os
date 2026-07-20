@@ -4,18 +4,22 @@
 # Releases never bypass code review: the code changes must already be on main via a
 # reviewed PR before you run this. shipit only does the release-cut + deploy:
 #
-#   1. Verify the tree is clean and resolve the target version X.Y.Z (from the latest
-#      jarvis-* tag — main's pyproject is NOT bumped by shipit).
+#   1. Verify the tree is clean, that HEAD is exactly origin/main, and resolve the
+#      target version X.Y.Z (from the latest jarvis-* tag — main's pyproject is NOT
+#      bumped by shipit).
 #   2. Cut branch  release/jarvis-X.Y.Z  from main.
 #   3. Bump pyproject.toml + commit + annotated tag  jarvis-X.Y.Z  *on the release
 #      branch* — main is never modified (done in a throwaway git worktree so the
 #      shared main checkout's HEAD never moves).
-#   4. Deploy the tag to  $PRODUCTION_CODE/jarvis_os  (clone on first run, then
-#      fetch + checkout the tag + `uv sync`), and restart the systemd services.
-#   5. Notify Telegram (best-effort).
+#   4. Push the release branch AND the tag to origin.
+#   5. Deploy the tag to  $PRODUCTION_CODE/jarvis_os  from ORIGIN (clone on first run,
+#      then fetch + checkout the tag + `uv sync`), and restart the systemd services.
+#   6. Notify Telegram (best-effort).
 #
-# Nothing is pushed to the GitHub remote: production tracks the LOCAL dev repo, so
-# releases are offline, deterministic, and trivially reversible.
+# GIT IS THE SOURCE OF TRUTH. Every ref a release depends on lives on the remote:
+# shipit refuses to run if HEAD isn't origin/main, pushes the release branch and tag
+# before deploying, and production tracks `origin` — so what runs in prod is exactly
+# what is on the remote, reproducible from any machine.
 #
 # Usage:
 #   scripts/shipit.sh                 # patch-bump from the latest jarvis-* tag
@@ -54,6 +58,18 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [ "$BRANCH" = "main" ] || say "warning: shipping from '$BRANCH', not 'main' (releases cut from merged main)"
 if ! git diff --quiet || ! git diff --cached --quiet; then
   die "tracked changes present — releases are cut from a clean, already-merged main"
+fi
+
+# Git is the source of truth: a release must be reproducible from the remote alone.
+ORIGIN_URL="$(git remote get-url origin 2>/dev/null)" \
+  || die "no 'origin' remote — git is the source of truth for releases"
+say "syncing with origin ($ORIGIN_URL)"
+git fetch origin --tags --prune --quiet || die "cannot fetch origin — releases require the remote"
+git rev-parse -q --verify refs/remotes/origin/main >/dev/null \
+  || die "origin/main not found on $ORIGIN_URL"
+if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+  die "HEAD is not origin/main — land the code on main via a merged PR and pull first
+     (local $(git rev-parse --short HEAD) vs origin/main $(git rev-parse --short origin/main))"
 fi
 
 cur_version()   { grep -m1 -E '^version *= *"' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/'; }
@@ -110,13 +126,22 @@ say "tagging $TAG on $REL_BRANCH"
 run "git -C '$WT' tag -a '$TAG' -m 'Jarvis OS $VERSION'"
 run "git worktree remove --force '$WT'"
 
-# --- 4. deploy to production ----------------------------------------------------
+# --- 4. push to origin (git is the source of truth) ------------------------------
+# Do this BEFORE deploying: production pulls from the remote, so an unpushed ref
+# would mean shipping something no one else can reproduce.
+say "pushing $REL_BRANCH and $TAG to origin"
+run "git push origin 'refs/heads/$REL_BRANCH:refs/heads/$REL_BRANCH'"
+run "git push origin 'refs/tags/$TAG'"
+
+# --- 5. deploy to production (from origin, not this checkout) --------------------
 say "deploying to $PROD_DIR"
 run "mkdir -p '$PROD_ROOT'"
 if [ ! -d "$PROD_DIR/.git" ]; then
-  say "first deploy — cloning local repo into $PROD_DIR"
-  run "git clone '$REPO' '$PROD_DIR'"
+  say "first deploy — cloning $ORIGIN_URL into $PROD_DIR"
+  run "git clone '$ORIGIN_URL' '$PROD_DIR'"
 fi
+# keep prod pointed at the remote, even if it was first cloned from a local path
+run "git -C '$PROD_DIR' remote set-url origin '$ORIGIN_URL'"
 run "git -C '$PROD_DIR' fetch origin --tags --prune --force"
 run "git -C '$PROD_DIR' checkout -f '$TAG'"
 say "building production venv (uv sync --frozen --extra ui)"
@@ -144,7 +169,7 @@ JSON
   fi
 fi
 
-# --- 5. restart services if installed -------------------------------------------
+# --- 6. restart services if installed -------------------------------------------
 restarted=0
 for svc in jarvis.service jarvis-ui.service; do
   if systemctl --user list-unit-files "$svc" 2>/dev/null | grep -q "$svc"; then
@@ -160,7 +185,7 @@ else
   say "services not installed — run scripts/install_prod_service.sh once to enable them"
 fi
 
-# --- 6. notify Telegram (best-effort) -------------------------------------------
+# --- 7. notify Telegram (best-effort) -------------------------------------------
 notify_telegram() {
   local text="🚀 Shipped $TAG to production ($PROD_DIR)"
   if [ "$DRY_RUN" = 1 ]; then
