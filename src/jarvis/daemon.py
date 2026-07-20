@@ -197,8 +197,10 @@ class Daemon:
         Primary path: dispatch a NEW background agent resuming the worker's session
         (`claude --bg --resume`) — full context carries over and the worker stays
         visible in the agents view; the SessionStart hook rebinds the work order to
-        the fork's session id. Fallback: release the idle session and resume it
-        headlessly (stop + `--resume -p`).
+        the fork's session id, and the superseded session is stopped once the fork
+        is up — so a multi-turn conversation keeps exactly one live agent, not one
+        per turn. Fallback: release the idle session and resume it headlessly
+        (stop + `--resume -p`).
         """
         from .dispatch import _write_worker_settings, worker_name
 
@@ -221,6 +223,13 @@ class Daemon:
                 store.mark_message(msg["id"], "delivered")
                 store.add_event(wo["id"], "message_delivered",
                                 {"msg_id": msg["id"], "via": "bg-resume", "job": job_id})
+                # Retire the session we just forked from — strictly AFTER the fork
+                # exists, so the conversation is never left without a live agent.
+                # Otherwise every turn leaks a spent bg agent into the agents view.
+                if bg_id and claude_cli.stop_session(bg_id):
+                    store.add_event(wo["id"], "session_retired",
+                                    {"bg_id": bg_id, "session_id": wo["session_id"],
+                                     "reason": "superseded by resume-fork"})
                 if store.get_work_order(wo["id"])["status"] in ("waiting_input", "needs_review"):
                     store.set_status(wo["id"], "running")
                     store.clear_attention(wo["id"])
