@@ -85,10 +85,21 @@
 <h2>Timeline</h2>
 <div class="panel">
   <ul class="timeline">
-    {% for e in events %}
-    <li>{{ fmt_age(e.ts) }} ago — {{ e.kind }} {{ e.payload if e.payload not in ('{}', none) else '' }}</li>
+    {% for e in timeline %}
+    <li{% if e.level == 'debug' %} class="dbg"{% endif %}>
+      {{ fmt_age(e.ts) }} ago — <strong>{{ e.label }}</strong>{% if e.detail %}
+      <span class="detail" style="white-space: pre-wrap;">{{ e.detail }}</span>{% endif %}
+    </li>
+    {% else %}
+    <li class="empty">nothing to report yet</li>
     {% endfor %}
   </ul>
+  {% if debug %}
+    <a class="sub" href="/wo/{{ project }}/{{ wo.id }}">Hide debug logs</a>
+  {% elif debug_count %}
+    <a class="sub" href="/wo/{{ project }}/{{ wo.id }}?debug=1">Show debug logs
+      ({{ debug_count }})</a>
+  {% endif %}
 </div>
 
 {% endblock %}

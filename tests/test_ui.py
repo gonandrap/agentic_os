@@ -209,3 +209,32 @@ def test_neo_teach_directly(client):
     assert r.status_code == 303
     page = client.get("/neo")
     assert "prefer uv over pip" in page.text
+
+
+def test_timeline_hides_plumbing_until_debug_is_requested(client, daemon, project):
+    """The default timeline reads as a story; delivery receipts and session hooks
+    only appear behind the debug toggle."""
+    wo = ops.create_work_order("proj_a", "export citations",
+                               description="BibTeX drops DOIs")
+    daemon.tick()
+    store = ProjectStore(project)
+    store.add_event(wo["id"], "turn_ended")
+    store.add_event(wo["id"], "hook:Stop", {"session_id": "a768", "cwd": "/x"})
+    store.add_event(wo["id"], "message_delivered", {"msg_id": 1, "via": "bg-resume"})
+    store.queue_message(wo["id"], "also cover EndNote", source="ui")
+    ops.finish(wo["id"], "exporter fixed")
+
+    plain = client.get(f"/wo/proj_a/{wo['id']}")
+    assert plain.status_code == 200
+    assert "Work order created" in plain.text
+    assert "Finished" in plain.text and "exporter fixed" in plain.text
+    assert "also cover EndNote" in plain.text
+    for noise in ("turn_ended", "hook:Stop", "message_delivered", "bg-resume"):
+        assert noise not in plain.text
+    assert "Show debug logs" in plain.text
+
+    debug = client.get(f"/wo/proj_a/{wo['id']}?debug=1")
+    assert debug.status_code == 200
+    for noise in ("turn_ended", "hook:Stop", "message_delivered"):
+        assert noise in debug.text
+    assert "Hide debug logs" in debug.text
