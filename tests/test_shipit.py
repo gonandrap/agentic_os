@@ -26,6 +26,7 @@ def _git(repo: Path, *args: str) -> None:
 
 
 def _make_repo(tmp_path: Path) -> Path:
+    """A dev clone whose `origin` is a bare remote — git is the source of truth."""
     repo = tmp_path / "dev"
     (repo / "scripts").mkdir(parents=True)
     shutil.copy(SHIPIT, repo / "scripts" / "shipit.sh")
@@ -37,6 +38,12 @@ def _make_repo(tmp_path: Path) -> Path:
     _git(repo, "config", "user.name", "Test")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "init")
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+                   check=True, capture_output=True, text=True)
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "push", "-q", "-u", "origin", "main")
     return repo
 
 
@@ -87,6 +94,47 @@ def test_deploys_tag_and_restarts(tmp_path):
     out = r.stdout
     assert "checkout -f 'jarvis-0.2.0'" in out
     assert "jarvis-0.2.0" in out
+
+
+def test_pushes_release_branch_and_tag_to_origin(tmp_path):
+    """Git is the source of truth: nothing a release depends on stays local-only."""
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", "0.2.0")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "push origin 'refs/heads/release/jarvis-0.2.0" in out
+    assert "push origin 'refs/tags/jarvis-0.2.0'" in out
+
+
+def test_deploys_from_the_git_remote_not_the_local_checkout(tmp_path):
+    """Production tracks origin, so what runs in prod is what's on the remote."""
+    repo = _make_repo(tmp_path)
+    origin = str(tmp_path / "origin.git")
+    r = _dry_run(repo, tmp_path / "prod", "0.2.0")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert f"clone '{origin}'" in out
+    assert f"remote set-url origin '{origin}'" in out
+    assert f"clone '{repo}'" not in out
+
+
+def test_refuses_when_main_is_ahead_of_origin(tmp_path):
+    """An unpushed commit means the release wouldn't be reproducible from git."""
+    repo = _make_repo(tmp_path)
+    (repo / "local_only.txt").write_text("not pushed\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "local only")
+    r = _dry_run(repo, tmp_path / "prod", "0.2.0")
+    assert r.returncode != 0
+    assert "origin/main" in (r.stdout + r.stderr)
+
+
+def test_refuses_without_an_origin_remote(tmp_path):
+    repo = _make_repo(tmp_path)
+    _git(repo, "remote", "remove", "origin")
+    r = _dry_run(repo, tmp_path / "prod", "0.2.0")
+    assert r.returncode != 0
+    assert "origin" in (r.stdout + r.stderr)
 
 
 def test_explicit_version_is_respected(tmp_path):
