@@ -7,6 +7,7 @@ Grouped commands:
   jarvis backlog add|list|promote|done
   jarvis learn add|list|search
   jarvis notify / jarvis inbox
+  jarvis bug report                       file a Jarvis OS bug (GitHub issue + ping)
   jarvis ui                               web dashboard
   jarvis daemon run                       (internal) foreground daemon
   jarvis _hook                            (internal) Claude Code hook handler
@@ -232,6 +233,20 @@ def build_parser() -> argparse.ArgumentParser:
     ib.add_parser("list")
     i = ib.add_parser("ack")
     i.add_argument("inbox_id", nargs="?", type=int, help="omit to ack everything")
+
+    # bug reports ----------------------------------------------------------------
+    bug = sub.add_parser(
+        "bug", help="report a bug in Jarvis OS itself").add_subparsers(
+        dest="bug_cmd", required=True)
+    br = bug.add_parser("report", help="file a Jarvis OS bug as a GitHub issue")
+    br.add_argument("title")
+    br.add_argument("--description", "-d", required=True,
+                    help="what happened, in Jarvis OS terms")
+    br.add_argument("--expected", "-e", required=True, help="what you expected")
+    br.add_argument("--actual", "-a", required=True, help="what you got instead")
+    br.add_argument("--steps", default="", help="optional steps to reproduce")
+    br.add_argument("--project", default="", help="reporting project (default: $JARVIS_PROJECT)")
+    br.add_argument("--wo-id", default="", help="reporting work order (default: $JARVIS_WO_ID)")
 
     # ui / daemon / hook ---------------------------------------------------------------------------
     u = sub.add_parser("ui", help="run the web dashboard")
@@ -587,6 +602,15 @@ def cmd_notify(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bug(args: argparse.Namespace) -> int:
+    from .bugreport import report_bug
+    result = report_bug(title=args.title, description=args.description,
+                        expected=args.expected, actual=args.actual, steps=args.steps,
+                        project=args.project, wo_id=args.wo_id)
+    _print(result, args.json)
+    return 0
+
+
 def cmd_inbox(args: argparse.Namespace) -> int:
     from .central_store import CentralStore
     central = CentralStore()
@@ -637,6 +661,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "_hook":
         from .hooks import main_hook
         return main_hook()
+    from .bugreport import BugReportError
     from .catalog import CatalogError
     from .ops import OpsError
     try:
@@ -660,13 +685,15 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_notify(args)
         if args.cmd == "inbox":
             return cmd_inbox(args)
+        if args.cmd == "bug":
+            return cmd_bug(args)
         if args.cmd == "ui":
             return cmd_ui(args)
         if args.cmd == "daemon" and args.d_cmd == "run":
             from .daemon import run_daemon
             run_daemon(args.catalog, poll_interval=args.poll_interval)
             return 0
-    except (OpsError, CatalogError) as e:
+    except (OpsError, CatalogError, BugReportError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     return 0

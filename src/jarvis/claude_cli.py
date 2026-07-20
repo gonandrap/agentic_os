@@ -111,6 +111,7 @@ def spawn_background(
     worktree: str | None = None,
     settings_file: Path | None = None,
     resume_session_id: str | None = None,
+    add_dirs: list[Path] | None = None,
 ) -> str | None:
     """Spawn a native Claude Code background session; returns the job id if the
     CLI reported one.
@@ -124,6 +125,10 @@ def spawn_background(
     (fork semantics: full context carried over, fresh session id — verified live).
     This is how user feedback is delivered while keeping the worker visible in the
     agents view.
+
+    add_dirs are extra directories the session may reach; Claude also loads skills from
+    each `<dir>/.claude/skills/`, which is how the OS ships its own skills to a worker
+    whose worktree contains only tracked files.
 
     settings_file carries the FULL settings for the worker (OS-injected project
     settings merged with per-work-order env like JARVIS_WO_ID). It must be passed
@@ -145,6 +150,8 @@ def spawn_background(
         args += ["--append-system-prompt", append_system_prompt]
     if settings_file:
         args += ["--settings", str(settings_file)]
+    for d in add_dirs or []:
+        args += ["--add-dir", str(d)]
     args.append(prompt)
     out = _run(args, cwd=cwd, timeout=120)
     m = _JOB_ID_RE.search(out or "")

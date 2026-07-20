@@ -112,9 +112,11 @@ def test_build_settings_hash_stable():
 def test_operation_md_preserves_specifics(project):
     bootstrap_project(spec(project))
     op = project / "OPERATION.md"
-    text = op.read_text().replace("template v2", "template v0")  # simulate old version
+    from jarvis.bootstrap import TEMPLATE_VERSION
+    current = f"template v{TEMPLATE_VERSION}"
+    text = op.read_text().replace(current, "template v0")  # simulate old version
     text = text.replace("_None yet._", "Run `make test` before shipping.")
     op.write_text(text)
     bootstrap_project(spec(project))
     assert "Run `make test` before shipping." in op.read_text()
-    assert "template v2" in op.read_text().split("\n", 1)[0]
+    assert current in op.read_text().split("\n", 1)[0]
