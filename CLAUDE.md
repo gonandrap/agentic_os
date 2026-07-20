@@ -37,6 +37,10 @@ jarvis start --catalog <path-to-catalog>   # boot the OS (user catalogs live unt
 jarvis stop
 jarvis wo create <project> "title" -d "details" [--model m]
 jarvis wo list [project] / show <id> / send <id> "msg" / review <id> / cancel <id>
+jarvis wo hide <id> / unhide <id>          # declutter: keeps the record, drops it from
+                                           # listings, the summary and the attention list
+jarvis wo delete <id> --yes                # irreversible: erases the WO and its whole
+                                           # history (timeline, messages, assumptions)
 jarvis wo resume-auto <id>                 # unstick a worker blocked on a permission prompt (flip to auto + resume)
 jarvis neo list                            # Neo's Q&A: pending reviews + escalations
 jarvis neo review <qid> [--correct "…"]    # approve or teach; corrections become learnings
