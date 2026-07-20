@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS work_orders (
     append_system_prompt TEXT,
     session_id TEXT,
     bg_id TEXT,
+    job_id TEXT,        -- supervisor job of the worker's most recent turn
+    reply_job_id TEXT,  -- job whose final assistant message is already recorded
     worktree TEXT,
     branch TEXT,
     needs_attention INTEGER NOT NULL DEFAULT 0,
@@ -92,6 +94,12 @@ CREATE INDEX IF NOT EXISTS idx_msgs_status ON wo_messages(status);
 CREATE INDEX IF NOT EXISTS idx_notif_status ON notifications(status);
 """
 
+# Columns added after the first release. `CREATE TABLE IF NOT EXISTS` is a no-op on an
+# existing database, so new columns must be ALTERed in on open.
+ADDED_COLUMNS = {
+    "work_orders": {"job_id": "TEXT", "reply_job_id": "TEXT"},
+}
+
 
 class ProjectStore:
     def __init__(self, project_path: str | Path):
@@ -99,6 +107,17 @@ class ProjectStore:
         self.db_path = project_db_path(self.project_path)
         self.conn = db.connect(self.db_path)
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        for table, columns in ADDED_COLUMNS.items():
+            have = {
+                r["name"]
+                for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, decl in columns.items():
+                if name not in have:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def close(self) -> None:
         self.conn.close()
@@ -160,6 +179,21 @@ class ProjectStore:
             rows = self.conn.execute(
                 "SELECT * FROM work_orders ORDER BY created_at DESC LIMIT ?", (limit,)
             ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def work_orders_awaiting_reply(self) -> list[dict[str, Any]]:
+        """Work orders whose latest spawned turn has no recorded final message yet.
+
+        Status-agnostic on purpose: a worker that calls `jarvis wo finish` flips itself
+        to completed before its session goes idle, so filtering by open statuses would
+        miss exactly the turn that matters most.
+        """
+        rows = self.conn.execute(
+            """SELECT * FROM work_orders
+               WHERE job_id IS NOT NULL
+                 AND (reply_job_id IS NULL OR reply_job_id != job_id)
+               ORDER BY updated_at"""
+        ).fetchall()
         return db.rows_to_dicts(rows)
 
     def claim_next_pending(self) -> dict[str, Any] | None:
@@ -224,6 +258,23 @@ class ProjectStore:
             (wo_id, db.now(), direction, content, source, status),
         )
         return int(cur.lastrowid)
+
+    def record_agent_reply(self, wo_id: str, content: str, source: str = "worker") -> int:
+        """Persist a worker's final assistant message into the work order record.
+
+        The work order is the representation of the worker's conversation: the user and
+        Neo decide from it and never open the session, so the full reply is stored, not
+        just the `wo finish --summary` headline.
+        """
+        return self.queue_message(wo_id, content, source=source,
+                                  direction="agent_to_user", status="delivered")
+
+    def agent_replies(self, wo_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM wo_messages WHERE wo_id=? AND direction='agent_to_user' ORDER BY ts",
+            (wo_id,),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
 
     def queued_messages(self, wo_id: str | None = None) -> list[dict[str, Any]]:
         if wo_id:

@@ -260,9 +260,104 @@ def test_message_delivery_when_idle(started, fake_claude, project):
 
     msgs = store.list_messages(wo["id"])
     assert msgs[0]["status"] == "delivered"
-    # worker's reply (from the fork's job result) recorded as agent_to_user
-    replies = [m for m in msgs if m["direction"] == "agent_to_user"]
-    assert replies and "ack:" in replies[0]["content"]
+
+    # The fork's reply is recovered by the next reconcile pass, not inline: delivery
+    # runs on a small pool and a worker turn can take many minutes.
+    daemon.tick_count = 0
+    daemon.tick()
+
+    replies = [m["content"] for m in store.list_messages(wo["id"])
+               if m["direction"] == "agent_to_user"]
+    assert any("ack:" in r for r in replies), replies
+
+
+def test_worker_final_message_is_recorded_alongside_the_summary(
+    started, fake_claude, project
+):
+    """The work order must stand alone — the user and Neo decide from it and never open
+    the worker session. `--summary` is a headline; the worker's full closing message is
+    kept next to it. Regression: `wo finish` flips the order to `completed` before its
+    session goes idle, so a status-filtered sweep would drop exactly that reply."""
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    sid = bind_session(daemon, project, wo["id"])
+
+    ops.finish(wo["id"], "one-line headline")
+    assert store.get_work_order(wo["id"])["status"] == "completed"
+
+    fake_claude.set_session_state(sid, "done")
+    daemon.tick_count = 0
+    daemon.tick()
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["result_summary"] == "one-line headline"   # headline survives
+    replies = [m["content"] for m in store.list_messages(wo["id"])
+               if m["direction"] == "agent_to_user"]
+    assert any(r.startswith("final:") for r in replies), replies
+    assert "worker_reply" in [e["kind"] for e in store.list_events(wo["id"])]
+
+    # Capture is idempotent: further passes must not duplicate the reply.
+    daemon.tick_count = 0
+    daemon.tick()
+    again = [m["content"] for m in store.list_messages(wo["id"])
+             if m["direction"] == "agent_to_user"]
+    assert again == replies
+
+
+def test_missing_job_result_does_not_stall_the_work_order(started, fake_claude, project):
+    """If the supervisor never publishes a result, give up after a bounded number of
+    passes rather than holding the work order open forever."""
+    import shutil
+
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    sid = bind_session(daemon, project, wo["id"])
+
+    fake_claude.set_session_state(sid, "done")
+    job_id = store.get_work_order(wo["id"])["job_id"]
+    shutil.rmtree(fake_claude.dir / "jobs" / job_id)  # result file never appears
+
+    for _ in range(4):
+        daemon.tick_count = 0
+        daemon.tick()
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["reply_job_id"] == job_id          # marked resolved, stops retrying
+    assert fresh["status"] == "needs_review"        # settled, not stuck in `running`
+    assert "worker_reply_lost" in [e["kind"] for e in store.list_events(wo["id"])]
+
+
+def test_delivery_retires_the_previous_session(started, fake_claude, project):
+    """Each delivered turn forks a fresh bg agent; the one it forked from is stopped
+    afterwards, so a multi-turn conversation keeps exactly one live agent per WO."""
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    sid = bind_session(daemon, project, wo["id"])
+
+    def turn(text: str, current_sid: str) -> str:
+        fake_claude.set_session_state(current_sid, "done")  # worker idle → deliverable
+        ops.send_message(wo["id"], text, source="ui")
+        daemon.tick_count = 0
+        daemon.tick()
+        daemon.delivery_pool.shutdown(wait=True)
+        from concurrent.futures import ThreadPoolExecutor
+        daemon.delivery_pool = ThreadPoolExecutor(max_workers=2)
+        return bind_session(daemon, project, wo["id"])
+
+    sid = turn("first follow-up", sid)
+    sid = turn("second follow-up", sid)
+
+    mine = [s for s in fake_claude.sessions if s["name"].startswith(f"[WO {wo['id']}]")]
+    assert len(mine) == 1, f"stale sessions accumulated: {[s['sessionId'] for s in mine]}"
+    assert mine[0]["sessionId"] == sid
+    # and the WO is bound to the survivor, not to a session that was stopped
+    assert store.get_work_order(wo["id"])["session_id"] == sid
 
 
 def test_finish_and_assumption_review(started, project):
