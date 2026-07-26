@@ -89,6 +89,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("status", help="whole-OS status; flags what needs your attention")
     sp.add_argument("--attention", action="store_true", help="only show attention items")
 
+    sp = sub.add_parser("doctor", help="check the OS's own post-conditions (invariants)")
+    sp.add_argument("project", nargs="?", help="one project (default: the whole fleet)")
+    sp.add_argument("--repair", action="store_true",
+                    help="apply the repairs instead of only reporting them")
+    sp.add_argument("--catalog", help="catalog to read the fleet from")
+    sp.add_argument("--json", action="store_true")
+
     sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
     sp.add_argument("path", help="project directory")
     sp.add_argument("--name", help="project name (default: directory name)")
@@ -332,6 +339,30 @@ def cmd_status(args: argparse.Namespace) -> int:
     if st["backlog"]["open"]:
         print(f"\n🗂 backlog: {st['backlog']['open']} open items — `jarvis backlog list`")
     return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    from . import ops
+    res = ops.run_doctor(project=args.project, repair=args.repair,
+                         catalog_path=args.catalog)
+    if args.json:
+        _print(res, True)
+        return 1 if res["violations"] else 0
+    if not res["violations"]:
+        print("✓ all OS invariants hold")
+        return 0
+    verb = "repaired" if res["repair"] else "found (run with --repair to fix)"
+    print(f"⚠ {res['violations']} invariant violation(s) {verb}:\n")
+    for p in res["projects"]:
+        if p.get("error"):
+            print(f"• {p['project']}: {p['error']}")
+        for v in p["violations"]:
+            where = f" {v['wo_id']}" if v["wo_id"] else ""
+            print(f"• [{p['project']}]{where} {v['invariant']}")
+            print(f"    {v['detail']}")
+            if v["repaired"]:
+                print(f"    → {'fixed' if res['repair'] else 'would fix'}: {v['repair']}")
+    return 1
 
 
 def cmd_adopt(args: argparse.Namespace) -> int:
@@ -671,6 +702,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_stop(args)
         if args.cmd == "status":
             return cmd_status(args)
+        if args.cmd == "doctor":
+            return cmd_doctor(args)
         if args.cmd == "adopt":
             return cmd_adopt(args)
         if args.cmd == "wo":

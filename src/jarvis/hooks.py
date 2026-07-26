@@ -210,7 +210,23 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
                 store.update_work_order(wo_id, session_id=session_id)
 
         elif event == "Notification":
-            # Fired when the session needs attention (permission request, idle prompt).
+            # Fired when the session needs attention — but for two very different
+            # reasons: a real mid-work block (permission request), or the idle prompt
+            # Claude Code raises ~1 min after a turn ends, which every finished worker
+            # triggers. The payload does not distinguish them.
+            #
+            # So the work order's own state decides. If it has already settled (the
+            # worker called `jarvis wo finish`, or the reconciler filed it for review),
+            # this is the idle prompt and there is nothing to report: acting on it
+            # overwrites the real reason ("2 assumptions pending your review") with a
+            # generic "Claude is waiting for your input" and sends the user hunting for
+            # a question that does not exist. Verified against two live work orders.
+            if wo["status"] not in ("running", "dispatching", "waiting_input"):
+                store.add_event(wo_id, "notification_ignored", {
+                    "message": payload.get("message"),
+                    "reason": f"work order already {wo['status']}",
+                })
+                return {"wo_id": wo_id, "event": event, "ignored": True}
             message = payload.get("message") or "Worker needs attention"
             if wo["status"] in ("running", "dispatching"):
                 store.set_status(wo_id, "waiting_input")
