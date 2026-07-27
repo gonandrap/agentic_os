@@ -114,6 +114,8 @@ if have uv; then
   ok "uv $(uv --version 2>/dev/null | awk '{print $2}')"
 elif [ -n "$PYTHON" ]; then
   ok "python $("$PYTHON" -c 'import platform; print(platform.python_version())') ($PYTHON)"
+elif have pipx; then
+  ok "pipx ($(command -v pipx))"
 else
   die "need uv, pipx, or Python 3.11+ — install one of:
      uv       curl -fsSL https://astral.sh/uv/install.sh | sh
