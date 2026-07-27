@@ -58,6 +58,16 @@ def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
     return proc.stdout
 
 
+# Claude Code's session-state vocabulary, as emitted by `claude agents --json` and by
+# the supervisor's own `~/.claude/jobs/<id>/state.json` (verified against CLI 2.1.220).
+# NOTE: there is no "running" here — that word belongs to Jarvis's *work order* status
+# vocabulary (see project_store.WO_STATUSES). Conflating the two silently misreads every
+# healthy worker as needing the user, so always go through the helpers below.
+ACTIVE_STATES = frozenset({"working", "starting", "queued"})
+BLOCKED_STATES = frozenset({"blocked"})
+FINISHED_STATES = frozenset({"done", "failed", "cancelled"})
+
+
 @dataclass
 class BgSession:
     """A background session as reported by `claude agents --json`."""
@@ -65,9 +75,24 @@ class BgSession:
     session_id: str
     cwd: str
     name: str
-    state: str  # running | blocked | done | ...
+    state: str  # working | blocked | done | failed | cancelled | ...
     kind: str = "background"
     started_at: float | None = None
+
+    @property
+    def is_active(self) -> bool:
+        """The agent is making progress on its own — nothing is wanted from the user."""
+        return self.state in ACTIVE_STATES
+
+    @property
+    def is_blocked(self) -> bool:
+        """The agent stopped mid-turn on a permission prompt or a question."""
+        return self.state in BLOCKED_STATES
+
+    @property
+    def is_finished(self) -> bool:
+        """The turn ended, whether it succeeded, failed or was cancelled."""
+        return self.state in FINISHED_STATES
 
 
 def list_background_sessions(cwd: Path | None = None, include_done: bool = True) -> list[BgSession]:
