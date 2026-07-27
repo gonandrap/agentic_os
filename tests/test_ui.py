@@ -138,6 +138,30 @@ def test_inbox_page_and_ack(client, daemon, project):
     assert "inbox empty" in client.get("/inbox").text
 
 
+def test_dashboard_clears_unacked_banner_after_ack(client, daemon, project):
+    """Acking every inbox item must clear the "unacked notification" banner on
+    the main dashboard, not just the /inbox page."""
+    store = ProjectStore(project)
+    store.add_notification("disk almost full", level="critical")
+    daemon.tick()
+
+    dash = client.get("/").text
+    assert "unacked notification" in dash
+
+    client.post("/inbox/ack", data={})
+
+    dash_after = client.get("/").text
+    assert "unacked notification" not in dash_after
+
+
+def test_dashboard_is_never_cached(client):
+    """The dashboard state (unacked count, attention items) changes on every
+    action, so browsers must always revalidate it — never serve a stale copy
+    from disk cache or history (bfcache) after the user navigates back."""
+    r = client.get("/")
+    assert r.headers.get("cache-control", "") == "no-store"
+
+
 def test_backlog_page_promote_blocked_then_forced(client, project):
     central = CentralStore()
     a = central.add_backlog("proj_a", "foundation")
