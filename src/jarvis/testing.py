@@ -190,8 +190,31 @@ def fake_gh(tmp_path, monkeypatch):
     return Handle()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def isolate_jarvis_home(tmp_path_factory):
+    """Point the whole session at scratch state before any test runs.
+
+    Tests are executed by workers whose JARVIS_HOME is the *production* state dir,
+    and anything a test drops in the real central inbox is picked up by the live
+    daemon and pushed to the real sinks — a stray write becomes a real Telegram
+    about a work order that never existed. So isolation cannot be opt-in: a test
+    that simply forgets to request `jarvis_home` must still land in a tmpdir.
+
+    Session-scoped on purpose. Function-scoped monkeypatching restores the old
+    value at teardown, which hands the real home back to anything still running
+    (a daemon thread that outlived its test, a subprocess mid-flight). This
+    fixture keeps the floor under them for the entire run.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setenv("JARVIS_HOME", str(tmp_path_factory.mktemp("jarvis-home-session")))
+    yield
+    mp.undo()
+
+
 @pytest.fixture()
 def jarvis_home(tmp_path, monkeypatch):
+    """A home of this test's own. Narrows the session-wide scratch home above;
+    request it whenever a test inspects or asserts on central state."""
     home = tmp_path / "jarvis-home"
     monkeypatch.setenv("JARVIS_HOME", str(home))
     return home

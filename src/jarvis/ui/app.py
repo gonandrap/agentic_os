@@ -227,6 +227,10 @@ def create_app() -> FastAPI:
         neo = NeoStore()
         try:
             counts = neo.counts()
+            # Oldest first: that is the order Neo drains them, and the oldest is the
+            # one most likely to be stuck.
+            in_flight = list(reversed(
+                neo.list_questions(statuses=("queued", "answering"))))
             escalated = neo.list_questions(statuses=("escalated", "failed"))
             unreviewed = neo.list_questions(statuses=("answered",),
                                             review_status="unreviewed")
@@ -239,8 +243,8 @@ def create_app() -> FastAPI:
         finally:
             neo.close()
         return render(request, "neo.html", active="neo", counts=counts,
-                      escalated=escalated, unreviewed=unreviewed,
-                      history=history, learnings=learnings)
+                      in_flight=in_flight, escalated=escalated,
+                      unreviewed=unreviewed, history=history, learnings=learnings)
 
     @app.get("/gates", response_class=HTMLResponse)
     def gates_page(request: Request):
@@ -276,8 +280,9 @@ def create_app() -> FastAPI:
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/review")
-    def review(name: str, wo_id: str, decision: str = Form(...)):
-        ops.review_work_order(wo_id, accept=(decision == "accept"))
+    def review(name: str, wo_id: str, decision: str = Form(...),
+               feedback: str = Form("")):
+        ops.review_work_order(wo_id, accept=(decision == "accept"), feedback=feedback)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/cancel")

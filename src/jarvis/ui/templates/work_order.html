@@ -84,12 +84,16 @@
     <span class="sub mono">{{ fmt_age(a.ts) }} ago</span></div>
   {% endfor %}
   <div class="row">
-    <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/review">
+    <form method="post" action="/wo/{{ project }}/{{ wo.id }}/review"
+          style="flex:1; display:flex; gap:8px; align-items:center">
+      <input type="text" name="feedback" style="flex:1"
+             placeholder="Why? (optional — teaches Neo, and on reject goes to the worker as guidance)">
       <button name="decision" value="accept" class="accept">Accept all</button>
       <button name="decision" value="reject" class="danger">Reject all</button>
     </form>
-    <span class="sub">rejecting keeps the work order flagged — send guidance below</span>
   </div>
+  <div class="row"><span class="sub">Rejecting without a reason keeps the work order
+    flagged — send guidance below.</span></div>
 </div>
 {% endif %}
 
