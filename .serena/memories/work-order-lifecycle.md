@@ -71,9 +71,17 @@ Binary is `JARVIS_CLAUDE_BIN` or `claude` (`:22`).
 `JARVIS_PROJECT_PATH`, `JARVIS_HOME`, `PATH` (`:63-72`), written to
 `<project>/.jarvis/worker-settings/<wo-id>.json` (`:74-76`).
 
-**Prompt** — `build_worker_prompt()` (`dispatch.py:86`), including central knowledge from
-`CentralStore.relevant_knowledge()` (`dispatch.py:148`). The worker sees ONLY this prompt,
-which is why WO descriptions must carry the user's full intent.
+**Prompt** — `build_worker_prompt()` (`dispatch.py:136`). The worker sees ONLY this
+prompt, which is why WO descriptions must carry the user's full intent.
+
+The knowledge base is **indexed into** it, not pasted into it: `CentralStore.knowledge_brief()`
+(`central_store.py:369`, called at `dispatch.py:198`) returns a bounded
+`KnowledgeBrief` — entries tagged `pinned` in full (capped by `os.knowledge_inject_limit`), then
+one headline + id per entry selected round-robin across topics (capped by
+`os.knowledge_digest_limit`/`_chars`), then a by-topic count of what did not fit.
+`render_knowledge_block()` (`dispatch.py:86`) renders it and tells the worker to fetch
+full text with `jarvis learn search|show|list|topics`. So prompt cost is flat in the size of the
+knowledge base, and a worker that needs an entry pays one tool call for it.
 
 ## Other `claude` invocation shapes
 
