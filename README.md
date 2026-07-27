@@ -52,7 +52,7 @@ uv tool install --editable .
 ```json
 {
   "os": {
-    "defaults": { "model": "sonnet", "permission_mode": "auto", "max_concurrent": 5 },
+    "defaults": { "model": "claude-opus-5", "permission_mode": "auto", "max_concurrent": 5 },
     "notifications": { "sinks": ["log", "telegram"] }
   },
   "projects": [

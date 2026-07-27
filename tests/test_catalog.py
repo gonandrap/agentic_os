@@ -9,9 +9,9 @@ def test_minimal_catalog(tmp_path):
     f = tmp_path / "c.json"
     f.write_text(json.dumps({"projects": [{"name": "a", "path": str(tmp_path)}]}))
     cat = load_catalog(f)
-    assert cat.os.default_model == "sonnet"
+    assert cat.os.default_model == "claude-opus-5"
     assert cat.projects[0].name == "a"
-    assert cat.projects[0].worker.model == "sonnet"
+    assert cat.projects[0].worker.model == "claude-opus-5"
     assert cat.projects[0].worker.permission_mode == "auto"
     assert cat.projects[0].max_concurrent == 5
 

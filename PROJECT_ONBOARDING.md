@@ -16,7 +16,7 @@ entry per project:
     {
       "name": "my_project",
       "path": "~/workspace/my_project",
-      "worker": {"model": "sonnet", "permission_mode": "auto"},
+      "worker": {"model": "claude-opus-5", "permission_mode": "auto"},
       "max_concurrent": 5,
       "settings_overrides": {},
       "append_system_prompt": ""
