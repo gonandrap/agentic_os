@@ -195,7 +195,7 @@ class Daemon:
             # Deliverable only when the session is idle (done) or already released:
             # `claude --resume` refuses sessions owned by a live bg agent, and
             # injecting into a mid-turn worker would interleave anyway.
-            if sess is not None and sess.state != "done":
+            if sess is not None and not sess.is_finished:
                 continue
             self.in_flight_deliveries.add(msg["id"])
             store.add_event(wo["id"], "delivering", {"msg_id": msg["id"]})
@@ -435,7 +435,7 @@ class Daemon:
         # is already `completed`, so the status-filtered loop below would never see it.
         for wo in store.work_orders_awaiting_reply():
             sess = by_session_id.get(wo.get("session_id") or "")
-            if sess is None or sess.state == "done":
+            if sess is None or sess.is_finished:
                 self.capture_worker_reply(store, wo)
 
         # Settle framework work orders against live session states.
@@ -470,12 +470,18 @@ class Daemon:
                         level="warning", wo_id=wo["id"], source="reconciler",
                     )
                 continue
-            if sess.state == "running" and wo["status"] != "running":
+            if sess.is_active and wo["status"] != "running":
+                # The agent is making progress again, so whatever stalled it is gone.
+                # This direction matters as much as the one below: without it a work
+                # order that blocked once stays "needs you" forever and the UI keeps
+                # asking for input the worker no longer wants.
                 store.set_status(wo["id"], "running")
-            elif sess.state == "blocked" and wo["status"] == "running":
+                if not store.pending_assumptions(wo["id"]):
+                    store.clear_attention(wo["id"])
+            elif sess.is_blocked and wo["status"] == "running":
                 store.set_status(wo["id"], "waiting_input")
                 store.flag_attention(wo["id"], "worker blocked (permission or input needed)")
-            elif sess.state == "done":
+            elif sess.is_finished:
                 if not self.capture_worker_reply(store, wo):
                     continue  # settle only once the record holds what the worker said
                 fresh = store.get_work_order(wo["id"])
@@ -498,7 +504,7 @@ class Daemon:
                 continue
             if store.find_by_session(sess.session_id):
                 continue
-            if sess.state == "done":
+            if sess.is_finished:
                 continue  # only surface live ad-hoc sessions
             wo = store.create_work_order(
                 title=sess.name or f"ad-hoc session {sess.id}",
@@ -507,8 +513,13 @@ class Daemon:
                 origin="adhoc",
             )
             store.update_work_order(wo["id"], session_id=sess.session_id)
-            store.set_status(wo["id"], "running" if sess.state == "running" else "waiting_input")
-            log.info("[%s] adopted ad-hoc session %s as %s", project.name, sess.id, wo["id"])
+            if sess.is_blocked:
+                store.set_status(wo["id"], "waiting_input")
+                store.flag_attention(wo["id"], "worker blocked (permission or input needed)")
+            else:
+                store.set_status(wo["id"], "running")
+            log.info("[%s] adopted ad-hoc session %s (%s) as %s",
+                     project.name, sess.id, sess.state, wo["id"])
 
 
 def run_daemon(catalog_path: str | Path, poll_interval: float = 5.0,
