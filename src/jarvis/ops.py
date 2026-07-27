@@ -148,7 +148,18 @@ def run_doctor(project: str | None = None, repair: bool = False,
     the same checks with repair enabled on every reconcile tick — this is the manual
     handle for "is the OS lying to me right now?".
     """
-    from .invariants import check_project
+    from .invariants import check_catalog, check_project
+
+    # Catalog-level checks run whenever a catalog is resolvable at all: a gate that can
+    # never open is a fault in the configuration, visible before any work order exists.
+    config_violations: dict[str, list[Any]] = {}
+    try:
+        cat = resolve_catalog(catalog_path)
+    except (OpsError, CatalogError):
+        cat = None
+    if cat is not None:
+        for v in check_catalog(cat, project):
+            config_violations.setdefault(v.context.get("project", ""), []).append(v)
 
     if catalog_path:
         # Explicit catalog: works before the OS has ever been started, when the
@@ -180,6 +191,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
             found = check_project(store, repair=repair)
         finally:
             store.close()
+        found = [*config_violations.pop(p["name"], []), *found]
         total += len(found)
         results.append({
             "project": p["name"],
@@ -187,6 +199,18 @@ def run_doctor(project: str | None = None, repair: bool = False,
                 {"invariant": v.invariant, "wo_id": v.wo_id, "detail": v.detail,
                  "repaired": v.repaired, "repair": v.repair}
                 for v in found
+            ],
+        })
+    # A catalog project the registry doesn't know about still gets its config reported —
+    # a misconfigured gate matters most before the project has ever run.
+    for name, violations in config_violations.items():
+        total += len(violations)
+        results.append({
+            "project": name,
+            "violations": [
+                {"invariant": v.invariant, "wo_id": v.wo_id, "detail": v.detail,
+                 "repaired": v.repaired, "repair": v.repair}
+                for v in violations
             ],
         })
     return {"repair": repair, "violations": total, "projects": results}
@@ -222,7 +246,14 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 for wo in store.list_work_orders():
                     if wo["needs_attention"]:
                         flagged.setdefault(wo["id"], wo)
+                # Work orders held up by an escalated gate are reported once, below,
+                # by the item that actually carries the command to run. Listing the
+                # work order's own flag as well says the same thing twice and buries
+                # the actionable line.
+                gate_held = {a["wo_id"] for a in store.escalated_approvals()}
                 for wo in flagged.values():
+                    if wo["id"] in gate_held:
+                        continue
                     item = {
                         "project": p["name"], "wo_id": wo["id"],
                         "title": wo["title"], "status": wo["status"],
@@ -270,6 +301,11 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         try:
             neo_counts = neo.counts()
             for q in neo.list_questions(statuses=("escalated", "failed")):
+                if q.get("kind") == "approval":
+                    # Gate escalations get their own item below, with the command to run.
+                    # Reported here too, they would tell the user to `jarvis neo answer`
+                    # a question whose real resolution is `jarvis gate approve`.
+                    continue
                 attention.append({
                     "project": q["project"], "wo_id": q["wo_id"],
                     "title": f"Neo escalated: {q['question'][:80]}",
@@ -279,6 +315,26 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 })
         finally:
             neo.close()
+        # Gates Neo sent up. These are the only approval requests that cost the user
+        # anything: the rest were decided without them, which is the point.
+        gate_items = []
+        for name, path in registered_project_paths().items():
+            if not path.is_dir():
+                continue
+            store = ProjectStore(path)
+            try:
+                for a in store.escalated_approvals():
+                    gate_items.append({
+                        "project": name, "wo_id": a["wo_id"],
+                        "title": f"approve {a['kind']}: {a['command'][:60]}",
+                        "status": "gate_escalated",
+                        "reason": a["escalation_reason"] or "Neo declined to decide",
+                        "approval_id": a["id"],
+                        "decide": f"jarvis gate approve {a['id']} --reason \"...\"",
+                    })
+            finally:
+                store.close()
+        attention.extend(gate_items)
         return {
             "daemon": {
                 "running": pid is not None,
@@ -294,6 +350,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             },
             "backlog": {"open": len(backlog_open)},
             "neo": neo_counts,
+            "gates": {"awaiting_you": len(gate_items)},
             "healthy": pid is not None and not attention,
         }
     finally:
@@ -747,6 +804,198 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
     except OpsError:
         pass
     return {"question_id": question_id, "delivery": delivery}
+
+
+# -- gates (privileged-action approvals) --------------------------------------------------------
+
+def _project_gate_config(project_name: str):
+    """The project's gate config from the catalog, or an empty one.
+
+    An unreadable catalog yields "no gates", which fails closed for `jarvis gate
+    request`: with no gate enabled there is nothing to request, and the caller is told
+    so rather than getting a request nobody will ever act on.
+    """
+    from .gates import GateConfig
+
+    try:
+        catalog = resolve_catalog()
+    except (OpsError, CatalogError):
+        return GateConfig()
+    for spec in catalog.projects:
+        if spec.name == project_name:
+            return spec.gates
+    return GateConfig()
+
+
+def request_gate_approval(wo_id: str, command: str, why: str = "", evidence: str = "",
+                          project_name: str | None = None) -> dict[str, Any]:
+    """(Workers) ask for permission to run a privileged command, making the case for it.
+
+    The gate fires either way — running the command directly files a request too — but
+    this route carries a justification and evidence, and the reviewer sees only what is
+    written here. A worker that asks first is far more likely to be approved.
+    """
+    from . import gates
+    from .neo_store import NeoStore
+
+    name, path, wo = find_work_order(wo_id, project_name)
+    config = _project_gate_config(name)
+    if not config:
+        raise OpsError(
+            f"project {name!r} has no gates enabled, so there is nothing to request. "
+            f"Either the command needs no approval, or the catalog needs a `gates` "
+            f"entry for this project."
+        )
+    action = gates.classify(command, config)
+    if action is None:
+        raise OpsError(
+            f"that command does not trip any gate enabled for {name!r} "
+            f"(enabled: {sorted(config.enabled)}) — run it directly, no approval needed."
+        )
+
+    store = ProjectStore(path)
+    try:
+        existing = store.latest_approval_for(wo_id, action.kind, action.command)
+        if existing and existing["status"] == "pending":
+            return {"project": name, "wo_id": wo_id, "approval_id": existing["id"],
+                    "kind": action.kind, "status": "pending",
+                    "note": "an identical request is already under review — end your "
+                            "turn; the verdict arrives as your next user turn"}
+        grant = store.usable_grant(wo_id, action.kind, action.command)
+        if grant:
+            return {"project": name, "wo_id": wo_id, "approval_id": grant["id"],
+                    "kind": action.kind, "status": "approved",
+                    "note": "already approved — run the command as written"}
+        neo = NeoStore()
+        try:
+            approval, question = gates.file_request(
+                store, neo, name, wo, action, justification=why, evidence=evidence,
+            )
+        finally:
+            neo.close()
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "approval_id": approval["id"],
+            "kind": action.kind, "command": action.command,
+            "neo_question_id": question["id"], "status": "pending",
+            "note": "queued for review — END YOUR TURN; the verdict arrives as your "
+                    "next user turn"}
+
+
+def decide_gate(approval_id: int, approved: bool, reason: str = "",
+                project_name: str | None = None) -> dict[str, Any]:
+    """(User) open or refuse a gate directly, whatever Neo did or didn't say.
+
+    Also the resolution path for an escalation: Neo declining leaves the request pending
+    precisely so this can close it.
+    """
+    from . import gates
+    from .neo_store import NeoStore
+
+    if not approved and not reason.strip():
+        raise OpsError("a denial needs a reason — the worker acts on it")
+
+    name, path, approval = _find_approval(approval_id, project_name)
+    if approval["status"] != "pending":
+        raise OpsError(
+            f"approval {approval_id} is already {approval['status']}"
+            + (f" (by {approval['decided_by']})" if approval["decided_by"] else "")
+        )
+    store = ProjectStore(path)
+    try:
+        gates.apply_decision(store, approval_id, approved=approved,
+                             reason=reason or "approved by the user", decided_by="user")
+        store.clear_attention(approval["wo_id"])
+    finally:
+        store.close()
+    # The user has decided, so Neo's queued question (if it is still waiting) is moot.
+    neo = NeoStore()
+    try:
+        qid = approval["neo_question_id"]
+        q = neo.get(qid) if qid else None
+        if q and q["status"] in ("queued", "answering", "escalated", "failed"):
+            neo.record_answer(qid, "APPROVED" if approved else "DENIED",
+                              answered_by="user", reason=reason)
+            neo.review(qid, approved=True)  # user-authored ⇒ nothing to review
+    finally:
+        neo.close()
+    return {"project": name, "wo_id": approval["wo_id"], "approval_id": approval_id,
+            "decision": "approved" if approved else "denied",
+            "command": approval["command"],
+            "delivery": "jarvisd delivers the verdict when the worker is idle"}
+
+
+def _find_approval(approval_id: int, project_name: str | None = None
+                   ) -> tuple[str, Path, dict[str, Any]]:
+    """Locate an approval by id across registered projects.
+
+    Approval ids are per-project autoincrements, so two projects can hold the same id.
+    Ambiguity is reported rather than guessed at — silently opening the wrong project's
+    release gate is not an acceptable failure mode.
+    """
+    paths = registered_project_paths()
+    candidates = {project_name: paths[project_name]} if project_name else paths
+    if project_name and project_name not in paths:
+        raise OpsError(f"project {project_name!r} not registered")
+    hits: list[tuple[str, Path, dict[str, Any]]] = []
+    for name, path in candidates.items():
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            approval = store.get_approval(approval_id)
+        finally:
+            store.close()
+        if approval:
+            hits.append((name, path, approval))
+    if not hits:
+        raise OpsError(f"approval {approval_id} not found in any registered project")
+    if len(hits) > 1:
+        raise OpsError(
+            f"approval id {approval_id} exists in {[h[0] for h in hits]} — "
+            f"disambiguate with --project"
+        )
+    return hits[0]
+
+
+def list_gates(project_name: str | None = None, wo_id: str | None = None,
+               pending_only: bool = False) -> list[dict[str, Any]]:
+    """Approval requests across the fleet, newest first."""
+    paths = registered_project_paths()
+    if project_name:
+        if project_name not in paths:
+            raise OpsError(f"project {project_name!r} not registered")
+        paths = {project_name: paths[project_name]}
+    out: list[dict[str, Any]] = []
+    for name, path in paths.items():
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            store.expire_approvals()
+            rows = store.list_approvals(
+                wo_id, statuses=("pending",) if pending_only else None
+            )
+        finally:
+            store.close()
+        out.extend({**r, "project": name} for r in rows)
+    out.sort(key=lambda r: r["ts"], reverse=True)
+    return out
+
+
+def show_gate(approval_id: int, project_name: str | None = None) -> dict[str, Any]:
+    """One approval request in full, including the text the reviewer saw."""
+    from .neo_store import NeoStore
+
+    name, _path, approval = _find_approval(approval_id, project_name)
+    question = None
+    if approval["neo_question_id"]:
+        neo = NeoStore()
+        try:
+            question = neo.get(approval["neo_question_id"])
+        finally:
+            neo.close()
+    return {**approval, "project": name, "neo_question": question}
 
 
 # -- backlog ------------------------------------------------------------------------------------

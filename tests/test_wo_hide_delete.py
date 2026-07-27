@@ -76,17 +76,21 @@ def test_delete_work_order_cascades(project):
     store.record_agent_reply(wo["id"], "worker said hi")
     store.add_assumption(wo["id"], "assumed a thing")
     store.add_notification("done", wo_id=wo["id"])
+    store.add_approval(wo["id"], "release", "./scripts/ship.sh")
     store.queue_message(other["id"], "untouched")
     store.add_event(other["id"], "turn_ended")
 
     counts = store.delete_work_order(wo["id"])
 
-    assert counts == {"events": 2, "messages": 2, "assumptions": 1, "notifications": 1}
+    # 3 events: the assumption, the approval request, and the queued message.
+    assert counts == {"events": 3, "messages": 2, "assumptions": 1, "approvals": 1,
+                      "notifications": 1}
     with pytest.raises(KeyError):
         store.get_work_order(wo["id"])
     assert store.list_events(wo["id"]) == []
     assert store.list_messages(wo["id"]) == []
     assert store.pending_assumptions(wo["id"]) == []
+    assert store.list_approvals(wo["id"]) == []
     assert store.unrouted_notifications() == []
     # the neighbour is untouched
     assert store.get_work_order(other["id"])["title"] == "survivor"

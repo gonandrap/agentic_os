@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .gates import GateConfig
+
 # Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
 VALID_PERMISSION_MODES = {
     "acceptEdits",
@@ -69,6 +71,10 @@ class ProjectSpec:
     worker: WorkerDefaults = field(default_factory=WorkerDefaults)
     settings_overrides: dict[str, Any] = field(default_factory=dict)
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
+    # Privileged actions this project's workers may attempt under review rather than
+    # not at all (see gates.py). Off by default: enabling a gate widens what a worker
+    # can do, so it is always a deliberate per-project choice.
+    gates: GateConfig = field(default_factory=GateConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -199,6 +205,10 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             permission_mode=pmode,
             append_system_prompt=w.get("append_system_prompt"),
         )
+        try:
+            gate_cfg = GateConfig.parse(p.get("gates"))
+        except ValueError as e:
+            raise _err(f"project {name}: {e}") from e
         projects.append(
             ProjectSpec(
                 name=name,
@@ -208,6 +218,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 worker=worker,
                 settings_overrides=p.get("settings_overrides", {}),
                 max_concurrent=max_conc,
+                gates=gate_cfg,
                 raw=p,
             )
         )
