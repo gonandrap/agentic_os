@@ -83,6 +83,9 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any]) -> tuple[str, st
         return "You answered the worker", p.get("answer") or ""
     if kind == "reviewed":
         verb = "accepted" if p.get("accepted") else "rejected"
+        if p.get("assumption_id"):
+            # One assumption decided on its own — the content is the story, not a count.
+            return f"Assumption {verb}", p.get("content") or ""
         count = p.get("count")
         return f"Assumptions {verb}", f"{count} assumption(s)" if count else ""
     if kind == "learning_captured":

@@ -198,7 +198,21 @@ def create_app() -> FastAPI:
 
     @app.post("/wo/{name}/{wo_id}/review")
     def review(name: str, wo_id: str, decision: str = Form(...)):
-        ops.review_work_order(wo_id, accept=(decision == "accept"))
+        ops.review_work_order(wo_id, accept=(decision == "accept"), project_name=name)
+        return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
+
+    @app.post("/wo/{name}/{wo_id}/assumption/{assumption_id}/review")
+    def review_one_assumption(name: str, wo_id: str, assumption_id: int,
+                              decision: str = Form(...)):
+        """Per-assumption verdict — the same ops call as
+        `jarvis wo review <id> --assumption <aid>`."""
+        try:
+            ops.review_assumption(wo_id, assumption_id,
+                                  accept=(decision == "accept"), project_name=name)
+        except ops.OpsError as e:
+            # Almost always a double-submit on an already-decided assumption; say so
+            # rather than 500ing on a stale page.
+            return RedirectResponse(f"/wo/{name}/{wo_id}?error={e}", status_code=303)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/cancel")

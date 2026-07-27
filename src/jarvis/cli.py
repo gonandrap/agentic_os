@@ -148,9 +148,16 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("wo_id")
     f.add_argument("--summary", required=True)
 
-    r = wo.add_parser("review", help="accept/reject a work order's pending assumptions")
+    r = wo.add_parser("review", help="accept/reject a work order's pending assumptions "
+                                     "— all of them, or one at a time")
     r.add_argument("wo_id")
     r.add_argument("--reject", action="store_true")
+    r.add_argument("--assumption", type=int, metavar="ID",
+                   help="decide just this one assumption (ids come from "
+                        "`jarvis wo show <id>`); the rest stay pending, so a mixed "
+                        "accept/reject verdict is expressible. Without it the whole "
+                        "pending set gets the same verdict.")
+    r.add_argument("--project")
 
     x = wo.add_parser("cancel", help="cancel a work order")
     x.add_argument("wo_id")
@@ -468,7 +475,13 @@ def cmd_wo(args: argparse.Namespace) -> int:
     elif args.wo_cmd == "finish":
         _print(ops.finish(args.wo_id, args.summary), args.json)
     elif args.wo_cmd == "review":
-        _print(ops.review_work_order(args.wo_id, accept=not args.reject), args.json)
+        if args.assumption is not None:
+            _print(ops.review_assumption(args.wo_id, args.assumption,
+                                         accept=not args.reject,
+                                         project_name=args.project), args.json)
+        else:
+            _print(ops.review_work_order(args.wo_id, accept=not args.reject,
+                                         project_name=args.project), args.json)
     elif args.wo_cmd == "cancel":
         _print(ops.cancel(args.wo_id), args.json)
     elif args.wo_cmd == "ack":

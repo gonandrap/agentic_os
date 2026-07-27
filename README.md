@@ -128,6 +128,15 @@ replacement.
 Assumptions flip the work order to `needs_review` — visible in `jarvis status`, the
 dashboard, and (if configured) Telegram.
 
+Each assumption carries its own verdict. `jarvis wo review <id>` (or **Accept all** /
+**Reject all** on the work order page) decides the whole pending set at once;
+`jarvis wo review <id> --assumption <aid> [--reject]` — and the per-row Accept/Reject
+buttons beside each assumption — decides one and leaves the rest pending. A work order
+only settles once nothing is pending, and **one rejection anywhere in the round keeps it
+open**: a mixed verdict stays `needs_review` and flagged, because an accepted assumption
+does not answer a rejected one. Send the guidance with `jarvis wo send`; that reopens the
+round, so the reworked result can complete cleanly.
+
 Attention is re-derived from state on every reconcile tick, so it can't be cleared by
 hand — the next tick puts it back. `jarvis wo ack <id>` (or **Got it** on the work order
 page) records what you dismissed and keeps it down; a *different* blocker still surfaces.

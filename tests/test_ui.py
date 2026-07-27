@@ -120,6 +120,56 @@ def test_attention_strip_shows_review_items(client, daemon, project):
     assert "all quiet" in client.get("/").text
 
 
+def test_each_assumption_gets_its_own_accept_and_reject(client, daemon, project):
+    """The dashboard ask: two assumptions, one accepted and one rejected, and the
+    work order must not quietly land in `completed` on the strength of the accept."""
+    wo = ops.create_work_order("proj_a", "two judgement calls")
+    daemon.tick()
+    ops.assume(wo["id"], "assumed the API is v2")
+    ops.assume(wo["id"], "assumed we can drop python 3.10")
+    ops.finish(wo["id"], "done-ish")
+
+    store = ProjectStore(project)
+    a1, a2 = store.pending_assumptions(wo["id"])
+
+    detail = client.get(f"/wo/proj_a/{wo['id']}").text
+    for a in (a1, a2):
+        assert f"/wo/proj_a/{wo['id']}/assumption/{a['id']}/review" in detail
+    assert "Accept all" in detail          # the bulk pair survives
+
+    r = client.post(f"/wo/proj_a/{wo['id']}/assumption/{a1['id']}/review",
+                    data={"decision": "accept"})
+    assert r.status_code == 303
+    assert [a["id"] for a in store.pending_assumptions(wo["id"])] == [a2["id"]]
+    assert store.get_work_order(wo["id"])["status"] == "needs_review"
+
+    r = client.post(f"/wo/proj_a/{wo['id']}/assumption/{a2['id']}/review",
+                    data={"decision": "reject"})
+    assert r.status_code == 303
+    settled = store.get_work_order(wo["id"])
+    assert settled["status"] == "needs_review"        # mixed verdict never completes
+    assert "rejected" in settled["attention_reason"]
+    assert "NEEDS YOU" in client.get("/").text
+
+
+def test_deciding_an_assumption_twice_flashes_an_error(client, daemon, project):
+    """A stale tab re-posting an already-decided assumption must not 500."""
+    wo = ops.create_work_order("proj_a", "one judgement call")
+    daemon.tick()
+    ops.assume(wo["id"], "assumed UTC everywhere")
+    ops.finish(wo["id"], "done-ish")
+    store = ProjectStore(project)
+    aid = store.pending_assumptions(wo["id"])[0]["id"]
+
+    assert client.post(f"/wo/proj_a/{wo['id']}/assumption/{aid}/review",
+                       data={"decision": "accept"}).status_code == 303
+    r = client.post(f"/wo/proj_a/{wo['id']}/assumption/{aid}/review",
+                    data={"decision": "reject"})
+    assert r.status_code == 303
+    assert "error=" in r.headers["location"]
+    assert store.get_work_order(wo["id"])["status"] == "completed"  # unchanged
+
+
 def test_send_message_via_ui(client, project):
     wo = ops.create_work_order("proj_a", "task")
     client.post(f"/wo/proj_a/{wo['id']}/send", data={"message": "check the docs too"})

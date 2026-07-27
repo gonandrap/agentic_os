@@ -79,16 +79,29 @@
 {% if assumptions %}
 <h2{% if pending == 'assumptions' %} id="pending"{% endif %}>Assumptions pending your review</h2>
 <div class="panel">
+  {# Each assumption carries its own verdict, so one work order can end with some
+     accepted and some rejected. The bulk pair below is the shortcut for the common
+     all-at-once case, not the only way to answer. #}
   {% for a in assumptions %}
-  <div class="row"><div class="grow">{{ a.content }}</div>
-    <span class="sub mono">{{ fmt_age(a.ts) }} ago</span></div>
+  {# wraps so the two buttons drop below the text on a phone instead of squeezing it #}
+  <div class="row" style="flex-wrap: wrap;"><div class="grow">{{ a.content }}</div>
+    <span class="sub mono">{{ fmt_age(a.ts) }} ago</span>
+    <form class="inline" method="post"
+          action="/wo/{{ project }}/{{ wo.id }}/assumption/{{ a.id }}/review">
+      <button name="decision" value="accept" class="accept"
+              title="Accept this assumption only — the others stay pending">Accept</button>
+      <button name="decision" value="reject" class="danger"
+              title="Reject this assumption only — the others stay pending">Reject</button>
+    </form>
+  </div>
   {% endfor %}
   <div class="row">
     <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/review">
       <button name="decision" value="accept" class="accept">Accept all</button>
       <button name="decision" value="reject" class="danger">Reject all</button>
     </form>
-    <span class="sub">rejecting keeps the work order flagged — send guidance below</span>
+    <span class="sub">one rejection anywhere keeps the work order open and flagged —
+      send guidance below</span>
   </div>
 </div>
 {% endif %}
