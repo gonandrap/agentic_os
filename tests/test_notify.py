@@ -49,8 +49,12 @@ def test_wo_url_quotes_path_segments():
 
 
 @pytest.fixture
-def sent(monkeypatch):
-    """Capture the Telegram payload instead of hitting the network."""
+def sent(monkeypatch, allow_external_sinks):
+    """Capture the Telegram payload instead of hitting the network.
+
+    Stubbing `urlopen` is what earns this the right to lift the isolation gate's
+    external-sink kill switch — nothing here can reach the real API.
+    """
     calls: list[dict] = []
 
     class Resp:

@@ -2,16 +2,127 @@
 `claude` CLI that mimics the supervisor's observed behavior (bg roster, session ids,
 resume semantics, headless -p calls).
 
-Used by tests/, evals/, and tests_browser/ via their conftest re-exports."""
+Used by tests/, evals/, and tests_browser/ via their conftest re-exports, plus
+`gate_test_environment` — the isolation gate the repo-root conftest installs before
+collection. See that function for what a test run is not allowed to reach, and
+tests/test_isolation_gate.py for the proof that it can't."""
 
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
+
+from .bugreport import GH_BIN_ENV
+from .claude_cli import CLAUDE_BIN_ENV
+from .notify import DISABLE_EXTERNAL_SINKS_ENV
+
+#: Sandbox root the gate installed, or None if `gate_test_environment` never ran.
+#: Tests assert against it; nothing in production reads it.
+GATE_ROOT: Path | None = None
+
+#: The process-wide floor home the gate installed. The autouse `jarvis_home` fixture
+#: overrides `$JARVIS_HOME` per test, so this is what code running *outside* a test body
+#: (collection, module import, a subprocess spawned at import time) sees.
+GATE_HOME: Path | None = None
+
+#: A `gh` that refuses to run. Points JARVIS_GH_BIN somewhere harmless so a test that
+#: forgets the `fake_gh` fixture cannot file a public issue on the OS's real tracker.
+BLOCKED_GH = r'''#!/usr/bin/env python3
+import sys
+sys.stderr.write(
+    "blocked by the Jarvis test-isolation gate: this is a test run, and the real `gh` "
+    "would file a real issue on a real tracker. Use the `fake_gh` fixture.\n")
+sys.exit(1)
+'''
+
+#: Likewise for `claude`. A test that forgets the `fake_claude` fixture would otherwise
+#: spawn REAL background Claude Code agents against real projects and bill real tokens.
+BLOCKED_CLAUDE = r'''#!/usr/bin/env python3
+import sys
+sys.stderr.write(
+    "blocked by the Jarvis test-isolation gate: this is a test run, and the real "
+    "`claude` would spawn real agents and bill real tokens. Use the `fake_claude` "
+    "fixture (or set JARVIS_EVALS_LLM=1 for the opt-in LLM evals).\n")
+sys.exit(1)
+'''
+
+#: Opt-in flag for the LLM-graded evals, which exist precisely to call the real model.
+#: When it is set, the gate leaves `claude` alone — the run has asked for the real thing.
+LLM_EVALS_ENV = "JARVIS_EVALS_LLM"
+
+
+def gate_test_environment(root: Path | None = None) -> Path:
+    """Make this process incapable of reaching production. Returns the sandbox root.
+
+    Called from `pytest_configure` in the repo-root conftest — before collection, so it
+    covers module import time as well as test bodies, and it is inherited by every
+    subprocess a test spawns (workers, the daemon, a nested pytest).
+
+    Every escape route a test run has to the world outside its tmp dir:
+
+    * ``JARVIS_HOME`` — central `os.db`, `neo.db`, logs, the daemon pidfile. A worker
+      session inherits the PRODUCTION home, so without this the suite writes live state,
+      and the live daemon then routes whatever it finds in the central inbox to the real
+      sinks. That is not hypothetical: it Telegrammed the user twice on 2026-07-27.
+    * the Telegram and desktop sinks — see `notify.DISABLE_EXTERNAL_SINKS_ENV`.
+    * ``gh`` — `jarvis bug report` files a GitHub issue on a PUBLIC tracker.
+    * ``claude`` — a test that forgets `fake_claude` would spawn real background agents
+      against real projects and bill real tokens. Left alone when `JARVIS_EVALS_LLM` is
+      set, since the LLM-graded evals exist to call the real model.
+
+    The gate is a floor, not a substitute for per-test isolation: the autouse
+    `jarvis_home` fixture still gives each test its own home under its own tmp_path, so
+    two tests that never name the fixture cannot collide in a shared sandbox.
+    """
+    global GATE_ROOT, GATE_HOME
+    if root is None:
+        root = Path(tempfile.mkdtemp(prefix="jarvis-test-gate-"))
+    env = gate_environment(root)
+    home = Path(env["JARVIS_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    os.environ.update(env)
+    GATE_ROOT, GATE_HOME = root, home
+    return root
+
+
+def gate_environment(root: Path) -> dict[str, str]:
+    """The environment that makes a process incapable of reaching production.
+
+    Split out from `gate_test_environment` so it can be asserted on without mutating
+    this process. Writes the stub binaries into `root`; touches nothing else.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    env = {
+        "JARVIS_HOME": str(root / "jarvis-home"),
+        DISABLE_EXTERNAL_SINKS_ENV: "1",
+        GH_BIN_ENV: str(_blocked_bin(root, "gh", BLOCKED_GH)),
+    }
+    if not os.environ.get(LLM_EVALS_ENV):
+        env[CLAUDE_BIN_ENV] = str(_blocked_bin(root, "claude", BLOCKED_CLAUDE))
+    return env
+
+
+def _blocked_bin(root: Path, name: str, source: str) -> Path:
+    path = root / name
+    path.write_text(source)
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return path
+
+
+def teardown_test_environment() -> None:
+    """Remove the gate's sandbox. Called from `pytest_unconfigure`."""
+    global GATE_ROOT, GATE_HOME
+    if GATE_ROOT is not None:
+        shutil.rmtree(GATE_ROOT, ignore_errors=True)
+        GATE_ROOT = GATE_HOME = None
+
 
 FAKE_CLAUDE = r'''#!/usr/bin/env python3
 """Fake `claude` CLI for tests.
@@ -176,11 +287,29 @@ def fake_gh(tmp_path, monkeypatch):
     return Handle()
 
 
-@pytest.fixture()
+@pytest.fixture(autouse=True)
 def jarvis_home(tmp_path, monkeypatch):
+    """Per-test central state. Autouse: isolation is not something a test can forget.
+
+    Naming it as a parameter is still the way to get the path; the only thing autouse
+    changes is that a test which does NOT name it is isolated anyway, instead of writing
+    whatever `$JARVIS_HOME` the shell carried in (in a worker session: production).
+    `gate_test_environment` is the process-wide floor under this.
+    """
     home = tmp_path / "jarvis-home"
     monkeypatch.setenv("JARVIS_HOME", str(home))
     return home
+
+
+@pytest.fixture()
+def allow_external_sinks(monkeypatch):
+    """Lift the external-sink kill switch for a test that must exercise sink internals.
+
+    Only for tests that have already neutered the transport themselves — a stubbed
+    `urlopen`, a fake binary. Grep for this fixture name to audit every place the gate
+    is lifted; if the list ever grows past the sink-rendering tests, something is wrong.
+    """
+    monkeypatch.delenv(DISABLE_EXTERNAL_SINKS_ENV, raising=False)
 
 
 @pytest.fixture()
