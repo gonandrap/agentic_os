@@ -353,9 +353,21 @@ def test_stale_deep_link_to_unregistered_project_is_not_a_500(client):
     them unable to tell a Jarvis bug from a vanished work order.
     """
     r = client.get("/wo/proj_gone/wo-4fdb20ba")
-    assert r.status_code == 200
+    # 404, not 200: there is genuinely no such page. What matters is that it is not a
+    # 500 and that the page names which half of the link went stale.
+    assert r.status_code == 404
     assert "Internal Server Error" not in r.text
     assert "proj_gone" in r.text and "not registered" in r.text
+    assert "never registered, or it has since been removed" in r.text
+
+
+def test_stale_deep_link_to_a_deleted_work_order_says_which_half_is_gone(client):
+    """The other stale-link shape: the project is fine, the work order is not (a
+    notification that outlived `jarvis wo delete`). Blaming the project here would send
+    the user to check the catalog for no reason."""
+    r = client.get("/wo/proj_a/wo-neverexisted")
+    assert r.status_code == 404
+    assert "is registered, but it has no work order" in r.text
 
 
 def test_unexpected_error_renders_a_page_and_lands_in_the_os_log(

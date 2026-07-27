@@ -1,7 +1,7 @@
 # Jarvis OS codebase map
 
 `jarvis-os` Python package, stdlib-only core (argparse + sqlite3 + json). Source in
-`src/jarvis/`, 19 modules. Read this instead of re-exploring the tree.
+`src/jarvis/`, 20 modules. Read this instead of re-exploring the tree.
 
 ## Modules (responsibility — key symbols — intra-package imports)
 
@@ -37,8 +37,20 @@
   `settings_drift()`:76, `deep_merge()`:50, `BootstrapReport`:38, `TEMPLATE_VERSION = 2`:24.
 - `hooks.py` — the `jarvis _hook` endpoint: PreToolUse preflight + session lifecycle → WO state.
   `handle_hook()`:100, `main_hook()`:183, `preflight_decision()`:55, `find_project_root()`:85.
-- `notify.py` — notification sinks + routing inbox rows outward. `route_new_inbox()`:105,
-  `SINKS`:98, `sink_telegram()`:57, `wo_url()`:37.
+- `invariants.py` — the OS's post-conditions, re-evaluated as steady-state predicates on
+  every reconcile tick and by `jarvis doctor`. Per-project checks in `INVARIANTS` (take a
+  `ProjectStore`, repair what is unambiguous); OS-wide checks in `OS_INVARIANTS` /
+  `check_os()` (take nothing, never repairable — e.g. `INV-UI-HEALTHY`, the dashboard
+  throwing 500s). `true_blockers()` is the single source of truth for "what does this WO
+  want from me". No LLM, ever.
+- `uilog.py` — the dashboard's own logs (`$JARVIS_HOME/logs/ui.log`, `ui-access.log`) and,
+  the point of the module, reading them back. `record_error()`, `record_access()`,
+  `read_errors(cursor)` (opaque resume cursor: offset + inode + hash of the file's first
+  line), `recent_errors()`, `ERROR_WINDOW_SECONDS = 24h`, `MAX_BYTES = 512 KiB` rotation.
+  The `[ERROR]` entry format is a PARSED CONTRACT — daemon, status and doctor all read it.
+- `notify.py` — notification sinks + routing inbox rows outward. `route_new_inbox()`,
+  `SINKS`, `sink_telegram()`, `wo_url()` (pure URL builder), `check_wo_link()` (validated:
+  returns `(None, why)` when the deep link would dead-end). Imports `project_store`.
 - `neo.py` — Neo the answerer agent: persona, headless answering, verdict parsing.
   `drain_queue()`:118, `answer_question()`:102, `build_system_prompt()`:56, `parse_verdict()`:83.
 
@@ -49,8 +61,9 @@
   `create_work_order()`:261, `finish()`:374, `find_work_order()`:281, `os_status()`:142, `OpsError`:31.
 
 **Top:**
-- `daemon.py` (496 L) — jarvisd supervision loop. `Daemon`:40, `tick()`:102,
-  `dispatch_pending()`:139, `reconcile_project()`:371, `run_daemon()`:470, `daemon_running()`:485.
+- `daemon.py` — jarvisd supervision loop. `Daemon`, `tick()`, `dispatch_pending()`,
+  `reconcile_project()`, `check_ui_log()` (raises a `jarvis inbox` item for new dashboard
+  errors; exactly-once via the `ui_log_cursor` os_state key), `run_daemon()`, `daemon_running()`.
 - `cli.py` (676 L) — argparse surface + output formatting. `build_parser()`:72, `main()`:631,
   `cmd_start()`:254, `cmd_wo()`:342, `cmd_status()`:281. Every jarvis import is lazy, inside handlers.
 - `ui/app.py` — FastAPI/Jinja dashboard. `create_app()`:50, routes at :75/:103/:154,
