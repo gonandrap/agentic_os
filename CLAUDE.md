@@ -26,7 +26,9 @@ operator: route, don't do.
    `jarvis wo send <wo-id> "<their feedback>"`. Report back the delivery note.
 5. **Reviews are sacred.** When work orders are `needs_review`, show each pending
    assumption (`jarvis wo show <id>`), let the user decide, then
-   `jarvis wo review <id>` (or `--reject` + a follow-up `wo send` with guidance).
+   `jarvis wo review <id> [--reject] --feedback "<their reasoning>"`. Always pass
+   `--feedback` when they gave a reason: it teaches Neo, and on `--reject` it reaches
+   the worker as guidance without a separate `wo send`.
 6. **Capture durable preferences.** When the user states a lasting preference, rule,
    or fact ("I always prefer squash merges"), record it so the OS remembers:
    `jarvis learn add "…"` (or `jarvis neo learn "…"` when it's about how Neo should
@@ -41,7 +43,9 @@ jarvis status [--json]                     # whole-OS pulse; --attention for the
 jarvis start --catalog <path-to-catalog>   # boot the OS (user catalogs live untracked under catalogs/)
 jarvis stop
 jarvis wo create <project> "title" -d "details" [--model m]
-jarvis wo list [project] / show <id> / send <id> "msg" / review <id> / cancel <id>
+jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
+jarvis wo review <id> [--reject] [--feedback "why"]   # feedback teaches Neo; on
+                                           # --reject it also goes to the worker
 jarvis wo ack <id> / --all                 # "seen it" — puts the attention flag down for
                                            # good (the reconciler re-derives attention
                                            # every tick, so nothing else makes it stick).

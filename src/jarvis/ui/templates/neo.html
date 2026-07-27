@@ -29,6 +29,22 @@
   the daemon isn't draining the queue — check <span class="mono">jarvis status</span>.</p>
 {% endif %}
 
+{% if not history and not unreviewed and not escalated and not in_flight %}
+<div class="panel" style="margin-top:14px">
+  <div class="row"><div class="grow">
+    <strong>No worker has asked Neo anything yet.</strong>
+    <div class="sub" style="margin-top:6px">
+      This is not the intended steady state. Neo is the workers' first responder:
+      they are told to run <span class="mono">jarvis wo ask</span> on <em>any</em>
+      doubt, and Neo answers as you within a minute. If work orders keep arriving as
+      long assumption lists to review instead, the workers are guessing — that is
+      worth a look, not a shrug.
+      <br>Seed Neo below so its first answer already sounds like you.
+    </div>
+  </div></div>
+</div>
+{% endif %}
+
 {% if escalated %}
 <h2>Escalated — Neo wants you to decide</h2>
 <div class="panel">

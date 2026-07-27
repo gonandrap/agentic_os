@@ -22,7 +22,10 @@ from typing import Any
 from .catalog import ProjectSpec
 from .paths import project_state_dir
 
-TEMPLATE_VERSION = 4
+# v5 = v4's privileged-action gates section + the decision-routing rewrite (Neo as
+# first responder). Both landed as "v4" on separate branches, so a project that
+# regenerated against either one would have skipped the other's content.
+TEMPLATE_VERSION = 5
 ASSETS = Path(__file__).parent / "assets"
 
 

@@ -20,9 +20,35 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
 
 - **Work in your assigned worktree** (you are started in it). Commit your work; push
   and open a PR following this repo's conventions. Never push to main.
-- **Record every assumption** you make (scope, design, functionality):
+- **Route any doubt to Neo — it is your first responder**:
+  `jarvis wo ask "$JARVIS_WO_ID" "<your question>"`, then end your turn.
+
+  The answer arrives as your next user turn, usually within a minute, from Neo (the
+  user's delegate) or the user. This is the *normal, expected* way to work: it is not
+  an escalation, it does not interrupt the user, and it costs you about a minute. Put
+  everything needed to decide inside the question text — whoever answers sees only
+  that text, never your session — with the concrete options and your recommendation.
+
+  The trigger is **doubt**, not importance. If you catch yourself weighing options,
+  thinking "either would work", or picking one because you have to pick something, you
+  are in doubt: ask, *before* you build on it.
+
+  Do not talk yourself out of asking. "It's reversible", "it's only an implementation
+  detail", "I'll note it as an assumption" — those are rationalisations for guessing.
+  Almost everything is reversible; that is not the question. The question is whether
+  you would be *rebuilding* if you guessed wrong.
+- **Record the calls you were sure about** — this should be rare:
   `jarvis wo assume "$JARVIS_WO_ID" "<the assumption>"`
-  This appends to ASSUMPTIONS.md and flags the work order for review.
+
+  An assumption is for the *other* case: a call you made with **no doubt** — you
+  followed an existing convention, the work order implied it, the codebase left one
+  sensible option. Record every such call, including the small and obvious ones
+  (naming, file layout, which convention you followed, how you split the commits):
+  recording is cheap and the work order record is the only audit trail anyone gets. It
+  appends to ASSUMPTIONS.md and flags the work order for review.
+
+  An assumption is a disclosure of something you were *sure* about. It is never a
+  guess you are hoping nobody checks — if you are guessing, ask instead.
 - **File deferred work in the central backlog** instead of leaving "future work" notes:
   `jarvis backlog add {project_name} "<title>" --description "<details>"`
 - **Report reusable learnings** (patterns, gotchas, good practices) to the OS knowledge
