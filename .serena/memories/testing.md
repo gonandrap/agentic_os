@@ -20,15 +20,22 @@ shared fixtures in the package, not in conftest.
 | `tests/test_catalog.py` (8) | `catalog.py` — `load_catalog`, `parse_catalog`, `CatalogError` |
 | `tests/test_stores.py` (9) | `central_store.py` + `project_store.py`, incl. the WO status machine |
 | `tests/test_timeline.py` (12) | `timeline.py` — `build_timeline`, `event_level` |
-| `tests/test_notify.py` (6) | `notify.py` + catalog UI config |
+| `tests/test_notify.py` (9) | `notify.py` + catalog UI config + deep-link validation |
 | `tests/test_neo.py` (13) | `neo.py`, `neo_store.py`, and their `ops`/`daemon` integration |
 | `tests/test_pipeline.py` (25) | end-to-end: `ops`, `daemon`, `dispatch`, `hooks`, `claude_cli` (fake), stores |
 | `tests/test_wo_hide_delete.py` (13) | `ops.hide/delete_work_order` + `cli` + cascade across all three stores |
 | `tests/test_ui.py` (18) | `ui/app.py` via `TestClient`, actions routed through `ops` |
+| `tests/test_uilog.py` (9) | `uilog.py` — the `ui.log` format contract and its resume cursor |
+| `tests/test_ui_observability.py` (10) | a dashboard 500 reaching the inbox, `jarvis status`, `jarvis doctor`, and the access log |
 | `tests/test_shipit.py` (9) | `scripts/shipit.sh` (shell, not a Python module) |
 
 Thin spots: no dedicated tests for `paths.py`, `db.py`, `claude_cli.py` (only exercised
 through the fake), or `cli.py` (only via `test_wo_hide_delete.py`).
+
+**Never call `monkeypatch.undo()`.** Every fixture in a test shares one `monkeypatch`
+instance, so `undo()` also reverts the `JARVIS_HOME` that `jarvis_home` set — and the rest
+of the test then reads and writes the real fleet's state directory. To restore one patched
+attribute, capture the original and `setattr` it back.
 
 ## LLM-graded persona evals — read before editing CLAUDE.md
 
