@@ -139,6 +139,58 @@ def stop_os() -> dict[str, Any]:
 
 # -- status ------------------------------------------------------------------------------
 
+def run_doctor(project: str | None = None, repair: bool = False,
+               catalog_path: str | None = None) -> dict[str, Any]:
+    """Run the OS's post-condition checks over one project or the whole fleet.
+
+    Read-only unless `repair` is set, so it is safe to run at any time. The daemon runs
+    the same checks with repair enabled on every reconcile tick — this is the manual
+    handle for "is the OS lying to me right now?".
+    """
+    from .invariants import check_project
+
+    if catalog_path:
+        # Explicit catalog: works before the OS has ever been started, when the
+        # central registry is still empty.
+        rows = [{"name": ps.name, "path": str(ps.path), "status": "active"}
+                for ps in resolve_catalog(catalog_path).projects]
+    else:
+        central = CentralStore()
+        try:
+            rows = central.list_projects()
+        finally:
+            central.close()
+    if project:
+        rows = [p for p in rows if p["name"] == project]
+        if not rows:
+            raise OpsError(f"unknown project: {project}")
+
+    results, total = [], 0
+    for p in rows:
+        if p["status"] != "active":
+            continue
+        path = Path(p["path"])
+        if not path.is_dir():
+            results.append({"project": p["name"], "error": "path missing",
+                            "violations": []})
+            continue
+        store = ProjectStore(path)
+        try:
+            found = check_project(store, repair=repair)
+        finally:
+            store.close()
+        total += len(found)
+        results.append({
+            "project": p["name"],
+            "violations": [
+                {"invariant": v.invariant, "wo_id": v.wo_id, "detail": v.detail,
+                 "repaired": v.repaired, "repair": v.repair}
+                for v in found
+            ],
+        })
+    return {"repair": repair, "violations": total, "projects": results}
+
+
 def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
     central = CentralStore()
     try:

@@ -385,6 +385,18 @@ class ProjectStore:
             ).fetchall()
         return db.rows_to_dicts(rows)
 
+    def all_assumptions(self, wo_id: str) -> list[dict[str, Any]]:
+        """Every assumption of a work order, reviewed or not.
+
+        `pending_assumptions` answers "what does the user still owe a decision on";
+        this answers "what was ever recorded", which is what the persistence invariant
+        has to compare the timeline against.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM assumptions WHERE wo_id=? ORDER BY ts", (wo_id,)
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
     def review_assumption(self, assumption_id: int, status: str) -> None:
         assert status in ("accepted", "rejected"), status
         self.conn.execute("UPDATE assumptions SET status=? WHERE id=?", (status, assumption_id))
