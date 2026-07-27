@@ -99,6 +99,7 @@ also watch and join them from `claude agents`.
 | **Work order** | A unit of work; one worker agent, one git worktree, full audit trail |
 | **Origin badge** | `jarvis`/`ui` = framework-created; `manual`/`adhoc` = flagged ⚠ in UI and status |
 | **Ad-hoc adoption** | A background session Jarvis didn't spawn is adopted so it shows up in status and the dashboard. It's a mirror, not a dispatch: it never got the worker contract, so it owes no `jarvis wo finish` and its session ending is not a failure |
+| **Launcher** | How sessions are actually started for a project. Default: `claude --bg`. A project whose sessions come from your own wrapper gets a **launcher contract** (`.jarvis/launcher.json`) instead — five verbs, written by an onboarding session (`jarvis onboard`) and re-checked when the wrapper moves |
 | **OPERATION.md** | Per-project contract every worker follows (assumptions, backlog, learnings, notify) |
 | **ASSUMPTIONS.md** | Per-project log of decisions workers made autonomously, pending your review |
 | **Neo** | OS-level answerer agent: workers ask (`jarvis wo ask`), Neo answers as you; you review its answers (UI neo tab) and corrections become its learnings |
@@ -139,6 +140,12 @@ the same as `jarvis inbox ack`, which clears notifications — a different strea
 See [PROJECT_ONBOARDING.md](PROJECT_ONBOARDING.md). Short version: add the project to the catalog, run
 `jarvis adopt <path>` (idempotent, backs up existing settings), replace any direct
 notification scripts with `jarvis notify`.
+
+If background sessions on your machine come from your own wrapper rather than
+`claude --bg`, add a second step — `jarvis onboard <project>` — which runs an interview
+session with you and writes a launcher contract Jarvis executes from then on. Wrappers
+change, so the contract records what it was derived from and Jarvis asks for a fresh
+session when that drifts.
 
 ## Development
 

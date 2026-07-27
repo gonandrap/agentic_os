@@ -41,7 +41,8 @@
       "name": "my_research",
       "path": "~/workspace/my_research",
       "description": "Data analysis scripts and notebooks",
-      "model": "haiku"
+      "model": "haiku",
+      "$comment2": "Optional \"launcher\": \"<path to a launcher contract>\" — how background sessions are STARTED for this project. Left out (as here), Jarvis looks for <project>/.jarvis/launcher.json, then $JARVIS_HOME/launcher.json, then falls back to `claude --bg`. Contracts are written by an onboarding session: jarvis onboard my_research"
     }
   ]
 }

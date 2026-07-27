@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import claude_cli
+from . import launcher as launcher_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
@@ -104,18 +105,49 @@ class Daemon:
 
     # -- main tick -------------------------------------------------------------
 
+    def launcher_for(self, project: ProjectSpec) -> launcher_mod.Launcher:
+        """The launcher governing a project, re-read every tick.
+
+        Deliberately uncached: an onboarding session can drop a new contract in at any
+        moment, and a daemon still driving the previous one would be running the fleet
+        on a launcher the user has already replaced.
+        """
+        return launcher_mod.launcher_for(project)
+
+    def collect_sessions(self) -> dict[str, list[claude_cli.BgSession]]:
+        """Each project's live sessions, asked of that project's own launcher.
+
+        Projects whose roster could not be read are ABSENT from the result rather than
+        present-and-empty: an empty list means "no sessions", which the reconciler reads
+        as every worker having vanished.
+        """
+        by_project: dict[str, list[claude_cli.BgSession]] = {}
+        rosters: dict[str, list[claude_cli.BgSession]] = {}  # per-tick memo
+        for project in self.catalog.projects:
+            if not project.path.is_dir():
+                continue
+            try:
+                launcher = self.launcher_for(project)
+                scope = getattr(launcher, "roster_scope", "global")
+                key = launcher.name if scope == "global" else f"{launcher.name}:{project.path}"
+                if key not in rosters:
+                    rosters[key] = launcher.roster(project.path)
+                sessions = rosters[key]
+                # A global roster covers the whole machine, so it has to be narrowed to
+                # this project; a cwd-scoped one was already asked about this project
+                # and is taken as given (a wrapper may well report a cwd of its own).
+                by_project[project.name] = (
+                    launcher_mod.sessions_under(sessions, project.path)
+                    if scope == "global" else sessions
+                )
+            except launcher_mod.LauncherError as e:
+                log.warning("[%s] session listing failed: %s", project.name, e)
+        return by_project
+
     def tick(self) -> None:
         self.tick_count += 1
         reconcile = self.tick_count % RECONCILE_EVERY_TICKS == 1
-        sessions_by_project: dict[str, list[claude_cli.BgSession]] = {}
-        if reconcile:
-            try:
-                sessions = claude_cli.list_background_sessions()
-                for s in sessions:
-                    sessions_by_project.setdefault(s.cwd, []).append(s)
-            except claude_cli.ClaudeCliError as e:
-                log.warning("agents listing failed: %s", e)
-                reconcile = False
+        sessions_by_project = self.collect_sessions() if reconcile else {}
 
         for project in self.catalog.projects:
             if not project.path.is_dir():
@@ -124,12 +156,13 @@ class Daemon:
             try:
                 self.route_outbox(project, store)
                 self.dispatch_pending(project, store)
-                if reconcile:
-                    self.reconcile_project(project, store, sessions_by_project)
+                if reconcile and project.name in sessions_by_project:
+                    sessions = sessions_by_project[project.name]
+                    self.reconcile_project(project, store, sessions)
                     # Delivery needs fresh session states: a message can only be
                     # injected once the worker's bg session is idle (state done)
                     # or released — resume refuses live bg-owned sessions.
-                    self.deliver_messages(project, store, sessions_by_project)
+                    self.deliver_messages(project, store, sessions)
                     # Last: check the state everything above just produced.
                     self.check_invariants(project, store)
                 self.central.touch_project(project.name)
@@ -154,7 +187,7 @@ class Daemon:
                     store, self.central, project, wo,
                     knowledge_limit=self.catalog.os.knowledge_inject_limit,
                 )
-            except claude_cli.ClaudeCliError as e:
+            except launcher_mod.LauncherError as e:
                 log.error("[%s] dispatch of %s failed: %s", project.name, wo["id"], e)
 
     # -- 2. notifications ----------------------------------------------------------
@@ -173,14 +206,16 @@ class Daemon:
     # -- 3. message delivery ----------------------------------------------------------
 
     def deliver_messages(self, project: ProjectSpec, store: ProjectStore,
-                         sessions_by_cwd: dict[str, list[claude_cli.BgSession]]) -> None:
-        proot = str(project.path)
-        by_sid = {
-            s.session_id: s
-            for cwd, group in sessions_by_cwd.items()
-            if cwd == proot or cwd.startswith(proot + "/")
-            for s in group if s.session_id
-        }
+                         sessions: list[claude_cli.BgSession]) -> None:
+        by_sid = {s.session_id: s for s in sessions if s.session_id}
+        launcher = self.launcher_for(project)
+        # A launcher that can neither resume a conversation nor message one has no way
+        # to reach a running worker at all. Say so once and leave the message queued —
+        # retrying every tick would only stamp the same failure over the timeline.
+        undeliverable = (not launcher.capabilities.resume
+                         and not launcher.supports("send"))
+        reason = (f"launcher {launcher.name!r} can neither resume nor message a "
+                  f"session — deliver this feedback by hand")
         for msg in store.queued_messages():
             if msg["id"] in self.in_flight_deliveries:
                 continue
@@ -191,6 +226,10 @@ class Daemon:
                 continue
             if not wo.get("session_id"):
                 continue  # not dispatched yet; prompt will pick it up when it runs
+            if undeliverable:
+                if wo["attention_reason"] != reason:
+                    store.flag_attention(wo["id"], reason)
+                continue
             sess = by_sid.get(wo["session_id"])
             # Deliverable only when the session is idle (done) or already released:
             # `claude --resume` refuses sessions owned by a live bg agent, and
@@ -206,30 +245,40 @@ class Daemon:
                  bg_id: str | None = None) -> None:
         """Deliver a queued user message to the worker's conversation.
 
-        Primary path: dispatch a NEW background agent resuming the worker's session
-        (`claude --bg --resume`) — full context carries over and the worker stays
-        visible in the agents view; the SessionStart hook rebinds the work order to
-        the fork's session id, and the superseded session is stopped once the fork
-        is up — so a multi-turn conversation keeps exactly one live agent, not one
-        per turn. Fallback: release the idle session and resume it headlessly
-        (stop + `--resume -p`).
+        Primary path (launchers that can resume): spawn a NEW session continuing the
+        worker's conversation — full context carries over and the worker stays visible
+        in the agents view; the SessionStart hook rebinds the work order to the fork's
+        session id, and the superseded session is stopped once the fork is up, so a
+        multi-turn conversation keeps exactly one live agent, not one per turn.
+        Fallback: the launcher's `send` verb (for the native launcher, a headless
+        resume). A launcher that can do neither cannot be given feedback at all — the
+        message stays queued and the user is told, rather than it vanishing.
         """
-        from .dispatch import _write_worker_settings, worker_name
+        from .dispatch import _worker_env, _write_worker_settings, worker_name
 
         store = ProjectStore(project.path)  # thread-local connection
         try:
+            launcher = self.launcher_for(project)
+            caps = launcher.capabilities
             log.info("[%s] delivering message %s to %s", project.name, msg["id"], wo["id"])
             wt = project.path / ".claude" / "worktrees" / (wo.get("worktree") or "")
             cwd = wt if wo.get("worktree") and wt.is_dir() else project.path
             try:
-                job_id = claude_cli.spawn_background(
+                if not caps.resume:
+                    raise launcher_mod.LauncherError(
+                        f"launcher {launcher.name!r} does not support resume")
+                job_id = launcher.spawn(
                     prompt=msg["content"],
                     cwd=cwd,
                     name=worker_name(wo),
                     model=wo.get("model"),
                     permission_mode=wo.get("permission_mode"),
-                    settings_file=_write_worker_settings(project, wo),
+                    settings_file=(_write_worker_settings(project, wo)
+                                   if caps.settings_file else None),
+                    env=None if caps.settings_file else _worker_env(project, wo),
                     resume_session_id=wo["session_id"],
+                    wo_id=wo["id"],
+                    project=project.name,
                 )
                 store.mark_message(msg["id"], "delivered")
                 store.add_event(wo["id"], "message_delivered",
@@ -237,7 +286,7 @@ class Daemon:
                 # Retire the session we just forked from — strictly AFTER the fork
                 # exists, so the conversation is never left without a live agent.
                 # Otherwise every turn leaks a spent bg agent into the agents view.
-                if bg_id and claude_cli.stop_session(bg_id):
+                if bg_id and launcher.stop(bg_id):
                     store.add_event(wo["id"], "session_retired",
                                     {"bg_id": bg_id, "session_id": wo["session_id"],
                                      "reason": "superseded by resume-fork"})
@@ -247,19 +296,20 @@ class Daemon:
                 # Hand the reply off to the reconciler rather than blocking here: this
                 # runs on a 4-slot pool, and a worker turn can take many minutes.
                 store.update_work_order(wo["id"], job_id=job_id, reply_job_id=None)
-            except claude_cli.ClaudeCliError as e:
-                log.warning("[%s] bg-resume delivery failed (%s); falling back to headless resume",
+            except launcher_mod.LauncherError as e:
+                log.warning("[%s] resume delivery failed (%s); falling back to `send`",
                             project.name, e)
-                result = claude_cli.send_to_session(
-                    wo["session_id"], msg["content"], cwd=project.path, bg_id=bg_id,
+                result = launcher.send(
+                    wo["session_id"], msg["content"], cwd=project.path, job_id=bg_id,
                 )
                 store.mark_message(msg["id"], "delivered")
                 store.add_event(wo["id"], "message_delivered",
-                                {"msg_id": msg["id"], "via": "headless-resume"})
-                # Headless resume returns the reply inline — no job to reconcile.
+                                {"msg_id": msg["id"], "via": "send"})
+                # `send` runs the turn synchronously and returns the reply — no job to
+                # reconcile afterwards.
                 if result:
                     store.record_agent_reply(wo["id"], result)
-        except claude_cli.ClaudeCliError as e:
+        except launcher_mod.LauncherError as e:
             log.error("[%s] delivery of message %s failed: %s", project.name, msg["id"], e)
             store.mark_message(msg["id"], "failed")
             store.flag_attention(wo["id"], f"message delivery failed: {e}")
@@ -374,7 +424,8 @@ class Daemon:
 
     # -- 6. reconcile -------------------------------------------------------------------
 
-    def capture_worker_reply(self, store: ProjectStore, wo: dict) -> bool:
+    def capture_worker_reply(self, store: ProjectStore, wo: dict,
+                             launcher: launcher_mod.Launcher | None = None) -> bool:
         """Persist the final assistant message of the work order's latest turn.
 
         A work order is the representation of its worker's conversation — the user and
@@ -388,7 +439,7 @@ class Daemon:
         if not job_id or job_id == wo.get("reply_job_id"):
             return True  # nothing outstanding
 
-        state, result = claude_cli.job_result(job_id)
+        state, result = (launcher or launcher_mod.NativeLauncher()).result(job_id)
         if result:
             store.record_agent_reply(wo["id"], result)
             store.update_work_order(wo["id"], reply_job_id=job_id)
@@ -434,13 +485,9 @@ class Daemon:
         self,
         project: ProjectSpec,
         store: ProjectStore,
-        sessions_by_cwd: dict[str, list[claude_cli.BgSession]],
+        sessions: list[claude_cli.BgSession],
     ) -> None:
-        proot = str(project.path)
-        sessions = [
-            s for cwd, group in sessions_by_cwd.items() if cwd == proot or cwd.startswith(proot + "/")
-            for s in group
-        ]
+        launcher = self.launcher_for(project)
         by_session_id = {s.session_id: s for s in sessions if s.session_id}
         by_name_prefix: dict[str, claude_cli.BgSession] = {}
         for s in sessions:
@@ -454,10 +501,17 @@ class Daemon:
         for wo in store.work_orders_awaiting_reply():
             sess = by_session_id.get(wo.get("session_id") or "")
             if sess is None or sess.is_finished:
-                self.capture_worker_reply(store, wo)
+                self.capture_worker_reply(store, wo, launcher)
 
         # Settle framework work orders against live session states.
         for wo in store.list_work_orders(statuses=("running", "waiting_input", "dispatching")):
+            if wo["status"] == "waiting_input" and not wo.get("worktree") \
+                    and not wo.get("job_id"):
+                # Never dispatched — it is waiting on a person, not on a session. The
+                # bootstrap order `jarvis onboard` raises is the case in point: nothing
+                # was spawned, so "the worker's session never appeared" is not a failure
+                # to declare five minutes later.
+                continue
             sid = wo.get("session_id")
             if not sid:
                 # --bg dispatch assigns its own session id; bind by unique name if the
@@ -507,7 +561,7 @@ class Daemon:
                 store.set_status(wo["id"], "waiting_input")
                 store.flag_attention(wo["id"], "worker blocked (permission or input needed)")
             elif sess.is_finished:
-                if not self.capture_worker_reply(store, wo):
+                if not self.capture_worker_reply(store, wo, launcher):
                     continue  # settle only once the record holds what the worker said
                 fresh = store.get_work_order(wo["id"])
                 if fresh.get("result_summary"):

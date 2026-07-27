@@ -2,6 +2,8 @@
 
 Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
+  jarvis onboard <project>                teach Jarvis how sessions are launched here
+  jarvis launcher status|show|verify      the launch contract in force per project
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel
   jarvis neo list|show|review|answer|learnings|learn
   jarvis backlog add|list|promote|done
@@ -68,6 +70,9 @@ STATUS_ICON = {
     "needs_review": "👀", "completed": "✅", "failed": "❌", "cancelled": "🚫",
 }
 ORIGIN_BADGE = {"jarvis": "🤖 jarvis", "ui": "🖥 ui", "manual": "⚠ manual", "adhoc": "⚠ ad-hoc"}
+# A bootstrap order runs an onboarding interview, not project work — worth saying out
+# loud wherever one is listed, since its whole contract with the agent is different.
+KIND_BADGE = {"bootstrap": "🔌 launcher onboarding"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -102,6 +107,31 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--catalog", help="catalog to take overrides/defaults from")
     sp.add_argument("--force-config", action="store_true")
     sp.add_argument("--dry-run", action="store_true")
+
+    sp = sub.add_parser("onboard", help="teach Jarvis how background sessions are "
+                                        "launched for a project (bootstrap work order)")
+    sp.add_argument("project")
+    sp.add_argument("--reason", default="", help="why this is being (re-)run — goes "
+                                                 "into the onboarding prompt")
+    sp.add_argument("--dispatch", dest="dispatch", action="store_true", default=None,
+                    help="let jarvisd run the session (needs a verified launcher)")
+    sp.add_argument("--no-dispatch", dest="dispatch", action="store_false",
+                    help="always hand the prompt to the user instead")
+    sp.add_argument("--print", dest="print_prompt", action="store_true",
+                    help="print the bootstrap prompt itself, ready to paste")
+
+    # launcher ------------------------------------------------------------------------
+    lc = sub.add_parser(
+        "launcher", help="how this project's worker sessions are launched"
+    ).add_subparsers(dest="lc_cmd", required=True)
+    c = lc.add_parser("status", help="launcher health per project (verified? drifted?)")
+    c.add_argument("project", nargs="?")
+    c = lc.add_parser("show", help="print the contract in force for a project")
+    c.add_argument("project")
+    c = lc.add_parser("verify", help="check a project's launcher contract")
+    c.add_argument("project")
+    c.add_argument("--live", action="store_true",
+                   help="really spawn a throwaway session — the only check that counts")
 
     # work orders -------------------------------------------------------------------
     wo = sub.add_parser("wo", help="work orders").add_subparsers(dest="wo_cmd", required=True)
@@ -392,6 +422,77 @@ def cmd_adopt(args: argparse.Namespace) -> int:
     return 0 if not report.warnings else 1
 
 
+def cmd_onboard(args: argparse.Namespace) -> int:
+    from . import ops
+
+    result = ops.onboard(args.project, reason=args.reason, dispatch=args.dispatch)
+    if args.print_prompt:
+        print(Path(result["prompt_path"]).read_text())
+        return 0
+    if args.json:
+        _print(result, True)
+        return 0
+    verb = "Re-onboarding" if result["amending"] else "Onboarding"
+    print(f"{verb} {result['project']} — work order {result['wo_id']}")
+    print(f"  current launcher: {result['launcher']}")
+    print(f"  prompt:           {result['prompt_path']}")
+    if result["dispatch"]:
+        print("  jarvisd will start this session through the verified launcher.")
+    else:
+        print("\nJarvis cannot start this session itself — that is what the session is "
+              "for.\nStart one in the project however you normally do, and give it that "
+              "file as its prompt:\n")
+        print(f"  jarvis onboard {result['project']} --print   # the prompt, to paste\n")
+    return 0
+
+
+def cmd_launcher(args: argparse.Namespace) -> int:
+    from . import ops
+
+    if args.lc_cmd == "status":
+        result = ops.launcher_status(args.project)
+        if args.json:
+            _print(result, True)
+            return 0
+        for p in result["projects"]:
+            # The built-in launcher ships with the OS and is covered by its test suite,
+            # so it has no verification date to report and never asks for one.
+            if p["source"] == "built-in":
+                stamp = ""
+            elif p.get("verified_at"):
+                stamp = (" — live-verified "
+                         + time.strftime("%Y-%m-%d", time.localtime(p["verified_at"])))
+            else:
+                stamp = " — never live-verified"
+            print(f"{p['project']}: {p['launcher']} ({p['source']}){stamp}")
+            for problem in p.get("problems", []):
+                print(f"  ⚠ {problem}")
+        return 0 if not any(p.get("problems") for p in result["projects"]) else 1
+
+    if args.lc_cmd == "show":
+        result = ops.launcher_show(args.project)
+        if args.json or result["contract"] is None:
+            _print(result, args.json)
+            return 0
+        print(json.dumps(result["contract"], indent=2))
+        return 0
+
+    result = ops.launcher_verify(args.project, live=args.live)
+    if args.json:
+        _print(result, True)
+        return 0
+    print(f"{result['project']}: {result['launcher']} ({result['source']})"
+          f"{' — live' if result['live'] else ' — static only'}")
+    for check in result["checks"]:
+        mark = "✓" if check["ok"] else "✗"
+        detail = f" — {check['detail']}" if check["detail"] else ""
+        print(f"  {mark} {check['check']}{detail}")
+    if result["ok"] and not result["live"] and result["source"] != "built-in":
+        print(f"\nStatic checks pass. Nothing is proven until:\n"
+              f"  jarvis launcher verify {args.project} --live")
+    return 0 if result["ok"] else 1
+
+
 def cmd_wo(args: argparse.Namespace) -> int:
     from . import ops
     from .project_store import OPEN_STATUSES, ProjectStore
@@ -426,7 +527,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 store.close()
             for wo in wos:
                 out.append({"project": name, **{k: wo[k] for k in (
-                    "id", "title", "status", "origin", "needs_attention",
+                    "id", "title", "status", "origin", "kind", "needs_attention",
                     "attention_reason", "created_at", "hidden")}})
         if args.json:
             _print(out, True)
@@ -434,10 +535,12 @@ def cmd_wo(args: argparse.Namespace) -> int:
             for wo in out:
                 icon = STATUS_ICON.get(wo["status"], "•")
                 badge = ORIGIN_BADGE.get(wo["origin"], wo["origin"])
+                kind = KIND_BADGE.get(wo.get("kind") or "work")
                 att = " ⚠" if wo["needs_attention"] else ""
                 hid = " 🙈" if wo["hidden"] else ""
                 print(f"{icon} {wo['id']} [{wo['project']}] [{badge}] "
-                      f"{wo['title']} ({wo['status']}, {_age(wo['created_at'])}){att}{hid}")
+                      f"{wo['title']} ({wo['status']}, {_age(wo['created_at'])})"
+                      f"{att}{hid}" + (f" — {kind}" if kind else ""))
             if not out:
                 print("no work orders")
 
@@ -716,6 +819,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_doctor(args)
         if args.cmd == "adopt":
             return cmd_adopt(args)
+        if args.cmd == "onboard":
+            return cmd_onboard(args)
+        if args.cmd == "launcher":
+            return cmd_launcher(args)
         if args.cmd == "wo":
             return cmd_wo(args)
         if args.cmd == "backlog":

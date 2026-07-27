@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import claude_cli
+from . import launcher as launcher_mod
 from .catalog import ProjectSpec
 from .central_store import CentralStore
 from .project_store import ProjectStore
@@ -24,6 +24,27 @@ def _worker_path() -> str:
     return path
 
 
+def _worker_env(project: ProjectSpec, wo: dict[str, Any]) -> dict[str, str]:
+    """The environment every worker needs, whatever launched it.
+
+    Normally this rides inside the settings file. A launcher that takes no settings file
+    still has to give its session these, or the worker's own `jarvis …` calls land in
+    the wrong home and against no work order at all.
+    """
+    from .paths import jarvis_home
+
+    return {
+        "JARVIS_WO_ID": wo["id"],
+        "JARVIS_PROJECT": project.name,
+        "JARVIS_PROJECT_PATH": str(project.path),
+        # The worker's jarvis calls must hit the same central state as the daemon.
+        "JARVIS_HOME": str(jarvis_home()),
+        # Workers call `jarvis …` from Bash (contract); make sure it resolves even
+        # though the Claude supervisor daemon has its own PATH.
+        "PATH": _worker_path(),
+    }
+
+
 def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     """Merge the project's injected settings with per-work-order env and persist
     them for --settings.
@@ -36,7 +57,6 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     import json as _json
 
     from .bootstrap import build_settings
-    from .paths import jarvis_home
 
     settings = build_settings(project.settings_overrides)
     settings.pop("_jarvis", None)
@@ -60,16 +80,7 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
             allow.append(rule)
 
     env = dict(settings.get("env") or {})
-    env.update({
-        "JARVIS_WO_ID": wo["id"],
-        "JARVIS_PROJECT": project.name,
-        "JARVIS_PROJECT_PATH": str(project.path),
-        # The worker's jarvis calls must hit the same central state as the daemon.
-        "JARVIS_HOME": str(jarvis_home()),
-        # Workers call `jarvis …` from Bash (contract); make sure it resolves even
-        # though the Claude supervisor daemon has its own PATH.
-        "PATH": _worker_path(),
-    })
+    env.update(_worker_env(project, wo))
     settings["env"] = env
     out = project.path / ".jarvis" / "worker-settings" / f"{wo['id']}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -144,6 +155,24 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
     return "\n".join(parts)
 
 
+def build_prompt_for(wo: dict[str, Any], project: ProjectSpec,
+                     knowledge: list[dict[str, Any]]) -> str:
+    """The prompt a work order's kind calls for.
+
+    A `bootstrap` order is not project work: it is the onboarding interview that
+    produces this project's launcher contract, and it gets a prompt that shares nothing
+    with the worker contract (no branch, no PR, no assumptions ledger).
+    """
+    if wo.get("kind") == "bootstrap":
+        from .onboarding import build_bootstrap_prompt
+        prompt_path = project.path / ".jarvis" / "onboarding" / f"{wo['id']}.md"
+        if prompt_path.is_file():
+            # `jarvis onboard` already rendered it (and the user may have edited it).
+            return prompt_path.read_text()
+        return build_bootstrap_prompt(project, wo["id"])
+    return build_worker_prompt(wo, project, knowledge)
+
+
 def dispatch_work_order(
     store: ProjectStore,
     central: CentralStore,
@@ -152,50 +181,66 @@ def dispatch_work_order(
     knowledge_limit: int = 8,
 ) -> dict[str, Any]:
     """Spawn the worker for a work order already in `dispatching` state."""
-    worktree = wo["id"]  # ids already carry the wo- prefix
+    from .onboarding import record_spawn_outcome
+
     knowledge = central.relevant_knowledge(project.name, limit=knowledge_limit)
-    prompt = build_worker_prompt(wo, project, knowledge)
+    prompt = build_prompt_for(wo, project, knowledge)
 
     model = wo.get("model") or project.worker.model
     effort = wo.get("effort") or project.worker.effort
     permission_mode = wo.get("permission_mode") or project.worker.permission_mode
     extra_sp = wo.get("append_system_prompt") or project.worker.append_system_prompt
 
+    launcher = launcher_mod.launcher_for(project)
+    caps = launcher.capabilities
     settings_file = _write_worker_settings(project, wo)
     # OS skills (e.g. reporting a Jarvis bug) reach the worker only via --add-dir: its
     # worktree holds tracked files only, so an untracked .claude/skills/ never arrives.
     from .bootstrap import install_agent_skills
     skills_dir = install_agent_skills(project.path)
+
+    # Isolation is not negotiable — only who provides it is. A launcher that cannot make
+    # a worktree gets one made for it, and spawns with that directory as its cwd.
+    worktree = wo["id"]  # ids already carry the wo- prefix
+    cwd = project.path
+    if not caps.worktree:
+        cwd = launcher_mod.ensure_worktree(project.path, wo["id"])
+        worktree = None
     try:
-        job_id = claude_cli.spawn_background(
+        job_id = launcher.spawn(
             prompt=prompt,
-            cwd=project.path,
+            cwd=cwd,
             name=worker_name(wo),
             model=model,
             effort=effort,
             permission_mode=permission_mode,
             append_system_prompt=extra_sp,
             worktree=worktree,
-            settings_file=settings_file,
-            add_dirs=[skills_dir],
+            settings_file=settings_file if caps.settings_file else None,
+            add_dirs=[skills_dir] if caps.add_dirs else None,
+            env=_worker_env(project, wo) if not caps.settings_file else None,
+            wo_id=wo["id"],
+            project=project.name,
         )
-    except claude_cli.ClaudeCliError as e:
+    except launcher_mod.LauncherError as e:
+        record_spawn_outcome(project.name, ok=False, error=str(e))
         store.set_status(wo["id"], "failed")
         store.flag_attention(wo["id"], f"dispatch failed: {e}")
         store.add_notification(
             title=f"Dispatch failed for {wo['id']}",
-            body=str(e),
+            body=f"{e}\n\nLauncher: {launcher.name} ({launcher.source})",
             level="warning",
             wo_id=wo["id"],
             source="jarvisd",
         )
         raise
+    record_spawn_outcome(project.name, ok=True)
 
     # job_id lets the reconciler recover this turn's final assistant message once the
     # session goes idle; reply_job_id is cleared so that capture is still outstanding.
     store.update_work_order(
         wo["id"],
-        worktree=worktree,
+        worktree=wo["id"],
         model=model,
         effort=effort,
         permission_mode=permission_mode,
@@ -204,10 +249,12 @@ def dispatch_work_order(
     )
     store.set_status(wo["id"], "running")
     store.add_event(wo["id"], "dispatched", {
-        "worktree": worktree,
+        "worktree": wo["id"],
         "model": model,
         "permission_mode": permission_mode,
         "job": job_id,
+        "launcher": launcher.name,
+        "launcher_source": launcher.source,
         "note": "session id binds via SessionStart hook / name reconciliation",
     })
     central.touch_project(project.name)

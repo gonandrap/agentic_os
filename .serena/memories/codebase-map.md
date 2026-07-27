@@ -14,8 +14,9 @@
   `Catalog`:96, `WorkerDefaults`:50, `load_catalog()`:112, `parse_catalog()`:123,
   `CatalogError`:45, `DEFAULT_PERMISSION_MODE = "auto"`:25.
 - `claude_cli.py` — ALL interaction with the `claude` binary (override via `JARVIS_CLAUDE_BIN`:22).
-  `spawn_background()`:103, `list_background_sessions()`:73, `job_result()`:162,
-  `send_to_session()`:194, `run_headless()`:214, `BgSession`:62, `ClaudeCliError`:18.
+  `spawn_background()`:128, `list_background_sessions()`:98, `job_result()`:200,
+  `send_to_session()`:232, `run_headless()`:252, `BgSession`:72, `ClaudeCliError`:18.
+  NOT called directly for session lifecycle any more — go through `launcher.py`.
 - `timeline.py` — render `wo_events` into a human timeline. `build_timeline()`:95,
   `count_debug()`:123, `event_level()`:40, `DEBUG_KINDS`:19, `STATUS_LABEL`:28.
 - `testing.py` — reusable pytest fixtures + the fake `claude` executable so suites never
@@ -31,6 +32,21 @@
 - `neo_store.py` — Neo's DB. `NeoStore`:59, `ask()`:71, `claim_next()`:82, `record_answer()`:94,
   `review()`:153, `add_learning()`/`learnings()`:166/175.
 
+**Session launching (imports `claude_cli` only):**
+- `launcher.py` — the five verbs the OS needs from whatever starts sessions: `spawn`,
+  `list`(`roster`), `result`, `send`, `stop`. `NativeLauncher` = `claude --bg` (the
+  default, needs no config); `ContractLauncher` = a JSON contract describing somebody
+  else's wrapper (protocol: `assets/launcher-protocol.md`). `launcher_for()`,
+  `contract_source()` (catalog `launcher` > `<project>/.jarvis/launcher.json` >
+  `$JARVIS_HOME/launcher.json` > native), `validate_contract()`, `render_command()`,
+  `verify()`, `fingerprint()`/`source_drift()`, `ensure_worktree()`, `Capabilities`,
+  `LauncherError` (every launcher failure, including wrapped `ClaudeCliError`s).
+- `onboarding.py` — the bootstrap work order that PRODUCES a contract:
+  `build_bootstrap_prompt()` (an interview prompt, nothing like the worker prompt),
+  `start_onboarding()`, `launcher_health()` (drift / never-verified / repeated spawn
+  failures → attention items), `record_verification()`, `record_spawn_outcome()`.
+  Launcher state lives in the central `os_state` table under `launcher:<project>`.
+
 **Adapters:**
 - `bootstrap.py` — make a project OS-ready (settings injection, gitignore, README/OPERATION.md,
   workspace trust, `.jarvis/`). `bootstrap_project()`:226, `build_settings()`:66,
@@ -43,8 +59,10 @@
   `drain_queue()`:118, `answer_question()`:102, `build_system_prompt()`:56, `parse_verdict()`:83.
 
 **Middle:**
-- `dispatch.py` — claimed WO → live worker session. `dispatch_work_order()`:139,
-  `build_worker_prompt()`:86, `_write_worker_settings()`:27, `worker_name()`:80.
+- `dispatch.py` — claimed WO → live worker session, via `launcher_for(project)`.
+  `dispatch_work_order()`, `build_prompt_for()` (kind `work` → `build_worker_prompt()`,
+  kind `bootstrap` → the onboarding prompt), `_write_worker_settings()`, `_worker_env()`,
+  `worker_name()`.
 - `ops.py` (620 L) — business logic shared by CLI and UI. `start_os()`:63,
   `create_work_order()`:261, `finish()`:374, `find_work_order()`:281, `os_status()`:142, `OpsError`:31.
 
@@ -58,7 +76,8 @@
 
 ## Layering
 
-Imports run strictly downward: leaves → stores → adapters → `dispatch`/`ops` → `daemon`/`cli`/`ui`.
+Imports run strictly downward: leaves → stores → `launcher`/`onboarding` → adapters →
+`dispatch`/`ops` → `daemon`/`cli`/`ui`.
 No import cycles at module-import time: `cli.py` imports everything lazily inside function
 bodies, and `daemon.py:134` imports `notify` lazily inside `tick()`. One upward-looking edge:
 `ops.py:26` imports `daemon.daemon_running` — a pure pidfile probe (`daemon.py:485`), harmless.

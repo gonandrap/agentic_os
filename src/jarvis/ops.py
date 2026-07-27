@@ -203,8 +203,10 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         try:
             _cat = catalog or resolve_catalog()
             mode_by_project = {ps.name: ps.worker.permission_mode for ps in _cat.projects}
+            spec_by_project = {ps.name: ps for ps in _cat.projects}
         except (OpsError, CatalogError):
             mode_by_project = {}
+            spec_by_project = {}
         for p in central.list_projects():
             if p["status"] != "active":
                 continue
@@ -251,6 +253,23 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         "project": p["name"], "wo_id": None,
                         "title": "settings drift", "status": "config",
                         "reason": f".claude/settings.json: {drift}",
+                    })
+                # How this project's workers get launched, and whether that knowledge is
+                # still trustworthy. A stale contract is silent until a dispatch fails,
+                # so it belongs in the pulse check rather than in a log.
+                from .onboarding import launcher_health
+                health = launcher_health(
+                    spec_by_project.get(p["name"]) or launcher_spec(p["name"], path))
+                projects[-1]["launcher"] = {
+                    "name": health["launcher"], "source": health["source"],
+                    "verified_at": health.get("verified_at"),
+                    "problems": health.get("problems", []),
+                }
+                for problem in health.get("problems", []):
+                    attention.append({
+                        "project": p["name"], "wo_id": None,
+                        "title": "launcher contract", "status": "config",
+                        "reason": f"{problem} — run `jarvis onboard {p['name']}`",
                     })
                 mode = mode_by_project.get(p["name"])
                 if mode and worker_stalls_on_prompts(mode):
@@ -449,7 +468,21 @@ def finish(wo_id: str, summary: str) -> dict[str, Any]:
     return {"project": name, "wo_id": wo_id, "status": status}
 
 
-def stop_worker_session(wo: dict[str, Any]) -> dict[str, Any]:
+def launcher_spec(project_name: str, project_path: Path) -> ProjectSpec:
+    """A project spec good enough to resolve a launcher, catalog or no catalog.
+
+    Launcher resolution reads `name`, `path` and the catalog's `launcher` override.
+    Cancel/delete run from anywhere — including before a catalog is registered — so a
+    missing catalog degrades to the on-disk contract lookup instead of failing.
+    """
+    try:
+        return project_spec(resolve_catalog(), project_name)
+    except (OpsError, CatalogError):
+        return ProjectSpec(name=project_name, path=project_path)
+
+
+def stop_worker_session(wo: dict[str, Any], project_name: str | None = None,
+                        project_path: Path | None = None) -> dict[str, Any]:
     """Release the background session a work order dispatched, if it still has one.
 
     Cancelling or deleting a work order has to take the worker down with it: nobody
@@ -463,31 +496,37 @@ def stop_worker_session(wo: dict[str, Any]) -> dict[str, Any]:
     The live roster is the source of truth for the bg id — `job_id` on the record can
     lag behind (each resume-fork mints a new one), so it is only the fallback.
     """
-    from . import claude_cli
+    from . import launcher as launcher_mod
 
-    if not claude_cli.available():
-        return {"stopped": False, "reason": "claude CLI not available"}
+    spec = launcher_spec(project_name or "", project_path or Path("."))
+    try:
+        launcher = launcher_mod.launcher_for(spec)
+    except launcher_mod.LauncherError as e:
+        return {"stopped": False, "reason": str(e)}
+    if not launcher.available():
+        return {"stopped": False, "reason": f"launcher {launcher.name!r} not available"}
     bg_id, reason = None, "no live session"
     try:
-        for sess in claude_cli.list_background_sessions():
+        for sess in launcher.roster(spec.path):
             if (wo.get("session_id") and sess.session_id == wo["session_id"]) or \
                     sess.name.startswith(f"[WO {wo['id']}]"):
                 bg_id = sess.id
                 break
-    except claude_cli.ClaudeCliError as e:
+    except launcher_mod.LauncherError as e:
         reason = f"could not list sessions: {e}"
     if bg_id is None and wo.get("session_id"):
         bg_id = wo.get("job_id")  # roster missed it; try the id we were handed at spawn
     if not bg_id:
         return {"stopped": False, "reason": reason}
-    if claude_cli.stop_session(bg_id):
+    if launcher.stop(bg_id):
         return {"stopped": True, "bg_id": bg_id, "session_id": wo.get("session_id")}
-    return {"stopped": False, "bg_id": bg_id, "reason": "`claude stop` failed"}
+    return {"stopped": False, "bg_id": bg_id,
+            "reason": f"the {launcher.name} launcher's stop failed"}
 
 
 def cancel(wo_id: str) -> dict[str, Any]:
     name, path, wo = find_work_order(wo_id)
-    stopped = stop_worker_session(wo)
+    stopped = stop_worker_session(wo, name, path)
     store = ProjectStore(path)
     try:
         store.set_status(wo_id, "cancelled")
@@ -587,7 +626,7 @@ def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, 
     nothing left to reattach a running agent to.
     """
     name, path, wo = find_work_order(wo_id, project_name)
-    stopped = stop_worker_session(wo)
+    stopped = stop_worker_session(wo, name, path)
     store = ProjectStore(path)
     try:
         deleted = store.delete_work_order(wo_id)
@@ -747,6 +786,97 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
     except OpsError:
         pass
     return {"question_id": question_id, "delivery": delivery}
+
+
+# -- launcher / onboarding -------------------------------------------------------------------
+
+def _spec_for(project_name: str) -> ProjectSpec:
+    """The catalog spec for a project, falling back to its registered path.
+
+    Onboarding has to work on a project that is adopted but not yet in a running
+    catalog — that is exactly the state a fresh install is in.
+    """
+    try:
+        return project_spec(resolve_catalog(), project_name)
+    except (OpsError, CatalogError):
+        paths = registered_project_paths()
+        if project_name not in paths:
+            raise OpsError(
+                f"project {project_name!r} is neither in the catalog nor registered — "
+                f"run `jarvis adopt <path>` first"
+            ) from None
+        return ProjectSpec(name=project_name, path=paths[project_name])
+
+
+def onboard(project_name: str, reason: str = "",
+            dispatch: bool | None = None) -> dict[str, Any]:
+    """Raise a bootstrap work order that teaches Jarvis how to launch sessions here."""
+    from .onboarding import start_onboarding
+
+    return start_onboarding(_spec_for(project_name), reason=reason, dispatch=dispatch)
+
+
+def launcher_status(project_name: str | None = None) -> dict[str, Any]:
+    """Launcher health for one project or the whole fleet."""
+    from .onboarding import launcher_health
+
+    if project_name:
+        names = [project_name]
+    else:
+        names = sorted(registered_project_paths())
+    return {"projects": [launcher_health(_spec_for(n)) for n in names]}
+
+
+def launcher_show(project_name: str) -> dict[str, Any]:
+    """The contract in force for a project (or a note that it is the built-in one)."""
+    from . import launcher as launcher_mod
+
+    spec = _spec_for(project_name)
+    try:
+        source = launcher_mod.contract_source(spec)
+    except launcher_mod.LauncherError as e:
+        raise OpsError(str(e)) from e
+    if source is None:
+        return {"project": project_name, "launcher": "native", "source": "built-in",
+                "contract": None,
+                "note": "no contract — Jarvis uses `claude --bg`. Run "
+                        f"`jarvis onboard {project_name}` to teach it another way."}
+    try:
+        contract = launcher_mod.load_contract(source)
+    except launcher_mod.LauncherError as e:
+        raise OpsError(str(e)) from e
+    return {"project": project_name, "launcher": contract.get("name"),
+            "source": str(source), "contract": contract,
+            "fingerprint": launcher_mod.fingerprint(contract)}
+
+
+def launcher_verify(project_name: str, live: bool = False) -> dict[str, Any]:
+    """Check a project's launcher, and record the outcome.
+
+    Static by default. `live` really spawns a probe session, which is the only evidence
+    that counts — see `onboarding.record_verification`.
+    """
+    from . import launcher as launcher_mod
+    from .onboarding import record_verification
+
+    spec = _spec_for(project_name)
+    try:
+        launcher = launcher_mod.launcher_for(spec)
+    except launcher_mod.LauncherError as e:
+        raise OpsError(str(e)) from e
+    # A contract written by hand (or by an onboarding session) has "auto" digests until
+    # someone hashes the sources; verification is that someone.
+    contract = getattr(launcher, "contract", None)
+    source = getattr(launcher, "source", "")
+    if contract is not None and source and source != "built-in":
+        before = json.dumps(contract, sort_keys=True)
+        launcher_mod.stamp_source_digests(contract)
+        if json.dumps(contract, sort_keys=True) != before:
+            Path(source).write_text(json.dumps(contract, indent=2) + "\n")
+    report = launcher_mod.verify(launcher, spec.path, live=live)
+    report["project"] = project_name
+    record_verification(project_name, report)
+    return report
 
 
 # -- backlog ------------------------------------------------------------------------------------

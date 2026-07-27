@@ -5,6 +5,7 @@ from jarvis.testing import (  # noqa: F401
     claude_json,
     fake_claude,
     fake_gh,
+    fake_wrapper,
     jarvis_home,
     make_git_project,
     project,

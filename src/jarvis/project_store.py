@@ -29,6 +29,12 @@ OPEN_STATUSES = ("pending", "dispatching", "running", "waiting_input", "needs_re
 # direct DB insert; adhoc is a background session we discovered that Jarvis didn't spawn.
 WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc")
 
+# What KIND of job this is, which decides the prompt the worker is given. `work` is a
+# normal task in the project; `bootstrap` is an onboarding session whose deliverable is
+# the project's launcher contract (see onboarding.build_bootstrap_prompt) — a different
+# prompt, a different contract with the agent, and a human in the room.
+WO_KINDS = ("work", "bootstrap")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS work_orders (
     id TEXT PRIMARY KEY,
@@ -109,6 +115,8 @@ ADDED_COLUMNS = {
         # `true_blockers` subtracts these, and only these, so a *new* blocker still
         # surfaces. Cleared whenever the flag legitimately drops (the ack is spent).
         "acknowledged_blockers": "TEXT",
+        # work | bootstrap — see WO_KINDS. Decides which prompt the worker is given.
+        "kind": "TEXT NOT NULL DEFAULT 'work'",
     },
 }
 
@@ -148,22 +156,24 @@ class ProjectStore:
         backlog_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         wo_id: str | None = None,
+        kind: str = "work",
     ) -> dict[str, Any]:
         assert origin in WO_ORIGINS, origin
+        assert kind in WO_KINDS, kind
         wo_id = wo_id or db.new_id("wo")
         ts = db.now()
         self.conn.execute(
             """INSERT INTO work_orders (id, title, description, status, origin,
                    created_at, updated_at, model, effort, permission_mode,
-                   append_system_prompt, backlog_id, metadata)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   append_system_prompt, backlog_id, metadata, kind)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 wo_id, title, description, "pending", origin, ts, ts, model, effort,
                 permission_mode, append_system_prompt, backlog_id,
-                db.to_json(metadata or {}),
+                db.to_json(metadata or {}), kind,
             ),
         )
-        self.add_event(wo_id, "created", {"origin": origin})
+        self.add_event(wo_id, "created", {"origin": origin, "kind": kind})
         return self.get_work_order(wo_id)
 
     def get_work_order(self, wo_id: str) -> dict[str, Any]:

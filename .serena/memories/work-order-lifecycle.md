@@ -37,7 +37,21 @@ through `ProjectStore.set_status()` (`project_store.py:235`) — nothing writes 
 
 ## How a worker is actually launched
 
-`claude_cli.spawn_background()` (`claude_cli.py:103-153`) via `_run()` (`:35`):
+Through `launcher.launcher_for(project)`, never `claude_cli` directly. With no contract
+on disk that resolves to `NativeLauncher`, which is exactly the `claude --bg` invocation
+below; a project onboarded onto somebody else's wrapper (`jarvis onboard <project>`)
+gets a `ContractLauncher` driving argv templates from `.jarvis/launcher.json` instead.
+Degradations the dispatcher applies when a contract declares a capability false:
+no `worktree` → `launcher.ensure_worktree()` makes one and it becomes the session's cwd;
+no `settings_file` → `dispatch._worker_env()` goes through the process environment;
+no `add_dirs` → OS skills don't reach the worker; no `resume` → feedback goes through
+the contract's `send` verb, and with neither the WO is flagged rather than losing the
+message. Work orders carry a `kind` (`work` | `bootstrap`); a bootstrap order gets the
+onboarding interview prompt from `onboarding.build_bootstrap_prompt()`.
+
+### The native shape
+
+`claude_cli.spawn_background()` (`claude_cli.py:128`) via `_run()` (`:35`):
 `subprocess.run([claude_bin(), *args], cwd=…, capture_output=True, timeout=120)`.
 
 ```

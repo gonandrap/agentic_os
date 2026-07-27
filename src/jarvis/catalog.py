@@ -69,6 +69,9 @@ class ProjectSpec:
     worker: WorkerDefaults = field(default_factory=WorkerDefaults)
     settings_overrides: dict[str, Any] = field(default_factory=dict)
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
+    # Path to this project's launcher contract, overriding the .jarvis/launcher.json
+    # the onboarding session writes. Empty = resolve on disk (see launcher.contract_source).
+    launcher: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -208,6 +211,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 worker=worker,
                 settings_overrides=p.get("settings_overrides", {}),
                 max_concurrent=max_conc,
+                launcher=str(p.get("launcher", "") or ""),
                 raw=p,
             )
         )

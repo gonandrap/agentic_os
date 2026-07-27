@@ -65,7 +65,15 @@ jarvis bug report "title" -d "..." -e "expected" -a "actual" [--steps "..."]
 jarvis doctor [project] [--repair]         # check the OS's own post-conditions;
                                            # read-only unless --repair. The daemon runs
                                            # the same checks every reconcile tick.
-jarvis adopt <path>                        # migrate a project into the OS
+jarvis adopt <path>                        # migrate a project into the OS (its files)
+jarvis onboard <project> [--reason "…"]    # teach the OS how sessions are LAUNCHED in
+                                           # that project: raises a bootstrap work order
+                                           # (an interview, not project work) whose
+                                           # deliverable is .jarvis/launcher.json.
+                                           # The first one can't be dispatched — hand
+                                           # the user `jarvis onboard <p> --print`.
+jarvis launcher status|show|verify [--live]  # which launcher a project uses, and whether
+                                           # it is still trustworthy. Only --live counts.
 jarvis ui                                  # dashboard at http://127.0.0.1:8787
 ```
 

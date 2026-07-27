@@ -123,6 +123,57 @@ else:
 '''
 
 
+# A background-session wrapper that is deliberately NOT Claude Code: different flags,
+# different state words, a different roster shape, no worktree support and no resume.
+# Everything a launcher contract has to bridge. If the dispatch/reconcile/delivery paths
+# work through this as well as through FAKE_CLAUDE, the launcher abstraction is real.
+FAKE_WRAPPER = r'''#!/usr/bin/env python3
+"""Fake third-party background-agent wrapper (`bgwrap`) for tests."""
+import json, os, sys, hashlib
+
+state_dir = os.environ["FAKE_WRAPPER_DIR"]
+jobs_path = os.path.join(state_dir, "jobs.json")
+argv = sys.argv[1:]
+with open(os.path.join(state_dir, "calls.jsonl"), "a") as f:
+    f.write(json.dumps({"argv": argv, "cwd": os.getcwd()}) + "\n")
+
+def load():
+    try:
+        with open(jobs_path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+def save(jobs):
+    with open(jobs_path, "w") as f:
+        json.dump(jobs, f)
+
+def opt(name, default=None):
+    return argv[argv.index(name) + 1] if name in argv else default
+
+if argv[:1] == ["run"]:
+    label = opt("--label", "")
+    prompt = argv[argv.index("--") + 1] if "--" in argv else ""
+    jobs = load()
+    job = "j" + hashlib.sha1((label + str(len(jobs))).encode()).hexdigest()[:8]
+    jobs.append({"job": job, "conversation": "conv-" + job, "dir": os.getcwd(),
+                 "label": label, "status": "RUNNING", "prompt": prompt[:60]})
+    save(jobs)
+    with open(os.path.join(state_dir, job + ".json"), "w") as f:
+        json.dump({"status": "RUNNING", "final_message": ""}, f)
+    print(f"started job:{job}")
+elif argv[:1] == ["ps"]:
+    print(json.dumps({"jobs": load()}))
+elif argv[:1] == ["say"]:
+    print(f"ack: {argv[2][:40]}")
+elif argv[:1] == ["kill"]:
+    jobs = [j for j in load() if j["job"] != argv[1]]
+    save(jobs)
+else:
+    sys.stderr.write(f"bgwrap: unhandled argv {argv}\n"); sys.exit(2)
+'''
+
+
 FAKE_GH = r'''#!/usr/bin/env python3
 """Fake `gh` CLI for tests: records invocations, prints an issue URL."""
 import json, os, sys
@@ -233,6 +284,89 @@ def fake_claude(tmp_path, monkeypatch):
                 jdir.mkdir(parents=True, exist_ok=True)
                 (jdir / "state.json").write_text(json.dumps(payload))
             (fdir / "sessions.json").write_text(json.dumps(sessions))
+
+    return Handle()
+
+
+@pytest.fixture()
+def fake_wrapper(tmp_path, monkeypatch):
+    """Install a fake third-party session wrapper plus a contract that drives it."""
+    wdir = tmp_path / "fake-wrapper"
+    wdir.mkdir()
+    binpath = wdir / "bgwrap"
+    binpath.write_text(FAKE_WRAPPER)
+    binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("FAKE_WRAPPER_DIR", str(wdir))
+
+    contract_data = {
+        "schema_version": 1,
+        "name": "bgwrap",
+        "description": "fake third-party wrapper",
+        # No worktree and no resume: the two degradation paths Jarvis has to cover.
+        "capabilities": {"worktree": False, "resume": False, "settings_file": True,
+                         "add_dirs": False, "hooks": True},
+        "spawn": {
+            "command": [
+                str(binpath), "run", "--label", "{name}",
+                {"if": "model", "args": ["--model", "{model}"]},
+                {"if": "settings_file", "args": ["--settings", "{settings_file}"]},
+                "--", "{prompt}",
+            ],
+            "job_id": {"from": "stdout", "regex": r"job:(\w+)"},
+        },
+        "list": {
+            "command": [str(binpath), "ps", "--json"],
+            "scope": "cwd",
+            "sessions": {"from": "stdout_json", "path": "jobs",
+                         "fields": {"id": "job", "session_id": "conversation",
+                                    "cwd": "dir", "name": "label", "state": "status"}},
+            "state_map": {"RUNNING": "working", "WAITING": "blocked", "EXIT": "done"},
+        },
+        "result": {
+            "file": str(wdir / "{job_id}.json"),
+            "state": {"path": "status"},
+            "text": {"path": "final_message"},
+        },
+        "send": {"command": [str(binpath), "say", "{session_id}", "{message}"]},
+        "stop": {"command": [str(binpath), "kill", "{job_id}"]},
+        "provenance": {"sources": [{"path": str(binpath), "sha256": "auto"}]},
+    }
+
+    class Handle:
+        dir = wdir
+        bin = binpath
+        contract = contract_data
+
+        def install(self, project_path: Path) -> Path:
+            """Write the contract into a project, as an onboarding session would."""
+            from .launcher import PROJECT_CONTRACT, stamp_source_digests
+            path = Path(project_path) / PROJECT_CONTRACT
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(stamp_source_digests(dict(contract_data)), indent=2))
+            return path
+
+        @property
+        def calls(self) -> list[dict]:
+            path = wdir / "calls.jsonl"
+            if not path.exists():
+                return []
+            return [json.loads(l) for l in path.read_text().splitlines()]
+
+        @property
+        def jobs(self) -> list[dict]:
+            path = wdir / "jobs.json"
+            return json.loads(path.read_text()) if path.exists() else []
+
+        def finish(self, job_id: str, message: str = "final: done") -> None:
+            """Move a job to its terminal state, with a final message to capture."""
+            jobs = self.jobs
+            for j in jobs:
+                if j["job"] == job_id:
+                    j["status"] = "EXIT"
+            (wdir / "jobs.json").write_text(json.dumps(jobs))
+            (wdir / f"{job_id}.json").write_text(
+                json.dumps({"status": "EXIT", "final_message": message}))
 
     return Handle()
 
