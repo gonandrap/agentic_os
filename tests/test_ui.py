@@ -189,13 +189,46 @@ def test_unknown_project_and_wo(client):
     assert "not found" in client.get("/wo/proj_a/wo-nope").text
 
 
+def test_neo_tab_lists_questions_still_with_neo(client, daemon, project):
+    """A queued question used to appear only as a number in the counts line, so a
+    Neo that had stopped draining was indistinguishable from a Neo with nothing to
+    do — the page said "Neo hasn't handled anything yet" while a worker sat parked."""
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "CSV or JSON?")
+
+    r = client.get("/neo")
+    assert r.status_code == 200
+    assert "1 queued" in r.text
+    assert "With Neo right now" in r.text
+    assert "CSV or JSON?" in r.text          # the question itself, not just a count
+    assert f"/wo/proj_a/{wo['id']}" in r.text  # traceable back to the parked worker
+
+
+def test_neo_tab_shows_a_question_stuck_mid_answer(client, daemon, project):
+    """`claim_next` flips a question to `answering` and only a completed drain moves
+    it on; a crash in between strands it, since neo_tick only ever looks at `queued`.
+    Stranded is exactly when the user needs to see it."""
+    from jarvis.neo_store import NeoStore
+
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "CSV or JSON?")
+    neo = NeoStore()
+    try:
+        assert neo.claim_next()["status"] == "answering"  # drain dies right here
+    finally:
+        neo.close()
+
+    r = client.get("/neo")
+    assert "CSV or JSON?" in r.text
+    assert "answering" in r.text
+
+
 def test_neo_tab_review_flow(client, daemon, project):
     wo = ops.create_work_order("proj_a", "pick a format")
     daemon.tick()
     ops.ask_question(wo["id"], "CSV or JSON?")
-    r = client.get("/neo")
-    assert r.status_code == 200  # queued question renders in counts
-    assert "1 queued" in r.text
 
     daemon._neo_drain()
     r = client.get("/neo")
@@ -344,3 +377,42 @@ def test_got_it_is_not_offered_when_a_decision_is_owed(client, project):
     assert r.status_code == 303
     assert "error=" in r.headers["location"]
     assert store.get_work_order(wo["id"])["needs_attention"]
+
+
+def test_stale_deep_link_to_unregistered_project_is_not_a_500(client):
+    """Notifications embed a deep link built from whatever project name the emitter
+    passed. When that project is not (or is no longer) registered the dashboard has
+    to say so — a bare "Internal Server Error" tells the user nothing and leaves
+    them unable to tell a Jarvis bug from a vanished work order.
+    """
+    r = client.get("/wo/proj_gone/wo-4fdb20ba")
+    assert r.status_code == 200
+    assert "Internal Server Error" not in r.text
+    assert "proj_gone" in r.text and "not registered" in r.text
+
+
+def test_unexpected_error_renders_a_page_and_lands_in_the_os_log(
+        jarvis_home, fake_claude, catalog_file, monkeypatch):
+    """Defence in depth: whatever else breaks, the dashboard owes the user a page
+    and the OS owes itself a trace on disk. Before this, UI tracebacks went to the
+    systemd journal only — invisible to `$JARVIS_HOME/logs`, to Jarvis and to Neo.
+
+    Starlette always re-raises after sending the response so the server can log it,
+    hence `raise_server_exceptions=False` — a real browser still gets the page.
+    """
+    ops.start_os(str(catalog_file), foreground=True)
+    c = TestClient(create_app(), follow_redirects=False, raise_server_exceptions=False)
+
+    def boom():
+        raise RuntimeError("kaboom in os_status")
+
+    monkeypatch.setattr(ops, "os_status", boom)
+    r = c.get("/")
+    assert r.status_code == 500
+    assert "something went wrong" in r.text.lower()
+    assert "kaboom in os_status" in r.text
+
+    log = (jarvis_home / "logs" / "ui.log").read_text()
+    assert "kaboom in os_status" in log
+    assert "GET /" in log
+    assert "RuntimeError" in log
