@@ -96,7 +96,8 @@ uv tool install --editable ".[ui]"       # or: ./install.sh --tag jarvis-X.Y.Z
 
 ## Quick start
 
-1. Describe your fleet in a catalog (see `catalog.example.json`):
+1. Describe your fleet in a catalog — the installer left one at `~/.jarvis/catalog.json`;
+   `catalog.example.json` in this repo shows every option:
 
 ```json
 {
@@ -114,7 +115,7 @@ uv tool install --editable ".[ui]"       # or: ./install.sh --tag jarvis-X.Y.Z
 2. Start the OS:
 
 ```bash
-jarvis start --catalog catalog.json
+jarvis start --catalog ~/.jarvis/catalog.json
 ```
 
 This bootstraps every project (README check, OPERATION.md contract, `.jarvis/` state
