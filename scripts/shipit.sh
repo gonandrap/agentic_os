@@ -156,7 +156,7 @@ if [ ! -f "$PROD_CONFIG" ]; then
 {
   "$comment": "Production fleet catalog. Projects under $PRODUCTION_CODE get added here (prod onboarding — future). Empty is valid.",
   "os": {
-    "defaults": { "model": "sonnet", "permission_mode": "auto" },
+    "defaults": { "model": "claude-opus-5", "permission_mode": "auto" },
     "notifications": {
       "sinks": ["log", "telegram"],
       "telegram": { "token_env": "JARVIS_TELEGRAM_TOKEN", "chat_id_env": "JARVIS_TELEGRAM_CHAT_ID" }
