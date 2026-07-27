@@ -577,6 +577,16 @@ def test_wo_not_found(started):
         ops.find_work_order("wo-doesnotexist")
 
 
+def test_wo_lookup_scoped_to_unregistered_project(started):
+    """A deep link can name a project the OS does not know — a notification that
+    outlived its project, a typo, a test fixture that leaked into a real sink.
+    That must arrive as an OpsError: the CLI and the dashboard only catch OpsError,
+    so a raw KeyError here becomes a traceback and an HTTP 500.
+    """
+    with pytest.raises(ops.OpsError, match="not registered"):
+        ops.find_work_order("wo-4fdb20ba", "proj_gone")
+
+
 def test_pretooluse_auto_allows_jarvis_chains():
     from jarvis.hooks import is_jarvis_command_chain, preflight_decision
 
