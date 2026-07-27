@@ -32,6 +32,8 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
+from . import db
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .project_store import ProjectStore
 
@@ -81,13 +83,25 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     if pending:
         n = len(pending)
         blockers.append(f"{n} assumption{'s' if n != 1 else ''} pending your review")
-    if wo["status"] == "failed":
+    # Two of the blockers below only exist because Jarvis dispatched the worker and
+    # briefed it on the contract (`jarvis wo finish`, worktree, OPERATION.md). An
+    # adopted ad-hoc session got none of that — no JARVIS_WO_ID, no briefing — so it
+    # cannot signal completion and its session ending is not a failure. Holding it to
+    # the contract anyway made every adopted session a guaranteed attention item.
+    # Adoption exists for visibility; see Daemon.retire_adhoc.
+    governed = wo.get("origin") != "adhoc"
+    if governed and wo["status"] == "failed":
         blockers.append("worker failed — review and retry")
+    # Blocked on a prompt is real whoever started the session: nobody else can unstick it.
     if wo["status"] == "waiting_input":
         blockers.append("worker is waiting on your input")
-    if wo["status"] == "needs_review" and not pending:
+    if governed and wo["status"] == "needs_review" and not pending:
         blockers.append("finished without a completion signal — review the session")
-    return blockers
+    # What the user has already looked at and dismissed stops being a blocker — but only
+    # exactly that. Anything new still gets through (a pending assumption never can be
+    # acknowledged away; `jarvis wo ack` refuses).
+    acked = db.from_json(wo.get("acknowledged_blockers"), []) or []
+    return [b for b in blockers if b not in acked]
 
 
 def _mentions_assumptions(reason: str | None) -> bool:
@@ -130,6 +144,44 @@ def check_attention_reason_is_true(store: ProjectStore) -> Iterator[Violation]:
             repaired=True,
             repair=f"reason set to {blockers[0]!r}",
             context={"was": reason, "now": blockers[0]},
+        )
+
+
+def check_adhoc_not_governed(store: ProjectStore) -> Iterator[Violation]:
+    """INV-ADHOC-NOT-GOVERNED — an adopted session must not be judged as a worker.
+
+    The reconciler adopts background sessions it finds in a project directory so they
+    show up in `jarvis status` and on the dashboard. That is a *mirror*, not a
+    dispatch: the session was started by the user in `claude agents`, never received
+    the worker contract, and has no way to call `jarvis wo finish`. Judging it against
+    that contract parked it in `needs_review` ("worker idle without `jarvis wo finish`")
+    the moment it ended a turn, and in `failed` ("worker session disappeared") the
+    moment the user cleaned it up — one live fleet accumulated fifteen of these, one of
+    which was the session the user was talking to.
+
+    `true_blockers` stops *new* ones. This retires the records already on disk, so the
+    fix reaches a running fleet on the next reconcile tick instead of waiting for the
+    user to hand-clear a dashboard.
+
+    Repairable: with no contract there is no verdict to make. The record, its timeline
+    and whatever reply was captured all stay; only the demand for the user goes away.
+    Anything the session genuinely left pending (an assumption it filed itself) is left
+    exactly where it is.
+    """
+    for wo in store.list_work_orders(statuses=("failed", "needs_review"),
+                                     include_hidden=True):
+        if wo["origin"] != "adhoc" or store.pending_assumptions(wo["id"]):
+            continue
+        store.set_status(wo["id"], "completed")
+        store.clear_attention(wo["id"])
+        yield Violation(
+            invariant="INV-ADHOC-NOT-GOVERNED",
+            wo_id=wo["id"],
+            detail=f"adopted ad-hoc session held to the worker contract "
+                   f"({wo.get('attention_reason') or wo['status']})",
+            repaired=True,
+            repair="retired to completed; attention cleared",
+            context={"was": wo["status"], "reason": wo.get("attention_reason")},
         )
 
 
@@ -253,6 +305,7 @@ def check_attention_has_reason(store: ProjectStore) -> Iterator[Violation]:
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
     check_attention_reason_is_true,
+    check_adhoc_not_governed,      # retire before the flag checks judge the leftovers
     check_no_phantom_attention,
     check_blocked_work_is_surfaced,
     check_attention_has_reason,

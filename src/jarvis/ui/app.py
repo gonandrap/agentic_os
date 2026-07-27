@@ -206,6 +206,16 @@ def create_app() -> FastAPI:
         ops.cancel(wo_id)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
+    @app.post("/wo/{name}/{wo_id}/ack")
+    def ack_wo(name: str, wo_id: str):
+        try:
+            ops.ack_attention(wo_id, project_name=name)
+        except ops.OpsError as e:
+            # The one case that refuses: pending assumptions want a decision, not a
+            # dismissal. Say so instead of silently doing nothing.
+            return RedirectResponse(f"/wo/{name}/{wo_id}?error={e}", status_code=303)
+        return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
+
     @app.post("/wo/{name}/{wo_id}/hide")
     def hide_wo(name: str, wo_id: str):
         ops.hide_work_order(wo_id, hidden=True, project_name=name)

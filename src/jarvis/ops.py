@@ -24,6 +24,7 @@ from .catalog import (
 )
 from .central_store import CentralStore
 from .daemon import daemon_running
+from .invariants import true_blockers
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import OPEN_STATUSES, ProjectStore
 
@@ -503,6 +504,63 @@ def cancel(wo_id: str) -> dict[str, Any]:
         out["note"] = (f"the worker's session ({wo['session_id']}) could not be stopped "
                        f"({stopped.get('reason')}) — stop it from the agents view")
     return out
+
+
+def ack_attention(wo_id: str | None = None, all_projects: bool = False,
+                  project_name: str | None = None) -> dict[str, Any]:
+    """Acknowledge attention flags — "I have seen this, stop showing it to me".
+
+    The missing counterpart to `jarvis inbox ack`. Attention does not live in the inbox:
+    it is a flag on each work order, re-derived from state on every reconcile tick. So
+    acking the whole inbox left the attention list untouched, and clearing a flag by
+    hand lasted until the next tick put it straight back. This is the only way to put
+    one down for good.
+
+    Pending assumptions are never acknowledgeable: they are a decision the OS is waiting
+    on, and burying one silently drops work the user asked for. `jarvis wo review`
+    (accept) or `--reject` is the way through those.
+    """
+    if not wo_id and not all_projects:
+        raise OpsError("give a work order id, or --all to acknowledge everything")
+
+    if wo_id:
+        name, path, _ = find_work_order(wo_id, project_name)
+        targets = {name: path}
+    else:
+        targets = registered_project_paths()
+        if project_name:
+            if project_name not in targets:
+                raise OpsError(f"project {project_name!r} not registered")
+            targets = {project_name: targets[project_name]}
+
+    acknowledged: list[str] = []
+    skipped: list[dict[str, str]] = []
+    for _name, path in targets.items():
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            if wo_id:
+                candidates = [store.get_work_order(wo_id)]
+            else:
+                candidates = [w for w in store.list_work_orders() if w["needs_attention"]]
+            for wo in candidates:
+                blockers = true_blockers(store, wo)
+                needs_decision = [b for b in blockers if "assumption" in b.lower()]
+                if needs_decision:
+                    if wo_id:
+                        raise OpsError(
+                            f"{wo['id']} is waiting on a decision ({needs_decision[0]}) "
+                            f"— acknowledging would bury it. Use `jarvis wo review "
+                            f"{wo['id']}` to accept, or `--reject` to send it back."
+                        )
+                    skipped.append({"wo_id": wo["id"], "reason": needs_decision[0]})
+                    continue
+                store.ack_attention(wo["id"], blockers)
+                acknowledged.append(wo["id"])
+        finally:
+            store.close()
+    return {"acknowledged": acknowledged, "skipped": skipped}
 
 
 def hide_work_order(wo_id: str, hidden: bool = True,

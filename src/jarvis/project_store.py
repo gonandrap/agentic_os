@@ -103,6 +103,12 @@ ADDED_COLUMNS = {
         # Hidden orders stay on the record but stop competing for the user's attention:
         # out of listings, out of the summary, and never dispatched.
         "hidden": "INTEGER NOT NULL DEFAULT 0",
+        # Blockers the user has explicitly seen and dismissed (JSON list). Attention is
+        # re-derived from state on every reconcile tick, so clearing the flag alone does
+        # not stick — the tick puts it straight back. This is what makes an ack hold:
+        # `true_blockers` subtracts these, and only these, so a *new* blocker still
+        # surfaces. Cleared whenever the flag legitimately drops (the ack is spent).
+        "acknowledged_blockers": "TEXT",
     },
 }
 
@@ -242,7 +248,22 @@ class ProjectStore:
         self.add_event(wo_id, "attention", {"reason": reason})
 
     def clear_attention(self, wo_id: str) -> None:
-        self.update_work_order(wo_id, needs_attention=0, attention_reason=None)
+        # The blocker is gone, so any ack against it is spent: if the same reason comes
+        # back later it is a new event and must be shown again.
+        self.update_work_order(wo_id, needs_attention=0, attention_reason=None,
+                               acknowledged_blockers=None)
+
+    def ack_attention(self, wo_id: str, blockers: list[str]) -> None:
+        """Record that the user has seen these blockers, and put the flag down.
+
+        Deliberately dumb: the caller derives `blockers` (via `invariants.true_blockers`)
+        so the store stays free of policy. Unlike `clear_attention` this remembers what
+        was dismissed, which is the only reason the flag stays down across reconcile
+        ticks — see `acknowledged_blockers` in ADDED_COLUMNS.
+        """
+        self.update_work_order(wo_id, needs_attention=0, attention_reason=None,
+                               acknowledged_blockers=db.to_json(blockers))
+        self.add_event(wo_id, "acknowledged", {"blockers": blockers})
 
     def set_hidden(self, wo_id: str, hidden: bool = True) -> None:
         """Hide (or unhide) a work order.

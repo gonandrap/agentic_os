@@ -249,6 +249,12 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
             if fresh["status"] in ("running", "waiting_input", "dispatching"):
                 if fresh.get("result_summary"):
                     _finalize(store, wo_id)
+                elif fresh["origin"] == "adhoc":
+                    # An adopted session the user started themselves: never dispatched,
+                    # never briefed, so it owes no completion signal (Daemon.retire_adhoc).
+                    store.set_status(wo_id, "completed")
+                    store.clear_attention(wo_id)
+                    store.add_event(wo_id, "adhoc_retired", {"why": "session ended"})
                 else:
                     store.set_status(wo_id, "needs_review")
                     store.flag_attention(wo_id, "session ended without `jarvis wo finish`")
