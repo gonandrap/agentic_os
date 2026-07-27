@@ -7,7 +7,7 @@ Grouped commands:
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
   jarvis neo list|show|review|answer|learnings|learn|export
   jarvis backlog add|list|promote|done
-  jarvis learn add|list|search
+  jarvis learn add|list|search|show|topics|pin|unpin
   jarvis notify / jarvis inbox
   jarvis bug report                       file a Jarvis OS bug (GitHub issue + ping)
   jarvis ui                               web dashboard
@@ -369,12 +369,29 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--project", default="", help="omit for a global learning")
     k.add_argument("--topic", default="")
     k.add_argument("--tags", default="")
-    k = kn.add_parser("list")
-    k.add_argument("--project")
-    k = kn.add_parser("search")
+    k.add_argument("--pin", action="store_true",
+                   help="inject this entry verbatim into every worker prompt "
+                        "(reserve for safety rails; everything else is looked up)")
+    k = kn.add_parser("list", help="headlines only unless --full")
+    k.add_argument("--project", help="this project + global entries")
+    k.add_argument("--topic")
+    k.add_argument("--full", action="store_true", help="full text instead of headlines")
+    k.add_argument("--limit", type=int, default=100)
+    k = kn.add_parser("search", help="full text of entries matching a term")
     k.add_argument("term")
+    k.add_argument("--project", help="this project + global entries")
+    k.add_argument("--topic")
+    k.add_argument("--limit", type=int, default=20)
+    k = kn.add_parser("show", help="full text of specific entries, by id")
+    k.add_argument("ids", nargs="+")
+    k = kn.add_parser("topics", help="topics and how many entries each holds")
+    k.add_argument("--project")
+    k = kn.add_parser("pin", help="always inject this entry in full")
+    k.add_argument("kn_id")
+    k = kn.add_parser("unpin", help="demote to an index headline")
+    k.add_argument("kn_id")
     k = kn.add_parser("retract", help="retire a superseded entry (kept for the record, "
-                                      "dropped from worker prompts)")
+                                      "dropped from worker prompts and the index)")
     k.add_argument("knowledge_id")
     k.add_argument("--reason", required=True,
                    help="what supersedes it — this is kept beside the entry for ever")
@@ -912,22 +929,62 @@ def cmd_backlog(args: argparse.Namespace) -> int:
 
 
 def cmd_learn(args: argparse.Namespace) -> int:
-    from .central_store import CentralStore
+    from .central_store import PINNED_TAG, CentralStore, has_tag, headline, split_tags
+    from .ops import OpsError
+
+    def digested(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Index form: enough to decide whether to fetch the entry, not the entry.
+
+        `retired` rides along because `list` is an audit surface that shows retracted
+        entries: a headline is short enough to be mistaken for standing advice, so the
+        one field that says otherwise has to survive the truncation.
+        """
+        out = []
+        for r in rows:
+            row = {"id": r["id"], "project": r["project"] or "global", "topic": r["topic"],
+                   "pinned": has_tag(r["tags"], PINNED_TAG),
+                   "headline": headline(r["content"])}
+            if r.get("retired_at"):
+                row["retired"] = r["retired_reason"] or "(no reason recorded)"
+            out.append(row)
+        return out
+
     central = CentralStore()
     try:
         if args.kn_cmd == "add":
+            tags = split_tags(args.tags)
+            if args.pin and PINNED_TAG not in tags:
+                tags.append(PINNED_TAG)
             _print(central.add_knowledge(args.content, project=args.project,
-                                         topic=args.topic, tags=args.tags), args.json)
+                                         topic=args.topic, tags=",".join(tags)), args.json)
         elif args.kn_cmd == "list":
-            # An audit surface, so retired entries are listed too — `--project` would
-            # otherwise hide them, `search_knowledge` already shows them, and the same
-            # command answering two different questions is worse than either.
-            rows = (central.relevant_knowledge(args.project, limit=100,
-                                               include_retired=True)
-                    if args.project else central.search_knowledge("", limit=100))
-            _print(rows, args.json)
+            # An audit surface, so retired entries are listed too — `search_knowledge`
+            # is the unfiltered read, and `digested` marks what was retracted so a
+            # headline cannot pass for standing advice.
+            rows = central.search_knowledge("", limit=args.limit, project=args.project,
+                                            topic=args.topic)
+            _print(rows if args.full else digested(rows), args.json)
         elif args.kn_cmd == "search":
-            _print(central.search_knowledge(args.term), args.json)
+            rows = central.search_knowledge(args.term, limit=args.limit,
+                                            project=args.project, topic=args.topic)
+            if not rows and not args.json:
+                print(f"no knowledge matching {args.term!r} — "
+                      f"try `jarvis learn topics` for what is recorded")
+            _print(rows, args.json)
+        elif args.kn_cmd == "show":
+            rows = [r for r in (central.get_knowledge(i) for i in args.ids) if r]
+            missing = set(args.ids) - {r["id"] for r in rows}
+            if missing:
+                raise OpsError(f"unknown knowledge id(s): {', '.join(sorted(missing))}")
+            _print(rows, args.json)
+        elif args.kn_cmd == "topics":
+            _print([{"topic": t or "(no topic)", "entries": n}
+                    for t, n in central.knowledge_topics(args.project)], args.json)
+        elif args.kn_cmd in ("pin", "unpin"):
+            row = central.pin_knowledge(args.kn_id, pinned=args.kn_cmd == "pin")
+            if row is None:
+                raise OpsError(f"unknown knowledge id {args.kn_id!r}")
+            _print(row, args.json)
         elif args.kn_cmd == "retract":
             try:
                 row = central.retract_knowledge(args.knowledge_id, args.reason)

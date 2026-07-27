@@ -45,8 +45,9 @@ catalog and Jarvis:
   (`jarvis notify`) that fans out to your inbox, logs, Telegram, or desktop.
 - **Centralizes the backlog** — deferred work from any project lands in one
   dependency-aware backlog you can promote into work orders with one command.
-- **Shares knowledge** — learnings reported by workers in one project are injected into
-  future work orders in every project.
+- **Shares knowledge** — learnings reported by workers in one project are indexed into
+  future work orders in every project, and workers pull the full text on demand, so the
+  base can grow without inflating every prompt.
 - **Keeps you in the loop** — `jarvis status` (or the web dashboard) shows the whole
   fleet and flags exactly what needs your attention: assumptions to review, blocked
   workers, unacked alerts.
@@ -155,7 +156,7 @@ also watch and join them from `claude agents`.
 | **Neo** | OS-level answerer agent: workers ask (`jarvis wo ask`), Neo answers as you; you review its answers (UI neo tab) and corrections become its learnings |
 | **Inbox** | Central notification stream (`jarvis inbox`), fanned out to sinks |
 | **Backlog** | Central deferred-work list with dependencies (`jarvis backlog`) |
-| **Knowledge** | Central learnings injected into future work orders (`jarvis learn`) |
+| **Knowledge** | Central learnings. Worker prompts carry an *index* (headline + id, bounded); workers fetch full text on demand with `jarvis learn search`/`show`. Entries you pin ride along verbatim |
 
 ## Worker contract
 
@@ -165,6 +166,8 @@ Every worker must (enforced by OPERATION.md + dispatch prompt):
 jarvis wo assume  <wo-id> "assumed X because Y"      # every autonomous decision
 jarvis wo ask     <wo-id> "blocking question"        # Neo (or you) answers next turn
 jarvis backlog add <project> "deferred thing"        # instead of "future work" notes
+jarvis learn search "<term>" --project <p>           # READ before you touch an area
+jarvis learn show <kn-id>                            # full text behind an index headline
 jarvis learn add "reusable insight" --project <p>    # share with other projects
 jarvis notify --level critical "prod is down" "..."  # human attention
 jarvis wo finish  <wo-id> --summary "delivered ..."  # completion signal

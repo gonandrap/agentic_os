@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from . import claude_cli
-from .catalog import ProjectSpec
-from .central_store import CentralStore
+from .catalog import OsConfig, ProjectSpec
+from .central_store import CentralStore, KnowledgeBrief
 from .project_store import ProjectStore
 
 
@@ -123,8 +123,58 @@ def worker_name(wo: dict[str, Any]) -> str:
     return f"[WO {wo['id']}] {wo['title'][:60]}"
 
 
+def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str]:
+    """The knowledge base as a map plus a retrieval verb, not as a payload.
+
+    Pasting entries in full made the prompt grow with the base — every work order in the
+    fleet paying for every learning ever recorded — while the selector (most-recent-N)
+    meant the entry that actually mattered usually fell outside the window anyway. So the
+    prompt ships headlines and ids at bounded cost, and the worker pulls full text for
+    what its task touches.
+    """
+    lines = [
+        "",
+        f"# Knowledge base — {brief.total} entries visible to `{project_name}` "
+        f"(this project + global)",
+        "**This section is an INDEX, not the knowledge.** Headlines are truncated; the "
+        "full text of an entry arrives only when you ask for it. Before you touch an "
+        "area — a build step, a deploy path, a convention, a service — look it up:",
+        "```bash",
+        f'jarvis learn search "<term>" --project {project_name}  # full text of matches',
+        "jarvis learn show <id> [<id> ...]  # full text of specific entries",
+        f"jarvis learn list --project {project_name} --topic <t>  # everything in a topic",
+        f"jarvis learn topics --project {project_name}  # what topics exist",
+        "```",
+        "Entries marked `(global)` came from another project; the rest are this one's.",
+    ]
+    if brief.pinned:
+        lines += ["", "## Pinned — read these now (full text)"]
+        for k in brief.pinned:
+            topic = f" [{k['topic']}]" if k["topic"] else ""
+            lines.append(f"- ({k['project'] or 'global'}{topic}) {k['content']}")
+    if brief.digest:
+        lines += ["", "## Index — headline only, `jarvis learn show <id>` for the rest"]
+        current = object()
+        for k in brief.digest:
+            if k["topic"] != current:
+                current = k["topic"]
+                lines.append(f"### {k['topic'] or '(no topic)'}")
+            scope = "" if k["project"] == project_name else " (global)"
+            lines.append(f"- `{k['id']}`{scope} {k['headline']}")
+    if brief.overflow:
+        listed = ", ".join(f"{t or '(no topic)'} ({n})" for t, n in brief.overflow)
+        lines += [
+            "",
+            f"## Not indexed above — {brief.overflow_count} further entries, by topic",
+            f"{listed}",
+            f"Reach them with `jarvis learn list --project {project_name} --topic <topic>` "
+            f"or `jarvis learn search`.",
+        ]
+    return lines
+
+
 def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
-                        knowledge: list[dict[str, Any]]) -> str:
+                        knowledge: KnowledgeBrief | None = None) -> str:
     """What the worker is told, composed from the work order and its project.
 
     Two kinds of work order get two contracts (`project_store.WO_KINDS`). Everything
@@ -182,7 +232,12 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"guessing, ask instead.",
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"`",
-        f"- The OS knowledge base is the ONLY memory that survives you: "
+        f"- READ the OS knowledge base on demand — it is indexed at the end of this "
+        f"prompt, not pasted into it: `jarvis learn search \"<term>\" --project "
+        f"{project.name}` and `jarvis learn show <id>`. Look up any area you are about "
+        f"to touch before you touch it; a past worker probably already paid for the "
+        f"lesson. Do not assume the index headline is the whole entry.",
+        f"- WRITE to it: the OS knowledge base is the ONLY memory that survives you: "
         f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`. "
         f"Anything durable you learn — project state, gotchas, conventions, decisions "
         f"— goes there. Your own memory files, notes and scratch docs are invisible to "
@@ -261,7 +316,7 @@ def _navigation_briefing() -> list[str]:
 
 
 def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
-                     knowledge: list[dict[str, Any]]) -> list[str]:
+                     knowledge: KnowledgeBrief | None = None) -> list[str]:
     """The tail every briefing carries, whatever the work order's kind."""
     parts += ["", *_navigation_briefing()]
     pre_approved = _pre_approval(wo)
@@ -270,16 +325,12 @@ def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
     if project.gates:
         parts += ["", *_gate_briefing(wo, project)]
     if knowledge:
-        parts += ["", "# Knowledge base (learnings from this and other projects)"]
-        for k in knowledge:
-            scope = k["project"] or "global"
-            topic = f" [{k['topic']}]" if k["topic"] else ""
-            parts.append(f"- ({scope}{topic}) {k['content']}")
+        parts += render_knowledge_block(knowledge, project.name)
     return parts
 
 
 def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
-                    knowledge: list[dict[str, Any]]) -> str:
+                    knowledge: KnowledgeBrief | None = None) -> str:
     """The briefing for a feature order's planner.
 
     Four things make it different from a worker's, and each is load-bearing:
@@ -445,6 +496,10 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"` — including anything you decided was OUT of this "
         f"feature's scope.",
+        f"- READ the OS knowledge base before you decompose — it is indexed at the end "
+        f"of this prompt, not pasted into it: `jarvis learn search \"<term>\" --project "
+        f"{project.name}` and `jarvis learn show <id>`. A plan built without it will "
+        f"hand children the lessons the fleet already paid for, again.",
         f"- The OS knowledge base is the ONLY memory that survives you: "
         f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`.",
         f"- Alert the human when needed: `jarvis notify --project {project.name} "
@@ -557,7 +612,7 @@ def dispatch_work_order(
     central: CentralStore,
     project: ProjectSpec,
     wo: dict[str, Any],
-    knowledge_limit: int = 8,
+    os_config: OsConfig | None = None,
 ) -> dict[str, Any]:
     """Open the worker's conversation for a work order already in `dispatching` state.
 
@@ -567,7 +622,13 @@ def dispatch_work_order(
     """
     from . import worker_session
 
-    knowledge = central.relevant_knowledge(project.name, limit=knowledge_limit)
+    cfg = os_config or OsConfig()
+    knowledge = central.knowledge_brief(
+        project.name,
+        pinned_limit=cfg.knowledge_inject_limit,
+        digest_limit=cfg.knowledge_digest_limit,
+        digest_chars=cfg.knowledge_digest_chars,
+    )
     prompt = build_worker_prompt(wo, project, knowledge)
 
     # Resolved onto the row before the turn is launched, so every later turn rebuilds the
