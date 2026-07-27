@@ -37,6 +37,11 @@ jarvis start --catalog <path-to-catalog>   # boot the OS (user catalogs live unt
 jarvis stop
 jarvis wo create <project> "title" -d "details" [--model m]
 jarvis wo list [project] / show <id> / send <id> "msg" / review <id> / cancel <id>
+jarvis wo ack <id> / --all                 # "seen it" — puts the attention flag down for
+                                           # good (the reconciler re-derives attention
+                                           # every tick, so nothing else makes it stick).
+                                           # Refuses on pending assumptions: those want
+                                           # `jarvis wo review`, not a dismissal.
 jarvis wo hide <id> / unhide <id>          # declutter: keeps the record, drops it from
                                            # listings, the summary and the attention list
 jarvis wo delete <id> --yes                # irreversible: erases the WO and its whole

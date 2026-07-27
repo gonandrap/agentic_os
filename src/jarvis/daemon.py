@@ -412,6 +412,24 @@ class Daemon:
         self.reply_capture_misses.pop(wo["id"], None)
         return True
 
+    def retire_adhoc(self, store: ProjectStore, wo: dict, why: str) -> None:
+        """Close an adopted session's record without passing judgement on it.
+
+        Jarvis did not dispatch this session: it was started by the user in
+        `claude agents` and adopted afterwards so it would show up in `jarvis status`
+        and on the dashboard. It never got `JARVIS_WO_ID` or the worker briefing, so it
+        owes no `jarvis wo finish` and its ending is not an incident. Marking it
+        `failed`/`needs_review` (as this reconciler used to) turned every session the
+        user ran into a permanent attention item.
+
+        The record keeps everything it learned — timeline, captured replies, any
+        assumptions — it just stops demanding the user.
+        """
+        store.set_status(wo["id"], "completed")
+        store.clear_attention(wo["id"])
+        store.add_event(wo["id"], "adhoc_retired", {"why": why})
+        log.info("retired ad-hoc %s (%s)", wo["id"], why)
+
     def reconcile_project(
         self,
         project: ProjectSpec,
@@ -462,13 +480,20 @@ class Daemon:
                     continue  # may not have registered yet
                 age = time.time() - wo["updated_at"]
                 if age > 120:
-                    store.set_status(wo["id"], "failed")
-                    store.flag_attention(wo["id"], "worker session disappeared")
-                    store.add_notification(
-                        title=f"{wo['id']} worker disappeared",
-                        body=f"Session {sid} no longer exists.",
-                        level="warning", wo_id=wo["id"], source="reconciler",
-                    )
+                    if wo["origin"] == "adhoc":
+                        # The user's own session, gone from the agents view. They
+                        # closed it — that is housekeeping, not an incident.
+                        self.retire_adhoc(store, wo, "session left the agents view")
+                    else:
+                        # Jarvis dispatched this one and promised to see it through,
+                        # so a vanished session is a real failure.
+                        store.set_status(wo["id"], "failed")
+                        store.flag_attention(wo["id"], "worker session disappeared")
+                        store.add_notification(
+                            title=f"{wo['id']} worker disappeared",
+                            body=f"Session {sid} no longer exists.",
+                            level="warning", wo_id=wo["id"], source="reconciler",
+                        )
                 continue
             if sess.is_active and wo["status"] != "running":
                 # The agent is making progress again, so whatever stalled it is gone.
@@ -493,16 +518,28 @@ class Daemon:
                         store.set_status(wo["id"], "completed")
                         store.clear_attention(wo["id"])
                 elif not store.queued_messages(wo["id"]):
-                    store.set_status(wo["id"], "needs_review")
-                    store.flag_attention(
-                        wo["id"], "worker idle without `jarvis wo finish` — review the session"
-                    )
+                    if wo["origin"] == "adhoc":
+                        # Not a dispatched worker: ending a turn is just a turn ending.
+                        self.retire_adhoc(store, wo, "session went idle")
+                    else:
+                        store.set_status(wo["id"], "needs_review")
+                        store.flag_attention(
+                            wo["id"],
+                            "worker idle without `jarvis wo finish` — review the session",
+                        )
 
         # Adopt unknown background sessions as ad-hoc work orders (visibility).
         for sess in sessions:
             if not sess.session_id or sess.name.startswith("[WO "):
                 continue
-            if store.find_by_session(sess.session_id):
+            known = store.find_by_session(sess.session_id)
+            if known:
+                # A retired ad-hoc session can start another turn — the user just typed
+                # again. Reopen the record rather than showing "completed" next to a
+                # session that is visibly working.
+                if (known["origin"] == "adhoc" and known["status"] == "completed"
+                        and sess.is_active):
+                    store.set_status(known["id"], "running")
                 continue
             if sess.is_finished:
                 continue  # only surface live ad-hoc sessions

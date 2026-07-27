@@ -155,6 +155,13 @@ def build_parser() -> argparse.ArgumentParser:
     x = wo.add_parser("cancel", help="cancel a work order")
     x.add_argument("wo_id")
 
+    ak = wo.add_parser("ack", help="acknowledge a work order's attention flag — it "
+                                   "stops asking for you in status and on the dashboard")
+    ak.add_argument("wo_id", nargs="?")
+    ak.add_argument("--all", action="store_true",
+                    help="acknowledge every flagged work order in the fleet")
+    ak.add_argument("--project")
+
     h = wo.add_parser("hide", help="hide a work order from listings and the attention "
                                    "list (nothing is deleted)")
     h.add_argument("wo_id")
@@ -464,6 +471,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
         _print(ops.review_work_order(args.wo_id, accept=not args.reject), args.json)
     elif args.wo_cmd == "cancel":
         _print(ops.cancel(args.wo_id), args.json)
+    elif args.wo_cmd == "ack":
+        _print(ops.ack_attention(args.wo_id, all_projects=args.all,
+                                 project_name=args.project), args.json)
     elif args.wo_cmd in ("hide", "unhide"):
         _print(ops.hide_work_order(args.wo_id, hidden=args.wo_cmd == "hide",
                                    project_name=args.project), args.json)

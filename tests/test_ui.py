@@ -11,6 +11,7 @@ from jarvis import ops  # noqa: E402
 from jarvis.catalog import load_catalog  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
 from jarvis.daemon import Daemon  # noqa: E402
+from jarvis.invariants import check_project  # noqa: E402
 from jarvis.project_store import ProjectStore  # noqa: E402
 from jarvis.ui.app import create_app  # noqa: E402
 
@@ -304,3 +305,42 @@ def test_delete_from_the_work_order_page_removes_it(client, project):
     finally:
         store.close()
     assert "doomed task" not in client.get("/project/proj_a").text
+
+
+def test_got_it_button_puts_the_flag_down(client, project):
+    """The dashboard complaint in one test: acking has to survive the daemon.
+
+    The attention strip is what the user actually reads, and before this there was no
+    control on the page that could clear it — `jarvis inbox ack` acks notifications,
+    which is a different store entirely.
+    """
+    wo = ops.create_work_order("proj_a", "noisy task")
+    store = ProjectStore(project)
+    store.set_status(wo["id"], "needs_review")
+    store.flag_attention(wo["id"], "finished without a completion signal — review the session")
+    assert "NEEDS YOU" in client.get("/").text
+
+    detail = client.get(f"/wo/proj_a/{wo['id']}")
+    assert "Got it" in detail.text
+    r = client.post(f"/wo/proj_a/{wo['id']}/ack")
+    assert r.status_code == 303
+
+    check_project(ProjectStore(project), repair=True)  # the daemon's next tick
+    assert "all quiet" in client.get("/").text
+
+
+def test_got_it_is_not_offered_when_a_decision_is_owed(client, project):
+    """Assumptions need accept/reject — dismissing one would drop the work silently."""
+    wo = ops.create_work_order("proj_a", "task with a judgement call")
+    store = ProjectStore(project)
+    store.add_assumption(wo["id"], "picked postgres over sqlite")
+    store.set_status(wo["id"], "needs_review")
+    store.flag_attention(wo["id"], "1 assumption pending your review")
+
+    detail = client.get(f"/wo/proj_a/{wo['id']}")
+    assert "Got it" not in detail.text
+
+    r = client.post(f"/wo/proj_a/{wo['id']}/ack")  # forced by hand anyway
+    assert r.status_code == 303
+    assert "error=" in r.headers["location"]
+    assert store.get_work_order(wo["id"])["needs_attention"]

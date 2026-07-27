@@ -98,6 +98,7 @@ also watch and join them from `claude agents`.
 | **Catalog** | JSON file declaring projects, models, settings overrides |
 | **Work order** | A unit of work; one worker agent, one git worktree, full audit trail |
 | **Origin badge** | `jarvis`/`ui` = framework-created; `manual`/`adhoc` = flagged ⚠ in UI and status |
+| **Ad-hoc adoption** | A background session Jarvis didn't spawn is adopted so it shows up in status and the dashboard. It's a mirror, not a dispatch: it never got the worker contract, so it owes no `jarvis wo finish` and its session ending is not a failure |
 | **OPERATION.md** | Per-project contract every worker follows (assumptions, backlog, learnings, notify) |
 | **ASSUMPTIONS.md** | Per-project log of decisions workers made autonomously, pending your review |
 | **Neo** | OS-level answerer agent: workers ask (`jarvis wo ask`), Neo answers as you; you review its answers (UI neo tab) and corrections become its learnings |
@@ -126,6 +127,12 @@ replacement.
 
 Assumptions flip the work order to `needs_review` — visible in `jarvis status`, the
 dashboard, and (if configured) Telegram.
+
+Attention is re-derived from state on every reconcile tick, so it can't be cleared by
+hand — the next tick puts it back. `jarvis wo ack <id>` (or **Got it** on the work order
+page) records what you dismissed and keeps it down; a *different* blocker still surfaces.
+Pending assumptions can't be acked: they want `jarvis wo review`. Note that acking is not
+the same as `jarvis inbox ack`, which clears notifications — a different stream.
 
 ## Onboarding existing projects
 
