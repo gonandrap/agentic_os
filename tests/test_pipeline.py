@@ -14,6 +14,7 @@ from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
 from jarvis.hooks import handle_hook
+from jarvis.invariants import true_blockers
 from jarvis.project_store import ProjectStore
 
 
@@ -450,14 +451,18 @@ def test_reconciler_flags_unfinished_idle_worker(started, fake_claude, project):
     assert "without `jarvis wo finish`" in fresh["attention_reason"]
 
 
+def _add_adhoc(fake_claude, project, state, sid="adhoc-session-1", name="my manual hack"):
+    sessions = fake_claude.sessions
+    sessions.append({"id": "abcd1234", "sessionId": sid,
+                     "cwd": str(project), "kind": "background",
+                     "name": name, "state": state, "startedAt": 0})
+    (fake_claude.dir / "sessions.json").write_text(json.dumps(sessions))
+
+
 def test_reconciler_adopts_adhoc_sessions(started, fake_claude, project):
     daemon = started
     # a bg session someone started by hand in the project dir
-    sessions = fake_claude.sessions
-    sessions.append({"id": "abcd1234", "sessionId": "adhoc-session-1",
-                     "cwd": str(project), "kind": "background",
-                     "name": "my manual hack", "state": "running", "startedAt": 0})
-    (fake_claude.dir / "sessions.json").write_text(json.dumps(sessions))
+    _add_adhoc(fake_claude, project, "working")
 
     daemon.tick_count = 0
     daemon.tick()
@@ -470,6 +475,83 @@ def test_reconciler_adopts_adhoc_sessions(started, fake_claude, project):
     daemon.tick_count = 0
     daemon.tick()
     assert len([w for w in store.list_work_orders() if w["origin"] == "adhoc"]) == 1
+
+
+def test_adopted_working_session_does_not_ask_for_input(started, fake_claude, project):
+    """A healthy ad-hoc worker must never be adopted as "waiting on you".
+
+    Regression: the reconciler compared Claude Code's session state against
+    "running" — a word the CLI never emits (it says "working") — so every live
+    ad-hoc session was adopted straight into waiting_input and the UI claimed the
+    session wanted the user while it was quietly making progress.
+    """
+    daemon = started
+    _add_adhoc(fake_claude, project, "working")
+    daemon.tick_count = 0
+    daemon.tick()
+
+    store = ProjectStore(project)
+    adhoc = [w for w in store.list_work_orders() if w["origin"] == "adhoc"][0]
+    assert adhoc["status"] == "running"
+    assert not adhoc["needs_attention"]
+    assert not true_blockers(store, adhoc)
+
+
+def test_adopted_blocked_session_asks_for_input(started, fake_claude, project):
+    daemon = started
+    _add_adhoc(fake_claude, project, "blocked")
+    daemon.tick_count = 0
+    daemon.tick()
+
+    store = ProjectStore(project)
+    adhoc = [w for w in store.list_work_orders() if w["origin"] == "adhoc"][0]
+    assert adhoc["status"] == "waiting_input"
+    assert adhoc["needs_attention"]
+
+
+def test_reconciler_clears_attention_when_worker_resumes(started, fake_claude, project):
+    """waiting_input must not be sticky: a worker that unblocks stops needing the user.
+
+    Regression: nothing could ever move a work order back to `running`, so the
+    "needs you" banner survived long after the worker had resumed.
+    """
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    sid = bind_session(daemon, project, wo["id"])
+
+    fake_claude.set_session_state(sid, "blocked")  # hit a permission prompt
+    daemon.tick_count = 0
+    daemon.tick()
+    blocked = store.get_work_order(wo["id"])
+    assert blocked["status"] == "waiting_input"
+    assert blocked["needs_attention"]
+
+    fake_claude.set_session_state(sid, "working")  # user answered; worker carries on
+    daemon.tick_count = 0
+    daemon.tick()
+    resumed = store.get_work_order(wo["id"])
+    assert resumed["status"] == "running"
+    assert not resumed["needs_attention"]
+    assert not true_blockers(store, resumed)
+
+
+@pytest.mark.parametrize("state", ["failed", "cancelled"])
+def test_reconciler_settles_non_done_terminal_states(started, fake_claude, project, state):
+    """A session that died is finished too — it must not hang in `running` forever."""
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    sid = bind_session(daemon, project, wo["id"])
+
+    fake_claude.set_session_state(sid, state)
+    daemon.tick_count = 0
+    daemon.tick()
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "needs_review"
+    assert fresh["needs_attention"]
 
 
 def test_backlog_promotion_with_dependencies(started, project):

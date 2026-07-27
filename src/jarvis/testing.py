@@ -63,7 +63,10 @@ elif "--bg" in argv:
         "cwd": os.getcwd(),
         "kind": "background",
         "name": name,
-        "state": "running",
+        # Claude Code's vocabulary, not Jarvis's: a live agent is "working". Emitting
+        # "running" here (the work-order status word) once hid a real bug for weeks —
+        # the daemon compared against it and every healthy worker read as blocked.
+        "state": "working",
         "startedAt": 0,
         "resumedFrom": resumed,
         "prompt": argv[-1][:40],
@@ -71,14 +74,14 @@ elif "--bg" in argv:
     save_sessions(sessions)
     # Job state the daemon polls for a turn's final assistant message (internal-format
     # stand-in). The supervisor publishes one per bg job. A forked (--resume) turn is a
-    # single short exchange and lands right away; an initial dispatch stays running
+    # single short exchange and lands right away; an initial dispatch stays working
     # until the test flips the session to done via set_session_state.
     jobs_root = os.environ.get("JARVIS_CLAUDE_JOBS_DIR")
     if jobs_root:
         jdir = os.path.join(jobs_root, job_id)
         os.makedirs(jdir, exist_ok=True)
         state = ({"state": "done", "output": {"result": f"ack: {argv[-1][:40]}"}}
-                 if resumed else {"state": "running"})
+                 if resumed else {"state": "working"})
         with open(os.path.join(jdir, "state.json"), "w") as f:
             json.dump(state, f)
     print(f"  claude stop {job_id}      stop this session")
