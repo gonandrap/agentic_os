@@ -175,12 +175,17 @@ class Daemon:
     def deliver_messages(self, project: ProjectSpec, store: ProjectStore,
                          sessions_by_cwd: dict[str, list[claude_cli.BgSession]]) -> None:
         proot = str(project.path)
-        by_sid = {
-            s.session_id: s
+        mine = [
+            s
             for cwd, group in sessions_by_cwd.items()
             if cwd == proot or cwd.startswith(proot + "/")
-            for s in group if s.session_id
-        }
+            for s in group
+        ]
+        by_sid = {s.session_id: s for s in mine if s.session_id}
+        # Jarvis wrote `job_id` itself on the last spawn, so it names the turn the OS
+        # actually started. Preferred over `session_id`, which is written by whichever
+        # session fires a SessionStart hook.
+        by_job = {s.id: s for s in mine if s.id}
         for msg in store.queued_messages():
             if msg["id"] in self.in_flight_deliveries:
                 continue
@@ -191,7 +196,7 @@ class Daemon:
                 continue
             if not wo.get("session_id"):
                 continue  # not dispatched yet; prompt will pick it up when it runs
-            sess = by_sid.get(wo["session_id"])
+            sess = by_job.get(wo.get("job_id") or "") or by_sid.get(wo["session_id"])
             # Deliverable only when the session is idle (done) or already released:
             # `claude --resume` refuses sessions owned by a live bg agent, and
             # injecting into a mid-turn worker would interleave anyway.
@@ -200,10 +205,15 @@ class Daemon:
             self.in_flight_deliveries.add(msg["id"])
             store.add_event(wo["id"], "delivering", {"msg_id": msg["id"]})
             bg_id = sess.id if sess is not None else None
-            self.delivery_pool.submit(self._deliver, project, wo, dict(msg), bg_id)
+            # Resume the live session, not the recorded one: they differ whenever the
+            # binding was walked backwards, and forking the wrong one silently drops
+            # every turn since from the worker's context.
+            resume_sid = sess.session_id if sess is not None else wo["session_id"]
+            self.delivery_pool.submit(self._deliver, project, wo, dict(msg), bg_id,
+                                      resume_sid)
 
     def _deliver(self, project: ProjectSpec, wo: dict, msg: dict,
-                 bg_id: str | None = None) -> None:
+                 bg_id: str | None = None, resume_sid: str | None = None) -> None:
         """Deliver a queued user message to the worker's conversation.
 
         Primary path: dispatch a NEW background agent resuming the worker's session
@@ -213,7 +223,14 @@ class Daemon:
         is up — so a multi-turn conversation keeps exactly one live agent, not one
         per turn. Fallback: release the idle session and resume it headlessly
         (stop + `--resume -p`).
+
+        The fork is briefed exactly like the first turn (model, effort, extra system
+        prompt, OS skills). A resumed session re-derives its system prompt at launch
+        rather than inheriting it from the transcript, so anything omitted here is
+        simply absent from turn two onwards — including the project's own standing
+        instructions to the worker.
         """
+        from .bootstrap import install_agent_skills
         from .dispatch import _write_worker_settings, worker_name
 
         store = ProjectStore(project.path)  # thread-local connection
@@ -221,25 +238,31 @@ class Daemon:
             log.info("[%s] delivering message %s to %s", project.name, msg["id"], wo["id"])
             wt = project.path / ".claude" / "worktrees" / (wo.get("worktree") or "")
             cwd = wt if wo.get("worktree") and wt.is_dir() else project.path
+            resume_sid = resume_sid or wo["session_id"]
             try:
                 job_id = claude_cli.spawn_background(
                     prompt=msg["content"],
                     cwd=cwd,
                     name=worker_name(wo),
-                    model=wo.get("model"),
+                    model=wo.get("model") or project.worker.model,
+                    effort=wo.get("effort") or project.worker.effort,
                     permission_mode=wo.get("permission_mode"),
+                    append_system_prompt=(wo.get("append_system_prompt")
+                                          or project.worker.append_system_prompt),
                     settings_file=_write_worker_settings(project, wo),
-                    resume_session_id=wo["session_id"],
+                    add_dirs=[install_agent_skills(project.path)],
+                    resume_session_id=resume_sid,
                 )
                 store.mark_message(msg["id"], "delivered")
                 store.add_event(wo["id"], "message_delivered",
-                                {"msg_id": msg["id"], "via": "bg-resume", "job": job_id})
+                                {"msg_id": msg["id"], "via": "bg-resume", "job": job_id,
+                                 "resumed": resume_sid})
                 # Retire the session we just forked from — strictly AFTER the fork
                 # exists, so the conversation is never left without a live agent.
                 # Otherwise every turn leaks a spent bg agent into the agents view.
                 if bg_id and claude_cli.stop_session(bg_id):
                     store.add_event(wo["id"], "session_retired",
-                                    {"bg_id": bg_id, "session_id": wo["session_id"],
+                                    {"bg_id": bg_id, "session_id": resume_sid,
                                      "reason": "superseded by resume-fork"})
                 if store.get_work_order(wo["id"])["status"] in ("waiting_input", "needs_review"):
                     store.set_status(wo["id"], "running")
@@ -251,7 +274,7 @@ class Daemon:
                 log.warning("[%s] bg-resume delivery failed (%s); falling back to headless resume",
                             project.name, e)
                 result = claude_cli.send_to_session(
-                    wo["session_id"], msg["content"], cwd=project.path, bg_id=bg_id,
+                    resume_sid, msg["content"], cwd=project.path, bg_id=bg_id,
                 )
                 store.mark_message(msg["id"], "delivered")
                 store.add_event(wo["id"], "message_delivered",
@@ -527,7 +550,7 @@ class Daemon:
                 # SessionStart hook hasn't reported yet.
                 sess = by_name_prefix.get(wo["id"])
                 if sess and sess.session_id:
-                    store.update_work_order(wo["id"], session_id=sess.session_id)
+                    store.bind_session(wo["id"], sess.session_id)
                     store.add_event(wo["id"], "session_bound", {"via": "reconciler",
                                                                 "session_id": sess.session_id})
                     sid = sess.session_id

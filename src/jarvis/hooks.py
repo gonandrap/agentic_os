@@ -282,6 +282,19 @@ def find_project_root(cwd: Path) -> Path | None:
     return None
 
 
+def _is_current_session(store: ProjectStore, wo_id: str, session_id: str) -> bool:
+    """Is this hook coming from the session the work order is actually bound to?
+
+    A work order outlives its sessions: every delivered turn forks a new one and the
+    old one is retired. Hooks from a retired session still arrive (it can be re-opened,
+    and it fires SessionEnd when it is stopped), and they must not steer the work
+    order. Unknown-session hooks are treated as current only when there is nothing to
+    compare against — a work order with no binding yet.
+    """
+    bound = store.get_work_order(wo_id).get("session_id")
+    return not bound or not session_id or bound == session_id
+
+
 def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
     event = payload.get("hook_event_name", "")
     session_id = payload.get("session_id", "")
@@ -320,12 +333,32 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
         })
 
         if event == "SessionStart":
-            if wo["status"] in ("dispatching",):
+            # Bind (or correct) the session id: --bg dispatch assigns its own, so the
+            # hook is the authoritative source — but only for a session the work order
+            # has never been bound to. Re-opening a spent session in the agents view
+            # respawns it under its original id and fires this hook again; binding to
+            # that walks the work order backwards onto a stopped session (see
+            # ProjectStore.bind_session).
+            if session_id and store.bind_session(wo_id, session_id):
+                store.add_event(wo_id, "session_bound",
+                                {"via": "hook", "session_id": session_id})
+            elif session_id and session_id != wo.get("session_id"):
+                store.add_event(wo_id, "session_rebind_ignored", {
+                    "session_id": session_id, "bound_to": wo.get("session_id"),
+                    "reason": "a spent session of this work order was re-opened",
+                })
+            if store.get_work_order(wo_id)["status"] == "dispatching":
                 store.set_status(wo_id, "running")
-            # Bind (or correct) the session id: --bg dispatch assigns its own,
-            # so the hook is the authoritative source.
-            if session_id and wo.get("session_id") != session_id:
-                store.update_work_order(wo_id, session_id=session_id)
+
+        elif not _is_current_session(store, wo_id, session_id):
+            # A superseded session reporting on itself. Its own end is not the work
+            # order's end, and its idle prompt is not the worker asking for input —
+            # the live fork is elsewhere. Recorded above, acted on never.
+            store.add_event(wo_id, "hook_ignored", {
+                "event": event, "session_id": session_id,
+                "reason": "not the session this work order is bound to",
+            })
+            return {"wo_id": wo_id, "event": event, "ignored": True}
 
         elif event == "Notification":
             # Fired when the session needs attention — but for two very different

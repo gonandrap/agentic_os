@@ -291,6 +291,35 @@ def check_assumptions_persisted(store: ProjectStore) -> Iterator[Violation]:
             )
 
 
+def check_session_binding_moves_forward(store: ProjectStore) -> Iterator[Violation]:
+    """INV-SESSION-FORWARD — a work order must never be bound to a session it has left.
+
+    Each delivered turn forks a new session and stops the old one, so `session_id`
+    naming a *spent* session means the pointer walked backwards. Everything downstream
+    trusts it: the next message forks from that dead conversation (dropping every turn
+    since) and stops an already-stopped agent, orphaning the live one in the agents
+    view. `ProjectStore.bind_session` is what prevents it; this is the tripwire for
+    anything that writes `session_id` around it.
+
+    Not repairable: the store cannot tell which session is live — that needs the agents
+    roster — and guessing would move the binding a second time.
+    """
+    for wo in store.list_work_orders(include_hidden=True):
+        sid = wo.get("session_id")
+        if not sid:
+            continue
+        prior = db.from_json(wo.get("prior_sessions"), []) or []
+        if sid not in prior:
+            continue
+        yield Violation(
+            invariant="INV-SESSION-FORWARD",
+            wo_id=wo["id"],
+            detail=f"bound to session {sid}, which this work order already left "
+                   f"({len(prior)} spent session(s) on record)",
+            context={"session_id": sid, "prior_sessions": prior},
+        )
+
+
 def check_attention_has_reason(store: ProjectStore) -> Iterator[Violation]:
     """INV-ATTENTION-BLANK — a flagged work order must say what it wants.
 
@@ -376,6 +405,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_no_phantom_attention,
     check_blocked_work_is_surfaced,
     check_attention_has_reason,
+    check_session_binding_moves_forward,
 )
 
 
