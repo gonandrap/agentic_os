@@ -275,6 +275,8 @@ def test_daemon_tick_triggers_drain(asked):
 
 def test_parse_verdict_tolerates_fences():
     v = neo_mod.parse_verdict('```json\n{"escalate": false, "answer": "go", "reason": "r"}\n```')
-    assert v == {"escalate": False, "answer": "go", "reason": "r"}
+    # `approve` is only meaningful for approval requests, and absent means "not
+    # approved" — an answer that never mentions it must never open a gate.
+    assert v == {"escalate": False, "answer": "go", "reason": "r", "approve": False}
     v = neo_mod.parse_verdict("total nonsense")
     assert v["escalate"] is True

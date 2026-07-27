@@ -69,6 +69,10 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # Workers call `jarvis …` from Bash (contract); make sure it resolves even
         # though the Claude supervisor daemon has its own PATH.
         "PATH": _worker_path(),
+        # Which privileged actions the PreToolUse gate mediates for this worker. Travels
+        # as env rather than being looked up per hook call: the hook runs on every Bash
+        # command and must not load and parse the catalog to decide it has nothing to do.
+        "JARVIS_GATES": project.gates.to_json(),
     })
     settings["env"] = env
     out = project.path / ".jarvis" / "worker-settings" / f"{wo['id']}.json"
@@ -135,6 +139,8 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "order says otherwise. User feedback may arrive as new user turns; treat it "
         "as authoritative for this work order.",
     ]
+    if project.gates:
+        parts += ["", *_gate_briefing(wo, project)]
     if knowledge:
         parts += ["", "# Knowledge base (learnings from this and other projects)"]
         for k in knowledge:
@@ -142,6 +148,37 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
             topic = f" [{k['topic']}]" if k["topic"] else ""
             parts.append(f"- ({scope}{topic}) {k['content']}")
     return "\n".join(parts)
+
+
+def _gate_briefing(wo: dict[str, Any], project: ProjectSpec) -> list[str]:
+    """Tell the worker that shipping is reachable, and how.
+
+    Worth stating explicitly: a worker that believes releases are simply forbidden will
+    finish the work order with "someone should ship this" rather than asking, and the
+    gate never gets used. The point of the gate is that the answer is "yes, with review".
+    """
+    from .gates import KINDS
+
+    live = [k for k in KINDS if k.name in project.gates.enabled]
+    lines = [
+        "# Privileged actions (gated, NOT forbidden)",
+        "These actions are reviewed before they run — an independent reviewer (Neo, the "
+        "user's delegate) decides, and approval lets you proceed:",
+    ]
+    lines += [f"- `{k.name}` — {k.summary}" for k in live]
+    lines += [
+        "",
+        "Attempting one directly is safe: the attempt is blocked, a request is filed "
+        "automatically, and you are told to wait. But you make a much stronger case by "
+        "asking first, because the reviewer sees ONLY the text you write:",
+        f"    jarvis gate request {wo['id']} \"<the exact command>\" "
+        f"--why \"<why this is ready>\" --evidence \"<PR number, test results, checks>\"",
+        "",
+        "Then END YOUR TURN. The verdict arrives as your next user turn. If approved, run "
+        "that exact command — the approval is scoped to that one string and expires, so "
+        "do not reword it. If denied, fix what the reason names; do not retry as-is.",
+    ]
+    return lines
 
 
 def dispatch_work_order(

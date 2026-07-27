@@ -52,6 +52,118 @@ def _allow(reason: str) -> dict[str, Any]:
     }
 
 
+def _deny(reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+def gate_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
+    """Mediate a privileged action: allow it if approved, otherwise get it reviewed.
+
+    Returns None when the command isn't gated — the caller then applies the ordinary
+    rules. Once a command IS recognised as privileged this never returns None: it either
+    allows (a live grant covers it) or denies. Including when the machinery itself
+    breaks — an unreadable DB must not become an open door, so errors deny.
+
+    The deny is not a refusal, it is a redirect. Approval cannot be resolved inline: the
+    hook has ~30 seconds and a Neo review takes minutes. So the first attempt files the
+    request and stops; the verdict arrives through the ordinary message channel and the
+    retry goes through.
+    """
+    from . import gates
+
+    wo_id = env.get("JARVIS_WO_ID")
+    if not wo_id:
+        return None  # interactive session — gates govern dispatched workers only
+    config = gates.GateConfig.from_json(env.get("JARVIS_GATES"))
+    if not config:
+        return None  # project hasn't opted in
+    command = (payload.get("tool_input") or {}).get("command") or ""
+    action = gates.classify(command, config)
+    if action is None:
+        return None
+
+    try:
+        return _resolve_gate(action, wo_id, env, payload)
+    except Exception as e:  # noqa: BLE001 — fail closed; see the docstring
+        return _deny(
+            f"Gate `{action.kind}`: the OS could not verify approval for this command "
+            f"({e!r}), so it is blocked. This is a fault in Jarvis, not a verdict on "
+            f"your request — report it with your `report-jarvis-bug` skill."
+        )
+
+
+def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
+                  payload: dict[str, Any]) -> dict[str, Any]:
+    from . import gates
+    from .neo_store import NeoStore
+
+    root_env = env.get("JARVIS_PROJECT_PATH")
+    root = Path(root_env) if root_env else find_project_root(Path(payload.get("cwd") or "."))
+    if root is None or not (root / ".jarvis").is_dir():
+        return _deny(
+            f"Gate `{action.kind}`: this command needs approval, but the OS cannot find "
+            f"the project database to record the request in. Blocked."
+        )
+
+    store = ProjectStore(root)
+    try:
+        grant = store.usable_grant(wo_id, action.kind, action.command)
+        if grant is not None:
+            store.consume_grant(grant["id"])
+            return _allow(
+                f"gate {grant['id']} ({action.kind}) approved by "
+                f"{grant['decided_by']}: {grant['decision_reason'] or 'no reason given'}"
+            )
+
+        prior = store.latest_approval_for(wo_id, action.kind, action.command)
+        if prior is not None and prior["status"] == "pending":
+            return _deny(
+                f"Gate `{action.kind}`: approval request {prior['id']} for this exact "
+                f"command is already under review. END YOUR TURN — the verdict arrives "
+                f"as your next user turn. Do not retry in a loop."
+            )
+        if prior is not None and prior["status"] == "denied":
+            return _deny(
+                f"Gate `{action.kind}`: this command was DENIED "
+                f"(request {prior['id']}, by {prior['decided_by']}): "
+                f"{prior['decision_reason'] or 'no reason recorded'}. Do not retry it "
+                f"as-is. Address the reason, then `jarvis gate request` afresh."
+            )
+
+        wo = store.get_work_order(wo_id)
+        neo = NeoStore()
+        try:
+            approval, question = gates.file_request(
+                store, neo, env.get("JARVIS_PROJECT", ""), wo, action,
+                justification=(
+                    "(none — the worker ran the command directly rather than filing a "
+                    "request, so no case was made for it)"
+                ),
+            )
+        finally:
+            neo.close()
+        return _deny(
+            f"Gate `{action.kind}`: {action.summary} needs approval, so this attempt was "
+            f"blocked and approval request {approval['id']} was filed for review "
+            f"(Neo question {question['id']}).\n\n"
+            f"END YOUR TURN NOW — the verdict arrives as your next user turn, and the "
+            f"retry will go through if it is approved.\n\n"
+            f"You filed no justification because you ran the command directly. To make "
+            f"the case properly (branch, PR, test results — reviewers see only what you "
+            f"write), run:\n"
+            f"    jarvis gate request {wo_id} \"{action.command}\" "
+            f"--why \"<why this is ready to ship>\" --evidence \"<PR, tests, checks>\""
+        )
+    finally:
+        store.close()
+
+
 def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
     """PreToolUse auto-approvals that keep autonomous workers unattended:
 
@@ -61,11 +173,17 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
       this work order, so the worker owns it (verified live: acceptEdits alone still
       prompted for Write in a background session). Only active for worker sessions
       (JARVIS_WO_ID set), never for interactive sessions in managed projects.
+
+    Gated privileged actions are resolved FIRST, so no auto-approval below can hand out
+    a merge or a release by accident.
     """
     tool = payload.get("tool_name")
     tool_input = payload.get("tool_input") or {}
 
     if tool == "Bash":
+        gated = gate_decision(payload, env)
+        if gated is not None:
+            return gated
         if is_jarvis_command_chain(tool_input.get("command", "")):
             return _allow("jarvis contract command")
         return None

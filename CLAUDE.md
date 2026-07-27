@@ -52,6 +52,14 @@ jarvis wo hide <id> / unhide <id>          # declutter: keeps the record, drops 
 jarvis wo delete <id> --yes                # irreversible: erases the WO and its whole
                                            # history (timeline, messages, assumptions)
 jarvis wo resume-auto <id>                 # unstick a worker blocked on a permission prompt (flip to auto + resume)
+jarvis gate list [--pending]               # privileged-action approvals (merge a PR, ship
+                                           # a release). Workers attempt these and get
+                                           # blocked; Neo reviews and decides, so most
+                                           # never reach the user. Only the ones Neo
+                                           # escalates show up in `jarvis status`.
+jarvis gate show <id>                      # the request exactly as the reviewer saw it
+jarvis gate approve <id> --reason "…"      # open the gate: the worker may run the command
+jarvis gate deny <id> --reason "…"         # refuse it; the reason goes to the worker
 jarvis neo list                            # Neo's Q&A: pending reviews + escalations
 jarvis neo review <qid> [--correct "…"]    # approve or teach; corrections become learnings
 jarvis neo answer <qid> "…"                # answer a question Neo escalated to the user
@@ -80,6 +88,7 @@ Before exploring the tree, read the memories — they are cheap and current:
 | `codebase-map` | all 19 modules in `src/jarvis/`, their symbols, the layering, the three SQLite DBs, the `jarvis start` call chain |
 | `work-order-lifecycle` | the WO state machine and exactly how a worker `claude` process is spawned |
 | `dev-vs-prod-environments` | the two checkouts, their paths, `JARVIS_HOME`, the release path |
+| `privileged-action-gates` | how a worker ships code: the gate, Neo's review, the deny-rule trap |
 | `testing` | how to run the suite and what covers what |
 
 Use Serena's symbol tools (`find_symbol`, `find_referencing_symbols`, `get_symbols_overview`)

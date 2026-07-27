@@ -103,6 +103,20 @@ elif "-p" in argv and "--resume" not in argv:
     elif "FORCE_GARBAGE" in prompt:
         print(json.dumps({"result": "I think you should maybe do the thing?"}))
         sys.exit(0)
+    elif "PRIVILEGED ACTION REQUEST" in prompt:
+        # A gate review, which speaks a different verdict shape: the decision lives in
+        # `approve`, not in prose. Default is to escalate, matching the real reviewer's
+        # instruction to send anything it cannot verify to the user — a fake that
+        # approved by default would let every gate test pass without asserting anything.
+        if "FORCE_APPROVE" in prompt:
+            verdict = {"escalate": False, "approve": True,
+                       "reason": "test-forced approval"}
+        elif "FORCE_DENY" in prompt:
+            verdict = {"escalate": False, "approve": False,
+                       "reason": "test-forced denial"}
+        else:
+            verdict = {"escalate": True, "approve": False,
+                       "reason": "test default: gate reviews escalate unless forced"}
     else:
         verdict = {"escalate": False,
                    "answer": f"neo-decision for: {prompt.splitlines()[-1][:60]}",
