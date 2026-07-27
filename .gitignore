@@ -230,3 +230,6 @@ evals/results.json
 
 # promo build artifacts (video, frames, screenshots, fixture world)
 promo/out/
+
+# Jarvis OS local state
+.jarvis/
