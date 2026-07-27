@@ -377,3 +377,42 @@ def test_got_it_is_not_offered_when_a_decision_is_owed(client, project):
     assert r.status_code == 303
     assert "error=" in r.headers["location"]
     assert store.get_work_order(wo["id"])["needs_attention"]
+
+
+def test_stale_deep_link_to_unregistered_project_is_not_a_500(client):
+    """Notifications embed a deep link built from whatever project name the emitter
+    passed. When that project is not (or is no longer) registered the dashboard has
+    to say so — a bare "Internal Server Error" tells the user nothing and leaves
+    them unable to tell a Jarvis bug from a vanished work order.
+    """
+    r = client.get("/wo/proj_gone/wo-4fdb20ba")
+    assert r.status_code == 200
+    assert "Internal Server Error" not in r.text
+    assert "proj_gone" in r.text and "not registered" in r.text
+
+
+def test_unexpected_error_renders_a_page_and_lands_in_the_os_log(
+        jarvis_home, fake_claude, catalog_file, monkeypatch):
+    """Defence in depth: whatever else breaks, the dashboard owes the user a page
+    and the OS owes itself a trace on disk. Before this, UI tracebacks went to the
+    systemd journal only — invisible to `$JARVIS_HOME/logs`, to Jarvis and to Neo.
+
+    Starlette always re-raises after sending the response so the server can log it,
+    hence `raise_server_exceptions=False` — a real browser still gets the page.
+    """
+    ops.start_os(str(catalog_file), foreground=True)
+    c = TestClient(create_app(), follow_redirects=False, raise_server_exceptions=False)
+
+    def boom():
+        raise RuntimeError("kaboom in os_status")
+
+    monkeypatch.setattr(ops, "os_status", boom)
+    r = c.get("/")
+    assert r.status_code == 500
+    assert "something went wrong" in r.text.lower()
+    assert "kaboom in os_status" in r.text
+
+    log = (jarvis_home / "logs" / "ui.log").read_text()
+    assert "kaboom in os_status" in log
+    assert "GET /" in log
+    assert "RuntimeError" in log

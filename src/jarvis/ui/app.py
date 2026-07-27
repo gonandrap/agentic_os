@@ -4,6 +4,7 @@ the same ops functions as the CLI. Binds to localhost by default (no auth in MVP
 from __future__ import annotations
 
 import time
+import traceback
 from pathlib import Path
 
 from fastapi import FastAPI, Form, Request
@@ -13,6 +14,7 @@ from fastapi.templating import Jinja2Templates
 from .. import ops
 from ..central_store import CentralStore
 from ..daemon import daemon_running
+from ..paths import logs_dir
 from ..project_store import ProjectStore
 from ..timeline import build_timeline, count_debug
 
@@ -51,6 +53,27 @@ def fmt_age(ts: float | None) -> str:
     return f"{int(d / 86400)}d"
 
 
+def log_ui_error(request: Request, exc: BaseException) -> None:
+    """Append a dashboard failure to `$JARVIS_HOME/logs/ui.log`.
+
+    Uvicorn already prints the traceback on stdout, but in production that is the
+    systemd journal — outside the OS's own state directory, so neither `jarvis`
+    commands nor the agents reading `logs/` can see that the UI ever broke. The
+    daemon keeps `jarvisd.log` next to the databases for exactly this reason; the
+    dashboard now does the same.
+    """
+    try:
+        d = logs_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        with (d / "ui.log").open("a") as f:
+            f.write(f"{stamp} [ERROR] {request.method} {request.url.path} — "
+                    f"{type(exc).__name__}: {exc}\n{tb}")
+    except Exception:  # noqa: BLE001 — logging must never mask the original failure
+        pass
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None)
     templates = Jinja2Templates(directory=str(TEMPLATES))
@@ -60,7 +83,7 @@ def create_app() -> FastAPI:
     )
 
     def render(request: Request, template: str, active: str = "dashboard",
-               **ctx) -> HTMLResponse:
+               status_code: int = 200, **ctx) -> HTMLResponse:
         from ..neo_store import NeoStore
         ctx["active"] = active
         ctx["daemon_up"] = daemon_running() is not None
@@ -71,7 +94,23 @@ def create_app() -> FastAPI:
             neo.close()
         ctx["neo_badge"] = (c.get("escalated", 0) + c.get("failed", 0)
                             + c.get("unreviewed", 0)) or None
-        return templates.TemplateResponse(request, template, ctx)
+        return templates.TemplateResponse(request, template, ctx,
+                                          status_code=status_code)
+
+    @app.exception_handler(Exception)
+    def unhandled(request: Request, exc: Exception) -> HTMLResponse:
+        """Last line of defence: a bare "Internal Server Error" tells the user
+        nothing, and a dead-end deep link out of a Telegram alert is exactly where
+        they land. Name the failure on the page and put the traceback on disk."""
+        log_ui_error(request, exc)
+        message = (f"Something went wrong loading {request.url.path} — "
+                   f"{type(exc).__name__}: {exc}. "
+                   "The full traceback is in $JARVIS_HOME/logs/ui.log.")
+        try:
+            return render(request, "error.html", message=message, status_code=500)
+        except Exception:  # noqa: BLE001 — the chrome itself may be what broke
+            return HTMLResponse(f"<h1>Something went wrong</h1><p>{message}</p>",
+                                status_code=500)
 
     # -- pages ------------------------------------------------------------------
 

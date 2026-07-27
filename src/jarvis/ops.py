@@ -335,9 +335,13 @@ def find_work_order(wo_id: str, project_name: str | None = None
                     ) -> tuple[str, Path, dict[str, Any]]:
     """Locate a work order across all registered projects."""
     paths = registered_project_paths()
-    candidates = {project_name: paths[project_name]} if project_name else paths
+    # Guard before the lookup, not after: callers (the CLI, the dashboard) only catch
+    # OpsError, so an unregistered name reaching `paths[...]` surfaces as a bare
+    # KeyError — a traceback in the terminal and an HTTP 500 in the browser.
     if project_name and project_name not in paths:
-        raise OpsError(f"project {project_name!r} not registered")
+        raise OpsError(f"project {project_name!r} not registered "
+                       f"(known: {sorted(paths)})")
+    candidates = {project_name: paths[project_name]} if project_name else paths
     for name, path in candidates.items():
         if not path.is_dir():
             continue
