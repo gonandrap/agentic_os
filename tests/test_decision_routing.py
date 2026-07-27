@@ -43,45 +43,60 @@ def test_contract_offers_both_decision_paths(contract: str) -> None:
     assert "jarvis wo assume wo-test" in contract
 
 
-def test_contract_routes_decisions_by_ownership_not_reversibility(contract: str) -> None:
+def test_contract_makes_neo_the_first_responder(contract: str) -> None:
     """The regression this whole change exists to prevent.
 
     'Prefer an assumption when the decision is reversible' asks about risk of being
-    wrong, which a capable worker can always argue its way past. The test has to be
-    about who owns the decision.
+    wrong, which a capable worker can always argue its way past. Asking has to be the
+    default response to a doubt, not a branch the worker can reason itself out of.
     """
-    assert "OWNERSHIP" in contract
-    assert "would a different answer change WHAT gets built" in contract
+    assert "Neo is your first responder. Any doubt goes to it." in contract
     assert "Prefer recording an assumption" not in contract, (
         "the reversibility hedge is back — it makes `jarvis wo ask` unreachable"
     )
 
 
+def test_the_trigger_is_doubt_not_importance(contract: str) -> None:
+    """Scoping the trigger to big/scope-changing calls re-derives the weaker
+    contract: the worker still guesses on everything it judges small."""
+    assert "The trigger is DOUBT, not importance" in contract
+    assert "either would work" in contract
+
+
 def test_contract_names_asking_as_normal_not_escalation(contract: str) -> None:
     """A worker that reads asking as 'bothering the user' will never do it."""
     assert "it is not an escalation" in contract
-    assert "does not cost the user attention" in contract
+    assert "does not interrupt the user" in contract
 
 
 def test_contract_says_ask_before_building(contract: str) -> None:
-    assert "Ask BEFORE you build, not after" in contract
+    assert "Ask BEFORE you build on it, not after" in contract
+
+
+def test_contract_makes_assumptions_the_rare_case(contract: str) -> None:
+    assert "should be RARE" in contract
+    assert "a call you made with NO doubt" in contract
 
 
 def test_contract_still_demands_every_assumption_be_recorded(contract: str) -> None:
-    """Routing by ownership must not shrink the audit trail as a side effect.
+    """Demoting assumptions must not shrink the audit trail as a side effect.
 
     Measured: an earlier draft defined an assumption as "a call you were entitled to
     make", and workers concluded that following a repo convention was not a decision
-    at all — 5 of 8 owned calls went unrecorded (evals/llm/test_worker_judgment.py
-    :: owned calls are still disclosed). Whether routine calls deserve a review-queue
-    slot is a separate question; it must not be answered by accident here.
+    at all — 5 of 8 went unrecorded (evals/llm/test_worker_judgment.py :: no-doubt
+    calls are still disclosed). Whether routine calls deserve a review-queue slot is
+    a separate question; it must not be answered by accident here.
     """
     assert "Record EVERY such call, including the small and obvious ones" in contract
     assert "only audit trail" in contract
 
 
-def test_contract_preempts_the_reversibility_rationalisation(contract: str) -> None:
-    assert "Do not talk yourself into \"it's reversible\"" in contract
+def test_contract_preempts_the_rationalisations_for_guessing(contract: str) -> None:
+    """Named verbatim, because these are the exact sentences a capable worker
+    reaches for when it would rather not stop and ask."""
+    for excuse in ("It's reversible", "it's only an "
+                   "implementation detail", "I'll note it as an assumption"):
+        assert excuse in contract, f"unaddressed rationalisation: {excuse!r}"
 
 
 def test_operation_template_mirrors_the_contract() -> None:
@@ -89,11 +104,15 @@ def test_operation_template_mirrors_the_contract() -> None:
     started outside the OS) reads. They must not drift apart."""
     from jarvis.bootstrap import ASSETS
 
-    tmpl = (ASSETS / "OPERATION.md.tmpl").read_text()
-    assert "Route decisions by ownership, not by risk" in tmpl
+    # the template is hard-wrapped prose, so compare on collapsed whitespace
+    tmpl = " ".join((ASSETS / "OPERATION.md.tmpl").read_text().split())
+    assert "Route any doubt to Neo — it is your first responder" in tmpl
     assert "jarvis wo ask" in tmpl
     assert "jarvis wo assume" in tmpl
-    assert "not an escalation" in tmpl
+    assert "it is not an escalation" in tmpl
+    assert "The trigger is **doubt**, not importance" in tmpl
+    assert "this should be rare" in tmpl.lower()
+    assert "no doubt" in tmpl
 
 
 # -- the user's verdict becomes a Neo learning ---------------------------------

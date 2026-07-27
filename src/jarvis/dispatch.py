@@ -98,28 +98,33 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "not go looking for that file, everything you need is here):",
         "- Work only inside your assigned worktree (you start in it). Commit your "
         "work and open a PR per this repo's conventions. Never push to main.",
-        "- Decisions: the test is OWNERSHIP, not risk. Before you build on a "
-        "decision, ask yourself: would a different answer change WHAT gets built — "
-        "the scope, the user-visible behaviour, which of two designs ships? If yes, "
-        "the decision is not yours.",
-        f"  - Not yours -> ASK, and END YOUR TURN: `jarvis wo ask {wo['id']} "
-        f"\"<your question>\"`. The answer arrives as your next user turn, usually "
-        f"within a minute, from Neo (the user's delegate) or the user. This is the "
-        f"normal way to get a decision — it is not an escalation and it does not "
-        f"cost the user attention. Put everything needed to decide INSIDE the "
-        f"question text: whoever answers sees only that text, never your session. "
-        f"Give them the concrete options and your recommendation.",
-        f"  - Yours -> DECIDE, and disclose it: `jarvis wo assume {wo['id']} "
-        f"\"...\"`. Record EVERY such call, including the small and obvious ones — "
-        f"naming, file layout, which existing convention you followed, how you split "
-        f"the commits. Recording is cheap and the work order record is the only audit "
-        f"trail anyone gets; \"that's just following the repo's convention\" is still "
-        f"a call you made, so log it. What an assumption is NOT is a guess about what "
-        f"the user wants — if you are guessing, you are in the branch above, so ask.",
-        "  - Do not talk yourself into \"it's reversible\". Almost everything is "
-        "reversible; that is not the question. The question is whether you would be "
-        "REBUILDING if the answer is no. Ask BEFORE you build, not after — an "
-        "assumption reaches the user only once the work is already resting on it.",
+        f"- **Neo is your first responder. Any doubt goes to it.** Not just the big "
+        f"calls — any point where you are not sure. `jarvis wo ask {wo['id']} "
+        f"\"<your question>\"`, then END YOUR TURN. The answer arrives as your next "
+        f"user turn, usually within a minute, from Neo (the user's delegate) or the "
+        f"user. This is the normal, expected way to work: it is not an escalation, it "
+        f"does not interrupt the user, and it costs you about a minute. Put "
+        f"everything needed to decide INSIDE the question text — whoever answers sees "
+        f"only that text, never your session — with the concrete options and your "
+        f"recommendation.",
+        "  - The trigger is DOUBT, not importance. If you catch yourself weighing "
+        "options, thinking \"either would work\", or picking one because you have to "
+        "pick something, you are in doubt: ask. Ask BEFORE you build on it, not "
+        "after.",
+        "  - Do not talk yourself out of asking. \"It's reversible\", \"it's only an "
+        "implementation detail\", \"I'll note it as an assumption\" — those are "
+        "rationalisations for guessing. Almost everything is reversible; that is not "
+        "the question. The question is whether you would be REBUILDING if you guessed "
+        "wrong.",
+        f"- `jarvis wo assume {wo['id']} \"...\"` is for the OTHER case, and it "
+        f"should be RARE: a call you made with NO doubt — you followed an existing "
+        f"convention, the work order implied it, the codebase left one sensible "
+        f"option. Record EVERY such call, including the small and obvious ones "
+        f"(naming, file layout, which convention you followed, how you split the "
+        f"commits): recording is cheap and the work order record is the only audit "
+        f"trail anyone gets. An assumption is a disclosure of something you were SURE "
+        f"about. It is never a guess you are hoping nobody checks — if you are "
+        f"guessing, ask instead.",
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"`",
         f"- The OS knowledge base is the ONLY memory that survives you: "
