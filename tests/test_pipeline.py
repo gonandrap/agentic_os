@@ -103,16 +103,23 @@ def test_concurrency_limit(started, fake_claude):
     assert len(bg) == 5  # default max_concurrent = 5; the other 2 stay queued
 
 
-def test_knowledge_injected_into_prompt(started, fake_claude):
+def test_knowledge_indexed_into_prompt(started, fake_claude):
+    """The dispatcher ships a queryable index of the knowledge base, and a long entry
+    reaches the worker as a headline + id rather than as prompt weight."""
     daemon = started
     central = CentralStore()
     central.add_knowledge("always run make lint", project="proj_a", topic="ci")
     central.add_knowledge("global: prefer uv over pip", project="")
+    long_one = "the deploy runbook\n" + ("step after step. " * 300)
+    central.add_knowledge(long_one, project="proj_a", topic="deploy")
     ops.create_work_order("proj_a", "task")
     daemon.tick()
     prompt = [c for c in fake_claude.calls if "--bg" in c["argv"]][0]["argv"][-1]
     assert "always run make lint" in prompt
     assert "prefer uv over pip" in prompt
+    assert "the deploy runbook" in prompt          # indexed...
+    assert "step after step. step" not in prompt   # ...but its body stayed behind
+    assert "jarvis learn show <id>" in prompt      # and the worker knows how to fetch it
 
 
 def test_hook_events_update_state(started, project):
