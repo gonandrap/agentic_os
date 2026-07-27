@@ -36,6 +36,10 @@ ORIGIN_META = {
 }
 LEVEL_TONE = {"info": "muted", "warning": "warn", "critical": "bad"}
 
+# How often the dashboard re-reads OS state. Not a page reload — the browser swaps
+# the live regions in place (see dashboard.html), so in-progress typing survives.
+REFRESH_SECONDS = 15
+
 
 def fmt_age(ts: float | None) -> str:
     if not ts:
@@ -74,7 +78,7 @@ def create_app() -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request):
         st = ops.os_status()
-        return render(request, "dashboard.html", st=st, refresh=15)
+        return render(request, "dashboard.html", st=st, refresh=REFRESH_SECONDS)
 
     @app.get("/project/{name}", response_class=HTMLResponse)
     def project(request: Request, name: str, hidden: str = ""):

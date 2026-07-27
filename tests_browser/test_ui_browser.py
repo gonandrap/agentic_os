@@ -167,7 +167,43 @@ def test_inbox_ack_in_browser(page, server, daemon, project):
     assert "deploy finished" not in page.locator("body").inner_text()
 
 
-def test_dashboard_auto_refresh_tag(page, server):
+def test_dashboard_refreshes_without_reloading_the_page(page, server):
+    """The only meta-refresh left is the noscript fallback — a live page never
+    navigates, because navigating wipes whatever is half-typed in the form."""
     page.goto(server)
-    meta = page.locator("meta[http-equiv='refresh']")
-    assert meta.count() == 1
+    # the fallback is served, but a scripting browser parses <noscript> as inert
+    # text — so the live page has no meta-refresh element at all
+    assert 'http-equiv="refresh"' in page.content()
+    assert page.evaluate(
+        "document.querySelectorAll('meta[http-equiv=\"refresh\"]').length"
+    ) == 0
+    for region in ("live-chrome", "live-top", "live-bottom"):
+        assert page.locator(f"#{region}").count() == 1
+    # the form is deliberately outside every live region
+    assert page.evaluate(
+        "!!document.querySelector('form[action=\"/wo/create\"]')"
+        " && !document.querySelector('#live-top form[action=\"/wo/create\"]')"
+        " && !document.querySelector('#live-bottom form[action=\"/wo/create\"]')"
+    )
+
+
+def test_live_sync_updates_state_but_keeps_the_half_typed_order(page, server, project):
+    page.goto(server)
+    form = "form[action='/wo/create']"
+    page.select_option(f"{form} select[name='project']", "proj_a")
+    page.fill(f"{form} input[name='title']", "half-typed order")
+    page.fill(f"{form} textarea[name='description']", "context I am still writing")
+
+    # state changes underneath the open page
+    wo = ops.create_work_order("proj_a", "landed while you were typing")
+    page.evaluate("window.jarvisLiveSync()")
+
+    # the live region picked the new work order up...
+    assert wo["id"] in page.locator("#live-top").inner_text()
+    assert "landed while you were typing" in page.locator("#live-top").inner_text()
+    # ...and the form is exactly as the user left it
+    assert page.input_value(f"{form} select[name='project']") == "proj_a"
+    assert page.input_value(f"{form} input[name='title']") == "half-typed order"
+    assert page.input_value(f"{form} textarea[name='description']") == (
+        "context I am still writing"
+    )

@@ -33,6 +33,20 @@ def test_dashboard_renders_quiet(client):
     assert "proj_a" in r.text
 
 
+def test_dashboard_auto_refresh_is_scoped_to_the_live_regions(client):
+    """A whole-page refresh wipes a half-typed work order, so the meta tag is
+    noscript-only and JS swaps just the live regions."""
+    r = client.get("/")
+    assert '<noscript><meta http-equiv="refresh"' in r.text
+    assert r.text.count('http-equiv="refresh"') == 1
+    for region in ('id="live-chrome"', 'id="live-top"', 'id="live-bottom"'):
+        assert region in r.text
+    # the create form must sit outside the swapped regions
+    assert (r.text.index("<!-- /live-top -->")
+            < r.text.index('action="/wo/create"')
+            < r.text.index('id="live-bottom"'))
+
+
 def test_create_wo_via_ui_marks_origin(client, project):
     r = client.post("/wo/create", data={"project": "proj_a", "title": "from the ui"})
     assert r.status_code == 303

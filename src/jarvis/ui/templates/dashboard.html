@@ -1,7 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Jarvis — dashboard{% endblock %}
-{% block head %}<meta http-equiv="refresh" content="{{ refresh }}">{% endblock %}
+{% block head %}
+{# No whole-page refresh: it would wipe whatever the user is typing into the new
+   work order form. JS swaps the live regions in place; noscript falls back. #}
+<noscript><meta http-equiv="refresh" content="{{ refresh }}"></noscript>
+{% endblock %}
 {% block content %}
+
+<div id="live-top">
 
 <div class="attention {{ 'hot' if st.attention else '' }}">
   {% if st.attention %}
@@ -82,6 +88,8 @@
   {% if not open_any.v %}<div class="empty">no open work orders</div>{% endif %}
 </div>
 
+</div><!-- /live-top -->
+
 <h2>New work order</h2>
 <div class="panel" style="padding: 14px 16px;">
   <form method="post" action="/wo/create">
@@ -99,6 +107,7 @@
   </form>
 </div>
 
+<div id="live-bottom">
 {% if st.backlog.open %}
 <h2>Backlog</h2>
 <div class="panel"><div class="row">
@@ -106,5 +115,54 @@
   <span class="grow"></span><a href="/backlog">open backlog →</a>
 </div></div>
 {% endif %}
+</div><!-- /live-bottom -->
+
+<script>
+/* Live dashboard without losing your place: re-fetch this same server-rendered
+   page every REFRESH_MS and swap only the regions that changed. The new work
+   order form is deliberately outside every region, so a poll can never clobber
+   a half-typed order. */
+(function () {
+  var REFRESH_MS = {{ refresh }} * 1000;
+  var REGIONS = ["live-chrome", "live-top", "live-bottom"];
+  var timer = null;
+
+  function swap(fresh, current) {
+    if (!fresh || !current) return;
+    if (fresh.innerHTML === current.innerHTML) return;
+    // never yank the DOM out from under a focused element (e.g. mid tab-walk)
+    if (current.contains(document.activeElement)) return;
+    current.innerHTML = fresh.innerHTML;
+  }
+
+  function sync() {
+    if (document.hidden) return Promise.resolve();
+    return fetch(location.href, { cache: "no-store", credentials: "same-origin" })
+      .then(function (res) { return res.ok ? res.text() : null; })
+      .then(function (html) {
+        if (html === null) return;
+        var doc = new DOMParser().parseFromString(html, "text/html");
+        REGIONS.forEach(function (id) {
+          swap(doc.getElementById(id), document.getElementById(id));
+        });
+        document.body.dataset.liveSyncedAt = String(performance.now() | 0);
+      })
+      .catch(function () { /* server restarting or offline — keep the last good render */ });
+  }
+
+  function schedule() {
+    if (timer) clearInterval(timer);
+    timer = setInterval(sync, REFRESH_MS);
+  }
+
+  // a backgrounded tab stops polling; coming back catches up immediately
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) sync();
+  });
+
+  schedule();
+  window.jarvisLiveSync = sync;  // browser tests drive a tick without waiting
+})();
+</script>
 
 {% endblock %}
