@@ -299,7 +299,9 @@ class Daemon:
             ppath = paths.get(q["project"])
             pstore = ProjectStore(ppath) if ppath and ppath.is_dir() else None
             try:
-                if verdict["escalate"]:
+                if q.get("kind") == "approval":
+                    self._deliver_gate_verdict(central, pstore, q, verdict)
+                elif verdict["escalate"]:
                     central.add_inbox(
                         project=q["project"], level="warning",
                         title=f"Neo escalated a question from {q['wo_id']}",
@@ -334,6 +336,67 @@ class Daemon:
         finally:
             store.close()
             central.close()
+
+    def _deliver_gate_verdict(self, central: CentralStore, pstore: ProjectStore | None,
+                              q: dict, verdict: dict) -> None:
+        """Apply Neo's verdict on a privileged-action request.
+
+        An escalation leaves the request `pending` on purpose: the gate is still shut and
+        the user is now the one holding the key, so the row must stay claimable by
+        `jarvis gate approve`. Only an explicit approve/deny closes it.
+        """
+        from . import gates
+
+        if pstore is None:
+            log.error("gate verdict for %s has no project store — request %s left pending",
+                      q["wo_id"], q["id"])
+            return
+        approval = pstore.approval_for_question(q["id"])
+        if approval is None:
+            log.error("neo question %s is an approval with no approval row", q["id"])
+            return
+
+        if verdict["escalate"]:
+            central.add_inbox(
+                project=q["project"], level="warning",
+                title=f"Approval needed: {approval['kind']} from {q['wo_id']}",
+                body=(f"Neo declined to decide: {verdict['reason']}\n\n"
+                      f"Command: {approval['command']}\n\n"
+                      f"Approve it with: jarvis gate approve {approval['id']} "
+                      f"--reason \"...\"\n"
+                      f"Deny it with:    jarvis gate deny {approval['id']} "
+                      f"--reason \"...\"\n"
+                      f"Full request:    jarvis gate show {approval['id']}"),
+                wo_id=q["wo_id"],
+            )
+            pstore.mark_approval_escalated(approval["id"], verdict["reason"])
+            pstore.flag_attention(
+                q["wo_id"],
+                f"gate approval escalated by Neo: {approval['kind']} "
+                f"(request {approval['id']})",
+            )
+            pstore.add_event(q["wo_id"], "gate_escalated", {
+                "approval_id": approval["id"], "reason": verdict["reason"],
+            })
+            return
+
+        approved = bool(verdict.get("approve"))
+        gates.apply_decision(pstore, approval["id"], approved=approved,
+                             reason=verdict["reason"], decided_by="neo")
+        # A shipped release is something the user wants to know happened, even when they
+        # did not have to authorise it — that is the trade for spending none of their
+        # attention on the approval itself.
+        central.add_inbox(
+            project=q["project"],
+            level="info" if approved else "warning",
+            title=(f"Neo {'approved' if approved else 'denied'} "
+                   f"{approval['kind']} for {q['wo_id']}"),
+            body=(f"{verdict['reason']}\n\nCommand: {approval['command']}\n"
+                  f"Review Neo's call with: jarvis neo review {q['id']}"),
+            wo_id=q["wo_id"],
+        )
+        log.info("gate %s %s by neo for %s", approval["id"],
+                 "approved" if approved else "denied", q["wo_id"])
 
     # -- 5. invariants (post-conditions) --------------------------------------------------
 
@@ -517,6 +580,13 @@ class Daemon:
                     else:
                         store.set_status(wo["id"], "completed")
                         store.clear_attention(wo["id"])
+                elif store.pending_approvals(wo["id"]):
+                    # Parked on a privileged-action gate: it was told to end its turn and
+                    # wait for the verdict, so an idle session is compliance, not
+                    # abandonment. Judging it here would file the work order for review
+                    # while the thing it is waiting for is still in Neo's queue.
+                    if wo["status"] != "waiting_input":
+                        store.set_status(wo["id"], "waiting_input")
                 elif not store.queued_messages(wo["id"]):
                     if wo["origin"] == "adhoc":
                         # Not a dispatched worker: ending a turn is just a turn ending.

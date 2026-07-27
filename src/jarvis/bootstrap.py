@@ -22,7 +22,10 @@ from typing import Any
 from .catalog import ProjectSpec
 from .paths import project_state_dir
 
-TEMPLATE_VERSION = 4
+# v5 = v4's privileged-action gates section + the decision-routing rewrite (Neo as
+# first responder). Both landed as "v4" on separate branches, so a project that
+# regenerated against either one would have skipped the other's content.
+TEMPLATE_VERSION = 5
 ASSETS = Path(__file__).parent / "assets"
 
 
@@ -183,9 +186,56 @@ def ensure_operation_md(project: ProjectSpec, report: BootstrapReport) -> None:
             template_version=TEMPLATE_VERSION,
             project_name=project.name,
             project_specifics=specifics,
+            gates_section=_gates_section(project),
         )
     )
     report.note("wrote OPERATION.md")
+
+
+def _gates_section(project: ProjectSpec) -> str:
+    """The privileged-actions clause of the contract, for OPERATION.md.
+
+    Written from the catalog rather than hard-coded because the answer differs per
+    project, and getting it wrong in either direction is costly: a worker that wrongly
+    believes it may ship will try, and a worker that wrongly believes it may not will
+    stop short and leave the release to a human who was never told it was ready.
+    """
+    from .gates import KINDS
+
+    if not project.gates:
+        return "\n" + "\n".join([
+            "",
+            "Nothing in this project ships without a human. You open pull requests;",
+            "merging them, cutting releases and restarting services are the user's call.",
+            "Finish the work order with the PR link and say plainly that it is ready —",
+            "do not attempt the merge or the release yourself.",
+        ])
+    live = [k for k in KINDS if k.name in project.gates.enabled]
+    lines = [
+        "",
+        "",
+        "These actions are **gated, not forbidden**: you may attempt them, and an",
+        "independent reviewer (Neo, the user's delegate) decides whether they run.",
+        "",
+    ]
+    lines += [f"- `{k.name}` — {k.summary}" for k in live]
+    lines += [
+        "",
+        "Ask before acting — the reviewer sees ONLY the text you write, so a request with",
+        "evidence is far more likely to be approved than a bare attempt:",
+        "",
+        "```bash",
+        'jarvis gate request "$JARVIS_WO_ID" "<the exact command>" \\',
+        '    --why "<why this is ready to ship>" \\',
+        '    --evidence "<PR number, test results, checks>"',
+        "```",
+        "",
+        "Then END YOUR TURN. The verdict arrives as your next user turn. If approved, run",
+        "that exact command — the grant is scoped to that one string and expires, so do",
+        "not reword it. If denied, fix what the reason names; retrying unchanged will be",
+        "blocked again.",
+    ]
+    return "\n".join(lines)
 
 
 def workspace_trusted(project_path: Path) -> bool | None:

@@ -87,6 +87,20 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any]) -> tuple[str, st
         return f"Assumptions {verb}", f"{count} assumption(s)" if count else ""
     if kind == "learning_captured":
         return "Learning captured", p.get("topic") or ""
+    if kind == "gate_requested":
+        return (f"Asked permission to {p.get('kind') or 'act'}",
+                p.get("command") or "")
+    if kind == "gate_decided":
+        verb = "Approved" if p.get("decision") == "approved" else "Denied"
+        return (f"{verb} by {p.get('by') or '?'}: {p.get('kind') or 'gate'}",
+                p.get("reason") or "")
+    if kind == "gate_escalated":
+        return "Gate approval escalated to you", p.get("reason") or ""
+    if kind == "gate_opened":
+        # The moment the privileged command actually ran — the most audit-relevant
+        # entry a work order can have, so it is never debug.
+        return (f"Ran the approved {p.get('kind') or 'command'}",
+                f"use {p.get('use')} of {p.get('of')}")
     if kind == "finished":
         return "Finished", p.get("summary") or ""
     if kind == "hidden":

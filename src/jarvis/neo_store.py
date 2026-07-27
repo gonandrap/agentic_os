@@ -25,6 +25,11 @@ Q_STATUSES = (
 # Review lifecycle of an answered question.
 REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
 
+# What Neo is being asked for. `question` is an open decision ("which library?");
+# `approval` is a privileged-action gate ("may I merge this PR?"), which gets a
+# different persona and a verdict with an approve/deny bit. See gates.py.
+Q_KINDS = ("question", "approval")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS questions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,6 +39,7 @@ CREATE TABLE IF NOT EXISTS questions (
     question TEXT NOT NULL,
     context TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'queued',
+    kind TEXT NOT NULL DEFAULT 'question',   -- question | approval
     answer TEXT,
     answered_by TEXT,                        -- neo | user
     answer_reason TEXT,                      -- Neo's stated reasoning / escalation reason
@@ -55,6 +61,15 @@ CREATE INDEX IF NOT EXISTS idx_q_review ON questions(review_status);
 CREATE INDEX IF NOT EXISTS idx_learn_project ON learnings(project);
 """
 
+# Columns added after the first release. `CREATE TABLE IF NOT EXISTS` is a no-op on an
+# existing database, so new columns must be ALTERed in on open — every live instance
+# already has a neo.db from before these existed.
+ADDED_COLUMNS = {
+    "questions": {
+        "kind": "TEXT NOT NULL DEFAULT 'question'",
+    },
+}
+
 
 class NeoStore:
     def __init__(self, path: Path | None = None):
@@ -62,16 +77,30 @@ class NeoStore:
         self.db_path = path or neo_db_path()
         self.conn = db.connect(self.db_path)
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        for table, columns in ADDED_COLUMNS.items():
+            have = {
+                r["name"]
+                for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, decl in columns.items():
+                if name not in have:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def close(self) -> None:
         self.conn.close()
 
     # -- questions -------------------------------------------------------------
 
-    def ask(self, project: str, wo_id: str, question: str, context: str = "") -> dict[str, Any]:
+    def ask(self, project: str, wo_id: str, question: str, context: str = "",
+            kind: str = "question") -> dict[str, Any]:
+        assert kind in Q_KINDS, kind
         cur = self.conn.execute(
-            "INSERT INTO questions (ts, project, wo_id, question, context) VALUES (?,?,?,?,?)",
-            (db.now(), project, wo_id, question, context),
+            "INSERT INTO questions (ts, project, wo_id, question, context, kind) "
+            "VALUES (?,?,?,?,?,?)",
+            (db.now(), project, wo_id, question, context, kind),
         )
         return self.get(int(cur.lastrowid))  # type: ignore[return-value]
 

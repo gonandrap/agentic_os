@@ -11,7 +11,25 @@
   {{ learnings|length }} learnings)</span>
 </p>
 
-{% if not history and not unreviewed and not escalated and not counts.get('queued') %}
+{% if in_flight %}
+<h2>With Neo right now</h2>
+<div class="panel">
+  {% for q in in_flight %}
+  <div class="row">
+    <span class="st {{ 'tone-warn' if q.status == 'answering' else 'tone-muted' }}">
+      <span class="i">{{ '◍' if q.status == 'answering' else '◌' }}</span>{{ q.status }}</span>
+    <span class="grow">{{ q.question[:160] }}</span>
+    <span class="sub mono">{{ q.project }} ·
+      <a href="/wo/{{ q.project }}/{{ q.wo_id }}">{{ q.wo_id }}</a> ·
+      waiting {{ fmt_age(q.ts) }}</span>
+  </div>
+  {% endfor %}
+</div>
+<p class="sub">The worker that asked is parked until Neo replies. If these sit here,
+  the daemon isn't draining the queue — check <span class="mono">jarvis status</span>.</p>
+{% endif %}
+
+{% if not history and not unreviewed and not escalated and not in_flight %}
 <div class="panel" style="margin-top:14px">
   <div class="row"><div class="grow">
     <strong>No worker has asked Neo anything yet.</strong>

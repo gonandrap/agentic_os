@@ -199,6 +199,10 @@ def create_app() -> FastAPI:
         neo = NeoStore()
         try:
             counts = neo.counts()
+            # Oldest first: that is the order Neo drains them, and the oldest is the
+            # one most likely to be stuck.
+            in_flight = list(reversed(
+                neo.list_questions(statuses=("queued", "answering"))))
             escalated = neo.list_questions(statuses=("escalated", "failed"))
             unreviewed = neo.list_questions(statuses=("answered",),
                                             review_status="unreviewed")
@@ -211,8 +215,8 @@ def create_app() -> FastAPI:
         finally:
             neo.close()
         return render(request, "neo.html", active="neo", counts=counts,
-                      escalated=escalated, unreviewed=unreviewed,
-                      history=history, learnings=learnings)
+                      in_flight=in_flight, escalated=escalated,
+                      unreviewed=unreviewed, history=history, learnings=learnings)
 
     @app.get("/api/status")
     def api_status():

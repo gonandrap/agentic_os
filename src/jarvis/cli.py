@@ -3,6 +3,7 @@
 Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel
+  jarvis gate request|list|show|approve|deny   privileged-action approvals
   jarvis neo list|show|review|answer|learnings|learn
   jarvis backlog add|list|promote|done
   jarvis learn add|list|search
@@ -187,6 +188,36 @@ def build_parser() -> argparse.ArgumentParser:
     ra.add_argument("wo_id")
     ra.add_argument("--project")
 
+    # gates (privileged-action approvals) ------------------------------------------------
+    ga = sub.add_parser(
+        "gate",
+        help="privileged-action approvals: shipping actions a worker may attempt only "
+             "with an independent review",
+    ).add_subparsers(dest="ga_cmd", required=True)
+    g = ga.add_parser("request",
+                      help="(workers) ask permission to run a privileged command")
+    g.add_argument("wo_id")
+    g.add_argument("command", help="the EXACT command you will run if approved")
+    g.add_argument("--why", default="", help="why this is ready to ship")
+    g.add_argument("--evidence", default="",
+                   help="PR number, test results, checks — the reviewer sees only this")
+    g.add_argument("--project")
+    g = ga.add_parser("list", help="approval requests, newest first")
+    g.add_argument("--project")
+    g.add_argument("--wo")
+    g.add_argument("--pending", action="store_true", help="only requests awaiting a verdict")
+    g = ga.add_parser("show", help="one request in full, as the reviewer saw it")
+    g.add_argument("approval_id", type=int)
+    g.add_argument("--project")
+    g = ga.add_parser("approve", help="open a gate: the worker may run the command")
+    g.add_argument("approval_id", type=int)
+    g.add_argument("--reason", default="", help="recorded, and shown to the worker")
+    g.add_argument("--project")
+    g = ga.add_parser("deny", help="refuse a gate, with a reason the worker can act on")
+    g.add_argument("approval_id", type=int)
+    g.add_argument("--reason", required=True)
+    g.add_argument("--project")
+
     # backlog ---------------------------------------------------------------------------
     bl = sub.add_parser("backlog", help="unified deferred-work backlog").add_subparsers(
         dest="bl_cmd", required=True)
@@ -326,6 +357,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"  • [{a['project']}]{wo} {a['title']} — {a['reason']}")
             if a.get("attach"):
                 print(f"      approve it: {a['attach']}  ·  or `jarvis wo resume-auto {a['wo_id']}`")
+            if a.get("decide"):
+                print(f"      {a['decide']}  ·  see it: "
+                      f"`jarvis gate show {a['approval_id']}`")
     if st["inbox"]["unacked"]:
         print(f"\n📥 inbox: {st['inbox']['unacked']} unacked"
               f" ({st['inbox']['critical']} critical) — `jarvis inbox list`")
@@ -455,6 +489,12 @@ def cmd_wo(args: argparse.Namespace) -> int:
                                            messages, include_debug=args.debug),
                 "messages": messages,
                 "assumptions": store.pending_assumptions(args.wo_id),
+                # What this work order was allowed (or refused) permission to ship.
+                "gates": [
+                    {k: a[k] for k in ("id", "kind", "command", "status", "escalated",
+                                       "decided_by", "decision_reason")}
+                    for a in store.list_approvals(args.wo_id)
+                ],
             }
         finally:
             store.close()
@@ -491,6 +531,58 @@ def cmd_wo(args: argparse.Namespace) -> int:
         _print(ops.delete_work_order(args.wo_id, project_name=args.project), args.json)
     elif args.wo_cmd == "resume-auto":
         _print(ops.resume_in_auto(args.wo_id, project_name=args.project), args.json)
+    return 0
+
+
+GATE_ICON = {"pending": "⏸", "approved": "✅", "denied": "⛔", "expired": "⌛"}
+
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    from . import ops
+
+    if args.ga_cmd == "request":
+        _print(ops.request_gate_approval(
+            args.wo_id, args.command, why=args.why, evidence=args.evidence,
+            project_name=args.project), args.json)
+    elif args.ga_cmd == "list":
+        rows = ops.list_gates(project_name=args.project, wo_id=args.wo,
+                              pending_only=args.pending)
+        if args.json:
+            _print(rows, True)
+        elif not rows:
+            print("no approval requests" + (" pending" if args.pending else ""))
+        else:
+            for r in rows:
+                icon = GATE_ICON.get(r["status"], "•")
+                where = "you" if r["escalated"] else "neo"
+                state = f"{r['status']} (with {where})" if r["status"] == "pending" \
+                    else f"{r['status']} by {r['decided_by'] or '?'}"
+                print(f"{icon} {r['id']} [{r['project']}] {r['kind']} · {state} "
+                      f"· {r['wo_id']} · {_age(r['ts'])} ago")
+                print(f"    {r['command']}")
+                if r["status"] == "pending" and r["escalated"]:
+                    print(f"    ↳ Neo escalated: {r['escalation_reason']}")
+                    print(f"    ↳ jarvis gate approve {r['id']} --reason \"...\"  |  "
+                          f"jarvis gate deny {r['id']} --reason \"...\"")
+                elif r["decision_reason"]:
+                    print(f"    ↳ {r['decision_reason']}")
+    elif args.ga_cmd == "show":
+        data = ops.show_gate(args.approval_id, project_name=args.project)
+        if args.json:
+            _print(data, True)
+        else:
+            q = data.pop("neo_question", None)
+            _pretty(data)
+            if q:
+                print("\n-- the request as the reviewer saw it "
+                      "----------------------------------")
+                print(q["question"])
+                if q.get("answer"):
+                    print(f"\nVerdict: {q['answer']} ({q.get('answered_by')})")
+                    print(f"Reason: {q.get('answer_reason')}")
+    elif args.ga_cmd in ("approve", "deny"):
+        _print(ops.decide_gate(args.approval_id, approved=args.ga_cmd == "approve",
+                               reason=args.reason, project_name=args.project), args.json)
     return 0
 
 
@@ -722,6 +814,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_adopt(args)
         if args.cmd == "wo":
             return cmd_wo(args)
+        if args.cmd == "gate":
+            return cmd_gate(args)
         if args.cmd == "backlog":
             return cmd_backlog(args)
         if args.cmd == "learn":
