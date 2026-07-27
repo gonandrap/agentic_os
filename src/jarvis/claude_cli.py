@@ -177,6 +177,12 @@ def spawn_background(
         args += ["--settings", str(settings_file)]
     for d in add_dirs or []:
         args += ["--add-dir", str(d)]
+    # `--` fences the prompt off from option parsing. Without it a variadic option
+    # (`--add-dir <directories...>` is one) keeps consuming positionals and swallows
+    # the prompt as a directory: the session boots with nothing to do and parks at
+    # the welcome screen forever, which reads as "created but never started".
+    # It also lets a prompt begin with a dash. Never append anything after this.
+    args.append("--")
     args.append(prompt)
     out = _run(args, cwd=cwd, timeout=120)
     m = _JOB_ID_RE.search(out or "")

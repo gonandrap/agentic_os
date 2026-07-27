@@ -43,8 +43,18 @@ through `ProjectStore.set_status()` (`project_store.py:235`) — nothing writes 
 ```
 claude --bg --name "[WO <id>] <title[:60]>" [--resume <sid>] [--worktree <wo-id>]
        [--model <model>] [--effort <effort>] [--permission-mode <mode>]
-       [--append-system-prompt <sp>] [--settings <path>] <prompt>
+       [--append-system-prompt <sp>] [--settings <path>] [--add-dir <dir>]…
+       -- <prompt>
 ```
+
+**The `--` before the prompt is load-bearing — never append an arg after it.**
+`--add-dir <directories...>` is *variadic*: commander keeps eating positionals until a
+`-`-prefixed token or `--`. With `--add-dir` emitted last (as it is), an unfenced prompt
+is consumed as a second directory, so the session boots with nothing to do and parks at
+the welcome screen — the user sees "the session was created but never started" and has to
+type into it by hand. Symptoms in the supervisor's `state.json`: `detail: "stuck on a
+startup dialog"` / `needs: "send a prompt to start"`, and the prompt is absent from the
+session transcript entirely. Regression tests: `tests/test_worker_spawn_args.py`.
 
 Flags assembled `claude_cli.py:134-149`, invoked `:150`. Job id scraped from stdout with
 `_JOB_ID_RE = re.compile(r"claude stop ([0-9a-f]{6,})")` (`claude_cli.py:100`, used `:151-152`).
