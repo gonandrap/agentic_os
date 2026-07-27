@@ -245,18 +245,28 @@ def send_to_session(session_id: str, message: str, cwd: Path,
 
 def run_headless(prompt: str, system_prompt: str | None = None,
                  model: str | None = None, cwd: Path | None = None,
-                 timeout: int = 300) -> str:
+                 timeout: int = 300, tools: str | None = None) -> str:
     """One-shot headless call (`claude -p`) returning the result text.
 
     Used by Neo: the system prompt (persona + learnings) is byte-stable across
     calls, so consecutive invocations within the Anthropic cache TTL share a
     cached prefix — question-specific content rides in `prompt`, after it.
+
+    `tools` selects the callee's built-in tool set: `None` (default) leaves it
+    alone, `""` strips every tool, or a comma-separated list ("Read,Bash").
+    Strip them when the answer must come from the prompt rather than from the
+    machine — a tooled callee will happily go read the real state and answer
+    about *that*. Note this is availability, not permission: `--allowedTools`
+    and `--disallowedTools` do not remove a tool, and under
+    `permissions.defaultMode: auto` they do not stop it being used either.
     """
     args: list[str] = ["-p", prompt, "--output-format", "json"]
     if system_prompt:
         args += ["--append-system-prompt", system_prompt]
     if model:
         args += ["--model", model]
+    if tools is not None:  # "" is meaningful: it disables every tool
+        args += ["--tools", tools]
     out = _run(args, cwd=cwd, timeout=timeout)
     try:
         data = json.loads(out)
