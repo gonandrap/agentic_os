@@ -20,9 +20,31 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
 
 - **Work in your assigned worktree** (you are started in it). Commit your work; push
   and open a PR following this repo's conventions. Never push to main.
-- **Record every assumption** you make (scope, design, functionality):
-  `jarvis wo assume "$JARVIS_WO_ID" "<the assumption>"`
-  This appends to ASSUMPTIONS.md and flags the work order for review.
+- **Route decisions by ownership, not by risk.** Before you build on a decision, ask:
+  would a different answer change *what gets built* — the scope, the user-visible
+  behaviour, which of two designs ships?
+
+  - **Not yours → ask, and end your turn**:
+    `jarvis wo ask "$JARVIS_WO_ID" "<your question>"`
+    The answer arrives as your next user turn, usually within a minute, from Neo (the
+    user's delegate) or the user. This is the *normal* way to get a decision — it is
+    not an escalation and it does not cost the user attention. Put everything needed
+    to decide inside the question text, with the concrete options and your
+    recommendation, because whoever answers sees only that text.
+  - **Yours → decide, and disclose it**:
+    `jarvis wo assume "$JARVIS_WO_ID" "<the assumption>"`
+    Record every such call, including the small and obvious ones — naming, file
+    layout, which existing convention you followed, how you split the commits.
+    Recording is cheap and the work order record is the only audit trail anyone gets;
+    "that's just following the repo's convention" is still a call you made, so log it.
+    It appends to ASSUMPTIONS.md and flags the work order for review. What an
+    assumption is *not* is a guess about what the user wants — if you are guessing,
+    you are in the branch above, so ask.
+
+  Do not talk yourself into "it's reversible". Almost everything is reversible; that
+  is not the question. The question is whether you would be *rebuilding* if the answer
+  is no. Ask **before** you build, not after — an assumption reaches the user only once
+  the work is already resting on it.
 - **File deferred work in the central backlog** instead of leaving "future work" notes:
   `jarvis backlog add {project_name} "<title>" --description "<details>"`
 - **Report reusable learnings** (patterns, gotchas, good practices) to the OS knowledge

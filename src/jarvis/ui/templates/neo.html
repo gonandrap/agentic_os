@@ -11,6 +11,22 @@
   {{ learnings|length }} learnings)</span>
 </p>
 
+{% if not history and not unreviewed and not escalated and not counts.get('queued') %}
+<div class="panel" style="margin-top:14px">
+  <div class="row"><div class="grow">
+    <strong>No worker has asked Neo anything yet.</strong>
+    <div class="sub" style="margin-top:6px">
+      This is not the intended steady state. Workers are told to run
+      <span class="mono">jarvis wo ask</span> whenever a decision would change
+      <em>what</em> they build, and Neo answers as you within a minute. If work orders
+      keep arriving as assumptions to review instead, the workers are deciding things
+      that are yours — that is worth a look, not a shrug.
+      <br>Seed Neo below so its first answer already sounds like you.
+    </div>
+  </div></div>
+</div>
+{% endif %}
+
 {% if escalated %}
 <h2>Escalated — Neo wants you to decide</h2>
 <div class="panel">

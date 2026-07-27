@@ -22,7 +22,7 @@ from typing import Any
 from .catalog import ProjectSpec
 from .paths import project_state_dir
 
-TEMPLATE_VERSION = 3
+TEMPLATE_VERSION = 4
 ASSETS = Path(__file__).parent / "assets"
 
 

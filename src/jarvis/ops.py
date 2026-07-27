@@ -616,8 +616,15 @@ def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, 
     return out
 
 
-def review_work_order(wo_id: str, accept: bool = True) -> dict[str, Any]:
-    """Accept (or reject) all pending assumptions and settle the work order."""
+def review_work_order(wo_id: str, accept: bool = True,
+                      feedback: str = "") -> dict[str, Any]:
+    """Accept (or reject) all pending assumptions and settle the work order.
+
+    `feedback` is where the user's reasoning goes, and it does two jobs that used to
+    need two more commands: it becomes a Neo learning (so the decisions the user makes
+    today train the agent meant to make them tomorrow), and on a rejection it is
+    delivered to the still-open worker as guidance.
+    """
     name, path, wo = find_work_order(wo_id)
     store = ProjectStore(path)
     try:
@@ -628,13 +635,39 @@ def review_work_order(wo_id: str, accept: bool = True) -> dict[str, Any]:
             if accept:
                 store.set_status(wo_id, "completed")
                 store.clear_attention(wo_id)
-            else:
+            elif not feedback:
+                # With feedback the guidance is delivered below, so the work order is
+                # not waiting on the user — only a bare rejection strands it.
                 store.flag_attention(wo_id, "assumptions rejected — send guidance with `jarvis wo send`")
-        store.add_event(wo_id, "reviewed", {"accepted": accept, "count": len(pending)})
+        store.add_event(wo_id, "reviewed", {"accepted": accept, "count": len(pending),
+                                            "feedback": feedback})
     finally:
         store.close()
-    return {"project": name, "wo_id": wo_id, "reviewed": len(pending),
-            "accepted": accept}
+
+    out = {"project": name, "wo_id": wo_id, "reviewed": len(pending), "accepted": accept}
+    if not feedback:
+        return out
+
+    from . import neo as neo_mod
+    from .neo_store import NeoStore
+    neo = NeoStore()
+    try:
+        learning = neo.add_learning(
+            neo_mod.learning_from_assumption_review(wo, pending, accept, feedback),
+            project=name, source="review",
+        )
+    finally:
+        neo.close()
+    out["learning_id"] = learning["id"]
+
+    # A rejection without guidance reaching the worker just strands it. Deliver it.
+    if not accept and wo["status"] in OPEN_STATUSES:
+        try:
+            out["delivered"] = send_message(wo_id, feedback, source="jarvis",
+                                            project_name=name)
+        except OpsError as e:
+            out["delivery_error"] = str(e)
+    return out
 
 
 # -- Neo (OS answerer agent) ---------------------------------------------------------------------

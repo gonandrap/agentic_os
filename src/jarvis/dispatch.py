@@ -98,13 +98,28 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "not go looking for that file, everything you need is here):",
         "- Work only inside your assigned worktree (you start in it). Commit your "
         "work and open a PR per this repo's conventions. Never push to main.",
-        f"- Record EVERY assumption you make: `jarvis wo assume {wo['id']} \"...\"`",
-        f"- Blocked on a decision you cannot make? Ask the OS and END YOUR TURN: "
-        f"`jarvis wo ask {wo['id']} \"<your question>\"` — the answer arrives as "
-        f"your next user turn (from Neo, the user's delegate, or the user). Put "
-        f"everything needed to decide INSIDE the question text: whoever answers sees "
-        f"only that text, never your session. Prefer recording an assumption and "
-        f"continuing when the decision is reversible.",
+        "- Decisions: the test is OWNERSHIP, not risk. Before you build on a "
+        "decision, ask yourself: would a different answer change WHAT gets built — "
+        "the scope, the user-visible behaviour, which of two designs ships? If yes, "
+        "the decision is not yours.",
+        f"  - Not yours -> ASK, and END YOUR TURN: `jarvis wo ask {wo['id']} "
+        f"\"<your question>\"`. The answer arrives as your next user turn, usually "
+        f"within a minute, from Neo (the user's delegate) or the user. This is the "
+        f"normal way to get a decision — it is not an escalation and it does not "
+        f"cost the user attention. Put everything needed to decide INSIDE the "
+        f"question text: whoever answers sees only that text, never your session. "
+        f"Give them the concrete options and your recommendation.",
+        f"  - Yours -> DECIDE, and disclose it: `jarvis wo assume {wo['id']} "
+        f"\"...\"`. Record EVERY such call, including the small and obvious ones — "
+        f"naming, file layout, which existing convention you followed, how you split "
+        f"the commits. Recording is cheap and the work order record is the only audit "
+        f"trail anyone gets; \"that's just following the repo's convention\" is still "
+        f"a call you made, so log it. What an assumption is NOT is a guess about what "
+        f"the user wants — if you are guessing, you are in the branch above, so ask.",
+        "  - Do not talk yourself into \"it's reversible\". Almost everything is "
+        "reversible; that is not the question. The question is whether you would be "
+        "REBUILDING if the answer is no. Ask BEFORE you build, not after — an "
+        "assumption reaches the user only once the work is already resting on it.",
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"`",
         f"- The OS knowledge base is the ONLY memory that survives you: "

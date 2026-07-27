@@ -157,3 +157,17 @@ def learning_from_review(q: dict[str, Any], feedback: str) -> str:
     """Distill a corrected answer into a learning Neo will see next time."""
     return (f"When a worker asked: \"{q['question'][:200]}\" — I answered: "
             f"\"{(q.get('answer') or '')[:200]}\". The user corrected me: {feedback}")
+
+
+def learning_from_assumption_review(wo: dict[str, Any], assumptions: list[dict[str, Any]],
+                                    accepted: bool, feedback: str) -> str:
+    """Distill the user's verdict on a work order's assumptions into a learning.
+
+    Neo's other learning source (reviews of its own answers) only fires once Neo is
+    already answering. This one fires on the decisions the user is making TODAY, so
+    Neo arrives at its first question with the user's taste already in the prompt.
+    """
+    what = "; ".join(f"\"{a['content'][:200]}\"" for a in assumptions[:5]) or "(none recorded)"
+    verdict = "accepted" if accepted else "rejected"
+    return (f"On work order \"{wo.get('title', '')[:120]}\" a worker decided: {what}. "
+            f"The user {verdict} that: {feedback}")

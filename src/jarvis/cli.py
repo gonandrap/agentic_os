@@ -151,6 +151,9 @@ def build_parser() -> argparse.ArgumentParser:
     r = wo.add_parser("review", help="accept/reject a work order's pending assumptions")
     r.add_argument("wo_id")
     r.add_argument("--reject", action="store_true")
+    r.add_argument("--feedback", default="",
+                   help="your reasoning — teaches Neo, and on --reject is delivered "
+                        "to the worker as guidance")
 
     x = wo.add_parser("cancel", help="cancel a work order")
     x.add_argument("wo_id")
@@ -468,7 +471,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
     elif args.wo_cmd == "finish":
         _print(ops.finish(args.wo_id, args.summary), args.json)
     elif args.wo_cmd == "review":
-        _print(ops.review_work_order(args.wo_id, accept=not args.reject), args.json)
+        _print(ops.review_work_order(args.wo_id, accept=not args.reject,
+                                     feedback=args.feedback), args.json)
     elif args.wo_cmd == "cancel":
         _print(ops.cancel(args.wo_id), args.json)
     elif args.wo_cmd == "ack":

@@ -236,8 +236,9 @@ def create_app() -> FastAPI:
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/review")
-    def review(name: str, wo_id: str, decision: str = Form(...)):
-        ops.review_work_order(wo_id, accept=(decision == "accept"))
+    def review(name: str, wo_id: str, decision: str = Form(...),
+               feedback: str = Form("")):
+        ops.review_work_order(wo_id, accept=(decision == "accept"), feedback=feedback)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/cancel")

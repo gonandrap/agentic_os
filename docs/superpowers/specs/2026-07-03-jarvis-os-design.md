@@ -268,8 +268,24 @@ mechanics and rollout strategy; the user's own fleet plan lives in an untracked
 
 ### 3.9 Neo — the OS answerer agent
 
-Workers that hit a blocking decision run `jarvis wo ask <wo-id> "question"` and end
-their turn instead of stalling on the user. Questions queue in Neo's own DB
+**Neo is the default route for decisions, not a rare escape hatch.** The worker
+contract splits decisions by *ownership*, not by risk: if a different answer would
+change what gets built, the worker asks; otherwise it decides and discloses the call
+as an assumption. This matters because Neo is the OS's only attention filter — its
+escalation rules (production, credentials, money, deletion/publication, legal,
+unknown preference) are what keep the user's plate small. A Neo with no traffic is
+a filter that never runs, and every decision then reaches the user unfiltered, as a
+post-hoc assumption review on work already built on it.
+
+An earlier contract wording ("prefer recording an assumption when the decision is
+reversible") made the ask path unreachable: reversibility asks about *risk of being
+wrong*, and a capable worker on `permission_mode=auto` can always construct a
+reversible reading. Across the first ~30 work orders of the fleet, `jarvis wo ask`
+was called exactly zero times. An empty **neo** tab is a symptom to investigate, not
+a normal state.
+
+Workers that hit a decision they do not own run `jarvis wo ask <wo-id> "question"` and
+end their turn instead of stalling on the user. Questions queue in Neo's own DB
 (`$JARVIS_HOME/neo.db`). Each daemon tick, a single Neo thread drains the queue FIFO:
 one headless `claude -p` call per question, persona + accumulated learnings as a
 byte-stable system prompt (append-only rendering), the question last. Back-to-back
@@ -287,6 +303,12 @@ approve, or correct with feedback. Corrections become learnings (injected into a
 future Neo prompts — the more it's used, the more it answers like the user) and are
 forwarded to the still-open work order as guidance. Escalated questions take the
 user's answer via `jarvis neo answer`.
+
+Learnings have a second source, so Neo is not cold-started by its own traffic:
+`jarvis wo review <id> [--reject] --feedback "…"` turns the user's verdict on a work
+order's assumptions into a learning too (and, on a rejection, delivers that same text
+to the worker). The decisions the user makes today train the agent meant to make them
+tomorrow, whether or not a worker has asked anything yet.
 
 ## 4. Error handling
 
