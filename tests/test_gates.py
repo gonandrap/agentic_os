@@ -76,6 +76,33 @@ def test_ordinary_work_is_not_gated(command):
     assert gates.classify(command, ALL_GATES) is None, f"{command!r} must not be gated"
 
 
+@pytest.mark.parametrize("command", [
+    # Naming a privileged action is not performing one. Every one of these was gated
+    # before `scannable()` existed, and each cost a Neo review and stalled the worker:
+    # two reached the user as escalations from wo-6e7caf6c.
+    'jarvis learn add "turn 1 was told never to run shipit" --project jarvis_os',
+    'grep -n "shipit\\|def classify" -B3 -A 20 src/jarvis/gates.py | head -60',
+    'git commit -m "document systemctl restart in the runbook"',
+    'gh pr create --title "stop flagging gh pr merge when it appears in prose"',
+    'echo "cat x | gh pr merge 31"',
+    "jarvis wo send wo-1 'do not git push origin main'",
+])
+def test_merely_naming_a_privileged_action_is_not_gated(command):
+    assert gates.classify(command, ALL_GATES) is None, f"{command!r} must not be gated"
+
+
+@pytest.mark.parametrize("command", [
+    # …but a shell that re-parses its quoted payload turns that data back into code.
+    'sh -c "bash scripts/shipit.sh"',
+    'bash -c "gh pr merge 31"',
+    'bash -lc "gh pr merge 31"',
+    'eval "systemctl restart jarvis"',
+    'echo "gh pr merge 31" | xargs -I{} sh -c "{}"',
+])
+def test_a_quoted_payload_handed_to_a_shell_is_still_gated(command):
+    assert gates.classify(command, ALL_GATES) is not None, f"{command!r} must be gated"
+
+
 def test_gated_action_hidden_in_a_pipeline_is_still_caught():
     """A classifier that only reads well-formed simple commands has a bypass."""
     for command in (
