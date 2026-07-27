@@ -39,7 +39,11 @@
 
 **Storage (import only `db` + `paths`):**
 - `central_store.py` — OS-wide DB. `CentralStore`:63, `upsert_project()`:75, `add_inbox()`:103,
-  `add_backlog()`/`list_backlog()`:158/179, `relevant_knowledge()`:226, `get_state`/`set_state`:250/244.
+  `add_backlog()`/`list_backlog()`, `relevant_knowledge()`, `get_state`/`set_state`.
+  Knowledge reaches prompts as a bounded INDEX, never as content: `headline()`,
+  `KnowledgeBrief`, `knowledge_brief()` (pinned tier + topic-round-robin index +
+  overflow roll-call, all excluding retired entries), `get_knowledge()`,
+  `pin_knowledge()`, `knowledge_topics()`.
 - `project_store.py` — per-project DB + the WO state machine. `WO_STATUSES`:16,
   `OPEN_STATUSES`:26, `ProjectStore`:110, `create_work_order()`:133, `claim_next_pending()`:207,
   `set_status()`:235, `add_event()`:282, `delete_work_order()`:258.
@@ -86,7 +90,8 @@
   `mem:work-order-lifecycle`.
 - `dispatch.py` — composes what the worker is TOLD (prompt, settings, resolved
   model/effort/permission mode) and hands the running of it to `worker_session`.
-  `dispatch_work_order()`, `build_worker_prompt()`, `_write_worker_settings()`,
+  `dispatch_work_order()`, `build_worker_prompt()`, `_planner_prompt()`,
+  `_common_briefing()`, `render_knowledge_block()`, `_write_worker_settings()`,
   `worker_name()`.
 - `ops.py` (620 L) — business logic shared by CLI and UI. `start_os()`:63,
   `create_work_order()`:261, `finish()`:374, `find_work_order()`:281, `os_status()`:142, `OpsError`:31.
