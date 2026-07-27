@@ -167,7 +167,7 @@ trap cleanup EXIT
 if [ "$DRY_RUN" = 1 ]; then SRC="<tmp-clone>"; else SRC="$(mktemp -d)"; fi
 
 say "downloading $TAG"
-run "git clone --quiet --depth 1 --branch '$TAG' '$REPO' '$SRC/jarvis_os'" \
+run "git -c advice.detachedHead=false clone --quiet --depth 1 --branch '$TAG' '$REPO' '$SRC/jarvis_os'" \
   || die "could not clone $TAG from $REPO"
 
 # --- 4. install -----------------------------------------------------------------------
