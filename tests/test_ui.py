@@ -134,7 +134,7 @@ def test_adhoc_badge_visible(client, daemon, fake_claude, project):
     sessions = fake_claude.sessions
     sessions.append({"id": "zz", "sessionId": "adhoc-9", "cwd": str(project),
                      "kind": "background", "name": "manual poking",
-                     "state": "running", "startedAt": 0})
+                     "state": "working", "startedAt": 0})
     (fake_claude.dir / "sessions.json").write_text(json.dumps(sessions))
     daemon.tick_count = 0
     daemon.tick()
