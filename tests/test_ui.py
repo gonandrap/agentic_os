@@ -344,3 +344,28 @@ def test_got_it_is_not_offered_when_a_decision_is_owed(client, project):
     assert r.status_code == 303
     assert "error=" in r.headers["location"]
     assert store.get_work_order(wo["id"])["needs_attention"]
+
+
+def test_knowledge_page_pin_toggle(client):
+    """Pinning is the switch between 'in every worker prompt verbatim' and 'an index
+    line the worker looks up' — so it has to be operable without touching SQLite."""
+    from jarvis.central_store import PINNED_TAG, CentralStore, has_tag
+
+    central = CentralStore()
+    row = central.add_knowledge("never deploy on a Friday", project="proj_a",
+                                topic="deploy")
+
+    page = client.get("/knowledge")
+    assert "never deploy on a Friday" in page.text
+    assert row["id"] in page.text            # the id the worker would `learn show`
+    assert "index" in page.text.lower()      # the page explains the new contract
+
+    r = client.post("/knowledge/pin", data={"kn_id": row["id"], "pinned": "1"})
+    assert r.status_code == 303
+    fresh = central.get_knowledge(row["id"])
+    assert fresh is not None and has_tag(fresh["tags"], PINNED_TAG)
+    assert "unpin" in client.get("/knowledge").text
+
+    client.post("/knowledge/pin", data={"kn_id": row["id"], "pinned": "0"})
+    fresh = central.get_knowledge(row["id"])
+    assert fresh is not None and not has_tag(fresh["tags"], PINNED_TAG)

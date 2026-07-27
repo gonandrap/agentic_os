@@ -57,7 +57,13 @@ jarvis neo review <qid> [--correct "…"]    # approve or teach; corrections bec
 jarvis neo answer <qid> "…"                # answer a question Neo escalated to the user
 jarvis inbox / jarvis inbox ack [id]
 jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--force]
-jarvis learn add "insight" [--project p] / search <term>
+jarvis learn add "insight" [--project p] [--pin] / search <term> [--project p]
+jarvis learn show <kn-id> / list [--topic t] / topics / pin <id> / unpin <id>
+                                           # worker prompts carry an INDEX of the
+                                           # knowledge base (headline + id, bounded);
+                                           # workers fetch full text on demand.
+                                           # `pin` = ride along verbatim in every
+                                           # prompt — safety rails only.
 jarvis bug report "title" -d "..." -e "expected" -a "actual" [--steps "..."]
                                            # a bug in the OS itself -> GitHub issue on
                                            # the (PUBLIC) tracker + Telegram ping.

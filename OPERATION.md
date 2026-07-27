@@ -25,6 +25,13 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
   This appends to ASSUMPTIONS.md and flags the work order for review.
 - **File deferred work in the central backlog** instead of leaving "future work" notes:
   `jarvis backlog add jarvis_os "<title>" --description "<details>"`
+- **Read the knowledge base before you act.** It reaches you as an *index* of headlines
+  at the end of your prompt, not as the knowledge itself. Look up any area you are about
+  to touch:
+  `jarvis learn search "<term>" --project jarvis_os` · `jarvis learn show <id>` ·
+  `jarvis learn list --project jarvis_os --topic <t>` · `jarvis learn topics`
+  A past worker probably already paid for the lesson. Never assume an index headline is
+  the whole entry.
 - **Report reusable learnings** (patterns, gotchas, good practices) to the OS knowledge
   base so other projects benefit:
   `jarvis learn add "<what you learned>" --project jarvis_os --topic "<topic>"`

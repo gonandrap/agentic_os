@@ -203,7 +203,10 @@ def test_prompt_contract(fleet, fake_claude):
     prompt = [c for c in fake_claude.calls if "--bg" in c["argv"]][0]["argv"][-1]
     for must in ("upgrade deps", "careful please", f"jarvis wo assume {wo['id']}",
                  f"jarvis wo ask {wo['id']}", f"jarvis wo finish {wo['id']}",
-                 "never bump major versions", "Never push to main"):
+                 "never bump major versions", "Never push to main",
+                 # the knowledge base must arrive as something the worker can query,
+                 # not only as whatever happened to fit in the prompt
+                 "jarvis learn search", "jarvis learn show <id>"):
         assert must in prompt, f"contract element missing: {must}"
 
 

@@ -147,12 +147,29 @@ def create_app() -> FastAPI:
 
     @app.get("/knowledge", response_class=HTMLResponse)
     def knowledge(request: Request):
+        from ..central_store import PINNED_TAG, has_tag
         central = CentralStore()
         try:
             rows = central.search_knowledge("", limit=200)
+            topics = central.knowledge_topics()
         finally:
             central.close()
-        return render(request, "knowledge.html", active="knowledge", rows=rows)
+        rows = sorted(rows, key=lambda r: (not has_tag(r["tags"], PINNED_TAG), -r["ts"]))
+        for r in rows:
+            r["pinned"] = has_tag(r["tags"], PINNED_TAG)
+        return render(request, "knowledge.html", active="knowledge", rows=rows,
+                      topics=topics)
+
+    @app.post("/knowledge/pin")
+    def knowledge_pin(kn_id: str = Form(...), pinned: str = Form("")):
+        """Pinned entries ride in every worker prompt verbatim; everything else is an
+        index line the worker looks up. This is the toggle between the two."""
+        central = CentralStore()
+        try:
+            central.pin_knowledge(kn_id, pinned=pinned == "1")
+        finally:
+            central.close()
+        return RedirectResponse("/knowledge", status_code=303)
 
     @app.get("/neo", response_class=HTMLResponse)
     def neo_page(request: Request):
