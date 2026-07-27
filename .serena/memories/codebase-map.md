@@ -84,4 +84,19 @@ Also under `$JARVIS_HOME`: `logs/` (paths.py:31), `run/jarvisd.pid` (paths.py:35
 `upsert_project()`:81 → `set_state("catalog_path")`:88) → `ops._spawn_daemon()`:116 re-execs
 `python -m jarvis.cli daemon run` detached → `daemon.run_daemon()`:470 → `Daemon.run_forever()`:64.
 
+`jarvis --version` / `-V` (`cli.py` `_VersionAction`) prints the installed dist version via
+`bugreport.jarvis_version()` — resolved lazily so hooks don't pay for dist metadata.
+
+## How users install it (there is no PyPI release)
+
+`install.sh` at the repo root is the curl target
+(`raw.githubusercontent.com/gonandrap/agentic_os/main/install.sh`): it resolves the newest
+`jarvis-X.Y.Z` tag with `git ls-remote`, shallow-clones that tag, and installs it with
+`uv tool install` → `pipx` → `venv`+pip (whichever exists), dropping `jarvis` in
+`~/.local/bin` and scaffolding `$JARVIS_HOME/catalog.json` if absent. Re-running upgrades.
+The script ships from `main`; what it installs is always a release tag. **`jarvis-os` on
+PyPI is an unrelated project** — never point anyone at `pip install jarvis-os`.
+Covered by `tests/test_install_script.py` (`--dry-run` against a throwaway local remote;
+real install behind `JARVIS_TEST_INSTALL=1`).
+
 See `mem:work-order-lifecycle` for the WO state machine and `mem:testing` for the suite.
