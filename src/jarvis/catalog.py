@@ -24,6 +24,12 @@ VALID_PERMISSION_MODES = {
 # mode; `auto` does not weaken those. See ASSUMPTIONS.md §9.
 DEFAULT_PERMISSION_MODE = "auto"
 
+# Model every worker runs on unless the catalog overrides it (os.defaults.model, a
+# project's `model`, or per work order via `jarvis wo create --model`). Passed straight
+# through to `claude --model`, so it accepts a full model id (pinned, as here) or an
+# alias like `opus`/`sonnet` (which floats to whatever is latest in that tier).
+DEFAULT_MODEL = "claude-opus-5"
+
 # Modes in which a `--bg` worker never stalls waiting for a human: `auto` (classifier
 # vets each action), `bypassPermissions` (no checks), and `dontAsk` (unlisted tools are
 # denied, not prompted). Every OTHER mode — acceptEdits, manual/default, plan — prompts
@@ -77,7 +83,7 @@ class NeoConfig:
 
 @dataclass
 class OsConfig:
-    default_model: str = "sonnet"
+    default_model: str = DEFAULT_MODEL
     default_effort: str | None = None
     default_permission_mode: str = DEFAULT_PERMISSION_MODE
     default_max_concurrent: int = DEFAULT_MAX_CONCURRENT
@@ -141,7 +147,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     )
 
     os_cfg = OsConfig(
-        default_model=defaults.get("model", "sonnet"),
+        default_model=defaults.get("model", DEFAULT_MODEL),
         default_effort=defaults.get("effort"),
         default_permission_mode=defaults.get("permission_mode", DEFAULT_PERMISSION_MODE),
         default_max_concurrent=int(defaults.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),

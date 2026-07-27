@@ -23,6 +23,7 @@ DEBUG_KINDS = frozenset({
     "turn_ended",               # Stop hook fired
     "session_bound",            # reconciler matched a session to this work order
     "permission_mode_changed",  # worker permission plumbing
+    "notification_ignored",     # idle prompt on an already-settled work order
 })
 
 STATUS_LABEL = {
@@ -84,10 +85,17 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any]) -> tuple[str, st
         verb = "accepted" if p.get("accepted") else "rejected"
         count = p.get("count")
         return f"Assumptions {verb}", f"{count} assumption(s)" if count else ""
+    if kind == "learning_captured":
+        return "Learning captured", p.get("topic") or ""
     if kind == "finished":
         return "Finished", p.get("summary") or ""
     if kind == "hidden":
         return ("Hidden" if p.get("hidden") else "Unhidden"), ""
+    if kind == "invariant":
+        detail = p.get("detail") or ""
+        if p.get("repaired"):
+            return "OS self-check repaired this", f"{detail} → {p.get('repair') or ''}"
+        return "OS self-check failed", detail
     # Unclassified or debug: show the kind and its raw payload.
     return kind, json.dumps(p, sort_keys=True) if p else ""
 

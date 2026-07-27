@@ -107,9 +107,17 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"continuing when the decision is reversible.",
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"`",
-        f"- Report reusable learnings: `jarvis learn add \"...\" --project {project.name}`",
+        f"- The OS knowledge base is the ONLY memory that survives you: "
+        f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`. "
+        f"Anything durable you learn — project state, gotchas, conventions, decisions "
+        f"— goes there. Your own memory files, notes and scratch docs are invisible to "
+        f"the user, to Neo and to the next worker (Jarvis mirrors any memory file you "
+        f"do write, but say it here and it lands intact).",
         f"- Alert the human when needed: `jarvis notify --project {project.name} "
         f"--level warning|critical \"title\" \"body\"`",
+        "- Hit a bug in Jarvis OS itself (a `jarvis` command fails, hangs, or does the "
+        "wrong thing)? Use your `report-jarvis-bug` skill, then carry on with this work "
+        "order. Bugs in THIS project are not Jarvis OS bugs — those go to the backlog.",
         f"- When done, ALWAYS run: `jarvis wo finish {wo['id']} --summary \"...\"` and "
         f"then write your full answer as the last thing you say.",
         "",
@@ -154,6 +162,10 @@ def dispatch_work_order(
     extra_sp = wo.get("append_system_prompt") or project.worker.append_system_prompt
 
     settings_file = _write_worker_settings(project, wo)
+    # OS skills (e.g. reporting a Jarvis bug) reach the worker only via --add-dir: its
+    # worktree holds tracked files only, so an untracked .claude/skills/ never arrives.
+    from .bootstrap import install_agent_skills
+    skills_dir = install_agent_skills(project.path)
     try:
         job_id = claude_cli.spawn_background(
             prompt=prompt,
@@ -165,6 +177,7 @@ def dispatch_work_order(
             append_system_prompt=extra_sp,
             worktree=worktree,
             settings_file=settings_file,
+            add_dirs=[skills_dir],
         )
     except claude_cli.ClaudeCliError as e:
         store.set_status(wo["id"], "failed")

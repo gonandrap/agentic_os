@@ -20,8 +20,9 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import ProjectSpec
+from .paths import project_state_dir
 
-TEMPLATE_VERSION = 2
+TEMPLATE_VERSION = 3
 ASSETS = Path(__file__).parent / "assets"
 
 
@@ -32,6 +33,29 @@ def jarvis_hook_command() -> str:
     if exe:
         return f"{exe} _hook"
     return f"{sys.executable} -m jarvis.cli _hook"
+
+
+def install_agent_skills(project_path: Path) -> Path:
+    """Materialize the OS-provided agent skills for a project; return the directory to
+    hand Claude via `--add-dir`.
+
+    Getting a skill in front of a worker is awkward: workers run in a fresh git
+    worktree, so an untracked `.claude/skills/` in the main checkout never reaches
+    them, and no settings key can declare an extra skills directory (checked against
+    the CLI). What does work — verified live — is `--add-dir X`, which loads skills
+    from `X/.claude/skills/`. So the OS keeps its skills inside the project's
+    gitignored `.jarvis/` tree and points every worker at them on spawn.
+
+    The tree is generated, never authored: it is rebuilt on each dispatch so a stale
+    or locally mangled copy heals itself.
+    """
+    root = project_state_dir(project_path) / "agent-skills"
+    dest = root / ".claude" / "skills"
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(ASSETS / "skills", dest)
+    return root
 
 
 @dataclass

@@ -7,6 +7,8 @@ One process, one poll loop over every project in the catalog. Per tick:
   4. let Neo (the OS answerer agent) drain queued worker questions
   5. reconcile work order states against `claude agents --json`
      (fix drift, adopt unknown background sessions as `adhoc` work orders)
+  6. check the OS's own post-conditions (src/jarvis/invariants.py) and repair the
+     state that is unambiguously wrong — the only step that does not trust the others
 
 The daemon is an orchestrator, never a doer: all actual work happens inside the
 Claude Code worker sessions it spawns.
@@ -53,6 +55,9 @@ class Daemon:
         self.neo_draining = False
         # wo_id -> consecutive reconcile passes that found no result file for its job.
         self.reply_capture_misses: dict[str, int] = {}
+        # Invariant violations already reported this run, so a standing problem is
+        # surfaced once instead of every tick. Keyed by (invariant, wo_id).
+        self.reported_violations: set[tuple[str, str | None]] = set()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -125,6 +130,8 @@ class Daemon:
                     # injected once the worker's bg session is idle (state done)
                     # or released — resume refuses live bg-owned sessions.
                     self.deliver_messages(project, store, sessions_by_project)
+                    # Last: check the state everything above just produced.
+                    self.check_invariants(project, store)
                 self.central.touch_project(project.name)
             except Exception:  # noqa: BLE001
                 log.exception("project %s tick failed", project.name)
@@ -188,7 +195,7 @@ class Daemon:
             # Deliverable only when the session is idle (done) or already released:
             # `claude --resume` refuses sessions owned by a live bg agent, and
             # injecting into a mid-turn worker would interleave anyway.
-            if sess is not None and sess.state != "done":
+            if sess is not None and not sess.is_finished:
                 continue
             self.in_flight_deliveries.add(msg["id"])
             store.add_event(wo["id"], "delivering", {"msg_id": msg["id"]})
@@ -328,7 +335,44 @@ class Daemon:
             store.close()
             central.close()
 
-    # -- 5. reconcile -------------------------------------------------------------------
+    # -- 5. invariants (post-conditions) --------------------------------------------------
+
+    def check_invariants(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Verify the OS's own state and repair what is unambiguously wrong.
+
+        Runs after reconcile so it judges the state this tick actually produced. Every
+        other step here trusts that its writes stuck; this is the only one that checks.
+        Repairs are recorded on the work order's timeline so a self-healed inconsistency
+        is visible rather than silently papered over, and each distinct violation is
+        reported once per daemon run.
+        """
+        from .invariants import check_project
+
+        try:
+            violations = check_project(store, repair=True)
+        except Exception:  # noqa: BLE001 — the checker must never take the daemon down
+            log.exception("[%s] invariant check failed", project.name)
+            return
+
+        for v in violations:
+            if v.key in self.reported_violations:
+                continue
+            self.reported_violations.add(v.key)
+            log.warning("[%s] %s", project.name, v)
+            if v.wo_id:
+                store.add_event(v.wo_id, "invariant", {
+                    "invariant": v.invariant, "detail": v.detail,
+                    "repaired": v.repaired, "repair": v.repair, **v.context,
+                })
+            if not v.repaired:
+                # Nothing deterministic to do about it — this one needs a human.
+                store.add_notification(
+                    title=f"OS invariant violated: {v.invariant}",
+                    body=f"{v.detail}" + (f" ({v.wo_id})" if v.wo_id else ""),
+                    level="warning", wo_id=v.wo_id, source="invariants",
+                )
+
+    # -- 6. reconcile -------------------------------------------------------------------
 
     def capture_worker_reply(self, store: ProjectStore, wo: dict) -> bool:
         """Persist the final assistant message of the work order's latest turn.
@@ -391,7 +435,7 @@ class Daemon:
         # is already `completed`, so the status-filtered loop below would never see it.
         for wo in store.work_orders_awaiting_reply():
             sess = by_session_id.get(wo.get("session_id") or "")
-            if sess is None or sess.state == "done":
+            if sess is None or sess.is_finished:
                 self.capture_worker_reply(store, wo)
 
         # Settle framework work orders against live session states.
@@ -426,12 +470,18 @@ class Daemon:
                         level="warning", wo_id=wo["id"], source="reconciler",
                     )
                 continue
-            if sess.state == "running" and wo["status"] != "running":
+            if sess.is_active and wo["status"] != "running":
+                # The agent is making progress again, so whatever stalled it is gone.
+                # This direction matters as much as the one below: without it a work
+                # order that blocked once stays "needs you" forever and the UI keeps
+                # asking for input the worker no longer wants.
                 store.set_status(wo["id"], "running")
-            elif sess.state == "blocked" and wo["status"] == "running":
+                if not store.pending_assumptions(wo["id"]):
+                    store.clear_attention(wo["id"])
+            elif sess.is_blocked and wo["status"] == "running":
                 store.set_status(wo["id"], "waiting_input")
                 store.flag_attention(wo["id"], "worker blocked (permission or input needed)")
-            elif sess.state == "done":
+            elif sess.is_finished:
                 if not self.capture_worker_reply(store, wo):
                     continue  # settle only once the record holds what the worker said
                 fresh = store.get_work_order(wo["id"])
@@ -454,7 +504,7 @@ class Daemon:
                 continue
             if store.find_by_session(sess.session_id):
                 continue
-            if sess.state == "done":
+            if sess.is_finished:
                 continue  # only surface live ad-hoc sessions
             wo = store.create_work_order(
                 title=sess.name or f"ad-hoc session {sess.id}",
@@ -463,8 +513,13 @@ class Daemon:
                 origin="adhoc",
             )
             store.update_work_order(wo["id"], session_id=sess.session_id)
-            store.set_status(wo["id"], "running" if sess.state == "running" else "waiting_input")
-            log.info("[%s] adopted ad-hoc session %s as %s", project.name, sess.id, wo["id"])
+            if sess.is_blocked:
+                store.set_status(wo["id"], "waiting_input")
+                store.flag_attention(wo["id"], "worker blocked (permission or input needed)")
+            else:
+                store.set_status(wo["id"], "running")
+            log.info("[%s] adopted ad-hoc session %s (%s) as %s",
+                     project.name, sess.id, sess.state, wo["id"])
 
 
 def run_daemon(catalog_path: str | Path, poll_interval: float = 5.0,

@@ -7,6 +7,7 @@ Grouped commands:
   jarvis backlog add|list|promote|done
   jarvis learn add|list|search
   jarvis notify / jarvis inbox
+  jarvis bug report                       file a Jarvis OS bug (GitHub issue + ping)
   jarvis ui                               web dashboard
   jarvis daemon run                       (internal) foreground daemon
   jarvis _hook                            (internal) Claude Code hook handler
@@ -87,6 +88,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("status", help="whole-OS status; flags what needs your attention")
     sp.add_argument("--attention", action="store_true", help="only show attention items")
+
+    sp = sub.add_parser("doctor", help="check the OS's own post-conditions (invariants)")
+    sp.add_argument("project", nargs="?", help="one project (default: the whole fleet)")
+    sp.add_argument("--repair", action="store_true",
+                    help="apply the repairs instead of only reporting them")
+    sp.add_argument("--catalog", help="catalog to read the fleet from")
+    sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
     sp.add_argument("path", help="project directory")
@@ -233,6 +241,20 @@ def build_parser() -> argparse.ArgumentParser:
     i = ib.add_parser("ack")
     i.add_argument("inbox_id", nargs="?", type=int, help="omit to ack everything")
 
+    # bug reports ----------------------------------------------------------------
+    bug = sub.add_parser(
+        "bug", help="report a bug in Jarvis OS itself").add_subparsers(
+        dest="bug_cmd", required=True)
+    br = bug.add_parser("report", help="file a Jarvis OS bug as a GitHub issue")
+    br.add_argument("title")
+    br.add_argument("--description", "-d", required=True,
+                    help="what happened, in Jarvis OS terms")
+    br.add_argument("--expected", "-e", required=True, help="what you expected")
+    br.add_argument("--actual", "-a", required=True, help="what you got instead")
+    br.add_argument("--steps", default="", help="optional steps to reproduce")
+    br.add_argument("--project", default="", help="reporting project (default: $JARVIS_PROJECT)")
+    br.add_argument("--wo-id", default="", help="reporting work order (default: $JARVIS_WO_ID)")
+
     # ui / daemon / hook ---------------------------------------------------------------------------
     u = sub.add_parser("ui", help="run the web dashboard")
     u.add_argument("--port", type=int)
@@ -317,6 +339,30 @@ def cmd_status(args: argparse.Namespace) -> int:
     if st["backlog"]["open"]:
         print(f"\n🗂 backlog: {st['backlog']['open']} open items — `jarvis backlog list`")
     return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    from . import ops
+    res = ops.run_doctor(project=args.project, repair=args.repair,
+                         catalog_path=args.catalog)
+    if args.json:
+        _print(res, True)
+        return 1 if res["violations"] else 0
+    if not res["violations"]:
+        print("✓ all OS invariants hold")
+        return 0
+    verb = "repaired" if res["repair"] else "found (run with --repair to fix)"
+    print(f"⚠ {res['violations']} invariant violation(s) {verb}:\n")
+    for p in res["projects"]:
+        if p.get("error"):
+            print(f"• {p['project']}: {p['error']}")
+        for v in p["violations"]:
+            where = f" {v['wo_id']}" if v["wo_id"] else ""
+            print(f"• [{p['project']}]{where} {v['invariant']}")
+            print(f"    {v['detail']}")
+            if v["repaired"]:
+                print(f"    → {'fixed' if res['repair'] else 'would fix'}: {v['repair']}")
+    return 1
 
 
 def cmd_adopt(args: argparse.Namespace) -> int:
@@ -587,6 +633,15 @@ def cmd_notify(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bug(args: argparse.Namespace) -> int:
+    from .bugreport import report_bug
+    result = report_bug(title=args.title, description=args.description,
+                        expected=args.expected, actual=args.actual, steps=args.steps,
+                        project=args.project, wo_id=args.wo_id)
+    _print(result, args.json)
+    return 0
+
+
 def cmd_inbox(args: argparse.Namespace) -> int:
     from .central_store import CentralStore
     central = CentralStore()
@@ -637,6 +692,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "_hook":
         from .hooks import main_hook
         return main_hook()
+    from .bugreport import BugReportError
     from .catalog import CatalogError
     from .ops import OpsError
     try:
@@ -646,6 +702,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_stop(args)
         if args.cmd == "status":
             return cmd_status(args)
+        if args.cmd == "doctor":
+            return cmd_doctor(args)
         if args.cmd == "adopt":
             return cmd_adopt(args)
         if args.cmd == "wo":
@@ -660,13 +718,15 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_notify(args)
         if args.cmd == "inbox":
             return cmd_inbox(args)
+        if args.cmd == "bug":
+            return cmd_bug(args)
         if args.cmd == "ui":
             return cmd_ui(args)
         if args.cmd == "daemon" and args.d_cmd == "run":
             from .daemon import run_daemon
             run_daemon(args.catalog, poll_interval=args.poll_interval)
             return 0
-    except (OpsError, CatalogError) as e:
+    except (OpsError, CatalogError, BugReportError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     return 0

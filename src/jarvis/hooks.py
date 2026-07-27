@@ -82,6 +82,73 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
     return None
 
 
+def memory_topic(file_path: str) -> str | None:
+    """Topic name for a Claude Code memory file, or None if the path isn't one.
+
+    Claude Code keeps its own per-project file memory at
+    `<claude config dir>/projects/<slug>/memory/<name>.md` — a store Jarvis neither
+    writes nor reads, and which dies with the worker's worktree slug. `MEMORY.md` is
+    that store's index (pointers, not knowledge), so it is skipped.
+    """
+    try:
+        p = Path(file_path)
+    except (TypeError, ValueError):
+        return None
+    parts = p.parts
+    if p.suffix != ".md" or p.name == "MEMORY.md" or len(parts) < 4:
+        return None
+    if parts[-2] != "memory" or parts[-4] != "projects":
+        return None
+    return p.stem
+
+
+def capture_memory_write(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
+    """PostToolUse: mirror a worker's Claude-memory write into the knowledge base.
+
+    Workers are told to run `jarvis learn add`, but "remember this" is a reflex that
+    Claude Code's built-in memory answers first — and anything that lands there is
+    invisible to the user, to Neo, and to every future worker. Mirroring makes the
+    knowledge base the single memory regardless of which channel the worker reaches for.
+    """
+    wo_id = env.get("JARVIS_WO_ID")
+    if not wo_id:
+        return None  # interactive session — its memory is its own business
+    tool_input = payload.get("tool_input") or {}
+    file_path = tool_input.get("file_path") or ""
+    topic = memory_topic(file_path)
+    if topic is None:
+        return None
+    try:
+        content = Path(file_path).read_text().strip()
+    except OSError:
+        return None  # deleted or unreadable between write and hook — nothing to mirror
+    if not content:
+        return None
+
+    from .central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        if not central.record_memory_file(content, project=env.get("JARVIS_PROJECT", ""),
+                                          topic=topic):
+            return None  # rewritten with identical content — already captured
+    finally:
+        central.close()
+
+    root_env = env.get("JARVIS_PROJECT_PATH")
+    root = Path(root_env) if root_env else find_project_root(Path(payload.get("cwd") or "."))
+    if root is not None and (root / ".jarvis").is_dir():
+        store = ProjectStore(root)
+        try:
+            store.add_event(wo_id, "learning_captured",
+                            {"topic": topic, "source": file_path})
+        except Exception:  # noqa: BLE001 — the knowledge is saved; the note is a bonus
+            pass
+        finally:
+            store.close()
+    return {"captured": topic, "wo_id": wo_id}
+
+
 def find_project_root(cwd: Path) -> Path | None:
     """Map a hook cwd (possibly a worktree under .claude/worktrees/) to the project
     root that holds .jarvis/."""
@@ -104,6 +171,9 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
 
     if event == "PreToolUse":
         return preflight_decision(payload, env)
+
+    if event == "PostToolUse":
+        return capture_memory_write(payload, env)
 
     root_env = env.get("JARVIS_PROJECT_PATH")
     root = Path(root_env) if root_env else find_project_root(cwd)
@@ -140,7 +210,23 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
                 store.update_work_order(wo_id, session_id=session_id)
 
         elif event == "Notification":
-            # Fired when the session needs attention (permission request, idle prompt).
+            # Fired when the session needs attention — but for two very different
+            # reasons: a real mid-work block (permission request), or the idle prompt
+            # Claude Code raises ~1 min after a turn ends, which every finished worker
+            # triggers. The payload does not distinguish them.
+            #
+            # So the work order's own state decides. If it has already settled (the
+            # worker called `jarvis wo finish`, or the reconciler filed it for review),
+            # this is the idle prompt and there is nothing to report: acting on it
+            # overwrites the real reason ("2 assumptions pending your review") with a
+            # generic "Claude is waiting for your input" and sends the user hunting for
+            # a question that does not exist. Verified against two live work orders.
+            if wo["status"] not in ("running", "dispatching", "waiting_input"):
+                store.add_event(wo_id, "notification_ignored", {
+                    "message": payload.get("message"),
+                    "reason": f"work order already {wo['status']}",
+                })
+                return {"wo_id": wo_id, "event": event, "ignored": True}
             message = payload.get("message") or "Worker needs attention"
             if wo["status"] in ("running", "dispatching"):
                 store.set_status(wo_id, "waiting_input")
