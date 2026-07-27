@@ -22,6 +22,7 @@ from .catalog import (
     load_catalog,
     worker_stalls_on_prompts,
 )
+from . import db
 from .central_store import CentralStore
 from .daemon import daemon_running
 from .invariants import true_blockers
@@ -612,25 +613,124 @@ def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, 
     return out
 
 
-def review_work_order(wo_id: str, accept: bool = True) -> dict[str, Any]:
-    """Accept (or reject) all pending assumptions and settle the work order."""
-    name, path, wo = find_work_order(wo_id)
+REJECTED_REASON = "assumptions rejected — send guidance with `jarvis wo send`"
+
+# Events that open a fresh review round: the worker signing off, or the user handing
+# it back with guidance. See `_round_had_rejection`.
+_ROUND_BOUNDARY_EVENTS = ("finished", "message_queued")
+
+
+def _round_had_rejection(store: ProjectStore, wo_id: str) -> bool:
+    """Did the *current* review round reject anything?
+
+    A round is one pass of the user over what a worker left behind: it opens when the
+    worker finishes (or when the user sends the work order back with guidance) and
+    closes when the last pending assumption is stamped. Rejections only count inside
+    the open round — scoring against every rejection ever would mean a work order that
+    was rejected once could never complete again, however many guidance-and-rework
+    cycles later, and the user has no manual "complete" command to dig it out with.
+
+    Read from the timeline rather than the rows because a row records the verdict but
+    not when it was cast, and the round boundary is a moment in time.
+    """
+    events = store.list_events(wo_id, limit=1000)
+    boundary = max((float(e.get("ts") or 0) for e in events
+                    if e.get("kind") in _ROUND_BOUNDARY_EVENTS), default=0.0)
+    for e in events:
+        if e.get("kind") != "reviewed" or float(e.get("ts") or 0) < boundary:
+            continue
+        if not db.from_json(e.get("payload"), {}).get("accepted"):
+            return True
+    return False
+
+
+def _settle_review(store: ProjectStore, wo_id: str) -> str:
+    """Move the work order to wherever the assumption verdicts leave it.
+
+    Three outcomes, and the middle one is the whole point of per-assumption review:
+
+    - `pending`  — decisions still owed. Nothing settles; the attention reason is
+      re-derived so the count on the dashboard keeps shrinking as you decide.
+    - `rejected` — the round is closed but at least one assumption was rejected. That
+      includes the MIXED verdict (some accepted, some rejected): the work order stays
+      `needs_review` and flagged, because an accepted majority does not make a
+      rejected assumption go away — the worker still has to be told what to do
+      instead. A mixed verdict must never land in `completed` silently.
+    - `completed` — the round closed with every assumption accepted.
+    """
+    wo = store.get_work_order(wo_id)
+    if store.pending_assumptions(wo_id):
+        if wo["status"] == "needs_review" or wo["needs_attention"]:
+            blockers = true_blockers(store, wo)
+            if blockers:
+                store.flag_attention(wo_id, blockers[0])
+        return "pending"
+    # Reviewing early (the worker is still running) decides the assumptions but has no
+    # business settling a work order that has not finished yet.
+    if wo["status"] != "needs_review":
+        return "unchanged"
+    if _round_had_rejection(store, wo_id):
+        store.flag_attention(wo_id, REJECTED_REASON)
+        return "rejected"
+    store.set_status(wo_id, "completed")
+    store.clear_attention(wo_id)
+    return "completed"
+
+
+def review_work_order(wo_id: str, accept: bool = True,
+                      project_name: str | None = None) -> dict[str, Any]:
+    """Accept (or reject) all pending assumptions at once and settle the work order.
+
+    The bulk verb, kept for the common all-at-once case. `review_assumption` is the
+    same decision taken one assumption at a time; both settle through `_settle_review`,
+    so accepting the rest in bulk after rejecting one still refuses to complete.
+    """
+    name, path, wo = find_work_order(wo_id, project_name)
     store = ProjectStore(path)
     try:
         pending = store.pending_assumptions(wo_id)
         for a in pending:
             store.review_assumption(a["id"], "accepted" if accept else "rejected")
-        if wo["status"] == "needs_review":
-            if accept:
-                store.set_status(wo_id, "completed")
-                store.clear_attention(wo_id)
-            else:
-                store.flag_attention(wo_id, "assumptions rejected — send guidance with `jarvis wo send`")
         store.add_event(wo_id, "reviewed", {"accepted": accept, "count": len(pending)})
+        settled = _settle_review(store, wo_id)
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "reviewed": len(pending),
-            "accepted": accept}
+            "accepted": accept, "settled": settled}
+
+
+def review_assumption(wo_id: str, assumption_id: int, accept: bool = True,
+                      project_name: str | None = None) -> dict[str, Any]:
+    """Accept (or reject) ONE pending assumption, leaving the others undecided.
+
+    What makes a mixed verdict expressible: a work order that came back with two
+    assumptions can have one accepted and the other rejected. The work order only
+    settles once the last one is decided, and a single rejection anywhere in the round
+    is enough to keep it open (see `_settle_review`).
+    """
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        pending = store.pending_assumptions(wo_id)
+        match = next((a for a in pending if a["id"] == assumption_id), None)
+        if match is None:
+            known = ", ".join(str(a["id"]) for a in pending) or "none"
+            raise OpsError(
+                f"assumption {assumption_id} is not pending on {wo_id} "
+                f"(pending ids: {known}) — it may already be reviewed; "
+                f"`jarvis wo show {wo_id} --json` lists them"
+            )
+        store.review_assumption(assumption_id, "accepted" if accept else "rejected")
+        store.add_event(wo_id, "reviewed", {"accepted": accept, "count": 1,
+                                            "assumption_id": assumption_id,
+                                            "content": match["content"]})
+        settled = _settle_review(store, wo_id)
+        left = len(store.pending_assumptions(wo_id))
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "assumption_id": assumption_id,
+            "content": match["content"], "accepted": accept,
+            "pending_left": left, "settled": settled}
 
 
 # -- Neo (OS answerer agent) ---------------------------------------------------------------------
