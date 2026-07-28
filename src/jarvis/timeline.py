@@ -22,6 +22,8 @@ DEBUG_KINDS = frozenset({
     "message_delivered",        # delivery receipt
     "turn_ended",               # Stop hook fired
     "session_bound",            # reconciler matched a session to this work order
+    "session_rebind_ignored",   # a spent session of this work order was re-opened
+    "hook_ignored",             # a hook from a session that is no longer the live one
     "permission_mode_changed",  # worker permission plumbing
     "notification_ignored",     # idle prompt on an already-settled work order
 })
