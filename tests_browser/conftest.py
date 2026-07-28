@@ -49,15 +49,14 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.fixture()
-def server(jarvis_home, fake_claude, catalog_file):
-    """OS started (foreground bootstrap) + live UI server; yields the base URL."""
+def _serve(catalog_path):
+    """Start the OS against `catalog_path` and a UI server over it; yields the URL."""
     import uvicorn
 
     from jarvis import ops
     from jarvis.ui.app import create_app
 
-    ops.start_os(str(catalog_file), foreground=True)
+    ops.start_os(str(catalog_path), foreground=True)
     port = _free_port()
     config = uvicorn.Config(create_app(), host="127.0.0.1", port=port,
                             log_level="critical")
@@ -75,7 +74,45 @@ def server(jarvis_home, fake_claude, catalog_file):
 
 
 @pytest.fixture()
+def server(jarvis_home, fake_claude, catalog_file):
+    """OS started (foreground bootstrap) + live UI server; yields the base URL."""
+    yield from _serve(catalog_file)
+
+
+@pytest.fixture()
+def gated_catalog(tmp_path, project):
+    """A catalog whose only project gates every privileged action."""
+    import json
+
+    from jarvis import gates
+
+    data = {
+        "os": {"defaults": {"model": "sonnet"},
+               "notifications": {"sinks": ["log"]}},
+        "projects": [{"name": "proj_a", "path": str(project),
+                      "description": "test project",
+                      "gates": {"enabled": list(gates.KIND_NAMES)}}],
+    }
+    path = tmp_path / "catalog-gated.json"
+    path.write_text(json.dumps(data))
+    return path
+
+
+@pytest.fixture()
+def gated_server(jarvis_home, fake_claude, gated_catalog):
+    """The same UI, over a fleet where privileged actions need approval."""
+    yield from _serve(gated_catalog)
+
+
+@pytest.fixture()
 def daemon(catalog_file):
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon
     return Daemon(load_catalog(catalog_file))
+
+
+@pytest.fixture()
+def gated_daemon(gated_catalog):
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+    return Daemon(load_catalog(gated_catalog))

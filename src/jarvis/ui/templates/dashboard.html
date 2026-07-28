@@ -19,7 +19,11 @@
           <a href="/wo/{{ a.project }}/{{ a.wo_id }}" class="mono">{{ a.wo_id }}</a>
         {% endif %}
         <strong>{{ a.project }}</strong> — {{ a.title }}
-        <div class="sub">{{ a.reason }}</div>
+        <div class="sub">{{ a.reason }}
+          {%- if a.approval_id %}
+          {# the item names a command to approve; the place to do that is the gates tab #}
+          · <a href="/gates#gate-{{ a.approval_id }}">decide it →</a>
+          {%- endif %}</div>
       </li>
       {% endfor %}
     </ul>
