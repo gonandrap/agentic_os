@@ -136,6 +136,11 @@ ADDED_COLUMNS = {
         # `true_blockers` subtracts these, and only these, so a *new* blocker still
         # surfaces. Cleared whenever the flag legitimately drops (the ack is spent).
         "acknowledged_blockers": "TEXT",
+        # Every session id this work order has already been bound to (JSON list). A
+        # multi-turn work order forks a fresh session per delivered turn, and any of
+        # the spent ones can fire a SessionStart hook again if it is re-opened — this
+        # is what lets `bind_session` refuse to walk the binding backwards.
+        "prior_sessions": "TEXT",
     },
 }
 
@@ -204,6 +209,33 @@ class ProjectStore:
             "SELECT * FROM work_orders WHERE session_id=?", (session_id,)
         ).fetchone()
         return dict(row) if row else None
+
+    def bind_session(self, wo_id: str, session_id: str) -> bool:
+        """Point the work order at the session now carrying it. Returns True if it moved.
+
+        Binding only ever moves FORWARD, and this is the only place that enforces it.
+        Each delivered turn forks a NEW session (`claude --bg --resume`), so a work
+        order accumulates a trail of spent session ids — and *any* of them can fire a
+        SessionStart hook later, because re-opening a finished agent in the agents view
+        respawns it under its original id. Rebinding to one of those drags the pointer
+        backwards, and everything downstream reads it: the next delivery then forks
+        from a stale conversation and stops a session that was already stopped, leaving
+        the real live agent orphaned in the agents view (observed on wo-9478c1be).
+
+        So a session id this work order has already been bound to is never bound again.
+        """
+        wo = self.get_work_order(wo_id)
+        current = wo.get("session_id") or ""
+        if session_id == current:
+            return False
+        prior = db.from_json(wo.get("prior_sessions"), []) or []
+        if session_id in prior:
+            return False
+        if current:
+            prior.append(current)
+        self.update_work_order(wo_id, session_id=session_id,
+                               prior_sessions=db.to_json(prior))
+        return True
 
     def list_work_orders(
         self, statuses: tuple[str, ...] | None = None, limit: int = 200,

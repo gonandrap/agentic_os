@@ -996,8 +996,16 @@ def _find_approval(approval_id: int, project_name: str | None = None
 
 
 def list_gates(project_name: str | None = None, wo_id: str | None = None,
-               pending_only: bool = False) -> list[dict[str, Any]]:
-    """Approval requests across the fleet, newest first."""
+               pending_only: bool = False, include_request: bool = False
+               ) -> list[dict[str, Any]]:
+    """Approval requests across the fleet, newest first.
+
+    `include_request` attaches each row's `neo_question` — the text the reviewer
+    actually read. A reviewer deciding from a list needs the same page the first
+    reviewer had; without it the dashboard would ask the user to approve a bare
+    command string. One NeoStore is opened for the whole list, so this is cheap
+    enough to render a page from.
+    """
     paths = registered_project_paths()
     if project_name:
         if project_name not in paths:
@@ -1017,6 +1025,15 @@ def list_gates(project_name: str | None = None, wo_id: str | None = None,
             store.close()
         out.extend({**r, "project": name} for r in rows)
     out.sort(key=lambda r: r["ts"], reverse=True)
+    if include_request:
+        from .neo_store import NeoStore
+        neo = NeoStore()
+        try:
+            for row in out:
+                qid = row["neo_question_id"]
+                row["neo_question"] = neo.get(qid) if qid else None
+        finally:
+            neo.close()
     return out
 
 

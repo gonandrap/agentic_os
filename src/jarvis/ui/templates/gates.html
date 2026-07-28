@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}Gates — Jarvis{% endblock %}
+{% block content %}
+
+{% macro decide_form(g) %}
+{# One form, two submit buttons: the reason is shared, and `decision` carries the
+   value of whichever button was pressed. A denial without a reason is refused by
+   ops.decide_gate — the worker acts on that text. #}
+<form method="post" action="/gates/{{ g.id }}/decide"
+      style="display:flex; gap:8px; margin-top:8px">
+  <input type="hidden" name="project" value="{{ g.project }}">
+  <input type="hidden" name="next" value="/gates">
+  <input type="text" name="reason"
+         placeholder="reason — goes to the worker; required to deny">
+  <button class="accept" name="decision" value="approve">✓ Approve</button>
+  <button class="danger" name="decision" value="deny">✗ Deny</button>
+</form>
+{% endmacro %}
+
+{% macro request_detail(g) %}
+{% if g.justification %}<div class="sub">Case made: {{ g.justification }}</div>{% endif %}
+{% if g.evidence %}<div class="sub">Evidence: {{ g.evidence }}</div>{% endif %}
+{% if g.neo_question %}
+<details style="margin-top:6px">
+  <summary class="sub">the request exactly as the reviewer saw it</summary>
+  <pre class="request-text">{{ g.neo_question.question }}</pre>
+</details>
+{% else %}
+<div class="sub">no review record — this request never reached Neo</div>
+{% endif %}
+{% endmacro %}
+
+<p class="kv" style="margin-top:18px">
+  Workers may attempt privileged actions — merging a PR, cutting a release, restarting a
+  service — but the attempt is held here first. Neo reviews most of them for you; only the
+  ones it declines to decide reach this page as yours.
+  <span class="counts">({{ escalated|length }} waiting on you ·
+  {{ with_neo|length }} with Neo ·
+  {{ decided|length }} decided)</span>
+</p>
+
+{% if escalated %}
+<h2>Waiting on you — Neo escalated</h2>
+<div class="panel">
+  {% for g in escalated %}
+  <div class="msg" id="gate-{{ g.id }}">
+    <div class="who tone-warn">#{{ g.id }} · {{ g.kind }} · {{ g.project }} ·
+      <a href="/wo/{{ g.project }}/{{ g.wo_id }}" class="mono">{{ g.wo_id }}</a> ·
+      {{ fmt_age(g.ts) }} ago</div>
+    <div class="mono" style="margin:6px 0">$ {{ g.command }}</div>
+    <div class="sub">Why Neo escalated: {{ g.escalation_reason or '—' }}</div>
+    {{ request_detail(g) }}
+    {{ decide_form(g) }}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<h2>With Neo — no action needed</h2>
+<div class="panel">
+  {% for g in with_neo %}
+  <div class="msg" id="gate-{{ g.id }}">
+    <div class="who">#{{ g.id }} · {{ g.kind }} · {{ g.project }} ·
+      <a href="/wo/{{ g.project }}/{{ g.wo_id }}" class="mono">{{ g.wo_id }}</a> ·
+      requested {{ fmt_age(g.ts) }} ago</div>
+    <div class="mono" style="margin:6px 0">$ {{ g.command }}</div>
+    <details>
+      <summary class="sub">under review — decide it yourself instead</summary>
+      {{ request_detail(g) }}
+      {{ decide_form(g) }}
+    </details>
+  </div>
+  {% else %}
+  <div class="empty">nothing under review</div>
+  {% endfor %}
+</div>
+
+<h2>Decided</h2>
+<div class="panel">
+  <table>
+    <tr><th>#</th><th>project / wo</th><th>action</th><th>command</th>
+        <th>verdict</th><th>by</th><th>age</th></tr>
+    {% for g in decided %}
+    {% set m = gate_meta.get(g.status, {'word': g.status, 'icon': '•', 'tone': 'muted'}) %}
+    <tr>
+      <td class="mono">{{ g.id }}</td>
+      <td class="mono">{{ g.project }}<br><a href="/wo/{{ g.project }}/{{ g.wo_id }}">{{ g.wo_id }}</a></td>
+      <td class="mono">{{ g.kind }}</td>
+      <td class="mono">{{ g.command[:80] }}
+        {% if g.decision_reason %}<div class="sub">{{ g.decision_reason }}</div>{% endif %}</td>
+      <td><span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
+        {% if g.status == 'approved' %}<div class="sub">{{ g.uses }}/{{ g.max_uses }} used</div>{% endif %}</td>
+      <td class="mono">{{ g.decided_by or '—' }}</td>
+      <td class="mono">{{ fmt_age(g.ts) }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7" class="empty">no gate has been decided yet</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+{% endblock %}
