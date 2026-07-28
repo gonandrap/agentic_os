@@ -37,6 +37,14 @@ ORIGIN_META = {
     "adhoc":  {"word": "ad-hoc", "framework": False},
 }
 LEVEL_TONE = {"info": "muted", "warning": "warn", "critical": "bad"}
+# Privileged-action gates. `pending` splits in two on the page — with Neo (costs the
+# user nothing) vs escalated to the user — so it carries the neutral mark here.
+GATE_META = {
+    "pending":  {"word": "pending",  "icon": "◌", "tone": "warn"},
+    "approved": {"word": "approved", "icon": "✓", "tone": "ok"},
+    "denied":   {"word": "denied",   "icon": "✗", "tone": "bad"},
+    "expired":  {"word": "expired",  "icon": "–", "tone": "muted"},
+}
 
 # How often the dashboard re-reads OS state. Not a page reload — the browser swaps
 # the live regions in place (see dashboard.html), so in-progress typing survives.
@@ -74,11 +82,25 @@ def log_ui_error(request: Request, exc: BaseException) -> None:
         pass
 
 
+def gate_badge() -> int | None:
+    """How many gates are waiting on the user, for the nav.
+
+    Only escalated ones count: a request Neo is still reviewing is deliberately
+    free of charge, and badging it would undo the point of having Neo. Never
+    raises — a badge must not be the reason a page 500s.
+    """
+    try:
+        return len([g for g in ops.list_gates(pending_only=True)
+                    if g["escalated"]]) or None
+    except Exception:  # noqa: BLE001 — see docstring
+        return None
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None)
     templates = Jinja2Templates(directory=str(TEMPLATES))
     templates.env.globals.update(
-        status_meta=STATUS_META, origin_meta=ORIGIN_META,
+        status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         level_tone=LEVEL_TONE, fmt_age=fmt_age,
     )
 
@@ -94,6 +116,7 @@ def create_app() -> FastAPI:
             neo.close()
         ctx["neo_badge"] = (c.get("escalated", 0) + c.get("failed", 0)
                             + c.get("unreviewed", 0)) or None
+        ctx["gate_badge"] = gate_badge()
         return templates.TemplateResponse(request, template, ctx,
                                           status_code=status_code)
 
@@ -153,6 +176,10 @@ def create_app() -> FastAPI:
             events = store.list_events(wo_id)
             messages = store.list_messages(wo_id)
             assumptions = store.pending_assumptions(wo_id)
+            # A worker held at a gate looks identical to an idle one from here, so
+            # the reason it stopped belongs on the page it stopped on.
+            store.expire_approvals()
+            approvals = store.list_approvals(wo_id)
         finally:
             store.close()
         show_debug = debug not in ("", "0", "false")
@@ -160,7 +187,8 @@ def create_app() -> FastAPI:
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug),
                       debug=show_debug, debug_count=count_debug(events),
-                      messages=messages, assumptions=assumptions)
+                      messages=messages, assumptions=assumptions,
+                      approvals=approvals)
 
     @app.get("/inbox", response_class=HTMLResponse)
     def inbox(request: Request):
@@ -199,6 +227,10 @@ def create_app() -> FastAPI:
         neo = NeoStore()
         try:
             counts = neo.counts()
+            # Oldest first: that is the order Neo drains them, and the oldest is the
+            # one most likely to be stuck.
+            in_flight = list(reversed(
+                neo.list_questions(statuses=("queued", "answering"))))
             escalated = neo.list_questions(statuses=("escalated", "failed"))
             unreviewed = neo.list_questions(statuses=("answered",),
                                             review_status="unreviewed")
@@ -211,8 +243,20 @@ def create_app() -> FastAPI:
         finally:
             neo.close()
         return render(request, "neo.html", active="neo", counts=counts,
-                      escalated=escalated, unreviewed=unreviewed,
-                      history=history, learnings=learnings)
+                      in_flight=in_flight, escalated=escalated,
+                      unreviewed=unreviewed, history=history, learnings=learnings)
+
+    @app.get("/gates", response_class=HTMLResponse)
+    def gates_page(request: Request):
+        """Privileged-action approvals. Three states, three different asks of the
+        user: escalated ones need a decision, ones still with Neo need nothing (but
+        can be pre-empted), decided ones are the audit trail."""
+        rows = ops.list_gates(include_request=True)
+        pending = [g for g in rows if g["status"] == "pending"]
+        return render(request, "gates.html", active="gates",
+                      escalated=[g for g in pending if g["escalated"]],
+                      with_neo=[g for g in pending if not g["escalated"]],
+                      decided=[g for g in rows if g["status"] != "pending"])
 
     @app.get("/api/status")
     def api_status():
@@ -236,8 +280,9 @@ def create_app() -> FastAPI:
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/review")
-    def review(name: str, wo_id: str, decision: str = Form(...)):
-        ops.review_work_order(wo_id, accept=(decision == "accept"))
+    def review(name: str, wo_id: str, decision: str = Form(...),
+               feedback: str = Form("")):
+        ops.review_work_order(wo_id, accept=(decision == "accept"), feedback=feedback)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/cancel")
@@ -302,6 +347,27 @@ def create_app() -> FastAPI:
         finally:
             neo.close()
         return RedirectResponse("/neo", status_code=303)
+
+    @app.post("/gates/{approval_id}/decide")
+    def decide_gate(approval_id: int, decision: str = Form(...),
+                    reason: str = Form(""), project: str = Form(""),
+                    next: str = Form("")):
+        """Open or refuse a gate. Approval ids are per-project autoincrements, so the
+        form carries the project the row was rendered from — without it two projects
+        holding the same id make `ops.decide_gate` refuse to guess.
+
+        `next` returns the user to the page they decided from (the gates tab or a work
+        order). Only same-site paths are honoured: a form field is attacker-settable,
+        and an open redirect out of the dashboard is not worth the convenience.
+        """
+        back = next if next.startswith("/") and not next.startswith("//") else "/gates"
+        try:
+            ops.decide_gate(approval_id, approved=(decision == "approve"),
+                            reason=reason, project_name=project or None)
+        except ops.OpsError as e:
+            sep = "&" if "?" in back else "?"
+            return RedirectResponse(f"{back}{sep}error={e}", status_code=303)
+        return RedirectResponse(back, status_code=303)
 
     @app.post("/inbox/ack")
     def ack(inbox_id: str = Form("")):

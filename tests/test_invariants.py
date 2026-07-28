@@ -296,6 +296,24 @@ def test_the_daemon_repairs_and_records_on_its_tick(project, catalog_file):
     assert "invariant" in kinds
 
 
+def test_session_binding_only_moves_forward(project):
+    """A work order must never end up bound to a session it has already left."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("multi-turn")
+
+    assert store.bind_session(wo["id"], "sess-one") is True
+    assert store.bind_session(wo["id"], "sess-two") is True     # turn two forks
+    assert store.bind_session(wo["id"], "sess-one") is False    # turn one re-opened
+    assert store.bind_session(wo["id"], "sess-two") is False    # already there
+    assert store.get_work_order(wo["id"])["session_id"] == "sess-two"
+    assert not check_project(store)
+
+    # and if something writes session_id around bind_session, doctor says so
+    store.update_work_order(wo["id"], session_id="sess-one")
+    found = [v for v in check_project(store) if v.invariant == "INV-SESSION-FORWARD"]
+    assert len(found) == 1 and found[0].wo_id == wo["id"] and not found[0].repaired
+
+
 def test_the_daemon_reports_a_standing_violation_once(project, catalog_file):
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon

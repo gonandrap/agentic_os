@@ -88,10 +88,37 @@ CREATE TABLE IF NOT EXISTS assumptions (
     content TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' -- pending | accepted | rejected
 );
+-- Requests to perform a privileged action (merge a PR, cut a release). Filed by the
+-- PreToolUse gate when a worker attempts one, reviewed by Neo, and consumed by the
+-- retry. A row is a receipt for one command, not a capability: see gates.py.
+CREATE TABLE IF NOT EXISTS approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wo_id TEXT NOT NULL REFERENCES work_orders(id),
+    ts REAL NOT NULL,
+    kind TEXT NOT NULL,                     -- gates.KIND_NAMES
+    command TEXT NOT NULL,                  -- the exact string the grant authorises
+    matched TEXT NOT NULL DEFAULT '',       -- the recogniser that fired
+    justification TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending', -- pending | approved | denied | expired
+    -- Neo declined to decide, so the request is still pending but it is now the USER
+    -- who holds it. This is the bit that decides whether a gate costs the user any
+    -- attention: pending-with-Neo must stay silent, pending-with-user must not.
+    escalated INTEGER NOT NULL DEFAULT 0,
+    escalation_reason TEXT,
+    neo_question_id INTEGER,
+    decided_by TEXT,                        -- neo | user
+    decision_reason TEXT,
+    decided_at REAL,
+    expires_at REAL,
+    uses INTEGER NOT NULL DEFAULT 0,
+    max_uses INTEGER NOT NULL DEFAULT 3
+);
 CREATE INDEX IF NOT EXISTS idx_wo_status ON work_orders(status);
 CREATE INDEX IF NOT EXISTS idx_events_wo ON wo_events(wo_id);
 CREATE INDEX IF NOT EXISTS idx_msgs_status ON wo_messages(status);
 CREATE INDEX IF NOT EXISTS idx_notif_status ON notifications(status);
+CREATE INDEX IF NOT EXISTS idx_approvals_wo ON approvals(wo_id, status);
 """
 
 # Columns added after the first release. `CREATE TABLE IF NOT EXISTS` is a no-op on an
@@ -109,6 +136,11 @@ ADDED_COLUMNS = {
         # `true_blockers` subtracts these, and only these, so a *new* blocker still
         # surfaces. Cleared whenever the flag legitimately drops (the ack is spent).
         "acknowledged_blockers": "TEXT",
+        # Every session id this work order has already been bound to (JSON list). A
+        # multi-turn work order forks a fresh session per delivered turn, and any of
+        # the spent ones can fire a SessionStart hook again if it is re-opened — this
+        # is what lets `bind_session` refuse to walk the binding backwards.
+        "prior_sessions": "TEXT",
     },
 }
 
@@ -177,6 +209,33 @@ class ProjectStore:
             "SELECT * FROM work_orders WHERE session_id=?", (session_id,)
         ).fetchone()
         return dict(row) if row else None
+
+    def bind_session(self, wo_id: str, session_id: str) -> bool:
+        """Point the work order at the session now carrying it. Returns True if it moved.
+
+        Binding only ever moves FORWARD, and this is the only place that enforces it.
+        Each delivered turn forks a NEW session (`claude --bg --resume`), so a work
+        order accumulates a trail of spent session ids — and *any* of them can fire a
+        SessionStart hook later, because re-opening a finished agent in the agents view
+        respawns it under its original id. Rebinding to one of those drags the pointer
+        backwards, and everything downstream reads it: the next delivery then forks
+        from a stale conversation and stops a session that was already stopped, leaving
+        the real live agent orphaned in the agents view (observed on wo-9478c1be).
+
+        So a session id this work order has already been bound to is never bound again.
+        """
+        wo = self.get_work_order(wo_id)
+        current = wo.get("session_id") or ""
+        if session_id == current:
+            return False
+        prior = db.from_json(wo.get("prior_sessions"), []) or []
+        if session_id in prior:
+            return False
+        if current:
+            prior.append(current)
+        self.update_work_order(wo_id, session_id=session_id,
+                               prior_sessions=db.to_json(prior))
+        return True
 
     def list_work_orders(
         self, statuses: tuple[str, ...] | None = None, limit: int = 200,
@@ -288,6 +347,7 @@ class ProjectStore:
         try:
             for key, table in (("events", "wo_events"), ("messages", "wo_messages"),
                                ("assumptions", "assumptions"),
+                               ("approvals", "approvals"),
                                ("notifications", "notifications")):
                 cur = self.conn.execute(f"DELETE FROM {table} WHERE wo_id=?", (wo_id,))
                 deleted[key] = cur.rowcount
@@ -421,6 +481,145 @@ class ProjectStore:
     def review_assumption(self, assumption_id: int, status: str) -> None:
         assert status in ("accepted", "rejected"), status
         self.conn.execute("UPDATE assumptions SET status=? WHERE id=?", (status, assumption_id))
+
+    # -- approvals (privileged-action gates; see gates.py) ------------------------
+
+    def add_approval(self, wo_id: str, kind: str, command: str, matched: str = "",
+                     justification: str = "", evidence: str = "",
+                     max_uses: int = 3) -> dict[str, Any]:
+        cur = self.conn.execute(
+            """INSERT INTO approvals (wo_id, ts, kind, command, matched, justification,
+                                      evidence, max_uses)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (wo_id, db.now(), kind, command, matched, justification, evidence, max_uses),
+        )
+        approval_id = int(cur.lastrowid)  # type: ignore[arg-type]
+        self.add_event(wo_id, "gate_requested", {
+            "approval_id": approval_id, "kind": kind, "command": command,
+        })
+        return self.get_approval(approval_id)  # type: ignore[return-value]
+
+    def get_approval(self, approval_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
+        return dict(row) if row else None
+
+    def latest_approval_for(self, wo_id: str, kind: str, command: str
+                            ) -> dict[str, Any] | None:
+        """The most recent request this work order filed for this exact command.
+
+        Exact-match on the command is the whole security model: a grant is a receipt for
+        one string. A worker that "tidies up" the command on retry gets a fresh gate,
+        which is the correct outcome — the reviewer approved what it read.
+        """
+        row = self.conn.execute(
+            """SELECT * FROM approvals WHERE wo_id=? AND kind=? AND command=?
+               ORDER BY ts DESC, id DESC LIMIT 1""",
+            (wo_id, kind, command),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def link_neo_question(self, approval_id: int, question_id: int) -> None:
+        self.conn.execute("UPDATE approvals SET neo_question_id=? WHERE id=?",
+                          (question_id, approval_id))
+
+    def approval_for_question(self, question_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM approvals WHERE neo_question_id=?",
+                                (question_id,)).fetchone()
+        return dict(row) if row else None
+
+    def mark_approval_escalated(self, approval_id: int, reason: str) -> None:
+        """Neo declined to decide: the request stays open, now against the user."""
+        self.conn.execute(
+            "UPDATE approvals SET escalated=1, escalation_reason=? WHERE id=?",
+            (reason, approval_id),
+        )
+
+    def escalated_approvals(self, wo_id: str | None = None) -> list[dict[str, Any]]:
+        """Requests waiting on the user specifically — the only gates that are allowed
+        to consume attention."""
+        return [a for a in self.pending_approvals(wo_id) if a["escalated"]]
+
+    def decide_approval(self, approval_id: int, approved: bool, reason: str,
+                        decided_by: str, ttl_seconds: int = 3600) -> dict[str, Any]:
+        """Record a verdict. An approval starts its clock now, not when it was filed:
+        the window exists to bound the gap between "yes" and the act."""
+        approval = self.get_approval(approval_id)
+        if approval is None:
+            raise KeyError(f"approval {approval_id} not found")
+        now = db.now()
+        self.conn.execute(
+            """UPDATE approvals SET status=?, decided_by=?, decision_reason=?,
+                                    decided_at=?, expires_at=? WHERE id=?""",
+            ("approved" if approved else "denied", decided_by, reason, now,
+             now + ttl_seconds if approved else None, approval_id),
+        )
+        return self.get_approval(approval_id)  # type: ignore[return-value]
+
+    def usable_grant(self, wo_id: str, kind: str, command: str) -> dict[str, Any] | None:
+        """An approval that still authorises this command right now, or None.
+
+        Expiry and use-count are checked here rather than trusted from the row's status,
+        so a grant cannot outlive its window just because nothing swept the table.
+        """
+        approval = self.latest_approval_for(wo_id, kind, command)
+        if approval is None or approval["status"] != "approved":
+            return None
+        if approval["uses"] >= approval["max_uses"]:
+            return None
+        if approval["expires_at"] is not None and db.now() > approval["expires_at"]:
+            return None
+        return approval
+
+    def consume_grant(self, approval_id: int) -> dict[str, Any]:
+        """Spend one use of a grant. Called only when the gate actually opens, so the
+        count reflects attempts that ran, not attempts that were merely considered."""
+        self.conn.execute("UPDATE approvals SET uses = uses + 1 WHERE id=?", (approval_id,))
+        approval = self.get_approval(approval_id)
+        assert approval is not None
+        self.add_event(approval["wo_id"], "gate_opened", {
+            "approval_id": approval_id,
+            "kind": approval["kind"],
+            "use": approval["uses"],
+            "of": approval["max_uses"],
+        })
+        return approval
+
+    def list_approvals(self, wo_id: str | None = None,
+                       statuses: tuple[str, ...] | None = None,
+                       limit: int = 200) -> list[dict[str, Any]]:
+        q = "SELECT * FROM approvals"
+        conds: list[str] = []
+        params: list[Any] = []
+        if wo_id:
+            conds.append("wo_id=?")
+            params.append(wo_id)
+        if statuses:
+            conds.append(f"status IN ({','.join('?' for _ in statuses)})")
+            params.extend(statuses)
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY ts DESC, id DESC LIMIT ?"
+        params.append(limit)
+        return db.rows_to_dicts(self.conn.execute(q, params).fetchall())
+
+    def pending_approvals(self, wo_id: str | None = None) -> list[dict[str, Any]]:
+        """Requests still awaiting a verdict — from Neo or, once escalated, the user."""
+        return self.list_approvals(wo_id, statuses=("pending",))
+
+    def expire_approvals(self) -> int:
+        """Move spent or timed-out grants to `expired` so listings tell the truth.
+
+        Cosmetic for enforcement — `usable_grant` already refuses them — but a dashboard
+        showing a month-old "approved" release gate reads as standing permission, which
+        is exactly the wrong impression to leave lying around.
+        """
+        cur = self.conn.execute(
+            """UPDATE approvals SET status='expired'
+               WHERE status='approved'
+                 AND (uses >= max_uses OR (expires_at IS NOT NULL AND expires_at < ?))""",
+            (db.now(),),
+        )
+        return cur.rowcount
 
     # -- summary ----------------------------------------------------------------
 

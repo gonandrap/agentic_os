@@ -28,6 +28,13 @@ On top of that floor, `jarvis_home` is an **autouse** fixture, so every test get
 home under its own `tmp_path` — forgetful tests are isolated *and* cannot collide with each
 other. Naming `jarvis_home` as a parameter is still how you get the path.
 
+This replaced the session-scoped `isolate_jarvis_home` fixture from #30. That fixture was
+session-scoped because function-scoped monkeypatch teardown restores the *pre-test* value,
+handing the real home back to anything still running (a daemon thread outliving its test, a
+subprocess mid-flight). The property survives: the gate overwrites `os.environ` directly at
+`pytest_configure` — not via monkeypatch, so nothing undoes it — and teardown therefore
+falls back onto the sandbox, never onto production.
+
 Why this exists: a worker session inherits `JARVIS_HOME=~/workspace/production/state`, so
 before the gate any test that touched central state wrote **live** state, and the live
 daemon then routed the central inbox to the real sinks. On 2026-07-27 that Telegrammed the
@@ -55,6 +62,7 @@ redirected away from a home that actually had an `os.db` in it.
 | `tests/test_ui.py` (18) | `ui/app.py` via `TestClient`, actions routed through `ops` |
 | `tests/test_shipit.py` (9) | `scripts/shipit.sh` (shell, not a Python module) |
 | `tests/test_isolation_gate.py` (21) | the gate above: `JARVIS_HOME`, both external sinks, `gh`, `claude` |
+| `tests/test_state_isolation.py` (3) | the same invariant from the store side — `CentralStore`/`NeoStore` resolve their paths at construction, so the guard has to be in the environment |
 
 Thin spots: no dedicated tests for `paths.py`, `db.py`, `claude_cli.py` (only exercised
 through the fake), or `cli.py` (only via `test_wo_hide_delete.py`).

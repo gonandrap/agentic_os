@@ -214,6 +214,20 @@ elif "-p" in argv and "--resume" not in argv:
     elif "FORCE_GARBAGE" in prompt:
         print(json.dumps({"result": "I think you should maybe do the thing?"}))
         sys.exit(0)
+    elif "PRIVILEGED ACTION REQUEST" in prompt:
+        # A gate review, which speaks a different verdict shape: the decision lives in
+        # `approve`, not in prose. Default is to escalate, matching the real reviewer's
+        # instruction to send anything it cannot verify to the user — a fake that
+        # approved by default would let every gate test pass without asserting anything.
+        if "FORCE_APPROVE" in prompt:
+            verdict = {"escalate": False, "approve": True,
+                       "reason": "test-forced approval"}
+        elif "FORCE_DENY" in prompt:
+            verdict = {"escalate": False, "approve": False,
+                       "reason": "test-forced denial"}
+        else:
+            verdict = {"escalate": True, "approve": False,
+                       "reason": "test default: gate reviews escalate unless forced"}
     else:
         verdict = {"escalate": False,
                    "answer": f"neo-decision for: {prompt.splitlines()[-1][:60]}",
@@ -294,7 +308,18 @@ def jarvis_home(tmp_path, monkeypatch):
     Naming it as a parameter is still the way to get the path; the only thing autouse
     changes is that a test which does NOT name it is isolated anyway, instead of writing
     whatever `$JARVIS_HOME` the shell carried in (in a worker session: production).
-    `gate_test_environment` is the process-wide floor under this.
+
+    This replaces the session-scoped `isolate_jarvis_home` fixture (#30), and keeps the
+    property that motivated it. Its concern was that function-scoped monkeypatching
+    restores the *pre-test* value at teardown, handing the real home back to anything
+    still running — a daemon thread that outlived its test, a subprocess mid-flight.
+    That still holds here, because the value restored is no longer the real home: the
+    root conftest's `gate_test_environment` has already overwritten `os.environ` (not
+    via monkeypatch, so nothing undoes it) before collection. Teardown falls back onto
+    the gate's sandbox, never onto production.
+
+    Per-test rather than per-session so two tests that both forget the fixture cannot
+    collide in one shared home.
     """
     home = tmp_path / "jarvis-home"
     monkeypatch.setenv("JARVIS_HOME", str(home))

@@ -19,7 +19,7 @@ def test_dashboard_quiet_state(page, server):
 
 def test_nav_walk_all_tabs(page, server):
     page.goto(server)
-    for label, path in [("neo", "/neo"), ("inbox", "/inbox"),
+    for label, path in [("neo", "/neo"), ("gates", "/gates"), ("inbox", "/inbox"),
                         ("backlog", "/backlog"), ("knowledge", "/knowledge"),
                         ("dashboard", "/")]:
         page.click(f"nav >> text={label}")
@@ -136,6 +136,47 @@ def test_neo_badge_counts(page, server, daemon, project):
     page.goto(server)
     badge = page.locator("nav .nav-badge")
     assert badge.inner_text() == "2"
+
+
+def test_gate_escalation_decided_in_the_browser(page, gated_server, gated_daemon,
+                                                project):
+    """The whole point of the tab: a worker's release attempt reaches the user as a
+    decision they can make from the dashboard, with the reviewer's own text in front
+    of them, and approving it actually opens the gate for the worker."""
+    wo = ops.create_work_order("proj_a", "ship 1.2.3")
+    gated_daemon.tick()
+    ops.request_gate_approval(wo["id"], "./scripts/shipit.sh",
+                              why="green build, changelog written")
+    gated_daemon._neo_drain()  # the fake model escalates unless forced
+
+    page.goto(gated_server)  # the attention strip routes to the tab
+    assert "approve release" in page.locator(".attention").inner_text()
+    page.click(".attention a:has-text('decide it')")
+    assert "/gates" in page.url
+
+    # inner_text() is rendered text, and the section headings are uppercased by CSS
+    body = page.locator("body").inner_text().lower()
+    assert "waiting on you" in body
+    assert "./scripts/shipit.sh" in body
+    assert "green build, changelog written" in body
+
+    # the request as the reviewer read it is one click away, not a separate command
+    page.click("summary:has-text('the request exactly as the reviewer saw it')")
+    assert "shipit" in page.locator("pre.request-text").first.inner_text()
+
+    page.fill("input[name='reason']", "checked the diff myself")
+    page.click("button:has-text('Approve')")
+
+    store = ProjectStore(project)
+    try:
+        approval = store.list_approvals(wo["id"])[0]
+        assert approval["status"] == "approved"
+        assert approval["decided_by"] == "user"
+    finally:
+        store.close()
+    assert "checked the diff myself" in page.locator("body").inner_text()
+    page.goto(gated_server)
+    assert page.locator(".attention .quiet").is_visible()  # and the strip goes quiet
 
 
 def test_backlog_promote_blocked_then_forced(page, server, project):

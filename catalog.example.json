@@ -35,6 +35,23 @@
       },
       "settings_overrides": {
         "permissions": { "allow": ["Bash(npm run *)"] }
+      },
+      "gates": {
+        "$comment": [
+          "Privileged actions a worker may ATTEMPT, with an independent review by Neo",
+          "deciding whether they run. Omit this key entirely (the default) and workers",
+          "simply cannot do these things. Known gates: pr_merge, release,",
+          "service_restart, push_protected.",
+          "",
+          "IMPORTANT: do not ALSO list a gated command under permissions.deny. Claude",
+          "Code evaluates deny rules regardless of what a hook returns, so the deny wins",
+          "and the approved retry is blocked too — silently. `jarvis doctor` reports this",
+          "as INV-GATE-DENY-CONFLICT."
+        ],
+        "enabled": ["pr_merge", "release"],
+        "patterns": {
+          "release": ["scripts/deploy\\.sh"]
+        }
       }
     },
     {
