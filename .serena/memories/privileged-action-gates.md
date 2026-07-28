@@ -39,6 +39,22 @@ arrives later through the ordinary message-delivery path.
 5. Worker retries the **byte-identical** command → `usable_grant` hits → `allow` +
    `consume_grant`.
 
+## Code vs data: `gates.scannable`
+
+`classify` matches the whole command (pipelines and `&&` chains must not be a bypass), so
+it used to fire on any command that merely *contained* a gated verb. Real escalations this
+produced: `jarvis learn add "…never run shipit…"` and
+`grep -n "shipit\|def classify" src/jarvis/gates.py` both gated as **releases**, and
+`git commit -m "document systemctl restart…"` as a **service restart**.
+
+`scannable()` blanks quoted spans before matching — a quoted argument is data. The
+exception is `sh -c` / `bash -c` / `eval` / `xargs`, which hand their payload back to a
+shell: those are scanned whole, because there the quotes really are code. Erring that
+direction is deliberate — a spurious gate costs one review, a missed one ships unreviewed.
+
+Pinned by `test_merely_naming_a_privileged_action_is_not_gated` and
+`test_a_quoted_payload_handed_to_a_shell_is_still_gated`.
+
 ## Scope of a grant
 
 `(wo_id, kind, exact command)`, `GRANT_TTL_SECONDS=3600`, `GRANT_MAX_USES=3`. Exact-match on

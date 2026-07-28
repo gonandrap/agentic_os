@@ -210,20 +210,53 @@ class GatedAction:
     matched: str  # the pattern that fired — shown to the reviewer, and to the user
 
 
+# Quoted spans are data, not code. `'…'` is literal; `"…"` may interpolate, but a gated
+# verb inside it is still an argument, not a command — unless a shell re-parses it, which
+# is what _SHELL_INVOKER catches below.
+_QUOTED = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"", re.DOTALL)
+
+# …with one exception: these hand their quoted payload back to a shell to execute, so
+# there the quotes are code after all. Scan such commands whole.
+_SHELL_INVOKER = re.compile(
+    r"\b(?:ba|z|k|da|a)?sh\s+(?:-[a-zA-Z]*\s+)*-[a-zA-Z]*c\b|\beval\b|\bxargs\b",
+    re.IGNORECASE,
+)
+
+
+def scannable(command: str) -> str:
+    """The part of `command` that could actually *execute* something.
+
+    Blanks quoted arguments so that merely naming a privileged action doesn't trip its
+    gate — `git commit -m "document systemctl restart"` writes a commit message, and
+    `jarvis learn add "…never run the release script…"` writes a note. Both used to be
+    gated as the real thing, which cost a Neo review and stalled the worker for nothing.
+
+    A quoted payload IS code when something re-parses it (`sh -c`, `eval`, `xargs`), so
+    those are scanned whole. Erring that way is deliberate: a spurious gate costs one
+    review, a missed one ships unreviewed code.
+    """
+    if _SHELL_INVOKER.search(command):
+        return command
+    # Replace rather than delete, so neighbouring tokens can't fuse into a false match.
+    return _QUOTED.sub(" ", command)
+
+
 def classify(command: str, config: GateConfig) -> GatedAction | None:
     """The gate this Bash command trips, or None.
 
-    Matches against the raw command string rather than parsed segments: a gated action
-    hidden in a pipeline, a subshell or behind `&&` is the same action, and a classifier
-    that only understands well-formed simple commands is a classifier with a bypass.
+    Matches the whole command rather than parsed segments: a gated action hidden in a
+    pipeline, a subshell or behind `&&` is the same action, and a classifier that only
+    understands well-formed simple commands is a classifier with a bypass. Quoted
+    arguments are blanked first — see `scannable`.
     """
     if not command or not config.enabled:
         return None
+    haystack = scannable(command)
     for kind in KINDS:
         if kind.name not in config.enabled:
             continue
         for pattern in (*kind.patterns, *config.extra_patterns.get(kind.name, ())):
-            if re.search(pattern, command, re.IGNORECASE):
+            if re.search(pattern, haystack, re.IGNORECASE):
                 return GatedAction(kind=kind.name, summary=kind.summary,
                                    command=command.strip(), matched=pattern)
     return None
