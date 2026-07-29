@@ -83,6 +83,12 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     if pending:
         n = len(pending)
         blockers.append(f"{n} assumption{'s' if n != 1 else ''} pending your review")
+    # A privileged action Neo declined to decide on. Nobody else can open that gate, and
+    # the work order cannot proceed past it.
+    for approval in store.escalated_approvals(wo["id"]):
+        blockers.append(
+            f"gate approval needed: {approval['kind']} (request {approval['id']})"
+        )
     # Two of the blockers below only exist because Jarvis dispatched the worker and
     # briefed it on the contract (`jarvis wo finish`, worktree, OPERATION.md). An
     # adopted ad-hoc session got none of that — no JARVIS_WO_ID, no briefing — so it
@@ -93,7 +99,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     if governed and wo["status"] == "failed":
         blockers.append("worker failed — review and retry")
     # Blocked on a prompt is real whoever started the session: nobody else can unstick it.
-    if wo["status"] == "waiting_input":
+    # A worker waiting on a gate that is still with Neo is the exception: routing those
+    # away from the user is the entire point of having a delegate, so it stays silent
+    # until Neo either decides or escalates (handled above).
+    if wo["status"] == "waiting_input" and not _waiting_on_neo_gate(store, wo):
         blockers.append("worker is waiting on your input")
     if governed and wo["status"] == "needs_review" and not pending:
         blockers.append("finished without a completion signal — review the session")
@@ -106,6 +115,12 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
 
 def _mentions_assumptions(reason: str | None) -> bool:
     return "assumption" in (reason or "").lower()
+
+
+def _waiting_on_neo_gate(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """True when this work order is parked on a privileged-action request that Neo has
+    not answered yet. Not a user blocker: Neo is the one holding it."""
+    return any(not a["escalated"] for a in store.pending_approvals(wo["id"]))
 
 
 # -- invariants ---------------------------------------------------------------------
@@ -276,6 +291,35 @@ def check_assumptions_persisted(store: ProjectStore) -> Iterator[Violation]:
             )
 
 
+def check_session_binding_moves_forward(store: ProjectStore) -> Iterator[Violation]:
+    """INV-SESSION-FORWARD — a work order must never be bound to a session it has left.
+
+    Each delivered turn forks a new session and stops the old one, so `session_id`
+    naming a *spent* session means the pointer walked backwards. Everything downstream
+    trusts it: the next message forks from that dead conversation (dropping every turn
+    since) and stops an already-stopped agent, orphaning the live one in the agents
+    view. `ProjectStore.bind_session` is what prevents it; this is the tripwire for
+    anything that writes `session_id` around it.
+
+    Not repairable: the store cannot tell which session is live — that needs the agents
+    roster — and guessing would move the binding a second time.
+    """
+    for wo in store.list_work_orders(include_hidden=True):
+        sid = wo.get("session_id")
+        if not sid:
+            continue
+        prior = db.from_json(wo.get("prior_sessions"), []) or []
+        if sid not in prior:
+            continue
+        yield Violation(
+            invariant="INV-SESSION-FORWARD",
+            wo_id=wo["id"],
+            detail=f"bound to session {sid}, which this work order already left "
+                   f"({len(prior)} spent session(s) on record)",
+            context={"session_id": sid, "prior_sessions": prior},
+        )
+
+
 def check_attention_has_reason(store: ProjectStore) -> Iterator[Violation]:
     """INV-ATTENTION-BLANK — a flagged work order must say what it wants.
 
@@ -302,6 +346,58 @@ def check_attention_has_reason(store: ProjectStore) -> Iterator[Violation]:
             )
 
 
+# -- configuration checks (catalog, not database state) ------------------------------
+
+
+def check_gate_deny_conflict(spec: Any) -> Iterator[Violation]:
+    """INV-GATE-DENY-CONFLICT — an enabled gate must not also be denied outright.
+
+    A gate and a `deny` rule for the same command are not belt-and-braces, they are a
+    contradiction that resolves against the gate. Claude Code evaluates deny rules
+    regardless of what a PreToolUse hook returned, so the approved retry is blocked too
+    — and every surface reports success along the way: the request is filed, Neo reviews
+    it, Neo approves it, the timeline says `gate_opened`. Only the command silently never
+    runs, which reads to the user as the worker being incompetent rather than the
+    catalog being wrong.
+
+    Not repairable: the fix is an edit to the user's catalog, which is theirs to make.
+    Reported with the exact rule to delete.
+    """
+    from .gates import deny_conflicts
+
+    if not spec.gates:
+        return
+    deny_rules = (
+        (spec.settings_overrides.get("permissions") or {}).get("deny") or []
+    )
+    for gate_name, rule in deny_conflicts(spec.gates, deny_rules):
+        yield Violation(
+            invariant="INV-GATE-DENY-CONFLICT",
+            detail=(
+                f"project {spec.name!r} enables the `{gate_name}` gate but also denies "
+                f"{rule!r} in settings_overrides. A deny rule beats a hook's allow, so "
+                f"approval can never take effect: remove {rule!r} from the catalog and "
+                f"let the gate mediate it."
+            ),
+            context={"project": spec.name, "gate": gate_name, "rule": rule},
+        )
+
+
+def check_catalog(catalog: Any, project: str | None = None) -> list[Violation]:
+    """Config-level post-conditions over the catalog itself.
+
+    Separate from the store checks below because the subject is different: these predict
+    that the OS *cannot* do something it has been configured to do, which no amount of
+    database state will reveal.
+    """
+    found: list[Violation] = []
+    for spec in catalog.projects:
+        if project and spec.name != project:
+            continue
+        found.extend(check_gate_deny_conflict(spec))
+    return found
+
+
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
     check_attention_reason_is_true,
@@ -309,6 +405,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_no_phantom_attention,
     check_blocked_work_is_surfaced,
     check_attention_has_reason,
+    check_session_binding_moves_forward,
 )
 
 

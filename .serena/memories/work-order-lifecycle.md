@@ -75,6 +75,43 @@ Binary is `JARVIS_CLAUDE_BIN` or `claude` (`:22`).
 `CentralStore.relevant_knowledge()` (`dispatch.py:148`). The worker sees ONLY this prompt,
 which is why WO descriptions must carry the user's full intent.
 
+## One work order, many sessions (the binding rule)
+
+A work order outlives its sessions. Turn 1 is the dispatch; **every delivered message
+forks a NEW session** (`claude --bg --resume <sid>`: full context, fresh session id) and
+the one it forked from is stopped (`daemon._deliver`). So an N-turn work order leaves N
+session ids behind, and `claude agents --json --all` shows all of them — `--all` is the
+history. The *default* `claude agents` listing only shows sessions the supervisor still
+owns, so a correctly retired predecessor disappears from it. Two or more entries there
+for one `[WO …]` name means a session leaked.
+
+**The supervisor's job id is the session id's first segment** (`0686a1b5` ↔
+`0686a1b5-2324-…`; verified across 39 live sessions), and a bg session's env carries
+`CLAUDE_JOB_DIR=~/.claude/jobs/<job id>`.
+
+`wo.session_id` names the session currently carrying the work order and is written by
+the SessionStart hook — which means *any* session of that work order can write it.
+Re-opening a finished agent in the agents view respawns it under its ORIGINAL id
+(`state.json` keeps `respawnFlags` + `resumeSessionId`) and fires SessionStart again.
+Before wo-6e7caf6c that walked the binding backwards, and the damage was all downstream:
+the next turn forked from a dead conversation (losing every turn since), "retired" a
+session that was already stopped, and orphaned the live agent. Observed on wo-9478c1be.
+
+Two rules now hold this together, both in the store/hook layer:
+- `ProjectStore.bind_session()` is the ONLY way to move `session_id`, and it refuses
+  any id already in the `prior_sessions` column — bindings move forward only.
+  Post-condition `INV-SESSION-FORWARD` (`invariants.py`) is the tripwire for code that
+  writes `session_id` around it.
+- `hooks._is_current_session()` drops Stop/SessionEnd/Notification from a superseded
+  session. Retiring the predecessor makes it fire SessionEnd seconds later; acted on,
+  that flipped a freshly-resumed work order straight back to `needs_review`.
+
+A delivery resolves its target session by `wo.job_id` (which Jarvis itself wrote at
+spawn) before falling back to `session_id`, and forks are briefed exactly like the first
+turn — model, effort, `--append-system-prompt`, `--add-dir` skills. A resumed session
+re-derives its system prompt at launch; it does NOT inherit the first turn's from the
+transcript, so anything omitted is simply absent from turn two onwards.
+
 ## Other `claude` invocation shapes
 
 - `send_to_session()` — `claude --resume <sid> -p <msg> --output-format json` (`claude_cli.py:206`)

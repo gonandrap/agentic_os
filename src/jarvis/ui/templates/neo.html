@@ -11,6 +11,40 @@
   {{ learnings|length }} learnings)</span>
 </p>
 
+{% if in_flight %}
+<h2>With Neo right now</h2>
+<div class="panel">
+  {% for q in in_flight %}
+  <div class="row">
+    <span class="st {{ 'tone-warn' if q.status == 'answering' else 'tone-muted' }}">
+      <span class="i">{{ '◍' if q.status == 'answering' else '◌' }}</span>{{ q.status }}</span>
+    <span class="grow">{{ q.question[:160] }}</span>
+    <span class="sub mono">{{ q.project }} ·
+      <a href="/wo/{{ q.project }}/{{ q.wo_id }}">{{ q.wo_id }}</a> ·
+      waiting {{ fmt_age(q.ts) }}</span>
+  </div>
+  {% endfor %}
+</div>
+<p class="sub">The worker that asked is parked until Neo replies. If these sit here,
+  the daemon isn't draining the queue — check <span class="mono">jarvis status</span>.</p>
+{% endif %}
+
+{% if not history and not unreviewed and not escalated and not in_flight %}
+<div class="panel" style="margin-top:14px">
+  <div class="row"><div class="grow">
+    <strong>No worker has asked Neo anything yet.</strong>
+    <div class="sub" style="margin-top:6px">
+      This is not the intended steady state. Neo is the workers' first responder:
+      they are told to run <span class="mono">jarvis wo ask</span> on <em>any</em>
+      doubt, and Neo answers as you within a minute. If work orders keep arriving as
+      long assumption lists to review instead, the workers are guessing — that is
+      worth a look, not a shrug.
+      <br>Seed Neo below so its first answer already sounds like you.
+    </div>
+  </div></div>
+</div>
+{% endif %}
+
 {% if escalated %}
 <h2>Escalated — Neo wants you to decide</h2>
 <div class="panel">
@@ -23,10 +57,18 @@
     </div>
     <div style="margin:6px 0"><strong>Q:</strong> {{ q.question }}</div>
     <div class="sub">Why escalated: {{ q.answer_reason or '—' }}</div>
+    {% if q.kind == 'approval' %}
+    {# Answering here would send the worker a message and leave the gate shut: only
+       `decide_gate` records the verdict the hook checks. Send them where it counts. #}
+    <div class="sub" style="margin-top:8px">This is a privileged-action request —
+      typing a reply here would not open the gate.
+      <a href="/gates">decide it on the gates tab →</a></div>
+    {% else %}
     <form method="post" action="/neo/{{ q.id }}/answer" style="margin-top:8px">
       <textarea name="text" placeholder="Your answer — it goes straight to the worker" required></textarea>
       <button class="primary" style="margin-top:6px">Send answer to worker</button>
     </form>
+    {% endif %}
   </div>
   {% endfor %}
 </div>
