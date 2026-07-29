@@ -112,9 +112,25 @@ turn — model, effort, `--append-system-prompt`, `--add-dir` skills. A resumed 
 re-derives its system prompt at launch; it does NOT inherit the first turn's from the
 transcript, so anything omitted is simply absent from turn two onwards.
 
+**The briefing lives in ONE place: `claude_cli._briefing_args()`.** Both launch paths
+(`spawn_background`, `send_to_session`) build their argv through it. Anything that starts
+a worker turn must do the same — hand-rolling the flag list is how the headless fallback
+came to carry none of them at all (fixed in PR #42; the fork was fixed earlier in #37).
+`daemon._deliver` builds the briefing once and passes it to the fork and the fallback.
+
+Also: a resume must run with `cwd` = the directory the session was created in (the
+worktree, not `project.path`). Transcripts are stored per-cwd — see
+`claude_cli.session_transcript_path` — so the wrong cwd cannot find the conversation.
+
+Note `dispatch_work_order` writes the *resolved* model/effort/permission_mode back to the
+work order row (`dispatch.py:255`), so from turn two those columns are populated and the
+`or project.worker.*` fallback is moot — except for `adhoc` work orders, which the
+reconciler adopts without ever going through dispatch and which therefore have them NULL.
+
 ## Other `claude` invocation shapes
 
-- `send_to_session()` — `claude --resume <sid> -p <msg> --output-format json` (`claude_cli.py:206`)
+- `send_to_session()` — `claude --resume <sid> -p <msg> --output-format json` plus the
+  same briefing flags (`claude_cli.py`); the daemon's fallback when the bg fork fails
 - `run_headless()` — `claude -p <prompt> --output-format json [--append-system-prompt] [--model]`
   (`claude_cli.py:224-228`); used by Neo and by the LLM evals
 - `stop_session()` — `claude stop <bg id>` (`claude_cli.py:189`)
