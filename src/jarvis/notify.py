@@ -24,6 +24,21 @@ from .paths import logs_dir
 
 LEVEL_EMOJI = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}
 
+#: Kill switch for every sink whose effect leaves this process — Telegram (the user's
+#: phone) and desktop (their screen). Set by the test-isolation gate in the repo-root
+#: conftest, because a test run must never be able to reach the real user. `log` is
+#: exempt: it writes under $JARVIS_HOME, which the same gate has already sandboxed.
+#:
+#: This exists because it happened. On 2026-07-27 a worker's test run wrote inbox items
+#: into PRODUCTION os.db (workers inherit JARVIS_HOME=<production state>) and the live
+#: daemon dutifully Telegrammed the user two critical alerts about the fixture project
+#: `proj_a`, one carrying a deep link that 500'd.
+DISABLE_EXTERNAL_SINKS_ENV = "JARVIS_DISABLE_EXTERNAL_SINKS"
+
+
+def external_sinks_disabled() -> bool:
+    return bool(os.environ.get(DISABLE_EXTERNAL_SINKS_ENV))
+
 #: Anchor on the work-order page marking whatever is waiting on the user
 #: (pending assumptions, the attention banner, otherwise the reply box).
 PENDING_ANCHOR = "pending"
@@ -55,6 +70,8 @@ def sink_log(item: dict[str, Any], catalog: Catalog) -> str:
 
 
 def sink_telegram(item: dict[str, Any], catalog: Catalog) -> str:
+    if external_sinks_disabled():
+        return f"skipped: {DISABLE_EXTERNAL_SINKS_ENV} set"
     token = os.environ.get(catalog.os.telegram_token_env, "")
     chat_id = os.environ.get(catalog.os.telegram_chat_id_env, "")
     if not token or not chat_id:
@@ -83,6 +100,8 @@ def sink_telegram(item: dict[str, Any], catalog: Catalog) -> str:
 
 
 def sink_desktop(item: dict[str, Any], catalog: Catalog) -> str:
+    if external_sinks_disabled():
+        return f"skipped: {DISABLE_EXTERNAL_SINKS_ENV} set"
     if not shutil.which("notify-send"):
         return "skipped: notify-send not available"
     try:

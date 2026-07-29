@@ -16,7 +16,6 @@ from jarvis.testing import (  # noqa: F401
     catalog_file,
     claude_json,
     fake_claude,
-    isolate_jarvis_home,
     jarvis_home,
     make_git_project,
     project,

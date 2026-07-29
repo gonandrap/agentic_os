@@ -15,12 +15,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+#: `claude` location override, mirroring bugreport's GH_BIN_ENV. Tests point it at a
+#: fake; the test-isolation gate points it at a stub that refuses to run.
+CLAUDE_BIN_ENV = "JARVIS_CLAUDE_BIN"
+
+
 class ClaudeCliError(RuntimeError):
     pass
 
 
 def claude_bin() -> str:
-    return os.environ.get("JARVIS_CLAUDE_BIN", "claude")
+    return os.environ.get(CLAUDE_BIN_ENV, "claude")
 
 
 def available() -> bool:
