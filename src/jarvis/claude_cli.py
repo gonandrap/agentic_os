@@ -130,6 +130,42 @@ def list_background_sessions(cwd: Path | None = None, include_done: bool = True)
 _JOB_ID_RE = re.compile(r"claude stop ([0-9a-f]{6,})")
 
 
+def _briefing_args(
+    model: str | None = None,
+    effort: str | None = None,
+    permission_mode: str | None = None,
+    append_system_prompt: str | None = None,
+    settings_file: Path | None = None,
+    add_dirs: list[Path] | None = None,
+) -> list[str]:
+    """The flags that constitute a worker's briefing, in one place.
+
+    A resumed session RE-DERIVES its system prompt, model, effort, permission mode
+    and reachable directories from the argv it is launched with — it does not
+    inherit them from the transcript. So every path that starts a worker turn
+    (initial dispatch, bg resume-fork, headless resume) must pass the same set, or
+    the worker silently loses the project's standing instructions and the OS skills
+    from that turn onwards. Shared here so a new launch path cannot forget one.
+
+    Callers must not append a bare positional after these: `--add-dir` is variadic
+    and would swallow it (fence with `--` first, as spawn_background does).
+    """
+    args: list[str] = []
+    if model:
+        args += ["--model", model]
+    if effort:
+        args += ["--effort", effort]
+    if permission_mode:
+        args += ["--permission-mode", permission_mode]
+    if append_system_prompt:
+        args += ["--append-system-prompt", append_system_prompt]
+    if settings_file:
+        args += ["--settings", str(settings_file)]
+    for d in add_dirs or []:
+        args += ["--add-dir", str(d)]
+    return args
+
+
 def spawn_background(
     prompt: str,
     cwd: Path,
@@ -170,18 +206,8 @@ def spawn_background(
         args += ["--resume", resume_session_id]
     if worktree:
         args += ["--worktree", worktree]
-    if model:
-        args += ["--model", model]
-    if effort:
-        args += ["--effort", effort]
-    if permission_mode:
-        args += ["--permission-mode", permission_mode]
-    if append_system_prompt:
-        args += ["--append-system-prompt", append_system_prompt]
-    if settings_file:
-        args += ["--settings", str(settings_file)]
-    for d in add_dirs or []:
-        args += ["--add-dir", str(d)]
+    args += _briefing_args(model, effort, permission_mode, append_system_prompt,
+                           settings_file, add_dirs)
     # `--` fences the prompt off from option parsing. Without it a variadic option
     # (`--add-dir <directories...>` is one) keeps consuming positionals and swallows
     # the prompt as a directory: the session boots with nothing to do and parks at
@@ -235,17 +261,33 @@ def stop_session(bg_id: str) -> bool:
 
 
 def send_to_session(session_id: str, message: str, cwd: Path,
-                    bg_id: str | None = None, timeout: int = 900) -> str:
+                    bg_id: str | None = None, timeout: int = 900,
+                    model: str | None = None,
+                    effort: str | None = None,
+                    permission_mode: str | None = None,
+                    append_system_prompt: str | None = None,
+                    settings_file: Path | None = None,
+                    add_dirs: list[Path] | None = None) -> str:
     """Deliver a user message to an existing session (headless resume).
 
     Runs a full turn: the session receives the message, processes it, and the
     result text is returned. The transcript is shared with the original session.
     If the session is still attached to an (idle) background agent, it is released
     first — resume refuses to run against bg-owned sessions.
+
+    This is the fallback under a failed bg resume-fork, and it is still a worker
+    turn: it takes the same briefing as the fork (see `_briefing_args`), because a
+    resume re-derives all of it from argv. `cwd` must be the directory the session
+    was created in — transcripts are stored per-cwd, so resuming from elsewhere
+    does not find the conversation.
     """
     if bg_id:
         stop_session(bg_id)
     args = ["--resume", session_id, "-p", message, "--output-format", "json"]
+    # Safe to append after `-p <message>`: the message is this option's value, not a
+    # bare positional, so a trailing variadic `--add-dir` has nothing to swallow.
+    args += _briefing_args(model, effort, permission_mode, append_system_prompt,
+                           settings_file, add_dirs)
     out = _run(args, cwd=cwd, timeout=timeout)
     try:
         data = json.loads(out)
