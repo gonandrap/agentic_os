@@ -417,7 +417,9 @@ def kill_process_group(pid: int | None) -> bool:
 
 def run_headless(prompt: str, system_prompt: str | None = None,
                  model: str | None = None, cwd: Path | None = None,
-                 timeout: int = 300, tools: str | None = None) -> str:
+                 timeout: int = 300, tools: str | None = None,
+                 permission_mode: str | None = None,
+                 env_extra: dict[str, str] | None = None) -> str:
     """One-shot headless call (`claude -p`) returning the result text.
 
     Used by Neo: the system prompt (persona + learnings) is byte-stable across
@@ -431,6 +433,12 @@ def run_headless(prompt: str, system_prompt: str | None = None,
     about *that*. Note this is availability, not permission: `--allowedTools`
     and `--disallowedTools` do not remove a tool, and under
     `permissions.defaultMode: auto` they do not stop it being used either.
+
+    `permission_mode` and `env_extra` exist for the other direction: running a
+    subject that is *supposed* to touch the machine, in a controlled one. A
+    headless callee cannot answer a permission prompt any more than a `--bg`
+    worker can, so a tooled call needs the same `auto` mode dispatch gives real
+    workers; `env_extra` is how the sandbox gets on its PATH.
     """
     args: list[str] = ["-p", prompt, "--output-format", "json"]
     if system_prompt:
@@ -439,7 +447,9 @@ def run_headless(prompt: str, system_prompt: str | None = None,
         args += ["--model", model]
     if tools is not None:  # "" is meaningful: it disables every tool
         args += ["--tools", tools]
-    out = _run(args, cwd=cwd, timeout=timeout)
+    if permission_mode:
+        args += ["--permission-mode", permission_mode]
+    out = _run(args, cwd=cwd, timeout=timeout, env_extra=env_extra)
     try:
         data = json.loads(out)
         return data.get("result", "")
