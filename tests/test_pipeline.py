@@ -504,6 +504,38 @@ def test_headless_fallback_turn_is_briefed_like_the_first(started, fake_claude, 
     assert call["cwd"] == str(wt)  # where the session lives, not the project root
 
 
+def test_adhoc_fork_gets_the_projects_permission_mode(started, fake_claude, project):
+    """An adopted session's row has permission_mode NULL — it never went through
+    dispatch, which is what resolves the mode and writes it back. Sending it a message
+    hands it to Jarvis to drive as a --bg fork, and a background agent cannot answer a
+    permission prompt: launched in Claude's default mode it would stall, costing the
+    user a `jarvis wo resume-auto` to clear. So the fork resolves the project's worker
+    mode at the call site — without backfilling the column, so an adopted work order
+    stays distinguishable from a dispatched one."""
+    daemon = started
+    _add_adhoc(fake_claude, project, "working", sid="adhoc-pm-1")
+    daemon.tick_count = 0
+    daemon.tick()
+
+    store = ProjectStore(project)
+    wo = [w for w in store.list_work_orders() if w["origin"] == "adhoc"][0]
+    assert wo["permission_mode"] is None, "adhoc rows must not carry a resolved mode"
+
+    fake_claude.set_session_state("adhoc-pm-1", "done")
+    ops.send_message(wo["id"], "carry on", source="ui")
+    daemon.tick_count = 0
+    daemon.tick()
+    daemon.delivery_pool.shutdown(wait=True)
+
+    forks = [c for c in fake_claude.calls
+             if "--bg" in c["argv"] and "--resume" in c["argv"]]
+    assert forks, "no resume-fork was spawned for the adopted session"
+    argv = forks[-1]["argv"]
+    assert argv[argv.index("--permission-mode") + 1] == "auto"
+    # resolved for the launch only — the row still says "nobody dispatched this"
+    assert store.get_work_order(wo["id"])["permission_mode"] is None
+
+
 def test_finish_and_assumption_review(started, project):
     daemon = started
     wo = ops.create_work_order("proj_a", "task")

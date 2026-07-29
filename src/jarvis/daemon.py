@@ -245,7 +245,17 @@ class Daemon:
             briefing: dict[str, Any] = dict(
                 model=wo.get("model") or project.worker.model,
                 effort=wo.get("effort") or project.worker.effort,
-                permission_mode=wo.get("permission_mode"),
+                # `or project.worker.permission_mode`, mirroring dispatch: the mode is
+                # part of the briefing, so a resume that drops it is the same defect as
+                # a resume that drops the system prompt. Only `adhoc` rows reach here
+                # with it NULL — dispatch persists the resolved mode back to the row —
+                # and once a work order is being driven by a --bg fork it CANNOT answer
+                # a permission prompt, so Claude's default mode is not the conservative
+                # choice, it is a guaranteed stall the user must clear by hand.
+                # Resolved here only: the column is left NULL so an adopted session
+                # stays distinguishable from a dispatched one.
+                permission_mode=(wo.get("permission_mode")
+                                 or project.worker.permission_mode),
                 append_system_prompt=(wo.get("append_system_prompt")
                                       or project.worker.append_system_prompt),
                 settings_file=_write_worker_settings(project, wo),
