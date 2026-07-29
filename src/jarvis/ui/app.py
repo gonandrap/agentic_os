@@ -98,6 +98,16 @@ def gate_badge() -> int | None:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None)
+
+    @app.middleware("http")
+    async def no_store(request: Request, call_next):
+        # Every page reflects live OS state (inbox acks, work order status); a
+        # browser serving a stale copy from disk cache or history (bfcache) after
+        # the user navigates back would show notifications as still unacked.
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     templates = Jinja2Templates(directory=str(TEMPLATES))
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
