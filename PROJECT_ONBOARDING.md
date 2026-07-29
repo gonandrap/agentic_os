@@ -1,5 +1,10 @@
 # Onboarding projects onto Jarvis
 
+> Jarvis itself not installed yet? Start with the one-liner in the
+> [README](README.md#install):
+> `curl -fsSL https://raw.githubusercontent.com/gonandrap/agentic_os/main/install.sh | bash`
+> — it also writes the starter catalog this guide edits.
+
 Adoption is **per project, one command, reversible**. Nothing happens to a project
 until you run `jarvis adopt` on it (or include it in the catalog passed to
 `jarvis start`, which adopts everything listed).

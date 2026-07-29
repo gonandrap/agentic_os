@@ -71,10 +71,22 @@ STATUS_ICON = {
 ORIGIN_BADGE = {"jarvis": "🤖 jarvis", "ui": "🖥 ui", "manual": "⚠ manual", "adhoc": "⚠ ad-hoc"}
 
 
+class _VersionAction(argparse.Action):
+    """`jarvis --version` — resolved lazily so hooks don't pay for dist metadata."""
+
+    def __call__(self, parser, _namespace=None, _values=None, _option_string=None):  # noqa: ANN001
+        from .bugreport import jarvis_version
+        print(f"jarvis {jarvis_version()}")
+        parser.exit()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="jarvis", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--json", action="store_true", help="machine-readable output")
+    # Which release am I on? install.sh checks this against the tag it installed.
+    p.add_argument("-V", "--version", nargs=0, action=_VersionAction,
+                   help="print the installed Jarvis OS version")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     # start / stop / status ------------------------------------------------------
