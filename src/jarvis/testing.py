@@ -159,6 +159,10 @@ if "--version" in argv:
 elif argv[:1] == ["agents"]:
     print(json.dumps(load_sessions()))
 elif "--bg" in argv:
+    # Let a test fail only the bg resume-FORK, so the daemon's headless-resume
+    # fallback becomes reachable (FAKE_CLAUDE_RESUME would fail both).
+    if "--resume" in argv and os.environ.get("FAKE_CLAUDE_BG_RESUME") == "fail":
+        sys.stderr.write("bg resume-fork failed (test-forced)\n"); sys.exit(1)
     # like the real supervisor: assigns its own session id (ignores --session-id);
     # with --resume it forks the conversation under a fresh session id
     import hashlib

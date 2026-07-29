@@ -23,6 +23,7 @@ import signal
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 from . import claude_cli
 from .catalog import Catalog, ProjectSpec, load_catalog
@@ -239,19 +240,24 @@ class Daemon:
             wt = project.path / ".claude" / "worktrees" / (wo.get("worktree") or "")
             cwd = wt if wo.get("worktree") and wt.is_dir() else project.path
             resume_sid = resume_sid or wo["session_id"]
+            # One briefing, both paths: the headless fallback is a worker turn too, and
+            # a resume re-derives its briefing from argv rather than the transcript.
+            briefing: dict[str, Any] = dict(
+                model=wo.get("model") or project.worker.model,
+                effort=wo.get("effort") or project.worker.effort,
+                permission_mode=wo.get("permission_mode"),
+                append_system_prompt=(wo.get("append_system_prompt")
+                                      or project.worker.append_system_prompt),
+                settings_file=_write_worker_settings(project, wo),
+                add_dirs=[install_agent_skills(project.path)],
+            )
             try:
                 job_id = claude_cli.spawn_background(
                     prompt=msg["content"],
                     cwd=cwd,
                     name=worker_name(wo),
-                    model=wo.get("model") or project.worker.model,
-                    effort=wo.get("effort") or project.worker.effort,
-                    permission_mode=wo.get("permission_mode"),
-                    append_system_prompt=(wo.get("append_system_prompt")
-                                          or project.worker.append_system_prompt),
-                    settings_file=_write_worker_settings(project, wo),
-                    add_dirs=[install_agent_skills(project.path)],
                     resume_session_id=resume_sid,
+                    **briefing,
                 )
                 store.mark_message(msg["id"], "delivered")
                 store.add_event(wo["id"], "message_delivered",
@@ -273,8 +279,11 @@ class Daemon:
             except claude_cli.ClaudeCliError as e:
                 log.warning("[%s] bg-resume delivery failed (%s); falling back to headless resume",
                             project.name, e)
+                # `cwd`, not project.path: transcripts are keyed by the directory the
+                # session was created in, so resuming a worktree worker from the project
+                # root does not find its conversation.
                 result = claude_cli.send_to_session(
-                    resume_sid, msg["content"], cwd=project.path, bg_id=bg_id,
+                    resume_sid, msg["content"], cwd=cwd, bg_id=bg_id, **briefing,
                 )
                 store.mark_message(msg["id"], "delivered")
                 store.add_event(wo["id"], "message_delivered",

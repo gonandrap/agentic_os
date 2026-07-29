@@ -463,7 +463,45 @@ def test_follow_up_turn_is_briefed_like_the_first(started, fake_claude, project)
     assert argv[argv.index("--append-system-prompt") + 1] == "never touch production"
     assert argv[argv.index("--model") + 1] == "opus"
     assert argv[argv.index("--add-dir") + 1].endswith("agent-skills")
+    # The work order carries no permission_mode of its own, so the fork must fall back
+    # to the project's exactly as the initial dispatch does — otherwise turn two runs
+    # in Claude's default mode and stalls on a prompt no background worker can answer.
+    assert argv[argv.index("--permission-mode") + 1] == "auto"
     assert argv[-1] == "follow-up"  # the prompt still survives the variadic --add-dir
+
+
+def test_headless_fallback_turn_is_briefed_like_the_first(started, fake_claude, project,
+                                                          monkeypatch):
+    """The bg resume-fork can fail, and the headless resume that catches it is still a
+    worker turn — same briefing rules apply. It must also resume from the directory the
+    session was created in: transcripts are stored per-cwd, so resuming a worktree
+    worker from the project root would not find its conversation."""
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task", model="opus",
+                               append_system_prompt="never touch production")
+    daemon.tick()
+    sid = bind_session(daemon, project, wo["id"])
+    wt = project / ".claude" / "worktrees" / wo["id"]
+    wt.mkdir(parents=True, exist_ok=True)  # the real CLI makes this; the fake does not
+
+    fake_claude.set_session_state(sid, "done")
+    monkeypatch.setenv("FAKE_CLAUDE_BG_RESUME", "fail")
+    ops.send_message(wo["id"], "follow-up", source="ui")
+    daemon.tick_count = 0
+    daemon.tick()
+    daemon.delivery_pool.shutdown(wait=True)
+
+    headless = [c for c in fake_claude.calls if "--bg" not in c["argv"]
+                and "--resume" in c["argv"] and "-p" in c["argv"]]
+    assert headless, "bg fork was forced to fail but no headless resume was attempted"
+    call = headless[-1]
+    argv = call["argv"]
+    assert argv[argv.index("--append-system-prompt") + 1] == "never touch production"
+    assert argv[argv.index("--model") + 1] == "opus"
+    assert argv[argv.index("--add-dir") + 1].endswith("agent-skills")
+    assert argv[argv.index("--permission-mode") + 1] == "auto"
+    assert argv[argv.index("-p") + 1] == "follow-up"
+    assert call["cwd"] == str(wt)  # where the session lives, not the project root
 
 
 def test_finish_and_assumption_review(started, project):
