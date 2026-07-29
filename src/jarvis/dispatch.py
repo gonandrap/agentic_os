@@ -69,6 +69,10 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # Workers call `jarvis …` from Bash (contract); make sure it resolves even
         # though the Claude supervisor daemon has its own PATH.
         "PATH": _worker_path(),
+        # Which privileged actions the PreToolUse gate mediates for this worker. Travels
+        # as env rather than being looked up per hook call: the hook runs on every Bash
+        # command and must not load and parse the catalog to decide it has nothing to do.
+        "JARVIS_GATES": project.gates.to_json(),
     })
     settings["env"] = env
     out = project.path / ".jarvis" / "worker-settings" / f"{wo['id']}.json"
@@ -98,13 +102,33 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "not go looking for that file, everything you need is here):",
         "- Work only inside your assigned worktree (you start in it). Commit your "
         "work and open a PR per this repo's conventions. Never push to main.",
-        f"- Record EVERY assumption you make: `jarvis wo assume {wo['id']} \"...\"`",
-        f"- Blocked on a decision you cannot make? Ask the OS and END YOUR TURN: "
-        f"`jarvis wo ask {wo['id']} \"<your question>\"` — the answer arrives as "
-        f"your next user turn (from Neo, the user's delegate, or the user). Put "
-        f"everything needed to decide INSIDE the question text: whoever answers sees "
-        f"only that text, never your session. Prefer recording an assumption and "
-        f"continuing when the decision is reversible.",
+        f"- **Neo is your first responder. Any doubt goes to it.** Not just the big "
+        f"calls — any point where you are not sure. `jarvis wo ask {wo['id']} "
+        f"\"<your question>\"`, then END YOUR TURN. The answer arrives as your next "
+        f"user turn, usually within a minute, from Neo (the user's delegate) or the "
+        f"user. This is the normal, expected way to work: it is not an escalation, it "
+        f"does not interrupt the user, and it costs you about a minute. Put "
+        f"everything needed to decide INSIDE the question text — whoever answers sees "
+        f"only that text, never your session — with the concrete options and your "
+        f"recommendation.",
+        "  - The trigger is DOUBT, not importance. If you catch yourself weighing "
+        "options, thinking \"either would work\", or picking one because you have to "
+        "pick something, you are in doubt: ask. Ask BEFORE you build on it, not "
+        "after.",
+        "  - Do not talk yourself out of asking. \"It's reversible\", \"it's only an "
+        "implementation detail\", \"I'll note it as an assumption\" — those are "
+        "rationalisations for guessing. Almost everything is reversible; that is not "
+        "the question. The question is whether you would be REBUILDING if you guessed "
+        "wrong.",
+        f"- `jarvis wo assume {wo['id']} \"...\"` is for the OTHER case, and it "
+        f"should be RARE: a call you made with NO doubt — you followed an existing "
+        f"convention, the work order implied it, the codebase left one sensible "
+        f"option. Record EVERY such call, including the small and obvious ones "
+        f"(naming, file layout, which convention you followed, how you split the "
+        f"commits): recording is cheap and the work order record is the only audit "
+        f"trail anyone gets. An assumption is a disclosure of something you were SURE "
+        f"about. It is never a guess you are hoping nobody checks — if you are "
+        f"guessing, ask instead.",
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"`",
         f"- The OS knowledge base is the ONLY memory that survives you: "
@@ -135,6 +159,8 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "order says otherwise. User feedback may arrive as new user turns; treat it "
         "as authoritative for this work order.",
     ]
+    if project.gates:
+        parts += ["", *_gate_briefing(wo, project)]
     if knowledge:
         parts += ["", "# Knowledge base (learnings from this and other projects)"]
         for k in knowledge:
@@ -142,6 +168,37 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
             topic = f" [{k['topic']}]" if k["topic"] else ""
             parts.append(f"- ({scope}{topic}) {k['content']}")
     return "\n".join(parts)
+
+
+def _gate_briefing(wo: dict[str, Any], project: ProjectSpec) -> list[str]:
+    """Tell the worker that shipping is reachable, and how.
+
+    Worth stating explicitly: a worker that believes releases are simply forbidden will
+    finish the work order with "someone should ship this" rather than asking, and the
+    gate never gets used. The point of the gate is that the answer is "yes, with review".
+    """
+    from .gates import KINDS
+
+    live = [k for k in KINDS if k.name in project.gates.enabled]
+    lines = [
+        "# Privileged actions (gated, NOT forbidden)",
+        "These actions are reviewed before they run — an independent reviewer (Neo, the "
+        "user's delegate) decides, and approval lets you proceed:",
+    ]
+    lines += [f"- `{k.name}` — {k.summary}" for k in live]
+    lines += [
+        "",
+        "Attempting one directly is safe: the attempt is blocked, a request is filed "
+        "automatically, and you are told to wait. But you make a much stronger case by "
+        "asking first, because the reviewer sees ONLY the text you write:",
+        f"    jarvis gate request {wo['id']} \"<the exact command>\" "
+        f"--why \"<why this is ready>\" --evidence \"<PR number, test results, checks>\"",
+        "",
+        "Then END YOUR TURN. The verdict arrives as your next user turn. If approved, run "
+        "that exact command — the approval is scoped to that one string and expires, so "
+        "do not reword it. If denied, fix what the reason names; do not retry as-is.",
+    ]
+    return lines
 
 
 def dispatch_work_order(

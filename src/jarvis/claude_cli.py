@@ -15,12 +15,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+#: `claude` location override, mirroring bugreport's GH_BIN_ENV. Tests point it at a
+#: fake; the test-isolation gate points it at a stub that refuses to run.
+CLAUDE_BIN_ENV = "JARVIS_CLAUDE_BIN"
+
+
 class ClaudeCliError(RuntimeError):
     pass
 
 
 def claude_bin() -> str:
-    return os.environ.get("JARVIS_CLAUDE_BIN", "claude")
+    return os.environ.get(CLAUDE_BIN_ENV, "claude")
 
 
 def available() -> bool:
@@ -58,6 +63,16 @@ def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
     return proc.stdout
 
 
+# Claude Code's session-state vocabulary, as emitted by `claude agents --json` and by
+# the supervisor's own `~/.claude/jobs/<id>/state.json` (verified against CLI 2.1.220).
+# NOTE: there is no "running" here — that word belongs to Jarvis's *work order* status
+# vocabulary (see project_store.WO_STATUSES). Conflating the two silently misreads every
+# healthy worker as needing the user, so always go through the helpers below.
+ACTIVE_STATES = frozenset({"working", "starting", "queued"})
+BLOCKED_STATES = frozenset({"blocked"})
+FINISHED_STATES = frozenset({"done", "failed", "cancelled"})
+
+
 @dataclass
 class BgSession:
     """A background session as reported by `claude agents --json`."""
@@ -65,9 +80,24 @@ class BgSession:
     session_id: str
     cwd: str
     name: str
-    state: str  # running | blocked | done | ...
+    state: str  # working | blocked | done | failed | cancelled | ...
     kind: str = "background"
     started_at: float | None = None
+
+    @property
+    def is_active(self) -> bool:
+        """The agent is making progress on its own — nothing is wanted from the user."""
+        return self.state in ACTIVE_STATES
+
+    @property
+    def is_blocked(self) -> bool:
+        """The agent stopped mid-turn on a permission prompt or a question."""
+        return self.state in BLOCKED_STATES
+
+    @property
+    def is_finished(self) -> bool:
+        """The turn ended, whether it succeeded, failed or was cancelled."""
+        return self.state in FINISHED_STATES
 
 
 def list_background_sessions(cwd: Path | None = None, include_done: bool = True) -> list[BgSession]:
@@ -152,6 +182,12 @@ def spawn_background(
         args += ["--settings", str(settings_file)]
     for d in add_dirs or []:
         args += ["--add-dir", str(d)]
+    # `--` fences the prompt off from option parsing. Without it a variadic option
+    # (`--add-dir <directories...>` is one) keeps consuming positionals and swallows
+    # the prompt as a directory: the session boots with nothing to do and parks at
+    # the welcome screen forever, which reads as "created but never started".
+    # It also lets a prompt begin with a dash. Never append anything after this.
+    args.append("--")
     args.append(prompt)
     out = _run(args, cwd=cwd, timeout=120)
     m = _JOB_ID_RE.search(out or "")
@@ -220,18 +256,28 @@ def send_to_session(session_id: str, message: str, cwd: Path,
 
 def run_headless(prompt: str, system_prompt: str | None = None,
                  model: str | None = None, cwd: Path | None = None,
-                 timeout: int = 300) -> str:
+                 timeout: int = 300, tools: str | None = None) -> str:
     """One-shot headless call (`claude -p`) returning the result text.
 
     Used by Neo: the system prompt (persona + learnings) is byte-stable across
     calls, so consecutive invocations within the Anthropic cache TTL share a
     cached prefix — question-specific content rides in `prompt`, after it.
+
+    `tools` selects the callee's built-in tool set: `None` (default) leaves it
+    alone, `""` strips every tool, or a comma-separated list ("Read,Bash").
+    Strip them when the answer must come from the prompt rather than from the
+    machine — a tooled callee will happily go read the real state and answer
+    about *that*. Note this is availability, not permission: `--allowedTools`
+    and `--disallowedTools` do not remove a tool, and under
+    `permissions.defaultMode: auto` they do not stop it being used either.
     """
     args: list[str] = ["-p", prompt, "--output-format", "json"]
     if system_prompt:
         args += ["--append-system-prompt", system_prompt]
     if model:
         args += ["--model", model]
+    if tools is not None:  # "" is meaningful: it disables every tool
+        args += ["--tools", tools]
     out = _run(args, cwd=cwd, timeout=timeout)
     try:
         data = json.loads(out)

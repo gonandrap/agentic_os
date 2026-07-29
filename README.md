@@ -1,7 +1,41 @@
 # Jarvis — an agentic OS for Claude Code
 
-Jarvis is an OS layer that every Claude Code session sits on top of. Instead of running
-isolated sessions per project, you register your projects in a catalog and Jarvis:
+Jarvis is an OS layer that every Claude Code session sits on top of: register your
+projects in one catalog, hand it work orders, and it runs a Claude Code worker per task
+in its own git worktree — while `jarvis status` tells you the one thing that needs you.
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gonandrap/agentic_os/main/install.sh | bash
+```
+
+That installs the **latest release** into its own environment, puts `jarvis` on your
+PATH (`~/.local/bin`), and writes a starter catalog at `~/.jarvis/catalog.json`.
+Re-run it any time to upgrade — your catalog and state are never touched.
+You need Linux or macOS, `git`, Python 3.11+ (or [uv](https://docs.astral.sh/uv/)), and
+the [Claude Code](https://code.claude.com) CLI installed and authenticated.
+
+**Then onboard your first project** (it must be a git repository):
+
+```bash
+# 1. add it to ~/.jarvis/catalog.json:
+#      "projects": [ { "name": "my_app", "path": "~/workspace/my_app",
+#                      "description": "what this project is" } ]
+
+jarvis start --catalog ~/.jarvis/catalog.json     # 2. adopts every catalog project, starts the daemon
+jarvis wo create my_app "Add dark mode to the settings page"   # 3. give it work
+jarvis status                                     # what's running, what needs me?
+```
+
+Install options (pin a version, no dashboard, from source) are in
+[Install options](#install-options); what adoption does to a project is in
+[PROJECT_ONBOARDING.md](PROJECT_ONBOARDING.md).
+
+## What Jarvis does
+
+Instead of running isolated sessions per project, you register your projects in a
+catalog and Jarvis:
 
 - **Orchestrates** — a daemon polls each project's queue and spawns one native Claude
   Code background worker per *work order*, each in its own git worktree.
@@ -29,30 +63,46 @@ you ──┬── Jarvis persona (Claude session, incl. phone)
         (inbox, backlog, knowledge)        own git worktree, visible in agents view)
 ```
 
-## Requirements
+## Install options
 
-- Linux or macOS, Python 3.11+
-- [Claude Code](https://code.claude.com) CLI installed and authenticated
-- Your projects are git repositories
-
-## Install
+The installer (`install.sh`, also runnable from a checkout) resolves the newest
+`jarvis-X.Y.Z` tag on the repo and installs *that* — the script is fetched from `main`,
+but what you run is always a release. It uses `uv tool install` when uv is present,
+then `pipx`, then a plain `python3 -m venv` + pip, whichever it finds first.
 
 ```bash
-uv tool install jarvis-os        # or: pipx install jarvis-os
-# from a checkout:
-uv tool install --editable .
+curl -fsSL https://raw.githubusercontent.com/gonandrap/agentic_os/main/install.sh | bash -s -- --help
+
+# pass flags after `-s --` when piping:
+… | bash -s -- --tag jarvis-0.1.8      # pin an exact release
+… | bash -s -- --no-ui                 # skip the [ui] extra (no web dashboard)
+… | bash -s -- --bin-dir ~/bin         # where the `jarvis` executable lands
+… | bash -s -- --dry-run               # print the plan, change nothing
 ```
 
-`jarvis` must be on PATH (workers and hooks call it).
+`jarvis` must be on PATH — workers and hooks call it by name; the installer warns with
+the exact `export PATH=…` line if its bin dir isn't there. `jarvis --version` tells you
+which release you're on. Uninstall with `jarvis stop && uv tool uninstall jarvis-os`
+(state lives in `~/.jarvis` and each project's `.jarvis/`, so removing those is a
+separate, deliberate step).
+
+There is **no PyPI release**: the name `jarvis-os` on PyPI belongs to an unrelated
+project. Install from a release tag (above) or from a checkout:
+
+```bash
+git clone https://github.com/gonandrap/agentic_os.git && cd agentic_os
+uv tool install --editable ".[ui]"       # or: ./install.sh --tag jarvis-X.Y.Z
+```
 
 ## Quick start
 
-1. Describe your fleet in a catalog (see `catalog.example.json`):
+1. Describe your fleet in a catalog — the installer left one at `~/.jarvis/catalog.json`;
+   `catalog.example.json` in this repo shows every option:
 
 ```json
 {
   "os": {
-    "defaults": { "model": "sonnet", "permission_mode": "auto", "max_concurrent": 5 },
+    "defaults": { "model": "claude-opus-5", "permission_mode": "auto", "max_concurrent": 5 },
     "notifications": { "sinks": ["log", "telegram"] }
   },
   "projects": [
@@ -65,7 +115,7 @@ uv tool install --editable .
 2. Start the OS:
 
 ```bash
-jarvis start --catalog catalog.json
+jarvis start --catalog ~/.jarvis/catalog.json
 ```
 
 This bootstraps every project (README check, OPERATION.md contract, `.jarvis/` state
@@ -98,6 +148,7 @@ also watch and join them from `claude agents`.
 | **Catalog** | JSON file declaring projects, models, settings overrides |
 | **Work order** | A unit of work; one worker agent, one git worktree, full audit trail |
 | **Origin badge** | `jarvis`/`ui` = framework-created; `manual`/`adhoc` = flagged ⚠ in UI and status |
+| **Ad-hoc adoption** | A background session Jarvis didn't spawn is adopted so it shows up in status and the dashboard. It's a mirror, not a dispatch: it never got the worker contract, so it owes no `jarvis wo finish` and its session ending is not a failure |
 | **OPERATION.md** | Per-project contract every worker follows (assumptions, backlog, learnings, notify) |
 | **ASSUMPTIONS.md** | Per-project log of decisions workers made autonomously, pending your review |
 | **Neo** | OS-level answerer agent: workers ask (`jarvis wo ask`), Neo answers as you; you review its answers (UI neo tab) and corrections become its learnings |
@@ -126,6 +177,12 @@ replacement.
 
 Assumptions flip the work order to `needs_review` — visible in `jarvis status`, the
 dashboard, and (if configured) Telegram.
+
+Attention is re-derived from state on every reconcile tick, so it can't be cleared by
+hand — the next tick puts it back. `jarvis wo ack <id>` (or **Got it** on the work order
+page) records what you dismissed and keeps it down; a *different* blocker still surfaces.
+Pending assumptions can't be acked: they want `jarvis wo review`. Note that acking is not
+the same as `jarvis inbox ack`, which clears notifications — a different stream.
 
 ## Onboarding existing projects
 

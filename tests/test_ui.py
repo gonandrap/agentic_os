@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from jarvis import ops  # noqa: E402
+from jarvis import gates, ops  # noqa: E402
 from jarvis.catalog import load_catalog  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
 from jarvis.daemon import Daemon  # noqa: E402
+from jarvis.invariants import check_project  # noqa: E402
 from jarvis.project_store import ProjectStore  # noqa: E402
 from jarvis.ui.app import create_app  # noqa: E402
 
@@ -26,11 +29,74 @@ def daemon(catalog_file):
     return Daemon(load_catalog(catalog_file))
 
 
+@pytest.fixture()
+def gated_catalog(tmp_path, project):
+    """A catalog whose only project gates every privileged action."""
+    data = {
+        "os": {"defaults": {"model": "sonnet"},
+               "notifications": {"sinks": ["log"]}},
+        "projects": [{"name": "proj_a", "path": str(project),
+                      "description": "test project",
+                      "gates": {"enabled": list(gates.KIND_NAMES)}}],
+    }
+    path = tmp_path / "catalog-gated.json"
+    path.write_text(json.dumps(data))
+    return path
+
+
+@pytest.fixture()
+def gated(jarvis_home, fake_claude, gated_catalog, project):
+    """A started OS with a gated project, a dispatched work order, and a browser."""
+    ops.start_os(str(gated_catalog), foreground=True)
+    daemon = Daemon(load_catalog(gated_catalog))
+    wo = ops.create_work_order("proj_a", "ship version 1.2.3")
+    daemon.tick()
+
+    class Handle:
+        def __init__(self):
+            self.daemon = daemon
+            self.wo_id = wo["id"]
+            self.project = project
+            self.client = TestClient(create_app(), follow_redirects=False)
+
+        def request(self, command="./scripts/shipit.sh", why="please"):
+            """File a gate request and return the approval row."""
+            ops.request_gate_approval(self.wo_id, command, why=why)
+            store = ProjectStore(project)
+            try:
+                return store.list_approvals(self.wo_id)[0]
+            finally:
+                store.close()
+
+        def approval(self):
+            store = ProjectStore(project)
+            try:
+                return store.list_approvals(self.wo_id)[0]
+            finally:
+                store.close()
+
+    return Handle()
+
+
 def test_dashboard_renders_quiet(client):
     r = client.get("/")
     assert r.status_code == 200
     assert "all quiet" in r.text
     assert "proj_a" in r.text
+
+
+def test_dashboard_auto_refresh_is_scoped_to_the_live_regions(client):
+    """A whole-page refresh wipes a half-typed work order, so the meta tag is
+    noscript-only and JS swaps just the live regions."""
+    r = client.get("/")
+    assert '<noscript><meta http-equiv="refresh"' in r.text
+    assert r.text.count('http-equiv="refresh"') == 1
+    for region in ('id="live-chrome"', 'id="live-top"', 'id="live-bottom"'):
+        assert region in r.text
+    # the create form must sit outside the swapped regions
+    assert (r.text.index("<!-- /live-top -->")
+            < r.text.index('action="/wo/create"')
+            < r.text.index('id="live-bottom"'))
 
 
 def test_create_wo_via_ui_marks_origin(client, project):
@@ -120,7 +186,7 @@ def test_adhoc_badge_visible(client, daemon, fake_claude, project):
     sessions = fake_claude.sessions
     sessions.append({"id": "zz", "sessionId": "adhoc-9", "cwd": str(project),
                      "kind": "background", "name": "manual poking",
-                     "state": "running", "startedAt": 0})
+                     "state": "working", "startedAt": 0})
     (fake_claude.dir / "sessions.json").write_text(json.dumps(sessions))
     daemon.tick_count = 0
     daemon.tick()
@@ -198,13 +264,46 @@ def test_unknown_project_and_wo(client):
     assert "not found" in client.get("/wo/proj_a/wo-nope").text
 
 
+def test_neo_tab_lists_questions_still_with_neo(client, daemon, project):
+    """A queued question used to appear only as a number in the counts line, so a
+    Neo that had stopped draining was indistinguishable from a Neo with nothing to
+    do — the page said "Neo hasn't handled anything yet" while a worker sat parked."""
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "CSV or JSON?")
+
+    r = client.get("/neo")
+    assert r.status_code == 200
+    assert "1 queued" in r.text
+    assert "With Neo right now" in r.text
+    assert "CSV or JSON?" in r.text          # the question itself, not just a count
+    assert f"/wo/proj_a/{wo['id']}" in r.text  # traceable back to the parked worker
+
+
+def test_neo_tab_shows_a_question_stuck_mid_answer(client, daemon, project):
+    """`claim_next` flips a question to `answering` and only a completed drain moves
+    it on; a crash in between strands it, since neo_tick only ever looks at `queued`.
+    Stranded is exactly when the user needs to see it."""
+    from jarvis.neo_store import NeoStore
+
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "CSV or JSON?")
+    neo = NeoStore()
+    try:
+        assert neo.claim_next()["status"] == "answering"  # drain dies right here
+    finally:
+        neo.close()
+
+    r = client.get("/neo")
+    assert "CSV or JSON?" in r.text
+    assert "answering" in r.text
+
+
 def test_neo_tab_review_flow(client, daemon, project):
     wo = ops.create_work_order("proj_a", "pick a format")
     daemon.tick()
     ops.ask_question(wo["id"], "CSV or JSON?")
-    r = client.get("/neo")
-    assert r.status_code == 200  # queued question renders in counts
-    assert "1 queued" in r.text
 
     daemon._neo_drain()
     r = client.get("/neo")
@@ -250,6 +349,140 @@ def test_neo_teach_directly(client):
     assert r.status_code == 303
     page = client.get("/neo")
     assert "prefer uv over pip" in page.text
+
+
+def test_gates_tab_is_empty_and_unbadged_when_nothing_is_gated(client):
+    r = client.get("/gates")
+    assert r.status_code == 200
+    assert "nothing under review" in r.text
+    assert "no gate has been decided yet" in r.text
+    # an ungated fleet must not grow a nav badge asking for attention it doesn't need
+    assert 'href="/gates"' in r.text
+    assert '<span class="nav-badge">' not in r.text  # the CSS rule always matches
+
+
+def test_gates_tab_shows_the_request_the_reviewer_saw(gated):
+    """Approving a bare command string is not a review. The page has to carry the
+    same case Neo read, or the user is rubber-stamping."""
+    approval = gated.request(why="all tests pass, PR is merged")
+    gated.daemon._neo_drain()  # the fake model escalates by default
+
+    r = gated.client.get("/gates")
+    assert r.status_code == 200
+    assert "Waiting on you" in r.text
+    assert "./scripts/shipit.sh" in r.text
+    assert "all tests pass, PR is merged" in r.text
+    assert "the request exactly as the reviewer saw it" in r.text
+    # the full request text Neo was given, verbatim
+    assert "PRIVILEGED ACTION REQUEST" in r.text or "cut a release" in r.text
+    assert f'id="gate-{approval["id"]}"' in r.text
+    assert '<span class="nav-badge">1</span>' in r.text  # escalated ⇒ the tab is badged
+
+
+def test_gate_pending_with_neo_costs_no_badge(gated):
+    """A request Neo is still reviewing is free by design — badging it would undo
+    the entire point of having Neo review it."""
+    gated.request()
+    r = gated.client.get("/gates")
+    assert "With Neo" in r.text
+    assert "./scripts/shipit.sh" in r.text
+    assert "Waiting on you" not in r.text
+    assert '<span class="nav-badge">' not in r.text
+
+
+def test_approve_from_the_dashboard_opens_the_gate(gated):
+    from jarvis.hooks import preflight_decision
+
+    approval = gated.request()
+    gated.daemon._neo_drain()
+
+    r = gated.client.post(f"/gates/{approval['id']}/decide",
+                          data={"decision": "approve", "reason": "I checked it myself",
+                                "project": "proj_a", "next": "/gates"})
+    assert r.status_code == 303
+    assert r.headers["location"] == "/gates"
+
+    fresh = gated.approval()
+    assert fresh["status"] == "approved"
+    assert fresh["decided_by"] == "user"
+    assert fresh["decision_reason"] == "I checked it myself"
+
+    # the point of approving: the worker's retry now goes through
+    settings = json.loads(
+        (gated.project / ".jarvis" / "worker-settings"
+         / f"{gated.wo_id}.json").read_text())
+    result = preflight_decision(
+        {"tool_name": "Bash", "tool_input": {"command": "./scripts/shipit.sh"},
+         "cwd": str(gated.project)}, settings["env"])
+    assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+    page = gated.client.get("/gates").text
+    assert "Decided" in page and "approved" in page and "I checked it myself" in page
+
+
+def test_deny_from_the_dashboard_needs_a_reason(gated):
+    """ops.decide_gate refuses a reasonless denial — the worker acts on that text.
+    The dashboard must surface the refusal rather than silently doing nothing."""
+    approval = gated.request()
+    gated.daemon._neo_drain()
+
+    r = gated.client.post(f"/gates/{approval['id']}/decide",
+                          data={"decision": "deny", "reason": "  ",
+                                "project": "proj_a", "next": "/gates"})
+    assert r.status_code == 303
+    from urllib.parse import unquote
+    assert "needs a reason" in unquote(r.headers["location"])
+    assert gated.approval()["status"] == "pending"
+
+    r = gated.client.post(f"/gates/{approval['id']}/decide",
+                          data={"decision": "deny", "reason": "not this week",
+                                "project": "proj_a", "next": "/gates"})
+    assert r.status_code == 303
+    assert gated.approval()["status"] == "denied"
+
+
+def test_gate_decision_returns_to_the_page_it_was_made_from(gated):
+    """Deciding from a work order should land back on that work order, and `next`
+    must not become an open redirect out of the dashboard."""
+    approval = gated.request()
+    back = f"/wo/proj_a/{gated.wo_id}"
+
+    detail = gated.client.get(back)
+    assert "Privileged actions" in detail.text
+    assert "./scripts/shipit.sh" in detail.text
+    assert f'value="{back}"' in detail.text
+
+    r = gated.client.post(f"/gates/{approval['id']}/decide",
+                          data={"decision": "approve", "reason": "go",
+                                "project": "proj_a", "next": back})
+    assert r.headers["location"] == back
+
+    other = gated.request(command="gh pr merge 7 --squash")
+    r = gated.client.post(f"/gates/{other['id']}/decide",
+                          data={"decision": "approve", "reason": "go",
+                                "project": "proj_a", "next": "//evil.example.com"})
+    assert r.headers["location"] == "/gates"
+
+
+def test_neo_tab_sends_gate_escalations_to_the_gates_tab(gated):
+    """A gate escalation is a Neo question, so it also lands on the neo tab. Answering
+    it there queues a message and leaves the gate shut — the reply box has to be
+    replaced by a pointer at the thing that actually decides it."""
+    gated.request()
+    gated.daemon._neo_drain()
+
+    r = gated.client.get("/neo")
+    assert "PRIVILEGED ACTION REQUEST" in r.text
+    assert "decide it on the gates tab" in r.text
+    assert "Send answer to worker" not in r.text
+
+
+def test_dashboard_attention_deep_links_an_escalated_gate(gated):
+    approval = gated.request()
+    gated.daemon._neo_drain()
+    r = gated.client.get("/")
+    assert "NEEDS YOU" in r.text
+    assert f'href="/gates#gate-{approval["id"]}"' in r.text
 
 
 def test_timeline_hides_plumbing_until_debug_is_requested(client, daemon, project):
@@ -314,3 +547,81 @@ def test_delete_from_the_work_order_page_removes_it(client, project):
     finally:
         store.close()
     assert "doomed task" not in client.get("/project/proj_a").text
+
+
+def test_got_it_button_puts_the_flag_down(client, project):
+    """The dashboard complaint in one test: acking has to survive the daemon.
+
+    The attention strip is what the user actually reads, and before this there was no
+    control on the page that could clear it — `jarvis inbox ack` acks notifications,
+    which is a different store entirely.
+    """
+    wo = ops.create_work_order("proj_a", "noisy task")
+    store = ProjectStore(project)
+    store.set_status(wo["id"], "needs_review")
+    store.flag_attention(wo["id"], "finished without a completion signal — review the session")
+    assert "NEEDS YOU" in client.get("/").text
+
+    detail = client.get(f"/wo/proj_a/{wo['id']}")
+    assert "Got it" in detail.text
+    r = client.post(f"/wo/proj_a/{wo['id']}/ack")
+    assert r.status_code == 303
+
+    check_project(ProjectStore(project), repair=True)  # the daemon's next tick
+    assert "all quiet" in client.get("/").text
+
+
+def test_got_it_is_not_offered_when_a_decision_is_owed(client, project):
+    """Assumptions need accept/reject — dismissing one would drop the work silently."""
+    wo = ops.create_work_order("proj_a", "task with a judgement call")
+    store = ProjectStore(project)
+    store.add_assumption(wo["id"], "picked postgres over sqlite")
+    store.set_status(wo["id"], "needs_review")
+    store.flag_attention(wo["id"], "1 assumption pending your review")
+
+    detail = client.get(f"/wo/proj_a/{wo['id']}")
+    assert "Got it" not in detail.text
+
+    r = client.post(f"/wo/proj_a/{wo['id']}/ack")  # forced by hand anyway
+    assert r.status_code == 303
+    assert "error=" in r.headers["location"]
+    assert store.get_work_order(wo["id"])["needs_attention"]
+
+
+def test_stale_deep_link_to_unregistered_project_is_not_a_500(client):
+    """Notifications embed a deep link built from whatever project name the emitter
+    passed. When that project is not (or is no longer) registered the dashboard has
+    to say so — a bare "Internal Server Error" tells the user nothing and leaves
+    them unable to tell a Jarvis bug from a vanished work order.
+    """
+    r = client.get("/wo/proj_gone/wo-4fdb20ba")
+    assert r.status_code == 200
+    assert "Internal Server Error" not in r.text
+    assert "proj_gone" in r.text and "not registered" in r.text
+
+
+def test_unexpected_error_renders_a_page_and_lands_in_the_os_log(
+        jarvis_home, fake_claude, catalog_file, monkeypatch):
+    """Defence in depth: whatever else breaks, the dashboard owes the user a page
+    and the OS owes itself a trace on disk. Before this, UI tracebacks went to the
+    systemd journal only — invisible to `$JARVIS_HOME/logs`, to Jarvis and to Neo.
+
+    Starlette always re-raises after sending the response so the server can log it,
+    hence `raise_server_exceptions=False` — a real browser still gets the page.
+    """
+    ops.start_os(str(catalog_file), foreground=True)
+    c = TestClient(create_app(), follow_redirects=False, raise_server_exceptions=False)
+
+    def boom():
+        raise RuntimeError("kaboom in os_status")
+
+    monkeypatch.setattr(ops, "os_status", boom)
+    r = c.get("/")
+    assert r.status_code == 500
+    assert "something went wrong" in r.text.lower()
+    assert "kaboom in os_status" in r.text
+
+    log = (jarvis_home / "logs" / "ui.log").read_text()
+    assert "kaboom in os_status" in log
+    assert "GET /" in log
+    assert "RuntimeError" in log

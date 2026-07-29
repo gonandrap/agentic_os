@@ -16,8 +16,9 @@ pytest evals -q
 
 **LLM-graded evals** (`evals/llm/`) — batteries against the real `claude` CLI, judging
 the parts only a model can get wrong: Neo's escalation judgment, adherence to
-learnings, and the Jarvis persona's route-don't-do discipline. They cost tokens and
-need a logged-in Claude Code, so they are opt-in:
+learnings, the Jarvis persona's route-don't-do discipline, and the worker contract's
+assume-vs-ask judgment. They cost tokens and need a logged-in Claude Code, so they are
+opt-in:
 
 ```bash
 JARVIS_EVALS_LLM=1 pytest evals/llm -q            # default model: sonnet

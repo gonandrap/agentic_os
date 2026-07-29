@@ -14,6 +14,7 @@ from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
 from jarvis.hooks import handle_hook
+from jarvis.invariants import true_blockers
 from jarvis.project_store import ProjectStore
 
 
@@ -360,6 +361,111 @@ def test_delivery_retires_the_previous_session(started, fake_claude, project):
     assert store.get_work_order(wo["id"])["session_id"] == sid
 
 
+def test_reopened_session_does_not_walk_the_binding_backwards(started, fake_claude, project):
+    """Re-opening a spent session must not re-point the work order at it.
+
+    From wo-9478c1be, live: after turn one the user opened the finished agent in the
+    agents view to read it. Re-opening respawns that session under its ORIGINAL id, so
+    SessionStart fired again — and the hook rebound the work order to a session that
+    had already been stopped. The next delivered turn then forked from that stale
+    conversation (losing turn two entirely) and "retired" the already-stopped agent,
+    so the genuinely live one was orphaned into the agents view for good.
+    """
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    first_sid = bind_session(daemon, project, wo["id"])
+
+    fake_claude.set_session_state(first_sid, "done")
+    ops.send_message(wo["id"], "first follow-up", source="ui")
+    daemon.tick_count = 0
+    daemon.tick()
+    daemon.delivery_pool.shutdown(wait=True)
+    from concurrent.futures import ThreadPoolExecutor
+    daemon.delivery_pool = ThreadPoolExecutor(max_workers=2)
+    fork_sid = bind_session(daemon, project, wo["id"])
+    assert fork_sid != first_sid
+
+    # the user re-opens turn one's agent: same session id, SessionStart fires again
+    handle_hook({"hook_event_name": "SessionStart", "session_id": first_sid,
+                 "cwd": str(project)},
+                {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)})
+    assert store.get_work_order(wo["id"])["session_id"] == fork_sid
+    assert "session_rebind_ignored" in [e["kind"] for e in store.list_events(wo["id"])]
+
+    # ...and the next turn still forks from the live session, not the re-opened one
+    fake_claude.set_session_state(fork_sid, "done")
+    ops.send_message(wo["id"], "second follow-up", source="ui")
+    daemon.tick_count = 0
+    daemon.tick()
+    daemon.delivery_pool.shutdown(wait=True)
+
+    resumes = [c for c in fake_claude.calls
+               if "--bg" in c["argv"] and "--resume" in c["argv"]]
+    assert [c["argv"][c["argv"].index("--resume") + 1] for c in resumes] == \
+        [first_sid, fork_sid]
+    mine = [s for s in fake_claude.sessions if s["name"].startswith(f"[WO {wo['id']}]")]
+    assert len(mine) == 1, f"orphaned sessions: {[s['sessionId'] for s in mine]}"
+
+
+def test_hooks_from_a_superseded_session_do_not_steer_the_work_order(started, fake_claude,
+                                                                    project):
+    """A spent session still fires hooks — its SessionEnd must not end the work order.
+
+    Stopping the session Jarvis forked from raises SessionEnd for it moments after the
+    fork started working. Acted on, that files a live work order for review with
+    "session ended without `jarvis wo finish`".
+    """
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    first_sid = bind_session(daemon, project, wo["id"])
+
+    fake_claude.set_session_state(first_sid, "done")
+    ops.send_message(wo["id"], "follow-up", source="ui")
+    daemon.tick_count = 0
+    daemon.tick()
+    daemon.delivery_pool.shutdown(wait=True)
+    bind_session(daemon, project, wo["id"])  # the fork takes the binding
+
+    for event in ("SessionEnd", "Notification", "Stop"):
+        handle_hook({"hook_event_name": event, "session_id": first_sid,
+                     "cwd": str(project), "message": "Claude is waiting for your input"},
+                    {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)})
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "running"
+    assert fresh["needs_attention"] == 0
+
+
+def test_follow_up_turn_is_briefed_like_the_first(started, fake_claude, project):
+    """A resumed session re-derives its system prompt at launch — it does not inherit
+    the first turn's from the transcript. So the fork must carry the same briefing:
+    without it the project's standing instructions to the worker (and the OS skills
+    directory) silently vanish from turn two onwards."""
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task", model="opus",
+                               append_system_prompt="never touch production")
+    daemon.tick()
+    sid = bind_session(daemon, project, wo["id"])
+
+    fake_claude.set_session_state(sid, "done")
+    ops.send_message(wo["id"], "follow-up", source="ui")
+    daemon.tick_count = 0
+    daemon.tick()
+    daemon.delivery_pool.shutdown(wait=True)
+
+    resumes = [c for c in fake_claude.calls
+               if "--bg" in c["argv"] and "--resume" in c["argv"]]
+    argv = resumes[-1]["argv"]
+    assert argv[argv.index("--append-system-prompt") + 1] == "never touch production"
+    assert argv[argv.index("--model") + 1] == "opus"
+    assert argv[argv.index("--add-dir") + 1].endswith("agent-skills")
+    assert argv[-1] == "follow-up"  # the prompt still survives the variadic --add-dir
+
+
 def test_finish_and_assumption_review(started, project):
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
@@ -450,14 +556,18 @@ def test_reconciler_flags_unfinished_idle_worker(started, fake_claude, project):
     assert "without `jarvis wo finish`" in fresh["attention_reason"]
 
 
+def _add_adhoc(fake_claude, project, state, sid="adhoc-session-1", name="my manual hack"):
+    sessions = fake_claude.sessions
+    sessions.append({"id": "abcd1234", "sessionId": sid,
+                     "cwd": str(project), "kind": "background",
+                     "name": name, "state": state, "startedAt": 0})
+    (fake_claude.dir / "sessions.json").write_text(json.dumps(sessions))
+
+
 def test_reconciler_adopts_adhoc_sessions(started, fake_claude, project):
     daemon = started
     # a bg session someone started by hand in the project dir
-    sessions = fake_claude.sessions
-    sessions.append({"id": "abcd1234", "sessionId": "adhoc-session-1",
-                     "cwd": str(project), "kind": "background",
-                     "name": "my manual hack", "state": "running", "startedAt": 0})
-    (fake_claude.dir / "sessions.json").write_text(json.dumps(sessions))
+    _add_adhoc(fake_claude, project, "working")
 
     daemon.tick_count = 0
     daemon.tick()
@@ -470,6 +580,83 @@ def test_reconciler_adopts_adhoc_sessions(started, fake_claude, project):
     daemon.tick_count = 0
     daemon.tick()
     assert len([w for w in store.list_work_orders() if w["origin"] == "adhoc"]) == 1
+
+
+def test_adopted_working_session_does_not_ask_for_input(started, fake_claude, project):
+    """A healthy ad-hoc worker must never be adopted as "waiting on you".
+
+    Regression: the reconciler compared Claude Code's session state against
+    "running" — a word the CLI never emits (it says "working") — so every live
+    ad-hoc session was adopted straight into waiting_input and the UI claimed the
+    session wanted the user while it was quietly making progress.
+    """
+    daemon = started
+    _add_adhoc(fake_claude, project, "working")
+    daemon.tick_count = 0
+    daemon.tick()
+
+    store = ProjectStore(project)
+    adhoc = [w for w in store.list_work_orders() if w["origin"] == "adhoc"][0]
+    assert adhoc["status"] == "running"
+    assert not adhoc["needs_attention"]
+    assert not true_blockers(store, adhoc)
+
+
+def test_adopted_blocked_session_asks_for_input(started, fake_claude, project):
+    daemon = started
+    _add_adhoc(fake_claude, project, "blocked")
+    daemon.tick_count = 0
+    daemon.tick()
+
+    store = ProjectStore(project)
+    adhoc = [w for w in store.list_work_orders() if w["origin"] == "adhoc"][0]
+    assert adhoc["status"] == "waiting_input"
+    assert adhoc["needs_attention"]
+
+
+def test_reconciler_clears_attention_when_worker_resumes(started, fake_claude, project):
+    """waiting_input must not be sticky: a worker that unblocks stops needing the user.
+
+    Regression: nothing could ever move a work order back to `running`, so the
+    "needs you" banner survived long after the worker had resumed.
+    """
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    sid = bind_session(daemon, project, wo["id"])
+
+    fake_claude.set_session_state(sid, "blocked")  # hit a permission prompt
+    daemon.tick_count = 0
+    daemon.tick()
+    blocked = store.get_work_order(wo["id"])
+    assert blocked["status"] == "waiting_input"
+    assert blocked["needs_attention"]
+
+    fake_claude.set_session_state(sid, "working")  # user answered; worker carries on
+    daemon.tick_count = 0
+    daemon.tick()
+    resumed = store.get_work_order(wo["id"])
+    assert resumed["status"] == "running"
+    assert not resumed["needs_attention"]
+    assert not true_blockers(store, resumed)
+
+
+@pytest.mark.parametrize("state", ["failed", "cancelled"])
+def test_reconciler_settles_non_done_terminal_states(started, fake_claude, project, state):
+    """A session that died is finished too — it must not hang in `running` forever."""
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    sid = bind_session(daemon, project, wo["id"])
+
+    fake_claude.set_session_state(sid, state)
+    daemon.tick_count = 0
+    daemon.tick()
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "needs_review"
+    assert fresh["needs_attention"]
 
 
 def test_backlog_promotion_with_dependencies(started, project):
@@ -493,6 +680,16 @@ def test_backlog_promotion_with_dependencies(started, project):
 def test_wo_not_found(started):
     with pytest.raises(ops.OpsError, match="not found"):
         ops.find_work_order("wo-doesnotexist")
+
+
+def test_wo_lookup_scoped_to_unregistered_project(started):
+    """A deep link can name a project the OS does not know — a notification that
+    outlived its project, a typo, a test fixture that leaked into a real sink.
+    That must arrive as an OpsError: the CLI and the dashboard only catch OpsError,
+    so a raw KeyError here becomes a traceback and an HTTP 500.
+    """
+    with pytest.raises(ops.OpsError, match="not registered"):
+        ops.find_work_order("wo-4fdb20ba", "proj_gone")
 
 
 def test_pretooluse_auto_allows_jarvis_chains():

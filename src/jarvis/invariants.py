@@ -32,6 +32,8 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
+from . import db
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .project_store import ProjectStore
 
@@ -81,17 +83,44 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     if pending:
         n = len(pending)
         blockers.append(f"{n} assumption{'s' if n != 1 else ''} pending your review")
-    if wo["status"] == "failed":
+    # A privileged action Neo declined to decide on. Nobody else can open that gate, and
+    # the work order cannot proceed past it.
+    for approval in store.escalated_approvals(wo["id"]):
+        blockers.append(
+            f"gate approval needed: {approval['kind']} (request {approval['id']})"
+        )
+    # Two of the blockers below only exist because Jarvis dispatched the worker and
+    # briefed it on the contract (`jarvis wo finish`, worktree, OPERATION.md). An
+    # adopted ad-hoc session got none of that — no JARVIS_WO_ID, no briefing — so it
+    # cannot signal completion and its session ending is not a failure. Holding it to
+    # the contract anyway made every adopted session a guaranteed attention item.
+    # Adoption exists for visibility; see Daemon.retire_adhoc.
+    governed = wo.get("origin") != "adhoc"
+    if governed and wo["status"] == "failed":
         blockers.append("worker failed — review and retry")
-    if wo["status"] == "waiting_input":
+    # Blocked on a prompt is real whoever started the session: nobody else can unstick it.
+    # A worker waiting on a gate that is still with Neo is the exception: routing those
+    # away from the user is the entire point of having a delegate, so it stays silent
+    # until Neo either decides or escalates (handled above).
+    if wo["status"] == "waiting_input" and not _waiting_on_neo_gate(store, wo):
         blockers.append("worker is waiting on your input")
-    if wo["status"] == "needs_review" and not pending:
+    if governed and wo["status"] == "needs_review" and not pending:
         blockers.append("finished without a completion signal — review the session")
-    return blockers
+    # What the user has already looked at and dismissed stops being a blocker — but only
+    # exactly that. Anything new still gets through (a pending assumption never can be
+    # acknowledged away; `jarvis wo ack` refuses).
+    acked = db.from_json(wo.get("acknowledged_blockers"), []) or []
+    return [b for b in blockers if b not in acked]
 
 
 def _mentions_assumptions(reason: str | None) -> bool:
     return "assumption" in (reason or "").lower()
+
+
+def _waiting_on_neo_gate(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """True when this work order is parked on a privileged-action request that Neo has
+    not answered yet. Not a user blocker: Neo is the one holding it."""
+    return any(not a["escalated"] for a in store.pending_approvals(wo["id"]))
 
 
 # -- invariants ---------------------------------------------------------------------
@@ -130,6 +159,44 @@ def check_attention_reason_is_true(store: ProjectStore) -> Iterator[Violation]:
             repaired=True,
             repair=f"reason set to {blockers[0]!r}",
             context={"was": reason, "now": blockers[0]},
+        )
+
+
+def check_adhoc_not_governed(store: ProjectStore) -> Iterator[Violation]:
+    """INV-ADHOC-NOT-GOVERNED — an adopted session must not be judged as a worker.
+
+    The reconciler adopts background sessions it finds in a project directory so they
+    show up in `jarvis status` and on the dashboard. That is a *mirror*, not a
+    dispatch: the session was started by the user in `claude agents`, never received
+    the worker contract, and has no way to call `jarvis wo finish`. Judging it against
+    that contract parked it in `needs_review` ("worker idle without `jarvis wo finish`")
+    the moment it ended a turn, and in `failed` ("worker session disappeared") the
+    moment the user cleaned it up — one live fleet accumulated fifteen of these, one of
+    which was the session the user was talking to.
+
+    `true_blockers` stops *new* ones. This retires the records already on disk, so the
+    fix reaches a running fleet on the next reconcile tick instead of waiting for the
+    user to hand-clear a dashboard.
+
+    Repairable: with no contract there is no verdict to make. The record, its timeline
+    and whatever reply was captured all stay; only the demand for the user goes away.
+    Anything the session genuinely left pending (an assumption it filed itself) is left
+    exactly where it is.
+    """
+    for wo in store.list_work_orders(statuses=("failed", "needs_review"),
+                                     include_hidden=True):
+        if wo["origin"] != "adhoc" or store.pending_assumptions(wo["id"]):
+            continue
+        store.set_status(wo["id"], "completed")
+        store.clear_attention(wo["id"])
+        yield Violation(
+            invariant="INV-ADHOC-NOT-GOVERNED",
+            wo_id=wo["id"],
+            detail=f"adopted ad-hoc session held to the worker contract "
+                   f"({wo.get('attention_reason') or wo['status']})",
+            repaired=True,
+            repair="retired to completed; attention cleared",
+            context={"was": wo["status"], "reason": wo.get("attention_reason")},
         )
 
 
@@ -224,6 +291,35 @@ def check_assumptions_persisted(store: ProjectStore) -> Iterator[Violation]:
             )
 
 
+def check_session_binding_moves_forward(store: ProjectStore) -> Iterator[Violation]:
+    """INV-SESSION-FORWARD — a work order must never be bound to a session it has left.
+
+    Each delivered turn forks a new session and stops the old one, so `session_id`
+    naming a *spent* session means the pointer walked backwards. Everything downstream
+    trusts it: the next message forks from that dead conversation (dropping every turn
+    since) and stops an already-stopped agent, orphaning the live one in the agents
+    view. `ProjectStore.bind_session` is what prevents it; this is the tripwire for
+    anything that writes `session_id` around it.
+
+    Not repairable: the store cannot tell which session is live — that needs the agents
+    roster — and guessing would move the binding a second time.
+    """
+    for wo in store.list_work_orders(include_hidden=True):
+        sid = wo.get("session_id")
+        if not sid:
+            continue
+        prior = db.from_json(wo.get("prior_sessions"), []) or []
+        if sid not in prior:
+            continue
+        yield Violation(
+            invariant="INV-SESSION-FORWARD",
+            wo_id=wo["id"],
+            detail=f"bound to session {sid}, which this work order already left "
+                   f"({len(prior)} spent session(s) on record)",
+            context={"session_id": sid, "prior_sessions": prior},
+        )
+
+
 def check_attention_has_reason(store: ProjectStore) -> Iterator[Violation]:
     """INV-ATTENTION-BLANK — a flagged work order must say what it wants.
 
@@ -250,12 +346,66 @@ def check_attention_has_reason(store: ProjectStore) -> Iterator[Violation]:
             )
 
 
+# -- configuration checks (catalog, not database state) ------------------------------
+
+
+def check_gate_deny_conflict(spec: Any) -> Iterator[Violation]:
+    """INV-GATE-DENY-CONFLICT — an enabled gate must not also be denied outright.
+
+    A gate and a `deny` rule for the same command are not belt-and-braces, they are a
+    contradiction that resolves against the gate. Claude Code evaluates deny rules
+    regardless of what a PreToolUse hook returned, so the approved retry is blocked too
+    — and every surface reports success along the way: the request is filed, Neo reviews
+    it, Neo approves it, the timeline says `gate_opened`. Only the command silently never
+    runs, which reads to the user as the worker being incompetent rather than the
+    catalog being wrong.
+
+    Not repairable: the fix is an edit to the user's catalog, which is theirs to make.
+    Reported with the exact rule to delete.
+    """
+    from .gates import deny_conflicts
+
+    if not spec.gates:
+        return
+    deny_rules = (
+        (spec.settings_overrides.get("permissions") or {}).get("deny") or []
+    )
+    for gate_name, rule in deny_conflicts(spec.gates, deny_rules):
+        yield Violation(
+            invariant="INV-GATE-DENY-CONFLICT",
+            detail=(
+                f"project {spec.name!r} enables the `{gate_name}` gate but also denies "
+                f"{rule!r} in settings_overrides. A deny rule beats a hook's allow, so "
+                f"approval can never take effect: remove {rule!r} from the catalog and "
+                f"let the gate mediate it."
+            ),
+            context={"project": spec.name, "gate": gate_name, "rule": rule},
+        )
+
+
+def check_catalog(catalog: Any, project: str | None = None) -> list[Violation]:
+    """Config-level post-conditions over the catalog itself.
+
+    Separate from the store checks below because the subject is different: these predict
+    that the OS *cannot* do something it has been configured to do, which no amount of
+    database state will reveal.
+    """
+    found: list[Violation] = []
+    for spec in catalog.projects:
+        if project and spec.name != project:
+            continue
+        found.extend(check_gate_deny_conflict(spec))
+    return found
+
+
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
     check_attention_reason_is_true,
+    check_adhoc_not_governed,      # retire before the flag checks judge the leftovers
     check_no_phantom_attention,
     check_blocked_work_is_surfaced,
     check_attention_has_reason,
+    check_session_binding_moves_forward,
 )
 
 

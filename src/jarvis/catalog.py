@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .gates import GateConfig
+
 # Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
 VALID_PERMISSION_MODES = {
     "acceptEdits",
@@ -23,6 +25,12 @@ VALID_PERMISSION_MODES = {
 # project's PreToolUse deny guards (catalog settings_overrides), which fire in every
 # mode; `auto` does not weaken those. See ASSUMPTIONS.md §9.
 DEFAULT_PERMISSION_MODE = "auto"
+
+# Model every worker runs on unless the catalog overrides it (os.defaults.model, a
+# project's `model`, or per work order via `jarvis wo create --model`). Passed straight
+# through to `claude --model`, so it accepts a full model id (pinned, as here) or an
+# alias like `opus`/`sonnet` (which floats to whatever is latest in that tier).
+DEFAULT_MODEL = "claude-opus-5"
 
 # Modes in which a `--bg` worker never stalls waiting for a human: `auto` (classifier
 # vets each action), `bypassPermissions` (no checks), and `dontAsk` (unlisted tools are
@@ -63,6 +71,10 @@ class ProjectSpec:
     worker: WorkerDefaults = field(default_factory=WorkerDefaults)
     settings_overrides: dict[str, Any] = field(default_factory=dict)
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
+    # Privileged actions this project's workers may attempt under review rather than
+    # not at all (see gates.py). Off by default: enabling a gate widens what a worker
+    # can do, so it is always a deliberate per-project choice.
+    gates: GateConfig = field(default_factory=GateConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -77,7 +89,7 @@ class NeoConfig:
 
 @dataclass
 class OsConfig:
-    default_model: str = "sonnet"
+    default_model: str = DEFAULT_MODEL
     default_effort: str | None = None
     default_permission_mode: str = DEFAULT_PERMISSION_MODE
     default_max_concurrent: int = DEFAULT_MAX_CONCURRENT
@@ -141,7 +153,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     )
 
     os_cfg = OsConfig(
-        default_model=defaults.get("model", "sonnet"),
+        default_model=defaults.get("model", DEFAULT_MODEL),
         default_effort=defaults.get("effort"),
         default_permission_mode=defaults.get("permission_mode", DEFAULT_PERMISSION_MODE),
         default_max_concurrent=int(defaults.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),
@@ -193,6 +205,10 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             permission_mode=pmode,
             append_system_prompt=w.get("append_system_prompt"),
         )
+        try:
+            gate_cfg = GateConfig.parse(p.get("gates"))
+        except ValueError as e:
+            raise _err(f"project {name}: {e}") from e
         projects.append(
             ProjectSpec(
                 name=name,
@@ -202,6 +218,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 worker=worker,
                 settings_overrides=p.get("settings_overrides", {}),
                 max_concurrent=max_conc,
+                gates=gate_cfg,
                 raw=p,
             )
         )

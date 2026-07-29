@@ -175,12 +175,17 @@ class Daemon:
     def deliver_messages(self, project: ProjectSpec, store: ProjectStore,
                          sessions_by_cwd: dict[str, list[claude_cli.BgSession]]) -> None:
         proot = str(project.path)
-        by_sid = {
-            s.session_id: s
+        mine = [
+            s
             for cwd, group in sessions_by_cwd.items()
             if cwd == proot or cwd.startswith(proot + "/")
-            for s in group if s.session_id
-        }
+            for s in group
+        ]
+        by_sid = {s.session_id: s for s in mine if s.session_id}
+        # Jarvis wrote `job_id` itself on the last spawn, so it names the turn the OS
+        # actually started. Preferred over `session_id`, which is written by whichever
+        # session fires a SessionStart hook.
+        by_job = {s.id: s for s in mine if s.id}
         for msg in store.queued_messages():
             if msg["id"] in self.in_flight_deliveries:
                 continue
@@ -191,19 +196,24 @@ class Daemon:
                 continue
             if not wo.get("session_id"):
                 continue  # not dispatched yet; prompt will pick it up when it runs
-            sess = by_sid.get(wo["session_id"])
+            sess = by_job.get(wo.get("job_id") or "") or by_sid.get(wo["session_id"])
             # Deliverable only when the session is idle (done) or already released:
             # `claude --resume` refuses sessions owned by a live bg agent, and
             # injecting into a mid-turn worker would interleave anyway.
-            if sess is not None and sess.state != "done":
+            if sess is not None and not sess.is_finished:
                 continue
             self.in_flight_deliveries.add(msg["id"])
             store.add_event(wo["id"], "delivering", {"msg_id": msg["id"]})
             bg_id = sess.id if sess is not None else None
-            self.delivery_pool.submit(self._deliver, project, wo, dict(msg), bg_id)
+            # Resume the live session, not the recorded one: they differ whenever the
+            # binding was walked backwards, and forking the wrong one silently drops
+            # every turn since from the worker's context.
+            resume_sid = sess.session_id if sess is not None else wo["session_id"]
+            self.delivery_pool.submit(self._deliver, project, wo, dict(msg), bg_id,
+                                      resume_sid)
 
     def _deliver(self, project: ProjectSpec, wo: dict, msg: dict,
-                 bg_id: str | None = None) -> None:
+                 bg_id: str | None = None, resume_sid: str | None = None) -> None:
         """Deliver a queued user message to the worker's conversation.
 
         Primary path: dispatch a NEW background agent resuming the worker's session
@@ -213,7 +223,14 @@ class Daemon:
         is up — so a multi-turn conversation keeps exactly one live agent, not one
         per turn. Fallback: release the idle session and resume it headlessly
         (stop + `--resume -p`).
+
+        The fork is briefed exactly like the first turn (model, effort, extra system
+        prompt, OS skills). A resumed session re-derives its system prompt at launch
+        rather than inheriting it from the transcript, so anything omitted here is
+        simply absent from turn two onwards — including the project's own standing
+        instructions to the worker.
         """
+        from .bootstrap import install_agent_skills
         from .dispatch import _write_worker_settings, worker_name
 
         store = ProjectStore(project.path)  # thread-local connection
@@ -221,25 +238,31 @@ class Daemon:
             log.info("[%s] delivering message %s to %s", project.name, msg["id"], wo["id"])
             wt = project.path / ".claude" / "worktrees" / (wo.get("worktree") or "")
             cwd = wt if wo.get("worktree") and wt.is_dir() else project.path
+            resume_sid = resume_sid or wo["session_id"]
             try:
                 job_id = claude_cli.spawn_background(
                     prompt=msg["content"],
                     cwd=cwd,
                     name=worker_name(wo),
-                    model=wo.get("model"),
+                    model=wo.get("model") or project.worker.model,
+                    effort=wo.get("effort") or project.worker.effort,
                     permission_mode=wo.get("permission_mode"),
+                    append_system_prompt=(wo.get("append_system_prompt")
+                                          or project.worker.append_system_prompt),
                     settings_file=_write_worker_settings(project, wo),
-                    resume_session_id=wo["session_id"],
+                    add_dirs=[install_agent_skills(project.path)],
+                    resume_session_id=resume_sid,
                 )
                 store.mark_message(msg["id"], "delivered")
                 store.add_event(wo["id"], "message_delivered",
-                                {"msg_id": msg["id"], "via": "bg-resume", "job": job_id})
+                                {"msg_id": msg["id"], "via": "bg-resume", "job": job_id,
+                                 "resumed": resume_sid})
                 # Retire the session we just forked from — strictly AFTER the fork
                 # exists, so the conversation is never left without a live agent.
                 # Otherwise every turn leaks a spent bg agent into the agents view.
                 if bg_id and claude_cli.stop_session(bg_id):
                     store.add_event(wo["id"], "session_retired",
-                                    {"bg_id": bg_id, "session_id": wo["session_id"],
+                                    {"bg_id": bg_id, "session_id": resume_sid,
                                      "reason": "superseded by resume-fork"})
                 if store.get_work_order(wo["id"])["status"] in ("waiting_input", "needs_review"):
                     store.set_status(wo["id"], "running")
@@ -251,7 +274,7 @@ class Daemon:
                 log.warning("[%s] bg-resume delivery failed (%s); falling back to headless resume",
                             project.name, e)
                 result = claude_cli.send_to_session(
-                    wo["session_id"], msg["content"], cwd=project.path, bg_id=bg_id,
+                    resume_sid, msg["content"], cwd=project.path, bg_id=bg_id,
                 )
                 store.mark_message(msg["id"], "delivered")
                 store.add_event(wo["id"], "message_delivered",
@@ -299,7 +322,9 @@ class Daemon:
             ppath = paths.get(q["project"])
             pstore = ProjectStore(ppath) if ppath and ppath.is_dir() else None
             try:
-                if verdict["escalate"]:
+                if q.get("kind") == "approval":
+                    self._deliver_gate_verdict(central, pstore, q, verdict)
+                elif verdict["escalate"]:
                     central.add_inbox(
                         project=q["project"], level="warning",
                         title=f"Neo escalated a question from {q['wo_id']}",
@@ -334,6 +359,67 @@ class Daemon:
         finally:
             store.close()
             central.close()
+
+    def _deliver_gate_verdict(self, central: CentralStore, pstore: ProjectStore | None,
+                              q: dict, verdict: dict) -> None:
+        """Apply Neo's verdict on a privileged-action request.
+
+        An escalation leaves the request `pending` on purpose: the gate is still shut and
+        the user is now the one holding the key, so the row must stay claimable by
+        `jarvis gate approve`. Only an explicit approve/deny closes it.
+        """
+        from . import gates
+
+        if pstore is None:
+            log.error("gate verdict for %s has no project store — request %s left pending",
+                      q["wo_id"], q["id"])
+            return
+        approval = pstore.approval_for_question(q["id"])
+        if approval is None:
+            log.error("neo question %s is an approval with no approval row", q["id"])
+            return
+
+        if verdict["escalate"]:
+            central.add_inbox(
+                project=q["project"], level="warning",
+                title=f"Approval needed: {approval['kind']} from {q['wo_id']}",
+                body=(f"Neo declined to decide: {verdict['reason']}\n\n"
+                      f"Command: {approval['command']}\n\n"
+                      f"Approve it with: jarvis gate approve {approval['id']} "
+                      f"--reason \"...\"\n"
+                      f"Deny it with:    jarvis gate deny {approval['id']} "
+                      f"--reason \"...\"\n"
+                      f"Full request:    jarvis gate show {approval['id']}"),
+                wo_id=q["wo_id"],
+            )
+            pstore.mark_approval_escalated(approval["id"], verdict["reason"])
+            pstore.flag_attention(
+                q["wo_id"],
+                f"gate approval escalated by Neo: {approval['kind']} "
+                f"(request {approval['id']})",
+            )
+            pstore.add_event(q["wo_id"], "gate_escalated", {
+                "approval_id": approval["id"], "reason": verdict["reason"],
+            })
+            return
+
+        approved = bool(verdict.get("approve"))
+        gates.apply_decision(pstore, approval["id"], approved=approved,
+                             reason=verdict["reason"], decided_by="neo")
+        # A shipped release is something the user wants to know happened, even when they
+        # did not have to authorise it — that is the trade for spending none of their
+        # attention on the approval itself.
+        central.add_inbox(
+            project=q["project"],
+            level="info" if approved else "warning",
+            title=(f"Neo {'approved' if approved else 'denied'} "
+                   f"{approval['kind']} for {q['wo_id']}"),
+            body=(f"{verdict['reason']}\n\nCommand: {approval['command']}\n"
+                  f"Review Neo's call with: jarvis neo review {q['id']}"),
+            wo_id=q["wo_id"],
+        )
+        log.info("gate %s %s by neo for %s", approval["id"],
+                 "approved" if approved else "denied", q["wo_id"])
 
     # -- 5. invariants (post-conditions) --------------------------------------------------
 
@@ -412,6 +498,24 @@ class Daemon:
         self.reply_capture_misses.pop(wo["id"], None)
         return True
 
+    def retire_adhoc(self, store: ProjectStore, wo: dict, why: str) -> None:
+        """Close an adopted session's record without passing judgement on it.
+
+        Jarvis did not dispatch this session: it was started by the user in
+        `claude agents` and adopted afterwards so it would show up in `jarvis status`
+        and on the dashboard. It never got `JARVIS_WO_ID` or the worker briefing, so it
+        owes no `jarvis wo finish` and its ending is not an incident. Marking it
+        `failed`/`needs_review` (as this reconciler used to) turned every session the
+        user ran into a permanent attention item.
+
+        The record keeps everything it learned — timeline, captured replies, any
+        assumptions — it just stops demanding the user.
+        """
+        store.set_status(wo["id"], "completed")
+        store.clear_attention(wo["id"])
+        store.add_event(wo["id"], "adhoc_retired", {"why": why})
+        log.info("retired ad-hoc %s (%s)", wo["id"], why)
+
     def reconcile_project(
         self,
         project: ProjectSpec,
@@ -435,7 +539,7 @@ class Daemon:
         # is already `completed`, so the status-filtered loop below would never see it.
         for wo in store.work_orders_awaiting_reply():
             sess = by_session_id.get(wo.get("session_id") or "")
-            if sess is None or sess.state == "done":
+            if sess is None or sess.is_finished:
                 self.capture_worker_reply(store, wo)
 
         # Settle framework work orders against live session states.
@@ -446,7 +550,7 @@ class Daemon:
                 # SessionStart hook hasn't reported yet.
                 sess = by_name_prefix.get(wo["id"])
                 if sess and sess.session_id:
-                    store.update_work_order(wo["id"], session_id=sess.session_id)
+                    store.bind_session(wo["id"], sess.session_id)
                     store.add_event(wo["id"], "session_bound", {"via": "reconciler",
                                                                 "session_id": sess.session_id})
                     sid = sess.session_id
@@ -462,20 +566,33 @@ class Daemon:
                     continue  # may not have registered yet
                 age = time.time() - wo["updated_at"]
                 if age > 120:
-                    store.set_status(wo["id"], "failed")
-                    store.flag_attention(wo["id"], "worker session disappeared")
-                    store.add_notification(
-                        title=f"{wo['id']} worker disappeared",
-                        body=f"Session {sid} no longer exists.",
-                        level="warning", wo_id=wo["id"], source="reconciler",
-                    )
+                    if wo["origin"] == "adhoc":
+                        # The user's own session, gone from the agents view. They
+                        # closed it — that is housekeeping, not an incident.
+                        self.retire_adhoc(store, wo, "session left the agents view")
+                    else:
+                        # Jarvis dispatched this one and promised to see it through,
+                        # so a vanished session is a real failure.
+                        store.set_status(wo["id"], "failed")
+                        store.flag_attention(wo["id"], "worker session disappeared")
+                        store.add_notification(
+                            title=f"{wo['id']} worker disappeared",
+                            body=f"Session {sid} no longer exists.",
+                            level="warning", wo_id=wo["id"], source="reconciler",
+                        )
                 continue
-            if sess.state == "running" and wo["status"] != "running":
+            if sess.is_active and wo["status"] != "running":
+                # The agent is making progress again, so whatever stalled it is gone.
+                # This direction matters as much as the one below: without it a work
+                # order that blocked once stays "needs you" forever and the UI keeps
+                # asking for input the worker no longer wants.
                 store.set_status(wo["id"], "running")
-            elif sess.state == "blocked" and wo["status"] == "running":
+                if not store.pending_assumptions(wo["id"]):
+                    store.clear_attention(wo["id"])
+            elif sess.is_blocked and wo["status"] == "running":
                 store.set_status(wo["id"], "waiting_input")
                 store.flag_attention(wo["id"], "worker blocked (permission or input needed)")
-            elif sess.state == "done":
+            elif sess.is_finished:
                 if not self.capture_worker_reply(store, wo):
                     continue  # settle only once the record holds what the worker said
                 fresh = store.get_work_order(wo["id"])
@@ -486,19 +603,38 @@ class Daemon:
                     else:
                         store.set_status(wo["id"], "completed")
                         store.clear_attention(wo["id"])
+                elif store.pending_approvals(wo["id"]):
+                    # Parked on a privileged-action gate: it was told to end its turn and
+                    # wait for the verdict, so an idle session is compliance, not
+                    # abandonment. Judging it here would file the work order for review
+                    # while the thing it is waiting for is still in Neo's queue.
+                    if wo["status"] != "waiting_input":
+                        store.set_status(wo["id"], "waiting_input")
                 elif not store.queued_messages(wo["id"]):
-                    store.set_status(wo["id"], "needs_review")
-                    store.flag_attention(
-                        wo["id"], "worker idle without `jarvis wo finish` — review the session"
-                    )
+                    if wo["origin"] == "adhoc":
+                        # Not a dispatched worker: ending a turn is just a turn ending.
+                        self.retire_adhoc(store, wo, "session went idle")
+                    else:
+                        store.set_status(wo["id"], "needs_review")
+                        store.flag_attention(
+                            wo["id"],
+                            "worker idle without `jarvis wo finish` — review the session",
+                        )
 
         # Adopt unknown background sessions as ad-hoc work orders (visibility).
         for sess in sessions:
             if not sess.session_id or sess.name.startswith("[WO "):
                 continue
-            if store.find_by_session(sess.session_id):
+            known = store.find_by_session(sess.session_id)
+            if known:
+                # A retired ad-hoc session can start another turn — the user just typed
+                # again. Reopen the record rather than showing "completed" next to a
+                # session that is visibly working.
+                if (known["origin"] == "adhoc" and known["status"] == "completed"
+                        and sess.is_active):
+                    store.set_status(known["id"], "running")
                 continue
-            if sess.state == "done":
+            if sess.is_finished:
                 continue  # only surface live ad-hoc sessions
             wo = store.create_work_order(
                 title=sess.name or f"ad-hoc session {sess.id}",
@@ -507,8 +643,13 @@ class Daemon:
                 origin="adhoc",
             )
             store.update_work_order(wo["id"], session_id=sess.session_id)
-            store.set_status(wo["id"], "running" if sess.state == "running" else "waiting_input")
-            log.info("[%s] adopted ad-hoc session %s as %s", project.name, sess.id, wo["id"])
+            if sess.is_blocked:
+                store.set_status(wo["id"], "waiting_input")
+                store.flag_attention(wo["id"], "worker blocked (permission or input needed)")
+            else:
+                store.set_status(wo["id"], "running")
+            log.info("[%s] adopted ad-hoc session %s (%s) as %s",
+                     project.name, sess.id, sess.state, wo["id"])
 
 
 def run_daemon(catalog_path: str | Path, poll_interval: float = 5.0,

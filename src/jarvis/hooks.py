@@ -52,6 +52,118 @@ def _allow(reason: str) -> dict[str, Any]:
     }
 
 
+def _deny(reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+def gate_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
+    """Mediate a privileged action: allow it if approved, otherwise get it reviewed.
+
+    Returns None when the command isn't gated — the caller then applies the ordinary
+    rules. Once a command IS recognised as privileged this never returns None: it either
+    allows (a live grant covers it) or denies. Including when the machinery itself
+    breaks — an unreadable DB must not become an open door, so errors deny.
+
+    The deny is not a refusal, it is a redirect. Approval cannot be resolved inline: the
+    hook has ~30 seconds and a Neo review takes minutes. So the first attempt files the
+    request and stops; the verdict arrives through the ordinary message channel and the
+    retry goes through.
+    """
+    from . import gates
+
+    wo_id = env.get("JARVIS_WO_ID")
+    if not wo_id:
+        return None  # interactive session — gates govern dispatched workers only
+    config = gates.GateConfig.from_json(env.get("JARVIS_GATES"))
+    if not config:
+        return None  # project hasn't opted in
+    command = (payload.get("tool_input") or {}).get("command") or ""
+    action = gates.classify(command, config)
+    if action is None:
+        return None
+
+    try:
+        return _resolve_gate(action, wo_id, env, payload)
+    except Exception as e:  # noqa: BLE001 — fail closed; see the docstring
+        return _deny(
+            f"Gate `{action.kind}`: the OS could not verify approval for this command "
+            f"({e!r}), so it is blocked. This is a fault in Jarvis, not a verdict on "
+            f"your request — report it with your `report-jarvis-bug` skill."
+        )
+
+
+def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
+                  payload: dict[str, Any]) -> dict[str, Any]:
+    from . import gates
+    from .neo_store import NeoStore
+
+    root_env = env.get("JARVIS_PROJECT_PATH")
+    root = Path(root_env) if root_env else find_project_root(Path(payload.get("cwd") or "."))
+    if root is None or not (root / ".jarvis").is_dir():
+        return _deny(
+            f"Gate `{action.kind}`: this command needs approval, but the OS cannot find "
+            f"the project database to record the request in. Blocked."
+        )
+
+    store = ProjectStore(root)
+    try:
+        grant = store.usable_grant(wo_id, action.kind, action.command)
+        if grant is not None:
+            store.consume_grant(grant["id"])
+            return _allow(
+                f"gate {grant['id']} ({action.kind}) approved by "
+                f"{grant['decided_by']}: {grant['decision_reason'] or 'no reason given'}"
+            )
+
+        prior = store.latest_approval_for(wo_id, action.kind, action.command)
+        if prior is not None and prior["status"] == "pending":
+            return _deny(
+                f"Gate `{action.kind}`: approval request {prior['id']} for this exact "
+                f"command is already under review. END YOUR TURN — the verdict arrives "
+                f"as your next user turn. Do not retry in a loop."
+            )
+        if prior is not None and prior["status"] == "denied":
+            return _deny(
+                f"Gate `{action.kind}`: this command was DENIED "
+                f"(request {prior['id']}, by {prior['decided_by']}): "
+                f"{prior['decision_reason'] or 'no reason recorded'}. Do not retry it "
+                f"as-is. Address the reason, then `jarvis gate request` afresh."
+            )
+
+        wo = store.get_work_order(wo_id)
+        neo = NeoStore()
+        try:
+            approval, question = gates.file_request(
+                store, neo, env.get("JARVIS_PROJECT", ""), wo, action,
+                justification=(
+                    "(none — the worker ran the command directly rather than filing a "
+                    "request, so no case was made for it)"
+                ),
+            )
+        finally:
+            neo.close()
+        return _deny(
+            f"Gate `{action.kind}`: {action.summary} needs approval, so this attempt was "
+            f"blocked and approval request {approval['id']} was filed for review "
+            f"(Neo question {question['id']}).\n\n"
+            f"END YOUR TURN NOW — the verdict arrives as your next user turn, and the "
+            f"retry will go through if it is approved.\n\n"
+            f"You filed no justification because you ran the command directly. To make "
+            f"the case properly (branch, PR, test results — reviewers see only what you "
+            f"write), run:\n"
+            f"    jarvis gate request {wo_id} \"{action.command}\" "
+            f"--why \"<why this is ready to ship>\" --evidence \"<PR, tests, checks>\""
+        )
+    finally:
+        store.close()
+
+
 def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
     """PreToolUse auto-approvals that keep autonomous workers unattended:
 
@@ -61,11 +173,17 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
       this work order, so the worker owns it (verified live: acceptEdits alone still
       prompted for Write in a background session). Only active for worker sessions
       (JARVIS_WO_ID set), never for interactive sessions in managed projects.
+
+    Gated privileged actions are resolved FIRST, so no auto-approval below can hand out
+    a merge or a release by accident.
     """
     tool = payload.get("tool_name")
     tool_input = payload.get("tool_input") or {}
 
     if tool == "Bash":
+        gated = gate_decision(payload, env)
+        if gated is not None:
+            return gated
         if is_jarvis_command_chain(tool_input.get("command", "")):
             return _allow("jarvis contract command")
         return None
@@ -164,6 +282,19 @@ def find_project_root(cwd: Path) -> Path | None:
     return None
 
 
+def _is_current_session(store: ProjectStore, wo_id: str, session_id: str) -> bool:
+    """Is this hook coming from the session the work order is actually bound to?
+
+    A work order outlives its sessions: every delivered turn forks a new one and the
+    old one is retired. Hooks from a retired session still arrive (it can be re-opened,
+    and it fires SessionEnd when it is stopped), and they must not steer the work
+    order. Unknown-session hooks are treated as current only when there is nothing to
+    compare against — a work order with no binding yet.
+    """
+    bound = store.get_work_order(wo_id).get("session_id")
+    return not bound or not session_id or bound == session_id
+
+
 def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
     event = payload.get("hook_event_name", "")
     session_id = payload.get("session_id", "")
@@ -202,12 +333,32 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
         })
 
         if event == "SessionStart":
-            if wo["status"] in ("dispatching",):
+            # Bind (or correct) the session id: --bg dispatch assigns its own, so the
+            # hook is the authoritative source — but only for a session the work order
+            # has never been bound to. Re-opening a spent session in the agents view
+            # respawns it under its original id and fires this hook again; binding to
+            # that walks the work order backwards onto a stopped session (see
+            # ProjectStore.bind_session).
+            if session_id and store.bind_session(wo_id, session_id):
+                store.add_event(wo_id, "session_bound",
+                                {"via": "hook", "session_id": session_id})
+            elif session_id and session_id != wo.get("session_id"):
+                store.add_event(wo_id, "session_rebind_ignored", {
+                    "session_id": session_id, "bound_to": wo.get("session_id"),
+                    "reason": "a spent session of this work order was re-opened",
+                })
+            if store.get_work_order(wo_id)["status"] == "dispatching":
                 store.set_status(wo_id, "running")
-            # Bind (or correct) the session id: --bg dispatch assigns its own,
-            # so the hook is the authoritative source.
-            if session_id and wo.get("session_id") != session_id:
-                store.update_work_order(wo_id, session_id=session_id)
+
+        elif not _is_current_session(store, wo_id, session_id):
+            # A superseded session reporting on itself. Its own end is not the work
+            # order's end, and its idle prompt is not the worker asking for input —
+            # the live fork is elsewhere. Recorded above, acted on never.
+            store.add_event(wo_id, "hook_ignored", {
+                "event": event, "session_id": session_id,
+                "reason": "not the session this work order is bound to",
+            })
+            return {"wo_id": wo_id, "event": event, "ignored": True}
 
         elif event == "Notification":
             # Fired when the session needs attention — but for two very different
@@ -249,6 +400,12 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
             if fresh["status"] in ("running", "waiting_input", "dispatching"):
                 if fresh.get("result_summary"):
                     _finalize(store, wo_id)
+                elif fresh["origin"] == "adhoc":
+                    # An adopted session the user started themselves: never dispatched,
+                    # never briefed, so it owes no completion signal (Daemon.retire_adhoc).
+                    store.set_status(wo_id, "completed")
+                    store.clear_attention(wo_id)
+                    store.add_event(wo_id, "adhoc_retired", {"why": "session ended"})
                 else:
                     store.set_status(wo_id, "needs_review")
                     store.flag_attention(wo_id, "session ended without `jarvis wo finish`")

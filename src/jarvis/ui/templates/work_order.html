@@ -50,7 +50,14 @@
   </p>
   {% if wo.needs_attention %}
     <p class="st tone-warn"{% if pending == 'attention' %} id="pending"{% endif %}>
-      <span class="i">◭</span>{{ wo.attention_reason }}</p>
+      <span class="i">◭</span>{{ wo.attention_reason }}
+      {% if not assumptions %}
+      <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/ack">
+        <button title="Seen it — stop asking for me. The record stays; a new blocker
+                       will still surface.">Got it</button>
+      </form>
+      {% endif %}
+    </p>
     {% if wo.status == 'waiting_input' and wo.session_id %}
     <div class="row" style="gap: 10px; flex-wrap: wrap; align-items: center;">
       <span class="sub">Blocked on a permission prompt. A background worker can't be
@@ -77,12 +84,51 @@
     <span class="sub mono">{{ fmt_age(a.ts) }} ago</span></div>
   {% endfor %}
   <div class="row">
-    <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/review">
+    <form method="post" action="/wo/{{ project }}/{{ wo.id }}/review"
+          style="flex:1; display:flex; gap:8px; align-items:center">
+      <input type="text" name="feedback" style="flex:1"
+             placeholder="Why? (optional — teaches Neo, and on reject goes to the worker as guidance)">
       <button name="decision" value="accept" class="accept">Accept all</button>
       <button name="decision" value="reject" class="danger">Reject all</button>
     </form>
-    <span class="sub">rejecting keeps the work order flagged — send guidance below</span>
   </div>
+  <div class="row"><span class="sub">Rejecting without a reason keeps the work order
+    flagged — send guidance below.</span></div>
+</div>
+{% endif %}
+
+{% if approvals %}
+{# A worker that tripped a gate has ended its turn and is waiting for a verdict. From
+   the timeline alone that is indistinguishable from a worker that simply stopped, so
+   the gate — and the decision it is waiting for — belongs on this page. #}
+<h2>Privileged actions</h2>
+<div class="panel">
+  {% for a in approvals %}
+  {% set m = gate_meta.get(a.status, {'word': a.status, 'icon': '•', 'tone': 'muted'}) %}
+  <div class="msg">
+    <div class="who {{ 'tone-warn' if a.status == 'pending' }}">#{{ a.id }} · {{ a.kind }} ·
+      <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
+      {%- if a.status == 'pending' %} with {{ 'you' if a.escalated else 'Neo' }}
+      {%- elif a.decided_by %} by {{ a.decided_by }}{% endif %} ·
+      {{ fmt_age(a.ts) }} ago · <a href="/gates#gate-{{ a.id }}">gates →</a></div>
+    <div class="mono" style="margin:6px 0">$ {{ a.command }}</div>
+    {% if a.status == 'pending' and a.escalated %}
+    <div class="sub">Neo escalated: {{ a.escalation_reason or '—' }}</div>
+    {% endif %}
+    {% if a.decision_reason %}<div class="sub">{{ a.decision_reason }}</div>{% endif %}
+    {% if a.status == 'pending' %}
+    <form method="post" action="/gates/{{ a.id }}/decide"
+          style="display:flex; gap:8px; margin-top:8px">
+      <input type="hidden" name="project" value="{{ project }}">
+      <input type="hidden" name="next" value="/wo/{{ project }}/{{ wo.id }}">
+      <input type="text" name="reason"
+             placeholder="reason — goes to the worker; required to deny">
+      <button class="accept" name="decision" value="approve">✓ Approve</button>
+      <button class="danger" name="decision" value="deny">✗ Deny</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endfor %}
 </div>
 {% endif %}
 

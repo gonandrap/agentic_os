@@ -53,10 +53,19 @@ Rules:
   {"escalate": true, "answer": "", "reason": "<one line why the user must decide>"}"""
 
 
-def build_system_prompt(store: NeoStore, project: str, learnings_limit: int = 50) -> str:
-    """Persona + learnings. Byte-stable across questions (per project) so consecutive
-    headless calls share a cached prompt prefix."""
-    parts = [PERSONA, "", "# Learnings (from the user's reviews of your past answers)"]
+def build_system_prompt(store: NeoStore, project: str, learnings_limit: int = 50,
+                        kind: str = "question") -> str:
+    """Persona + learnings. Byte-stable across questions (per project and kind) so
+    consecutive headless calls of the same kind share a cached prompt prefix.
+
+    Approval requests get the gate-reviewer persona instead of the answerer one: the
+    general persona is told to escalate anything that publishes or touches production,
+    which is right for open questions and would send every release straight to the user.
+    """
+    from .gates import REVIEWER_PERSONA
+
+    persona = REVIEWER_PERSONA if kind == "approval" else PERSONA
+    parts = [persona, "", "# Learnings (from the user's reviews of your past answers)"]
     rows = store.learnings(project, limit=learnings_limit)
     if not rows:
         parts.append("(none yet — escalate when unsure)")
@@ -82,7 +91,11 @@ _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 def parse_verdict(raw: str) -> dict[str, Any]:
     """Parse Neo's strict-JSON reply, tolerating fenced or chatty output.
-    Unparseable output is treated as an escalation — never deliver garbage."""
+    Unparseable output is treated as an escalation — never deliver garbage.
+
+    `approve` carries the verdict on an approval request. It defaults to False, so
+    output that omits it never opens a gate: the only way through is an explicit yes.
+    """
     m = _JSON_RE.search(raw or "")
     if m:
         try:
@@ -92,10 +105,11 @@ def parse_verdict(raw: str) -> dict[str, Any]:
                     "escalate": bool(data.get("escalate")),
                     "answer": str(data.get("answer") or ""),
                     "reason": str(data.get("reason") or ""),
+                    "approve": bool(data.get("approve", False)),
                 }
         except json.JSONDecodeError:
             pass
-    return {"escalate": True, "answer": "",
+    return {"escalate": True, "answer": "", "approve": False,
             "reason": f"unparseable Neo output: {(raw or '')[:120]}"}
 
 
@@ -104,7 +118,8 @@ def answer_question(store: NeoStore, q: dict[str, Any], model: str,
     """One Neo call for one claimed question. Returns the parsed verdict."""
     from .paths import ensure_home
 
-    system = build_system_prompt(store, q["project"], learnings_limit)
+    system = build_system_prompt(store, q["project"], learnings_limit,
+                                 kind=q.get("kind") or "question")
     prompt = build_question_prompt(q)
     raw = claude_cli.run_headless(
         prompt, system_prompt=system, model=model, timeout=timeout,
@@ -144,9 +159,14 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             store.mark(q["id"], "escalated", reason=verdict["reason"])
             log.info("neo escalated question %s: %s", q["id"], verdict["reason"])
         else:
-            store.record_answer(q["id"], verdict["answer"], answered_by="neo",
+            # An approval's decision lives in `approve`, not in prose. Record it as the
+            # answer too so `jarvis neo show` and the review surfaces read plainly.
+            answer = verdict["answer"]
+            if q.get("kind") == "approval":
+                answer = "APPROVED" if verdict.get("approve") else "DENIED"
+            store.record_answer(q["id"], answer, answered_by="neo",
                                 reason=verdict["reason"])
-            log.info("neo answered question %s", q["id"])
+            log.info("neo answered question %s (%s)", q["id"], q.get("kind") or "question")
         if deliver:
             deliver(q, verdict)
         results.append({"question": q, "verdict": verdict})
@@ -157,3 +177,17 @@ def learning_from_review(q: dict[str, Any], feedback: str) -> str:
     """Distill a corrected answer into a learning Neo will see next time."""
     return (f"When a worker asked: \"{q['question'][:200]}\" — I answered: "
             f"\"{(q.get('answer') or '')[:200]}\". The user corrected me: {feedback}")
+
+
+def learning_from_assumption_review(wo: dict[str, Any], assumptions: list[dict[str, Any]],
+                                    accepted: bool, feedback: str) -> str:
+    """Distill the user's verdict on a work order's assumptions into a learning.
+
+    Neo's other learning source (reviews of its own answers) only fires once Neo is
+    already answering. This one fires on the decisions the user is making TODAY, so
+    Neo arrives at its first question with the user's taste already in the prompt.
+    """
+    what = "; ".join(f"\"{a['content'][:200]}\"" for a in assumptions[:5]) or "(none recorded)"
+    verdict = "accepted" if accepted else "rejected"
+    return (f"On work order \"{wo.get('title', '')[:120]}\" a worker decided: {what}. "
+            f"The user {verdict} that: {feedback}")

@@ -1,0 +1,337 @@
+"""Ad-hoc sessions are observed, not governed — and an acknowledged flag stays down.
+
+Reconstructed from a live fleet that accumulated 17 attention items, 15 of which were
+the same two bugs:
+
+1. The reconciler adopts every background session it finds in a project directory "for
+   visibility" (a session the user started themselves in `claude agents`). It then held
+   that session to the Jarvis worker contract: end a turn without calling
+   `jarvis wo finish` and you are flagged "worker idle without `jarvis wo finish`";
+   vanish from `claude agents` and you are marked `failed` — "worker session
+   disappeared". An adopted session was never dispatched by Jarvis, has no
+   `JARVIS_WO_ID`, and never received the contract, so it *cannot* satisfy it. Every
+   adopted session therefore became an attention item with certainty.
+
+2. Clearing a flag by hand did nothing: `check_blocked_work_is_surfaced` re-derives
+   attention from status on every reconcile tick, so an acknowledged work order was
+   re-flagged seconds later. The user acked the whole inbox and the dashboard kept
+   showing the same 17 items — because attention lives on the work order, not in the
+   inbox, and nothing could put it down.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from jarvis import ops
+from jarvis.hooks import handle_hook
+from jarvis.invariants import check_project, true_blockers
+from jarvis.project_store import ProjectStore
+
+from test_pipeline import _add_adhoc, bind_session, started  # noqa: F401
+
+
+def _adhoc_wo(store: ProjectStore) -> dict:
+    return [w for w in store.list_work_orders() if w["origin"] == "adhoc"][0]
+
+
+def _drop_session(fake_claude, sid: str) -> None:
+    """The user deletes the session from `claude agents` (or it is simply pruned)."""
+    remaining = [s for s in fake_claude.sessions if s.get("sessionId") != sid]
+    fake_claude.sessions[:] = remaining
+    (fake_claude.dir / "sessions.json").write_text(json.dumps(remaining))
+
+
+def _age_out(store: ProjectStore, wo_id: str, seconds: float = 400.0) -> None:
+    """Backdate the work order past the reconciler's grace period."""
+    row = store.get_work_order(wo_id)
+    store.conn.execute(
+        "UPDATE work_orders SET updated_at=? WHERE id=?",
+        (row["updated_at"] - seconds, wo_id),
+    )
+
+
+# -- 1. an ad-hoc session is not a worker under contract ------------------------------
+
+
+def test_adopted_session_going_idle_is_not_held_to_the_contract(
+    started, fake_claude, project
+):
+    """The user's own session ends a turn. That is not an anomaly — it is a turn ending.
+
+    This is the exact shape of six live attention items ("worker idle without
+    `jarvis wo finish` — review the session"), one of which was the very session the
+    user was talking to at the time.
+    """
+    daemon = started
+    _add_adhoc(fake_claude, project, "working", sid="adhoc-1", name="my manual hack")
+    daemon.tick_count = 0
+    daemon.tick()
+
+    store = ProjectStore(project)
+    fake_claude.set_session_state("adhoc-1", "done")
+    daemon.tick_count = 0
+    daemon.tick()
+
+    fresh = store.get_work_order(_adhoc_wo(store)["id"])
+    assert fresh["status"] == "completed"
+    assert not fresh["needs_attention"]
+    assert not true_blockers(store, fresh)
+
+
+def test_adopted_session_removed_from_agents_view_is_not_a_failure(
+    started, fake_claude, project
+):
+    """Deleting your own background session is a normal thing to do, not a fault.
+
+    Seven live work orders sat in `failed` / "worker session disappeared" because the
+    user cleaned up short-lived sessions in `claude agents` after the work was done.
+    """
+    daemon = started
+    _add_adhoc(fake_claude, project, "working", sid="adhoc-1", name="serena-and-mode-split-1e")
+    daemon.tick_count = 0
+    daemon.tick()
+
+    store = ProjectStore(project)
+    wo_id = _adhoc_wo(store)["id"]
+    _drop_session(fake_claude, "adhoc-1")
+    _age_out(store, wo_id)
+    daemon.tick_count = 0
+    daemon.tick()
+
+    fresh = store.get_work_order(wo_id)
+    assert fresh["status"] == "completed"
+    assert not fresh["needs_attention"]
+    # and it must not page the user either
+    titles = [r["title"] for r in
+              store.conn.execute("SELECT title FROM notifications").fetchall()]
+    assert not any("disappeared" in t for t in titles)
+
+
+def test_a_dispatched_worker_that_disappears_is_still_a_failure(
+    started, fake_claude, project
+):
+    """Regression guard: the fix must not silence the case it exists for.
+
+    Jarvis dispatched this one and promised to see it through, so a vanished session is
+    a real failure the user has to know about.
+    """
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    sid = bind_session(daemon, project, wo["id"])
+
+    _drop_session(fake_claude, sid)
+    _age_out(store, wo["id"])
+    daemon.tick_count = 0
+    daemon.tick()
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "failed"
+    assert "disappeared" in fresh["attention_reason"]
+
+
+def test_a_dispatched_worker_idle_without_finish_is_still_flagged(
+    started, fake_claude, project
+):
+    """The other half of the guard: framework workers do owe a completion signal."""
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    sid = bind_session(daemon, project, wo["id"])
+
+    fake_claude.set_session_state(sid, "done")
+    daemon.tick_count = 0
+    daemon.tick()
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "needs_review"
+    assert "without `jarvis wo finish`" in fresh["attention_reason"]
+
+
+def test_true_blockers_does_not_invent_a_contract_for_adhoc(project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("a session I started myself", origin="adhoc")
+    store.set_status(wo["id"], "needs_review")
+    assert true_blockers(store, store.get_work_order(wo["id"])) == []
+
+    store.set_status(wo["id"], "failed")
+    assert true_blockers(store, store.get_work_order(wo["id"])) == []
+
+
+def test_a_blocked_adhoc_session_still_asks_for_you(project):
+    """Not everything about an ad-hoc session is noise: stuck on a prompt is real."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("my manual hack", origin="adhoc")
+    store.set_status(wo["id"], "waiting_input")
+    assert true_blockers(store, store.get_work_order(wo["id"])) == [
+        "worker is waiting on your input"
+    ]
+
+
+def test_adhoc_assumptions_are_never_swallowed(project):
+    """An ad-hoc session that used `jarvis wo assume` still gets its review."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("adopted session", origin="adhoc")
+    store.add_assumption(wo["id"], "picked postgres over sqlite")
+    store.set_status(wo["id"], "needs_review")
+    assert true_blockers(store, store.get_work_order(wo["id"])) == [
+        "1 assumption pending your review"
+    ]
+
+
+def test_the_wreckage_already_on_disk_is_repaired(project):
+    """The 15 stale items in the live fleet must clear themselves on the next tick.
+
+    Shipping a fix that only prevents *new* false positives would leave the user
+    staring at the same dashboard.
+    """
+    store = ProjectStore(project)
+    gone = store.create_work_order("serena-and-mode-split-1e", origin="adhoc")
+    store.set_status(gone["id"], "failed")
+    store.flag_attention(gone["id"], "worker session disappeared")
+    idle = store.create_work_order("adversarial design review jarvis", origin="adhoc")
+    store.set_status(idle["id"], "needs_review")
+    store.flag_attention(idle["id"], "worker idle without `jarvis wo finish`")
+
+    violations = check_project(store, repair=True)
+
+    assert {v.invariant for v in violations} == {"INV-ADHOC-NOT-GOVERNED"}
+    for wo_id in (gone["id"], idle["id"]):
+        fresh = store.get_work_order(wo_id)
+        assert fresh["status"] == "completed"
+        assert not fresh["needs_attention"]
+    # ...and it is a one-time repair, not a per-tick alarm
+    assert check_project(store, repair=True) == []
+
+
+def test_repair_is_only_proposed_when_repair_is_off(project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("serena-and-mode-split-de", origin="adhoc")
+    store.set_status(wo["id"], "failed")
+    store.flag_attention(wo["id"], "worker session disappeared")
+
+    violations = check_project(store, repair=False)
+
+    assert [v.invariant for v in violations] == ["INV-ADHOC-NOT-GOVERNED"]
+    assert store.get_work_order(wo["id"])["status"] == "failed"  # untouched
+
+
+def test_session_end_hook_does_not_bill_an_adhoc_session(project):
+    """The SessionEnd path had the same bug as the reconciler."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("my manual hack", origin="adhoc")
+    store.update_work_order(wo["id"], session_id="adhoc-1")
+    store.set_status(wo["id"], "running")
+
+    handle_hook(
+        {"hook_event_name": "SessionEnd", "session_id": "adhoc-1", "cwd": str(project)},
+        {"JARVIS_PROJECT_PATH": str(project)},
+    )
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "completed"
+    assert not fresh["needs_attention"]
+
+
+# -- 2. acknowledging a flag actually puts it down ------------------------------------
+
+
+def test_ack_survives_the_reconcilers_next_pass(project):
+    """The bug the user hit: ack, then watch the daemon put it straight back.
+
+    `check_blocked_work_is_surfaced` re-derives attention from status, so before this
+    fix the flag returned on the next tick — for as long as the work order existed.
+    """
+    store = ProjectStore(project)
+    wo = store.create_work_order("task")
+    store.set_status(wo["id"], "needs_review")
+    store.flag_attention(wo["id"], "finished without a completion signal — review the session")
+
+    fresh = store.get_work_order(wo["id"])
+    store.ack_attention(wo["id"], true_blockers(store, fresh))
+    assert not store.get_work_order(wo["id"])["needs_attention"]
+
+    check_project(store, repair=True)  # the daemon's next tick
+
+    assert not store.get_work_order(wo["id"])["needs_attention"]
+
+
+def test_ack_does_not_deafen_the_work_order_to_something_new(project):
+    """An ack covers what you saw, not everything that will ever happen next."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("task")
+    store.set_status(wo["id"], "needs_review")
+    store.flag_attention(wo["id"], "finished without a completion signal — review the session")
+    store.ack_attention(wo["id"], true_blockers(store, store.get_work_order(wo["id"])))
+
+    store.add_assumption(wo["id"], "swapped the auth library")
+    check_project(store, repair=True)
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["needs_attention"]
+    assert fresh["attention_reason"] == "1 assumption pending your review"
+
+
+def test_ack_refuses_to_bury_a_pending_assumption(started, project):
+    """Assumptions need a decision, not a dismissal."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("task")
+    store.add_assumption(wo["id"], "picked postgres")
+    store.set_status(wo["id"], "needs_review")
+    store.flag_attention(wo["id"], "1 assumption pending your review")
+
+    with pytest.raises(ops.OpsError, match="jarvis wo review"):
+        ops.ack_attention(wo["id"])
+
+    assert store.get_work_order(wo["id"])["needs_attention"]
+
+
+def test_ack_all_clears_the_whole_attention_list(started, project):
+    store = ProjectStore(project)
+    ids = []
+    for i in range(3):
+        wo = store.create_work_order(f"task {i}")
+        store.set_status(wo["id"], "needs_review")
+        store.flag_attention(wo["id"], "finished without a completion signal — review the session")
+        ids.append(wo["id"])
+    keep = store.create_work_order("needs a decision")
+    store.add_assumption(keep["id"], "picked postgres")
+    store.set_status(keep["id"], "needs_review")
+    store.flag_attention(keep["id"], "1 assumption pending your review")
+
+    result = ops.ack_attention(all_projects=True)
+
+    assert set(result["acknowledged"]) == set(ids)
+    assert result["skipped"] == [
+        {"wo_id": keep["id"], "reason": "1 assumption pending your review"}
+    ]
+    assert [w["id"] for w in store.list_work_orders() if w["needs_attention"]] == [keep["id"]]
+
+
+def test_ack_is_recorded_on_the_timeline(started, project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("task")
+    store.set_status(wo["id"], "needs_review")
+    store.flag_attention(wo["id"], "finished without a completion signal — review the session")
+
+    ops.ack_attention(wo["id"])
+
+    kinds = [e["kind"] for e in store.list_events(wo["id"], limit=50)]
+    assert "acknowledged" in kinds
+
+
+def test_status_stops_listing_acknowledged_work(started, project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("task")
+    store.set_status(wo["id"], "needs_review")
+    store.flag_attention(wo["id"], "finished without a completion signal — review the session")
+    assert any(a["wo_id"] == wo["id"] for a in ops.os_status()["attention"])
+
+    ops.ack_attention(wo["id"])
+
+    assert not any(a["wo_id"] == wo["id"] for a in ops.os_status()["attention"])

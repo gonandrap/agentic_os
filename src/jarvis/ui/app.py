@@ -4,6 +4,7 @@ the same ops functions as the CLI. Binds to localhost by default (no auth in MVP
 from __future__ import annotations
 
 import time
+import traceback
 from pathlib import Path
 
 from fastapi import FastAPI, Form, Request
@@ -13,6 +14,7 @@ from fastapi.templating import Jinja2Templates
 from .. import ops
 from ..central_store import CentralStore
 from ..daemon import daemon_running
+from ..paths import logs_dir
 from ..project_store import ProjectStore
 from ..timeline import build_timeline, count_debug
 
@@ -35,6 +37,18 @@ ORIGIN_META = {
     "adhoc":  {"word": "ad-hoc", "framework": False},
 }
 LEVEL_TONE = {"info": "muted", "warning": "warn", "critical": "bad"}
+# Privileged-action gates. `pending` splits in two on the page — with Neo (costs the
+# user nothing) vs escalated to the user — so it carries the neutral mark here.
+GATE_META = {
+    "pending":  {"word": "pending",  "icon": "◌", "tone": "warn"},
+    "approved": {"word": "approved", "icon": "✓", "tone": "ok"},
+    "denied":   {"word": "denied",   "icon": "✗", "tone": "bad"},
+    "expired":  {"word": "expired",  "icon": "–", "tone": "muted"},
+}
+
+# How often the dashboard re-reads OS state. Not a page reload — the browser swaps
+# the live regions in place (see dashboard.html), so in-progress typing survives.
+REFRESH_SECONDS = 15
 
 
 def fmt_age(ts: float | None) -> str:
@@ -45,6 +59,41 @@ def fmt_age(ts: float | None) -> str:
         if d < limit:
             return f"{int(d / div)}{unit}"
     return f"{int(d / 86400)}d"
+
+
+def log_ui_error(request: Request, exc: BaseException) -> None:
+    """Append a dashboard failure to `$JARVIS_HOME/logs/ui.log`.
+
+    Uvicorn already prints the traceback on stdout, but in production that is the
+    systemd journal — outside the OS's own state directory, so neither `jarvis`
+    commands nor the agents reading `logs/` can see that the UI ever broke. The
+    daemon keeps `jarvisd.log` next to the databases for exactly this reason; the
+    dashboard now does the same.
+    """
+    try:
+        d = logs_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        with (d / "ui.log").open("a") as f:
+            f.write(f"{stamp} [ERROR] {request.method} {request.url.path} — "
+                    f"{type(exc).__name__}: {exc}\n{tb}")
+    except Exception:  # noqa: BLE001 — logging must never mask the original failure
+        pass
+
+
+def gate_badge() -> int | None:
+    """How many gates are waiting on the user, for the nav.
+
+    Only escalated ones count: a request Neo is still reviewing is deliberately
+    free of charge, and badging it would undo the point of having Neo. Never
+    raises — a badge must not be the reason a page 500s.
+    """
+    try:
+        return len([g for g in ops.list_gates(pending_only=True)
+                    if g["escalated"]]) or None
+    except Exception:  # noqa: BLE001 — see docstring
+        return None
 
 
 def create_app() -> FastAPI:
@@ -61,12 +110,12 @@ def create_app() -> FastAPI:
 
     templates = Jinja2Templates(directory=str(TEMPLATES))
     templates.env.globals.update(
-        status_meta=STATUS_META, origin_meta=ORIGIN_META,
+        status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         level_tone=LEVEL_TONE, fmt_age=fmt_age,
     )
 
     def render(request: Request, template: str, active: str = "dashboard",
-               **ctx) -> HTMLResponse:
+               status_code: int = 200, **ctx) -> HTMLResponse:
         from ..neo_store import NeoStore
         ctx["active"] = active
         ctx["daemon_up"] = daemon_running() is not None
@@ -77,14 +126,31 @@ def create_app() -> FastAPI:
             neo.close()
         ctx["neo_badge"] = (c.get("escalated", 0) + c.get("failed", 0)
                             + c.get("unreviewed", 0)) or None
-        return templates.TemplateResponse(request, template, ctx)
+        ctx["gate_badge"] = gate_badge()
+        return templates.TemplateResponse(request, template, ctx,
+                                          status_code=status_code)
+
+    @app.exception_handler(Exception)
+    def unhandled(request: Request, exc: Exception) -> HTMLResponse:
+        """Last line of defence: a bare "Internal Server Error" tells the user
+        nothing, and a dead-end deep link out of a Telegram alert is exactly where
+        they land. Name the failure on the page and put the traceback on disk."""
+        log_ui_error(request, exc)
+        message = (f"Something went wrong loading {request.url.path} — "
+                   f"{type(exc).__name__}: {exc}. "
+                   "The full traceback is in $JARVIS_HOME/logs/ui.log.")
+        try:
+            return render(request, "error.html", message=message, status_code=500)
+        except Exception:  # noqa: BLE001 — the chrome itself may be what broke
+            return HTMLResponse(f"<h1>Something went wrong</h1><p>{message}</p>",
+                                status_code=500)
 
     # -- pages ------------------------------------------------------------------
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request):
         st = ops.os_status()
-        return render(request, "dashboard.html", st=st, refresh=15)
+        return render(request, "dashboard.html", st=st, refresh=REFRESH_SECONDS)
 
     @app.get("/project/{name}", response_class=HTMLResponse)
     def project(request: Request, name: str, hidden: str = ""):
@@ -120,6 +186,10 @@ def create_app() -> FastAPI:
             events = store.list_events(wo_id)
             messages = store.list_messages(wo_id)
             assumptions = store.pending_assumptions(wo_id)
+            # A worker held at a gate looks identical to an idle one from here, so
+            # the reason it stopped belongs on the page it stopped on.
+            store.expire_approvals()
+            approvals = store.list_approvals(wo_id)
         finally:
             store.close()
         show_debug = debug not in ("", "0", "false")
@@ -127,7 +197,8 @@ def create_app() -> FastAPI:
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug),
                       debug=show_debug, debug_count=count_debug(events),
-                      messages=messages, assumptions=assumptions)
+                      messages=messages, assumptions=assumptions,
+                      approvals=approvals)
 
     @app.get("/inbox", response_class=HTMLResponse)
     def inbox(request: Request):
@@ -166,6 +237,10 @@ def create_app() -> FastAPI:
         neo = NeoStore()
         try:
             counts = neo.counts()
+            # Oldest first: that is the order Neo drains them, and the oldest is the
+            # one most likely to be stuck.
+            in_flight = list(reversed(
+                neo.list_questions(statuses=("queued", "answering"))))
             escalated = neo.list_questions(statuses=("escalated", "failed"))
             unreviewed = neo.list_questions(statuses=("answered",),
                                             review_status="unreviewed")
@@ -178,8 +253,20 @@ def create_app() -> FastAPI:
         finally:
             neo.close()
         return render(request, "neo.html", active="neo", counts=counts,
-                      escalated=escalated, unreviewed=unreviewed,
-                      history=history, learnings=learnings)
+                      in_flight=in_flight, escalated=escalated,
+                      unreviewed=unreviewed, history=history, learnings=learnings)
+
+    @app.get("/gates", response_class=HTMLResponse)
+    def gates_page(request: Request):
+        """Privileged-action approvals. Three states, three different asks of the
+        user: escalated ones need a decision, ones still with Neo need nothing (but
+        can be pre-empted), decided ones are the audit trail."""
+        rows = ops.list_gates(include_request=True)
+        pending = [g for g in rows if g["status"] == "pending"]
+        return render(request, "gates.html", active="gates",
+                      escalated=[g for g in pending if g["escalated"]],
+                      with_neo=[g for g in pending if not g["escalated"]],
+                      decided=[g for g in rows if g["status"] != "pending"])
 
     @app.get("/api/status")
     def api_status():
@@ -203,13 +290,24 @@ def create_app() -> FastAPI:
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/review")
-    def review(name: str, wo_id: str, decision: str = Form(...)):
-        ops.review_work_order(wo_id, accept=(decision == "accept"))
+    def review(name: str, wo_id: str, decision: str = Form(...),
+               feedback: str = Form("")):
+        ops.review_work_order(wo_id, accept=(decision == "accept"), feedback=feedback)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/cancel")
     def cancel_wo(name: str, wo_id: str):
         ops.cancel(wo_id)
+        return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
+
+    @app.post("/wo/{name}/{wo_id}/ack")
+    def ack_wo(name: str, wo_id: str):
+        try:
+            ops.ack_attention(wo_id, project_name=name)
+        except ops.OpsError as e:
+            # The one case that refuses: pending assumptions want a decision, not a
+            # dismissal. Say so instead of silently doing nothing.
+            return RedirectResponse(f"/wo/{name}/{wo_id}?error={e}", status_code=303)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/hide")
@@ -259,6 +357,27 @@ def create_app() -> FastAPI:
         finally:
             neo.close()
         return RedirectResponse("/neo", status_code=303)
+
+    @app.post("/gates/{approval_id}/decide")
+    def decide_gate(approval_id: int, decision: str = Form(...),
+                    reason: str = Form(""), project: str = Form(""),
+                    next: str = Form("")):
+        """Open or refuse a gate. Approval ids are per-project autoincrements, so the
+        form carries the project the row was rendered from — without it two projects
+        holding the same id make `ops.decide_gate` refuse to guess.
+
+        `next` returns the user to the page they decided from (the gates tab or a work
+        order). Only same-site paths are honoured: a form field is attacker-settable,
+        and an open redirect out of the dashboard is not worth the convenience.
+        """
+        back = next if next.startswith("/") and not next.startswith("//") else "/gates"
+        try:
+            ops.decide_gate(approval_id, approved=(decision == "approve"),
+                            reason=reason, project_name=project or None)
+        except ops.OpsError as e:
+            sep = "&" if "?" in back else "?"
+            return RedirectResponse(f"{back}{sep}error={e}", status_code=303)
+        return RedirectResponse(back, status_code=303)
 
     @app.post("/inbox/ack")
     def ack(inbox_id: str = Form("")):
