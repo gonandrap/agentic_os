@@ -112,10 +112,13 @@ def test_create_wo_via_ui_marks_origin(client, project):
     assert "⚙" in page.text
 
 
-def test_waiting_input_wo_shows_attach_hint_and_resume(client, daemon, project):
-    """A worker blocked on a permission prompt can't be approved from the web UI
-    (bg sessions take no programmatic approval), so the page surfaces the native
-    `claude attach <session-id>` escape hatch plus a resume-in-auto action."""
+def test_waiting_input_wo_shows_resume_hint_and_auto_action(client, daemon, project):
+    """A worker blocked on a permission prompt can't be approved from the web UI, so the
+    page surfaces the native escape hatch plus a resume-in-auto action.
+
+    `claude --resume`, not `claude attach`: attaching is a background-agent verb, and
+    worker turns are headless — between turns nothing owns the session, so it opens
+    directly."""
     wo = ops.create_work_order("proj_a", "blocked task")
     daemon.tick()
     store = ProjectStore(project)
@@ -125,7 +128,7 @@ def test_waiting_input_wo_shows_attach_hint_and_resume(client, daemon, project):
 
     detail = client.get(f"/wo/proj_a/{wo['id']}")
     assert detail.status_code == 200
-    assert "claude attach sess-abc123" in detail.text
+    assert "claude --resume sess-abc123" in detail.text
     assert f"/wo/proj_a/{wo['id']}/resume-auto" in detail.text
 
     r = client.post(f"/wo/proj_a/{wo['id']}/resume-auto")

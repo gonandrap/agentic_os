@@ -404,8 +404,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if args.json:
         _print(res, True)
         return 1 if res["violations"] else 0
+    orphans = res.get("orphaned_sessions") or []
     if not res["violations"]:
         print("✓ all OS invariants hold")
+        _print_orphans(orphans)
         return 0
     verb = "repaired" if res["repair"] else "found (run with --repair to fix)"
     print(f"⚠ {res['violations']} invariant violation(s) {verb}:\n")
@@ -418,7 +420,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"    {v['detail']}")
             if v["repaired"]:
                 print(f"    → {'fixed' if res['repair'] else 'would fix'}: {v['repair']}")
+    _print_orphans(orphans)
     return 1
+
+
+def _print_orphans(orphans: list[dict]) -> None:
+    """Leftover background agents from the pre-headless-turn transport.
+
+    Listed, never stopped for you: they live in your own agents view. Nothing creates
+    them any more, so this list only shrinks.
+    """
+    if not orphans:
+        return
+    print(f"\nℹ {len(orphans)} leftover background session(s) with no open work order.")
+    print("  These are debris from the old worker transport. Stop them when convenient:")
+    for o in orphans:
+        print(f"    {o['stop']}    # {o['name'][:60]} ({o['state']})")
 
 
 def cmd_adopt(args: argparse.Namespace) -> int:

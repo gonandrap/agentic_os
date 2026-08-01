@@ -213,7 +213,55 @@ def run_doctor(project: str | None = None, repair: bool = False,
                 for v in violations
             ],
         })
-    return {"repair": repair, "violations": total, "projects": results}
+    out = {"repair": repair, "violations": total, "projects": results}
+    orphans = orphaned_worker_sessions()
+    if orphans:
+        out["orphaned_sessions"] = orphans
+    return out
+
+
+def orphaned_worker_sessions() -> list[dict[str, Any]]:
+    """Background agents named `[WO …]` that no open work order is driving.
+
+    Every one of these is debris from the transport headless turns replaced: it forked a
+    fresh background agent per delivered turn and retired the previous one on a
+    best-effort `claude stop`, so each failed retirement leaked an agent permanently (the
+    live fleet reached 63). Nothing creates them any more, and an in-flight work order
+    releases its own on the next message it receives (`worker_session.send`), so what is
+    left is the historical pile.
+
+    Reported, never stopped: these live in the user's own agents view, and bulk-killing
+    sessions there is theirs to authorise. Each row carries the exact command.
+    """
+    from . import claude_cli
+
+    if not claude_cli.available():
+        return []
+    try:
+        sessions = claude_cli.list_background_sessions()
+    except claude_cli.ClaudeCliError:
+        return []
+    named = [s for s in sessions if s.name.startswith("[WO ")]
+    if not named:
+        return []
+
+    live_sessions: set[str] = set()
+    for name, path in registered_project_paths().items():  # noqa: B007
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            for wo in store.list_work_orders(statuses=OPEN_STATUSES,
+                                             include_hidden=True):
+                if wo.get("session_id"):
+                    live_sessions.add(wo["session_id"])
+        finally:
+            store.close()
+    return [
+        {"bg_id": s.id, "session_id": s.session_id, "name": s.name, "state": s.state,
+         "stop": f"claude stop {s.id}"}
+        for s in named if s.session_id not in live_sessions
+    ]
 
 
 def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
@@ -260,10 +308,11 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         "reason": wo["attention_reason"],
                     }
                     # A worker blocked on a permission prompt can't be approved from
-                    # jarvis (bg sessions take no programmatic approval) — surface the
-                    # native escape hatch instead.
+                    # jarvis — surface the native escape hatch instead. `--resume`, not
+                    # `attach`: attaching is a background-agent verb and worker turns are
+                    # headless, so the session is free to be opened directly between turns.
                     if wo["status"] == "waiting_input" and wo["session_id"]:
-                        item["attach"] = f"claude attach {wo['session_id']}"
+                        item["attach"] = f"claude --resume {wo['session_id']}"
                     attention.append(item)
                 drift = settings_drift(path / ".claude" / "settings.json")
                 projects.append({

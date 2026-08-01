@@ -20,6 +20,7 @@ from jarvis.testing import (  # noqa: F401
     jarvis_home,
     make_git_project,
     project,
+    settle_turns,
 )
 
 RESULTS_PATH = Path(__file__).parent / "results.json"
