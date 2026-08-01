@@ -1,7 +1,7 @@
 # Jarvis OS codebase map
 
 `jarvis-os` Python package, stdlib-only core (argparse + sqlite3 + json). Source in
-`src/jarvis/`, 19 modules. Read this instead of re-exploring the tree.
+`src/jarvis/`, 20 modules. Read this instead of re-exploring the tree.
 
 ## Modules (responsibility — key symbols — intra-package imports)
 
@@ -13,9 +13,11 @@
 - `catalog.py` — parse/validate the catalog JSON into typed specs. `ProjectSpec`:58,
   `Catalog`:96, `WorkerDefaults`:50, `load_catalog()`:112, `parse_catalog()`:123,
   `CatalogError`:45, `DEFAULT_PERMISSION_MODE = "auto"`:25.
-- `claude_cli.py` — ALL interaction with the `claude` binary (override via `JARVIS_CLAUDE_BIN`:22).
-  `spawn_background()`:103, `list_background_sessions()`:73, `job_result()`:162,
-  `send_to_session()`:194, `run_headless()`:214, `BgSession`:62, `ClaudeCliError`:18.
+- `claude_cli.py` — ALL interaction with the `claude` binary (override via `CLAUDE_BIN_ENV`).
+  Worker turns: `turn_args()`, `spawn_turn()`, `read_turn_result()`, `TurnResult`,
+  `process_alive()`, `kill_process_group()`. Background sessions (ad-hoc + migration only):
+  `spawn_background()`, `list_background_sessions()`, `stop_session()`, `BgSession`.
+  Also `run_headless()` (Neo), `_briefing_args()`, `ClaudeCliError`.
 - `timeline.py` — render `wo_events` into a human timeline. `build_timeline()`:95,
   `count_debug()`:123, `event_level()`:40, `DEBUG_KINDS`:19, `STATUS_LABEL`:28.
 - `testing.py` — reusable pytest fixtures + the fake `claude` executable so suites never
@@ -43,8 +45,15 @@
   `drain_queue()`:118, `answer_question()`:102, `build_system_prompt()`:56, `parse_verdict()`:83.
 
 **Middle:**
-- `dispatch.py` — claimed WO → live worker session. `dispatch_work_order()`:139,
-  `build_worker_prompt()`:86, `_write_worker_settings()`:27, `worker_name()`:80.
+- `worker_session.py` — **the conversation layer**: the ONLY module that knows how a
+  worker turn is run. `start()`, `send()`, `poll()`, `busy()`, `cancel()`,
+  `briefing_for()`, `is_stalled()`, `TURN_STALL_SECONDS`. Everything above it speaks in
+  turns, not processes or sessions. Its module docstring is the design rationale; see
+  `mem:work-order-lifecycle`.
+- `dispatch.py` — composes what the worker is TOLD (prompt, settings, resolved
+  model/effort/permission mode) and hands the running of it to `worker_session`.
+  `dispatch_work_order()`, `build_worker_prompt()`, `_write_worker_settings()`,
+  `worker_name()`.
 - `ops.py` (620 L) — business logic shared by CLI and UI. `start_os()`:63,
   `create_work_order()`:261, `finish()`:374, `find_work_order()`:281, `os_status()`:142, `OpsError`:31.
 
@@ -71,7 +80,7 @@ No module calls `sqlite3.connect` directly.
 |---|---|---|
 | Central | `paths.central_db_path()`:21 = `$JARVIS_HOME/os.db` (`JARVIS_HOME` defaults `~/.jarvis`, paths.py:18) | `projects`, `inbox`, `backlog`, `knowledge`, `os_state` (central_store.py:16,25,36,46,54) |
 | Neo | `paths.neo_db_path()`:25 = `$JARVIS_HOME/neo.db` | `questions`, `learnings` (neo_store.py:29,45) |
-| Per-project | `paths.project_db_path()`:54 = `<project>/.jarvis/jarvis.db` | `work_orders`, `wo_events`, `wo_messages`, `notifications`, `assumptions` (project_store.py:33,57,64,74,84) |
+| Per-project | `paths.project_db_path()`:54 = `<project>/.jarvis/jarvis.db` | `work_orders`, `wo_events`, `wo_messages`, `wo_turns`, `notifications`, `assumptions`, `approvals` |
 
 `ProjectStore.__init__`:111 runs `_migrate()`:118 applying `ADDED_COLUMNS`:99.
 Also under `$JARVIS_HOME`: `logs/` (paths.py:31), `run/jarvisd.pid` (paths.py:35-40).
@@ -99,4 +108,8 @@ PyPI is an unrelated project** — never point anyone at `pip install jarvis-os`
 Covered by `tests/test_install_script.py` (`--dry-run` against a throwaway local remote;
 real install behind `JARVIS_TEST_INSTALL=1`).
 
-See `mem:work-order-lifecycle` for the WO state machine and `mem:testing` for the suite.
+Also under `<project>/.jarvis/`: `turns/<wo-id>/<seq>.json` (a turn's raw result),
+`worker-settings/<wo-id>.json`, `agent-skills/`. All gitignored.
+
+See `mem:work-order-lifecycle` for the WO state machine and how a turn runs, and
+`mem:testing` for the suite.
