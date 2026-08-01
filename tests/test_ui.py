@@ -467,6 +467,64 @@ def test_gate_decision_returns_to_the_page_it_was_made_from(gated):
     assert r.headers["location"] == "/gates"
 
 
+def test_dismiss_from_the_dashboard_clears_the_command_without_approving_it(gated):
+    """The third button. It has to do what approve does to the worker and none of what
+    approve does to the record."""
+    from jarvis.hooks import preflight_decision
+
+    command = "grep -rn shipit.sh src/jarvis/gates.py"
+    approval = gated.request(command=command, why="read-only, greps a file")
+
+    r = gated.client.post(f"/gates/{approval['id']}/decide",
+                          data={"decision": "dismiss",
+                                "reason": "the literal is inside a search pattern",
+                                "project": "proj_a", "next": "/gates"})
+    assert r.status_code == 303
+
+    fresh = gated.approval()
+    assert fresh["status"] == "dismissed"
+    assert fresh["decided_by"] == "user"
+
+    settings = json.loads(
+        (gated.project / ".jarvis" / "worker-settings"
+         / f"{gated.wo_id}.json").read_text())
+    result = preflight_decision(
+        {"tool_name": "Bash", "tool_input": {"command": command},
+         "cwd": str(gated.project)}, settings["env"])
+    assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+    page = gated.client.get("/gates").text
+    # Listed apart from the verdicts, with the rate, and NOT counted as approved.
+    assert "Not gated actions — the OS got these wrong" in page
+    assert "false-positive rate: 1 of 1 (100%)" in page
+    assert "no gate has been decided yet" in page
+
+
+def test_dismiss_from_the_dashboard_needs_a_reason(gated):
+    """The reason is the defect report on the recogniser — the only thing attached to
+    the false-positive count that says what actually went wrong."""
+    approval = gated.request(command="grep -rn shipit.sh src/")
+
+    r = gated.client.post(f"/gates/{approval['id']}/decide",
+                          data={"decision": "dismiss", "reason": " ",
+                                "project": "proj_a", "next": "/gates"})
+    from urllib.parse import unquote
+    assert "needs a reason" in unquote(r.headers["location"])
+    assert gated.approval()["status"] == "pending"
+
+
+def test_a_mangled_decision_value_cannot_open_a_gate(gated):
+    """`decision` is an attacker-settable form field, so an unknown value must fail
+    closed rather than falling through to the permissive branch."""
+    approval = gated.request()
+
+    gated.client.post(f"/gates/{approval['id']}/decide",
+                      data={"decision": "approve​", "reason": "nice try",
+                            "project": "proj_a", "next": "/gates"})
+
+    assert gated.approval()["status"] == "denied"
+
+
 def test_neo_tab_sends_gate_escalations_to_the_gates_tab(gated):
     """A gate escalation is a Neo question, so it also lands on the neo tab. Answering
     it there queues a message and leaves the gate shut — the reply box has to be
