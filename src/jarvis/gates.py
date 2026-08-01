@@ -53,7 +53,26 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 GRANT_TTL_SECONDS = 3600
 GRANT_MAX_USES = 3
 
-APPROVAL_STATUSES = ("pending", "approved", "denied", "expired")
+APPROVAL_STATUSES = ("pending", "approved", "denied", "dismissed", "expired")
+
+# The verdicts a reviewer can reach. `dismissed` is not a softer denial and not a quieter
+# approval — it answers a different question.
+#
+# The first three statuses shipped without it, and the omission produced a contradiction
+# the user was made to arbitrate twice, both times coherently and in opposite directions.
+# When a recogniser fires on a command that performs no privileged action — a deploy
+# script's name quoted inside a grep pattern, a PR body that cites a path — every
+# available verdict recorded something false. `approved` asserts that a privileged action
+# was reviewed and authorised, leaving an audit trail implying a real deploy was vetted.
+# `denied` asserts the worker made a bad request and tells it not to retry, blocking a
+# command that was never privileged. Escalating spends the user's attention on an OS bug,
+# which is the exact cost the gate exists to avoid. The identical command was denied once
+# and approved once as a direct result.
+#
+# `dismissed` says the only true thing: the classifier was wrong. It clears the command,
+# records no authorisation, and is counted separately so the false-positive rate is a
+# number someone can watch rather than an anecdote.
+VERDICTS = ("approved", "denied", "dismissed")
 
 
 @dataclass(frozen=True)
@@ -306,16 +325,54 @@ def deny_conflicts(config: GateConfig, deny_rules: Iterable[str]
 # straight to the user and the gate would be a slower version of the wall it replaced.
 # Gate reviews therefore get their own mandate, with the standard the user actually
 # applies: is this the work order's own reviewed work, shipped the normal way?
+#
+# The PREMISE CHECK comes first, and its position is the fix, not a stylistic choice. The
+# earlier persona OPENED by asserting "a worker tried to run a command that ships code",
+# then required of every approval that "work landed on a branch, in a pull request, with
+# checks passing" — which a misclassified `grep` can never satisfy, so the closest-fitting
+# clause left was DENY. The persona structurally forced the wrong answer on false
+# positives; Neo was following it correctly. "Was this even a gated action" has to be
+# answered BEFORE "should this gated action proceed", because it is a question about a
+# different subject: the classifier, not the worker.
 REVIEWER_PERSONA = """You are Neo, reviewing a PRIVILEGED ACTION REQUEST inside the \
 Jarvis agentic OS.
 
-A worker agent tried to run a command that ships code — merging a pull request, cutting
-a release, restarting a service. The command was blocked and handed to you. You decide,
-on the user's behalf, whether it goes through.
+A worker agent ran a command that the OS's recogniser matched as privileged — merging a
+pull request, cutting a release, restarting a service. The command was blocked and handed
+to you. You decide, on the user's behalf, what happens to it.
 
 You are the independent check, not a rubber stamp. The worker wrote the request; it is
 an argument for its own case, so verify the claims against the evidence it supplies
 rather than accepting the summary.
+
+FIRST, THE PREMISE CHECK — does this command actually perform the action at all?
+
+The recogniser matches text, so it also fires on commands that merely NAME a privileged
+action. Ask this before anything else, because the other three verdicts all answer a
+question that has not arisen yet.
+
+DISMISS when the command performs no privileged action. Typical cases:
+- The gated literal appears only inside a search pattern, a file path, a quoted string,
+  a heredoc body, a commit message or PR prose — it is being read or written about, not
+  run. `grep -rn <deploy script> src/` searches for a name; it deploys nothing.
+- The command is plainly read-only: grep, head, cat, ls, git log, git diff, git status.
+- The verb is not the gated one. `gh pr create` opens a pull request; the gate is on the
+  MERGE. Opening a PR is ordinary work.
+
+Dismissing is not approval and not refusal. It records that the OS's classifier was
+wrong, unblocks the exact command, and authorises nothing — so it costs the user no
+attention and leaves no audit trail claiming a release was vetted. When a command is a
+false positive, DISMISS is the only honest verdict available; do not approve it (that
+records an authorisation that never happened) and do not deny it (that tells the worker
+it misbehaved and blocks a command that was always fine).
+
+HARD LIMIT on dismissal, and it is absolute: a command that ACTUALLY invokes the deploy
+or release script, ACTUALLY merges a pull request, or ACTUALLY restarts or stops a
+service is a genuine privileged action, however routine or well-justified it looks. It
+gets the full review below. If you are unsure whether the command runs the thing or only
+mentions it, it runs it — assume the privileged reading and review it properly.
+
+If the command really does perform the action, continue:
 
 APPROVE when all of these hold:
 - The action is squarely within what the work order was asked to do.
@@ -326,10 +383,12 @@ APPROVE when all of these hold:
 - Consequences are recoverable by ordinary means (revert the merge, ship the previous
   release again).
 
-DENY when the request is outside the work order's scope, skips review (a direct push to
-a protected branch when a PR was the agreed route), targets something other than what it
-claims, or bundles unrelated changes. Say plainly what is wrong; the worker sees your
-reason and can fix it and ask again.
+DENY when the request is a real privileged action that should not proceed: outside the
+work order's scope, skipping review (a direct push to a protected branch when a PR was
+the agreed route), targeting something other than what it claims, or bundling unrelated
+changes. Say plainly what is wrong; the worker sees your reason and can fix it and ask
+again. Deny is an accusation that the worker asked for the wrong thing — never use it
+for a command the recogniser matched by mistake. That is what DISMISS is for.
 
 ESCALATE to the user, rather than deciding, when:
 - Tests or checks are failing, absent, or not mentioned at all.
@@ -340,12 +399,18 @@ ESCALATE to the user, rather than deciding, when:
 - Anything in the request does not add up, including a claim you cannot check.
 
 Escalating is the safe answer and costs only a little of the user's time. Approving
-something that should not ship costs much more. When genuinely torn, escalate.
+something that should not ship costs much more. When genuinely torn about a REAL
+privileged action, escalate. Note that a false positive is the one case where escalating
+is NOT the safe answer: it spends the user's attention on an OS bug, which is the exact
+cost this gate exists to avoid. Dismiss it instead.
 
 Output STRICT JSON, nothing else:
-  {"escalate": false, "approve": true,  "reason": "<one line: what you verified>"}
-  {"escalate": false, "approve": false, "reason": "<one line: what is wrong>"}
-  {"escalate": true,  "approve": false, "reason": "<one line: why the user must decide>"}"""
+  {"escalate": false, "verdict": "approve",  "reason": "<one line: what you verified>"}
+  {"escalate": false, "verdict": "deny",     "reason": "<one line: what is wrong>"}
+  {"escalate": false, "verdict": "dismiss",  "reason": "<one line: why this command \
+performs no privileged action>"}
+  {"escalate": true,  "verdict": "deny",     "reason": "<one line: why the user must \
+decide>"}"""
 
 
 def build_request_question(action: GatedAction, wo: dict[str, Any],
@@ -376,8 +441,10 @@ def build_request_question(action: GatedAction, wo: dict[str, Any],
                   evidence.strip()[:2000]]
     parts += [
         "",
-        "Decide: approve it, deny it with a reason the worker can act on, or escalate "
-        "to the user.",
+        "Decide: dismiss it if the command performs no privileged action and the "
+        "recogniser matched it by mistake; otherwise approve it, deny it with a reason "
+        "the worker can act on, or escalate to the user.",
+        f"(The recogniser that fired was: {action.matched})",
     ]
     return "\n".join(parts)
 
@@ -442,24 +509,66 @@ def denied_message(approval: dict[str, Any], reason: str, by: str) -> str:
     )
 
 
-def apply_decision(store: ProjectStore, approval_id: int, approved: bool,
+# A dismissal has to tell the worker two things a grant does not: that nothing was
+# authorised, and that nothing about its request was wrong. A worker told only "you may
+# proceed" learns to treat the gate as a formality; a worker told "you were denied"
+# learns to avoid a command that was always fine. Neither is true here.
+def dismissed_message(approval: dict[str, Any], reason: str, by: str) -> str:
+    return (
+        f"[Gate {approval['id']} DISMISSED by {by} — not a privileged action] {reason}\n\n"
+        f"The OS matched this command as `{approval['kind']}` by mistake. It performs no "
+        f"privileged action, so nothing was authorised and nothing was refused: this is "
+        f"a defect in the gate's recogniser, not a verdict on your request.\n\n"
+        f"Run it again, exactly as written, and it will go through:\n"
+        f"    {approval['command']}\n\n"
+        f"The dismissal covers this exact command string for this work order and does "
+        f"not expire. Anything that genuinely does ship code still needs a real request."
+    )
+
+
+_VERDICT_MESSAGE = {
+    "approved": approved_message,
+    "denied": denied_message,
+    "dismissed": dismissed_message,
+}
+
+
+def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
                    reason: str, decided_by: str) -> dict[str, Any]:
     """Record a verdict and queue the worker's resume message.
 
-    Shared by Neo's drain and the user's `jarvis gate approve/deny`, so a gate opened by
-    either route leaves identical state behind. Returns the updated approval row.
+    Shared by Neo's drain and the user's `jarvis gate approve/deny/dismiss`, so a gate
+    resolved by either route leaves identical state behind. Returns the updated row.
+
+    A dismissal emits `gate_dismissed` rather than `gate_decided`, deliberately. The two
+    are not the same event: `gate_decided` is the record of a privileged action being
+    ruled on, and folding false positives into it would inflate exactly the audit trail
+    the separate verdict exists to keep honest.
     """
-    approval = store.decide_approval(approval_id, approved=approved, reason=reason,
+    if verdict not in VERDICTS:
+        raise ValueError(f"unknown verdict {verdict!r} — expected one of {list(VERDICTS)}")
+    approval = store.decide_approval(approval_id, verdict=verdict, reason=reason,
                                      decided_by=decided_by)
-    message = (approved_message if approved else denied_message)(approval, reason, decided_by)
-    store.queue_message(approval["wo_id"], message, source="gate")
-    store.add_event(approval["wo_id"], "gate_decided", {
-        "approval_id": approval_id,
-        "decision": "approved" if approved else "denied",
-        "by": decided_by,
-        "kind": approval["kind"],
-        "reason": reason,
-    })
+    store.queue_message(approval["wo_id"],
+                        _VERDICT_MESSAGE[verdict](approval, reason, decided_by),
+                        source="gate")
+    if verdict == "dismissed":
+        store.add_event(approval["wo_id"], "gate_dismissed", {
+            "approval_id": approval_id,
+            "by": decided_by,
+            "kind": approval["kind"],
+            "command": approval["command"],
+            "matched": approval["matched"],
+            "reason": reason,
+        })
+    else:
+        store.add_event(approval["wo_id"], "gate_decided", {
+            "approval_id": approval_id,
+            "decision": verdict,
+            "by": decided_by,
+            "kind": approval["kind"],
+            "reason": reason,
+        })
     return approval
 
 

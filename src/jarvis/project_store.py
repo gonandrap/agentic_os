@@ -107,7 +107,12 @@ CREATE TABLE IF NOT EXISTS approvals (
     matched TEXT NOT NULL DEFAULT '',       -- the recogniser that fired
     justification TEXT NOT NULL DEFAULT '',
     evidence TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'pending', -- pending | approved | denied | expired
+    -- pending | approved | denied | dismissed | expired.
+    -- `dismissed` is not a verdict on a privileged action, it is a verdict on the
+    -- CLASSIFIER: the command never performed one and the gate matched it by mistake.
+    -- It clears the command like an approval does but records no authorisation, and it
+    -- is the only decided status that never expires — see gates.py.
+    status TEXT NOT NULL DEFAULT 'pending',
     -- Neo declined to decide, so the request is still pending but it is now the USER
     -- who holds it. This is the bit that decides whether a gate costs the user any
     -- attention: pending-with-Neo must stay silent, pending-with-user must not.
@@ -601,10 +606,20 @@ class ProjectStore:
         to consume attention."""
         return [a for a in self.pending_approvals(wo_id) if a["escalated"]]
 
-    def decide_approval(self, approval_id: int, approved: bool, reason: str,
+    def decide_approval(self, approval_id: int, verdict: str, reason: str,
                         decided_by: str, ttl_seconds: int = 3600) -> dict[str, Any]:
-        """Record a verdict. An approval starts its clock now, not when it was filed:
-        the window exists to bound the gap between "yes" and the act."""
+        """Record a verdict — `approved`, `denied` or `dismissed`.
+
+        Only an approval gets an expiry. It starts its clock now, not when the request
+        was filed: the window exists to bound the gap between "yes" and the act.
+
+        A dismissal deliberately gets none. It does not say "you may do this for the next
+        hour", it says "this command performs no privileged action" — a fact about the
+        command string, which does not lapse. Giving it a TTL would model it as a
+        permission, and would make one classifier bug cost a second review an hour later.
+        """
+        if verdict not in ("approved", "denied", "dismissed"):
+            raise ValueError(f"unknown verdict {verdict!r}")
         approval = self.get_approval(approval_id)
         if approval is None:
             raise KeyError(f"approval {approval_id} not found")
@@ -612,20 +627,29 @@ class ProjectStore:
         self.conn.execute(
             """UPDATE approvals SET status=?, decided_by=?, decision_reason=?,
                                     decided_at=?, expires_at=? WHERE id=?""",
-            ("approved" if approved else "denied", decided_by, reason, now,
-             now + ttl_seconds if approved else None, approval_id),
+            (verdict, decided_by, reason, now,
+             now + ttl_seconds if verdict == "approved" else None, approval_id),
         )
         return self.get_approval(approval_id)  # type: ignore[return-value]
 
     def usable_grant(self, wo_id: str, kind: str, command: str) -> dict[str, Any] | None:
-        """An approval that still authorises this command right now, or None.
+        """The decided request that lets this exact command through right now, or None.
 
-        Expiry and use-count are checked here rather than trusted from the row's status,
-        so a grant cannot outlive its window just because nothing swept the table.
+        Two statuses clear a command, and they are not the same thing — callers must read
+        `status` to tell them apart, because only one of them is an authorisation:
+
+        * `approved` — a privileged action was reviewed and permitted. Bounded: expiry
+          and use-count are re-checked here rather than trusted from the row, so a grant
+          cannot outlive its window just because nothing swept the table.
+        * `dismissed` — the gate matched a command that performs no privileged action.
+          Unbounded on purpose (see `decide_approval`); the scope that keeps it safe is
+          the exact-string match on one work order, not a clock.
         """
         approval = self.latest_approval_for(wo_id, kind, command)
-        if approval is None or approval["status"] != "approved":
+        if approval is None or approval["status"] not in ("approved", "dismissed"):
             return None
+        if approval["status"] == "dismissed":
+            return approval
         if approval["uses"] >= approval["max_uses"]:
             return None
         if approval["expires_at"] is not None and db.now() > approval["expires_at"]:
@@ -634,7 +658,11 @@ class ProjectStore:
 
     def consume_grant(self, approval_id: int) -> dict[str, Any]:
         """Spend one use of a grant. Called only when the gate actually opens, so the
-        count reflects attempts that ran, not attempts that were merely considered."""
+        count reflects attempts that ran, not attempts that were merely considered.
+
+        A dismissed row counts its uses too, though nothing enforces the limit for it:
+        the number is how often one classifier bug actually cost a worker something.
+        """
         self.conn.execute("UPDATE approvals SET uses = uses + 1 WHERE id=?", (approval_id,))
         approval = self.get_approval(approval_id)
         assert approval is not None
@@ -643,6 +671,9 @@ class ProjectStore:
             "kind": approval["kind"],
             "use": approval["uses"],
             "of": approval["max_uses"],
+            # Which of the two clearing statuses opened it. The timeline must not report
+            # a dismissed false positive as "ran the approved command".
+            "clearance": approval["status"],
         })
         return approval
 
@@ -674,6 +705,11 @@ class ProjectStore:
         Cosmetic for enforcement — `usable_grant` already refuses them — but a dashboard
         showing a month-old "approved" release gate reads as standing permission, which
         is exactly the wrong impression to leave lying around.
+
+        `status='approved'` in the WHERE clause is doing two jobs, and the second one is
+        load-bearing: it EXCLUDES `dismissed`. A dismissal never expires, and sweeping it
+        into `expired` would also erase the false-positive count that
+        `dismissed_count()` exists to report — the whole reason the verdict is separate.
         """
         cur = self.conn.execute(
             """UPDATE approvals SET status='expired'
@@ -682,6 +718,20 @@ class ProjectStore:
             (db.now(),),
         )
         return cur.rowcount
+
+    def dismissed_count(self, wo_id: str | None = None) -> int:
+        """How many gate requests turned out not to be gated actions at all.
+
+        The OS's classifier false-positive rate, in one number. It is the signal for
+        whether the recognisers in `gates.KINDS` are getting better or worse, so it is
+        counted from the rows rather than derived from anything a reviewer wrote.
+        """
+        q = "SELECT COUNT(*) c FROM approvals WHERE status='dismissed'"
+        params: list[Any] = []
+        if wo_id:
+            q += " AND wo_id=?"
+            params.append(wo_id)
+        return int(self.conn.execute(q, params).fetchone()["c"])
 
     # -- summary ----------------------------------------------------------------
 
