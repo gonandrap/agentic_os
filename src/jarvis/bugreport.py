@@ -7,9 +7,9 @@ it puts the issue link in front of the user through the normal notification pipe
 
 The template is fixed on purpose. Bugs found by agents are read later by an agent
 fixing them, and "what I expected vs what I got" plus the exact running version is what
-makes a report actionable months later. The version comes from the installed
-distribution rather than a constant, because main's pyproject deliberately lags the
-shipped version (see scripts/shipit.sh) — a hardcoded string would lie in production.
+makes a report actionable months later. Getting that version right is fiddly enough to
+have its own section below; the one rule it answers to is that a report must never carry
+a number that was never released.
 
 A filing that fails raises. Half-succeeding — pinging the user about an issue that
 does not exist — teaches them to distrust the pings.
@@ -21,6 +21,8 @@ import os
 import shutil
 import subprocess
 import time
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 #: The OS's own issue tracker. Overridable so forks (and tests) target their own repo.
@@ -36,14 +38,117 @@ class BugReportError(RuntimeError):
     """Filing the bug failed; nothing was reported to anyone."""
 
 
-def jarvis_version() -> str:
-    """The version of Jarvis OS actually running, from installed dist metadata."""
+# -- which Jarvis is running ----------------------------------------------------
+#
+# Three surfaces show this string — the bug template below, `jarvis --version`, and the
+# dashboard's environment badge — and all three are read by someone trying to correlate
+# a symptom with a release. So the one hard requirement is: NEVER report a number that
+# was never released.
+#
+# Installed dist metadata alone cannot meet that. It is exactly right in production
+# (the deploy checks out the tag, whose pyproject carries the bump) and misleading in
+# the dev checkout, because the bump lives only on release branches — main's pyproject
+# sits on whatever number it was last left at, and reporting that invents a release.
+#
+# Git settles it, with one catch worth knowing before touching this code: the release
+# branch is cut FROM main and the bump commit + tag land on that branch, never merged
+# back. So a release tag is a DESCENDANT of main, not an ancestor, and plain
+# `git describe` from the dev checkout resolves nothing at all ("No tags can describe").
+# Asking whether HEAD *is* a release tag is the question that has an answer:
+#
+#   detached exactly at jarvis-X.Y.Z  -> a real release, report X.Y.Z
+#   a Jarvis checkout, but not at a tag -> a dev build, say so with the commit
+#   no checkout (wheel install)         -> dist metadata, which is right there anyway
+
+#: Release tags are `jarvis-X.Y.Z`; the deploy leaves production detached at one.
+RELEASE_TAG_PREFIX = "jarvis-"
+
+
+def _source_dir() -> Path:
+    """The directory holding this module. Seam for tests."""
+    return Path(__file__).resolve().parent
+
+
+def _git(cwd: Path, *args: str) -> str | None:
+    """Run git in `cwd` and return stripped stdout, or None if it did not work out.
+
+    Never raises and never inspects the process cwd: `jarvis bug report` is routinely
+    run by a worker sitting in ITS OWN project's worktree, so asking git about the
+    working directory would report some unrelated project's version.
+    """
+    try:
+        proc = subprocess.run(["git", "-C", str(cwd), *args],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):  # no git binary, or it hung
+        return None
+    if proc.returncode != 0:  # not a repo, no matching tag, whatever — same answer
+        return None
+    return proc.stdout.strip() or None
+
+
+def _jarvis_checkout() -> Path | None:
+    """The Jarvis git checkout this code runs from, or None if it is not running from one.
+
+    The layout check is the point. Production and dev both install editable, so the
+    package sits at <checkout>/src/jarvis and git can be trusted. A wheel install puts
+    it in site-packages — which may itself sit inside some *unrelated* repo (a venv
+    under a user's own project), and git would happily describe that one. Requiring the
+    repo root to be the parent of our own src/jarvis keeps that mistake impossible.
+    """
+    src = _source_dir()
+    top = _git(src, "rev-parse", "--show-toplevel")
+    if not top:
+        return None
+    root = Path(top).resolve()
+    return root if root / "src" / "jarvis" == src else None
+
+
+def _dev_version(root: Path, suffix: str) -> str:
+    """How a build that is not a release identifies itself.
+
+    Deliberately carries no X.Y.Z: the dev checkout is not "0.2.1 plus a bit", it is a
+    commit that sits *behind* the latest tag (the release bump is not on main), so any
+    number here would be the invention this whole module is trying to avoid.
+    """
+    sha = _git(root, "rev-parse", "--short", "HEAD") or "unknown"
+    return f"dev-{sha}{suffix}"
+
+
+def _installed_version() -> str:
+    """Dist metadata, then the in-tree constant. The no-git fallback."""
     from importlib.metadata import PackageNotFoundError, version
     try:
         return version("jarvis-os")
     except PackageNotFoundError:  # running from a source tree without an install
         from . import __version__
         return f"{__version__} (uninstalled source tree)"
+
+
+@lru_cache(maxsize=1)
+def jarvis_version() -> str:
+    """The version of Jarvis OS actually running.
+
+    A shipped release reports its bare number; anything else is self-evidently not one.
+    A tree with uncommitted changes to tracked files is marked `-dirty`, in the release
+    case too — a hand-edited production checkout is no longer the release it claims to
+    be, and that is worth seeing on a bug report.
+
+    Cached: the dashboard badge asks once per page render, and a deploy restarts the
+    process anyway. Never raises — a version string must not be why a page 500s.
+    """
+    try:
+        root = _jarvis_checkout()
+        if root is not None:
+            suffix = "-dirty" if _git(root, "status", "--porcelain",
+                                      "--untracked-files=no") else ""
+            tag = _git(root, "describe", "--tags", "--exact-match",
+                       "--match", f"{RELEASE_TAG_PREFIX}*")
+            if tag and tag.startswith(RELEASE_TAG_PREFIX):
+                return f"{tag[len(RELEASE_TAG_PREFIX):]}{suffix}"
+            return _dev_version(root, suffix)
+    except Exception:  # noqa: BLE001 — fall back rather than break every caller
+        pass
+    return _installed_version()
 
 
 def bug_repo() -> str:
