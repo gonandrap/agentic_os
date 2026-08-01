@@ -68,6 +68,14 @@ jarvis gate list [--pending]               # privileged-action approvals (merge 
 jarvis gate show <id>                      # the request exactly as the reviewer saw it
 jarvis gate approve <id> --reason "…"      # open the gate: the worker may run the command
 jarvis gate deny <id> --reason "…"         # refuse it; the reason goes to the worker
+jarvis gate dismiss <id> --reason "…"      # NOT a gated action: the recogniser matched a
+                                           # command that ships nothing (a release script
+                                           # named in a grep pattern, a path quoted in a
+                                           # PR body). Unblocks it, records a classifier
+                                           # defect rather than an authorisation, and is
+                                           # counted separately so the false-positive
+                                           # rate is visible. Never approve or deny one:
+                                           # both write something false into the record.
 jarvis neo list                            # Neo's Q&A: pending reviews + escalations
 jarvis neo review <qid> [--correct "…"]    # approve or teach; corrections become learnings
 jarvis neo answer <qid> "…"                # answer a question Neo escalated to the user
