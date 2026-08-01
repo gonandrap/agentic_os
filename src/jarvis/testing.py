@@ -15,7 +15,9 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -130,10 +132,11 @@ FAKE_CLAUDE = r'''#!/usr/bin/env python3
 Records every invocation to $FAKE_CLAUDE_DIR/calls.jsonl and keeps a background-session
 roster in $FAKE_CLAUDE_DIR/sessions.json that `agents --json` serves back.
 """
-import json, os, sys
+import json, os, sys, time
 
 state_dir = os.environ["FAKE_CLAUDE_DIR"]
-calls_path = os.path.join(state_dir, "calls.jsonl")
+calls_dir = os.path.join(state_dir, "calls")
+turns_dir = os.path.join(state_dir, "turns")
 sessions_path = os.path.join(state_dir, "sessions.json")
 
 def load_sessions():
@@ -148,8 +151,12 @@ def save_sessions(s):
         json.dump(s, f)
 
 argv = sys.argv[1:]
-with open(calls_path, "a") as f:
-    f.write(json.dumps({"argv": argv, "cwd": os.getcwd()}) + "\n")
+# One file per invocation, never a shared append target: worker turns are concurrent
+# detached processes and a worker prompt is far past the 4KB atomic-append ceiling, so
+# a single calls.jsonl loses and interleaves records under any real fan-out.
+os.makedirs(calls_dir, exist_ok=True)
+with open(os.path.join(calls_dir, f"{time.time_ns()}-{os.getpid()}.json"), "w") as f:
+    json.dump({"argv": argv, "cwd": os.getcwd()}, f)
 
 def opt(name, default=None):
     return argv[argv.index(name) + 1] if name in argv else default
@@ -172,6 +179,10 @@ elif "--bg" in argv:
     seed = name + (resumed or "") + str(len(sessions))
     sid = "sess-" + hashlib.sha1(seed.encode()).hexdigest()[:12]
     job_id = sid[5:13]
+    # The conversation exists from the moment the session does, and outlives the agent
+    # that held it — which is what makes it resumable after `claude stop`.
+    os.makedirs(turns_dir, exist_ok=True)
+    open(os.path.join(turns_dir, sid + ".jsonl"), "a").close()
     sessions.append({
         "id": job_id,
         "sessionId": sid,
@@ -205,7 +216,52 @@ elif argv[:1] == ["stop"]:
     remaining = [s for s in sessions if s["id"] != argv[1]]
     if len(remaining) == len(sessions):
         sys.stderr.write(f"no such session {argv[1]}\n"); sys.exit(1)
+    # Releasing the agent does not delete the conversation: it stays resumable, which
+    # is the whole basis of the migration path off background sessions.
+    os.makedirs(turns_dir, exist_ok=True)
+    for s in sessions:
+        if s["id"] == argv[1]:
+            open(os.path.join(turns_dir, s["sessionId"] + ".jsonl"), "a").close()
     save_sessions(remaining)
+elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
+    # A WORKER TURN: `claude -p --session-id|--resume <sid> [briefing] -- <prompt>`.
+    # Mirrors the real CLI's two load-bearing properties (verified against 2.1.220):
+    # the id passed in is the id that comes back, on the opening turn AND on every
+    # resume — a headless resume does not fork.
+    sid = opt("--session-id") or opt("--resume")
+    prompt = argv[-1]
+    os.makedirs(turns_dir, exist_ok=True)
+    log = os.path.join(turns_dir, sid + ".jsonl")
+    if "--resume" in argv and not os.path.exists(log):
+        sys.stderr.write(f"No conversation found with session ID: {sid}\n")
+        sys.exit(1)
+    # Like the real CLI: a session a background agent still owns cannot be resumed.
+    if "--resume" in argv and any(s["sessionId"] == sid for s in load_sessions()):
+        sys.stderr.write(
+            f"Error: Session {sid} is currently running as a background agent (bg).\n")
+        sys.exit(1)
+    with open(log, "a") as f:
+        f.write(json.dumps(prompt) + "\n")
+    seq = sum(1 for _ in open(log))
+    # A turn the test wants to observe mid-flight: block until the file is removed.
+    hold = os.environ.get("FAKE_CLAUDE_TURN_HOLD")
+    if hold:
+        while os.path.exists(hold):
+            time.sleep(0.02)
+    if os.environ.get("FAKE_CLAUDE_TURN") == "fail":
+        sys.stderr.write("turn failed (test-forced)\n"); sys.exit(1)
+    if os.environ.get("FAKE_CLAUDE_TURN") == "silent":
+        sys.exit(0)  # process ends writing nothing — a crashed turn
+    if os.environ.get("FAKE_CLAUDE_TURN") == "error":
+        print(json.dumps({"type": "result", "subtype": "error_during_execution",
+                          "is_error": True, "result": "model call failed",
+                          "session_id": sid}))
+        sys.exit(0)
+    print(json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "session_id": sid, "result": f"final: {prompt[:60]}",
+        "num_turns": seq, "total_cost_usd": 0.01,
+    }))
 elif "-p" in argv and "--resume" not in argv:
     # headless one-shot (`claude -p ...`) — Neo's answering path. Deterministic
     # verdict driven by the prompt so tests control escalation.
@@ -237,16 +293,6 @@ elif "-p" in argv and "--resume" not in argv:
                    "answer": f"neo-decision for: {prompt.splitlines()[-1][:60]}",
                    "reason": "test verdict"}
     print(json.dumps({"result": json.dumps(verdict)}))
-elif "--resume" in argv and "-p" in argv:
-    behavior = os.environ.get("FAKE_CLAUDE_RESUME", "ok")
-    if behavior == "fail":
-        sys.stderr.write("resume failed\n"); sys.exit(1)
-    sid = argv[argv.index("--resume") + 1]
-    # like the real CLI: refuse to resume a session still owned by a bg agent
-    if any(s["sessionId"] == sid for s in load_sessions()):
-        sys.stderr.write(f"Error: Session {sid} is currently running as a background agent (bg).\n")
-        sys.exit(1)
-    print(json.dumps({"result": f"ack: {argv[argv.index('-p') + 1][:40]}"}))
 else:
     sys.stderr.write(f"fake claude: unhandled argv {argv}\n"); sys.exit(2)
 '''
@@ -359,19 +405,69 @@ def fake_claude(tmp_path, monkeypatch):
 
         @property
         def calls(self) -> list[dict]:
-            path = fdir / "calls.jsonl"
-            if not path.exists():
+            """Every invocation, oldest first (one file each; the name is a timestamp)."""
+            cdir = fdir / "calls"
+            if not cdir.is_dir():
                 return []
-            return [json.loads(l) for l in path.read_text().splitlines()]
+            out = []
+            for path in sorted(cdir.iterdir()):
+                try:
+                    out.append(json.loads(path.read_text()))
+                except (OSError, json.JSONDecodeError):
+                    continue  # mid-write; the caller polls
+            return out
+
+        def wait_calls(self, matching, count: int = 1, timeout: float = 15.0
+                       ) -> list[dict]:
+            """Wait for `count` recorded calls satisfying `matching(call)`.
+
+            A worker turn is a detached process, so it records itself a moment AFTER the
+            call that launched it returns. Every argv assertion has to wait for that;
+            otherwise the test is racing the process it just started.
+            """
+            deadline = time.monotonic() + timeout
+            found: list[dict] = []
+            while time.monotonic() < deadline:
+                found = [c for c in self.calls if matching(c)]
+                if len(found) >= count:
+                    return found
+                time.sleep(0.02)
+            return found
 
         @property
         def sessions(self) -> list[dict]:
             path = fdir / "sessions.json"
             return json.loads(path.read_text()) if path.exists() else []
 
-        def job_state(self, job_id: str) -> dict:
-            path = fdir / "jobs" / job_id / "state.json"
-            return json.loads(path.read_text()) if path.exists() else {}
+        @property
+        def turns(self) -> dict[str, list[str]]:
+            """Every headless worker turn, as {session id: [prompt, …]}.
+
+            The key assertion this enables: one session id accumulating many turns is
+            exactly what "the id does not move" looks like from outside.
+            """
+            tdir = fdir / "turns"
+            if not tdir.is_dir():
+                return {}
+            return {
+                path.stem: [json.loads(line) for line in
+                            path.read_text().splitlines() if line]
+                for path in sorted(tdir.iterdir())
+            }
+
+        def turns_fail(self, mode: str = "fail") -> None:
+            """Make subsequent turns fail. `fail` = non-zero exit, `silent` = exits
+            writing nothing at all (a crashed process), `error` = a well-formed result
+            with `is_error`."""
+            monkeypatch.setenv("FAKE_CLAUDE_TURN", mode)
+
+        def hold_turns(self) -> Path:
+            """Make subsequent turns block until the returned path is deleted, so a
+            test can observe a work order mid-turn."""
+            gate = fdir / "turn-hold"
+            gate.write_text("held")
+            monkeypatch.setenv("FAKE_CLAUDE_TURN_HOLD", str(gate))
+            return gate
 
         def set_session_state(self, session_id: str, state: str) -> None:
             """Move a session's state, keeping its job result file in step.
@@ -393,6 +489,30 @@ def fake_claude(tmp_path, monkeypatch):
             (fdir / "sessions.json").write_text(json.dumps(sessions))
 
     return Handle()
+
+
+def _settle_turns(store: Any, timeout: float = 15.0) -> bool:
+    """Block until every in-flight turn in this project has been reaped.
+
+    Worker turns are detached processes, so a test that launched one has to wait for it
+    the way the daemon does — by polling. Returns False on timeout rather than raising,
+    so the caller's own assertion reports the failure.
+    """
+    from . import worker_session
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        worker_session.poll(store)
+        if not store.running_turns():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+@pytest.fixture()
+def settle_turns():
+    """`settle_turns(store)` — block until every in-flight turn has been reaped."""
+    return _settle_turns
 
 
 def make_git_project(root: Path, name: str, readme: str | None = "# proj\n") -> Path:

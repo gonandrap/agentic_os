@@ -48,15 +48,31 @@ def make_two_projects(jarvis_home, fake_claude, tmp_path, claude_json):
     return {"a": pa, "b": pb, "daemon": daemon, "catalog": catalog}
 
 
-def bind(project_path, wo_id):
-    sess = [s for s in claude_cli.list_background_sessions()
-            if s.name.startswith(f"[WO {wo_id}]")]
-    handle_hook(
-        {"hook_event_name": "SessionStart", "session_id": sess[0].session_id,
-         "cwd": str(project_path)},
-        {"JARVIS_WO_ID": wo_id, "JARVIS_PROJECT_PATH": str(project_path)},
-    )
-    return sess[0]
+def session_of(project_path, wo_id) -> str:
+    """The work order's session id — assigned at dispatch, and fixed for its lifetime."""
+    store = ProjectStore(project_path)
+    try:
+        return store.get_work_order(wo_id)["session_id"]
+    finally:
+        store.close()
+
+
+def turn_calls(fake_claude, resumed=None, expect=0):
+    """Worker-turn invocations. `expect` waits for that many: a turn is a detached
+    process, so it records itself a moment after the call that launched it returned."""
+    def match(c):
+        argv = c["argv"]
+        if "-p" not in argv:
+            return False
+        if resumed is True:
+            return "--resume" in argv
+        if resumed is False:
+            return "--session-id" in argv
+        return "--session-id" in argv or "--resume" in argv
+
+    if expect:
+        return fake_claude.wait_calls(match, count=expect)
+    return [c for c in fake_claude.calls if match(c)]
 
 
 # -- 1. status truthfulness: flag exactly what needs the user -----------------------
@@ -74,8 +90,8 @@ def test_blocked_worker_flagged(fleet):
     d = fleet["daemon"]
     wo = ops.create_work_order("proj_a", "task")
     d.tick()
-    sess = bind(fleet["a"], wo["id"])
-    handle_hook({"hook_event_name": "Notification", "session_id": sess.session_id,
+    sid = session_of(fleet["a"], wo["id"])
+    handle_hook({"hook_event_name": "Notification", "session_id": sid,
                  "cwd": str(fleet["a"]), "message": "needs permission"},
                 {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(fleet["a"])})
     st = ops.os_status()
@@ -123,24 +139,22 @@ def test_settings_drift_flagged(fleet):
                for a in st["attention"])
 
 
-@scenario("jarvis/status-truth", "a vanished worker session becomes failed + attention")
-def test_dead_session_flagged(fleet, fake_claude, monkeypatch):
+@scenario("jarvis/status-truth", "a worker turn that dies becomes failed + attention")
+def test_dead_turn_flagged(fleet, fake_claude, settle_turns):
     d = fleet["daemon"]
+    fake_claude.turns_fail("silent")   # the process exits writing no result
     wo = ops.create_work_order("proj_a", "task")
     d.tick()
-    sess = bind(fleet["a"], wo["id"])
-    claude_cli.stop_session(sess.id)  # session disappears from the roster
     store = ProjectStore(fleet["a"])
-    try:  # age the wo past the 120s grace period
-        store.conn.execute("UPDATE work_orders SET updated_at = updated_at - 999 WHERE id=?",
-                           (wo["id"],))
+    try:
+        assert settle_turns(store)
     finally:
         store.close()
     d.tick_count = 0
-    d.tick()  # reconcile tick
+    d.tick()
     st = ops.os_status()
-    assert any(a["wo_id"] == wo["id"] and "disappeared" in a["reason"]
-               for a in st["attention"])
+    assert any(a["wo_id"] == wo["id"] and "failed" in a["reason"]
+               for a in st["attention"]), st["attention"]
 
 
 # -- 2. routing: right project, right metadata, right limits -----------------------
@@ -150,7 +164,7 @@ def test_project_isolation_and_defaults(fleet, fake_claude):
     d = fleet["daemon"]
     ops.create_work_order("proj_b", "b-task")
     d.tick()
-    bg = [c for c in fake_claude.calls if "--bg" in c["argv"]]
+    bg = fake_claude.wait_calls(lambda c: "--session-id" in c["argv"])
     assert len(bg) == 1
     argv = bg[0]["argv"]
     assert bg[0]["cwd"] == str(fleet["b"])
@@ -168,7 +182,7 @@ def test_wo_overrides(fleet, fake_claude):
     d = fleet["daemon"]
     ops.create_work_order("proj_a", "special", model="opus", permission_mode="plan")
     d.tick()
-    argv = [c for c in fake_claude.calls if "--bg" in c["argv"]][0]["argv"]
+    argv = fake_claude.wait_calls(lambda c: "--session-id" in c["argv"])[0]["argv"]
     assert argv[argv.index("--model") + 1] == "opus"
     assert argv[argv.index("--permission-mode") + 1] == "plan"
 
@@ -179,7 +193,7 @@ def test_concurrency_respected(fleet, fake_claude):
     for i in range(3):
         ops.create_work_order("proj_b", f"t{i}")  # max_concurrent=1
     d.tick()
-    assert len([c for c in fake_claude.calls if "--bg" in c["argv"]]) == 1
+    assert len(fake_claude.wait_calls(lambda c: "--session-id" in c["argv"])) == 1
     store = ProjectStore(fleet["b"])
     try:
         running = store.list_work_orders(statuses=("running",))
@@ -187,7 +201,7 @@ def test_concurrency_respected(fleet, fake_claude):
     finally:
         store.close()
     d.tick()
-    assert len([c for c in fake_claude.calls if "--bg" in c["argv"]]) == 2
+    assert len(fake_claude.wait_calls(lambda c: "--session-id" in c["argv"], count=2)) == 2
 
 
 @scenario("jarvis/routing", "the worker prompt carries the full contract + knowledge")
@@ -200,7 +214,8 @@ def test_prompt_contract(fleet, fake_claude):
     d = fleet["daemon"]
     wo = ops.create_work_order("proj_a", "upgrade deps", description="careful please")
     d.tick()
-    prompt = [c for c in fake_claude.calls if "--bg" in c["argv"]][0]["argv"][-1]
+    prompt = fake_claude.wait_calls(
+        lambda c: "--session-id" in c["argv"])[0]["argv"][-1]
     for must in ("upgrade deps", "careful please", f"jarvis wo assume {wo['id']}",
                  f"jarvis wo ask {wo['id']}", f"jarvis wo finish {wo['id']}",
                  "never bump major versions", "Never push to main"):
@@ -210,31 +225,28 @@ def test_prompt_contract(fleet, fake_claude):
 # -- 3. feedback routing --------------------------------------------------------------
 
 @scenario("jarvis/feedback", "feedback waits while the worker runs, delivers when idle")
-def test_feedback_waits_then_delivers(fleet, fake_claude):
+def test_feedback_waits_then_delivers(fleet, fake_claude, settle_turns):
     d = fleet["daemon"]
+    gate = fake_claude.hold_turns()
     wo = ops.create_work_order("proj_a", "task")
     d.tick()
-    sess = bind(fleet["a"], wo["id"])
+    sid = session_of(fleet["a"], wo["id"])
     ops.send_message(wo["id"], "use the staging bucket")
     d.tick_count = 0
     d.tick()
     store = ProjectStore(fleet["a"])
     try:
         assert store.queued_messages(wo["id"]), "must NOT deliver mid-turn"
-    finally:
-        store.close()
-    fake_claude.set_session_state(sess.session_id, "done")
-    d.tick_count = 0
-    d.tick()
-    d.delivery_pool.shutdown(wait=True)
-    store = ProjectStore(fleet["a"])
-    try:
+        gate.unlink()                      # turn one finishes
+        assert settle_turns(store)
+        d.tick_count = 0
+        d.tick()
         assert not store.queued_messages(wo["id"])
-        resumes = [c for c in fake_claude.calls
-                   if "--bg" in c["argv"] and "--resume" in c["argv"]]
+        resumes = turn_calls(fake_claude, resumed=True, expect=1)
         assert resumes and resumes[0]["argv"][
-            resumes[0]["argv"].index("--resume") + 1] == sess.session_id
+            resumes[0]["argv"].index("--resume") + 1] == sid
         # the worker's reply came back into the record
+        assert settle_turns(store)
         msgs = store.list_messages(wo["id"])
         assert any(m["direction"] == "agent_to_user" for m in msgs)
     finally:
@@ -312,7 +324,8 @@ def test_worker_permissions_scoped(fleet, fake_claude):
     d = fleet["daemon"]
     wo = ops.create_work_order("proj_a", "task")
     d.tick()
-    argv = [c for c in fake_claude.calls if "--bg" in c["argv"]][0]["argv"]
+    argv = fake_claude.wait_calls(
+        lambda c: "--session-id" in c["argv"])[0]["argv"]
     settings = json.loads(open(argv[argv.index("--settings") + 1]).read())
     allow = settings["permissions"]["allow"]
     wt = f"{str(fleet['a']).lstrip('/')}/.claude/worktrees/{wo['id']}"

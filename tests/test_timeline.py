@@ -14,10 +14,13 @@ SIGNAL_KINDS = [
     "created", "dispatched", "status", "attention", "assumption",
     "question_asked", "neo_answered", "escalation_answered", "reviewed",
     "finished",
+    # A turn that failed or was cancelled is the story, not the plumbing: it is why
+    # the work order stopped.
+    "turn_failed", "turn_cancelled",
 ]
 DEBUG_KINDS = [
-    "message_queued", "delivering", "message_delivered", "turn_ended",
-    "session_bound", "permission_mode_changed",
+    "message_queued", "delivering", "message_delivered",
+    "turn_started", "turn_ended", "session_released", "permission_mode_changed",
     "hook:SessionStart", "hook:Stop", "hook:SessionEnd", "hook:Notification",
 ]
 
@@ -45,7 +48,7 @@ def test_unknown_kinds_default_to_signal():
 
 def test_debug_events_hidden_by_default():
     events = [ev("created", 1.0, origin="jarvis"), ev("turn_ended", 2.0),
-              ev("message_delivered", 3.0, msg_id=1, via="bg-resume")]
+              ev("message_delivered", 3.0, msg_id=1, turn=2)]
     kinds = [e["kind"] for e in build_timeline({}, events, [])]
     assert kinds == ["created"]
 

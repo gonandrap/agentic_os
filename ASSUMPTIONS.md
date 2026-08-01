@@ -414,3 +414,102 @@ no implementation yet. Decisions made autonomously:
     the project repo but never commits there; the user ports observer logic into
     probes/playbooks and commits. painforwisdom first, auto_heycrypto last with the
     settings-superset check, per the fleet plan.
+
+## J. Headless turn runtime (2026-08-01, worktree-headless-turns)
+
+Design doc: `docs/superpowers/specs/2026-08-01-headless-turn-runtime-design.md`.
+The user asked for the delivery mechanism to be isolated into its own layer and moved off
+background sessions, explicitly told me not to come back with scope questions, and asked
+for every call to be recorded here instead. These are those calls.
+
+62. **The layer is `src/jarvis/worker_session.py`, a module of functions — not a
+    pluggable runtime with two implementations.** A `Protocol` plus a bg-backed and a
+    headless-backed strategy was the obvious "safe" shape, and I rejected it: production
+    is a tag checkout, so rollback is redeploying the previous tag, not flipping a
+    runtime flag. A second implementation would be dead code carrying the exact
+    complexity this change exists to delete. One seam, one implementation.
+
+63. **Jarvis mints the session id (`uuid4`) before the process starts, and it never
+    changes for the life of the work order.** Verified: `--session-id` is honoured under
+    `-p`, and `-p --resume` reuses the id rather than forking (`--fork-session` exists to
+    opt into forking). This is the load-bearing decision — it is what lets
+    `bind_session`, `prior_sessions`, `INV-SESSION-FORWARD`, SessionStart-hook binding,
+    `[WO <id>]`-name reconciliation and the "session never appeared" timeout all be
+    deleted rather than ported.
+
+64. **Turns run as detached processes (`start_new_session=True`) with their JSON result
+    written to a file under `.jarvis/turns/<wo-id>/<seq>.json`, not as blocking calls on
+    a daemon thread pool.** Blocking in the pool is simpler and I did not take it:
+    `shipit` restarts jarvisd on every release, and a turn can run for hours, so every
+    deploy would lose the reply of every in-flight turn. Detaching also frees the 4-slot
+    delivery pool, which disappears.
+
+65. **A new `wo_turns` table, rather than reusing `job_id`/`reply_job_id`.** The
+    conversation becomes explicit and queryable, which is what makes reply capture a
+    field read instead of a three-strikes retry loop over the Claude supervisor's
+    private `state.json`. The old columns are left in place (SQLite drops are expensive
+    and old rows still carry history) but are no longer written.
+
+66. **A stalled turn (>6h) raises attention; it is NOT killed.** A legitimately long turn
+    and a hung one are indistinguishable from outside, and killing loses real work. The
+    flag names `jarvis wo cancel`, so the decision stays with the user.
+
+67. **Liveness is `os.kill(pid, 0)` plus a `/proc/<pid>/cmdline` check that the pid is
+    still a `claude`.** Pid reuse across a multi-hour turn is unlikely but a false
+    "still running" hangs a work order forever, and the deployment is Linux. Degrades to
+    `os.kill` alone where `/proc` is absent.
+
+68. **`SessionEnd` stops settling the work order and becomes a pure timeline event.**
+    Forced, not chosen: under `-p` that hook fires at the end of *every* turn (verified),
+    so leaving it as-is would file every work order for review after its first turn.
+    Settlement moves wholesale to the turn reconciler. This is the single change most
+    likely to break the OS silently, so it is called out in the design doc too.
+
+69. **Ad-hoc adoption of the user's own background sessions is kept as-is.** It is an
+    independent feature about *user* visibility, and now that workers never enter the
+    roster it gets simpler rather than obsolete. `claude agents --json` polling and
+    `INV-ADHOC-NOT-GOVERNED` stay.
+
+70. **Legacy in-flight work orders migrate themselves, with no migration script.**
+    `worker_session.send()` looks the session up in the roster and, if a background agent
+    still owns it, calls `stop_session()` before resuming — which a headless resume
+    requires anyway. So the first message delivered to a work order created under the old
+    transport releases its background agent and moves it onto the new one permanently.
+
+71. **The 63 stale background sessions are reported, never auto-stopped.**
+    `jarvis doctor` lists orphaned `[WO …]` agents with no open work order and prints the
+    exact `claude stop` commands. Bulk-stopping sessions in the user's own agents view is
+    theirs to authorise, and the pileup stops growing the moment this ships regardless.
+
+72. **`spawn_background`, `list_background_sessions` and `stop_session` stay in
+    `claude_cli`; `job_result`, `jobs_dir` and `send_to_session` are deleted.** The first
+    three still serve ad-hoc adoption and the migration path above. The last three exist
+    only to serve the old transport.
+
+73. **Every turn still carries the full briefing** (model, effort, permission mode,
+    appended system prompt, settings file, `--add-dir` skills) via the existing
+    `claude_cli._briefing_args`. A resumed session re-derives all of it from argv rather
+    than from the transcript, so this preserves the property PR #42 established, on the
+    new transport, unchanged.
+
+74. **Turns are launched with `stdin=DEVNULL` and keep the `--` fence.** Both are
+    empirical: without the redirect every turn waits 3s on stdin, and `--tools` turns out
+    to be variadic exactly like `--add-dir`, so an unfenced prompt is swallowed as an
+    option value.
+
+75. **The UI's `claude attach <session_id>` hint becomes `claude --resume <sid>` run from
+    the worktree.** `attach` is a background-agent verb and workers are no longer
+    background agents, so the old hint would simply fail. The browser terminal client the
+    user described is explicitly out of scope for this change.
+
+76. **A work order that is in flight when this release lands is surfaced, never settled.**
+    It has a session but no turn on record, which is indistinguishable from "the daemon
+    died between claiming it and spawning anything" — the state the `turn is None` branch
+    exists to fail. Rehearsing the upgrade against a copy of the live database showed both
+    real in-flight work orders being marked `failed` on the first tick after restart, ~85h
+    into their lives. A background agent may still be driving them and this reconciler
+    cannot see it, so any verdict here is a guess and "failed" is the expensive one to get
+    wrong. The two cases are told apart by `session_id`/`job_id` being set, and the
+    carried-over work order is flagged for the user instead — the next message migrates it
+    for real (`worker_session.send` releases the agent and resumes the session under a
+    turn), and `jarvis wo cancel` still stops it. It passes through that branch once.

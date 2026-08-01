@@ -1,11 +1,12 @@
 """End-to-end pipeline tests against the fake `claude` CLI:
-start → create work order → daemon tick dispatches → hooks update state →
-messages deliver → finish/review → notifications route → adhoc adoption.
+start → create work order → daemon tick dispatches a turn → hooks update state →
+messages deliver as the next turn → finish/review → notifications route → adhoc adoption.
 """
 
 from __future__ import annotations
 
 import json
+import uuid
 
 import pytest
 
@@ -28,24 +29,42 @@ def started(jarvis_home, fake_claude, catalog_file, project):
     return daemon
 
 
-def bind_session(daemon, project, wo_id: str) -> str:
-    """Mirror reality: the SessionStart hook binds the supervisor-assigned session id.
-    Returns the bound session id."""
-    store = ProjectStore(project)
-    try:
-        import subprocess  # find the fake session by name via the daemon's own channel
-        from jarvis import claude_cli
-        sess = [s for s in claude_cli.list_background_sessions()
-                if s.name.startswith(f"[WO {wo_id}]")]
-        assert sess, f"no fake session named [WO {wo_id}]"
-        sid = sess[0].session_id
-        handle_hook(
-            {"hook_event_name": "SessionStart", "session_id": sid, "cwd": str(project)},
-            {"JARVIS_WO_ID": wo_id, "JARVIS_PROJECT_PATH": str(project)},
-        )
-        return sid
-    finally:
-        store.close()
+def turn_calls(fake_claude, resumed: bool | None = None,
+               expect: int = 0) -> list[dict]:
+    """Every worker-turn invocation the fake recorded, newest last.
+
+    `resumed=False` selects opening turns (`--session-id`), `True` the ones that
+    continue a conversation (`--resume`). Pass `expect` to wait for that many: a turn is
+    a detached process, so it records itself a moment after the call that launched it
+    returned, and asserting straight away races it.
+    """
+    def match(call):
+        argv = call["argv"]
+        if "-p" not in argv:
+            return False
+        if resumed is True:
+            return "--resume" in argv
+        if resumed is False:
+            return "--session-id" in argv
+        return "--session-id" in argv or "--resume" in argv
+
+    if expect:
+        return fake_claude.wait_calls(match, count=expect)
+    return [c for c in fake_claude.calls if match(c)]
+
+
+def run_turn(daemon, store, settle_turns):
+    """A full cycle: tick (which launches whatever is due), wait for that turn's
+    process to exit, then tick again so the work order settles against the result.
+
+    Turns are detached processes now, so a test has to wait for one exactly the way
+    the daemon does instead of assuming the work happened inside the call.
+    """
+    daemon.tick_count = 0
+    daemon.tick()
+    assert settle_turns(store), "a worker turn never finished"
+    daemon.tick_count = 0
+    daemon.tick()
 
 
 def test_start_bootstraps_and_registers(started, project, jarvis_home):
@@ -64,22 +83,22 @@ def test_dispatch_flow(started, fake_claude, project):
     store = ProjectStore(project)
     fresh = store.get_work_order(wo["id"])
     assert fresh["status"] == "running"
-    assert fresh["session_id"] is None  # bound later by hook/reconciler
     assert fresh["worktree"] == wo["id"]
+    # The session id exists before the worker does — Jarvis mints it and passes it in,
+    # so there is nothing to bind afterwards and nothing that can move it later.
+    sid = fresh["session_id"]
+    assert uuid.UUID(sid)
 
-    # the SessionStart hook binds the supervisor-assigned session id
-    sid = bind_session(daemon, project, wo["id"])
-    assert store.get_work_order(wo["id"])["session_id"] == sid
-
-    # the fake claude recorded a --bg spawn with our conventions
-    bg = [c for c in fake_claude.calls if "--bg" in c["argv"]]
-    assert len(bg) == 1
-    argv = bg[0]["argv"]
-    assert argv[argv.index("--name") + 1].startswith(f"[WO {wo['id']}]")
+    opening = turn_calls(fake_claude, resumed=False, expect=1)
+    assert len(opening) == 1
+    argv = opening[0]["argv"]
+    assert argv[argv.index("--session-id") + 1] == sid
+    assert "--bg" not in argv, "workers must not enter the background-agent roster"
+    assert argv[argv.index("-n") + 1].startswith(f"[WO {wo['id']}]")
     assert argv[argv.index("--worktree") + 1] == wo["id"]
     assert argv[argv.index("--model") + 1] == "sonnet"
     assert argv[argv.index("--permission-mode") + 1] == "auto"
-    # full settings (hooks + permissions + env) travel with the spawn as a file,
+    # full settings (hooks + permissions + env) travel with the turn as a file,
     # because the worktree has no .claude/settings.json (it's untracked)
     settings_path = argv[argv.index("--settings") + 1]
     settings = json.loads(open(settings_path).read())
@@ -88,10 +107,26 @@ def test_dispatch_flow(started, fake_claude, project):
     assert "PATH" in settings["env"]
     assert "Stop" in settings["hooks"]
     assert "Bash(jarvis *)" in settings["permissions"]["allow"]
+    assert argv[-2] == "--", "the prompt must stay fenced off from variadic options"
     prompt = argv[-1]
     assert "add feature X" in prompt and "OPERATION.md" in prompt
-    # appears in the (fake) agents view
-    assert fake_claude.sessions[0]["name"].startswith("[WO ")
+
+    # the turn is on the record as turn 1 of the conversation
+    turn = store.latest_turn(wo["id"])
+    assert turn["seq"] == 1 and turn["kind"] == "dispatch" and turn["state"] == "running"
+    assert turn["pid"]
+
+
+def test_worker_never_appears_in_the_agents_roster(started, fake_claude):
+    """The pileup this transport exists to end: 63 dead `[WO …]` background agents.
+
+    A worker turn is a process Jarvis owns, so nothing it does can leave a session
+    behind in the roster to be cleaned up later.
+    """
+    daemon = started
+    ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    assert fake_claude.sessions == []
 
 
 def test_concurrency_limit(started, fake_claude):
@@ -99,8 +134,7 @@ def test_concurrency_limit(started, fake_claude):
     for i in range(7):
         ops.create_work_order("proj_a", f"task {i}")
     daemon.tick()
-    bg = [c for c in fake_claude.calls if "--bg" in c["argv"]]
-    assert len(bg) == 5  # default max_concurrent = 5; the other 2 stay queued
+    assert len(turn_calls(fake_claude, expect=5)) == 5  # the other 2 stay queued
 
 
 def test_knowledge_injected_into_prompt(started, fake_claude):
@@ -110,7 +144,7 @@ def test_knowledge_injected_into_prompt(started, fake_claude):
     central.add_knowledge("global: prefer uv over pip", project="")
     ops.create_work_order("proj_a", "task")
     daemon.tick()
-    prompt = [c for c in fake_claude.calls if "--bg" in c["argv"]][0]["argv"][-1]
+    prompt = turn_calls(fake_claude, expect=1)[0]["argv"][-1]
     assert "always run make lint" in prompt
     assert "prefer uv over pip" in prompt
 
@@ -120,7 +154,7 @@ def test_hook_events_update_state(started, project):
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
-    sid = bind_session(daemon, project, wo["id"])
+    sid = store.get_work_order(wo["id"])["session_id"]
 
     env = {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)}
     handle_hook({"hook_event_name": "Notification", "session_id": sid,
@@ -131,9 +165,32 @@ def test_hook_events_update_state(started, project):
     # a notification was queued for the user
     assert any("needs input" in n["title"] for n in store.unrouted_notifications())
 
-    handle_hook({"hook_event_name": "Stop", "session_id": sid, "cwd": str(project)}, env)
-    kinds = [e["kind"] for e in store.list_events(wo["id"])]
-    assert "turn_ended" in kinds
+    handle_hook({"hook_event_name": "Stop", "session_id": sid, "cwd": str(project),
+                 "last_assistant_message": "here is what I did"}, env)
+    stop = [e for e in store.list_events(wo["id"]) if e["kind"] == "hook:Stop"]
+    assert stop, "the Stop hook must land on the timeline"
+    assert json.loads(stop[-1]["payload"])["last_assistant_message"] == \
+        "here is what I did"
+
+
+def test_session_end_no_longer_settles_the_work_order(started, project):
+    """Under `-p`, SessionEnd fires at the end of EVERY turn — verified against the real
+    CLI. Left as it was (file the work order for review), a healthy work order would be
+    filed for review after its very first turn. Settling is the turn reconciler's job.
+    """
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    sid = store.get_work_order(wo["id"])["session_id"]
+
+    handle_hook({"hook_event_name": "SessionEnd", "session_id": sid,
+                 "cwd": str(project), "reason": "other"},
+                {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)})
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "running"
+    assert fresh["needs_attention"] == 0
 
 
 def test_user_reply_clears_attention(started, project):
@@ -147,7 +204,7 @@ def test_user_reply_clears_attention(started, project):
     wo = ops.create_work_order("proj_a", "give me a summary of the current status")
     daemon.tick()
     store = ProjectStore(project)
-    sid = bind_session(daemon, project, wo["id"])
+    sid = store.get_work_order(wo["id"])["session_id"]
 
     # worker blocks on a permission prompt → flagged for the user
     env = {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)}
@@ -199,12 +256,12 @@ def test_status_quiet_under_autonomous_mode(started):
 
 def test_resume_in_auto_flips_mode_and_unblocks(started, project):
     """Resume-in-auto: recover a worker stalled on a permission prompt by flipping it
-    to `auto` and nudging it to continue — the daemon then resume-forks in auto mode."""
+    to `auto` and nudging it to continue — the daemon then sends the nudge as the next
+    turn, which re-derives the now-`auto` mode from argv."""
     daemon = started
     wo = ops.create_work_order("proj_a", "task", permission_mode="acceptEdits")
     daemon.tick()
     store = ProjectStore(project)
-    bind_session(daemon, project, wo["id"])
     env = {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)}
     handle_hook({"hook_event_name": "Notification", "session_id":
                  store.get_work_order(wo["id"])["session_id"], "cwd": str(project),
@@ -230,65 +287,85 @@ def test_hook_noop_for_non_worker_sessions(started, project):
     assert store.list_work_orders() == before
 
 
-def test_message_delivery_when_idle(started, fake_claude, project):
+def test_message_delivery_when_idle(started, fake_claude, project, settle_turns):
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
-    sid = bind_session(daemon, project, wo["id"])
+    sid = store.get_work_order(wo["id"])["session_id"]
 
     ops.send_message(wo["id"], "please also update the docs", source="ui")
     daemon.tick_count = 0
-    daemon.tick()  # worker session still running → not deliverable
-    daemon.delivery_pool.shutdown(wait=True)
-    assert [c for c in fake_claude.calls if "--resume" in c["argv"]] == []
-    from concurrent.futures import ThreadPoolExecutor
-    daemon.delivery_pool = ThreadPoolExecutor(max_workers=2)
+    daemon.tick()  # turn one is still in flight → nothing deliverable yet
+    assert turn_calls(fake_claude, resumed=True) == []
 
-    fake_claude.set_session_state(sid, "done")  # worker went idle
+    assert settle_turns(store)
     daemon.tick_count = 0
     daemon.tick()
-    daemon.delivery_pool.shutdown(wait=True)  # let the delivery thread finish
 
-    # delivered as a NEW bg agent resuming the worker's session (stays in agents view)
-    resumes = [c for c in fake_claude.calls
-               if "--bg" in c["argv"] and "--resume" in c["argv"]]
+    # delivered as the next turn of the SAME conversation
+    resumes = turn_calls(fake_claude, resumed=True, expect=1)
     assert len(resumes) == 1
     argv = resumes[0]["argv"]
     assert argv[argv.index("--resume") + 1] == sid
-    assert argv[argv.index("--name") + 1].startswith(f"[WO {wo['id']}]")
+    assert argv[argv.index("-n") + 1].startswith(f"[WO {wo['id']}]")
     assert "update the docs" in argv[-1]
 
-    msgs = store.list_messages(wo["id"])
-    assert msgs[0]["status"] == "delivered"
+    assert store.list_messages(wo["id"])[0]["status"] == "delivered"
 
-    # The fork's reply is recovered by the next reconcile pass, not inline: delivery
-    # runs on a small pool and a worker turn can take many minutes.
-    daemon.tick_count = 0
-    daemon.tick()
-
+    assert settle_turns(store)
     replies = [m["content"] for m in store.list_messages(wo["id"])
                if m["direction"] == "agent_to_user"]
-    assert any("ack:" in r for r in replies), replies
+    assert any("update the docs" in r for r in replies), replies
+
+
+def test_session_id_never_moves_across_turns(started, fake_claude, project,
+                                             settle_turns):
+    """The property the whole refactor rests on: one work order, one session id, for
+    every turn of its life.
+
+    Under the old transport each delivered turn forked a new background agent under a
+    fresh supervisor-assigned id, which needed `bind_session`, a `prior_sessions` trail
+    and an invariant just to keep the pointer from walking backwards — and leaked the
+    superseded agent whenever the retiring `claude stop` did not land.
+    """
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    sid = store.get_work_order(wo["id"])["session_id"]
+    assert settle_turns(store)
+
+    for text in ("first follow-up", "second follow-up"):
+        ops.send_message(wo["id"], text, source="ui")
+        daemon.tick_count = 0
+        daemon.tick()
+        assert settle_turns(store)
+
+    assert store.get_work_order(wo["id"])["session_id"] == sid
+    # every turn named that one id, and the fake — like the real CLI — handed it back
+    assert list(fake_claude.turns) == [sid]
+    assert len(fake_claude.turns[sid]) == 3
+    assert [t["seq"] for t in store.list_turns(wo["id"])] == [1, 2, 3]
+    assert fake_claude.sessions == []  # nothing left behind in the agents roster
 
 
 def test_worker_final_message_is_recorded_alongside_the_summary(
-    started, fake_claude, project
+    started, fake_claude, project, settle_turns
 ):
     """The work order must stand alone — the user and Neo decide from it and never open
     the worker session. `--summary` is a headline; the worker's full closing message is
     kept next to it. Regression: `wo finish` flips the order to `completed` before its
-    session goes idle, so a status-filtered sweep would drop exactly that reply."""
+    turn ends, so a status-filtered sweep would drop exactly that reply."""
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
-    sid = bind_session(daemon, project, wo["id"])
 
     ops.finish(wo["id"], "one-line headline")
     assert store.get_work_order(wo["id"])["status"] == "completed"
 
-    fake_claude.set_session_state(sid, "done")
+    assert settle_turns(store)
     daemon.tick_count = 0
     daemon.tick()
 
@@ -297,221 +374,146 @@ def test_worker_final_message_is_recorded_alongside_the_summary(
     replies = [m["content"] for m in store.list_messages(wo["id"])
                if m["direction"] == "agent_to_user"]
     assert any(r.startswith("final:") for r in replies), replies
-    assert "worker_reply" in [e["kind"] for e in store.list_events(wo["id"])]
+    assert "turn_ended" in [e["kind"] for e in store.list_events(wo["id"])]
 
     # Capture is idempotent: further passes must not duplicate the reply.
-    daemon.tick_count = 0
-    daemon.tick()
+    for _ in range(2):
+        daemon.tick_count = 0
+        daemon.tick()
     again = [m["content"] for m in store.list_messages(wo["id"])
              if m["direction"] == "agent_to_user"]
     assert again == replies
 
 
-def test_missing_job_result_does_not_stall_the_work_order(started, fake_claude, project):
-    """If the supervisor never publishes a result, give up after a bounded number of
-    passes rather than holding the work order open forever."""
-    import shutil
-
+def test_crashed_turn_fails_the_work_order(started, fake_claude, project, settle_turns):
+    """A turn whose process dies without writing a result must fail the work order, not
+    hang it in `running` forever waiting for output that is never coming."""
     daemon = started
+    fake_claude.turns_fail("silent")  # exits 0, writes nothing at all
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
-    sid = bind_session(daemon, project, wo["id"])
 
-    fake_claude.set_session_state(sid, "done")
-    job_id = store.get_work_order(wo["id"])["job_id"]
-    shutil.rmtree(fake_claude.dir / "jobs" / job_id)  # result file never appears
+    assert settle_turns(store)
+    daemon.tick_count = 0
+    daemon.tick()
 
-    for _ in range(4):
-        daemon.tick_count = 0
-        daemon.tick()
-
+    assert store.latest_turn(wo["id"])["state"] == "failed"
     fresh = store.get_work_order(wo["id"])
-    assert fresh["reply_job_id"] == job_id          # marked resolved, stops retrying
-    assert fresh["status"] == "needs_review"        # settled, not stuck in `running`
-    assert "worker_reply_lost" in [e["kind"] for e in store.list_events(wo["id"])]
+    assert fresh["status"] == "failed"
+    assert fresh["needs_attention"]
+    assert any("turn failed" in n["title"] or "turn failed" in n["body"]
+               for n in store.unrouted_notifications())
 
 
-def test_delivery_retires_the_previous_session(started, fake_claude, project):
-    """Each delivered turn forks a fresh bg agent; the one it forked from is stopped
-    afterwards, so a multi-turn conversation keeps exactly one live agent per WO."""
+def test_turn_reporting_is_error_fails_the_work_order(started, fake_claude, project,
+                                                      settle_turns):
+    """A well-formed result carrying `is_error` is a failed turn, however tidy it looks."""
     daemon = started
+    fake_claude.turns_fail("error")
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
-    sid = bind_session(daemon, project, wo["id"])
+    assert settle_turns(store)
+    daemon.tick_count = 0
+    daemon.tick()
 
-    def turn(text: str, current_sid: str) -> str:
-        fake_claude.set_session_state(current_sid, "done")  # worker idle → deliverable
-        ops.send_message(wo["id"], text, source="ui")
+    turn = store.latest_turn(wo["id"])
+    assert turn["state"] == "failed" and "model call failed" in turn["error"]
+    assert store.get_work_order(wo["id"])["status"] == "failed"
+
+
+def test_a_turn_in_flight_blocks_a_second_one(started, fake_claude, project,
+                                              settle_turns):
+    """One turn at a time per work order: two concurrent `--resume`s of one session is
+    something the CLI refuses, and would interleave into one transcript if it did not."""
+    daemon = started
+    gate = fake_claude.hold_turns()
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+
+    ops.send_message(wo["id"], "hurry up", source="ui")
+    for _ in range(3):
         daemon.tick_count = 0
         daemon.tick()
-        daemon.delivery_pool.shutdown(wait=True)
-        from concurrent.futures import ThreadPoolExecutor
-        daemon.delivery_pool = ThreadPoolExecutor(max_workers=2)
-        return bind_session(daemon, project, wo["id"])
+    assert turn_calls(fake_claude, resumed=True) == []
+    assert store.list_messages(wo["id"])[0]["status"] == "queued"
 
-    sid = turn("first follow-up", sid)
-    sid = turn("second follow-up", sid)
-
-    mine = [s for s in fake_claude.sessions if s["name"].startswith(f"[WO {wo['id']}]")]
-    assert len(mine) == 1, f"stale sessions accumulated: {[s['sessionId'] for s in mine]}"
-    assert mine[0]["sessionId"] == sid
-    # and the WO is bound to the survivor, not to a session that was stopped
-    assert store.get_work_order(wo["id"])["session_id"] == sid
+    gate.unlink()  # turn one completes
+    assert settle_turns(store)
+    daemon.tick_count = 0
+    daemon.tick()
+    assert len(turn_calls(fake_claude, resumed=True, expect=1)) == 1
 
 
-def test_reopened_session_does_not_walk_the_binding_backwards(started, fake_claude, project):
-    """Re-opening a spent session must not re-point the work order at it.
-
-    From wo-9478c1be, live: after turn one the user opened the finished agent in the
-    agents view to read it. Re-opening respawns that session under its ORIGINAL id, so
-    SessionStart fired again — and the hook rebound the work order to a session that
-    had already been stopped. The next delivered turn then forked from that stale
-    conversation (losing turn two entirely) and "retired" the already-stopped agent,
-    so the genuinely live one was orphaned into the agents view for good.
-    """
+def test_hooks_from_an_unknown_session_do_not_steer_the_work_order(started, project):
+    """A work order has one session id now, but legacy rows can still be hooked by a
+    session they have left — a spent background agent the user re-opens from the agents
+    view. Those hooks are recorded and acted on never."""
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
-    first_sid = bind_session(daemon, project, wo["id"])
-
-    fake_claude.set_session_state(first_sid, "done")
-    ops.send_message(wo["id"], "first follow-up", source="ui")
-    daemon.tick_count = 0
-    daemon.tick()
-    daemon.delivery_pool.shutdown(wait=True)
-    from concurrent.futures import ThreadPoolExecutor
-    daemon.delivery_pool = ThreadPoolExecutor(max_workers=2)
-    fork_sid = bind_session(daemon, project, wo["id"])
-    assert fork_sid != first_sid
-
-    # the user re-opens turn one's agent: same session id, SessionStart fires again
-    handle_hook({"hook_event_name": "SessionStart", "session_id": first_sid,
-                 "cwd": str(project)},
-                {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)})
-    assert store.get_work_order(wo["id"])["session_id"] == fork_sid
-    assert "session_rebind_ignored" in [e["kind"] for e in store.list_events(wo["id"])]
-
-    # ...and the next turn still forks from the live session, not the re-opened one
-    fake_claude.set_session_state(fork_sid, "done")
-    ops.send_message(wo["id"], "second follow-up", source="ui")
-    daemon.tick_count = 0
-    daemon.tick()
-    daemon.delivery_pool.shutdown(wait=True)
-
-    resumes = [c for c in fake_claude.calls
-               if "--bg" in c["argv"] and "--resume" in c["argv"]]
-    assert [c["argv"][c["argv"].index("--resume") + 1] for c in resumes] == \
-        [first_sid, fork_sid]
-    mine = [s for s in fake_claude.sessions if s["name"].startswith(f"[WO {wo['id']}]")]
-    assert len(mine) == 1, f"orphaned sessions: {[s['sessionId'] for s in mine]}"
-
-
-def test_hooks_from_a_superseded_session_do_not_steer_the_work_order(started, fake_claude,
-                                                                    project):
-    """A spent session still fires hooks — its SessionEnd must not end the work order.
-
-    Stopping the session Jarvis forked from raises SessionEnd for it moments after the
-    fork started working. Acted on, that files a live work order for review with
-    "session ended without `jarvis wo finish`".
-    """
-    daemon = started
-    wo = ops.create_work_order("proj_a", "task")
-    daemon.tick()
-    store = ProjectStore(project)
-    first_sid = bind_session(daemon, project, wo["id"])
-
-    fake_claude.set_session_state(first_sid, "done")
-    ops.send_message(wo["id"], "follow-up", source="ui")
-    daemon.tick_count = 0
-    daemon.tick()
-    daemon.delivery_pool.shutdown(wait=True)
-    bind_session(daemon, project, wo["id"])  # the fork takes the binding
 
     for event in ("SessionEnd", "Notification", "Stop"):
-        handle_hook({"hook_event_name": event, "session_id": first_sid,
+        handle_hook({"hook_event_name": event, "session_id": "some-other-session",
                      "cwd": str(project), "message": "Claude is waiting for your input"},
                     {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)})
 
     fresh = store.get_work_order(wo["id"])
     assert fresh["status"] == "running"
     assert fresh["needs_attention"] == 0
+    assert "hook_ignored" in [e["kind"] for e in store.list_events(wo["id"])]
 
 
-def test_follow_up_turn_is_briefed_like_the_first(started, fake_claude, project):
+def test_follow_up_turn_is_briefed_like_the_first(started, fake_claude, project,
+                                                  settle_turns):
     """A resumed session re-derives its system prompt at launch — it does not inherit
-    the first turn's from the transcript. So the fork must carry the same briefing:
+    the first turn's from the transcript. So every turn must carry the same briefing:
     without it the project's standing instructions to the worker (and the OS skills
-    directory) silently vanish from turn two onwards."""
+    directory) silently vanish from turn two onwards.
+
+    It must also resume from the directory the session was created in: transcripts are
+    stored per-cwd, so resuming a worktree worker from the project root would not find
+    its conversation.
+    """
     daemon = started
     wo = ops.create_work_order("proj_a", "task", model="opus",
                                append_system_prompt="never touch production")
     daemon.tick()
-    sid = bind_session(daemon, project, wo["id"])
-
-    fake_claude.set_session_state(sid, "done")
-    ops.send_message(wo["id"], "follow-up", source="ui")
-    daemon.tick_count = 0
-    daemon.tick()
-    daemon.delivery_pool.shutdown(wait=True)
-
-    resumes = [c for c in fake_claude.calls
-               if "--bg" in c["argv"] and "--resume" in c["argv"]]
-    argv = resumes[-1]["argv"]
-    assert argv[argv.index("--append-system-prompt") + 1] == "never touch production"
-    assert argv[argv.index("--model") + 1] == "opus"
-    assert argv[argv.index("--add-dir") + 1].endswith("agent-skills")
-    # The work order carries no permission_mode of its own, so the fork must fall back
-    # to the project's exactly as the initial dispatch does — otherwise turn two runs
-    # in Claude's default mode and stalls on a prompt no background worker can answer.
-    assert argv[argv.index("--permission-mode") + 1] == "auto"
-    assert argv[-1] == "follow-up"  # the prompt still survives the variadic --add-dir
-
-
-def test_headless_fallback_turn_is_briefed_like_the_first(started, fake_claude, project,
-                                                          monkeypatch):
-    """The bg resume-fork can fail, and the headless resume that catches it is still a
-    worker turn — same briefing rules apply. It must also resume from the directory the
-    session was created in: transcripts are stored per-cwd, so resuming a worktree
-    worker from the project root would not find its conversation."""
-    daemon = started
-    wo = ops.create_work_order("proj_a", "task", model="opus",
-                               append_system_prompt="never touch production")
-    daemon.tick()
-    sid = bind_session(daemon, project, wo["id"])
+    store = ProjectStore(project)
     wt = project / ".claude" / "worktrees" / wo["id"]
     wt.mkdir(parents=True, exist_ok=True)  # the real CLI makes this; the fake does not
+    assert settle_turns(store)
 
-    fake_claude.set_session_state(sid, "done")
-    monkeypatch.setenv("FAKE_CLAUDE_BG_RESUME", "fail")
     ops.send_message(wo["id"], "follow-up", source="ui")
     daemon.tick_count = 0
     daemon.tick()
-    daemon.delivery_pool.shutdown(wait=True)
 
-    headless = [c for c in fake_claude.calls if "--bg" not in c["argv"]
-                and "--resume" in c["argv"] and "-p" in c["argv"]]
-    assert headless, "bg fork was forced to fail but no headless resume was attempted"
-    call = headless[-1]
+    call = turn_calls(fake_claude, resumed=True, expect=1)[-1]
     argv = call["argv"]
     assert argv[argv.index("--append-system-prompt") + 1] == "never touch production"
     assert argv[argv.index("--model") + 1] == "opus"
     assert argv[argv.index("--add-dir") + 1].endswith("agent-skills")
+    # The work order carries no permission_mode of its own, so the follow-up must fall
+    # back to the project's exactly as the opening turn does — otherwise turn two runs
+    # in Claude's default mode and stalls on a prompt no headless worker can answer.
     assert argv[argv.index("--permission-mode") + 1] == "auto"
-    assert argv[argv.index("-p") + 1] == "follow-up"
+    assert "--worktree" not in argv, "the worktree already exists; it is the cwd now"
+    assert argv[-2] == "--" and argv[-1] == "follow-up"
     assert call["cwd"] == str(wt)  # where the session lives, not the project root
 
 
-def test_adhoc_fork_gets_the_projects_permission_mode(started, fake_claude, project):
+def test_adhoc_turn_gets_the_projects_permission_mode(started, fake_claude, project,
+                                                      settle_turns):
     """An adopted session's row has permission_mode NULL — it never went through
     dispatch, which is what resolves the mode and writes it back. Sending it a message
-    hands it to Jarvis to drive as a --bg fork, and a background agent cannot answer a
-    permission prompt: launched in Claude's default mode it would stall, costing the
-    user a `jarvis wo resume-auto` to clear. So the fork resolves the project's worker
-    mode at the call site — without backfilling the column, so an adopted work order
-    stays distinguishable from a dispatched one."""
+    hands it to Jarvis to drive, and a headless turn cannot answer a permission prompt:
+    launched in Claude's default mode it would stall, costing the user a
+    `jarvis wo resume-auto` to clear. So the turn resolves the project's worker mode at
+    the call site — without backfilling the column, so an adopted work order stays
+    distinguishable from a dispatched one."""
     daemon = started
     _add_adhoc(fake_claude, project, "working", sid="adhoc-pm-1")
     daemon.tick_count = 0
@@ -525,12 +527,10 @@ def test_adhoc_fork_gets_the_projects_permission_mode(started, fake_claude, proj
     ops.send_message(wo["id"], "carry on", source="ui")
     daemon.tick_count = 0
     daemon.tick()
-    daemon.delivery_pool.shutdown(wait=True)
 
-    forks = [c for c in fake_claude.calls
-             if "--bg" in c["argv"] and "--resume" in c["argv"]]
-    assert forks, "no resume-fork was spawned for the adopted session"
-    argv = forks[-1]["argv"]
+    resumes = turn_calls(fake_claude, resumed=True, expect=1)
+    assert resumes, "no turn was launched for the adopted session"
+    argv = resumes[-1]["argv"]
     assert argv[argv.index("--permission-mode") + 1] == "auto"
     # resolved for the launch only — the row still says "nobody dispatched this"
     assert store.get_work_order(wo["id"])["permission_mode"] is None
@@ -583,42 +583,27 @@ def test_notification_routing(started, project, jarvis_home):
     assert st["inbox"]["critical"] == 1
 
 
-def test_reconciler_binds_session_by_name(started, fake_claude, project):
-    """Without any hook, the reconciler binds the session via the [WO id] name."""
+def test_reconciler_settles_done_worker(started, fake_claude, project, settle_turns):
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
-    assert store.get_work_order(wo["id"])["session_id"] is None
+
+    ops.finish(wo["id"], "all good")   # worker finished properly, then its turn ended
+    assert settle_turns(store)
     daemon.tick_count = 0
-    daemon.tick()
-    bound = store.get_work_order(wo["id"])["session_id"]
-    assert bound and bound == fake_claude.sessions[0]["sessionId"]
-
-
-def test_reconciler_settles_done_worker(started, fake_claude, project):
-    daemon = started
-    wo = ops.create_work_order("proj_a", "task")
-    daemon.tick()
-    store = ProjectStore(project)
-    sid = bind_session(daemon, project, wo["id"])
-
-    # worker finished properly, then its session went idle
-    ops.finish(wo["id"], "all good")
-    fake_claude.set_session_state(sid, "done")
-    daemon.tick_count = 0  # force reconcile on next tick
     daemon.tick()
     assert store.get_work_order(wo["id"])["status"] == "completed"
 
 
-def test_reconciler_flags_unfinished_idle_worker(started, fake_claude, project):
+def test_reconciler_flags_unfinished_idle_worker(started, fake_claude, project,
+                                                 settle_turns):
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
-    sid = bind_session(daemon, project, wo["id"])
 
-    fake_claude.set_session_state(sid, "done")  # idle but never called finish
+    assert settle_turns(store)  # turn ended but the worker never called finish
     daemon.tick_count = 0
     daemon.tick()
     fresh = store.get_work_order(wo["id"])
@@ -684,8 +669,10 @@ def test_adopted_blocked_session_asks_for_input(started, fake_claude, project):
     assert adhoc["needs_attention"]
 
 
-def test_reconciler_clears_attention_when_worker_resumes(started, fake_claude, project):
-    """waiting_input must not be sticky: a worker that unblocks stops needing the user.
+def test_reconciler_clears_attention_when_worker_resumes(started, fake_claude, project,
+                                                         settle_turns):
+    """waiting_input must not be sticky: a worker that gets going again stops needing
+    the user.
 
     Regression: nothing could ever move a work order back to `running`, so the
     "needs you" banner survived long after the worker had resumed.
@@ -694,39 +681,24 @@ def test_reconciler_clears_attention_when_worker_resumes(started, fake_claude, p
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
-    sid = bind_session(daemon, project, wo["id"])
+    sid = store.get_work_order(wo["id"])["session_id"]
 
-    fake_claude.set_session_state(sid, "blocked")  # hit a permission prompt
-    daemon.tick_count = 0
-    daemon.tick()
+    handle_hook({"hook_event_name": "Notification", "session_id": sid,
+                 "cwd": str(project), "message": "Claude needs your permission"},
+                {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)})
     blocked = store.get_work_order(wo["id"])
     assert blocked["status"] == "waiting_input"
     assert blocked["needs_attention"]
 
-    fake_claude.set_session_state(sid, "working")  # user answered; worker carries on
+    assert settle_turns(store)
+    ops.send_message(wo["id"], "yes, go ahead", source="ui")  # user answered
     daemon.tick_count = 0
     daemon.tick()
+
     resumed = store.get_work_order(wo["id"])
     assert resumed["status"] == "running"
     assert not resumed["needs_attention"]
     assert not true_blockers(store, resumed)
-
-
-@pytest.mark.parametrize("state", ["failed", "cancelled"])
-def test_reconciler_settles_non_done_terminal_states(started, fake_claude, project, state):
-    """A session that died is finished too — it must not hang in `running` forever."""
-    daemon = started
-    wo = ops.create_work_order("proj_a", "task")
-    daemon.tick()
-    store = ProjectStore(project)
-    sid = bind_session(daemon, project, wo["id"])
-
-    fake_claude.set_session_state(sid, state)
-    daemon.tick_count = 0
-    daemon.tick()
-    fresh = store.get_work_order(wo["id"])
-    assert fresh["status"] == "needs_review"
-    assert fresh["needs_attention"]
 
 
 def test_backlog_promotion_with_dependencies(started, project):

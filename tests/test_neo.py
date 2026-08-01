@@ -38,6 +38,19 @@ def drain(daemon):
     daemon._neo_drain()
 
 
+
+def _neo_calls(fake_claude) -> list[dict]:
+    """Neo's headless calls only.
+
+    Worker turns are `claude -p` invocations too since the transport moved off
+    background sessions, so "has -p" no longer identifies Neo on its own: a turn is the
+    one carrying a session id.
+    """
+    return [c for c in fake_claude.calls
+            if "-p" in c["argv"]
+            and "--session-id" not in c["argv"] and "--resume" not in c["argv"]]
+
+
 def test_ask_queues_and_parks_worker(asked, project):
     daemon, wo, result = asked
     assert result["question_id"] == 1
@@ -83,7 +96,7 @@ def test_neo_answers_and_delivers_to_worker(asked, project, fake_claude):
     finally:
         store.close()
     # the headless call carried the persona as a byte-stable system prompt
-    calls = [c for c in fake_claude.calls if "-p" in c["argv"] and "--resume" not in c["argv"]]
+    calls = _neo_calls(fake_claude)
     assert len(calls) == 1
     argv = calls[0]["argv"]
     system = argv[argv.index("--append-system-prompt") + 1]
@@ -100,7 +113,7 @@ def test_fifo_order_and_backtoback_drain(started, fake_claude):
     ops.ask_question(wo2["id"], "second question")
     ops.ask_question(wo1["id"], "third question")
     drain(daemon)
-    calls = [c for c in fake_claude.calls if "-p" in c["argv"] and "--resume" not in c["argv"]]
+    calls = _neo_calls(fake_claude)
     prompts = [c["argv"][c["argv"].index("-p") + 1] for c in calls]
     assert [p.splitlines()[-1] for p in prompts] == [
         "first question", "second question", "third question"]
@@ -225,13 +238,13 @@ def test_learnings_shape_future_answers(asked, fake_claude):
     prompt grows append-only so the previously cached prefix stays valid."""
     daemon, wo, _ = asked
     drain(daemon)
-    calls = [c for c in fake_claude.calls if "-p" in c["argv"] and "--resume" not in c["argv"]]
+    calls = _neo_calls(fake_claude)
     system_before = calls[-1]["argv"][calls[-1]["argv"].index("--append-system-prompt") + 1]
 
     ops.neo_review(1, approved=False, feedback="Prefer CSV, always")
     ops.ask_question(wo["id"], "And what delimiter?")
     drain(daemon)
-    calls = [c for c in fake_claude.calls if "-p" in c["argv"] and "--resume" not in c["argv"]]
+    calls = _neo_calls(fake_claude)
     system_after = calls[-1]["argv"][calls[-1]["argv"].index("--append-system-prompt") + 1]
     assert "Prefer CSV, always" in system_after
     # append-only: the old prefix (minus the placeholder line) survives verbatim

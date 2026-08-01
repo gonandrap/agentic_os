@@ -296,24 +296,6 @@ def test_the_daemon_repairs_and_records_on_its_tick(project, catalog_file):
     assert "invariant" in kinds
 
 
-def test_session_binding_only_moves_forward(project):
-    """A work order must never end up bound to a session it has already left."""
-    store = ProjectStore(project)
-    wo = store.create_work_order("multi-turn")
-
-    assert store.bind_session(wo["id"], "sess-one") is True
-    assert store.bind_session(wo["id"], "sess-two") is True     # turn two forks
-    assert store.bind_session(wo["id"], "sess-one") is False    # turn one re-opened
-    assert store.bind_session(wo["id"], "sess-two") is False    # already there
-    assert store.get_work_order(wo["id"])["session_id"] == "sess-two"
-    assert not check_project(store)
-
-    # and if something writes session_id around bind_session, doctor says so
-    store.update_work_order(wo["id"], session_id="sess-one")
-    found = [v for v in check_project(store) if v.invariant == "INV-SESSION-FORWARD"]
-    assert len(found) == 1 and found[0].wo_id == wo["id"] and not found[0].repaired
-
-
 def test_the_daemon_reports_a_standing_violation_once(project, catalog_file):
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon
@@ -380,3 +362,33 @@ def test_ops_doctor_reports_per_project(project, catalog_file):
 
     assert res["violations"] == 1
     assert res["projects"][0]["violations"][0]["invariant"] == "INV-ATTENTION-REASON"
+
+
+def test_doctor_reports_leftover_background_sessions(jarvis_home, fake_claude,
+                                                     catalog_file, project):
+    """The 63 stale agents the old transport leaked are surfaced, never auto-stopped.
+
+    They live in the user's own agents view, so bulk-killing them is theirs to
+    authorise — doctor lists them with the exact command instead.
+    """
+    from jarvis import claude_cli, ops
+    from jarvis.project_store import ProjectStore
+
+    ops.start_os(str(catalog_file), foreground=True)
+    store = ProjectStore(project)
+    live = store.create_work_order("still running")
+    claude_cli.spawn_background(prompt="x", cwd=project,
+                                name=f"[WO {live['id']}] still running")
+    store.update_work_order(live["id"], session_id=fake_claude.sessions[-1]["sessionId"])
+    store.set_status(live["id"], "running")
+    claude_cli.spawn_background(prompt="x", cwd=project, name="[WO wo-longgone] debris")
+    claude_cli.spawn_background(prompt="x", cwd=project, name="a session I started")
+
+    res = ops.run_doctor()
+
+    orphans = res.get("orphaned_sessions") or []
+    assert [o["name"] for o in orphans] == ["[WO wo-longgone] debris"], orphans
+    assert orphans[0]["stop"].startswith("claude stop ")
+    # reported only — nothing was stopped
+    assert len(fake_claude.sessions) == 3
+    assert [c for c in fake_claude.calls if c["argv"][:1] == ["stop"]] == []

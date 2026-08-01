@@ -20,12 +20,15 @@ from jarvis import claude_cli
 
 # Arity of every option `spawn_background` can emit, as the `claude` CLI declares
 # it (checked against `claude --help` on 2.1.220).
-BOOLEAN = {"--bg"}
-VARIADIC = {"--add-dir"}  # declared `--add-dir <directories...>` — greedy
+BOOLEAN = {"--bg", "-p"}
+# Both are declared with `<xxx...>` and are greedy. `--tools` is the one that bit us
+# while verifying this refactor: `claude -p --tools "" "prompt"` swallowed the prompt
+# as a tool name and died with "Input must be provided…".
+VARIADIC = {"--add-dir", "--tools"}
 # everything else below takes exactly one value
 SINGLE_VALUE = {
-    "--name", "--resume", "--worktree", "--model", "--effort",
-    "--permission-mode", "--append-system-prompt", "--settings",
+    "--name", "-n", "--resume", "--session-id", "--worktree", "--model", "--effort",
+    "--permission-mode", "--append-system-prompt", "--settings", "--output-format",
 }
 
 
@@ -146,3 +149,64 @@ def test_prompt_beginning_with_a_dash_is_not_read_as_a_flag(fake_claude, tmp_pat
     assert commander_positionals(argv) == ["--version is what the user asked about"], (
         f"argv={argv}"
     )
+
+
+# -- worker turns (the transport workers actually run on) ------------------------------
+
+
+def turn_argv(**kwargs) -> list[str]:
+    defaults = dict(prompt="Do the thing.", session_id="11111111-2222-4333-8444-555555555555",
+                    resume=False)
+    return claude_cli.turn_args(**{**defaults, **kwargs})
+
+
+def test_turn_prompt_survives_the_full_flag_set(tmp_path) -> None:
+    """The same variadic trap, on the path every worker turn now takes."""
+    skills = tmp_path / "agent-skills"
+    skills.mkdir()
+    settings = tmp_path / "wo-abc123.json"
+    settings.write_text("{}")
+    prompt = "Do the thing.\nAnd report back."
+
+    argv = turn_argv(
+        prompt=prompt, name="[WO wo-abc123] title", worktree="wo-abc123",
+        model="claude-opus-5", effort="high", permission_mode="auto",
+        append_system_prompt="extra", settings_file=settings, add_dirs=[skills],
+    )
+
+    assert commander_positionals(argv) == [prompt], f"argv={argv}"
+    assert argv[-2] == "--", f"no `--` terminator before the prompt; argv={argv}"
+
+
+def test_opening_turn_assigns_the_id_and_later_turns_resume_it() -> None:
+    """`--session-id` opens the conversation, `--resume` continues it — same id.
+
+    Verified against CLI 2.1.220: a headless resume reuses the id it is given rather
+    than forking (that is what `--fork-session` is for), which is the property the whole
+    work-order↔session binding now rests on.
+    """
+    sid = "11111111-2222-4333-8444-555555555555"
+
+    first = turn_argv(resume=False)
+    later = turn_argv(resume=True)
+
+    assert first[first.index("--session-id") + 1] == sid
+    assert "--resume" not in first
+    assert later[later.index("--resume") + 1] == sid
+    assert "--session-id" not in later
+    for argv in (first, later):
+        assert argv[:3] == ["-p", "--output-format", "json"]
+
+
+def test_turn_never_enters_the_background_roster() -> None:
+    """A worker turn must never be spawned with --bg: that is the transport whose
+    leaked sessions this replaced."""
+    assert "--bg" not in turn_argv(resume=False)
+    assert "--bg" not in turn_argv(resume=True)
+
+
+def test_worktree_is_only_created_on_the_opening_turn(tmp_path) -> None:
+    """Turn one creates the worktree and starts in it; later turns run with it as cwd,
+    so passing the flag again would be asking for a worktree that already exists."""
+    assert "--worktree" in turn_argv(resume=False, worktree="wo-abc123")
+    assert "--worktree" not in turn_argv(resume=True)

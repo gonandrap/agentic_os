@@ -20,10 +20,10 @@ DEBUG_KINDS = frozenset({
     "message_queued",           # queued for delivery — the message body is the signal
     "delivering",               # delivery attempt
     "message_delivered",        # delivery receipt
-    "turn_ended",               # Stop hook fired
-    "session_bound",            # reconciler matched a session to this work order
-    "session_rebind_ignored",   # a spent session of this work order was re-opened
-    "hook_ignored",             # a hook from a session that is no longer the live one
+    "turn_started",             # a `claude -p` turn was launched
+    "turn_ended",               # that turn's process finished and its reply was captured
+    "session_released",         # a legacy background agent handed its session over
+    "hook_ignored",             # a hook from a session that is not this work order's
     "permission_mode_changed",  # worker permission plumbing
     "notification_ignored",     # idle prompt on an already-settled work order
 })
@@ -73,6 +73,10 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any]) -> tuple[str, st
         return STATUS_LABEL.get(status, status or "Status changed"), ""
     if kind == "dispatched":
         return "Worker dispatched", p.get("worktree") or ""
+    if kind == "turn_failed":
+        return "Worker turn failed", (p.get("error") or "")[:200]
+    if kind == "turn_cancelled":
+        return "Worker turn cancelled", ""
     if kind == "attention":
         return "Needs you", p.get("reason") or ""
     if kind == "assumption":

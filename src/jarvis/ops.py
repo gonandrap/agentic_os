@@ -213,7 +213,55 @@ def run_doctor(project: str | None = None, repair: bool = False,
                 for v in violations
             ],
         })
-    return {"repair": repair, "violations": total, "projects": results}
+    out = {"repair": repair, "violations": total, "projects": results}
+    orphans = orphaned_worker_sessions()
+    if orphans:
+        out["orphaned_sessions"] = orphans
+    return out
+
+
+def orphaned_worker_sessions() -> list[dict[str, Any]]:
+    """Background agents named `[WO …]` that no open work order is driving.
+
+    Every one of these is debris from the transport headless turns replaced: it forked a
+    fresh background agent per delivered turn and retired the previous one on a
+    best-effort `claude stop`, so each failed retirement leaked an agent permanently (the
+    live fleet reached 63). Nothing creates them any more, and an in-flight work order
+    releases its own on the next message it receives (`worker_session.send`), so what is
+    left is the historical pile.
+
+    Reported, never stopped: these live in the user's own agents view, and bulk-killing
+    sessions there is theirs to authorise. Each row carries the exact command.
+    """
+    from . import claude_cli
+
+    if not claude_cli.available():
+        return []
+    try:
+        sessions = claude_cli.list_background_sessions()
+    except claude_cli.ClaudeCliError:
+        return []
+    named = [s for s in sessions if s.name.startswith("[WO ")]
+    if not named:
+        return []
+
+    live_sessions: set[str] = set()
+    for name, path in registered_project_paths().items():  # noqa: B007
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            for wo in store.list_work_orders(statuses=OPEN_STATUSES,
+                                             include_hidden=True):
+                if wo.get("session_id"):
+                    live_sessions.add(wo["session_id"])
+        finally:
+            store.close()
+    return [
+        {"bg_id": s.id, "session_id": s.session_id, "name": s.name, "state": s.state,
+         "stop": f"claude stop {s.id}"}
+        for s in named if s.session_id not in live_sessions
+    ]
 
 
 def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
@@ -260,10 +308,11 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         "reason": wo["attention_reason"],
                     }
                     # A worker blocked on a permission prompt can't be approved from
-                    # jarvis (bg sessions take no programmatic approval) — surface the
-                    # native escape hatch instead.
+                    # jarvis — surface the native escape hatch instead. `--resume`, not
+                    # `attach`: attaching is a background-agent verb and worker turns are
+                    # headless, so the session is free to be opened directly between turns.
                     if wo["status"] == "waiting_input" and wo["session_id"]:
-                        item["attach"] = f"claude attach {wo['session_id']}"
+                        item["attach"] = f"claude --resume {wo['session_id']}"
                     attention.append(item)
                 drift = settings_drift(path / ".claude" / "settings.json")
                 projects.append({
@@ -510,22 +559,30 @@ def finish(wo_id: str, summary: str) -> dict[str, Any]:
     return {"project": name, "wo_id": wo_id, "status": status}
 
 
-def stop_worker_session(wo: dict[str, Any]) -> dict[str, Any]:
-    """Release the background session a work order dispatched, if it still has one.
+def stop_worker_session(wo: dict[str, Any], store: ProjectStore) -> dict[str, Any]:
+    """Take the worker down with the work order, if anything of it is still running.
 
-    Cancelling or deleting a work order has to take the worker down with it: nobody
-    reads its output any more, but the agent keeps running — burning tokens, editing
-    its worktree and cluttering the agents view as an orphan.
+    Cancelling or deleting a work order has to stop its worker: nobody reads the output
+    any more, but the process keeps going — burning tokens and editing its worktree.
 
-    Best effort by design: the caller's state change must never depend on the CLI
-    being reachable, so every failure (no claude binary, unparseable roster, session
-    already gone) comes back as `stopped: False` with a reason instead of raising.
+    Two things can be running, and both are checked. A headless turn is a process Jarvis
+    owns, killed by process group. A background agent is only possible for a work order
+    created under the old transport, and is released with `claude stop`.
 
-    The live roster is the source of truth for the bg id — `job_id` on the record can
-    lag behind (each resume-fork mints a new one), so it is only the fallback.
+    Best effort by design: the caller's state change must never depend on a process
+    being killable or the CLI being reachable, so every failure comes back as
+    `stopped: False` with a reason instead of raising.
     """
-    from . import claude_cli
+    from . import claude_cli, worker_session
 
+    killed = worker_session.cancel(store, wo["id"])
+    if killed["stopped"]:
+        return {"stopped": True, "pid": killed["pid"],
+                "session_id": wo.get("session_id")}
+
+    # Nothing of ours in flight. A legacy work order may still have a background agent.
+    if not wo.get("job_id"):
+        return {"stopped": False, "reason": killed.get("reason", "no turn in flight")}
     if not claude_cli.available():
         return {"stopped": False, "reason": "claude CLI not available"}
     bg_id, reason = None, "no live session"
@@ -537,7 +594,7 @@ def stop_worker_session(wo: dict[str, Any]) -> dict[str, Any]:
                 break
     except claude_cli.ClaudeCliError as e:
         reason = f"could not list sessions: {e}"
-    if bg_id is None and wo.get("session_id"):
+    if bg_id is None:
         bg_id = wo.get("job_id")  # roster missed it; try the id we were handed at spawn
     if not bg_id:
         return {"stopped": False, "reason": reason}
@@ -548,9 +605,9 @@ def stop_worker_session(wo: dict[str, Any]) -> dict[str, Any]:
 
 def cancel(wo_id: str) -> dict[str, Any]:
     name, path, wo = find_work_order(wo_id)
-    stopped = stop_worker_session(wo)
     store = ProjectStore(path)
     try:
+        stopped = stop_worker_session(wo, store)
         store.set_status(wo_id, "cancelled")
         store.clear_attention(wo_id)
         if stopped["stopped"]:
@@ -648,9 +705,9 @@ def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, 
     nothing left to reattach a running agent to.
     """
     name, path, wo = find_work_order(wo_id, project_name)
-    stopped = stop_worker_session(wo)
     store = ProjectStore(path)
     try:
+        stopped = stop_worker_session(wo, store)
         deleted = store.delete_work_order(wo_id)
     finally:
         store.close()

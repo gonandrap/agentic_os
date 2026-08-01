@@ -1,136 +1,116 @@
-# Work-order lifecycle and worker spawning
+# Work-order lifecycle and how a worker turn runs
 
 The core flow of the OS. Module map in `mem:codebase-map`.
 
 ## States
 
 `WO_STATUSES` at `project_store.py:16`, `OPEN_STATUSES` at `:26`. Every transition goes
-through `ProjectStore.set_status()` (`project_store.py:235`) — nothing writes status directly.
+through `ProjectStore.set_status()` — nothing writes status directly.
 
-1. **`pending`** — `ops.create_work_order()` (`ops.py:261`) resolves the project path via
-   `registered_project_paths()` (`ops.py:252`, reads the central `projects` table), then
-   `ProjectStore.create_work_order()` (`project_store.py:133`) inserts with status `pending`.
-   Entry points: CLI `cli.cmd_wo()` (`cli.py:342`), UI `ui/app.py:181` `create_wo`.
-2. **`dispatching`** — `Daemon.dispatch_pending()` (`daemon.py:139`) loops while
-   `store.count_active() < project.max_concurrent` and calls
-   `ProjectStore.claim_next_pending()` (`project_store.py:207`).
-3. **`running`** — `dispatch.dispatch_work_order()` (`dispatch.py:139`) spawns the worker,
-   writes `job_id`/`worktree`/`model`, sets `running` (`dispatch.py:192`) and adds a
-   `dispatched` event (`:193`). On `ClaudeCliError` it sets `failed` (`dispatch.py:170`).
-   `hooks.handle_hook()` `SessionStart` binds the session id and corrects
-   `dispatching`→`running` (`hooks.py:139-146`).
-4. **`waiting_input`** — `hooks.py:150-161` on a `Notification` hook, plus attention flag.
-5. **`needs_review`** — three independent paths, which is why review can trigger without a
-   clean finish:
-   - `ops.finish()` (`ops.py:374`) — the worker's own `jarvis wo finish`: records
-     `result_summary`, then `needs_review` if `pending_assumptions()` else `completed`
-     (`ops.py:379-386`).
-   - `hooks.py` `SessionEnd` → `needs_review` with "session ended without `jarvis wo finish`"
-     (`hooks.py:167`); `hooks._finalize()` (`:174-176`) → `needs_review` when assumptions pend.
-   - `Daemon.reconcile_project()` (`daemon.py:371`) when the bg session reports `done`:
-     `needs_review` for pending assumptions (`daemon.py:440`) or "worker idle without
-     `jarvis wo finish`" (`daemon.py:446`).
-6. **Close-out** — `ops.review_work_order()`:458, `ops.cancel()`:399, `ops.hide_work_order()`:411,
-   `ops.delete_work_order()`:428. Delete cascades: `ProjectStore.delete_work_order`
-   (`project_store.py:258`) + `CentralStore.purge_work_order` (`central_store.py:111`) +
-   `NeoStore.purge_work_order` (`neo_store.py:109`).
+1. **`pending`** — `ops.create_work_order()` resolves the project path via
+   `registered_project_paths()`, then `ProjectStore.create_work_order()` inserts with
+   status `pending`. Entry points: CLI `cli.cmd_wo()`, UI `ui/app.py` `create_wo`.
+2. **`dispatching`** — `Daemon.dispatch_pending()` loops while
+   `store.count_active() < project.max_concurrent` and calls `claim_next_pending()`.
+3. **`running`** — `dispatch.dispatch_work_order()` composes the prompt/settings and
+   hands off to `worker_session.start()`, then sets `running`.
+4. **`waiting_input`** — `hooks.py` on a `Notification`, or the reconciler when the
+   work order is parked on a privileged-action gate.
+5. **`needs_review` / `completed` / `failed`** — settled by
+   `Daemon.settle_work_order()` from the latest **turn row**, see below.
+6. **Close-out** — `ops.review_work_order()`, `cancel()`, `hide_work_order()`,
+   `delete_work_order()`.
 
-## How a worker is actually launched
+## The transport: headless turns (replaced background sessions, 2026-08-01)
 
-`claude_cli.spawn_background()` (`claude_cli.py:103-153`) via `_run()` (`:35`):
-`subprocess.run([claude_bin(), *args], cwd=…, capture_output=True, timeout=120)`.
+**Read `src/jarvis/worker_session.py`'s module docstring first — it is the layer, and it
+explains the why.** Design doc:
+`docs/superpowers/specs/2026-08-01-headless-turn-runtime-design.md`.
+
+A work order's conversation is a sequence of **turns**, one row each in `wo_turns`
+(`project_store.py`). Each turn is a detached `claude -p` process Jarvis owns:
 
 ```
-claude --bg --name "[WO <id>] <title[:60]>" [--resume <sid>] [--worktree <wo-id>]
-       [--model <model>] [--effort <effort>] [--permission-mode <mode>]
-       [--append-system-prompt <sp>] [--settings <path>] [--add-dir <dir>]…
-       -- <prompt>
+claude -p --output-format json --session-id <uuid> -n "[WO <id>] <title>" \
+       --worktree <wo-id> [briefing] -- "<prompt>"      # turn 1
+claude -p --output-format json --resume <uuid> -n "…" [briefing] -- "<prompt>"   # after
 ```
 
-**The `--` before the prompt is load-bearing — never append an arg after it.**
-`--add-dir <directories...>` is *variadic*: commander keeps eating positionals until a
-`-`-prefixed token or `--`. With `--add-dir` emitted last (as it is), an unfenced prompt
-is consumed as a second directory, so the session boots with nothing to do and parks at
-the welcome screen — the user sees "the session was created but never started" and has to
-type into it by hand. Symptoms in the supervisor's `state.json`: `detail: "stuck on a
-startup dialog"` / `needs: "send a prompt to start"`, and the prompt is absent from the
-session transcript entirely. Regression tests: `tests/test_worker_spawn_args.py`.
+* `claude_cli.turn_args()` builds the argv, `spawn_turn()` detaches it
+  (`start_new_session=True`, `stdin=DEVNULL`, stdout → `.jarvis/turns/<wo-id>/<seq>.json`).
+* `worker_session.poll()` reaps: `claude_cli.process_alive(pid)` (signal-0 **plus** a
+  `/proc/<pid>/cmdline` whole-path-component check — substring "claude" matches any
+  `.claude/` path, including this repo's own venv) then `read_turn_result()`.
+* The turn's `result` **is** the worker's final message → `record_agent_reply()`. If it
+  comes back empty, fall back to `last_assistant_message` from the `Stop` hook event.
+* One turn at a time per work order (`worker_session.busy`).
+* A turn running > `TURN_STALL_SECONDS` (6h) raises attention; it is never killed.
+* `worker_session.cancel()` kills the process group.
 
-Flags assembled `claude_cli.py:134-149`, invoked `:150`. Job id scraped from stdout with
-`_JOB_ID_RE = re.compile(r"claude stop ([0-9a-f]{6,})")` (`claude_cli.py:100`, used `:151-152`).
-Binary is `JARVIS_CLAUDE_BIN` or `claude` (`:22`).
+**The session id is minted by Jarvis and never moves.** `--session-id` is honoured under
+`-p`, and a headless `--resume` REUSES the id rather than forking (`--fork-session` is the
+opt-in to forking) — verified live against CLI 2.1.220. This is why `bind_session`,
+`prior_sessions`, `INV-SESSION-FORWARD`, SessionStart-hook binding and `[WO id]`-name
+reconciliation are all **gone**, not ported.
 
-**Model / effort / permission mode** are resolved in `dispatch.dispatch_work_order()`
-(`dispatch.py:151-154`): per-WO override first, else `project.worker.*` from the catalog
-(`WorkerDefaults` `catalog.py:50`, `DEFAULT_PERMISSION_MODE = "auto"` `catalog.py:25`).
-`--worktree` is the WO id itself (`dispatch.py:147`).
+**Every turn re-sends the full briefing** (`worker_session.briefing_for` →
+`claude_cli._briefing_args`): model, effort, permission mode, appended system prompt,
+settings file, `--add-dir` skills. A resumed session re-derives all of it from argv, not
+from the transcript, so anything omitted vanishes from that turn onwards.
 
-**Worker settings file** — `_write_worker_settings()` (`dispatch.py:27`) merges
-`bootstrap.build_settings(project.settings_overrides)` with per-WO permission allow rules for
-`.claude/worktrees/<wo-id>/**` (`dispatch.py:50-60`) plus env `JARVIS_WO_ID`, `JARVIS_PROJECT`,
-`JARVIS_PROJECT_PATH`, `JARVIS_HOME`, `PATH` (`:63-72`), written to
-`<project>/.jarvis/worker-settings/<wo-id>.json` (`:74-76`).
+**The `--` fence is load-bearing.** `--add-dir` AND `--tools` are variadic; an unfenced
+prompt is swallowed as an option value.
 
-**Prompt** — `build_worker_prompt()` (`dispatch.py:86`), including central knowledge from
-`CentralStore.relevant_knowledge()` (`dispatch.py:148`). The worker sees ONLY this prompt,
-which is why WO descriptions must carry the user's full intent.
+**Worktree**: turn 1 runs with `cwd=project.path` + `--worktree <wo-id>`; later turns run
+with `cwd=<that worktree>` and no flag (transcripts are keyed by creation cwd).
 
-## One work order, many sessions (the binding rule)
+## Hooks (`hooks.py`) — what each one does now
 
-A work order outlives its sessions. Turn 1 is the dispatch; **every delivered message
-forks a NEW session** (`claude --bg --resume <sid>`: full context, fresh session id) and
-the one it forked from is stopped (`daemon._deliver`). So an N-turn work order leaves N
-session ids behind, and `claude agents --json --all` shows all of them — `--all` is the
-history. The *default* `claude agents` listing only shows sessions the supervisor still
-owns, so a correctly retired predecessor disappears from it. Two or more entries there
-for one `[WO …]` name means a session leaked.
+All hooks fire under `-p`, verified live. Critically, **`SessionStart` and `SessionEnd`
+fire on EVERY turn** (`SessionStart.source == "resume"` from turn 2 on).
 
-**The supervisor's job id is the session id's first segment** (`0686a1b5` ↔
-`0686a1b5-2324-…`; verified across 39 live sessions), and a bg session's env carries
-`CLAUDE_JOB_DIR=~/.claude/jobs/<job id>`.
+* `PreToolUse` — gates + auto-approvals. Unchanged, and the gate machinery depends on it.
+* `SessionStart` — records the event; only corrects `dispatching`→`running`. No binding.
+* `Stop` — records the event, whose payload carries `last_assistant_message` (the backup
+  reply source).
+* `SessionEnd` — **deliberately inert.** It used to settle the work order
+  ("session ended without `jarvis wo finish`"); under headless turns that would file
+  every work order for review after its first turn. Settling is the reconciler's job.
+* `Notification` — unchanged.
 
-`wo.session_id` names the session currently carrying the work order and is written by
-the SessionStart hook — which means *any* session of that work order can write it.
-Re-opening a finished agent in the agents view respawns it under its ORIGINAL id
-(`state.json` keeps `respawnFlags` + `resumeSessionId`) and fires SessionStart again.
-Before wo-6e7caf6c that walked the binding backwards, and the damage was all downstream:
-the next turn forked from a dead conversation (losing every turn since), "retired" a
-session that was already stopped, and orphaned the live agent. Observed on wo-9478c1be.
+## Settlement (`Daemon.settle_work_order`)
 
-Two rules now hold this together, both in the store/hook layer:
-- `ProjectStore.bind_session()` is the ONLY way to move `session_id`, and it refuses
-  any id already in the `prior_sessions` column — bindings move forward only.
-  Post-condition `INV-SESSION-FORWARD` (`invariants.py`) is the tripwire for code that
-  writes `session_id` around it.
-- `hooks._is_current_session()` drops Stop/SessionEnd/Notification from a superseded
-  session. Retiring the predecessor makes it fire SessionEnd seconds later; acted on,
-  that flipped a freshly-resumed work order straight back to `needs_review`.
+| latest turn | work order |
+|---|---|
+| `running` | `running` (+ stall flag past 6h) |
+| `failed` | `failed` + attention + notification |
+| `done` + queued messages | untouched; the next turn goes out this tick |
+| `done` + `result_summary` + pending assumptions | `needs_review` |
+| `done` + `result_summary` | `completed` |
+| `done` + pending approvals | `waiting_input` (parked on a gate — compliance) |
+| `done`, none of the above | `needs_review` "idle without `jarvis wo finish`" |
 
-A delivery resolves its target session by `wo.job_id` (which Jarvis itself wrote at
-spawn) before falling back to `session_id`, and forks are briefed exactly like the first
-turn — model, effort, `--append-system-prompt`, `--add-dir` skills. A resumed session
-re-derives its system prompt at launch; it does NOT inherit the first turn's from the
-transcript, so anything omitted is simply absent from turn two onwards.
+`settle_turns` and `deliver_messages` run on **every** tick (cheap: a signal and a file
+read). Only `adopt_sessions` + `check_invariants` stay on the `RECONCILE_EVERY_TICKS`
+cadence, because only they need `claude agents --json`.
 
-**The briefing lives in ONE place: `claude_cli._briefing_args()`.** Both launch paths
-(`spawn_background`, `send_to_session`) build their argv through it. Anything that starts
-a worker turn must do the same — hand-rolling the flag list is how the headless fallback
-came to carry none of them at all (fixed in PR #42; the fork was fixed earlier in #37).
-`daemon._deliver` builds the briefing once and passes it to the fork and the fallback.
+## Background sessions still exist — for the USER only
 
-Also: a resume must run with `cwd` = the directory the session was created in (the
-worktree, not `project.path`). Transcripts are stored per-cwd — see
-`claude_cli.session_transcript_path` — so the wrong cwd cannot find the conversation.
+`claude agents --json` now contains only sessions the user started. `Daemon.adopt_sessions`
+mirrors them as `origin="adhoc"` work orders for visibility and never holds them to the
+worker contract (`retire_adhoc`, `INV-ADHOC-NOT-GOVERNED`).
 
-Note `dispatch_work_order` writes the *resolved* model/effort/permission_mode back to the
-work order row (`dispatch.py:255`), so from turn two those columns are populated and the
-`or project.worker.*` fallback is moot — except for `adhoc` work orders, which the
-reconciler adopts without ever going through dispatch and which therefore have them NULL.
+**Migration is automatic**: `worker_session._release_background_owner()` fires when a work
+order has no turn on record (a legacy dispatched one, or an adopted one) and `claude stop`s
+whatever background agent owns its session before resuming — which a headless resume
+requires anyway. `jarvis doctor` lists leftover `[WO …]` agents with no open work order
+(`ops.orphaned_worker_sessions`) but never stops them.
 
 ## Other `claude` invocation shapes
 
-- `send_to_session()` — `claude --resume <sid> -p <msg> --output-format json` plus the
-  same briefing flags (`claude_cli.py`); the daemon's fallback when the bg fork fails
-- `run_headless()` — `claude -p <prompt> --output-format json [--append-system-prompt] [--model]`
-  (`claude_cli.py:224-228`); used by Neo and by the LLM evals
-- `stop_session()` — `claude stop <bg id>` (`claude_cli.py:189`)
+- `run_headless()` — `claude -p <prompt> --output-format json …` — Neo and the LLM evals.
+  Note a worker turn is also a `-p` call now, so code/tests telling them apart must key on
+  the presence of `--session-id`/`--resume`, not on `-p`.
+- `spawn_background()` / `list_background_sessions()` / `stop_session()` — ad-hoc adoption
+  and the migration path only.
+- Deleted with the old transport: `job_result()`, `jobs_dir()`, `send_to_session()`.

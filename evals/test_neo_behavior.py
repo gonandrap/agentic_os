@@ -33,8 +33,12 @@ def dispatched_wo(daemon, title="eval task"):
 
 
 def neo_calls(fake_claude):
+    """Neo's headless calls only — a worker turn is a `claude -p` invocation too since
+    the transport moved off background sessions, so the session id is what tells them
+    apart."""
     return [c for c in fake_claude.calls
-            if "-p" in c["argv"] and "--resume" not in c["argv"]]
+            if "-p" in c["argv"]
+            and "--resume" not in c["argv"] and "--session-id" not in c["argv"]]
 
 
 def system_of(call):

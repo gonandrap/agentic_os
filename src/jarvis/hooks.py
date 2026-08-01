@@ -285,11 +285,11 @@ def find_project_root(cwd: Path) -> Path | None:
 def _is_current_session(store: ProjectStore, wo_id: str, session_id: str) -> bool:
     """Is this hook coming from the session the work order is actually bound to?
 
-    A work order outlives its sessions: every delivered turn forks a new one and the
-    old one is retired. Hooks from a retired session still arrive (it can be re-opened,
-    and it fires SessionEnd when it is stopped), and they must not steer the work
-    order. Unknown-session hooks are treated as current only when there is nothing to
-    compare against — a work order with no binding yet.
+    A work order has exactly one session id for its whole life now, so this is close to
+    a formality — but it still earns its keep for work orders created under the old
+    background-session transport, whose spent sessions can be re-opened from the agents
+    view and fire hooks that must not steer anything. Unknown-session hooks count as
+    current only when there is nothing to compare against.
     """
     bound = store.get_work_order(wo_id).get("session_id")
     return not bound or not session_id or bound == session_id
@@ -330,23 +330,20 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
             "session_id": session_id,
             "cwd": str(cwd),
             "message": payload.get("message"),
+            # Stop carries the turn's final assistant message. Kept as the backup reply
+            # source: the turn's own JSON result is primary, and `worker_session` reads
+            # this only when that comes back empty.
+            **({"last_assistant_message": payload["last_assistant_message"]}
+               if payload.get("last_assistant_message") else {}),
         })
 
         if event == "SessionStart":
-            # Bind (or correct) the session id: --bg dispatch assigns its own, so the
-            # hook is the authoritative source — but only for a session the work order
-            # has never been bound to. Re-opening a spent session in the agents view
-            # respawns it under its original id and fires this hook again; binding to
-            # that walks the work order backwards onto a stopped session (see
-            # ProjectStore.bind_session).
-            if session_id and store.bind_session(wo_id, session_id):
-                store.add_event(wo_id, "session_bound",
-                                {"via": "hook", "session_id": session_id})
-            elif session_id and session_id != wo.get("session_id"):
-                store.add_event(wo_id, "session_rebind_ignored", {
-                    "session_id": session_id, "bound_to": wo.get("session_id"),
-                    "reason": "a spent session of this work order was re-opened",
-                })
+            # No binding to do: Jarvis mints the session id with `--session-id` before
+            # the process exists, and a headless `--resume` reuses it, so the work order
+            # already knows it and it never changes. This hook fires on every turn
+            # (`source: resume` from turn two on) and is now purely confirmation — the
+            # only state it touches is the dispatching->running correction, for the case
+            # where the worker starts talking before the daemon's next tick.
             if store.get_work_order(wo_id)["status"] == "dispatching":
                 store.set_status(wo_id, "running")
 
@@ -391,36 +388,21 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
             )
 
         elif event == "Stop":
-            # End of a turn: the worker went idle. Completion is signaled separately
-            # via `jarvis wo finish`; the daemon reconciler settles final states.
-            store.add_event(wo_id, "turn_ended", {})
+            # End of a turn. Recorded above (with the final assistant message); what it
+            # means for the work order is settled from the turn row, not from here.
+            pass
 
         elif event == "SessionEnd":
-            fresh = store.get_work_order(wo_id)
-            if fresh["status"] in ("running", "waiting_input", "dispatching"):
-                if fresh.get("result_summary"):
-                    _finalize(store, wo_id)
-                elif fresh["origin"] == "adhoc":
-                    # An adopted session the user started themselves: never dispatched,
-                    # never briefed, so it owes no completion signal (Daemon.retire_adhoc).
-                    store.set_status(wo_id, "completed")
-                    store.clear_attention(wo_id)
-                    store.add_event(wo_id, "adhoc_retired", {"why": "session ended"})
-                else:
-                    store.set_status(wo_id, "needs_review")
-                    store.flag_attention(wo_id, "session ended without `jarvis wo finish`")
+            # Deliberately inert. Under the headless-turn transport this fires at the
+            # end of EVERY turn, not at the end of the conversation — so the settlement
+            # this hook used to do ("session ended without `jarvis wo finish`") would
+            # file every work order for review after its first turn. Settling is the
+            # turn reconciler's job now (Daemon.settle_work_order), which can tell a
+            # turn ending from a conversation ending. Recorded on the timeline above.
+            pass
         return {"wo_id": wo_id, "event": event}
     finally:
         store.close()
-
-
-def _finalize(store: ProjectStore, wo_id: str) -> None:
-    if store.pending_assumptions(wo_id):
-        store.set_status(wo_id, "needs_review")
-        store.flag_attention(wo_id, "assumptions pending review")
-    else:
-        store.set_status(wo_id, "completed")
-        store.clear_attention(wo_id)
 
 
 def main_hook() -> int:
