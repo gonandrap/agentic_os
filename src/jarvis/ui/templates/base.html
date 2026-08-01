@@ -40,6 +40,14 @@
   .daemon { font-family: var(--mono); font-size: 12.5px; }
   .daemon.up { color: var(--green); } .daemon.down { color: var(--red); }
 
+  /* which Jarvis is this? prod must be unmistakable — dev stays quiet on purpose */
+  .instance { font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.08em;
+              white-space: nowrap; padding: 2px 9px; border-radius: 99px;
+              border: 1px solid var(--line); color: var(--ink-3); cursor: default; }
+  .instance.prod { font-weight: 700; color: var(--amber-ink);
+                   border-color: color-mix(in srgb, var(--amber) 60%, transparent);
+                   background: color-mix(in srgb, var(--amber) 18%, var(--surface)); }
+
   /* the signature: attention strip */
   .attention { border-radius: 8px; margin: 18px 0; overflow: hidden; }
   .attention.hot { border: 1px solid color-mix(in srgb, var(--amber) 45%, transparent); }
@@ -138,6 +146,8 @@
 <div class="shell">
   <header id="live-chrome">
     <span class="wordmark"><span class="caret">&gt;</span> JARVIS</span>
+    <span class="instance{{ ' prod' if instance.prod }}" title="{{ instance.detail }}"
+      >{{ instance.label }} · v{{ instance.version }}</span>
     <span class="daemon {{ 'up' if daemon_up else 'down' }}">
       {{ '● daemon up' if daemon_up else '○ daemon down' }}
     </span>

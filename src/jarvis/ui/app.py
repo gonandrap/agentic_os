@@ -14,7 +14,7 @@ from fastapi.templating import Jinja2Templates
 from .. import ops
 from ..central_store import CentralStore
 from ..daemon import daemon_running
-from ..paths import logs_dir
+from ..paths import PRODUCTION, deployment_env, logs_dir
 from ..project_store import ProjectStore
 from ..timeline import build_timeline, count_debug
 
@@ -82,6 +82,30 @@ def log_ui_error(request: Request, exc: BaseException) -> None:
         pass
 
 
+def instance_badge() -> dict[str, str | bool]:
+    """Which Jarvis this dashboard is driving, for the header.
+
+    Production and development are the same code in two checkouts on one machine
+    (docs/DEPLOYMENT.md), and their dashboards are otherwise identical — so the badge
+    is the only thing stopping someone from acting on the live fleet while believing
+    they are in the dev sandbox. Both facts are read once per process: neither the
+    environment nor the installed version can change under a running server.
+
+    The version is the *installed* one, never a constant in the source: on `main` the
+    version string deliberately lags the shipped tag (only release branches carry the
+    bump), so a literal would be wrong in exactly the place it matters most.
+    """
+    from ..bugreport import jarvis_version
+    env, detail = deployment_env()
+    try:
+        version = jarvis_version()
+    except Exception:  # noqa: BLE001 — see gate_badge: a badge must not 500 a page
+        version = "unknown"
+    return {"env": env, "prod": env == PRODUCTION, "version": version,
+            "label": "prod" if env == PRODUCTION else "dev",
+            "detail": f"{env} · {detail} · version {version}"}
+
+
 def gate_badge() -> int | None:
     """How many gates are waiting on the user, for the nav.
 
@@ -111,7 +135,7 @@ def create_app() -> FastAPI:
     templates = Jinja2Templates(directory=str(TEMPLATES))
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
-        level_tone=LEVEL_TONE, fmt_age=fmt_age,
+        level_tone=LEVEL_TONE, fmt_age=fmt_age, instance=instance_badge(),
     )
 
     def render(request: Request, template: str, active: str = "dashboard",
