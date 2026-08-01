@@ -77,17 +77,19 @@ def test_delete_work_order_cascades(project):
     store.add_assumption(wo["id"], "assumed a thing")
     store.add_notification("done", wo_id=wo["id"])
     store.add_approval(wo["id"], "release", "./scripts/ship.sh")
+    store.create_turn(wo["id"], kind="dispatch", prompt="go")
     store.queue_message(other["id"], "untouched")
     store.add_event(other["id"], "turn_ended")
 
     counts = store.delete_work_order(wo["id"])
 
     # 3 events: the assumption, the approval request, and the queued message.
-    assert counts == {"events": 3, "messages": 2, "assumptions": 1, "approvals": 1,
-                      "notifications": 1}
+    assert counts == {"events": 3, "messages": 2, "turns": 1, "assumptions": 1,
+                      "approvals": 1, "notifications": 1}
     with pytest.raises(KeyError):
         store.get_work_order(wo["id"])
     assert store.list_events(wo["id"]) == []
+    assert store.list_turns(wo["id"]) == []
     assert store.list_messages(wo["id"]) == []
     assert store.pending_assumptions(wo["id"]) == []
     assert store.list_approvals(wo["id"]) == []

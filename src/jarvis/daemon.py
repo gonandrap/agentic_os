@@ -3,11 +3,11 @@
 One process, one poll loop over every project in the catalog. Per tick:
   1. dispatch pending work orders (respecting per-project concurrency)
   2. route project notification outboxes to the central inbox, then to sinks
-  3. deliver queued user messages to idle worker sessions
-  4. let Neo (the OS answerer agent) drain queued worker questions
-  5. reconcile work order states against `claude agents --json`
-     (fix drift, adopt unknown background sessions as `adhoc` work orders)
-  6. check the OS's own post-conditions (src/jarvis/invariants.py) and repair the
+  3. reap finished worker turns and settle their work orders
+  4. deliver queued user messages as the next turn of their conversation
+  5. let Neo (the OS answerer agent) drain queued worker questions
+  6. adopt the user's own background sessions as `adhoc` work orders (visibility)
+  7. check the OS's own post-conditions (src/jarvis/invariants.py) and repair the
      state that is unambiguously wrong — the only step that does not trust the others
 
 The daemon is an orchestrator, never a doer: all actual work happens inside the
@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from . import claude_cli
+from . import claude_cli, worker_session
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
@@ -34,10 +34,7 @@ from .project_store import ProjectStore
 
 log = logging.getLogger("jarvisd")
 
-RECONCILE_EVERY_TICKS = 6  # reconcile via `claude agents --json` every N ticks
-# How many reconcile passes to keep waiting for a finished job's result file before
-# giving up on capturing that turn's reply (the supervisor writes it asynchronously).
-MAX_REPLY_CAPTURE_ATTEMPTS = 3
+RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (ad-hoc only)
 
 
 class Daemon:
@@ -48,14 +45,10 @@ class Daemon:
         self.stores: dict[str, ProjectStore] = {}
         self.stop_requested = False
         self.tick_count = 0
-        self.delivery_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="deliver")
-        self.in_flight_deliveries: set[int] = set()
         # Neo drains its queue on ONE thread: answering in FIFO order back-to-back
         # keeps the shared persona+learnings prefix inside the prompt-cache TTL.
         self.neo_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="neo")
         self.neo_draining = False
-        # wo_id -> consecutive reconcile passes that found no result file for its job.
-        self.reply_capture_misses: dict[str, int] = {}
         # Invariant violations already reported this run, so a standing problem is
         # surfaced once instead of every tick. Keyed by (invariant, wo_id).
         self.reported_violations: set[tuple[str, str | None]] = set()
@@ -84,7 +77,6 @@ class Daemon:
                 elapsed = time.monotonic() - started
                 time.sleep(max(0.2, self.poll_interval - elapsed))
         finally:
-            self.delivery_pool.shutdown(wait=False)
             self.neo_pool.shutdown(wait=False)
             self._remove_pidfile()
             log.info("jarvisd stopped")
@@ -124,13 +116,19 @@ class Daemon:
             store = self.store_for(project)
             try:
                 self.route_outbox(project, store)
+                # Turns are Jarvis's own processes, so reaping them costs a signal and a
+                # file read — cheap enough to run every tick rather than on the reconcile
+                # cadence. That is what makes a finished turn visible within one poll
+                # interval instead of one reconcile interval, and it is why delivery no
+                # longer has to wait for a roster refresh either.
+                self.settle_turns(project, store)
+                self.deliver_messages(project, store)
                 self.dispatch_pending(project, store)
                 if reconcile:
-                    self.reconcile_project(project, store, sessions_by_project)
-                    # Delivery needs fresh session states: a message can only be
-                    # injected once the worker's bg session is idle (state done)
-                    # or released — resume refuses live bg-owned sessions.
-                    self.deliver_messages(project, store, sessions_by_project)
+                    # The agents roster now holds ONLY the user's own sessions: workers
+                    # are headless and never enter it. Adoption is the sole reason to
+                    # keep paying for `claude agents --json`.
+                    self.adopt_sessions(project, store, sessions_by_project)
                     # Last: check the state everything above just produced.
                     self.check_invariants(project, store)
                 self.central.touch_project(project.name)
@@ -173,141 +171,47 @@ class Daemon:
 
     # -- 3. message delivery ----------------------------------------------------------
 
-    def deliver_messages(self, project: ProjectSpec, store: ProjectStore,
-                         sessions_by_cwd: dict[str, list[claude_cli.BgSession]]) -> None:
-        proot = str(project.path)
-        mine = [
-            s
-            for cwd, group in sessions_by_cwd.items()
-            if cwd == proot or cwd.startswith(proot + "/")
-            for s in group
-        ]
-        by_sid = {s.session_id: s for s in mine if s.session_id}
-        # Jarvis wrote `job_id` itself on the last spawn, so it names the turn the OS
-        # actually started. Preferred over `session_id`, which is written by whichever
-        # session fires a SessionStart hook.
-        by_job = {s.id: s for s in mine if s.id}
+    def deliver_messages(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Send queued user messages into their work orders' conversations.
+
+        No roster lookup any more, and no thread pool: a turn is a detached process, so
+        launching one is instant and the only thing delivery has to wait for is the
+        previous turn of the SAME work order finishing (`worker_session.busy`).
+        """
         for msg in store.queued_messages():
-            if msg["id"] in self.in_flight_deliveries:
-                continue
             try:
                 wo = store.get_work_order(msg["wo_id"])
             except KeyError:
                 store.mark_message(msg["id"], "failed")
                 continue
             if not wo.get("session_id"):
-                continue  # not dispatched yet; prompt will pick it up when it runs
-            sess = by_job.get(wo.get("job_id") or "") or by_sid.get(wo["session_id"])
-            # Deliverable only when the session is idle (done) or already released:
-            # `claude --resume` refuses sessions owned by a live bg agent, and
-            # injecting into a mid-turn worker would interleave anyway.
-            if sess is not None and not sess.is_finished:
-                continue
-            self.in_flight_deliveries.add(msg["id"])
-            store.add_event(wo["id"], "delivering", {"msg_id": msg["id"]})
-            bg_id = sess.id if sess is not None else None
-            # Resume the live session, not the recorded one: they differ whenever the
-            # binding was walked backwards, and forking the wrong one silently drops
-            # every turn since from the worker's context.
-            resume_sid = sess.session_id if sess is not None else wo["session_id"]
-            self.delivery_pool.submit(self._deliver, project, wo, dict(msg), bg_id,
-                                      resume_sid)
+                continue  # not dispatched yet; the worker prompt will carry it instead
+            if worker_session.busy(store, wo["id"]):
+                continue  # mid-turn: one turn at a time, and resume would refuse anyway
+            self._deliver(project, store, wo, dict(msg))
 
-    def _deliver(self, project: ProjectSpec, wo: dict, msg: dict,
-                 bg_id: str | None = None, resume_sid: str | None = None) -> None:
-        """Deliver a queued user message to the worker's conversation.
-
-        Primary path: dispatch a NEW background agent resuming the worker's session
-        (`claude --bg --resume`) — full context carries over and the worker stays
-        visible in the agents view; the SessionStart hook rebinds the work order to
-        the fork's session id, and the superseded session is stopped once the fork
-        is up — so a multi-turn conversation keeps exactly one live agent, not one
-        per turn. Fallback: release the idle session and resume it headlessly
-        (stop + `--resume -p`).
-
-        The fork is briefed exactly like the first turn (model, effort, extra system
-        prompt, OS skills). A resumed session re-derives its system prompt at launch
-        rather than inheriting it from the transcript, so anything omitted here is
-        simply absent from turn two onwards — including the project's own standing
-        instructions to the worker.
-        """
-        from .bootstrap import install_agent_skills
-        from .dispatch import _write_worker_settings, worker_name
-
-        store = ProjectStore(project.path)  # thread-local connection
+    def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
+                 msg: dict) -> None:
+        log.info("[%s] delivering message %s to %s", project.name, msg["id"], wo["id"])
+        store.add_event(wo["id"], "delivering", {"msg_id": msg["id"]})
         try:
-            log.info("[%s] delivering message %s to %s", project.name, msg["id"], wo["id"])
-            wt = project.path / ".claude" / "worktrees" / (wo.get("worktree") or "")
-            cwd = wt if wo.get("worktree") and wt.is_dir() else project.path
-            resume_sid = resume_sid or wo["session_id"]
-            # One briefing, both paths: the headless fallback is a worker turn too, and
-            # a resume re-derives its briefing from argv rather than the transcript.
-            briefing: dict[str, Any] = dict(
-                model=wo.get("model") or project.worker.model,
-                effort=wo.get("effort") or project.worker.effort,
-                # `or project.worker.permission_mode`, mirroring dispatch: the mode is
-                # part of the briefing, so a resume that drops it is the same defect as
-                # a resume that drops the system prompt. Only `adhoc` rows reach here
-                # with it NULL — dispatch persists the resolved mode back to the row —
-                # and once a work order is being driven by a --bg fork it CANNOT answer
-                # a permission prompt, so Claude's default mode is not the conservative
-                # choice, it is a guaranteed stall the user must clear by hand.
-                # Resolved here only: the column is left NULL so an adopted session
-                # stays distinguishable from a dispatched one.
-                permission_mode=(wo.get("permission_mode")
-                                 or project.worker.permission_mode),
-                append_system_prompt=(wo.get("append_system_prompt")
-                                      or project.worker.append_system_prompt),
-                settings_file=_write_worker_settings(project, wo),
-                add_dirs=[install_agent_skills(project.path)],
-            )
-            try:
-                job_id = claude_cli.spawn_background(
-                    prompt=msg["content"],
-                    cwd=cwd,
-                    name=worker_name(wo),
-                    resume_session_id=resume_sid,
-                    **briefing,
-                )
-                store.mark_message(msg["id"], "delivered")
-                store.add_event(wo["id"], "message_delivered",
-                                {"msg_id": msg["id"], "via": "bg-resume", "job": job_id,
-                                 "resumed": resume_sid})
-                # Retire the session we just forked from — strictly AFTER the fork
-                # exists, so the conversation is never left without a live agent.
-                # Otherwise every turn leaks a spent bg agent into the agents view.
-                if bg_id and claude_cli.stop_session(bg_id):
-                    store.add_event(wo["id"], "session_retired",
-                                    {"bg_id": bg_id, "session_id": resume_sid,
-                                     "reason": "superseded by resume-fork"})
-                if store.get_work_order(wo["id"])["status"] in ("waiting_input", "needs_review"):
-                    store.set_status(wo["id"], "running")
-                    store.clear_attention(wo["id"])
-                # Hand the reply off to the reconciler rather than blocking here: this
-                # runs on a 4-slot pool, and a worker turn can take many minutes.
-                store.update_work_order(wo["id"], job_id=job_id, reply_job_id=None)
-            except claude_cli.ClaudeCliError as e:
-                log.warning("[%s] bg-resume delivery failed (%s); falling back to headless resume",
-                            project.name, e)
-                # `cwd`, not project.path: transcripts are keyed by the directory the
-                # session was created in, so resuming a worktree worker from the project
-                # root does not find its conversation.
-                result = claude_cli.send_to_session(
-                    resume_sid, msg["content"], cwd=cwd, bg_id=bg_id, **briefing,
-                )
-                store.mark_message(msg["id"], "delivered")
-                store.add_event(wo["id"], "message_delivered",
-                                {"msg_id": msg["id"], "via": "headless-resume"})
-                # Headless resume returns the reply inline — no job to reconcile.
-                if result:
-                    store.record_agent_reply(wo["id"], result)
+            turn = worker_session.send(store, project, wo, msg["content"],
+                                       msg_id=msg["id"])
         except claude_cli.ClaudeCliError as e:
-            log.error("[%s] delivery of message %s failed: %s", project.name, msg["id"], e)
+            log.error("[%s] delivery of message %s failed: %s", project.name,
+                      msg["id"], e)
             store.mark_message(msg["id"], "failed")
             store.flag_attention(wo["id"], f"message delivery failed: {e}")
-        finally:
-            self.in_flight_deliveries.discard(msg["id"])
-            store.close()
+            return
+        store.mark_message(msg["id"], "delivered")
+        store.add_event(wo["id"], "message_delivered",
+                        {"msg_id": msg["id"], "turn": turn["seq"]})
+        # The work order is moving again, whatever it had settled into. A user who sends
+        # a message to a finished work order means it to continue, and the turn is
+        # already out — leaving the status settled would make the record lie.
+        if wo["status"] != "running":
+            store.set_status(wo["id"], "running")
+            store.clear_attention(wo["id"])
 
     # -- 4. Neo (answer worker questions) --------------------------------------------
 
@@ -477,53 +381,92 @@ class Daemon:
                     level="warning", wo_id=v.wo_id, source="invariants",
                 )
 
-    # -- 6. reconcile -------------------------------------------------------------------
+    # -- 6. turns and reconciliation -----------------------------------------------------
 
-    def capture_worker_reply(self, store: ProjectStore, wo: dict) -> bool:
-        """Persist the final assistant message of the work order's latest turn.
+    def settle_turns(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Reap finished turns, then move each work order to where its turn says it is.
 
-        A work order is the representation of its worker's conversation — the user and
-        Neo decide from the record alone and never open the session — so the worker's
-        full reply is stored alongside the `wo finish --summary` headline.
-
-        Returns True when the work order may settle: either the reply landed, or it is
-        established that none is coming.
+        Two layers, deliberately: `worker_session.poll` decides whether a *turn* ended
+        and records what the worker said; this decides what that means for the *work
+        order*. The second half is the settlement logic that used to compare against
+        `claude agents --json`, reading a row Jarvis owns instead of a roster it does not.
         """
-        job_id = wo.get("job_id")
-        if not job_id or job_id == wo.get("reply_job_id"):
-            return True  # nothing outstanding
+        for turn in worker_session.poll(store):
+            log.info("[%s] turn %s of %s ended: %s", project.name, turn["seq"],
+                     turn["wo_id"], turn["state"])
+        for wo in store.list_work_orders(
+                statuses=("running", "waiting_input", "dispatching")):
+            if wo["origin"] == "adhoc":
+                continue  # not ours to run; adopt_sessions tracks these
+            try:
+                self.settle_work_order(project, store, wo)
+            except Exception:  # noqa: BLE001 — one work order must not stall the rest
+                log.exception("[%s] settling %s failed", project.name, wo["id"])
 
-        state, result = claude_cli.job_result(job_id)
-        if result:
-            store.record_agent_reply(wo["id"], result)
-            store.update_work_order(wo["id"], reply_job_id=job_id)
-            store.add_event(wo["id"], "worker_reply",
-                            {"job": job_id, "chars": len(result)})
-            self.reply_capture_misses.pop(wo["id"], None)
-            return True
-        if state == "done":
-            store.update_work_order(wo["id"], reply_job_id=job_id)  # ran, said nothing
-            self.reply_capture_misses.pop(wo["id"], None)
-            return True
+    def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
+                          wo: dict) -> None:
+        turn = store.latest_turn(wo["id"])
+        if turn is None:
+            # Claimed but never launched — the daemon died between the two writes.
+            if time.time() - wo["updated_at"] > 300:
+                store.set_status(wo["id"], "failed")
+                store.flag_attention(wo["id"], "worker turn never started")
+            return
 
-        misses = self.reply_capture_misses.get(wo["id"], 0) + 1
-        self.reply_capture_misses[wo["id"]] = misses
-        if misses < MAX_REPLY_CAPTURE_ATTEMPTS:
-            return False
-        log.warning("no worker reply captured for %s (job %s, state %s) after %d passes",
-                    wo["id"], job_id, state, misses)
-        store.update_work_order(wo["id"], reply_job_id=job_id)
-        store.add_event(wo["id"], "worker_reply_lost", {"job": job_id, "state": state})
-        self.reply_capture_misses.pop(wo["id"], None)
-        return True
+        if turn["state"] == "running":
+            if wo["status"] == "dispatching":
+                store.set_status(wo["id"], "running")
+            elif worker_session.is_stalled(turn) and not wo["needs_attention"]:
+                hours = int((time.time() - turn["started_at"]) // 3600)
+                store.flag_attention(
+                    wo["id"],
+                    f"turn running for over {hours}h — check on it or "
+                    f"`jarvis wo cancel {wo['id']}`",
+                )
+            return
+
+        if turn["state"] == "failed":
+            if wo["status"] != "failed":
+                store.set_status(wo["id"], "failed")
+                store.flag_attention(wo["id"], "worker turn failed — review and retry")
+                store.add_notification(
+                    title=f"{wo['id']} worker turn failed",
+                    body=(turn.get("error") or "no error recorded")[:500],
+                    level="warning", wo_id=wo["id"], source="reconciler",
+                )
+            return
+
+        # The turn is done. Everything below decides what the work order does next.
+        if store.queued_messages(wo["id"]):
+            return  # the next turn goes out this tick; nothing has settled yet
+        fresh = store.get_work_order(wo["id"])
+        if fresh.get("result_summary"):
+            if store.pending_assumptions(wo["id"]):
+                if fresh["status"] != "needs_review":
+                    store.set_status(wo["id"], "needs_review")
+                    store.flag_attention(wo["id"], "assumptions pending review")
+            else:
+                store.set_status(wo["id"], "completed")
+                store.clear_attention(wo["id"])
+        elif store.pending_approvals(wo["id"]):
+            # Parked on a privileged-action gate: it was told to end its turn and wait
+            # for the verdict, so an idle worker here is compliance, not abandonment.
+            if fresh["status"] != "waiting_input":
+                store.set_status(wo["id"], "waiting_input")
+        else:
+            store.set_status(wo["id"], "needs_review")
+            store.flag_attention(
+                wo["id"],
+                "worker idle without `jarvis wo finish` — review the session",
+            )
 
     def retire_adhoc(self, store: ProjectStore, wo: dict, why: str) -> None:
         """Close an adopted session's record without passing judgement on it.
 
-        Jarvis did not dispatch this session: it was started by the user in
-        `claude agents` and adopted afterwards so it would show up in `jarvis status`
-        and on the dashboard. It never got `JARVIS_WO_ID` or the worker briefing, so it
-        owes no `jarvis wo finish` and its ending is not an incident. Marking it
+        Jarvis did not dispatch this session: the user started it in `claude agents` and
+        the reconciler adopted it afterwards so it would show up in `jarvis status` and
+        on the dashboard. It never got `JARVIS_WO_ID` or the worker briefing, so it owes
+        no `jarvis wo finish` and its ending is not an incident. Marking it
         `failed`/`needs_review` (as this reconciler used to) turned every session the
         user ran into a permanent attention item.
 
@@ -535,114 +478,48 @@ class Daemon:
         store.add_event(wo["id"], "adhoc_retired", {"why": why})
         log.info("retired ad-hoc %s (%s)", wo["id"], why)
 
-    def reconcile_project(
+    def adopt_sessions(
         self,
         project: ProjectSpec,
         store: ProjectStore,
         sessions_by_cwd: dict[str, list[claude_cli.BgSession]],
     ) -> None:
+        """Mirror the background sessions the USER started into work order records.
+
+        Since workers moved to headless turns, nothing Jarvis dispatches appears in the
+        agents roster — so everything found here belongs to the user. Adoption exists for
+        visibility only (`jarvis status`, the dashboard); an adopted row is never held to
+        the worker contract. See `retire_adhoc` and INV-ADHOC-NOT-GOVERNED.
+        """
         proot = str(project.path)
         sessions = [
-            s for cwd, group in sessions_by_cwd.items() if cwd == proot or cwd.startswith(proot + "/")
+            s for cwd, group in sessions_by_cwd.items()
+            if cwd == proot or cwd.startswith(proot + "/")
             for s in group
         ]
         by_session_id = {s.session_id: s for s in sessions if s.session_id}
-        by_name_prefix: dict[str, claude_cli.BgSession] = {}
-        for s in sessions:
-            m = re.match(r"\[WO (wo-[0-9a-f]+)\]", s.name)
-            if m:
-                by_name_prefix[m.group(1)] = s
 
-        # Recover the final assistant message of every turn that has ended. Runs ahead
-        # of (and independently from) settling: a worker that called `jarvis wo finish`
-        # is already `completed`, so the status-filtered loop below would never see it.
-        for wo in store.work_orders_awaiting_reply():
-            sess = by_session_id.get(wo.get("session_id") or "")
-            if sess is None or sess.is_finished:
-                self.capture_worker_reply(store, wo)
-
-        # Settle framework work orders against live session states.
-        for wo in store.list_work_orders(statuses=("running", "waiting_input", "dispatching")):
-            sid = wo.get("session_id")
-            if not sid:
-                # --bg dispatch assigns its own session id; bind by unique name if the
-                # SessionStart hook hasn't reported yet.
-                sess = by_name_prefix.get(wo["id"])
-                if sess and sess.session_id:
-                    store.bind_session(wo["id"], sess.session_id)
-                    store.add_event(wo["id"], "session_bound", {"via": "reconciler",
-                                                                "session_id": sess.session_id})
-                    sid = sess.session_id
-                else:
-                    age = time.time() - wo["updated_at"]
-                    if age > 300:
-                        store.set_status(wo["id"], "failed")
-                        store.flag_attention(wo["id"], "worker session never appeared")
-                    continue
-            sess = by_session_id.get(sid)
-            if sess is None:
-                if wo["status"] == "dispatching":
-                    continue  # may not have registered yet
-                age = time.time() - wo["updated_at"]
-                if age > 120:
-                    if wo["origin"] == "adhoc":
-                        # The user's own session, gone from the agents view. They
-                        # closed it — that is housekeeping, not an incident.
-                        self.retire_adhoc(store, wo, "session left the agents view")
-                    else:
-                        # Jarvis dispatched this one and promised to see it through,
-                        # so a vanished session is a real failure.
-                        store.set_status(wo["id"], "failed")
-                        store.flag_attention(wo["id"], "worker session disappeared")
-                        store.add_notification(
-                            title=f"{wo['id']} worker disappeared",
-                            body=f"Session {sid} no longer exists.",
-                            level="warning", wo_id=wo["id"], source="reconciler",
-                        )
+        for wo in store.list_work_orders(statuses=("running", "waiting_input")):
+            if wo["origin"] != "adhoc":
                 continue
-            if sess.is_active and wo["status"] != "running":
-                # The agent is making progress again, so whatever stalled it is gone.
-                # This direction matters as much as the one below: without it a work
-                # order that blocked once stays "needs you" forever and the UI keeps
-                # asking for input the worker no longer wants.
-                store.set_status(wo["id"], "running")
-                if not store.pending_assumptions(wo["id"]):
-                    store.clear_attention(wo["id"])
+            sess = by_session_id.get(wo.get("session_id") or "")
+            if sess is None:
+                # Gone from the agents view: the user closed it. Housekeeping, not an
+                # incident.
+                if time.time() - wo["updated_at"] > 120:
+                    self.retire_adhoc(store, wo, "session left the agents view")
             elif sess.is_blocked and wo["status"] == "running":
                 store.set_status(wo["id"], "waiting_input")
-                store.flag_attention(wo["id"], "worker blocked (permission or input needed)")
+                store.flag_attention(wo["id"],
+                                     "session blocked (permission or input needed)")
+            elif sess.is_active and wo["status"] != "running":
+                store.set_status(wo["id"], "running")
+                store.clear_attention(wo["id"])
             elif sess.is_finished:
-                if not self.capture_worker_reply(store, wo):
-                    continue  # settle only once the record holds what the worker said
-                fresh = store.get_work_order(wo["id"])
-                if fresh.get("result_summary"):
-                    if store.pending_assumptions(wo["id"]):
-                        store.set_status(wo["id"], "needs_review")
-                        store.flag_attention(wo["id"], "assumptions pending review")
-                    else:
-                        store.set_status(wo["id"], "completed")
-                        store.clear_attention(wo["id"])
-                elif store.pending_approvals(wo["id"]):
-                    # Parked on a privileged-action gate: it was told to end its turn and
-                    # wait for the verdict, so an idle session is compliance, not
-                    # abandonment. Judging it here would file the work order for review
-                    # while the thing it is waiting for is still in Neo's queue.
-                    if wo["status"] != "waiting_input":
-                        store.set_status(wo["id"], "waiting_input")
-                elif not store.queued_messages(wo["id"]):
-                    if wo["origin"] == "adhoc":
-                        # Not a dispatched worker: ending a turn is just a turn ending.
-                        self.retire_adhoc(store, wo, "session went idle")
-                    else:
-                        store.set_status(wo["id"], "needs_review")
-                        store.flag_attention(
-                            wo["id"],
-                            "worker idle without `jarvis wo finish` — review the session",
-                        )
+                self.retire_adhoc(store, wo, "session went idle")
 
-        # Adopt unknown background sessions as ad-hoc work orders (visibility).
         for sess in sessions:
-            if not sess.session_id or sess.name.startswith("[WO "):
+            if not sess.session_id:
                 continue
             known = store.find_by_session(sess.session_id)
             if known:
@@ -664,7 +541,8 @@ class Daemon:
             store.update_work_order(wo["id"], session_id=sess.session_id)
             if sess.is_blocked:
                 store.set_status(wo["id"], "waiting_input")
-                store.flag_attention(wo["id"], "worker blocked (permission or input needed)")
+                store.flag_attention(wo["id"],
+                                     "session blocked (permission or input needed)")
             else:
                 store.set_status(wo["id"], "running")
             log.info("[%s] adopted ad-hoc session %s (%s) as %s",

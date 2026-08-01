@@ -510,22 +510,30 @@ def finish(wo_id: str, summary: str) -> dict[str, Any]:
     return {"project": name, "wo_id": wo_id, "status": status}
 
 
-def stop_worker_session(wo: dict[str, Any]) -> dict[str, Any]:
-    """Release the background session a work order dispatched, if it still has one.
+def stop_worker_session(wo: dict[str, Any], store: ProjectStore) -> dict[str, Any]:
+    """Take the worker down with the work order, if anything of it is still running.
 
-    Cancelling or deleting a work order has to take the worker down with it: nobody
-    reads its output any more, but the agent keeps running — burning tokens, editing
-    its worktree and cluttering the agents view as an orphan.
+    Cancelling or deleting a work order has to stop its worker: nobody reads the output
+    any more, but the process keeps going — burning tokens and editing its worktree.
 
-    Best effort by design: the caller's state change must never depend on the CLI
-    being reachable, so every failure (no claude binary, unparseable roster, session
-    already gone) comes back as `stopped: False` with a reason instead of raising.
+    Two things can be running, and both are checked. A headless turn is a process Jarvis
+    owns, killed by process group. A background agent is only possible for a work order
+    created under the old transport, and is released with `claude stop`.
 
-    The live roster is the source of truth for the bg id — `job_id` on the record can
-    lag behind (each resume-fork mints a new one), so it is only the fallback.
+    Best effort by design: the caller's state change must never depend on a process
+    being killable or the CLI being reachable, so every failure comes back as
+    `stopped: False` with a reason instead of raising.
     """
-    from . import claude_cli
+    from . import claude_cli, worker_session
 
+    killed = worker_session.cancel(store, wo["id"])
+    if killed["stopped"]:
+        return {"stopped": True, "pid": killed["pid"],
+                "session_id": wo.get("session_id")}
+
+    # Nothing of ours in flight. A legacy work order may still have a background agent.
+    if not wo.get("job_id"):
+        return {"stopped": False, "reason": killed.get("reason", "no turn in flight")}
     if not claude_cli.available():
         return {"stopped": False, "reason": "claude CLI not available"}
     bg_id, reason = None, "no live session"
@@ -537,7 +545,7 @@ def stop_worker_session(wo: dict[str, Any]) -> dict[str, Any]:
                 break
     except claude_cli.ClaudeCliError as e:
         reason = f"could not list sessions: {e}"
-    if bg_id is None and wo.get("session_id"):
+    if bg_id is None:
         bg_id = wo.get("job_id")  # roster missed it; try the id we were handed at spawn
     if not bg_id:
         return {"stopped": False, "reason": reason}
@@ -548,9 +556,9 @@ def stop_worker_session(wo: dict[str, Any]) -> dict[str, Any]:
 
 def cancel(wo_id: str) -> dict[str, Any]:
     name, path, wo = find_work_order(wo_id)
-    stopped = stop_worker_session(wo)
     store = ProjectStore(path)
     try:
+        stopped = stop_worker_session(wo, store)
         store.set_status(wo_id, "cancelled")
         store.clear_attention(wo_id)
         if stopped["stopped"]:
@@ -648,9 +656,9 @@ def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, 
     nothing left to reattach a running agent to.
     """
     name, path, wo = find_work_order(wo_id, project_name)
-    stopped = stop_worker_session(wo)
     store = ProjectStore(path)
     try:
+        stopped = stop_worker_session(wo, store)
         deleted = store.delete_work_order(wo_id)
     finally:
         store.close()

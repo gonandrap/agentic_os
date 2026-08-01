@@ -241,7 +241,8 @@ def test_the_skill_warns_that_the_tracker_is_public():
 def test_dispatch_points_the_worker_at_the_skill(started_project_wo):
     """A skill the worker cannot load is not wired to anything."""
     fake_claude, project_path = started_project_wo
-    spawn = [c for c in fake_claude.calls if "--bg" in c["argv"]][-1]
+    spawn = fake_claude.wait_calls(
+        lambda c: "-p" in c["argv"] and "--session-id" in c["argv"])[-1]
     argv = spawn["argv"]
     assert "--add-dir" in argv, "workers are never told where the OS skills live"
     added = argv[argv.index("--add-dir") + 1]

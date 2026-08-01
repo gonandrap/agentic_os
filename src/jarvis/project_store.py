@@ -44,8 +44,12 @@ CREATE TABLE IF NOT EXISTS work_orders (
     append_system_prompt TEXT,
     session_id TEXT,
     bg_id TEXT,
-    job_id TEXT,        -- supervisor job of the worker's most recent turn
-    reply_job_id TEXT,  -- job whose final assistant message is already recorded
+    -- LEGACY (background-session transport), no longer written; see wo_turns. A
+    -- non-NULL job_id is now only a marker that this work order predates headless
+    -- turns, which is what tells worker_session to release its background agent
+    -- before the next turn resumes.
+    job_id TEXT,
+    reply_job_id TEXT,
     worktree TEXT,
     branch TEXT,
     needs_attention INTEGER NOT NULL DEFAULT 0,
@@ -114,6 +118,33 @@ CREATE TABLE IF NOT EXISTS approvals (
     uses INTEGER NOT NULL DEFAULT 0,
     max_uses INTEGER NOT NULL DEFAULT 3
 );
+-- One turn of a worker's conversation: a `claude -p` process Jarvis started, and what
+-- it said back. The work order's conversation IS this table in order of `seq`.
+--
+-- Replaces the old job_id/reply_job_id pair, which tracked a background job through the
+-- Claude supervisor's private state file. Owning the record outright is what makes reply
+-- capture a field read instead of a retry loop over someone else's internals.
+CREATE TABLE IF NOT EXISTS wo_turns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wo_id TEXT NOT NULL REFERENCES work_orders(id),
+    seq INTEGER NOT NULL,                   -- 1-based position in the conversation
+    kind TEXT NOT NULL,                     -- dispatch | message
+    msg_id INTEGER,                         -- the wo_messages row that triggered it
+    prompt TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'running',  -- running | done | failed
+    pid INTEGER,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    exit_code INTEGER,
+    result TEXT,                            -- the turn's final assistant message
+    error TEXT,
+    cost_usd REAL,
+    num_turns INTEGER,
+    outfile TEXT NOT NULL DEFAULT '',
+    errfile TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_turns_wo ON wo_turns(wo_id, seq);
+CREATE INDEX IF NOT EXISTS idx_turns_state ON wo_turns(state);
 CREATE INDEX IF NOT EXISTS idx_wo_status ON work_orders(status);
 CREATE INDEX IF NOT EXISTS idx_events_wo ON wo_events(wo_id);
 CREATE INDEX IF NOT EXISTS idx_msgs_status ON wo_messages(status);
@@ -136,10 +167,11 @@ ADDED_COLUMNS = {
         # `true_blockers` subtracts these, and only these, so a *new* blocker still
         # surfaces. Cleared whenever the flag legitimately drops (the ack is spent).
         "acknowledged_blockers": "TEXT",
-        # Every session id this work order has already been bound to (JSON list). A
-        # multi-turn work order forks a fresh session per delivered turn, and any of
-        # the spent ones can fire a SessionStart hook again if it is re-opened — this
-        # is what lets `bind_session` refuse to walk the binding backwards.
+        # LEGACY, no longer written. Under the old background-session transport every
+        # delivered turn forked a fresh session id, so a work order accumulated a trail
+        # of spent ones and needed this to stop its binding walking backwards. Headless
+        # turns reuse one Jarvis-minted id for the work order's whole life, so there is
+        # no trail to keep. Retained because old rows still carry their history.
         "prior_sessions": "TEXT",
     },
 }
@@ -210,33 +242,6 @@ class ProjectStore:
         ).fetchone()
         return dict(row) if row else None
 
-    def bind_session(self, wo_id: str, session_id: str) -> bool:
-        """Point the work order at the session now carrying it. Returns True if it moved.
-
-        Binding only ever moves FORWARD, and this is the only place that enforces it.
-        Each delivered turn forks a NEW session (`claude --bg --resume`), so a work
-        order accumulates a trail of spent session ids — and *any* of them can fire a
-        SessionStart hook later, because re-opening a finished agent in the agents view
-        respawns it under its original id. Rebinding to one of those drags the pointer
-        backwards, and everything downstream reads it: the next delivery then forks
-        from a stale conversation and stops a session that was already stopped, leaving
-        the real live agent orphaned in the agents view (observed on wo-9478c1be).
-
-        So a session id this work order has already been bound to is never bound again.
-        """
-        wo = self.get_work_order(wo_id)
-        current = wo.get("session_id") or ""
-        if session_id == current:
-            return False
-        prior = db.from_json(wo.get("prior_sessions"), []) or []
-        if session_id in prior:
-            return False
-        if current:
-            prior.append(current)
-        self.update_work_order(wo_id, session_id=session_id,
-                               prior_sessions=db.to_json(prior))
-        return True
-
     def list_work_orders(
         self, statuses: tuple[str, ...] | None = None, limit: int = 200,
         include_hidden: bool = False,
@@ -251,21 +256,6 @@ class ProjectStore:
         rows = self.conn.execute(
             f"SELECT * FROM work_orders{where} ORDER BY created_at DESC LIMIT ?",
             (*params, limit),
-        ).fetchall()
-        return db.rows_to_dicts(rows)
-
-    def work_orders_awaiting_reply(self) -> list[dict[str, Any]]:
-        """Work orders whose latest spawned turn has no recorded final message yet.
-
-        Status-agnostic on purpose: a worker that calls `jarvis wo finish` flips itself
-        to completed before its session goes idle, so filtering by open statuses would
-        miss exactly the turn that matters most.
-        """
-        rows = self.conn.execute(
-            """SELECT * FROM work_orders
-               WHERE job_id IS NOT NULL
-                 AND (reply_job_id IS NULL OR reply_job_id != job_id)
-               ORDER BY updated_at"""
         ).fetchall()
         return db.rows_to_dicts(rows)
 
@@ -346,6 +336,7 @@ class ProjectStore:
         self.conn.execute("BEGIN")
         try:
             for key, table in (("events", "wo_events"), ("messages", "wo_messages"),
+                               ("turns", "wo_turns"),
                                ("assumptions", "assumptions"),
                                ("approvals", "approvals"),
                                ("notifications", "notifications")):
@@ -420,6 +411,61 @@ class ProjectStore:
     def list_messages(self, wo_id: str, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM wo_messages WHERE wo_id=? ORDER BY ts LIMIT ?", (wo_id, limit)
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    # -- turns (the worker's conversation) --------------------------------------
+
+    def create_turn(self, wo_id: str, kind: str, prompt: str,
+                    msg_id: int | None = None, outfile: str = "",
+                    errfile: str = "") -> dict[str, Any]:
+        """Open a turn row. Written BEFORE the process is spawned, so a turn can never
+        be running with nothing on record to reap it."""
+        assert kind in ("dispatch", "message"), kind
+        seq = self.conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM wo_turns WHERE wo_id=?", (wo_id,)
+        ).fetchone()["n"]
+        cur = self.conn.execute(
+            """INSERT INTO wo_turns (wo_id, seq, kind, msg_id, prompt, started_at,
+                                     outfile, errfile)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (wo_id, seq, kind, msg_id, prompt, db.now(), outfile, errfile),
+        )
+        return self.get_turn(int(cur.lastrowid))  # type: ignore[arg-type,return-value]
+
+    def get_turn(self, turn_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM wo_turns WHERE id=?", (turn_id,)).fetchone()
+        return dict(row) if row else None
+
+    def set_turn_pid(self, turn_id: int, pid: int) -> None:
+        self.conn.execute("UPDATE wo_turns SET pid=? WHERE id=?", (pid, turn_id))
+
+    def finish_turn(self, turn_id: int, state: str, result: str | None = None,
+                    error: str | None = None, cost_usd: float | None = None,
+                    num_turns: int | None = None) -> dict[str, Any]:
+        assert state in ("done", "failed"), state
+        self.conn.execute(
+            """UPDATE wo_turns SET state=?, ended_at=?, result=?, error=?, cost_usd=?,
+                                   num_turns=? WHERE id=?""",
+            (state, db.now(), result, error, cost_usd, num_turns, turn_id),
+        )
+        return self.get_turn(turn_id)  # type: ignore[return-value]
+
+    def latest_turn(self, wo_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq DESC LIMIT 1", (wo_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def running_turns(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM wo_turns WHERE state='running' ORDER BY started_at"
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def list_turns(self, wo_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq LIMIT ?", (wo_id, limit)
         ).fetchall()
         return db.rows_to_dicts(rows)
 

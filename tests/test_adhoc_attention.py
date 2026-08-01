@@ -30,7 +30,7 @@ from jarvis.hooks import handle_hook
 from jarvis.invariants import check_project, true_blockers
 from jarvis.project_store import ProjectStore
 
-from test_pipeline import _add_adhoc, bind_session, started  # noqa: F401
+from test_pipeline import _add_adhoc, started  # noqa: F401
 
 
 def _adhoc_wo(store: ProjectStore) -> dict:
@@ -110,41 +110,39 @@ def test_adopted_session_removed_from_agents_view_is_not_a_failure(
     assert not any("disappeared" in t for t in titles)
 
 
-def test_a_dispatched_worker_that_disappears_is_still_a_failure(
-    started, fake_claude, project
+def test_a_dispatched_worker_whose_turn_dies_is_still_a_failure(
+    started, fake_claude, project, settle_turns
 ):
     """Regression guard: the fix must not silence the case it exists for.
 
-    Jarvis dispatched this one and promised to see it through, so a vanished session is
-    a real failure the user has to know about.
+    Jarvis dispatched this one and promised to see it through, so a worker that stops
+    without a result is a real failure the user has to know about.
     """
     daemon = started
+    fake_claude.turns_fail("silent")
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
-    sid = bind_session(daemon, project, wo["id"])
 
-    _drop_session(fake_claude, sid)
-    _age_out(store, wo["id"])
+    assert settle_turns(store)
     daemon.tick_count = 0
     daemon.tick()
 
     fresh = store.get_work_order(wo["id"])
     assert fresh["status"] == "failed"
-    assert "disappeared" in fresh["attention_reason"]
+    assert "turn failed" in fresh["attention_reason"]
 
 
 def test_a_dispatched_worker_idle_without_finish_is_still_flagged(
-    started, fake_claude, project
+    started, fake_claude, project, settle_turns
 ):
     """The other half of the guard: framework workers do owe a completion signal."""
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
-    sid = bind_session(daemon, project, wo["id"])
 
-    fake_claude.set_session_state(sid, "done")
+    assert settle_turns(store)
     daemon.tick_count = 0
     daemon.tick()
 
@@ -221,21 +219,30 @@ def test_repair_is_only_proposed_when_repair_is_off(project):
     assert store.get_work_order(wo["id"])["status"] == "failed"  # untouched
 
 
-def test_session_end_hook_does_not_bill_an_adhoc_session(project):
-    """The SessionEnd path had the same bug as the reconciler."""
+def test_session_end_hook_bills_nobody(project):
+    """SessionEnd is inert under headless turns, and that is load-bearing twice over.
+
+    It fires at the end of every turn now, so the settlement it used to do would file a
+    healthy dispatched work order for review after turn one — and it had the ad-hoc bug
+    too, billing a session the user started themselves against a contract it never
+    received. Retirement is `Daemon.adopt_sessions`'s job, from the roster.
+    """
     store = ProjectStore(project)
-    wo = store.create_work_order("my manual hack", origin="adhoc")
-    store.update_work_order(wo["id"], session_id="adhoc-1")
-    store.set_status(wo["id"], "running")
+    adhoc = store.create_work_order("my manual hack", origin="adhoc")
+    store.update_work_order(adhoc["id"], session_id="adhoc-1")
+    store.set_status(adhoc["id"], "running")
+    dispatched = store.create_work_order("a real work order", origin="jarvis")
+    store.update_work_order(dispatched["id"], session_id="wo-sess-1")
+    store.set_status(dispatched["id"], "running")
 
-    handle_hook(
-        {"hook_event_name": "SessionEnd", "session_id": "adhoc-1", "cwd": str(project)},
-        {"JARVIS_PROJECT_PATH": str(project)},
-    )
-
-    fresh = store.get_work_order(wo["id"])
-    assert fresh["status"] == "completed"
-    assert not fresh["needs_attention"]
+    for wo, sid in ((adhoc, "adhoc-1"), (dispatched, "wo-sess-1")):
+        handle_hook(
+            {"hook_event_name": "SessionEnd", "session_id": sid, "cwd": str(project)},
+            {"JARVIS_PROJECT_PATH": str(project)},
+        )
+        fresh = store.get_work_order(wo["id"])
+        assert fresh["status"] == "running", wo["origin"]
+        assert not fresh["needs_attention"], wo["origin"]
 
 
 # -- 2. acknowledging a flag actually puts it down ------------------------------------

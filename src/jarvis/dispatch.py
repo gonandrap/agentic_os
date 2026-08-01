@@ -208,34 +208,29 @@ def dispatch_work_order(
     wo: dict[str, Any],
     knowledge_limit: int = 8,
 ) -> dict[str, Any]:
-    """Spawn the worker for a work order already in `dispatching` state."""
-    worktree = wo["id"]  # ids already carry the wo- prefix
+    """Open the worker's conversation for a work order already in `dispatching` state.
+
+    Dispatch composes what the worker is told — the prompt, the settings file, the
+    resolved model/effort/permission mode — and hands the running of it to
+    `worker_session`, which owns the transport.
+    """
+    from . import worker_session
+
     knowledge = central.relevant_knowledge(project.name, limit=knowledge_limit)
     prompt = build_worker_prompt(wo, project, knowledge)
 
-    model = wo.get("model") or project.worker.model
-    effort = wo.get("effort") or project.worker.effort
-    permission_mode = wo.get("permission_mode") or project.worker.permission_mode
-    extra_sp = wo.get("append_system_prompt") or project.worker.append_system_prompt
+    # Resolved onto the row before the turn is launched, so every later turn rebuilds the
+    # same briefing from the record rather than re-reading a catalog that may have moved.
+    resolved = {
+        "model": wo.get("model") or project.worker.model,
+        "effort": wo.get("effort") or project.worker.effort,
+        "permission_mode": wo.get("permission_mode") or project.worker.permission_mode,
+    }
+    store.update_work_order(wo["id"], **resolved)
+    wo = store.get_work_order(wo["id"])
 
-    settings_file = _write_worker_settings(project, wo)
-    # OS skills (e.g. reporting a Jarvis bug) reach the worker only via --add-dir: its
-    # worktree holds tracked files only, so an untracked .claude/skills/ never arrives.
-    from .bootstrap import install_agent_skills
-    skills_dir = install_agent_skills(project.path)
     try:
-        job_id = claude_cli.spawn_background(
-            prompt=prompt,
-            cwd=project.path,
-            name=worker_name(wo),
-            model=model,
-            effort=effort,
-            permission_mode=permission_mode,
-            append_system_prompt=extra_sp,
-            worktree=worktree,
-            settings_file=settings_file,
-            add_dirs=[skills_dir],
-        )
+        turn = worker_session.start(store, project, wo, prompt)
     except claude_cli.ClaudeCliError as e:
         store.set_status(wo["id"], "failed")
         store.flag_attention(wo["id"], f"dispatch failed: {e}")
@@ -248,24 +243,13 @@ def dispatch_work_order(
         )
         raise
 
-    # job_id lets the reconciler recover this turn's final assistant message once the
-    # session goes idle; reply_job_id is cleared so that capture is still outstanding.
-    store.update_work_order(
-        wo["id"],
-        worktree=worktree,
-        model=model,
-        effort=effort,
-        permission_mode=permission_mode,
-        job_id=job_id,
-        reply_job_id=None,
-    )
     store.set_status(wo["id"], "running")
     store.add_event(wo["id"], "dispatched", {
-        "worktree": worktree,
-        "model": model,
-        "permission_mode": permission_mode,
-        "job": job_id,
-        "note": "session id binds via SessionStart hook / name reconciliation",
+        "worktree": wo["id"],
+        "session_id": store.get_work_order(wo["id"])["session_id"],
+        "turn": turn["seq"],
+        "pid": turn["pid"],
+        **resolved,
     })
     central.touch_project(project.name)
     return store.get_work_order(wo["id"])

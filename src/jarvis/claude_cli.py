@@ -10,9 +10,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 #: `claude` location override, mirroring bugreport's GH_BIN_ENV. Tests point it at a
@@ -220,33 +222,6 @@ def spawn_background(
     return m.group(1) if m else None
 
 
-def jobs_dir() -> Path:
-    override = os.environ.get("JARVIS_CLAUDE_JOBS_DIR")
-    if override:
-        return Path(override)
-    config = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
-    return config / "jobs"
-
-
-def job_result(job_id: str) -> tuple[str | None, str | None]:
-    """Read a background job's supervisor state file: `(state, result_text)`.
-
-    Non-blocking, so a poll loop (the daemon reconciler) can ask cheaply every tick.
-    Both values are None when the file is absent or unreadable — the format is
-    internal to the supervisor, so failures are swallowed rather than raised.
-    `result_text` is the session's final assistant message for that job.
-    """
-    try:
-        state = json.loads((jobs_dir() / job_id / "state.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        return None, None
-    if not isinstance(state, dict):
-        return None, None
-    output = state.get("output")
-    result = output.get("result") if isinstance(output, dict) else None
-    return state.get("state"), result
-
-
 def stop_session(bg_id: str) -> bool:
     """Release a background session from the supervisor (`claude stop <id>`).
 
@@ -260,40 +235,165 @@ def stop_session(bg_id: str) -> bool:
         return False
 
 
-def send_to_session(session_id: str, message: str, cwd: Path,
-                    bg_id: str | None = None, timeout: int = 900,
-                    model: str | None = None,
-                    effort: str | None = None,
-                    permission_mode: str | None = None,
-                    append_system_prompt: str | None = None,
-                    settings_file: Path | None = None,
-                    add_dirs: list[Path] | None = None) -> str:
-    """Deliver a user message to an existing session (headless resume).
+# -- worker turns (the transport every worker conversation runs on) --------------------
 
-    Runs a full turn: the session receives the message, processes it, and the
-    result text is returned. The transcript is shared with the original session.
-    If the session is still attached to an (idle) background agent, it is released
-    first — resume refuses to run against bg-owned sessions.
 
-    This is the fallback under a failed bg resume-fork, and it is still a worker
-    turn: it takes the same briefing as the fork (see `_briefing_args`), because a
-    resume re-derives all of it from argv. `cwd` must be the directory the session
-    was created in — transcripts are stored per-cwd, so resuming from elsewhere
-    does not find the conversation.
+@dataclass
+class TurnResult:
+    """The parsed outcome of one headless turn (`claude -p --output-format json`)."""
+
+    ok: bool
+    result: str = ""
+    session_id: str = ""
+    error: str = ""
+    cost_usd: float | None = None
+    num_turns: int | None = None
+    subtype: str = ""
+
+
+def turn_args(
+    prompt: str,
+    session_id: str,
+    resume: bool,
+    name: str | None = None,
+    worktree: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    permission_mode: str | None = None,
+    append_system_prompt: str | None = None,
+    settings_file: Path | None = None,
+    add_dirs: list[Path] | None = None,
+) -> list[str]:
+    """argv for one worker turn. Split out from `spawn_turn` so tests can assert on it.
+
+    `--session-id` on the opening turn, `--resume` on every one after. Both name the
+    SAME id: unlike `--bg --resume` (which forks the conversation under a supervisor-
+    assigned id), a headless resume reuses the id it is given — `--fork-session` exists
+    to opt into the other behaviour. That is what lets Jarvis mint the id up front and
+    treat it as immutable for the work order's lifetime.
     """
-    if bg_id:
-        stop_session(bg_id)
-    args = ["--resume", session_id, "-p", message, "--output-format", "json"]
-    # Safe to append after `-p <message>`: the message is this option's value, not a
-    # bare positional, so a trailing variadic `--add-dir` has nothing to swallow.
+    args = ["-p", "--output-format", "json",
+            "--resume" if resume else "--session-id", session_id]
+    if name:
+        args += ["-n", name]
+    if worktree:
+        args += ["--worktree", worktree]
     args += _briefing_args(model, effort, permission_mode, append_system_prompt,
                            settings_file, add_dirs)
-    out = _run(args, cwd=cwd, timeout=timeout)
+    # Same fence, same reason as `spawn_background`: `--add-dir` and `--tools` are both
+    # variadic and will eat the prompt as an option value if it arrives bare. Nothing
+    # may be appended after this.
+    args += ["--", prompt]
+    return args
+
+
+def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
+               errfile: Path, resume: bool = False, **kwargs: Any) -> int:
+    """Start one worker turn as a detached process; returns its pid.
+
+    Detached (`start_new_session=True`) on purpose: a turn can run for hours and
+    `shipit` restarts jarvisd on every release, so a turn parented to the daemon would
+    lose its reply on each deploy. Its own process group is also what makes `cancel()`
+    able to take the whole tree down.
+
+    stdin is /dev/null because `claude -p` otherwise spends three seconds waiting for
+    input that is never coming, on every turn.
+    """
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    args = turn_args(prompt, session_id, resume, **kwargs)
     try:
-        data = json.loads(out)
-        return data.get("result", "")
+        with outfile.open("w") as out, errfile.open("w") as err:
+            proc = subprocess.Popen(
+                [claude_bin(), *args],
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
+                start_new_session=True,
+            )
+    except (FileNotFoundError, OSError) as e:
+        raise ClaudeCliError(f"could not start `{claude_bin()}`: {e}") from e
+    return proc.pid
+
+
+def read_turn_result(outfile: Path, errfile: Path | None = None) -> TurnResult | None:
+    """Parse a finished turn's output. None means "nothing usable there (yet)".
+
+    The caller decides what None means: still running (the process is alive) or a
+    turn that died without saying anything (it is not).
+    """
+    try:
+        raw = outfile.read_text()
+    except OSError:
+        return None
+    if not raw.strip():
+        return None
+    try:
+        data = json.loads(raw)
     except json.JSONDecodeError:
-        return out
+        return None
+    if not isinstance(data, dict):
+        return None
+    stderr_tail = ""
+    if errfile is not None:
+        try:
+            stderr_tail = errfile.read_text().strip()[-1000:]
+        except OSError:
+            stderr_tail = ""
+    ok = not data.get("is_error")
+    return TurnResult(
+        ok=ok,
+        result=data.get("result") or "",
+        session_id=data.get("session_id") or "",
+        error="" if ok else (data.get("result") or stderr_tail or "turn reported is_error"),
+        cost_usd=data.get("total_cost_usd"),
+        num_turns=data.get("num_turns"),
+        subtype=data.get("subtype") or "",
+    )
+
+
+def process_alive(pid: int | None) -> bool:
+    """Is this pid still a live `claude` process?
+
+    The `/proc` cmdline check guards against pid reuse: a turn runs for hours, and a
+    recycled pid read as "still running" would hang its work order forever. Where
+    `/proc` is unavailable the check degrades to plain signal-0 liveness.
+
+    Matching is on a whole path component, never a substring: `claude` appears inside
+    plenty of unrelated command lines (anything running out of a `.claude/` directory —
+    this test suite included, from `.claude/worktrees/*/.venv/bin/python`), and treating
+    those as live turns is the very failure the check exists to prevent.
+    """
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        return True  # alive, just not ours to signal
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return True  # no /proc (or it vanished mid-read) — trust the signal
+    want = Path(claude_bin()).name
+    return any(Path(tok).name == want
+               for tok in raw.decode(errors="replace").split("\0") if tok)
+
+
+def kill_process_group(pid: int | None) -> bool:
+    """Terminate a turn and everything it spawned. False if it was already gone."""
+    if not pid:
+        return False
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            return True
+        except OSError:
+            return False
 
 
 def run_headless(prompt: str, system_prompt: str | None = None,
