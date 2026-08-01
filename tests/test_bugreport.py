@@ -149,14 +149,23 @@ def test_dev_checkout_reports_a_commit_never_a_version_number(checkout):
     assert "1.2.3" not in version, "a dev build must not claim a released version"
 
 
-def test_plain_git_describe_would_not_have_worked(checkout):
-    """Guards the reason this code asks `--exact-match` instead of describing HEAD:
-    release tags are descendants of main, so nothing is reachable from a dev HEAD."""
+def test_a_failing_git_describe_falls_through_instead_of_propagating(checkout):
+    """Guards the reason this code asks `--exact-match` rather than describing HEAD.
+
+    Release tags are descendants of main, so on a dev HEAD `git describe` does not
+    return a stale answer — it exits non-zero with "No tags can describe". That fatal
+    must become the dev string, never an exception and never an empty version.
+    """
     import subprocess
     described = subprocess.run(
         ["git", "-C", str(checkout), "describe", "--tags", "--match", "jarvis-*"],
         capture_output=True, text=True)
-    assert described.returncode != 0
+    assert described.returncode != 0, "fixture no longer reproduces the real topology"
+    assert "No tags can describe" in described.stderr
+
+    version = bugreport.jarvis_version()
+    assert version.startswith("dev-")
+    assert "fatal" not in version and "1.2.3" not in version
 
 
 def test_uncommitted_changes_are_flagged_on_a_release_too(checkout):
