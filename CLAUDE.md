@@ -55,6 +55,12 @@ jarvis wo done <id>                        # the user closing it: the work is fi
                                            # Stops the worker if one is still running.
                                            # Refuses on pending assumptions (same rule
                                            # as ack) — closing would accept them silently.
+                                           # This is also how a `waiting_pr_merge` work
+                                           # order ends: the worker finished behind a PR
+                                           # (`jarvis wo finish --pr <url>`), it stays on
+                                           # the open list with the link and WITHOUT an
+                                           # attention flag, and the user closes it once
+                                           # they merge. Nothing polls GitHub.
 jarvis wo hide <id> / unhide <id>          # declutter: keeps the record, drops it from
                                            # listings, the summary and the attention list
 jarvis wo delete <id> --yes                # irreversible: erases the WO and its whole

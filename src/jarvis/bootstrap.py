@@ -25,7 +25,7 @@ from .paths import project_state_dir
 # v5 = v4's privileged-action gates section + the decision-routing rewrite (Neo as
 # first responder). Both landed as "v4" on separate branches, so a project that
 # regenerated against either one would have skipped the other's content.
-TEMPLATE_VERSION = 5
+TEMPLATE_VERSION = 6
 ASSETS = Path(__file__).parent / "assets"
 
 

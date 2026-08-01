@@ -3,15 +3,15 @@
 {% block content %}
 
 <h2>{{ project_name }} <span class="kv mono">{{ path }}</span></h2>
-{# Settled work orders (completed, cancelled, failed) are collapsed to a count: they are
-   the bulk of any project with history and none of them is asking for anything. Every
-   link carries the hidden flag through, so expanding a group does not silently undo
+{# Only two things on this page are asking for the user: a running worker, and a pull
+   request waiting to be merged. Those get a row each. Every other open status, and the
+   settled ones (the bulk of any project with history), collapse to a count. Every link
+   carries the hidden flag through, so expanding a group does not silently undo
    "show hidden too". #}
 {% set collapsed = '/project/' + project_name + ('?hidden=1' if show_hidden else '') %}
 {% set keep = '&hidden=1' if show_hidden else '' %}
-{% if settled %}
-<p class="sub">
-  {% for status, n in settled %}
+{% macro count_line(groups) %}
+  {% for status, n in groups %}
     {%- set word = status_meta.get(status, {}).get('word', status) -%}
     {%- if revealed == status -%}
       <strong>{{ n }} {{ word }}</strong> (<a href="{{ collapsed }}">collapse</a>)
@@ -21,9 +21,13 @@
     {%- endif -%}
     {{ ' · ' if not loop.last }}
   {% endfor %}
+{% endmacro %}
+{% if open_counts or settled %}
+<p class="sub">
+  {{ count_line(open_counts + settled) }}
   ·
   {% if revealed == 'all' %}
-    <a href="{{ collapsed }}">show only what's open</a>
+    <a href="{{ collapsed }}">collapse them again</a>
   {% else %}
     <a href="/project/{{ project_name }}?show=all{{ keep }}">show all</a>
   {% endif %}
@@ -39,7 +43,7 @@
   {% endif %}
 </p>
 <div class="panel">
-  {% for wo in wos %}
+  {% for wo in featured + rest %}
     {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
     {% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
     <div class="row">
@@ -47,6 +51,9 @@
       <div class="grow">
         <a href="/wo/{{ project_name }}/{{ wo.id }}" class="mono">{{ wo.id }}</a> {{ wo.title }}
         {% if wo.hidden %}<span class="badge outside" title="hidden">🙈 hidden</span>{% endif %}
+        {% if wo.status == 'waiting_pr_merge' and wo.pr_url %}
+          <div class="sub">⑃ <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a></div>
+        {% endif %}
         {% if wo.needs_attention %}<div class="sub tone-warn">◭ {{ wo.attention_reason }}</div>{% endif %}
       </div>
       <span class="badge {{ 'framework' if o.framework else 'outside' }}">
@@ -55,7 +62,7 @@
     </div>
   {% else %}
     <div class="empty">
-      {% if settled %}nothing open — the rest is settled, counted above
+      {% if open_counts or settled %}nothing running and nothing to merge — the rest is counted above
       {% else %}no work orders yet{% endif %}
     </div>
   {% endfor %}

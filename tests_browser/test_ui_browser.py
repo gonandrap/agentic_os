@@ -235,8 +235,15 @@ def test_live_sync_updates_state_but_keeps_the_half_typed_order(page, server, pr
     page.fill(f"{form} input[name='title']", "half-typed order")
     page.fill(f"{form} textarea[name='description']", "context I am still writing")
 
-    # state changes underneath the open page
+    # state changes underneath the open page. A running work order, so it lands as a
+    # row: the dashboard collapses everything open that is not running or waiting on a
+    # merge, and a brand-new one is neither.
     wo = ops.create_work_order("proj_a", "landed while you were typing")
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "running")
+    finally:
+        store.close()
     page.evaluate("window.jarvisLiveSync()")
 
     # the live region picked the new work order up...

@@ -102,6 +102,10 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "not go looking for that file, everything you need is here):",
         "- Work only inside your assigned worktree (you start in it). Commit your "
         "work and open a PR per this repo's conventions. Never push to main.",
+        f"- **The PR title MUST start with `[{wo['id']}] `** — e.g. "
+        f"`[{wo['id']}] {wo['title'][:40]}`. It is what ties the pull request back to "
+        f"this work order for everyone who never sees Jarvis. `gh pr create` with any "
+        f"other title is blocked.",
         f"- **Neo is your first responder. Any doubt goes to it.** Not just the big "
         f"calls — any point where you are not sure. `jarvis wo ask {wo['id']} "
         f"\"<your question>\"`, then END YOUR TURN. The answer arrives as your next "
@@ -143,7 +147,10 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "wrong thing)? Use your `report-jarvis-bug` skill, then carry on with this work "
         "order. Bugs in THIS project are not Jarvis OS bugs — those go to the backlog.",
         f"- When done, ALWAYS run: `jarvis wo finish {wo['id']} --summary \"...\"` and "
-        f"then write your full answer as the last thing you say.",
+        f"then write your full answer as the last thing you say. If you opened a pull "
+        f"request, pass it too: `--pr <url>`. That parks the work order in 'waiting for "
+        f"PR merge', where it stays on the user's open list with the link until they "
+        f"merge it, instead of settling as completed work nobody is looking at.",
         "",
         "# What the outside world sees",
         "The work order record IS this conversation, as far as anyone else is concerned. "

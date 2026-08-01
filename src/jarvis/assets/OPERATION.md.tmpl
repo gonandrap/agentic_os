@@ -20,6 +20,10 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
 
 - **Work in your assigned worktree** (you are started in it). Commit your work; push
   and open a PR following this repo's conventions. Never push to main.
+- **Title the PR `[$JARVIS_WO_ID] <what it does>`** — the work order id verbatim, in
+  square brackets, first. That prefix is what ties the pull request back to the work
+  order for everyone who never sees Jarvis, so `gh pr create` with any other title is
+  blocked by the hook.
 - **Route any doubt to Neo — it is your first responder**:
   `jarvis wo ask "$JARVIS_WO_ID" "<your question>"`, then end your turn.
 
@@ -64,6 +68,10 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
 - **Summarize your result** when done:
   `jarvis wo finish "$JARVIS_WO_ID" --summary "<what was delivered, where>"`
   then write your full answer as the last thing you say.
+
+  If you opened a pull request, pass it as well: `--pr <url>`. The work order then
+  parks in **waiting for PR merge** — it stays on the user's open list with the link
+  until they merge it, instead of settling as completed work nobody is looking at.
 
 ## What the outside world sees
 

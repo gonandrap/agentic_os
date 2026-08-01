@@ -66,8 +66,13 @@ def _age(ts: float | None) -> str:
 
 STATUS_ICON = {
     "pending": "⏳", "dispatching": "🚀", "running": "🟢", "waiting_input": "🙋",
-    "needs_review": "👀", "completed": "✅", "failed": "❌", "cancelled": "🚫",
+    "needs_review": "👀", "waiting_pr_merge": "🔀", "completed": "✅", "failed": "❌",
+    "cancelled": "🚫",
 }
+# What the user is most likely to act on, listed first: work in flight, then the pull
+# requests waiting for them to merge. Everything else keeps its recency order below.
+# The dashboard groups by the same rule (see ui/app.py FEATURED_STATUSES).
+LIST_PRIORITY = {"running": 0, "waiting_pr_merge": 1}
 ORIGIN_BADGE = {"jarvis": "🤖 jarvis", "ui": "🖥 ui", "manual": "⚠ manual", "adhoc": "⚠ ad-hoc"}
 
 
@@ -160,6 +165,10 @@ def build_parser() -> argparse.ArgumentParser:
     f = wo.add_parser("finish", help="(workers) mark a work order finished")
     f.add_argument("wo_id")
     f.add_argument("--summary", required=True)
+    f.add_argument("--pr", default="", metavar="URL",
+                   help="the pull request this work order opened — parks it in "
+                        "'waiting for PR merge' instead of completing it, so it stays "
+                        "on the open list until the user merges")
 
     r = wo.add_parser("review", help="accept/reject a work order's pending assumptions")
     r.add_argument("wo_id")
@@ -498,7 +507,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
             for wo in wos:
                 out.append({"project": name, **{k: wo[k] for k in (
                     "id", "title", "status", "origin", "needs_attention",
-                    "attention_reason", "created_at", "hidden")}})
+                    "attention_reason", "created_at", "hidden", "pr_url")}})
+        # Running first, then the PRs waiting to be merged, then everything else as it
+        # came (newest first, per project). `sorted` is stable, so the second key is
+        # only a tie-break within a group.
+        out.sort(key=lambda wo: LIST_PRIORITY.get(wo["status"], 9))
         if args.json:
             _print(out, True)
         else:
@@ -507,8 +520,10 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 badge = ORIGIN_BADGE.get(wo["origin"], wo["origin"])
                 att = " ⚠" if wo["needs_attention"] else ""
                 hid = " 🙈" if wo["hidden"] else ""
+                pr = f"\n    → merge {wo['pr_url']}" if wo["status"] == "waiting_pr_merge" \
+                     and wo["pr_url"] else ""
                 print(f"{icon} {wo['id']} [{wo['project']}] [{badge}] "
-                      f"{wo['title']} ({wo['status']}, {_age(wo['created_at'])}){att}{hid}")
+                      f"{wo['title']} ({wo['status']}, {_age(wo['created_at'])}){att}{hid}{pr}")
             if not out:
                 print("no work orders")
 
@@ -543,7 +558,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
         _print(ops.ask_question(args.wo_id, args.question,
                                 project_name=args.project), args.json)
     elif args.wo_cmd == "finish":
-        _print(ops.finish(args.wo_id, args.summary), args.json)
+        _print(ops.finish(args.wo_id, args.summary, pr_url=args.pr or None), args.json)
     elif args.wo_cmd == "review":
         _print(ops.review_work_order(args.wo_id, accept=not args.reject,
                                      feedback=args.feedback), args.json)

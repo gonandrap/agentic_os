@@ -167,7 +167,12 @@ jarvis backlog add <project> "deferred thing"        # instead of "future work" 
 jarvis learn add "reusable insight" --project <p>    # share with other projects
 jarvis notify --level critical "prod is down" "..."  # human attention
 jarvis wo finish  <wo-id> --summary "delivered ..."  # completion signal
+jarvis wo finish  <wo-id> --summary "..." --pr <url> # …and it's waiting on your merge
 ```
+
+The PR title must start with the work order id — `[wo-1234abcd] what it does` — so the
+pull request is traceable back to the work order by people who never see Jarvis. The
+`gh pr create` hook enforces it.
 
 A work order is the representation of its worker's conversation. The final assistant
 message of every worker turn is captured verbatim into the record, so `jarvis wo show`
@@ -177,6 +182,12 @@ replacement.
 
 Assumptions flip the work order to `needs_review` — visible in `jarvis status`, the
 dashboard, and (if configured) Telegram.
+
+A work order finished with `--pr` lands in `waiting_pr_merge` instead of `completed`:
+it stays on the open list with its link until you merge and `jarvis wo done` it (nothing
+polls GitHub). It never raises the attention flag — it is a merge queue, not a blocker —
+and the dashboard gives those a row each, right after the running workers, with
+everything else open folded into a count.
 
 Attention is re-derived from state on every reconcile tick, so it can't be cleared by
 hand — the next tick puts it back. `jarvis wo ack <id>` (or **Got it** on the work order

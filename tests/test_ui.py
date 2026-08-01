@@ -519,6 +519,10 @@ def test_timeline_hides_plumbing_until_debug_is_requested(client, daemon, projec
 
 def test_hide_and_unhide_from_the_work_order_page(client, project):
     wo = ops.create_work_order("proj_a", "shy task")
+    # running, so it is one of the statuses the project page gives a row of its own
+    store = ProjectStore(project)
+    store.set_status(wo["id"], "running")
+    store.close()
 
     r = client.post(f"/wo/proj_a/{wo['id']}/hide")
     assert r.status_code == 303
@@ -603,6 +607,9 @@ def test_settled_work_orders_collapse_into_a_count(client, project):
     killed = ops.create_work_order("proj_a", "old and cancelled")
     ops.mark_done(done["id"])
     ops.cancel(killed["id"])
+    store = ProjectStore(project)
+    store.set_status(open_wo["id"], "running")
+    store.close()
 
     page = client.get("/project/proj_a")
     assert "still going" in page.text
@@ -621,6 +628,41 @@ def test_settled_work_orders_collapse_into_a_count(client, project):
         assert title in everything.text
 
 
+def test_pr_merges_and_running_work_get_the_rows(client, project):
+    """The listing question the user actually asks the dashboard: what is moving, and
+    what is waiting for me to merge it. Everything else open is a count."""
+    running = ops.create_work_order("proj_a", "still going")
+    merging = ops.create_work_order("proj_a", "waiting on a merge")
+    ops.create_work_order("proj_a", "not started yet")
+    ops.finish(merging["id"], "PR is up", pr_url="https://github.com/a/b/pull/9")
+    store = ProjectStore(project)
+    store.set_status(running["id"], "running")
+    store.close()
+
+    for url in ("/", "/project/proj_a"):
+        page = client.get(url)
+        assert "still going" in page.text, url
+        assert "waiting on a merge" in page.text, url
+        assert "https://github.com/a/b/pull/9" in page.text, url  # one click to merge
+        assert "not started yet" not in page.text, url
+        assert "1 pending" in page.text, url
+        # running is listed before the merge queue, and both before anything else
+        assert page.text.index("still going") < page.text.index("waiting on a merge")
+
+    for url in ("/?show=pending", "/project/proj_a?show=pending"):
+        assert "not started yet" in client.get(url).text, url
+
+
+def test_a_pr_waiting_to_be_merged_never_enters_the_attention_strip(client, project):
+    """It is a merge queue, not an interrupt: NEEDS YOU has to stay for real blockers."""
+    wo = ops.create_work_order("proj_a", "waiting on a merge")
+    ops.finish(wo["id"], "PR is up", pr_url="https://github.com/a/b/pull/9")
+
+    page = client.get("/")
+    assert "all quiet" in page.text
+    assert "NEEDS YOU" not in page.text
+
+
 def test_expanding_a_settled_group_keeps_hidden_work_orders_showing(client, project):
     """Two independent toggles: expanding one must not silently undo the other."""
     shy = ops.create_work_order("proj_a", "hidden and finished")
@@ -634,9 +676,12 @@ def test_expanding_a_settled_group_keeps_hidden_work_orders_showing(client, proj
 
 
 def test_a_bogus_show_value_falls_back_to_the_open_list(client, project):
-    ops.create_work_order("proj_a", "still going")
+    live = ops.create_work_order("proj_a", "still going")
     done = ops.create_work_order("proj_a", "old and finished")
     ops.mark_done(done["id"])
+    store = ProjectStore(project)
+    store.set_status(live["id"], "running")
+    store.close()
 
     page = client.get("/project/proj_a?show=../../etc/passwd")
     assert page.status_code == 200

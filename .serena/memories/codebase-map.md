@@ -37,7 +37,8 @@
 - `bootstrap.py` — make a project OS-ready (settings injection, gitignore, README/OPERATION.md,
   workspace trust, `.jarvis/`). `bootstrap_project()`:226, `build_settings()`:66,
   `settings_drift()`:76, `deep_merge()`:50, `BootstrapReport`:38, `TEMPLATE_VERSION = 2`:24.
-- `hooks.py` — the `jarvis _hook` endpoint: PreToolUse preflight + session lifecycle → WO state.
+- `hooks.py` — the `jarvis _hook` endpoint: PreToolUse preflight (gates → PR-title rule →
+  auto-approvals) + session lifecycle → WO state.
   `handle_hook()`:100, `main_hook()`:183, `preflight_decision()`:55, `find_project_root()`:85.
 - `notify.py` — notification sinks + routing inbox rows outward. `route_new_inbox()`:105,
   `SINKS`:98, `sink_telegram()`:57, `wo_url()`:37.

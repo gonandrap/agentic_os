@@ -42,6 +42,70 @@ def is_jarvis_command_chain(command: str) -> bool:
     return "jarvis" in command
 
 
+def wo_title_prefix(wo_id: str) -> str:
+    """The mandatory leading token of a pull request title: `[wo-1234abcd] `.
+
+    The work order id verbatim, so the string a reviewer sees on GitHub is the string
+    `jarvis wo show` accepts — no separate numbering scheme to translate.
+    """
+    return f"[{wo_id}] "
+
+
+def gh_pr_create_title(command: str) -> str | None:
+    """The `--title` of a `gh pr create` in this command, or None.
+
+    None means "not something this hook has an opinion about": not a `gh pr create`, no
+    explicit title (`--fill`, an editor prompt), or a command shlex cannot parse.
+    Deliberately narrow — a hook that fires on commands it does not really understand
+    costs more than the leak it prevents, and the contract text covers the rest.
+    """
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return None
+    for i, word in enumerate(words):
+        if word in ("&&", "||", ";", "|"):
+            continue
+        if word != "gh" or words[i + 1:i + 3] != ["pr", "create"]:
+            continue
+        for j, arg in enumerate(words[i + 3:], start=i + 3):
+            if arg in ("&&", "||", ";", "|"):
+                break
+            if arg.startswith("--title="):
+                return arg.split("=", 1)[1]
+            if arg in ("--title", "-t"):
+                return words[j + 1] if j + 1 < len(words) else None
+    return None
+
+
+def pr_title_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
+    """Hold `gh pr create` to the work order's title prefix.
+
+    A pull request is the one artifact of a work order that outlives the OS's own
+    records and is read by people who never see them, so it has to carry the id back.
+    Contract text alone leaves it to memory; this makes it an invariant on the one path
+    that opens PRs in practice.
+
+    Denies rather than rewrites: the title is the worker's to write, and a hook silently
+    editing the argument of a command it was asked to approve is a worse surprise than
+    being told what to fix.
+    """
+    wo_id = env.get("JARVIS_WO_ID")
+    if not wo_id:
+        return None
+    title = gh_pr_create_title((payload.get("tool_input") or {}).get("command", ""))
+    if title is None:
+        return None
+    prefix = wo_title_prefix(wo_id)
+    if title.startswith(prefix):
+        return None
+    return _deny(
+        f"PR titles in a Jarvis-managed project must start with the work order id, so "
+        f"the pull request is traceable back to it. Re-run with:\n"
+        f'    --title "{prefix}{title}"'
+    )
+
+
 def _allow(reason: str) -> dict[str, Any]:
     return {
         "hookSpecificOutput": {
@@ -175,7 +239,8 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
       (JARVIS_WO_ID set), never for interactive sessions in managed projects.
 
     Gated privileged actions are resolved FIRST, so no auto-approval below can hand out
-    a merge or a release by accident.
+    a merge or a release by accident. The PR-title rule is checked next, for the same
+    reason in reverse: it must not be reachable around by an auto-approval below it.
     """
     tool = payload.get("tool_name")
     tool_input = payload.get("tool_input") or {}
@@ -184,6 +249,9 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         gated = gate_decision(payload, env)
         if gated is not None:
             return gated
+        mistitled = pr_title_decision(payload, env)
+        if mistitled is not None:
+            return mistitled
         if is_jarvis_command_chain(tool_input.get("command", "")):
             return _allow("jarvis contract command")
         return None
