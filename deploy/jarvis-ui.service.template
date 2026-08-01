@@ -11,6 +11,9 @@ Type=simple
 WorkingDirectory=@PROD_DIR@
 Environment=JARVIS_HOME=@PROD_ROOT@/state
 Environment=PRODUCTION_CODE=@PROD_ROOT@
+# Says so on every dashboard page. Absent (units not yet redeployed), the code's own
+# location still resolves it — see paths.deployment_env.
+Environment=JARVIS_ENV=production
 Environment=PATH=@PATH@
 ExecStart=@PROD_DIR@/.venv/bin/jarvis ui --host 127.0.0.1 --port @UI_PORT@
 Restart=always
