@@ -301,6 +301,12 @@ elif "-p" in argv and "--resume" not in argv:
         verdict = {"escalate": False,
                    "answer": f"neo-decision for: {prompt.splitlines()[-1][:60]}",
                    "reason": "test verdict"}
+    if "FORCE_DISPATCH" in prompt:
+        # Neo spotting a self-contradicting ledger and filing the pre-approved cleanup.
+        # Rides on top of whatever verdict was chosen above, because the real thing does
+        # too: answering and noticing the record is wrong are independent.
+        verdict["dispatch"] = {"title": "test-forced ledger cleanup",
+                               "description": "entries A and B contradict; B won"}
     print(json.dumps({"result": json.dumps(verdict)}))
 else:
     sys.stderr.write(f"fake claude: unhandled argv {argv}\n"); sys.exit(2)

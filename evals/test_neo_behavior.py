@@ -248,3 +248,51 @@ def test_unreviewed_accounting(daemon):
     ops.neo_review(1, approved=True)
     ops.neo_review(2, approved=False, feedback="wrong, do X")
     assert ops.os_status()["neo"]["unreviewed"] == 1
+
+
+# -- 5. the ledger gets repaired, not just complained about ------------------------
+
+@scenario("neo/ledger-hygiene", "a contradicting record produces a filed cleanup, not a note")
+def test_cleanup_is_filed_and_visible(daemon, project):
+    """The promise: the OS's memory is append-only, so a superseded ruling sits next to
+    its replacement until someone corrects it. Neo is the only reader holding both, so
+    when it says the record is wrong, that has to become work the user can see — not a
+    line in an answer nobody re-reads."""
+    wo = dispatched_wo(daemon)
+    ops.ask_question(wo["id"], "FORCE_DISPATCH: the old ruling or the new one?")
+    daemon._neo_drain()
+    store = ProjectStore(project)
+    try:
+        filed = [w for w in store.list_work_orders() if w["origin"] == "neo"]
+        assert len(filed) == 1, "the cleanup must exist as a work order"
+        assert filed[0]["status"] == "pending", "and be queued to actually run"
+        # the work order the user was watching says where it came from
+        assert "neo_dispatched" in [e["kind"] for e in store.list_events(wo["id"])]
+        # and the worker still got its answer: the cleanup is extra, never a substitute
+        assert [m for m in store.queued_messages(wo["id"])
+                if m["content"].startswith(neo_mod.ANSWER_PREFIX)]
+    finally:
+        store.close()
+
+
+@scenario("neo/ledger-hygiene", "a pre-approved cleanup never spawns another")
+def test_cleanups_do_not_multiply(daemon, project):
+    """Neo answers the cleanup worker's questions too. Unbounded, one unresolvable
+    contradiction becomes a fresh work order per round trip — the exact noise the
+    feature is supposed to remove."""
+    wo = dispatched_wo(daemon)
+    ops.ask_question(wo["id"], "FORCE_DISPATCH: which ruling?")
+    daemon._neo_drain()
+    store = ProjectStore(project)
+    try:
+        cleanup = [w for w in store.list_work_orders() if w["origin"] == "neo"][0]
+    finally:
+        store.close()
+    daemon.tick()
+    ops.ask_question(cleanup["id"], "FORCE_DISPATCH: this one contradicts itself too?")
+    daemon._neo_drain()
+    store = ProjectStore(project)
+    try:
+        assert len([w for w in store.list_work_orders() if w["origin"] == "neo"]) == 1
+    finally:
+        store.close()

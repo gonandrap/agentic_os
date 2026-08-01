@@ -166,6 +166,9 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "order says otherwise. User feedback may arrive as new user turns; treat it "
         "as authoritative for this work order.",
     ]
+    pre_approved = _pre_approval(wo)
+    if pre_approved:
+        parts += ["", *_pre_approved_briefing(pre_approved)]
     if project.gates:
         parts += ["", *_gate_briefing(wo, project)]
     if knowledge:
@@ -175,6 +178,51 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
             topic = f" [{k['topic']}]" if k["topic"] else ""
             parts.append(f"- ({scope}{topic}) {k['content']}")
     return "\n".join(parts)
+
+
+def _pre_approval(wo: dict[str, Any]) -> dict[str, Any] | None:
+    """The pre-approval marker, if this work order carries one.
+
+    Metadata arrives as a JSON string straight off the row, and a work order with none
+    is the overwhelming common case, so this stays quiet about anything malformed —
+    a briefing is not the place to raise a schema error.
+    """
+    from . import db
+    from .project_store import PRE_APPROVED_KEY
+
+    meta = wo.get("metadata")
+    if isinstance(meta, str):
+        meta = db.from_json(meta, {})
+    if not isinstance(meta, dict):
+        return None
+    marker = meta.get(PRE_APPROVED_KEY)
+    return marker if isinstance(marker, dict) and marker else None
+
+
+def _pre_approved_briefing(marker: dict[str, Any]) -> list[str]:
+    """Tell the worker the decision it would otherwise ask about is already made.
+
+    The contract above tells workers to ask on any doubt, and that is right for work
+    the user commissioned. This work order was filed BY the reviewer, so "may I?" would
+    route the question back to the one who already said yes — a minute spent to be told
+    what the briefing says. The scope line is what keeps that narrow: it names the thing
+    approved, and everything outside it goes back to the ordinary rule.
+    """
+    by = str(marker.get("by") or "the reviewer")
+    scope = str(marker.get("scope") or "the change this work order describes")
+    lines = [
+        "# This work order is PRE-APPROVED",
+        f"It was filed by {by}, who already decided it should happen. You do NOT need "
+        f"to ask whether to proceed: {scope} is approved. Go and do it.",
+        "The approval covers THAT and nothing else. Everything the contract says still "
+        "applies to everything else — ask on any other doubt, record your assumptions, "
+        "and privileged actions are still gated. If you find the work order is wrong "
+        "about the facts, say so and ask rather than carrying out something incorrect.",
+    ]
+    origin = marker.get("from_wo")
+    if origin:
+        lines.append(f"Filed while answering a question on {origin}.")
+    return lines
 
 
 def _gate_briefing(wo: dict[str, Any], project: ProjectSpec) -> list[str]:
