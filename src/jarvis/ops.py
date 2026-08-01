@@ -559,6 +559,56 @@ def finish(wo_id: str, summary: str) -> dict[str, Any]:
     return {"project": name, "wo_id": wo_id, "status": status}
 
 
+def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """The user closing a work order themselves: "this is finished, stop tracking it".
+
+    Distinct from all three neighbours, which is why it exists. `finish` is the *worker*
+    reporting its own result and carries a summary the user does not have. `cancel` says
+    the work should not happen, which is the wrong thing to record about work that did.
+    `hide` only stops showing the record, leaving it open forever.
+
+    Two behaviours it borrows deliberately:
+
+    - It stops the worker, exactly as `cancel` does. A work order nobody is reading any
+      more must not leave a process burning tokens and editing its worktree.
+    - It refuses while assumptions are pending, exactly as `ack_attention` does. Those
+      are decisions the OS is waiting on, and closing over them would silently accept
+      them on the user's behalf. `jarvis wo review` is the way through.
+
+    An existing `result_summary` is left alone: whatever the worker last reported is
+    still the truest thing on the record, and this is not a claim about the outcome.
+    """
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        if store.pending_assumptions(wo_id):
+            raise OpsError(
+                f"{wo_id} is waiting on a decision (assumptions pending review) — "
+                f"marking it done would accept them silently. Use `jarvis wo review "
+                f"{wo_id}` to accept, or `--reject` to send it back."
+            )
+        stopped = stop_worker_session(wo, store)
+        store.set_status(wo_id, "completed")
+        store.clear_attention(wo_id)
+        store.add_event(wo_id, "marked_done", {"was": wo["status"],
+                                               "session_stopped": stopped["stopped"]})
+        if stopped["stopped"]:
+            store.add_event(wo_id, "session_stopped",
+                            {**{k: v for k, v in stopped.items() if k != "stopped"},
+                             "reason": "work order marked done"})
+    finally:
+        store.close()
+    if wo.get("backlog_id"):
+        central = CentralStore()
+        try:
+            central.mark_backlog(wo["backlog_id"], "done")
+        finally:
+            central.close()
+    return {"project": name, "wo_id": wo_id, "title": wo["title"],
+            "status": "completed", "was": wo["status"],
+            "session_stopped": stopped["stopped"]}
+
+
 def stop_worker_session(wo: dict[str, Any], store: ProjectStore) -> dict[str, Any]:
     """Take the worker down with the work order, if anything of it is still running.
 

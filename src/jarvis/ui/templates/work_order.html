@@ -17,6 +17,15 @@
       {{ '⚙ ' if o.framework else '⚠ ' }}{{ o.word }}</span>
     <span class="grow"></span>
     {% if wo.status not in ('completed', 'failed', 'cancelled') %}
+    {# Not offered while assumptions are pending: closing over them would accept them
+       silently. The panel that decides them is further down this same page. #}
+    {% if not assumptions %}
+    <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/done">
+      <button class="accept" title="The work is finished — close this work order.
+                                    Any worker still running is stopped.">
+        Mark done</button>
+    </form>
+    {% endif %}
     <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/cancel">
       <button class="danger">Cancel</button>
     </form>

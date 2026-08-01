@@ -15,7 +15,7 @@ from .. import ops
 from ..central_store import CentralStore
 from ..daemon import daemon_running
 from ..paths import logs_dir
-from ..project_store import ProjectStore
+from ..project_store import OPEN_STATUSES, TERMINAL_STATUSES, ProjectStore
 from ..timeline import build_timeline, count_debug
 
 TEMPLATES = Path(__file__).parent / "templates"
@@ -153,17 +153,30 @@ def create_app() -> FastAPI:
         return render(request, "dashboard.html", st=st, refresh=REFRESH_SECONDS)
 
     @app.get("/project/{name}", response_class=HTMLResponse)
-    def project(request: Request, name: str, hidden: str = ""):
+    def project(request: Request, name: str, hidden: str = "", show: str = ""):
+        """A project's work orders — the open ones by default.
+
+        Settled work orders are the bulk of any project with history and none of them
+        is asking for anything, so they collapse into a per-status count that the user
+        can expand. `show` is one of "" (open only), a terminal status name (open plus
+        that group), or "all".
+        """
         paths = ops.registered_project_paths()
         if name not in paths:
             return render(request, "error.html", message=f"unknown project {name!r}")
         show_hidden = hidden not in ("", "0", "false")
+        revealed = show if show in TERMINAL_STATUSES else ("all" if show == "all" else "")
+        if revealed == "all":
+            statuses = None
+        else:
+            statuses = OPEN_STATUSES + ((revealed,) if revealed else ())
         store = ProjectStore(paths[name])
         try:
-            wos = store.list_work_orders(include_hidden=show_hidden)
-            hidden_count = sum(
-                1 for wo in store.list_work_orders(include_hidden=True) if wo["hidden"]
-            )
+            wos = store.list_work_orders(statuses=statuses, include_hidden=show_hidden)
+            visible_counts = store.status_counts()
+            all_counts = store.status_counts(include_hidden=True)
+            counts = all_counts if show_hidden else visible_counts
+            hidden_count = sum(all_counts.values()) - sum(visible_counts.values())
         finally:
             store.close()
         central = CentralStore()
@@ -171,9 +184,10 @@ def create_app() -> FastAPI:
             backlog = central.list_backlog(project=name, status="open")
         finally:
             central.close()
+        settled = [(s, counts[s]) for s in TERMINAL_STATUSES if counts.get(s)]
         return render(request, "project.html", project_name=name, path=paths[name],
                       wos=wos, backlog=backlog, show_hidden=show_hidden,
-                      hidden_count=hidden_count)
+                      hidden_count=hidden_count, settled=settled, revealed=revealed)
 
     @app.get("/wo/{name}/{wo_id}", response_class=HTMLResponse)
     def work_order(request: Request, name: str, wo_id: str, debug: str = ""):
@@ -298,6 +312,16 @@ def create_app() -> FastAPI:
     @app.post("/wo/{name}/{wo_id}/cancel")
     def cancel_wo(name: str, wo_id: str):
         ops.cancel(wo_id)
+        return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
+
+    @app.post("/wo/{name}/{wo_id}/done")
+    def done_wo(name: str, wo_id: str):
+        try:
+            ops.mark_done(wo_id, project_name=name)
+        except ops.OpsError as e:
+            # Pending assumptions are the one refusal: they want a decision, not a
+            # close. The panel that takes it is on this same page.
+            return RedirectResponse(f"/wo/{name}/{wo_id}?error={e}", status_code=303)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/ack")

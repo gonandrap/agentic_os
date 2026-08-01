@@ -2,7 +2,7 @@
 
 Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
-  jarvis wo create|list|show|send|ask|assume|finish|review|cancel
+  jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done
   jarvis gate request|list|show|approve|deny   privileged-action approvals
   jarvis neo list|show|review|answer|learnings|learn
   jarvis backlog add|list|promote|done
@@ -170,6 +170,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     x = wo.add_parser("cancel", help="cancel a work order")
     x.add_argument("wo_id")
+
+    dn = wo.add_parser("done", help="close a work order yourself — the work is "
+                                    "finished; stops the worker if one is still running")
+    dn.add_argument("wo_id")
+    dn.add_argument("--project")
 
     ak = wo.add_parser("ack", help="acknowledge a work order's attention flag — it "
                                    "stops asking for you in status and on the dashboard")
@@ -544,6 +549,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
                                      feedback=args.feedback), args.json)
     elif args.wo_cmd == "cancel":
         _print(ops.cancel(args.wo_id), args.json)
+    elif args.wo_cmd == "done":
+        _print(ops.mark_done(args.wo_id, project_name=args.project), args.json)
     elif args.wo_cmd == "ack":
         _print(ops.ack_attention(args.wo_id, all_projects=args.all,
                                  project_name=args.project), args.json)
