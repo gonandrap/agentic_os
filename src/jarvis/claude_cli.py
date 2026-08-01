@@ -353,19 +353,35 @@ def read_turn_result(outfile: Path, errfile: Path | None = None) -> TurnResult |
 
 
 def process_alive(pid: int | None) -> bool:
-    """Is this pid still a live `claude` process?
+    """Is this turn's process still running?
 
-    The `/proc` cmdline check guards against pid reuse: a turn runs for hours, and a
-    recycled pid read as "still running" would hang its work order forever. Where
-    `/proc` is unavailable the check degrades to plain signal-0 liveness.
+    Three cases, in the order they are asked, because no single check covers them all:
 
-    Matching is on a whole path component, never a substring: `claude` appears inside
-    plenty of unrelated command lines (anything running out of a `.claude/` directory —
-    this test suite included, from `.claude/worktrees/*/.venv/bin/python`), and treating
-    those as live turns is the very failure the check exists to prevent.
+    1. **Still our child** (the usual case — same daemon that launched it).
+       `waitpid(WNOHANG)` is authoritative *and* reaps it. `os.kill(pid, 0)` is not
+       enough here: a detached child nobody waits on becomes a **zombie**, and signalling
+       a zombie succeeds, so a finished turn would read as running forever.
+    2. **Ours, but mid-launch.** `waitpid` returns 0 for a child that has forked but not
+       yet exec'd, which is correct. Inspecting `/proc` instead would not be: in that
+       window the cmdline is still the *parent's*, so a cmdline test declares a
+       just-launched turn dead and reaps it before it has written anything. That is
+       exactly what CI caught.
+    3. **No longer our child** — jarvisd restarted, so the turn was reparented to init
+       (which reaps it, making `kill` honest again). Only here is the `/proc` cmdline
+       consulted, purely as a pid-reuse guard: a turn can run for hours, and a recycled
+       pid read as "still running" would hang its work order forever. Matching is on a
+       whole path component, never a substring — `claude` appears in plenty of unrelated
+       command lines, this suite's own `.claude/worktrees/*/.venv/bin/python` included.
     """
     if not pid:
         return False
+    try:
+        reaped, _ = os.waitpid(pid, os.WNOHANG)
+        return reaped != pid  # 0 → still running; pid → it just exited (now reaped)
+    except ChildProcessError:
+        pass  # not (or no longer) our child — fall through to the signal check
+    except (OSError, ValueError):
+        pass
     try:
         os.kill(pid, 0)
     except (ProcessLookupError, ValueError):

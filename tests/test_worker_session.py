@@ -223,6 +223,48 @@ def test_process_alive_rejects_a_pid_that_is_not_a_claude(fake_claude):
     assert claude_cli.process_alive(os.getpid()) is False
 
 
+def test_a_finished_turn_is_not_reported_alive_as_a_zombie(fleet):
+    """Nothing waits on a detached turn, so on exit it becomes a **zombie** — and
+    signalling a zombie succeeds. `os.kill` alone would therefore report every finished
+    turn as still running, forever, and no work order would ever settle.
+    """
+    import os
+
+    store, project = fleet["store"], fleet["project"]
+    wo = _wo(fleet)
+    turn = worker_session.start(store, project, wo, "go")
+
+    # wait for the process to finish WITHOUT reaping it — that is what makes a zombie
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if Path(turn["outfile"]).exists() and Path(turn["outfile"]).read_text().strip():
+            break
+        time.sleep(0.02)
+    time.sleep(0.2)
+    os.kill(turn["pid"], 0)  # still signallable: this is the trap
+
+    assert claude_cli.process_alive(turn["pid"]) is False
+
+
+def test_a_just_launched_turn_is_never_reported_dead(fleet, fake_claude, settle_turns):
+    """The mirror of the zombie case, and the one CI caught.
+
+    Between fork and exec a child's `/proc` cmdline is still the PARENT's, so judging
+    liveness from the cmdline declares a turn dead the instant it is launched — and
+    `poll` then reaps it before it has written anything, failing a perfectly healthy
+    turn. Locally the window closed too fast to notice; CI lost the race every run.
+    """
+    store, project = fleet["store"], fleet["project"]
+    gate = fake_claude.hold_turns()
+    for _ in range(8):
+        wo = _wo(fleet)
+        turn = worker_session.start(store, project, wo, "go")
+        assert claude_cli.process_alive(turn["pid"]), "reaped a turn that just started"
+        assert worker_session.poll(store) == []
+    gate.unlink()
+    assert settle_turns(store)
+
+
 # -- migration off background sessions ---------------------------------------------------
 
 
