@@ -411,10 +411,30 @@ class Daemon:
                           wo: dict) -> None:
         turn = store.latest_turn(wo["id"])
         if turn is None:
+            if time.time() - wo["updated_at"] <= 300:
+                return  # just claimed; give the launch a moment to record its turn
+            if wo.get("session_id") or wo.get("job_id"):
+                # In flight when this release landed: dispatched under the background
+                # -session transport, so it has a conversation but no turn on record.
+                # Its agent is still the thing driving it and this reconciler cannot
+                # see that agent, so settling it either way would be a guess — failing
+                # it would be a lie about work that may be perfectly fine. Surface it
+                # instead: the next message migrates it (`worker_session.send` releases
+                # the agent and resumes the same session under a turn), and `cancel`
+                # still stops it. Either way it passes through here only once.
+                if not wo["needs_attention"]:
+                    store.flag_attention(
+                        wo["id"],
+                        "carried over from the old worker transport — send it a "
+                        f"message to resume it, or `jarvis wo cancel {wo['id']}`",
+                    )
+                    store.add_event(wo["id"], "pre_turn_carryover",
+                                    {"job_id": wo.get("job_id"),
+                                     "session_id": wo.get("session_id")})
+                return
             # Claimed but never launched — the daemon died between the two writes.
-            if time.time() - wo["updated_at"] > 300:
-                store.set_status(wo["id"], "failed")
-                store.flag_attention(wo["id"], "worker turn never started")
+            store.set_status(wo["id"], "failed")
+            store.flag_attention(wo["id"], "worker turn never started")
             return
 
         if turn["state"] == "running":

@@ -501,3 +501,15 @@ for every call to be recorded here instead. These are those calls.
     the worktree.** `attach` is a background-agent verb and workers are no longer
     background agents, so the old hint would simply fail. The browser terminal client the
     user described is explicitly out of scope for this change.
+
+76. **A work order that is in flight when this release lands is surfaced, never settled.**
+    It has a session but no turn on record, which is indistinguishable from "the daemon
+    died between claiming it and spawning anything" — the state the `turn is None` branch
+    exists to fail. Rehearsing the upgrade against a copy of the live database showed both
+    real in-flight work orders being marked `failed` on the first tick after restart, ~85h
+    into their lives. A background agent may still be driving them and this reconciler
+    cannot see it, so any verdict here is a guess and "failed" is the expensive one to get
+    wrong. The two cases are told apart by `session_id`/`job_id` being set, and the
+    carried-over work order is flagged for the user instead — the next message migrates it
+    for real (`worker_session.send` releases the agent and resumes the session under a
+    turn), and `jarvis wo cancel` still stops it. It passes through that branch once.

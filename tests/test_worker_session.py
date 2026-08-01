@@ -268,6 +268,51 @@ def test_a_just_launched_turn_is_never_reported_dead(fleet, fake_claude, settle_
 # -- migration off background sessions ---------------------------------------------------
 
 
+def test_a_work_order_in_flight_at_upgrade_is_surfaced_not_failed(fleet):
+    """The deploy-day case: work orders that were already running when this release
+    landed have a conversation but no turn on record.
+
+    They must not be settled from that absence. Their background agent is still the
+    thing driving them and this reconciler cannot see it, so failing them would be a
+    lie about work that may be perfectly fine — and on the live fleet it would have
+    hit every in-flight work order within five minutes of the restart.
+    """
+    store = fleet["store"]
+    wo = _wo(fleet)
+    store.update_work_order(wo["id"], session_id="a-session-from-before",
+                            job_id="bg-42")
+    store.set_status(wo["id"], "running")
+    store.conn.execute("UPDATE work_orders SET updated_at=? WHERE id=?",
+                       (time.time() - 3600, wo["id"]))
+
+    fleet["daemon"].settle_work_order(fleet["project"], store,
+                                      store.get_work_order(wo["id"]))
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "running", "an in-flight work order was failed on upgrade"
+    assert fresh["needs_attention"]
+    assert "message to resume" in fresh["attention_reason"]
+    assert "pre_turn_carryover" in [e["kind"] for e in store.list_events(wo["id"])]
+
+
+def test_a_work_order_claimed_but_never_launched_still_fails(fleet):
+    """The other side of that branch, and why it exists: no session and no turn means
+    the daemon died between claiming the work order and spawning anything. Nothing is
+    running, and nothing ever will be."""
+    store = fleet["store"]
+    wo = _wo(fleet)
+    store.set_status(wo["id"], "dispatching")
+    store.conn.execute("UPDATE work_orders SET updated_at=? WHERE id=?",
+                       (time.time() - 3600, wo["id"]))
+
+    fleet["daemon"].settle_work_order(fleet["project"], store,
+                                      store.get_work_order(wo["id"]))
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "failed"
+    assert fresh["attention_reason"] == "worker turn never started"
+
+
 def test_a_legacy_bg_session_is_released_before_its_next_turn(fleet, fake_claude,
                                                               settle_turns):
     """Work orders dispatched under the old transport migrate themselves.

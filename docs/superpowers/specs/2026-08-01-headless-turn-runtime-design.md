@@ -244,6 +244,16 @@ resuming, it looks the session up in the roster and, if a background agent owns 
 message delivered to a legacy work order releases its background agent and moves the
 conversation onto the new transport permanently.
 
+Until that first message arrives, though, a carried-over work order looks exactly like a
+launch that never happened: a session id and no turn. The reconciler must not settle it
+from that absence — rehearsed against a copy of the live database, the naive reading marked
+both real in-flight work orders `failed` on the first tick after the restart. `session_id`
+(or the legacy `job_id`) tells the two apart, and the carried-over one is flagged for the
+user rather than judged: send it a message to migrate it, or cancel it. Schema migration
+needs no script — `ProjectStore` runs the whole `CREATE TABLE IF NOT EXISTS` script on
+every open, so `wo_turns` appears on existing databases the first time the new code opens
+them.
+
 That same lookup drains the backlog as it goes. For the sessions with no work order left
 to drive them, `jarvis doctor` gains a read-only report: how many `[WO …]`-named
 background agents are in the roster with no open work order, and the exact `claude stop`
