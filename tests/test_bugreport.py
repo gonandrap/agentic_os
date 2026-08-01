@@ -7,6 +7,7 @@ so failures raise instead of half-succeeding.
 """
 
 import json as _json
+import os as _os
 
 import pytest
 
@@ -84,11 +85,126 @@ def test_optional_steps_appear_only_when_given():
     assert "Steps to reproduce" in with_steps and "jarvis status" in with_steps
 
 
-def test_version_is_read_from_the_installed_distribution():
-    """pyproject on main deliberately lags the shipped version (see shipit.sh), so the
-    installed dist metadata is the only trustworthy source."""
+# -- which Jarvis is running ----------------------------------------------------
+#
+# The requirement under every test here: the reported string must never be a number
+# that was never released. main's pyproject deliberately lags the shipped version (the
+# bump lives only on release branches), so dist metadata alone invents releases in the
+# dev checkout — issue #51, where a bug filed from dev recorded 0.1.1 while production
+# ran 0.2.1.
+
+
+@pytest.fixture(autouse=True)
+def _uncached_version():
+    """`jarvis_version` is cached for the dashboard's sake; tests need it re-resolved."""
+    bugreport.jarvis_version.cache_clear()
+    yield
+    bugreport.jarvis_version.cache_clear()
+
+
+def _git(cwd, *args):
+    import subprocess
+    env = {"HOME": str(cwd), "PATH": _os.environ.get("PATH", ""),
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True, env=env,
+                          capture_output=True, text=True).stdout.strip()
+
+
+@pytest.fixture()
+def checkout(tmp_path, monkeypatch):
+    """A throwaway git checkout laid out like this repo, with one release tag on a
+    branch that is NOT an ancestor of main — exactly how shipit leaves the real repo."""
+    root = tmp_path / "jarvis_os"
+    (root / "src" / "jarvis").mkdir(parents=True)
+    (root / "src" / "jarvis" / "__init__.py").write_text("")
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "first")
+    # The release cut: a branch off main carrying the bump commit and the tag, never
+    # merged back. main therefore has no reachable jarvis-* tag, ever.
+    _git(root, "checkout", "-q", "-b", "release/jarvis-1.2.3")
+    (root / "pyproject.toml").write_text('version = "1.2.3"\n')
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "Release jarvis-1.2.3")
+    _git(root, "tag", "jarvis-1.2.3")
+    _git(root, "checkout", "-q", "main")
+    monkeypatch.setattr(bugreport, "_source_dir", lambda: root / "src" / "jarvis")
+    return root
+
+
+def test_production_reports_the_release_tag_it_is_detached_at(checkout):
+    """Production is `git checkout -f jarvis-X.Y.Z`, so HEAD *is* the release."""
+    _git(checkout, "checkout", "-q", "jarvis-1.2.3")
+    assert bugreport.jarvis_version() == "1.2.3"
+
+
+def test_dev_checkout_reports_a_commit_never_a_version_number(checkout):
+    """The issue-#51 regression: on main there is no reachable tag, and dist metadata
+    would hand back a pyproject number that never shipped."""
+    version = bugreport.jarvis_version()
+    head = _git(checkout, "rev-parse", "--short", "HEAD")
+    assert version == f"dev-{head}"
+    assert "1.2.3" not in version, "a dev build must not claim a released version"
+
+
+def test_plain_git_describe_would_not_have_worked(checkout):
+    """Guards the reason this code asks `--exact-match` instead of describing HEAD:
+    release tags are descendants of main, so nothing is reachable from a dev HEAD."""
+    import subprocess
+    described = subprocess.run(
+        ["git", "-C", str(checkout), "describe", "--tags", "--match", "jarvis-*"],
+        capture_output=True, text=True)
+    assert described.returncode != 0
+
+
+def test_uncommitted_changes_are_flagged_on_a_release_too(checkout):
+    """A hand-edited production checkout is not the release it claims to be."""
+    _git(checkout, "checkout", "-q", "jarvis-1.2.3")
+    (checkout / "pyproject.toml").write_text('version = "9.9.9"\n')
+    assert bugreport.jarvis_version() == "1.2.3-dirty"
+
+
+def test_untracked_scratch_files_do_not_count_as_dirty(checkout):
+    """Workers leave scratch files everywhere; only tracked changes alter the code."""
+    (checkout / "notes.md").write_text("scratch")
+    assert bugreport.jarvis_version().endswith(_git(checkout, "rev-parse", "--short",
+                                                    "HEAD"))
+
+
+def test_a_wheel_install_falls_back_to_dist_metadata(tmp_path, monkeypatch):
+    """No checkout, no git answer — and dist metadata is correct there anyway, because
+    the wheel was built from the tag whose pyproject carries the bump."""
     from importlib.metadata import version as dist_version
+    site = tmp_path / "site-packages" / "jarvis"
+    site.mkdir(parents=True)
+    monkeypatch.setattr(bugreport, "_source_dir", lambda: site)
     assert bugreport.jarvis_version() == dist_version("jarvis-os")
+
+
+def test_an_unrelated_enclosing_repo_is_not_mistaken_for_a_jarvis_checkout(
+        tmp_path, monkeypatch):
+    """A venv under someone else's project puts our package inside THEIR repo. Reporting
+    their commit as the Jarvis version would be the same lie in a new costume."""
+    from importlib.metadata import version as dist_version
+    other = tmp_path / "someones_project"
+    site = other / ".venv" / "lib" / "python3.13" / "site-packages" / "jarvis"
+    site.mkdir(parents=True)
+    _git(other, "init", "-q", "-b", "main")
+    (other / "README.md").write_text("not jarvis")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-qm", "first")
+    monkeypatch.setattr(bugreport, "_source_dir", lambda: site)
+    assert bugreport.jarvis_version() == dist_version("jarvis-os")
+
+
+def test_version_never_raises_even_when_git_explodes(monkeypatch):
+    """Three surfaces render this string, one of them a web page. It must not throw."""
+    def boom(*_a, **_k):
+        raise RuntimeError("git went sideways")
+    monkeypatch.setattr(bugreport, "_jarvis_checkout", boom)
+    assert bugreport.jarvis_version()
 
 
 # -- filing the issue -----------------------------------------------------------
