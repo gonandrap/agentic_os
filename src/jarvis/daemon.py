@@ -9,9 +9,9 @@ One process, one poll loop over every project in the catalog. Per tick, in this 
   5. let Neo (the OS answerer agent) drain queued worker questions
 
 Every RECONCILE_EVERY_TICKS ticks it additionally:
-  6. adopts the user's own background sessions as `adhoc` work orders (visibility) —
-     the only step that still needs `claude agents --json`, since workers are headless
-     and never enter that roster
+  6. tracks the sessions the user *injected* (`jarvis wo inject`) — the only step that
+     still needs `claude agents --json`, since workers are headless and never enter that
+     roster. Sessions Jarvis was not given are not looked at, let alone recorded
   7. checks the OS's own post-conditions (src/jarvis/invariants.py) and repairs the
      state that is unambiguously wrong — the only step that does not trust the others
 
@@ -34,11 +34,11 @@ from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
 from .paths import daemon_pidfile, ensure_home, logs_dir
-from .project_store import ProjectStore
+from .project_store import UNGOVERNED_ORIGINS, ProjectStore
 
 log = logging.getLogger("jarvisd")
 
-RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (ad-hoc only)
+RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injected only)
 
 
 class Daemon:
@@ -104,15 +104,24 @@ class Daemon:
     def tick(self) -> None:
         self.tick_count += 1
         reconcile = self.tick_count % RECONCILE_EVERY_TICKS == 1
-        sessions_by_project: dict[str, list[claude_cli.BgSession]] = {}
-        if reconcile:
+        # `None` means "the roster was not read this tick" — either nothing is injected
+        # or the listing failed — and is NOT the same as an empty roster, which would
+        # mean every injected session ended. Session tracking is skipped on None.
+        sessions_by_project: dict[str, list[claude_cli.BgSession]] | None = None
+        # The roster is a subprocess, and tracking injected sessions is the only thing
+        # left that reads it. With nothing injected there is nothing to track, so the
+        # common case — a project driven entirely by dispatched work orders — pays
+        # nothing for it. The invariants below run either way: they read the OS's own
+        # databases, so a Claude CLI that is missing or broken must not switch off the
+        # OS's self-check.
+        if reconcile and self._tracking_injected_sessions():
             try:
-                sessions = claude_cli.list_background_sessions()
-                for s in sessions:
+                sessions_by_project = {}
+                for s in claude_cli.list_background_sessions():
                     sessions_by_project.setdefault(s.cwd, []).append(s)
             except claude_cli.ClaudeCliError as e:
                 log.warning("agents listing failed: %s", e)
-                reconcile = False
+                sessions_by_project = None
 
         for project in self.catalog.projects:
             if not project.path.is_dir():
@@ -129,10 +138,11 @@ class Daemon:
                 self.deliver_messages(project, store)
                 self.dispatch_pending(project, store)
                 if reconcile:
-                    # The agents roster now holds ONLY the user's own sessions: workers
-                    # are headless and never enter it. Adoption is the sole reason to
-                    # keep paying for `claude agents --json`.
-                    self.adopt_sessions(project, store, sessions_by_project)
+                    # The agents roster holds ONLY the user's own sessions: workers are
+                    # headless and never enter it. Jarvis looks at the ones it was
+                    # handed and no others.
+                    if sessions_by_project is not None:
+                        self.track_injected_sessions(project, store, sessions_by_project)
                     # Last: check the state everything above just produced.
                     self.check_invariants(project, store)
                 self.central.touch_project(project.name)
@@ -385,7 +395,7 @@ class Daemon:
                     level="warning", wo_id=v.wo_id, source="invariants",
                 )
 
-    # -- 2 & 6. turns, settlement, and ad-hoc adoption -----------------------------------------------------
+    # -- 2 & 6. turns, settlement, and injected sessions ---------------------------------------------------
 
     def settle_turns(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Reap finished turns, then move each work order to where its turn says it is.
@@ -400,8 +410,8 @@ class Daemon:
                      turn["wo_id"], turn["state"])
         for wo in store.list_work_orders(
                 statuses=("running", "waiting_input", "dispatching")):
-            if wo["origin"] == "adhoc":
-                continue  # not ours to run; adopt_sessions tracks these
+            if wo["origin"] in UNGOVERNED_ORIGINS:
+                continue  # not ours to run; track_injected_sessions follows these
             try:
                 self.settle_work_order(project, store, wo)
             except Exception:  # noqa: BLE001 — one work order must not stall the rest
@@ -484,36 +494,59 @@ class Daemon:
                 "worker idle without `jarvis wo finish` — review the session",
             )
 
-    def retire_adhoc(self, store: ProjectStore, wo: dict, why: str) -> None:
-        """Close an adopted session's record without passing judgement on it.
+    def retire_ungoverned(self, store: ProjectStore, wo: dict, why: str) -> None:
+        """Close an injected session's record without passing judgement on it.
 
-        Jarvis did not dispatch this session: the user started it in `claude agents` and
-        the reconciler adopted it afterwards so it would show up in `jarvis status` and
-        on the dashboard. It never got `JARVIS_WO_ID` or the worker briefing, so it owes
-        no `jarvis wo finish` and its ending is not an incident. Marking it
-        `failed`/`needs_review` (as this reconciler used to) turned every session the
-        user ran into a permanent attention item.
+        Jarvis did not dispatch this session: the user started it themselves and handed
+        it over with `jarvis wo inject`. It never got `JARVIS_WO_ID` or the worker
+        briefing, so it owes no `jarvis wo finish` and its ending is not an incident.
+        Marking it `failed`/`needs_review` (as this reconciler used to) turned every
+        session the user ran into a permanent attention item.
 
         The record keeps everything it learned — timeline, captured replies, any
         assumptions — it just stops demanding the user.
         """
         store.set_status(wo["id"], "completed")
         store.clear_attention(wo["id"])
-        store.add_event(wo["id"], "adhoc_retired", {"why": why})
-        log.info("retired ad-hoc %s (%s)", wo["id"], why)
+        store.add_event(wo["id"], "session_retired", {"why": why})
+        log.info("retired injected session %s (%s)", wo["id"], why)
 
-    def adopt_sessions(
+    def _tracking_injected_sessions(self) -> bool:
+        """Does any project have a live session Jarvis was handed? Decides whether this
+        tick pays for `claude agents --json` at all."""
+        for project in self.catalog.projects:
+            if not project.path.is_dir():
+                continue
+            try:
+                store = self.store_for(project)
+                if any(wo["origin"] == "injected" for wo in
+                       store.list_work_orders(statuses=("running", "waiting_input"),
+                                              include_hidden=True)):
+                    return True
+            except Exception:  # noqa: BLE001 — an unreadable store is the next loop's problem
+                log.exception("could not check %s for injected sessions", project.name)
+        return False
+
+    def track_injected_sessions(
         self,
         project: ProjectSpec,
         store: ProjectStore,
         sessions_by_cwd: dict[str, list[claude_cli.BgSession]],
     ) -> None:
-        """Mirror the background sessions the USER started into work order records.
+        """Follow the sessions the user handed to Jarvis, and only those.
 
-        Since workers moved to headless turns, nothing Jarvis dispatches appears in the
-        agents roster — so everything found here belongs to the user. Adoption exists for
-        visibility only (`jarvis status`, the dashboard); an adopted row is never held to
-        the worker contract. See `retire_adhoc` and INV-ADHOC-NOT-GOVERNED.
+        Jarvis used to adopt every session it found running under a project path. It no
+        longer does: a session the user started is theirs, and Jarvis does not see it,
+        name it, flag it or write into it until `jarvis wo inject` hands it over (GitHub
+        issue 47). This tracks what was handed over; it never creates a record.
+
+        An injected row is still not held to the worker contract — the session never
+        received it. See `retire_ungoverned` and INV-ADHOC-NOT-GOVERNED.
+
+        Only `injected` rows are followed, never the legacy `adhoc` ones: those were
+        adopted without consent and INV-ADHOC-LEGACY-RETIRED closes them once on
+        upgrade. Following them too would undo that — the reopen rule below would put
+        every still-live one straight back to `running` on the next tick.
         """
         proot = str(project.path)
         sessions = [
@@ -524,14 +557,14 @@ class Daemon:
         by_session_id = {s.session_id: s for s in sessions if s.session_id}
 
         for wo in store.list_work_orders(statuses=("running", "waiting_input")):
-            if wo["origin"] != "adhoc":
+            if wo["origin"] != "injected":
                 continue
             sess = by_session_id.get(wo.get("session_id") or "")
             if sess is None:
                 # Gone from the agents view: the user closed it. Housekeeping, not an
                 # incident.
                 if time.time() - wo["updated_at"] > 120:
-                    self.retire_adhoc(store, wo, "session left the agents view")
+                    self.retire_ungoverned(store, wo, "session left the agents view")
             elif sess.is_blocked and wo["status"] == "running":
                 store.set_status(wo["id"], "waiting_input")
                 store.flag_attention(wo["id"],
@@ -540,37 +573,18 @@ class Daemon:
                 store.set_status(wo["id"], "running")
                 store.clear_attention(wo["id"])
             elif sess.is_finished:
-                self.retire_adhoc(store, wo, "session went idle")
+                self.retire_ungoverned(store, wo, "session went idle")
 
+        # A retired session can start another turn — the user just typed again. Reopen
+        # the record rather than showing "completed" next to a session that is visibly
+        # working. Only for sessions already injected: an unknown one stays unknown.
         for sess in sessions:
-            if not sess.session_id:
+            if not sess.session_id or not sess.is_active:
                 continue
             known = store.find_by_session(sess.session_id)
-            if known:
-                # A retired ad-hoc session can start another turn — the user just typed
-                # again. Reopen the record rather than showing "completed" next to a
-                # session that is visibly working.
-                if (known["origin"] == "adhoc" and known["status"] == "completed"
-                        and sess.is_active):
-                    store.set_status(known["id"], "running")
-                continue
-            if sess.is_finished:
-                continue  # only surface live ad-hoc sessions
-            wo = store.create_work_order(
-                title=sess.name or f"ad-hoc session {sess.id}",
-                description="Background session not created through Jarvis "
-                            "(adopted by the reconciler for visibility).",
-                origin="adhoc",
-            )
-            store.update_work_order(wo["id"], session_id=sess.session_id)
-            if sess.is_blocked:
-                store.set_status(wo["id"], "waiting_input")
-                store.flag_attention(wo["id"],
-                                     "session blocked (permission or input needed)")
-            else:
-                store.set_status(wo["id"], "running")
-            log.info("[%s] adopted ad-hoc session %s (%s) as %s",
-                     project.name, sess.id, sess.state, wo["id"])
+            if (known and known["origin"] == "injected"
+                    and known["status"] == "completed"):
+                store.set_status(known["id"], "running")
 
 
 def run_daemon(catalog_path: str | Path, poll_interval: float = 5.0,

@@ -102,13 +102,16 @@ class BgSession:
         return self.state in FINISHED_STATES
 
 
-def list_background_sessions(cwd: Path | None = None, include_done: bool = True) -> list[BgSession]:
+def list_background_sessions(cwd: Path | None = None, include_done: bool = True,
+                             timeout: int = 60) -> list[BgSession]:
+    """The Claude sessions the user has open. `timeout` is short for interactive callers
+    (a web request must not hang on a slow CLI) and generous for the daemon."""
     args = ["agents", "--json"]
     if include_done:
         args.append("--all")
     if cwd is not None:
         args += ["--cwd", str(cwd)]
-    out = _run(args, timeout=60)
+    out = _run(args, timeout=timeout)
     try:
         data = json.loads(out or "[]")
     except json.JSONDecodeError as e:
