@@ -3,7 +3,7 @@
 Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done
-  jarvis gate request|list|show|approve|deny   privileged-action approvals
+  jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
   jarvis neo list|show|review|answer|learnings|learn
   jarvis backlog add|list|promote|done
   jarvis learn add|list|search
@@ -233,6 +233,15 @@ def build_parser() -> argparse.ArgumentParser:
     g = ga.add_parser("deny", help="refuse a gate, with a reason the worker can act on")
     g.add_argument("approval_id", type=int)
     g.add_argument("--reason", required=True)
+    g.add_argument("--project")
+    g = ga.add_parser(
+        "dismiss",
+        help="not a gated action at all: the recogniser matched a command that performs "
+             "no privileged action. Unblocks it without recording an authorisation",
+    )
+    g.add_argument("approval_id", type=int)
+    g.add_argument("--reason", required=True,
+                   help="what the recogniser got wrong — this is the defect report")
     g.add_argument("--project")
 
     # backlog ---------------------------------------------------------------------------
@@ -570,7 +579,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
     return 0
 
 
-GATE_ICON = {"pending": "⏸", "approved": "✅", "denied": "⛔", "expired": "⌛"}
+GATE_ICON = {"pending": "⏸", "approved": "✅", "denied": "⛔", "dismissed": "⊘",
+             "expired": "⌛"}
 
 
 def cmd_gate(args: argparse.Namespace) -> int:
@@ -591,17 +601,30 @@ def cmd_gate(args: argparse.Namespace) -> int:
             for r in rows:
                 icon = GATE_ICON.get(r["status"], "•")
                 where = "you" if r["escalated"] else "neo"
-                state = f"{r['status']} (with {where})" if r["status"] == "pending" \
-                    else f"{r['status']} by {r['decided_by'] or '?'}"
+                if r["status"] == "pending":
+                    state = f"pending (with {where})"
+                elif r["status"] == "dismissed":
+                    state = f"dismissed by {r['decided_by'] or '?'} — not a gated action"
+                else:
+                    state = f"{r['status']} by {r['decided_by'] or '?'}"
                 print(f"{icon} {r['id']} [{r['project']}] {r['kind']} · {state} "
                       f"· {r['wo_id']} · {_age(r['ts'])} ago")
                 print(f"    {r['command']}")
                 if r["status"] == "pending" and r["escalated"]:
                     print(f"    ↳ Neo escalated: {r['escalation_reason']}")
                     print(f"    ↳ jarvis gate approve {r['id']} --reason \"...\"  |  "
-                          f"jarvis gate deny {r['id']} --reason \"...\"")
+                          f"jarvis gate deny {r['id']} --reason \"...\"  |  "
+                          f"jarvis gate dismiss {r['id']} --reason \"...\"")
                 elif r["decision_reason"]:
                     print(f"    ↳ {r['decision_reason']}")
+            # The classifier's own error rate, kept in front of whoever reads this list.
+            # It is the only place the cost of an over-broad recogniser shows up as a
+            # number rather than as one worker's lost round trip.
+            dismissed = [r for r in rows if r["status"] == "dismissed"]
+            if dismissed:
+                print(f"\n{len(dismissed)} of {len(rows)} shown were dismissed as "
+                      f"classifier false positives — commands that tripped a gate but "
+                      f"perform no privileged action.")
     elif args.ga_cmd == "show":
         data = ops.show_gate(args.approval_id, project_name=args.project)
         if args.json:
@@ -616,8 +639,10 @@ def cmd_gate(args: argparse.Namespace) -> int:
                 if q.get("answer"):
                     print(f"\nVerdict: {q['answer']} ({q.get('answered_by')})")
                     print(f"Reason: {q.get('answer_reason')}")
-    elif args.ga_cmd in ("approve", "deny"):
-        _print(ops.decide_gate(args.approval_id, approved=args.ga_cmd == "approve",
+    elif args.ga_cmd in ("approve", "deny", "dismiss"):
+        verdict = {"approve": "approved", "deny": "denied",
+                   "dismiss": "dismissed"}[args.ga_cmd]
+        _print(ops.decide_gate(args.approval_id, verdict=verdict,
                                reason=args.reason, project_name=args.project), args.json)
     return 0
 

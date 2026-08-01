@@ -3,17 +3,26 @@
 {% block content %}
 
 {% macro decide_form(g) %}
-{# One form, two submit buttons: the reason is shared, and `decision` carries the
-   value of whichever button was pressed. A denial without a reason is refused by
-   ops.decide_gate — the worker acts on that text. #}
+{# One form, three submit buttons: the reason is shared, and `decision` carries the
+   value of whichever button was pressed. A denial or a dismissal without a reason is
+   refused by ops.decide_gate — the worker acts on the first, and the second IS the
+   defect report on the recogniser.
+
+   "Not a gated action" is deliberately not styled as a third opinion between approve
+   and deny. It answers a different question — whether this command was privileged at
+   all — so it sits apart from the two verdicts that assume it was. #}
 <form method="post" action="/gates/{{ g.id }}/decide"
       style="display:flex; gap:8px; margin-top:8px">
   <input type="hidden" name="project" value="{{ g.project }}">
   <input type="hidden" name="next" value="/gates">
   <input type="text" name="reason"
-         placeholder="reason — goes to the worker; required to deny">
+         placeholder="reason — goes to the worker; required to deny or dismiss">
   <button class="accept" name="decision" value="approve">✓ Approve</button>
   <button class="danger" name="decision" value="deny">✗ Deny</button>
+  <button name="decision" value="dismiss"
+          title="The command performs no privileged action — the gate matched it by
+                 mistake. Unblocks it and records a classifier defect, not an approval."
+          >⊘ Not a gated action</button>
 </form>
 {% endmacro %}
 
@@ -36,7 +45,8 @@
   ones it declines to decide reach this page as yours.
   <span class="counts">({{ escalated|length }} waiting on you ·
   {{ with_neo|length }} with Neo ·
-  {{ decided|length }} decided)</span>
+  {{ decided|length }} decided ·
+  {{ dismissed|length }} not gated actions)</span>
 </p>
 
 {% if escalated %}
@@ -95,6 +105,38 @@
     </tr>
     {% else %}
     <tr><td colspan="7" class="empty">no gate has been decided yet</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<h2>Not gated actions — the OS got these wrong</h2>
+<div class="panel">
+  <p class="kv">
+    Commands that tripped a gate but perform no privileged action: a release script named
+    inside a search pattern, a path quoted in a PR body, a plain <span class="mono">grep</span>.
+    Nothing was authorised and nothing was refused — the recogniser in
+    <span class="mono">gates.py</span> matched text it should not have. These cost a review
+    each and are listed apart from the verdicts because they measure the OS, not the fleet.
+    {% if false_positive_rate %}
+    <span class="counts">false-positive rate: {{ false_positive_rate }} of all gates ruled on</span>
+    {% endif %}
+  </p>
+  <table>
+    <tr><th>#</th><th>project / wo</th><th>gate</th><th>command</th>
+        <th>what the recogniser got wrong</th><th>by</th><th>age</th></tr>
+    {% for g in dismissed %}
+    <tr>
+      <td class="mono">{{ g.id }}</td>
+      <td class="mono">{{ g.project }}<br><a href="/wo/{{ g.project }}/{{ g.wo_id }}">{{ g.wo_id }}</a></td>
+      <td class="mono">{{ g.kind }}</td>
+      <td class="mono">{{ g.command[:80] }}
+        {% if g.matched %}<div class="sub">matched: {{ g.matched }}</div>{% endif %}</td>
+      <td>{{ g.decision_reason or '—' }}</td>
+      <td class="mono">{{ g.decided_by or '—' }}</td>
+      <td class="mono">{{ fmt_age(g.ts) }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7" class="empty">no gate has been dismissed as a false positive</td></tr>
     {% endfor %}
   </table>
 </div>

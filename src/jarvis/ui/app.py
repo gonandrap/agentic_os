@@ -39,11 +39,14 @@ ORIGIN_META = {
 LEVEL_TONE = {"info": "muted", "warning": "warn", "critical": "bad"}
 # Privileged-action gates. `pending` splits in two on the page — with Neo (costs the
 # user nothing) vs escalated to the user — so it carries the neutral mark here.
+# `dismissed` is neutral-toned on purpose: nothing was permitted and nothing was
+# refused, so neither the ok nor the bad colour tells the truth about it.
 GATE_META = {
-    "pending":  {"word": "pending",  "icon": "◌", "tone": "warn"},
-    "approved": {"word": "approved", "icon": "✓", "tone": "ok"},
-    "denied":   {"word": "denied",   "icon": "✗", "tone": "bad"},
-    "expired":  {"word": "expired",  "icon": "–", "tone": "muted"},
+    "pending":   {"word": "pending",   "icon": "◌", "tone": "warn"},
+    "approved":  {"word": "approved",  "icon": "✓", "tone": "ok"},
+    "denied":    {"word": "denied",    "icon": "✗", "tone": "bad"},
+    "dismissed": {"word": "not a gate", "icon": "⊘", "tone": "muted"},
+    "expired":   {"word": "expired",   "icon": "–", "tone": "muted"},
 }
 
 # How often the dashboard re-reads OS state. Not a page reload — the browser swaps
@@ -80,6 +83,20 @@ def log_ui_error(request: Request, exc: BaseException) -> None:
                     f"{type(exc).__name__}: {exc}\n{tb}")
     except Exception:  # noqa: BLE001 — logging must never mask the original failure
         pass
+
+
+def _false_positive_rate(rows: list) -> str | None:
+    """"3 of 11 (27%)" — how often the gate fired on a command that ships nothing.
+
+    Measured over requests that were actually ruled on. Pending ones are excluded
+    because they have no answer yet, and including them would drag the rate down
+    towards zero simply by being slow to review.
+    """
+    ruled = [g for g in rows if g["status"] != "pending"]
+    if not ruled:
+        return None
+    n = sum(1 for g in ruled if g["status"] == "dismissed")
+    return f"{n} of {len(ruled)} ({round(100 * n / len(ruled))}%)"
 
 
 def gate_badge() -> int | None:
@@ -272,15 +289,27 @@ def create_app() -> FastAPI:
 
     @app.get("/gates", response_class=HTMLResponse)
     def gates_page(request: Request):
-        """Privileged-action approvals. Three states, three different asks of the
+        """Privileged-action approvals. Four states, four different asks of the
         user: escalated ones need a decision, ones still with Neo need nothing (but
-        can be pre-empted), decided ones are the audit trail."""
+        can be pre-empted), decided ones are the audit trail — and dismissed ones are
+        not an audit trail at all.
+
+        The dismissed ones are split out rather than listed with the verdicts because
+        they are a different measurement: they say nothing about what the fleet was
+        allowed to ship, and everything about how often the OS's own recogniser is
+        wrong. Mixed into the decided table they would read as approvals-by-another-name
+        and the false-positive rate would be invisible, which is the whole reason the
+        verdict is separate from `approved`.
+        """
         rows = ops.list_gates(include_request=True)
         pending = [g for g in rows if g["status"] == "pending"]
+        dismissed = [g for g in rows if g["status"] == "dismissed"]
+        decided = [g for g in rows if g["status"] not in ("pending", "dismissed")]
         return render(request, "gates.html", active="gates",
                       escalated=[g for g in pending if g["escalated"]],
                       with_neo=[g for g in pending if not g["escalated"]],
-                      decided=[g for g in rows if g["status"] != "pending"])
+                      decided=decided, dismissed=dismissed,
+                      false_positive_rate=_false_positive_rate(rows))
 
     @app.get("/api/status")
     def api_status():
@@ -393,10 +422,17 @@ def create_app() -> FastAPI:
         `next` returns the user to the page they decided from (the gates tab or a work
         order). Only same-site paths are honoured: a form field is attacker-settable,
         and an open redirect out of the dashboard is not worth the convenience.
+
+        `dismiss` is the third button: it clears a command the recogniser matched by
+        mistake without recording that any privileged action was authorised.
         """
         back = next if next.startswith("/") and not next.startswith("//") else "/gates"
+        # Unknown button values fall through to `denied`, which is the fail-closed
+        # reading: a mangled form must never be able to open a gate.
+        verdict = {"approve": "approved", "deny": "denied",
+                   "dismiss": "dismissed"}.get(decision, "denied")
         try:
-            ops.decide_gate(approval_id, approved=(decision == "approve"),
+            ops.decide_gate(approval_id, verdict=verdict,
                             reason=reason, project_name=project or None)
         except ops.OpsError as e:
             sep = "&" if "?" in back else "?"

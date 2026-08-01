@@ -25,7 +25,11 @@ from .paths import project_state_dir
 # v5 = v4's privileged-action gates section + the decision-routing rewrite (Neo as
 # first responder). Both landed as "v4" on separate branches, so a project that
 # regenerated against either one would have skipped the other's content.
-TEMPLATE_VERSION = 5
+# v6 = the `dismissed` gate verdict. A worker that does not know a false positive has an
+# outcome other than "denied" reasonably concludes the command is forbidden and starts
+# rewording it to get past the recogniser, which is the one response that must not be
+# learned. Bumping the version is what pushes that paragraph into every managed repo.
+TEMPLATE_VERSION = 6
 ASSETS = Path(__file__).parent / "assets"
 
 
@@ -234,6 +238,14 @@ def _gates_section(project: ProjectSpec) -> str:
         "that exact command — the grant is scoped to that one string and expires, so do",
         "not reword it. If denied, fix what the reason names; retrying unchanged will be",
         "blocked again.",
+        "",
+        "There is a third verdict, **dismissed**. The gate recognises commands by matching",
+        "text, so it sometimes fires on one that merely *names* a privileged action — a",
+        "release script inside a grep pattern, a path quoted in a PR body. That is a defect",
+        "in the OS, not a refusal: the reviewer dismisses it, nothing is authorised, and the",
+        "command goes through unchanged. So when a gate fires on something you know ships",
+        "nothing, do not reword the command to slip past it. File the request, say plainly",
+        "why it performs no privileged action, and end your turn.",
     ]
     return "\n".join(lines)
 
