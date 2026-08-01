@@ -66,7 +66,12 @@ def gh_pr_create_title(command: str) -> str | None:
     for i, word in enumerate(words):
         if word in ("&&", "||", ";", "|"):
             continue
-        if word != "gh" or words[i + 1:i + 3] != ["pr", "create"]:
+        # `gh`, but also `/snap/bin/gh` — gh is commonly not on a worker's PATH (it is
+        # not on the production fleet's), so an absolute path is the normal way to
+        # reach it, and a matcher that only knew the bare name let the first real PR
+        # through untitled.
+        if (word != "gh" and not word.endswith("/gh")) \
+                or words[i + 1:i + 3] != ["pr", "create"]:
             continue
         for j, arg in enumerate(words[i + 3:], start=i + 3):
             if arg in ("&&", "||", ";", "|"):

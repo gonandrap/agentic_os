@@ -142,6 +142,8 @@ def test_cli_list_puts_running_then_pr_merges_first(started, project, capsys):
     "gh pr create --title='Add feature X'",
     'gh pr create -t "Add feature X"',
     'cd /tmp/wt && gh pr create --title "Add feature X"',
+    # gh is often not on a worker's PATH, so an absolute path is the normal invocation
+    '/snap/bin/gh pr create --title "Add feature X"',
 ])
 def test_gh_pr_create_without_the_prefix_is_denied(command):
     out = hooks.preflight_decision(
