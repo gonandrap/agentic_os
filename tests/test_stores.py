@@ -102,3 +102,24 @@ def test_knowledge_relevance(jarvis_home):
     got = [k["content"] for k in central.relevant_knowledge("p1")]
     assert "proj tip" in got and "global tip" in got and "other proj tip" not in got
     assert central.search_knowledge("global")[0]["content"] == "global tip"
+
+
+def test_status_counts_are_not_capped_by_the_listing_limit(project):
+    """Counted in SQL, so a project with more history than one page still adds up.
+
+    `list_work_orders` stops at `limit`; counting its result would under-report exactly
+    where the count matters most.
+    """
+    store = ProjectStore(project)
+    for i in range(5):
+        store.set_status(store.create_work_order(f"done {i}")["id"], "completed")
+    store.create_work_order("open one")
+    hidden = store.create_work_order("hidden and cancelled")
+    store.set_status(hidden["id"], "cancelled")
+    store.set_hidden(hidden["id"], True)
+
+    assert store.status_counts() == {"completed": 5, "pending": 1}
+    assert store.status_counts(include_hidden=True) == {
+        "completed": 5, "pending": 1, "cancelled": 1,
+    }
+    assert len(store.list_work_orders(limit=2)) == 2  # the listing still pages

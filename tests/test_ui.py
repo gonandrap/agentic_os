@@ -552,6 +552,98 @@ def test_delete_from_the_work_order_page_removes_it(client, project):
     assert "doomed task" not in client.get("/project/proj_a").text
 
 
+def test_mark_done_from_the_work_order_page(client, project):
+    wo = ops.create_work_order("proj_a", "finished by hand")
+
+    detail = client.get(f"/wo/proj_a/{wo['id']}")
+    assert "Mark done" in detail.text
+
+    r = client.post(f"/wo/proj_a/{wo['id']}/done")
+    assert r.status_code == 303
+    assert r.headers["location"] == f"/wo/proj_a/{wo['id']}"
+
+    store = ProjectStore(project)
+    try:
+        assert store.get_work_order(wo["id"])["status"] == "completed"
+    finally:
+        store.close()
+    detail = client.get(f"/wo/proj_a/{wo['id']}")
+    assert "Marked done by you" in detail.text
+    assert "Mark done" not in detail.text  # nothing left to close
+
+
+def test_mark_done_is_not_offered_while_assumptions_are_pending(client, project):
+    """It would accept the assumptions silently. The panel that decides them is on the
+    same page, so the user is one click from being allowed to close it."""
+    wo = ops.create_work_order("proj_a", "has an open question")
+    ops.assume(wo["id"], "used the sqlite backend")
+
+    detail = client.get(f"/wo/proj_a/{wo['id']}")
+    assert "Mark done" not in detail.text
+    assert "Accept all" in detail.text
+
+    r = client.post(f"/wo/proj_a/{wo['id']}/done")  # forced by hand anyway
+    assert r.status_code == 303
+    assert "error=" in r.headers["location"]
+    store = ProjectStore(project)
+    try:
+        assert store.get_work_order(wo["id"])["status"] != "completed"
+    finally:
+        store.close()
+
+    ops.review_work_order(wo["id"], accept=True)
+    assert "Mark done" in client.get(f"/wo/proj_a/{wo['id']}").text
+
+
+def test_settled_work_orders_collapse_into_a_count(client, project):
+    """The complaint: a project page that lists every work order ever created is
+    unreadable. Settled ones are the bulk of it and none is asking for anything."""
+    open_wo = ops.create_work_order("proj_a", "still going")
+    done = ops.create_work_order("proj_a", "old and finished")
+    killed = ops.create_work_order("proj_a", "old and cancelled")
+    ops.mark_done(done["id"])
+    ops.cancel(killed["id"])
+
+    page = client.get("/project/proj_a")
+    assert "still going" in page.text
+    assert "old and finished" not in page.text
+    assert "old and cancelled" not in page.text
+    assert "1 completed" in page.text and "1 cancelled" in page.text
+    assert "failed" not in page.text  # zero of them: no count, no link
+
+    just_completed = client.get("/project/proj_a?show=completed")
+    assert "old and finished" in just_completed.text
+    assert "old and cancelled" not in just_completed.text  # just that group
+    assert "still going" in just_completed.text  # the open ones never leave
+
+    everything = client.get("/project/proj_a?show=all")
+    for title in ("still going", "old and finished", "old and cancelled"):
+        assert title in everything.text
+
+
+def test_expanding_a_settled_group_keeps_hidden_work_orders_showing(client, project):
+    """Two independent toggles: expanding one must not silently undo the other."""
+    shy = ops.create_work_order("proj_a", "hidden and finished")
+    ops.mark_done(shy["id"])
+    ops.hide_work_order(shy["id"], hidden=True)
+
+    assert "hidden and finished" not in client.get("/project/proj_a?show=completed").text
+    both = client.get("/project/proj_a?show=completed&hidden=1")
+    assert "hidden and finished" in both.text
+    assert "show=completed" in both.text  # the "hide them again" link keeps the group
+
+
+def test_a_bogus_show_value_falls_back_to_the_open_list(client, project):
+    ops.create_work_order("proj_a", "still going")
+    done = ops.create_work_order("proj_a", "old and finished")
+    ops.mark_done(done["id"])
+
+    page = client.get("/project/proj_a?show=../../etc/passwd")
+    assert page.status_code == 200
+    assert "still going" in page.text
+    assert "old and finished" not in page.text
+
+
 def test_got_it_button_puts_the_flag_down(client, project):
     """The dashboard complaint in one test: acking has to survive the daemon.
 

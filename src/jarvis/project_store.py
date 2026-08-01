@@ -24,6 +24,9 @@ WO_STATUSES = (
     "cancelled",
 )
 OPEN_STATUSES = ("pending", "dispatching", "running", "waiting_input", "needs_review")
+# Settled: nothing more will happen to these on their own. They are the bulk of an old
+# project's history, so listings collapse them behind a count rather than printing them.
+TERMINAL_STATUSES = ("completed", "cancelled", "failed")
 
 # How the work order entered the system. jarvis/ui follow the framework; manual is a
 # direct DB insert; adhoc is a background session we discovered that Jarvis didn't spawn.
@@ -258,6 +261,19 @@ class ProjectStore:
             (*params, limit),
         ).fetchall()
         return db.rows_to_dicts(rows)
+
+    def status_counts(self, include_hidden: bool = False) -> dict[str, int]:
+        """How many work orders sit in each status. Counted in SQL, not by listing.
+
+        `list_work_orders` is capped at `limit`, so counting its result would quietly
+        under-report exactly where it matters most — a project with more history than
+        one page of it.
+        """
+        where = "" if include_hidden else " WHERE hidden=0"
+        rows = self.conn.execute(
+            f"SELECT status, COUNT(*) AS n FROM work_orders{where} GROUP BY status"
+        ).fetchall()
+        return {row["status"]: int(row["n"]) for row in rows}
 
     def claim_next_pending(self) -> dict[str, Any] | None:
         """Atomically claim the oldest pending order (pending -> dispatching)."""

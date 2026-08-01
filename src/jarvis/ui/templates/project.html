@@ -3,13 +3,39 @@
 {% block content %}
 
 <h2>{{ project_name }} <span class="kv mono">{{ path }}</span></h2>
+{# Settled work orders (completed, cancelled, failed) are collapsed to a count: they are
+   the bulk of any project with history and none of them is asking for anything. Every
+   link carries the hidden flag through, so expanding a group does not silently undo
+   "show hidden too". #}
+{% set collapsed = '/project/' + project_name + ('?hidden=1' if show_hidden else '') %}
+{% set keep = '&hidden=1' if show_hidden else '' %}
+{% if settled %}
+<p class="sub">
+  {% for status, n in settled %}
+    {%- set word = status_meta.get(status, {}).get('word', status) -%}
+    {%- if revealed == status -%}
+      <strong>{{ n }} {{ word }}</strong> (<a href="{{ collapsed }}">collapse</a>)
+    {%- else -%}
+      <a href="/project/{{ project_name }}?show={{ status }}{{ keep }}"
+         title="Show the {{ n }} {{ word }} work order(s) as well">{{ n }} {{ word }}</a>
+    {%- endif -%}
+    {{ ' · ' if not loop.last }}
+  {% endfor %}
+  ·
+  {% if revealed == 'all' %}
+    <a href="{{ collapsed }}">show only what's open</a>
+  {% else %}
+    <a href="/project/{{ project_name }}?show=all{{ keep }}">show all</a>
+  {% endif %}
+</p>
+{% endif %}
 <p class="sub">
   {% if show_hidden %}
     Showing hidden work orders too ·
-    <a href="/project/{{ project_name }}">hide them again</a>
+    <a href="/project/{{ project_name }}{{ '?show=' + revealed if revealed }}">hide them again</a>
   {% elif hidden_count %}
     {{ hidden_count }} hidden ·
-    <a href="/project/{{ project_name }}?hidden=1">show</a>
+    <a href="/project/{{ project_name }}?hidden=1{{ '&show=' + revealed if revealed }}">show</a>
   {% endif %}
 </p>
 <div class="panel">
@@ -28,7 +54,10 @@
       <span class="sub mono">{{ fmt_age(wo.created_at) }}</span>
     </div>
   {% else %}
-    <div class="empty">no work orders yet</div>
+    <div class="empty">
+      {% if settled %}nothing open — the rest is settled, counted above
+      {% else %}no work orders yet{% endif %}
+    </div>
   {% endfor %}
 </div>
 

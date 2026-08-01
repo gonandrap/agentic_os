@@ -109,6 +109,10 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any]) -> tuple[str, st
                 f"use {p.get('use')} of {p.get('of')}")
     if kind == "finished":
         return "Finished", p.get("summary") or ""
+    if kind == "marked_done":
+        # The user closed it, not the worker — worth telling apart on the record.
+        return "Marked done by you", (
+            "the worker's turn was stopped" if p.get("session_stopped") else "")
     if kind == "hidden":
         return ("Hidden" if p.get("hidden") else "Unhidden"), ""
     if kind == "invariant":

@@ -51,6 +51,10 @@ jarvis wo ack <id> / --all                 # "seen it" — puts the attention fl
                                            # every tick, so nothing else makes it stick).
                                            # Refuses on pending assumptions: those want
                                            # `jarvis wo review`, not a dismissal.
+jarvis wo done <id>                        # the user closing it: the work is finished.
+                                           # Stops the worker if one is still running.
+                                           # Refuses on pending assumptions (same rule
+                                           # as ack) — closing would accept them silently.
 jarvis wo hide <id> / unhide <id>          # declutter: keeps the record, drops it from
                                            # listings, the summary and the attention list
 jarvis wo delete <id> --yes                # irreversible: erases the WO and its whole
