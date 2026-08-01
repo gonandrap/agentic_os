@@ -1,24 +1,28 @@
 """jarvisd — the deterministic OS daemon.
 
-One process, one poll loop over every project in the catalog. Per tick:
-  1. dispatch pending work orders (respecting per-project concurrency)
-  2. route project notification outboxes to the central inbox, then to sinks
-  3. reap finished worker turns and settle their work orders
-  4. deliver queued user messages as the next turn of their conversation
+One process, one poll loop over every project in the catalog. Per tick, in this order:
+  1. route project notification outboxes to the central inbox, then to sinks
+  2. reap finished worker turns and settle their work orders against what came back
+  3. deliver queued user messages as the next turn of their conversation
+  4. dispatch pending work orders (respecting per-project concurrency) — last, so it
+     sees the concurrency slots steps 2 and 3 just freed
   5. let Neo (the OS answerer agent) drain queued worker questions
-  6. adopt the user's own background sessions as `adhoc` work orders (visibility)
-  7. check the OS's own post-conditions (src/jarvis/invariants.py) and repair the
+
+Every RECONCILE_EVERY_TICKS ticks it additionally:
+  6. adopts the user's own background sessions as `adhoc` work orders (visibility) —
+     the only step that still needs `claude agents --json`, since workers are headless
+     and never enter that roster
+  7. checks the OS's own post-conditions (src/jarvis/invariants.py) and repairs the
      state that is unambiguously wrong — the only step that does not trust the others
 
-The daemon is an orchestrator, never a doer: all actual work happens inside the
-Claude Code worker sessions it spawns.
+The daemon is an orchestrator, never a doer: all actual work happens inside the worker
+turns it launches (see worker_session.py, which owns how a turn is actually run).
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import re
 import signal
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -140,7 +144,7 @@ class Daemon:
         from .notify import route_new_inbox
         route_new_inbox(self.central, self.catalog)
 
-    # -- 1. dispatch -------------------------------------------------------------
+    # -- 4. dispatch -------------------------------------------------------------
 
     def dispatch_pending(self, project: ProjectSpec, store: ProjectStore) -> None:
         while store.count_active() < project.max_concurrent:
@@ -156,7 +160,7 @@ class Daemon:
             except claude_cli.ClaudeCliError as e:
                 log.error("[%s] dispatch of %s failed: %s", project.name, wo["id"], e)
 
-    # -- 2. notifications ----------------------------------------------------------
+    # -- 1. notifications ----------------------------------------------------------
 
     def route_outbox(self, project: ProjectSpec, store: ProjectStore) -> None:
         for n in store.unrouted_notifications():
@@ -213,7 +217,7 @@ class Daemon:
             store.set_status(wo["id"], "running")
             store.clear_attention(wo["id"])
 
-    # -- 4. Neo (answer worker questions) --------------------------------------------
+    # -- 5. Neo (answer worker questions) --------------------------------------------
 
     def neo_tick(self) -> None:
         """Kick a queue drain when questions are waiting and none is running."""
@@ -344,7 +348,7 @@ class Daemon:
         log.info("gate %s %s by neo for %s", approval["id"],
                  "approved" if approved else "denied", q["wo_id"])
 
-    # -- 5. invariants (post-conditions) --------------------------------------------------
+    # -- 7. invariants (post-conditions) --------------------------------------------------
 
     def check_invariants(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Verify the OS's own state and repair what is unambiguously wrong.
@@ -381,7 +385,7 @@ class Daemon:
                     level="warning", wo_id=v.wo_id, source="invariants",
                 )
 
-    # -- 6. turns and reconciliation -----------------------------------------------------
+    # -- 2 & 6. turns, settlement, and ad-hoc adoption -----------------------------------------------------
 
     def settle_turns(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Reap finished turns, then move each work order to where its turn says it is.
