@@ -513,3 +513,36 @@ for every call to be recorded here instead. These are those calls.
     carried-over work order is flagged for the user instead — the next message migrates it
     for real (`worker_session.send` releases the agent and resumes the session under a
     turn), and `jarvis wo cancel` still stops it. It passes through that branch once.
+
+77. **Jarvis stops adopting Claude sessions; adoption becomes `jarvis wo inject`**
+    (GitHub issue 47, decided by the user via Neo). Supersedes 69. The reconciler used to
+    mirror every session running under a registered project path into an `origin=adhoc`
+    work order, and every other code path then treated that record as a normal work
+    order — including the ones that *write* into the session. The observed incident:
+    the user's own interactive session was adopted, renamed `[WO …]`, flagged for their
+    attention, and then resumed headlessly by `resume-auto` with a worker briefing, so it
+    answered a prompt they never typed and the dashboard showed that answer as the work
+    order's last message. Now nothing is recorded until the user hands the session over.
+
+78. **An injected session gets its own origin, `injected`; `adhoc` becomes a pure legacy
+    marker.** "The user handed this to me" and "I found it and took it" are different
+    facts and only one of them is still produced. Everywhere that treated `adhoc` as *not
+    governed by the worker contract* (`true_blockers`, `INV-ADHOC-NOT-GOVERNED`, the
+    settlement skip, retirement) accepts both, because that was always about how the
+    session started rather than about who recorded it. The origin badge does diverge:
+    `injected` is deliberate and is not flagged ⚠.
+
+79. **Injection creates the record and nothing else.** No rename, no turn, nothing written
+    into the session. Consent is per write-act: the first write is the user's own
+    `jarvis wo send` / `jarvis wo resume-auto`. This is also the smaller change — the
+    `[WO <id>]` rename was never adoption's doing, it comes from the turn launcher.
+
+80. **Legacy `adhoc` rows are retired once, on upgrade** (`INV-ADHOC-LEGACY-RETIRED`).
+    Leaving them is not neutral: nothing refreshes them any more, and "worker is waiting
+    on your input" is a real blocker that `true_blockers` does not suppress, so a row
+    parked in `waiting_input` would ask for the user forever about a session that may
+    have ended weeks ago. The invariant closes `running`/`waiting_input` adhoc rows to
+    `completed`, writes a timeline entry naming the upgrade as the cause, keeps the
+    timeline, replies and any assumptions, and skips any row with assumptions still
+    pending. It is idempotent, and the tracker deliberately ignores `adhoc` rows so the
+    retirement cannot be undone on the next tick.
