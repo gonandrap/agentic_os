@@ -462,6 +462,163 @@ def find_work_order(wo_id: str, project_name: str | None = None
     raise OpsError(f"work order {wo_id!r} not found in any registered project")
 
 
+def _project_for_cwd(cwd: str, paths: dict[str, Path]) -> str | None:
+    """Which registered project owns this directory, if any.
+
+    Longest match wins, so a project nested inside another resolves to the inner one
+    rather than to whichever happened to be checked first.
+    """
+    best: tuple[int, str] | None = None
+    for name, path in paths.items():
+        root = str(path)
+        if cwd == root or cwd.startswith(root.rstrip("/") + "/"):
+            if best is None or len(root) > best[0]:
+                best = (len(root), name)
+    return best[1] if best else None
+
+
+def injectable_sessions(project_name: str, timeout: int = 5) -> dict[str, Any]:
+    """The user's live Claude sessions under a project that Jarvis is not tracking.
+
+    Read-only, and deliberately fail-soft: this feeds a dashboard panel, and shelling out
+    to `claude agents --json` on a web request must never be the reason a page breaks. On
+    any failure it returns an `error` for the template to show inline instead of raising.
+    """
+    from . import claude_cli
+
+    paths = registered_project_paths()
+    if project_name not in paths:
+        return {"sessions": [], "error": f"project {project_name!r} is not registered"}
+    if not claude_cli.available():
+        return {"sessions": [], "error": "the `claude` CLI is not on PATH"}
+    try:
+        roster = claude_cli.list_background_sessions(timeout=timeout)
+    except claude_cli.ClaudeCliError as e:
+        return {"sessions": [], "error": f"could not list sessions: {e}"}
+
+    store = ProjectStore(paths[project_name])
+    try:
+        known = {wo["session_id"] for wo in store.list_work_orders(include_hidden=True)
+                 if wo.get("session_id")}
+    finally:
+        store.close()
+    root = str(paths[project_name])
+    return {"sessions": [
+        {"session_id": s.session_id, "bg_id": s.id, "name": s.name, "state": s.state,
+         "cwd": s.cwd, "started_at": s.started_at}
+        for s in roster
+        if s.session_id and s.session_id not in known and not s.is_finished
+        and (s.cwd == root or s.cwd.startswith(root.rstrip("/") + "/"))
+    ], "error": ""}
+
+
+def inject_session(session_id: str, project_name: str | None = None,
+                   title: str | None = None) -> dict[str, Any]:
+    """Hand a Claude session the user started over to Jarvis, as a work order.
+
+    This is the ONLY way a session the user opened enters the OS. Jarvis does not adopt
+    sessions it finds any more (GitHub issue 47): one running under a registered project
+    path is the user's private conversation until they say otherwise.
+
+    Injection creates the record and nothing else. It does not rename the session, does
+    not send it a turn, and writes nothing into it — the first write is the user's own
+    `jarvis wo send` / `jarvis wo resume-auto`, which is a separate, explicit act. From
+    here the daemon tracks the session's state (running / blocked / ended) and, exactly
+    as before, never holds it to the worker contract.
+    """
+    from . import claude_cli
+
+    if not claude_cli.available():
+        raise OpsError("the `claude` CLI is not on PATH, so its sessions cannot be read")
+    try:
+        roster = claude_cli.list_background_sessions()
+    except claude_cli.ClaudeCliError as e:
+        raise OpsError(f"could not list Claude sessions: {e}") from e
+
+    # Accept either identifier: `claude agents --json` reports both a session id and its
+    # own agent id, and the two namespaces do not overlap.
+    match = next((s for s in roster if s.session_id == session_id), None) \
+        or next((s for s in roster if s.id == session_id), None)
+    if match is None:
+        raise OpsError(
+            f"no Claude session {session_id!r} — `claude agents` lists the live ones"
+        )
+    if not match.session_id:
+        raise OpsError(f"session {session_id!r} has no session id yet; try again once "
+                       f"it has started")
+
+    paths = registered_project_paths()
+    if project_name:
+        if project_name not in paths:
+            raise OpsError(f"project {project_name!r} not registered "
+                           f"(known: {sorted(paths)})")
+        target = project_name
+    else:
+        target = _project_for_cwd(match.cwd, paths) or ""
+        if not target:
+            raise OpsError(
+                f"session {session_id!r} runs in {match.cwd!r}, which is not inside any "
+                f"registered project — pass --project to say where it belongs"
+            )
+
+    store = ProjectStore(paths[target])
+    try:
+        # Re-injecting is a no-op rather than an error: the point is that Jarvis knows
+        # about the session, and it already does. A duplicate row would split its history.
+        existing = store.find_by_session(match.session_id)
+        if existing:
+            note = f"already tracked as {existing['id']} ({existing['origin']})"
+            # Re-injecting a session that was retired when it went idle picks tracking
+            # back up. The daemon cannot do this on its own any more: it stops reading
+            # the roster once a project has no live injected session, which is what keeps
+            # `claude agents --json` off the tick for everyone who never injects.
+            if (existing["origin"] == "injected" and existing["status"] == "completed"
+                    and match.is_active):
+                store.set_status(existing["id"], "running")
+                store.add_event(existing["id"], "session_injected",
+                                {"session_id": match.session_id, "state": match.state,
+                                 "reopened": True})
+                note = f"{existing['id']} was retired when the session went idle; "
+                note += "it is running again, so tracking has resumed"
+            return {"project": target, "wo_id": existing["id"],
+                    "title": existing["title"],
+                    "status": store.get_work_order(existing["id"])["status"],
+                    "session_id": match.session_id, "already_known": True,
+                    "note": note}
+        # Mirror the session's current state, exactly as the daemon's tracker would. The
+        # status goes in at INSERT time: a row that is `pending` for even one daemon tick
+        # would be claimed and dispatched, which is a worker turn in the user's session.
+        status = ("waiting_input" if match.is_blocked
+                  else "completed" if match.is_finished else "running")
+        wo = store.create_work_order(
+            title=title or match.name or f"session {match.id}",
+            description=(
+                "A Claude session the user started themselves and handed to Jarvis "
+                "with `jarvis wo inject`. Jarvis did not dispatch it: it never received "
+                "the worker briefing, so it owes no `jarvis wo finish` and its ending is "
+                "not a failure."
+            ),
+            origin="injected",
+            status=status,
+            session_id=match.session_id,
+        )
+        store.add_event(wo["id"], "session_injected", {
+            "session_id": match.session_id, "bg_id": match.id, "cwd": match.cwd,
+            "state": match.state, "name": match.name,
+        })
+        if match.is_blocked:
+            store.flag_attention(wo["id"],
+                                 "session blocked (permission or input needed)")
+        fresh = store.get_work_order(wo["id"])
+        return {"project": target, "wo_id": fresh["id"], "title": fresh["title"],
+                "status": fresh["status"], "session_id": match.session_id,
+                "already_known": False,
+                "note": "the session was not written to — `jarvis wo send "
+                        f"{fresh['id']} \"…\"` is what starts driving it"}
+    finally:
+        store.close()
+
+
 def send_message(wo_id: str, content: str, source: str = "jarvis",
                  project_name: str | None = None) -> dict[str, Any]:
     name, path, wo = find_work_order(wo_id, project_name)

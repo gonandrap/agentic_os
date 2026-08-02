@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from . import db
+from .project_store import UNGOVERNED_ORIGINS
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .project_store import ProjectStore
@@ -90,12 +91,12 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
             f"gate approval needed: {approval['kind']} (request {approval['id']})"
         )
     # Two of the blockers below only exist because Jarvis dispatched the worker and
-    # briefed it on the contract (`jarvis wo finish`, worktree, OPERATION.md). An
-    # adopted ad-hoc session got none of that — no JARVIS_WO_ID, no briefing — so it
-    # cannot signal completion and its session ending is not a failure. Holding it to
-    # the contract anyway made every adopted session a guaranteed attention item.
-    # Adoption exists for visibility; see Daemon.retire_adhoc.
-    governed = wo.get("origin") != "adhoc"
+    # briefed it on the contract (`jarvis wo finish`, worktree, OPERATION.md). A session
+    # the user started and injected got none of that — no JARVIS_WO_ID, no briefing — so
+    # it cannot signal completion and its session ending is not a failure. Holding it to
+    # the contract anyway made every such session a guaranteed attention item.
+    # See Daemon.retire_ungoverned.
+    governed = wo.get("origin") not in UNGOVERNED_ORIGINS
     if governed and wo["status"] == "failed":
         blockers.append("worker failed — review and retry")
     # Blocked on a prompt is real whoever started the session: nobody else can unstick it.
@@ -163,16 +164,16 @@ def check_attention_reason_is_true(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_adhoc_not_governed(store: ProjectStore) -> Iterator[Violation]:
-    """INV-ADHOC-NOT-GOVERNED — an adopted session must not be judged as a worker.
+    """INV-ADHOC-NOT-GOVERNED — an injected session must not be judged as a worker.
 
-    The reconciler adopts background sessions it finds in a project directory so they
-    show up in `jarvis status` and on the dashboard. That is a *mirror*, not a
-    dispatch: the session was started by the user in `claude agents`, never received
-    the worker contract, and has no way to call `jarvis wo finish`. Judging it against
-    that contract parked it in `needs_review` ("worker idle without `jarvis wo finish`")
-    the moment it ended a turn, and in `failed` ("worker session disappeared") the
-    moment the user cleaned it up — one live fleet accumulated fifteen of these, one of
-    which was the session the user was talking to.
+    A session the user started and handed over with `jarvis wo inject` is a *mirror*,
+    not a dispatch: it never received the worker contract and has no way to call
+    `jarvis wo finish`. Judging it against that contract parked it in `needs_review`
+    ("worker idle without `jarvis wo finish`") the moment it ended a turn, and in
+    `failed` ("worker session disappeared") the moment the user cleaned it up — one live
+    fleet accumulated fifteen of these, one of which was the session the user was
+    talking to. (Back then Jarvis adopted these sessions on its own; it no longer does,
+    which is why `adhoc` rows still on disk get the same treatment as `injected` ones.)
 
     `true_blockers` stops *new* ones. This retires the records already on disk, so the
     fix reaches a running fleet on the next reconcile tick instead of waiting for the
@@ -185,15 +186,62 @@ def check_adhoc_not_governed(store: ProjectStore) -> Iterator[Violation]:
     """
     for wo in store.list_work_orders(statuses=("failed", "needs_review"),
                                      include_hidden=True):
-        if wo["origin"] != "adhoc" or store.pending_assumptions(wo["id"]):
+        if (wo["origin"] not in UNGOVERNED_ORIGINS
+                or store.pending_assumptions(wo["id"])):
             continue
         store.set_status(wo["id"], "completed")
         store.clear_attention(wo["id"])
         yield Violation(
             invariant="INV-ADHOC-NOT-GOVERNED",
             wo_id=wo["id"],
-            detail=f"adopted ad-hoc session held to the worker contract "
+            detail=f"{wo['origin']} session held to the worker contract "
                    f"({wo.get('attention_reason') or wo['status']})",
+            repaired=True,
+            repair="retired to completed; attention cleared",
+            context={"was": wo["status"], "reason": wo.get("attention_reason")},
+        )
+
+
+def check_legacy_adhoc_retired(store: ProjectStore) -> Iterator[Violation]:
+    """INV-ADHOC-LEGACY-RETIRED — a session Jarvis adopted on its own is let go.
+
+    Jarvis used to adopt every Claude session running under a registered project path
+    into an `origin="adhoc"` work order, and then track it. It no longer does: adoption
+    is now the user's explicit act (`jarvis wo inject`), so nothing follows those rows
+    any more.
+
+    That is why leaving them alone is not the neutral option. A row parked in
+    `waiting_input` is a genuine user blocker — "worker is waiting on your input" is
+    true whoever started the session, so `true_blockers` does not suppress it — and with
+    nothing left to refresh it, it would ask for the user forever, about a session that
+    may have ended weeks ago. This closes them once, at the point of upgrade.
+
+    Repairable: the record, its timeline, its captured replies and any assumptions all
+    stay exactly as they are; only the demand for the user goes away, which is the same
+    treatment `Daemon.retire_ungoverned` gives a session that ends normally. A row with
+    assumptions still pending is left alone: the user owes it an answer, and that is a
+    real blocker, not adoption noise.
+
+    Idempotent: a retired row is `completed`, so a re-run finds nothing. Only `adhoc`
+    rows are touched — `injected` ones were handed over deliberately and are still
+    tracked.
+    """
+    # Adoption only ever produced these two statuses, and no path moves an adhoc row to
+    # `pending`/`dispatching`. `failed`/`needs_review` are INV-ADHOC-NOT-GOVERNED's.
+    for wo in store.list_work_orders(statuses=("running", "waiting_input"),
+                                     include_hidden=True):
+        if wo["origin"] != "adhoc" or store.pending_assumptions(wo["id"]):
+            continue
+        why = ("Jarvis no longer adopts sessions on its own (GitHub issue 47); "
+               "this record was closed by the upgrade, not by anything the session did")
+        store.set_status(wo["id"], "completed")
+        store.clear_attention(wo["id"])
+        store.add_event(wo["id"], "session_retired", {"why": why, "was": wo["status"]})
+        yield Violation(
+            invariant="INV-ADHOC-LEGACY-RETIRED",
+            wo_id=wo["id"],
+            detail=f"auto-adopted session still open ({wo['status']}) with nothing "
+                   f"left to track it",
             repaired=True,
             repair="retired to completed; attention cleared",
             context={"was": wo["status"], "reason": wo.get("attention_reason")},
@@ -373,6 +421,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
     check_attention_reason_is_true,
     check_adhoc_not_governed,      # retire before the flag checks judge the leftovers
+    check_legacy_adhoc_retired,    # ...and before them, let go of what nothing tracks
     check_no_phantom_attention,
     check_blocked_work_is_surfaced,
     check_attention_has_reason,

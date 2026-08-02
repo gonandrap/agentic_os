@@ -1,0 +1,33 @@
+{# Your own Claude sessions running in this project, which Jarvis is NOT tracking.
+
+   Jarvis does not adopt these on its own any more (GitHub issue 47) — a session you
+   started is yours until you hand it over. Injecting one creates the work order record
+   and nothing else: the session is not renamed and receives no turn until you send it a
+   message from its work order page.
+
+   Loaded as a fragment because it is the only view that shells out to `claude agents`;
+   see the /project/{name}/sessions route. #}
+{% if error %}
+  <h2>Your sessions in this project</h2>
+  <div class="panel"><div class="empty">{{ error }}</div></div>
+{% elif sessions %}
+  <h2>Your sessions in this project</h2>
+  <p class="sub">Jarvis is not tracking these. Inject one to give it a work order —
+     nothing is written into the session until you send it a message.</p>
+  <div class="panel">
+    {% for s in sessions %}
+    <div class="row">
+      <div class="grow">
+        {{ s.name or 'unnamed session' }}
+        <div class="sub mono">{{ s.session_id }} · {{ s.state }}{% if s.cwd %} · {{ s.cwd }}{% endif %}</div>
+      </div>
+      <span class="sub mono">{{ fmt_age(s.started_at) }}</span>
+      <form class="inline" method="post" action="/project/{{ project_name }}/inject">
+        <input type="hidden" name="session_id" value="{{ s.session_id }}">
+        <button title="Track this session as a work order. It is not renamed and gets no
+                       turn until you send it a message.">Inject</button>
+      </form>
+    </div>
+    {% endfor %}
+  </div>
+{% endif %}

@@ -34,6 +34,9 @@ ORIGIN_META = {
     "jarvis": {"word": "jarvis", "framework": True},
     "ui":     {"word": "ui",     "framework": True},
     "manual": {"word": "manual", "framework": False},
+    # `injected` is not a warning: the user handed this session over on purpose. `adhoc`
+    # is the legacy marker from when Jarvis adopted sessions on its own, and stays one.
+    "injected": {"word": "injected", "framework": True},
     "adhoc":  {"word": "ad-hoc", "framework": False},
 }
 LEVEL_TONE = {"info": "muted", "warning": "warn", "critical": "bad"}
@@ -189,6 +192,22 @@ def create_app() -> FastAPI:
                       wos=wos, backlog=backlog, show_hidden=show_hidden,
                       hidden_count=hidden_count, settled=settled, revealed=revealed)
 
+    @app.get("/project/{name}/sessions", response_class=HTMLResponse)
+    def project_sessions(request: Request, name: str):
+        """The inject panel, as a fragment the project page pulls in after it renders.
+
+        Separate from the page on purpose: this is the one view that shells out to
+        `claude agents --json`, and a slow or missing CLI must cost the project page
+        nothing. `ops.injectable_sessions` never raises — it returns the error as text
+        for the fragment to show inline.
+        """
+        found = ops.injectable_sessions(name)
+        return templates.TemplateResponse(
+            request, "_sessions.html",
+            {"project_name": name, "sessions": found["sessions"],
+             "error": found["error"]},
+        )
+
     @app.get("/wo/{name}/{wo_id}", response_class=HTMLResponse)
     def work_order(request: Request, name: str, wo_id: str, debug: str = ""):
         try:
@@ -297,6 +316,16 @@ def create_app() -> FastAPI:
         except ops.OpsError as e:
             return RedirectResponse(f"/?error={e}", status_code=303)
         return RedirectResponse(f"/wo/{project}/{wo['id']}", status_code=303)
+
+    @app.post("/project/{name}/inject")
+    def inject(name: str, session_id: str = Form(...), title: str = Form("")):
+        """Hand one of the user's own Claude sessions to Jarvis. Creates the record and
+        nothing else — nothing is written into the session until they send it a message."""
+        try:
+            res = ops.inject_session(session_id, project_name=name, title=title or None)
+        except ops.OpsError as e:
+            return RedirectResponse(f"/project/{name}?error={e}", status_code=303)
+        return RedirectResponse(f"/wo/{name}/{res['wo_id']}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/send")
     def send(name: str, wo_id: str, message: str = Form(...)):

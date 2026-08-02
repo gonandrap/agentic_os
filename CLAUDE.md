@@ -60,6 +60,11 @@ jarvis wo hide <id> / unhide <id>          # declutter: keeps the record, drops 
 jarvis wo delete <id> --yes                # irreversible: erases the WO and its whole
                                            # history (timeline, messages, assumptions)
 jarvis wo resume-auto <id>                 # unstick a worker blocked on a permission prompt (flip to auto + resume)
+jarvis wo inject <session-id>              # hand the user's OWN Claude session to Jarvis.
+                                           # Jarvis never adopts a session it finds: one
+                                           # the user started is theirs. Injecting only
+                                           # creates the record — nothing is written into
+                                           # the session until a `wo send`/`resume-auto`.
 jarvis gate list [--pending]               # privileged-action approvals (merge a PR, ship
                                            # a release). Workers attempt these and get
                                            # blocked; Neo reviews and decides, so most
