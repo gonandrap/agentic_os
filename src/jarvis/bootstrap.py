@@ -69,6 +69,46 @@ def install_agent_skills(project_path: Path) -> Path:
     return root
 
 
+def _tree_matches(src: Path, dest: Path) -> bool:
+    """Same set of files, same bytes — used to avoid rewriting an already-current skill."""
+    rel = {p.relative_to(src) for p in src.rglob("*") if p.is_file()}
+    if rel != {p.relative_to(dest) for p in dest.rglob("*") if p.is_file()}:
+        return False
+    return all((src / r).read_bytes() == (dest / r).read_bytes() for r in rel)
+
+
+def install_project_skills(project_path: Path) -> list[str]:
+    """Install the OS's user-facing skills into the project itself; return the names
+    written (empty when everything was already current).
+
+    Different audience from `install_agent_skills`, so a different delivery. Those are
+    for the workers Jarvis dispatches and ride in on `--add-dir` at spawn time. These are
+    for the sessions the *user* opens by hand, which get no such flag and only ever load
+    `<project>/.claude/skills/` — so they are written into the project, next to the
+    `.claude/settings.json` bootstrap already injects there. Like that file they are
+    untracked and not gitignored: the OS leaves it to the project whether to commit them.
+
+    Only the subdirectories the OS owns are touched. `<project>/.claude/skills/` is where
+    users keep their own skills, so this never clears the tree — contrast
+    `install_agent_skills`, which owns its whole (gitignored, generated) destination and
+    rebuilds it wholesale.
+    """
+    written: list[str] = []
+    root = project_path / ".claude" / "skills"
+    for src in sorted(p for p in (ASSETS / "project-skills").iterdir() if p.is_dir()):
+        dest = root / src.name
+        if dest.exists():
+            if _tree_matches(src, dest):
+                continue
+            # No catalog knob customizes a skill, so a local edit is drift, not
+            # configuration — preserving it would mean the OS could never ship a fix.
+            shutil.rmtree(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, dest)
+        written.append(src.name)
+    return written
+
+
 @dataclass
 class BootstrapReport:
     project: str
@@ -306,6 +346,15 @@ def ensure_trust(project: ProjectSpec, report: BootstrapReport) -> None:
     report.note("trusted workspace in ~/.claude.json (hasTrustDialogAccepted)")
 
 
+def ensure_project_skills(project: ProjectSpec, report: BootstrapReport) -> None:
+    """Give the user's own sessions in this project the OS skills meant for them."""
+    written = install_project_skills(project.path)
+    if written:
+        report.note("installed .claude/skills/: " + ", ".join(written))
+    else:
+        report.note(".claude/skills/ already up to date")
+
+
 def ensure_state_dir(project: ProjectSpec, report: BootstrapReport) -> None:
     state = project.path / ".jarvis"
     if not state.exists():
@@ -327,7 +376,8 @@ def bootstrap_project(project: ProjectSpec, force_config: bool = False,
         readme = project.path / "README.md"
         if not readme.exists():
             report.note("would generate README.md stub")
-        report.note("would write OPERATION.md, .jarvis/, .gitignore entry, settings.json")
+        report.note("would write OPERATION.md, .jarvis/, .gitignore entry, settings.json, "
+                    ".claude/skills/")
         if workspace_trusted(project.path) is not True:
             report.note("would trust workspace in ~/.claude.json")
         return report
@@ -336,5 +386,6 @@ def bootstrap_project(project: ProjectSpec, force_config: bool = False,
     ensure_state_dir(project, report)
     ensure_gitignore(project, report)
     inject_settings(project, report, force=force_config)
+    ensure_project_skills(project, report)
     ensure_trust(project, report)
     return report

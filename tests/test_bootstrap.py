@@ -109,6 +109,60 @@ def test_build_settings_hash_stable():
     assert s1["_jarvis"]["hash"] == s2["_jarvis"]["hash"]
 
 
+SKILL = ".claude/skills/jarvis-inject-session/SKILL.md"
+
+
+def test_bootstrap_installs_the_inject_skill(project):
+    """The user's own sessions only ever load <project>/.claude/skills/."""
+    report = bootstrap_project(spec(project))
+    body = (project / SKILL).read_text()
+    assert "name: jarvis-inject-session" in body
+    assert any("installed .claude/skills/" in a for a in report.actions)
+    # second pass: unchanged content is left alone, not rewritten
+    report2 = bootstrap_project(spec(project))
+    assert ".claude/skills/ already up to date" in report2.actions
+
+
+def test_inject_skill_uses_the_session_id_claude_exports(project):
+    """The id comes from the environment Claude Code sets, never from a guess, and a
+    missing one has to fail out loud rather than inject an empty string."""
+    bootstrap_project(spec(project))
+    body = (project / SKILL).read_text()
+    assert 'jarvis wo inject "$CLAUDE_CODE_SESSION_ID"' in body
+    assert '-z "$CLAUDE_CODE_SESSION_ID"' in body       # guard: unset
+    assert '-n "$JARVIS_WO_ID"' in body                 # guard: already a work order
+
+
+def test_inject_skill_heals_local_edits_but_spares_the_user_s_own(project):
+    bootstrap_project(spec(project))
+    skills = project / ".claude" / "skills"
+    (skills / "jarvis-inject-session" / "SKILL.md").write_text("mangled\n")
+    mine = skills / "my-own-skill"
+    mine.mkdir()
+    (mine / "SKILL.md").write_text("mine\n")
+
+    report = bootstrap_project(spec(project))
+    assert "name: jarvis-inject-session" in (project / SKILL).read_text()
+    assert any("installed .claude/skills/" in a for a in report.actions)
+    assert (mine / "SKILL.md").read_text() == "mine\n"   # never clears the whole tree
+
+
+def test_inject_skill_is_not_handed_to_workers(project):
+    """A worker session is already a work order; self-injection would file a second
+    record against the same session id."""
+    from jarvis.bootstrap import install_agent_skills
+    root = install_agent_skills(project)
+    names = {p.name for p in (root / ".claude" / "skills").iterdir()}
+    assert "report-jarvis-bug" in names
+    assert "jarvis-inject-session" not in names
+
+
+def test_dry_run_writes_no_skill(project):
+    report = bootstrap_project(spec(project), dry_run=True)
+    assert not (project / ".claude" / "skills").exists()
+    assert any(".claude/skills/" in a for a in report.actions)
+
+
 def test_operation_md_preserves_specifics(project):
     bootstrap_project(spec(project))
     op = project / "OPERATION.md"

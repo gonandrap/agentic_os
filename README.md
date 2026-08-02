@@ -119,7 +119,8 @@ jarvis start --catalog ~/.jarvis/catalog.json
 ```
 
 This bootstraps every project (README check, OPERATION.md contract, `.jarvis/` state
-dir, injected `.claude/settings.json`, and workspace trust) and starts the daemon.
+dir, injected `.claude/settings.json` and `.claude/skills/`, and workspace trust) and
+starts the daemon.
 Listing a project in the catalog trusts its workspace for you — no per-project trust
 dialog.
 
