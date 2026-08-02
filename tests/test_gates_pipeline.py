@@ -227,7 +227,7 @@ def test_user_can_open_an_escalated_gate(fleet):
     fleet.daemon._neo_drain()
     approval = fleet.approval()
 
-    ops.decide_gate(approval["id"], approved=True, reason="I checked it myself")
+    ops.decide_gate(approval["id"], verdict="approved", reason="I checked it myself")
 
     assert _decision(fleet.attempt("./scripts/shipit.sh")) == "allow"
     store = fleet.store()
@@ -254,7 +254,7 @@ def test_user_can_refuse_an_escalated_gate(fleet):
     fleet.daemon._neo_drain()
     approval = fleet.approval()
 
-    ops.decide_gate(approval["id"], approved=False, reason="not this week")
+    ops.decide_gate(approval["id"], verdict="denied", reason="not this week")
 
     assert _decision(fleet.attempt("./scripts/shipit.sh")) == "deny"
     assert fleet.approval()["status"] == "denied"
@@ -264,7 +264,7 @@ def test_denial_requires_a_reason(fleet):
     ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh", why="please")
     approval = fleet.approval()
     with pytest.raises(ops.OpsError, match="needs a reason"):
-        ops.decide_gate(approval["id"], approved=False, reason="   ")
+        ops.decide_gate(approval["id"], verdict="denied", reason="   ")
 
 
 def test_a_decided_gate_cannot_be_decided_again(fleet):
@@ -274,7 +274,7 @@ def test_a_decided_gate_cannot_be_decided_again(fleet):
     approval = fleet.approval()
 
     with pytest.raises(ops.OpsError, match="already approved"):
-        ops.decide_gate(approval["id"], approved=False, reason="changed my mind")
+        ops.decide_gate(approval["id"], verdict="denied", reason="changed my mind")
 
 
 # -- the worker's own request path ----------------------------------------------------
@@ -378,3 +378,143 @@ def test_gate_listing_and_show_surface_the_request(fleet):
     # The request text the reviewer saw is part of the record, not just a prompt.
     assert "ready to go" in detail["neo_question"]["question"]
     assert "PR #42" in detail["neo_question"]["question"]
+
+
+# -- false positives: the fourth verdict, end to end ----------------------------------
+
+
+def test_neo_dismisses_a_false_positive_and_the_command_runs(fleet):
+    """The counterpart of `test_neo_approves_and_the_retry_goes_through`, for the case
+    where the premise was wrong: the command never performed a privileged action."""
+    # A plain grep. It trips the `release` gate only because the deploy script's name
+    # appears in the search pattern — this exact shape is what filed the real requests
+    # that were denied once and approved once.
+    command = "grep -rn shipit.sh src/jarvis/gates.py"
+    ops.request_gate_approval(
+        fleet.wo_id, command,
+        why="FORCE_DISMISS — this greps a file; it performs no privileged action",
+    )
+    assert _decision(fleet.attempt(command)) == "deny"
+
+    fleet.daemon._neo_drain()
+
+    approval = fleet.approval()
+    assert approval["status"] == "dismissed"
+    assert approval["decided_by"] == "neo"
+    # Nothing was authorised, so nothing has a clock or a budget.
+    assert approval["expires_at"] is None
+
+    # The worker is told, and the retry runs.
+    store = fleet.store()
+    try:
+        messages = store.queued_messages(fleet.wo_id)
+        assert any("DISMISSED" in m["content"] for m in messages)
+        assert store.get_work_order(fleet.wo_id)["needs_attention"] == 0
+    finally:
+        store.close()
+    assert _decision(fleet.attempt(command)) == "allow"
+
+
+def test_a_dismissal_costs_the_user_no_inbox_item(fleet):
+    """Neo's approvals and denials both post to the inbox. A dismissal must not.
+
+    It reports that the OS's own recogniser misfired on a command that ships nothing;
+    an inbox item for that spends the user's attention on an OS bug, which is the exact
+    cost the gate exists to avoid. The rate is surfaced as a count instead.
+    """
+    ops.request_gate_approval(fleet.wo_id, "grep -rn shipit.sh src/jarvis/gates.py",
+                              why="FORCE_DISMISS — read-only")
+    fleet.daemon._neo_drain()
+
+    central = CentralStore()
+    try:
+        items = central.unacked_inbox()
+    finally:
+        central.close()
+
+    assert [i for i in items if fleet.wo_id in (i.get("body") or "")] == []
+    # ...and it is still counted, because a defect nobody can measure never gets fixed.
+    assert ops.os_status()["gates"]["false_positives"] == 1
+
+
+def test_a_dismissal_by_neo_still_lands_as_an_approval_answer_on_the_record(fleet):
+    """`jarvis neo review` reads the answer text, so the third verdict has to appear
+    there — otherwise a dismissal reads as a denial in Neo's own history."""
+    ops.request_gate_approval(fleet.wo_id, "grep -rn shipit.sh src/jarvis/gates.py",
+                              why="FORCE_DISMISS — read-only")
+    fleet.daemon._neo_drain()
+
+    neo = NeoStore()
+    try:
+        q = neo.get(fleet.approval()["neo_question_id"])
+    finally:
+        neo.close()
+    assert q["answer"] == "DISMISSED"
+
+
+def test_user_can_dismiss_a_gate_the_classifier_got_wrong(fleet):
+    command = "grep -rn shipit.sh src/jarvis/gates.py"
+    fleet.attempt(command)
+    approval = fleet.approval()
+
+    ops.decide_gate(approval["id"], verdict="dismissed",
+                    reason="the literal is inside a grep pattern; this reads a file")
+
+    assert _decision(fleet.attempt(command)) == "allow"
+    assert fleet.approval()["status"] == "dismissed"
+    neo = NeoStore()
+    try:
+        assert neo.get(approval["neo_question_id"])["answer"] == "DISMISSED"
+    finally:
+        neo.close()
+
+
+def test_dismissal_requires_a_reason(fleet):
+    """The reason IS the defect report on the recogniser, and the only note attached to
+    the false-positive count anyone will later read."""
+    fleet.attempt("grep -rn shipit.sh src/jarvis/gates.py")
+    approval = fleet.approval()
+    with pytest.raises(ops.OpsError, match="needs a reason"):
+        ops.decide_gate(approval["id"], verdict="dismissed", reason="  ")
+
+
+def test_decide_gate_refuses_a_verdict_it_does_not_understand(fleet):
+    fleet.attempt("./scripts/shipit.sh")
+    approval = fleet.approval()
+    with pytest.raises(ops.OpsError, match="unknown verdict"):
+        ops.decide_gate(approval["id"], verdict="probably", reason="hmm")
+    assert fleet.approval()["status"] == "pending"
+
+
+def test_the_false_positive_rate_is_reportable_across_the_fleet(fleet):
+    """The number the WO asks for: how often the gate fires on nothing.
+
+    It is the signal for whether the recognisers are improving, so it has to survive
+    both the expiry sweep and a mix of other verdicts in the same table.
+    """
+    fleet.attempt("grep -rn shipit.sh src/jarvis/gates.py")
+    ops.decide_gate(fleet.approval()["id"], verdict="dismissed", reason="a grep")
+    ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh",
+                              why="FORCE_APPROVE — ready")
+    fleet.daemon._neo_drain()
+
+    rows = ops.list_gates()
+    assert sorted(r["status"] for r in rows) == ["approved", "dismissed"]
+    assert ops.os_status()["gates"]["false_positives"] == 1
+    # list_gates sweeps expiries on the way past; the dismissal must survive it.
+    assert [r for r in ops.list_gates() if r["status"] == "dismissed"]
+
+
+def test_an_older_neo_that_never_heard_of_dismissal_still_ships_a_release(fleet):
+    """Backward tolerance, exercised through the real drain rather than the parser.
+
+    Neo's persona ships in the deployed code but its learnings live in the production
+    state directory, so a release can leave the two briefly out of step in either
+    direction. An old-shaped verdict must still open the gate it always opened.
+    """
+    ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh",
+                              why="FORCE_LEGACY_APPROVE — merged and green")
+    fleet.daemon._neo_drain()
+
+    assert fleet.approval()["status"] == "approved"
+    assert _decision(fleet.attempt("./scripts/shipit.sh")) == "allow"

@@ -68,6 +68,21 @@
   {% endfor %}
 </div>
 
+{# Your own Claude sessions, fetched after this page has rendered: listing them shells
+   out to the Claude CLI, and a slow or missing CLI must not hold up the work orders
+   above. Without JS the panel simply is not there — `jarvis wo inject` does the same. #}
+<div id="sessions-panel"></div>
+<noscript><p class="sub">To hand one of your own Claude sessions to Jarvis:
+  <span class="mono">jarvis wo inject &lt;session-id&gt;</span></p></noscript>
+<script>
+(function () {
+  fetch("/project/{{ project_name }}/sessions", { cache: "no-store", credentials: "same-origin" })
+    .then(function (res) { return res.ok ? res.text() : ""; })
+    .then(function (html) { document.getElementById("sessions-panel").innerHTML = html; })
+    .catch(function () { /* no panel is better than a broken page */ });
+})();
+</script>
+
 {% if backlog %}
 <h2>Open backlog for this project</h2>
 <div class="panel">

@@ -66,6 +66,11 @@ jarvis wo hide <id> / unhide <id>          # declutter: keeps the record, drops 
 jarvis wo delete <id> --yes                # irreversible: erases the WO and its whole
                                            # history (timeline, messages, assumptions)
 jarvis wo resume-auto <id>                 # unstick a worker blocked on a permission prompt (flip to auto + resume)
+jarvis wo inject <session-id>              # hand the user's OWN Claude session to Jarvis.
+                                           # Jarvis never adopts a session it finds: one
+                                           # the user started is theirs. Injecting only
+                                           # creates the record — nothing is written into
+                                           # the session until a `wo send`/`resume-auto`.
 jarvis gate list [--pending]               # privileged-action approvals (merge a PR, ship
                                            # a release). Workers attempt these and get
                                            # blocked; Neo reviews and decides, so most
@@ -74,6 +79,14 @@ jarvis gate list [--pending]               # privileged-action approvals (merge 
 jarvis gate show <id>                      # the request exactly as the reviewer saw it
 jarvis gate approve <id> --reason "…"      # open the gate: the worker may run the command
 jarvis gate deny <id> --reason "…"         # refuse it; the reason goes to the worker
+jarvis gate dismiss <id> --reason "…"      # NOT a gated action: the recogniser matched a
+                                           # command that ships nothing (a release script
+                                           # named in a grep pattern, a path quoted in a
+                                           # PR body). Unblocks it, records a classifier
+                                           # defect rather than an authorisation, and is
+                                           # counted separately so the false-positive
+                                           # rate is visible. Never approve or deny one:
+                                           # both write something false into the record.
 jarvis neo list                            # Neo's Q&A: pending reviews + escalations
 jarvis neo review <qid> [--correct "…"]    # approve or teach; corrections become learnings
 jarvis neo answer <qid> "…"                # answer a question Neo escalated to the user

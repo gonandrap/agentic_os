@@ -100,17 +100,27 @@ fire on EVERY turn** (`SessionStart.source == "resume"` from turn 2 on).
 | `done`, none of the above | `needs_review` "idle without `jarvis wo finish`" |
 
 `settle_turns` and `deliver_messages` run on **every** tick (cheap: a signal and a file
-read). Only `adopt_sessions` + `check_invariants` stay on the `RECONCILE_EVERY_TICKS`
-cadence, because only they need `claude agents --json`.
+read). Only `track_injected_sessions` + `check_invariants` stay on the
+`RECONCILE_EVERY_TICKS` cadence, and only the first needs `claude agents --json` — which
+it skips entirely on ticks where no project has a live `injected` row.
 
-## Background sessions still exist — for the USER only
+## Background sessions still exist — for the USER only, and only if handed over
 
-`claude agents --json` now contains only sessions the user started. `Daemon.adopt_sessions`
-mirrors them as `origin="adhoc"` work orders for visibility and never holds them to the
-worker contract (`retire_adhoc`, `INV-ADHOC-NOT-GOVERNED`).
+`claude agents --json` contains only sessions the user started. Jarvis does **not** adopt
+them (GitHub issue 47): a session the user opened is theirs — not seen, not named, not
+flagged, and above all not written into. `jarvis wo inject <session-id>`
+(`ops.inject_session`, plus the panel on the project page) is the only way one enters the
+OS. It creates the record and nothing else: no rename, no turn. From then on
+`Daemon.track_injected_sessions` follows the session's state, and the row is never held to
+the worker contract (`retire_ungoverned`, `INV-ADHOC-NOT-GOVERNED`).
+
+`origin="injected"` is the new marker; `origin="adhoc"` is the legacy one from the
+auto-adoption era. Both are in `project_store.UNGOVERNED_ORIGINS` and get the same
+"not a worker" treatment, but only `injected` is tracked — `INV-ADHOC-LEGACY-RETIRED`
+closes leftover `adhoc` rows once on upgrade, and tracking them too would reopen them.
 
 **Migration is automatic**: `worker_session._release_background_owner()` fires when a work
-order has no turn on record (a legacy dispatched one, or an adopted one) and `claude stop`s
+order has no turn on record (a legacy dispatched one, or an injected one) and `claude stop`s
 whatever background agent owns its session before resuming — which a headless resume
 requires anyway. `jarvis doctor` lists leftover `[WO …]` agents with no open work order
 (`ops.orphaned_worker_sessions`) but never stops them.
@@ -120,6 +130,6 @@ requires anyway. `jarvis doctor` lists leftover `[WO …]` agents with no open w
 - `run_headless()` — `claude -p <prompt> --output-format json …` — Neo and the LLM evals.
   Note a worker turn is also a `-p` call now, so code/tests telling them apart must key on
   the presence of `--session-id`/`--resume`, not on `-p`.
-- `spawn_background()` / `list_background_sessions()` / `stop_session()` — ad-hoc adoption
-  and the migration path only.
+- `spawn_background()` / `list_background_sessions()` / `stop_session()` — injected-session
+  tracking and the migration path only.
 - Deleted with the old transport: `job_result()`, `jobs_dir()`, `send_to_session()`.

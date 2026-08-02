@@ -185,8 +185,14 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
         grant = store.usable_grant(wo_id, action.kind, action.command)
         if grant is not None:
             store.consume_grant(grant["id"])
+            # Two things open a gate and only one of them is permission. Saying which is
+            # which here matters because this string is the audit record of why the
+            # command ran: "approved" against a command that was never privileged is the
+            # false entry the dismissed verdict exists to keep out of the log.
+            verb = ("dismissed as a classifier false positive (nothing was authorised) by"
+                    if grant["status"] == "dismissed" else "approved by")
             return _allow(
-                f"gate {grant['id']} ({action.kind}) approved by "
+                f"gate {grant['id']} ({action.kind}) {verb} "
                 f"{grant['decided_by']}: {grant['decision_reason'] or 'no reason given'}"
             )
 

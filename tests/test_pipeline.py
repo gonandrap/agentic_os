@@ -505,23 +505,20 @@ def test_follow_up_turn_is_briefed_like_the_first(started, fake_claude, project,
     assert call["cwd"] == str(wt)  # where the session lives, not the project root
 
 
-def test_adhoc_turn_gets_the_projects_permission_mode(started, fake_claude, project,
-                                                      settle_turns):
-    """An adopted session's row has permission_mode NULL — it never went through
+def test_injected_turn_gets_the_projects_permission_mode(started, fake_claude, project,
+                                                         settle_turns):
+    """An injected session's row has permission_mode NULL — it never went through
     dispatch, which is what resolves the mode and writes it back. Sending it a message
     hands it to Jarvis to drive, and a headless turn cannot answer a permission prompt:
     launched in Claude's default mode it would stall, costing the user a
     `jarvis wo resume-auto` to clear. So the turn resolves the project's worker mode at
-    the call site — without backfilling the column, so an adopted work order stays
+    the call site — without backfilling the column, so an injected work order stays
     distinguishable from a dispatched one."""
     daemon = started
-    _add_adhoc(fake_claude, project, "working", sid="adhoc-pm-1")
-    daemon.tick_count = 0
-    daemon.tick()
-
+    res = _inject(fake_claude, project, "working", sid="adhoc-pm-1")
     store = ProjectStore(project)
-    wo = [w for w in store.list_work_orders() if w["origin"] == "adhoc"][0]
-    assert wo["permission_mode"] is None, "adhoc rows must not carry a resolved mode"
+    wo = store.get_work_order(res["wo_id"])
+    assert wo["permission_mode"] is None, "injected rows must not carry a resolved mode"
 
     fake_claude.set_session_state("adhoc-pm-1", "done")
     ops.send_message(wo["id"], "carry on", source="ui")
@@ -529,7 +526,7 @@ def test_adhoc_turn_gets_the_projects_permission_mode(started, fake_claude, proj
     daemon.tick()
 
     resumes = turn_calls(fake_claude, resumed=True, expect=1)
-    assert resumes, "no turn was launched for the adopted session"
+    assert resumes, "no turn was launched for the injected session"
     argv = resumes[-1]["argv"]
     assert argv[argv.index("--permission-mode") + 1] == "auto"
     # resolved for the launch only — the row still says "nobody dispatched this"
@@ -611,62 +608,188 @@ def test_reconciler_flags_unfinished_idle_worker(started, fake_claude, project,
     assert "without `jarvis wo finish`" in fresh["attention_reason"]
 
 
-def _add_adhoc(fake_claude, project, state, sid="adhoc-session-1", name="my manual hack"):
+def _add_session(fake_claude, project, state, sid="adhoc-session-1",
+                 name="my manual hack", cwd=None):
+    """A Claude session the USER started, in the project directory."""
     sessions = fake_claude.sessions
     sessions.append({"id": "abcd1234", "sessionId": sid,
-                     "cwd": str(project), "kind": "background",
+                     "cwd": str(cwd or project), "kind": "background",
                      "name": name, "state": state, "startedAt": 0})
     (fake_claude.dir / "sessions.json").write_text(json.dumps(sessions))
 
 
-def test_reconciler_adopts_adhoc_sessions(started, fake_claude, project):
+def _inject(fake_claude, project, state, sid="adhoc-session-1",
+            name="my manual hack", **kw):
+    """Add the session and hand it to Jarvis, the way the user would."""
+    _add_session(fake_claude, project, state, sid=sid, name=name)
+    return ops.inject_session(sid, **kw)
+
+
+def test_reconciler_does_not_adopt_sessions(started, fake_claude, project):
+    """The heart of GitHub issue 47: a session the user started is theirs.
+
+    Jarvis used to mirror every session running under a registered project path into an
+    `origin=adhoc` work order "for visibility", and then treat that record as a work
+    order like any other — renaming the session, flagging it for the user's attention,
+    and (via `wo send` / `resume-auto`) resuming it headlessly with a worker briefing, so
+    the user's own conversation received turns they never typed. It must not see the
+    session at all until it is handed over.
+    """
     daemon = started
-    # a bg session someone started by hand in the project dir
-    _add_adhoc(fake_claude, project, "working")
+    _add_session(fake_claude, project, "working")
 
     daemon.tick_count = 0
     daemon.tick()
+    daemon.tick_count = 0
+    daemon.tick()
+
     store = ProjectStore(project)
-    adhoc = [w for w in store.list_work_orders() if w["origin"] == "adhoc"]
-    assert len(adhoc) == 1
-    assert adhoc[0]["title"] == "my manual hack"
-    assert adhoc[0]["status"] == "running"
-    # stable across ticks (no duplicates)
+    assert store.list_work_orders() == [], "the session was adopted without consent"
+
+
+def test_reconciler_does_not_read_the_roster_with_nothing_injected(started, fake_claude,
+                                                                   project):
+    """Tracking injected sessions is the only thing left that needs `claude agents
+    --json`. With nothing injected, the subprocess must not run at all."""
+    daemon = started
+    _add_session(fake_claude, project, "working")
+    before = [c for c in fake_claude.calls if c["argv"][:1] == ["agents"]]
+
     daemon.tick_count = 0
     daemon.tick()
-    assert len([w for w in store.list_work_orders() if w["origin"] == "adhoc"]) == 1
+
+    after = [c for c in fake_claude.calls if c["argv"][:1] == ["agents"]]
+    assert len(after) == len(before), "listed the user's sessions with nothing to track"
 
 
-def test_adopted_working_session_does_not_ask_for_input(started, fake_claude, project):
-    """A healthy ad-hoc worker must never be adopted as "waiting on you".
+def test_injected_session_is_tracked(started, fake_claude, project):
+    daemon = started
+    res = _inject(fake_claude, project, "working")
+    store = ProjectStore(project)
+
+    wo = store.get_work_order(res["wo_id"])
+    assert wo["origin"] == "injected"
+    assert wo["title"] == "my manual hack"
+    assert wo["status"] == "running"
+    assert wo["session_id"] == "adhoc-session-1"
+
+    # tracked from here: the session ends, the record follows it — and stays singular
+    daemon.tick_count = 0
+    daemon.tick()
+    assert len(store.list_work_orders()) == 1
+
+
+def test_injecting_writes_nothing_into_the_session(started, fake_claude, project):
+    """Injection is consent to *track*, not to drive. The session is not renamed and
+    receives no turn; the first write is the user's own `wo send` / `resume-auto`."""
+    daemon = started
+    _inject(fake_claude, project, "working")
+    daemon.tick_count = 0
+    daemon.tick()
+
+    assert not turn_calls(fake_claude, expect=0), "injection started a turn"
+    assert fake_claude.sessions[-1]["name"] == "my manual hack", "session was renamed"
+
+
+def test_injected_session_is_never_dispatched(started, fake_claude, project):
+    """The record must not exist as `pending` for even one tick: the daemon claims
+    pending work orders and would launch a worker turn inside the user's session."""
+    daemon = started
+    res = _inject(fake_claude, project, "working")
+    store = ProjectStore(project)
+    assert store.get_work_order(res["wo_id"])["status"] == "running"
+
+    daemon.tick()  # dispatch_pending runs every tick, not just reconcile ones
+    assert not turn_calls(fake_claude, expect=0)
+    assert store.get_work_order(res["wo_id"])["worktree"] is None
+
+
+def test_injected_working_session_does_not_ask_for_input(started, fake_claude, project):
+    """A healthy session must never be recorded as "waiting on you".
 
     Regression: the reconciler compared Claude Code's session state against
     "running" — a word the CLI never emits (it says "working") — so every live
-    ad-hoc session was adopted straight into waiting_input and the UI claimed the
+    session was recorded straight into waiting_input and the UI claimed the
     session wanted the user while it was quietly making progress.
     """
     daemon = started
-    _add_adhoc(fake_claude, project, "working")
+    res = _inject(fake_claude, project, "working")
     daemon.tick_count = 0
     daemon.tick()
 
     store = ProjectStore(project)
-    adhoc = [w for w in store.list_work_orders() if w["origin"] == "adhoc"][0]
-    assert adhoc["status"] == "running"
-    assert not adhoc["needs_attention"]
-    assert not true_blockers(store, adhoc)
+    wo = store.get_work_order(res["wo_id"])
+    assert wo["status"] == "running"
+    assert not wo["needs_attention"]
+    assert not true_blockers(store, wo)
 
 
-def test_adopted_blocked_session_asks_for_input(started, fake_claude, project):
+def test_injected_blocked_session_asks_for_input(started, fake_claude, project):
     daemon = started
-    _add_adhoc(fake_claude, project, "blocked")
+    res = _inject(fake_claude, project, "blocked")
     daemon.tick_count = 0
     daemon.tick()
 
     store = ProjectStore(project)
-    adhoc = [w for w in store.list_work_orders() if w["origin"] == "adhoc"][0]
-    assert adhoc["status"] == "waiting_input"
-    assert adhoc["needs_attention"]
+    wo = store.get_work_order(res["wo_id"])
+    assert wo["status"] == "waiting_input"
+    assert wo["needs_attention"]
+
+
+def test_inject_resolves_the_project_from_the_sessions_directory(started, fake_claude,
+                                                                 project):
+    daemon = started  # noqa: F841 — the OS must be up for projects to be registered
+    _add_session(fake_claude, project, "working", sid="sub-1",
+                 cwd=str(project) + "/src/deep")
+    res = ops.inject_session("sub-1")
+    assert res["project"] == "proj_a"
+
+
+def test_inject_refuses_what_it_cannot_place(started, fake_claude, project, tmp_path):
+    daemon = started  # noqa: F841
+    _add_session(fake_claude, project, "working", sid="stray-1",
+                 cwd=str(tmp_path / "somewhere-else"))
+
+    with pytest.raises(ops.OpsError, match="not inside any registered project"):
+        ops.inject_session("stray-1")
+    with pytest.raises(ops.OpsError, match="no Claude session"):
+        ops.inject_session("no-such-session")
+
+    # --project is the override: the same session, placed by hand, is accepted
+    assert ops.inject_session("stray-1", project_name="proj_a")["project"] == "proj_a"
+
+
+def test_injecting_twice_does_not_duplicate_the_record(started, fake_claude, project):
+    daemon = started  # noqa: F841
+    first = _inject(fake_claude, project, "working")
+    again = ops.inject_session("adhoc-session-1")
+
+    assert again["wo_id"] == first["wo_id"]
+    assert again["already_known"]
+    store = ProjectStore(project)
+    assert len(store.list_work_orders()) == 1
+
+
+def test_re_injecting_resumes_tracking_a_session_that_woke_up(started, fake_claude,
+                                                              project):
+    """The daemon stops reading the roster once a project has no live injected session —
+    that is what keeps `claude agents --json` off the tick for everyone who never
+    injects. So re-injecting is how a retired session is picked back up."""
+    daemon = started
+    res = _inject(fake_claude, project, "working")
+    store = ProjectStore(project)
+
+    fake_claude.set_session_state("adhoc-session-1", "done")
+    daemon.tick_count = 0
+    daemon.tick()
+    assert store.get_work_order(res["wo_id"])["status"] == "completed"
+
+    fake_claude.set_session_state("adhoc-session-1", "working")  # the user typed again
+    again = ops.inject_session("adhoc-session-1")
+
+    assert again["wo_id"] == res["wo_id"]
+    assert store.get_work_order(res["wo_id"])["status"] == "running"
+    assert "tracking has resumed" in again["note"]
 
 
 def test_reconciler_clears_attention_when_worker_resumes(started, fake_claude, project,
