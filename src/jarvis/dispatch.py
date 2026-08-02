@@ -197,6 +197,17 @@ def _gate_briefing(wo: dict[str, Any], project: ProjectSpec) -> list[str]:
         "Then END YOUR TURN. The verdict arrives as your next user turn. If approved, run "
         "that exact command — the approval is scoped to that one string and expires, so "
         "do not reword it. If denied, fix what the reason names; do not retry as-is.",
+        "",
+        # Without this the worker reads a gate on a `grep` as a judgement on its work and
+        # starts rewording harmless commands to sneak past the recogniser. Naming the
+        # third outcome is what makes "just file it and wait" the obvious move instead.
+        "A third verdict exists: DISMISSED. The recogniser matches text, so it sometimes "
+        "fires on a command that merely NAMES one of these actions — a release script "
+        "inside a grep pattern, a path quoted in a PR body. That is an OS bug, not a "
+        "refusal: the reviewer dismisses it, nothing is authorised, and you may run the "
+        "command as written. So if a gate fires on something you know ships nothing, do "
+        "not reword the command to get around it — file it, say plainly why it performs "
+        "no privileged action, and end your turn.",
     ]
     return lines
 

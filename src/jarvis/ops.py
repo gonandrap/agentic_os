@@ -367,11 +367,17 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         # Gates Neo sent up. These are the only approval requests that cost the user
         # anything: the rest were decided without them, which is the point.
         gate_items = []
+        # Gate requests that turned out not to be gated actions at all. Reported as a
+        # number and never as an attention item: a classifier defect is the OS's problem,
+        # not the user's, but the rate is the one signal that says whether the
+        # recognisers are getting better.
+        false_positives = 0
         for name, path in registered_project_paths().items():
             if not path.is_dir():
                 continue
             store = ProjectStore(path)
             try:
+                false_positives += store.dismissed_count()
                 for a in store.escalated_approvals():
                     gate_items.append({
                         "project": name, "wo_id": a["wo_id"],
@@ -399,7 +405,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             },
             "backlog": {"open": len(backlog_open)},
             "neo": neo_counts,
-            "gates": {"awaiting_you": len(gate_items)},
+            "gates": {"awaiting_you": len(gate_items),
+                      "false_positives": false_positives},
             "healthy": pid is not None and not attention,
         }
     finally:
@@ -1183,18 +1190,30 @@ def request_gate_approval(wo_id: str, command: str, why: str = "", evidence: str
                     "next user turn"}
 
 
-def decide_gate(approval_id: int, approved: bool, reason: str = "",
+def decide_gate(approval_id: int, verdict: str, reason: str = "",
                 project_name: str | None = None) -> dict[str, Any]:
-    """(User) open or refuse a gate directly, whatever Neo did or didn't say.
+    """(User) rule on a gate directly, whatever Neo did or didn't say.
 
-    Also the resolution path for an escalation: Neo declining leaves the request pending
-    precisely so this can close it.
+    `verdict` is `approved`, `denied` or `dismissed`. Also the resolution path for an
+    escalation: Neo declining leaves the request pending precisely so this can close it.
     """
     from . import gates
+
     from .neo_store import NeoStore
 
-    if not approved and not reason.strip():
+    if verdict not in gates.VERDICTS:
+        raise OpsError(f"unknown verdict {verdict!r} — expected one of "
+                       f"{list(gates.VERDICTS)}")
+    # A denial needs a reason because the worker has to act on it. A dismissal needs one
+    # for a different reason: the text IS the defect report on the recogniser, and it is
+    # the only record of what went wrong that anyone reading the false-positive count
+    # will ever be able to inspect.
+    if verdict == "denied" and not reason.strip():
         raise OpsError("a denial needs a reason — the worker acts on it")
+    if verdict == "dismissed" and not reason.strip():
+        raise OpsError("a dismissal needs a reason — it is the report on what the gate's "
+                       "recogniser got wrong, and the only note attached to the "
+                       "false-positive count")
 
     name, path, approval = _find_approval(approval_id, project_name)
     if approval["status"] != "pending":
@@ -1204,7 +1223,7 @@ def decide_gate(approval_id: int, approved: bool, reason: str = "",
         )
     store = ProjectStore(path)
     try:
-        gates.apply_decision(store, approval_id, approved=approved,
+        gates.apply_decision(store, approval_id, verdict=verdict,
                              reason=reason or "approved by the user", decided_by="user")
         store.clear_attention(approval["wo_id"])
     finally:
@@ -1215,13 +1234,12 @@ def decide_gate(approval_id: int, approved: bool, reason: str = "",
         qid = approval["neo_question_id"]
         q = neo.get(qid) if qid else None
         if q and q["status"] in ("queued", "answering", "escalated", "failed"):
-            neo.record_answer(qid, "APPROVED" if approved else "DENIED",
-                              answered_by="user", reason=reason)
+            neo.record_answer(qid, verdict.upper(), answered_by="user", reason=reason)
             neo.review(qid, approved=True)  # user-authored ⇒ nothing to review
     finally:
         neo.close()
     return {"project": name, "wo_id": approval["wo_id"], "approval_id": approval_id,
-            "decision": "approved" if approved else "denied",
+            "decision": verdict,
             "command": approval["command"],
             "delivery": "jarvisd delivers the verdict when the worker is idle"}
 

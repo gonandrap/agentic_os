@@ -340,23 +340,30 @@ class Daemon:
             })
             return
 
-        approved = bool(verdict.get("approve"))
-        gates.apply_decision(pstore, approval["id"], approved=approved,
+        ruling = verdict.get("verdict") or ("approved" if verdict.get("approve")
+                                            else "denied")
+        gates.apply_decision(pstore, approval["id"], verdict=ruling,
                              reason=verdict["reason"], decided_by="neo")
         # A shipped release is something the user wants to know happened, even when they
         # did not have to authorise it — that is the trade for spending none of their
         # attention on the approval itself.
-        central.add_inbox(
-            project=q["project"],
-            level="info" if approved else "warning",
-            title=(f"Neo {'approved' if approved else 'denied'} "
-                   f"{approval['kind']} for {q['wo_id']}"),
-            body=(f"{verdict['reason']}\n\nCommand: {approval['command']}\n"
-                  f"Review Neo's call with: jarvis neo review {q['id']}"),
-            wo_id=q["wo_id"],
-        )
-        log.info("gate %s %s by neo for %s", approval["id"],
-                 "approved" if approved else "denied", q["wo_id"])
+        #
+        # A dismissal is the exception, and silence here is the feature. It reports that
+        # the OS's own recogniser misfired on a command that ships nothing; an inbox item
+        # for that would spend the user's attention on an OS bug, which is precisely the
+        # cost the gate exists to avoid. The false-positive rate is surfaced as a COUNT
+        # instead — `jarvis gate list` and the dashboard — because what matters about
+        # classifier defects is the rate, not each instance.
+        if ruling != "dismissed":
+            central.add_inbox(
+                project=q["project"],
+                level="info" if ruling == "approved" else "warning",
+                title=f"Neo {ruling} {approval['kind']} for {q['wo_id']}",
+                body=(f"{verdict['reason']}\n\nCommand: {approval['command']}\n"
+                      f"Review Neo's call with: jarvis neo review {q['id']}"),
+                wo_id=q["wo_id"],
+            )
+        log.info("gate %s %s by neo for %s", approval["id"], ruling, q["wo_id"])
 
     # -- 7. invariants (post-conditions) --------------------------------------------------
 

@@ -276,17 +276,26 @@ elif "-p" in argv and "--resume" not in argv:
         sys.exit(0)
     elif "PRIVILEGED ACTION REQUEST" in prompt:
         # A gate review, which speaks a different verdict shape: the decision lives in
-        # `approve`, not in prose. Default is to escalate, matching the real reviewer's
+        # `verdict`, not in prose. Default is to escalate, matching the real reviewer's
         # instruction to send anything it cannot verify to the user — a fake that
         # approved by default would let every gate test pass without asserting anything.
         if "FORCE_APPROVE" in prompt:
-            verdict = {"escalate": False, "approve": True,
+            verdict = {"escalate": False, "verdict": "approve",
                        "reason": "test-forced approval"}
         elif "FORCE_DENY" in prompt:
-            verdict = {"escalate": False, "approve": False,
+            verdict = {"escalate": False, "verdict": "deny",
                        "reason": "test-forced denial"}
+        elif "FORCE_DISMISS" in prompt:
+            verdict = {"escalate": False, "verdict": "dismiss",
+                       "reason": "test-forced dismissal: not a privileged action"}
+        elif "FORCE_LEGACY_APPROVE" in prompt:
+            # An older Neo that has never heard of `verdict`. Kept as a distinct switch
+            # because the two contracts must coexist across a release: the persona ships
+            # in the code, Neo's learnings live in the production state directory.
+            verdict = {"escalate": False, "approve": True,
+                       "reason": "test-forced approval, pre-`verdict` shape"}
         else:
-            verdict = {"escalate": True, "approve": False,
+            verdict = {"escalate": True, "verdict": "deny",
                        "reason": "test default: gate reviews escalate unless forced"}
     else:
         verdict = {"escalate": False,

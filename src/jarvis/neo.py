@@ -88,28 +88,65 @@ def build_question_prompt(q: dict[str, Any]) -> str:
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
+# What Neo may write in `verdict`, and the status it means. Both the bare verb and the
+# past participle are accepted: the persona asks for "approve", the database stores
+# "approved", and a model that writes the other one is not making a mistake worth
+# escalating over.
+_VERDICT_ALIASES = {
+    "approve": "approved", "approved": "approved",
+    "deny": "denied", "denied": "denied", "reject": "denied", "rejected": "denied",
+    "dismiss": "dismissed", "dismissed": "dismissed",
+}
+
+
+def _gate_verdict(data: dict[str, Any]) -> str:
+    """The gate verdict Neo reached: `approved`, `denied` or `dismissed`.
+
+    Reads the `verdict` field, falling back to the older boolean `approve`. The fallback
+    is not politeness — it is required during a release. Neo's persona lives in the
+    deployed code but its LEARNINGS live in the production state directory, so the two
+    can disagree across an upgrade in either direction: a Neo still emitting the old
+    shape must keep working, and a `verdict` this build did not expect must not silently
+    open a gate.
+
+    Anything unrecognised falls back to the boolean, which defaults to False. Output that
+    says nothing intelligible therefore denies rather than approves: the only way through
+    a gate is an explicit yes.
+    """
+    raw = data.get("verdict")
+    if isinstance(raw, str):
+        verdict = _VERDICT_ALIASES.get(raw.strip().lower())
+        if verdict:
+            return verdict
+    return "approved" if bool(data.get("approve", False)) else "denied"
+
 
 def parse_verdict(raw: str) -> dict[str, Any]:
     """Parse Neo's strict-JSON reply, tolerating fenced or chatty output.
     Unparseable output is treated as an escalation — never deliver garbage.
 
-    `approve` carries the verdict on an approval request. It defaults to False, so
-    output that omits it never opens a gate: the only way through is an explicit yes.
+    `verdict` carries the ruling on an approval request; `approve` is kept alongside it
+    as the boolean the old contract used, so callers that only ask "did this open a
+    gate" still read correctly. Note that a dismissal leaves `approve` False: it clears
+    the command without authorising anything, and code that conflates the two would put
+    an approval back into the audit trail.
     """
     m = _JSON_RE.search(raw or "")
     if m:
         try:
             data = json.loads(m.group(0))
             if isinstance(data, dict) and "escalate" in data:
+                verdict = _gate_verdict(data)
                 return {
                     "escalate": bool(data.get("escalate")),
                     "answer": str(data.get("answer") or ""),
                     "reason": str(data.get("reason") or ""),
-                    "approve": bool(data.get("approve", False)),
+                    "verdict": verdict,
+                    "approve": verdict == "approved",
                 }
         except json.JSONDecodeError:
             pass
-    return {"escalate": True, "answer": "", "approve": False,
+    return {"escalate": True, "answer": "", "approve": False, "verdict": "denied",
             "reason": f"unparseable Neo output: {(raw or '')[:120]}"}
 
 
@@ -163,7 +200,7 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             # answer too so `jarvis neo show` and the review surfaces read plainly.
             answer = verdict["answer"]
             if q.get("kind") == "approval":
-                answer = "APPROVED" if verdict.get("approve") else "DENIED"
+                answer = (verdict.get("verdict") or "denied").upper()
             store.record_answer(q["id"], answer, answered_by="neo",
                                 reason=verdict["reason"])
             log.info("neo answered question %s (%s)", q["id"], q.get("kind") or "question")
