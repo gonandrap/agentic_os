@@ -100,11 +100,23 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any]) -> tuple[str, st
         verb = "Approved" if p.get("decision") == "approved" else "Denied"
         return (f"{verb} by {p.get('by') or '?'}: {p.get('kind') or 'gate'}",
                 p.get("reason") or "")
+    if kind == "gate_dismissed":
+        # Deliberately not phrased as a verdict on the worker. Nothing was authorised and
+        # nothing was refused: the OS's own recogniser misfired, and the record has to say
+        # so plainly or it reads later as a release someone waved through.
+        return (f"Not a privileged action — the `{p.get('kind') or 'gate'}` gate matched "
+                f"this by mistake ({p.get('by') or '?'})",
+                p.get("reason") or "")
     if kind == "gate_escalated":
         return "Gate approval escalated to you", p.get("reason") or ""
     if kind == "gate_opened":
         # The moment the privileged command actually ran — the most audit-relevant
-        # entry a work order can have, so it is never debug.
+        # entry a work order can have, so it is never debug. Unless it was never
+        # privileged, in which case calling it "the approved command" would write the
+        # exact falsehood the dismissed verdict exists to keep out of the record.
+        if p.get("clearance") == "dismissed":
+            return (f"Ran the command the `{p.get('kind') or 'gate'}` gate had matched "
+                    f"by mistake", "no privileged action was authorised")
         return (f"Ran the approved {p.get('kind') or 'command'}",
                 f"use {p.get('use')} of {p.get('of')}")
     if kind == "finished":
