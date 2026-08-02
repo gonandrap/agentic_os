@@ -16,10 +16,18 @@ through `ProjectStore.set_status()` — nothing writes status directly.
    hands off to `worker_session.start()`, then sets `running`.
 4. **`waiting_input`** — `hooks.py` on a `Notification`, or the reconciler when the
    work order is parked on a privileged-action gate.
-5. **`needs_review` / `completed` / `failed`** — settled by
+5. **`needs_review` / `waiting_pr_merge` / `completed` / `failed`** — settled by
    `Daemon.settle_work_order()` from the latest **turn row**, see below.
 6. **Close-out** — `ops.review_work_order()`, `cancel()`, `hide_work_order()`,
-   `delete_work_order()`.
+   `delete_work_order()`, and `mark_done()` (the user's own "this is finished", and the
+   only way out of `waiting_pr_merge`).
+
+**`waiting_pr_merge`** is set by `jarvis wo finish --pr <url>` (`ops.finish`, which
+stores `work_orders.pr_url`). It is an OPEN status that deliberately raises **no**
+attention flag — `invariants.true_blockers` has no branch for it, on purpose: it is a
+merge queue the user works through in the dashboard, not a decision blocking the fleet.
+Pending assumptions outrank it (`needs_review` wins). Nothing polls GitHub; the user
+merges and runs `jarvis wo done`. Auto-complete-on-merge is filed as backlog work.
 
 ## The transport: headless turns (replaced background sessions, 2026-08-01)
 
@@ -86,6 +94,7 @@ fire on EVERY turn** (`SessionStart.source == "resume"` from turn 2 on).
 | `failed` | `failed` + attention + notification |
 | `done` + queued messages | untouched; the next turn goes out this tick |
 | `done` + `result_summary` + pending assumptions | `needs_review` |
+| `done` + `result_summary` + `pr_url` | `waiting_pr_merge` (re-settles here every tick) |
 | `done` + `result_summary` | `completed` |
 | `done` + pending approvals | `waiting_input` (parked on a gate — compliance) |
 | `done`, none of the above | `needs_review` "idle without `jarvis wo finish`" |

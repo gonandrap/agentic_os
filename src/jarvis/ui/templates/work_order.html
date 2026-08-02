@@ -50,6 +50,11 @@
     <p class="sub">🙈 Hidden — it stays on the record but is out of listings, the
       summary and the attention list, and won't be dispatched.</p>
   {% endif %}
+  {% if wo.pr_url %}
+    <p class="kv">⑃ pull request:
+      <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a>
+      {%- if wo.status == 'waiting_pr_merge' %} — merge it, then "Mark done".{% endif %}</p>
+  {% endif %}
   {% if wo.description %}<p class="kv" style="white-space: pre-wrap;">{{ wo.description }}</p>{% endif %}
   <p class="kv mono">
     created {{ fmt_age(wo.created_at) }} ago · updated {{ fmt_age(wo.updated_at) }} ago

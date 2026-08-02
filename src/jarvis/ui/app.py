@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import time
 import traceback
+from collections import Counter
 from pathlib import Path
 
 from fastapi import FastAPI, Form, Request
@@ -15,7 +16,12 @@ from .. import ops
 from ..central_store import CentralStore
 from ..daemon import daemon_running
 from ..paths import logs_dir
-from ..project_store import OPEN_STATUSES, TERMINAL_STATUSES, ProjectStore
+from ..project_store import (
+    OPEN_STATUSES,
+    TERMINAL_STATUSES,
+    WO_STATUSES,
+    ProjectStore,
+)
 from ..timeline import build_timeline, count_debug
 
 TEMPLATES = Path(__file__).parent / "templates"
@@ -26,6 +32,7 @@ STATUS_META = {
     "running":       {"word": "running",     "icon": "●", "tone": "active"},
     "waiting_input": {"word": "waiting on you", "icon": "◉", "tone": "warn"},
     "needs_review":  {"word": "needs review",   "icon": "◭", "tone": "warn"},
+    "waiting_pr_merge": {"word": "waiting for PR merge", "icon": "⑃", "tone": "ok"},
     "completed":     {"word": "completed",   "icon": "✓", "tone": "ok"},
     "failed":        {"word": "failed",      "icon": "✗", "tone": "bad"},
     "cancelled":     {"word": "cancelled",   "icon": "–", "tone": "muted"},
@@ -55,6 +62,33 @@ GATE_META = {
 # How often the dashboard re-reads OS state. Not a page reload — the browser swaps
 # the live regions in place (see dashboard.html), so in-progress typing survives.
 REFRESH_SECONDS = 15
+
+# The two open statuses worth a row of their own, in this order: what is being worked
+# on right now, then what is waiting for the user to go and merge it. Everything else
+# open collapses into a count line, the same way settled work orders already do — the
+# point of the page is "what needs me", and a pending work order needs nobody.
+FEATURED_STATUSES = ("running", "waiting_pr_merge")
+
+
+def group_open(wos: list[dict], revealed: str = "") -> tuple[list[dict], list[dict]]:
+    """Split open work orders into the featured rows and the rest.
+
+    The rest come back only when the user has expanded them (`revealed` is their status
+    or "all"); the caller renders the counts either way, so nothing is hidden silently.
+    Featured rows are ordered by FEATURED_STATUSES, then by whatever order they arrived
+    in (newest first out of the store).
+    """
+    featured = [wo for status in FEATURED_STATUSES for wo in wos
+                if wo["status"] == status]
+    rest = [wo for wo in wos if wo["status"] not in FEATURED_STATUSES]
+    shown = [wo for wo in rest if revealed in ("all", wo["status"])]
+    return featured, shown
+
+
+def _counts_by_status(statuses) -> list[tuple[str, int]]:
+    """(status, n) pairs in WO_STATUSES order — a stable line, not dict order."""
+    counted = Counter(statuses)
+    return [(s, counted[s]) for s in WO_STATUSES if counted.get(s)]
 
 
 def fmt_age(ts: float | None) -> str:
@@ -168,24 +202,36 @@ def create_app() -> FastAPI:
     # -- pages ------------------------------------------------------------------
 
     @app.get("/", response_class=HTMLResponse)
-    def dashboard(request: Request):
+    def dashboard(request: Request, show: str = ""):
+        """The pulse. Open work orders are grouped so the two the user can act on —
+        running, and waiting for them to merge a PR — are rows, and the rest is a
+        count line they can expand (`show` = a status name, or "all")."""
         st = ops.os_status()
-        return render(request, "dashboard.html", st=st, refresh=REFRESH_SECONDS)
+        rows = [{**wo, "project": p["name"]}
+                for p in st["projects"] for wo in p.get("open_work_orders", [])]
+        revealed = show if show == "all" or any(wo["status"] == show for wo in rows) \
+            else ""
+        featured, rest = group_open(rows, revealed)
+        rest_counts = _counts_by_status(
+            wo["status"] for wo in rows if wo["status"] not in FEATURED_STATUSES)
+        return render(request, "dashboard.html", st=st, refresh=REFRESH_SECONDS,
+                      featured=featured, rest=rest, rest_counts=rest_counts,
+                      revealed=revealed)
 
     @app.get("/project/{name}", response_class=HTMLResponse)
     def project(request: Request, name: str, hidden: str = "", show: str = ""):
-        """A project's work orders — the open ones by default.
+        """A project's work orders — the two that want the user, by default.
 
-        Settled work orders are the bulk of any project with history and none of them
-        is asking for anything, so they collapse into a per-status count that the user
-        can expand. `show` is one of "" (open only), a terminal status name (open plus
-        that group), or "all".
+        Running work orders and PRs waiting to be merged get a row each. Everything
+        else — the other open statuses, and the settled ones that are the bulk of any
+        project with history — collapses into per-status counts the user can expand.
+        `show` is "" (featured only), any status name (plus that group), or "all".
         """
         paths = ops.registered_project_paths()
         if name not in paths:
             return render(request, "error.html", message=f"unknown project {name!r}")
         show_hidden = hidden not in ("", "0", "false")
-        revealed = show if show in TERMINAL_STATUSES else ("all" if show == "all" else "")
+        revealed = show if show in WO_STATUSES else ("all" if show == "all" else "")
         if revealed == "all":
             statuses = None
         else:
@@ -205,8 +251,14 @@ def create_app() -> FastAPI:
         finally:
             central.close()
         settled = [(s, counts[s]) for s in TERMINAL_STATUSES if counts.get(s)]
+        featured, rest = group_open(wos, revealed)
+        # Counted in SQL rather than from `wos`, which is capped at a page: the same
+        # reason the settled line is. Terminal statuses have their own line below.
+        other_open = [s for s in OPEN_STATUSES if s not in FEATURED_STATUSES]
+        open_counts = [(s, counts[s]) for s in other_open if counts.get(s)]
         return render(request, "project.html", project_name=name, path=paths[name],
-                      wos=wos, backlog=backlog, show_hidden=show_hidden,
+                      featured=featured, rest=rest, open_counts=open_counts,
+                      backlog=backlog, show_hidden=show_hidden,
                       hidden_count=hidden_count, settled=settled, revealed=revealed)
 
     @app.get("/project/{name}/sessions", response_class=HTMLResponse)

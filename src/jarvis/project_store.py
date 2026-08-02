@@ -19,11 +19,17 @@ WO_STATUSES = (
     "running",       # worker session active
     "waiting_input", # worker asked something / is blocked on the user
     "needs_review",  # finished but has pending assumptions or attention items
+    # Worker done, PR open, waiting for the user to merge it. Deliberately NOT an
+    # attention item (see invariants.true_blockers): it is a merge queue the user works
+    # through in the dashboard, not a decision blocking the OS, and putting every
+    # finished work order in the "NEEDS YOU" strip is how that strip stops being read.
+    "waiting_pr_merge",
     "completed",
     "failed",
     "cancelled",
 )
-OPEN_STATUSES = ("pending", "dispatching", "running", "waiting_input", "needs_review")
+OPEN_STATUSES = ("pending", "dispatching", "running", "waiting_input", "needs_review",
+                 "waiting_pr_merge")
 # Settled: nothing more will happen to these on their own. They are the bulk of an old
 # project's history, so listings collapse them behind a count rather than printing them.
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
@@ -189,6 +195,11 @@ ADDED_COLUMNS = {
         # turns reuse one Jarvis-minted id for the work order's whole life, so there is
         # no trail to keep. Retained because old rows still carry their history.
         "prior_sessions": "TEXT",
+        # The pull request this work order is waiting on, as reported by the worker via
+        # `jarvis wo finish --pr`. Its presence is what puts the work order in
+        # `waiting_pr_merge` rather than `completed`, and it is the link the user
+        # follows from the dashboard to go and merge.
+        "pr_url": "TEXT",
     },
 }
 

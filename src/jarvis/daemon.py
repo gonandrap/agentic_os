@@ -486,6 +486,13 @@ class Daemon:
                 if fresh["status"] != "needs_review":
                     store.set_status(wo["id"], "needs_review")
                     store.flag_attention(wo["id"], "assumptions pending review")
+            elif fresh.get("pr_url"):
+                # Finished behind a pull request: it is the user's merge that ends this
+                # work order, not the worker's last turn. Settling it to `completed`
+                # here would take it off the open list before anyone had merged it.
+                if fresh["status"] != "waiting_pr_merge":
+                    store.set_status(wo["id"], "waiting_pr_merge")
+                    store.clear_attention(wo["id"])
             else:
                 store.set_status(wo["id"], "completed")
                 store.clear_attention(wo["id"])

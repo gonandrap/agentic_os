@@ -321,7 +321,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     "summary": summary,
                     "open_work_orders": [
                         {k: wo[k] for k in ("id", "title", "status", "origin",
-                                            "needs_attention", "attention_reason")}
+                                            "needs_attention", "attention_reason",
+                                            "pr_url")}
                         for wo in open_wos
                     ],
                     "settings_drift": drift,
@@ -698,20 +699,39 @@ def assume(wo_id: str, content: str) -> dict[str, Any]:
     return {"project": name, "wo_id": wo_id, "recorded": content}
 
 
-def finish(wo_id: str, summary: str) -> dict[str, Any]:
+def finish(wo_id: str, summary: str, pr_url: str | None = None) -> dict[str, Any]:
+    """The worker reporting its own result.
+
+    `pr_url` is what separates "delivered" from "delivered and merged": a work order
+    that ends in a pull request is not finished until a human merges it, so it settles
+    into `waiting_pr_merge` and stays on the open list with the link, instead of going
+    to `completed` and disappearing into the settled group nobody reads. The user
+    closes it with `jarvis wo done` after merging — nothing polls GitHub.
+
+    Pending assumptions still outrank it: those are a decision the OS is waiting on,
+    and a PR the user merges before deciding them accepts them by the back door.
+    """
     name, path, wo = find_work_order(wo_id)
     store = ProjectStore(path)
     try:
-        store.update_work_order(wo_id, result_summary=summary)
+        fields: dict[str, Any] = {"result_summary": summary}
+        if pr_url:
+            fields["pr_url"] = pr_url
+        store.update_work_order(wo_id, **fields)
         if store.pending_assumptions(wo_id):
             store.set_status(wo_id, "needs_review")
             store.flag_attention(wo_id, "assumptions pending review")
             status = "needs_review"
+        elif pr_url:
+            store.set_status(wo_id, "waiting_pr_merge")
+            store.clear_attention(wo_id)
+            status = "waiting_pr_merge"
         else:
             store.set_status(wo_id, "completed")
             store.clear_attention(wo_id)
             status = "completed"
-        store.add_event(wo_id, "finished", {"summary": summary})
+        store.add_event(wo_id, "finished", {"summary": summary,
+                                            **({"pr_url": pr_url} if pr_url else {})})
     finally:
         store.close()
     if wo.get("backlog_id") and status == "completed":
@@ -720,7 +740,8 @@ def finish(wo_id: str, summary: str) -> dict[str, Any]:
             central.mark_backlog(wo["backlog_id"], "done")
         finally:
             central.close()
-    return {"project": name, "wo_id": wo_id, "status": status}
+    return {"project": name, "wo_id": wo_id, "status": status,
+            **({"pr_url": pr_url} if pr_url else {})}
 
 
 def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:

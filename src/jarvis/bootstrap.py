@@ -29,7 +29,11 @@ from .paths import project_state_dir
 # outcome other than "denied" reasonably concludes the command is forbidden and starts
 # rewording it to get past the recogniser, which is the one response that must not be
 # learned. Bumping the version is what pushes that paragraph into every managed repo.
-TEMPLATE_VERSION = 6
+# v7 = the `[<wo-id>] ` pull request title rule, and `jarvis wo finish --pr`. Numbered 7
+# rather than 6 because the `dismissed` paragraph above ALSO landed as v6, on another
+# branch — exactly the collision the v5 note describes, caught this time in a merge
+# instead of by a project that silently skipped one branch's content.
+TEMPLATE_VERSION = 7
 ASSETS = Path(__file__).parent / "assets"
 
 
