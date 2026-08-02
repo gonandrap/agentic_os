@@ -51,9 +51,12 @@ entry per project:
 | `.jarvis/` | state dir with the project's queue DB | delete dir |
 | `.gitignore` | `.jarvis/` entry appended | remove line |
 | `.claude/settings.json` | replaced by OS baseline + catalog `settings_overrides`; original backed up to `settings.json.pre-jarvis` **the first time** | restore backup |
+| `.claude/skills/jarvis-inject-session/` | the OS's own skill, for the sessions **you** open here: it hands the running conversation to Jarvis (`jarvis wo inject`). Regenerated when edited | delete dir |
 | `~/.claude.json` | project path marked `hasTrustDialogAccepted: true` (workspace trusted); every other key preserved | set it back to `false` |
 
-`settings.local.json` is never touched — it stays your per-machine escape hatch.
+`settings.local.json` is never touched — it stays your per-machine escape hatch, and your
+own skills in `.claude/skills/` are left alone: adoption only owns the directories it
+created.
 
 Try it safely first:
 
@@ -79,8 +82,9 @@ for them:
 git add OPERATION.md .gitignore README.md && git commit -m "Adopt Jarvis OS"
 ```
 
-(`.claude/settings.json` stays uncommitted by design — Jarvis re-injects it and passes
-it to workers directly.)
+(`.claude/settings.json` and `.claude/skills/jarvis-inject-session/` stay uncommitted by
+design — Jarvis rewrites both on every start. Commit the skill if you want your
+teammates to have it too; it will simply be left in place.)
 
 ## 5. Start the OS
 
