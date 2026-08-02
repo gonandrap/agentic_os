@@ -29,8 +29,16 @@ OPEN_STATUSES = ("pending", "dispatching", "running", "waiting_input", "needs_re
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
 
 # How the work order entered the system. jarvis/ui follow the framework; manual is a
-# direct DB insert; adhoc is a background session we discovered that Jarvis didn't spawn.
-WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc")
+# direct DB insert; injected is a session the user started and then handed to Jarvis
+# with `jarvis wo inject`; adhoc is the legacy marker for a session the reconciler
+# adopted on its own, which it no longer does (GitHub issue 47).
+WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected")
+
+# Origins whose session Jarvis did not dispatch: it belongs to the user, never received
+# the worker briefing or `JARVIS_WO_ID`, and therefore cannot satisfy the worker contract
+# (no `jarvis wo finish`, and its ending is not a failure). Holding one to that contract
+# is what made every such record a permanent attention item — see INV-ADHOC-NOT-GOVERNED.
+UNGOVERNED_ORIGINS = ("adhoc", "injected")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS work_orders (
@@ -220,19 +228,28 @@ class ProjectStore:
         backlog_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         wo_id: str | None = None,
+        status: str = "pending",
+        session_id: str | None = None,
     ) -> dict[str, Any]:
+        """Create a work order. `status` and `session_id` are set in the same INSERT
+        rather than afterwards, because the row is visible to the daemon the instant it
+        lands: a record that is `pending` for even a moment can be claimed and dispatched
+        (`claim_next_pending`), which for an injected session would launch a worker into
+        the user's own conversation.
+        """
         assert origin in WO_ORIGINS, origin
+        assert status in WO_STATUSES, status
         wo_id = wo_id or db.new_id("wo")
         ts = db.now()
         self.conn.execute(
             """INSERT INTO work_orders (id, title, description, status, origin,
                    created_at, updated_at, model, effort, permission_mode,
-                   append_system_prompt, backlog_id, metadata)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   append_system_prompt, backlog_id, metadata, session_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                wo_id, title, description, "pending", origin, ts, ts, model, effort,
+                wo_id, title, description, status, origin, ts, ts, model, effort,
                 permission_mode, append_system_prompt, backlog_id,
-                db.to_json(metadata or {}),
+                db.to_json(metadata or {}), session_id,
             ),
         )
         self.add_event(wo_id, "created", {"origin": origin})

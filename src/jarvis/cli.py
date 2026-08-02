@@ -2,7 +2,7 @@
 
 Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
-  jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done
+  jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
   jarvis neo list|show|review|answer|learnings|learn
   jarvis backlog add|list|promote|done
@@ -68,7 +68,8 @@ STATUS_ICON = {
     "pending": "⏳", "dispatching": "🚀", "running": "🟢", "waiting_input": "🙋",
     "needs_review": "👀", "completed": "✅", "failed": "❌", "cancelled": "🚫",
 }
-ORIGIN_BADGE = {"jarvis": "🤖 jarvis", "ui": "🖥 ui", "manual": "⚠ manual", "adhoc": "⚠ ad-hoc"}
+ORIGIN_BADGE = {"jarvis": "🤖 jarvis", "ui": "🖥 ui", "manual": "⚠ manual",
+                "adhoc": "⚠ ad-hoc", "injected": "🔗 injected"}
 
 
 class _VersionAction(argparse.Action):
@@ -198,6 +199,13 @@ def build_parser() -> argparse.ArgumentParser:
     dl.add_argument("--project")
     dl.add_argument("--yes", "-y", action="store_true",
                     help="confirm the deletion (required)")
+
+    ij = wo.add_parser("inject", help="hand a Claude session you started over to "
+                                      "Jarvis, as a work order")
+    ij.add_argument("session_id", help="from `claude agents` (its session id or agent id)")
+    ij.add_argument("--project", help="which project it belongs to (default: whichever "
+                                      "one the session's directory is inside)")
+    ij.add_argument("--title", help="work order title (default: the session's name)")
 
     ra = wo.add_parser("resume-auto",
                        help="unstick a worker blocked on a permission prompt: flip it "
@@ -574,6 +582,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 "(or use `jarvis wo hide` to just get it out of the way)."
             )
         _print(ops.delete_work_order(args.wo_id, project_name=args.project), args.json)
+    elif args.wo_cmd == "inject":
+        _print(ops.inject_session(args.session_id, project_name=args.project,
+                                  title=args.title), args.json)
     elif args.wo_cmd == "resume-auto":
         _print(ops.resume_in_auto(args.wo_id, project_name=args.project), args.json)
     return 0

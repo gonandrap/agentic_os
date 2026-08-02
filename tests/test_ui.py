@@ -184,17 +184,60 @@ def test_send_message_via_ui(client, project):
     assert msgs[0]["status"] == "queued"
 
 
-def test_adhoc_badge_visible(client, daemon, fake_claude, project):
+def _add_session(fake_claude, project, sid="adhoc-9", name="manual poking",
+                 state="working"):
+    """A Claude session the user started in the project directory."""
     import json
     sessions = fake_claude.sessions
-    sessions.append({"id": "zz", "sessionId": "adhoc-9", "cwd": str(project),
-                     "kind": "background", "name": "manual poking",
-                     "state": "working", "startedAt": 0})
+    sessions.append({"id": "zz", "sessionId": sid, "cwd": str(project),
+                     "kind": "background", "name": name,
+                     "state": state, "startedAt": 0})
     (fake_claude.dir / "sessions.json").write_text(json.dumps(sessions))
+
+
+def test_your_own_sessions_are_offered_for_injection(client, daemon, fake_claude,
+                                                     project):
+    """The dashboard affordance for GitHub issue 47: the project page offers to take a
+    session the user started, and until they say so it stays off the books."""
+    _add_session(fake_claude, project)
     daemon.tick_count = 0
     daemon.tick()
+
+    assert "manual poking" not in client.get("/project/proj_a").text
+
+    panel = client.get("/project/proj_a/sessions").text
+    assert "manual poking" in panel and "adhoc-9" in panel
+    assert "Inject" in panel
+
+    r = client.post("/project/proj_a/inject", data={"session_id": "adhoc-9"},
+                    follow_redirects=True)
+    assert "manual poking" in r.text and "injected" in r.text
+
+
+def test_the_session_panel_never_breaks_the_page(client, fake_claude, project,
+                                                 monkeypatch):
+    """It shells out to `claude agents --json` — the one thing on any page that does.
+    A CLI that is slow, broken or missing costs the panel, never the page."""
+    from jarvis import claude_cli
+
+    def boom(*a, **k):
+        raise claude_cli.ClaudeCliError("timed out after 5s")
+
+    monkeypatch.setattr(claude_cli, "list_background_sessions", boom)
+
+    r = client.get("/project/proj_a")
+    assert r.status_code == 200
+
+    panel = client.get("/project/proj_a/sessions")
+    assert panel.status_code == 200
+    assert "could not list sessions" in panel.text
+
+
+def test_injected_badge_visible(client, daemon, fake_claude, project):
+    _add_session(fake_claude, project)
+    client.post("/project/proj_a/inject", data={"session_id": "adhoc-9"})
     r = client.get("/")
-    assert "ad-hoc" in r.text and "⚠" in r.text
+    assert "injected" in r.text
 
 
 def test_inbox_page_and_ack(client, daemon, project):

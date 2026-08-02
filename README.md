@@ -147,8 +147,8 @@ also watch and join them from `claude agents`.
 |---|---|
 | **Catalog** | JSON file declaring projects, models, settings overrides |
 | **Work order** | A unit of work; one worker agent, one git worktree, full audit trail |
-| **Origin badge** | `jarvis`/`ui` = framework-created; `manual`/`adhoc` = flagged ⚠ in UI and status |
-| **Ad-hoc adoption** | A background session Jarvis didn't spawn is adopted so it shows up in status and the dashboard. It's a mirror, not a dispatch: it never got the worker contract, so it owes no `jarvis wo finish` and its session ending is not a failure |
+| **Origin badge** | `jarvis`/`ui`/`injected` = you or the framework put it there; `manual`/`adhoc` = flagged ⚠ in UI and status |
+| **Injection** | Your own Claude sessions are yours: Jarvis never adopts one it finds. Hand one over with `jarvis wo inject <session-id>` (or the button on the project page) and it gets a work order that shows up in status and on the dashboard. That's a mirror, not a dispatch: it never got the worker contract, so it owes no `jarvis wo finish` and its session ending is not a failure. Injecting writes nothing into the session — the first write is your own `jarvis wo send` |
 | **OPERATION.md** | Per-project contract every worker follows (assumptions, backlog, learnings, notify) |
 | **ASSUMPTIONS.md** | Per-project log of decisions workers made autonomously, pending your review |
 | **Neo** | OS-level answerer agent: workers ask (`jarvis wo ask`), Neo answers as you; you review its answers (UI neo tab) and corrections become its learnings |
