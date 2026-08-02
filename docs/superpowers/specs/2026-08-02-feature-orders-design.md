@@ -72,6 +72,25 @@ transport, no new supervision and no change to `worker_session.py`** — agent d
 ride in beside the skills on the `--add-dir` that every turn already carries. The team is
 a content change, not an architecture change.
 
+**The experiment, recorded because the claim rests on it.** A probe agent definition was
+written to a scratch directory outside any repository, at
+`<scratch>/.claude/agents/jarvis-architect.md`, whose entire system prompt instructed it
+to reply with a unique sentinel string. A headless turn was then run from an *empty*
+working directory — so nothing local could supply the definition — asking the lead to
+invoke that subagent type with the Task tool and report either its exact reply or the word
+`UNAVAILABLE`.
+
+- **With `--add-dir <scratch>`**: the lead returned the sentinel, `subtype: success`. The
+  Task tool worked under `-p`, and the definition was found.
+- **Without the flag, same prompt, same empty cwd**: `UNAVAILABLE`.
+
+The negative control is the load-bearing half. It is what rules out the definition having
+been picked up from the ambient environment, and therefore what establishes that
+`--add-dir` — the flag Jarvis *already* passes on every turn — is the delivery mechanism.
+Everything in section 4, and the "no new framework" position taken in the reconciliation
+section below, depends on that control holding. Anyone who doubts it should re-run it
+before building on it rather than trusting this table.
+
 ## Recommended design
 
 ### 1. Where planning runs: the planner is a work order
@@ -230,14 +249,33 @@ into `.jarvis/agent-skills/.claude/agents/`, reaching the worker on the `--add-d
 owning and rebuilding its whole generated tree, so adding a sibling directory is a small,
 well-precedented change — likely a rename to something like `install_agent_assets()`.
 
+`src/jarvis/assets/agents/` is one of the two surfaces shared with the Neo panel design;
+see the reconciliation section below. The authoring format is common, the rosters are not.
+
 The three profiles:
 
 - **architect** — decomposition and sequencing. Which pieces are separable, what the
-  interface between them is, what must land first.
+  interface between them is, what must land first. **Sighted**: reads the codebase, and
+  sees the lead's framing.
 - **test lead** — what "done" means for each child. Every child needs acceptance criteria
-  in its own description, because the child worker will never see the plan.
+  in its own description, because the child worker will never see the plan. **Sighted**:
+  acceptance criteria have to be written against the architect's actual decomposition.
 - **scope** — what the user actually asked for and what is explicitly out. The
-  counterweight to a planner that keeps finding adjacent work.
+  counterweight to a planner that keeps finding adjacent work. **Blind** — see below.
+
+**The scope seat runs blind, against the original feature description only.** This is a
+correction adopted from the Neo panel design (PR 64), whose case for blind seats is that
+independence is what turns agreement into evidence rather than an echo. It does not apply
+to all three seats here — an architect that cannot see the codebase cannot decompose
+anything, and a test lead that cannot see the decomposition cannot write criteria against
+it — but it applies exactly to scope. A scope check that has already read the
+decomposition will rationalise it: every child will look necessary, because it is being
+judged against a plan rather than against the ask. Run blind, it answers the only question
+worth asking — *is this what was requested?* — and a disagreement between a blind scope
+seat and a sighted architect is real signal about scope creep.
+
+So the general rule for this roster: a seat is sighted when its job needs the artefact,
+and blind when its job is to check the artefact against something outside it.
 
 "Product manager" and "project manager" from the original sketch are deliberately absent.
 The planner *is* the project manager — sequencing and slot budgeting are its own job, and
@@ -333,10 +371,67 @@ feature order needs.
 like `neo.drain_queue()`. Rejected: it is a second execution model to supervise, and it
 gives up the worktree, the gate, `jarvis wo ask`, the timeline and cancellation — all of
 which the work-order path provides for free. Neo's pipeline is the right shape for
-answering a question from stored context; planning needs to read a codebase.
+answering a question from stored context; planning needs to read a codebase. This is the
+rejection the reconciliation below turns on, and it was reached before the Neo panel
+design was known — two designs arriving at it independently is part of why it stands.
 
 **A generic "order type" plugin abstraction now.** Rejected as premature. Two concrete
 types, one of which decomposes into the other, is enough to learn what actually varies.
+
+## Reconciliation with the Neo panel design (PR 64)
+
+`docs/superpowers/specs/2026-08-02-neo-team-design.md`, from work order `wo-18c2e7e4`,
+replaces Neo the single decider with a panel of profiled agents. It carries a section
+proposing a shared `panel.py` primitive, with this design named as its intended second
+caller, and leaves ownership to be settled between the two. This section is the answer,
+and it is symmetric: neither document proceeds on an assumption about the other.
+
+**Both designs deliberate with a roster of profiled agents. They should not share a
+mechanism, because they are opposite on every axis that decides one.**
+
+| | Neo panel | Feature-order planner |
+|---|---|---|
+| Orchestrated by | Python, in the daemon | the lead model, via the Task tool |
+| Runs in | the daemon process, fanning out `run_headless()` | a work order — a real session, in a worktree |
+| Seats see | a question plus stored context | the codebase |
+| Blindness | mandatory: agreement is only evidence if independent | mixed — sighted architect and test lead, blind scope |
+| Seats are | review lenses | domain roles, which the panel design explicitly declines |
+| Rounds | one blind round, then a chair | iterative; the lead consults, reads the answer, consults again |
+| Output | one strict-JSON verdict | a validated dependency graph |
+
+The load-bearing row is the third. An architect seat that cannot open a file cannot
+decompose a feature, and the panel's seats have no worktree by construction. Adopting
+`panel.decide()` would mean moving planning into the daemon — the alternative rejected
+immediately above, on grounds that have nothing to do with this reconciliation.
+
+**Ownership: `panel.py` belongs to `wo-18c2e7e4`, outright.** This design does not claim
+it, does not call it, and does not want a share of it. Neo is the only consumer that needs
+blind Python fan-out; planning stays session-side. The concern the shared-primitive
+proposal was guarding against — the OS acquiring two bodies of multi-agent orchestration
+code that drift apart — turns out not to arise here, because *this design contributes no
+orchestration code at all*. Its team is markdown under `assets/`, delivered by the
+`--add-dir` path that `bootstrap.install_agent_skills()` and `worker_session.briefing_for()`
+already maintain, as the negative-control experiment above establishes. There is no second
+framework to diverge from the first.
+
+**What is shared is exactly two surfaces:**
+
+1. **One seat-definition authoring format and directory**, `src/jarvis/assets/agents/`, in
+   the Claude Code agent-definition markdown format. The panel reads those files to build
+   its per-seat system prompts; this design's planner receives them for free over
+   `--add-dir`. **Two loaders, one authoring format, different rosters** — a seat's mandate
+   is written and edited in one place regardless of which caller runs it.
+2. **One strict-structured-output validate-and-retry helper**, generalised out of
+   `neo.parse_verdict`. The panel needs it for the chair's verdict; this design needs it
+   for plan submission, which is a graph that must be validated for cycles, unknown ids and
+   child count before anything is created.
+
+**Whichever work order lands first extracts the shared helper and the
+`src/jarvis/assets/agents/` layout; the second adopts it rather than forking it.** The same
+sentence appears in PR 64.
+
+Neither work order has implemented anything at the time of writing, which is why this was
+settled between two documents rather than between two merged modules.
 
 ## Risks and failure modes
 
@@ -385,7 +480,10 @@ plan work order, `jarvis fo plan --from-file`, plan validation, user approval,
 
 **Phase 3 — the team and the rollup.** The three agent profiles shipped through
 `install_agent_skills()`, Neo reviewing plans with escalation, feature-level attention
-rollup, `max_parallel`.
+rollup, `max_parallel`. This is the phase that touches the two surfaces shared with PR 64:
+if the Neo panel has landed first, adopt its `src/jarvis/assets/agents/` layout and its
+structured-output helper rather than forking them; if it has not, extract both here in a
+shape the panel can adopt.
 
 **Phase 4 — deferred.** Branch stacking (after the base-branch CLI behaviour is verified
 live), cross-project programs, and the polymorphic order table if a third session-running
