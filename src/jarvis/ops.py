@@ -320,9 +320,13 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     "description": p["description"],
                     "summary": summary,
                     "open_work_orders": [
-                        {k: wo[k] for k in ("id", "title", "status", "origin",
-                                            "needs_attention", "attention_reason",
-                                            "pr_url")}
+                        {**{k: wo[k] for k in ("id", "title", "status", "origin",
+                                               "needs_attention", "attention_reason",
+                                               "pr_url")},
+                         # Why a pending work order is not starting. Derived here, with
+                         # the store open, so every surface reading os_status gets the
+                         # same answer as `jarvis wo list` instead of deriving its own.
+                         "blocked_by": blocked_by(store, wo)}
                         for wo in open_wos
                     ],
                     "settings_drift": drift,
@@ -429,7 +433,8 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       origin: str = "jarvis", model: str | None = None,
                       effort: str | None = None, permission_mode: str | None = None,
                       append_system_prompt: str | None = None,
-                      backlog_id: str | None = None) -> dict[str, Any]:
+                      backlog_id: str | None = None,
+                      depends_on: list[str] | None = None) -> dict[str, Any]:
     paths = registered_project_paths()
     if project_name not in paths:
         raise OpsError(f"project {project_name!r} not registered "
@@ -440,9 +445,27 @@ def create_work_order(project_name: str, title: str, description: str = "",
             title=title, description=description, origin=origin, model=model,
             effort=effort, permission_mode=permission_mode,
             append_system_prompt=append_system_prompt, backlog_id=backlog_id,
+            depends_on=depends_on,
         )
+    except (KeyError, ValueError) as e:
+        # A dependency on a work order in another project cannot be honoured — the edge
+        # is resolved inside one project database — so say which project was searched
+        # rather than letting a bare KeyError reach the terminal as a traceback.
+        raise OpsError(f"cannot create the work order: {e} "
+                       f"(dependencies are resolved within {project_name!r})") from e
     finally:
         store.close()
+
+
+def blocked_by(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
+    """Unfinished dependencies, without a query for the overwhelming majority.
+
+    `depends_on` is already on the row, so a work order with no edges — nearly all of
+    them — is answered from memory rather than costing a lookup per listing entry.
+    """
+    if not store.dependencies(wo):
+        return []
+    return store.unfinished_dependencies(wo["id"])
 
 
 def find_work_order(wo_id: str, project_name: str | None = None
@@ -1020,6 +1043,42 @@ def hide_work_order(wo_id: str, hidden: bool = True,
         store.close()
     return {"project": name, "wo_id": wo_id, "title": wo["title"],
             "hidden": bool(hidden)}
+
+
+def unblock_work_order(wo_id: str, drop_all: bool = False,
+                       project_name: str | None = None) -> dict[str, Any]:
+    """Cut the dependency edges holding a pending work order back.
+
+    By default only the edges that can never clear — a dependency cancelled, failed or
+    deleted — because those are the ones that strand it; a dependency still working is
+    doing exactly what the edge was drawn for and releasing the dependent early would
+    hand it a worktree without the code it was told to build on. `drop_all` is the
+    override for a user who wants it to run anyway, and says so.
+    """
+    from . import invariants
+
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        blockers = store.unfinished_dependencies(wo_id)
+        if not blockers:
+            raise OpsError(f"{wo_id} is not blocked by anything")
+        cut = blockers if drop_all else invariants.dead_dependencies(store, wo)
+        if not cut:
+            raise OpsError(
+                f"{wo_id} is waiting on work that is still live "
+                f"({', '.join(d['id'] for d in blockers)}), not stranded. "
+                f"Pass --all to cut those edges anyway."
+            )
+        remaining = store.drop_dependencies(wo_id, [d["id"] for d in cut])
+        # The stranding was the blocker; with the edge gone the work order is ordinary
+        # pending again, and leaving the flag up would keep asking about a settled thing.
+        if not remaining:
+            store.clear_attention(wo_id)
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "title": wo["title"],
+            "dropped": [d["id"] for d in cut], "still_blocked_by": remaining}
 
 
 def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
