@@ -1,7 +1,7 @@
 # Jarvis OS codebase map
 
 `jarvis-os` Python package, stdlib-only core (argparse + sqlite3 + json). Source in
-`src/jarvis/`, 20 modules. Read this instead of re-exploring the tree.
+`src/jarvis/`, 21 modules. Read this instead of re-exploring the tree.
 
 ## Modules (responsibility — key symbols — intra-package imports)
 
@@ -44,6 +44,10 @@
   `SINKS`:98, `sink_telegram()`:57, `wo_url()`:37.
 - `neo.py` — Neo the answerer agent: persona, headless answering, verdict parsing.
   `drain_queue()`:118, `answer_question()`:102, `build_system_prompt()`:56, `parse_verdict()`:83.
+- `github.py` — the only place the OS reads GitHub, over `gh` (auth + `JARVIS_GH_BIN`
+  override shared with `bugreport`). `pr_view()`, `PullRequest`, `GitHubError`. Read-only
+  by design: merging is a gated action, never something the poll loop does. Consumed by
+  `Daemon.poll_pull_requests` — see `mem:work-order-lifecycle`.
 
 **Middle:**
 - `worker_session.py` — **the conversation layer**: the ONLY module that knows how a

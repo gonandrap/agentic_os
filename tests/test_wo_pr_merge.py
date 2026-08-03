@@ -11,12 +11,15 @@ read the moment everything finished ends up in it.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from jarvis import cli, hooks, ops
+from jarvis import cli, github, hooks, ops
 from jarvis.catalog import load_catalog
-from jarvis.daemon import Daemon
-from jarvis.invariants import check_project, true_blockers
+from jarvis.central_store import CentralStore
+from jarvis.daemon import PR_POLL_EVERY_TICKS, Daemon
+from jarvis.invariants import PR_CLOSED_BLOCKER, check_project, true_blockers
 from jarvis.project_store import OPEN_STATUSES, ProjectStore
 
 PR = "https://github.com/acme/proj/pull/7"
@@ -132,6 +135,213 @@ def test_cli_list_puts_running_then_pr_merges_first(started, project, capsys):
              for ln in lines]
     assert order[:2] == [running["id"], merging["id"]]
     assert pending["id"] in order
+
+
+# -- the merge poll -----------------------------------------------------------------
+#
+# The other half of `waiting_pr_merge`: the OS finding out on its own that the pull
+# request was dealt with, so a merge the user already performed does not also cost them
+# a `jarvis wo done`. Everything here goes through the fake `gh` — the real one is
+# unreachable under the test-isolation gate, which is the point.
+
+
+@pytest.fixture()
+def parked(started, project, fake_gh):
+    """A work order finished behind PR, with `gh` ready to be told what happened."""
+    wo = ops.create_work_order("proj_a", "add feature X")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR)
+    return wo
+
+
+def poll(daemon, store):
+    """Run the poll step alone, without the rest of the tick around it."""
+    daemon.poll_pull_requests(daemon.catalog.project("proj_a"), store)
+
+
+def test_a_merged_pr_completes_the_work_order(started, project, fake_gh, parked):
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-08-02T10:00:00Z")
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    row = store.get_work_order(parked["id"])
+    assert row["status"] == "completed"
+    assert row["pr_state"] == "MERGED"
+    assert not row["needs_attention"]
+    # the timeline has to say GitHub ended this, not the user
+    events = [e for e in store.list_events(parked["id"]) if e["kind"] == "pr_merged"]
+    assert len(events) == 1
+    assert json.loads(events[0]["payload"])["merged_at"] == "2026-08-02T10:00:00Z"
+    assert not any(e["kind"] == "marked_done" for e in store.list_events(parked["id"]))
+
+
+def test_an_open_pr_is_left_exactly_where_it_was(started, project, fake_gh, parked):
+    """The common case: one `gh` call, no write, no attention."""
+    fake_gh.set_pr(PR, "OPEN")
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    row = store.get_work_order(parked["id"])
+    assert row["status"] == "waiting_pr_merge"
+    assert not row["needs_attention"]
+    assert true_blockers(store, row) == []
+
+
+def test_a_closed_pr_asks_for_the_user(started, project, fake_gh, parked):
+    """Closed without merging means the delivered work was refused — that needs them."""
+    fake_gh.set_pr(PR, "CLOSED")
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    row = store.get_work_order(parked["id"])
+    assert row["status"] == "needs_review"
+    assert row["pr_state"] == "CLOSED"
+    assert row["needs_attention"]
+    assert row["attention_reason"] == PR_CLOSED_BLOCKER
+    assert true_blockers(store, row) == [PR_CLOSED_BLOCKER]
+    assert any(e["kind"] == "pr_closed" for e in store.list_events(parked["id"]))
+
+
+def test_the_closed_pr_reason_survives_the_reconciler(started, project, fake_gh,
+                                                      parked):
+    """INV-ATTENTION-REASON rewrites any reason `true_blockers` cannot derive.
+
+    Without the PR_CLOSED_BLOCKER branch this work order would keep its status but be
+    relabelled "finished without a completion signal — review the session", sending the
+    user to read a worker session that did nothing wrong.
+    """
+    fake_gh.set_pr(PR, "CLOSED")
+    store = ProjectStore(project)
+    poll(started, store)
+
+    violations = list(check_project(store))
+
+    assert [v.invariant for v in violations] == []
+    assert store.get_work_order(parked["id"])["attention_reason"] == PR_CLOSED_BLOCKER
+
+
+def test_a_closed_pr_is_still_the_users_to_close(started, project, fake_gh, parked):
+    """Refused work is not failed work: the ordinary exits still apply."""
+    fake_gh.set_pr(PR, "CLOSED")
+    store = ProjectStore(project)
+    poll(started, store)
+
+    out = ops.mark_done(parked["id"])
+
+    assert out["status"] == "completed"
+    assert not ProjectStore(project).get_work_order(parked["id"])["needs_attention"]
+
+
+def test_nothing_parked_means_no_subprocess(started, project, fake_gh):
+    """A fleet with no open pull requests must not pay for this step at all."""
+    ops.create_work_order("proj_a", "still going")
+    ops.finish(ops.create_work_order("proj_a", "no PR here")["id"], "done")
+
+    poll(started, ProjectStore(project))
+
+    assert fake_gh.calls == []
+
+
+def test_a_merged_pr_closes_the_backlog_item_behind_it(started, project, fake_gh):
+    """Promotion links the two; only the ending was missing."""
+    central = CentralStore()
+    item = central.add_backlog("proj_a", "add feature X")
+    wo = ops.promote_backlog(item["id"])
+    ops.finish(wo["wo_id"], "opened a PR", pr_url=PR)
+    fake_gh.set_pr(PR, "MERGED")
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    row = central.get_backlog(item["id"])
+    assert row is not None and row["status"] == "done"
+
+
+def test_an_unreadable_gh_warns_once_and_leaves_the_work_order_parked(
+        started, project, fake_gh, parked):
+    """Silence would leave a dead feature the user never learns about; every poll would
+    make the inbox unreadable. Once per daemon run is the whole of it."""
+    fake_gh.fail("gh: not authenticated")
+    store = ProjectStore(project)
+
+    poll(started, store)
+    poll(started, store)
+
+    warnings = [n for n in store.unrouted_notifications() if n["source"] == "pr-poll"]
+    assert len(warnings) == 1
+    assert "auto-complete on merge is off" in warnings[0]["title"]
+    assert "GH_TOKEN" in warnings[0]["body"]
+    assert store.get_work_order(parked["id"])["status"] == "waiting_pr_merge"
+
+
+def test_one_unreadable_pr_does_not_hide_the_others(started, project, fake_gh, parked):
+    """A deleted repo or a typo'd URL is one work order's problem, not the project's."""
+    other = ops.create_work_order("proj_a", "add feature Y")
+    ops.finish(other["id"], "opened a PR", pr_url="https://github.com/acme/proj/pull/8")
+    fake_gh.set_pr("https://github.com/acme/proj/pull/8", "MERGED")  # PR itself unknown
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    assert store.get_work_order(other["id"])["status"] == "completed"
+    assert store.get_work_order(parked["id"])["status"] == "waiting_pr_merge"
+
+
+def test_the_poll_runs_on_its_own_cadence(started, project, fake_gh, parked):
+    """Every tick would be four times the API calls for no perceptible gain."""
+    fake_gh.set_pr(PR, "OPEN")
+
+    started.tick_count = 0
+    started.tick()                       # tick 1: polls
+    assert len(fake_gh.calls) == 1
+    for _ in range(PR_POLL_EVERY_TICKS - 1):
+        started.tick()
+    assert len(fake_gh.calls) == 1       # ... and not again until the cadence comes up
+    started.tick()
+    assert len(fake_gh.calls) == 2
+
+
+def test_a_merge_notifies_nobody(started, project, fake_gh, parked):
+    """`route_new_inbox` has no level filter, so any row here Telegrams the user — about
+    a merge they just performed. `jarvis wo done` is silent; so is this."""
+    fake_gh.set_pr(PR, "MERGED")
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    assert [n for n in store.unrouted_notifications() if n["source"] == "pr-poll"] == []
+    assert store.get_work_order(parked["id"])["status"] == "completed"
+
+
+# -- reading GitHub -----------------------------------------------------------------
+
+
+def test_pr_view_parses_the_state(fake_gh):
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-08-02T10:00:00Z")
+
+    pr = github.pr_view(PR)
+
+    assert pr.merged and not pr.closed_unmerged
+    assert pr.merged_at == "2026-08-02T10:00:00Z"
+    assert github.pr_view(PR).state == "MERGED"
+
+
+def test_pr_view_raises_rather_than_guessing(fake_gh):
+    """An unreadable pull request must never look like an unmerged one: guessing OPEN
+    parks a merged work order forever, guessing CLOSED demands the user for nothing."""
+    fake_gh.fail("HTTP 401: Bad credentials")
+
+    with pytest.raises(github.GitHubError) as e:
+        github.pr_view(PR)
+    assert "Bad credentials" in str(e.value)
+
+
+def test_the_isolation_gate_stops_a_test_reaching_real_github():
+    """No `fake_gh` fixture: the blocked stub must answer, not the real `gh`."""
+    with pytest.raises(github.GitHubError):
+        github.pr_view(PR)
 
 
 # -- the PR title prefix ------------------------------------------------------------
