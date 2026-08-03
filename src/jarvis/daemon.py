@@ -34,7 +34,7 @@ from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
 from .paths import daemon_pidfile, ensure_home, logs_dir
-from .project_store import UNGOVERNED_ORIGINS, ProjectStore
+from .project_store import PRE_APPROVED_KEY, UNGOVERNED_ORIGINS, ProjectStore
 
 log = logging.getLogger("jarvisd")
 
@@ -280,6 +280,8 @@ class Daemon:
                     )
                     pstore.add_event(q["wo_id"], "neo_answered",
                                      {"neo_question_id": q["id"]})
+                if pstore and q.get("kind") != "approval":
+                    self._dispatch_neo_cleanup(pstore, q, verdict)
             finally:
                 if pstore:
                     pstore.close()
@@ -296,6 +298,55 @@ class Daemon:
         finally:
             store.close()
             central.close()
+
+    def _dispatch_neo_cleanup(self, pstore: ProjectStore, q: dict, verdict: dict) -> None:
+        """File the pre-approved ledger cleanup Neo asked for, if it asked for one.
+
+        The learnings and the knowledge base are append-only, so a superseded ruling sits
+        next to the one that replaced it until somebody writes the correction — and the
+        only reader positioned to notice is Neo, mid-answer, staring at both. This is the
+        hand it gets to fix that: a work order carrying its own authorisation, so the
+        worker corrects the record instead of asking permission to.
+
+        Two guards, both load-bearing:
+          * The cleanup is pre-approved to CORRECT THE RECORD, not to ship. Privileged
+            actions still gate — that is why the marker names its scope in words rather
+            than being a bare flag.
+          * A cleanup never dispatches a cleanup. Neo answers the cleanup worker's
+            questions too, and without this a contradiction it cannot resolve would file
+            a fresh work order on every round trip.
+        """
+        dispatch = verdict.get("dispatch")
+        if not dispatch:
+            return
+        try:
+            origin_wo = pstore.get_work_order(q["wo_id"])
+        except KeyError:
+            origin_wo = {}
+        if origin_wo.get("origin") == "neo":
+            log.info("neo cleanup dispatch from %s ignored: already a cleanup work order",
+                     q["wo_id"])
+            return
+        description = "\n\n".join(filter(None, [
+            dispatch["description"],
+            f"Neo filed this while answering question {q['id']} on {q['wo_id']}. "
+            f"The correction is ALREADY APPROVED — make it. The stores are append-only, "
+            f"so the remedy is to APPEND an entry that supersedes the wrong one "
+            f"(`jarvis learn add` for the knowledge base, `jarvis neo learn` for Neo's "
+            f"own learnings), naming what it replaces and why.",
+        ]))
+        wo = pstore.create_work_order(
+            title=dispatch["title"], description=description, origin="neo",
+            metadata={PRE_APPROVED_KEY: {
+                "by": "neo",
+                "scope": "correcting the recorded ledger entries this work order names",
+                "neo_question_id": q["id"],
+                "from_wo": q["wo_id"],
+            }},
+        )
+        pstore.add_event(q["wo_id"], "neo_dispatched",
+                         {"neo_question_id": q["id"], "cleanup_wo_id": wo["id"]})
+        log.info("neo dispatched pre-approved cleanup %s from %s", wo["id"], q["wo_id"])
 
     def _deliver_gate_verdict(self, central: CentralStore, pstore: ProjectStore | None,
                               q: dict, verdict: dict) -> None:

@@ -45,6 +45,9 @@ ORIGIN_META = {
     # is the legacy marker from when Jarvis adopted sessions on its own, and stays one.
     "injected": {"word": "injected", "framework": True},
     "adhoc":  {"word": "ad-hoc", "framework": False},
+    # Framework-spawned like `jarvis`, but nobody asked for it by hand: Neo filed it
+    # itself to correct a contradicting ledger entry.
+    "neo":    {"word": "neo",    "framework": True},
 }
 LEVEL_TONE = {"info": "muted", "warning": "warn", "critical": "bad"}
 # Privileged-action gates. `pending` splits in two on the page — with Neo (costs the
