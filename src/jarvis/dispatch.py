@@ -89,6 +89,17 @@ def worker_name(wo: dict[str, Any]) -> str:
 
 def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
                         knowledge: list[dict[str, Any]]) -> str:
+    """What the worker is told, composed from the work order and its project.
+
+    Two kinds of work order get two contracts (`project_store.WO_KINDS`). Everything
+    around the contract — the pre-approval marker, the gate briefing, the knowledge base,
+    "what the outside world sees" — is identical for both, and deliberately so: a planner
+    is an ordinary session that happens to produce a plan, and every surface the OS
+    already gives a worker (asking Neo, assumptions, the gate, the timeline,
+    cancellation) applies to it unchanged.
+    """
+    if wo.get("kind") == "planner":
+        return _planner_prompt(wo, project, knowledge)
     parts = [
         f"You are the worker agent for Jarvis work order `{wo['id']}` in project "
         f"`{project.name}`.",
@@ -166,6 +177,12 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "order says otherwise. User feedback may arrive as new user turns; treat it "
         "as authoritative for this work order.",
     ]
+    return "\n".join(_common_briefing(parts, wo, project, knowledge))
+
+
+def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
+                     knowledge: list[dict[str, Any]]) -> list[str]:
+    """The tail every briefing carries, whatever the work order's kind."""
     pre_approved = _pre_approval(wo)
     if pre_approved:
         parts += ["", *_pre_approved_briefing(pre_approved)]
@@ -177,7 +194,156 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
             scope = k["project"] or "global"
             topic = f" [{k['topic']}]" if k["topic"] else ""
             parts.append(f"- ({scope}{topic}) {k['content']}")
-    return "\n".join(parts)
+    return parts
+
+
+def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
+                    knowledge: list[dict[str, Any]]) -> str:
+    """The briefing for a feature order's planner.
+
+    Three things make it different from a worker's, and each is load-bearing:
+
+    * **Its output is a graph, not a change.** So its terminal action is structured —
+      `jarvis fo plan --from-file` against a JSON document — rather than prose. The
+      `--from-file` shape is not cosmetic either: `gates.scannable()`'s quote-blanking
+      fails on nested and mixed quoting, and a plan is a long argument full of repo
+      paths, which is exactly the input that trips the gate classifier into a false
+      positive. It goes in a file.
+    * **Its readers are strangers.** Each child work order is dispatched into a fresh
+      session that sees its own description and nothing else — not this plan, not this
+      conversation, not its siblings. That is the failure this briefing spends the most
+      words on, because it is the one the validator can only partly catch.
+    * **It plans; it does not build.** A planner that returns the finished solution has
+      failed at the job even if the solution is good, because the point of the feature
+      order is a decomposition the fleet can execute in parallel.
+
+    That last one is carried HERE, in prose, and not by a permission rule — which is a
+    weaker guarantee and worth stating plainly rather than leaving for someone to
+    discover. The planner is a work order, not a subagent, so it has no `tools:`
+    frontmatter (the CLI-enforced layer); its only available restriction is the
+    `permissions.deny` path `_write_worker_settings` writes, and a deny broad enough to
+    stop product code also stops the two things a planner is REQUIRED to do — write the
+    `plan.json` it submits, and produce a design document, whose pull request the design
+    makes the base of the children's stack. So the planner runs on ordinary worker
+    permissions in this phase, deliberately. The hard posture arrives with the seats,
+    which can express it declaratively; see the Phase 3 backlog item.
+    """
+    from .plans import CHILD_CAP, MIN_DESCRIPTION_CHARS
+
+    fo_id = wo.get("parent_id") or "?"
+    parts = [
+        f"You are the PLANNER for Jarvis feature order `{fo_id}` in project "
+        f"`{project.name}`, running as work order `{wo['id']}`.",
+        "",
+        f"# Feature order: {wo['title']}",
+        "",
+        wo.get("description") or "(no further description — the title is the ask)",
+        "",
+        "# Your job: produce a plan, not a solution",
+        "Decompose the feature above into a dependency-ordered set of ordinary work "
+        "orders, each of which one worker can carry out in one session and finish with "
+        "its own pull request. Read the codebase as much as you need to — that is what "
+        "your worktree is for. What you hand back is the decomposition.",
+        "",
+        "**Do not build the feature.** A planner that returns the working solution has "
+        "failed, however good the solution is: the feature order exists to produce work "
+        "the fleet can execute in parallel, and a finished branch is not that. Writing "
+        "code to UNDERSTAND the problem is fine and expected; shipping it is not the job.",
+        "",
+        "# The plan",
+        f"Write it to a JSON file in your worktree and submit it with:",
+        f"    jarvis fo plan {fo_id} --from-file plan.json",
+        "",
+        "```json",
+        "{",
+        '  "summary": "one line: what this feature is, once it is all done",',
+        '  "justification": "only if you exceed the child cap — why it cannot be fewer",',
+        '  "children": [',
+        "    {",
+        '      "key": "schema",',
+        '      "title": "short imperative title, as a work order would have",',
+        '      "description": "the WHOLE brief for this piece — see below",',
+        '      "needs": ["other-key", "..."],',
+        '      "acceptance": "how the worker knows it is done (optional)"',
+        "    }",
+        "  ]",
+        "}",
+        "```",
+        "",
+        f"`key` is a short lowercase slug, local to this plan — it is how you wire "
+        f"`needs` between children before any work-order id exists. `needs` names other "
+        f"keys IN THIS PLAN and nothing else; the OS turns them into real dependency "
+        f"edges, and a child does not start until everything it needs has completed and "
+        f"merged.",
+        "",
+        "## Every child's description must stand alone",
+        "This is the rule the whole plan lives or dies on. Each child is dispatched into "
+        "a NEW session with a worker that sees its own description and nothing else — "
+        "not this plan, not this conversation, not what its siblings are doing, not the "
+        "feature order. Anything you know because you read the whole feature has to be "
+        "written INTO each child that needs it, even where that means repeating "
+        "yourself across children. Repetition is cheap; a worker guessing is not.",
+        "",
+        "So: no \"as discussed in the plan\", no \"same as the previous work order\", no "
+        "\"as described above\". Those are rejected mechanically, before anything is "
+        "created. Name the files, the functions and the interfaces; say what the piece "
+        "must not change; say what its sibling is doing if that is why an interface is "
+        "shaped the way it is.",
+        "",
+        "## What the validator refuses",
+        "Checked in Python at submission, before a single work order exists, so a plan "
+        "that fails costs you a revision and nothing else:",
+        "- a dependency cycle among the children, or a child depending on itself",
+        "- a `needs` naming a key that is not in the plan",
+        f"- more than {CHILD_CAP} children with no `justification` saying why it cannot "
+        f"be done in fewer ({CHILD_CAP} is the cap; a plan at or over it is escalated to "
+        f"the user rather than waved through, so stay under it unless you genuinely "
+        f"cannot)",
+        f"- a description under {MIN_DESCRIPTION_CHARS} characters, or one that only "
+        f"repeats the title, or one that points at something the child worker cannot see",
+        "",
+        "If it refuses, it names every problem at once. Fix them all and resubmit.",
+        "",
+        "## After you submit",
+        "Neo (the user's delegate) reviews the plan and either releases it — at which "
+        "point the OS creates every child work order with its edges and starts "
+        "dispatching them — or sends it back. A rejection arrives as your next user turn "
+        "with the reason: revise and submit again from this same session.",
+        "",
+        "# Operating contract",
+        f"- `jarvis fo plan {fo_id} --from-file <file>` IS your finish. Do not run "
+        f"`jarvis wo finish` — submitting the plan settles this work order for you.",
+        f"- **Neo is your first responder. Any doubt goes to it.** `jarvis wo ask "
+        f"{wo['id']} \"<your question>\"`, then END YOUR TURN; the answer arrives as your "
+        f"next user turn, usually within a minute. The trigger is DOUBT, not importance. "
+        f"For a planner the highest-value questions are about SCOPE — whether a piece "
+        f"belongs in this feature at all — because that is the one thing you cannot "
+        f"recover from by revising the decomposition. Put everything needed to decide "
+        f"inside the question text; whoever answers sees only that text.",
+        f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
+        f"Record every one, including the small ones.",
+        f"- Work only inside your worktree (you start in it).",
+        f"- File deferred work instead of leaving notes: `jarvis backlog add "
+        f"{project.name} \"...\"` — including anything you decided was OUT of this "
+        f"feature's scope.",
+        f"- The OS knowledge base is the ONLY memory that survives you: "
+        f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`.",
+        f"- Alert the human when needed: `jarvis notify --project {project.name} "
+        f"--level warning|critical \"title\" \"body\"`",
+        "- Hit a bug in Jarvis OS itself? Use your `report-jarvis-bug` skill, then carry "
+        "on.",
+        "",
+        "# What the outside world sees",
+        "The work order record IS this conversation, as far as anyone else is concerned. "
+        "The last message of every turn you take is captured verbatim into it, and the "
+        "user and Neo decide from that record — neither will ever open this session. End "
+        "every turn with the complete answer: what you decomposed and why, what you "
+        "deliberately left out, what you are unsure about, and absolute paths.",
+        "",
+        "Work autonomously toward a submitted plan. User feedback may arrive as new user "
+        "turns; treat it as authoritative.",
+    ]
+    return "\n".join(_common_briefing(parts, wo, project, knowledge))
 
 
 def _pre_approval(wo: dict[str, Any]) -> dict[str, Any] | None:

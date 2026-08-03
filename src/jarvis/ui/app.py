@@ -17,6 +17,7 @@ from ..central_store import CentralStore
 from ..daemon import daemon_running
 from ..paths import logs_dir
 from ..project_store import (
+    FO_OPEN_STATUSES,
     OPEN_STATUSES,
     TERMINAL_STATUSES,
     WO_STATUSES,
@@ -36,6 +37,19 @@ STATUS_META = {
     "completed":     {"word": "completed",   "icon": "✓", "tone": "ok"},
     "failed":        {"word": "failed",      "icon": "✗", "tone": "bad"},
     "cancelled":     {"word": "cancelled",   "icon": "–", "tone": "muted"},
+}
+# A feature order's own lifecycle. Separate from STATUS_META rather than merged into it:
+# the words overlap ("pending", "completed") but they mean different things — a pending
+# work order is queued for a worker, a pending feature order has not been decomposed yet
+# — and one table serving both would have to pick one meaning for the shared keys.
+FO_STATUS_META = {
+    "pending":     {"word": "not planned yet", "icon": "◌", "tone": "muted"},
+    "planning":    {"word": "planning",     "icon": "◍", "tone": "active"},
+    "plan_review": {"word": "plan in review", "icon": "◭", "tone": "warn"},
+    "executing":   {"word": "executing",    "icon": "●", "tone": "active"},
+    "completed":   {"word": "completed",    "icon": "✓", "tone": "ok"},
+    "failed":      {"word": "failed",       "icon": "✗", "tone": "bad"},
+    "cancelled":   {"word": "cancelled",    "icon": "–", "tone": "muted"},
 }
 ORIGIN_META = {
     "jarvis": {"word": "jarvis", "framework": True},
@@ -177,7 +191,7 @@ def create_app() -> FastAPI:
     templates = Jinja2Templates(directory=str(TEMPLATES))
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
-        level_tone=LEVEL_TONE, fmt_age=fmt_age,
+        fo_status_meta=FO_STATUS_META, level_tone=LEVEL_TONE, fmt_age=fmt_age,
     )
 
     def render(request: Request, template: str, active: str = "dashboard",
@@ -252,6 +266,13 @@ def create_app() -> FastAPI:
             statuses = OPEN_STATUSES + ((revealed,) if revealed else ())
         store = ProjectStore(paths[name])
         try:
+            # Open feature orders get their own short list above the work orders, and
+            # deliberately do NOT expand into their children here: the children are
+            # already in the listing below as ordinary work orders, and printing the
+            # tree twice on one page is how a page stops being read. The tree lives on
+            # the feature's own page.
+            features = [{**fo, "progress": ops.feature_progress(store, fo)}
+                        for fo in store.list_feature_orders(statuses=FO_OPEN_STATUSES)]
             wos = store.list_work_orders(statuses=statuses, include_hidden=show_hidden)
             # Inside the store's lifetime: the label reads the dependencies' own rows.
             blocked = {wo["id"]: ops.blocked_by(store, wo) for wo in wos}
@@ -276,7 +297,24 @@ def create_app() -> FastAPI:
         return render(request, "project.html", project_name=name, path=paths[name],
                       featured=featured, rest=rest, open_counts=open_counts,
                       backlog=backlog, show_hidden=show_hidden, blocked=blocked,
-                      hidden_count=hidden_count, settled=settled, revealed=revealed)
+                      hidden_count=hidden_count, settled=settled, revealed=revealed,
+                      features=features)
+
+    @app.get("/fo/{name}/{fo_id}", response_class=HTMLResponse)
+    def feature_order(request: Request, name: str, fo_id: str, error: str = ""):
+        """A feature order's page. Its main content is the dependency tree.
+
+        The one view where the whole plan is visible at once — the ask, the
+        decomposition as it was submitted, and each child's live status against it. It
+        is also where an escalated plan is decided, because deciding needs all three of
+        those on one screen and no other page has them.
+        """
+        try:
+            detail = ops.show_feature_order(fo_id, name)
+        except ops.OpsError as e:
+            return render(request, "error.html", message=str(e))
+        return render(request, "feature_order.html", fo=detail, project=detail["project"],
+                      error=error)
 
     @app.get("/project/{name}/sessions", response_class=HTMLResponse)
     def project_sessions(request: Request, name: str):
@@ -481,6 +519,36 @@ def create_app() -> FastAPI:
     def resume_auto(name: str, wo_id: str):
         ops.resume_in_auto(wo_id, project_name=name)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
+
+    @app.post("/fo/create")
+    def create_fo(project: str = Form(...), title: str = Form(...),
+                  description: str = Form("")):
+        try:
+            fo = ops.create_feature_order(project, title, description=description,
+                                          origin="ui")
+        except ops.OpsError as e:
+            return RedirectResponse(f"/project/{project}?error={e}", status_code=303)
+        return RedirectResponse(f"/fo/{project}/{fo['id']}", status_code=303)
+
+    @app.post("/fo/{name}/{fo_id}/review")
+    def review_plan(name: str, fo_id: str, decision: str = Form(...),
+                    feedback: str = Form("")):
+        try:
+            ops.review_plan(fo_id, accept=(decision == "accept"), feedback=feedback,
+                            decided_by="user", project_name=name)
+        except ops.OpsError as e:
+            # A rejection with no reason is the refusal that actually happens here: the
+            # planner sees only the reason, so without it the revision is a guess.
+            return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
+        return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
+
+    @app.post("/fo/{name}/{fo_id}/cancel")
+    def cancel_fo(name: str, fo_id: str):
+        try:
+            ops.cancel_feature_order(fo_id, project_name=name)
+        except ops.OpsError as e:
+            return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
+        return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
 
     @app.post("/neo/{question_id}/review")
     def neo_review(question_id: int, decision: str = Form(...),

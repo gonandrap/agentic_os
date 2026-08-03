@@ -154,9 +154,18 @@ class Daemon:
                 # longer has to wait for a roster refresh either.
                 self.settle_turns(project, store)
                 self.deliver_messages(project, store)
+                # Before dispatch, not after: a planner filed this tick is an ordinary
+                # pending work order, so it is claimed by the same pass rather than
+                # waiting a whole poll interval to start.
+                self.plan_features(project, store)
                 self.dispatch_pending(project, store)
                 if poll_prs:
                     self.poll_pull_requests(project, store)
+                # After the pull-request poll, so the merge that completes a feature's
+                # last child settles the feature in the same tick rather than the next
+                # one — but outside the `if`, because a child can also finish without
+                # ever opening a pull request.
+                self.settle_features(project, store)
                 if reconcile:
                     # The agents roster holds ONLY the user's own sessions: workers are
                     # headless and never enter it. Jarvis looks at the ones it was
@@ -189,6 +198,109 @@ class Daemon:
                 )
             except claude_cli.ClaudeCliError as e:
                 log.error("[%s] dispatch of %s failed: %s", project.name, wo["id"], e)
+
+    # -- 4a. feature orders: open a planner ------------------------------------------
+
+    def plan_features(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Give every unplanned feature order its planner.
+
+        The daemon does not fan out here and never will: it creates exactly ONE child
+        work order, briefed as the planning lead. Everything the OS already does for a
+        worker then applies to the planner for free — the headless transport, the
+        worktree, `jarvis wo ask`, assumptions, the gate, stall detection, the timeline,
+        cancellation — which is the whole reason planning is a work order rather than a
+        pipeline inside this process.
+
+        Idempotent by status, not by a flag: the feature order leaves `pending` in the
+        same call that files the planner, so a tick that crashes between the two leaves
+        the feature order `pending` and simply files it again next time. The opposite
+        ordering would strand a feature order in `planning` with no planner.
+        """
+        for fo in store.list_feature_orders(statuses=("pending",)):
+            try:
+                wo = store.create_work_order(
+                    title=f"Plan: {fo['title']}"[:200],
+                    # The ask verbatim. The planner CONTRACT is composed at dispatch
+                    # (dispatch._planner_prompt); what lives on the record is what the
+                    # user actually asked for, so the description reads the same in
+                    # `jarvis wo show` as it does in `jarvis fo show`.
+                    description=fo["description"],
+                    origin="jarvis", kind="planner", parent_id=fo["id"],
+                )
+            except Exception:  # noqa: BLE001 — one bad feature order must not stop the rest
+                log.exception("[%s] could not open a planner for %s", project.name,
+                              fo["id"])
+                continue
+            store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
+            store.set_feature_status(fo["id"], "planning")
+            log.info("[%s] planning %s: opened %s", project.name, fo["id"], wo["id"])
+
+    def settle_features(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Close out feature orders whose children have all landed, or one of which has
+        not.
+
+        Only `executing` feature orders are looked at, and that single fact is what makes
+        "flag once, at feature level" true by construction rather than by bookkeeping: a
+        feature that fails leaves `executing` in the same call that raises its flag, so
+        the next tick does not see it and cannot raise it again. No `already_reported`
+        set, no dedupe key.
+
+        The rules, decided 2026-08-03:
+
+        * **`completed` when every child is `completed`.** `waiting_pr_merge` does not
+          count — the same strict rule Phase 1 shipped for dependency edges, and for the
+          same reason: a feature is done when its code is on the default branch, not when
+          it is sitting on branches. The merge poller closes each child a couple of
+          minutes after the user merges, so this costs nobody a step.
+        * **`failed` when ANY child is `failed` or `cancelled`.** Deliberately without
+          the design's "and the remainder cannot proceed" qualifier: a feature with a
+          dead child needs a human whichever siblings could still run, so the
+          reachability check buys nothing and is easy to get subtly wrong. A cancelled
+          child counts too — it did not settle successfully, so `completed` would be a
+          lie — but the reason says cancellation rather than failure, because the two ask
+          the user for different things.
+
+        No notification is raised here, on purpose. A failed child has already pinged the
+        user through `settle_work_order`, and `notify.route_new_inbox` applies no level
+        filter — every inbox row reaches every sink — so a second row would be the same
+        event arriving on the phone twice. The feature-level flag is what the user finds
+        when they follow the first one.
+        """
+        from .invariants import FEATURE_CHILD_CANCELLED, FEATURE_CHILD_FAILED
+
+        for fo in store.list_feature_orders(statuses=("executing",)):
+            children = store.feature_children(fo["id"])
+            if not children:
+                continue  # released with nothing in it; nothing to settle against
+            dead = [c for c in children if c["status"] in ("failed", "cancelled")]
+            if dead:
+                first = dead[0]
+                template = (FEATURE_CHILD_FAILED if first["status"] == "failed"
+                            else FEATURE_CHILD_CANCELLED)
+                reason = template.format(id=first["id"])
+                store.set_feature_status(fo["id"], "failed")
+                store.flag_feature_attention(fo["id"], reason)
+                log.info("[%s] feature %s failed: %s", project.name, fo["id"], reason)
+            elif all(c["status"] == "completed" for c in children):
+                store.set_feature_status(fo["id"], "completed")
+                store.clear_feature_attention(fo["id"])
+                self._close_feature_backlog(fo)
+                log.info("[%s] feature %s completed (%d work orders)", project.name,
+                         fo["id"], len(children))
+
+    def _close_feature_backlog(self, fo: dict) -> None:
+        """A feature order promoted from the backlog closes its item when it lands.
+
+        The same courtesy `ops.mark_backlog_done` does for a work order, and it has to be
+        here rather than there because a feature order has no `finish` — nobody reports
+        its result; it is derived from its children.
+        """
+        if not fo.get("backlog_id"):
+            return
+        try:
+            self.central.mark_backlog(fo["backlog_id"], "done")
+        except Exception:  # noqa: BLE001 — a stale backlog id must not stop the settle
+            log.exception("could not close backlog item %s", fo["backlog_id"])
 
     # -- 1. notifications ----------------------------------------------------------
 
@@ -281,6 +393,8 @@ class Daemon:
             try:
                 if q.get("kind") == "approval":
                     self._deliver_gate_verdict(central, pstore, q, verdict)
+                elif q.get("kind") == "plan":
+                    self._deliver_plan_verdict(central, store, pstore, q, verdict)
                 elif verdict["escalate"]:
                     central.add_inbox(
                         project=q["project"], level="warning",
@@ -300,7 +414,7 @@ class Daemon:
                     )
                     pstore.add_event(q["wo_id"], "neo_answered",
                                      {"neo_question_id": q["id"]})
-                if pstore and q.get("kind") != "approval":
+                if pstore and q.get("kind") not in ("approval", "plan"):
                     self._dispatch_neo_cleanup(pstore, q, verdict)
             finally:
                 if pstore:
@@ -367,6 +481,77 @@ class Daemon:
         pstore.add_event(q["wo_id"], "neo_dispatched",
                          {"neo_question_id": q["id"], "cleanup_wo_id": wo["id"]})
         log.info("neo dispatched pre-approved cleanup %s from %s", wo["id"], q["wo_id"])
+
+    def _deliver_plan_verdict(self, central: CentralStore, neo_store: Any,
+                              pstore: ProjectStore | None, q: dict,
+                              verdict: dict) -> None:
+        """Apply Neo's verdict on a submitted plan.
+
+        Neo releases or sends back through the same `ops.review_plan` the user's
+        `jarvis fo approve` uses — the escalation exists because Neo declined to take a
+        decision, not because the decision changed shape.
+
+        THE CAP OVERRIDES NEO. A plan at or over the child cap goes to the user whatever
+        Neo said, because the cap is one of the two backstops the whole
+        Neo-reviews-plans default rests on, and a backstop a reviewer can wave through
+        is not one. Neo is still asked first, and its reading is attached to what the
+        user sees: the alternative — skipping the call for large plans — hands the user
+        a nine-node dependency graph with no read on it, which is the most expensive
+        thing to review unaided.
+        """
+        from . import db as db_mod
+        from . import plans
+
+        if pstore is None:
+            log.error("plan verdict for question %s has no project store", q["id"])
+            return
+        fo = pstore.feature_order_for_question(q["id"])
+        if fo is None:
+            log.warning("plan question %s reviews no feature order (deleted?)", q["id"])
+            return
+        if fo["status"] != "plan_review":
+            # The user got there first through `jarvis fo approve`, or the feature order
+            # was cancelled while Neo was thinking. Either way the decision is taken.
+            log.info("plan question %s: %s is already %s, dropping Neo's verdict",
+                     q["id"], fo["id"], fo["status"])
+            return
+
+        plan = db_mod.from_json(fo.get("plan"), {}) or {}
+        n_children = len(plan.get("children") or [])
+        over_cap = n_children >= plans.CHILD_CAP
+        if not verdict["escalate"] and not over_cap:
+            from . import ops
+            accepted = verdict.get("verdict") == "approved"
+            try:
+                ops.review_plan(fo["id"], accept=accepted,
+                                feedback=verdict["reason"] or "(no reason given)",
+                                decided_by="neo")
+            except ops.OpsError:
+                log.exception("neo's verdict on %s could not be applied", fo["id"])
+            else:
+                log.info("neo %s the plan for %s", "released" if accepted else
+                         "sent back", fo["id"])
+            return
+
+        reason = verdict["reason"] or "Neo declined to decide"
+        if over_cap and not verdict["escalate"]:
+            reason = (f"{n_children} children is at or over the cap of "
+                      f"{plans.CHILD_CAP}, so this plan needs you rather than Neo. "
+                      f"Neo's reading: {verdict.get('verdict', '?')} — {reason}")
+            # Neo answered, but the answer is not what happens. Re-marking the question
+            # keeps `jarvis neo list` and `jarvis status` telling the same story: this
+            # is now the user's to decide.
+            neo_store.mark(q["id"], "escalated", reason=reason)
+        pstore.flag_feature_attention(fo["id"], f"plan needs your review: {reason[:160]}")
+        central.add_inbox(
+            project=q["project"], level="warning",
+            title=f"A plan needs your review: {fo['id']}",
+            body=f"{fo['title']}\n{n_children} work orders proposed.\n{reason}\n\n"
+                 f"Read it with: jarvis fo show {fo['id']}\n"
+                 f"Then: jarvis fo approve {fo['id']} [--reject] --feedback \"...\"",
+            wo_id=fo.get("plan_wo_id"),
+        )
+        log.info("plan for %s escalated to the user: %s", fo["id"], reason)
 
     def _deliver_gate_verdict(self, central: CentralStore, pstore: ProjectStore | None,
                               q: dict, verdict: dict) -> None:

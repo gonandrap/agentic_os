@@ -141,6 +141,27 @@
   </form>
 </div>
 
+{# The coarse ask, for work that is bigger than one session. Deliberately a SECOND form
+   rather than a checkbox on the one above: the two produce different things, and the
+   description field is optional there and required here — a feature order's first
+   reader is a planner in a fresh session, and it will decompose four words. #}
+<h2>New feature order</h2>
+<div class="panel" style="padding: 14px 16px;">
+  <form method="post" action="/fo/create">
+    <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+      <select name="project" required style="max-width: 220px;">
+        {% for p in st.projects %}<option value="{{ p.name }}">{{ p.name }}</option>{% endfor %}
+      </select>
+      <input type="text" name="title" placeholder="the whole feature" required>
+    </div>
+    <div style="display: flex; gap: 10px; align-items: flex-start;">
+      <textarea name="description" required
+                placeholder="the whole ask — the planner sees only this text, and the plan is built from it"></textarea>
+      <button type="submit" class="primary">Plan it</button>
+    </div>
+  </form>
+</div>
+
 <div id="live-bottom">
 {% if st.backlog.open %}
 <h2>Backlog</h2>

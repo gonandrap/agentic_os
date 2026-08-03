@@ -1,7 +1,8 @@
 """Per-project store: <project>/.jarvis/jarvis.db
 
 Authoritative record of a project's work orders, their event timeline, the user⇄agent
-message queue, the notification outbox, and assumptions pending review.
+message queue, the notification outbox, assumptions pending review, and the feature
+orders that own work orders in sets.
 """
 
 from __future__ import annotations
@@ -50,6 +51,32 @@ WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected", "neo")
 # any other work order, briefing and all.
 UNGOVERNED_ORIGINS = ("adhoc", "injected")
 
+# What a work order IS to the OS, which is not the same question as what it is about.
+# `worker` is every work order that has ever existed: one session, one job, one pull
+# request. `planner` is the session a feature order opens to decompose itself — same
+# transport, same worktree, same contract, but a different briefing and a structured
+# terminal action (`jarvis fo plan`) instead of a prose one.
+#
+# A column rather than a derivation, even though `feature_orders.plan_wo_id` already
+# names the planner: `parent_id` cannot tell the two apart (a feature order's CHILDREN
+# carry it too), and the briefing has to know which it is composing without querying
+# back up into a second table on every dispatch.
+WO_KINDS = ("worker", "planner")
+
+# Feature order lifecycle. Deliberately NOT a copy of WO_STATUSES: a feature order never
+# runs a session of its own, so most of a work order's states are meaningless for it.
+FO_STATUSES = (
+    "pending",      # created; the planner has not been dispatched
+    "planning",     # the plan work order is running
+    "plan_review",  # a plan was submitted; Neo is reviewing it, or it is escalated
+    "executing",    # children dispatching / running
+    "completed",    # every child settled successfully
+    "failed",       # a child failed or was cancelled
+    "cancelled",    # the user stopped it
+)
+FO_OPEN_STATUSES = ("pending", "planning", "plan_review", "executing")
+FO_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
+
 # Work-order metadata key: this work order was authorised by whoever filed it, so the
 # worker must not spend a round trip asking whether it may do the thing it was sent to
 # do. Value: {"by": "neo", "scope": "<what is pre-approved, in words>", ...}.
@@ -81,6 +108,33 @@ CREATE TABLE IF NOT EXISTS work_orders (
     needs_attention INTEGER NOT NULL DEFAULT 0,
     attention_reason TEXT,
     result_summary TEXT,
+    backlog_id TEXT,
+    metadata TEXT
+);
+-- A planned unit of work above the work order: the coarse ask the user actually has,
+-- which the project plans into a dependency-ordered set of ordinary work orders before
+-- any of them runs. Its children are `work_orders` rows carrying `parent_id`.
+--
+-- Per-project rather than central (where the backlog lives) because a feature order is
+-- scoped to one project by construction, and keeping the parent in the same database as
+-- its children buys one transaction, real foreign keys, and one query for a listing.
+CREATE TABLE IF NOT EXISTS feature_orders (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    origin TEXT NOT NULL DEFAULT 'jarvis',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    plan_wo_id TEXT REFERENCES work_orders(id),   -- the planner
+    plan TEXT,                              -- the submitted plan, as JSON
+    -- The Neo question reviewing the submitted plan. The back-link lives here rather
+    -- than a `fo_id` on the question, mirroring `approvals.neo_question_id`: Neo's
+    -- database is OS-wide and knows nothing about a project's tables.
+    plan_question_id INTEGER,
+    max_parallel INTEGER,                   -- slot cap for this feature's children (Phase 3)
+    needs_attention INTEGER NOT NULL DEFAULT 0,
+    attention_reason TEXT,
     backlog_id TEXT,
     metadata TEXT
 );
@@ -181,6 +235,7 @@ CREATE INDEX IF NOT EXISTS idx_events_wo ON wo_events(wo_id);
 CREATE INDEX IF NOT EXISTS idx_msgs_status ON wo_messages(status);
 CREATE INDEX IF NOT EXISTS idx_notif_status ON notifications(status);
 CREATE INDEX IF NOT EXISTS idx_approvals_wo ON approvals(wo_id, status);
+CREATE INDEX IF NOT EXISTS idx_fo_status ON feature_orders(status);
 """
 
 # Columns added after the first release. `CREATE TABLE IF NOT EXISTS` is a no-op on an
@@ -223,6 +278,14 @@ ADDED_COLUMNS = {
         # `waiting_pr_merge` earned a status because nothing derived it; this does not.
         # Shape matches `backlog.depends_on` exactly, so the two read the same way.
         "depends_on": "TEXT NOT NULL DEFAULT '[]'",
+        # The feature order this work order belongs to — its planner or one of its
+        # children. NULL for a standalone work order, which is nearly all of them, and
+        # the reason this whole migration is invisible to a project that never creates a
+        # feature order. `ALTER TABLE ADD COLUMN` may carry a REFERENCES clause only
+        # while the column defaults to NULL, which it does.
+        "parent_id": "TEXT REFERENCES feature_orders(id)",
+        # `worker` or `planner` — see WO_KINDS.
+        "kind": "TEXT NOT NULL DEFAULT 'worker'",
     },
 }
 
@@ -280,6 +343,8 @@ class ProjectStore:
         status: str = "pending",
         session_id: str | None = None,
         depends_on: list[str] | None = None,
+        parent_id: str | None = None,
+        kind: str = "worker",
     ) -> dict[str, Any]:
         """Create a work order. `status` and `session_id` are set in the same INSERT
         rather than afterwards, because the row is visible to the daemon the instant it
@@ -295,25 +360,32 @@ class ProjectStore:
         """
         assert origin in WO_ORIGINS, origin
         assert status in WO_STATUSES, status
+        assert kind in WO_KINDS, kind
         wo_id = wo_id or db.new_id("wo")
         deps = list(depends_on or [])
         if wo_id in deps:
             raise ValueError(f"work order {wo_id!r} cannot depend on itself")
         for dep in deps:
             self.get_work_order(dep)  # KeyError names the id that does not exist
+        if parent_id:
+            self.get_feature_order(parent_id)  # same: KeyError names it
         ts = db.now()
         self.conn.execute(
             """INSERT INTO work_orders (id, title, description, status, origin,
                    created_at, updated_at, model, effort, permission_mode,
-                   append_system_prompt, backlog_id, metadata, session_id, depends_on)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   append_system_prompt, backlog_id, metadata, session_id, depends_on,
+                   parent_id, kind)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 wo_id, title, description, status, origin, ts, ts, model, effort,
                 permission_mode, append_system_prompt, backlog_id,
                 db.to_json(metadata or {}), session_id, db.to_json(deps),
+                parent_id, kind,
             ),
         )
-        self.add_event(wo_id, "created", {"origin": origin, "depends_on": deps})
+        self.add_event(wo_id, "created", {"origin": origin, "depends_on": deps,
+                                          **({"parent_id": parent_id} if parent_id else {}),
+                                          **({"kind": kind} if kind != "worker" else {})})
         return self.get_work_order(wo_id)
 
     def get_work_order(self, wo_id: str) -> dict[str, Any]:
@@ -492,6 +564,13 @@ class ProjectStore:
         deleted: dict[str, int] = {}
         self.conn.execute("BEGIN")
         try:
+            # Foreign keys are on, so a feature order still pointing at this work order
+            # as its planner would refuse the delete outright. Releasing the link is the
+            # right move rather than cascading: the feature order is not the thing being
+            # deleted, and losing the planner is a fact about it worth surviving.
+            self.conn.execute(
+                "UPDATE feature_orders SET plan_wo_id=NULL WHERE plan_wo_id=?", (wo_id,)
+            )
             for key, table in (("events", "wo_events"), ("messages", "wo_messages"),
                                ("turns", "wo_turns"),
                                ("assumptions", "assumptions"),
@@ -505,6 +584,146 @@ class ProjectStore:
             self.conn.execute("ROLLBACK")
             raise
         return deleted
+
+    # -- feature orders ----------------------------------------------------------
+    #
+    # A feature order has no session, no turns and no messages of its own — everything
+    # it does, it does through work orders. So it has no timeline table either: its
+    # history is written into the timeline of whichever work order carried the step
+    # (`plan_submitted` on the planner, `created` on each child), which is where anyone
+    # investigating it is already looking.
+
+    def create_feature_order(self, title: str, description: str = "",
+                             origin: str = "jarvis", backlog_id: str | None = None,
+                             metadata: dict[str, Any] | None = None,
+                             fo_id: str | None = None) -> dict[str, Any]:
+        assert origin in WO_ORIGINS, origin
+        fo_id = fo_id or db.new_id("fo")
+        ts = db.now()
+        self.conn.execute(
+            """INSERT INTO feature_orders (id, title, description, status, origin,
+                   created_at, updated_at, backlog_id, metadata)
+               VALUES (?,?,?,'pending',?,?,?,?,?)""",
+            (fo_id, title, description, origin, ts, ts, backlog_id,
+             db.to_json(metadata or {})),
+        )
+        return self.get_feature_order(fo_id)
+
+    def get_feature_order(self, fo_id: str) -> dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT * FROM feature_orders WHERE id=?", (fo_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"feature order {fo_id!r} not found in {self.db_path}")
+        return dict(row)
+
+    def list_feature_orders(self, statuses: tuple[str, ...] | None = None,
+                            limit: int = 200) -> list[dict[str, Any]]:
+        where = f" WHERE status IN ({','.join('?' for _ in statuses)})" if statuses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM feature_orders{where} ORDER BY created_at DESC LIMIT ?",
+            (*(statuses or ()), limit),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def update_feature_order(self, fo_id: str, **fields: Any) -> None:
+        if not fields:
+            return
+        fields["updated_at"] = db.now()
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self.conn.execute(
+            f"UPDATE feature_orders SET {cols} WHERE id=?", (*fields.values(), fo_id)
+        )
+
+    def set_feature_status(self, fo_id: str, status: str, **extra: Any) -> None:
+        assert status in FO_STATUSES, status
+        self.update_feature_order(fo_id, status=status, **extra)
+
+    def flag_feature_attention(self, fo_id: str, reason: str) -> None:
+        self.update_feature_order(fo_id, needs_attention=1, attention_reason=reason)
+
+    def clear_feature_attention(self, fo_id: str) -> None:
+        self.update_feature_order(fo_id, needs_attention=0, attention_reason=None)
+
+    def feature_children(self, fo_id: str) -> list[dict[str, Any]]:
+        """The feature order's child work orders, oldest first.
+
+        Oldest first, unlike every other listing here: children are created in
+        dependency order (`plans.creation_order`), so creation order IS the plan's
+        order, and printing it newest-first would show the graph upside down.
+
+        The planner is deliberately excluded — it carries `parent_id` too, because it
+        belongs to the feature order as much as any child does, but it is the session
+        that produced the plan rather than a piece of the work. `plan_wo_id` is how you
+        reach it.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM work_orders WHERE parent_id=? AND kind='worker' "
+            "ORDER BY created_at",
+            (fo_id,),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def feature_order_for_question(self, question_id: int) -> dict[str, Any] | None:
+        """The feature order whose plan this Neo question is reviewing, if any.
+
+        The mirror of `approval_for_question`, and it exists for the same reason: Neo's
+        database is OS-wide and knows nothing about a project's tables, so the back-link
+        has to be resolved from this side.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM feature_orders WHERE plan_question_id=?", (question_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def create_plan_children(self, fo_id: str,
+                             ordered: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Turn an approved plan into work orders, in one transaction.
+
+        `ordered` must already be in dependency order (`plans.creation_order`): each
+        child's `needs` are plan-local keys, and they are resolved to real work-order ids
+        as the children are created, which only works if every child follows the ones it
+        needs. That constraint is not tidiness — `create_work_order` refuses an edge
+        pointing at a row that does not exist yet, and that refusal is exactly what keeps
+        the live dependency graph acyclic by construction. Resolving the keys as we go
+        means a plan's edges are written by the same guarded path as a hand-typed
+        `--depends-on`, rather than being stamped onto rows afterwards.
+
+        All-or-nothing: a feature order holding three of its six children is worse than
+        one holding none, because the three would start running against a plan that was
+        never fully created.
+        """
+        by_key: dict[str, str] = {}
+        created: list[str] = []
+        self.conn.execute("BEGIN")
+        try:
+            for child in ordered:
+                wo = self.create_work_order(
+                    title=child["title"],
+                    description=child["description"],
+                    origin="jarvis",
+                    depends_on=[by_key[k] for k in child["needs"] if k in by_key],
+                    parent_id=fo_id,
+                )
+                by_key[child["key"]] = wo["id"]
+                created.append(wo["id"])
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return [self.get_work_order(wo_id) for wo_id in created]
+
+    def feature_summary(self) -> dict[str, Any]:
+        """How many feature orders sit in each status, and how many want the user."""
+        by_status = {
+            r["status"]: int(r["n"]) for r in self.conn.execute(
+                "SELECT status, COUNT(*) AS n FROM feature_orders GROUP BY status"
+            ).fetchall()
+        }
+        attention = self.conn.execute(
+            "SELECT COUNT(*) c FROM feature_orders WHERE needs_attention=1"
+        ).fetchone()["c"]
+        return {"by_status": by_status, "needs_attention": int(attention)}
 
     # -- events --------------------------------------------------------------
 

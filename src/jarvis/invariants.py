@@ -80,6 +80,21 @@ class Violation:
         return f"{self.invariant} — {where}{self.detail}{fixed}"
 
 
+#: What a FEATURE order says when one of its children ended badly. Two reasons rather
+#: than one because they ask the user for different things: a failed child is a problem
+#: to diagnose, a cancelled one is a decision already taken whose consequences for the
+#: rest of the feature have not been. Both are formatted with the child's id.
+#:
+#: Unlike the two constants around them these are NOT re-derived by `true_blockers` —
+#: that function answers "what does this WORK ORDER need from me", and a feature order is
+#: not a work order, so INV-ATTENTION-REASON never sees these and cannot relabel them.
+#: They live here anyway so that every reason the OS puts in front of the user is written
+#: in one file. If a feature-order invariant is ever added, it inherits the obligation:
+#: whatever derives the flag has to be able to produce these strings.
+FEATURE_CHILD_FAILED = "{id} failed — this feature cannot finish without it"
+FEATURE_CHILD_CANCELLED = ("{id} was cancelled — this feature will not deliver what the "
+                           "plan promised")
+
 #: What a work order says when something it depends on can never complete. A dependency
 #: that is `cancelled` or `failed` will not come back, so the dependent would sit in
 #: `pending` for ever with nothing on its face to say why — the stranded row the

@@ -3,6 +3,7 @@
 Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
+  jarvis fo create|list|show|plan|approve|cancel        feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
   jarvis neo list|show|review|answer|learnings|learn
   jarvis backlog add|list|promote|done
@@ -233,6 +234,52 @@ def build_parser() -> argparse.ArgumentParser:
     ra.add_argument("wo_id")
     ra.add_argument("--project")
 
+    # feature orders -------------------------------------------------------------------
+    # Parallel to `wo` on purpose: a user who knows the work-order surface should not
+    # have to learn a second grammar to use the one above it.
+    fo = sub.add_parser(
+        "fo",
+        help="feature orders: a coarse ask the project plans into work orders itself",
+    ).add_subparsers(dest="fo_cmd", required=True)
+
+    f = fo.add_parser("create", help="file a feature order — the OS plans it into work "
+                                     "orders and dispatches them in dependency order")
+    f.add_argument("project")
+    f.add_argument("title")
+    f.add_argument("--description", "-d", default="",
+                   help="the whole ask. Required: the planner sees only this text")
+    f.add_argument("--origin", default="jarvis", choices=["jarvis", "ui", "manual"])
+
+    f = fo.add_parser("list", help="feature orders and how far along they are")
+    f.add_argument("project", nargs="?")
+    f.add_argument("--all", action="store_true", help="include settled feature orders")
+
+    f = fo.add_parser("show", help="one feature order: its plan and its children")
+    f.add_argument("fo_id")
+    f.add_argument("--project")
+
+    f = fo.add_parser("plan", help="(planners) submit the plan — the planner's terminal "
+                                   "action, and what settles its work order")
+    f.add_argument("fo_id")
+    f.add_argument("--from-file", required=True, dest="from_file", metavar="PATH",
+                   help="the plan, as JSON. A file rather than an argument on purpose: "
+                        "a plan is a long string full of repo paths, which is exactly "
+                        "what trips the privileged-action classifier")
+    f.add_argument("--project")
+
+    f = fo.add_parser("approve", help="release a submitted plan (or send it back), when "
+                                      "Neo escalated the decision to you")
+    f.add_argument("fo_id")
+    f.add_argument("--reject", action="store_true")
+    f.add_argument("--feedback", default="",
+                   help="your reasoning — on --reject it reaches the planner as guidance "
+                        "and it revises in its existing session")
+    f.add_argument("--project")
+
+    f = fo.add_parser("cancel", help="stop a feature order and everything it has running")
+    f.add_argument("fo_id")
+    f.add_argument("--project")
+
     # gates (privileged-action approvals) ------------------------------------------------
     ga = sub.add_parser(
         "gate",
@@ -283,8 +330,13 @@ def build_parser() -> argparse.ArgumentParser:
     b = bl.add_parser("list")
     b.add_argument("project", nargs="?")
     b.add_argument("--all", action="store_true", help="include non-open items")
-    b = bl.add_parser("promote", help="turn a backlog item into a work order")
+    b = bl.add_parser("promote", help="turn a backlog item into a work order (or, with "
+                                      "--as feature, into a feature order the project "
+                                      "plans for itself)")
     b.add_argument("item_id")
+    b.add_argument("--as", dest="as_kind", default="work", choices=["work", "feature"],
+                   help="`work` (default) dispatches one worker; `feature` opens a "
+                        "planner that decomposes it first")
     b.add_argument("--force", action="store_true", help="ignore unfinished dependencies")
     b = bl.add_parser("done", help="mark a backlog item done without a work order")
     b.add_argument("item_id")
@@ -631,6 +683,79 @@ def cmd_wo(args: argparse.Namespace) -> int:
     return 0
 
 
+FO_ICON = {"pending": "⏳", "planning": "🧭", "plan_review": "👀", "executing": "🟢",
+           "completed": "✅", "failed": "❌", "cancelled": "🚫"}
+
+
+def cmd_fo(args: argparse.Namespace) -> int:
+    import json as _json
+
+    from . import ops
+
+    if args.fo_cmd == "create":
+        fo = ops.create_feature_order(args.project, args.title,
+                                      description=args.description, origin=args.origin)
+        _print({"created": fo["id"], "project": args.project, "status": fo["status"],
+                "note": "jarvisd will open a planner for it shortly; the plan comes "
+                        "back for review before any work order is created"}, args.json)
+
+    elif args.fo_cmd == "list":
+        rows = ops.list_feature_orders(args.project, include_settled=args.all)
+        if args.json:
+            _print(rows, True)
+        elif not rows:
+            print("no feature orders")
+        else:
+            for fo in rows:
+                icon = FO_ICON.get(fo["status"], "•")
+                att = " ⚠" if fo["needs_attention"] else ""
+                print(f"{icon} {fo['id']} [{fo['project']}] {fo['title']} "
+                      f"({fo['status']}, {fo['progress']['label']}, "
+                      f"{_age(fo['created_at'])}){att}")
+
+    elif args.fo_cmd == "show":
+        detail = ops.show_feature_order(args.fo_id, args.project)
+        if args.json:
+            _print(detail, True)
+        else:
+            print(f"{FO_ICON.get(detail['status'], '•')} {detail['id']} "
+                  f"[{detail['project']}] {detail['title']} ({detail['status']})")
+            print(f"\n{detail['description']}\n")
+            if detail["attention_reason"]:
+                print(f"⚠ {detail['attention_reason']}\n")
+            if detail["planner"]:
+                p = detail["planner"]
+                print(f"planner: {p['id']} ({p['status']})")
+            if detail["plan_text"]:
+                print(f"\nplan:\n{detail['plan_text']}")
+            if detail["children"]:
+                print(f"\nchildren ({detail['progress']['label']}):")
+                for c in detail["children"]:
+                    icon = STATUS_ICON.get(c["status"], "•")
+                    att = " ⚠" if c["needs_attention"] else ""
+                    print(f"  {icon} {c['id']} {c['title']} "
+                          f"({c['status_label']}){att}")
+
+    elif args.fo_cmd == "plan":
+        path = Path(args.from_file)
+        if not path.is_file():
+            raise ops.OpsError(f"no such plan file: {path}")
+        try:
+            doc = _json.loads(path.read_text())
+        except _json.JSONDecodeError as e:
+            raise ops.OpsError(f"{path} is not valid JSON: {e}") from e
+        _print(ops.submit_plan(args.fo_id, doc, project_name=args.project), args.json)
+
+    elif args.fo_cmd == "approve":
+        _print(ops.review_plan(args.fo_id, accept=not args.reject,
+                               feedback=args.feedback, decided_by="user",
+                               project_name=args.project), args.json)
+
+    elif args.fo_cmd == "cancel":
+        _print(ops.cancel_feature_order(args.fo_id, args.project), args.json)
+    return 0
+
+
 GATE_ICON = {"pending": "⏸", "approved": "✅", "denied": "⛔", "dismissed": "⊘",
              "expired": "⌛"}
 
@@ -722,7 +847,8 @@ def cmd_backlog(args: argparse.Namespace) -> int:
                 if not items:
                     print("backlog empty")
         elif args.bl_cmd == "promote":
-            _print(ops.promote_backlog(args.item_id, force=args.force), args.json)
+            _print(ops.promote_backlog(args.item_id, force=args.force,
+                                       as_feature=args.as_kind == "feature"), args.json)
         elif args.bl_cmd == "done":
             central.mark_backlog(args.item_id, "done")
             _print({"item": args.item_id, "status": "done"}, args.json)
@@ -927,6 +1053,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_adopt(args)
         if args.cmd == "wo":
             return cmd_wo(args)
+        if args.cmd == "fo":
+            return cmd_fo(args)
         if args.cmd == "gate":
             return cmd_gate(args)
         if args.cmd == "backlog":

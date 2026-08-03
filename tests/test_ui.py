@@ -950,3 +950,129 @@ def test_unexpected_error_renders_a_page_and_lands_in_the_os_log(
     assert "kaboom in os_status" in log
     assert "GET /" in log
     assert "RuntimeError" in log
+
+
+# -- feature orders ------------------------------------------------------------------
+#
+# The feature page is the one view where the whole feature is visible at once — the ask,
+# the plan as submitted, and each child's live status against it. It is also where an
+# escalated plan is decided, because deciding needs all three on one screen.
+
+
+@pytest.fixture()
+def feature(client, daemon, project):
+    """A feature order whose plan is submitted and escalated to the user."""
+    from tests.test_feature_orders import ASK, a_plan, child
+
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
+    daemon.tick()
+    ops.submit_plan(fo["id"], a_plan(child("schema"), child("api", needs=["schema"])))
+    daemon._neo_drain()  # the fake escalates plan reviews unless forced
+    return client, ops.show_feature_order(fo["id"])
+
+
+def test_the_feature_page_shows_the_ask_the_plan_and_the_children(feature):
+    client, fo = feature
+
+    page = client.get(f"/fo/proj_a/{fo['id']}").text
+
+    assert "CSV export" in page
+    assert "Add a CSV exporter" in page          # the ask, verbatim
+    assert "Build schema" in page and "Build api" in page   # the plan
+    assert "nothing created yet" in page         # a plan is a proposal until released
+
+
+def test_the_feature_page_is_where_an_escalated_plan_is_decided(feature):
+    client, fo = feature
+
+    page = client.get(f"/fo/proj_a/{fo['id']}").text
+
+    assert "Release this plan?" in page
+    assert f"/fo/proj_a/{fo['id']}/review" in page
+
+
+def test_releasing_a_plan_from_the_browser_creates_the_children(feature):
+    client, fo = feature
+
+    res = client.post(f"/fo/proj_a/{fo['id']}/review",
+                      data={"decision": "accept", "feedback": "looks right"})
+
+    assert res.status_code == 303
+    detail = ops.show_feature_order(fo["id"])
+    assert detail["status"] == "executing"
+    assert [c["title"] for c in detail["children"]] == ["Build schema", "Build api"]
+    page = client.get(f"/fo/proj_a/{fo['id']}").text
+    assert "⊘ after" in page      # the tree, with the edge drawn
+
+
+def test_sending_a_plan_back_with_no_reason_says_so_instead_of_failing(feature):
+    """The planner sees only the reason, so a bare rejection is a guess. The refusal has
+    to reach the page rather than becoming a 500."""
+    client, fo = feature
+
+    res = client.post(f"/fo/proj_a/{fo['id']}/review", data={"decision": "reject"})
+
+    assert res.status_code == 303
+    assert "error=" in res.headers["location"]
+    assert ops.show_feature_order(fo["id"])["status"] == "plan_review"
+
+
+def test_a_plan_neo_can_decide_never_reaches_the_users_page(client, daemon, project):
+    """The control for the panel above: routine plans must not put a decision on screen,
+    because a feature order that costs an interactive review every time costs more
+    attention than typing the work orders by hand."""
+    from tests.test_feature_orders import ASK, a_plan, child
+
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
+    daemon.tick()
+    ops.submit_plan(fo["id"], a_plan(child("schema", extra="FORCE_APPROVE")))
+    daemon._neo_drain()
+
+    page = client.get(f"/fo/proj_a/{fo['id']}").text
+
+    assert "Release this plan?" not in page
+    assert "executing" in page
+
+
+def test_the_project_page_lists_feature_orders_without_repeating_the_tree(feature):
+    client, fo = feature
+
+    page = client.get("/project/proj_a").text
+
+    assert f"/fo/proj_a/{fo['id']}" in page
+    assert "Feature orders" in page
+    # The children belong to the listing below as ordinary work orders, and to the
+    # feature's own page as a tree. Not to both, on one page.
+    assert page.count(f"/fo/proj_a/{fo['id']}") == 1
+
+
+def test_the_dashboard_takes_a_feature_order(client):
+    res = client.post("/fo/create", data={"project": "proj_a", "title": "CSV export",
+                                          "description": "the whole ask, at length, "
+                                                         "with enough detail to plan"})
+
+    assert res.status_code == 303
+    assert res.headers["location"].startswith("/fo/proj_a/fo-")
+
+
+def test_a_feature_order_with_no_description_is_refused_by_the_browser_too(client):
+    res = client.post("/fo/create", data={"project": "proj_a", "title": "CSV export"})
+
+    assert res.status_code == 303
+    assert res.headers["location"].startswith("/project/proj_a?error=")
+
+
+def test_cancelling_a_feature_order_from_the_browser(feature):
+    client, fo = feature
+
+    res = client.post(f"/fo/proj_a/{fo['id']}/cancel")
+
+    assert res.status_code == 303
+    assert ops.show_feature_order(fo["id"])["status"] == "cancelled"
+
+
+def test_an_unknown_feature_order_is_a_page_not_a_traceback(client):
+    page = client.get("/fo/proj_a/fo-nope")
+
+    assert page.status_code == 200
+    assert "not found in any registered project" in page.text
