@@ -314,7 +314,8 @@ def create_app() -> FastAPI:
         show_debug = debug not in ("", "0", "false")
         return render(request, "work_order.html", project=pname, wo=wo,
                       timeline=build_timeline(wo, events, messages,
-                                              include_debug=show_debug),
+                                              include_debug=show_debug,
+                                              questions=ops.neo_question_texts(wo_id)),
                       debug=show_debug, debug_count=count_debug(events),
                       messages=messages, assumptions=assumptions,
                       approvals=approvals)

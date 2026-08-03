@@ -148,6 +148,21 @@ class NeoStore:
         )
         return self.conn.execute("DELETE FROM questions WHERE wo_id=?", (wo_id,)).rowcount
 
+    def question_texts(self, wo_id: str) -> dict[int, str]:
+        """{question_id: question} for one work order — the timeline's back-fill.
+
+        Questions asked before the text was copied into the `question_asked` event
+        payload exist only here, so a timeline rendered from the project DB alone
+        cannot show them. This is read-only and best-effort: see
+        `ops.neo_question_texts`.
+        """
+        return {
+            int(r["id"]): r["question"] or ""
+            for r in self.conn.execute(
+                "SELECT id, question FROM questions WHERE wo_id=?", (wo_id,)
+            ).fetchall()
+        }
+
     def list_questions(self, statuses: tuple[str, ...] | None = None,
                        review_status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
         q = "SELECT * FROM questions"

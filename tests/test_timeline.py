@@ -114,6 +114,58 @@ def test_message_plumbing_events_never_duplicate_the_message_itself():
     assert entries[0]["detail"] == "the ask"
 
 
+# -- rendered details ----------------------------------------------------------------
+# Every kind below reads a payload key. A renderer that reads a key no writer stores
+# renders an empty detail forever, and asserting only on event_level (as the tests
+# above do) cannot see it — that is exactly how the empty "Worker asked a question"
+# entry shipped. These tests assert the DETAIL, so a key that goes unwritten fails here.
+
+def test_question_asked_shows_what_was_asked():
+    events = [ev("question_asked", 1.0, neo_question_id=7,
+                 question="CSV or JSON for the export default?")]
+    entry = build_timeline({}, events, [])[0]
+    assert entry["label"] == "Worker asked a question"
+    assert entry["detail"] == "CSV or JSON for the export default?"
+
+
+def test_an_older_question_is_filled_in_from_neos_db():
+    """Events written before the text was stored carry only the id."""
+    events = [ev("question_asked", 1.0, neo_question_id=7)]
+    entries = build_timeline({}, events, [], questions={7: "the original question"})
+    assert entries[0]["detail"] == "the original question"
+
+
+def test_a_question_with_nothing_to_fill_it_in_from_still_renders():
+    """No payload text, no lookup (Neo's DB unreadable, or the question purged)."""
+    events = [ev("question_asked", 1.0, neo_question_id=7)]
+    entries = build_timeline({}, events, [])
+    assert entries[0]["label"] == "Worker asked a question"
+    assert entries[0]["detail"] == ""
+
+
+def test_the_payload_wins_over_the_lookup():
+    events = [ev("question_asked", 1.0, neo_question_id=7, question="what was asked")]
+    entries = build_timeline({}, events, [], questions={7: "stale"})
+    assert entries[0]["detail"] == "what was asked"
+
+
+def test_answers_are_not_repeated_on_top_of_their_message():
+    """Both answer paths queue the answer as a message in the same breath, so the
+    text is already the next line — an event detail here would print it twice."""
+    events = [ev("question_asked", 1.0, question="CSV or JSON?"),
+              ev("neo_answered", 3.0, neo_question_id=7),
+              ev("escalation_answered", 5.0, neo_question_id=8)]
+    messages = [{"ts": 2.0, "direction": "user_to_agent", "content": "[Neo] go with CSV"},
+                {"ts": 4.0, "direction": "user_to_agent", "content": "[user] and gzip it"}]
+    entries = build_timeline({}, events, messages)
+    by_kind = {e["kind"]: e for e in entries}
+    assert by_kind["neo_answered"]["detail"] == ""
+    assert by_kind["escalation_answered"]["detail"] == ""
+    # ...and the answers themselves are still on the record, once each.
+    assert [e["detail"] for e in entries if e["kind"] == "message"] == [
+        "[Neo] go with CSV", "[user] and gzip it"]
+
+
 def test_cli_wo_show_hides_debug_entries_by_default(jarvis_home, fake_claude,
                                                     catalog_file, capsys):
     """`jarvis wo show` speaks the same timeline as the web UI, with --debug to
