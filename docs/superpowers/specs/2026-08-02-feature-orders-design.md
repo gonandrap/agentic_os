@@ -240,12 +240,43 @@ chat — the responsiveness the OS is judged on. Recommendation: a per-feature-o
 `max_parallel`, defaulting to `min(2, project.max_concurrent - 1)`, so at least one slot
 always remains for work the user asked for just now.
 
-### 4. The planning team
+### 4. The team — four members, decided
 
-**Recommendation: ship agent profiles the same way skills are shipped, and start with
-three, not the five in the original sketch.**
+**A project's team is exactly four members** (user, 2026-08-02), and the orchestrator
+involves the others **on demand, based on the type of order received**. An ordinary work
+order engages nobody: the orchestrator dispatches it as it does today, and the team is
+never woken. That on-demand rule is what keeps this from taxing the ordinary path.
 
-Mechanically: `src/jarvis/assets/agents/*.md`, materialized by `install_agent_skills()`
+| Member | Exists today | Is | Engaged when |
+|---|---|---|---|
+| **orchestrator** | **yes** | the project's daemon-side dispatcher | always |
+| **planner** | no | a work order, in a worktree | a feature order arrives |
+| **architect** | no | a subagent seat of the planner | the planner asks |
+| **test lead** | no | a subagent seat of the planner | the planner asks |
+
+Only two of the four are new *agents*, and both are seats inside the planner's session.
+The orchestrator already exists; the planner is an ordinary work order with a different
+briefing. Nothing here adds a supervised process.
+
+**The orchestrator carries the scope mandate.** The roster has no separate scope seat, and
+it does not need one: the orchestrator received the feature order, so it holds the original
+ask verbatim, and it does not participate in the planning deliberation. That makes it
+**structurally blind** rather than blind by configuration — the stronger form of the
+property, obtained for free. Its scope check is a single question asked of the returned
+plan before anything is accepted: *is this what was requested?*
+
+This is where PR 64's blind-seat argument lands in this design. Independence is what turns
+agreement into evidence rather than an echo, and a scope check that has already read the
+decomposition will rationalise it — every child looks necessary when it is judged against
+the plan instead of against the ask. The architect and the test lead are deliberately
+**sighted**: an architect that cannot see the codebase cannot decompose anything, and a
+test lead that cannot see the decomposition cannot write criteria against it. So the
+general rule for this roster is that **a member is sighted when its job needs the artefact,
+and blind when its job is to check the artefact against something outside it** — and the
+only member whose job is the latter is the one that never entered the room.
+
+Mechanically, for the two seats: `src/jarvis/assets/agents/*.md`, materialized by
+`install_agent_skills()`
 into `.jarvis/agent-skills/.claude/agents/`, reaching the worker on the `--add-dir` that
 `briefing_for()` already passes. Verified above. The function is already documented as
 owning and rebuilding its whole generated tree, so adding a sibling directory is a small,
@@ -254,54 +285,63 @@ well-precedented change — likely a rename to something like `install_agent_ass
 `src/jarvis/assets/agents/` is one of the two surfaces shared with the Neo panel design;
 see the reconciliation section below. The authoring format is common, the rosters are not.
 
-The three profiles:
+The two seats:
 
 - **architect** — decomposition and sequencing. Which pieces are separable, what the
   interface between them is, what must land first. **Sighted**: reads the codebase, and
-  sees the lead's framing.
+  sees the planner's framing.
 - **test lead** — what "done" means for each child. Every child needs acceptance criteria
   in its own description, because the child worker will never see the plan. **Sighted**:
   acceptance criteria have to be written against the architect's actual decomposition.
-- **scope** — what the user actually asked for and what is explicitly out. The
-  counterweight to a planner that keeps finding adjacent work. **Blind** — see below.
 
-**The scope seat runs blind, against the original feature description only.** This is a
-correction adopted from the Neo panel design (PR 64), whose case for blind seats is that
-independence is what turns agreement into evidence rather than an echo. It does not apply
-to all three seats here — an architect that cannot see the codebase cannot decompose
-anything, and a test lead that cannot see the decomposition cannot write criteria against
-it — but it applies exactly to scope. A scope check that has already read the
-decomposition will rationalise it: every child will look necessary, because it is being
-judged against a plan rather than against the ask. Run blind, it answers the only question
-worth asking — *is this what was requested?* — and a disagreement between a blind scope
-seat and a sighted architect is real signal about scope creep.
+"Product manager" and "project manager" from the original sketch are deliberately absent,
+and this survives the user's roster unchanged. The planner *is* the project manager —
+sequencing and slot budgeting are its own job, and a separate PM agent holds no information
+the planner does not.
 
-So the general rule for this roster: a seat is sighted when its job needs the artefact,
-and blind when its job is to check the artefact against something outside it.
-
-"Product manager" and "project manager" from the original sketch are deliberately absent.
-The planner *is* the project manager — sequencing and slot budgeting are its own job, and
-a separate PM agent holds no information the lead does not. A distinct product voice is
-worth adding the moment a feature order arrives underspecified often enough to measure;
-until then it is a role that will paraphrase the description back.
-
-Whether these profiles reach every worker or only planners is worth deciding explicitly.
-Recommendation: only planners, at first. `--add-dir` is unconditional today, so gating it
-means `briefing_for()` growing a notion of work-order kind — a small change, but a real
-one, and the alternative (every worker can spawn an architect) has an unmeasured cost.
+**Ordinary workers get no profile** (user, 2026-08-02): a worker is an individual that gets
+the work done, and a role would be dressing up a session with exactly one job. So the seats
+reach planners only, which means `briefing_for()` grows a notion of work-order kind —
+`--add-dir` is unconditional today. That is a small change, and it is the whole cost of
+keeping the ordinary path untouched.
 
 ### 5. Review, attention, and who approves a plan
 
 A bad plan is the most expensive failure mode in the system: it spends N worker sessions
 before anyone notices. Two decision points follow.
 
-**Plan approval.** Recommendation: **the user approves the plan in v1** — the feature order
-goes to `plan_review` and waits. The target state, once plan quality has been observed, is
-that **Neo reviews the plan and escalates on doubt**, exactly as it does for privileged
-actions: that is what Neo is for, the machinery exists (`neo_store.ask()`, `review()`,
-escalation), and it is the only version that keeps the user's attention cost at zero for a
-routine feature. Starting with the user is a deliberate confidence-building step, not a
-disagreement with the destination.
+**Plan approval: Neo reviews the plan and escalates on doubt — from v1** (decided
+2026-08-02). The feature order enters `plan_review`, Neo reads the submitted plan exactly
+as it reads a privileged-action request, and either releases it to `executing` or escalates
+to the user. The machinery already exists: `neo_store.ask()`, `review()`, and the
+escalation path that makes a decision the user's only when Neo declines to take it.
+
+An earlier draft of this document recommended the *user* approving every plan in v1, as a
+confidence-building step. That is reversed, and the reason is the principle the user stated
+directly: **no routine attention unless something is off.** A user who does not want to
+review each implementation milestone is not going to want to hand-approve each plan either,
+and a feature order that costs an interactive review every time is a feature order that
+costs more attention than typing six `jarvis wo create` calls — which is the thing this
+design exists to replace.
+
+**That reversal moves weight onto two backstops, so both are load-bearing rather than
+nice-to-have, and neither may be dropped as a simplification:**
+
+1. **The child cap.** A hard ceiling on children per feature order — start at eight. Above
+   it the planner must justify the count in its submission, and the plan does not validate
+   without that justification. This is what bounds the blast radius of a plan Neo waves
+   through: the worst case is a bounded number of wasted sessions, not an unbounded one.
+2. **The plan validator.** Structural rejection at submission, before anything is created:
+   dependency cycles, unknown or dangling ids, children over the cap without justification,
+   and — the one that matters most in practice — **children whose description does not stand
+   alone.** A child that says "as discussed in the plan" is rejected, because the child
+   worker will never see the plan. These are mechanical checks in Python, not judgement, and
+   they run whether or not Neo is paying attention.
+
+The escalation triggers are worth naming explicitly rather than leaving to Neo's discretion:
+a plan at or over the child cap, a plan whose children touch a project's gated actions, and
+any plan Neo cannot reconcile with a standing learning. Those are the cases where the
+attention is not routine, which is exactly when the user should see it.
 
 **Attention rollup.** `true_blockers()` is per work order. A feature order with six
 children could put six lines in the "NEEDS YOU" strip, and this codebase already
@@ -321,7 +361,7 @@ so most work-order states are meaningless for it.
 ```
 pending      created; the planner has not been dispatched
 planning     the plan work order is running
-plan_review  a plan was submitted and is awaiting approval (user, later Neo)
+plan_review  a plan was submitted; Neo is reviewing it, or it is escalated
 executing    children dispatching / running
 completed    every child settled successfully
 failed       a child failed and the remainder cannot proceed
@@ -449,7 +489,7 @@ mechanism, because they are opposite on every axis that decides one.**
 | Orchestrated by | Python, in the daemon | the lead model, via the Task tool |
 | Runs in | the daemon process, fanning out `run_headless()` | a work order — a real session, in a worktree |
 | Seats see | a question plus stored context | the codebase |
-| Blindness | mandatory: agreement is only evidence if independent | mixed — sighted architect and test lead, blind scope |
+| Blindness | mandatory: agreement is only evidence if independent | seats are sighted; the blind check sits with the orchestrator, outside the room |
 | Seats are | review lenses | domain roles, which the panel design explicitly declines |
 | Rounds | one blind round, then a chair | iterative; the lead consults, reads the answer, consults again |
 | Output | one strict-JSON verdict | a validated dependency graph |
@@ -492,7 +532,9 @@ settled between two documents rather than between two merged modules.
 
 - **Plan explosion.** A planner that emits twenty children burns twenty sessions. Cap
   children per feature order (start at eight) and require the planner to justify anything
-  above the cap in its submission.
+  above the cap in its submission — and escalate any plan at or over the cap to the user
+  rather than letting Neo release it. See section 5: this cap is one of the two backstops
+  the Neo-reviews-plans default rests on.
 - **Cascading block.** One child fails and its descendants are blocked forever. The feature
   order needs a `failed` path that flags **once**, at feature level, and offers re-plan or
   force-continue — not N stranded `pending` rows nobody looks at.
@@ -505,7 +547,8 @@ settled between two documents rather than between two merged modules.
   validator should be able to say so.
 - **Dependency cycles.** Rejected at plan submission, before anything is created.
 - **Cost.** A feature order is N+1 sessions and a bad plan spends all of them. This is the
-  argument for the plan review gate being on by default, and for the child cap.
+  argument for the child cap and the plan validator being load-bearing rather than
+  optional, now that Neo rather than the user is the routine reviewer (section 5).
 - **Stale plans.** Between plan approval and the last child dispatching, `main` moves. A
   child whose plan assumed a file that no longer exists will discover it mid-session and
   ask Neo. Acceptable for v1; worth measuring before adding anything.
@@ -555,11 +598,13 @@ worker rebase onto its dependency's branch itself as its first act, which is slo
 puts a merge conflict inside a worker session rather than in front of the user.
 
 **Phase 2 — feature orders with a single generic planner.** The table, the lifecycle, the
-plan work order, `jarvis fo plan --from-file`, plan validation, user approval,
-`jarvis fo` and the dashboard page. One planner, no profiled team.
+plan work order, `jarvis fo plan --from-file`, the plan validator and the child cap,
+Neo reviewing plans with escalation, `jarvis fo` and the dashboard page. One planner, no
+seats yet — the orchestrator's scope check is the only review of the plan's shape, which
+is why the validator lands in this phase and not later.
 
-**Phase 3 — the team and the rollup.** The three agent profiles shipped through
-`install_agent_skills()`, Neo reviewing plans with escalation, feature-level attention
+**Phase 3 — the seats and the rollup.** The architect and test-lead seats shipped through
+`install_agent_skills()`, their `tools:` postures per section 8, feature-level attention
 rollup, `max_parallel`. This is the phase that touches the two surfaces shared with PR 64:
 if the Neo panel has landed first, adopt its `src/jarvis/assets/agents/` layout and its
 structured-output helper rather than forking them; if it has not, extract both here in a
