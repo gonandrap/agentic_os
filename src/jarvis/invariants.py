@@ -33,14 +33,19 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from . import db
-from .project_store import UNGOVERNED_ORIGINS
+from .project_store import DEPENDENCY_DEAD_STATUSES, UNGOVERNED_ORIGINS
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .project_store import ProjectStore
 
 # Statuses where the user is the one holding the work up. A `running` worker is not
-# blocked on anything the user can see, and a `pending` one hasn't started.
-BLOCKED_STATUSES = ("waiting_input", "needs_review", "failed")
+# blocked on anything the user can see. `pending` used to be excluded on the same
+# reasoning — it hasn't started, so nobody is waiting on a decision — and dependency
+# edges broke that: a pending work order whose dependency was cancelled will never
+# start, and only the user can choose between cancelling it and cutting the edge.
+# This tuple must cover every status `true_blockers` can return a blocker for, or the
+# blocker is derived correctly and then never surfaced.
+BLOCKED_STATUSES = ("waiting_input", "needs_review", "failed", "pending")
 # Statuses where nothing can possibly be pending: the work order is over.
 TERMINAL_STATUSES = ("completed", "cancelled")
 
@@ -73,6 +78,14 @@ class Violation:
         where = f"{self.wo_id}: " if self.wo_id else ""
         fixed = f" [repaired: {self.repair}]" if self.repaired else ""
         return f"{self.invariant} — {where}{self.detail}{fixed}"
+
+
+#: What a work order says when something it depends on can never complete. A dependency
+#: that is `cancelled` or `failed` will not come back, so the dependent would sit in
+#: `pending` for ever with nothing on its face to say why — the stranded row the
+#: feature-order design warns about. Same rule as PR_CLOSED_BLOCKER above: an attention
+#: reason must be re-derivable by `true_blockers` or the next tick relabels it.
+DEAD_DEPENDENCY_BLOCKER = "blocked by a dependency that can never complete"
 
 
 # -- the derivation everything else is checked against ------------------------------
@@ -112,6 +125,13 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     # until Neo either decides or escalates (handled above).
     if wo["status"] == "waiting_input" and not _waiting_on_neo_gate(store, wo):
         blockers.append("worker is waiting on your input")
+    # A dependency that will never complete. Ordinary blocking is silent on purpose —
+    # `pending — blocked by …` is a listing label, not a decision anyone owes — but a
+    # dependency that is cancelled or failed cannot clear itself, so the work order will
+    # wait for ever and only the user can choose between cancelling it and cutting the
+    # edge (`jarvis wo unblock`). That is the difference between waiting and stranded.
+    if wo["status"] == "pending" and dead_dependencies(store, wo):
+        blockers.append(DEAD_DEPENDENCY_BLOCKER)
     if governed and wo["status"] == "needs_review" and not pending:
         # Two very different ways to arrive at `needs_review` without an assumption to
         # decide, and they ask the user for opposite things. A closed pull request means
@@ -126,6 +146,34 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     # acknowledged away; `jarvis wo ack` refuses).
     acked = db.from_json(wo.get("acknowledged_blockers"), []) or []
     return [b for b in blockers if b not in acked]
+
+
+def dead_dependencies(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
+    """Dependencies of this work order that can never be satisfied.
+
+    Cancelled, failed, or deleted out from under it. Anything else is merely not done
+    yet, which is the normal condition of a dependency and asks nothing of anyone.
+    """
+    return [dep for dep in store.unfinished_dependencies(wo["id"])
+            if dep["status"] in DEPENDENCY_DEAD_STATUSES or dep["status"] == "missing"]
+
+
+def status_label(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """How this work order's status should read to a human.
+
+    `pending` alone promises "will start as soon as a slot frees", which is a lie for a
+    row that is waiting on another work order — possibly for days. Every surface that
+    prints a status renders it through here, so the CLI listing, `jarvis status` and the
+    dashboard cannot drift apart on the answer. (They have before: a dashboard listing
+    and its own header disagreed about what needed the user because each derived it
+    separately — see the FEATURED_STATUSES fix in PR 65.)
+    """
+    if wo["status"] != "pending":
+        return wo["status"]
+    blockers = store.unfinished_dependencies(wo["id"])
+    if not blockers:
+        return "pending"
+    return f"pending — blocked by {', '.join(dep['id'] for dep in blockers)}"
 
 
 def _mentions_assumptions(reason: str | None) -> bool:

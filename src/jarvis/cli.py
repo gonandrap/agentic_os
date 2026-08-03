@@ -134,6 +134,17 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--permission-mode")
     c.add_argument("--append-system-prompt")
     c.add_argument("--origin", default="jarvis", choices=["jarvis", "ui", "manual"])
+    c.add_argument("--depends-on", default="",
+                   help="comma-separated work order ids that must COMPLETE before this "
+                        "one is dispatched (same project only)")
+
+    ub = wo.add_parser("unblock", help="cut the dependency edges holding a work order "
+                                       "back (by default only the ones that can never "
+                                       "clear)")
+    ub.add_argument("wo_id")
+    ub.add_argument("--project")
+    ub.add_argument("--all", action="store_true", dest="drop_all",
+                    help="cut every remaining edge, including dependencies still running")
 
     l = wo.add_parser("list", help="list work orders")
     l.add_argument("project", nargs="?", help="restrict to one project")
@@ -490,18 +501,25 @@ def cmd_adopt(args: argparse.Namespace) -> int:
 
 
 def cmd_wo(args: argparse.Namespace) -> int:
-    from . import ops
+    from . import invariants, ops
     from .project_store import OPEN_STATUSES, ProjectStore
     from .timeline import build_timeline
 
     if args.wo_cmd == "create":
+        deps = [d.strip() for d in args.depends_on.split(",") if d.strip()]
         wo = ops.create_work_order(
             args.project, args.title, description=args.description, origin=args.origin,
             model=args.model, effort=args.effort, permission_mode=args.permission_mode,
-            append_system_prompt=args.append_system_prompt,
+            append_system_prompt=args.append_system_prompt, depends_on=deps,
         )
         _print({"created": wo["id"], "project": args.project, "status": wo["status"],
-                "note": "jarvisd will dispatch it shortly"}, args.json)
+                "depends_on": deps,
+                "note": (f"jarvisd will dispatch it once {', '.join(deps)} completes"
+                         if deps else "jarvisd will dispatch it shortly")}, args.json)
+
+    elif args.wo_cmd == "unblock":
+        _print(ops.unblock_work_order(args.wo_id, drop_all=args.drop_all,
+                                      project_name=args.project), args.json)
 
     elif args.wo_cmd == "list":
         paths = ops.registered_project_paths()
@@ -519,12 +537,16 @@ def cmd_wo(args: argparse.Namespace) -> int:
                     statuses=None if args.all else OPEN_STATUSES,
                     include_hidden=args.include_hidden,
                 )
+                # Derived inside the store's lifetime: the label reads the dependencies'
+                # rows, so it cannot be computed after the connection is closed.
+                labels = {wo["id"]: invariants.status_label(store, wo) for wo in wos}
             finally:
                 store.close()
             for wo in wos:
                 out.append({"project": name, **{k: wo[k] for k in (
                     "id", "title", "status", "origin", "needs_attention",
-                    "attention_reason", "created_at", "hidden", "pr_url")}})
+                    "attention_reason", "created_at", "hidden", "pr_url")},
+                    "status_label": labels[wo["id"]]})
         # Running first, then the PRs waiting to be merged, then everything else as it
         # came (newest first, per project). `sorted` is stable, so the second key is
         # only a tie-break within a group.
@@ -540,7 +562,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 pr = f"\n    → merge {wo['pr_url']}" if wo["status"] == "waiting_pr_merge" \
                      and wo["pr_url"] else ""
                 print(f"{icon} {wo['id']} [{wo['project']}] [{badge}] "
-                      f"{wo['title']} ({wo['status']}, {_age(wo['created_at'])}){att}{hid}{pr}")
+                      f"{wo['title']} ({wo['status_label']}, "
+                      f"{_age(wo['created_at'])}){att}{hid}{pr}")
             if not out:
                 print("no work orders")
 
@@ -551,6 +574,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
             messages = store.list_messages(args.wo_id)
             detail = {
                 "project": name, **wo,
+                "status_label": invariants.status_label(store, wo),
+                "blocked_by": store.unfinished_dependencies(args.wo_id),
                 "timeline": build_timeline(wo, store.list_events(args.wo_id),
                                            messages, include_debug=args.debug,
                                            questions=ops.neo_question_texts(args.wo_id)),
