@@ -22,11 +22,17 @@ from .catalog import (
     load_catalog,
     worker_stalls_on_prompts,
 )
+from . import db, invariants
 from .central_store import CentralStore
 from .daemon import daemon_running
 from .invariants import PR_CLOSED_BLOCKER, true_blockers
 from .paths import daemon_pidfile, ensure_home, logs_dir
-from .project_store import OPEN_STATUSES, ProjectStore
+from .project_store import (
+    FO_OPEN_STATUSES,
+    FO_TERMINAL_STATUSES,
+    OPEN_STATUSES,
+    ProjectStore,
+)
 
 
 class OpsError(RuntimeError):
@@ -1178,6 +1184,170 @@ def review_work_order(wo_id: str, accept: bool = True,
         except OpsError as e:
             out["delivery_error"] = str(e)
     return out
+
+
+# -- feature orders --------------------------------------------------------------------------
+
+def create_feature_order(project_name: str, title: str, description: str = "",
+                         origin: str = "jarvis",
+                         backlog_id: str | None = None) -> dict[str, Any]:
+    """File the coarse ask. Nothing is decomposed here — the daemon opens a planner.
+
+    Deliberately the same shape as `create_work_order`, because the whole point of the
+    `jarvis fo` surface is that a user who knows `jarvis wo` already knows it. What the
+    user types is identical; what the OS does with it is not.
+    """
+    paths = registered_project_paths()
+    if project_name not in paths:
+        raise OpsError(f"project {project_name!r} not registered "
+                       f"(known: {sorted(paths)}). Run `jarvis start` first.")
+    if not (description or "").strip():
+        # A work order can survive a bare title — a human reads it and fills the gaps.
+        # A feature order cannot: its first reader is a planner in a fresh session with
+        # no memory of the conversation that produced it, and a planner given four words
+        # will decompose four words.
+        raise OpsError(
+            f"a feature order needs a description: the planner sees only this text, "
+            f"and it is what the whole decomposition is built from. Use "
+            f"`jarvis fo create {project_name} \"{title[:40]}\" -d \"...\"`."
+        )
+    store = ProjectStore(paths[project_name])
+    try:
+        return store.create_feature_order(title=title, description=description,
+                                          origin=origin, backlog_id=backlog_id)
+    finally:
+        store.close()
+
+
+def find_feature_order(fo_id: str, project_name: str | None = None
+                       ) -> tuple[str, Path, dict[str, Any]]:
+    """Locate a feature order across all registered projects. Mirrors
+    `find_work_order`, including its guard: callers only catch `OpsError`, so an
+    unregistered name must not surface as a bare `KeyError`."""
+    paths = registered_project_paths()
+    if project_name and project_name not in paths:
+        raise OpsError(f"project {project_name!r} not registered "
+                       f"(known: {sorted(paths)})")
+    candidates = {project_name: paths[project_name]} if project_name else paths
+    for name, path in candidates.items():
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            return name, path, store.get_feature_order(fo_id)
+        except KeyError:
+            continue
+        finally:
+            store.close()
+    raise OpsError(f"feature order {fo_id!r} not found in any registered project")
+
+
+def feature_progress(store: ProjectStore, fo: dict[str, Any]) -> dict[str, Any]:
+    """How far along this feature order is, derived from its children every time.
+
+    Never stored. The feature order's status says which PHASE it is in; the counts say
+    where inside the phase it is, and they are a fact about the child rows — the same
+    reasoning that keeps "blocked" out of `WO_STATUSES`. A stored 3/6 is a 3/6 that goes
+    wrong the first time somebody cancels a child by hand.
+    """
+    children = store.feature_children(fo["id"])
+    done = sum(1 for c in children if c["status"] == "completed")
+    return {
+        "children": len(children),
+        "done": done,
+        "needs_attention": sum(1 for c in children if c["needs_attention"]),
+        "running": sum(1 for c in children
+                       if c["status"] in ("dispatching", "running", "waiting_input")),
+        "awaiting_merge": sum(1 for c in children if c["status"] == "waiting_pr_merge"),
+        "failed": sum(1 for c in children if c["status"] in ("failed", "cancelled")),
+        "label": f"{done}/{len(children)} done" if children else "no children yet",
+    }
+
+
+def list_feature_orders(project_name: str | None = None,
+                        include_settled: bool = False) -> list[dict[str, Any]]:
+    paths = registered_project_paths()
+    if project_name:
+        if project_name not in paths:
+            raise OpsError(f"project {project_name!r} not registered")
+        paths = {project_name: paths[project_name]}
+    out = []
+    for name, path in sorted(paths.items()):
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            statuses = None if include_settled else FO_OPEN_STATUSES
+            for fo in store.list_feature_orders(statuses=statuses):
+                out.append({"project": name, **fo,
+                            "progress": feature_progress(store, fo)})
+        finally:
+            store.close()
+    return out
+
+
+def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """The feature order, its plan and its children — the tree, in one call."""
+    from . import plans
+
+    name, path, fo = find_feature_order(fo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        plan = db.from_json(fo.get("plan"), None)
+        children = [
+            {**{k: c[k] for k in ("id", "title", "status", "needs_attention",
+                                  "attention_reason", "pr_url")},
+             "depends_on": store.dependencies(c),
+             "status_label": invariants.status_label(store, c)}
+            for c in store.feature_children(fo_id)
+        ]
+        planner = None
+        if fo.get("plan_wo_id"):
+            try:
+                p = store.get_work_order(fo["plan_wo_id"])
+                planner = {k: p[k] for k in ("id", "title", "status", "result_summary")}
+            except KeyError:
+                planner = None  # deleted out from under it; the link was released
+        return {
+            "project": name, **fo,
+            "plan": plan,
+            "plan_text": "\n".join(plans.render_plan(plan)) if plan else "",
+            "planner": planner,
+            "children": children,
+            "progress": feature_progress(store, fo),
+        }
+    finally:
+        store.close()
+
+
+def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """The user stopping a feature order, and everything it has running.
+
+    A feature order that stopped while its planner and four children kept going would be
+    a label, not a cancellation — so this reaches down. Every non-terminal work order it
+    owns (the planner included) is cancelled through the ordinary `cancel` path, which is
+    what stops the sessions; nothing here reimplements that.
+    """
+    name, path, fo = find_feature_order(fo_id, project_name)
+    if fo["status"] in FO_TERMINAL_STATUSES:
+        raise OpsError(f"{fo_id} is already {fo['status']}")
+    store = ProjectStore(path)
+    try:
+        owned = store.feature_children(fo_id)
+        if fo.get("plan_wo_id"):
+            try:
+                owned.append(store.get_work_order(fo["plan_wo_id"]))
+            except KeyError:
+                pass
+        stop_ids = [w["id"] for w in owned if w["status"] in OPEN_STATUSES]
+        store.set_feature_status(fo_id, "cancelled")
+        store.clear_feature_attention(fo_id)
+    finally:
+        store.close()
+    for wo_id in stop_ids:
+        cancel(wo_id)
+    return {"project": name, "fo_id": fo_id, "title": fo["title"],
+            "status": "cancelled", "cancelled_work_orders": stop_ids}
 
 
 # -- Neo (OS answerer agent) ---------------------------------------------------------------------

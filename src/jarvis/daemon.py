@@ -154,6 +154,10 @@ class Daemon:
                 # longer has to wait for a roster refresh either.
                 self.settle_turns(project, store)
                 self.deliver_messages(project, store)
+                # Before dispatch, not after: a planner filed this tick is an ordinary
+                # pending work order, so it is claimed by the same pass rather than
+                # waiting a whole poll interval to start.
+                self.plan_features(project, store)
                 self.dispatch_pending(project, store)
                 if poll_prs:
                     self.poll_pull_requests(project, store)
@@ -189,6 +193,42 @@ class Daemon:
                 )
             except claude_cli.ClaudeCliError as e:
                 log.error("[%s] dispatch of %s failed: %s", project.name, wo["id"], e)
+
+    # -- 4a. feature orders: open a planner ------------------------------------------
+
+    def plan_features(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Give every unplanned feature order its planner.
+
+        The daemon does not fan out here and never will: it creates exactly ONE child
+        work order, briefed as the planning lead. Everything the OS already does for a
+        worker then applies to the planner for free — the headless transport, the
+        worktree, `jarvis wo ask`, assumptions, the gate, stall detection, the timeline,
+        cancellation — which is the whole reason planning is a work order rather than a
+        pipeline inside this process.
+
+        Idempotent by status, not by a flag: the feature order leaves `pending` in the
+        same call that files the planner, so a tick that crashes between the two leaves
+        the feature order `pending` and simply files it again next time. The opposite
+        ordering would strand a feature order in `planning` with no planner.
+        """
+        for fo in store.list_feature_orders(statuses=("pending",)):
+            try:
+                wo = store.create_work_order(
+                    title=f"Plan: {fo['title']}"[:200],
+                    # The ask verbatim. The planner CONTRACT is composed at dispatch
+                    # (dispatch._planner_prompt); what lives on the record is what the
+                    # user actually asked for, so the description reads the same in
+                    # `jarvis wo show` as it does in `jarvis fo show`.
+                    description=fo["description"],
+                    origin="jarvis", kind="planner", parent_id=fo["id"],
+                )
+            except Exception:  # noqa: BLE001 — one bad feature order must not stop the rest
+                log.exception("[%s] could not open a planner for %s", project.name,
+                              fo["id"])
+                continue
+            store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
+            store.set_feature_status(fo["id"], "planning")
+            log.info("[%s] planning %s: opened %s", project.name, fo["id"], wo["id"])
 
     # -- 1. notifications ----------------------------------------------------------
 
