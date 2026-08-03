@@ -330,8 +330,13 @@ def build_parser() -> argparse.ArgumentParser:
     b = bl.add_parser("list")
     b.add_argument("project", nargs="?")
     b.add_argument("--all", action="store_true", help="include non-open items")
-    b = bl.add_parser("promote", help="turn a backlog item into a work order")
+    b = bl.add_parser("promote", help="turn a backlog item into a work order (or, with "
+                                      "--as feature, into a feature order the project "
+                                      "plans for itself)")
     b.add_argument("item_id")
+    b.add_argument("--as", dest="as_kind", default="work", choices=["work", "feature"],
+                   help="`work` (default) dispatches one worker; `feature` opens a "
+                        "planner that decomposes it first")
     b.add_argument("--force", action="store_true", help="ignore unfinished dependencies")
     b = bl.add_parser("done", help="mark a backlog item done without a work order")
     b.add_argument("item_id")
@@ -841,7 +846,8 @@ def cmd_backlog(args: argparse.Namespace) -> int:
                 if not items:
                     print("backlog empty")
         elif args.bl_cmd == "promote":
-            _print(ops.promote_backlog(args.item_id, force=args.force), args.json)
+            _print(ops.promote_backlog(args.item_id, force=args.force,
+                                       as_feature=args.as_kind == "feature"), args.json)
         elif args.bl_cmd == "done":
             central.mark_backlog(args.item_id, "done")
             _print({"item": args.item_id, "status": "done"}, args.json)

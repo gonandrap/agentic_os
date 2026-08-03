@@ -629,6 +629,41 @@ Neo reviewing plans with escalation, `jarvis fo` and the dashboard page. One pla
 seats yet — the orchestrator's scope check is the only review of the plan's shape, which
 is why the validator lands in this phase and not later.
 
+> **Phase 2 status: SHIPPED** (`wo-bc3969ad`). The `feature_orders` table with
+> `work_orders.parent_id` and `work_orders.kind`, the seven states, the planner work
+> order, `jarvis fo plan --from-file` with the validator and the child cap, Neo
+> reviewing plans as a third question kind, `jarvis fo`, `jarvis backlog promote
+> --as feature`, and the dashboard feature page.
+>
+> **Four things this phase decided that the document above left open or got wrong.**
+>
+> 1. **No stacking, again** — Phase 2 ships the strict rule unchanged. Stacking is a
+>    change to `worker_session.start()`, which every worker launch in the fleet goes
+>    through, and it is not worth bundling into a phase this size. Backlogged for
+>    Phase 4 with the verified invocation attached.
+> 2. **The cap OVERRIDES Neo, and Neo is still asked.** Section 5 named "a plan at or
+>    over the child cap" as an escalation trigger but left it to Neo's discretion; a
+>    backstop the reviewer can wave through is not one, so it is now enforced in
+>    `Daemon._deliver_plan_verdict` regardless of the verdict. Neo is still called,
+>    because the alternative is handing the user a nine-node graph with no read on it,
+>    and its reading is attached to what they see.
+> 3. **The planner keeps ordinary write permissions.** Section 8's layer-1 restriction
+>    cannot be applied to it: a deny broad enough to stop product code also stops the
+>    `plan.json` it must submit and the design-document PR that decision 2 makes the base
+>    of the stack. The rule is carried in the planner briefing's prose, a test pins that
+>    as deliberate, and the enforced posture waits for Phase 3's seats.
+> 4. **"The remainder cannot proceed" was dropped.** Section 6's `failed` condition is
+>    implemented as "any child failed or cancelled", with no reachability check: a
+>    feature with a dead child needs a human whichever siblings could still run, so the
+>    qualifier buys nothing and is easy to get subtly wrong.
+>
+> The two backstops held up in practice and one of them nearly broke: the "description
+> does not stand alone" check first rejected *"the first step is to add the column"*,
+> treating an ordinal as a sibling reference. That is a false positive that makes plans
+> worse — it teaches planners to write around the checker — so the phrase list now
+> matches only unambiguously outward references, with negative controls beside every
+> rejection in the tests.
+
 **Phase 3 — the seats and the rollup.** The architect and test-lead seats shipped through
 `install_agent_skills()`, their `tools:` postures per section 8, feature-level attention
 rollup, `max_parallel`. This is the phase that touches the two surfaces shared with PR 64:

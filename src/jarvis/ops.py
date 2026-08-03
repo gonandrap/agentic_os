@@ -1861,7 +1861,15 @@ def show_gate(approval_id: int, project_name: str | None = None) -> dict[str, An
 
 # -- backlog ------------------------------------------------------------------------------------
 
-def promote_backlog(item_id: str, force: bool = False) -> dict[str, Any]:
+def promote_backlog(item_id: str, force: bool = False,
+                    as_feature: bool = False) -> dict[str, Any]:
+    """Turn an intake item into committed work.
+
+    `as_feature` is the whole of the backlog's involvement with feature orders, and the
+    backlog is deliberately left alone otherwise: it stays an OS-wide intake list of
+    things that are not yet anybody's work, and a feature order is committed work. The
+    only thing that changes is which of the two a promotion produces.
+    """
     central = CentralStore()
     try:
         item = central.get_backlog(item_id)
@@ -1876,6 +1884,20 @@ def promote_backlog(item_id: str, force: bool = False) -> dict[str, Any]:
                 + ", ".join(f"{b['id']} ({b['status']})" for b in blockers)
                 + " — finish them first or use --force"
             )
+        if as_feature:
+            fo = create_feature_order(
+                item["project"], item["title"], description=item["description"],
+                origin="jarvis", backlog_id=item_id,
+            )
+            # `promoted_wo_id` takes the feature order's id: the column records what the
+            # item BECAME, and widening it to a second nullable column would leave every
+            # reader having to check both to answer one question.
+            central.mark_backlog(item_id, "promoted", promoted_wo_id=fo["id"])
+            return {"backlog_id": item_id, "fo_id": fo["id"],
+                    "project": item["project"],
+                    "forced_over_blockers": [b["id"] for b in blockers] if force else [],
+                    "note": "a planner will decompose it; the plan comes back for "
+                            "review before any work order is created"}
         wo = create_work_order(
             item["project"], item["title"], description=item["description"],
             origin="jarvis", backlog_id=item_id,

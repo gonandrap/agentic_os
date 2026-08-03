@@ -161,6 +161,11 @@ class Daemon:
                 self.dispatch_pending(project, store)
                 if poll_prs:
                     self.poll_pull_requests(project, store)
+                # After the pull-request poll, so the merge that completes a feature's
+                # last child settles the feature in the same tick rather than the next
+                # one — but outside the `if`, because a child can also finish without
+                # ever opening a pull request.
+                self.settle_features(project, store)
                 if reconcile:
                     # The agents roster holds ONLY the user's own sessions: workers are
                     # headless and never enter it. Jarvis looks at the ones it was
@@ -229,6 +234,73 @@ class Daemon:
             store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
             store.set_feature_status(fo["id"], "planning")
             log.info("[%s] planning %s: opened %s", project.name, fo["id"], wo["id"])
+
+    def settle_features(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Close out feature orders whose children have all landed, or one of which has
+        not.
+
+        Only `executing` feature orders are looked at, and that single fact is what makes
+        "flag once, at feature level" true by construction rather than by bookkeeping: a
+        feature that fails leaves `executing` in the same call that raises its flag, so
+        the next tick does not see it and cannot raise it again. No `already_reported`
+        set, no dedupe key.
+
+        The rules, decided 2026-08-03:
+
+        * **`completed` when every child is `completed`.** `waiting_pr_merge` does not
+          count — the same strict rule Phase 1 shipped for dependency edges, and for the
+          same reason: a feature is done when its code is on the default branch, not when
+          it is sitting on branches. The merge poller closes each child a couple of
+          minutes after the user merges, so this costs nobody a step.
+        * **`failed` when ANY child is `failed` or `cancelled`.** Deliberately without
+          the design's "and the remainder cannot proceed" qualifier: a feature with a
+          dead child needs a human whichever siblings could still run, so the
+          reachability check buys nothing and is easy to get subtly wrong. A cancelled
+          child counts too — it did not settle successfully, so `completed` would be a
+          lie — but the reason says cancellation rather than failure, because the two ask
+          the user for different things.
+
+        No notification is raised here, on purpose. A failed child has already pinged the
+        user through `settle_work_order`, and `notify.route_new_inbox` applies no level
+        filter — every inbox row reaches every sink — so a second row would be the same
+        event arriving on the phone twice. The feature-level flag is what the user finds
+        when they follow the first one.
+        """
+        from .invariants import FEATURE_CHILD_CANCELLED, FEATURE_CHILD_FAILED
+
+        for fo in store.list_feature_orders(statuses=("executing",)):
+            children = store.feature_children(fo["id"])
+            if not children:
+                continue  # released with nothing in it; nothing to settle against
+            dead = [c for c in children if c["status"] in ("failed", "cancelled")]
+            if dead:
+                first = dead[0]
+                template = (FEATURE_CHILD_FAILED if first["status"] == "failed"
+                            else FEATURE_CHILD_CANCELLED)
+                reason = template.format(id=first["id"])
+                store.set_feature_status(fo["id"], "failed")
+                store.flag_feature_attention(fo["id"], reason)
+                log.info("[%s] feature %s failed: %s", project.name, fo["id"], reason)
+            elif all(c["status"] == "completed" for c in children):
+                store.set_feature_status(fo["id"], "completed")
+                store.clear_feature_attention(fo["id"])
+                self._close_feature_backlog(fo)
+                log.info("[%s] feature %s completed (%d work orders)", project.name,
+                         fo["id"], len(children))
+
+    def _close_feature_backlog(self, fo: dict) -> None:
+        """A feature order promoted from the backlog closes its item when it lands.
+
+        The same courtesy `ops.mark_backlog_done` does for a work order, and it has to be
+        here rather than there because a feature order has no `finish` — nobody reports
+        its result; it is derived from its children.
+        """
+        if not fo.get("backlog_id"):
+            return
+        try:
+            self.central.mark_backlog(fo["backlog_id"], "done")
+        except Exception:  # noqa: BLE001 — a stale backlog id must not stop the settle
+            log.exception("could not close backlog item %s", fo["backlog_id"])
 
     # -- 1. notifications ----------------------------------------------------------
 

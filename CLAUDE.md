@@ -61,6 +61,26 @@ jarvis wo unblock <id> [--all]             # cut the edges holding one back. By 
                                            # the order would otherwise wait for ever.
                                            # --all cuts live edges too: it runs now,
                                            # without the work it was told to build on.
+jarvis fo create <project> "title" -d "..."     # a FEATURE order: one ask too big for a
+                                           # single session. The project plans it into
+                                           # work orders ITSELF — a planner agent reads
+                                           # the codebase, decomposes it, and the plan
+                                           # comes back for review before any work order
+                                           # exists. -d is REQUIRED: the planner sees
+                                           # only that text. Use this instead of typing
+                                           # six `wo create` calls, and instead of
+                                           # deciding the split in chat.
+jarvis fo list [project] / show <id>       # show renders the plan + the child tree
+jarvis fo approve <id> [--reject] [--feedback "why"]   # only when Neo escalated: a plan
+                                           # it can decide never reaches the user. It
+                                           # escalates a plan at or over 8 children,
+                                           # one whose children need a gated action, or
+                                           # one it cannot square with a learning.
+                                           # --reject sends the planner back to revise
+                                           # in its existing session, so the feedback
+                                           # must say what to CHANGE.
+jarvis fo cancel <id>                      # stops the planner and every child running
+jarvis backlog promote <id> --as feature   # intake -> feature order, not a work order
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
 jarvis wo review <id> [--reject] [--feedback "why"]   # feedback teaches Neo; on
                                            # --reject it also goes to the worker
@@ -137,6 +157,7 @@ Before exploring the tree, read the memories — they are cheap and current:
 |---|---|
 | `codebase-map` | all 19 modules in `src/jarvis/`, their symbols, the layering, the three SQLite DBs, the `jarvis start` call chain |
 | `work-order-lifecycle` | the WO state machine and exactly how a worker `claude` process is spawned |
+| `feature-orders` | the planned unit above the work order: the 7-state lifecycle, the planner, the plan validator, how Neo reviews a plan |
 | `dev-vs-prod-environments` | the two checkouts, their paths, `JARVIS_HOME`, the release path |
 | `privileged-action-gates` | how a worker ships code: the gate, Neo's review, the deny-rule trap |
 | `testing` | how to run the suite and what covers what |

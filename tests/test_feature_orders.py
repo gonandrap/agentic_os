@@ -71,6 +71,12 @@ def planning(started, store):
     return daemon, store.get_feature_order(fo["id"])
 
 
+def backlog_item(central, item_id: str) -> dict:
+    item = central.get_backlog(item_id)
+    assert item is not None, item_id
+    return item
+
+
 def planner_of(store, fo_id: str) -> dict:
     return store.get_work_order(store.get_feature_order(fo_id)["plan_wo_id"])
 
@@ -355,6 +361,142 @@ def test_neos_verdict_is_dropped_if_the_user_got_there_first(planning, store):
 
     assert store.get_feature_order(fo["id"])["status"] == "planning"
     assert store.feature_children(fo["id"]) == []
+
+
+# -- settling: how a feature order ends ------------------------------------------------------
+
+
+@pytest.fixture()
+def executing(planning, store):
+    """A released feature order with two children, `schema` then `api`."""
+    daemon, fo = planning
+    ops.submit_plan(fo["id"], a_plan(child("schema", extra="FORCE_APPROVE"),
+                                     child("api", needs=["schema"])))
+    released(daemon, store, fo["id"])
+    schema, api = store.feature_children(fo["id"])
+    return daemon, store.get_feature_order(fo["id"]), schema, api
+
+
+def test_a_feature_order_completes_only_when_every_child_has(executing, store):
+    daemon, fo, schema, api = executing
+
+    store.set_status(schema["id"], "completed")
+    daemon.tick()
+    assert store.get_feature_order(fo["id"])["status"] == "executing"
+
+    store.set_status(api["id"], "completed")
+    daemon.tick()
+
+    assert store.get_feature_order(fo["id"])["status"] == "completed"
+    assert store.get_feature_order(fo["id"])["needs_attention"] == 0
+
+
+def test_a_child_waiting_for_its_pr_to_merge_does_not_count_as_done(executing, store):
+    """The strict rule Phase 1 shipped for dependency edges, applied to the parent: a
+    feature is done when its code is on the default branch, not when it is on branches.
+    The merge poller closes each child a couple of minutes after the user merges, so
+    this costs nobody a step."""
+    daemon, fo, schema, api = executing
+    store.set_status(schema["id"], "completed")
+    store.set_status(api["id"], "waiting_pr_merge")
+
+    daemon.tick()
+
+    assert store.get_feature_order(fo["id"])["status"] == "executing"
+
+
+def test_one_failed_child_fails_the_feature_and_says_which(executing, store):
+    daemon, fo, schema, api = executing
+
+    store.set_status(schema["id"], "failed")
+    daemon.tick()
+
+    fo = store.get_feature_order(fo["id"])
+    assert fo["status"] == "failed"
+    assert fo["needs_attention"] == 1
+    assert schema["id"] in fo["attention_reason"]
+    assert "failed" in fo["attention_reason"]
+
+
+def test_a_cancelled_child_also_fails_the_feature_but_words_it_as_cancellation(
+        executing, store):
+    """It did not settle successfully, so `completed` would be a lie — but a cancellation
+    is a decision already taken, and a failure is a problem to diagnose. They ask the
+    user for different things, so they must not read the same."""
+    daemon, fo, schema, api = executing
+
+    store.set_status(schema["id"], "cancelled")
+    daemon.tick()
+
+    fo = store.get_feature_order(fo["id"])
+    assert fo["status"] == "failed"
+    assert "was cancelled" in fo["attention_reason"]
+    assert "failed —" not in fo["attention_reason"]
+
+
+def test_a_failed_feature_flags_once_and_not_every_tick(executing, store):
+    """Flag-once is true by construction, not by bookkeeping: a feature that fails leaves
+    `executing` in the same call that raises the flag, so the next tick never sees it."""
+    daemon, fo, schema, api = executing
+    store.set_status(schema["id"], "failed")
+    daemon.tick()
+    store.clear_feature_attention(fo["id"])  # the user acknowledges it
+
+    daemon.tick()
+    daemon.tick()
+
+    assert store.get_feature_order(fo["id"])["needs_attention"] == 0
+
+
+def test_a_feature_order_still_planning_is_never_settled(planning, store):
+    """Only `executing` is looked at. A feature with no children yet has none completed,
+    and a settle step that did not check the status would call that `failed`."""
+    daemon, fo = planning
+
+    daemon.tick()
+
+    assert store.get_feature_order(fo["id"])["status"] == "planning"
+
+
+def test_a_completed_feature_closes_the_backlog_item_it_came_from(started, store):
+    """A feature order has no `finish` — nobody reports its result, it is derived — so
+    the courtesy `ops.mark_backlog_done` does for a work order has to happen here."""
+    from jarvis.central_store import CentralStore
+
+    daemon = started
+    central = CentralStore()
+    try:
+        item = central.add_backlog("proj_a", "CSV export", description=ASK)
+        out = ops.promote_backlog(item["id"], as_feature=True)
+        daemon.tick()
+        ops.submit_plan(out["fo_id"], a_plan(child("only", extra="FORCE_APPROVE")))
+        released(daemon, store, out["fo_id"])
+        store.set_status(store.feature_children(out["fo_id"])[0]["id"], "completed")
+
+        daemon.tick()
+
+        assert store.get_feature_order(out["fo_id"])["status"] == "completed"
+        assert backlog_item(central, item["id"])["status"] == "done"
+    finally:
+        central.close()
+
+
+def test_promoting_a_backlog_item_as_a_feature_plans_it_instead_of_dispatching_it(
+        started, store):
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        item = central.add_backlog("proj_a", "CSV export", description=ASK)
+
+        out = ops.promote_backlog(item["id"], as_feature=True)
+
+        assert out["fo_id"].startswith("fo-")
+        assert backlog_item(central, item["id"])["promoted_wo_id"] == out["fo_id"]
+        # Nothing dispatched: a feature order is planned before anything runs.
+        assert store.list_work_orders() == []
+    finally:
+        central.close()
 
 
 # -- cancellation ---------------------------------------------------------------------------
