@@ -8,11 +8,16 @@ One process, one poll loop over every project in the catalog. Per tick, in this 
      sees the concurrency slots steps 2 and 3 just freed
   5. let Neo (the OS answerer agent) drain queued worker questions
 
+Every PR_POLL_EVERY_TICKS ticks it additionally:
+  6. asks GitHub what happened to the pull requests its work orders are parked behind,
+     and ends the ones that were merged — the only step that leaves the machine, and
+     the reason a merge does not need a `jarvis wo done` after it
+
 Every RECONCILE_EVERY_TICKS ticks it additionally:
-  6. tracks the sessions the user *injected* (`jarvis wo inject`) — the only step that
+  7. tracks the sessions the user *injected* (`jarvis wo inject`) — the only step that
      still needs `claude agents --json`, since workers are headless and never enter that
      roster. Sessions Jarvis was not given are not looked at, let alone recorded
-  7. checks the OS's own post-conditions (src/jarvis/invariants.py) and repairs the
+  8. checks the OS's own post-conditions (src/jarvis/invariants.py) and repairs the
      state that is unambiguously wrong — the only step that does not trust the others
 
 The daemon is an orchestrator, never a doer: all actual work happens inside the worker
@@ -34,11 +39,19 @@ from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
 from .paths import daemon_pidfile, ensure_home, logs_dir
-from .project_store import UNGOVERNED_ORIGINS, ProjectStore
+from .project_store import PRE_APPROVED_KEY, UNGOVERNED_ORIGINS, ProjectStore
 
 log = logging.getLogger("jarvisd")
 
 RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injected only)
+#: Ask GitHub about parked pull requests every N ticks — ~2 minutes at the default 5s
+#: interval. Its own cadence rather than the reconcile one because it is the only step
+#: that leaves the machine: one `gh` subprocess per parked work order per poll. Two
+#: minutes is well inside what a user perceives as "it noticed my merge", and a fleet
+#: with five PRs parked spends ~150 calls/hour against `gh`'s 5000/hour authenticated
+#: limit. Not catalog-configurable on purpose: a knob nobody will tune is a knob that
+#: only ever gets set wrong.
+PR_POLL_EVERY_TICKS = 24
 
 
 class Daemon:
@@ -56,6 +69,10 @@ class Daemon:
         # Invariant violations already reported this run, so a standing problem is
         # surfaced once instead of every tick. Keyed by (invariant, wo_id).
         self.reported_violations: set[tuple[str, str | None]] = set()
+        # Projects already warned that their pull requests cannot be polled (no `gh`, no
+        # credentials, an unreachable host). Same idea: say it once, not every 2 minutes
+        # forever. Reset by restarting the daemon, which is also what fixes it.
+        self.pr_poll_warned: set[str] = set()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -104,6 +121,7 @@ class Daemon:
     def tick(self) -> None:
         self.tick_count += 1
         reconcile = self.tick_count % RECONCILE_EVERY_TICKS == 1
+        poll_prs = self.tick_count % PR_POLL_EVERY_TICKS == 1
         # `None` means "the roster was not read this tick" — either nothing is injected
         # or the listing failed — and is NOT the same as an empty roster, which would
         # mean every injected session ended. Session tracking is skipped on None.
@@ -137,6 +155,8 @@ class Daemon:
                 self.settle_turns(project, store)
                 self.deliver_messages(project, store)
                 self.dispatch_pending(project, store)
+                if poll_prs:
+                    self.poll_pull_requests(project, store)
                 if reconcile:
                     # The agents roster holds ONLY the user's own sessions: workers are
                     # headless and never enter it. Jarvis looks at the ones it was
@@ -280,6 +300,8 @@ class Daemon:
                     )
                     pstore.add_event(q["wo_id"], "neo_answered",
                                      {"neo_question_id": q["id"]})
+                if pstore and q.get("kind") != "approval":
+                    self._dispatch_neo_cleanup(pstore, q, verdict)
             finally:
                 if pstore:
                     pstore.close()
@@ -296,6 +318,55 @@ class Daemon:
         finally:
             store.close()
             central.close()
+
+    def _dispatch_neo_cleanup(self, pstore: ProjectStore, q: dict, verdict: dict) -> None:
+        """File the pre-approved ledger cleanup Neo asked for, if it asked for one.
+
+        The learnings and the knowledge base are append-only, so a superseded ruling sits
+        next to the one that replaced it until somebody writes the correction — and the
+        only reader positioned to notice is Neo, mid-answer, staring at both. This is the
+        hand it gets to fix that: a work order carrying its own authorisation, so the
+        worker corrects the record instead of asking permission to.
+
+        Two guards, both load-bearing:
+          * The cleanup is pre-approved to CORRECT THE RECORD, not to ship. Privileged
+            actions still gate — that is why the marker names its scope in words rather
+            than being a bare flag.
+          * A cleanup never dispatches a cleanup. Neo answers the cleanup worker's
+            questions too, and without this a contradiction it cannot resolve would file
+            a fresh work order on every round trip.
+        """
+        dispatch = verdict.get("dispatch")
+        if not dispatch:
+            return
+        try:
+            origin_wo = pstore.get_work_order(q["wo_id"])
+        except KeyError:
+            origin_wo = {}
+        if origin_wo.get("origin") == "neo":
+            log.info("neo cleanup dispatch from %s ignored: already a cleanup work order",
+                     q["wo_id"])
+            return
+        description = "\n\n".join(filter(None, [
+            dispatch["description"],
+            f"Neo filed this while answering question {q['id']} on {q['wo_id']}. "
+            f"The correction is ALREADY APPROVED — make it. The stores are append-only, "
+            f"so the remedy is to APPEND an entry that supersedes the wrong one "
+            f"(`jarvis learn add` for the knowledge base, `jarvis neo learn` for Neo's "
+            f"own learnings), naming what it replaces and why.",
+        ]))
+        wo = pstore.create_work_order(
+            title=dispatch["title"], description=description, origin="neo",
+            metadata={PRE_APPROVED_KEY: {
+                "by": "neo",
+                "scope": "correcting the recorded ledger entries this work order names",
+                "neo_question_id": q["id"],
+                "from_wo": q["wo_id"],
+            }},
+        )
+        pstore.add_event(q["wo_id"], "neo_dispatched",
+                         {"neo_question_id": q["id"], "cleanup_wo_id": wo["id"]})
+        log.info("neo dispatched pre-approved cleanup %s from %s", wo["id"], q["wo_id"])
 
     def _deliver_gate_verdict(self, central: CentralStore, pstore: ProjectStore | None,
                               q: dict, verdict: dict) -> None:
@@ -507,6 +578,96 @@ class Daemon:
                 wo["id"],
                 "worker idle without `jarvis wo finish` — review the session",
             )
+
+    # -- 6. pull requests parked on a human ------------------------------------------
+
+    def poll_pull_requests(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Ask GitHub what happened to the pull requests this project is parked behind.
+
+        `settle_work_order` can only see as far as the worker's last turn, and a work
+        order that ends in a pull request outlives that turn: the merge is the real
+        ending and it happens somewhere Jarvis cannot see. This is the one step that
+        looks outside the machine, and it exists so the user does not have to type
+        `jarvis wo done` after every merge they already performed.
+
+        Three answers, from `github.pr_view`:
+
+        * **merged** — the work landed; the work order ends (`ops.complete_merged`).
+        * **closed, unmerged** — someone refused the work; it goes to `needs_review`
+          and asks for the user (`ops.record_pr_closed`).
+        * **open** — nothing to do, and nothing written. The overwhelmingly common case,
+          so it costs exactly one `gh` call and no database write.
+
+        Hidden work orders are polled too. Hiding drops a record from listings and the
+        attention list; it does not mean the record may go on saying something untrue.
+
+        The step is skipped whole when nothing is parked — one indexed query — so a
+        fleet with no open pull requests never spawns a subprocess for this.
+        """
+        parked = [wo for wo in store.list_work_orders(statuses=("waiting_pr_merge",),
+                                                      include_hidden=True)
+                  if wo.get("pr_url")]
+        if not parked:
+            return
+        from . import github, ops
+
+        for wo in parked:
+            try:
+                pr = github.pr_view(wo["pr_url"], cwd=project.path)
+            except github.GitHubError as e:
+                # One unreadable pull request must not hide the others: a deleted repo
+                # or a typo'd URL is a per-work-order problem, and a missing `gh` will
+                # simply fail again on the next one. Either way the user hears once.
+                log.debug("[%s] could not read %s for %s: %s", project.name,
+                          wo["pr_url"], wo["id"], e)
+                self._warn_pr_poll_broken(project, store, e)
+                continue
+            except Exception:  # noqa: BLE001 — never let one work order stall the rest
+                log.exception("[%s] polling %s failed", project.name, wo["id"])
+                continue
+            try:
+                if pr.merged:
+                    # Deliberately silent. `route_new_inbox` has no level filter, so an
+                    # "info" row here would Telegram the user on every merge — about a
+                    # merge they just performed themselves. `jarvis wo done` announces
+                    # nothing either, and this is the same event with the typing removed.
+                    # The timeline, the status change and `jarvis status` carry it.
+                    log.info("[%s] %s merged — completing %s", project.name,
+                             wo["pr_url"], wo["id"])
+                    ops.complete_merged(store, wo, merged_at=pr.merged_at)
+                elif pr.closed_unmerged:
+                    log.info("[%s] %s closed unmerged — %s needs the user",
+                             project.name, wo["pr_url"], wo["id"])
+                    ops.record_pr_closed(store, wo)
+            except Exception:  # noqa: BLE001
+                log.exception("[%s] settling %s against its PR failed", project.name,
+                              wo["id"])
+
+    def _warn_pr_poll_broken(self, project: ProjectSpec, store: ProjectStore,
+                             error: Exception) -> None:
+        """Tell the user once per daemon run that this project's PRs are not polled.
+
+        Silence would be worse than a warning here: the OS would look like it had a
+        feature it does not, and the user would keep waiting for merges to register.
+        Once is the other half of that — a broken `gh` is broken on every poll, and an
+        inbox entry every two minutes is how an inbox stops being read.
+
+        The likely cause is documented in `bugreport.create_issue` and worth repeating
+        in the body: a daemon-spawned process often cannot reach `gh`'s keyring
+        credentials, so the service environment needs `GH_TOKEN`.
+        """
+        if project.name in self.pr_poll_warned:
+            return
+        self.pr_poll_warned.add(project.name)
+        log.warning("[%s] pull-request polling unavailable: %s", project.name, error)
+        store.add_notification(
+            title=f"auto-complete on merge is off for {project.name}",
+            body=(f"{error}\n\nWork orders parked behind a pull request will stay on "
+                  f"the open list until you close them with `jarvis wo done`. If this "
+                  f"is the daemon, `gh`'s keyring credentials may be out of reach — "
+                  f"set GH_TOKEN in the service environment."),
+            level="warning", source="pr-poll",
+        )
 
     def retire_ungoverned(self, store: ProjectStore, wo: dict, why: str) -> None:
         """Close an injected session's record without passing judgement on it.

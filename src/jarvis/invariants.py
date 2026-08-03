@@ -44,6 +44,13 @@ BLOCKED_STATUSES = ("waiting_input", "needs_review", "failed")
 # Statuses where nothing can possibly be pending: the work order is over.
 TERMINAL_STATUSES = ("completed", "cancelled")
 
+#: What a work order says when the pull request it was parked behind was closed without
+#: being merged. Lives here rather than at the call site because `true_blockers` is the
+#: only source of attention reasons — INV-ATTENTION-REASON rewrites any flag it cannot
+#: derive, so a reason raised by `Daemon.poll_pull_requests` and not repeated here would
+#: silently become "finished without a completion signal" on the next reconcile tick.
+PR_CLOSED_BLOCKER = "pull request closed without merging — the work was not accepted"
+
 
 @dataclass
 class Violation:
@@ -106,7 +113,14 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     if wo["status"] == "waiting_input" and not _waiting_on_neo_gate(store, wo):
         blockers.append("worker is waiting on your input")
     if governed and wo["status"] == "needs_review" and not pending:
-        blockers.append("finished without a completion signal — review the session")
+        # Two very different ways to arrive at `needs_review` without an assumption to
+        # decide, and they ask the user for opposite things. A closed pull request means
+        # the work WAS delivered and then refused, so there is nothing to review in the
+        # session — the question is what to do about the refusal.
+        if wo.get("pr_state") == "CLOSED":
+            blockers.append(PR_CLOSED_BLOCKER)
+        else:
+            blockers.append("finished without a completion signal — review the session")
     # What the user has already looked at and dismissed stops being a blocker — but only
     # exactly that. Anything new still gets through (a pending assumption never can be
     # acknowledged away; `jarvis wo ack` refuses).

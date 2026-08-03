@@ -74,7 +74,7 @@ STATUS_ICON = {
 # The dashboard groups by the same rule (see ui/app.py FEATURED_STATUSES).
 LIST_PRIORITY = {"running": 0, "waiting_pr_merge": 1}
 ORIGIN_BADGE = {"jarvis": "🤖 jarvis", "ui": "🖥 ui", "manual": "⚠ manual",
-                "adhoc": "⚠ ad-hoc", "injected": "🔗 injected"}
+                "adhoc": "⚠ ad-hoc", "injected": "🔗 injected", "neo": "🧠 neo"}
 
 
 class _VersionAction(argparse.Action):

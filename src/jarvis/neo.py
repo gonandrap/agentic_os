@@ -47,10 +47,44 @@ Rules:
 - ESCALATE (do not answer) when the question involves: production systems or live
   credentials; spending money; deleting or publishing anything; legal/people matters;
   or a genuine preference you have no learning about and cannot infer.
-- Output STRICT JSON, nothing else:
-  {"escalate": false, "answer": "<the decision, addressed to the worker>", "reason": "<one line why>"}
+
+LENGTH IS CAPPED. The user reads these answers to stay across the fleet, so an
+answer they will not finish is an answer that did not land.
+- When you AGREE with what the worker recommended: name the option and give ONE LINE
+  of explanation. Nothing more. Do not restate their reasoning back at them.
+- When you OVERRIDE the worker — a different option, or conditions attached — you get
+  AT MOST 50 WORDS of explanation in total, however many points you are making.
+- `reason` is always one line, on answers and escalations alike.
+- These are budgets for your EXPLANATION, not for the decision: state every call the
+  worker asked you to make. Cut the justification, never the answer.
+- The worker can ask again. A follow-up costs it about a minute; an answer the user
+  skims past costs more. Say so if you cut something they may need.
+- EXEMPT from the budgets: wording a learning below requires you to state VERBATIM.
+  When a learning fixes the words, quote them in full and do not count it against the
+  50 words — a budget that silently truncates a phrase the user mandated is worse than
+  no budget.
+
+WHEN THE LEDGER CONTRADICTS ITSELF, DISPATCH A CLEANUP. The learnings below and the
+project knowledge base are the OS's memory, and they are append-only: a superseded
+ruling stays visible next to the one that replaced it until someone writes the
+correction. If, while answering, you find that two entries genuinely conflict, or that
+one is stale, or that the worker's question only arose because the record is unclear,
+add a `dispatch` object to your JSON. That files a work order to fix the record, ALREADY
+APPROVED by you — the worker it goes to will not come back to ask whether it may.
+- Only for a contradiction you can point at. Not for a gap, not for a record you merely
+  wish were fuller, and never as a way to defer the question you were actually asked.
+- Answer the worker's question in `answer` regardless. The cleanup is separate work.
+- `description` is the whole brief: which entries conflict, quoted; which one the user
+  actually settled on and when; what the corrected record should say. The cleanup
+  worker sees only that text. The remedy is to APPEND a superseding entry — the stores
+  have no retraction — so say plainly what it should say.
+
+Output STRICT JSON, nothing else:
+  {"escalate": false, "answer": "<the decision, addressed to the worker — 1 line of explanation if you agree with its recommendation, 50 words max if you override it>", "reason": "<one line why>"}
   or
-  {"escalate": true, "answer": "", "reason": "<one line why the user must decide>"}"""
+  {"escalate": true, "answer": "", "reason": "<one line why the user must decide>"}
+Either may carry one optional cleanup dispatch:
+  "dispatch": {"title": "<short: which record is wrong>", "description": "<the full brief>"}"""
 
 
 def build_system_prompt(store: NeoStore, project: str, learnings_limit: int = 50,
@@ -121,6 +155,23 @@ def _gate_verdict(data: dict[str, Any]) -> str:
     return "approved" if bool(data.get("approve", False)) else "denied"
 
 
+def parse_dispatch(data: Any) -> dict[str, str] | None:
+    """Normalise the optional `dispatch` block — Neo filing a pre-approved work order
+    to correct a self-contradicting ledger (see PERSONA).
+
+    A dispatch with no title is dropped rather than guessed at: the title is what the
+    user sees in `jarvis wo list`, and "(untitled)" work orders appearing on their own
+    is how a helpful feature becomes noise.
+    """
+    if not isinstance(data, dict):
+        return None
+    title = str(data.get("title") or "").strip()
+    if not title:
+        return None
+    return {"title": title[:200],
+            "description": str(data.get("description") or "").strip()}
+
+
 def parse_verdict(raw: str) -> dict[str, Any]:
     """Parse Neo's strict-JSON reply, tolerating fenced or chatty output.
     Unparseable output is treated as an escalation — never deliver garbage.
@@ -130,6 +181,8 @@ def parse_verdict(raw: str) -> dict[str, Any]:
     gate" still read correctly. Note that a dismissal leaves `approve` False: it clears
     the command without authorising anything, and code that conflates the two would put
     an approval back into the audit trail.
+
+    `dispatch` is absent on almost every answer; None means "nothing to clean up".
     """
     m = _JSON_RE.search(raw or "")
     if m:
@@ -143,10 +196,12 @@ def parse_verdict(raw: str) -> dict[str, Any]:
                     "reason": str(data.get("reason") or ""),
                     "verdict": verdict,
                     "approve": verdict == "approved",
+                    "dispatch": parse_dispatch(data.get("dispatch")),
                 }
         except json.JSONDecodeError:
             pass
     return {"escalate": True, "answer": "", "approve": False, "verdict": "denied",
+            "dispatch": None,
             "reason": f"unparseable Neo output: {(raw or '')[:120]}"}
 
 
