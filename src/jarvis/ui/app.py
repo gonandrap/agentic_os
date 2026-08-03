@@ -80,11 +80,20 @@ GATE_META = {
 # the live regions in place (see dashboard.html), so in-progress typing survives.
 REFRESH_SECONDS = 15
 
-# The two open statuses worth a row of their own, in this order: what is being worked
-# on right now, then what is waiting for the user to go and merge it. Everything else
-# open collapses into a count line, the same way settled work orders already do — the
-# point of the page is "what needs me", and a pending work order needs nobody.
-FEATURED_STATUSES = ("running", "waiting_pr_merge")
+# The open statuses worth a row of their own, in this order: the two that owe the user a
+# decision, then what is being worked on right now, then what is waiting for them to go
+# and merge it. Only `pending` and `dispatching` collapse into a count line, the way
+# settled work orders do — the point of the page is "what needs me", and a work order the
+# OS has not started yet needs nobody.
+#
+# `needs_review` and `waiting_input` are here because invariants.true_blockers names them
+# as genuine blockers, and a listing that disagrees with that is a bug in the listing.
+# Collapsing them was one: a project whose only open work was three `needs_review` orders
+# counted them in the header and then said "nothing running and nothing to merge" in the
+# same breath. Status, not the attention flag, decides: `jarvis wo ack` puts the flag down
+# for good, and an acked work order that vanished from the only listing of open work would
+# be unfindable.
+FEATURED_STATUSES = ("needs_review", "waiting_input", "running", "waiting_pr_merge")
 
 
 def group_open(wos: list[dict], revealed: str = "") -> tuple[list[dict], list[dict]]:
@@ -220,9 +229,10 @@ def create_app() -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request, show: str = ""):
-        """The pulse. Open work orders are grouped so the two the user can act on —
-        running, and waiting for them to merge a PR — are rows, and the rest is a
-        count line they can expand (`show` = a status name, or "all")."""
+        """The pulse. Open work orders are grouped so the ones the user can act on —
+        a decision they owe, running work, a PR waiting for them to merge it — are
+        rows, and the rest is a count line they can expand (`show` = a status name,
+        or "all")."""
         st = ops.os_status()
         rows = [{**wo, "project": p["name"]}
                 for p in st["projects"] for wo in p.get("open_work_orders", [])]
@@ -237,12 +247,13 @@ def create_app() -> FastAPI:
 
     @app.get("/project/{name}", response_class=HTMLResponse)
     def project(request: Request, name: str, hidden: str = "", show: str = ""):
-        """A project's work orders — the two that want the user, by default.
+        """A project's work orders — the ones that want the user, by default.
 
-        Running work orders and PRs waiting to be merged get a row each. Everything
-        else — the other open statuses, and the settled ones that are the bulk of any
-        project with history — collapses into per-status counts the user can expand.
-        `show` is "" (featured only), any status name (plus that group), or "all".
+        Work orders owing the user a decision, running ones, and PRs waiting to be
+        merged get a row each. Everything else — work the OS has not started yet, and
+        the settled orders that are the bulk of any project with history — collapses
+        into per-status counts the user can expand. `show` is "" (featured only), any
+        status name (plus that group), or "all".
         """
         paths = ops.registered_project_paths()
         if name not in paths:
@@ -341,7 +352,8 @@ def create_app() -> FastAPI:
         show_debug = debug not in ("", "0", "false")
         return render(request, "work_order.html", project=pname, wo=wo,
                       timeline=build_timeline(wo, events, messages,
-                                              include_debug=show_debug),
+                                              include_debug=show_debug,
+                                              questions=ops.neo_question_texts(wo_id)),
                       debug=show_debug, debug_count=count_debug(events),
                       messages=messages, assumptions=assumptions,
                       approvals=approvals)

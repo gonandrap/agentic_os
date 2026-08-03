@@ -72,9 +72,9 @@
 </div>
 
 <h2>Open work orders</h2>
-{# What is being worked on now, then what is waiting for you to merge it — those are
-   the rows. The other open statuses collapse into a count you can expand: they are
-   waiting on the OS, not on you. #}
+{# The decisions you owe, then what is being worked on now, then what is waiting for you
+   to merge it — those are the rows. Only the statuses the OS has not started yet collapse
+   into a count you can expand: those are waiting on the OS, not on you. #}
 {% if rest_counts %}
 <p class="sub">
   {% for status, n in rest_counts %}
@@ -116,7 +116,7 @@
     </div>
   {% else %}
     <div class="empty">
-      {% if rest_counts %}nothing running and nothing to merge — the rest is counted above
+      {% if rest_counts %}nothing running and nothing waiting on you — the rest is counted above
       {% else %}no open work orders{% endif %}
     </div>
   {% endfor %}
