@@ -33,7 +33,12 @@ from .paths import project_state_dir
 # rather than 6 because the `dismissed` paragraph above ALSO landed as v6, on another
 # branch — exactly the collision the v5 note describes, caught this time in a merge
 # instead of by a project that silently skipped one branch's content.
-TEMPLATE_VERSION = 7
+# v8 = "Serena first, grep second". A worker cannot be given this posture by withholding a
+# tool the way the planning seats are — it needs Grep and Bash to do its job — so ranking
+# the tools in prose is the only lever, and it has to reach every managed repo to be worth
+# anything. Stated conditionally: Jarvis configures no MCP server itself, so whether a
+# worker has Serena depends on the user's own Claude config and on the project.
+TEMPLATE_VERSION = 8
 ASSETS = Path(__file__).parent / "assets"
 
 

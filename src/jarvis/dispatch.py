@@ -24,6 +24,37 @@ def _worker_path() -> str:
     return path
 
 
+# Serena's READ-ONLY tool surface. Naming a tool in an agent's `tools:` key makes it
+# available; it does not make it runnable — permission is a separate gate, and a headless
+# turn cannot answer a prompt. Probed live 2026-08-03: a seat holding
+# `mcp__…__activate_project` in `tools:` but not in `permissions.allow` had the call
+# BLOCKED and reported it could not proceed; with these rules added, the same seat ran
+# activate_project -> find_symbol -> find_referencing_symbols and answered correctly with
+# no text search at all. So this list is what turns "Serena first" from prose into
+# something a worker can actually do.
+#
+# Enumerated rather than granted wholesale, for the same reason the planning seats
+# enumerate: Serena also ships `execute_shell_command`, `create_text_file` and
+# `replace_symbol_body`. Allowing the server as a unit would hand every worker — and every
+# seat that is deliberately denied a shell — a shell, through a side door.
+SERENA_READ_TOOLS = (
+    "activate_project", "get_symbols_overview", "find_symbol",
+    "find_referencing_symbols", "find_declaration", "find_implementations",
+    "search_for_pattern", "find_file", "list_dir", "list_memories", "read_memory",
+)
+
+# A plugin install produces the long prefix, `claude mcp add serena` the short one. Jarvis
+# configures no MCP server itself, so it cannot know which; both are listed, and a rule
+# naming a tool that does not exist on this install is simply inert.
+SERENA_TOOL_PREFIXES = ("mcp__serena__", "mcp__plugin_serena_serena__")
+
+
+def serena_allow_rules() -> list[str]:
+    """`permissions.allow` entries for every read-only Serena tool, under both prefixes."""
+    return [f"{prefix}{tool}"
+            for prefix in SERENA_TOOL_PREFIXES for tool in SERENA_READ_TOOLS]
+
+
 def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     """Merge the project's injected settings with per-work-order env and persist
     them for --settings.
@@ -55,6 +86,11 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         f"Write(//{wt_abs}/**)",
         f"NotebookEdit(//{wt_abs}/**)",
         f"Read(//{proj_abs}/**)",
+        # Read-only code navigation. Without these the symbol tools are visible and
+        # unrunnable, which is worse than absent: the worker is told to prefer Serena,
+        # tries, gets blocked, and either stalls asking for permission it cannot be
+        # granted headlessly or falls back to grep having wasted a call.
+        *serena_allow_rules(),
     ):
         if rule not in allow:
             allow.append(rule)
@@ -180,9 +216,54 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
     return "\n".join(_common_briefing(parts, wo, project, knowledge))
 
 
+def _navigation_briefing() -> list[str]:
+    """Serena before grep, for every session Jarvis dispatches.
+
+    This is prose rather than a capability restriction, and it has to be: a worker needs
+    `Grep` and `Bash` to do its actual job, so the seats' trick of simply not granting
+    the tool is not available here. What IS available is saying which tool answers the
+    question — and the two do not answer the same question. `find_referencing_symbols`
+    has no grep equivalent at all.
+
+    It is stated conditionally because Jarvis knows nothing about Serena: there is no
+    `mcpServers` key in `settings.base.json` and no mention of it anywhere in `src/`, so
+    whether a worker has it depends entirely on the user's own Claude configuration and
+    on whether the project has been indexed. An instruction that assumed it would be a
+    lie in most adopted projects; one that ranks it when present costs nothing when it is
+    absent.
+    """
+    return [
+        "# Navigating the code: Serena first, grep second",
+        "If this project has Serena (its symbol tools appear in your tool list, or "
+        "`.serena/project.yml` is in the repo), use it to find code and do NOT grep for "
+        "symbols. Serena has a language-server symbol index, so `find_symbol`, "
+        "`get_symbols_overview` and especially `find_referencing_symbols` answer where "
+        "something is defined and who calls it as facts, in one call. Grep answers a "
+        "different question — where a string appears — and you then have to rebuild the "
+        "answer from hits that miss every caller spelling the name differently.",
+        "",
+        "- `list_memories` / `read_memory` FIRST on a mapped project: its architecture is "
+        "already written down, and rediscovering it is the most expensive thing you can "
+        "do with your context.",
+        "- `find_symbol` instead of `grep -rn \"def foo\"`; "
+        "`find_referencing_symbols` instead of grepping for call sites — that one has no "
+        "grep equivalent; `get_symbols_overview` before opening a file whole.",
+        "- `search_for_pattern` (Serena's own) or `Grep` for GENUINE text questions: a "
+        "config key, an error string, a TODO. Text search is not wrong, it is just the "
+        "wrong tool for finding code.",
+        "- If the symbol tools say no project is active, `activate_project` on the repo "
+        "root first.",
+        "",
+        "If the project has no Serena, `Glob` and `Grep` are the fallback and there is "
+        "nothing to apologise for — just expect to work harder for a less complete "
+        "picture.",
+    ]
+
+
 def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
                      knowledge: list[dict[str, Any]]) -> list[str]:
     """The tail every briefing carries, whatever the work order's kind."""
+    parts += ["", *_navigation_briefing()]
     pre_approved = _pre_approval(wo)
     if pre_approved:
         parts += ["", *_pre_approved_briefing(pre_approved)]

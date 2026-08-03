@@ -163,6 +163,21 @@ concept the catalog has, so it would mean guessing `src/`-shaped paths per proje
 breaking exactly the design-document case. So "you plan, you do not build" stays prose in
 `_planner_prompt`, and the enforced posture lives on the seats.
 
+**The seats navigate by SYMBOL INDEX, not by grep**, and three live probes decide how
+that is wired. (1) `tools:` excludes MCP tools by default — a seat declared
+`Read, Grep, Glob` reported SERENA-UNAVAILABLE, so the Serena names are listed explicitly.
+(2) **Availability is not permission**: a seat holding `activate_project` in `tools:` but
+not in `permissions.allow` had the call BLOCKED and gave up, so
+`dispatch.serena_allow_rules()` writes an allow rule for every read-only Serena tool into
+the worker settings. (3) An unknown tool name in `tools:` is inert, so BOTH
+`mcp__serena__` and `mcp__plugin_serena_serena__` are always listed — Jarvis configures no
+MCP server itself and cannot know which install it is on. **Never grant Serena
+wholesale**: it ships `execute_shell_command`, `create_text_file` and
+`replace_symbol_body`, which would hand a shell to the seats that were deliberately denied
+one. The same ranking is in `build_worker_prompt` and `OPERATION.md` (v8) for the whole
+fleet, stated conditionally. Graded by `evals/llm/test_navigation_judgment.py`, which
+watches TOOL CALLS via a `PreToolUse` recorder and attributes them by `agent_type`.
+
 **`agent_type` on `approvals`** (Phase 3, layer 2). `JARVIS_WO_ID` is per-session, so a
 gate a SEAT trips files against the work order that owns the turn — correct ownership, but
 without the column the record says the planner attempted what the architect did.

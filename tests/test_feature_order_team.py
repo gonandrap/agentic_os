@@ -39,6 +39,40 @@ SEATS = ("jarvis-architect", "jarvis-test-lead")
 # advisory prohibition is not one.
 EDITING_TOOLS = ("Write", "Edit", "NotebookEdit", "Bash")
 
+# Serena's own write and exec tools, unprefixed. A seat granted "Serena" wholesale would
+# get `execute_shell_command` and `replace_symbol_body` along with the symbol index —
+# which is a shell and file writes, i.e. exactly the posture above, undone through a side
+# door. The grant is therefore tool-by-tool, and this list is what must never appear in it.
+SERENA_WRITE_TOOLS = (
+    "create_text_file", "replace_symbol_body", "replace_content", "replace_in_files",
+    "insert_after_symbol", "insert_before_symbol", "rename_symbol", "safe_delete_symbol",
+    "execute_shell_command", "write_memory", "delete_memory", "edit_memory",
+    "rename_memory", "onboarding",
+)
+
+# The read-only Serena tools a seat needs to navigate code by symbol rather than by text.
+# `find_referencing_symbols` is the load-bearing one: it is the question grep cannot
+# answer at all, because a caller that spells the name differently or reaches the symbol
+# through an import alias is invisible to a text search.
+SERENA_READ_TOOLS = (
+    "activate_project", "get_symbols_overview", "find_symbol",
+    "find_referencing_symbols", "search_for_pattern", "list_memories", "read_memory",
+)
+
+# Both naming schemes are listed in every seat, and this is safe rather than sloppy:
+# probed live 2026-08-03, a tool name in `tools:` that does not exist on the install is
+# silently ignored and does not disturb the rest of the list (a seat listing both
+# `mcp__serena__find_symbol` and `mcp__plugin_serena_serena__find_symbol` on a
+# plugin install reported HAVE_PLAIN=no HAVE_PLUGIN=yes HAVE_READ=yes). A plugin install
+# produces the long prefix and `claude mcp add serena` produces the short one, so naming
+# only one would leave the seat silently Serena-blind on the other.
+SERENA_PREFIXES = ("mcp__serena__", "mcp__plugin_serena_serena__")
+
+
+def granted_tools(seat: str) -> set[str]:
+    return {t.strip() for t in
+            frontmatter((ASSETS / "agents" / f"{seat}.md").read_text())["tools"].split(",")}
+
 
 def frontmatter(text: str) -> dict[str, str]:
     """The `---` block at the top of an agent definition, as key -> value."""
@@ -74,9 +108,7 @@ def test_a_seat_cannot_produce_code(seat):
     Not 'the prompt says do not write code' — the prompt is a preference the model can
     talk itself out of at hour three. This is the capability the CLI never grants.
     """
-    granted = {t.strip() for t in
-               frontmatter((ASSETS / "agents" / f"{seat}.md").read_text())["tools"]
-               .split(",")}
+    granted = granted_tools(seat)
 
     assert granted, "an empty tools list would make the seat useless, not safe"
     assert not granted & set(EDITING_TOOLS), (
@@ -89,11 +121,105 @@ def test_a_seat_can_still_read_the_codebase(seat):
     """Sighted by design: an architect that cannot open a file cannot decompose anything,
     and a test lead that cannot read the existing suite invents a harness that is not
     there. Blindness in this design belongs to the reviewer, who was never in the room."""
-    granted = {t.strip() for t in
-               frontmatter((ASSETS / "agents" / f"{seat}.md").read_text())["tools"]
-               .split(",")}
+    granted = granted_tools(seat)
 
     assert "Read" in granted and "Grep" in granted
+
+
+# -- navigating by symbol, not by text ---------------------------------------------------
+
+
+@pytest.mark.parametrize("seat", SEATS)
+def test_a_seat_is_granted_serenas_symbol_tools(seat):
+    """`tools:` is an ALLOWLIST, so a seat that names only Read/Grep/Glob cannot reach
+    Serena at all — probed live 2026-08-03: such a seat reported SERENA-UNAVAILABLE, and
+    the same seat with the MCP names added reported SERENA-AVAILABLE. So telling a seat in
+    prose to prefer Serena while withholding the tools would ship an instruction it is
+    structurally unable to follow, which is worse than saying nothing."""
+    granted = granted_tools(seat)
+
+    for prefix in SERENA_PREFIXES:
+        missing = [t for t in SERENA_READ_TOOLS if f"{prefix}{t}" not in granted]
+        assert not missing, f"{seat} is missing {missing} under {prefix}"
+
+
+@pytest.mark.parametrize("seat", SEATS)
+def test_serena_does_not_smuggle_write_access_back_in(seat):
+    """The control for the grant above, and the reason it is enumerated tool-by-tool
+    rather than waved through as "give it Serena": Serena ships
+    `execute_shell_command`, `create_text_file` and `replace_symbol_body`. Granting the
+    server wholesale would hand a seat a shell and file writes through a side door, which
+    is precisely the posture `test_a_seat_cannot_produce_code` exists to hold."""
+    granted = granted_tools(seat)
+
+    smuggled = [t for t in granted
+                if any(t == f"{p}{w}" for p in SERENA_PREFIXES for w in SERENA_WRITE_TOOLS)]
+    assert not smuggled, f"{seat} can write through Serena: {smuggled}"
+
+
+@pytest.mark.parametrize("seat", SEATS)
+def test_a_seat_is_told_to_reach_for_serena_before_grep(seat):
+    """The capability is necessary and not sufficient: a seat holding both `Grep` and
+    `find_symbol` will use whichever it thinks of first. The definition has to rank them,
+    and it has to say what the fallback is — these seats run in arbitrary adopted
+    projects, most of which have no Serena index at all."""
+    text = (ASSETS / "agents" / f"{seat}.md").read_text()
+    body = text.split("---\n", 2)[2].lower()
+
+    assert "serena" in body, "the seat is never told the symbol tools exist"
+    assert "do not grep for code" in body, "the ranking is never stated outright"
+    assert "find_referencing_symbols" in body, (
+        "the one question grep cannot answer is the one most worth naming"
+    )
+    # The fallback, so a seat in a project with no index is not stuck refusing to look.
+    assert "fallback" in body and "no serena" in body
+
+
+def test_the_worker_briefing_ranks_serena_over_grep(project):
+    """Not just the seats. Every worker Jarvis dispatches navigates code, and a worker
+    cannot be given this posture by withholding the tool the way a seat is — it needs
+    `Grep` and `Bash` to do its job. Ranking them in prose is the only lever available,
+    so the briefing is where it has to live."""
+    from jarvis.catalog import ProjectSpec
+    from jarvis.dispatch import build_worker_prompt
+
+    spec = ProjectSpec(name="proj_a", path=project, description="")
+    wo = {"id": "wo-1", "title": "t", "description": "d", "kind": "worker"}
+
+    prompt = build_worker_prompt(wo, spec, [])
+
+    assert "Serena first, grep second" in prompt
+    assert "find_referencing_symbols" in prompt
+    # Conditional, because Jarvis configures no MCP server itself: an unconditional
+    # instruction would be a lie in every project that has no Serena.
+    assert "If this project has Serena" in prompt
+    assert "no Serena" in prompt
+
+
+def test_the_planner_briefing_ranks_serena_too(project):
+    """The planner reads more code than anyone — it is deciding what the pieces ARE."""
+    from jarvis.catalog import ProjectSpec
+    from jarvis.dispatch import build_worker_prompt
+
+    spec = ProjectSpec(name="proj_a", path=project, description="")
+    wo = {"id": "wo-1", "title": "t", "description": "d", "kind": "planner",
+          "parent_id": "fo-1"}
+
+    prompt = build_worker_prompt(wo, spec, [])
+
+    assert "Serena first, grep second" in prompt
+
+
+def test_the_operation_contract_ranks_serena_too(project):
+    """OPERATION.md is what a session reads when it goes looking for the contract, and it
+    is the copy that survives in the repo. It has to agree with the briefing."""
+    from jarvis.bootstrap import ASSETS as A
+
+    text = (A / "OPERATION.md.tmpl").read_text()
+
+    assert "Serena first, grep second" in text
+    assert "find_referencing_symbols" in text
+    assert "no grep equivalent" in text
 
 
 # -- delivery: who gets the seats -------------------------------------------------------
@@ -335,3 +461,50 @@ def test_json_of_a_gate_shows_the_seat(gated):
     data = ops.show_gate(store.list_approvals(wo["id"])[0]["id"])
     assert data["agent_type"] == "jarvis-test-lead"
     assert json.dumps(data, default=str)  # and it survives the CLI's serialisation
+
+
+def test_a_worker_may_actually_run_serenas_read_tools(project, jarvis_home):
+    """Availability and permission are two different gates, and the second one is the one
+    that bit.
+
+    Probed live 2026-08-03: a seat holding `mcp__…__activate_project` in its `tools:` key
+    but NOT in `permissions.allow` had the call BLOCKED, and reported it could not proceed
+    — a headless turn cannot answer a permission prompt, so the seat either stalls or
+    wastes a call and falls back to grep. With these rules present the same seat ran
+    activate_project -> find_symbol -> find_referencing_symbols and used no text search at
+    all. So this is what turns "Serena first" from prose into something a worker can do.
+    """
+    import json as _json
+
+    from jarvis.catalog import ProjectSpec
+    from jarvis.dispatch import (
+        SERENA_READ_TOOLS,
+        SERENA_TOOL_PREFIXES,
+        _write_worker_settings,
+    )
+
+    spec = ProjectSpec(name="proj_a", path=project, description="")
+    out = _write_worker_settings(spec, {"id": "wo-nav", "title": "t"})
+    allow = _json.loads(out.read_text())["permissions"]["allow"]
+
+    for prefix in SERENA_TOOL_PREFIXES:
+        for tool in SERENA_READ_TOOLS:
+            assert f"{prefix}{tool}" in allow, f"{prefix}{tool} is visible but unrunnable"
+
+
+def test_dispatch_never_allows_serenas_write_tools(project, jarvis_home):
+    """The control. Serena ships `execute_shell_command`, `create_text_file` and
+    `replace_symbol_body`; allowing the server as a unit would hand every worker — and
+    every seat deliberately denied a shell — a shell through a side door."""
+    import json as _json
+
+    from jarvis.catalog import ProjectSpec
+    from jarvis.dispatch import _write_worker_settings
+
+    spec = ProjectSpec(name="proj_a", path=project, description="")
+    out = _write_worker_settings(spec, {"id": "wo-nav", "title": "t"})
+    allow = _json.loads(out.read_text())["permissions"]["allow"]
+
+    smuggled = [r for r in allow
+                if any(r.endswith(w) for w in SERENA_WRITE_TOOLS)]
+    assert not smuggled, f"dispatch allows Serena write/exec tools: {smuggled}"
