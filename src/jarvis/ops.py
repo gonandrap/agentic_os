@@ -1141,13 +1141,39 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
         neo.close()
     store = ProjectStore(path)
     try:
-        store.add_event(wo_id, "question_asked", {"neo_question_id": q["id"]})
+        # The text, not just the id: the question lives in Neo's separate DB, so a
+        # timeline built from the project store alone could never show what was asked.
+        store.add_event(wo_id, "question_asked",
+                        {"neo_question_id": q["id"], "question": question})
         if wo["status"] == "running":
             store.set_status(wo_id, "waiting_input")
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "question_id": q["id"],
             "note": "queued for Neo — end your turn; the answer arrives as your next user turn"}
+
+
+def neo_question_texts(wo_id: str) -> dict[int, str]:
+    """{question_id: question} for back-filling a timeline. Never raises.
+
+    `question_asked` events written before the text was stored in their payload carry
+    only the id, and the text is in Neo's DB. Every surface that renders a timeline
+    passes this in so those older entries still read as questions. Failure to open
+    Neo's DB must not take `jarvis wo show` (or the work order page) down with it —
+    a timeline missing one detail beats no timeline at all.
+    """
+    from .neo_store import NeoStore
+
+    try:
+        neo = NeoStore()
+    except Exception:  # noqa: BLE001 — best-effort enrichment, see docstring
+        return {}
+    try:
+        return neo.question_texts(wo_id)
+    except Exception:  # noqa: BLE001
+        return {}
+    finally:
+        neo.close()
 
 
 def neo_status() -> dict[str, Any]:

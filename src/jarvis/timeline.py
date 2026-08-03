@@ -63,8 +63,25 @@ def _payload(event: dict[str, Any]) -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
-def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any]) -> tuple[str, str]:
-    """(label, detail) in plain language for one event."""
+def _question(p: dict[str, Any], questions: dict[int, str]) -> str:
+    """What the worker asked, from the payload or — for older events — from Neo's DB."""
+    stored = p.get("question")
+    if stored:
+        return str(stored)
+    qid = p.get("neo_question_id")
+    try:
+        return questions.get(int(qid), "") if qid is not None else ""
+    except (TypeError, ValueError):
+        return ""
+
+
+def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any],
+              questions: dict[int, str]) -> tuple[str, str]:
+    """(label, detail) in plain language for one event.
+
+    `questions` back-fills question text for events that predate it being stored in
+    the payload; see `build_timeline`.
+    """
     if kind == "created":
         about = [wo.get("title") or "", wo.get("description") or ""]
         return "Work order created", "\n".join(x for x in about if x)
@@ -82,14 +99,18 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any]) -> tuple[str, st
     if kind == "assumption":
         return "Assumption recorded", p.get("content") or ""
     if kind == "question_asked":
-        return "Worker asked a question", p.get("question") or ""
+        return "Worker asked a question", _question(p, questions)
+    # The two "answered" kinds carry NO detail on purpose. Both writers queue the
+    # answer as a message in the same breath, and messages render verbatim, so the
+    # text is already the very next line of the timeline. Attaching it here too would
+    # print every Neo answer twice.
     if kind == "neo_answered":
-        return "Neo answered the worker", p.get("answer") or ""
+        return "Neo answered the worker", ""
     if kind == "neo_dispatched":
         return ("Neo filed a pre-approved cleanup",
                 p.get("cleanup_wo_id") or "")
     if kind == "escalation_answered":
-        return "You answered the worker", p.get("answer") or ""
+        return "You answered the worker", ""  # same as neo_answered, above
     if kind == "reviewed":
         verb = "accepted" if p.get("accepted") else "rejected"
         count = p.get("count")
@@ -141,19 +162,26 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any]) -> tuple[str, st
 
 def build_timeline(wo: dict[str, Any], events: list[dict[str, Any]],
                    messages: list[dict[str, Any]],
-                   *, include_debug: bool = False) -> list[dict[str, Any]]:
+                   *, include_debug: bool = False,
+                   questions: dict[int, str] | None = None) -> list[dict[str, Any]]:
     """Merge events and conversation into time-ordered, human-readable entries.
 
     Each entry: {ts, level, kind, label, detail}. Debug entries are omitted unless
     `include_debug`.
+
+    `questions` is {neo_question_id: question}, used only to fill in `question_asked`
+    events written before the text was stored in the payload. Callers get it from
+    `ops.neo_question_texts`; omitting it costs nothing but those older details. This
+    function stays pure — it never opens a store itself.
     """
+    questions = questions or {}
     entries: list[dict[str, Any]] = []
     for e in events:
         kind = e.get("kind", "")
         level = event_level(kind)
         if level == "debug" and not include_debug:
             continue
-        label, detail = _describe(kind, _payload(e), wo)
+        label, detail = _describe(kind, _payload(e), wo, questions)
         entries.append({"ts": e.get("ts") or 0.0, "level": level, "kind": kind,
                         "label": label, "detail": detail})
     for m in messages:

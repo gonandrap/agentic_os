@@ -552,7 +552,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
             detail = {
                 "project": name, **wo,
                 "timeline": build_timeline(wo, store.list_events(args.wo_id),
-                                           messages, include_debug=args.debug),
+                                           messages, include_debug=args.debug,
+                                           questions=ops.neo_question_texts(args.wo_id)),
                 "messages": messages,
                 "assumptions": store.pending_assumptions(args.wo_id),
                 # What this work order was allowed (or refused) permission to ship.
