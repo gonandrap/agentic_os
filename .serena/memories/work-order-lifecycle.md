@@ -26,8 +26,24 @@ through `ProjectStore.set_status()` — nothing writes status directly.
 stores `work_orders.pr_url`). It is an OPEN status that deliberately raises **no**
 attention flag — `invariants.true_blockers` has no branch for it, on purpose: it is a
 merge queue the user works through in the dashboard, not a decision blocking the fleet.
-Pending assumptions outrank it (`needs_review` wins). Nothing polls GitHub; the user
-merges and runs `jarvis wo done`. Auto-complete-on-merge is filed as backlog work.
+Pending assumptions outrank it (`needs_review` wins).
+
+`Daemon.poll_pull_requests` is what ends it, on its own `PR_POLL_EVERY_TICKS` (24, ~2min)
+cadence — the only step in the OS that leaves the machine. It runs
+`github.pr_view` (`gh pr view <url> --json state,mergedAt`) for each parked work order
+and writes the answer to `work_orders.pr_state`:
+
+* MERGED → `ops.complete_merged` — `completed`, event `pr_merged`, backlog item closed,
+  worker stopped. Deliberately the same close-out as `jarvis wo done`
+  (`ops.close_out`), with a different event so the record does not claim the user did it.
+* CLOSED unmerged → `ops.record_pr_closed` — `needs_review` + attention. The reason is
+  `invariants.PR_CLOSED_BLOCKER` and it MUST stay a `true_blockers` branch:
+  INV-ATTENTION-REASON rewrites any reason that derivation does not produce.
+* OPEN → nothing written.
+
+Skipped entirely when no work order is parked, so an idle fleet spawns no subprocess.
+A `gh` that cannot answer warns ONCE per project per daemon run (`pr_poll_warned`) and
+leaves the work order parked; `jarvis wo done` is still the manual way out.
 
 ## The transport: headless turns (replaced background sessions, 2026-08-01)
 

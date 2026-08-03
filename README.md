@@ -184,11 +184,21 @@ replacement.
 Assumptions flip the work order to `needs_review` — visible in `jarvis status`, the
 dashboard, and (if configured) Telegram.
 
-A work order finished with `--pr` lands in `waiting_pr_merge` instead of `completed`:
-it stays on the open list with its link until you merge and `jarvis wo done` it (nothing
-polls GitHub). It never raises the attention flag — it is a merge queue, not a blocker —
-and the dashboard gives those a row each, right after the running workers, with
-everything else open folded into a count.
+A work order finished with `--pr` lands in `waiting_pr_merge` instead of `completed`: it
+stays on the open list with its link until the pull request is dealt with. It never
+raises the attention flag — it is a merge queue, not a blocker — and the dashboard gives
+those a row each, right after the running workers, with everything else open folded into
+a count.
+
+You do not have to close them by hand. Every couple of minutes the daemon asks `gh` what
+happened to each parked pull request: **merged** ends the work order silently (and the
+backlog item behind it) — you performed the merge, you do not need telling — while
+**closed without merging** sends it to `needs_review` and asks for you,
+since work that was delivered and then refused is exactly what the attention list is
+for. `jarvis wo done` still works and is the way out when a pull request will never
+merge. If `gh` is missing or unauthenticated the OS says so once, in the inbox, rather
+than quietly looking like a feature it no longer has — a daemon often cannot reach
+`gh`'s keyring, so a service environment wants `GH_TOKEN` set.
 
 Attention is re-derived from state on every reconcile tick, so it can't be cleared by
 hand — the next tick puts it back. `jarvis wo ack <id>` (or **Got it** on the work order
