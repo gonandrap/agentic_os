@@ -705,11 +705,15 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None) -> dict[str, Any
     `pr_url` is what separates "delivered" from "delivered and merged": a work order
     that ends in a pull request is not finished until a human merges it, so it settles
     into `waiting_pr_merge` and stays on the open list with the link, instead of going
-    to `completed` and disappearing into the settled group nobody reads. The user
-    closes it with `jarvis wo done` after merging — nothing polls GitHub.
+    to `completed` and disappearing into the settled group nobody reads. The merge is
+    what ends it: `Daemon.poll_pull_requests` watches the PR and completes the work
+    order itself, and `jarvis wo done` remains the manual exit for a PR that will never
+    merge.
 
     Pending assumptions still outrank it: those are a decision the OS is waiting on,
-    and a PR the user merges before deciding them accepts them by the back door.
+    and a PR the user merges before deciding them accepts them by the back door. That
+    makes `review_work_order` the only route back for such a work order, and it is that
+    function's job to do the parking skipped here.
     """
     name, path, wo = find_work_order(wo_id)
     store = ProjectStore(path)
@@ -865,6 +869,18 @@ def record_pr_closed(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
     store.flag_attention(wo["id"], PR_CLOSED_BLOCKER)
     return {"wo_id": wo["id"], "status": "needs_review", "was": wo["status"],
             "pr_url": wo.get("pr_url")}
+
+
+def _awaiting_merge(wo: dict[str, Any]) -> bool:
+    """True when this work order's ending is still a pull request nobody has merged.
+
+    The condition for putting a work order into `waiting_pr_merge` from anywhere other
+    than `finish`. `pr_state` is what the merge poll last saw, and both of its values
+    rule the merge queue out: MERGED already ended the work order, and CLOSED means the
+    pull request is never merging — parking on a closed PR would put the work order back
+    in front of a poll whose only possible move is to flag it for the user again.
+    """
+    return bool(wo.get("pr_url")) and wo.get("pr_state") not in ("MERGED", "CLOSED")
 
 
 def stop_worker_session(wo: dict[str, Any], store: ProjectStore) -> dict[str, Any]:
@@ -1046,6 +1062,16 @@ def review_work_order(wo_id: str, accept: bool = True,
     need two more commands: it becomes a Neo learning (so the decisions the user makes
     today train the agent meant to make them tomorrow), and on a rejection it is
     delivered to the still-open worker as guidance.
+
+    Accepting settles the work order the way `finish` would have if the assumptions had
+    never existed — which for a work order behind an unmerged pull request is
+    `waiting_pr_merge`, NOT `completed`. `finish` deliberately routes a work order with
+    pending assumptions to `needs_review` even when it carries a PR (the decision
+    outranks the merge), so this review is the only route back and it owes that work
+    order the parking `finish` skipped. Completing it here loses the PR twice: off the
+    user's open list, and out of `Daemon.poll_pull_requests`, which only ever looks at
+    `waiting_pr_merge` — so the merge that should have ended the work order unattended
+    ends nothing.
     """
     name, path, wo = find_work_order(wo_id)
     store = ProjectStore(path)
@@ -1053,9 +1079,11 @@ def review_work_order(wo_id: str, accept: bool = True,
         pending = store.pending_assumptions(wo_id)
         for a in pending:
             store.review_assumption(a["id"], "accepted" if accept else "rejected")
+        status = wo["status"]
         if wo["status"] == "needs_review":
             if accept:
-                store.set_status(wo_id, "completed")
+                status = "waiting_pr_merge" if _awaiting_merge(wo) else "completed"
+                store.set_status(wo_id, status)
                 store.clear_attention(wo_id)
             elif not feedback:
                 # With feedback the guidance is delivered below, so the work order is
@@ -1066,7 +1094,8 @@ def review_work_order(wo_id: str, accept: bool = True,
     finally:
         store.close()
 
-    out = {"project": name, "wo_id": wo_id, "reviewed": len(pending), "accepted": accept}
+    out = {"project": name, "wo_id": wo_id, "reviewed": len(pending), "accepted": accept,
+           "status": status}
     if not feedback:
         return out
 
