@@ -104,6 +104,12 @@
         {% if wo.status == 'waiting_pr_merge' and wo.pr_url %}
           <div class="sub">⑃ <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a></div>
         {% endif %}
+        {% if wo.blocked_by %}
+          <div class="sub">⊘ blocked by:
+            {% for b in wo.blocked_by %}<a class="mono"
+              href="/wo/{{ wo.project }}/{{ b.id }}">{{ b.id }}</a> ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}
+          </div>
+        {% endif %}
       </div>
       <span class="badge {{ 'framework' if o.framework else 'outside' }}">
         {{ '⚙ ' if o.framework else '⚠ ' }}{{ o.word }}</span>

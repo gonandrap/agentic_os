@@ -215,8 +215,31 @@ ADDED_COLUMNS = {
         # order is there because the pull request was shut without merging, rather than
         # because a worker went idle. Absent means "never polled".
         "pr_state": "TEXT",
+        # Work orders that must finish before this one may be claimed (JSON list of
+        # work-order ids). Deliberately NOT a `blocked` status: this codebase's statuses
+        # are load-bearing — OPEN_STATUSES, TERMINAL_STATUSES, true_blockers and the
+        # settle path all switch on them — and "blocked" is fully derivable from this
+        # column plus the dependencies' statuses, so storing it would only invite drift.
+        # `waiting_pr_merge` earned a status because nothing derived it; this does not.
+        # Shape matches `backlog.depends_on` exactly, so the two read the same way.
+        "depends_on": "TEXT NOT NULL DEFAULT '[]'",
     },
 }
+
+# A dependency is satisfied only when it reaches `completed` — the strict rule of the
+# feature-order design. It is affordable because the merge poller landed first: the user
+# merges the pull request they were going to merge anyway and the work order completes
+# itself within a tick or two, so an edge costs no extra human step.
+#
+# `waiting_pr_merge` deliberately does NOT satisfy: the dependent's worktree is cut from
+# the main working tree's HEAD, which does not yet contain an unmerged dependency's code,
+# so releasing it early gives it a tree without the thing it was told to build on.
+DEPENDENCY_SATISFIED_STATUS = "completed"
+
+# ...and these are the statuses from which it can never get there. A dependency parked in
+# one of them strands its dependents forever, which is the one case that has to speak up
+# rather than sit quietly in `pending` (see invariants.true_blockers).
+DEPENDENCY_DEAD_STATUSES = ("cancelled", "failed")
 
 
 class ProjectStore:
@@ -256,29 +279,41 @@ class ProjectStore:
         wo_id: str | None = None,
         status: str = "pending",
         session_id: str | None = None,
+        depends_on: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a work order. `status` and `session_id` are set in the same INSERT
         rather than afterwards, because the row is visible to the daemon the instant it
         lands: a record that is `pending` for even a moment can be claimed and dispatched
         (`claim_next_pending`), which for an injected session would launch a worker into
         the user's own conversation.
+
+        `depends_on` names work orders that must reach `completed` first. Every id is
+        checked here, at the only moment a dependency edge is ever written — which is
+        also why there is no cycle check: an edge may only point at a row that already
+        exists, so the graph is acyclic by construction. Anything that lets an existing
+        work order acquire an edge later loses that property and owes one.
         """
         assert origin in WO_ORIGINS, origin
         assert status in WO_STATUSES, status
         wo_id = wo_id or db.new_id("wo")
+        deps = list(depends_on or [])
+        if wo_id in deps:
+            raise ValueError(f"work order {wo_id!r} cannot depend on itself")
+        for dep in deps:
+            self.get_work_order(dep)  # KeyError names the id that does not exist
         ts = db.now()
         self.conn.execute(
             """INSERT INTO work_orders (id, title, description, status, origin,
                    created_at, updated_at, model, effort, permission_mode,
-                   append_system_prompt, backlog_id, metadata, session_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   append_system_prompt, backlog_id, metadata, session_id, depends_on)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 wo_id, title, description, status, origin, ts, ts, model, effort,
                 permission_mode, append_system_prompt, backlog_id,
-                db.to_json(metadata or {}), session_id,
+                db.to_json(metadata or {}), session_id, db.to_json(deps),
             ),
         )
-        self.add_event(wo_id, "created", {"origin": origin})
+        self.add_event(wo_id, "created", {"origin": origin, "depends_on": deps})
         return self.get_work_order(wo_id)
 
     def get_work_order(self, wo_id: str) -> dict[str, Any]:
@@ -323,15 +358,73 @@ class ProjectStore:
         ).fetchall()
         return {row["status"]: int(row["n"]) for row in rows}
 
+    def dependencies(self, wo: dict[str, Any]) -> list[str]:
+        """The ids this work order waits on. Decoded at the use site, not on the row.
+
+        `depends_on` stays raw JSON on the dict, like `acknowledged_blockers` and unlike
+        `backlog.depends_on` — the two stores differ here and this follows the local one.
+        Work-order rows are handed around widely (`{**wo, ...}` in worker_session, the
+        dashboard, the hooks), so decoding a column in place would change the shape of a
+        dict a lot of code already reads.
+        """
+        return db.from_json(wo.get("depends_on"), []) or []
+
+    def unfinished_dependencies(self, wo_id: str) -> list[dict[str, Any]]:
+        """The dependencies still standing between this work order and dispatch.
+
+        A dependency that has been deleted counts as unfinished rather than satisfied,
+        and says so — the alternative is releasing a work order because the thing it was
+        told to build on vanished, which is the worse of the two failures.
+        """
+        blockers = []
+        for dep_id in self.dependencies(self.get_work_order(wo_id)):
+            try:
+                dep = self.get_work_order(dep_id)
+            except KeyError:
+                blockers.append({"id": dep_id, "status": "missing", "title": "?"})
+                continue
+            if dep["status"] != DEPENDENCY_SATISFIED_STATUS:
+                blockers.append({k: dep[k] for k in ("id", "status", "title")})
+        return blockers
+
+    def drop_dependencies(self, wo_id: str, dep_ids: list[str]) -> list[str]:
+        """Cut these edges. Returns the edges that remain.
+
+        The only way an edge is ever removed, and it is always a deliberate act by the
+        user: a dependency that can never complete strands its dependent, and cutting
+        the edge is the alternative to cancelling work that is still wanted. Removing
+        edges cannot create a cycle, so the acyclic-by-construction property that
+        `create_work_order` relies on survives this.
+        """
+        remaining = [d for d in self.dependencies(self.get_work_order(wo_id))
+                     if d not in dep_ids]
+        self.update_work_order(wo_id, depends_on=db.to_json(remaining))
+        self.add_event(wo_id, "dependencies_dropped",
+                       {"dropped": dep_ids, "remaining": remaining})
+        return remaining
+
     def claim_next_pending(self) -> dict[str, Any] | None:
-        """Atomically claim the oldest pending order (pending -> dispatching)."""
+        """Atomically claim the oldest claimable pending order (pending -> dispatching).
+
+        A work order whose dependencies have not all completed is passed over and stays
+        `pending`: it is not claimable, but nothing about it has changed, so nothing is
+        written. For the overwhelming majority of work orders — no dependencies at all —
+        the subquery is vacuously true and this is the query it always was.
+        """
         cur = self.conn.execute(
             """UPDATE work_orders SET status='dispatching', updated_at=?
-               WHERE id = (SELECT id FROM work_orders
-                           WHERE status='pending' AND hidden=0
-                           ORDER BY created_at LIMIT 1)
+               WHERE id = (SELECT w.id FROM work_orders w
+                           WHERE w.status='pending' AND w.hidden=0
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM json_each(w.depends_on) dep
+                                 WHERE NOT EXISTS (
+                                     SELECT 1 FROM work_orders d
+                                     WHERE d.id = dep.value AND d.status = ?
+                                 )
+                             )
+                           ORDER BY w.created_at LIMIT 1)
                RETURNING *"""
-            , (db.now(),),
+            , (db.now(), DEPENDENCY_SATISFIED_STATUS),
         )
         row = cur.fetchone()
         return dict(row) if row else None

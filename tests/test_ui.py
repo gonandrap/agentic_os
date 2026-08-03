@@ -754,6 +754,35 @@ def test_pr_merges_and_running_work_get_the_rows(client, project):
         assert "not started yet" in client.get(url).text, url
 
 
+def test_a_blocked_work_order_says_what_it_is_waiting_for(client, project):
+    """Both listings, because they derive it by different routes — the dashboard off
+    `ops.os_status`, the project page off the store directly. A surface that worked
+    while its twin lied is exactly how the FEATURED_STATUSES bug survived."""
+    dep = ops.create_work_order("proj_a", "the schema change")
+    ops.create_work_order("proj_a", "needs the schema", depends_on=[dep["id"]])
+
+    # Pending work still collapses by default — a work order waiting its turn needs
+    # nobody — so the line is asserted where the user actually expands to see it.
+    for url in ("/?show=pending", "/project/proj_a?show=pending"):
+        page = client.get(url)
+        assert "blocked by" in page.text, url
+        assert dep["id"] in page.text, url
+
+
+def test_a_stranded_work_order_reaches_the_attention_strip(client, project):
+    """The one dependency case that is not routine: it will never start on its own."""
+    dep = ops.create_work_order("proj_a", "the schema change")
+    child = ops.create_work_order("proj_a", "needs the schema", depends_on=[dep["id"]])
+    store = ProjectStore(project)
+    store.set_status(dep["id"], "cancelled")
+    check_project(store, repair=True)
+    store.close()
+
+    body = client.get("/").text
+    assert child["id"] in body
+    assert "can never complete" in body
+
+
 def test_a_pr_waiting_to_be_merged_never_enters_the_attention_strip(client, project):
     """It is a merge queue, not an interrupt: NEEDS YOU has to stay for real blockers."""
     wo = ops.create_work_order("proj_a", "waiting on a merge")

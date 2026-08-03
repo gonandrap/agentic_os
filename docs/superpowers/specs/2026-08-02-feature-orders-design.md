@@ -597,6 +597,32 @@ to evaluate are: serialise on merge (strict, the pre-Phase-0 behaviour), or have
 worker rebase onto its dependency's branch itself as its first act, which is slower and
 puts a merge conflict inside a worker session rather than in front of the user.
 
+> **Phase 1 status: SHIPPED** (`wo-1f0b6879`). `work_orders.depends_on`, the claim-time
+> filter, `jarvis wo create --depends-on`, the derived `pending — blocked by …` label on
+> all three listings, and `jarvis wo unblock` for the one case that strands. The strict
+> rule (satisfied on `completed` only) is what landed.
+>
+> **Probe result: stacking is possible, but not through `--worktree`.** Four arms with a
+> negative control, live. `-w, --worktree [name]` takes only a name, and — the finding
+> that matters — it bases the new worktree on the **main working tree's HEAD**, ignoring
+> `cwd` entirely: with `cwd` inside a worktree on `feat-a` the flag still produced a tree
+> at `main` (arm 3), and moving the *main* checkout to `feat-a` moved the result with it
+> (arm 4). So the cheap version of stacking — point `cwd` at the dependency's worktree
+> and keep the flag — does not work, and neither does anything that would require moving
+> the user's shared checkout, which is one tree and would race across concurrent
+> dispatches.
+>
+> The working invocation is for Jarvis to create the worktree itself and pass no flag:
+> `git -C <project> worktree add -b <branch> <path> <base>`, then turn 1 with `cwd` set
+> to that path. Verified: the child's tree contained the dependency's file, and
+> `--session-id` was honoured and echoed back unchanged, so the immutable-session-id
+> property survives. `worker_session.send()` already launches this way from turn 2
+> onward, so the path is established rather than new. The cost is that
+> `worker_session.start()` — the single function every worker launch goes through — has
+> to take over worktree creation for the stacked case. That is why decision 2 (children
+> stack their pull requests) is buildable but was not built here: the `depends_on` column
+> and the claim filter are the same either way, exactly as this phase predicted.
+
 **Phase 2 — feature orders with a single generic planner.** The table, the lifecycle, the
 plan work order, `jarvis fo plan --from-file`, the plan validator and the child cap,
 Neo reviewing plans with escalation, `jarvis fo` and the dashboard page. One planner, no
