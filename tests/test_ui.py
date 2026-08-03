@@ -731,7 +731,11 @@ def test_settled_work_orders_collapse_into_a_count(client, project):
 
 def test_pr_merges_and_running_work_get_the_rows(client, project):
     """The listing question the user actually asks the dashboard: what is moving, and
-    what is waiting for me to merge it. Everything else open is a count."""
+    what is waiting for me to merge it.
+
+    `pending` is the collapsed case here because it is one of the two statuses that
+    genuinely need nobody — see the test below for the ones that do.
+    """
     running = ops.create_work_order("proj_a", "still going")
     merging = ops.create_work_order("proj_a", "waiting on a merge")
     ops.create_work_order("proj_a", "not started yet")
@@ -752,6 +756,57 @@ def test_pr_merges_and_running_work_get_the_rows(client, project):
 
     for url in ("/?show=pending", "/project/proj_a?show=pending"):
         assert "not started yet" in client.get(url).text, url
+
+
+def test_a_decision_you_owe_gets_a_row_not_a_count(client, daemon, project):
+    """The statuses invariants.true_blockers calls real blockers have to be rows.
+
+    They were counts, which is how a project page came to print "3 needs review" in the
+    header and "nothing running and nothing to merge" in the panel underneath it. A
+    listing that disagrees with true_blockers about what needs the user is a bug in the
+    listing.
+    """
+    reviewing = ops.create_work_order("proj_a", "decide this please")
+    blocked = ops.create_work_order("proj_a", "worker is stuck")
+    daemon.tick()
+    ops.assume(reviewing["id"], "assumed the API is v2")
+    ops.finish(reviewing["id"], "done-ish")
+    store = ProjectStore(project)
+    store.set_status(blocked["id"], "waiting_input")
+    assert store.get_work_order(reviewing["id"])["status"] == "needs_review"
+    store.close()
+    ops.create_work_order("proj_a", "not started yet")  # after the tick: stays pending
+
+    for url in ("/", "/project/proj_a"):
+        page = client.get(url).text
+        assert "decide this please" in page, url
+        assert "worker is stuck" in page, url
+        assert "not started yet" not in page, url  # started by nobody, needs nobody
+        assert "show=pending" in page, url  # a count line, expandable
+        assert "show=needs_review" not in page, url  # a row, so never a count line
+        # a review the user owes comes before a worker merely blocked on them
+        assert page.index("decide this please") < page.index("worker is stuck"), url
+
+    for url in ("/?show=pending", "/project/proj_a?show=pending"):
+        assert "not started yet" in client.get(url).text, url
+
+
+def test_a_project_whose_only_open_work_needs_review_is_not_an_empty_panel(client,
+                                                                          daemon):
+    """The reported bug, exactly: counts and panel contradicting each other."""
+    for n in range(3):
+        wo = ops.create_work_order("proj_a", f"needs a decision {n}")
+        daemon.tick()
+        ops.assume(wo["id"], "assumed something")
+        ops.finish(wo["id"], "done-ish")
+
+    for url in ("/", "/project/proj_a"):
+        page = client.get(url).text
+        assert "nothing running and nothing waiting on you" not in page, url
+        # the count line's own signature: the link that expands the collapsed group
+        assert "show=needs_review" not in page, url
+        for n in range(3):
+            assert f"needs a decision {n}" in page, url
 
 
 def test_a_blocked_work_order_says_what_it_is_waiting_for(client, project):
