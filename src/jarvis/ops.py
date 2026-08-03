@@ -24,7 +24,7 @@ from .catalog import (
 )
 from .central_store import CentralStore
 from .daemon import daemon_running
-from .invariants import true_blockers
+from .invariants import PR_CLOSED_BLOCKER, true_blockers
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import OPEN_STATUSES, ProjectStore
 
@@ -772,26 +772,99 @@ def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
                 f"marking it done would accept them silently. Use `jarvis wo review "
                 f"{wo_id}` to accept, or `--reject` to send it back."
             )
-        stopped = stop_worker_session(wo, store)
-        store.set_status(wo_id, "completed")
-        store.clear_attention(wo_id)
-        store.add_event(wo_id, "marked_done", {"was": wo["status"],
-                                               "session_stopped": stopped["stopped"]})
-        if stopped["stopped"]:
-            store.add_event(wo_id, "session_stopped",
-                            {**{k: v for k, v in stopped.items() if k != "stopped"},
-                             "reason": "work order marked done"})
+        stopped = close_out(store, wo, "marked_done", why="work order marked done")
     finally:
         store.close()
-    if wo.get("backlog_id"):
-        central = CentralStore()
-        try:
-            central.mark_backlog(wo["backlog_id"], "done")
-        finally:
-            central.close()
+    mark_backlog_done(wo)
     return {"project": name, "wo_id": wo_id, "title": wo["title"],
             "status": "completed", "was": wo["status"],
             "session_stopped": stopped["stopped"]}
+
+
+def close_out(store: ProjectStore, wo: dict[str, Any], event: str, *, why: str,
+              payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Settle a work order as `completed` and take its worker down with it.
+
+    The mechanics shared by every "this is over, and it went fine" path: `jarvis wo
+    done` (the user saying so) and a merged pull request (GitHub saying so). Both end
+    the same way and must keep ending the same way — the only difference between them
+    is `event`, which is what the timeline shows for who decided.
+
+    Does NOT check pending assumptions: the two callers disagree about that. `mark_done`
+    refuses over them, because closing by hand would accept them silently; the merge
+    poller never sees one, because `finish` routes a work order with assumptions to
+    `needs_review` instead of parking it behind its PR.
+
+    Callers own the backlog side (`mark_backlog_done`), since they hold the row.
+    """
+    stopped = stop_worker_session(wo, store)
+    store.set_status(wo["id"], "completed")
+    store.clear_attention(wo["id"])
+    store.add_event(wo["id"], event, {**(payload or {}), "was": wo["status"],
+                                      "session_stopped": stopped["stopped"]})
+    if stopped["stopped"]:
+        store.add_event(wo["id"], "session_stopped",
+                        {**{k: v for k, v in stopped.items() if k != "stopped"},
+                         "reason": why})
+    return stopped
+
+
+def mark_backlog_done(wo: dict[str, Any]) -> None:
+    """Close the backlog item a work order was promoted from, if it came from one."""
+    if not wo.get("backlog_id"):
+        return
+    central = CentralStore()
+    try:
+        central.mark_backlog(wo["backlog_id"], "done")
+    finally:
+        central.close()
+
+
+def complete_merged(store: ProjectStore, wo: dict[str, Any],
+                    merged_at: str | None = None) -> dict[str, Any]:
+    """The pull request landed: end the work order, exactly as the user closing it does.
+
+    This is the whole point of polling GitHub. `jarvis wo finish --pr` parks a work
+    order in `waiting_pr_merge` precisely because the merge is the real ending, and
+    until now the OS could not see that ending happen — so every finished work order
+    sat on the open list until the user hand-typed `jarvis wo done`. On a fleet where
+    one work order can depend on another having landed, that hand-typing is the
+    schedule, which is why this had to exist before work orders could depend on
+    each other at all.
+
+    Records `pr_merged` rather than `marked_done`: the record must not claim the user
+    did something they did not do.
+    """
+    store.update_work_order(wo["id"], pr_state="MERGED")
+    stopped = close_out(store, wo, "pr_merged", why="pull request merged",
+                        payload={"pr_url": wo.get("pr_url"), "merged_at": merged_at})
+    mark_backlog_done(wo)
+    return {"wo_id": wo["id"], "status": "completed", "was": wo["status"],
+            "pr_url": wo.get("pr_url"), "merged_at": merged_at,
+            "session_stopped": stopped["stopped"]}
+
+
+def record_pr_closed(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
+    """The pull request was closed without merging: the delivered work was refused.
+
+    The opposite of `complete_merged` and not a variant of it. Nothing landed, so the
+    work order cannot be completed; and leaving it in `waiting_pr_merge` would keep it
+    in a merge queue waiting for a merge that is never coming. It goes to `needs_review`
+    and asks for the user, which is what the attention list is for — someone shut this
+    pull request on purpose and only they know whether the work should be redone,
+    redirected or dropped.
+
+    The worker is left alone: it finished long ago, and there is nothing here for it to
+    do without a human deciding what "refused" means. `jarvis wo send` restarts it if
+    the answer is "try again", `jarvis wo done` closes it if the answer is "drop it".
+    """
+    store.update_work_order(wo["id"], pr_state="CLOSED")
+    store.add_event(wo["id"], "pr_closed", {"pr_url": wo.get("pr_url"),
+                                            "was": wo["status"]})
+    store.set_status(wo["id"], "needs_review")
+    store.flag_attention(wo["id"], PR_CLOSED_BLOCKER)
+    return {"wo_id": wo["id"], "status": "needs_review", "was": wo["status"],
+            "pr_url": wo.get("pr_url")}
 
 
 def stop_worker_session(wo: dict[str, Any], store: ProjectStore) -> dict[str, Any]:

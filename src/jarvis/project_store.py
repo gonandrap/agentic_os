@@ -209,6 +209,12 @@ ADDED_COLUMNS = {
         # `waiting_pr_merge` rather than `completed`, and it is the link the user
         # follows from the dashboard to go and merge.
         "pr_url": "TEXT",
+        # The last state the daemon read back from GitHub for `pr_url` (OPEN, MERGED or
+        # CLOSED), written by `Daemon.poll_pull_requests`. CLOSED is the load-bearing
+        # one: it is what tells `invariants.true_blockers` that a `needs_review` work
+        # order is there because the pull request was shut without merging, rather than
+        # because a worker went idle. Absent means "never polled".
+        "pr_state": "TEXT",
     },
 }
 
