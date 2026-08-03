@@ -320,11 +320,31 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     if wo["status"] == "waiting_input" and wo["session_id"]:
                         item["attach"] = f"claude --resume {wo['session_id']}"
                     attention.append(item)
+                # A feature order contributes ONE line, never one per child: its children
+                # keep their own flags and are reachable from its page. The comment on
+                # `waiting_pr_merge` in project_store.py articulates the fear precisely —
+                # a strip that names everything is a strip that stops being read.
+                features = store.list_feature_orders(statuses=FO_OPEN_STATUSES)
+                for fo in features:
+                    if not fo["needs_attention"]:
+                        continue
+                    attention.append({
+                        "project": p["name"], "wo_id": None, "fo_id": fo["id"],
+                        "title": fo["title"], "status": f"feature:{fo['status']}",
+                        "reason": fo["attention_reason"],
+                        "decide": f"jarvis fo show {fo['id']}",
+                    })
                 drift = settings_drift(path / ".claude" / "settings.json")
                 projects.append({
                     "name": p["name"], "path": p["path"],
                     "description": p["description"],
                     "summary": summary,
+                    "feature_orders": [
+                        {**{k: fo[k] for k in ("id", "title", "status",
+                                               "needs_attention", "attention_reason")},
+                         "progress": feature_progress(store, fo)}
+                        for fo in features
+                    ],
                     "open_work_orders": [
                         {**{k: wo[k] for k in ("id", "title", "status", "origin",
                                                "needs_attention", "attention_reason",
@@ -361,10 +381,12 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         try:
             neo_counts = neo.counts()
             for q in neo.list_questions(statuses=("escalated", "failed")):
-                if q.get("kind") == "approval":
-                    # Gate escalations get their own item below, with the command to run.
+                if q.get("kind") in ("approval", "plan"):
+                    # Both of these are reported by the thing that actually carries the
+                    # decision — the gate item below, or the feature order above.
                     # Reported here too, they would tell the user to `jarvis neo answer`
-                    # a question whose real resolution is `jarvis gate approve`.
+                    # a question whose real resolution is `jarvis gate approve` or
+                    # `jarvis fo approve`.
                     continue
                 attention.append({
                     "project": q["project"], "wo_id": q["wo_id"],
@@ -1318,6 +1340,157 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
         }
     finally:
         store.close()
+
+
+def submit_plan(fo_id: str, doc: Any,
+                project_name: str | None = None) -> dict[str, Any]:
+    """(Planners) hand back the decomposition. The planner's terminal action.
+
+    Three things happen here and the order matters. The plan is validated first, so a
+    bad plan costs a revision and nothing else — no work order, no Neo call, no state to
+    unwind. Then it is stored and queued for review. Only then is the planner's work
+    order settled: `jarvis fo plan` IS its `jarvis wo finish`, which is why the planner
+    briefing tells it not to call the latter. A rejection later re-opens the same session
+    through the ordinary message path, so settling now costs the revision nothing.
+    """
+    from . import plans
+    from .neo_store import NeoStore
+
+    name, path, fo = find_feature_order(fo_id, project_name)
+    if fo["status"] not in ("planning", "plan_review"):
+        raise OpsError(
+            f"{fo_id} is {fo['status']}, so it is not waiting for a plan "
+            f"(a plan can be submitted while it is `planning`, or resubmitted while it "
+            f"is `plan_review`)"
+        )
+    try:
+        plan = plans.parse_plan(doc)
+    except plans.PlanError as e:
+        raise OpsError(
+            f"the plan was not accepted, and nothing was created. Fix all of these and "
+            f"resubmit:\n  - " + "\n  - ".join(e.problems)
+        ) from e
+
+    # The planner is who Neo's question hangs off: it is a real work order, it is who
+    # receives a rejection, and it is what `jarvis neo list` can link back to. A feature
+    # order whose planner was deleted still submits — the question just names the feature
+    # order instead of a row that no longer exists.
+    planner_id = fo.get("plan_wo_id") or fo_id
+    question = plans.build_plan_question(fo, plan)
+    neo = NeoStore()
+    try:
+        q = neo.ask(name, planner_id, question, kind="plan")
+    finally:
+        neo.close()
+
+    store = ProjectStore(path)
+    try:
+        store.update_feature_order(fo_id, plan=db.to_json(plan),
+                                   plan_question_id=q["id"])
+        store.set_feature_status(fo_id, "plan_review")
+        store.clear_feature_attention(fo_id)
+        if fo.get("plan_wo_id"):
+            store.add_event(fo["plan_wo_id"], "plan_submitted", {
+                "feature_order": fo_id, "children": len(plan["children"]),
+                "neo_question_id": q["id"],
+            })
+    finally:
+        store.close()
+
+    out = {"project": name, "fo_id": fo_id, "status": "plan_review",
+           "children": len(plan["children"]), "neo_question_id": q["id"],
+           "note": "queued for review — end your turn. If it is sent back, the reason "
+                   "arrives as your next user turn and you revise from this session."}
+    if fo.get("plan_wo_id"):
+        # The planner has no more to say until the review lands, and a work order left
+        # `running` with no turn in flight is what the reconciler calls idle.
+        out["planner"] = finish(
+            fo["plan_wo_id"],
+            f"submitted a plan for {fo_id}: {len(plan['children'])} work orders",
+        )
+    return out
+
+
+def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
+                decided_by: str = "user",
+                project_name: str | None = None) -> dict[str, Any]:
+    """Release a submitted plan, or send it back. Neo's path and the user's, shared.
+
+    One function for both deciders on purpose: the escalation exists because Neo
+    declined to take a decision, not because the decision changed shape, and two
+    implementations of "release the plan" would be two chances to disagree about what
+    releasing means.
+
+    Releasing creates every child at once (`ProjectStore.create_plan_children`) and moves
+    the feature order to `executing`; the ordinary claim-time dependency filter takes it
+    from there, so no scheduler is added anywhere. Rejecting returns it to `planning` and
+    delivers the reason to the planner as a message, which re-opens its existing session
+    rather than starting a cold one.
+    """
+    from . import plans
+    from .neo_store import NeoStore
+
+    name, path, fo = find_feature_order(fo_id, project_name)
+    if fo["status"] != "plan_review":
+        raise OpsError(f"{fo_id} is {fo['status']}, not awaiting a plan review")
+    if not accept and not feedback.strip():
+        raise OpsError(
+            "a rejection needs feedback — the planner sees only your reason, and "
+            "without it the revision is a guess"
+        )
+    plan = db.from_json(fo.get("plan"), None)
+    if not plan:
+        raise OpsError(f"{fo_id} has no stored plan to review")
+
+    store = ProjectStore(path)
+    try:
+        if accept:
+            children = store.create_plan_children(
+                fo_id, plans.creation_order(plan["children"]))
+            store.set_feature_status(fo_id, "executing")
+            store.clear_feature_attention(fo_id)
+        else:
+            children = []
+            store.set_feature_status(fo_id, "planning")
+            store.clear_feature_attention(fo_id)
+        if fo.get("plan_wo_id"):
+            store.add_event(fo["plan_wo_id"], "plan_reviewed", {
+                "feature_order": fo_id, "accepted": accept, "by": decided_by,
+                "reason": feedback, "children": [c["id"] for c in children],
+            })
+    finally:
+        store.close()
+
+    # Close the review question whichever way it went, so `jarvis neo list` stops
+    # showing a decision that has been taken. Only if it is still open: Neo's own
+    # verdicts are already recorded by the drain loop.
+    if fo.get("plan_question_id"):
+        neo = NeoStore()
+        try:
+            q = neo.get(fo["plan_question_id"])
+            if q and q["status"] in ("queued", "answering", "escalated"):
+                neo.record_answer(q["id"], "APPROVED" if accept else "REJECTED",
+                                  answered_by=decided_by, reason=feedback)
+        finally:
+            neo.close()
+
+    out = {"project": name, "fo_id": fo_id, "accepted": accept, "by": decided_by,
+           "status": "executing" if accept else "planning",
+           "children": [{"id": c["id"], "title": c["title"],
+                         "depends_on": db.from_json(c["depends_on"], [])}
+                        for c in children]}
+    if not accept and fo.get("plan_wo_id"):
+        try:
+            out["delivered"] = send_message(
+                fo["plan_wo_id"],
+                f"The plan for {fo_id} was sent back by {decided_by}. Revise it and "
+                f"resubmit with `jarvis fo plan {fo_id} --from-file <file>`.\n\n"
+                f"Reason: {feedback}",
+                source="jarvis", project_name=name,
+            )
+        except OpsError as e:
+            out["delivery_error"] = str(e)
+    return out
 
 
 def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[str, Any]:

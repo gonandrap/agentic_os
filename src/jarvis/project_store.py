@@ -664,6 +664,55 @@ class ProjectStore:
         ).fetchall()
         return db.rows_to_dicts(rows)
 
+    def feature_order_for_question(self, question_id: int) -> dict[str, Any] | None:
+        """The feature order whose plan this Neo question is reviewing, if any.
+
+        The mirror of `approval_for_question`, and it exists for the same reason: Neo's
+        database is OS-wide and knows nothing about a project's tables, so the back-link
+        has to be resolved from this side.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM feature_orders WHERE plan_question_id=?", (question_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def create_plan_children(self, fo_id: str,
+                             ordered: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Turn an approved plan into work orders, in one transaction.
+
+        `ordered` must already be in dependency order (`plans.creation_order`): each
+        child's `needs` are plan-local keys, and they are resolved to real work-order ids
+        as the children are created, which only works if every child follows the ones it
+        needs. That constraint is not tidiness — `create_work_order` refuses an edge
+        pointing at a row that does not exist yet, and that refusal is exactly what keeps
+        the live dependency graph acyclic by construction. Resolving the keys as we go
+        means a plan's edges are written by the same guarded path as a hand-typed
+        `--depends-on`, rather than being stamped onto rows afterwards.
+
+        All-or-nothing: a feature order holding three of its six children is worse than
+        one holding none, because the three would start running against a plan that was
+        never fully created.
+        """
+        by_key: dict[str, str] = {}
+        created: list[str] = []
+        self.conn.execute("BEGIN")
+        try:
+            for child in ordered:
+                wo = self.create_work_order(
+                    title=child["title"],
+                    description=child["description"],
+                    origin="jarvis",
+                    depends_on=[by_key[k] for k in child["needs"] if k in by_key],
+                    parent_id=fo_id,
+                )
+                by_key[child["key"]] = wo["id"]
+                created.append(wo["id"])
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return [self.get_work_order(wo_id) for wo_id in created]
+
     def feature_summary(self) -> dict[str, Any]:
         """How many feature orders sit in each status, and how many want the user."""
         by_status = {

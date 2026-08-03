@@ -26,9 +26,15 @@ Q_STATUSES = (
 REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
 
 # What Neo is being asked for. `question` is an open decision ("which library?");
-# `approval` is a privileged-action gate ("may I merge this PR?"), which gets a
-# different persona and a verdict with an approve/deny bit. See gates.py.
-Q_KINDS = ("question", "approval")
+# `approval` is a privileged-action gate ("may I merge this PR?"); `plan` is a feature
+# order's decomposition ("release these six work orders?"). Each of the latter two gets
+# its own persona and a verdict with an approve/reject bit — see gates.py and plans.py.
+#
+# `plan` is deliberately NOT routed through the approvals table even though the shape
+# rhymes: `approvals` is a receipt for one command string, and its `dismissed` count is
+# the OS's classifier false-positive rate. Plan reviews are neither, and mixing them in
+# would corrupt the one metric that says whether the gate recognisers are improving.
+Q_KINDS = ("question", "approval", "plan")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS questions (

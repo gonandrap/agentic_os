@@ -321,6 +321,8 @@ class Daemon:
             try:
                 if q.get("kind") == "approval":
                     self._deliver_gate_verdict(central, pstore, q, verdict)
+                elif q.get("kind") == "plan":
+                    self._deliver_plan_verdict(central, store, pstore, q, verdict)
                 elif verdict["escalate"]:
                     central.add_inbox(
                         project=q["project"], level="warning",
@@ -340,7 +342,7 @@ class Daemon:
                     )
                     pstore.add_event(q["wo_id"], "neo_answered",
                                      {"neo_question_id": q["id"]})
-                if pstore and q.get("kind") != "approval":
+                if pstore and q.get("kind") not in ("approval", "plan"):
                     self._dispatch_neo_cleanup(pstore, q, verdict)
             finally:
                 if pstore:
@@ -407,6 +409,77 @@ class Daemon:
         pstore.add_event(q["wo_id"], "neo_dispatched",
                          {"neo_question_id": q["id"], "cleanup_wo_id": wo["id"]})
         log.info("neo dispatched pre-approved cleanup %s from %s", wo["id"], q["wo_id"])
+
+    def _deliver_plan_verdict(self, central: CentralStore, neo_store: Any,
+                              pstore: ProjectStore | None, q: dict,
+                              verdict: dict) -> None:
+        """Apply Neo's verdict on a submitted plan.
+
+        Neo releases or sends back through the same `ops.review_plan` the user's
+        `jarvis fo approve` uses — the escalation exists because Neo declined to take a
+        decision, not because the decision changed shape.
+
+        THE CAP OVERRIDES NEO. A plan at or over the child cap goes to the user whatever
+        Neo said, because the cap is one of the two backstops the whole
+        Neo-reviews-plans default rests on, and a backstop a reviewer can wave through
+        is not one. Neo is still asked first, and its reading is attached to what the
+        user sees: the alternative — skipping the call for large plans — hands the user
+        a nine-node dependency graph with no read on it, which is the most expensive
+        thing to review unaided.
+        """
+        from . import db as db_mod
+        from . import plans
+
+        if pstore is None:
+            log.error("plan verdict for question %s has no project store", q["id"])
+            return
+        fo = pstore.feature_order_for_question(q["id"])
+        if fo is None:
+            log.warning("plan question %s reviews no feature order (deleted?)", q["id"])
+            return
+        if fo["status"] != "plan_review":
+            # The user got there first through `jarvis fo approve`, or the feature order
+            # was cancelled while Neo was thinking. Either way the decision is taken.
+            log.info("plan question %s: %s is already %s, dropping Neo's verdict",
+                     q["id"], fo["id"], fo["status"])
+            return
+
+        plan = db_mod.from_json(fo.get("plan"), {}) or {}
+        n_children = len(plan.get("children") or [])
+        over_cap = n_children >= plans.CHILD_CAP
+        if not verdict["escalate"] and not over_cap:
+            from . import ops
+            accepted = verdict.get("verdict") == "approved"
+            try:
+                ops.review_plan(fo["id"], accept=accepted,
+                                feedback=verdict["reason"] or "(no reason given)",
+                                decided_by="neo")
+            except ops.OpsError:
+                log.exception("neo's verdict on %s could not be applied", fo["id"])
+            else:
+                log.info("neo %s the plan for %s", "released" if accepted else
+                         "sent back", fo["id"])
+            return
+
+        reason = verdict["reason"] or "Neo declined to decide"
+        if over_cap and not verdict["escalate"]:
+            reason = (f"{n_children} children is at or over the cap of "
+                      f"{plans.CHILD_CAP}, so this plan needs you rather than Neo. "
+                      f"Neo's reading: {verdict.get('verdict', '?')} — {reason}")
+            # Neo answered, but the answer is not what happens. Re-marking the question
+            # keeps `jarvis neo list` and `jarvis status` telling the same story: this
+            # is now the user's to decide.
+            neo_store.mark(q["id"], "escalated", reason=reason)
+        pstore.flag_feature_attention(fo["id"], f"plan needs your review: {reason[:160]}")
+        central.add_inbox(
+            project=q["project"], level="warning",
+            title=f"A plan needs your review: {fo['id']}",
+            body=f"{fo['title']}\n{n_children} work orders proposed.\n{reason}\n\n"
+                 f"Read it with: jarvis fo show {fo['id']}\n"
+                 f"Then: jarvis fo approve {fo['id']} [--reject] --feedback \"...\"",
+            wo_id=fo.get("plan_wo_id"),
+        )
+        log.info("plan for %s escalated to the user: %s", fo["id"], reason)
 
     def _deliver_gate_verdict(self, central: CentralStore, pstore: ProjectStore | None,
                               q: dict, verdict: dict) -> None:

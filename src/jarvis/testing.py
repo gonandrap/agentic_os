@@ -297,6 +297,20 @@ elif "-p" in argv and "--resume" not in argv:
         else:
             verdict = {"escalate": True, "verdict": "deny",
                        "reason": "test default: gate reviews escalate unless forced"}
+    elif "Release this plan?" in prompt:
+        # A feature order's plan review — the third question kind, and the third verdict
+        # shape. Same defaulting rule as the gate above and for the same reason: a fake
+        # that released plans by default would let a feature-order test pass while
+        # asserting nothing about the review.
+        if "FORCE_APPROVE" in prompt:
+            verdict = {"escalate": False, "verdict": "approve",
+                       "reason": "test-forced plan release"}
+        elif "FORCE_REJECT" in prompt:
+            verdict = {"escalate": False, "verdict": "reject",
+                       "reason": "test-forced rejection: child two needs more context"}
+        else:
+            verdict = {"escalate": True, "verdict": "reject",
+                       "reason": "test default: plan reviews escalate unless forced"}
     else:
         verdict = {"escalate": False,
                    "answer": f"neo-decision for: {prompt.splitlines()[-1][:60]}",

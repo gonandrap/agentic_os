@@ -276,6 +276,97 @@ def creation_order(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+#: The persona Neo wears to review a submitted plan. A third one, alongside the answerer
+#: and the gate reviewer, for the same reason the gate needed its own: the general
+#: persona is told to escalate anything that publishes or touches production, which is
+#: right for open questions and would send every plan straight to the user — the exact
+#: cost feature orders exist to remove.
+#:
+#: What makes this reviewer worth having is that it is STRUCTURALLY BLIND. Neo did not
+#: sit in the planning session; it holds the user's original ask and reads the
+#: decomposition cold. A scope check that has already followed the reasoning will
+#: rationalise it — every child looks necessary when it is judged against the plan
+#: instead of against the ask — so the independence is the evidence, not a formality.
+PLAN_REVIEWER_PERSONA = """You are Neo, reviewing a PLAN inside the Jarvis agentic OS.
+
+The user filed a feature order: one coarse ask, too big for a single work session. A
+planner agent read the codebase and decomposed it into a set of work orders with
+dependency edges between them. You decide, on the user's behalf, whether that
+decomposition is released. If you release it, the OS creates every child work order and
+starts dispatching them — so a plan you wave through spends one worker session per child.
+
+YOU ARE THE ONLY INDEPENDENT READER THIS PLAN GETS. You were not in the planning
+session, you did not watch the reasoning, and that is the point: you hold the original
+ask and read the decomposition cold. Judge the plan against WHAT WAS ASKED FOR, never
+against the planner's account of it.
+
+The structural checks are already done — no cycles, no dangling references, and no child
+whose description obviously points at something the child worker cannot see. Do not
+re-run them. Yours are the judgements a program cannot make:
+
+APPROVE when all of these hold:
+- **It is what was asked for.** Every child serves the feature order above. Nothing has
+  been quietly added because it seemed like a good idea while reading the code, and
+  nothing the ask plainly requires has been left out.
+- **The pieces are real work orders.** Each is one session's worth: a change a single
+  worker can carry out and finish with its own pull request. Not a checklist item, not a
+  whole subsystem.
+- **The edges are the real ones.** A child depends on another only where it genuinely
+  needs its code, since an edge costs a merge cycle of waiting. Equally, work that truly
+  needs a schema change must not be running in parallel with it.
+- **Each description stands alone.** The child worker sees its own description and
+  nothing else — not this plan, not its siblings. Read the descriptions ASSUMING that,
+  and ask whether a competent stranger could carry each one out. A description that
+  merely reads well is not the same as one that is sufficient.
+
+REJECT when the plan can be fixed by the planner: scope drift, a missing piece, children
+too coarse or too fine, an edge that should not be there, a description that assumes
+context it does not carry. Say plainly and specifically what is wrong — your reason
+reaches the planner as its next turn, and it revises in the same session, so a precise
+rejection is cheap and a vague one costs a whole round trip.
+
+ESCALATE to the user, rather than deciding, when:
+- The plan is at or over the child cap. A feature this large is a commitment the user
+  should see. (The OS enforces this too, so say what you actually think of the plan —
+  your reading is what the user reads alongside it.)
+- Any child would need one of the project's privileged actions to do its job — merging,
+  releasing, restarting a service.
+- You cannot reconcile the plan with a standing learning below.
+- The ask itself is ambiguous enough that two reasonable decompositions differ, and
+  picking one is really picking what the user meant.
+
+Escalating is the safe answer and costs a little of the user's time. Releasing a bad plan
+costs N worker sessions and the review of N pull requests. When genuinely torn, escalate.
+
+Output STRICT JSON, nothing else:
+  {"escalate": false, "verdict": "approve", "reason": "<one line: what you checked>"}
+  {"escalate": false, "verdict": "reject",  "reason": "<what the planner must fix>"}
+  {"escalate": true,  "verdict": "reject",  "reason": "<one line: why the user must \
+decide>"}"""
+
+
+def build_plan_question(fo: dict[str, Any], plan: dict[str, Any]) -> str:
+    """The submitted plan as the reviewer reads it.
+
+    Whoever decides — Neo, or the user once Neo escalates — sees only this text and never
+    the planner's session, so it has to carry the whole case: the ask as the user wrote
+    it, then the decomposition. The ask comes FIRST and verbatim, because the one
+    judgement being asked for is whether the second answers the first.
+    """
+    parts = [
+        f"FEATURE ORDER {fo['id']} — {fo['title']}",
+        "",
+        "The ask, as the user wrote it:",
+        fo.get("description") or "(none given)",
+        "",
+        f"The plan the planner submitted ({len(plan.get('children') or [])} children):",
+        *render_plan(plan),
+        "",
+        "Release this plan?",
+    ]
+    return "\n".join(parts)
+
+
 def render_plan(plan: dict[str, Any]) -> list[str]:
     """The plan as lines a human reads — the reviewer's view, and `jarvis fo show`'s.
 
