@@ -42,6 +42,28 @@
     <a href="/project/{{ project_name }}?hidden=1{{ '&show=' + revealed if revealed }}">show</a>
   {% endif %}
 </p>
+{# Feature orders sit ABOVE the work orders and do not expand into their children here:
+   the children are already in the listing below as ordinary work orders, and printing
+   the same tree twice on one page is how a page stops being read. The tree is on the
+   feature's own page. #}
+{% if features %}
+<h3>Feature orders</h3>
+<div class="panel">
+  {% for fo in features %}
+    {% set fm = fo_status_meta.get(fo.status, {'word': fo.status, 'icon': '•', 'tone': 'muted'}) %}
+    <div class="row">
+      <span class="st tone-{{ fm.tone }}"><span class="i">{{ fm.icon }}</span>{{ fm.word }}</span>
+      <div class="grow">
+        <a href="/fo/{{ project_name }}/{{ fo.id }}" class="mono">{{ fo.id }}</a> {{ fo.title }}
+        <span class="sub">{{ fo.progress.label }}</span>
+        {% if fo.needs_attention %}<div class="sub tone-warn">◭ {{ fo.attention_reason }}</div>{% endif %}
+      </div>
+      <span class="sub mono">{{ fmt_age(fo.created_at) }}</span>
+    </div>
+  {% endfor %}
+</div>
+{% endif %}
+
 <div class="panel">
   {% for wo in featured + rest %}
     {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}

@@ -216,6 +216,17 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
     * **It plans; it does not build.** A planner that returns the finished solution has
       failed at the job even if the solution is good, because the point of the feature
       order is a decomposition the fleet can execute in parallel.
+
+    That last one is carried HERE, in prose, and not by a permission rule — which is a
+    weaker guarantee and worth stating plainly rather than leaving for someone to
+    discover. The planner is a work order, not a subagent, so it has no `tools:`
+    frontmatter (the CLI-enforced layer); its only available restriction is the
+    `permissions.deny` path `_write_worker_settings` writes, and a deny broad enough to
+    stop product code also stops the two things a planner is REQUIRED to do — write the
+    `plan.json` it submits, and produce a design document, whose pull request the design
+    makes the base of the children's stack. So the planner runs on ordinary worker
+    permissions in this phase, deliberately. The hard posture arrives with the seats,
+    which can express it declaratively; see the Phase 3 backlog item.
     """
     from .plans import CHILD_CAP, MIN_DESCRIPTION_CHARS
 

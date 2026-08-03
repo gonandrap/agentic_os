@@ -128,6 +128,28 @@ def test_the_planner_carries_the_ask_verbatim_and_a_planner_briefing(planning, s
     assert "Do not run `jarvis wo finish`" in prompt
 
 
+def test_a_planner_runs_on_ordinary_worker_permissions(planning, store, project):
+    """A DELIBERATE choice, pinned here so changing it has to be deliberate too.
+
+    The design wants a planner that cannot produce product code, but the planner is a
+    work order rather than a subagent, so it has no CLI-enforced `tools:` restriction —
+    only the settings `permissions` path. A deny broad enough to stop product code also
+    stops the two things a planner MUST do: write the plan.json it submits, and produce
+    a design document whose pull request the design makes the base of the children's
+    stack. So the rule is carried in the briefing prose in this phase, and the hard
+    posture waits for the seats, which can express it declaratively.
+    """
+    _, fo = planning
+    planner_id = fo["plan_wo_id"]
+
+    settings = json.loads(
+        (project / ".jarvis" / "worker-settings" / f"{planner_id}.json").read_text())
+
+    allow = settings["permissions"]["allow"]
+    assert any(r.startswith("Write(") and planner_id in r for r in allow)
+    assert not settings["permissions"].get("deny")
+
+
 def test_a_planner_is_not_created_twice(planning, store):
     """Idempotence is by status, not by a flag: the feature order leaves `pending` in
     the same call that files the planner."""
