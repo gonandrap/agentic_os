@@ -3,10 +3,11 @@
 {% block content %}
 
 <h2>{{ project_name }} <span class="kv mono">{{ path }}</span></h2>
-{# Only two things on this page are asking for the user: a running worker, and a pull
-   request waiting to be merged. Those get a row each. Every other open status, and the
-   settled ones (the bulk of any project with history), collapse to a count. Every link
-   carries the hidden flag through, so expanding a group does not silently undo
+{# Everything open that the user can act on gets a row: a decision they owe (needs
+   review, waiting on them), a running worker, a pull request waiting to be merged.
+   Only work the OS has not started yet — pending, dispatching — collapses to a count,
+   along with the settled orders that are the bulk of any project with history. Every
+   link carries the hidden flag through, so expanding a group does not silently undo
    "show hidden too". #}
 {% set collapsed = '/project/' + project_name + ('?hidden=1' if show_hidden else '') %}
 {% set keep = '&hidden=1' if show_hidden else '' %}
@@ -68,7 +69,7 @@
     </div>
   {% else %}
     <div class="empty">
-      {% if open_counts or settled %}nothing running and nothing to merge — the rest is counted above
+      {% if open_counts or settled %}nothing running and nothing waiting on you — the rest is counted above
       {% else %}no work orders yet{% endif %}
     </div>
   {% endfor %}
