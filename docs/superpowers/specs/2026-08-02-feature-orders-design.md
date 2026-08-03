@@ -66,6 +66,8 @@ against the real binary before this design was written, with a control.
 |---|---|
 | A headless `-p` turn can spawn subagents with the Task tool | probe returned the subagent's exact sentinel reply, `subtype: success` |
 | `--add-dir X` exposes `X/.claude/agents/*.md` as subagent types — the same mechanism that already delivers skills from `X/.claude/skills/` | with `--add-dir`, the probe agent answered; **control**: the identical prompt without `--add-dir` returned `UNAVAILABLE` |
+| The `tools:` key in a seat definition is an **enforced capability restriction**, not advice | a seat declared `tools: Read, Glob` reported `CANNOT-WRITE` and **left no file on disk**; **control**: an otherwise identical seat declared `tools: Read, Glob, Write`, same settings and same permissions, wrote its file |
+| `PreToolUse` hooks fire for a **subagent's** tool calls, and the payload identifies the seat | one turn produced two firings; the seat's carried `agent_type: seat-hooked` and an `agent_id`, and the lead's own call carried **no `agent_type` key at all**. `session_id` was identical for both, so `agent_type` is the discriminator |
 
 This matters more than it looks. It means the "team of profiled agents" needs **no new
 transport, no new supervision and no change to `worker_session.py`** — agent definitions
@@ -348,6 +350,59 @@ jarvis backlog promote <id> --as feature         # intake -> feature order
 `jarvis status` gains a feature-order count and the rolled-up attention line; the dashboard
 gains a feature page whose main content is the dependency tree.
 
+### 8. Per-seat capability posture — a planner plans, it does not build
+
+**The user's requirement (2026-08-02):** a planner's job is to produce a plan others work
+from, *never* to do the work itself. A planner that returns the built solution has failed,
+and that output must not be pushable. The same applies inside the team: the architect must
+not produce code either. Every member has its own posture.
+
+This is not a matter of instructions. A prompt saying "do not write code" is a preference
+the model can talk itself out of at hour three of a hard plan. The posture has to be
+enforced, and the two probes above establish that there are **two independent enforcement
+layers**, with different properties:
+
+**Layer 1 — declarative capability restriction, in the seat definition.** The `tools:` key
+of an agent definition is enforced by the CLI, not advisory: the restricted probe seat
+reported `CANNOT-WRITE` *and left no file on disk*, against a control seat that differed
+only in that key and wrote successfully. So an architect that cannot produce code is
+expressed by not granting it `Write`, `Edit` or `NotebookEdit` — one line of frontmatter,
+no Jarvis code, no round trip, and no way for the model to route around it.
+
+**Layer 2 — gate mediation, through the existing `PreToolUse` path.** Hooks fire for a
+subagent's tool calls, and the payload carries `agent_type` (the seat's name) and
+`agent_id`, while the lead's own calls carry **no `agent_type` key at all**. `session_id`
+is shared, so `agent_type` is the discriminator. This means per-seat gating needs a new
+*field* in `gates.py`'s matching, not a new mechanism: the machinery already runs on every
+tool call in a worker turn and already travels as `JARVIS_GATES` in the worker settings.
+
+**Recommendation: prefer layer 1 for prohibitions, and reserve layer 2 for actions that
+should be possible but reviewed.** A prohibition routed through layer 2 costs a Neo round
+trip to say "no" to something that was never allowed, and it puts a permanent false
+positive into the gate false-positive rate that the `dismissed` verdict exists to measure.
+So:
+
+| Member | Layer 1 — tools withheld | Layer 2 — gated |
+|---|---|---|
+| planner (a work order) | `Write`/`Edit` outside its plan artefact | the existing `pr_merge` / `release` / `service_restart` set |
+| architect | all edit tools | — |
+| test lead | all edit tools | — |
+
+The planner is the one member that cannot be handled by layer 1 alone: it is a work order,
+not a subagent, so it has no `tools:` frontmatter. Its restriction is the per-work-order
+settings path `dispatch._write_worker_settings()` already writes — the same declarative
+`permissions.deny` mechanism that grants an ordinary worker edit rights inside its own
+worktree, inverted. That is a Jarvis-side control rather than a CLI-side one, which is
+worth stating plainly: it is the weaker of the two layers, and it is the one place where
+"a planner must not build" rests on configuration Jarvis writes rather than on a capability
+the CLI never granted.
+
+**One caveat for the implementer.** `JARVIS_WO_ID` is per-session, so an action a *seat*
+attempts and a gate blocks files its approval request against the **planner's** work order.
+That is correct — the planner owns the turn and is answerable for what its team did — but
+anyone reading the resulting request needs `agent_type` recorded on it, or the record will
+say the planner attempted something the architect did.
+
 ## Alternatives considered
 
 **One polymorphic `orders` table with `kind` and a self-referencing `parent_id`.** This is
@@ -466,13 +521,38 @@ a work order with no dependencies its new `WHERE` clause is vacuously true.
 
 ## Phasing
 
-**Phase 0 — prerequisite.** `bl-54287b3f`, auto-complete a work order when its pull request
-merges. Ship first; strict dependency satisfaction is unusable without it.
+**Phase 0 — prerequisite. DONE.** `bl-54287b3f` was promoted while this design was in
+review and shipped as `wo-6722430e` / PR 66, already merged to `main`. It landed stronger
+than this document assumed: a new `src/jarvis/github.py` (read-only, `gh pr view <url>
+--json state,mergedAt`) plus `Daemon.poll_pull_requests` on a `PR_POLL_EVERY_TICKS`
+cadence of roughly two minutes. MERGED becomes `ops.complete_merged` — `completed`, event
+`pr_merged`, backlog item closed, worker stopped; CLOSED-unmerged becomes `needs_review`
+with attention.
 
-**Phase 1 — dependencies on ordinary work orders.** `work_orders.depends_on`, the claim-time
-filter, `jarvis wo create --depends-on`, the blocked-by display. No feature orders, no
-planner. This is independently useful the day it lands, and it de-risks the genuinely hard
-part — scheduling — before any of the soft part is built on top of it.
+The consequence for this design is direct and good: **advancing the schedule no longer
+costs the user a `jarvis wo done` per child.** They merge the pull request — which they
+were going to do anyway — and the dependency clears within about two minutes, unattended.
+The strongest objection to strict dependency satisfaction, as originally written here, no
+longer exists.
+
+**Phase 1 — dependencies on ordinary work orders, and the stacking probe.**
+`work_orders.depends_on`, the claim-time filter, `jarvis wo create --depends-on`, the
+blocked-by display. No feature orders, no planner. This is independently useful the day it
+lands, and it de-risks the genuinely hard part — scheduling — before any of the soft part
+is built on top of it.
+
+**Scoped into this phase by the user (2026-08-02): establish whether stacked worktrees are
+possible, first, before the rest of the phase is designed around an answer.** Concretely,
+a live probe with a negative control in the style of the two above: can a worktree be
+created from a base branch other than the default — via `--worktree`, or by creating the
+worktree with `git` directly and running the turn with `cwd` set to it and no flag (the
+transport already does exactly this from turn 2 onward, so the second form is very likely
+to work even if the first does not). The probe's deliverable is a yes/no plus the working
+invocation, and it gates nothing else in Phase 1 — the `depends_on` column and the
+claim-time filter are the same either way. If stacking proves impossible, the alternatives
+to evaluate are: serialise on merge (strict, the pre-Phase-0 behaviour), or have the child
+worker rebase onto its dependency's branch itself as its first act, which is slower and
+puts a merge conflict inside a worker session rather than in front of the user.
 
 **Phase 2 — feature orders with a single generic planner.** The table, the lifecycle, the
 plan work order, `jarvis fo plan --from-file`, plan validation, user approval,
@@ -489,21 +569,41 @@ shape the panel can adopt.
 live), cross-project programs, and the polymorphic order table if a third session-running
 type ever arrives.
 
-## Open questions
+## Decisions
 
-1. **Stacked worktrees.** Can `--worktree` create a worktree based on a branch other than
-   the default? Everything in option 3 of the dependency rule depends on it, and it has not
-   been checked. This should be probed live before Phase 4 is scoped, the same way the two
-   facts above were.
-2. **Does a child inherit the planner's pull request?** A feature is one logical change; six
-   children produce six pull requests. Whether that is right, or whether children should
-   stack onto one feature branch, is a workflow question for the user, not a technical one.
-3. **Who owns re-planning when a child discovers the plan was wrong?** Today a worker in
-   doubt asks Neo. A worker that discovers its *sibling's* work is misconceived has no
-   route to say so. This may want a `jarvis fo replan` that a child can call.
-4. **Profiles for every worker, or only planners?** Section 4 recommends planners only, but
-   the cost of the broader option has not been measured.
-5. **Does a feature order need its own gate posture?** A planner reads and writes a plan; it
-   never ships. Whether its `permission_mode` and gate configuration should differ from an
-   ordinary worker's is a small decision with a security-shaped edge, worth making
-   explicitly rather than inheriting.
+The five questions this document originally left open were answered by the user on
+2026-08-02. They are recorded here as decisions rather than deleted, because the reasoning
+matters more than the conclusion and a later reader will want to know what was considered.
+
+**1. Stacked worktrees — probe it in Phase 1, then evaluate.** Not deferred to Phase 4.
+Establish empirically whether a worktree can be based on a branch other than the default;
+if it cannot, evaluate the alternatives rather than assuming the design is stuck. Folded
+into the phasing above, with the two named alternatives.
+
+**2. Children stack their pull requests — "one PR on top of each other".** Each child still
+opens its own reviewable pull request; the base of each is its dependency's branch rather
+than the default branch. This chooses option 3 of the dependency rule, which is why
+decision 1 moved forward into Phase 1: the whole scheme rests on being able to cut a
+worktree from a non-default base. When the planner itself produced a pull request (a design
+document, say), that PR is the base of the stack; otherwise the base is the default branch.
+
+**3. A child never judges its sibling's work — it raises to Neo, which decides.** The
+original question assumed a child might call something like `jarvis fo replan`. That was
+the wrong shape: a work order does not have enough context to claim a feature needs
+re-planning, and evaluating a sibling is not its job. If a child notices a problem *by
+chance*, it does what every worker already does with anything it is unsure about — asks
+Neo — and Neo weighs the severity and decides whether a re-plan is warranted. **No new
+verb, no new permission, no cross-work-order authority.** The existing first-responder path
+already covers it, which makes this a decision to build nothing.
+
+**4. Ordinary workers get no profile.** Profiles belong to the planning team only. A worker
+is an individual that gets the work done; giving it a role would be dressing up a session
+that has exactly one job. This settles section 4's open recommendation in favour of the
+narrower option, and it means `briefing_for()` needs a notion of work-order kind only for
+planners — nothing changes for the workers that make up the overwhelming majority of the
+fleet.
+
+**5. Yes — and per member, not just per feature order.** Answered at length in section 8
+above, with the two enforcement layers the probes established. The principle: a planner
+produces a plan others work from and never the work itself, and each member of the team
+carries its own posture — an architect cannot produce code any more than the planner can.
