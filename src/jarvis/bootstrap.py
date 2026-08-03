@@ -46,27 +46,46 @@ def jarvis_hook_command() -> str:
     return f"{sys.executable} -m jarvis.cli _hook"
 
 
-def install_agent_skills(project_path: Path) -> Path:
-    """Materialize the OS-provided agent skills for a project; return the directory to
-    hand Claude via `--add-dir`.
+def _rebuild(src: Path, root: Path, leaf: str) -> Path:
+    """Rebuild `root/.claude/<leaf>/` from `src`, wholesale. Returns `root`.
 
-    Getting a skill in front of a worker is awkward: workers run in a fresh git
-    worktree, so an untracked `.claude/skills/` in the main checkout never reaches
-    them, and no settings key can declare an extra skills directory (checked against
-    the CLI). What does work — verified live — is `--add-dir X`, which loads skills
-    from `X/.claude/skills/`. So the OS keeps its skills inside the project's
-    gitignored `.jarvis/` tree and points every worker at them on spawn.
-
-    The tree is generated, never authored: it is rebuilt on each dispatch so a stale
-    or locally mangled copy heals itself.
+    Generated, never authored: the whole destination is dropped and recopied on each
+    dispatch, so a stale or locally mangled copy heals itself.
     """
-    root = project_state_dir(project_path) / "agent-skills"
-    dest = root / ".claude" / "skills"
+    dest = root / ".claude" / leaf
     if dest.exists():
         shutil.rmtree(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(ASSETS / "skills", dest)
+    shutil.copytree(src, dest)
     return root
+
+
+def install_agent_assets(project_path: Path, kind: str = "worker") -> list[Path]:
+    """Materialize the OS-provided agent assets for a work order of `kind`; return the
+    directories to hand Claude via `--add-dir`.
+
+    Getting an asset in front of a worker is awkward: workers run in a fresh git
+    worktree, so an untracked `.claude/` in the main checkout never reaches them, and no
+    settings key can declare an extra skills directory (checked against the CLI). What
+    does work — verified live, with a negative control — is `--add-dir X`, which loads
+    skills from `X/.claude/skills/` and subagent definitions from `X/.claude/agents/`.
+    So the OS keeps both inside the project's gitignored `.jarvis/` tree and points each
+    worker at whichever it is entitled to on spawn.
+
+    **Two roots, not one, and the split is load-bearing.** Skills go to every worker;
+    the planning seats go to planners only (the design's decision 4 — an ordinary worker
+    is an individual with one job and gets no profile). Putting the seats in the skills
+    root and omitting them for workers would mean the worker path had to DELETE
+    `agents/` to keep owning its whole generated tree — and that delete would land while
+    a concurrently-dispatched planner turn was reading it. Separate roots make the two
+    populations independent, so neither dispatch can disturb the other.
+    """
+    roots = [_rebuild(ASSETS / "skills",
+                      project_state_dir(project_path) / "agent-skills", "skills")]
+    if kind == "planner":
+        roots.append(_rebuild(ASSETS / "agents",
+                              project_state_dir(project_path) / "agent-seats", "agents"))
+    return roots
 
 
 def _tree_matches(src: Path, dest: Path) -> bool:
@@ -81,7 +100,7 @@ def install_project_skills(project_path: Path) -> list[str]:
     """Install the OS's user-facing skills into the project itself; return the names
     written (empty when everything was already current).
 
-    Different audience from `install_agent_skills`, so a different delivery. Those are
+    Different audience from `install_agent_assets`, so a different delivery. Those are
     for the workers Jarvis dispatches and ride in on `--add-dir` at spawn time. These are
     for the sessions the *user* opens by hand, which get no such flag and only ever load
     `<project>/.claude/skills/` — so they are written into the project, next to the
@@ -90,7 +109,7 @@ def install_project_skills(project_path: Path) -> list[str]:
 
     Only the subdirectories the OS owns are touched. `<project>/.claude/skills/` is where
     users keep their own skills, so this never clears the tree — contrast
-    `install_agent_skills`, which owns its whole (gitignored, generated) destination and
+    `install_agent_assets`, which owns its whole (gitignored, generated) destination and
     rebuilds it wholesale.
     """
     written: list[str] = []

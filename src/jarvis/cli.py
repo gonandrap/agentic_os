@@ -249,6 +249,12 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--description", "-d", default="",
                    help="the whole ask. Required: the planner sees only this text")
     f.add_argument("--origin", default="jarvis", choices=["jarvis", "ui", "manual"])
+    f.add_argument("--max-parallel", dest="max_parallel", type=int, metavar="N",
+                   help="run at most N of this feature's children at once. Omit for no "
+                        "cap beyond the project's own max_concurrent — which is the "
+                        "right answer unless the children contend for something the OS "
+                        "cannot see (a test database, a rate-limited API, review "
+                        "attention)")
 
     f = fo.add_parser("list", help="feature orders and how far along they are")
     f.add_argument("project", nargs="?")
@@ -338,6 +344,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="`work` (default) dispatches one worker; `feature` opens a "
                         "planner that decomposes it first")
     b.add_argument("--force", action="store_true", help="ignore unfinished dependencies")
+    b.add_argument("--max-parallel", dest="max_parallel", type=int, metavar="N",
+                   help="with --as feature: cap how many of its children run at once")
     b = bl.add_parser("done", help="mark a backlog item done without a work order")
     b.add_argument("item_id")
 
@@ -459,13 +467,19 @@ def cmd_status(args: argparse.Namespace) -> int:
     if st["attention"]:
         print(f"\n⚠ NEEDS YOUR ATTENTION ({len(st['attention'])}):")
         for a in st["attention"]:
-            wo = f" {a['wo_id']}" if a["wo_id"] else ""
-            print(f"  • [{a['project']}]{wo} {a['title']} — {a['reason']}")
+            ident = a["wo_id"] or a.get("fo_id")
+            print(f"  • [{a['project']}]{' ' + ident if ident else ''} {a['title']} "
+                  f"— {a['reason']}")
             if a.get("attach"):
                 print(f"      approve it: {a['attach']}  ·  or `jarvis wo resume-auto {a['wo_id']}`")
             if a.get("decide"):
-                print(f"      {a['decide']}  ·  see it: "
-                      f"`jarvis gate show {a['approval_id']}`")
+                # A gate item carries the command to run AND the request to read; a
+                # feature order's `decide` is already the whole instruction. Keyed on
+                # `approval_id` rather than on the item's shape, because reading it off
+                # every item is what made a feature order crash this line.
+                see = (f"  ·  see it: `jarvis gate show {a['approval_id']}`"
+                       if a.get("approval_id") else "")
+                print(f"      {a['decide']}{see}")
     if st["inbox"]["unacked"]:
         print(f"\n📥 inbox: {st['inbox']['unacked']} unacked"
               f" ({st['inbox']['critical']} critical) — `jarvis inbox list`")
@@ -694,8 +708,10 @@ def cmd_fo(args: argparse.Namespace) -> int:
 
     if args.fo_cmd == "create":
         fo = ops.create_feature_order(args.project, args.title,
-                                      description=args.description, origin=args.origin)
+                                      description=args.description, origin=args.origin,
+                                      max_parallel=args.max_parallel)
         _print({"created": fo["id"], "project": args.project, "status": fo["status"],
+                **({"max_parallel": fo["max_parallel"]} if fo["max_parallel"] else {}),
                 "note": "jarvisd will open a planner for it shortly; the plan comes "
                         "back for review before any work order is created"}, args.json)
 
@@ -728,6 +744,9 @@ def cmd_fo(args: argparse.Namespace) -> int:
                 print(f"planner: {p['id']} ({p['status']})")
             if detail["plan_text"]:
                 print(f"\nplan:\n{detail['plan_text']}")
+            if detail["max_parallel"]:
+                print(f"slots: at most {detail['max_parallel']} children at once "
+                      f"({detail['active_children']} running now)")
             if detail["children"]:
                 print(f"\nchildren ({detail['progress']['label']}):")
                 for c in detail["children"]:
@@ -848,7 +867,8 @@ def cmd_backlog(args: argparse.Namespace) -> int:
                     print("backlog empty")
         elif args.bl_cmd == "promote":
             _print(ops.promote_backlog(args.item_id, force=args.force,
-                                       as_feature=args.as_kind == "feature"), args.json)
+                                       as_feature=args.as_kind == "feature",
+                                       max_parallel=args.max_parallel), args.json)
         elif args.bl_cmd == "done":
             central.mark_backlog(args.item_id, "done")
             _print({"item": args.item_id, "status": "done"}, args.json)

@@ -305,8 +305,23 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 # work order's own flag as well says the same thing twice and buries
                 # the actionable line.
                 gate_held = {a["wo_id"] for a in store.escalated_approvals()}
+                # A feature order contributes ONE line to the strip, never one per child.
+                # Its children keep their own flags — nothing is cleared, and they are
+                # right there on the feature's page — but they are rolled up here rather
+                # than listed. The comment on `waiting_pr_merge` in project_store.py
+                # articulates the fear precisely: a strip that names everything is a strip
+                # that stops being read, and a six-child feature is six lines for what the
+                # user experiences as one piece of work.
+                #
+                # This is a change to how attention is PRESENTED. `true_blockers` stays
+                # the single source of truth for whether a work order needs anyone, and
+                # `jarvis wo list` still shows every flagged child individually.
+                rolled_up: dict[str, list[dict[str, Any]]] = {}
                 for wo in flagged.values():
                     if wo["id"] in gate_held:
+                        continue
+                    if wo.get("parent_id"):
+                        rolled_up.setdefault(wo["parent_id"], []).append(wo)
                         continue
                     item = {
                         "project": p["name"], "wo_id": wo["id"],
@@ -320,19 +335,43 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     if wo["status"] == "waiting_input" and wo["session_id"]:
                         item["attach"] = f"claude --resume {wo['session_id']}"
                     attention.append(item)
-                # A feature order contributes ONE line, never one per child: its children
-                # keep their own flags and are reachable from its page. The comment on
-                # `waiting_pr_merge` in project_store.py articulates the fear precisely —
-                # a strip that names everything is a strip that stops being read.
                 features = store.list_feature_orders(statuses=FO_OPEN_STATUSES)
-                for fo in features:
-                    if not fo["needs_attention"]:
+                # Which feature orders get a line: the open ones, plus any that is asking
+                # for the user or holds a flagged child. Both additions are about the same
+                # status — `failed` is SETTLED, and it is also the one a feature order
+                # raises its own flag in and the one that always leaves flagged children
+                # behind. Scanning only the open list would drop the flag on the floor at
+                # the moment it means the most, and would let those children back into the
+                # strip individually just as the rollup was carrying the most lines.
+                by_id = {fo["id"]: fo for fo in features}
+                for fo in store.flagged_feature_orders():
+                    by_id.setdefault(fo["id"], fo)
+                for parent_id in rolled_up:
+                    if parent_id not in by_id:
+                        try:
+                            by_id[parent_id] = store.get_feature_order(parent_id)
+                        except KeyError:  # deleted out from under its children
+                            by_id[parent_id] = {}
+                for fo_id, fo in by_id.items():
+                    kids = rolled_up.get(fo_id, [])
+                    if not fo or not (fo["needs_attention"] or kids):
                         continue
+                    reasons = []
+                    if fo["needs_attention"] and fo["attention_reason"]:
+                        reasons.append(fo["attention_reason"])
+                    if kids:
+                        reasons.append(
+                            f"{len(kids)} of its work orders need you: "
+                            + ", ".join(f"{k['id']} ({k['attention_reason']})"
+                                        for k in kids)
+                        )
+                    progress = feature_progress(store, fo)
                     attention.append({
-                        "project": p["name"], "wo_id": None, "fo_id": fo["id"],
+                        "project": p["name"], "wo_id": None, "fo_id": fo_id,
                         "title": fo["title"], "status": f"feature:{fo['status']}",
-                        "reason": fo["attention_reason"],
-                        "decide": f"jarvis fo show {fo['id']}",
+                        "reason": f"{progress['label']} — " + "; ".join(reasons),
+                        "rolled_up": [k["id"] for k in kids],
+                        "decide": f"jarvis fo show {fo_id}",
                     })
                 drift = settings_drift(path / ".claude" / "settings.json")
                 projects.append({
@@ -1212,17 +1251,27 @@ def review_work_order(wo_id: str, accept: bool = True,
 
 def create_feature_order(project_name: str, title: str, description: str = "",
                          origin: str = "jarvis",
-                         backlog_id: str | None = None) -> dict[str, Any]:
+                         backlog_id: str | None = None,
+                         max_parallel: int | None = None) -> dict[str, Any]:
     """File the coarse ask. Nothing is decomposed here — the daemon opens a planner.
 
     Deliberately the same shape as `create_work_order`, because the whole point of the
     `jarvis fo` surface is that a user who knows `jarvis wo` already knows it. What the
     user types is identical; what the OS does with it is not.
+
+    `max_parallel` caps how many of this feature's children run at once. It is the USER's
+    knob, not the planner's (ruled 2026-08-03): the design calls slot budgeting the
+    planner's job, but a planner that budgets its own slots can hand itself the whole
+    project's concurrency, and it would become one more thing the plan validator has to
+    police. NULL — the default — means the project-wide `max_concurrent` is the only cap,
+    which is exactly the behaviour every feature order had before this existed.
     """
     paths = registered_project_paths()
     if project_name not in paths:
         raise OpsError(f"project {project_name!r} not registered "
                        f"(known: {sorted(paths)}). Run `jarvis start` first.")
+    if max_parallel is not None and max_parallel < 1:
+        raise OpsError("--max-parallel must be at least 1 (omit it for no cap)")
     if not (description or "").strip():
         # A work order can survive a bare title — a human reads it and fills the gaps.
         # A feature order cannot: its first reader is a planner in a fresh session with
@@ -1236,7 +1285,8 @@ def create_feature_order(project_name: str, title: str, description: str = "",
     store = ProjectStore(paths[project_name])
     try:
         return store.create_feature_order(title=title, description=description,
-                                          origin=origin, backlog_id=backlog_id)
+                                          origin=origin, backlog_id=backlog_id,
+                                          max_parallel=max_parallel)
     finally:
         store.close()
 
@@ -1337,6 +1387,9 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
             "planner": planner,
             "children": children,
             "progress": feature_progress(store, fo),
+            # Only meaningful next to `max_parallel`, but returned unconditionally so a
+            # caller never has to branch on whether the key is there.
+            "active_children": store.count_active_children(fo_id),
         }
     finally:
         store.close()
@@ -1888,7 +1941,8 @@ def show_gate(approval_id: int, project_name: str | None = None) -> dict[str, An
 # -- backlog ------------------------------------------------------------------------------------
 
 def promote_backlog(item_id: str, force: bool = False,
-                    as_feature: bool = False) -> dict[str, Any]:
+                    as_feature: bool = False,
+                    max_parallel: int | None = None) -> dict[str, Any]:
     """Turn an intake item into committed work.
 
     `as_feature` is the whole of the backlog's involvement with feature orders, and the
@@ -1896,6 +1950,10 @@ def promote_backlog(item_id: str, force: bool = False,
     things that are not yet anybody's work, and a feature order is committed work. The
     only thing that changes is which of the two a promotion produces.
     """
+    if max_parallel is not None and not as_feature:
+        # Refused rather than ignored: a work order has no children to cap, so silently
+        # dropping the flag would promote something other than what was asked for.
+        raise OpsError("--max-parallel applies to a feature order; add --as feature")
     central = CentralStore()
     try:
         item = central.get_backlog(item_id)
@@ -1913,7 +1971,7 @@ def promote_backlog(item_id: str, force: bool = False,
         if as_feature:
             fo = create_feature_order(
                 item["project"], item["title"], description=item["description"],
-                origin="jarvis", backlog_id=item_id,
+                origin="jarvis", backlog_id=item_id, max_parallel=max_parallel,
             )
             # `promoted_wo_id` takes the feature order's id: the column records what the
             # item BECAME, and widening it to a second nullable column would leave every

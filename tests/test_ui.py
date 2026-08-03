@@ -1076,3 +1076,58 @@ def test_an_unknown_feature_order_is_a_page_not_a_traceback(client):
 
     assert page.status_code == 200
     assert "not found in any registered project" in page.text
+
+
+def test_the_feature_page_shows_its_slot_budget(client, daemon, project):
+    """`max_parallel` is invisible everywhere else, so the one page that holds the whole
+    feature is where the user finds out why three children are showing two running."""
+    from tests.test_feature_orders import ASK, a_plan, child
+
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK,
+                                  max_parallel=2)
+    daemon.tick()
+    ops.submit_plan(fo["id"], a_plan(child("one", extra="FORCE_APPROVE"),
+                                     child("two", extra="FORCE_APPROVE"),
+                                     child("three", extra="FORCE_APPROVE")))
+    daemon._neo_drain()
+    daemon.tick()
+
+    page = client.get(f"/fo/proj_a/{fo['id']}").text
+
+    assert "2/2 slots in use" in page
+    # ...and the child that is waiting says so, rather than reading as about-to-start.
+    assert "waiting for a slot" in page
+
+
+def test_an_uncapped_feature_page_says_nothing_about_slots(feature):
+    """The control: a feature with no cap has nothing to report, and the project's own
+    max_concurrent is not this page's business."""
+    client, fo = feature
+
+    assert "slots in use" not in client.get(f"/fo/proj_a/{fo['id']}").text
+
+
+def test_the_attention_strip_links_a_rolled_up_feature_to_its_page(client, daemon,
+                                                                   project):
+    """The rollup collapses the children's lines, so the one link it leaves has to reach
+    the page where they are individually visible — otherwise collapsing them hides them."""
+    from jarvis.project_store import ProjectStore
+    from tests.test_feature_orders import ASK, a_plan, child
+
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
+    daemon.tick()
+    ops.submit_plan(fo["id"], a_plan(child("one", extra="FORCE_APPROVE"),
+                                     child("two", extra="FORCE_APPROVE")))
+    daemon._neo_drain()
+    store = ProjectStore(project)
+    try:
+        kid = store.feature_children(fo["id"])[0]
+        store.update_work_order(kid["id"], needs_attention=1,
+                                attention_reason="assumption needs a decision")
+    finally:
+        store.close()
+
+    page = client.get("/").text
+
+    assert f'/fo/proj_a/{fo["id"]}' in page
+    assert "1 of its work orders need you" in page

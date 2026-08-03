@@ -201,7 +201,7 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
                     knowledge: list[dict[str, Any]]) -> str:
     """The briefing for a feature order's planner.
 
-    Three things make it different from a worker's, and each is load-bearing:
+    Four things make it different from a worker's, and each is load-bearing:
 
     * **Its output is a graph, not a change.** So its terminal action is structured —
       `jarvis fo plan --from-file` against a JSON document — rather than prose. The
@@ -216,17 +216,30 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
     * **It plans; it does not build.** A planner that returns the finished solution has
       failed at the job even if the solution is good, because the point of the feature
       order is a decomposition the fleet can execute in parallel.
+    * **It leads a team.** Two seats — `jarvis-architect` and `jarvis-test-lead` — reach
+      it as subagent types over the extra `--add-dir` that `briefing_for` gives a
+      planner and no one else. A briefing that did not name them would leave two
+      definitions sitting on disk that nothing ever invokes, so this section is what
+      makes the seats real.
 
-    That last one is carried HERE, in prose, and not by a permission rule — which is a
-    weaker guarantee and worth stating plainly rather than leaving for someone to
-    discover. The planner is a work order, not a subagent, so it has no `tools:`
-    frontmatter (the CLI-enforced layer); its only available restriction is the
+    The third one is carried HERE, in prose, and not by a permission rule on the planner
+    itself — which is a weaker guarantee and worth stating plainly rather than leaving
+    for someone to discover. The planner is a work order, not a subagent, so it has no
+    `tools:` frontmatter (the CLI-enforced layer); its only available restriction is the
     `permissions.deny` path `_write_worker_settings` writes, and a deny broad enough to
     stop product code also stops the two things a planner is REQUIRED to do — write the
     `plan.json` it submits, and produce a design document, whose pull request the design
-    makes the base of the children's stack. So the planner runs on ordinary worker
-    permissions in this phase, deliberately. The hard posture arrives with the seats,
-    which can express it declaratively; see the Phase 3 backlog item.
+    makes the base of the children's stack. Phase 3 revisited this and left it alone. The
+    alternative its backlog item floated was denying edits under the project's source
+    directories while leaving the worktree root writable — but "source directory" is not a
+    concept the catalog has, so it would mean guessing `src/`-shaped paths per project,
+    and breaking any planner whose design document lives under one is exactly the case
+    decision 2 depends on.
+
+    The SEATS are where the posture is enforced instead, and there it is real: each is
+    declared `tools: Read, Grep, Glob`, which the CLI enforces rather than advises. No
+    `Bash` either — withholding `Write` while granting a shell is not a prohibition,
+    because a heredoc writes a file just as well (ruled 2026-08-03).
     """
     from .plans import CHILD_CAP, MIN_DESCRIPTION_CHARS
 
@@ -249,6 +262,31 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "failed, however good the solution is: the feature order exists to produce work "
         "the fleet can execute in parallel, and a finished branch is not that. Writing "
         "code to UNDERSTAND the problem is fine and expected; shipping it is not the job.",
+        "",
+        "# Your team",
+        "You are the lead of a planning team, not a lone session. Two seats are "
+        "available to you as subagent types through the Task tool, and they exist "
+        "because a decomposition and its acceptance criteria are different jobs that go "
+        "wrong in different ways:",
+        "",
+        "- **`jarvis-architect`** — which pieces are separable, what the interface "
+        "between them is, what must land first, and what should NOT be split. Consult it "
+        "BEFORE you write the plan, and again whenever a child looks too big for one "
+        "session.",
+        "- **`jarvis-test-lead`** — what \"done\" means for each child and how its worker "
+        "proves it, written to stand alone in a brief read cold. Consult it AFTER the "
+        "decomposition is settled and before you submit.",
+        "",
+        "Both seats can read the codebase and neither can write to it: they have `Read`, "
+        "`Grep` and `Glob` and nothing else, enforced by the CLI rather than by "
+        "instruction. So they cannot do the work by accident, and they cannot run a "
+        "command for you — anything that needs a shell is yours to run.",
+        "",
+        "Consulting them is expected, not optional politeness, and they are the reason "
+        "this is a feature order rather than a work order. But you hold the plan: they "
+        "advise in prose, you decide what the children are, and you own the submission. "
+        "Where the architect and the test lead disagree with each other or with you, say "
+        "so in your final answer rather than quietly picking one.",
         "",
         "# The plan",
         f"Write it to a JSON file in your worktree and submit it with:",

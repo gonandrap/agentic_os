@@ -17,6 +17,11 @@
       <li>
         {% if a.wo_id %}
           <a href="/wo/{{ a.project }}/{{ a.wo_id }}" class="mono">{{ a.wo_id }}</a>
+        {% elif a.fo_id %}
+          {# One line for the whole feature, its flagged children rolled into the reason.
+             The link goes to the feature page, which is where they are individually
+             reachable — that page is what makes the rollup safe to collapse. #}
+          <a href="/fo/{{ a.project }}/{{ a.fo_id }}" class="mono">{{ a.fo_id }}</a>
         {% endif %}
         <strong>{{ a.project }}</strong> — {{ a.title }}
         <div class="sub">{{ a.reason }}

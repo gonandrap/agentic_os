@@ -12,6 +12,11 @@
   <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
   · <a href="/project/{{ project }}">{{ project }}</a>
   · {{ fo.progress.label }}
+  {% if fo.max_parallel %}
+  {# Only shown when it is set: an uncapped feature has nothing to say here, and the
+     project's own max_concurrent is not this page's business. #}
+  · {{ fo.active_children }}/{{ fo.max_parallel }} slots in use
+  {% endif %}
   · {{ fmt_age(fo.created_at) }}
 </p>
 
@@ -84,6 +89,12 @@
             {% for d in c.depends_on %}<a class="mono"
               href="/wo/{{ project }}/{{ d }}">{{ d }}</a>{{ ', ' if not loop.last }}{% endfor %}
           </div>
+        {% endif %}
+        {% if not c.depends_on and c.status_label != c.status %}
+          {# Everything status_label says that the icon does not — today that is the
+             per-feature slot cap. Suppressed when there are dependencies, because the
+             line above already gave the stronger reason. #}
+          <div class="sub">⊘ {{ c.status_label }}</div>
         {% endif %}
         {% if c.status == 'waiting_pr_merge' and c.pr_url %}
           <div class="sub">⑃ <a href="{{ c.pr_url }}" rel="noopener">{{ c.pr_url }}</a></div>

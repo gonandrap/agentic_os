@@ -671,6 +671,53 @@ if the Neo panel has landed first, adopt its `src/jarvis/assets/agents/` layout 
 structured-output helper rather than forking them; if it has not, extract both here in a
 shape the panel can adopt.
 
+> **Phase 3 status: SHIPPED** (`wo-ad41a122`). `src/jarvis/assets/agents/` with
+> `jarvis-architect` and `jarvis-test-lead`, delivered to planners only by
+> `bootstrap.install_agent_assets()` (renamed from `install_agent_skills`); `agent_type`
+> on `approvals`; `feature_orders.max_parallel` enforced in `claim_next_pending`; and the
+> attention rollup in `os_status`.
+>
+> **Five things this phase decided that section 8 and section 5 left open.**
+>
+> 1. **The seats get `Read, Grep, Glob` — no `Bash`.** Section 8's table says only "all
+>    edit tools" withheld. Withholding `Write` while granting a shell is not a
+>    prohibition: `cat > f <<EOF` writes the file just as well, and a prohibition the
+>    model can route around is the advisory posture this phase exists to replace. The
+>    cost is that neither seat can read git history; `Grep` and `Glob` cover the code
+>    itself, and anything needing a shell is the planner's to run.
+> 2. **`agent_type` is recorded even though no seat can currently reach a gate.** With no
+>    `Bash`, layer 2 has no live caller today — the column, the payload read and the line
+>    in the request text are built anyway, because the day anyone grants a seat a shell
+>    the audit trail is already correct instead of silently attributing the seat's attempt
+>    to the planner.
+> 3. **`max_parallel` is the USER's knob, not the planner's.** Section 4 calls slot
+>    budgeting the planner's job. A planner that budgets its own slots can hand itself the
+>    whole project's concurrency, and it becomes one more thing the plan validator has to
+>    police — so it is `jarvis fo create --max-parallel N`, NULL meaning uncapped, spent
+>    alongside `max_concurrent` rather than instead of it. The planner is exempt from its
+>    own feature's cap: capping the session that decides what the children are against
+>    those children is capping a feature against itself.
+> 4. **The shared structured-output helper was NOT extracted.** The other shared surface,
+>    `src/jarvis/assets/agents/`, was — the panel adopts that layout. The helper has no
+>    consumer here: a plan arrives as a file through `jarvis fo plan --from-file` and is
+>    validated by `plans.parse_plan`, and the seats' replies go to the planner through the
+>    Task tool without Jarvis parsing them at all. `neo.parse_verdict` also has no retry
+>    to generalise — it falls back to escalate — so extracting it would mean inventing the
+>    retry and its caller at once, with nothing to check the shape against. Backlogged for
+>    PR 64's work order, which has the consumer.
+> 5. **The planner's own posture is unchanged.** Section 8 leaves open narrowing its
+>    `permissions.deny` to the project's source directories now that the seats carry the
+>    real prohibition. "Source directory" is not a concept the catalog has, so it would
+>    mean guessing `src/`-shaped paths per project — and breaking any planner whose design
+>    document lives under one, which decision 2 makes the base of the children's stack.
+>
+> **One bug found and fixed on the way, in Phase 2 code the rollup made reachable.**
+> `os_status` scanned only `FO_OPEN_STATUSES` for feature-order attention, but `failed` is
+> a SETTLED status and is also the only one a feature order raises its own flag in — so
+> "flag once, at feature level" was derived correctly and then never shown. `jarvis status`
+> separately read `approval_id` off every attention item carrying a `decide` key, which a
+> feature order does not have, so the line raised `KeyError`.
+
 **Phase 4 — deferred.** Branch stacking (after the base-branch CLI behaviour is verified
 live), cross-project programs, and the polymorphic order table if a third session-running
 type ever arrives.
