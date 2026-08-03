@@ -253,6 +253,9 @@ def create_app() -> FastAPI:
         store = ProjectStore(paths[name])
         try:
             wos = store.list_work_orders(statuses=statuses, include_hidden=show_hidden)
+            # Inside the store's lifetime: the label reads the dependencies' own rows.
+            blocked = {wo["id"]: ops.blocked_by(store, wo) for wo in wos}
+            blocked = {k: v for k, v in blocked.items() if v}
             visible_counts = store.status_counts()
             all_counts = store.status_counts(include_hidden=True)
             counts = all_counts if show_hidden else visible_counts
@@ -272,7 +275,7 @@ def create_app() -> FastAPI:
         open_counts = [(s, counts[s]) for s in other_open if counts.get(s)]
         return render(request, "project.html", project_name=name, path=paths[name],
                       featured=featured, rest=rest, open_counts=open_counts,
-                      backlog=backlog, show_hidden=show_hidden,
+                      backlog=backlog, show_hidden=show_hidden, blocked=blocked,
                       hidden_count=hidden_count, settled=settled, revealed=revealed)
 
     @app.get("/project/{name}/sessions", response_class=HTMLResponse)

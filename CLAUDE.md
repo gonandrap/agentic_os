@@ -43,6 +43,24 @@ jarvis status [--json]                     # whole-OS pulse; --attention for the
 jarvis start --catalog <path-to-catalog>   # boot the OS (user catalogs live untracked under catalogs/)
 jarvis stop
 jarvis wo create <project> "title" -d "details" [--model m]
+jarvis wo create ... --depends-on <wo-id,...>   # don't dispatch until those COMPLETE.
+                                           # Order a multi-step job in one go instead of
+                                           # watching the first piece and typing the
+                                           # second. A blocked order stays `pending` and
+                                           # says what it waits for; it never becomes an
+                                           # attention item just for waiting. Same
+                                           # project only. `waiting_pr_merge` does NOT
+                                           # count as done — the dependency's code is
+                                           # still on an unmerged branch — but the daemon
+                                           # completes it within ~2min of the merge, so
+                                           # an edge costs the user no extra step.
+jarvis wo unblock <id> [--all]             # cut the edges holding one back. By default
+                                           # only the ones that can never clear (the
+                                           # dependency was cancelled, failed or
+                                           # deleted); those DO raise attention, because
+                                           # the order would otherwise wait for ever.
+                                           # --all cuts live edges too: it runs now,
+                                           # without the work it was told to build on.
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
 jarvis wo review <id> [--reject] [--feedback "why"]   # feedback teaches Neo; on
                                            # --reject it also goes to the worker
@@ -55,12 +73,17 @@ jarvis wo done <id>                        # the user closing it: the work is fi
                                            # Stops the worker if one is still running.
                                            # Refuses on pending assumptions (same rule
                                            # as ack) — closing would accept them silently.
-                                           # This is also how a `waiting_pr_merge` work
-                                           # order ends: the worker finished behind a PR
-                                           # (`jarvis wo finish --pr <url>`), it stays on
+                                           # Rarely needed for a `waiting_pr_merge` work
+                                           # order now: the worker finished behind a PR
+                                           # (`jarvis wo finish --pr <url>`), it sits on
                                            # the open list with the link and WITHOUT an
-                                           # attention flag, and the user closes it once
-                                           # they merge. Nothing polls GitHub.
+                                           # attention flag, and the daemon closes it
+                                           # itself once GitHub says the PR merged. Use
+                                           # `wo done` when the PR will never merge, or
+                                           # when `gh` can't reach it (the OS says so
+                                           # once, in the inbox). A PR CLOSED unmerged
+                                           # goes to `needs_review` and asks for you:
+                                           # the work was delivered and refused.
 jarvis wo hide <id> / unhide <id>          # declutter: keeps the record, drops it from
                                            # listings, the summary and the attention list
 jarvis wo delete <id> --yes                # irreversible: erases the WO and its whole
