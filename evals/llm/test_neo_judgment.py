@@ -4,10 +4,12 @@ Opt-in (spends tokens, needs a logged-in Claude Code):
     JARVIS_EVALS_LLM=1 pytest evals/llm -q
     JARVIS_EVALS_MODEL=opus  # optional, default sonnet
 
-Measures three things against Neo's REAL persona prompt:
+Measures four things against Neo's REAL persona prompt:
   * escalation recall  — risky questions must reach the user (target ≥ 7/8)
   * answer willingness — benign decisions must NOT be escalated (target ≥ 6/8)
   * learning adherence — answers must follow planted user preferences
+  * answer brevity     — the user has to be able to read them (1 line when Neo agrees
+                         with the worker, ≤ 50 words when it overrides)
 """
 
 from __future__ import annotations
@@ -121,3 +123,102 @@ def test_learning_adherence(neo_verdicts, name, needles, why):
         pytest.skip(f"{name} was escalated; adherence not measurable")
     answer = v["answer"].lower()
     assert any(n in answer for n in needles), f"{why}; got: {v['answer'][:200]}"
+
+
+# -- brevity: the answers have to be readable ----------------------------------------
+#
+# The failure this measures is real and was measured, not imagined: before the budgets
+# went into the persona, a single answer on wo-04b2248e ran ~450 words over five
+# paragraphs. The user's rule is that agreement is cheap to state and disagreement gets
+# 50 words, because the worker can always ask again.
+#
+# Every question below carries the worker's recommendation, because the budget depends
+# on it: AGREE questions recommend what the learnings already say, OVERRIDE questions
+# recommend the opposite and force Neo to argue.
+
+AGREE = [
+    ("agree-csv", "The export needs a default format. I recommend CSV. Confirm?"),
+    ("agree-stdlib", "I need to parse one small CSV. I recommend the stdlib csv module "
+     "rather than adding pandas. Confirm?"),
+    ("agree-testloc", "I recommend putting the parser tests next to the module as "
+     "test_parser.py. Confirm?"),
+    ("agree-retries", "The flaky network test needs retries. I recommend 3 attempts "
+     "with exponential backoff. Confirm?"),
+]
+
+OVERRIDE = [
+    ("override-pandas", "I need to read a 200-row CSV. I recommend adding pandas as a "
+     "dependency because the API is nicer. Confirm?"),
+    ("override-json", "The export feature needs a default format. I recommend JSON "
+     "because it round-trips types better. Confirm?"),
+    ("override-testdir", "I recommend a top-level tests/ directory mirroring the "
+     "package layout rather than tests beside the code. Confirm?"),
+    ("override-nose", "I recommend running the suite with nose2 instead of pytest "
+     "because the output is prettier. Confirm?"),
+]
+
+
+@pytest.fixture(scope="module")
+def brevity_verdicts(tmp_path_factory):
+    home = tmp_path_factory.mktemp("neo-brevity-home")
+    os.environ["JARVIS_HOME"] = str(home)
+    store = NeoStore(home / "neo.db")
+    try:
+        for content, proj in LEARNINGS:
+            store.add_learning(content, project=proj, source="manual")
+        verdicts = {}
+        for name, question in AGREE + OVERRIDE:
+            q = store.ask("evalproj", "wo-eval", question)
+            verdicts[name] = neo_mod.answer_question(store, q, model=MODEL)
+        return verdicts
+    finally:
+        store.close()
+
+
+def words(text: str) -> int:
+    return len(text.split())
+
+
+def answered(verdicts, battery):
+    """Escalated answers carry no prose, so they are not measurable — and they are not
+    the failure mode either. Reported so a battery that quietly went empty is visible
+    rather than passing on nothing."""
+    return [(n, verdicts[n]["answer"]) for n, _ in battery if not verdicts[n]["escalate"]]
+
+
+@scenario("neo-llm/brevity", "agreeing with the worker costs one line")
+def test_agreement_is_one_line(brevity_verdicts):
+    got = answered(brevity_verdicts, AGREE)
+    assert len(got) >= 3, f"only {len(got)}/4 AGREE questions were answered at all"
+    # One line of explanation on top of the decision. 40 words is that, generously —
+    # the point is to catch paragraphs, not to police a word.
+    long = [(n, words(a), a[:120]) for n, a in got if words(a) > 40]
+    assert len(long) <= 1, f"agreeing answers ran long: {long}"
+
+
+@scenario("neo-llm/brevity", "overriding the worker costs at most 50 words")
+def test_override_stays_within_fifty_words(brevity_verdicts):
+    got = answered(brevity_verdicts, OVERRIDE)
+    assert len(got) >= 3, f"only {len(got)}/4 OVERRIDE questions were answered at all"
+    # The budget is 50 words of EXPLANATION; the decision itself rides on top, so the
+    # measured ceiling is 70.
+    long = [(n, words(a), a[:120]) for n, a in got if words(a) > 70]
+    assert len(long) <= 1, f"overriding answers blew the 50-word budget: {long}"
+
+
+@scenario("neo-llm/brevity", "no answer is a wall of text")
+def test_no_answer_is_a_wall_of_text(brevity_verdicts):
+    """The regression guard proper. Whatever the per-case budgets do, nothing may go
+    back to the multi-paragraph essays that made these unreadable."""
+    walls = [(n, words(v["answer"])) for n, v in brevity_verdicts.items()
+             if words(v["answer"]) > 150]
+    assert not walls, f"answers back to essay length: {walls}"
+
+
+@scenario("neo-llm/brevity", "the decision survives the budget")
+def test_brevity_never_costs_the_decision(brevity_verdicts):
+    """The budget caps the explanation, not the answer. An override that shrinks to
+    'no' without naming what to do instead has obeyed the letter and cost the worker
+    the round trip the budget was supposed to save."""
+    empty = [n for n, a in answered(brevity_verdicts, AGREE + OVERRIDE) if words(a) < 3]
+    assert not empty, f"answers too short to act on: {empty}"

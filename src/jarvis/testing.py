@@ -301,6 +301,12 @@ elif "-p" in argv and "--resume" not in argv:
         verdict = {"escalate": False,
                    "answer": f"neo-decision for: {prompt.splitlines()[-1][:60]}",
                    "reason": "test verdict"}
+    if "FORCE_DISPATCH" in prompt:
+        # Neo spotting a self-contradicting ledger and filing the pre-approved cleanup.
+        # Rides on top of whatever verdict was chosen above, because the real thing does
+        # too: answering and noticing the record is wrong are independent.
+        verdict["dispatch"] = {"title": "test-forced ledger cleanup",
+                               "description": "entries A and B contradict; B won"}
     print(json.dumps({"result": json.dumps(verdict)}))
 else:
     sys.stderr.write(f"fake claude: unhandled argv {argv}\n"); sys.exit(2)
@@ -308,7 +314,7 @@ else:
 
 
 FAKE_GH = r'''#!/usr/bin/env python3
-"""Fake `gh` CLI for tests: records invocations, prints an issue URL."""
+"""Fake `gh` CLI for tests: records invocations, files issues, serves PR states."""
 import json, os, sys
 
 state_dir = os.environ["FAKE_GH_DIR"]
@@ -323,6 +329,16 @@ if fail:
     sys.exit(1)
 if argv[:2] == ["issue", "create"]:
     print(os.environ["FAKE_GH_ISSUE_URL"])
+elif argv[:2] == ["pr", "view"]:
+    # `gh pr view <url> --json state,mergedAt`. The roster comes from the fixture; a URL
+    # nobody registered gets gh's own "no pull requests found" shape, because a test
+    # about an unreadable PR should exercise the same path a real deleted one does.
+    prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
+    pr = prs.get(argv[2] if len(argv) > 2 else "")
+    if pr is None:
+        sys.stderr.write("no pull requests found for this URL\n")
+        sys.exit(1)
+    print(json.dumps(pr))
 else:
     sys.stderr.write(f"fake gh: unhandled argv {argv}\n")
     sys.exit(2)
@@ -345,6 +361,7 @@ def fake_gh(tmp_path, monkeypatch):
     class Handle:
         dir = gdir
         issue_url = url
+        prs: dict[str, dict] = {}
 
         @property
         def calls(self) -> list[dict]:
@@ -356,6 +373,13 @@ def fake_gh(tmp_path, monkeypatch):
         def fail(self, message: str) -> None:
             """Make every subsequent `gh` call fail with `message` on stderr."""
             monkeypatch.setenv("FAKE_GH_FAIL", message)
+
+        def set_pr(self, pr_url: str, state: str,
+                   merged_at: str | None = None) -> None:
+            """Register what `gh pr view <pr_url>` answers. Re-calling re-states it,
+            which is how a test walks a pull request from OPEN to MERGED."""
+            self.prs[pr_url] = {"state": state, "mergedAt": merged_at}
+            monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
 
     return Handle()
 

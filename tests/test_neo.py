@@ -291,6 +291,6 @@ def test_parse_verdict_tolerates_fences():
     # `verdict`/`approve` are only meaningful for approval requests, and absent means
     # "not approved" — an answer that never mentions either must never open a gate.
     assert v == {"escalate": False, "answer": "go", "reason": "r",
-                 "approve": False, "verdict": "denied"}
+                 "approve": False, "verdict": "denied", "dispatch": None}
     v = neo_mod.parse_verdict("total nonsense")
     assert v["escalate"] is True

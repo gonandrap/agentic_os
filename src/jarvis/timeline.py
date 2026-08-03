@@ -85,6 +85,9 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any]) -> tuple[str, st
         return "Worker asked a question", p.get("question") or ""
     if kind == "neo_answered":
         return "Neo answered the worker", p.get("answer") or ""
+    if kind == "neo_dispatched":
+        return ("Neo filed a pre-approved cleanup",
+                p.get("cleanup_wo_id") or "")
     if kind == "escalation_answered":
         return "You answered the worker", p.get("answer") or ""
     if kind == "reviewed":

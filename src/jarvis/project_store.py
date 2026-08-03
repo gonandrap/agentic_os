@@ -37,14 +37,23 @@ TERMINAL_STATUSES = ("completed", "cancelled", "failed")
 # How the work order entered the system. jarvis/ui follow the framework; manual is a
 # direct DB insert; injected is a session the user started and then handed to Jarvis
 # with `jarvis wo inject`; adhoc is the legacy marker for a session the reconciler
-# adopted on its own, which it no longer does (GitHub issue 47).
-WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected")
+# adopted on its own, which it no longer does (GitHub issue 47); neo is one Neo filed
+# itself (a ledger cleanup), which nobody asked for by hand — worth telling apart from
+# `jarvis` in listings for exactly that reason.
+WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected", "neo")
 
 # Origins whose session Jarvis did not dispatch: it belongs to the user, never received
 # the worker briefing or `JARVIS_WO_ID`, and therefore cannot satisfy the worker contract
 # (no `jarvis wo finish`, and its ending is not a failure). Holding one to that contract
 # is what made every such record a permanent attention item — see INV-ADHOC-NOT-GOVERNED.
+# `neo` is deliberately NOT here: Neo files the record, but the daemon dispatches it like
+# any other work order, briefing and all.
 UNGOVERNED_ORIGINS = ("adhoc", "injected")
+
+# Work-order metadata key: this work order was authorised by whoever filed it, so the
+# worker must not spend a round trip asking whether it may do the thing it was sent to
+# do. Value: {"by": "neo", "scope": "<what is pre-approved, in words>", ...}.
+PRE_APPROVED_KEY = "pre_approved"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS work_orders (
@@ -200,6 +209,12 @@ ADDED_COLUMNS = {
         # `waiting_pr_merge` rather than `completed`, and it is the link the user
         # follows from the dashboard to go and merge.
         "pr_url": "TEXT",
+        # The last state the daemon read back from GitHub for `pr_url` (OPEN, MERGED or
+        # CLOSED), written by `Daemon.poll_pull_requests`. CLOSED is the load-bearing
+        # one: it is what tells `invariants.true_blockers` that a `needs_review` work
+        # order is there because the pull request was shut without merging, rather than
+        # because a worker went idle. Absent means "never polled".
+        "pr_state": "TEXT",
     },
 }
 

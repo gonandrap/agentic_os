@@ -320,6 +320,31 @@ order's assumptions into a learning too (and, on a rejection, delivers that same
 to the worker). The decisions the user makes today train the agent meant to make them
 tomorrow, whether or not a worker has asked anything yet.
 
+**Answers are length-capped, in the persona rather than in code.** Agreeing with what
+the worker recommended costs one line; overriding it gets at most 50 words; `reason` is
+always one line. The budget caps the *explanation*, never the decision, and the worker
+can always ask again — a follow-up costs it a minute, an answer the user skims past
+costs more. Wording a learning requires stated verbatim is exempt, so a compliance
+phrase is never squeezed out by the count. The cap is not enforced by truncation
+because truncation cuts mid-sentence exactly on the override case, which is the one
+carrying the reasoning the worker needs; adherence is measured instead by the opt-in
+LLM eval (`evals/llm/test_neo_judgment.py`, category `neo-llm/brevity`).
+
+**Neo can file its own work order when the ledger contradicts itself.** Both memories —
+Neo's learnings and the knowledge base — are append-only, so a superseded ruling stays
+visible next to the one that replaced it until somebody writes the correction, and the
+only reader positioned to notice is Neo, mid-answer, holding both. A verdict may
+therefore carry an optional `dispatch: {title, description}`, which the daemon turns
+into a work order with origin `neo`, in the same project, carrying a `pre_approved`
+metadata marker. The worker it reaches is told the correction is already authorised and
+must not spend a round trip asking whether it may — the marker names its *scope*, so
+everything outside that stays under the ordinary ask-on-doubt rule and privileged
+actions still gate. Two guards: an approval (gate) review never dispatches, and a
+cleanup work order never dispatches another, or one unresolvable contradiction would
+file a fresh work order on every round trip. The remedy available to the cleanup worker
+is to *append* a superseding entry; genuine retraction does not exist in either store
+yet (backlog `bl-28e18638`).
+
 ## 4. Error handling
 
 - Daemon crash: work orders in `dispatching`/`running` are reconciled from
