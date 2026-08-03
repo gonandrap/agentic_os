@@ -137,6 +137,85 @@ def test_cli_list_puts_running_then_pr_merges_first(started, project, capsys):
     assert pending["id"] in order
 
 
+# -- the way back from `needs_review` -------------------------------------------------
+#
+# `finish` routes a work order with pending assumptions to `needs_review` even when it
+# carries a PR — the decision outranks the merge. So the review is the ONLY route back,
+# and it has to put the work order where `finish` would have if the assumptions had never
+# existed. Settling it as `completed` instead loses the PR twice over: off the user's
+# open list, and out of the merge poll that would have ended it for them.
+
+
+@pytest.fixture()
+def reviewable_pr(started, project):
+    """Finished behind a PR, held in `needs_review` by one pending assumption."""
+    wo = ops.create_work_order("proj_a", "add feature X")
+    ops.assume(wo["id"], "used tabs, not spaces")
+    assert ops.finish(wo["id"], "opened a PR", pr_url=PR)["status"] == "needs_review"
+    return wo
+
+
+def test_accepting_the_assumptions_parks_the_pr_instead_of_completing(
+        started, project, reviewable_pr):
+    out = ops.review_work_order(reviewable_pr["id"], accept=True)
+
+    assert out["status"] == "waiting_pr_merge"
+    store = ProjectStore(project)
+    row = store.get_work_order(reviewable_pr["id"])
+    assert row["status"] == "waiting_pr_merge"
+    assert not row["needs_attention"]
+    assert true_blockers(store, row) == []
+
+
+def test_the_parked_work_order_is_still_polled_after_a_review(
+        started, project, fake_gh, reviewable_pr):
+    """The point of parking it: the merge still ends the work order unattended."""
+    ops.review_work_order(reviewable_pr["id"], accept=True, feedback="tabs are fine")
+    fake_gh.set_pr(PR, "MERGED")
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    assert store.get_work_order(reviewable_pr["id"])["status"] == "completed"
+
+
+def test_accepting_without_a_pr_still_completes(started, project):
+    """Unchanged for the ordinary case — only a PR-carrying work order is held back."""
+    wo = ops.create_work_order("proj_a", "answered a question")
+    ops.assume(wo["id"], "read it as a question, not a code change")
+    ops.finish(wo["id"], "no code needed")
+
+    out = ops.review_work_order(wo["id"], accept=True)
+
+    assert out["status"] == "completed"
+    assert ProjectStore(project).get_work_order(wo["id"])["status"] == "completed"
+
+
+def test_a_review_after_the_pr_was_closed_does_not_re_park_it(
+        started, project, fake_gh, parked):
+    """A CLOSED pull request is never going to merge, so the merge queue is the one
+    place this must not go back to — the next poll would only flag it again."""
+    fake_gh.set_pr(PR, "CLOSED")
+    store = ProjectStore(project)
+    poll(started, store)
+
+    out = ops.review_work_order(parked["id"], accept=True)
+
+    assert out["status"] == "completed"
+    assert store.get_work_order(parked["id"])["status"] == "completed"
+
+
+def test_rejecting_leaves_the_work_order_where_it_was(started, project, reviewable_pr):
+    """A rejection is not an ending: the worker gets guidance and the PR is still its
+    problem, so nothing about the merge queue changes."""
+    out = ops.review_work_order(reviewable_pr["id"], accept=False,
+                                feedback="No — spaces, like the rest of the file")
+
+    assert out["status"] == "needs_review"
+    assert ProjectStore(project).get_work_order(
+        reviewable_pr["id"])["status"] == "needs_review"
+
+
 # -- the merge poll -----------------------------------------------------------------
 #
 # The other half of `waiting_pr_merge`: the OS finding out on its own that the pull
