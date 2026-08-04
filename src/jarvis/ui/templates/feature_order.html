@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}{{ fo.id }} — Jarvis{% endblock %}
+{% block content %}
+{# The one page where the whole feature is visible at once: the ask the user wrote, the
+   decomposition the planner submitted against it, and each child's live status. That
+   ordering is the point — a plan is only judgeable next to the ask it answers, and this
+   is also where an escalated plan gets decided for exactly that reason. #}
+{% set m = fo_status_meta.get(fo.status, {'word': fo.status, 'icon': '•', 'tone': 'muted'}) %}
+
+<h2><span class="mono">{{ fo.id }}</span> {{ fo.title }}</h2>
+<p class="sub">
+  <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
+  · <a href="/project/{{ project }}">{{ project }}</a>
+  · {{ fo.progress.label }}
+  {% if fo.max_parallel %}
+  {# Only shown when it is set: an uncapped feature has nothing to say here, and the
+     project's own max_concurrent is not this page's business. #}
+  · {{ fo.active_children }}/{{ fo.max_parallel }} slots in use
+  {% endif %}
+  · {{ fmt_age(fo.created_at) }}
+</p>
+
+{% if error %}<div class="panel"><div class="row tone-bad">✗ {{ error }}</div></div>{% endif %}
+
+{% if fo.needs_attention %}
+<div class="panel"><div class="row tone-warn">◭ {{ fo.attention_reason }}</div></div>
+{% endif %}
+
+<h3>The ask</h3>
+<div class="panel"><div class="row"><div class="grow">{{ fo.description }}</div></div></div>
+
+{% if fo.planner %}
+<p class="sub">planner:
+  <a class="mono" href="/wo/{{ project }}/{{ fo.planner.id }}">{{ fo.planner.id }}</a>
+  ({{ fo.planner.status }})
+  {% if fo.planner.result_summary %}— {{ fo.planner.result_summary }}{% endif %}
+</p>
+{% endif %}
+
+{% if fo.plan %}
+<h3>The plan{% if fo.plan.summary %} — {{ fo.plan.summary }}{% endif %}</h3>
+{# Rendered from the stored document rather than from the children, so it keeps saying
+   what was APPROVED even after the children have moved on from it. #}
+<div class="panel">
+  {% for c in fo.plan.children %}
+  <div class="row">
+    <div class="grow">
+      <span class="mono">{{ c.key }}</span> <strong>{{ c.title }}</strong>
+      {% if c.needs %}<span class="sub">needs {{ c.needs | join(', ') }}</span>{% endif %}
+      <div class="sub">{{ c.description }}</div>
+      {% if c.acceptance %}<div class="sub">done when: {{ c.acceptance }}</div>{% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% if fo.plan.justification %}
+<p class="sub">Justification for {{ fo.plan.children | length }} children:
+  {{ fo.plan.justification }}</p>
+{% endif %}
+{% endif %}
+
+{% if fo.status == 'plan_review' %}
+{# Only reachable when Neo escalated: a plan it could decide never lands here. #}
+<h3>Release this plan?</h3>
+<div class="panel">
+  <form method="post" action="/fo/{{ project }}/{{ fo.id }}/review">
+    <p class="sub">Releasing creates all {{ fo.plan.children | length }} work orders at
+      once, with their dependency edges; the ones with no unmet dependency start
+      immediately. Sending it back returns the planner to its existing session with your
+      reason — so say what to change, not just that it is wrong.</p>
+    <textarea name="feedback" rows="3"
+              placeholder="your reasoning (required to send it back)"></textarea>
+    <button name="decision" value="accept">Release it</button>
+    <button name="decision" value="reject">Send it back</button>
+  </form>
+</div>
+{% endif %}
+
+<h3>Children</h3>
+<div class="panel">
+  {% for c in fo.children %}
+    {% set cm = status_meta.get(c.status, {'word': c.status, 'icon': '•', 'tone': 'muted'}) %}
+    <div class="row">
+      <span class="st tone-{{ cm.tone }}"><span class="i">{{ cm.icon }}</span>{{ cm.word }}</span>
+      <div class="grow">
+        <a href="/wo/{{ project }}/{{ c.id }}" class="mono">{{ c.id }}</a> {{ c.title }}
+        {% if c.depends_on %}
+          <div class="sub">⊘ after
+            {% for d in c.depends_on %}<a class="mono"
+              href="/wo/{{ project }}/{{ d }}">{{ d }}</a>{{ ', ' if not loop.last }}{% endfor %}
+          </div>
+        {% endif %}
+        {% if not c.depends_on and c.status_label != c.status %}
+          {# Everything status_label says that the icon does not — today that is the
+             per-feature slot cap. Suppressed when there are dependencies, because the
+             line above already gave the stronger reason. #}
+          <div class="sub">⊘ {{ c.status_label }}</div>
+        {% endif %}
+        {% if c.status == 'waiting_pr_merge' and c.pr_url %}
+          <div class="sub">⑃ <a href="{{ c.pr_url }}" rel="noopener">{{ c.pr_url }}</a></div>
+        {% endif %}
+        {% if c.needs_attention %}<div class="sub tone-warn">◭ {{ c.attention_reason }}</div>{% endif %}
+      </div>
+    </div>
+  {% else %}
+    <div class="empty">
+      {% if fo.status in ('pending', 'planning', 'plan_review') %}
+        nothing created yet — a plan is a proposal until it is released
+      {% else %}no children{% endif %}
+    </div>
+  {% endfor %}
+</div>
+
+{% if fo.status in ('pending', 'planning', 'plan_review', 'executing') %}
+<form class="inline" method="post" action="/fo/{{ project }}/{{ fo.id }}/cancel">
+  <button>Cancel this feature order</button>
+  <span class="sub">stops the planner and every child still running</span>
+</form>
+{% endif %}
+
+{% endblock %}

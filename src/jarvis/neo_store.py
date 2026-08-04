@@ -26,9 +26,15 @@ Q_STATUSES = (
 REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
 
 # What Neo is being asked for. `question` is an open decision ("which library?");
-# `approval` is a privileged-action gate ("may I merge this PR?"), which gets a
-# different persona and a verdict with an approve/deny bit. See gates.py.
-Q_KINDS = ("question", "approval")
+# `approval` is a privileged-action gate ("may I merge this PR?"); `plan` is a feature
+# order's decomposition ("release these six work orders?"). Each of the latter two gets
+# its own persona and a verdict with an approve/reject bit — see gates.py and plans.py.
+#
+# `plan` is deliberately NOT routed through the approvals table even though the shape
+# rhymes: `approvals` is a receipt for one command string, and its `dismissed` count is
+# the OS's classifier false-positive rate. Plan reviews are neither, and mixing them in
+# would corrupt the one metric that says whether the gate recognisers are improving.
+Q_KINDS = ("question", "approval", "plan")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS questions (
@@ -147,6 +153,21 @@ class NeoStore:
             (wo_id,),
         )
         return self.conn.execute("DELETE FROM questions WHERE wo_id=?", (wo_id,)).rowcount
+
+    def question_texts(self, wo_id: str) -> dict[int, str]:
+        """{question_id: question} for one work order — the timeline's back-fill.
+
+        Questions asked before the text was copied into the `question_asked` event
+        payload exist only here, so a timeline rendered from the project DB alone
+        cannot show them. This is read-only and best-effort: see
+        `ops.neo_question_texts`.
+        """
+        return {
+            int(r["id"]): r["question"] or ""
+            for r in self.conn.execute(
+                "SELECT id, question FROM questions WHERE wo_id=?", (wo_id,)
+            ).fetchall()
+        }
 
     def list_questions(self, statuses: tuple[str, ...] | None = None,
                        review_status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:

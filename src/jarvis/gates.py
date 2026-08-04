@@ -414,17 +414,25 @@ decide>"}"""
 
 
 def build_request_question(action: GatedAction, wo: dict[str, Any],
-                           justification: str, evidence: str = "") -> str:
+                           justification: str, evidence: str = "",
+                           agent_type: str | None = None) -> str:
     """Render the approval request Neo (or the user) reads.
 
     Whoever decides sees only this text — never the worker's session — so it has to
     carry the case by itself: what is being attempted, under which work order, why the
     worker believes it is ready, and whatever it offered as proof.
+
+    `agent_type` names the SEAT when a subagent tripped the gate. The work order still
+    owns the request — its lead is answerable for what its team did — but the reviewer
+    is being asked to judge an attempt, and an attempt by a seat that was never meant to
+    run commands is a different fact from the same attempt by the lead.
     """
+    actor = f"The `{agent_type}` seat of work order {wo['id']}" if agent_type \
+        else f"The worker for work order {wo['id']}"
     parts = [
         f"PRIVILEGED ACTION REQUEST — gate `{action.kind}`",
         "",
-        f"The worker for work order {wo['id']} wants to {action.summary}.",
+        f"{actor} wants to {action.summary}.",
         "",
         "Exact command it will run (approval authorises this command and nothing else):",
         f"    {action.command}",
@@ -454,7 +462,8 @@ def build_request_question(action: GatedAction, wo: dict[str, Any],
 
 def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any],
                  action: GatedAction, justification: str = "", evidence: str = "",
-                 max_uses: int = GRANT_MAX_USES) -> tuple[dict[str, Any], dict[str, Any]]:
+                 max_uses: int = GRANT_MAX_USES,
+                 agent_type: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Record an approval request and queue it for review. Returns (approval, question).
 
     One path for both entry points — the hook (a worker that just ran the command) and
@@ -464,14 +473,18 @@ def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any]
     The request rides the existing Neo queue rather than a parallel review pipeline,
     which is what gives it escalation-to-user, `jarvis neo list` and answer delivery
     without reimplementing any of them.
+
+    `agent_type` reaches here only from the hook: `jarvis gate request` is a shell
+    command, so whoever ran it had a shell, and the seats have none.
     """
     approval = store.add_approval(
         wo["id"], action.kind, action.command, matched=action.matched,
         justification=justification, evidence=evidence, max_uses=max_uses,
+        agent_type=agent_type,
     )
     question = neo.ask(
         project, wo["id"],
-        build_request_question(action, wo, justification, evidence),
+        build_request_question(action, wo, justification, evidence, agent_type),
         context=f"{wo.get('title') or ''}\n{(wo.get('description') or '')[:800]}",
         kind="approval",
     )

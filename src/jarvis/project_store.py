@@ -1,7 +1,8 @@
 """Per-project store: <project>/.jarvis/jarvis.db
 
 Authoritative record of a project's work orders, their event timeline, the user⇄agent
-message queue, the notification outbox, and assumptions pending review.
+message queue, the notification outbox, assumptions pending review, and the feature
+orders that own work orders in sets.
 """
 
 from __future__ import annotations
@@ -50,6 +51,39 @@ WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected", "neo")
 # any other work order, briefing and all.
 UNGOVERNED_ORIGINS = ("adhoc", "injected")
 
+# What a work order IS to the OS, which is not the same question as what it is about.
+# `worker` is every work order that has ever existed: one session, one job, one pull
+# request. `planner` is the session a feature order opens to decompose itself — same
+# transport, same worktree, same contract, but a different briefing and a structured
+# terminal action (`jarvis fo plan`) instead of a prose one.
+#
+# A column rather than a derivation, even though `feature_orders.plan_wo_id` already
+# names the planner: `parent_id` cannot tell the two apart (a feature order's CHILDREN
+# carry it too), and the briefing has to know which it is composing without querying
+# back up into a second table on every dispatch.
+WO_KINDS = ("worker", "planner")
+
+# A work order occupying a slot: dispatched, running, or waiting on something. One
+# constant rather than a literal at each site, because the two readers must agree — the
+# project-wide cap (`count_active`, spent by `Daemon.dispatch_pending`) and the
+# per-feature cap (`claim_next_pending`, spent by `feature_orders.max_parallel`) would
+# otherwise be free to mean different things by "active".
+ACTIVE_STATUSES = ("dispatching", "running", "waiting_input")
+
+# Feature order lifecycle. Deliberately NOT a copy of WO_STATUSES: a feature order never
+# runs a session of its own, so most of a work order's states are meaningless for it.
+FO_STATUSES = (
+    "pending",      # created; the planner has not been dispatched
+    "planning",     # the plan work order is running
+    "plan_review",  # a plan was submitted; Neo is reviewing it, or it is escalated
+    "executing",    # children dispatching / running
+    "completed",    # every child settled successfully
+    "failed",       # a child failed or was cancelled
+    "cancelled",    # the user stopped it
+)
+FO_OPEN_STATUSES = ("pending", "planning", "plan_review", "executing")
+FO_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
+
 # Work-order metadata key: this work order was authorised by whoever filed it, so the
 # worker must not spend a round trip asking whether it may do the thing it was sent to
 # do. Value: {"by": "neo", "scope": "<what is pre-approved, in words>", ...}.
@@ -81,6 +115,33 @@ CREATE TABLE IF NOT EXISTS work_orders (
     needs_attention INTEGER NOT NULL DEFAULT 0,
     attention_reason TEXT,
     result_summary TEXT,
+    backlog_id TEXT,
+    metadata TEXT
+);
+-- A planned unit of work above the work order: the coarse ask the user actually has,
+-- which the project plans into a dependency-ordered set of ordinary work orders before
+-- any of them runs. Its children are `work_orders` rows carrying `parent_id`.
+--
+-- Per-project rather than central (where the backlog lives) because a feature order is
+-- scoped to one project by construction, and keeping the parent in the same database as
+-- its children buys one transaction, real foreign keys, and one query for a listing.
+CREATE TABLE IF NOT EXISTS feature_orders (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    origin TEXT NOT NULL DEFAULT 'jarvis',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    plan_wo_id TEXT REFERENCES work_orders(id),   -- the planner
+    plan TEXT,                              -- the submitted plan, as JSON
+    -- The Neo question reviewing the submitted plan. The back-link lives here rather
+    -- than a `fo_id` on the question, mirroring `approvals.neo_question_id`: Neo's
+    -- database is OS-wide and knows nothing about a project's tables.
+    plan_question_id INTEGER,
+    max_parallel INTEGER,                   -- slot cap for this feature's children (Phase 3)
+    needs_attention INTEGER NOT NULL DEFAULT 0,
+    attention_reason TEXT,
     backlog_id TEXT,
     metadata TEXT
 );
@@ -181,6 +242,7 @@ CREATE INDEX IF NOT EXISTS idx_events_wo ON wo_events(wo_id);
 CREATE INDEX IF NOT EXISTS idx_msgs_status ON wo_messages(status);
 CREATE INDEX IF NOT EXISTS idx_notif_status ON notifications(status);
 CREATE INDEX IF NOT EXISTS idx_approvals_wo ON approvals(wo_id, status);
+CREATE INDEX IF NOT EXISTS idx_fo_status ON feature_orders(status);
 """
 
 # Columns added after the first release. `CREATE TABLE IF NOT EXISTS` is a no-op on an
@@ -215,8 +277,51 @@ ADDED_COLUMNS = {
         # order is there because the pull request was shut without merging, rather than
         # because a worker went idle. Absent means "never polled".
         "pr_state": "TEXT",
+        # Work orders that must finish before this one may be claimed (JSON list of
+        # work-order ids). Deliberately NOT a `blocked` status: this codebase's statuses
+        # are load-bearing — OPEN_STATUSES, TERMINAL_STATUSES, true_blockers and the
+        # settle path all switch on them — and "blocked" is fully derivable from this
+        # column plus the dependencies' statuses, so storing it would only invite drift.
+        # `waiting_pr_merge` earned a status because nothing derived it; this does not.
+        # Shape matches `backlog.depends_on` exactly, so the two read the same way.
+        "depends_on": "TEXT NOT NULL DEFAULT '[]'",
+        # The feature order this work order belongs to — its planner or one of its
+        # children. NULL for a standalone work order, which is nearly all of them, and
+        # the reason this whole migration is invisible to a project that never creates a
+        # feature order. `ALTER TABLE ADD COLUMN` may carry a REFERENCES clause only
+        # while the column defaults to NULL, which it does.
+        "parent_id": "TEXT REFERENCES feature_orders(id)",
+        # `worker` or `planner` — see WO_KINDS.
+        "kind": "TEXT NOT NULL DEFAULT 'worker'",
+    },
+    "approvals": {
+        # Which SEAT attempted the command, when a subagent did. NULL means the session's
+        # lead ran it directly, which is every gate a plain worker ever trips.
+        #
+        # Needed because `JARVIS_WO_ID` is per-session, not per-agent: a gate a subagent
+        # trips files its request against the work order that owns the turn. That is the
+        # right owner — the lead is answerable for what its team did — but without this
+        # column the audit trail would say the planner attempted what its architect did.
+        # `PreToolUse` carries `agent_type` for a subagent's call and omits the key
+        # entirely for the lead's, so the payload can always tell the two apart.
+        "agent_type": "TEXT",
     },
 }
+
+# A dependency is satisfied only when it reaches `completed` — the strict rule of the
+# feature-order design. It is affordable because the merge poller landed first: the user
+# merges the pull request they were going to merge anyway and the work order completes
+# itself within a tick or two, so an edge costs no extra human step.
+#
+# `waiting_pr_merge` deliberately does NOT satisfy: the dependent's worktree is cut from
+# the main working tree's HEAD, which does not yet contain an unmerged dependency's code,
+# so releasing it early gives it a tree without the thing it was told to build on.
+DEPENDENCY_SATISFIED_STATUS = "completed"
+
+# ...and these are the statuses from which it can never get there. A dependency parked in
+# one of them strands its dependents forever, which is the one case that has to speak up
+# rather than sit quietly in `pending` (see invariants.true_blockers).
+DEPENDENCY_DEAD_STATUSES = ("cancelled", "failed")
 
 
 class ProjectStore:
@@ -256,29 +361,50 @@ class ProjectStore:
         wo_id: str | None = None,
         status: str = "pending",
         session_id: str | None = None,
+        depends_on: list[str] | None = None,
+        parent_id: str | None = None,
+        kind: str = "worker",
     ) -> dict[str, Any]:
         """Create a work order. `status` and `session_id` are set in the same INSERT
         rather than afterwards, because the row is visible to the daemon the instant it
         lands: a record that is `pending` for even a moment can be claimed and dispatched
         (`claim_next_pending`), which for an injected session would launch a worker into
         the user's own conversation.
+
+        `depends_on` names work orders that must reach `completed` first. Every id is
+        checked here, at the only moment a dependency edge is ever written — which is
+        also why there is no cycle check: an edge may only point at a row that already
+        exists, so the graph is acyclic by construction. Anything that lets an existing
+        work order acquire an edge later loses that property and owes one.
         """
         assert origin in WO_ORIGINS, origin
         assert status in WO_STATUSES, status
+        assert kind in WO_KINDS, kind
         wo_id = wo_id or db.new_id("wo")
+        deps = list(depends_on or [])
+        if wo_id in deps:
+            raise ValueError(f"work order {wo_id!r} cannot depend on itself")
+        for dep in deps:
+            self.get_work_order(dep)  # KeyError names the id that does not exist
+        if parent_id:
+            self.get_feature_order(parent_id)  # same: KeyError names it
         ts = db.now()
         self.conn.execute(
             """INSERT INTO work_orders (id, title, description, status, origin,
                    created_at, updated_at, model, effort, permission_mode,
-                   append_system_prompt, backlog_id, metadata, session_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   append_system_prompt, backlog_id, metadata, session_id, depends_on,
+                   parent_id, kind)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 wo_id, title, description, status, origin, ts, ts, model, effort,
                 permission_mode, append_system_prompt, backlog_id,
-                db.to_json(metadata or {}), session_id,
+                db.to_json(metadata or {}), session_id, db.to_json(deps),
+                parent_id, kind,
             ),
         )
-        self.add_event(wo_id, "created", {"origin": origin})
+        self.add_event(wo_id, "created", {"origin": origin, "depends_on": deps,
+                                          **({"parent_id": parent_id} if parent_id else {}),
+                                          **({"kind": kind} if kind != "worker" else {})})
         return self.get_work_order(wo_id)
 
     def get_work_order(self, wo_id: str) -> dict[str, Any]:
@@ -323,22 +449,119 @@ class ProjectStore:
         ).fetchall()
         return {row["status"]: int(row["n"]) for row in rows}
 
+    def dependencies(self, wo: dict[str, Any]) -> list[str]:
+        """The ids this work order waits on. Decoded at the use site, not on the row.
+
+        `depends_on` stays raw JSON on the dict, like `acknowledged_blockers` and unlike
+        `backlog.depends_on` — the two stores differ here and this follows the local one.
+        Work-order rows are handed around widely (`{**wo, ...}` in worker_session, the
+        dashboard, the hooks), so decoding a column in place would change the shape of a
+        dict a lot of code already reads.
+        """
+        return db.from_json(wo.get("depends_on"), []) or []
+
+    def unfinished_dependencies(self, wo_id: str) -> list[dict[str, Any]]:
+        """The dependencies still standing between this work order and dispatch.
+
+        A dependency that has been deleted counts as unfinished rather than satisfied,
+        and says so — the alternative is releasing a work order because the thing it was
+        told to build on vanished, which is the worse of the two failures.
+        """
+        blockers = []
+        for dep_id in self.dependencies(self.get_work_order(wo_id)):
+            try:
+                dep = self.get_work_order(dep_id)
+            except KeyError:
+                blockers.append({"id": dep_id, "status": "missing", "title": "?"})
+                continue
+            if dep["status"] != DEPENDENCY_SATISFIED_STATUS:
+                blockers.append({k: dep[k] for k in ("id", "status", "title")})
+        return blockers
+
+    def drop_dependencies(self, wo_id: str, dep_ids: list[str]) -> list[str]:
+        """Cut these edges. Returns the edges that remain.
+
+        The only way an edge is ever removed, and it is always a deliberate act by the
+        user: a dependency that can never complete strands its dependent, and cutting
+        the edge is the alternative to cancelling work that is still wanted. Removing
+        edges cannot create a cycle, so the acyclic-by-construction property that
+        `create_work_order` relies on survives this.
+        """
+        remaining = [d for d in self.dependencies(self.get_work_order(wo_id))
+                     if d not in dep_ids]
+        self.update_work_order(wo_id, depends_on=db.to_json(remaining))
+        self.add_event(wo_id, "dependencies_dropped",
+                       {"dropped": dep_ids, "remaining": remaining})
+        return remaining
+
     def claim_next_pending(self) -> dict[str, Any] | None:
-        """Atomically claim the oldest pending order (pending -> dispatching)."""
+        """Atomically claim the oldest claimable pending order (pending -> dispatching).
+
+        Two things can make a pending work order unclaimable, and neither writes anything
+        when it fires: the order is passed over and stays `pending`, because nothing about
+        it has changed.
+
+        1. **A dependency has not completed** (Phase 1). Note that this does not hold up
+           the queue behind it — the filter is in the row selection, so a younger
+           unblocked order is claimed while an older blocked one waits.
+        2. **Its feature order is already running `max_parallel` children** (Phase 3).
+           A per-feature slot cap, spent alongside the project-wide `max_concurrent`
+           rather than instead of it: whichever is tighter binds. It applies only to a
+           feature's `worker` children — the planner is the feature order deciding what
+           its children are, not one of them, so capping it against its own children
+           would be capping a feature against itself.
+
+        For the overwhelming majority of work orders — no dependencies, no parent — both
+        subqueries are vacuously true and this is the query it always was.
+        """
+        marks = ",".join("?" for _ in ACTIVE_STATUSES)
         cur = self.conn.execute(
-            """UPDATE work_orders SET status='dispatching', updated_at=?
-               WHERE id = (SELECT id FROM work_orders
-                           WHERE status='pending' AND hidden=0
-                           ORDER BY created_at LIMIT 1)
+            f"""UPDATE work_orders SET status='dispatching', updated_at=?
+               WHERE id = (SELECT w.id FROM work_orders w
+                           WHERE w.status='pending' AND w.hidden=0
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM json_each(w.depends_on) dep
+                                 WHERE NOT EXISTS (
+                                     SELECT 1 FROM work_orders d
+                                     WHERE d.id = dep.value AND d.status = ?
+                                 )
+                             )
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM feature_orders f
+                                 WHERE f.id = w.parent_id AND w.kind = 'worker'
+                                   AND f.max_parallel IS NOT NULL
+                                   AND f.max_parallel <= (
+                                       SELECT COUNT(*) FROM work_orders s
+                                       WHERE s.parent_id = f.id AND s.kind = 'worker'
+                                         AND s.status IN ({marks})
+                                   )
+                             )
+                           ORDER BY w.created_at LIMIT 1)
                RETURNING *"""
-            , (db.now(),),
+            , (db.now(), DEPENDENCY_SATISFIED_STATUS, *ACTIVE_STATUSES),
         )
         row = cur.fetchone()
         return dict(row) if row else None
 
     def count_active(self) -> int:
+        marks = ",".join("?" for _ in ACTIVE_STATUSES)
         row = self.conn.execute(
-            "SELECT COUNT(*) c FROM work_orders WHERE status IN ('dispatching','running','waiting_input')"
+            f"SELECT COUNT(*) c FROM work_orders WHERE status IN ({marks})",
+            ACTIVE_STATUSES,
+        ).fetchone()
+        return row["c"]
+
+    def count_active_children(self, fo_id: str) -> int:
+        """How many of this feature order's children are occupying a slot right now.
+
+        The number `max_parallel` is compared against, exposed so a listing can say why a
+        child is waiting without re-deriving the claim query's arithmetic differently.
+        """
+        marks = ",".join("?" for _ in ACTIVE_STATUSES)
+        row = self.conn.execute(
+            f"""SELECT COUNT(*) c FROM work_orders
+                WHERE parent_id=? AND kind='worker' AND status IN ({marks})""",
+            (fo_id, *ACTIVE_STATUSES),
         ).fetchone()
         return row["c"]
 
@@ -399,6 +622,13 @@ class ProjectStore:
         deleted: dict[str, int] = {}
         self.conn.execute("BEGIN")
         try:
+            # Foreign keys are on, so a feature order still pointing at this work order
+            # as its planner would refuse the delete outright. Releasing the link is the
+            # right move rather than cascading: the feature order is not the thing being
+            # deleted, and losing the planner is a fact about it worth surviving.
+            self.conn.execute(
+                "UPDATE feature_orders SET plan_wo_id=NULL WHERE plan_wo_id=?", (wo_id,)
+            )
             for key, table in (("events", "wo_events"), ("messages", "wo_messages"),
                                ("turns", "wo_turns"),
                                ("assumptions", "assumptions"),
@@ -412,6 +642,161 @@ class ProjectStore:
             self.conn.execute("ROLLBACK")
             raise
         return deleted
+
+    # -- feature orders ----------------------------------------------------------
+    #
+    # A feature order has no session, no turns and no messages of its own — everything
+    # it does, it does through work orders. So it has no timeline table either: its
+    # history is written into the timeline of whichever work order carried the step
+    # (`plan_submitted` on the planner, `created` on each child), which is where anyone
+    # investigating it is already looking.
+
+    def create_feature_order(self, title: str, description: str = "",
+                             origin: str = "jarvis", backlog_id: str | None = None,
+                             metadata: dict[str, Any] | None = None,
+                             fo_id: str | None = None,
+                             max_parallel: int | None = None) -> dict[str, Any]:
+        assert origin in WO_ORIGINS, origin
+        assert max_parallel is None or max_parallel >= 1, max_parallel
+        fo_id = fo_id or db.new_id("fo")
+        ts = db.now()
+        self.conn.execute(
+            """INSERT INTO feature_orders (id, title, description, status, origin,
+                   created_at, updated_at, backlog_id, metadata, max_parallel)
+               VALUES (?,?,?,'pending',?,?,?,?,?,?)""",
+            (fo_id, title, description, origin, ts, ts, backlog_id,
+             db.to_json(metadata or {}), max_parallel),
+        )
+        return self.get_feature_order(fo_id)
+
+    def get_feature_order(self, fo_id: str) -> dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT * FROM feature_orders WHERE id=?", (fo_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"feature order {fo_id!r} not found in {self.db_path}")
+        return dict(row)
+
+    def list_feature_orders(self, statuses: tuple[str, ...] | None = None,
+                            limit: int = 200) -> list[dict[str, Any]]:
+        where = f" WHERE status IN ({','.join('?' for _ in statuses)})" if statuses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM feature_orders{where} ORDER BY created_at DESC LIMIT ?",
+            (*(statuses or ()), limit),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def flagged_feature_orders(self) -> list[dict[str, Any]]:
+        """Every feature order asking for the user, whatever its status.
+
+        Deliberately not filtered by `FO_OPEN_STATUSES`: `failed` is a SETTLED status and
+        it is also the one a feature order raises its flag in — `settle_features` marks
+        both in the same call. Listing only the open ones would drop the flag on the floor
+        at the exact moment it means the most.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM feature_orders WHERE needs_attention=1 ORDER BY created_at DESC"
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def update_feature_order(self, fo_id: str, **fields: Any) -> None:
+        if not fields:
+            return
+        fields["updated_at"] = db.now()
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self.conn.execute(
+            f"UPDATE feature_orders SET {cols} WHERE id=?", (*fields.values(), fo_id)
+        )
+
+    def set_feature_status(self, fo_id: str, status: str, **extra: Any) -> None:
+        assert status in FO_STATUSES, status
+        self.update_feature_order(fo_id, status=status, **extra)
+
+    def flag_feature_attention(self, fo_id: str, reason: str) -> None:
+        self.update_feature_order(fo_id, needs_attention=1, attention_reason=reason)
+
+    def clear_feature_attention(self, fo_id: str) -> None:
+        self.update_feature_order(fo_id, needs_attention=0, attention_reason=None)
+
+    def feature_children(self, fo_id: str) -> list[dict[str, Any]]:
+        """The feature order's child work orders, oldest first.
+
+        Oldest first, unlike every other listing here: children are created in
+        dependency order (`plans.creation_order`), so creation order IS the plan's
+        order, and printing it newest-first would show the graph upside down.
+
+        The planner is deliberately excluded — it carries `parent_id` too, because it
+        belongs to the feature order as much as any child does, but it is the session
+        that produced the plan rather than a piece of the work. `plan_wo_id` is how you
+        reach it.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM work_orders WHERE parent_id=? AND kind='worker' "
+            "ORDER BY created_at",
+            (fo_id,),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def feature_order_for_question(self, question_id: int) -> dict[str, Any] | None:
+        """The feature order whose plan this Neo question is reviewing, if any.
+
+        The mirror of `approval_for_question`, and it exists for the same reason: Neo's
+        database is OS-wide and knows nothing about a project's tables, so the back-link
+        has to be resolved from this side.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM feature_orders WHERE plan_question_id=?", (question_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def create_plan_children(self, fo_id: str,
+                             ordered: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Turn an approved plan into work orders, in one transaction.
+
+        `ordered` must already be in dependency order (`plans.creation_order`): each
+        child's `needs` are plan-local keys, and they are resolved to real work-order ids
+        as the children are created, which only works if every child follows the ones it
+        needs. That constraint is not tidiness — `create_work_order` refuses an edge
+        pointing at a row that does not exist yet, and that refusal is exactly what keeps
+        the live dependency graph acyclic by construction. Resolving the keys as we go
+        means a plan's edges are written by the same guarded path as a hand-typed
+        `--depends-on`, rather than being stamped onto rows afterwards.
+
+        All-or-nothing: a feature order holding three of its six children is worse than
+        one holding none, because the three would start running against a plan that was
+        never fully created.
+        """
+        by_key: dict[str, str] = {}
+        created: list[str] = []
+        self.conn.execute("BEGIN")
+        try:
+            for child in ordered:
+                wo = self.create_work_order(
+                    title=child["title"],
+                    description=child["description"],
+                    origin="jarvis",
+                    depends_on=[by_key[k] for k in child["needs"] if k in by_key],
+                    parent_id=fo_id,
+                )
+                by_key[child["key"]] = wo["id"]
+                created.append(wo["id"])
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return [self.get_work_order(wo_id) for wo_id in created]
+
+    def feature_summary(self) -> dict[str, Any]:
+        """How many feature orders sit in each status, and how many want the user."""
+        by_status = {
+            r["status"]: int(r["n"]) for r in self.conn.execute(
+                "SELECT status, COUNT(*) AS n FROM feature_orders GROUP BY status"
+            ).fetchall()
+        }
+        attention = self.conn.execute(
+            "SELECT COUNT(*) c FROM feature_orders WHERE needs_attention=1"
+        ).fetchone()["c"]
+        return {"by_status": by_status, "needs_attention": int(attention)}
 
     # -- events --------------------------------------------------------------
 
@@ -596,16 +981,21 @@ class ProjectStore:
 
     def add_approval(self, wo_id: str, kind: str, command: str, matched: str = "",
                      justification: str = "", evidence: str = "",
-                     max_uses: int = 3) -> dict[str, Any]:
+                     max_uses: int = 3,
+                     agent_type: str | None = None) -> dict[str, Any]:
         cur = self.conn.execute(
             """INSERT INTO approvals (wo_id, ts, kind, command, matched, justification,
-                                      evidence, max_uses)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (wo_id, db.now(), kind, command, matched, justification, evidence, max_uses),
+                                      evidence, max_uses, agent_type)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (wo_id, db.now(), kind, command, matched, justification, evidence, max_uses,
+             agent_type),
         )
         approval_id = int(cur.lastrowid)  # type: ignore[arg-type]
         self.add_event(wo_id, "gate_requested", {
             "approval_id": approval_id, "kind": kind, "command": command,
+            # In the payload as well as the column: the timeline is read on its own, and
+            # "the planner ran this" is exactly the wrong thing for it to imply.
+            **({"agent_type": agent_type} if agent_type else {}),
         })
         return self.get_approval(approval_id)  # type: ignore[return-value]
 

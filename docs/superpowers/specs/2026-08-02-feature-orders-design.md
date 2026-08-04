@@ -597,11 +597,72 @@ to evaluate are: serialise on merge (strict, the pre-Phase-0 behaviour), or have
 worker rebase onto its dependency's branch itself as its first act, which is slower and
 puts a merge conflict inside a worker session rather than in front of the user.
 
+> **Phase 1 status: SHIPPED** (`wo-1f0b6879`). `work_orders.depends_on`, the claim-time
+> filter, `jarvis wo create --depends-on`, the derived `pending — blocked by …` label on
+> all three listings, and `jarvis wo unblock` for the one case that strands. The strict
+> rule (satisfied on `completed` only) is what landed.
+>
+> **Probe result: stacking is possible, but not through `--worktree`.** Four arms with a
+> negative control, live. `-w, --worktree [name]` takes only a name, and — the finding
+> that matters — it bases the new worktree on the **main working tree's HEAD**, ignoring
+> `cwd` entirely: with `cwd` inside a worktree on `feat-a` the flag still produced a tree
+> at `main` (arm 3), and moving the *main* checkout to `feat-a` moved the result with it
+> (arm 4). So the cheap version of stacking — point `cwd` at the dependency's worktree
+> and keep the flag — does not work, and neither does anything that would require moving
+> the user's shared checkout, which is one tree and would race across concurrent
+> dispatches.
+>
+> The working invocation is for Jarvis to create the worktree itself and pass no flag:
+> `git -C <project> worktree add -b <branch> <path> <base>`, then turn 1 with `cwd` set
+> to that path. Verified: the child's tree contained the dependency's file, and
+> `--session-id` was honoured and echoed back unchanged, so the immutable-session-id
+> property survives. `worker_session.send()` already launches this way from turn 2
+> onward, so the path is established rather than new. The cost is that
+> `worker_session.start()` — the single function every worker launch goes through — has
+> to take over worktree creation for the stacked case. That is why decision 2 (children
+> stack their pull requests) is buildable but was not built here: the `depends_on` column
+> and the claim filter are the same either way, exactly as this phase predicted.
+
 **Phase 2 — feature orders with a single generic planner.** The table, the lifecycle, the
 plan work order, `jarvis fo plan --from-file`, the plan validator and the child cap,
 Neo reviewing plans with escalation, `jarvis fo` and the dashboard page. One planner, no
 seats yet — the orchestrator's scope check is the only review of the plan's shape, which
 is why the validator lands in this phase and not later.
+
+> **Phase 2 status: SHIPPED** (`wo-bc3969ad`). The `feature_orders` table with
+> `work_orders.parent_id` and `work_orders.kind`, the seven states, the planner work
+> order, `jarvis fo plan --from-file` with the validator and the child cap, Neo
+> reviewing plans as a third question kind, `jarvis fo`, `jarvis backlog promote
+> --as feature`, and the dashboard feature page.
+>
+> **Four things this phase decided that the document above left open or got wrong.**
+>
+> 1. **No stacking, again** — Phase 2 ships the strict rule unchanged. Stacking is a
+>    change to `worker_session.start()`, which every worker launch in the fleet goes
+>    through, and it is not worth bundling into a phase this size. Backlogged for
+>    Phase 4 with the verified invocation attached.
+> 2. **The cap OVERRIDES Neo, and Neo is still asked.** Section 5 named "a plan at or
+>    over the child cap" as an escalation trigger but left it to Neo's discretion; a
+>    backstop the reviewer can wave through is not one, so it is now enforced in
+>    `Daemon._deliver_plan_verdict` regardless of the verdict. Neo is still called,
+>    because the alternative is handing the user a nine-node graph with no read on it,
+>    and its reading is attached to what they see.
+> 3. **The planner keeps ordinary write permissions.** Section 8's layer-1 restriction
+>    cannot be applied to it: a deny broad enough to stop product code also stops the
+>    `plan.json` it must submit and the design-document PR that decision 2 makes the base
+>    of the stack. The rule is carried in the planner briefing's prose, a test pins that
+>    as deliberate, and the enforced posture waits for Phase 3's seats.
+> 4. **"The remainder cannot proceed" was dropped.** Section 6's `failed` condition is
+>    implemented as "any child failed or cancelled", with no reachability check: a
+>    feature with a dead child needs a human whichever siblings could still run, so the
+>    qualifier buys nothing and is easy to get subtly wrong.
+>
+> The two backstops held up in practice and one of them nearly broke: the "description
+> does not stand alone" check first rejected *"the first step is to add the column"*,
+> treating an ordinal as a sibling reference. That is a false positive that makes plans
+> worse — it teaches planners to write around the checker — so the phrase list now
+> matches only unambiguously outward references, with negative controls beside every
+> rejection in the tests.
 
 **Phase 3 — the seats and the rollup.** The architect and test-lead seats shipped through
 `install_agent_skills()`, their `tools:` postures per section 8, feature-level attention
@@ -609,6 +670,53 @@ rollup, `max_parallel`. This is the phase that touches the two surfaces shared w
 if the Neo panel has landed first, adopt its `src/jarvis/assets/agents/` layout and its
 structured-output helper rather than forking them; if it has not, extract both here in a
 shape the panel can adopt.
+
+> **Phase 3 status: SHIPPED** (`wo-ad41a122`). `src/jarvis/assets/agents/` with
+> `jarvis-architect` and `jarvis-test-lead`, delivered to planners only by
+> `bootstrap.install_agent_assets()` (renamed from `install_agent_skills`); `agent_type`
+> on `approvals`; `feature_orders.max_parallel` enforced in `claim_next_pending`; and the
+> attention rollup in `os_status`.
+>
+> **Five things this phase decided that section 8 and section 5 left open.**
+>
+> 1. **The seats get `Read, Grep, Glob` — no `Bash`.** Section 8's table says only "all
+>    edit tools" withheld. Withholding `Write` while granting a shell is not a
+>    prohibition: `cat > f <<EOF` writes the file just as well, and a prohibition the
+>    model can route around is the advisory posture this phase exists to replace. The
+>    cost is that neither seat can read git history; `Grep` and `Glob` cover the code
+>    itself, and anything needing a shell is the planner's to run.
+> 2. **`agent_type` is recorded even though no seat can currently reach a gate.** With no
+>    `Bash`, layer 2 has no live caller today — the column, the payload read and the line
+>    in the request text are built anyway, because the day anyone grants a seat a shell
+>    the audit trail is already correct instead of silently attributing the seat's attempt
+>    to the planner.
+> 3. **`max_parallel` is the USER's knob, not the planner's.** Section 4 calls slot
+>    budgeting the planner's job. A planner that budgets its own slots can hand itself the
+>    whole project's concurrency, and it becomes one more thing the plan validator has to
+>    police — so it is `jarvis fo create --max-parallel N`, NULL meaning uncapped, spent
+>    alongside `max_concurrent` rather than instead of it. The planner is exempt from its
+>    own feature's cap: capping the session that decides what the children are against
+>    those children is capping a feature against itself.
+> 4. **The shared structured-output helper was NOT extracted.** The other shared surface,
+>    `src/jarvis/assets/agents/`, was — the panel adopts that layout. The helper has no
+>    consumer here: a plan arrives as a file through `jarvis fo plan --from-file` and is
+>    validated by `plans.parse_plan`, and the seats' replies go to the planner through the
+>    Task tool without Jarvis parsing them at all. `neo.parse_verdict` also has no retry
+>    to generalise — it falls back to escalate — so extracting it would mean inventing the
+>    retry and its caller at once, with nothing to check the shape against. Backlogged for
+>    PR 64's work order, which has the consumer.
+> 5. **The planner's own posture is unchanged.** Section 8 leaves open narrowing its
+>    `permissions.deny` to the project's source directories now that the seats carry the
+>    real prohibition. "Source directory" is not a concept the catalog has, so it would
+>    mean guessing `src/`-shaped paths per project — and breaking any planner whose design
+>    document lives under one, which decision 2 makes the base of the children's stack.
+>
+> **One bug found and fixed on the way, in Phase 2 code the rollup made reachable.**
+> `os_status` scanned only `FO_OPEN_STATUSES` for feature-order attention, but `failed` is
+> a SETTLED status and is also the only one a feature order raises its own flag in — so
+> "flag once, at feature level" was derived correctly and then never shown. `jarvis status`
+> separately read `approval_id` off every attention item carrying a `decide` key, which a
+> feature order does not have, so the line raised `KeyError`.
 
 **Phase 4 — deferred.** Branch stacking (after the base-branch CLI behaviour is verified
 live), cross-project programs, and the polymorphic order table if a third session-running

@@ -74,6 +74,57 @@ def test_ask_queues_and_parks_worker(asked, project):
         neo.close()
 
 
+def test_the_work_order_record_shows_what_was_asked(asked, project, capsys):
+    """The question text reaches the timeline, not just Neo's DB.
+
+    Before this, `question_asked` stored only the Neo question id, so `jarvis wo show`
+    and the work order page displayed Neo's answer with no visible question — the
+    record read as an answer to nothing.
+    """
+    import json as _json
+
+    from jarvis import cli
+
+    _, wo, _ = asked
+    capsys.readouterr()
+    cli.main(["wo", "show", wo["id"], "--json"])
+    timeline = _json.loads(capsys.readouterr().out)["timeline"]
+    entry = next(e for e in timeline if e["kind"] == "question_asked")
+    assert entry["detail"] == "Should the export default to CSV or JSON?"
+
+
+def test_a_question_asked_before_the_fix_is_recovered_from_neos_db(asked, project):
+    """Events already on disk carry only the id — the text is still in Neo's DB, and
+    `ops.neo_question_texts` is what every timeline surface passes in to recover it."""
+    from jarvis.timeline import build_timeline
+
+    _, wo, result = asked
+    store = ProjectStore(project)
+    try:
+        # an event exactly as it was written before the text was stored in the payload
+        store.add_event(wo["id"], "question_asked",
+                        {"neo_question_id": result["question_id"]})
+        old = [e for e in store.list_events(wo["id"]) if e["kind"] == "question_asked"][-1]
+    finally:
+        store.close()
+    assert "question" not in json.loads(old["payload"])
+    entries = build_timeline({}, [old], [], questions=ops.neo_question_texts(wo["id"]))
+    assert entries[0]["detail"] == "Should the export default to CSV or JSON?"
+
+
+def test_question_text_lookup_survives_an_unreadable_neo_db(asked, monkeypatch):
+    """A timeline missing one detail beats `jarvis wo show` failing outright."""
+    import jarvis.neo_store as ns
+
+    _, wo, _ = asked
+
+    def boom(*a, **kw):
+        raise RuntimeError("neo.db is gone")
+
+    monkeypatch.setattr(ns, "NeoStore", boom)
+    assert ops.neo_question_texts(wo["id"]) == {}
+
+
 def test_neo_answers_and_delivers_to_worker(asked, project, fake_claude):
     daemon, wo, _ = asked
     drain(daemon)

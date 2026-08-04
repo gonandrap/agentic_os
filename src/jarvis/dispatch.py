@@ -24,6 +24,37 @@ def _worker_path() -> str:
     return path
 
 
+# Serena's READ-ONLY tool surface. Naming a tool in an agent's `tools:` key makes it
+# available; it does not make it runnable — permission is a separate gate, and a headless
+# turn cannot answer a prompt. Probed live 2026-08-03: a seat holding
+# `mcp__…__activate_project` in `tools:` but not in `permissions.allow` had the call
+# BLOCKED and reported it could not proceed; with these rules added, the same seat ran
+# activate_project -> find_symbol -> find_referencing_symbols and answered correctly with
+# no text search at all. So this list is what turns "Serena first" from prose into
+# something a worker can actually do.
+#
+# Enumerated rather than granted wholesale, for the same reason the planning seats
+# enumerate: Serena also ships `execute_shell_command`, `create_text_file` and
+# `replace_symbol_body`. Allowing the server as a unit would hand every worker — and every
+# seat that is deliberately denied a shell — a shell, through a side door.
+SERENA_READ_TOOLS = (
+    "activate_project", "get_symbols_overview", "find_symbol",
+    "find_referencing_symbols", "find_declaration", "find_implementations",
+    "search_for_pattern", "find_file", "list_dir", "list_memories", "read_memory",
+)
+
+# A plugin install produces the long prefix, `claude mcp add serena` the short one. Jarvis
+# configures no MCP server itself, so it cannot know which; both are listed, and a rule
+# naming a tool that does not exist on this install is simply inert.
+SERENA_TOOL_PREFIXES = ("mcp__serena__", "mcp__plugin_serena_serena__")
+
+
+def serena_allow_rules() -> list[str]:
+    """`permissions.allow` entries for every read-only Serena tool, under both prefixes."""
+    return [f"{prefix}{tool}"
+            for prefix in SERENA_TOOL_PREFIXES for tool in SERENA_READ_TOOLS]
+
+
 def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     """Merge the project's injected settings with per-work-order env and persist
     them for --settings.
@@ -55,6 +86,11 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         f"Write(//{wt_abs}/**)",
         f"NotebookEdit(//{wt_abs}/**)",
         f"Read(//{proj_abs}/**)",
+        # Read-only code navigation. Without these the symbol tools are visible and
+        # unrunnable, which is worse than absent: the worker is told to prefer Serena,
+        # tries, gets blocked, and either stalls asking for permission it cannot be
+        # granted headlessly or falls back to grep having wasted a call.
+        *serena_allow_rules(),
     ):
         if rule not in allow:
             allow.append(rule)
@@ -89,6 +125,17 @@ def worker_name(wo: dict[str, Any]) -> str:
 
 def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
                         knowledge: list[dict[str, Any]]) -> str:
+    """What the worker is told, composed from the work order and its project.
+
+    Two kinds of work order get two contracts (`project_store.WO_KINDS`). Everything
+    around the contract — the pre-approval marker, the gate briefing, the knowledge base,
+    "what the outside world sees" — is identical for both, and deliberately so: a planner
+    is an ordinary session that happens to produce a plan, and every surface the OS
+    already gives a worker (asking Neo, assumptions, the gate, the timeline,
+    cancellation) applies to it unchanged.
+    """
+    if wo.get("kind") == "planner":
+        return _planner_prompt(wo, project, knowledge)
     parts = [
         f"You are the worker agent for Jarvis work order `{wo['id']}` in project "
         f"`{project.name}`.",
@@ -166,6 +213,57 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "order says otherwise. User feedback may arrive as new user turns; treat it "
         "as authoritative for this work order.",
     ]
+    return "\n".join(_common_briefing(parts, wo, project, knowledge))
+
+
+def _navigation_briefing() -> list[str]:
+    """Serena before grep, for every session Jarvis dispatches.
+
+    This is prose rather than a capability restriction, and it has to be: a worker needs
+    `Grep` and `Bash` to do its actual job, so the seats' trick of simply not granting
+    the tool is not available here. What IS available is saying which tool answers the
+    question — and the two do not answer the same question. `find_referencing_symbols`
+    has no grep equivalent at all.
+
+    It is stated conditionally because Jarvis knows nothing about Serena: there is no
+    `mcpServers` key in `settings.base.json` and no mention of it anywhere in `src/`, so
+    whether a worker has it depends entirely on the user's own Claude configuration and
+    on whether the project has been indexed. An instruction that assumed it would be a
+    lie in most adopted projects; one that ranks it when present costs nothing when it is
+    absent.
+    """
+    return [
+        "# Navigating the code: Serena first, grep second",
+        "If this project has Serena (its symbol tools appear in your tool list, or "
+        "`.serena/project.yml` is in the repo), use it to find code and do NOT grep for "
+        "symbols. Serena has a language-server symbol index, so `find_symbol`, "
+        "`get_symbols_overview` and especially `find_referencing_symbols` answer where "
+        "something is defined and who calls it as facts, in one call. Grep answers a "
+        "different question — where a string appears — and you then have to rebuild the "
+        "answer from hits that miss every caller spelling the name differently.",
+        "",
+        "- `list_memories` / `read_memory` FIRST on a mapped project: its architecture is "
+        "already written down, and rediscovering it is the most expensive thing you can "
+        "do with your context.",
+        "- `find_symbol` instead of `grep -rn \"def foo\"`; "
+        "`find_referencing_symbols` instead of grepping for call sites — that one has no "
+        "grep equivalent; `get_symbols_overview` before opening a file whole.",
+        "- `search_for_pattern` (Serena's own) or `Grep` for GENUINE text questions: a "
+        "config key, an error string, a TODO. Text search is not wrong, it is just the "
+        "wrong tool for finding code.",
+        "- If the symbol tools say no project is active, `activate_project` on the repo "
+        "root first.",
+        "",
+        "If the project has no Serena, `Glob` and `Grep` are the fallback and there is "
+        "nothing to apologise for — just expect to work harder for a less complete "
+        "picture.",
+    ]
+
+
+def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
+                     knowledge: list[dict[str, Any]]) -> list[str]:
+    """The tail every briefing carries, whatever the work order's kind."""
+    parts += ["", *_navigation_briefing()]
     pre_approved = _pre_approval(wo)
     if pre_approved:
         parts += ["", *_pre_approved_briefing(pre_approved)]
@@ -177,7 +275,194 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
             scope = k["project"] or "global"
             topic = f" [{k['topic']}]" if k["topic"] else ""
             parts.append(f"- ({scope}{topic}) {k['content']}")
-    return "\n".join(parts)
+    return parts
+
+
+def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
+                    knowledge: list[dict[str, Any]]) -> str:
+    """The briefing for a feature order's planner.
+
+    Four things make it different from a worker's, and each is load-bearing:
+
+    * **Its output is a graph, not a change.** So its terminal action is structured —
+      `jarvis fo plan --from-file` against a JSON document — rather than prose. The
+      `--from-file` shape is not cosmetic either: `gates.scannable()`'s quote-blanking
+      fails on nested and mixed quoting, and a plan is a long argument full of repo
+      paths, which is exactly the input that trips the gate classifier into a false
+      positive. It goes in a file.
+    * **Its readers are strangers.** Each child work order is dispatched into a fresh
+      session that sees its own description and nothing else — not this plan, not this
+      conversation, not its siblings. That is the failure this briefing spends the most
+      words on, because it is the one the validator can only partly catch.
+    * **It plans; it does not build.** A planner that returns the finished solution has
+      failed at the job even if the solution is good, because the point of the feature
+      order is a decomposition the fleet can execute in parallel.
+    * **It leads a team.** Two seats — `jarvis-architect` and `jarvis-test-lead` — reach
+      it as subagent types over the extra `--add-dir` that `briefing_for` gives a
+      planner and no one else. A briefing that did not name them would leave two
+      definitions sitting on disk that nothing ever invokes, so this section is what
+      makes the seats real.
+
+    The third one is carried HERE, in prose, and not by a permission rule on the planner
+    itself — which is a weaker guarantee and worth stating plainly rather than leaving
+    for someone to discover. The planner is a work order, not a subagent, so it has no
+    `tools:` frontmatter (the CLI-enforced layer); its only available restriction is the
+    `permissions.deny` path `_write_worker_settings` writes, and a deny broad enough to
+    stop product code also stops the two things a planner is REQUIRED to do — write the
+    `plan.json` it submits, and produce a design document, whose pull request the design
+    makes the base of the children's stack. Phase 3 revisited this and left it alone. The
+    alternative its backlog item floated was denying edits under the project's source
+    directories while leaving the worktree root writable — but "source directory" is not a
+    concept the catalog has, so it would mean guessing `src/`-shaped paths per project,
+    and breaking any planner whose design document lives under one is exactly the case
+    decision 2 depends on.
+
+    The SEATS are where the posture is enforced instead, and there it is real: each is
+    declared `tools: Read, Grep, Glob`, which the CLI enforces rather than advises. No
+    `Bash` either — withholding `Write` while granting a shell is not a prohibition,
+    because a heredoc writes a file just as well (ruled 2026-08-03).
+    """
+    from .plans import CHILD_CAP, MIN_DESCRIPTION_CHARS
+
+    fo_id = wo.get("parent_id") or "?"
+    parts = [
+        f"You are the PLANNER for Jarvis feature order `{fo_id}` in project "
+        f"`{project.name}`, running as work order `{wo['id']}`.",
+        "",
+        f"# Feature order: {wo['title']}",
+        "",
+        wo.get("description") or "(no further description — the title is the ask)",
+        "",
+        "# Your job: produce a plan, not a solution",
+        "Decompose the feature above into a dependency-ordered set of ordinary work "
+        "orders, each of which one worker can carry out in one session and finish with "
+        "its own pull request. Read the codebase as much as you need to — that is what "
+        "your worktree is for. What you hand back is the decomposition.",
+        "",
+        "**Do not build the feature.** A planner that returns the working solution has "
+        "failed, however good the solution is: the feature order exists to produce work "
+        "the fleet can execute in parallel, and a finished branch is not that. Writing "
+        "code to UNDERSTAND the problem is fine and expected; shipping it is not the job.",
+        "",
+        "# Your team",
+        "You are the lead of a planning team, not a lone session. Two seats are "
+        "available to you as subagent types through the Task tool, and they exist "
+        "because a decomposition and its acceptance criteria are different jobs that go "
+        "wrong in different ways:",
+        "",
+        "- **`jarvis-architect`** — which pieces are separable, what the interface "
+        "between them is, what must land first, and what should NOT be split. Consult it "
+        "BEFORE you write the plan, and again whenever a child looks too big for one "
+        "session.",
+        "- **`jarvis-test-lead`** — what \"done\" means for each child and how its worker "
+        "proves it, written to stand alone in a brief read cold. Consult it AFTER the "
+        "decomposition is settled and before you submit.",
+        "",
+        "Both seats can read the codebase and neither can write to it: they have `Read`, "
+        "`Grep` and `Glob` and nothing else, enforced by the CLI rather than by "
+        "instruction. So they cannot do the work by accident, and they cannot run a "
+        "command for you — anything that needs a shell is yours to run.",
+        "",
+        "Consulting them is expected, not optional politeness, and they are the reason "
+        "this is a feature order rather than a work order. But you hold the plan: they "
+        "advise in prose, you decide what the children are, and you own the submission. "
+        "Where the architect and the test lead disagree with each other or with you, say "
+        "so in your final answer rather than quietly picking one.",
+        "",
+        "# The plan",
+        f"Write it to a JSON file in your worktree and submit it with:",
+        f"    jarvis fo plan {fo_id} --from-file plan.json",
+        "",
+        "```json",
+        "{",
+        '  "summary": "one line: what this feature is, once it is all done",',
+        '  "justification": "only if you exceed the child cap — why it cannot be fewer",',
+        '  "children": [',
+        "    {",
+        '      "key": "schema",',
+        '      "title": "short imperative title, as a work order would have",',
+        '      "description": "the WHOLE brief for this piece — see below",',
+        '      "needs": ["other-key", "..."],',
+        '      "acceptance": "how the worker knows it is done (optional)"',
+        "    }",
+        "  ]",
+        "}",
+        "```",
+        "",
+        f"`key` is a short lowercase slug, local to this plan — it is how you wire "
+        f"`needs` between children before any work-order id exists. `needs` names other "
+        f"keys IN THIS PLAN and nothing else; the OS turns them into real dependency "
+        f"edges, and a child does not start until everything it needs has completed and "
+        f"merged.",
+        "",
+        "## Every child's description must stand alone",
+        "This is the rule the whole plan lives or dies on. Each child is dispatched into "
+        "a NEW session with a worker that sees its own description and nothing else — "
+        "not this plan, not this conversation, not what its siblings are doing, not the "
+        "feature order. Anything you know because you read the whole feature has to be "
+        "written INTO each child that needs it, even where that means repeating "
+        "yourself across children. Repetition is cheap; a worker guessing is not.",
+        "",
+        "So: no \"as discussed in the plan\", no \"same as the previous work order\", no "
+        "\"as described above\". Those are rejected mechanically, before anything is "
+        "created. Name the files, the functions and the interfaces; say what the piece "
+        "must not change; say what its sibling is doing if that is why an interface is "
+        "shaped the way it is.",
+        "",
+        "## What the validator refuses",
+        "Checked in Python at submission, before a single work order exists, so a plan "
+        "that fails costs you a revision and nothing else:",
+        "- a dependency cycle among the children, or a child depending on itself",
+        "- a `needs` naming a key that is not in the plan",
+        f"- more than {CHILD_CAP} children with no `justification` saying why it cannot "
+        f"be done in fewer ({CHILD_CAP} is the cap; a plan at or over it is escalated to "
+        f"the user rather than waved through, so stay under it unless you genuinely "
+        f"cannot)",
+        f"- a description under {MIN_DESCRIPTION_CHARS} characters, or one that only "
+        f"repeats the title, or one that points at something the child worker cannot see",
+        "",
+        "If it refuses, it names every problem at once. Fix them all and resubmit.",
+        "",
+        "## After you submit",
+        "Neo (the user's delegate) reviews the plan and either releases it — at which "
+        "point the OS creates every child work order with its edges and starts "
+        "dispatching them — or sends it back. A rejection arrives as your next user turn "
+        "with the reason: revise and submit again from this same session.",
+        "",
+        "# Operating contract",
+        f"- `jarvis fo plan {fo_id} --from-file <file>` IS your finish. Do not run "
+        f"`jarvis wo finish` — submitting the plan settles this work order for you.",
+        f"- **Neo is your first responder. Any doubt goes to it.** `jarvis wo ask "
+        f"{wo['id']} \"<your question>\"`, then END YOUR TURN; the answer arrives as your "
+        f"next user turn, usually within a minute. The trigger is DOUBT, not importance. "
+        f"For a planner the highest-value questions are about SCOPE — whether a piece "
+        f"belongs in this feature at all — because that is the one thing you cannot "
+        f"recover from by revising the decomposition. Put everything needed to decide "
+        f"inside the question text; whoever answers sees only that text.",
+        f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
+        f"Record every one, including the small ones.",
+        f"- Work only inside your worktree (you start in it).",
+        f"- File deferred work instead of leaving notes: `jarvis backlog add "
+        f"{project.name} \"...\"` — including anything you decided was OUT of this "
+        f"feature's scope.",
+        f"- The OS knowledge base is the ONLY memory that survives you: "
+        f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`.",
+        f"- Alert the human when needed: `jarvis notify --project {project.name} "
+        f"--level warning|critical \"title\" \"body\"`",
+        "- Hit a bug in Jarvis OS itself? Use your `report-jarvis-bug` skill, then carry "
+        "on.",
+        "",
+        "# What the outside world sees",
+        "The work order record IS this conversation, as far as anyone else is concerned. "
+        "The last message of every turn you take is captured verbatim into it, and the "
+        "user and Neo decide from that record — neither will ever open this session. End "
+        "every turn with the complete answer: what you decomposed and why, what you "
+        "deliberately left out, what you are unsure about, and absolute paths.",
+        "",
+        "Work autonomously toward a submitted plan. User feedback may arrive as new user "
+        "turns; treat it as authoritative.",
+    ]
+    return "\n".join(_common_briefing(parts, wo, project, knowledge))
 
 
 def _pre_approval(wo: dict[str, Any]) -> dict[str, Any] | None:

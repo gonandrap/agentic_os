@@ -43,6 +43,44 @@ jarvis status [--json]                     # whole-OS pulse; --attention for the
 jarvis start --catalog <path-to-catalog>   # boot the OS (user catalogs live untracked under catalogs/)
 jarvis stop
 jarvis wo create <project> "title" -d "details" [--model m]
+jarvis wo create ... --depends-on <wo-id,...>   # don't dispatch until those COMPLETE.
+                                           # Order a multi-step job in one go instead of
+                                           # watching the first piece and typing the
+                                           # second. A blocked order stays `pending` and
+                                           # says what it waits for; it never becomes an
+                                           # attention item just for waiting. Same
+                                           # project only. `waiting_pr_merge` does NOT
+                                           # count as done — the dependency's code is
+                                           # still on an unmerged branch — but the daemon
+                                           # completes it within ~2min of the merge, so
+                                           # an edge costs the user no extra step.
+jarvis wo unblock <id> [--all]             # cut the edges holding one back. By default
+                                           # only the ones that can never clear (the
+                                           # dependency was cancelled, failed or
+                                           # deleted); those DO raise attention, because
+                                           # the order would otherwise wait for ever.
+                                           # --all cuts live edges too: it runs now,
+                                           # without the work it was told to build on.
+jarvis fo create <project> "title" -d "..."     # a FEATURE order: one ask too big for a
+                                           # single session. The project plans it into
+                                           # work orders ITSELF — a planner agent reads
+                                           # the codebase, decomposes it, and the plan
+                                           # comes back for review before any work order
+                                           # exists. -d is REQUIRED: the planner sees
+                                           # only that text. Use this instead of typing
+                                           # six `wo create` calls, and instead of
+                                           # deciding the split in chat.
+jarvis fo list [project] / show <id>       # show renders the plan + the child tree
+jarvis fo approve <id> [--reject] [--feedback "why"]   # only when Neo escalated: a plan
+                                           # it can decide never reaches the user. It
+                                           # escalates a plan at or over 8 children,
+                                           # one whose children need a gated action, or
+                                           # one it cannot square with a learning.
+                                           # --reject sends the planner back to revise
+                                           # in its existing session, so the feedback
+                                           # must say what to CHANGE.
+jarvis fo cancel <id>                      # stops the planner and every child running
+jarvis backlog promote <id> --as feature   # intake -> feature order, not a work order
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
 jarvis wo review <id> [--reject] [--feedback "why"]   # feedback teaches Neo; on
                                            # --reject it also goes to the worker
@@ -119,6 +157,7 @@ Before exploring the tree, read the memories — they are cheap and current:
 |---|---|
 | `codebase-map` | all 19 modules in `src/jarvis/`, their symbols, the layering, the three SQLite DBs, the `jarvis start` call chain |
 | `work-order-lifecycle` | the WO state machine and exactly how a worker `claude` process is spawned |
+| `feature-orders` | the planned unit above the work order: the 7-state lifecycle, the planner, the plan validator, how Neo reviews a plan |
 | `dev-vs-prod-environments` | the two checkouts, their paths, `JARVIS_HOME`, the release path |
 | `privileged-action-gates` | how a worker ships code: the gate, Neo's review, the deny-rule trap |
 | `testing` | how to run the suite and what covers what |

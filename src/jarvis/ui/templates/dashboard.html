@@ -17,6 +17,11 @@
       <li>
         {% if a.wo_id %}
           <a href="/wo/{{ a.project }}/{{ a.wo_id }}" class="mono">{{ a.wo_id }}</a>
+        {% elif a.fo_id %}
+          {# One line for the whole feature, its flagged children rolled into the reason.
+             The link goes to the feature page, which is where they are individually
+             reachable — that page is what makes the rollup safe to collapse. #}
+          <a href="/fo/{{ a.project }}/{{ a.fo_id }}" class="mono">{{ a.fo_id }}</a>
         {% endif %}
         <strong>{{ a.project }}</strong> — {{ a.title }}
         <div class="sub">{{ a.reason }}
@@ -72,9 +77,9 @@
 </div>
 
 <h2>Open work orders</h2>
-{# What is being worked on now, then what is waiting for you to merge it — those are
-   the rows. The other open statuses collapse into a count you can expand: they are
-   waiting on the OS, not on you. #}
+{# The decisions you owe, then what is being worked on now, then what is waiting for you
+   to merge it — those are the rows. Only the statuses the OS has not started yet collapse
+   into a count you can expand: those are waiting on the OS, not on you. #}
 {% if rest_counts %}
 <p class="sub">
   {% for status, n in rest_counts %}
@@ -104,13 +109,19 @@
         {% if wo.status == 'waiting_pr_merge' and wo.pr_url %}
           <div class="sub">⑃ <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a></div>
         {% endif %}
+        {% if wo.blocked_by %}
+          <div class="sub">⊘ blocked by:
+            {% for b in wo.blocked_by %}<a class="mono"
+              href="/wo/{{ wo.project }}/{{ b.id }}">{{ b.id }}</a> ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}
+          </div>
+        {% endif %}
       </div>
       <span class="badge {{ 'framework' if o.framework else 'outside' }}">
         {{ '⚙ ' if o.framework else '⚠ ' }}{{ o.word }}</span>
     </div>
   {% else %}
     <div class="empty">
-      {% if rest_counts %}nothing running and nothing to merge — the rest is counted above
+      {% if rest_counts %}nothing running and nothing waiting on you — the rest is counted above
       {% else %}no open work orders{% endif %}
     </div>
   {% endfor %}
@@ -131,6 +142,27 @@
     <div style="display: flex; gap: 10px; align-items: flex-start;">
       <textarea name="description" placeholder="details, context, constraints (optional)"></textarea>
       <button type="submit" class="primary">Create work order</button>
+    </div>
+  </form>
+</div>
+
+{# The coarse ask, for work that is bigger than one session. Deliberately a SECOND form
+   rather than a checkbox on the one above: the two produce different things, and the
+   description field is optional there and required here — a feature order's first
+   reader is a planner in a fresh session, and it will decompose four words. #}
+<h2>New feature order</h2>
+<div class="panel" style="padding: 14px 16px;">
+  <form method="post" action="/fo/create">
+    <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+      <select name="project" required style="max-width: 220px;">
+        {% for p in st.projects %}<option value="{{ p.name }}">{{ p.name }}</option>{% endfor %}
+      </select>
+      <input type="text" name="title" placeholder="the whole feature" required>
+    </div>
+    <div style="display: flex; gap: 10px; align-items: flex-start;">
+      <textarea name="description" required
+                placeholder="the whole ask — the planner sees only this text, and the plan is built from it"></textarea>
+      <button type="submit" class="primary">Plan it</button>
     </div>
   </form>
 </div>

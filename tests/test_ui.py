@@ -731,7 +731,11 @@ def test_settled_work_orders_collapse_into_a_count(client, project):
 
 def test_pr_merges_and_running_work_get_the_rows(client, project):
     """The listing question the user actually asks the dashboard: what is moving, and
-    what is waiting for me to merge it. Everything else open is a count."""
+    what is waiting for me to merge it.
+
+    `pending` is the collapsed case here because it is one of the two statuses that
+    genuinely need nobody — see the test below for the ones that do.
+    """
     running = ops.create_work_order("proj_a", "still going")
     merging = ops.create_work_order("proj_a", "waiting on a merge")
     ops.create_work_order("proj_a", "not started yet")
@@ -752,6 +756,86 @@ def test_pr_merges_and_running_work_get_the_rows(client, project):
 
     for url in ("/?show=pending", "/project/proj_a?show=pending"):
         assert "not started yet" in client.get(url).text, url
+
+
+def test_a_decision_you_owe_gets_a_row_not_a_count(client, daemon, project):
+    """The statuses invariants.true_blockers calls real blockers have to be rows.
+
+    They were counts, which is how a project page came to print "3 needs review" in the
+    header and "nothing running and nothing to merge" in the panel underneath it. A
+    listing that disagrees with true_blockers about what needs the user is a bug in the
+    listing.
+    """
+    reviewing = ops.create_work_order("proj_a", "decide this please")
+    blocked = ops.create_work_order("proj_a", "worker is stuck")
+    daemon.tick()
+    ops.assume(reviewing["id"], "assumed the API is v2")
+    ops.finish(reviewing["id"], "done-ish")
+    store = ProjectStore(project)
+    store.set_status(blocked["id"], "waiting_input")
+    assert store.get_work_order(reviewing["id"])["status"] == "needs_review"
+    store.close()
+    ops.create_work_order("proj_a", "not started yet")  # after the tick: stays pending
+
+    for url in ("/", "/project/proj_a"):
+        page = client.get(url).text
+        assert "decide this please" in page, url
+        assert "worker is stuck" in page, url
+        assert "not started yet" not in page, url  # started by nobody, needs nobody
+        assert "show=pending" in page, url  # a count line, expandable
+        assert "show=needs_review" not in page, url  # a row, so never a count line
+        # a review the user owes comes before a worker merely blocked on them
+        assert page.index("decide this please") < page.index("worker is stuck"), url
+
+    for url in ("/?show=pending", "/project/proj_a?show=pending"):
+        assert "not started yet" in client.get(url).text, url
+
+
+def test_a_project_whose_only_open_work_needs_review_is_not_an_empty_panel(client,
+                                                                          daemon):
+    """The reported bug, exactly: counts and panel contradicting each other."""
+    for n in range(3):
+        wo = ops.create_work_order("proj_a", f"needs a decision {n}")
+        daemon.tick()
+        ops.assume(wo["id"], "assumed something")
+        ops.finish(wo["id"], "done-ish")
+
+    for url in ("/", "/project/proj_a"):
+        page = client.get(url).text
+        assert "nothing running and nothing waiting on you" not in page, url
+        # the count line's own signature: the link that expands the collapsed group
+        assert "show=needs_review" not in page, url
+        for n in range(3):
+            assert f"needs a decision {n}" in page, url
+
+
+def test_a_blocked_work_order_says_what_it_is_waiting_for(client, project):
+    """Both listings, because they derive it by different routes — the dashboard off
+    `ops.os_status`, the project page off the store directly. A surface that worked
+    while its twin lied is exactly how the FEATURED_STATUSES bug survived."""
+    dep = ops.create_work_order("proj_a", "the schema change")
+    ops.create_work_order("proj_a", "needs the schema", depends_on=[dep["id"]])
+
+    # Pending work still collapses by default — a work order waiting its turn needs
+    # nobody — so the line is asserted where the user actually expands to see it.
+    for url in ("/?show=pending", "/project/proj_a?show=pending"):
+        page = client.get(url)
+        assert "blocked by" in page.text, url
+        assert dep["id"] in page.text, url
+
+
+def test_a_stranded_work_order_reaches_the_attention_strip(client, project):
+    """The one dependency case that is not routine: it will never start on its own."""
+    dep = ops.create_work_order("proj_a", "the schema change")
+    child = ops.create_work_order("proj_a", "needs the schema", depends_on=[dep["id"]])
+    store = ProjectStore(project)
+    store.set_status(dep["id"], "cancelled")
+    check_project(store, repair=True)
+    store.close()
+
+    body = client.get("/").text
+    assert child["id"] in body
+    assert "can never complete" in body
 
 
 def test_a_pr_waiting_to_be_merged_never_enters_the_attention_strip(client, project):
@@ -866,3 +950,184 @@ def test_unexpected_error_renders_a_page_and_lands_in_the_os_log(
     assert "kaboom in os_status" in log
     assert "GET /" in log
     assert "RuntimeError" in log
+
+
+# -- feature orders ------------------------------------------------------------------
+#
+# The feature page is the one view where the whole feature is visible at once — the ask,
+# the plan as submitted, and each child's live status against it. It is also where an
+# escalated plan is decided, because deciding needs all three on one screen.
+
+
+@pytest.fixture()
+def feature(client, daemon, project):
+    """A feature order whose plan is submitted and escalated to the user."""
+    from tests.test_feature_orders import ASK, a_plan, child
+
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
+    daemon.tick()
+    ops.submit_plan(fo["id"], a_plan(child("schema"), child("api", needs=["schema"])))
+    daemon._neo_drain()  # the fake escalates plan reviews unless forced
+    return client, ops.show_feature_order(fo["id"])
+
+
+def test_the_feature_page_shows_the_ask_the_plan_and_the_children(feature):
+    client, fo = feature
+
+    page = client.get(f"/fo/proj_a/{fo['id']}").text
+
+    assert "CSV export" in page
+    assert "Add a CSV exporter" in page          # the ask, verbatim
+    assert "Build schema" in page and "Build api" in page   # the plan
+    assert "nothing created yet" in page         # a plan is a proposal until released
+
+
+def test_the_feature_page_is_where_an_escalated_plan_is_decided(feature):
+    client, fo = feature
+
+    page = client.get(f"/fo/proj_a/{fo['id']}").text
+
+    assert "Release this plan?" in page
+    assert f"/fo/proj_a/{fo['id']}/review" in page
+
+
+def test_releasing_a_plan_from_the_browser_creates_the_children(feature):
+    client, fo = feature
+
+    res = client.post(f"/fo/proj_a/{fo['id']}/review",
+                      data={"decision": "accept", "feedback": "looks right"})
+
+    assert res.status_code == 303
+    detail = ops.show_feature_order(fo["id"])
+    assert detail["status"] == "executing"
+    assert [c["title"] for c in detail["children"]] == ["Build schema", "Build api"]
+    page = client.get(f"/fo/proj_a/{fo['id']}").text
+    assert "⊘ after" in page      # the tree, with the edge drawn
+
+
+def test_sending_a_plan_back_with_no_reason_says_so_instead_of_failing(feature):
+    """The planner sees only the reason, so a bare rejection is a guess. The refusal has
+    to reach the page rather than becoming a 500."""
+    client, fo = feature
+
+    res = client.post(f"/fo/proj_a/{fo['id']}/review", data={"decision": "reject"})
+
+    assert res.status_code == 303
+    assert "error=" in res.headers["location"]
+    assert ops.show_feature_order(fo["id"])["status"] == "plan_review"
+
+
+def test_a_plan_neo_can_decide_never_reaches_the_users_page(client, daemon, project):
+    """The control for the panel above: routine plans must not put a decision on screen,
+    because a feature order that costs an interactive review every time costs more
+    attention than typing the work orders by hand."""
+    from tests.test_feature_orders import ASK, a_plan, child
+
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
+    daemon.tick()
+    ops.submit_plan(fo["id"], a_plan(child("schema", extra="FORCE_APPROVE")))
+    daemon._neo_drain()
+
+    page = client.get(f"/fo/proj_a/{fo['id']}").text
+
+    assert "Release this plan?" not in page
+    assert "executing" in page
+
+
+def test_the_project_page_lists_feature_orders_without_repeating_the_tree(feature):
+    client, fo = feature
+
+    page = client.get("/project/proj_a").text
+
+    assert f"/fo/proj_a/{fo['id']}" in page
+    assert "Feature orders" in page
+    # The children belong to the listing below as ordinary work orders, and to the
+    # feature's own page as a tree. Not to both, on one page.
+    assert page.count(f"/fo/proj_a/{fo['id']}") == 1
+
+
+def test_the_dashboard_takes_a_feature_order(client):
+    res = client.post("/fo/create", data={"project": "proj_a", "title": "CSV export",
+                                          "description": "the whole ask, at length, "
+                                                         "with enough detail to plan"})
+
+    assert res.status_code == 303
+    assert res.headers["location"].startswith("/fo/proj_a/fo-")
+
+
+def test_a_feature_order_with_no_description_is_refused_by_the_browser_too(client):
+    res = client.post("/fo/create", data={"project": "proj_a", "title": "CSV export"})
+
+    assert res.status_code == 303
+    assert res.headers["location"].startswith("/project/proj_a?error=")
+
+
+def test_cancelling_a_feature_order_from_the_browser(feature):
+    client, fo = feature
+
+    res = client.post(f"/fo/proj_a/{fo['id']}/cancel")
+
+    assert res.status_code == 303
+    assert ops.show_feature_order(fo["id"])["status"] == "cancelled"
+
+
+def test_an_unknown_feature_order_is_a_page_not_a_traceback(client):
+    page = client.get("/fo/proj_a/fo-nope")
+
+    assert page.status_code == 200
+    assert "not found in any registered project" in page.text
+
+
+def test_the_feature_page_shows_its_slot_budget(client, daemon, project):
+    """`max_parallel` is invisible everywhere else, so the one page that holds the whole
+    feature is where the user finds out why three children are showing two running."""
+    from tests.test_feature_orders import ASK, a_plan, child
+
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK,
+                                  max_parallel=2)
+    daemon.tick()
+    ops.submit_plan(fo["id"], a_plan(child("one", extra="FORCE_APPROVE"),
+                                     child("two", extra="FORCE_APPROVE"),
+                                     child("three", extra="FORCE_APPROVE")))
+    daemon._neo_drain()
+    daemon.tick()
+
+    page = client.get(f"/fo/proj_a/{fo['id']}").text
+
+    assert "2/2 slots in use" in page
+    # ...and the child that is waiting says so, rather than reading as about-to-start.
+    assert "waiting for a slot" in page
+
+
+def test_an_uncapped_feature_page_says_nothing_about_slots(feature):
+    """The control: a feature with no cap has nothing to report, and the project's own
+    max_concurrent is not this page's business."""
+    client, fo = feature
+
+    assert "slots in use" not in client.get(f"/fo/proj_a/{fo['id']}").text
+
+
+def test_the_attention_strip_links_a_rolled_up_feature_to_its_page(client, daemon,
+                                                                   project):
+    """The rollup collapses the children's lines, so the one link it leaves has to reach
+    the page where they are individually visible — otherwise collapsing them hides them."""
+    from jarvis.project_store import ProjectStore
+    from tests.test_feature_orders import ASK, a_plan, child
+
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
+    daemon.tick()
+    ops.submit_plan(fo["id"], a_plan(child("one", extra="FORCE_APPROVE"),
+                                     child("two", extra="FORCE_APPROVE")))
+    daemon._neo_drain()
+    store = ProjectStore(project)
+    try:
+        kid = store.feature_children(fo["id"])[0]
+        store.update_work_order(kid["id"], needs_attention=1,
+                                attention_reason="assumption needs a decision")
+    finally:
+        store.close()
+
+    page = client.get("/").text
+
+    assert f'/fo/proj_a/{fo["id"]}' in page
+    assert "1 of its work orders need you" in page

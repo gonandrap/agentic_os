@@ -220,6 +220,12 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
                     "(none — the worker ran the command directly rather than filing a "
                     "request, so no case was made for it)"
                 ),
+                # Which SEAT attempted it, if a subagent did. `JARVIS_WO_ID` is
+                # per-session, so the request is filed against the work order either way;
+                # this is the only thing that keeps the record from saying the lead ran a
+                # command its team ran. `PreToolUse` omits the key for the lead's own
+                # calls, so absence is the discriminator, not a sentinel value.
+                agent_type=payload.get("agent_type") or None,
             )
         finally:
             neo.close()

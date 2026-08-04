@@ -92,13 +92,17 @@ def build_system_prompt(store: NeoStore, project: str, learnings_limit: int = 50
     """Persona + learnings. Byte-stable across questions (per project and kind) so
     consecutive headless calls of the same kind share a cached prompt prefix.
 
-    Approval requests get the gate-reviewer persona instead of the answerer one: the
-    general persona is told to escalate anything that publishes or touches production,
-    which is right for open questions and would send every release straight to the user.
+    Each kind gets its own persona, and for the same reason in both cases: the general
+    answerer persona is told to escalate anything that publishes or touches production,
+    which is right for open questions and would send every release — and every plan
+    whose children mention shipping — straight to the user, which is the attention cost
+    both features exist to remove.
     """
     from .gates import REVIEWER_PERSONA
+    from .plans import PLAN_REVIEWER_PERSONA
 
-    persona = REVIEWER_PERSONA if kind == "approval" else PERSONA
+    persona = {"approval": REVIEWER_PERSONA, "plan": PLAN_REVIEWER_PERSONA}.get(
+        kind, PERSONA)
     parts = [persona, "", "# Learnings (from the user's reviews of your past answers)"]
     rows = store.learnings(project, limit=learnings_limit)
     if not rows:
@@ -251,10 +255,10 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             store.mark(q["id"], "escalated", reason=verdict["reason"])
             log.info("neo escalated question %s: %s", q["id"], verdict["reason"])
         else:
-            # An approval's decision lives in `approve`, not in prose. Record it as the
-            # answer too so `jarvis neo show` and the review surfaces read plainly.
             answer = verdict["answer"]
-            if q.get("kind") == "approval":
+            if q.get("kind") in ("approval", "plan"):
+                # A ruling lives in `verdict`, not in prose. Record it as the answer too
+                # so `jarvis neo show` and the review surfaces read plainly.
                 answer = (verdict.get("verdict") or "denied").upper()
             store.record_answer(q["id"], answer, answered_by="neo",
                                 reason=verdict["reason"])

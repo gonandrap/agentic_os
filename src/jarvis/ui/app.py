@@ -17,6 +17,7 @@ from ..central_store import CentralStore
 from ..daemon import daemon_running
 from ..paths import logs_dir
 from ..project_store import (
+    FO_OPEN_STATUSES,
     OPEN_STATUSES,
     TERMINAL_STATUSES,
     WO_STATUSES,
@@ -36,6 +37,19 @@ STATUS_META = {
     "completed":     {"word": "completed",   "icon": "✓", "tone": "ok"},
     "failed":        {"word": "failed",      "icon": "✗", "tone": "bad"},
     "cancelled":     {"word": "cancelled",   "icon": "–", "tone": "muted"},
+}
+# A feature order's own lifecycle. Separate from STATUS_META rather than merged into it:
+# the words overlap ("pending", "completed") but they mean different things — a pending
+# work order is queued for a worker, a pending feature order has not been decomposed yet
+# — and one table serving both would have to pick one meaning for the shared keys.
+FO_STATUS_META = {
+    "pending":     {"word": "not planned yet", "icon": "◌", "tone": "muted"},
+    "planning":    {"word": "planning",     "icon": "◍", "tone": "active"},
+    "plan_review": {"word": "plan in review", "icon": "◭", "tone": "warn"},
+    "executing":   {"word": "executing",    "icon": "●", "tone": "active"},
+    "completed":   {"word": "completed",    "icon": "✓", "tone": "ok"},
+    "failed":      {"word": "failed",       "icon": "✗", "tone": "bad"},
+    "cancelled":   {"word": "cancelled",    "icon": "–", "tone": "muted"},
 }
 ORIGIN_META = {
     "jarvis": {"word": "jarvis", "framework": True},
@@ -66,11 +80,20 @@ GATE_META = {
 # the live regions in place (see dashboard.html), so in-progress typing survives.
 REFRESH_SECONDS = 15
 
-# The two open statuses worth a row of their own, in this order: what is being worked
-# on right now, then what is waiting for the user to go and merge it. Everything else
-# open collapses into a count line, the same way settled work orders already do — the
-# point of the page is "what needs me", and a pending work order needs nobody.
-FEATURED_STATUSES = ("running", "waiting_pr_merge")
+# The open statuses worth a row of their own, in this order: the two that owe the user a
+# decision, then what is being worked on right now, then what is waiting for them to go
+# and merge it. Only `pending` and `dispatching` collapse into a count line, the way
+# settled work orders do — the point of the page is "what needs me", and a work order the
+# OS has not started yet needs nobody.
+#
+# `needs_review` and `waiting_input` are here because invariants.true_blockers names them
+# as genuine blockers, and a listing that disagrees with that is a bug in the listing.
+# Collapsing them was one: a project whose only open work was three `needs_review` orders
+# counted them in the header and then said "nothing running and nothing to merge" in the
+# same breath. Status, not the attention flag, decides: `jarvis wo ack` puts the flag down
+# for good, and an acked work order that vanished from the only listing of open work would
+# be unfindable.
+FEATURED_STATUSES = ("needs_review", "waiting_input", "running", "waiting_pr_merge")
 
 
 def group_open(wos: list[dict], revealed: str = "") -> tuple[list[dict], list[dict]]:
@@ -168,7 +191,7 @@ def create_app() -> FastAPI:
     templates = Jinja2Templates(directory=str(TEMPLATES))
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
-        level_tone=LEVEL_TONE, fmt_age=fmt_age,
+        fo_status_meta=FO_STATUS_META, level_tone=LEVEL_TONE, fmt_age=fmt_age,
     )
 
     def render(request: Request, template: str, active: str = "dashboard",
@@ -206,9 +229,10 @@ def create_app() -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request, show: str = ""):
-        """The pulse. Open work orders are grouped so the two the user can act on —
-        running, and waiting for them to merge a PR — are rows, and the rest is a
-        count line they can expand (`show` = a status name, or "all")."""
+        """The pulse. Open work orders are grouped so the ones the user can act on —
+        a decision they owe, running work, a PR waiting for them to merge it — are
+        rows, and the rest is a count line they can expand (`show` = a status name,
+        or "all")."""
         st = ops.os_status()
         rows = [{**wo, "project": p["name"]}
                 for p in st["projects"] for wo in p.get("open_work_orders", [])]
@@ -223,12 +247,13 @@ def create_app() -> FastAPI:
 
     @app.get("/project/{name}", response_class=HTMLResponse)
     def project(request: Request, name: str, hidden: str = "", show: str = ""):
-        """A project's work orders — the two that want the user, by default.
+        """A project's work orders — the ones that want the user, by default.
 
-        Running work orders and PRs waiting to be merged get a row each. Everything
-        else — the other open statuses, and the settled ones that are the bulk of any
-        project with history — collapses into per-status counts the user can expand.
-        `show` is "" (featured only), any status name (plus that group), or "all".
+        Work orders owing the user a decision, running ones, and PRs waiting to be
+        merged get a row each. Everything else — work the OS has not started yet, and
+        the settled orders that are the bulk of any project with history — collapses
+        into per-status counts the user can expand. `show` is "" (featured only), any
+        status name (plus that group), or "all".
         """
         paths = ops.registered_project_paths()
         if name not in paths:
@@ -241,7 +266,17 @@ def create_app() -> FastAPI:
             statuses = OPEN_STATUSES + ((revealed,) if revealed else ())
         store = ProjectStore(paths[name])
         try:
+            # Open feature orders get their own short list above the work orders, and
+            # deliberately do NOT expand into their children here: the children are
+            # already in the listing below as ordinary work orders, and printing the
+            # tree twice on one page is how a page stops being read. The tree lives on
+            # the feature's own page.
+            features = [{**fo, "progress": ops.feature_progress(store, fo)}
+                        for fo in store.list_feature_orders(statuses=FO_OPEN_STATUSES)]
             wos = store.list_work_orders(statuses=statuses, include_hidden=show_hidden)
+            # Inside the store's lifetime: the label reads the dependencies' own rows.
+            blocked = {wo["id"]: ops.blocked_by(store, wo) for wo in wos}
+            blocked = {k: v for k, v in blocked.items() if v}
             visible_counts = store.status_counts()
             all_counts = store.status_counts(include_hidden=True)
             counts = all_counts if show_hidden else visible_counts
@@ -261,8 +296,25 @@ def create_app() -> FastAPI:
         open_counts = [(s, counts[s]) for s in other_open if counts.get(s)]
         return render(request, "project.html", project_name=name, path=paths[name],
                       featured=featured, rest=rest, open_counts=open_counts,
-                      backlog=backlog, show_hidden=show_hidden,
-                      hidden_count=hidden_count, settled=settled, revealed=revealed)
+                      backlog=backlog, show_hidden=show_hidden, blocked=blocked,
+                      hidden_count=hidden_count, settled=settled, revealed=revealed,
+                      features=features)
+
+    @app.get("/fo/{name}/{fo_id}", response_class=HTMLResponse)
+    def feature_order(request: Request, name: str, fo_id: str, error: str = ""):
+        """A feature order's page. Its main content is the dependency tree.
+
+        The one view where the whole plan is visible at once — the ask, the
+        decomposition as it was submitted, and each child's live status against it. It
+        is also where an escalated plan is decided, because deciding needs all three of
+        those on one screen and no other page has them.
+        """
+        try:
+            detail = ops.show_feature_order(fo_id, name)
+        except ops.OpsError as e:
+            return render(request, "error.html", message=str(e))
+        return render(request, "feature_order.html", fo=detail, project=detail["project"],
+                      error=error)
 
     @app.get("/project/{name}/sessions", response_class=HTMLResponse)
     def project_sessions(request: Request, name: str):
@@ -300,7 +352,8 @@ def create_app() -> FastAPI:
         show_debug = debug not in ("", "0", "false")
         return render(request, "work_order.html", project=pname, wo=wo,
                       timeline=build_timeline(wo, events, messages,
-                                              include_debug=show_debug),
+                                              include_debug=show_debug,
+                                              questions=ops.neo_question_texts(wo_id)),
                       debug=show_debug, debug_count=count_debug(events),
                       messages=messages, assumptions=assumptions,
                       approvals=approvals)
@@ -466,6 +519,36 @@ def create_app() -> FastAPI:
     def resume_auto(name: str, wo_id: str):
         ops.resume_in_auto(wo_id, project_name=name)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
+
+    @app.post("/fo/create")
+    def create_fo(project: str = Form(...), title: str = Form(...),
+                  description: str = Form("")):
+        try:
+            fo = ops.create_feature_order(project, title, description=description,
+                                          origin="ui")
+        except ops.OpsError as e:
+            return RedirectResponse(f"/project/{project}?error={e}", status_code=303)
+        return RedirectResponse(f"/fo/{project}/{fo['id']}", status_code=303)
+
+    @app.post("/fo/{name}/{fo_id}/review")
+    def review_plan(name: str, fo_id: str, decision: str = Form(...),
+                    feedback: str = Form("")):
+        try:
+            ops.review_plan(fo_id, accept=(decision == "accept"), feedback=feedback,
+                            decided_by="user", project_name=name)
+        except ops.OpsError as e:
+            # A rejection with no reason is the refusal that actually happens here: the
+            # planner sees only the reason, so without it the revision is a guess.
+            return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
+        return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
+
+    @app.post("/fo/{name}/{fo_id}/cancel")
+    def cancel_fo(name: str, fo_id: str):
+        try:
+            ops.cancel_feature_order(fo_id, project_name=name)
+        except ops.OpsError as e:
+            return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
+        return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
 
     @app.post("/neo/{question_id}/review")
     def neo_review(question_id: int, decision: str = Form(...),

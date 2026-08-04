@@ -3,6 +3,7 @@
 Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
+  jarvis fo create|list|show|plan|approve|cancel        feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
   jarvis neo list|show|review|answer|learnings|learn
   jarvis backlog add|list|promote|done
@@ -134,6 +135,17 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--permission-mode")
     c.add_argument("--append-system-prompt")
     c.add_argument("--origin", default="jarvis", choices=["jarvis", "ui", "manual"])
+    c.add_argument("--depends-on", default="",
+                   help="comma-separated work order ids that must COMPLETE before this "
+                        "one is dispatched (same project only)")
+
+    ub = wo.add_parser("unblock", help="cut the dependency edges holding a work order "
+                                       "back (by default only the ones that can never "
+                                       "clear)")
+    ub.add_argument("wo_id")
+    ub.add_argument("--project")
+    ub.add_argument("--all", action="store_true", dest="drop_all",
+                    help="cut every remaining edge, including dependencies still running")
 
     l = wo.add_parser("list", help="list work orders")
     l.add_argument("project", nargs="?", help="restrict to one project")
@@ -222,6 +234,58 @@ def build_parser() -> argparse.ArgumentParser:
     ra.add_argument("wo_id")
     ra.add_argument("--project")
 
+    # feature orders -------------------------------------------------------------------
+    # Parallel to `wo` on purpose: a user who knows the work-order surface should not
+    # have to learn a second grammar to use the one above it.
+    fo = sub.add_parser(
+        "fo",
+        help="feature orders: a coarse ask the project plans into work orders itself",
+    ).add_subparsers(dest="fo_cmd", required=True)
+
+    f = fo.add_parser("create", help="file a feature order — the OS plans it into work "
+                                     "orders and dispatches them in dependency order")
+    f.add_argument("project")
+    f.add_argument("title")
+    f.add_argument("--description", "-d", default="",
+                   help="the whole ask. Required: the planner sees only this text")
+    f.add_argument("--origin", default="jarvis", choices=["jarvis", "ui", "manual"])
+    f.add_argument("--max-parallel", dest="max_parallel", type=int, metavar="N",
+                   help="run at most N of this feature's children at once. Omit for no "
+                        "cap beyond the project's own max_concurrent — which is the "
+                        "right answer unless the children contend for something the OS "
+                        "cannot see (a test database, a rate-limited API, review "
+                        "attention)")
+
+    f = fo.add_parser("list", help="feature orders and how far along they are")
+    f.add_argument("project", nargs="?")
+    f.add_argument("--all", action="store_true", help="include settled feature orders")
+
+    f = fo.add_parser("show", help="one feature order: its plan and its children")
+    f.add_argument("fo_id")
+    f.add_argument("--project")
+
+    f = fo.add_parser("plan", help="(planners) submit the plan — the planner's terminal "
+                                   "action, and what settles its work order")
+    f.add_argument("fo_id")
+    f.add_argument("--from-file", required=True, dest="from_file", metavar="PATH",
+                   help="the plan, as JSON. A file rather than an argument on purpose: "
+                        "a plan is a long string full of repo paths, which is exactly "
+                        "what trips the privileged-action classifier")
+    f.add_argument("--project")
+
+    f = fo.add_parser("approve", help="release a submitted plan (or send it back), when "
+                                      "Neo escalated the decision to you")
+    f.add_argument("fo_id")
+    f.add_argument("--reject", action="store_true")
+    f.add_argument("--feedback", default="",
+                   help="your reasoning — on --reject it reaches the planner as guidance "
+                        "and it revises in its existing session")
+    f.add_argument("--project")
+
+    f = fo.add_parser("cancel", help="stop a feature order and everything it has running")
+    f.add_argument("fo_id")
+    f.add_argument("--project")
+
     # gates (privileged-action approvals) ------------------------------------------------
     ga = sub.add_parser(
         "gate",
@@ -272,9 +336,16 @@ def build_parser() -> argparse.ArgumentParser:
     b = bl.add_parser("list")
     b.add_argument("project", nargs="?")
     b.add_argument("--all", action="store_true", help="include non-open items")
-    b = bl.add_parser("promote", help="turn a backlog item into a work order")
+    b = bl.add_parser("promote", help="turn a backlog item into a work order (or, with "
+                                      "--as feature, into a feature order the project "
+                                      "plans for itself)")
     b.add_argument("item_id")
+    b.add_argument("--as", dest="as_kind", default="work", choices=["work", "feature"],
+                   help="`work` (default) dispatches one worker; `feature` opens a "
+                        "planner that decomposes it first")
     b.add_argument("--force", action="store_true", help="ignore unfinished dependencies")
+    b.add_argument("--max-parallel", dest="max_parallel", type=int, metavar="N",
+                   help="with --as feature: cap how many of its children run at once")
     b = bl.add_parser("done", help="mark a backlog item done without a work order")
     b.add_argument("item_id")
 
@@ -396,13 +467,19 @@ def cmd_status(args: argparse.Namespace) -> int:
     if st["attention"]:
         print(f"\n⚠ NEEDS YOUR ATTENTION ({len(st['attention'])}):")
         for a in st["attention"]:
-            wo = f" {a['wo_id']}" if a["wo_id"] else ""
-            print(f"  • [{a['project']}]{wo} {a['title']} — {a['reason']}")
+            ident = a["wo_id"] or a.get("fo_id")
+            print(f"  • [{a['project']}]{' ' + ident if ident else ''} {a['title']} "
+                  f"— {a['reason']}")
             if a.get("attach"):
                 print(f"      approve it: {a['attach']}  ·  or `jarvis wo resume-auto {a['wo_id']}`")
             if a.get("decide"):
-                print(f"      {a['decide']}  ·  see it: "
-                      f"`jarvis gate show {a['approval_id']}`")
+                # A gate item carries the command to run AND the request to read; a
+                # feature order's `decide` is already the whole instruction. Keyed on
+                # `approval_id` rather than on the item's shape, because reading it off
+                # every item is what made a feature order crash this line.
+                see = (f"  ·  see it: `jarvis gate show {a['approval_id']}`"
+                       if a.get("approval_id") else "")
+                print(f"      {a['decide']}{see}")
     if st["inbox"]["unacked"]:
         print(f"\n📥 inbox: {st['inbox']['unacked']} unacked"
               f" ({st['inbox']['critical']} critical) — `jarvis inbox list`")
@@ -490,18 +567,25 @@ def cmd_adopt(args: argparse.Namespace) -> int:
 
 
 def cmd_wo(args: argparse.Namespace) -> int:
-    from . import ops
+    from . import invariants, ops
     from .project_store import OPEN_STATUSES, ProjectStore
     from .timeline import build_timeline
 
     if args.wo_cmd == "create":
+        deps = [d.strip() for d in args.depends_on.split(",") if d.strip()]
         wo = ops.create_work_order(
             args.project, args.title, description=args.description, origin=args.origin,
             model=args.model, effort=args.effort, permission_mode=args.permission_mode,
-            append_system_prompt=args.append_system_prompt,
+            append_system_prompt=args.append_system_prompt, depends_on=deps,
         )
         _print({"created": wo["id"], "project": args.project, "status": wo["status"],
-                "note": "jarvisd will dispatch it shortly"}, args.json)
+                "depends_on": deps,
+                "note": (f"jarvisd will dispatch it once {', '.join(deps)} completes"
+                         if deps else "jarvisd will dispatch it shortly")}, args.json)
+
+    elif args.wo_cmd == "unblock":
+        _print(ops.unblock_work_order(args.wo_id, drop_all=args.drop_all,
+                                      project_name=args.project), args.json)
 
     elif args.wo_cmd == "list":
         paths = ops.registered_project_paths()
@@ -519,12 +603,16 @@ def cmd_wo(args: argparse.Namespace) -> int:
                     statuses=None if args.all else OPEN_STATUSES,
                     include_hidden=args.include_hidden,
                 )
+                # Derived inside the store's lifetime: the label reads the dependencies'
+                # rows, so it cannot be computed after the connection is closed.
+                labels = {wo["id"]: invariants.status_label(store, wo) for wo in wos}
             finally:
                 store.close()
             for wo in wos:
                 out.append({"project": name, **{k: wo[k] for k in (
                     "id", "title", "status", "origin", "needs_attention",
-                    "attention_reason", "created_at", "hidden", "pr_url")}})
+                    "attention_reason", "created_at", "hidden", "pr_url")},
+                    "status_label": labels[wo["id"]]})
         # Running first, then the PRs waiting to be merged, then everything else as it
         # came (newest first, per project). `sorted` is stable, so the second key is
         # only a tie-break within a group.
@@ -540,7 +628,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 pr = f"\n    → merge {wo['pr_url']}" if wo["status"] == "waiting_pr_merge" \
                      and wo["pr_url"] else ""
                 print(f"{icon} {wo['id']} [{wo['project']}] [{badge}] "
-                      f"{wo['title']} ({wo['status']}, {_age(wo['created_at'])}){att}{hid}{pr}")
+                      f"{wo['title']} ({wo['status_label']}, "
+                      f"{_age(wo['created_at'])}){att}{hid}{pr}")
             if not out:
                 print("no work orders")
 
@@ -551,8 +640,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
             messages = store.list_messages(args.wo_id)
             detail = {
                 "project": name, **wo,
+                "status_label": invariants.status_label(store, wo),
+                "blocked_by": store.unfinished_dependencies(args.wo_id),
                 "timeline": build_timeline(wo, store.list_events(args.wo_id),
-                                           messages, include_debug=args.debug),
+                                           messages, include_debug=args.debug,
+                                           questions=ops.neo_question_texts(args.wo_id)),
                 "messages": messages,
                 "assumptions": store.pending_assumptions(args.wo_id),
                 # What this work order was allowed (or refused) permission to ship.
@@ -602,6 +694,84 @@ def cmd_wo(args: argparse.Namespace) -> int:
                                   title=args.title), args.json)
     elif args.wo_cmd == "resume-auto":
         _print(ops.resume_in_auto(args.wo_id, project_name=args.project), args.json)
+    return 0
+
+
+FO_ICON = {"pending": "⏳", "planning": "🧭", "plan_review": "👀", "executing": "🟢",
+           "completed": "✅", "failed": "❌", "cancelled": "🚫"}
+
+
+def cmd_fo(args: argparse.Namespace) -> int:
+    import json as _json
+
+    from . import ops
+
+    if args.fo_cmd == "create":
+        fo = ops.create_feature_order(args.project, args.title,
+                                      description=args.description, origin=args.origin,
+                                      max_parallel=args.max_parallel)
+        _print({"created": fo["id"], "project": args.project, "status": fo["status"],
+                **({"max_parallel": fo["max_parallel"]} if fo["max_parallel"] else {}),
+                "note": "jarvisd will open a planner for it shortly; the plan comes "
+                        "back for review before any work order is created"}, args.json)
+
+    elif args.fo_cmd == "list":
+        rows = ops.list_feature_orders(args.project, include_settled=args.all)
+        if args.json:
+            _print(rows, True)
+        elif not rows:
+            print("no feature orders")
+        else:
+            for fo in rows:
+                icon = FO_ICON.get(fo["status"], "•")
+                att = " ⚠" if fo["needs_attention"] else ""
+                print(f"{icon} {fo['id']} [{fo['project']}] {fo['title']} "
+                      f"({fo['status']}, {fo['progress']['label']}, "
+                      f"{_age(fo['created_at'])}){att}")
+
+    elif args.fo_cmd == "show":
+        detail = ops.show_feature_order(args.fo_id, args.project)
+        if args.json:
+            _print(detail, True)
+        else:
+            print(f"{FO_ICON.get(detail['status'], '•')} {detail['id']} "
+                  f"[{detail['project']}] {detail['title']} ({detail['status']})")
+            print(f"\n{detail['description']}\n")
+            if detail["attention_reason"]:
+                print(f"⚠ {detail['attention_reason']}\n")
+            if detail["planner"]:
+                p = detail["planner"]
+                print(f"planner: {p['id']} ({p['status']})")
+            if detail["plan_text"]:
+                print(f"\nplan:\n{detail['plan_text']}")
+            if detail["max_parallel"]:
+                print(f"slots: at most {detail['max_parallel']} children at once "
+                      f"({detail['active_children']} running now)")
+            if detail["children"]:
+                print(f"\nchildren ({detail['progress']['label']}):")
+                for c in detail["children"]:
+                    icon = STATUS_ICON.get(c["status"], "•")
+                    att = " ⚠" if c["needs_attention"] else ""
+                    print(f"  {icon} {c['id']} {c['title']} "
+                          f"({c['status_label']}){att}")
+
+    elif args.fo_cmd == "plan":
+        path = Path(args.from_file)
+        if not path.is_file():
+            raise ops.OpsError(f"no such plan file: {path}")
+        try:
+            doc = _json.loads(path.read_text())
+        except _json.JSONDecodeError as e:
+            raise ops.OpsError(f"{path} is not valid JSON: {e}") from e
+        _print(ops.submit_plan(args.fo_id, doc, project_name=args.project), args.json)
+
+    elif args.fo_cmd == "approve":
+        _print(ops.review_plan(args.fo_id, accept=not args.reject,
+                               feedback=args.feedback, decided_by="user",
+                               project_name=args.project), args.json)
+
+    elif args.fo_cmd == "cancel":
+        _print(ops.cancel_feature_order(args.fo_id, args.project), args.json)
     return 0
 
 
@@ -696,7 +866,9 @@ def cmd_backlog(args: argparse.Namespace) -> int:
                 if not items:
                     print("backlog empty")
         elif args.bl_cmd == "promote":
-            _print(ops.promote_backlog(args.item_id, force=args.force), args.json)
+            _print(ops.promote_backlog(args.item_id, force=args.force,
+                                       as_feature=args.as_kind == "feature",
+                                       max_parallel=args.max_parallel), args.json)
         elif args.bl_cmd == "done":
             central.mark_backlog(args.item_id, "done")
             _print({"item": args.item_id, "status": "done"}, args.json)
@@ -901,6 +1073,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_adopt(args)
         if args.cmd == "wo":
             return cmd_wo(args)
+        if args.cmd == "fo":
+            return cmd_fo(args)
         if args.cmd == "gate":
             return cmd_gate(args)
         if args.cmd == "backlog":
