@@ -304,6 +304,35 @@ def test_learnings_shape_future_answers(asked, fake_claude):
     assert "# Learnings" in system_after
 
 
+def test_a_seat_scoped_learning_does_not_move_neos_cached_prefix(jarvis_home):
+    """A learning routed to one panel seat must be invisible to the single-agent path.
+
+    The panel ships disabled, so the default-configured OS must behave byte-identically
+    to today — and `build_system_prompt` calls `store.learnings(project)` with no seat.
+    A seat-scoped learning leaking into that query would rewrite the cached prompt
+    prefix every time someone taught a seat something, for no behavioural gain.
+
+    The second half is what stops the first from passing vacuously: a filter that
+    returned nothing at all would satisfy "the prompt did not move" perfectly.
+    """
+    store = NeoStore()
+    try:
+        store.add_learning("Always default to CSV", project="proj_a")
+        before = neo_mod.build_system_prompt(store, "proj_a")
+
+        store.add_learning("A grep naming shipit ships nothing",
+                           project="proj_a", seat="blast")
+        assert neo_mod.build_system_prompt(store, "proj_a") == before
+
+        store.add_learning("Never bundle two decisions in one PR", project="proj_a")
+        after = neo_mod.build_system_prompt(store, "proj_a")
+        assert after != before
+        assert after.startswith(before)          # append-only: the prefix still holds
+        assert "A grep naming shipit" not in after
+    finally:
+        store.close()
+
+
 def test_neo_disabled_via_catalog(jarvis_home, fake_claude, tmp_path, project, claude_json):
     data = {
         "os": {"neo": {"enabled": False}},
