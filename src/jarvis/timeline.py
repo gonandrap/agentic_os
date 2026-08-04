@@ -118,7 +118,10 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any],
     if kind == "learning_captured":
         return "Learning captured", p.get("topic") or ""
     if kind == "gate_requested":
-        return (f"Asked permission to {p.get('kind') or 'act'}",
+        # The seat, when a subagent tripped the gate. `add_approval` only writes the key
+        # when there is one, so the unqualified line is still what a plain worker gets.
+        who = f" (seat `{p['agent_type']}`)" if p.get("agent_type") else ""
+        return (f"Asked permission to {p.get('kind') or 'act'}{who}",
                 p.get("command") or "")
     if kind == "gate_decided":
         verb = "Approved" if p.get("decision") == "approved" else "Denied"

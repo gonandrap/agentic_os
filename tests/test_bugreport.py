@@ -335,24 +335,24 @@ SKILL = "report-jarvis-bug"
 def test_installing_agent_skills_lays_them_out_where_add_dir_finds_them(project):
     """`--add-dir X` loads skills from X/.claude/skills/ (verified against the CLI),
     which is the only injection point that reaches a worker in a fresh worktree."""
-    from jarvis.bootstrap import install_agent_skills
-    root = install_agent_skills(project)
+    from jarvis.bootstrap import install_agent_assets
+    root = install_agent_assets(project)[0]
     assert (root / ".claude" / "skills" / SKILL / "SKILL.md").is_file()
 
 
 def test_installing_agent_skills_is_idempotent_and_self_healing(project):
-    from jarvis.bootstrap import install_agent_skills
-    root = install_agent_skills(project)
+    from jarvis.bootstrap import install_agent_assets
+    root = install_agent_assets(project)[0]
     skill = root / ".claude" / "skills" / SKILL / "SKILL.md"
     skill.write_text("locally mangled")
-    install_agent_skills(project)
+    install_agent_assets(project)
     assert skill.read_text() != "locally mangled"
 
 
 def test_agent_skills_live_under_the_gitignored_state_dir(project):
     """They are generated, not authored — they must never show up in `git status`."""
-    from jarvis.bootstrap import install_agent_skills
-    root = install_agent_skills(project)
+    from jarvis.bootstrap import install_agent_assets
+    root = install_agent_assets(project)[0]
     assert ".jarvis" in root.relative_to(project).parts
 
 

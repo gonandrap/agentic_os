@@ -63,6 +63,13 @@ UNGOVERNED_ORIGINS = ("adhoc", "injected")
 # back up into a second table on every dispatch.
 WO_KINDS = ("worker", "planner")
 
+# A work order occupying a slot: dispatched, running, or waiting on something. One
+# constant rather than a literal at each site, because the two readers must agree — the
+# project-wide cap (`count_active`, spent by `Daemon.dispatch_pending`) and the
+# per-feature cap (`claim_next_pending`, spent by `feature_orders.max_parallel`) would
+# otherwise be free to mean different things by "active".
+ACTIVE_STATUSES = ("dispatching", "running", "waiting_input")
+
 # Feature order lifecycle. Deliberately NOT a copy of WO_STATUSES: a feature order never
 # runs a session of its own, so most of a work order's states are meaningless for it.
 FO_STATUSES = (
@@ -287,6 +294,18 @@ ADDED_COLUMNS = {
         # `worker` or `planner` — see WO_KINDS.
         "kind": "TEXT NOT NULL DEFAULT 'worker'",
     },
+    "approvals": {
+        # Which SEAT attempted the command, when a subagent did. NULL means the session's
+        # lead ran it directly, which is every gate a plain worker ever trips.
+        #
+        # Needed because `JARVIS_WO_ID` is per-session, not per-agent: a gate a subagent
+        # trips files its request against the work order that owns the turn. That is the
+        # right owner — the lead is answerable for what its team did — but without this
+        # column the audit trail would say the planner attempted what its architect did.
+        # `PreToolUse` carries `agent_type` for a subagent's call and omits the key
+        # entirely for the lead's, so the payload can always tell the two apart.
+        "agent_type": "TEXT",
+    },
 }
 
 # A dependency is satisfied only when it reaches `completed` — the strict rule of the
@@ -478,13 +497,26 @@ class ProjectStore:
     def claim_next_pending(self) -> dict[str, Any] | None:
         """Atomically claim the oldest claimable pending order (pending -> dispatching).
 
-        A work order whose dependencies have not all completed is passed over and stays
-        `pending`: it is not claimable, but nothing about it has changed, so nothing is
-        written. For the overwhelming majority of work orders — no dependencies at all —
-        the subquery is vacuously true and this is the query it always was.
+        Two things can make a pending work order unclaimable, and neither writes anything
+        when it fires: the order is passed over and stays `pending`, because nothing about
+        it has changed.
+
+        1. **A dependency has not completed** (Phase 1). Note that this does not hold up
+           the queue behind it — the filter is in the row selection, so a younger
+           unblocked order is claimed while an older blocked one waits.
+        2. **Its feature order is already running `max_parallel` children** (Phase 3).
+           A per-feature slot cap, spent alongside the project-wide `max_concurrent`
+           rather than instead of it: whichever is tighter binds. It applies only to a
+           feature's `worker` children — the planner is the feature order deciding what
+           its children are, not one of them, so capping it against its own children
+           would be capping a feature against itself.
+
+        For the overwhelming majority of work orders — no dependencies, no parent — both
+        subqueries are vacuously true and this is the query it always was.
         """
+        marks = ",".join("?" for _ in ACTIVE_STATUSES)
         cur = self.conn.execute(
-            """UPDATE work_orders SET status='dispatching', updated_at=?
+            f"""UPDATE work_orders SET status='dispatching', updated_at=?
                WHERE id = (SELECT w.id FROM work_orders w
                            WHERE w.status='pending' AND w.hidden=0
                              AND NOT EXISTS (
@@ -494,16 +526,42 @@ class ProjectStore:
                                      WHERE d.id = dep.value AND d.status = ?
                                  )
                              )
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM feature_orders f
+                                 WHERE f.id = w.parent_id AND w.kind = 'worker'
+                                   AND f.max_parallel IS NOT NULL
+                                   AND f.max_parallel <= (
+                                       SELECT COUNT(*) FROM work_orders s
+                                       WHERE s.parent_id = f.id AND s.kind = 'worker'
+                                         AND s.status IN ({marks})
+                                   )
+                             )
                            ORDER BY w.created_at LIMIT 1)
                RETURNING *"""
-            , (db.now(), DEPENDENCY_SATISFIED_STATUS),
+            , (db.now(), DEPENDENCY_SATISFIED_STATUS, *ACTIVE_STATUSES),
         )
         row = cur.fetchone()
         return dict(row) if row else None
 
     def count_active(self) -> int:
+        marks = ",".join("?" for _ in ACTIVE_STATUSES)
         row = self.conn.execute(
-            "SELECT COUNT(*) c FROM work_orders WHERE status IN ('dispatching','running','waiting_input')"
+            f"SELECT COUNT(*) c FROM work_orders WHERE status IN ({marks})",
+            ACTIVE_STATUSES,
+        ).fetchone()
+        return row["c"]
+
+    def count_active_children(self, fo_id: str) -> int:
+        """How many of this feature order's children are occupying a slot right now.
+
+        The number `max_parallel` is compared against, exposed so a listing can say why a
+        child is waiting without re-deriving the claim query's arithmetic differently.
+        """
+        marks = ",".join("?" for _ in ACTIVE_STATUSES)
+        row = self.conn.execute(
+            f"""SELECT COUNT(*) c FROM work_orders
+                WHERE parent_id=? AND kind='worker' AND status IN ({marks})""",
+            (fo_id, *ACTIVE_STATUSES),
         ).fetchone()
         return row["c"]
 
@@ -596,16 +654,18 @@ class ProjectStore:
     def create_feature_order(self, title: str, description: str = "",
                              origin: str = "jarvis", backlog_id: str | None = None,
                              metadata: dict[str, Any] | None = None,
-                             fo_id: str | None = None) -> dict[str, Any]:
+                             fo_id: str | None = None,
+                             max_parallel: int | None = None) -> dict[str, Any]:
         assert origin in WO_ORIGINS, origin
+        assert max_parallel is None or max_parallel >= 1, max_parallel
         fo_id = fo_id or db.new_id("fo")
         ts = db.now()
         self.conn.execute(
             """INSERT INTO feature_orders (id, title, description, status, origin,
-                   created_at, updated_at, backlog_id, metadata)
-               VALUES (?,?,?,'pending',?,?,?,?,?)""",
+                   created_at, updated_at, backlog_id, metadata, max_parallel)
+               VALUES (?,?,?,'pending',?,?,?,?,?,?)""",
             (fo_id, title, description, origin, ts, ts, backlog_id,
-             db.to_json(metadata or {})),
+             db.to_json(metadata or {}), max_parallel),
         )
         return self.get_feature_order(fo_id)
 
@@ -623,6 +683,19 @@ class ProjectStore:
         rows = self.conn.execute(
             f"SELECT * FROM feature_orders{where} ORDER BY created_at DESC LIMIT ?",
             (*(statuses or ()), limit),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def flagged_feature_orders(self) -> list[dict[str, Any]]:
+        """Every feature order asking for the user, whatever its status.
+
+        Deliberately not filtered by `FO_OPEN_STATUSES`: `failed` is a SETTLED status and
+        it is also the one a feature order raises its flag in — `settle_features` marks
+        both in the same call. Listing only the open ones would drop the flag on the floor
+        at the exact moment it means the most.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM feature_orders WHERE needs_attention=1 ORDER BY created_at DESC"
         ).fetchall()
         return db.rows_to_dicts(rows)
 
@@ -908,16 +981,21 @@ class ProjectStore:
 
     def add_approval(self, wo_id: str, kind: str, command: str, matched: str = "",
                      justification: str = "", evidence: str = "",
-                     max_uses: int = 3) -> dict[str, Any]:
+                     max_uses: int = 3,
+                     agent_type: str | None = None) -> dict[str, Any]:
         cur = self.conn.execute(
             """INSERT INTO approvals (wo_id, ts, kind, command, matched, justification,
-                                      evidence, max_uses)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (wo_id, db.now(), kind, command, matched, justification, evidence, max_uses),
+                                      evidence, max_uses, agent_type)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (wo_id, db.now(), kind, command, matched, justification, evidence, max_uses,
+             agent_type),
         )
         approval_id = int(cur.lastrowid)  # type: ignore[arg-type]
         self.add_event(wo_id, "gate_requested", {
             "approval_id": approval_id, "kind": kind, "command": command,
+            # In the payload as well as the column: the timeline is read on its own, and
+            # "the planner ran this" is exactly the wrong thing for it to imply.
+            **({"agent_type": agent_type} if agent_type else {}),
         })
         return self.get_approval(approval_id)  # type: ignore[return-value]
 

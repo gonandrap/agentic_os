@@ -5,9 +5,9 @@ typing six `jarvis wo create` calls. Design:
 `docs/superpowers/specs/2026-08-02-feature-orders-design.md`. Work-order machinery it
 sits on: `mem:work-order-lifecycle`.
 
-**Phases 0, 1 and 2 have shipped. Phase 3 (the seats, the attention rollup,
-`max_parallel`) and Phase 4 (branch stacking) have not.** Both are in the backlog with
-their findings attached — read those items before designing either.
+**Phases 0, 1, 2 and 3 have shipped. Phase 4 (branch stacking) has not** — it is in the
+backlog (`bl-e3a88979`) with the verified stacking invocation attached; read it before
+designing anything there.
 
 ## The loop
 
@@ -129,16 +129,94 @@ answers "what does this WORK ORDER need from me"), so INV-ATTENTION-REASON canno
 relabel these reasons. If a feature-order invariant is ever added it inherits the
 obligation: whatever derives the flag must be able to produce those strings.
 
-## The planner's posture — prose, and why not enforcement
+## The team (Phase 3) — two seats, and the posture that makes them safe
 
-The planner keeps ORDINARY worker permissions (pinned by
-`test_a_planner_runs_on_ordinary_worker_permissions`). It is a work order, not a
-subagent, so it has no CLI-enforced `tools:` frontmatter; the only Jarvis-side lever is a
-settings `permissions.deny`, and a deny broad enough to stop product code also stops the
-two things a planner MUST do — write the `plan.json` it submits, and produce a design
-document whose PR the design makes the base of the children's stack (decision 2). So
-"you plan, you do not build" lives in `dispatch._planner_prompt` prose. The hard posture
-is a backlog item for Phase 3, where the seats can express it declaratively.
+`src/jarvis/assets/agents/jarvis-architect.md` and `jarvis-test-lead.md`, in Claude Code's
+agent-definition markdown. `bootstrap.install_agent_assets(path, kind)` — renamed from
+`install_agent_skills` — materialises them into `.jarvis/agent-seats/.claude/agents/` and
+returns the `--add-dir` roots for that kind; `worker_session.briefing_for` passes
+`wo["kind"]`, which is the whole of how "seats reach planners only" (decision 4) is
+enforced. `dispatch._planner_prompt` names both seats and when to consult them: two
+definitions nothing ever invokes are two files on disk.
+
+**TWO ROOTS, not one, and it is not tidiness.** Skills stay at `.jarvis/agent-skills/`
+for every worker; the seats get their own sibling root. A single root would force the
+worker path to DELETE `agents/` to keep owning its whole generated tree — and that delete
+lands while a concurrently dispatched planner is reading it.
+
+**`tools: Read, Grep, Glob` — and deliberately no `Bash`** (ruled 2026-08-03). The design
+says only "all edit tools withheld", but withholding `Write` while granting a shell is not
+a prohibition: `cat > f <<EOF` writes the file just as well. The `tools:` key is enforced
+by the CLI, not advisory (probe: a `Read, Glob` seat reported CANNOT-WRITE *and left no
+file on disk*, against a control differing only in that key), which is why layer 1 is the
+one that counts. `test_feature_order_team.py` asserts against the shipped frontmatter, not
+a Python constant — the file the CLI reads IS the enforcement.
+
+**The planner itself keeps ORDINARY worker permissions**, unchanged in Phase 3 and pinned
+by `test_a_planner_runs_on_ordinary_worker_permissions`. It is a work order, not a
+subagent, so it has no `tools:` frontmatter; the only Jarvis-side lever is a settings
+`permissions.deny`, and a deny broad enough to stop product code also stops the two things
+a planner MUST do — write the `plan.json` it submits, and produce a design document whose
+PR the design makes the base of the children's stack (decision 2). Phase 3 considered
+narrowing it to the project's source directories and did not: "source directory" is not a
+concept the catalog has, so it would mean guessing `src/`-shaped paths per project and
+breaking exactly the design-document case. So "you plan, you do not build" stays prose in
+`_planner_prompt`, and the enforced posture lives on the seats.
+
+**The seats navigate by SYMBOL INDEX, not by grep**, and three live probes decide how
+that is wired. (1) `tools:` excludes MCP tools by default — a seat declared
+`Read, Grep, Glob` reported SERENA-UNAVAILABLE, so the Serena names are listed explicitly.
+(2) **Availability is not permission**: a seat holding `activate_project` in `tools:` but
+not in `permissions.allow` had the call BLOCKED and gave up, so
+`dispatch.serena_allow_rules()` writes an allow rule for every read-only Serena tool into
+the worker settings. (3) An unknown tool name in `tools:` is inert, so BOTH
+`mcp__serena__` and `mcp__plugin_serena_serena__` are always listed — Jarvis configures no
+MCP server itself and cannot know which install it is on. **Never grant Serena
+wholesale**: it ships `execute_shell_command`, `create_text_file` and
+`replace_symbol_body`, which would hand a shell to the seats that were deliberately denied
+one. The same ranking is in `build_worker_prompt` and `OPERATION.md` (v8) for the whole
+fleet, stated conditionally. Graded by `evals/llm/test_navigation_judgment.py`, which
+watches TOOL CALLS via a `PreToolUse` recorder and attributes them by `agent_type`.
+
+**`agent_type` on `approvals`** (Phase 3, layer 2). `JARVIS_WO_ID` is per-session, so a
+gate a SEAT trips files against the work order that owns the turn — correct ownership, but
+without the column the record says the planner attempted what the architect did.
+`PreToolUse` carries `agent_type` for a subagent's call and omits the key entirely for the
+lead's, so absence is the discriminator. Built even though no seat can currently reach a
+gate (they have no `Bash`): the day anyone grants one, the trail is already right.
+
+## `max_parallel` — the user's knob, not the planner's
+
+`jarvis fo create --max-parallel N` (also on `backlog promote --as feature`), NULL meaning
+uncapped. Enforced by a second `NOT EXISTS` in `ProjectStore.claim_next_pending`, spent
+ALONGSIDE the project's `max_concurrent` rather than instead of it — whichever is tighter
+binds. Vacuously true for `parent_id IS NULL`, so the ordinary path is the query it always
+was. Design section 4 calls slot budgeting the planner's job; that was reversed
+(2026-08-03) because a planner that budgets its own slots can hand itself the whole
+project's concurrency, and it would be one more thing `plans.parse_plan` has to police.
+
+The PLANNER is exempt from its own feature's cap (`w.kind = 'worker'` inside the clause):
+capping the session that decides what the children are against those children is capping a
+feature against itself. A held child says so through `invariants.status_label` — the single
+funnel every surface renders through — as `pending — waiting for a slot in fo-… (2/2
+children running)`, ranked BELOW the dependency label, because a child waiting on a
+sibling's merge will not start when a slot frees. It raises no attention: a slot always
+frees, so this is the system working.
+
+## The attention rollup
+
+`os_status` groups flagged work orders by `parent_id`; a feature order contributes ONE
+line (`1/3 done — 2 of its work orders need you: …`) and its children's lines are
+suppressed. Presentation only — `true_blockers` stays the single source of truth, nothing
+is cleared, and `jarvis wo list` still shows every flagged child. The link goes to the
+feature page, which is what makes collapsing safe.
+
+**Two Phase 2 bugs this uncovered, both fixed here.** `os_status` scanned only
+`FO_OPEN_STATUSES` for feature attention — but `failed` is a SETTLED status and is also
+the only one a feature order raises its own flag in, so the flag was derived and never
+shown (`store.flagged_feature_orders()` now backstops it). And `jarvis status` read
+`approval_id` off every attention item carrying a `decide` key, which a feature order does
+not have, so the line raised `KeyError` outright.
 
 ## Surfaces
 

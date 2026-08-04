@@ -24,6 +24,37 @@ def _worker_path() -> str:
     return path
 
 
+# Serena's READ-ONLY tool surface. Naming a tool in an agent's `tools:` key makes it
+# available; it does not make it runnable — permission is a separate gate, and a headless
+# turn cannot answer a prompt. Probed live 2026-08-03: a seat holding
+# `mcp__…__activate_project` in `tools:` but not in `permissions.allow` had the call
+# BLOCKED and reported it could not proceed; with these rules added, the same seat ran
+# activate_project -> find_symbol -> find_referencing_symbols and answered correctly with
+# no text search at all. So this list is what turns "Serena first" from prose into
+# something a worker can actually do.
+#
+# Enumerated rather than granted wholesale, for the same reason the planning seats
+# enumerate: Serena also ships `execute_shell_command`, `create_text_file` and
+# `replace_symbol_body`. Allowing the server as a unit would hand every worker — and every
+# seat that is deliberately denied a shell — a shell, through a side door.
+SERENA_READ_TOOLS = (
+    "activate_project", "get_symbols_overview", "find_symbol",
+    "find_referencing_symbols", "find_declaration", "find_implementations",
+    "search_for_pattern", "find_file", "list_dir", "list_memories", "read_memory",
+)
+
+# A plugin install produces the long prefix, `claude mcp add serena` the short one. Jarvis
+# configures no MCP server itself, so it cannot know which; both are listed, and a rule
+# naming a tool that does not exist on this install is simply inert.
+SERENA_TOOL_PREFIXES = ("mcp__serena__", "mcp__plugin_serena_serena__")
+
+
+def serena_allow_rules() -> list[str]:
+    """`permissions.allow` entries for every read-only Serena tool, under both prefixes."""
+    return [f"{prefix}{tool}"
+            for prefix in SERENA_TOOL_PREFIXES for tool in SERENA_READ_TOOLS]
+
+
 def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     """Merge the project's injected settings with per-work-order env and persist
     them for --settings.
@@ -55,6 +86,11 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         f"Write(//{wt_abs}/**)",
         f"NotebookEdit(//{wt_abs}/**)",
         f"Read(//{proj_abs}/**)",
+        # Read-only code navigation. Without these the symbol tools are visible and
+        # unrunnable, which is worse than absent: the worker is told to prefer Serena,
+        # tries, gets blocked, and either stalls asking for permission it cannot be
+        # granted headlessly or falls back to grep having wasted a call.
+        *serena_allow_rules(),
     ):
         if rule not in allow:
             allow.append(rule)
@@ -180,9 +216,54 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
     return "\n".join(_common_briefing(parts, wo, project, knowledge))
 
 
+def _navigation_briefing() -> list[str]:
+    """Serena before grep, for every session Jarvis dispatches.
+
+    This is prose rather than a capability restriction, and it has to be: a worker needs
+    `Grep` and `Bash` to do its actual job, so the seats' trick of simply not granting
+    the tool is not available here. What IS available is saying which tool answers the
+    question — and the two do not answer the same question. `find_referencing_symbols`
+    has no grep equivalent at all.
+
+    It is stated conditionally because Jarvis knows nothing about Serena: there is no
+    `mcpServers` key in `settings.base.json` and no mention of it anywhere in `src/`, so
+    whether a worker has it depends entirely on the user's own Claude configuration and
+    on whether the project has been indexed. An instruction that assumed it would be a
+    lie in most adopted projects; one that ranks it when present costs nothing when it is
+    absent.
+    """
+    return [
+        "# Navigating the code: Serena first, grep second",
+        "If this project has Serena (its symbol tools appear in your tool list, or "
+        "`.serena/project.yml` is in the repo), use it to find code and do NOT grep for "
+        "symbols. Serena has a language-server symbol index, so `find_symbol`, "
+        "`get_symbols_overview` and especially `find_referencing_symbols` answer where "
+        "something is defined and who calls it as facts, in one call. Grep answers a "
+        "different question — where a string appears — and you then have to rebuild the "
+        "answer from hits that miss every caller spelling the name differently.",
+        "",
+        "- `list_memories` / `read_memory` FIRST on a mapped project: its architecture is "
+        "already written down, and rediscovering it is the most expensive thing you can "
+        "do with your context.",
+        "- `find_symbol` instead of `grep -rn \"def foo\"`; "
+        "`find_referencing_symbols` instead of grepping for call sites — that one has no "
+        "grep equivalent; `get_symbols_overview` before opening a file whole.",
+        "- `search_for_pattern` (Serena's own) or `Grep` for GENUINE text questions: a "
+        "config key, an error string, a TODO. Text search is not wrong, it is just the "
+        "wrong tool for finding code.",
+        "- If the symbol tools say no project is active, `activate_project` on the repo "
+        "root first.",
+        "",
+        "If the project has no Serena, `Glob` and `Grep` are the fallback and there is "
+        "nothing to apologise for — just expect to work harder for a less complete "
+        "picture.",
+    ]
+
+
 def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
                      knowledge: list[dict[str, Any]]) -> list[str]:
     """The tail every briefing carries, whatever the work order's kind."""
+    parts += ["", *_navigation_briefing()]
     pre_approved = _pre_approval(wo)
     if pre_approved:
         parts += ["", *_pre_approved_briefing(pre_approved)]
@@ -201,7 +282,7 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
                     knowledge: list[dict[str, Any]]) -> str:
     """The briefing for a feature order's planner.
 
-    Three things make it different from a worker's, and each is load-bearing:
+    Four things make it different from a worker's, and each is load-bearing:
 
     * **Its output is a graph, not a change.** So its terminal action is structured —
       `jarvis fo plan --from-file` against a JSON document — rather than prose. The
@@ -216,17 +297,30 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
     * **It plans; it does not build.** A planner that returns the finished solution has
       failed at the job even if the solution is good, because the point of the feature
       order is a decomposition the fleet can execute in parallel.
+    * **It leads a team.** Two seats — `jarvis-architect` and `jarvis-test-lead` — reach
+      it as subagent types over the extra `--add-dir` that `briefing_for` gives a
+      planner and no one else. A briefing that did not name them would leave two
+      definitions sitting on disk that nothing ever invokes, so this section is what
+      makes the seats real.
 
-    That last one is carried HERE, in prose, and not by a permission rule — which is a
-    weaker guarantee and worth stating plainly rather than leaving for someone to
-    discover. The planner is a work order, not a subagent, so it has no `tools:`
-    frontmatter (the CLI-enforced layer); its only available restriction is the
+    The third one is carried HERE, in prose, and not by a permission rule on the planner
+    itself — which is a weaker guarantee and worth stating plainly rather than leaving
+    for someone to discover. The planner is a work order, not a subagent, so it has no
+    `tools:` frontmatter (the CLI-enforced layer); its only available restriction is the
     `permissions.deny` path `_write_worker_settings` writes, and a deny broad enough to
     stop product code also stops the two things a planner is REQUIRED to do — write the
     `plan.json` it submits, and produce a design document, whose pull request the design
-    makes the base of the children's stack. So the planner runs on ordinary worker
-    permissions in this phase, deliberately. The hard posture arrives with the seats,
-    which can express it declaratively; see the Phase 3 backlog item.
+    makes the base of the children's stack. Phase 3 revisited this and left it alone. The
+    alternative its backlog item floated was denying edits under the project's source
+    directories while leaving the worktree root writable — but "source directory" is not a
+    concept the catalog has, so it would mean guessing `src/`-shaped paths per project,
+    and breaking any planner whose design document lives under one is exactly the case
+    decision 2 depends on.
+
+    The SEATS are where the posture is enforced instead, and there it is real: each is
+    declared `tools: Read, Grep, Glob`, which the CLI enforces rather than advises. No
+    `Bash` either — withholding `Write` while granting a shell is not a prohibition,
+    because a heredoc writes a file just as well (ruled 2026-08-03).
     """
     from .plans import CHILD_CAP, MIN_DESCRIPTION_CHARS
 
@@ -249,6 +343,31 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "failed, however good the solution is: the feature order exists to produce work "
         "the fleet can execute in parallel, and a finished branch is not that. Writing "
         "code to UNDERSTAND the problem is fine and expected; shipping it is not the job.",
+        "",
+        "# Your team",
+        "You are the lead of a planning team, not a lone session. Two seats are "
+        "available to you as subagent types through the Task tool, and they exist "
+        "because a decomposition and its acceptance criteria are different jobs that go "
+        "wrong in different ways:",
+        "",
+        "- **`jarvis-architect`** — which pieces are separable, what the interface "
+        "between them is, what must land first, and what should NOT be split. Consult it "
+        "BEFORE you write the plan, and again whenever a child looks too big for one "
+        "session.",
+        "- **`jarvis-test-lead`** — what \"done\" means for each child and how its worker "
+        "proves it, written to stand alone in a brief read cold. Consult it AFTER the "
+        "decomposition is settled and before you submit.",
+        "",
+        "Both seats can read the codebase and neither can write to it: they have `Read`, "
+        "`Grep` and `Glob` and nothing else, enforced by the CLI rather than by "
+        "instruction. So they cannot do the work by accident, and they cannot run a "
+        "command for you — anything that needs a shell is yours to run.",
+        "",
+        "Consulting them is expected, not optional politeness, and they are the reason "
+        "this is a feature order rather than a work order. But you hold the plan: they "
+        "advise in prose, you decide what the children are, and you own the submission. "
+        "Where the architect and the test lead disagree with each other or with you, say "
+        "so in your final answer rather than quietly picking one.",
         "",
         "# The plan",
         f"Write it to a JSON file in your worktree and submit it with:",

@@ -186,9 +186,40 @@ def status_label(store: ProjectStore, wo: dict[str, Any]) -> str:
     if wo["status"] != "pending":
         return wo["status"]
     blockers = store.unfinished_dependencies(wo["id"])
-    if not blockers:
-        return "pending"
-    return f"pending — blocked by {', '.join(dep['id'] for dep in blockers)}"
+    if blockers:
+        return f"pending — blocked by {', '.join(dep['id'] for dep in blockers)}"
+    # Ranked below the dependency label deliberately: a work order waiting on a sibling's
+    # merge is not going to start when a slot frees, so naming the slot would be the less
+    # true of the two answers. Neither raises attention — a slot always frees, so this is
+    # the system working, not a decision anyone owes (the same rule that keeps a merely
+    # unfinished dependency silent).
+    cap = _slot_cap(store, wo)
+    if cap:
+        parent, limit, active = cap
+        return (f"pending — waiting for a slot in {parent} "
+                f"({active}/{limit} children running)")
+    return "pending"
+
+
+def _slot_cap(store: ProjectStore, wo: dict[str, Any]) -> tuple[str, int, int] | None:
+    """`(feature id, max_parallel, active children)` when this work order's feature order
+    is already running as many children as it allows, else None.
+
+    A parentless work order — nearly all of them — is answered from the row it was handed
+    and costs no query, the same shape `ops.blocked_by` uses for `depends_on`.
+    """
+    parent = wo.get("parent_id")
+    if not parent or wo.get("kind") != "worker":
+        return None
+    try:
+        fo = store.get_feature_order(parent)
+    except KeyError:
+        return None
+    limit = fo.get("max_parallel")
+    if not limit:
+        return None
+    active = store.count_active_children(parent)
+    return (parent, int(limit), active) if active >= limit else None
 
 
 def _mentions_assumptions(reason: str | None) -> bool:

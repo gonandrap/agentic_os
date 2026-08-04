@@ -150,8 +150,8 @@ def test_inject_skill_heals_local_edits_but_spares_the_user_s_own(project):
 def test_inject_skill_is_not_handed_to_workers(project):
     """A worker session is already a work order; self-injection would file a second
     record against the same session id."""
-    from jarvis.bootstrap import install_agent_skills
-    root = install_agent_skills(project)
+    from jarvis.bootstrap import install_agent_assets
+    root = install_agent_assets(project)[0]
     names = {p.name for p in (root / ".claude" / "skills").iterdir()}
     assert "report-jarvis-bug" in names
     assert "jarvis-inject-session" not in names
