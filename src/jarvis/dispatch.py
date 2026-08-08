@@ -123,6 +123,48 @@ def worker_name(wo: dict[str, Any]) -> str:
     return f"[WO {wo['id']}] {wo['title'][:60]}"
 
 
+def _read_knowledge_bullet(brief: KnowledgeBrief | None, project_name: str) -> list[str]:
+    """The contract's READ half — omitted entirely when there is no index.
+
+    Both knowledge bullets are conditional for the same reason: telling a worker to
+    consult an index that is not in its prompt is worse than saying nothing. It made a
+    subject in `evals/llm/test_worker_judgment.py` (which briefs with an empty base)
+    answer a branch-naming call with `jarvis learn search "branch name"` — going to look
+    something up in a knowledge base that did not exist, instead of recording the call.
+    """
+    if not brief:
+        return []
+    return [
+        f"- READ the OS knowledge base on demand — it is INDEXED at the end of this "
+        f"prompt, not pasted into it: `jarvis learn show <id>` for an entry the index "
+        f"lists, `jarvis learn search \"<term>\" --project {project_name}` to sweep "
+        f"for one. Look up any area you are about to touch BEFORE you touch it, and "
+        f"before you ask or assume about it — a past worker probably already paid for "
+        f"the lesson. The headline is a truncated first line, never the whole entry: "
+        f"if a headline looks relevant, fetch it rather than acting on the summary.",
+    ]
+
+
+def _lookup_first_bullet(brief: KnowledgeBrief | None) -> list[str]:
+    """Ordering rule under the "ask Neo" bullet: a lookup is not a doubt.
+
+    Scoped to headlines that actually match, and explicitly NOT a licence to go
+    searching instead of recording a call made with no doubt — both clauses are there
+    because the first draft cost `worker-llm/assume-recall` a point.
+    """
+    if not brief:
+        return []
+    return [
+        "  - But LOOK IT UP FIRST if a headline in the knowledge-base index below names "
+        "the area you are unsure about: fetch that entry (`jarvis learn show <id>`) "
+        "before you ask. A lookup is not a doubt — re-deciding what a past worker "
+        "already recorded spends Neo's or the user's attention for nothing. This "
+        "applies only when a headline actually matches; when nothing in the index "
+        "fits, ask, and never let it become a reason to go looking instead of "
+        "recording a call you made with no doubt.",
+    ]
+
+
 def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str]:
     """The knowledge base as a map plus a retrieval verb, not as a payload.
 
@@ -217,11 +259,7 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "options, thinking \"either would work\", or picking one because you have to "
         "pick something, you are in doubt: ask. Ask BEFORE you build on it, not "
         "after.",
-        "  - But LOOK IT UP FIRST when the knowledge-base index at the end of this "
-        "prompt covers the area. A lookup is not a doubt: if a past worker already "
-        "recorded the answer, `jarvis learn show <id>` costs you one command, while "
-        "asking spends Neo's or the user's attention re-deciding something the fleet "
-        "already paid for. If the index has nothing on it, ask — never guess.",
+        *_lookup_first_bullet(knowledge),
         "  - Do not talk yourself out of asking. \"It's reversible\", \"it's only an "
         "implementation detail\", \"I'll note it as an assumption\" — those are "
         "rationalisations for guessing. Almost everything is reversible; that is not "
@@ -238,14 +276,11 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"guessing, ask instead.",
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"`",
-        f"- READ the OS knowledge base on demand — it is INDEXED at the end of this "
-        f"prompt, not pasted into it: `jarvis learn show <id>` for an entry the index "
-        f"lists, `jarvis learn search \"<term>\" --project {project.name}` to sweep "
-        f"for one. Look up any area you are about to touch BEFORE you touch it, and "
-        f"before you ask or assume about it — a past worker probably already paid for "
-        f"the lesson. The headline is a truncated first line, never the whole entry: "
-        f"if a headline looks relevant, fetch it rather than acting on the summary.",
-        f"- WRITE to it: the OS knowledge base is the ONLY memory that survives you: "
+        *_read_knowledge_bullet(knowledge, project.name),
+        # "WRITE to it" only parses when the READ bullet is there to be "it"; with no
+        # index the bullet stands alone, exactly as it did before this change
+        f"- {'WRITE to it: the' if knowledge else 'The'} OS knowledge base is the ONLY "
+        f"memory that survives you: "
         f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`. "
         f"Anything durable you learn — project state, gotchas, conventions, decisions "
         f"— goes there. Your own memory files, notes and scratch docs are invisible to "
@@ -504,10 +539,13 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"` — including anything you decided was OUT of this "
         f"feature's scope.",
-        f"- READ the OS knowledge base before you decompose — it is indexed at the end "
-        f"of this prompt, not pasted into it: `jarvis learn search \"<term>\" --project "
-        f"{project.name}` and `jarvis learn show <id>`. A plan built without it will "
-        f"hand children the lessons the fleet already paid for, again.",
+        # conditional for the same reason as the worker's: no index, no instruction to
+        # go and read one
+        *([f"- READ the OS knowledge base before you decompose — it is indexed at the "
+           f"end of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
+           f"--project {project.name}` and `jarvis learn show <id>`. A plan built "
+           f"without it will hand children the lessons the fleet already paid for, "
+           f"again."] if knowledge else []),
         f"- The OS knowledge base is the ONLY memory that survives you: "
         f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`.",
         f"- Alert the human when needed: `jarvis notify --project {project.name} "

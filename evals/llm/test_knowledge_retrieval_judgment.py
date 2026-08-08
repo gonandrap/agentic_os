@@ -1,11 +1,27 @@
-"""LLM-graded knowledge-retrieval evals: can a worker actually CASH IN the index?
+"""LLM-graded knowledge-retrieval evals: is the INDEX ITSELF aimable?
+
+Paired with `test_knowledge_retrieval.py`, which asks the bigger question — put a tooled
+subject in a sandbox with a real `jarvis`, and does it go and read, before acting, and
+apply what it read? That is the stronger measurement and it is the one to trust about
+worker behaviour.
+
+This file asks the narrower one it cannot: **is the index a good map?** Its subjects are
+tool-less and answer with a single command, which makes each case cheap enough to run
+eleven of them across two adversarial batteries — decoy discrimination (five billing and
+deploy entries, only one of them right) and phantom resistance (four areas the index does
+not cover at all). Neither is visible to a tooled subject, which can search three times,
+read the wrong entry, notice, and recover: the retry masks exactly the property being
+measured.
+
+The other half is that retrieval here is graded by RUNNING the subject's chosen search
+term against a real store rather than by matching its reply. That is what caught the
+phrase-search defect (below) — a tooled subject's second query hid it.
+
 
 Worker prompts no longer carry the knowledge base; they carry a bounded index of it
-(headline + id) and four commands for fetching the rest. That trade only pays if a
-model handed the index reliably (a) notices the entry it needs exists and (b) aims a
-retrieval at the right one. Nothing else in the suite tests that: the unit tests prove
-the index is built and bounded, and a well-formed index nobody reads is exactly the
-failure this design was supposed to remove, just cheaper.
+(headline + id) and four commands for fetching the rest. That trade only pays if a model
+handed the index can (a) notice the entry it needs exists and (b) aim a retrieval at the
+right one — and a headline is 160 characters, so (b) is not free.
 
 Three batteries:
 

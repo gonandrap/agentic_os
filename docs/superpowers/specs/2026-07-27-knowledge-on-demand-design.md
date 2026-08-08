@@ -140,12 +140,26 @@ when the truth is that it knew and changed its mind. The row says which, and
 ### Does the worker actually retrieve?
 
 The mechanism being correct is not the claim; the claim is that a model handed an index
-notices what it needs and aims a retrieval at the right entry. That is graded in
-`evals/llm/test_knowledge_retrieval_judgment.py`, which builds a real store, renders the
-real dispatch prompt, and scores three batteries: **retrieve** (the answer sits behind a
-headline — reach for the KB), **precision** (name the right id, against adjacent decoys
-in the same topic), and **no-phantom** (an absent area must not summon a cited entry —
-without it, a model answering everything with `learn show` would sweep the other two).
+notices what it needs and aims a retrieval at the right entry. Two evals, deliberately
+different in kind:
+
+**`evals/llm/test_knowledge_retrieval.py` — behaviour.** A *tooled* subject in a sandbox
+with a real `jarvis` on its PATH and a real task, where the sandbox itself is silent or
+actively misleading about the answer, so imitating local precedent gets it wrong and only
+the knowledge base gets it right. Batteries escalate: a read verb ran → it ran *before*
+the first file was written → the change *reflects what the entry said* → it did not dump
+the base into its own context. Plus a **blind control**: the least guessable cases re-run
+with no knowledge base must FAIL, or the eval is scoring the model's priors rather than
+this plumbing. This is the measurement to trust about worker behaviour.
+
+**`evals/llm/test_knowledge_retrieval_judgment.py` — is the map aimable?** Tool-less
+subjects answering with one command, cheap enough to run eleven across two adversarial
+batteries a tooled subject structurally cannot measure: **precision** (five billing and
+deploy decoys, one right answer — "there is something about deploys in here" is not
+findability) and **no-phantom** (four areas the index does not cover; without this, a
+model answering everything with `learn show` sweeps the rest). A tooled subject can
+search three times, read the wrong entry, notice and recover — the retry is realistic,
+and it hides exactly the property these two batteries exist to measure.
 
 Retrieval is graded against the store rather than by string matching: when a reply
 searches, the term it chose is run through `search_knowledge` and the target has to come
@@ -168,9 +182,22 @@ eval.** Worth recording, because neither was visible to any structural test:
    loud) "Neo is your first responder, any doubt goes to it" rule. Spending the user's
    attention re-deciding what the fleet already recorded is the exact cost this OS
    exists to avoid, so the ordering is now explicit in both places: *a lookup is not a
-   doubt — look it up first when the index covers the area; if it has nothing, ask.*
-   The "if it has nothing, ask" half is load-bearing, and `test_worker_judgment.py`
-   (which builds its prompt with no index at all) is the guard that it still holds.
+   doubt — look it up first when a headline names the area; if nothing fits, ask.*
+
+The fix for (2) then broke a third thing, which is why the guard eval matters:
+`test_worker_judgment.py` dropped a point because a subject answered a **branch-naming**
+call with `jarvis learn search "branch name"`. That eval briefs with an *empty* knowledge
+base — so the contract had sent it looking things up in an index that was not in its
+prompt. **Both knowledge bullets are therefore conditional on the brief being non-empty**
+(as is the `WRITE to it:` prefix, which only parses when a READ bullet precedes it to be
+the "it"). With no index the worker contract is now byte-identical to the one before this
+change — asserted directly in `test_empty_base_also_removes_the_instructions_to_read_it`,
+which makes that eval a clean baseline rather than a thing this branch perturbs.
+
+The general lesson, and the reason it is written down here: **a prompt must not instruct
+an agent to consult a resource that is not in that prompt.** The instinct is to state the
+rule unconditionally so it is always available; the effect is an agent that goes looking
+for something that does not exist, and burns a turn discovering it.
 
 ### Accepted risk
 

@@ -122,6 +122,35 @@ def test_empty_base_renders_no_block(jarvis_home):
     assert "# Knowledge base" not in _prompt(brief)
 
 
+def test_empty_base_also_removes_the_instructions_to_read_it(jarvis_home):
+    """No index, no instruction to consult one.
+
+    Telling a worker to look something up in a knowledge base that is not in its prompt
+    is worse than saying nothing: it sent a subject in evals/llm/test_worker_judgment.py
+    (which briefs with an empty base) off to `jarvis learn search "branch name"` for a
+    branch-naming call it should simply have recorded. Both knowledge bullets are
+    therefore conditional, and the WRITE bullet is not — a worker with nothing to read
+    still has everything to record.
+    """
+    from jarvis.dispatch import build_worker_prompt
+
+    central = CentralStore()
+    wo = {"id": "wo-1", "title": "t", "description": "d"}
+    empty = build_worker_prompt(wo, SPEC, central.knowledge_brief("p1"))
+    assert "jarvis learn search" not in empty
+    assert "jarvis learn show" not in empty
+    assert "LOOK IT UP FIRST" not in empty
+    assert "jarvis learn add" in empty          # writing never depends on the base
+    assert "jarvis wo ask" in empty             # ...and asking Neo is untouched
+    # "WRITE to it" only parses when a READ bullet precedes it to be the "it"
+    assert "WRITE to it" not in empty
+
+    central.add_knowledge("something worth knowing", project="p1", topic="ci")
+    stocked = build_worker_prompt(wo, SPEC, central.knowledge_brief("p1"))
+    assert "jarvis learn search" in stocked     # negative control
+    assert "LOOK IT UP FIRST" in stocked
+
+
 # -- the prompt tells the worker to go and read ----------------------------------------
 
 def test_prompt_teaches_on_demand_retrieval(jarvis_home):
