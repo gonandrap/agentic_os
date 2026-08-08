@@ -129,6 +129,12 @@ class NeoConfig:
     # Filed as bl-9a925d2e. Do not quietly start honouring it: a knob nobody could use
     # that suddenly bites changes live Neo behaviour under cover of an unrelated change.
     timeout: int = 300
+    # Which model shortens an over-long question for the dashboard (`jarvis.digest`).
+    # A cheap one on purpose: the digest is display-only — it never reaches Neo, a
+    # worker or a learning — so this is a formatting job, not a judgement one.
+    # SET IT TO "" TO TURN DIGESTING OFF: no model named, no call made, and the page
+    # falls back to rendering every question in full, which is what it did before.
+    digest_model: str = "haiku"
     panel: PanelConfig = field(default_factory=PanelConfig)
 
 
@@ -242,6 +248,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         model=neo_raw.get("model", "opus"),
         learnings_limit=int(neo_raw.get("learnings_limit", 50)),
         timeout=int(neo_raw.get("timeout", 300)),
+        digest_model=str(neo_raw.get("digest_model", "haiku")),
         panel=_parse_panel(neo_raw.get("panel", {})),
     )
 

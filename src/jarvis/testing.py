@@ -267,6 +267,28 @@ elif "-p" in argv and "--resume" not in argv:
     # verdict driven by the prompt so tests control escalation.
     prompt = argv[argv.index("-p") + 1]
     system = opt("--append-system-prompt", "")
+    # A DASHBOARD DIGEST, AND IT COMES FIRST FOR THE SAME REASON THE SEAT BRANCH DOES:
+    # the call is identified by its system prompt, never by the user prompt — which is
+    # the worker's question verbatim, so a digest of a gate question would otherwise
+    # fall through to the gate branch below and answer with a verdict.
+    if "# Jarvis dashboard digest" in system:
+        if "FORCE_DIGEST_FAIL" in prompt:
+            sys.stderr.write("digest call failed (test-forced)\n"); sys.exit(1)
+        if "FORCE_DIGEST_GARBAGE" in prompt:
+            # No `headline`: the shape the validator must refuse. `structured.request`
+            # retries once and then raises, which is what the daemon records.
+            print(json.dumps({"result": json.dumps({"bullets": ["a", "b"]})}))
+            sys.exit(0)
+        head = prompt.strip().splitlines()[0][:80]
+        print(json.dumps({"result": json.dumps({
+            "headline": f"digest of: {head}",
+            # Seven, so a test can prove the FIVE-item cap is enforced in the validator
+            # and not merely requested in the prompt.
+            "bullets": [f"point {i}" for i in range(1, 8)],
+            "options": ["option A — cheap", "option B — thorough"],
+            "recommendation": "option A",
+        })}))
+        sys.exit(0)
     # A PANEL SEAT, AND THIS BRANCH COMES FIRST DELIBERATELY. Seat identity travels in
     # --append-system-prompt, never in the user prompt: a premise-seat call on a gate
     # question carries "PRIVILEGED ACTION REQUEST" in its prompt, so without this the
