@@ -237,6 +237,25 @@ def test_the_seats_are_laid_out_where_add_dir_finds_them(project):
         assert (seats[0] / ".claude" / "agents" / f"{seat}.md").is_file()
 
 
+def test_a_planner_is_handed_exactly_these_seats_and_nothing_else(project):
+    """EXACTLY, not "at least" — the assertion above says these two are present, which is
+    true of a directory holding five more.
+
+    `install_agent_assets` copytrees `assets/agents/` WHOLESALE, so anything anyone drops
+    in there becomes a subagent every planner session can invoke. Neo's panel seats are
+    the live example: they are agent definitions in the same authoring format, and putting
+    them in this directory (subdirectory or not) would hand five bogus seats to every
+    planner. They ship in `assets/neo-seats/` instead, and this is what notices if that
+    ever changes.
+    """
+    roots = install_agent_assets(project, "planner")
+    seats = next(r for r in roots if (r / ".claude" / "agents").is_dir())
+
+    delivered = {p.relative_to(seats / ".claude" / "agents").as_posix()
+                 for p in (seats / ".claude" / "agents").rglob("*") if p.is_file()}
+    assert delivered == {f"{s}.md" for s in SEATS}
+
+
 def test_an_ordinary_worker_is_handed_no_seats(project):
     """Design decision 4: ordinary workers get no profile. A worker is an individual with
     exactly one job, and a role would be dressing up a session that has one."""

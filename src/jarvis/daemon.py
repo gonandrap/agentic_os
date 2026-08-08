@@ -433,7 +433,7 @@ class Daemon:
         try:
             results = neo_mod.drain_queue(
                 store, model=cfg.model, learnings_limit=cfg.learnings_limit,
-                deliver=deliver,
+                deliver=deliver, answer=self._panel_answer(cfg),
             )
             if results:
                 log.info("neo drained %d question(s)", len(results))
@@ -442,6 +442,31 @@ class Daemon:
         finally:
             store.close()
             central.close()
+
+    @staticmethod
+    def _panel_answer(cfg: Any) -> Any:
+        """How this drain answers a question: the panel, or nothing (meaning the single
+        agent). This is the ONLY place the panel is wired in.
+
+        Returns None when the panel is disabled, so `drain_queue` falls to its own
+        default and the disabled OS makes exactly the calls it always did. The per-question
+        `kind` check has to live inside the callable rather than out here, because
+        `drain_queue` claims the questions itself and a drain can mix kinds.
+
+        `neo` never imports `panel`; the daemon is the one module that knows about both.
+        """
+        if not cfg.panel.enabled:
+            return None
+
+        from . import neo as neo_mod
+        from . import panel
+
+        def answer(store: Any, q: dict, model: str, learnings_limit: int) -> dict:
+            if (q.get("kind") or "question") in cfg.panel.kinds:
+                return panel.decide(store, q, cfg)
+            return neo_mod.answer_question(store, q, model, learnings_limit)
+
+        return answer
 
     def _dispatch_neo_cleanup(self, pstore: ProjectStore, q: dict, verdict: dict) -> None:
         """File the pre-approved ledger cleanup Neo asked for, if it asked for one.

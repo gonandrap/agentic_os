@@ -1,7 +1,7 @@
 # Jarvis OS codebase map
 
 `jarvis-os` Python package, stdlib-only core (argparse + sqlite3 + json). Source in
-`src/jarvis/`, 22 modules. Read this instead of re-exploring the tree.
+`src/jarvis/`, 23 modules. Read this instead of re-exploring the tree.
 
 ## Modules (responsibility — key symbols — intra-package imports)
 
@@ -60,6 +60,19 @@
   `parse_verdict()`:206 — one line on `structured.coerce`, with `_validate_verdict`:175
   (normalises; raises when `escalate` is absent) and `_unparseable_verdict`:194 (the
   fail-safe synthetic escalation — deliberately NOT a retry) as its two halves.
+- `panel.py` — Neo answering as a PANEL of profiled seats instead of as one agent, behind
+  `catalog.PanelConfig` and **shipped disabled**. `decide(store, q, cfg)`:355 is the entry
+  point and returns exactly `neo.parse_verdict`'s keys plus one additive `panel` key.
+  Seats are DATA: `assets/neo-seats/<seat>.md` (frontmatter + mandate, parsed by
+  `parse_definition()`:96 — a two-line `---` splitter, never a YAML dependency) plus a name
+  in the catalog roster. `build_seat_system_prompt()`:139 mirrors `neo.build_system_prompt`
+  and is byte-stable PER SEAT; `_round()`:224 runs the seats blind and concurrently
+  (`ThreadPoolExecutor`) inside the daemon's single Neo thread, building every prompt on the
+  calling thread first because the store's connection is thread-local. `fast_is_permitted()`:301
+  is the safety rule in code rather than in a prompt. THE SEAM: `neo` MUST NEVER IMPORT THIS
+  MODULE (a test AST-walks `neo.py` to prove it) — `panel.decide` is injected through
+  `neo.drain_queue(answer=…)` by `Daemon._panel_answer`, and the single-agent fallback is
+  simply not passing `answer=`. See `mem:neo-panel`.
 - `github.py` — the only place the OS reads GitHub, over `gh` (auth + `JARVIS_GH_BIN`
   override shared with `bugreport`). `pr_view()`, `PullRequest`, `GitHubError`. Read-only
   by design: merging is a gated action, never something the poll loop does. Consumed by
