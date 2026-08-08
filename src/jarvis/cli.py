@@ -5,7 +5,7 @@ Grouped commands:
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
   jarvis fo create|list|show|plan|approve|cancel        feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
-  jarvis neo list|show|review|answer|learnings|learn
+  jarvis neo list|show|review|answer|learnings|learn|export
   jarvis backlog add|list|promote|done
   jarvis learn add|list|search
   jarvis notify / jarvis inbox
@@ -63,6 +63,18 @@ def _age(ts: float | None) -> str:
     if delta < 129600:
         return f"{delta / 3600:.1f}h"
     return f"{delta / 86400:.1f}d"
+
+
+def _stamp(ts: float | None) -> str:
+    """An absolute local timestamp, for records read as a ledger rather than a feed.
+
+    `_age` answers "is this stale?" and is right for anything in flight. A learning is
+    not in flight: what a reader wants of it is WHEN it was recorded, so they can line
+    it up against the decision that produced it.
+    """
+    if not ts:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
 STATUS_ICON = {
@@ -369,15 +381,27 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--all", action="store_true", help="include reviewed items")
     n = ne.add_parser("show", help="one question with Neo's full answer")
     n.add_argument("question_id", type=int)
+    n.add_argument("--panel", action="store_true",
+                   help="also show how the panel deliberated: one line per seat")
     n = ne.add_parser("review", help="approve or correct one of Neo's answers")
     n.add_argument("question_id", type=int)
     n.add_argument("--correct", metavar="FEEDBACK",
                    help="reject the answer and teach Neo what you would have said")
+    n.add_argument("--seat", metavar="NAME", default="",
+                   help="teach only this panel seat, not all of them (the seat must "
+                        "have opined on this question — see `neo show --panel`)")
     n = ne.add_parser("answer", help="answer a question Neo escalated to you")
     n.add_argument("question_id", type=int)
     n.add_argument("text")
     n = ne.add_parser("learnings", help="what Neo has learned from your reviews")
     n.add_argument("--project", default="")
+    n.add_argument("--seat", metavar="NAME", default="",
+                   help="also show learnings scoped to this panel seat (global rows "
+                        "alone are shown without it)")
+    n.add_argument("--json", action="store_true", help="machine-readable output")
+    n = ne.add_parser("export", help="Neo's whole ledger as one document: every "
+                                     "question, learning and panel opinion")
+    n.add_argument("--json", action="store_true", help="machine-readable output")
     n = ne.add_parser("learn", help="teach Neo directly (no question needed)")
     n.add_argument("content")
     n.add_argument("--project", default="")
@@ -925,21 +949,43 @@ def cmd_neo(args: argparse.Namespace) -> int:
         neo = NeoStore()
         try:
             q = neo.get(args.question_id)
+            # Read the deliberation only when it is asked for. Panel opinions are
+            # inspectable on demand and never pushed, and that starts here: without
+            # `--panel` the document is exactly the question record, so nothing
+            # consuming it starts carrying deliberation it never asked to see.
+            opinions = neo.opinions(args.question_id) if q and args.panel else []
         finally:
             neo.close()
         if q is None:
             print(f"error: neo question {args.question_id} not found", file=sys.stderr)
             return 1
-        _print(q, args.json)
+        if not args.panel:
+            _print(q, args.json)
+        elif args.json:
+            _print({**q, "panel_opinions": opinions}, True)
+        else:
+            _print(q, False)
+            print("\nPanel deliberation:")
+            for o in opinions:
+                route = f" route={o['route']}" if o["route"] else ""
+                print(f"  {o['seat']:<8} {o['status']:<9} "
+                      f"verdict={o['verdict'] or '—':<9} "
+                      f"{o['latency_ms']}ms{route}")
+            if not opinions:
+                print("  no panel ran on this question — Neo answered it single-agent")
     elif args.neo_cmd == "review":
         _print(ops.neo_review(args.question_id, approved=args.correct is None,
-                              feedback=args.correct or ""), args.json)
+                              feedback=args.correct or "", seat=args.seat or ""),
+               args.json)
     elif args.neo_cmd == "answer":
         _print(ops.neo_answer_escalated(args.question_id, args.text), args.json)
     elif args.neo_cmd == "learnings":
+        # The seat scope is additive and the default is NARROW: no `--seat` shows the
+        # global rows alone, exactly as Neo's own single-agent prompt sees them.
+        ops.validate_seat(args.seat or "")
         neo = NeoStore()
         try:
-            rows = neo.learnings(args.project, limit=200)
+            rows = neo.learnings(args.project, limit=200, seat=args.seat or "")
         finally:
             neo.close()
         if args.json:
@@ -947,9 +993,12 @@ def cmd_neo(args: argparse.Namespace) -> int:
         else:
             for r in rows:
                 scope = r["project"] or "global"
-                print(f"• [{scope}] ({r['source']}) {r['content']}")
+                seat = f" · {r['seat']} seat" if r["seat"] else ""
+                print(f"• {_stamp(r['ts'])} [{scope}{seat}] ({r['source']}) {r['content']}")
             if not rows:
                 print("Neo has no learnings yet — review its answers to teach it")
+    elif args.neo_cmd == "export":
+        _print(ops.neo_export(), args.json)
     elif args.neo_cmd == "learn":
         neo = NeoStore()
         try:
