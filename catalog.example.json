@@ -14,7 +14,10 @@
       }
     },
     "ui": { "port": 8787, "base_url": "http://127.0.0.1:8787" },
+    "$comment_knowledge": "worker prompts get an INDEX of the knowledge base and fetch entries on demand; inject_limit caps the entries pinned in verbatim",
     "knowledge_inject_limit": 8,
+    "knowledge_digest_limit": 40,
+    "knowledge_digest_chars": 4000,
     "neo": {
       "$comment": "Neo answers worker questions on your behalf; review its answers in the UI's neo tab",
       "enabled": true,

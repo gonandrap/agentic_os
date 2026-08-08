@@ -193,8 +193,7 @@ class Daemon:
             log.info("[%s] dispatching %s: %s", project.name, wo["id"], wo["title"])
             try:
                 dispatch_work_order(
-                    store, self.central, project, wo,
-                    knowledge_limit=self.catalog.os.knowledge_inject_limit,
+                    store, self.central, project, wo, os_config=self.catalog.os,
                 )
             except claude_cli.ClaudeCliError as e:
                 log.error("[%s] dispatch of %s failed: %s", project.name, wo["id"], e)

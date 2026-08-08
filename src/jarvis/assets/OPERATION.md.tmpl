@@ -55,6 +55,13 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
   guess you are hoping nobody checks — if you are guessing, ask instead.
 - **File deferred work in the central backlog** instead of leaving "future work" notes:
   `jarvis backlog add {project_name} "<title>" --description "<details>"`
+- **Read the knowledge base before you act.** It reaches you as an *index* of headlines
+  at the end of your prompt, not as the knowledge itself. Look up any area you are about
+  to touch:
+  `jarvis learn search "<term>" --project {project_name}` · `jarvis learn show <id>` ·
+  `jarvis learn list --project {project_name} --topic <t>` · `jarvis learn topics`
+  A past worker probably already paid for the lesson. Never assume an index headline is
+  the whole entry.
 - **Report reusable learnings** (patterns, gotchas, good practices) to the OS knowledge
   base so other projects benefit:
   `jarvis learn add "<what you learned>" --project {project_name} --topic "<topic>"`

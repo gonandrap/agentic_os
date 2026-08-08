@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from . import claude_cli
-from .catalog import ProjectSpec
-from .central_store import CentralStore
+from .catalog import OsConfig, ProjectSpec
+from .central_store import CentralStore, KnowledgeBrief
 from .project_store import ProjectStore
 
 
@@ -123,8 +123,101 @@ def worker_name(wo: dict[str, Any]) -> str:
     return f"[WO {wo['id']}] {wo['title'][:60]}"
 
 
+def _read_knowledge_bullet(brief: KnowledgeBrief | None, project_name: str) -> list[str]:
+    """The contract's READ half — omitted entirely when there is no index.
+
+    Both knowledge bullets are conditional for the same reason: telling a worker to
+    consult an index that is not in its prompt is worse than saying nothing. It made a
+    subject in `evals/llm/test_worker_judgment.py` (which briefs with an empty base)
+    answer a branch-naming call with `jarvis learn search "branch name"` — going to look
+    something up in a knowledge base that did not exist, instead of recording the call.
+    """
+    if not brief:
+        return []
+    return [
+        f"- READ the OS knowledge base on demand — it is INDEXED at the end of this "
+        f"prompt, not pasted into it: `jarvis learn show <id>` for an entry the index "
+        f"lists, `jarvis learn search \"<term>\" --project {project_name}` to sweep "
+        f"for one. Look up any area you are about to touch BEFORE you touch it, and "
+        f"before you ask or assume about it — a past worker probably already paid for "
+        f"the lesson. The headline is a truncated first line, never the whole entry: "
+        f"if a headline looks relevant, fetch it rather than acting on the summary.",
+    ]
+
+
+def _lookup_first_bullet(brief: KnowledgeBrief | None) -> list[str]:
+    """Ordering rule under the "ask Neo" bullet: a lookup is not a doubt.
+
+    Scoped to headlines that actually match, and explicitly NOT a licence to go
+    searching instead of recording a call made with no doubt — both clauses are there
+    because the first draft cost `worker-llm/assume-recall` a point.
+    """
+    if not brief:
+        return []
+    return [
+        "  - But LOOK IT UP FIRST if a headline in the knowledge-base index below names "
+        "the area you are unsure about: fetch that entry (`jarvis learn show <id>`) "
+        "before you ask. A lookup is not a doubt — re-deciding what a past worker "
+        "already recorded spends Neo's or the user's attention for nothing. This "
+        "applies only when a headline actually matches; when nothing in the index "
+        "fits, ask, and never let it become a reason to go looking instead of "
+        "recording a call you made with no doubt.",
+    ]
+
+
+def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str]:
+    """The knowledge base as a map plus a retrieval verb, not as a payload.
+
+    Pasting entries in full made the prompt grow with the base — every work order in the
+    fleet paying for every learning ever recorded — while the selector (most-recent-N)
+    meant the entry that actually mattered usually fell outside the window anyway. So the
+    prompt ships headlines and ids at bounded cost, and the worker pulls full text for
+    what its task touches.
+    """
+    lines = [
+        "",
+        f"# Knowledge base — {brief.total} entries visible to `{project_name}` "
+        f"(this project + global)",
+        "**This section is an INDEX, not the knowledge.** Headlines are truncated; the "
+        "full text of an entry arrives only when you ask for it. If a headline below "
+        "touches what you are about to do, FETCH IT — before you act on it, and before "
+        "you ask Neo or record an assumption about it:",
+        "```bash",
+        f'jarvis learn search "<term>" --project {project_name}  # full text of matches',
+        "jarvis learn show <id> [<id> ...]  # full text of specific entries",
+        f"jarvis learn list --project {project_name} --topic <t>  # everything in a topic",
+        f"jarvis learn topics --project {project_name}  # what topics exist",
+        "```",
+        "Entries marked `(global)` came from another project; the rest are this one's.",
+    ]
+    if brief.pinned:
+        lines += ["", "## Pinned — read these now (full text)"]
+        for k in brief.pinned:
+            topic = f" [{k['topic']}]" if k["topic"] else ""
+            lines.append(f"- ({k['project'] or 'global'}{topic}) {k['content']}")
+    if brief.digest:
+        lines += ["", "## Index — headline only, `jarvis learn show <id>` for the rest"]
+        current = object()
+        for k in brief.digest:
+            if k["topic"] != current:
+                current = k["topic"]
+                lines.append(f"### {k['topic'] or '(no topic)'}")
+            scope = "" if k["project"] == project_name else " (global)"
+            lines.append(f"- `{k['id']}`{scope} {k['headline']}")
+    if brief.overflow:
+        listed = ", ".join(f"{t or '(no topic)'} ({n})" for t, n in brief.overflow)
+        lines += [
+            "",
+            f"## Not indexed above — {brief.overflow_count} further entries, by topic",
+            f"{listed}",
+            f"Reach them with `jarvis learn list --project {project_name} --topic <topic>` "
+            f"or `jarvis learn search`.",
+        ]
+    return lines
+
+
 def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
-                        knowledge: list[dict[str, Any]]) -> str:
+                        knowledge: KnowledgeBrief | None = None) -> str:
     """What the worker is told, composed from the work order and its project.
 
     Two kinds of work order get two contracts (`project_store.WO_KINDS`). Everything
@@ -166,6 +259,7 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "options, thinking \"either would work\", or picking one because you have to "
         "pick something, you are in doubt: ask. Ask BEFORE you build on it, not "
         "after.",
+        *_lookup_first_bullet(knowledge),
         "  - Do not talk yourself out of asking. \"It's reversible\", \"it's only an "
         "implementation detail\", \"I'll note it as an assumption\" — those are "
         "rationalisations for guessing. Almost everything is reversible; that is not "
@@ -182,7 +276,11 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"guessing, ask instead.",
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"`",
-        f"- The OS knowledge base is the ONLY memory that survives you: "
+        *_read_knowledge_bullet(knowledge, project.name),
+        # "WRITE to it" only parses when the READ bullet is there to be "it"; with no
+        # index the bullet stands alone, exactly as it did before this change
+        f"- {'WRITE to it: the' if knowledge else 'The'} OS knowledge base is the ONLY "
+        f"memory that survives you: "
         f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`. "
         f"Anything durable you learn — project state, gotchas, conventions, decisions "
         f"— goes there. Your own memory files, notes and scratch docs are invisible to "
@@ -261,7 +359,7 @@ def _navigation_briefing() -> list[str]:
 
 
 def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
-                     knowledge: list[dict[str, Any]]) -> list[str]:
+                     knowledge: KnowledgeBrief | None = None) -> list[str]:
     """The tail every briefing carries, whatever the work order's kind."""
     parts += ["", *_navigation_briefing()]
     pre_approved = _pre_approval(wo)
@@ -270,16 +368,12 @@ def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
     if project.gates:
         parts += ["", *_gate_briefing(wo, project)]
     if knowledge:
-        parts += ["", "# Knowledge base (learnings from this and other projects)"]
-        for k in knowledge:
-            scope = k["project"] or "global"
-            topic = f" [{k['topic']}]" if k["topic"] else ""
-            parts.append(f"- ({scope}{topic}) {k['content']}")
+        parts += render_knowledge_block(knowledge, project.name)
     return parts
 
 
 def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
-                    knowledge: list[dict[str, Any]]) -> str:
+                    knowledge: KnowledgeBrief | None = None) -> str:
     """The briefing for a feature order's planner.
 
     Four things make it different from a worker's, and each is load-bearing:
@@ -445,6 +539,13 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"` — including anything you decided was OUT of this "
         f"feature's scope.",
+        # conditional for the same reason as the worker's: no index, no instruction to
+        # go and read one
+        *([f"- READ the OS knowledge base before you decompose — it is indexed at the "
+           f"end of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
+           f"--project {project.name}` and `jarvis learn show <id>`. A plan built "
+           f"without it will hand children the lessons the fleet already paid for, "
+           f"again."] if knowledge else []),
         f"- The OS knowledge base is the ONLY memory that survives you: "
         f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`.",
         f"- Alert the human when needed: `jarvis notify --project {project.name} "
@@ -557,7 +658,7 @@ def dispatch_work_order(
     central: CentralStore,
     project: ProjectSpec,
     wo: dict[str, Any],
-    knowledge_limit: int = 8,
+    os_config: OsConfig | None = None,
 ) -> dict[str, Any]:
     """Open the worker's conversation for a work order already in `dispatching` state.
 
@@ -567,7 +668,13 @@ def dispatch_work_order(
     """
     from . import worker_session
 
-    knowledge = central.relevant_knowledge(project.name, limit=knowledge_limit)
+    cfg = os_config or OsConfig()
+    knowledge = central.knowledge_brief(
+        project.name,
+        pinned_limit=cfg.knowledge_inject_limit,
+        digest_limit=cfg.knowledge_digest_limit,
+        digest_chars=cfg.knowledge_digest_chars,
+    )
     prompt = build_worker_prompt(wo, project, knowledge)
 
     # Resolved onto the row before the turn is launched, so every later turn rebuilds the
