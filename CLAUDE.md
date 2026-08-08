@@ -133,9 +133,21 @@ jarvis gate dismiss <id> --reason "…"      # NOT a gated action: the recognise
 jarvis neo list                            # Neo's Q&A: pending reviews + escalations
 jarvis neo review <qid> [--correct "…"]    # approve or teach; corrections become learnings
 jarvis neo answer <qid> "…"                # answer a question Neo escalated to the user
+jarvis neo learnings [--project p]         # what Neo has been taught, with ids
+jarvis neo retract <id> --reason "…"       # retire a ruling the user has REVERSED. Both
+                                           # ledgers are append-only, so without this a
+                                           # superseded ruling stays in every prompt
+                                           # beside its replacement. NOT a delete: the
+                                           # row stays listed, marked ⊘ with the reason,
+                                           # and only leaves the prompt. --reason is
+                                           # required. Use it the moment the user
+                                           # contradicts something they told you before.
 jarvis inbox / jarvis inbox ack [id]
 jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--force]
-jarvis learn add "insight" [--project p] / search <term>
+jarvis learn add "insight" [--project p] / list [--project p] / search <term>
+jarvis learn retract <id> --reason "…"     # same for the knowledge base: retire a
+                                           # superseded entry so it stops reaching
+                                           # workers, without erasing that it was true
 jarvis bug report "title" -d "..." -e "expected" -a "actual" [--steps "..."]
                                            # a bug in the OS itself -> GitHub issue on
                                            # the (PUBLIC) tracker + Telegram ping.
