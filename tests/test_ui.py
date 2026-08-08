@@ -390,6 +390,62 @@ def test_neo_tab_escalation_answer_flow(client, daemon, project):
         store.close()
 
 
+def test_neo_tab_shows_panel_deliberation_collapsed(client, daemon, project):
+    """The deliberation is on the page the user already reads, folded shut.
+
+    A tab of its own would be a new place to spend exactly the attention the panel
+    exists to protect, so this is a `<details>` on `/neo` and nothing more.
+
+    The marker is "Panel deliberation", NOT the bare word "panel": `neo.html` has used
+    a CSS class named `panel` for its generic box since long before this existed, so a
+    test keyed on that string would pass against an unchanged template.
+    """
+    from jarvis.neo_store import NeoStore
+
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "CSV or JSON?")
+    daemon._neo_drain()
+
+    before = client.get("/neo").text
+    assert "Panel deliberation" not in before      # no opinions ⇒ no block at all
+
+    neo = NeoStore()
+    try:
+        neo.record_opinion(1, "premise", reply="the question is real", verdict="",
+                           route="panel", model="sonnet", latency_ms=311)
+        neo.record_opinion(1, "blast", reply="CSV is reversible", verdict="answer",
+                           status="abstained", model="opus", latency_ms=812)
+    finally:
+        neo.close()
+
+    page = client.get("/neo").text
+    assert "Panel deliberation" in page
+    assert "<details" in page
+    for seat in ("premise", "blast"):
+        assert seat in page
+    assert "311ms" in page and "812ms" in page
+    assert "abstained" in page
+    assert "the question is real" in page          # the seat's raw reply, on demand
+
+
+def test_neo_tab_labels_a_seat_scoped_learning(client):
+    """Unlabelled, a learning only one seat reads would display as a rule the whole of
+    Neo follows — the opposite of what it is."""
+    from jarvis.neo_store import NeoStore
+
+    neo = NeoStore()
+    try:
+        neo.add_learning("A grep naming shipit ships nothing", seat="blast")
+        neo.add_learning("Prefer uv over pip")
+    finally:
+        neo.close()
+    page = client.get("/neo").text
+    assert "blast seat" in page
+    # the control: the global row is on the same page and carries no seat label
+    assert "Prefer uv over pip" in page
+
+
 def test_neo_teach_directly(client):
     r = client.post("/neo/learn", data={"content": "prefer uv over pip", "project": ""})
     assert r.status_code == 303
