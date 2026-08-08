@@ -408,11 +408,21 @@ def create_app() -> FastAPI:
                        and not (q["answered_by"] == "neo"
                                 and q["review_status"] == "unreviewed")]
             learnings = neo.all_learnings(limit=100)
+            # How the panel deliberated, for the questions this page already shows.
+            # Deliberation is inspectable on demand and never pushed at anyone, so it
+            # renders collapsed and a question with no opinions gets no block at all —
+            # which is also why this dict holds only the questions that HAVE them.
+            opinions = {}
+            for q in (*in_flight, *escalated, *unreviewed, *history):
+                rows = neo.opinions(q["id"])
+                if rows:
+                    opinions[q["id"]] = rows
         finally:
             neo.close()
         return render(request, "neo.html", active="neo", counts=counts,
                       in_flight=in_flight, escalated=escalated,
-                      unreviewed=unreviewed, history=history, learnings=learnings)
+                      unreviewed=unreviewed, history=history, learnings=learnings,
+                      opinions=opinions)
 
     @app.get("/gates", response_class=HTMLResponse)
     def gates_page(request: Request):
