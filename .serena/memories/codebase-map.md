@@ -1,7 +1,7 @@
 # Jarvis OS codebase map
 
 `jarvis-os` Python package, stdlib-only core (argparse + sqlite3 + json). Source in
-`src/jarvis/`, 21 modules. Read this instead of re-exploring the tree.
+`src/jarvis/`, 22 modules. Read this instead of re-exploring the tree.
 
 ## Modules (responsibility — key symbols — intra-package imports)
 
@@ -24,6 +24,19 @@
   touch the real CLI. `FAKE_CLAUDE`:16, fixtures `jarvis_home`:124, `fake_claude`:131,
   `claude_json`:194, `project`:209, `catalog_file`:216, `make_git_project()`:184.
 
+**Near-leaf (imports only `claude_cli`):**
+- `structured.py` — ask a model for strict JSON, validate it, optionally retry.
+  `parse_json_object()`:59 (the greedy `_JSON_RE` + `json.loads`, **no policy**: returns
+  `None`, never `{}`), `coerce()`:74 (the failure policy for a reply already in hand),
+  `request()`:95 (the call loop; `call=claude_cli.run_headless` is the transport seam),
+  `InvalidOutput`:50, `RETRY_NOTE`:47. What its callers share is the FAILURE policy and
+  their answers are opposites: `attempts=1` + `on_invalid=<fallback>` is Neo's fail-safe
+  (`neo.parse_verdict`), `attempts=2, on_invalid=None` is a real retry (the panel chair).
+  `coerce` IS `request`'s `attempts=1` body — `request`'s last attempt calls it. A retry
+  appends the complaint to the USER prompt only; `system_prompt` stays byte-identical so
+  the Anthropic prompt cache still hits. `ClaudeCliError` propagates rather than reaching
+  `on_invalid`. Covered by `tests/test_structured.py` (25).
+
 **Storage (import only `db` + `paths`):**
 - `central_store.py` — OS-wide DB. `CentralStore`:63, `upsert_project()`:75, `add_inbox()`:103,
   `add_backlog()`/`list_backlog()`:158/179, `relevant_knowledge()`:226, `get_state`/`set_state`:250/244.
@@ -43,7 +56,10 @@
 - `notify.py` — notification sinks + routing inbox rows outward. `route_new_inbox()`:105,
   `SINKS`:98, `sink_telegram()`:57, `wo_url()`:37.
 - `neo.py` — Neo the answerer agent: persona, headless answering, verdict parsing.
-  `drain_queue()`:118, `answer_question()`:102, `build_system_prompt()`:56, `parse_verdict()`:83.
+  `drain_queue()`:238, `answer_question()`:221, `build_system_prompt()`:88,
+  `parse_verdict()`:206 — one line on `structured.coerce`, with `_validate_verdict`:175
+  (normalises; raises when `escalate` is absent) and `_unparseable_verdict`:194 (the
+  fail-safe synthetic escalation — deliberately NOT a retry) as its two halves.
 - `github.py` — the only place the OS reads GitHub, over `gh` (auth + `JARVIS_GH_BIN`
   override shared with `bugreport`). `pr_view()`, `PullRequest`, `GitHubError`. Read-only
   by design: merging is a gated action, never something the poll loop does. Consumed by
