@@ -362,12 +362,22 @@ class Daemon:
     # -- 5. Neo (answer worker questions) --------------------------------------------
 
     def neo_tick(self) -> None:
-        """Kick a queue drain when questions are waiting and none is running."""
+        """Kick a queue drain when questions are waiting and none is running.
+
+        Reclaiming stranded questions happens here, and only here. It runs BEFORE the
+        queued count is read, so a question rescued this tick is drained this tick; and
+        it runs behind the `neo_draining` guard, so it can never re-queue a question out
+        from under a call that is still running.
+        """
         if not self.catalog.os.neo.enabled or self.neo_draining:
             return
         from .neo_store import NeoStore
         store = NeoStore()
         try:
+            stale = store.reclaim_stale()
+            if stale["requeued"] or stale["failed"]:
+                log.warning("neo reclaimed stranded questions: requeued=%s failed=%s",
+                            stale["requeued"], stale["failed"])
             queued = store.counts().get("queued", 0)
         finally:
             store.close()

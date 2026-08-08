@@ -36,6 +36,36 @@ REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
 # would corrupt the one metric that says whether the gate recognisers are improving.
 Q_KINDS = ("question", "approval", "plan")
 
+# The panel's seats — see docs/superpowers/specs/2026-08-02-neo-team-design.md.
+# `premise` asks whether this was even the question that was asked (and routes),
+# `record` checks the standing rulings, `blast` owns the blast radius and the only veto,
+# `taste` speaks for the user's intent and attention. `chair` is not a fifth opinion: it
+# synthesises the others into the one strict-JSON verdict `neo.parse_verdict` accepts.
+#
+# The vocabulary lives HERE, in the lowest layer, rather than in the panel module: the
+# catalog roster validator and the CLI's `--seat` validator both need it and neither
+# should have to depend on the other.
+SEATS = ("premise", "record", "blast", "taste", "chair")
+
+# How one seat's contribution ended. A seat that errors or times out is recorded as
+# `abstained` and the panel proceeds; `failed` is for a call that came back unusable.
+OPINION_STATUSES = ("ok", "abstained", "failed")
+
+# A question claimed for answering longer than this is treated as stranded and returned
+# to the queue (see `NeoStore.reclaim_stale`).
+#
+# THIS MUST EXCEED THE LONGEST A LIVE NEO CALL CAN TAKE (`catalog.NeoConfig.timeout`,
+# 300s — pinned by a test). A cutoff below it re-queues a question out from under a call
+# that is still running, and the worker gets two answers to one question.
+STALE_ANSWERING_SECONDS = 900
+
+# How many times a question may be returned to the queue before it is given up on. The
+# initial claim is not an attempt: `attempts` counts the reclaims, so this is the number
+# of RETRIES. A question at the ceiling is marked `failed` rather than re-queued —
+# `queued` would loop for ever and `answering` would strand it again, and `failed` is the
+# only status the existing surfaces already render as attention.
+MAX_ANSWER_ATTEMPTS = 3
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS questions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,7 +90,21 @@ CREATE TABLE IF NOT EXISTS learnings (
     project TEXT NOT NULL DEFAULT '',        -- '' = applies everywhere
     content TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT 'manual',   -- review | escalation | manual
-    question_id INTEGER
+    question_id INTEGER,
+    seat TEXT NOT NULL DEFAULT ''            -- '' = global (every seat sees it)
+);
+CREATE TABLE IF NOT EXISTS panel_opinions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+    seat TEXT NOT NULL,
+    reply TEXT NOT NULL DEFAULT '',          -- the seat's raw reply, verbatim
+    verdict TEXT NOT NULL DEFAULT '',        -- the verdict it proposed, if any
+    route TEXT NOT NULL DEFAULT '',          -- fast | panel — only `premise` routes
+    status TEXT NOT NULL DEFAULT 'ok',       -- ok | abstained | failed
+    model TEXT NOT NULL DEFAULT '',
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (question_id, seat)
 );
 CREATE INDEX IF NOT EXISTS idx_q_status ON questions(status);
 CREATE INDEX IF NOT EXISTS idx_q_review ON questions(review_status);
@@ -73,6 +117,15 @@ CREATE INDEX IF NOT EXISTS idx_learn_project ON learnings(project);
 ADDED_COLUMNS = {
     "questions": {
         "kind": "TEXT NOT NULL DEFAULT 'question'",
+        # Stranded-question recovery. `claimed_at` is NULL on every row that predates
+        # this, which `reclaim_stale` reads as "as stale as it is old" — the questions
+        # already parked in `answering` on a live instance are exactly the ones the fix
+        # exists for, so they must not be exempt from it.
+        "attempts": "INTEGER NOT NULL DEFAULT 0",
+        "claimed_at": "REAL",
+    },
+    "learnings": {
+        "seat": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -118,13 +171,63 @@ class NeoStore:
         """Atomically claim the OLDEST queued question (FIFO — answering in order
         keeps Neo's shared prompt prefix warm in the Anthropic cache)."""
         cur = self.conn.execute(
-            """UPDATE questions SET status='answering'
+            """UPDATE questions SET status='answering', claimed_at=?
                WHERE id = (SELECT id FROM questions WHERE status='queued'
                            ORDER BY ts LIMIT 1)
                RETURNING *""",
+            (db.now(),),
         )
         row = cur.fetchone()
         return dict(row) if row else None
+
+    def reclaim_stale(self, older_than: float = STALE_ANSWERING_SECONDS,
+                      max_attempts: int = MAX_ANSWER_ATTEMPTS) -> dict[str, list[int]]:
+        """Unstick questions parked in `answering` by a drain that never finished.
+
+        `claim_next` sets `answering` and, until this existed, NOTHING ever set it back:
+        `neo.drain_queue` rescues only `ClaudeCliError` and the daemon wraps the whole
+        drain in a bare `except`. A daemon restart mid-drain — or any other exception —
+        therefore parked the question for ever, and the worker that asked it waited for
+        ever (bl-3f5f1464).
+
+        Rows past `older_than` seconds go back to `queued` with `attempts` incremented.
+        A row already at `max_attempts` is marked `failed` instead: `queued` would loop
+        for ever, `answering` would re-strand it, and `failed` is the status the OS
+        already surfaces as attention.
+
+        `older_than` MUST exceed the Neo call timeout — see STALE_ANSWERING_SECONDS.
+
+        Returns {"requeued": [id, ...], "failed": [id, ...]}.
+        """
+        cutoff = db.now() - older_than
+        # Give up FIRST, then re-queue: doing it the other way round would increment a
+        # row to the ceiling and then fail it in the same call, spending an attempt the
+        # question never got to use.
+        failed = [
+            int(r["id"])
+            for r in self.conn.execute(
+                """UPDATE questions
+                      SET status='failed',
+                          answer_reason='neo never answered: stranded in answering after '
+                                        || attempts || ' reclaim attempt(s)'
+                    WHERE status='answering' AND attempts >= ?
+                      AND COALESCE(claimed_at, ts) < ?
+                RETURNING id""",
+                (max_attempts, cutoff),
+            ).fetchall()
+        ]
+        requeued = [
+            int(r["id"])
+            for r in self.conn.execute(
+                """UPDATE questions
+                      SET status='queued', attempts=attempts+1, claimed_at=NULL
+                    WHERE status='answering' AND attempts < ?
+                      AND COALESCE(claimed_at, ts) < ?
+                RETURNING id""",
+                (max_attempts, cutoff),
+            ).fetchall()
+        ]
+        return {"requeued": requeued, "failed": failed}
 
     def record_answer(self, question_id: int, answer: str, answered_by: str = "neo",
                       reason: str = "") -> None:
@@ -211,31 +314,95 @@ class NeoStore:
         )
         return self.get(question_id)  # type: ignore[return-value]
 
+    # -- panel deliberation --------------------------------------------------------
+
+    def record_opinion(self, question_id: int, seat: str, reply: str = "",
+                       verdict: str = "", route: str = "", status: str = "ok",
+                       model: str = "", latency_ms: int = 0) -> dict[str, Any]:
+        """Store one seat's contribution to one decision.
+
+        `route` is set by the `premise` seat alone (`fast` or `panel`); every other seat
+        leaves it empty. A seat that errored or timed out is recorded with
+        `status='abstained'` and the panel proceeds — that row is the evidence it ran.
+
+        ONE ROW PER SEAT PER QUESTION, LAST RUN WINS. A question can genuinely be
+        answered twice: `reclaim_stale` returns a stranded one to the queue, so a second
+        panel run re-records the same seats. The upsert replaces the stranded attempt,
+        because the deliberation a human wants to read is the one behind the answer that
+        actually reached the worker (ruled by Neo, question 55). The row `id` survives
+        the overwrite, so a surface holding a handle to an opinion keeps it.
+        """
+        assert status in OPINION_STATUSES, status
+        self.conn.execute(
+            """INSERT INTO panel_opinions
+                   (ts, question_id, seat, reply, verdict, route, status, model,
+                    latency_ms)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(question_id, seat) DO UPDATE SET
+                   ts=excluded.ts, reply=excluded.reply, verdict=excluded.verdict,
+                   route=excluded.route, status=excluded.status, model=excluded.model,
+                   latency_ms=excluded.latency_ms""",
+            (db.now(), question_id, seat, reply, verdict, route, status, model,
+             latency_ms),
+        )
+        row = self.conn.execute(
+            "SELECT * FROM panel_opinions WHERE question_id=? AND seat=?",
+            (question_id, seat),
+        ).fetchone()
+        return dict(row)
+
+    def opinions(self, question_id: int) -> list[dict[str, Any]]:
+        """Every seat's opinion on one question, in the order the seats first reported.
+
+        Ordered by `id` rather than `ts` so a partial re-run cannot reshuffle the rows a
+        reader has already seen. Panel deliberation is inspectable on demand and is
+        never delivered to the worker or placed in the inbox.
+        """
+        return db.rows_to_dicts(self.conn.execute(
+            "SELECT * FROM panel_opinions WHERE question_id=? ORDER BY id",
+            (question_id,),
+        ).fetchall())
+
     # -- learnings ---------------------------------------------------------------
 
     def add_learning(self, content: str, project: str = "", source: str = "manual",
-                     question_id: int | None = None) -> dict[str, Any]:
+                     question_id: int | None = None, seat: str = "") -> dict[str, Any]:
+        """Record a learning. `seat=""` (the default) means every seat sees it.
+
+        A seat-scoped learning teaches the seat that got a decision wrong instead of all
+        of them — and, critically, it stays OUT of the default query. See `learnings`.
+        """
         cur = self.conn.execute(
-            "INSERT INTO learnings (ts, project, content, source, question_id) VALUES (?,?,?,?,?)",
-            (db.now(), project, content, source, question_id),
+            "INSERT INTO learnings (ts, project, content, source, question_id, seat) "
+            "VALUES (?,?,?,?,?,?)",
+            (db.now(), project, content, source, question_id, seat or ""),
         )
         row = self.conn.execute("SELECT * FROM learnings WHERE id=?", (cur.lastrowid,)).fetchone()
         return dict(row)
 
-    def learnings(self, project: str = "", limit: int = 50) -> list[dict[str, Any]]:
+    def learnings(self, project: str = "", limit: int = 50,
+                  seat: str = "") -> list[dict[str, Any]]:
         """Learnings relevant to a project (its own + global), OLDEST first.
 
         Oldest-first keeps the rendered learnings block append-only: a new learning
         extends Neo's prompt prefix instead of rewriting it, so previously cached
         prefix bytes stay valid. When over the limit, the newest N are kept (rendered
         still in ascending order — a one-time prefix shift per overflow).
+
+        THE SEAT SCOPE IS ADDITIVE, AND THE DEFAULT IS NOT "EVERYTHING". No `seat`
+        argument — and `seat=""` — return ONLY global rows; `seat="blast"` returns the
+        global rows PLUS that seat's. The no-argument case is load-bearing:
+        `neo.build_system_prompt` calls it that way for the single-agent path, so a
+        seat-scoped learning leaking into it would silently rewrite a prompt prefix that
+        has to stay byte-stable, and the panel ships disabled.
         """
         rows = self.conn.execute(
             """SELECT * FROM (
-                   SELECT * FROM learnings WHERE project=? OR project=''
+                   SELECT * FROM learnings
+                    WHERE (project=? OR project='') AND (seat='' OR seat=?)
                    ORDER BY ts DESC LIMIT ?
                ) ORDER BY ts""",
-            (project, limit),
+            (project, seat or "", limit),
         ).fetchall()
         return db.rows_to_dicts(rows)
 
