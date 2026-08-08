@@ -954,6 +954,20 @@ def cmd_neo(args: argparse.Namespace) -> int:
         if q is None:
             print(f"error: neo question {args.question_id} not found", file=sys.stderr)
             return 1
+        if not args.json:
+            # The dashboard's shortened rendering is stored as a JSON string, and one
+            # long unreadable line is the opposite of what it exists for. Decoded here,
+            # dropped when there is none. `--json` still gets the row as it is stored:
+            # that is what a row dump is for.
+            from . import digest as digest_mod
+            q = dict(q)
+            view = digest_mod.decode(q.get("digest"))
+            failed = digest_mod.failure_reason(q.get("digest"))
+            q.pop("digest")
+            if view:
+                q["digest (dashboard only — Neo read the question above in full)"] = view
+            elif failed:
+                q["digest"] = f"(not produced: {failed})"
         _print(q, args.json)
     elif args.neo_cmd == "review":
         _print(ops.neo_review(args.question_id, approved=args.correct is None,

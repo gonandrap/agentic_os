@@ -176,6 +176,32 @@ def gate_badge() -> int | None:
         return None
 
 
+def _decorate_question(q: dict) -> dict:
+    """Add the two display-only fields the `/neo` question blocks render.
+
+    `digest_view` is the shortened rendering (`jarvis.digest`), or None when there
+    isn't one — never attempted, attempted and failed, or the row predates the feature.
+    The template shows the full question in every one of those cases, so a page with no
+    digests anywhere is the page as it was before this existed.
+
+    `full_context` is what the disclosure reveals: EXACTLY the question-specific prompt
+    Neo was sent, built by the same function that builds it for the call. Not the system
+    prompt — that is the persona plus every learning, identical on every question, and
+    putting it here would bury the one thing the user opened the disclosure to read.
+    Building it here rather than storing it means it cannot drift from what Neo gets.
+    """
+    from .. import digest, neo
+    q["digest_view"] = digest.decode(q.get("digest"))
+    q["full_context"] = neo.build_question_prompt(q)
+    return q
+
+
+def _digest_credit() -> str:
+    """Attribution for the vendored output style, shown once on the page."""
+    from .. import digest
+    return digest.skill_attribution()
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None)
 
@@ -410,9 +436,12 @@ def create_app() -> FastAPI:
             learnings = neo.all_learnings(limit=100)
         finally:
             neo.close()
+        for q in escalated + unreviewed:
+            _decorate_question(q)
         return render(request, "neo.html", active="neo", counts=counts,
                       in_flight=in_flight, escalated=escalated,
-                      unreviewed=unreviewed, history=history, learnings=learnings)
+                      unreviewed=unreviewed, history=history, learnings=learnings,
+                      digest_credit=_digest_credit())
 
     @app.get("/gates", response_class=HTMLResponse)
     def gates_page(request: Request):
