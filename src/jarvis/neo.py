@@ -20,12 +20,10 @@ user as an attention item.
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from typing import Any
 
-from . import claude_cli
+from . import claude_cli, structured
 from .neo_store import NeoStore
 
 log = logging.getLogger("neo")
@@ -124,8 +122,6 @@ def build_question_prompt(q: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
-
 # What Neo may write in `verdict`, and the status it means. Both the bare verb and the
 # past participle are accepted: the persona asks for "approve", the database stores
 # "approved", and a model that writes the other one is not making a mistake worth
@@ -176,6 +172,37 @@ def parse_dispatch(data: Any) -> dict[str, str] | None:
             "description": str(data.get("description") or "").strip()}
 
 
+def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalise a parsed Neo reply into the verdict dict, or raise.
+
+    `escalate` is the field that says this is a Neo verdict at all rather than some other
+    JSON object the model happened to emit, so its absence is a bad shape, not a default.
+    """
+    if "escalate" not in data:
+        raise structured.InvalidOutput("no `escalate` field in Neo's reply")
+    verdict = _gate_verdict(data)
+    return {
+        "escalate": bool(data.get("escalate")),
+        "answer": str(data.get("answer") or ""),
+        "reason": str(data.get("reason") or ""),
+        "verdict": verdict,
+        "approve": verdict == "approved",
+        "dispatch": parse_dispatch(data.get("dispatch")),
+    }
+
+
+def _unparseable_verdict(raw: str) -> dict[str, Any]:
+    """The fail-safe: output Neo cannot be held to becomes an escalation to the user.
+
+    Deliberately NOT a retry. An answer nobody can read must never reach a worker as an
+    answer, and asking again would spend a call to find that out — so this path fails
+    toward the user's attention, which is the failure the OS can recover from.
+    """
+    return {"escalate": True, "answer": "", "approve": False, "verdict": "denied",
+            "dispatch": None,
+            "reason": f"unparseable Neo output: {(raw or '')[:120]}"}
+
+
 def parse_verdict(raw: str) -> dict[str, Any]:
     """Parse Neo's strict-JSON reply, tolerating fenced or chatty output.
     Unparseable output is treated as an escalation — never deliver garbage.
@@ -188,25 +215,7 @@ def parse_verdict(raw: str) -> dict[str, Any]:
 
     `dispatch` is absent on almost every answer; None means "nothing to clean up".
     """
-    m = _JSON_RE.search(raw or "")
-    if m:
-        try:
-            data = json.loads(m.group(0))
-            if isinstance(data, dict) and "escalate" in data:
-                verdict = _gate_verdict(data)
-                return {
-                    "escalate": bool(data.get("escalate")),
-                    "answer": str(data.get("answer") or ""),
-                    "reason": str(data.get("reason") or ""),
-                    "verdict": verdict,
-                    "approve": verdict == "approved",
-                    "dispatch": parse_dispatch(data.get("dispatch")),
-                }
-        except json.JSONDecodeError:
-            pass
-    return {"escalate": True, "answer": "", "approve": False, "verdict": "denied",
-            "dispatch": None,
-            "reason": f"unparseable Neo output: {(raw or '')[:120]}"}
+    return structured.coerce(raw, _validate_verdict, on_invalid=_unparseable_verdict)
 
 
 def answer_question(store: NeoStore, q: dict[str, Any], model: str,
