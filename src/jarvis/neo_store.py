@@ -91,7 +91,9 @@ CREATE TABLE IF NOT EXISTS learnings (
     content TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT 'manual',   -- review | escalation | manual
     question_id INTEGER,
-    seat TEXT NOT NULL DEFAULT ''            -- '' = global (every seat sees it)
+    seat TEXT NOT NULL DEFAULT '',           -- '' = global (every seat sees it)
+    retired_at REAL,                         -- NULL = standing; set = superseded
+    retired_reason TEXT                      -- why, in the user's words
 );
 CREATE TABLE IF NOT EXISTS panel_opinions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,6 +128,10 @@ ADDED_COLUMNS = {
     },
     "learnings": {
         "seat": "TEXT NOT NULL DEFAULT ''",
+        # Retraction. NULL on every pre-existing row, which reads as "standing" — the
+        # ledger was append-only until now, so nothing that predates this is retired.
+        "retired_at": "REAL",
+        "retired_reason": "TEXT",
     },
 }
 
@@ -380,8 +386,36 @@ class NeoStore:
         row = self.conn.execute("SELECT * FROM learnings WHERE id=?", (cur.lastrowid,)).fetchone()
         return dict(row)
 
-    def learnings(self, project: str = "", limit: int = 50,
-                  seat: str = "") -> list[dict[str, Any]]:
+    def retract_learning(self, learning_id: int, reason: str) -> dict[str, Any]:
+        """Retire a learning the user has superseded. NOT a delete.
+
+        The row stays in the table and keeps being returned by `all_learnings` — that
+        is the audit trail, and it is the whole reason this is an UPDATE. What changes
+        is that `learnings` stops returning it, so it leaves Neo's system prompt.
+
+        Retracting an already-retired learning RAISES rather than quietly re-stamping
+        it: the original reason and timestamp are the record of when the user changed
+        their mind, and a second retraction would overwrite both with no gain.
+        """
+        if not reason.strip():
+            raise ValueError("a retraction needs a reason: what supersedes this learning?")
+        row = self.conn.execute(
+            "SELECT * FROM learnings WHERE id=?", (learning_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"learning {learning_id} not found")
+        if row["retired_at"] is not None:
+            raise ValueError(
+                f"learning {learning_id} was already retired: {row['retired_reason']!r}")
+        self.conn.execute(
+            "UPDATE learnings SET retired_at=?, retired_reason=? WHERE id=?",
+            (db.now(), reason.strip(), learning_id),
+        )
+        return dict(self.conn.execute(
+            "SELECT * FROM learnings WHERE id=?", (learning_id,)).fetchone())
+
+    def learnings(self, project: str = "", limit: int = 50, seat: str = "",
+                  include_retired: bool = False) -> list[dict[str, Any]]:
         """Learnings relevant to a project (its own + global), OLDEST first.
 
         Oldest-first keeps the rendered learnings block append-only: a new learning
@@ -395,11 +429,20 @@ class NeoStore:
         `neo.build_system_prompt` calls it that way for the single-agent path, so a
         seat-scoped learning leaking into it would silently rewrite a prompt prefix that
         has to stay byte-stable, and the panel ships disabled.
+
+        RETIRED LEARNINGS ARE EXCLUDED BY DEFAULT, and the default is what matters: this
+        is the method every prompt builder reads, including the panel's per-seat one,
+        which lives in another module. Filtering here rather than in
+        `neo.build_system_prompt` is what makes a seat-scoped prompt correct without its
+        author having to know retraction exists (ruled by Neo, question 56). Audit
+        surfaces — `all_learnings`, and `jarvis neo learnings` — pass
+        `include_retired=True` and say so on the row.
         """
+        retired = "" if include_retired else " AND retired_at IS NULL"
         rows = self.conn.execute(
-            """SELECT * FROM (
+            f"""SELECT * FROM (
                    SELECT * FROM learnings
-                    WHERE (project=? OR project='') AND (seat='' OR seat=?)
+                    WHERE (project=? OR project='') AND (seat='' OR seat=?){retired}
                    ORDER BY ts DESC LIMIT ?
                ) ORDER BY ts""",
             (project, seat or "", limit),
@@ -407,7 +450,12 @@ class NeoStore:
         return db.rows_to_dicts(rows)
 
     def all_learnings(self, limit: int = 200) -> list[dict[str, Any]]:
-        """Every learning regardless of project scope (review surfaces)."""
+        """Every learning regardless of project scope (review surfaces).
+
+        This is the AUDIT surface, so it returns retired learnings too, carrying their
+        `retired_at` and `retired_reason`. A retraction retires a ruling; it does not
+        erase that the user once held it.
+        """
         rows = self.conn.execute(
             "SELECT * FROM learnings ORDER BY ts DESC LIMIT ?", (limit,)
         ).fetchall()

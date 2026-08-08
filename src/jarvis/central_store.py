@@ -53,7 +53,9 @@ CREATE TABLE IF NOT EXISTS knowledge (
     ts REAL NOT NULL,
     topic TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL,
-    tags TEXT NOT NULL DEFAULT ''
+    tags TEXT NOT NULL DEFAULT '',
+    retired_at REAL,                        -- NULL = standing; set = superseded
+    retired_reason TEXT                     -- why, in the user's words
 );
 CREATE TABLE IF NOT EXISTS os_state (
     key TEXT PRIMARY KEY,
@@ -63,6 +65,20 @@ CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
 CREATE INDEX IF NOT EXISTS idx_backlog_project ON backlog(project, status);
 """
 
+# Columns added after the first release, exactly as in `neo_store` and `project_store`.
+# `CREATE TABLE IF NOT EXISTS` is a NO-OP on a table that already exists, so a column
+# added to SCHEMA alone reaches new installs only and every live `os.db` fails on read.
+# Until this existed `os.db` had no upgrade path at all — `CentralStore.__init__` ran
+# `executescript(SCHEMA)` and nothing else — which is why the first column ever added to
+# it had to bring the mechanism with it.
+ADDED_COLUMNS = {
+    "knowledge": {
+        # Retraction. NULL on every pre-existing row, which reads as "standing".
+        "retired_at": "REAL",
+        "retired_reason": "TEXT",
+    },
+}
+
 
 class CentralStore:
     def __init__(self, path: Path | None = None):
@@ -70,6 +86,17 @@ class CentralStore:
         self.db_path = path or central_db_path()
         self.conn = db.connect(self.db_path)
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        for table, columns in ADDED_COLUMNS.items():
+            have = {
+                r["name"]
+                for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, decl in columns.items():
+                if name not in have:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def close(self) -> None:
         self.conn.close()
@@ -227,6 +254,33 @@ class CentralStore:
         )
         return {"id": kid, "project": project, "topic": topic, "content": content, "tags": tags}
 
+    def retract_knowledge(self, knowledge_id: str, reason: str) -> dict[str, Any]:
+        """Retire a knowledge entry the user has superseded. NOT a delete.
+
+        The row stays in the table and keeps being returned by `search_knowledge` — the
+        audit trail — while `relevant_knowledge` stops offering it to workers.
+
+        Retracting an already-retired entry RAISES rather than re-stamping it: the
+        original reason and timestamp record when the user changed their mind.
+        """
+        if not reason.strip():
+            raise ValueError("a retraction needs a reason: what supersedes this entry?")
+        row = self.conn.execute(
+            "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"knowledge entry {knowledge_id!r} not found")
+        if row["retired_at"] is not None:
+            raise ValueError(
+                f"knowledge entry {knowledge_id!r} was already retired: "
+                f"{row['retired_reason']!r}")
+        self.conn.execute(
+            "UPDATE knowledge SET retired_at=?, retired_reason=? WHERE id=?",
+            (db.now(), reason.strip(), knowledge_id),
+        )
+        return dict(self.conn.execute(
+            "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)).fetchone())
+
     def record_memory_file(self, content: str, project: str = "", topic: str = "",
                            tags: str = MEMORY_TAG) -> bool:
         """Mirror a mirrored-from-a-file memory into the knowledge base.
@@ -235,10 +289,18 @@ class CentralStore:
         replaced rather than appended — otherwise every edit would push older
         learnings out of the recency window with near-duplicates of itself.
         Returns False when nothing changed.
+
+        THE SELECT SKIPS RETIRED ROWS, so the next rewrite of a retracted memory file
+        INSERTs a fresh live row instead of writing into the retired one. Replacing a
+        retired row in place would turn one retraction into a permanent, silent mute on
+        a file the worker keeps updating — every later version written somewhere no
+        prompt reads, with no signal to anyone. A retraction is a statement about the
+        TEXT that was retired, not about the file (ruled by Neo, question 56). Steady
+        state is still at most one live row per (project, topic, tags), plus history.
         """
         row = self.conn.execute(
             "SELECT id, content FROM knowledge WHERE project=? AND topic=? AND tags=?"
-            " ORDER BY ts DESC LIMIT 1",
+            " AND retired_at IS NULL ORDER BY ts DESC LIMIT 1",
             (project, topic, tags),
         ).fetchone()
         if row is not None and row["content"] == content:
@@ -250,15 +312,26 @@ class CentralStore:
         self.add_knowledge(content, project=project, topic=topic, tags=tags)
         return True
 
-    def relevant_knowledge(self, project: str, limit: int = 8) -> list[dict[str, Any]]:
-        """Project-specific + global entries, most recent first."""
+    def relevant_knowledge(self, project: str, limit: int = 8,
+                           include_retired: bool = False) -> list[dict[str, Any]]:
+        """Project-specific + global entries, most recent first.
+
+        This is the PROMPT feed — `dispatch.build_worker_prompt` offers it to every
+        worker — so retired entries are excluded by default. `jarvis learn list` passes
+        `include_retired=True` and marks them; `search_knowledge` is the unfiltered
+        audit surface.
+        """
+        retired = "" if include_retired else " AND retired_at IS NULL"
         rows = self.conn.execute(
-            "SELECT * FROM knowledge WHERE project=? OR project='' ORDER BY ts DESC LIMIT ?",
+            f"SELECT * FROM knowledge WHERE (project=? OR project='')"
+            f"{retired} ORDER BY ts DESC LIMIT ?",
             (project, limit),
         ).fetchall()
         return db.rows_to_dicts(rows)
 
     def search_knowledge(self, term: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Free-text search. The AUDIT surface: retired entries are included, carrying
+        their `retired_at` and `retired_reason`."""
         like = f"%{term}%"
         rows = self.conn.execute(
             "SELECT * FROM knowledge WHERE content LIKE ? OR topic LIKE ? OR tags LIKE ? ORDER BY ts DESC LIMIT ?",
