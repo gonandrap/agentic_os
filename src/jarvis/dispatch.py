@@ -137,8 +137,9 @@ def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str
         f"# Knowledge base — {brief.total} entries visible to `{project_name}` "
         f"(this project + global)",
         "**This section is an INDEX, not the knowledge.** Headlines are truncated; the "
-        "full text of an entry arrives only when you ask for it. Before you touch an "
-        "area — a build step, a deploy path, a convention, a service — look it up:",
+        "full text of an entry arrives only when you ask for it. If a headline below "
+        "touches what you are about to do, FETCH IT — before you act on it, and before "
+        "you ask Neo or record an assumption about it:",
         "```bash",
         f'jarvis learn search "<term>" --project {project_name}  # full text of matches',
         "jarvis learn show <id> [<id> ...]  # full text of specific entries",
@@ -216,6 +217,11 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "options, thinking \"either would work\", or picking one because you have to "
         "pick something, you are in doubt: ask. Ask BEFORE you build on it, not "
         "after.",
+        "  - But LOOK IT UP FIRST when the knowledge-base index at the end of this "
+        "prompt covers the area. A lookup is not a doubt: if a past worker already "
+        "recorded the answer, `jarvis learn show <id>` costs you one command, while "
+        "asking spends Neo's or the user's attention re-deciding something the fleet "
+        "already paid for. If the index has nothing on it, ask — never guess.",
         "  - Do not talk yourself out of asking. \"It's reversible\", \"it's only an "
         "implementation detail\", \"I'll note it as an assumption\" — those are "
         "rationalisations for guessing. Almost everything is reversible; that is not "
@@ -232,11 +238,13 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"guessing, ask instead.",
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"`",
-        f"- READ the OS knowledge base on demand — it is indexed at the end of this "
-        f"prompt, not pasted into it: `jarvis learn search \"<term>\" --project "
-        f"{project.name}` and `jarvis learn show <id>`. Look up any area you are about "
-        f"to touch before you touch it; a past worker probably already paid for the "
-        f"lesson. Do not assume the index headline is the whole entry.",
+        f"- READ the OS knowledge base on demand — it is INDEXED at the end of this "
+        f"prompt, not pasted into it: `jarvis learn show <id>` for an entry the index "
+        f"lists, `jarvis learn search \"<term>\" --project {project.name}` to sweep "
+        f"for one. Look up any area you are about to touch BEFORE you touch it, and "
+        f"before you ask or assume about it — a past worker probably already paid for "
+        f"the lesson. The headline is a truncated first line, never the whole entry: "
+        f"if a headline looks relevant, fetch it rather than acting on the summary.",
         f"- WRITE to it: the OS knowledge base is the ONLY memory that survives you: "
         f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`. "
         f"Anything durable you learn — project state, gotchas, conventions, decisions "

@@ -399,19 +399,41 @@ class CentralStore:
         The row says which, and `cli.cmd_learn` marks it. `project` scopes to that
         project + global; omit it to search the whole fleet (cross-project learnings
         are often the point).
+
+        **Words are ORed and the result is ranked by how many of them a row matched**,
+        rather than the whole term being one `LIKE '%…%'`. A single word behaves exactly
+        as it always did; the difference is a query like "cents rounding format", which
+        under phrase matching required that literal string and so returned nothing at
+        all. That is how real agents search — the retrieval eval
+        (evals/llm/test_knowledge_retrieval_judgment.py) scored 2/7 on phrase matching
+        purely because natural multi-word queries retrieved nothing — and an index whose
+        lookup verb only answers single keywords is not a lookup verb.
+
+        Still substring matching per word, so it has no stemming and no synonyms:
+        "rounding" does not find "rounded" on its own, it survives only by riding along
+        with the other words in the query. FTS5 is the real fix and is on the backlog.
         """
-        like = f"%{term}%"
-        q = ["SELECT * FROM knowledge WHERE (content LIKE ? OR topic LIKE ? OR tags LIKE ?)"]
-        params: list[Any] = [like, like, like]
+        words = [w for w in (term or "").split() if w] or [""]
+        # score = how many of the query's words this row matched anywhere
+        score = " + ".join(
+            "(CASE WHEN content LIKE ? OR topic LIKE ? OR tags LIKE ? THEN 1 ELSE 0 END)"
+            for _ in words)
+        params: list[Any] = []
+        for w in words:
+            params += [f"%{w}%"] * 3
+        q = [f"SELECT *, ({score}) AS _score FROM knowledge WHERE _score > 0"]
         if project is not None:
             q.append("AND (project=? OR project='')")
             params.append(project)
         if topic is not None:
             q.append("AND topic=?")
             params.append(topic)
-        q.append("ORDER BY ts DESC LIMIT ?")
+        q.append("ORDER BY _score DESC, ts DESC LIMIT ?")
         params.append(limit)
-        return db.rows_to_dicts(self.conn.execute(" ".join(q), params).fetchall())
+        rows = db.rows_to_dicts(self.conn.execute(" ".join(q), params).fetchall())
+        for row in rows:  # ranking is how the list is ordered, not a field of an entry
+            row.pop("_score", None)
+        return rows
 
     def set_knowledge_tags(self, kid: str, tags: str) -> dict[str, Any] | None:
         self.conn.execute("UPDATE knowledge SET tags=? WHERE id=?", (tags, kid))

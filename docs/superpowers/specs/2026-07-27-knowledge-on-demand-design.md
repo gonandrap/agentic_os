@@ -121,12 +121,63 @@ The trade is a round-trip: a worker that needs an entry pays a tool call for it.
 the right trade — it is paid once, by the one worker who needs it, instead of upfront by
 every worker who does not.
 
+### Interaction with retraction
+
+Retraction (#74) gave both ledgers `retired_at`, so that a superseded ruling "leaves the
+prompt". **An index headline is still the prompt**, so retraction has to remove an entry
+from the map as well as from the payload — otherwise the worker reads the superseded
+headline, believes the OS knows something, and goes and fetches it. `knowledge_brief`
+therefore inherits `relevant_knowledge`'s filter across all three tiers, and
+`knowledge_topics` excludes retired entries too: a topic whose only entries were
+retracted must not advertise itself in the overflow roll-call as somewhere to go looking.
+
+The audit surfaces keep main's semantics. `search_knowledge` still returns retired
+entries — and it is now also the worker's retrieval verb, deliberately: a worker that
+looked something up and got nothing back would conclude the OS knows nothing about it,
+when the truth is that it knew and changed its mind. The row says which, and
+`cmd_learn`'s digest marks it, so a truncated headline cannot pass for standing advice.
+
+### Does the worker actually retrieve?
+
+The mechanism being correct is not the claim; the claim is that a model handed an index
+notices what it needs and aims a retrieval at the right entry. That is graded in
+`evals/llm/test_knowledge_retrieval_judgment.py`, which builds a real store, renders the
+real dispatch prompt, and scores three batteries: **retrieve** (the answer sits behind a
+headline — reach for the KB), **precision** (name the right id, against adjacent decoys
+in the same topic), and **no-phantom** (an absent area must not summon a cited entry —
+without it, a model answering everything with `learn show` would sweep the other two).
+
+Retrieval is graded against the store rather than by string matching: when a reply
+searches, the term it chose is run through `search_knowledge` and the target has to come
+back. A plausible-looking `learn search "deployment"` that retrieves nothing scores as
+the miss it is.
+
+**Its first run scored 2/7 and both causes were real defects in this design, not in the
+eval.** Worth recording, because neither was visible to any structural test:
+
+1. **The retrieval verb did not answer the way agents ask.** Two misses were the subject
+   searching correctly — `learn search "cents rounding format"` — against a store doing
+   `LIKE '%cents rounding format%'`, which requires that literal phrase and returned
+   nothing. Agents search in phrases. `search_knowledge` now ORs the words and ranks rows
+   by how many matched; a single word behaves exactly as before. Still no stemming
+   ("rounding" does not find "rounded" alone, it rides along with the rest of the query),
+   so FTS5 remains the real fix and stays on the backlog — but an index whose lookup verb
+   only answers single keywords was not a lookup verb.
+2. **Reading lost to asking.** Three misses went to `jarvis wo ask` on questions the
+   index plainly covered — the READ bullet was quietly losing to the (deliberately very
+   loud) "Neo is your first responder, any doubt goes to it" rule. Spending the user's
+   attention re-deciding what the fleet already recorded is the exact cost this OS
+   exists to avoid, so the ordering is now explicit in both places: *a lookup is not a
+   doubt — look it up first when the index covers the area; if it has nothing, ask.*
+   The "if it has nothing, ask" half is load-bearing, and `test_worker_judgment.py`
+   (which builds its prompt with no index at all) is the guard that it still holds.
+
 ### Accepted risk
 
 A worker that never searches now sees less than it used to. Mitigations: the pinned tier
-for anything that must not be missed, the contract bullet, and the index making absence
-visible. If real sessions show workers skipping retrieval, the next lever is a
-SessionStart nudge or an eval scenario that grades it — not going back to bulk injection.
+for anything that must not be missed, the contract bullet, the index making absence
+visible, and the eval above measuring whether any of it works. If those scores fall, the
+next lever is a SessionStart nudge — not going back to bulk injection.
 
 ## 4. Migration
 
@@ -140,8 +191,9 @@ what matters with `jarvis learn pin <id>` or the dashboard toggle.
 | Where | What |
 |---|---|
 | `src/jarvis/central_store.py` | `headline()`, `KnowledgeBrief`, `knowledge_brief()`, `get_knowledge`, `knowledge_topics`, `count_knowledge`, `pin_knowledge`, project/topic-scoped `search_knowledge` |
-| `src/jarvis/dispatch.py` | `render_knowledge_block()`, the contract's READ bullet, `dispatch_work_order(os_config=…)` |
+| `src/jarvis/dispatch.py` | `render_knowledge_block()`, called from `_common_briefing` so the worker AND planner contracts both get it; the READ bullet in each; `dispatch_work_order(os_config=…)` |
 | `src/jarvis/catalog.py` | `knowledge_digest_limit`, `knowledge_digest_chars` |
 | `src/jarvis/cli.py` | `learn show|topics|pin|unpin`, `--pin`, `--topic`, `--limit`, `--full` |
 | `src/jarvis/ui/` | knowledge page: ids, topic roll-call, pin/unpin toggle |
-| `tests/test_knowledge_ondemand.py` | the boundedness property and every tier |
+| `tests/test_knowledge_ondemand.py` | the boundedness property, every tier, retraction, and that each indexed id is retrievable by its own headline |
+| `evals/llm/test_knowledge_retrieval_judgment.py` | whether a model actually cashes the index in |
