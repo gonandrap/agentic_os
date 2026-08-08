@@ -412,3 +412,29 @@ class NeoStore:
             "SELECT * FROM learnings ORDER BY ts DESC LIMIT ?", (limit,)
         ).fetchall()
         return db.rows_to_dicts(rows)
+
+    # -- export ------------------------------------------------------------------
+
+    #: The tables `export` dumps, in the order they appear in the document.
+    EXPORT_TABLES = ("questions", "learnings", "panel_opinions")
+
+    def export(self) -> dict[str, list[dict[str, Any]]]:
+        """The whole ledger: every table, every row, every column, no truncation.
+
+        Prime directive 1 forbids reading `neo.db` directly, so this is the only way
+        anything outside the OS gets at Neo's record — the panel eval replaying the
+        question corpus is the first caller (`jarvis neo export --json`).
+
+        `SELECT *` rather than a hand-written column list is deliberate. A column added
+        to any of these tables ships in the export the day it lands, instead of being
+        silently dropped until someone notices the field they wanted was never there.
+
+        The document carries NO wall-clock field and every table is ordered by `id`, so
+        two consecutive exports of an unchanged database are byte-identical and a diff
+        between two of them shows only what actually changed.
+        """
+        return {
+            table: db.rows_to_dicts(
+                self.conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall())
+            for table in self.EXPORT_TABLES
+        }
