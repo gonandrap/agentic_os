@@ -12,7 +12,7 @@ from jarvis import ops
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
-from jarvis.neo_store import NeoStore
+from jarvis.neo_store import SEATS, NeoStore
 from jarvis.project_store import ProjectStore
 
 
@@ -331,6 +331,51 @@ def test_a_seat_scoped_learning_does_not_move_neos_cached_prefix(jarvis_home):
         assert "A grep naming shipit" not in after
     finally:
         store.close()
+
+
+def test_with_the_panel_disabled_neo_answers_exactly_as_before(started, project,
+                                                               fake_claude):
+    """THE REGRESSION PIN FOR THE WHOLE PANEL FEATURE.
+
+    Every work order in this feature ships the panel DISABLED, and the promise at that
+    default is not "roughly the same" — it is byte-identical behaviour: the same number of
+    Claude calls, the same system prompt bytes, the same message to the worker, and
+    nothing at all in `panel_opinions`. If a change alters what a default-configured Neo
+    does, it is wrong, and this is where that is caught.
+
+    Asserted on COUNTS and on STORED ROWS rather than on "a verdict came back": the fake
+    returns a valid non-escalating verdict for any prompt at all, so "Neo answered" is
+    true of a panel run, a single-agent run and very nearly anything else.
+    """
+    daemon = started
+    wo = ops.create_work_order("proj_a", "build the exporter")
+    daemon.tick()
+    for question in ("Which delimiter?", "Which encoding?", "Which line ending?"):
+        ops.ask_question(wo["id"], question)
+
+    drain(daemon)
+
+    calls = _neo_calls(fake_claude)
+    assert len(calls) == 3, "one call per question — no seat, no chair"
+    neo = NeoStore()
+    try:
+        systems = {c["argv"][c["argv"].index("--append-system-prompt") + 1]
+                   for c in calls}
+        assert systems == {neo_mod.build_system_prompt(neo, "proj_a")}
+        assert {c["argv"][c["argv"].index("--model") + 1] for c in calls} == {"opus"}
+        for qid in (1, 2, 3):
+            assert neo.opinions(qid) == [], "nothing deliberated"
+        answers = [neo.get(qid)["answer"] for qid in (1, 2, 3)]
+    finally:
+        neo.close()
+
+    store = ProjectStore(project)
+    try:
+        contents = [m["content"] for m in store.queued_messages(wo["id"])]
+    finally:
+        store.close()
+    assert contents == [f"{neo_mod.ANSWER_PREFIX} {a}" for a in answers]
+    assert not [s for s in SEATS for c in contents if s in c]
 
 
 def test_neo_disabled_via_catalog(jarvis_home, fake_claude, tmp_path, project, claude_json):

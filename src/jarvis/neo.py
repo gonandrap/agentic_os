@@ -236,21 +236,35 @@ def answer_question(store: NeoStore, q: dict[str, Any], model: str,
 
 
 def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
-                deliver: Any = None, max_questions: int = 50) -> list[dict[str, Any]]:
+                deliver: Any = None, max_questions: int = 50,
+                answer: Any = None) -> list[dict[str, Any]]:
     """Answer every queued question in FIFO order, back-to-back.
 
     `deliver(question, verdict)` is called per question with the outcome — the
     daemon uses it to route answers to workers and escalations to the user. The
     drain is sequential BY DESIGN: ordering + tight spacing keep Neo's shared
     prompt prefix warm in the Anthropic cache.
+
+    `answer(store, question, model, learnings_limit) -> verdict` is HOW a question gets
+    answered, defaulting to `answer_question` — one headless call, one agent. It is the
+    seam the multi-agent panel is injected through (`daemon._neo_drain` passes
+    `panel.decide` bound to the catalog when the panel is enabled).
+
+    THE SEAM IS A KEYWORD RATHER THAN AN IMPORT, AND THAT IS THE WHOLE POINT. The design
+    says "`answer_question` becomes a caller of the panel" and "if the panel's first seat
+    fails, fall back to today's single-agent path" — which taken literally is `neo`
+    importing `panel` while `panel` imports `neo`, an import cycle in a codebase that has
+    none. This module must never know that panels exist; falling back to the single agent
+    is then simply not passing `answer=`.
     """
+    answer = answer or answer_question
     results = []
     for _ in range(max_questions):
         q = store.claim_next()
         if q is None:
             break
         try:
-            verdict = answer_question(store, q, model, learnings_limit)
+            verdict = answer(store, q, model, learnings_limit)
         except claude_cli.ClaudeCliError as e:
             log.error("neo failed answering question %s: %s", q["id"], e)
             store.mark(q["id"], "failed", reason=str(e))
@@ -264,12 +278,14 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             store.mark(q["id"], "escalated", reason=verdict["reason"])
             log.info("neo escalated question %s: %s", q["id"], verdict["reason"])
         else:
-            answer = verdict["answer"]
+            # `text`, not `answer`: `answer` is the injected answerer above, and rebinding
+            # it here made the second question of every drain call a string.
+            text = verdict["answer"]
             if q.get("kind") in ("approval", "plan"):
                 # A ruling lives in `verdict`, not in prose. Record it as the answer too
                 # so `jarvis neo show` and the review surfaces read plainly.
-                answer = (verdict.get("verdict") or "denied").upper()
-            store.record_answer(q["id"], answer, answered_by="neo",
+                text = (verdict.get("verdict") or "denied").upper()
+            store.record_answer(q["id"], text, answered_by="neo",
                                 reason=verdict["reason"])
             log.info("neo answered question %s (%s)", q["id"], q.get("kind") or "question")
         if deliver:
