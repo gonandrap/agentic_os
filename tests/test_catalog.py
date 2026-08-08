@@ -3,6 +3,7 @@ import json
 import pytest
 
 from jarvis.catalog import CatalogError, load_catalog, parse_catalog
+from jarvis.neo_store import SEATS
 
 
 def test_minimal_catalog(tmp_path):
@@ -77,3 +78,71 @@ def test_empty_projects_allowed():
 def test_missing_projects_defaults_empty():
     cat = parse_catalog({"os": {"defaults": {"model": "sonnet"}}})
     assert cat.projects == []
+
+
+# -- Neo's panel ---------------------------------------------------------------------
+
+
+def panel_of(raw):
+    return parse_catalog({"os": {"neo": {"panel": raw}}, "projects": []}).os.neo.panel
+
+
+def test_the_panel_is_off_unless_a_catalog_turns_it_on():
+    """The rule every work order in this feature obeys. Enabling it is a catalog edit,
+    gated on a measurement that does not exist yet — never a default that drifts in."""
+    assert parse_catalog({"projects": []}).os.neo.panel.enabled is False
+
+
+def test_a_catalog_with_no_panel_key_parses():
+    cat = parse_catalog({"os": {"neo": {"model": "opus"}}, "projects": []})
+    assert cat.os.neo.panel.roster == ("premise", "chair")
+    assert cat.os.neo.panel.kinds == ("question", "approval")
+
+
+def test_an_empty_panel_block_parses():
+    assert panel_of({}).enabled is False
+
+
+def test_a_roster_of_every_seat_parses():
+    """The negative control for the validator below: `neo_store.SEATS` is the vocabulary,
+    and every name in it must be accepted — including the seats whose definitions ship in
+    a later release. A config written ahead of the code is caught at run time (the seat
+    records a `failed` opinion and the panel proceeds), not by refusing to boot the
+    fleet."""
+    assert panel_of({"roster": list(SEATS)}).roster == SEATS
+
+
+def test_a_roster_naming_an_unknown_seat_is_rejected():
+    """Every seat past `premise` is a safety check, so a typo that silently drops one
+    removes a check and tells nobody — the same reasoning as an invalid
+    `permission_mode`, with more at stake."""
+    with pytest.raises(CatalogError, match="scpetic"):
+        panel_of({"roster": ["premise", "scpetic", "chair"]})
+
+
+def test_a_seat_model_for_an_unknown_seat_is_rejected():
+    with pytest.raises(CatalogError, match="chiar"):
+        panel_of({"seat_models": {"chiar": "haiku"}})
+
+
+def test_a_panel_kind_that_is_not_a_question_kind_is_rejected():
+    with pytest.raises(CatalogError, match="approvals"):
+        panel_of({"kinds": ["question", "approvals"]})
+
+
+def test_the_panel_block_must_be_an_object():
+    with pytest.raises(CatalogError, match="os.neo.panel"):
+        parse_catalog({"os": {"neo": {"panel": "yes please"}}, "projects": []})
+
+
+def test_panel_settings_round_trip():
+    p = panel_of({"enabled": True, "roster": ["premise", "blast", "chair"],
+                  "seat_models": {"premise": "haiku"}, "chair_model": "opus",
+                  "timeout": 90, "kinds": ["approval"], "fast_path": False})
+    assert p.enabled is True
+    assert p.roster == ("premise", "blast", "chair")
+    assert p.seat_models == {"premise": "haiku"}
+    assert p.chair_model == "opus"
+    assert p.timeout == 90
+    assert p.kinds == ("approval",)
+    assert p.fast_path is False
