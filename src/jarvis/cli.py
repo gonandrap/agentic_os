@@ -361,6 +361,11 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--project")
     k = kn.add_parser("search")
     k.add_argument("term")
+    k = kn.add_parser("retract", help="retire a superseded entry (kept for the record, "
+                                      "dropped from worker prompts)")
+    k.add_argument("knowledge_id")
+    k.add_argument("--reason", required=True,
+                   help="what supersedes it — this is kept beside the entry for ever")
 
     # neo -----------------------------------------------------------------------------------
     ne = sub.add_parser("neo", help="Neo: the OS answerer agent (answers workers as you)"
@@ -381,6 +386,11 @@ def build_parser() -> argparse.ArgumentParser:
     n = ne.add_parser("learn", help="teach Neo directly (no question needed)")
     n.add_argument("content")
     n.add_argument("--project", default="")
+    n = ne.add_parser("retract", help="retire a superseded learning (kept for the "
+                                      "record, dropped from Neo's prompt)")
+    n.add_argument("learning_id", type=int)
+    n.add_argument("--reason", required=True,
+                   help="what supersedes it — this is kept beside the learning for ever")
 
     # notifications ----------------------------------------------------------------------------
     n = sub.add_parser("notify", help="emit a notification into the OS pipeline")
@@ -885,11 +895,25 @@ def cmd_learn(args: argparse.Namespace) -> int:
             _print(central.add_knowledge(args.content, project=args.project,
                                          topic=args.topic, tags=args.tags), args.json)
         elif args.kn_cmd == "list":
-            rows = (central.relevant_knowledge(args.project, limit=100)
+            # An audit surface, so retired entries are listed too — `--project` would
+            # otherwise hide them, `search_knowledge` already shows them, and the same
+            # command answering two different questions is worse than either.
+            rows = (central.relevant_knowledge(args.project, limit=100,
+                                               include_retired=True)
                     if args.project else central.search_knowledge("", limit=100))
             _print(rows, args.json)
         elif args.kn_cmd == "search":
             _print(central.search_knowledge(args.term), args.json)
+        elif args.kn_cmd == "retract":
+            try:
+                row = central.retract_knowledge(args.knowledge_id, args.reason)
+            except (KeyError, ValueError) as exc:
+                # `.args[0]`, not `str(exc)`: KeyError stringifies to its repr, so the
+                # message would reach the user wrapped in quotes.
+                print(f"error: {exc.args[0]}", file=sys.stderr)
+                return 1
+            _print({"retracted": row["id"], "reason": row["retired_reason"],
+                    "content": row["content"]}, args.json)
     finally:
         central.close()
     return 0
@@ -939,7 +963,9 @@ def cmd_neo(args: argparse.Namespace) -> int:
     elif args.neo_cmd == "learnings":
         neo = NeoStore()
         try:
-            rows = neo.learnings(args.project, limit=200)
+            # An audit surface: retired learnings are listed, marked, and shown with the
+            # reason they were retired. Neo's PROMPT gets the filtered default.
+            rows = neo.learnings(args.project, limit=200, include_retired=True)
         finally:
             neo.close()
         if args.json:
@@ -947,7 +973,11 @@ def cmd_neo(args: argparse.Namespace) -> int:
         else:
             for r in rows:
                 scope = r["project"] or "global"
-                print(f"• [{scope}] ({r['source']}) {r['content']}")
+                retired = (f" [retired: {r['retired_reason']}]"
+                           if r["retired_at"] else "")
+                bullet = "⊘" if r["retired_at"] else "•"
+                print(f"{bullet} #{r['id']} [{scope}] ({r['source']}) "
+                      f"{r['content']}{retired}")
             if not rows:
                 print("Neo has no learnings yet — review its answers to teach it")
     elif args.neo_cmd == "learn":
@@ -957,6 +987,17 @@ def cmd_neo(args: argparse.Namespace) -> int:
         finally:
             neo.close()
         _print({"learned": row["id"], "project": args.project or "global"}, args.json)
+    elif args.neo_cmd == "retract":
+        neo = NeoStore()
+        try:
+            row = neo.retract_learning(args.learning_id, args.reason)
+        except (KeyError, ValueError) as exc:
+            print(f"error: {exc.args[0]}", file=sys.stderr)
+            return 1
+        finally:
+            neo.close()
+        _print({"retracted": row["id"], "reason": row["retired_reason"],
+                "content": row["content"]}, args.json)
     return 0
 
 
