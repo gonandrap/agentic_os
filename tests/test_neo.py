@@ -720,6 +720,48 @@ def test_export_round_trips_every_row_and_every_column(asked, capsys):
             assert row["ts"] and row["id"]
 
 
+def test_export_emits_every_column_the_tables_actually_have(asked, capsys):
+    """No hand-written whitelist: the columns come from the tables themselves.
+
+    `test_export_round_trips_every_row_and_every_column` compares the CLI against
+    `NeoStore.export()`, so it cannot catch a whitelist — both sides would drop the same
+    column. This asks SQLite what the columns ARE and demands all of them, which is what
+    makes the guarantee survive the next migration.
+
+    It is not hypothetical: `retired_at`/`retired_reason` were added to `learnings` by a
+    concurrent work order after this export was written, and reached the document with
+    no change here.
+    """
+    import json as _json
+
+    from jarvis import cli
+    from jarvis.neo_store import NeoStore as _NS
+
+    daemon, _, _ = asked
+    drain(daemon)
+    seed_opinions()
+    neo = NeoStore()
+    try:
+        neo.add_learning("Prefer CSV", project="proj_a")
+        actual = {
+            table: {r["name"] for r in
+                    neo.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            for table in _NS.EXPORT_TABLES
+        }
+    finally:
+        neo.close()
+
+    capsys.readouterr()
+    cli.main(["neo", "export", "--json"])
+    doc = _json.loads(capsys.readouterr().out)
+    for table, columns in actual.items():
+        assert doc[table], f"{table} seeded no rows, so this asserts nothing"
+        for row in doc[table]:
+            assert set(row) == columns, table
+    # the concrete columns that made this rule worth writing down
+    assert {"retired_at", "retired_reason"} <= actual["learnings"]
+
+
 def test_two_consecutive_exports_are_byte_identical(asked, capsys):
     """No wall-clock field anywhere in the document — a diff of two exports has to show
     what changed in the ledger, not that time passed."""
