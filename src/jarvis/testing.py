@@ -266,6 +266,58 @@ elif "-p" in argv and "--resume" not in argv:
     # headless one-shot (`claude -p ...`) — Neo's answering path. Deterministic
     # verdict driven by the prompt so tests control escalation.
     prompt = argv[argv.index("-p") + 1]
+    system = opt("--append-system-prompt", "")
+    # A PANEL SEAT, AND THIS BRANCH COMES FIRST DELIBERATELY. Seat identity travels in
+    # --append-system-prompt, never in the user prompt: a premise-seat call on a gate
+    # question carries "PRIVILEGED ACTION REQUEST" in its prompt, so without this the
+    # branch below would answer it with a well-formed gate verdict AND NO `route` KEY —
+    # after which a lenient `panel.decide` defaults the route and the test passes having
+    # exercised nothing.
+    seat = next((s for s in ("premise", "record", "blast", "taste", "chair")
+                 if ("# Neo panel seat: " + s) in system), None)
+    if seat:
+        # Per-seat failure, NOT the shared FORCE_FAIL below: that one keys on the user
+        # prompt, which every seat on one question shares, so it could only ever fail all
+        # of them at once. A degradation test needs to fail exactly one.
+        if seat in [s for s in os.environ.get("FAKE_SEAT_FAIL", "").split(",") if s]:
+            sys.stderr.write(f"seat {seat} failed (test-forced)\n"); sys.exit(1)
+        if "FORCE_SEAT_GARBAGE" in prompt and seat == "premise":
+            print(json.dumps({"result": "the premise here is, well, hard to say"}))
+            sys.exit(0)
+        tail = prompt.splitlines()[-1][:60]
+        # NOTE: no seat name appears in any `answer` below, and that is load-bearing
+        # rather than tidy. Panel deliberation must never reach the worker, and the test
+        # that pins it asserts no seat name is in the delivered message — a canned answer
+        # containing the word "chair" would fail it for the wrong reason and, worse, a
+        # later loosening of that assertion would go unnoticed.
+        if seat == "premise":
+            reply = {"escalate": False, "answer": f"first-read decision on: {tail}",
+                     "reason": "premise finding", "route": "panel"}
+            if "FORCE_ROUTE_FAST" in prompt:
+                reply["route"] = "fast"
+            if "FORCE_NO_ROUTE" in prompt:
+                reply.pop("route")
+            if "FORCE_PROPOSE_DISMISS" in prompt:
+                reply["verdict"] = "dismiss"
+            elif "FORCE_PROPOSE_APPROVE" in prompt:
+                reply["verdict"] = "approve"
+        elif seat == "chair":
+            reply = {"escalate": False, "answer": f"synthesised decision on: {tail}",
+                     "reason": "the panel's verdict"}
+            if "FORCE_CHAIR_ESCALATE" in prompt:
+                reply = {"escalate": True, "answer": "",
+                         "reason": "test-forced escalation by the panel"}
+            elif "FORCE_CHAIR_APPROVE" in prompt:
+                reply["verdict"] = "approve"
+            elif "FORCE_CHAIR_DISMISS" in prompt:
+                reply["verdict"] = "dismiss"
+        else:
+            # The three seats that arrive with the next work order: no verdict shape of
+            # their own yet, but a distinct reply so "the seats deliberated" is provable.
+            reply = {"escalate": False, "answer": f"{seat}-finding for: {tail}",
+                     "reason": f"{seat} finding"}
+        print(json.dumps({"result": json.dumps(reply)}))
+        sys.exit(0)
     if "FORCE_FAIL" in prompt:
         sys.stderr.write("model call failed (test-forced)\n"); sys.exit(1)
     if "FORCE_ESCALATE" in prompt:
@@ -501,6 +553,15 @@ def fake_claude(tmp_path, monkeypatch):
                             path.read_text().splitlines() if line]
                 for path in sorted(tdir.iterdir())
             }
+
+        def fail_seat(self, *seats: str) -> None:
+            """Make the named panel seats' calls fail, and only those.
+
+            Per-seat rather than the shared `FORCE_FAIL`, which keys on the user prompt —
+            identical across every seat on one question — and so could only fail the whole
+            panel at once. Degradation is per seat: one seat abstains and the rest proceed.
+            """
+            monkeypatch.setenv("FAKE_SEAT_FAIL", ",".join(seats))
 
         def turns_fail(self, mode: str = "fail") -> None:
             """Make subsequent turns fail. `fail` = non-zero exit, `silent` = exits
