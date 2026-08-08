@@ -26,7 +26,28 @@ JARVIS_EVALS_LLM=1 JARVIS_EVALS_MODEL=opus pytest evals/llm -q
 ```
 
 Run the LLM layer before changing any persona/prompt text (Neo's PERSONA, the worker
-contract, CLAUDE.md) and paste the scorecard into the PR description.
+contract, CLAUDE.md, the seat mandates in `src/jarvis/assets/neo-seats/`) and paste the
+scorecard into the PR description.
+
+### The panel eval
+
+`evals/llm/test_neo_panel_judgment.py` is the measurement that Neo's panel is gated on:
+it grades `panel.decide` on the same twelve invented gate commands that
+`test_gate_review_judgment.py` grades the single agent on, so the two scorecards are
+directly comparable. It also prints a **cost reading** — calls per decision and
+wall-clock — that nothing asserts on: the design calls the cost claim "a claim to
+measure, not to assert", and this repo has no baseline.
+
+It does **not** replay the 34 real production decisions the design's Measurement section
+proposes. That is deferred to **bl-cc5df0bd** and needs two things a worker cannot supply:
+the corpus checked in as a fixture (this repo is public, and those questions carry project
+names, PR numbers and work-order prose), and the user's own re-labelling of a ground truth
+that contradicts itself.
+
+`tests/test_neo_panel_eval_harness.py` runs for free on every `pytest tests/` and proves
+this eval is still wired — that its skip gate reads exactly `JARVIS_EVALS_LLM`, that the
+batteries are non-empty module-level literals with no production path in them, and that
+`panel.decide` is what it calls.
 
 ## Reading the scorecard
 
