@@ -1640,12 +1640,55 @@ def neo_status() -> dict[str, Any]:
         neo.close()
 
 
-def neo_review(question_id: int, approved: bool, feedback: str = "") -> dict[str, Any]:
+def neo_export() -> dict[str, list[dict[str, Any]]]:
+    """Neo's whole ledger as one stable document — see `NeoStore.export`.
+
+    No filters and no truncation: this is the export path, not a listing.
+    """
+    from .neo_store import NeoStore
+
+    neo = NeoStore()
+    try:
+        return neo.export()
+    finally:
+        neo.close()
+
+
+def validate_seat(seat: str) -> None:
+    """Refuse a seat name the panel does not have, BEFORE anything is written.
+
+    An unknown seat is a typo, and a typo that is accepted writes a learning into a
+    prefix no seat will ever read — invisible, and indistinguishable from the lesson
+    having been lost.
+    """
+    from .neo_store import SEATS
+
+    if seat and seat not in SEATS:
+        raise OpsError(f"unknown panel seat {seat!r} — the seats are: {', '.join(SEATS)}")
+
+
+def neo_review(question_id: int, approved: bool, feedback: str = "",
+               seat: str = "") -> dict[str, Any]:
     """Review one of Neo's answers. A correction becomes a learning (Neo's own DB)
-    and, when the work order is still open, is forwarded to the worker as guidance."""
+    and, when the work order is still open, is forwarded to the worker as guidance.
+
+    `seat` routes that learning to one panel seat's prompt prefix instead of to every
+    seat, so a correction teaches the seat that got this decision wrong. It is REFUSED
+    unless that seat actually opined on this question: a correction aimed at a seat
+    which never saw the question teaches the wrong reader, and the ledger acquires a
+    lesson nobody can act on. That covers two cases — no panel ran at all (Neo answered
+    single-agent), and a panel that ran without this seat (the fast route runs `premise`
+    alone, which the design expects to be the common case).
+    """
     from . import neo as neo_mod
     from .neo_store import NeoStore
 
+    # Every refusal below happens before the first write: a rejected review must leave
+    # the question unreviewed and the ledger untouched, not half-applied.
+    validate_seat(seat)
+    if seat and approved:
+        raise OpsError("--seat scopes a correction, and an approval records no learning "
+                       "to scope — approve it, or say what Neo should have answered")
     if not approved and not feedback.strip():
         raise OpsError("a correction needs feedback — what should Neo have said?")
     neo = NeoStore()
@@ -1655,12 +1698,25 @@ def neo_review(question_id: int, approved: bool, feedback: str = "") -> dict[str
             raise OpsError(f"neo question {question_id} not found")
         if q["status"] != "answered":
             raise OpsError(f"neo question {question_id} is {q['status']}, not answered")
+        if seat:
+            opined = [o["seat"] for o in neo.opinions(question_id)]
+            if not opined:
+                raise OpsError(
+                    f"no panel ran on neo question {question_id}, so there is no "
+                    f"{seat!r} seat to correct — Neo answered it single-agent. Drop "
+                    f"--seat to teach every seat, or use `jarvis neo learn`.")
+            if seat not in opined:
+                raise OpsError(
+                    f"the {seat!r} seat did not opine on neo question {question_id}, so "
+                    f"it never saw the question — the seats that did: "
+                    f"{', '.join(opined)}. Drop --seat to teach every seat.")
         q = neo.review(question_id, approved, feedback)
         learning = None
         if not approved:
             learning = neo.add_learning(
                 neo_mod.learning_from_review(q, feedback),
                 project=q["project"], source="review", question_id=question_id,
+                seat=seat,
             )
     finally:
         neo.close()
@@ -1681,6 +1737,7 @@ def neo_review(question_id: int, approved: bool, feedback: str = "") -> dict[str
     return {"question_id": question_id,
             "review": "approved" if approved else "corrected",
             "learning_recorded": learning is not None,
+            "learning_seat": seat or "all seats",
             "forwarded_to_worker": forwarded}
 
 

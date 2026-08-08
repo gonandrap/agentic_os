@@ -144,10 +144,18 @@ jarvis neo retract <id> --reason "…"       # retire a ruling the user has REVE
                                            # contradicts something they told you before.
 jarvis inbox / jarvis inbox ack [id]
 jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--force]
-jarvis learn add "insight" [--project p] / list [--project p] / search <term>
+jarvis learn add "insight" [--project p] [--pin] / search <term> [--project p]
+jarvis learn show <kn-id> / list [--topic t] / topics / pin <id> / unpin <id>
+                                           # worker prompts carry an INDEX of the
+                                           # knowledge base (headline + id, bounded);
+                                           # workers fetch full text on demand.
+                                           # `pin` = ride along verbatim in every
+                                           # prompt — safety rails only.
 jarvis learn retract <id> --reason "…"     # same for the knowledge base: retire a
                                            # superseded entry so it stops reaching
-                                           # workers, without erasing that it was true
+                                           # workers — it leaves the index too, not
+                                           # just the payload — without erasing that
+                                           # it was true
 jarvis bug report "title" -d "..." -e "expected" -a "actual" [--steps "..."]
                                            # a bug in the OS itself -> GitHub issue on
                                            # the (PUBLIC) tracker + Telegram ping.

@@ -408,12 +408,29 @@ def create_app() -> FastAPI:
 
     @app.get("/knowledge", response_class=HTMLResponse)
     def knowledge(request: Request):
+        from ..central_store import PINNED_TAG, has_tag
         central = CentralStore()
         try:
             rows = central.search_knowledge("", limit=200)
+            topics = central.knowledge_topics()
         finally:
             central.close()
-        return render(request, "knowledge.html", active="knowledge", rows=rows)
+        rows = sorted(rows, key=lambda r: (not has_tag(r["tags"], PINNED_TAG), -r["ts"]))
+        for r in rows:
+            r["pinned"] = has_tag(r["tags"], PINNED_TAG)
+        return render(request, "knowledge.html", active="knowledge", rows=rows,
+                      topics=topics)
+
+    @app.post("/knowledge/pin")
+    def knowledge_pin(kn_id: str = Form(...), pinned: str = Form("")):
+        """Pinned entries ride in every worker prompt verbatim; everything else is an
+        index line the worker looks up. This is the toggle between the two."""
+        central = CentralStore()
+        try:
+            central.pin_knowledge(kn_id, pinned=pinned == "1")
+        finally:
+            central.close()
+        return RedirectResponse("/knowledge", status_code=303)
 
     @app.get("/neo", response_class=HTMLResponse)
     def neo_page(request: Request):
@@ -434,6 +451,15 @@ def create_app() -> FastAPI:
                        and not (q["answered_by"] == "neo"
                                 and q["review_status"] == "unreviewed")]
             learnings = neo.all_learnings(limit=100)
+            # How the panel deliberated, for the questions this page already shows.
+            # Deliberation is inspectable on demand and never pushed at anyone, so it
+            # renders collapsed and a question with no opinions gets no block at all —
+            # which is also why this dict holds only the questions that HAVE them.
+            opinions = {}
+            for q in (*in_flight, *escalated, *unreviewed, *history):
+                rows = neo.opinions(q["id"])
+                if rows:
+                    opinions[q["id"]] = rows
         finally:
             neo.close()
         for q in escalated + unreviewed:
@@ -441,7 +467,7 @@ def create_app() -> FastAPI:
         return render(request, "neo.html", active="neo", counts=counts,
                       in_flight=in_flight, escalated=escalated,
                       unreviewed=unreviewed, history=history, learnings=learnings,
-                      digest_credit=_digest_credit())
+                      opinions=opinions, digest_credit=_digest_credit())
 
     @app.get("/gates", response_class=HTMLResponse)
     def gates_page(request: Request):

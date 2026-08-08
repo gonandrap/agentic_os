@@ -85,6 +85,16 @@ from the transcript, so anything omitted vanishes from that turn onwards.
 **The `--` fence is load-bearing.** `--add-dir` AND `--tools` are variadic; an unfenced
 prompt is swallowed as an option value.
 
+**The knowledge base is INDEXED into the briefing, not pasted into it.**
+`CentralStore.knowledge_brief()` returns a bounded `KnowledgeBrief`; `render_knowledge_block()`
+renders it inside `_common_briefing()`, so worker AND planner prompts get it. Three tiers:
+entries tagged `pinned` in full (cap `os.knowledge_inject_limit`), then one headline + id per
+entry selected **round-robin across topics** (caps `os.knowledge_digest_limit`/`_chars`), then
+a by-topic count of what did not fit. Retired entries appear in none of them — retraction has
+to remove a ruling from the map as well as the payload. Workers cash an id in with
+`jarvis learn show|search|list|topics`. Prompt cost is therefore flat in the size of the base;
+the worker that needs an entry pays one tool call for it.
+
 **Worktree**: turn 1 runs with `cwd=project.path` + `--worktree <wo-id>`; later turns run
 with `cwd=<that worktree>` and no flag (transcripts are keyed by creation cwd).
 

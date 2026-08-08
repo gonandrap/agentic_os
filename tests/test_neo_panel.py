@@ -1,4 +1,9 @@
-"""Neo as a panel: the primitive, the `premise` seat, the chair, and the fast path.
+"""Neo as a panel: the primitive, all five seats, the fast path and the veto arbitration.
+
+The arbitration's own table lives in `tests/test_panel_arbitrate.py`, which is pure — plain
+dicts in, a verdict out. What is here is everything that needs the mechanism around it: how
+many calls a decision costs, which seat was handed which prompt and which model, what got
+stored, and what reached the worker.
 
 Every test here is MODEL-FREE — the seats' judgment is measured by the opt-in evals under
 evals/llm/, never here. What is testable in-process is the MECHANISM: how many calls a
@@ -46,10 +51,16 @@ from jarvis.project_store import ProjectStore
 
 SEAT_DIR = ASSETS / "neo-seats"
 
-# The seats this work order ships. `record`, `blast` and `taste` arrive with the veto
-# arbitration; they are named in `neo_store.SEATS` already so that the catalog validator
-# and the CLI can agree on the vocabulary before the seats exist.
-SHIPPED = ("premise", "chair")
+# Every seat, read off the SHIPPED DIRECTORY rather than listed here. A Python list of
+# what is supposed to be on disk keeps passing forever while the disk says something else,
+# and the enforcement that matters is the file the runtime actually reads.
+SHIPPED = tuple(sorted(p.stem for p in SEAT_DIR.glob("*.md")))
+
+#: The full roster. Not `neo_store.SEATS` — that is the VOCABULARY, and the two are
+#: different things on purpose: a roster may name a seat whose markdown arrives in a later
+#: release. They coincide today, and `test_every_seat_in_the_vocabulary_now_ships` is where
+#: that is asserted rather than assumed.
+FULL_ROSTER = ("premise", "record", "blast", "taste", "chair")
 
 GATE_QUESTION = (
     "PRIVILEGED ACTION REQUEST\n\n"
@@ -110,6 +121,10 @@ def test_a_seat_ships_as_markdown_with_frontmatter(seat):
     meta, body = panel.parse_definition((SEAT_DIR / f"{seat}.md").read_text())
 
     assert meta["name"] == seat, "the roster resolves a seat by its file and its name key"
+    assert meta["name"] in SEATS, (
+        "a seat file naming something outside the vocabulary can never be rostered: the "
+        "catalog validator rejects the name before the file is ever read"
+    )
     assert meta["description"], "a seat with no description is undocumented in the record"
     assert body.strip(), "a seat is its mandate; an empty body is an empty seat"
     # A `tools:` key is meaningful for a subagent and meaningless for a headless call.
@@ -117,13 +132,26 @@ def test_a_seat_ships_as_markdown_with_frontmatter(seat):
     assert "tools" not in meta
 
 
+def test_every_seat_in_the_vocabulary_now_ships():
+    """The vocabulary and the shipped set were deliberately allowed to differ while the
+    panel was being built in pieces. They no longer do, and saying so here is what stops
+    the parametrized test above from silently covering four seats if a file is lost."""
+    assert set(SHIPPED) == set(SEATS) == set(FULL_ROSTER)
+    assert panel.shipped_seats() == SEATS
+
+
 def test_the_seats_do_not_ship_in_the_planners_agents_directory():
     """`bootstrap._rebuild` copytrees `assets/agents/` WHOLESALE into every feature-order
     planner's `.claude/agents/`. A Neo seat dropped there — subdirectory or not — becomes
-    a bogus subagent that every planner session can invoke."""
+    a bogus subagent that every planner session can invoke.
+
+    Checked over the WHOLE vocabulary, not over the two seats that shipped first: three
+    more arrived after this test was written, and a per-name list is exactly the thing
+    that does not notice a fourth.
+    """
     assert SEAT_DIR.is_dir(), "the seats must ship somewhere"
-    assert not any("premise" in p.name or "chair" in p.name
-                   for p in (ASSETS / "agents").rglob("*"))
+    assert not [p for p in (ASSETS / "agents").rglob("*")
+                if any(s in p.name for s in SEATS)]
 
 
 def test_the_premise_seat_carries_the_hard_limit_verbatim():
@@ -157,6 +185,102 @@ def test_the_premise_seat_is_told_to_emit_a_route():
     body = (SEAT_DIR / "premise.md").read_text()
 
     assert '"route"' in body and "fast" in body and "panel" in body
+
+
+def collapsed(seat: str) -> str:
+    """A seat's mandate as one lower-cased line. The mandates are hard-wrapped prose and
+    every sentence worth pinning straddles a line break."""
+    return " ".join((SEAT_DIR / f"{seat}.md").read_text().lower().split())
+
+
+def test_the_blast_seat_carries_the_hard_limit_and_the_evidence_check():
+    """`blast` is the seat that has to hold the hard limit AFTER the premise seat has
+    already proposed letting the command through — it is the only seat allowed to overrule
+    it, so a copy of the limit lives here as well as there.
+
+    The evidence check is asserted in the same test because there is deliberately no
+    evidence seat: if it is not in this mandate it is in nobody's.
+    """
+    body = collapsed("blast")
+
+    assert "however routine or well-justified it looks" in body
+    assert "assume the privileged reading" in body
+    assert "non-vacuous" in body and "was ci actually green" in body
+
+
+def test_the_blast_seat_is_told_its_veto_is_one_way():
+    """The mandate has to agree with `arbitrate`, or the seat spends its replies reaching
+    for a power the code does not give it. Belt and braces: the code is the enforcement
+    (`test_nothing_can_force_an_approval`), and this is the seat being told so."""
+    body = collapsed("blast")
+
+    assert "you may never force an approval" in body
+    assert "a veto is not a denial" in body
+    assert "your silence is not consent" in body
+
+
+def test_the_taste_seat_is_told_it_has_no_veto_and_no_forcing_power():
+    """Its failure mode is an annoying answer, not a dangerous one. A seat that could block
+    on taste would spend exactly the attention it exists to protect — and a seat that
+    believes it can block will keep trying to, wasting a reply per decision."""
+    body = collapsed("taste")
+
+    assert "you have no veto and no forcing power" in body
+    assert "do not emit a `verdict` key and do not emit a `veto` key" in body
+    assert "an opinion the chair weighs" in body
+
+
+def test_the_taste_seat_owns_the_answer_budget_and_scope_discipline():
+    body = collapsed("taste")
+
+    assert "at most 50 words" in body
+    assert "never bundle" in body
+    assert "exempt" in body, "the verbatim obligations survive the budget it enforces"
+
+
+def test_the_record_seat_names_the_contradiction_before_the_verdict():
+    """Position is the mandate. A contradiction found after a verdict has been reasoned out
+    becomes a caveat on an answer already decided; the same one found first changes it."""
+    body = (SEAT_DIR / "record.md").read_text()
+
+    assert body.index("BEFORE THE VERDICT") < body.index("# OUTPUT")
+    assert "unresolvable" in body and "resolvable" in body
+
+
+def test_the_record_seat_has_retraction_as_a_real_remedy():
+    """Retraction shipped after this seat was designed. Without it the seat could only
+    complain about a stale ruling; with it, naming the entry is a fix the chair can carry
+    to the user."""
+    body = collapsed("record")
+
+    assert "retract" in body
+    assert "you retract nothing yourself" in body
+    assert "naming an entry for retraction is not a way around it" in body
+
+
+def test_the_record_seat_owns_the_verbatim_obligations():
+    """Compliance phrasing is precisely what a summariser drops — it reads like padding
+    right up to the moment it is missing. The budget is the chair's and the taste seat's;
+    the exemption has to be somebody's job to surface."""
+    body = collapsed("record")
+
+    assert "verbatim" in body
+    assert "exempt from the chair's budget" in body
+
+
+@pytest.mark.parametrize("seat", ("record", "blast"))
+def test_a_forcing_seat_is_told_its_reason_may_be_what_the_user_reads(seat):
+    """Panel deliberation is stored and inspectable, and never pushed. On a forced
+    escalation the chair does not run and the forcing seat's own `reason` IS what the user
+    reads, so "name no seat" has to be in the mandate of the seats that can force it — not
+    only in the chair's.
+
+    `taste` is excluded rather than forgotten: it can force nothing, so its words never
+    reach a user except through the chair, which carries the instruction already.
+    """
+    body = collapsed(seat)
+
+    assert "name no seat" in body or "do not name the seats" in body
 
 
 def test_the_chair_is_told_not_to_narrate_the_panel():
@@ -433,13 +557,42 @@ def test_a_failed_premise_seat_falls_back_to_the_single_agent(store, fake_claude
     assert [r["status"] for r in store.opinions(q["id"])] == ["abstained"]
 
 
-def test_a_seat_with_no_definition_shipped_does_not_stall_the_drain(store, fake_claude):
+@pytest.fixture()
+def unship(monkeypatch, tmp_path):
+    """Make a seat's definition not ship, for this test only.
+
+    Every seat in the vocabulary now has a file, so the "a roster may name a seat this
+    build has no markdown for" path can no longer be reached from the roster alone — and
+    it is the path a catalog written ahead of a release actually takes. Rather than delete
+    the case, the seat directory is swapped for a copy with one file left out.
+
+    `definition` is `lru_cache`d, so the cache is cleared on the way in AND on the way out:
+    a cached read of the real file would defeat the swap, and leaving the swapped miss
+    cached would poison every later test in the session.
+    """
+    def hide(*seats: str):
+        d = tmp_path / "neo-seats"
+        d.mkdir(exist_ok=True)
+        for s in SHIPPED:
+            if s not in seats:
+                (d / f"{s}.md").write_text((SEAT_DIR / f"{s}.md").read_text())
+        monkeypatch.setattr(panel, "SEAT_ASSETS", d)
+        panel.definition.cache_clear()
+
+    panel.definition.cache_clear()
+    yield hide
+    panel.definition.cache_clear()
+
+
+def test_a_seat_with_no_definition_shipped_does_not_stall_the_drain(store, fake_claude,
+                                                                    unship):
     """A roster may name a seat whose markdown arrives in a later release — the catalog
     validates against the VOCABULARY (`neo_store.SEATS`), not against this build.
 
     Recorded `failed` rather than `abstained`, and that distinction is the point: a seat
     that CANNOT run is not one that timed out, and only the second is degradation.
     """
+    unship("blast")
     q = claim(store, "which delimiter?")
 
     result = panel.decide(store, q, cfg(roster=("premise", "blast", "chair")))
@@ -511,6 +664,198 @@ def test_the_default_seat_timeout_is_well_below_neos_own():
     assert DEFAULT_PANEL_TIMEOUT < 300 / 2
 
 
+# -- the full roster -------------------------------------------------------------------------
+
+
+def full(**panel_kwargs) -> NeoConfig:
+    panel_kwargs.setdefault("roster", FULL_ROSTER)
+    return cfg(**panel_kwargs)
+
+
+def test_the_full_roster_on_the_fast_route_still_costs_exactly_one_call(store,
+                                                                       fake_claude):
+    """THE ARITHMETIC THE WHOLE DESIGN TURNS ON, and the reason `decide` runs the premise
+    seat FIRST AND ALONE rather than fanning the roster out in one blind round.
+
+    ~95% of gate reviews are classifier false positives. A single round over four seats
+    would decide the route only after paying for the three seats the route exists to skip
+    — turning the fast path from a 1-call answer into a 4-call one on the OS's
+    highest-volume channel, which is worse than the 2x regression the fast path was
+    introduced to prevent.
+    """
+    q = claim(store, GATE_QUESTION + "FORCE_ROUTE_FAST FORCE_PROPOSE_DISMISS",
+              kind="approval")
+
+    result = panel.decide(store, q, full())
+
+    calls = headless(fake_claude)
+    assert [seat_of(c) for c in calls] == ["premise"], "three seats and a chair skipped"
+    assert result["panel"]["route"] == "fast"
+    assert result["verdict"] == "dismissed" and result["approve"] is False
+    assert [r["seat"] for r in store.opinions(q["id"])] == ["premise"]
+
+
+def test_the_full_panel_runs_every_seat_and_then_the_chair(store, fake_claude):
+    q = claim(store, "which delimiter?")
+
+    result = panel.decide(store, q, full())
+
+    seats = [seat_of(c) for c in headless(fake_claude)]
+    assert seats[0] == "premise", "the seat that routes goes first"
+    assert set(seats[1:-1]) == {"record", "blast", "taste"}
+    assert seats[-1] == "chair"
+    rows = {r["seat"]: r for r in store.opinions(q["id"])}
+    assert set(rows) == set(FULL_ROSTER)
+    assert all(r["status"] == "ok" and r["reply"] for r in rows.values())
+    assert len({r["reply"] for r in rows.values()}) == len(FULL_ROSTER), (
+        "five identical replies would pass every count assertion above having deliberated "
+        "about nothing"
+    )
+    assert result["panel"]["route"] == "panel"
+
+
+def test_the_later_seats_are_blind_to_the_premise_seat_that_ran_before_them(store,
+                                                                           fake_claude):
+    """Second in wall-clock order is not second in knowledge. The premise seat runs first
+    so that the route can be decided before the rest are paid for — that ordering must not
+    quietly turn the panel into a relay, where agreement is an echo rather than evidence."""
+    q = claim(store, "which delimiter?")
+    panel.decide(store, q, full())
+
+    replies = {r["seat"]: r["reply"] for r in store.opinions(q["id"])}
+    for call in headless(fake_claude):
+        seat = seat_of(call)
+        if seat in (None, "chair"):
+            continue
+        seen = arg(call, "-p") + arg(call, "--append-system-prompt")
+        assert not [s for s in replies if s != seat and replies[s] and replies[s] in seen], seat
+
+    chair_call = next(c for c in headless(fake_claude) if seat_of(c) == "chair")
+    for seat in ("premise", "record", "blast", "taste"):
+        assert replies[seat] in arg(chair_call, "-p"), (
+            f"the chair synthesises; it was not shown what {seat} said"
+        )
+
+
+def test_each_seat_runs_on_its_own_model_and_the_rest_fall_back_to_the_fleet_default(
+        store, fake_claude):
+    """Most specific wins: the per-seat map, then `chair_model` for the chair, then Neo's
+    model. The chair should be able to keep the expensive model when the seats do not — it
+    is the one writing what a human reads."""
+    config = NeoConfig(model="opus", panel=PanelConfig(
+        enabled=True, roster=FULL_ROSTER, seat_models={"premise": "haiku"},
+        chair_model="sonnet"))
+    q = claim(store, "which delimiter?")
+
+    panel.decide(store, q, config)
+
+    models = {seat_of(c): arg(c, "--model") for c in headless(fake_claude)}
+    assert models == {"premise": "haiku", "chair": "sonnet",
+                      "record": "opus", "blast": "opus", "taste": "opus"}
+    stored = {r["seat"]: r["model"] for r in store.opinions(q["id"])}
+    assert stored == models, "what a seat ran on is part of the deliberation record"
+
+
+def test_a_failed_seat_abstains_and_the_panel_proceeds_without_it(store, fake_claude):
+    """A Neo outage must never become a fleet stall. Unlike the premise seat — which
+    ROUTES, so its silence leaves nothing to route on and falls back to the single agent —
+    a seat in the middle of the round is simply absent, and absence is not consent."""
+    fake_claude.fail_seat("blast")
+    q = claim(store, "which delimiter?")
+
+    result = panel.decide(store, q, full())
+
+    rows = {r["seat"]: r["status"] for r in store.opinions(q["id"])}
+    assert rows == {"premise": "ok", "record": "ok", "blast": "abstained",
+                    "taste": "ok", "chair": "ok"}
+    assert any(seat_of(c) == "chair" for c in headless(fake_claude)), (
+        "the chair still ran; an abstaining seat is not a forced outcome"
+    )
+    assert result["escalate"] is False
+    assert result["panel"]["route"] == "panel"
+
+
+# -- arbitration, end to end through `decide` ----------------------------------------------
+
+
+def test_a_forced_escalation_skips_the_chair_entirely(store, fake_claude):
+    """The arbitration is not advice to the chair, it is the decision. Asserting the chair
+    NEVER RAN is what distinguishes "the code forced this" from "the chair happened to
+    agree" — and the second is the prompt luck this feature exists to remove."""
+    q = claim(store, "FORCE_RADIUS_ESCALATE which delimiter?")
+
+    result = panel.decide(store, q, full())
+
+    seats = [seat_of(c) for c in headless(fake_claude)]
+    assert "chair" not in seats
+    assert set(seats) == {"premise", "record", "blast", "taste"}
+    assert "chair" not in {r["seat"] for r in store.opinions(q["id"])}
+    assert result["escalate"] is True and result["approve"] is False
+    assert result["reason"] == "test-forced escalation on the cost of being wrong"
+    assert not [s for s in SEATS if s in result["reason"].lower()], (
+        "the escalation quotes what was found and never who found it"
+    )
+
+
+def test_a_veto_turns_a_proposed_dismissal_into_an_escalation(store, fake_claude):
+    """The row that matters most in practice: the premise seat proposed clearing a gated
+    command, and the seat that owns the blast radius says it really does run the thing.
+
+    The proposal is DEMOTED — to the user, not to a denial that tells a worker it
+    misbehaved over an OS bug, and above all not to the approval it was raised against.
+    """
+    q = claim(store, GATE_QUESTION + "FORCE_PROPOSE_DISMISS FORCE_RADIUS_VETO",
+              kind="approval")
+
+    result = panel.decide(store, q, full())
+
+    assert result["escalate"] is True
+    assert result["verdict"] != "dismissed" and result["verdict"] != "approved"
+    assert result["approve"] is False
+    assert "chair" not in [seat_of(c) for c in headless(fake_claude)]
+
+
+def test_an_unresolvable_contradiction_forces_the_escalation(store, fake_claude):
+    q = claim(store, "FORCE_LEDGER_CONTRADICTION which delimiter?")
+
+    result = panel.decide(store, q, full())
+
+    assert result["escalate"] is True
+    assert result["reason"] == "test-forced unresolvable contradiction"
+    assert "chair" not in [seat_of(c) for c in headless(fake_claude)]
+
+
+def test_the_premise_seat_escalating_on_the_panel_route_forces_it_too(store, fake_claude):
+    """Ruled by Neo on question 59: the veto table enumerates forcing powers, not
+    prohibitions, and escalate is the fail-safe direction, so the design's own line that
+    "any seat that later returns escalate wins" governs. `taste` stays the exception, and
+    the test below is where that is pinned."""
+    q = claim(store, "FORCE_FRAME_ESCALATE which delimiter?")
+
+    result = panel.decide(store, q, full())
+
+    assert result["escalate"] is True
+    assert "chair" not in [seat_of(c) for c in headless(fake_claude)]
+
+
+def test_the_taste_seat_objecting_does_not_stop_the_chair(store, fake_claude):
+    """THE NEGATIVE CONTROL, END TO END. The taste seat escalates AND vetoes, as loudly as
+    its reply shape allows, and the panel carries on to the chair regardless.
+
+    Its objection is stored in the same breath, which is what stops this passing for a run
+    in which the seat never opined: the seat spoke, it was recorded, and it forced nothing.
+    """
+    q = claim(store, "FORCE_INTENT_ESCALATE which delimiter?")
+
+    result = panel.decide(store, q, full())
+
+    rows = {r["seat"]: r for r in store.opinions(q["id"])}
+    assert json.loads(rows["taste"]["reply"])["escalate"] is True, "it did object"
+    assert rows["chair"]["status"] == "ok", "and the chair ran anyway"
+    assert result["escalate"] is False
+    assert result["answer"] == json.loads(rows["chair"]["reply"])["answer"]
+
+
 # -- end to end, through the daemon, with the panel enabled ---------------------------------
 
 
@@ -571,6 +916,98 @@ def test_the_deliberation_never_reaches_the_worker_or_the_inbox(panel_daemon, pr
         central.close()
     assert not [s for s in SEATS
                 for i in rows if s in f"{i['title']} {i.get('body') or ''}"]
+
+
+@pytest.fixture()
+def full_panel_daemon(jarvis_home, fake_claude, tmp_path, project, claude_json):
+    """The daemon with the WHOLE roster rostered. The fixture above runs the shipped
+    default (`premise` + chair); this is the configuration the three new seats only ever
+    run under."""
+    path = tmp_path / "catalog-full-panel.json"
+    path.write_text(json.dumps({
+        "os": {"defaults": {"model": "sonnet"},
+               "notifications": {"sinks": ["log"]},
+               "neo": {"panel": {"enabled": True, "roster": list(FULL_ROSTER)}}},
+        "projects": [{"name": "proj_a", "path": str(project),
+                      "description": "test project"}],
+    }))
+    ops.start_os(str(path), foreground=True)
+    return Daemon(load_catalog(path))
+
+
+def test_a_full_panels_deliberation_never_reaches_the_worker(full_panel_daemon, project,
+                                                             fake_claude):
+    """The design's hard line, on a run where all four seats really did deliberate.
+
+    BOTH HALVES MATTER, and here the first one is load-bearing in a way it was not with
+    two seats: without the opinions assertion, "the message names no seat" passes
+    perfectly for a run in which `record`, `blast` and `taste` never opened their mouths.
+    """
+    daemon = full_panel_daemon
+    wo = ops.create_work_order("proj_a", "build the exporter")
+    daemon.tick()
+    ops.ask_question(wo["id"], "Should the export default to CSV or JSON?")
+
+    daemon._neo_drain()
+
+    neo = NeoStore()
+    try:
+        opinions = {r["seat"]: r for r in neo.opinions(1)}
+        assert set(opinions) == set(FULL_ROSTER), "the full panel did not deliberate"
+        assert all(o["status"] == "ok" for o in opinions.values())
+        assert len({o["reply"] for o in opinions.values()}) == len(FULL_ROSTER)
+        chair_answer = json.loads(opinions["chair"]["reply"])["answer"]
+    finally:
+        neo.close()
+
+    store = ProjectStore(project)
+    try:
+        messages = store.queued_messages(wo["id"])
+    finally:
+        store.close()
+    assert len(messages) == 1
+    assert messages[0]["content"] == f"{neo_mod.ANSWER_PREFIX} {chair_answer}"
+    assert not [s for s in SEATS if s in messages[0]["content"].lower()]
+
+
+def test_a_forced_escalation_reaches_the_inbox_naming_no_seat(full_panel_daemon, project,
+                                                              fake_claude):
+    """The path a forced escalation actually travels, and the one where a leak would be
+    most likely: the chair does not run, so the line the user reads is a seat's own words,
+    quoted by code rather than rewritten by a model.
+
+    The control is the last assertion — the deliberation IS on file and readable — which
+    is what proves the seats were absent from the inbox rather than absent full stop.
+    """
+    daemon = full_panel_daemon
+    wo = ops.create_work_order("proj_a", "build the exporter")
+    daemon.tick()
+    ops.ask_question(wo["id"],
+                     "FORCE_RADIUS_ESCALATE Should the export default to CSV or JSON?")
+
+    daemon._neo_drain()
+
+    central = CentralStore()
+    try:
+        rows = central.unacked_inbox()
+    finally:
+        central.close()
+    escalations = [i for i in rows if "escalated a question" in i["title"]]
+    assert len(escalations) == 1
+    item = escalations[0]
+    assert "test-forced escalation on the cost of being wrong" in (item["body"] or "")
+    haystack = f"{item['title']} {item.get('body') or ''}".lower()
+    assert not [s for s in SEATS if s in haystack]
+
+    neo = NeoStore()
+    try:
+        opinions = {r["seat"] for r in neo.opinions(1)}
+    finally:
+        neo.close()
+    assert opinions == {"premise", "record", "blast", "taste"}, (
+        "the deliberation is on file and inspectable — it simply was not pushed — and the "
+        "chair is absent because the arbitration, not the chair, made this call"
+    )
 
 
 def test_a_dismissed_gate_reaches_the_worker_through_the_normal_path(
