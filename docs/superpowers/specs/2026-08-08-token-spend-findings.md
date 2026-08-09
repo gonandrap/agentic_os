@@ -3,10 +3,16 @@
 **Work order:** wo-eb9b6337. **Question asked:** why did feature order `fo-e353491c`
 exhaust a Max 5x subscription without finishing?
 
-**Answer in one line:** it did not, on its own — it cost about 4% of what the project
+**Answer in one line:** it did not, on its own — it cost about 6% of what the project
 has spent — but it exposed a structural tax that costs the fleet roughly an eighth of
 every token it spends, and a process failure that made this particular feature order
 pay it six times over.
+
+**Note on §2, added after the first draft:** that section originally named MCP tool-list
+churn as the likely cause and recommended pinning the worker MCP config. A controlled
+A/B **disproved it**, and the section now records what has been ruled out instead. The
+tax and every figure attached to it are unchanged; only the diagnosis moved. The fix
+that did ship (§6) targets turn *count*, which is Jarvis's own and needs no diagnosis.
 
 Everything below is measured from Claude Code's own session transcripts under
 `~/.claude/projects`. `jarvis cost` (shipped with this document) reproduces every
@@ -61,6 +67,14 @@ of everything it ever wrote to the cache and ~$7.32 of its $23.92.
 Across the whole `jarvis_os` project: **9.0M tokens re-sent across 67 turn boundaries,
 ~$51.52 — 12.6% of the project's entire spend.**
 
+And it is worse than one re-write per boundary: the context is written **twice**, on two
+consecutive calls. In this work order's own session, calls 119 and 120 wrote 457,112 and
+then 458,948 tokens for a 457k context. Anyone estimating a saving should budget ~2×
+context per boundary, not 1×.
+
+The most direct evidence available is this work order itself — a real worker on the real
+dispatch path: **1,619,659 excess tokens in three turns, ~$9.31.**
+
 The tax follows a simple shape:
 
 ```
@@ -72,47 +86,66 @@ many-turn orders that have accumulated a large context.
 
 ### It is not cache TTL expiry
 
-The obvious explanation is wrong, and ruling it out is what makes this actionable.
-Within the planner's own transcript:
+Measured over **all 153 real worker turn boundaries** in the fleet's transcripts:
+**124 went cold, 29 stayed warm**, and the gap does not separate them.
 
-| Gap before the call | Cache read | Outcome |
+| | Gap range | Median gap |
 |---|---|---|
-| 644 seconds | 93,248 | **hit** |
-| 29 seconds | 15,465 | **missed** |
-| 57 seconds | 15,465 | **missed** |
-| 133 seconds | 15,465 | **missed** |
+| Cold boundaries (124) | **10 s** – 12 days | 52 s |
+| Warm boundaries (29) | 6 s – **3,233 s** | 89 s |
 
-A ten-minute gap kept the cache; a twenty-nine-second gap lost it. Time is not the
-variable.
+The coldest boundary in the fleet had a **ten-second** gap. A warm one had a
+**fifty-four-minute** gap. Any TTL story has to explain both at once, and none does.
 
-### What the variable appears to be
+### It is not the ambient MCP configuration either — the first hypothesis was wrong
 
-The transcripts carry `deferred_tools_delta` and `mcp_instructions_delta` records. At
-every turn boundary the entire MCP tool set is **removed** and then **re-added**:
+The transcripts do carry `deferred_tools_delta` and `mcp_instructions_delta` records
+showing the entire MCP tool set removed and re-added at every turn boundary, and a
+tool-list change does invalidate the whole prefix. That made MCP churn the obvious
+suspect, and `claude_cli._briefing_args` passes **no MCP configuration at all**, so
+every worker inherits the user's whole global set — Notion, Gmail, Google Calendar,
+Google Drive, Crypto.com, PubMed, Mermaid Chart, WordPress, context7 and serena,
+several of them unauthenticated and so connecting, failing and churning.
 
-```
-00:15:21  removed: ListMcpResourcesTool, mcp__claude_ai_Notion__*, plugin:serena, plugin:context7 …
-00:26:57  added:   (the same set back again)
-00:33:21  removed: …
-00:34:13  added:   …
-```
+**It is not sufficient to cause the tax.** Two controlled A/B runs of a plain
+`claude -p --session-id` / `--resume` pair, inheriting that entire global MCP set,
+stayed **warm** across the turn boundary:
 
-A change to the tool list invalidates tools, system and messages alike — the whole
-prefix. That matches the observed collapse to a fixed 15,465-token remainder, which is
-the part of the prompt that renders *before* the tool list.
+| Turn-2 first call | `cache_read` | `cache_write` |
+|---|---|---|
+| Turn 1 = 2 tool calls | 26,381 | 641 |
+| Turn 1 = 26 tool calls | 28,819 | 641 |
 
-Jarvis contributes to this by omission: `claude_cli._briefing_args` passes **no MCP
-configuration at all**, so every worker inherits the user's entire global set — Notion,
-Gmail, Google Calendar, Google Drive, Crypto.com, PubMed, Mermaid Chart, WordPress,
-context7 and serena. Several of those are unauthenticated in this environment, so they
-connect, fail, and churn. `dispatch.py:317`'s own docstring already notes there is no
-`mcpServers` key anywhere in `src/`.
+The second run exists to kill a second hypothesis at the same time: the 20-block
+cache-lookback window. Twenty-six tool calls in turn 1 puts the previous cache entry
+well beyond it, and the boundary was still warm.
 
-**This is a correlation with a plausible mechanism, not a proven cause.** The MCP
-handshake is Claude Code's internal behaviour; Jarvis can observe it and can change
-what it hands the CLI, but cannot directly control the ordering. That is precisely why
-the recommended next step is to change the config and *measure the tax again* rather
-than to assert a fix. See backlog `bl-*` (MCP pinning).
+So pinning `--mcp-config` / `--strict-mcp-config` would have bought a fleet-wide
+behaviour change — including the risk of silently stripping serena from every worker —
+and no saving. It was proposed in the first draft of this document and is retracted
+here. **This is what shipping the measurement first was for**: the wrong fix cost four
+cheap `claude` calls to disprove instead of a release and a regression nobody could
+see.
+
+### What is still unexplained
+
+On a cold boundary `cache_read` lands on one of a **small set of fixed values** —
+15,277 / 15,465 / 21,704 / 21,967 — never something arbitrary. The prefix therefore
+matches up to a constant point and then breaks. That point is the end of Claude Code's
+own system prompt, so the first thing that differs is whatever Jarvis appends after it.
+
+A plain resume does not break there. A worker turn does. The difference between them is
+entirely the briefing: `--append-system-prompt`, `--settings`, `--add-dir`, `-n`,
+`--model`, `--effort`, `--permission-mode`. Two of those are rebuilt from scratch on
+every single turn — `dispatch._write_worker_settings` rewrites the settings file, and
+`bootstrap.install_agent_assets` re-materialises the asset trees — so a byte difference
+in either would do it, and both are Jarvis's own code.
+
+Finishing this is a bisect, not a guess: add one briefing flag at a time to a two-turn
+scratch session and watch `cache_read` on turn 2's first call. Filed as a backlog item
+with that procedure written out. It is deliberately not attempted here — the honest
+state of the evidence is "large, real, cause narrowed to seven flags", and the next
+step is a handful of cheap calls rather than another hypothesis.
 
 ---
 
@@ -204,19 +237,42 @@ distinct second message in the same test.
 
 ---
 
-## 6. Recommendations, in order of expected saving
+## 6. The fix that shipped: one turn per delivery, not one per message
 
-1. **Pin a deliberate MCP set for worker turns** and re-measure the tax with
-   `jarvis cost`. Upper bound if the churn is the whole cause: ~12% of fleet spend.
-   Deliberately *not* done in this work order — serena is load-bearing for workers
-   (`dispatch._navigation_briefing` exists to push them to it), and getting this wrong
-   silently strips symbol tools from every worker in the fleet. Measure first, then
-   change, then prove.
-2. **Route feature-order scope questions to the user, not to Neo**, or checkpoint the
+The tax is `(turns − 1) × context × ~2`. Its *cause* is still open, but the **turn
+count** is entirely Jarvis's own, and `Daemon.deliver_messages` was spending it
+needlessly: it iterated `store.queued_messages()` and delivered **one message per
+turn**. Three quick comments from the user meant three turn boundaries — three full
+re-writes of a context that may be 400k tokens — for content the worker is better off
+reading together anyway, since it can act on the whole of what the user said instead of
+starting down the first message's path and being interrupted twice.
+
+Everything queued for one work order now goes out as a single turn, joined with a blank
+line and nothing else. Per work order, not globally: two work orders' messages are
+independent conversations and must stay separate turns, which is its own test.
+
+Two details are load-bearing. **Every** message in the coalesced turn is marked
+`delivered` — one left `queued` would be re-sent next tick, so the worker would read it
+twice and pay a second boundary for the privilege. And the joined text carries no
+framing: no count, no "message 2 of 3", nothing the worker could mistake for an
+instruction the user did not write.
+
+Saving: one boundary per extra message, so on a 400k-token conversation roughly 800k
+tokens (~$4.60) for every message that would previously have arrived on its own.
+
+## 7. Recommendations, in order of expected saving
+
+1. **Bisect the briefing** to find what actually breaks the prefix — seven flags, a
+   two-turn scratch session, a handful of cheap calls. Upper bound if it is fixable:
+   ~12% of fleet spend. Filed with the procedure written out. Do *not* re-try MCP
+   pinning; §2 disproves it.
+2. **Keep worker turn counts down where the context is large.** The tax is linear in
+   turns and in context at once, and each boundary costs ~2× context. This is the lever
+   that works whether or not the cause is ever found, and the message coalescing above
+   is the first instance of pulling it. `jarvis wo ask` round trips are the other big
+   source — batch questions into one ask rather than three.
+3. **Route feature-order scope questions to the user, not to Neo**, or checkpoint the
    plan's shape before the full document is written. On this feature order alone that
    was ~$5–8 and four turns.
-3. **Keep worker turn counts down where the context is large.** The tax is linear in
-   turns and in context size at once; a work order that takes eight turns at 250k
-   context pays about 2.5M tokens for the privilege of being resumed.
 4. **Watch subagent fan-out on planners specifically.** A third of this planner's cost,
    for analysis the parent then had to read anyway.

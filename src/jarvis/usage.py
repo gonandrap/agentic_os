@@ -16,10 +16,17 @@ persist and nothing to reconcile.
 Every worker turn is a separate `claude -p --resume` process (`claude_cli.turn_args`).
 On the first API call of each turn after the first, the conversation prefix the
 previous turn had cached is invalidated and the whole accumulated context is re-sent
-as a cache WRITE, at 1.25x, instead of a cache READ at 0.1x. It is not TTL expiry —
-measured on wo-cd73c537, a 644-second gap hit the cache while a 29-second gap missed
-it; the transcripts show the MCP tool set being torn down and re-registered at each
-turn boundary, and a tool-list change invalidates tools, system and messages alike.
+as a cache WRITE, at 1.25x, instead of a cache READ at 0.1x — twice over, in fact, on
+two consecutive calls.
+
+The cause is still open, but two candidates are ruled out and neither is worth
+re-testing. **Not TTL expiry**: across all 153 real worker turn boundaries, 124 went
+cold and 29 stayed warm, and gap does not separate them — the coldest had a 10-second
+gap and a warm one had a 3,233-second gap. **Not the ambient MCP set**, despite the
+tool-list churn visible in the transcripts: a plain two-turn `claude -p --resume`
+inheriting the user's entire global MCP config stays warm across the boundary. See
+`docs/superpowers/specs/2026-08-08-token-spend-findings.md` for the evidence and the
+bisect that would finish it.
 
 So `rewrite_excess` is the headline number this module exists to produce: in a
 perfectly cached session every token is written to the cache exactly once, and the
@@ -203,7 +210,7 @@ class SessionUsage:
         }
 
 
-def _assistant_messages(path: Path) -> list[dict[str, Any]]:
+def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
     """The assistant messages in one transcript, deduped by message id.
 
     THE TRAP: a single assistant message is written to the transcript several times —
@@ -217,7 +224,7 @@ def _assistant_messages(path: Path) -> list[dict[str, Any]]:
     by_id: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     try:
-        handle = path.open(errors="replace")
+        handle = Path(path).open(errors="replace")
     except OSError:
         return []
     with handle:

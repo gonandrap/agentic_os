@@ -272,6 +272,13 @@ def test_merging_sums_the_tax_but_takes_the_peak():
     assert merged.cache_write == 800
 
 
+def test_a_transcript_path_may_be_a_plain_string(transcripts):
+    """`_assistant_messages` is the module's useful handle for ad-hoc measurement, and a
+    string is the obvious thing to hand it — it should not need a `Path`."""
+    path = transcripts("s1", [row("m1", write=100, out=10)])
+    assert usage._assistant_messages(str(path)) == usage._assistant_messages(path)
+
+
 def test_rows_without_usage_are_ignored(transcripts):
     """Tool results, hooks and UI state make up most of a transcript.
 
