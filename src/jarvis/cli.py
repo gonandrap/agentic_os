@@ -33,6 +33,27 @@ def _print(data: Any, as_json: bool) -> None:
         _pretty(data)
 
 
+def _with_readable_digest(q: dict[str, Any]) -> dict[str, Any]:
+    """A Neo question row with its dashboard digest decoded, for HUMAN output only.
+
+    `questions.digest` holds JSON, and printing it as one long line is the opposite of
+    what a digest is for. Decoded into a nested block when there is one, replaced by the
+    recorded reason when the attempt failed, dropped entirely when it was never
+    attempted. `--json` never comes through here: a row dump is the row as stored.
+    """
+    from . import digest as digest_mod
+
+    row = dict(q)
+    view = digest_mod.decode(row.get("digest"))
+    failed = digest_mod.failure_reason(row.get("digest"))
+    row.pop("digest", None)
+    if view:
+        row["digest (dashboard only — Neo read the question above in full)"] = view
+    elif failed:
+        row["digest"] = f"(not produced: {failed})"
+    return row
+
+
 def _pretty(data: Any, indent: int = 0) -> None:
     pad = "  " * indent
     if isinstance(data, dict):
@@ -1102,12 +1123,15 @@ def cmd_neo(args: argparse.Namespace) -> int:
         if q is None:
             print(f"error: neo question {args.question_id} not found", file=sys.stderr)
             return 1
+        # `--json` gets the row exactly as it is stored; the human rendering gets the
+        # dashboard digest decoded rather than as one long line of JSON.
+        row = q if args.json else _with_readable_digest(q)
         if not args.panel:
-            _print(q, args.json)
+            _print(row, args.json)
         elif args.json:
             _print({**q, "panel_opinions": opinions}, True)
         else:
-            _print(q, False)
+            _print(row, False)
             print("\nPanel deliberation:")
             for o in opinions:
                 route = f" route={o['route']}" if o["route"] else ""

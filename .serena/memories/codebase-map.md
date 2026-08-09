@@ -1,7 +1,7 @@
 # Jarvis OS codebase map
 
 `jarvis-os` Python package, stdlib-only core (argparse + sqlite3 + json). Source in
-`src/jarvis/`, 23 modules. Read this instead of re-exploring the tree.
+`src/jarvis/`, 24 modules. Read this instead of re-exploring the tree.
 
 ## Modules (responsibility — key symbols — intra-package imports)
 
@@ -51,6 +51,17 @@
   `review()`:153, `add_learning()`/`learnings()`:166/175.
 
 **Adapters:**
+- `digest.py` — shorten an over-long worker question for the `/neo` page. One strict-JSON
+  call (`structured.request`, `attempts=2`) whose system prompt is the vendored
+  `i-have-adhd` output style (`assets/digest/`, MIT — NOT under `assets/agents|skills/`,
+  which bootstrap copytrees into every project). `summarise()`, `validate()`,
+  `needs_digest()`, `MIN_CHARS = 800`, `encode`/`decode`/`encode_failure`,
+  `DIGEST_HEADER` (the test fake keys on it). DISPLAY ONLY: nothing here reaches Neo, a
+  worker or a learning, so a bad digest costs a confusing paragraph and never a decision;
+  every failure path ends with the full question rendered. Produced asynchronously by
+  `Daemon.digest_tick`/`_digest_batch` into `questions.digest`, one attempt per question
+  ever (a recorded failure is what stops the retry loop). Off with
+  `os.neo.digest_model = ""`. Covered by `tests/test_digest.py`.
 - `bootstrap.py` — make a project OS-ready (settings injection, gitignore, README/OPERATION.md,
   workspace trust, `.jarvis/`). `bootstrap_project()`:226, `build_settings()`:66,
   `settings_drift()`:76, `deep_merge()`:50, `BootstrapReport`:38, `TEMPLATE_VERSION = 2`:24.

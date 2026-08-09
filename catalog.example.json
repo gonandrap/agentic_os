@@ -22,7 +22,9 @@
       "$comment": "Neo answers worker questions on your behalf; review its answers in the UI's neo tab",
       "enabled": true,
       "model": "opus",
-      "learnings_limit": 50
+      "learnings_limit": 50,
+      "$comment_digest": "which model shortens an over-long question for the neo tab; \"\" turns it off and every question renders in full",
+      "digest_model": "haiku"
     }
   },
   "projects": [
