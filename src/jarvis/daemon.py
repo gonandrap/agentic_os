@@ -342,8 +342,21 @@ class Daemon:
         No roster lookup any more, and no thread pool: a turn is a detached process, so
         launching one is instant and the only thing delivery has to wait for is the
         previous turn of the SAME work order finishing (`worker_session.busy`).
+
+        **Everything queued for one work order goes out as ONE turn.** Every turn
+        boundary re-sends the whole accumulated conversation at the 1.25x cache-WRITE
+        rate instead of reading it at 0.1x — measured at ~12% of this project's entire
+        token spend, and ~2x the context per boundary in practice (see `usage.py` and
+        `jarvis cost`). Delivering three queued comments as three turns therefore costs
+        three of those, for content the worker would rather read together anyway: it can
+        act on the whole of what the user said instead of starting down the first
+        message's path and being interrupted twice.
+
+        The coalescing is per work order, not global — two work orders' messages are
+        independent conversations and must stay separate turns.
         """
-        for msg in store.queued_messages():
+        pending: dict[str, list[dict[str, Any]]] = {}
+        for msg in store.queued_messages():  # chronological, so the joins stay in order
             try:
                 wo = store.get_work_order(msg["wo_id"])
             except KeyError:
@@ -353,24 +366,34 @@ class Daemon:
                 continue  # not dispatched yet; the worker prompt will carry it instead
             if worker_session.busy(store, wo["id"]):
                 continue  # mid-turn: one turn at a time, and resume would refuse anyway
-            self._deliver(project, store, wo, dict(msg))
+            pending.setdefault(wo["id"], []).append(dict(msg))
+        for wo_id, msgs in pending.items():
+            self._deliver(project, store, store.get_work_order(wo_id), msgs)
 
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
-                 msg: dict) -> None:
-        log.info("[%s] delivering message %s to %s", project.name, msg["id"], wo["id"])
-        store.add_event(wo["id"], "delivering", {"msg_id": msg["id"]})
+                 msgs: list[dict[str, Any]]) -> None:
+        ids = [m["id"] for m in msgs]
+        log.info("[%s] delivering message(s) %s to %s", project.name, ids, wo["id"])
+        store.add_event(wo["id"], "delivering", {"msg_ids": ids})
+        # A blank line between messages and nothing else. Anything framing them — a
+        # count, a header, "message 2 of 3" — is text the worker can mistake for an
+        # instruction from the user, and the user wrote none of it.
+        text = "\n\n".join(m["content"] for m in msgs)
         try:
-            turn = worker_session.send(store, project, wo, msg["content"],
-                                       msg_id=msg["id"])
+            turn = worker_session.send(store, project, wo, text, msg_id=ids[0])
         except claude_cli.ClaudeCliError as e:
-            log.error("[%s] delivery of message %s failed: %s", project.name,
-                      msg["id"], e)
-            store.mark_message(msg["id"], "failed")
+            log.error("[%s] delivery of message(s) %s failed: %s", project.name, ids, e)
+            for msg_id in ids:
+                store.mark_message(msg_id, "failed")
             store.flag_attention(wo["id"], f"message delivery failed: {e}")
             return
-        store.mark_message(msg["id"], "delivered")
+        # Every message in the turn is delivered, not just the one the turn row names:
+        # a message left `queued` here would be re-sent on the next tick, so the worker
+        # would read it twice and pay a second boundary for the privilege.
+        for msg_id in ids:
+            store.mark_message(msg_id, "delivered")
         store.add_event(wo["id"], "message_delivered",
-                        {"msg_id": msg["id"], "turn": turn["seq"]})
+                        {"msg_ids": ids, "turn": turn["seq"]})
         # The work order is moving again, whatever it had settled into. A user who sends
         # a message to a finished work order means it to continue, and the turn is
         # already out — leaving the status settled would make the record lie.

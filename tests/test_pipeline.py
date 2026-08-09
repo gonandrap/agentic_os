@@ -326,6 +326,75 @@ def test_message_delivery_when_idle(started, fake_claude, project, settle_turns)
     assert any("update the docs" in r for r in replies), replies
 
 
+def test_queued_messages_for_one_work_order_deliver_as_a_single_turn(
+        started, fake_claude, project, settle_turns):
+    """Three comments cost one turn boundary, not three.
+
+    Every boundary re-sends the whole accumulated conversation at the cache-WRITE rate
+    (~12% of this project's token spend; `jarvis cost` breaks it out), so delivering
+    each queued message as its own turn multiplies that by the number of messages —
+    for content the worker is better off reading together anyway.
+
+    Both halves are asserted: exactly ONE resumed turn, and all three messages present
+    in it and marked delivered. Counting turns alone would pass against a delivery path
+    that dropped two of the messages, which is the failure this coalescing could
+    plausibly introduce.
+    """
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    assert settle_turns(store)
+
+    for text in ("first thought", "second thought", "third thought"):
+        ops.send_message(wo["id"], text, source="ui")
+    daemon.tick_count = 0
+    daemon.tick()
+
+    resumes = turn_calls(fake_claude, resumed=True, expect=1)
+    assert len(resumes) == 1, "each queued message opened its own turn"
+    prompt = resumes[0]["argv"][-1]
+    for text in ("first thought", "second thought", "third thought"):
+        assert text in prompt
+    # In the order the user sent them, so the worker reads a conversation and not a bag.
+    assert prompt.index("first") < prompt.index("second") < prompt.index("third")
+
+    queued = [m for m in store.list_messages(wo["id"])
+              if m["direction"] == "user_to_agent"]
+    assert [m["status"] for m in queued] == ["delivered"] * 3, (
+        "a message left queued would be re-delivered next tick, and read twice")
+
+
+def test_two_work_orders_messages_stay_separate_turns(started, fake_claude, project,
+                                                      settle_turns):
+    """The coalescing is per work order. Two conversations must not be spliced.
+
+    The negative control for the test above: joining everything queued would also
+    satisfy "one turn per tick", and would be catastrophic.
+    """
+    daemon = started
+    first = ops.create_work_order("proj_a", "task one")
+    second = ops.create_work_order("proj_a", "task two")
+    daemon.tick()
+    store = ProjectStore(project)
+    assert settle_turns(store)
+
+    ops.send_message(first["id"], "for the first", source="ui")
+    ops.send_message(second["id"], "for the second", source="ui")
+    daemon.tick_count = 0
+    daemon.tick()
+
+    resumes = turn_calls(fake_claude, resumed=True, expect=2)
+    prompts = {r["argv"][r["argv"].index("--resume") + 1]: r["argv"][-1]
+               for r in resumes}
+    assert len(prompts) == 2
+    sessions = {wo["id"]: store.get_work_order(wo["id"])["session_id"]
+                for wo in (first, second)}
+    assert "for the first" in prompts[sessions[first["id"]]]
+    assert "for the second" not in prompts[sessions[first["id"]]]
+    assert "for the second" in prompts[sessions[second["id"]]]
+
+
 def test_session_id_never_moves_across_turns(started, fake_claude, project,
                                              settle_turns):
     """The property the whole refactor rests on: one work order, one session id, for
