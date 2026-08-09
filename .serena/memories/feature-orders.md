@@ -226,3 +226,36 @@ submitted, and each child's live status at once, which is also why an escalated 
 decided there. The project page lists feature orders but does NOT expand their children:
 those are already in the work-order listing below, and printing the tree twice on one
 page is how a page stops being read.
+
+## The question diet (wo-e4a359cb, 2026-08-09) — skeleton reviews and the design doc
+
+Production plan-review questions #65–#67 hit 67–84KB because `build_plan_question`
+inlined every child's full brief; measured on the real #67 the skeleton cut the
+question from 21,250 to 1,999 input tokens (−90.6%). Four rules now hold:
+
+* **`build_plan_question` renders a SKELETON** — ask verbatim, summary, one line per
+  child (key/title/needs + `done when:`), `design_doc` name — never descriptions.
+  `render_plan` (full) still backs `jarvis fo show` and the dashboard. TEST TRAP: the
+  fake Neo keys FORCE_* markers on the QUESTION text, so test plans must carry markers
+  in the SUMMARY (see `a_plan` in `tests/test_feature_orders.py`), not in briefs.
+* **`plan.json` has a first-class `design_doc`** (relative path, no `..`, validated in
+  `parse_plan`; file must exist at submit or `fo plan` refuses). `ops.submit_plan`
+  snapshots its text into the stored plan (`design_doc_content`);
+  `dispatch.materialize_design_doc` writes it to
+  `<project>/.jarvis/features/<fo-id>/<basename>` at child dispatch and the child
+  prompt gets a `# Design document` section pointing at it. Children cannot see the
+  planner's unmerged branch — that is why a snapshot, not a git reference. The planner
+  contract now says: shared context goes in the doc ONCE; a brief is goal, scope
+  boundary, acceptance, plus section references. "Repetition is cheap" is gone.
+* **A question to Neo is one paragraph** that may reference an artifact in-text —
+  `section 3 of design doc "docs/x.md"` (`sections.find_refs` / `extract_section`).
+  `ops.ask_question` resolves it (worktree → project tree → feature snapshot) and puts
+  ONLY that section in the question's `context`; unresolved references append a note
+  rather than failing the ask. `sections.QUESTION_WARN_CHARS=1500` warns,
+  `QUESTION_MAX_CHARS=4000` refuses with the fix named.
+* **Escalation inbox rows are headlines**: first line of the question, 200 chars, plus
+  `jarvis neo show/answer` pointers (`daemon.py` question-escalation branch).
+  `PLAN_REVIEWER_PERSONA` no longer tells Neo to judge briefs it does not receive.
+
+`evals/test_question_diet_budget.py` pins the ratio on a production-shaped synthetic
+plan and prints the readings from the module fixture's teardown.
