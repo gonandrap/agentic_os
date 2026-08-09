@@ -373,6 +373,76 @@ def test_neo_tab_review_flow(client, daemon, project):
     assert "Always CSV" in page.text
 
 
+#: A question of the shape that made this necessary — Neo question #53 was ~7,000
+#: characters of feature-order brief, rendered inline, and the user could not keep up.
+LONG_QUESTION = ("Should the exporter emit CSV or JSON, given the constraints below? "
+                 * 30)
+
+
+def test_neo_tab_shortens_an_over_long_question_and_keeps_the_full_text_one_click_away(
+        client, daemon, project):
+    """The whole feature, end to end, with its control.
+
+    The page must show the SHORTENED question — and the verbatim text must still be
+    reachable from it. Asserting only the first half cannot tell "correctly shortened"
+    from "the question was lost", which is the failure that would actually hurt: the
+    user reviews Neo's answers from this page, and an answer to a question they can no
+    longer read is not reviewable.
+    """
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], LONG_QUESTION)
+    daemon._neo_drain()                 # answered, awaiting the user's review
+    daemon.digest_tick()
+    daemon.digest_pool.shutdown(wait=True)
+
+    page = client.get("/neo").text
+    assert "digest of:" in page                       # the shortened rendering
+    assert "cut down to the decision" in page            # ...and it says that it is one
+    assert "i-have-adhd" in page                      # attribution for the style
+    # THE CONTROL: the verbatim question is on the page, inside the disclosure.
+    assert "Full question context sent to Neo" in page
+    body = page.split("Full question context sent to Neo", 1)[1]
+    assert LONG_QUESTION.strip() in body
+    assert f"Work order: {wo['id']}" in body          # the prompt Neo got, not just the text
+
+
+def test_neo_tab_shows_a_short_question_in_full_and_still_offers_the_disclosure(
+        client, daemon, project):
+    """No digest, no loss: a question under the threshold renders exactly as it did
+    before this existed. The disclosure is there anyway — it carries the work-order
+    context, which the page never shows otherwise, and a control that appears only
+    sometimes is not one the reader learns to trust."""
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "CSV or JSON?")
+    daemon._neo_drain()
+    daemon.digest_tick()
+    daemon.digest_pool.shutdown(wait=True)
+
+    page = client.get("/neo").text
+    assert "CSV or JSON?" in page
+    assert "digest of:" not in page
+    assert "cut down to the decision" not in page   # nothing was, so the page says nothing
+    assert "Full question context sent to Neo" in page
+
+
+def test_neo_tab_falls_back_to_the_full_question_when_the_digest_failed(
+        client, daemon, project):
+    """A recorded digest failure must render as today's page, not as a blank box."""
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], LONG_QUESTION + " FORCE_DIGEST_FAIL")
+    daemon._neo_drain()
+    daemon.digest_tick()
+    daemon.digest_pool.shutdown(wait=True)
+
+    page = client.get("/neo").text
+    assert LONG_QUESTION.strip() in page
+    assert "digest of:" not in page
+    assert "cut down to the decision" not in page
+
+
 def test_neo_tab_escalation_answer_flow(client, daemon, project):
     wo = ops.create_work_order("proj_a", "prod thing")
     daemon.tick()
