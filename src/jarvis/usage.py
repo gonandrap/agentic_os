@@ -19,14 +19,19 @@ previous turn had cached is invalidated and the whole accumulated context is re-
 as a cache WRITE, at 1.25x, instead of a cache READ at 0.1x — twice over, in fact, on
 two consecutive calls.
 
-The cause is still open, but two candidates are ruled out and neither is worth
-re-testing. **Not TTL expiry**: across all 153 real worker turn boundaries, 124 went
-cold and 29 stayed warm, and gap does not separate them — the coldest had a 10-second
-gap and a warm one had a 3,233-second gap. **Not the ambient MCP set**, despite the
-tool-list churn visible in the transcripts: a plain two-turn `claude -p --resume`
-inheriting the user's entire global MCP config stays warm across the boundary. See
-`docs/superpowers/specs/2026-08-08-token-spend-findings.md` for the evidence and the
-bisect that would finish it.
+The cause is upstream and Jarvis cannot fix it: Claude Code's system prompt carries a
+dynamic per-machine section that includes `git status`, so a worker — whose whole job
+is editing files in its worktree — presents a different prompt prefix on its next turn.
+Confirmed in a clean room at 27k of context: a git repo whose turn edited a file goes
+cold, the same repo read-only stays warm, and `--exclude-dynamic-system-prompt-sections`
+relocates the section without stabilising it. It is NOT TTL (a 10-second boundary after
+an edit is cold; a 54-minute one after a read-only turn is warm) and NOT the MCP set.
+Evidence and the four-call repro:
+`docs/superpowers/specs/2026-08-08-token-spend-findings.md`.
+
+What Jarvis controls is the number of boundaries, not their price — which is why
+`Daemon.deliver_messages` coalesces everything queued for a work order into one turn,
+and why this module reports `resume_boundaries` next to the tax.
 
 So `rewrite_excess` is the headline number this module exists to produce: in a
 perfectly cached session every token is written to the cache exactly once, and the

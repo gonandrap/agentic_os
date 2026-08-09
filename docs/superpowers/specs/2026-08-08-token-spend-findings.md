@@ -8,11 +8,13 @@ has spent — but it exposed a structural tax that costs the fleet roughly an ei
 every token it spends, and a process failure that made this particular feature order
 pay it six times over.
 
-**Note on §2, added after the first draft:** that section originally named MCP tool-list
-churn as the likely cause and recommended pinning the worker MCP config. A controlled
-A/B **disproved it**, and the section now records what has been ruled out instead. The
-tax and every figure attached to it are unchanged; only the diagnosis moved. The fix
-that did ship (§6) targets turn *count*, which is Jarvis's own and needs no diagnosis.
+**Note on §2, revised twice.** The first draft blamed MCP tool-list churn and
+recommended pinning the worker MCP config; a controlled A/B disproved it. The second
+draft said the cause was unknown and filed a bisect. The cause is now **found and
+confirmed**: `git status` rides in Claude Code's system prompt, and a worker changes it
+on every turn by doing its job. Every figure in this document held across both
+revisions — only the diagnosis moved, which is exactly what shipping the measurement
+first bought.
 
 Everything below is measured from Claude Code's own session transcripts under
 `~/.claude/projects`. `jarvis cost` (shipped with this document) reproduces every
@@ -127,25 +129,51 @@ here. **This is what shipping the measurement first was for**: the wrong fix cos
 cheap `claude` calls to disprove instead of a release and a regression nobody could
 see.
 
-### What is still unexplained
+### The actual cause: `git status` is in the system prompt
 
-On a cold boundary `cache_read` lands on one of a **small set of fixed values** —
-15,277 / 15,465 / 21,704 / 21,967 — never something arbitrary. The prefix therefore
-matches up to a constant point and then breaks. That point is the end of Claude Code's
-own system prompt, so the first thing that differs is whatever Jarvis appends after it.
+Claude Code's system prompt carries a **dynamic per-machine section** — its own
+`--exclude-dynamic-system-prompt-sections` flag names the contents: "cwd, env info,
+memory paths, **git status**". A worker's whole job is to change files in its worktree,
+so its `git status` differs on the next turn, the system prompt differs with it, and
+every byte of conversation after that point has to be re-sent.
 
-A plain resume does not break there. A worker turn does. The difference between them is
-entirely the briefing: `--append-system-prompt`, `--settings`, `--add-dir`, `-n`,
-`--model`, `--effort`, `--permission-mode`. Two of those are rebuilt from scratch on
-every single turn — `dispatch._write_worker_settings` rewrites the settings file, and
-`bootstrap.install_agent_assets` re-materialises the asset trees — so a byte difference
-in either would do it, and both are Jarvis's own code.
+Confirmed in a clean room at **27k** of context — no Jarvis code involved, three arms
+differing in one variable:
 
-Finishing this is a bisect, not a guess: add one briefing flag at a time to a two-turn
-scratch session and watch `cache_read` on turn 2's first call. Filed as a backlog item
-with that procedure written out. It is deliberately not attempted here — the honest
-state of the evidence is "large, real, cause narrowed to seven flags", and the next
-step is a handful of cheap calls rather than another hypothesis.
+| Arm | git repo? | turn 1 edited a file? | turn-2 first call |
+|---|---|---|---|
+| plain directory | no | no | **warm** — read 26,381 |
+| git repo | yes | no | **warm** — read 26,480 |
+| git repo | yes | **yes** | **cold** — read 15,461, re-wrote 12,352 |
+
+The third arm's `cache_read` collapses to **15,461** — precisely the value its own
+*first* call reported, i.e. the static system prompt and nothing after it. That is the
+same signature as the 124 cold boundaries in production, whose reads cluster on
+15,277 / 15,465 / 21,704 / 21,967: those are static system prompts of differing sizes,
+because each project's `CLAUDE.md` is a different length.
+
+Everything the earlier hypotheses failed to explain now follows. TTL was irrelevant
+because the variable is *what the worker did*, not *when* the next turn started — a
+10-second boundary after an edit is cold, a 54-minute boundary after a read-only turn is
+warm. And every warm reproduction earlier in this investigation was warm for the same
+uninteresting reason: those scratch directories were not git repositories, or the turn
+changed nothing in them.
+
+**`--exclude-dynamic-system-prompt-sections` does not fix it.** Tested: it moves the
+section into the first user message, which grows the surviving prefix from 15,461 to
+17,180 — and the boundary is still cold, because the relocated section still changes and
+still sits ahead of the entire conversation. The flag is for cross-user prompt-cache
+reuse, not for resuming one conversation.
+
+**So there is no Jarvis-side fix for the cause**, and this is worth stating plainly
+rather than leaving as an open task. Jarvis cannot stop a worker from editing files, and
+it cannot make the CLI hold `git status` out of the cached prefix. The tax is a property
+of running a file-editing agent across multiple processes with today's Claude Code. What
+Jarvis *can* control is how many boundaries it pays for — see §6.
+
+The repro is four `claude` calls and belongs upstream: a session resumed after any
+file edit re-sends its whole context. On a 400k-token conversation that is ~$4.60 per
+boundary at Opus list prices.
 
 ---
 
@@ -262,17 +290,49 @@ tokens (~$4.60) for every message that would previously have arrived on its own.
 
 ## 7. Recommendations, in order of expected saving
 
-1. **Bisect the briefing** to find what actually breaks the prefix — seven flags, a
-   two-turn scratch session, a handful of cheap calls. Upper bound if it is fixable:
-   ~12% of fleet spend. Filed with the procedure written out. Do *not* re-try MCP
-   pinning; §2 disproves it.
-2. **Keep worker turn counts down where the context is large.** The tax is linear in
-   turns and in context at once, and each boundary costs ~2× context. This is the lever
-   that works whether or not the cause is ever found, and the message coalescing above
-   is the first instance of pulling it. `jarvis wo ask` round trips are the other big
-   source — batch questions into one ask rather than three.
-3. **Route feature-order scope questions to the user, not to Neo**, or checkpoint the
+1. **Turn count is the only lever on the tax, so spend turns deliberately.** The cause
+   is upstream and unfixable here (§2), but the tax is `(turns − 1) × context × ~2`, and
+   Jarvis owns the turn count. Message coalescing (§6) is the first instance. The other
+   large source is `jarvis wo ask`: every round trip is a boundary, so a worker that asks
+   three questions separately pays three of them. Batch questions into one ask — the
+   worker contract should say so, and now has a number behind it.
+2. **Report it upstream.** A resumed session re-sends its whole context after any file
+   edit. Four `claude` calls reproduce it; the arms are in §2.
+3. **Put the planner's read-only seats on a cheaper model.** See §8 — a
+   measured 40% cut to a third of a planner's bill, at a quality cost the user should
+   weigh rather than have chosen for them.
+4. **Route feature-order scope questions to the user, not to Neo**, or checkpoint the
    plan's shape before the full document is written. On this feature order alone that
    was ~$5–8 and four turns.
-4. **Watch subagent fan-out on planners specifically.** A third of this planner's cost,
-   for analysis the parent then had to read anyway.
+
+## 8. What is actionable about the subagents (hotspot 3)
+
+Measured on the planner's three seat calls: **6,010,528 billed input tokens against
+77,581 output — a 77:1 read-to-write ratio — for $6.49**, a third of the planner's bill.
+That ratio is the finding. These seats are *defined* to produce no code (`jarvis-architect`
+and `jarvis-test-lead` hold no Write, no Edit, no Bash — the asset files say that is the
+point of the seat, not an oversight). They read, and they hand back an opinion.
+
+Two things follow, and only one of them is a code change.
+
+**They run on the dearest model, by omission.** Neither seat's frontmatter carries a
+`model:` key, so both inherit the planner's — Opus 5, at $5/$25 per MTok. For work that
+is 77:1 reading, the input price is essentially the whole bill: on Sonnet 5 ($3/$15) the
+same three calls cost ~$3.9 instead of $6.49, a **40% cut to a third of a planner's
+spend**, and on Haiku 4.5 ~$1.3. Adding `model: sonnet` to the two asset files is a
+one-line change per seat.
+
+It is deliberately **not** made here. The architect's analysis is what produced the scope
+question that this planner asked before writing anything — the one thing in the whole
+episode that worked as designed — and trading planning quality for 11% of a planner's
+cost is the user's call, not a worker's. It is filed with these numbers attached.
+
+**The seats are not wasting reads.** Worth recording because it was the obvious
+suspicion and it is wrong: both seat definitions already carry the full "Serena first,
+`list_memories`/`read_memory` before anything else, do not grep for symbols" instruction,
+and their tool grants are enumerated read-only symbol tools. They are not re-deriving
+the architecture from scratch. The 77:1 ratio is what careful code reading costs, not a
+defect to fix — which is why the lever is the price per token and not the number of them.
+
+`jarvis cost` reports the subagent share as its own line so this choice is visible at all,
+which it was not before.
