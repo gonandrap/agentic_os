@@ -406,7 +406,10 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                          # Why a pending work order is not starting. Derived here, with
                          # the store open, so every surface reading os_status gets the
                          # same answer as `jarvis wo list` instead of deriving its own.
-                         "blocked_by": blocked_by(store, wo)}
+                         "blocked_by": blocked_by(store, wo),
+                         # Same rule, for the other reason a work order can be sitting
+                         # still: parked on the Claude usage limit, retrying at N.
+                         "rate_limit": invariants.rate_limit_note(store, wo)}
                         for wo in open_wos
                     ],
                     "settings_drift": drift,

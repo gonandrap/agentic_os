@@ -55,6 +55,10 @@
       <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a>
       {%- if wo.status == 'waiting_pr_merge' %} — merge it, then "Mark done".{% endif %}</p>
   {% endif %}
+  {% if rate_limit %}
+    <p class="kv">⏳ {{ rate_limit }} — the turn was refused before it ran, so nothing
+      was lost and nothing is owed from you. It picks up where it left off.</p>
+  {% endif %}
   {% if wo.description %}<p class="kv" style="white-space: pre-wrap;">{{ wo.description }}</p>{% endif %}
   <p class="kv mono">
     created {{ fmt_age(wo.created_at) }} ago · updated {{ fmt_age(wo.updated_at) }} ago

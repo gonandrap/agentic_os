@@ -117,6 +117,7 @@ fire on EVERY turn** (`SessionStart.source == "resume"` from turn 2 on).
 | latest turn | work order |
 |---|---|
 | `running` | `running` (+ stall flag past 6h) |
+| `failed` **on the usage limit** | UNTOUCHED — see the next section |
 | `failed` | `failed` + attention + notification |
 | `done` + queued messages | untouched; the next turn goes out this tick |
 | `done` + `result_summary` + pending assumptions | `needs_review` |
@@ -129,6 +130,72 @@ fire on EVERY turn** (`SessionStart.source == "resume"` from turn 2 on).
 read). Only `track_injected_sessions` + `check_invariants` stay on the
 `RECONCILE_EVERY_TICKS` cadence, and only the first needs `claude agents --json` — which
 it skips entirely on ticks where no project has a live `injected` row.
+
+## Self-healing after the Claude usage limit (wo-996c7344, PR 89)
+
+Claude Code refuses a turn outright once the account's window is spent. The refusal is
+free and instant (`duration_api_ms: 0`, `total_cost_usd: 0`) and arrives as the turn's
+own result — `is_error: true`, `subtype: "success"`, body
+`You've hit your session limit · resets 11:50pm (America/Los_Angeles)`.
+
+**The message is assembled, so match its SHAPE and never its words.** From 2.1.226's
+string table (`WJe`, map `HUt`): `You've hit your ${label} · resets ${when}`, where the
+label is keyed by rate-limit type — `five_hour` → "session limit", `seven_day` →
+"weekly limit", `seven_day_opus` → "Opus limit", `seven_day_sonnet` → "Sonnet limit",
+`seven_day_overage_included` → **"Fable 5 limit"**, `overage` → "usage credit limit".
+Two of those carry a MODEL name, so a word list rots at the next launch — it already
+missed the last two. `claude_cli._LIMIT_RE` therefore matches "limit" … "resets" within
+60 chars, and the reset having to PARSE is the real false-positive gate (it is what
+keeps a worker's own `the rate limit reset logic in daemon.py:942` out).
+
+Spend caps deliberately do **not** match: they render `· run /usage-credits to raise it`
+instead of a reset, and they do not reopen on their own — the user has to act.
+
+`claude_cli.usage_limit(text) -> UsageLimit | None` resolves four renderings, which the
+CLI's formatter (`dye`) picks between by distance: `11:50pm (TZ)` under 24h;
+`Aug 14, 9:50am (TZ)` over it (the ordinary 7-day case); `Jan 3, 2027, 11:50pm (TZ)`
+when it crosses a year — **read that year, an unread one parses as the HOUR**; and
+`resets in 2h 15m` (fast mode). Minutes are dropped when zero. An unknown timezone falls
+back to LOCAL, never UTC. `Claude AI usage limit reached|<epoch>` is a legacy branch,
+kept but UNVERIFIED — that literal is absent from 2.1.226.
+
+To re-verify on a new CLI: `strings -n 8 ~/.local/share/claude/versions/<v> > /tmp/cc.txt`
+then search with python `re` (shell grep fights the `${}` and backticks).
+
+`worker_session.rate_limit_pause(store, wo_id) -> RateLimitPause | None` is the state.
+**There is no column, no flag and no status for it**: the whole condition is re-derived
+from the latest turn each time it is asked for, per the rule in `project_store.py:281-285`
+("`waiting_pr_merge` earned a status because nothing derived it; this does not").
+Neo settled that explicitly — question 83 on wo-996c7344. Four readers share the one
+predicate so they cannot drift:
+
+* `Daemon.settle_work_order` — returns early, so the work order keeps the ACTIVE status
+  it had. This is load-bearing: `failed` is a `DEPENDENCY_DEAD_STATUS` (strands
+  dependents), `Daemon.settle_features` fails the parent feature order off one failed
+  child, and `true_blockers` re-derives the attention reason FROM the status, so
+  "leave it failed and retry quietly" is not available.
+* `Daemon.deliver_messages` — HOLDS newer messages while paused, so the refused turn
+  (which carries a message already marked `delivered`) goes out first. The hold lifts
+  once retries are exhausted, which keeps `jarvis wo send … "retry"` working by hand.
+* `Daemon.retry_rate_limited` — relaunches via `worker_session.retry` every
+  `RATE_LIMIT_EVERY_TICKS` (12, ~1min).
+* `invariants.rate_limit_note` — the one user-facing string, rendered by
+  `status_label` (CLI) and `ops.os_status` → `open_work_orders[].rate_limit` (dashboard):
+  `running — Claude usage limit reached, retrying by itself at 23:50`.
+
+Constants in `worker_session.py`: `RATE_LIMIT_MIN_DELAY` (60s floor — the reset is a
+clock time rounded to the minute and can parse into the past), `RATE_LIMIT_FALLBACK_DELAY`
+(15min when no time is readable), `MAX_RATE_LIMIT_RETRIES` (8 consecutive refusals, then
+it fails for real with `rate_limit_exhausted`). `rate_limit_streak` counts off the tail
+via `ProjectStore.recent_turns` (NOT `list_turns`, whose LIMIT applies from the front).
+
+`worker_session.retry` re-decides two flags **from the filesystem** rather than copying
+them off the refused turn: `--resume` only if `claude_cli.session_transcript_path` exists
+(a session never written cannot be resumed), and `--worktree` only if the worktree
+directory does not exist yet (that flag is what creates it).
+
+Timeline kinds: `rate_limited`, `rate_limit_retry`, `rate_limit_exhausted` — all signal,
+and `turn_failed` is deliberately NOT emitted for a refusal.
 
 ## Background sessions still exist — for the USER only, and only if handed over
 

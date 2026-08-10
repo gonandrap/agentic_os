@@ -17,6 +17,10 @@ SIGNAL_KINDS = [
     # A turn that failed or was cancelled is the story, not the plumbing: it is why
     # the work order stopped.
     "turn_failed", "turn_cancelled",
+    # So is a turn Claude Code refused for the usage limit, and so is the OS putting
+    # itself right afterwards — that recovery is the answer to "why did it start again
+    # on its own at midnight", which is a question only the timeline can answer.
+    "rate_limited", "rate_limit_retry", "rate_limit_exhausted",
 ]
 DEBUG_KINDS = [
     "message_queued", "delivering", "message_delivered",

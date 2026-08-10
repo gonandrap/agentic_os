@@ -45,6 +45,7 @@ import json
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,22 @@ log = logging.getLogger("jarvisd")
 #: A turn still running after this long is reported, never killed: a legitimately long
 #: turn is indistinguishable from a hung one from out here, and killing loses real work.
 TURN_STALL_SECONDS = 6 * 3600
+
+#: How long to wait before retrying a turn whose limit message named a reset but no time
+#: this parser could read. Short enough to recover the same evening, long enough that a
+#: dozen work orders re-asking do not become a poll loop against the CLI.
+RATE_LIMIT_FALLBACK_DELAY = 15 * 60
+
+#: The floor under every retry, measured from the refusal. The reset moment is a clock
+#: time rounded to the minute, so it can land a few seconds in the past the instant it
+#: is parsed; without this the first retry would go out immediately and be refused again.
+RATE_LIMIT_MIN_DELAY = 60
+
+#: How many consecutive turns of ONE conversation may be refused for the limit before
+#: the OS stops retrying and hands it to the user. A real window reopens after one wait,
+#: so a streak this long means the parse is wrong or something structural is — and
+#: retrying for ever would hide that behind a work order that looks busy and is not.
+MAX_RATE_LIMIT_RETRIES = 8
 
 
 def new_session_id() -> str:
@@ -247,8 +264,17 @@ def _reap(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any]:
     # turn that motivated this hit a 429 having already paid $0.07 for the attempt.
     usage_json = json.dumps(result.usage) if result.usage else None
     if not result.ok:
-        store.add_event(wo_id, "turn_failed",
-                        {"seq": turn["seq"], "error": result.error[:500]})
+        # A refusal for the usage limit is not a failure of the work, so it does not get
+        # "Worker turn failed" in the timeline — the turn row still records state
+        # `failed`, which is the plumbing truth, but the story the user reads is that
+        # the OS paused and will resume itself. Emitted here, where a turn is reaped
+        # exactly once, so a pause lasting hours says so once and not every tick.
+        limit = claude_cli.usage_limit(result.error)
+        kind = "rate_limited" if limit else "turn_failed"
+        payload: dict[str, Any] = {"seq": turn["seq"], "error": result.error[:500]}
+        if limit:
+            payload["reset_at"] = limit.reset_at
+        store.add_event(wo_id, kind, payload)
         return store.finish_turn(turn["id"], "failed", error=result.error,
                                  result=result.result or None,
                                  cost_usd=result.cost_usd, num_turns=result.num_turns,
@@ -295,6 +321,125 @@ def _stderr_tail(turn: dict[str, Any]) -> str:
 def is_stalled(turn: dict[str, Any] | None) -> bool:
     return bool(turn and turn["state"] == "running"
                 and time.time() - turn["started_at"] > TURN_STALL_SECONDS)
+
+
+# -- parked on the usage limit -------------------------------------------------------
+#
+# A turn refused for the account's usage limit did not happen: nothing was sent, nothing
+# was billed, and the conversation is exactly where it was. Treating it as a failure
+# settles the work order into `failed`, which is a DEPENDENCY_DEAD_STATUS, fails the
+# parent feature order and puts a permanent attention flag on something that will be
+# fine again at 11:50pm. So the OS does not fail it at all: the work order stays in the
+# active status it already had and `Daemon.retry_rate_limited` relaunches the turn once
+# the window reopens.
+#
+# There is NO column and NO status for this. The whole condition is re-derived from the
+# latest turn every time it is asked for, which is the rule project_store.py states for
+# exactly this choice ("`waiting_pr_merge` earned a status because nothing derived it;
+# this does not"). Four readers share `rate_limit_pause` — the settler, message
+# delivery, the retry pass and `invariants.status_label` — so none of them can drift.
+
+
+@dataclass(frozen=True)
+class RateLimitPause:
+    """A work order waiting for the usage window to reopen."""
+
+    #: The turn that was refused. Its `prompt` is what the retry re-sends.
+    turn: dict[str, Any]
+    #: When the window reopens, as the CLI stated it. None when it named no readable time.
+    reset_at: float | None
+    #: The earliest moment the OS will relaunch — the reset plus the minimum floor.
+    retry_at: float
+    #: Consecutive refusals, this one included.
+    attempts: int
+    #: The refusal, verbatim and squeezed onto one line.
+    message: str
+
+    @property
+    def exhausted(self) -> bool:
+        """Retried enough. The work order fails for real and asks for the user."""
+        return self.attempts > MAX_RATE_LIMIT_RETRIES
+
+    def due(self, now: float | None = None) -> bool:
+        return (time.time() if now is None else now) >= self.retry_at
+
+
+def rate_limit_pause(store: ProjectStore, wo_id: str) -> RateLimitPause | None:
+    """This work order's usage-limit pause, or None if it is not in one.
+
+    None for every ordinary failure and for every healthy conversation, so callers use
+    it as the predicate itself. Costs one indexed row in the common case: the streak is
+    only counted once the latest turn is already known to be a refusal.
+    """
+    turn = store.latest_turn(wo_id)
+    if turn is None or turn["state"] != "failed":
+        return None
+    limit = claude_cli.usage_limit(turn.get("error"))
+    if limit is None:
+        return None
+    ended = turn.get("ended_at") or turn["started_at"]
+    when = (ended + RATE_LIMIT_FALLBACK_DELAY if limit.reset_at is None
+            else limit.reset_at)
+    return RateLimitPause(
+        turn=turn,
+        reset_at=limit.reset_at,
+        retry_at=max(when, ended + RATE_LIMIT_MIN_DELAY),
+        attempts=rate_limit_streak(store, wo_id),
+        message=limit.message,
+    )
+
+
+def rate_limit_streak(store: ProjectStore, wo_id: str) -> int:
+    """How many turns in a row this conversation has had refused for the limit.
+
+    Counted off the end of the conversation rather than stored, so it resets itself the
+    moment one turn gets through — which is the only definition of "recovered" that does
+    not need a column someone has to remember to clear.
+    """
+    n = 0
+    for turn in store.recent_turns(wo_id, limit=MAX_RATE_LIMIT_RETRIES + 2):
+        if turn["state"] != "failed" or claude_cli.usage_limit(turn.get("error")) is None:
+            break
+        n += 1
+    return n
+
+
+def retry(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
+          turn: dict[str, Any]) -> dict[str, Any]:
+    """Relaunch a turn that was refused before it ran. Same prompt, same conversation.
+
+    The prompt is read back off the turn row, which is why nothing is lost when the
+    refused turn was carrying a user message: `Daemon._deliver` marks a message
+    `delivered` the instant the process starts, so the turn row is the only remaining
+    copy of what the worker never got to read.
+
+    Two flags have to be re-decided rather than copied off the original turn, because a
+    refusal can land on either side of both. Each is settled by asking the filesystem
+    what actually exists, so the answer is a fact and not a guess about how far the CLI
+    got before it gave up:
+
+    * `--resume` vs `--session-id`: a session that was never written cannot be resumed,
+      and one that WAS cannot be re-opened. The transcript file is the test.
+    * `--worktree`: the flag creates the worktree, so passing it again once the
+      directory exists asks for one that is already there. Once it exists the retry
+      simply runs from inside it, which is what every later turn does anyway.
+    """
+    started = _conversation_started(project, wo)
+    tree = worktree_path(project, wo)
+    return _launch(
+        store, project, wo, turn["prompt"], kind=turn["kind"], resume=started,
+        worktree=None if tree or turn["kind"] != "dispatch" else wo.get("worktree"),
+        cwd=tree or project.path, msg_id=turn.get("msg_id"),
+    )
+
+
+def _conversation_started(project: ProjectSpec, wo: dict[str, Any]) -> bool:
+    """Has this work order's session ever been written to disk?"""
+    session_id = wo.get("session_id")
+    if not session_id:
+        return False
+    cwd = worktree_path(project, wo) or project.path
+    return claude_cli.session_transcript_path(cwd, session_id).exists()
 
 
 def cancel(store: ProjectStore, wo_id: str) -> dict[str, Any]:

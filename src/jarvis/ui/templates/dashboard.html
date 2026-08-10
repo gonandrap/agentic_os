@@ -109,6 +109,12 @@
         {% if wo.status == 'waiting_pr_merge' and wo.pr_url %}
           <div class="sub">⑃ <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a></div>
         {% endif %}
+        {# Still `running`, and nothing is running: Claude Code refused the turn because
+           the usage window is spent. The OS resumes it by itself, so this is an
+           explanation and not an ask — no attention flag, no action for the user. #}
+        {% if wo.rate_limit %}
+          <div class="sub">⏳ {{ wo.rate_limit }}</div>
+        {% endif %}
         {% if wo.blocked_by %}
           <div class="sub">⊘ blocked by:
             {% for b in wo.blocked_by %}<a class="mono"
