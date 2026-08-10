@@ -68,6 +68,52 @@ intentionally lags behind the shipped one.
 > `release` and refs named `release/…` (a file/directory conflict), so the release line
 > is the versioned `release/jarvis-X.Y.Z` branches plus `jarvis-X.Y.Z` tags.
 
+### Staged releases (`--stage`) — shipping from a work order
+
+A worker `claude` process lives inside `jarvis.service`'s cgroup, so a release run
+from a Jarvis-dispatched work order kills its own worker when the daemon restarts:
+the final turn dies mid-report, and the work order settles `failed` even though the
+release fully applied (that is exactly how v0.5.1 shipped — see
+`docs/superpowers/specs/2026-08-10-why-a-self-ship-reports-failure.md`). A self-ship
+therefore **stages** instead of restarting:
+
+```bash
+scripts/shipit.sh --stage 1.4.0 --wo wo-abc12345
+```
+
+This performs every release step — preconditions, release branch, bump + tag, push,
+deploy of the tag to `$PRODUCTION_CODE/jarvis_os`, `uv sync` — **except** the service
+restarts and the Telegram notify, then writes a marker file
+`$JARVIS_HOME/run/pending_release.json`:
+
+```json
+{"wo_id": "wo-abc12345", "project": "jarvis_os", "version": "1.4.0",
+ "tag": "jarvis-1.4.0", "staged_at": 1786500000, "state": "staged"}
+```
+
+The daemon finishes the job (`src/jarvis/release.py`):
+
+1. **Restart, once the worker has settled.** Every reconcile tick the daemon checks
+   the marker; when it is `staged` and the named work order has **no running turn**
+   — i.e. the shipping worker has finished reporting — it appends a timeline event,
+   rewrites the marker to `restarting`, restarts `jarvis-ui.service` inline and hands
+   `jarvis.service` to a detached `systemd-run` unit (the restart outlives the daemon
+   it kills).
+2. **Verify on boot.** The new daemon, before its first tick, checks that the
+   production checkout's `pyproject.toml` version equals the marker's **and** that
+   `ExecMainStartTimestamp` of *both* units is newer than the restart (never
+   `is-active`, never `git describe` — both lie during a half-apply). On success it
+   settles the work order as `completed`, sends the release notification through the
+   normal inbox → sinks path, and deletes the marker. On failure the marker becomes
+   `state: "failed_verification"` with the reason, the work order gets an attention
+   flag and a warning notification, and the marker is **never deleted automatically**
+   — resolve it by hand, then remove the file.
+
+A marker stuck in `staged`/`restarting` for over an hour is flagged by
+`jarvis doctor` (`INV-RELEASE-MARKER-STALE`). A plain `scripts/shipit.sh` run without
+`--stage` behaves exactly as described above: restarts and notify included — use that
+from your own shell.
+
 ## First-time production setup
 
 ```bash

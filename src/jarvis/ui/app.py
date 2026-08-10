@@ -257,6 +257,21 @@ def fmt_tok(n: int | None) -> str:
     return str(n)
 
 
+def fmt_dur(seconds: float | None) -> str:
+    """Turn durations at a readable magnitude — 1.2h, 4m, 15s.
+
+    Mirrors `cli._dur` the same way `fmt_tok` mirrors `cli._tok`: the shared thing is
+    a formatting convention, not behaviour.
+    """
+    if seconds is None:
+        return "—"
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}h"
+    if seconds >= 60:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds:.0f}s"
+
+
 def wo_cost(wo_id: str, project: str) -> dict | None:
     """One work order's spend, or None if it cannot be measured or read.
 
@@ -291,7 +306,7 @@ def create_app() -> FastAPI:
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         fo_status_meta=FO_STATUS_META, level_tone=LEVEL_TONE, fmt_age=fmt_age,
         instance=instance_badge(),
-        fmt_tok=fmt_tok,
+        fmt_tok=fmt_tok, fmt_dur=fmt_dur,
     )
 
     def render(request: Request, template: str, active: str = "dashboard",
@@ -475,6 +490,32 @@ def create_app() -> FastAPI:
                       units=report["units"], totals=report["totals"],
                       project=project,
                       projects=sorted(ops.registered_project_paths()))
+
+    @app.get("/cost/{name}/{wo_id}", response_class=HTMLResponse)
+    def cost_wo_page(request: Request, name: str, wo_id: str):
+        """One work order's spend, turn by turn — where a bloated order shows itself.
+
+        The rows come from the recorded result JSON of each turn (exact), with the
+        context peak drawn as a bar against the model's window so the growth across
+        turns is visible at a glance. Provenance is stated on the page: turns that
+        exist only in transcripts are listed as the estimates they are, never merged
+        into the recorded figures.
+        """
+        try:
+            report = ops.cost_report(target=wo_id, project=name)
+        except ops.OpsError as e:
+            return render(request, "error.html", message=str(e))
+        if "turns_detail" not in report:
+            return render(request, "error.html",
+                          message=f"{wo_id} has no per-turn view (only work orders do)")
+        turns = report["turns_detail"]
+        # Bars are scaled to the context window when any turn reports one, else to the
+        # largest peak on the page — growth stays comparable either way.
+        scale = max([t.get("context_window") or 0 for t in turns]
+                    + [t.get("context_peak") or 0 for t in turns] + [1])
+        return render(request, "cost_wo.html", active="cost", report=report,
+                      unit=report["units"][0], turns=turns, project=name,
+                      bar_scale=scale)
 
     @app.get("/inbox", response_class=HTMLResponse)
     def inbox(request: Request):

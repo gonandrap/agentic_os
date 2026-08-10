@@ -26,19 +26,42 @@
 #   scripts/shipit.sh 1.2.0           # release an explicit version
 #   scripts/shipit.sh patch|minor|major
 #   scripts/shipit.sh --dry-run [ver] # print what would happen, change nothing
+#   scripts/shipit.sh --stage <ver> --wo <wo-id>
+#                                     # SELF-SHIP mode: everything above EXCEPT the
+#                                     # service restarts and the Telegram notify.
+#                                     # Writes $JARVIS_HOME/run/pending_release.json;
+#                                     # the daemon performs the restarts once the
+#                                     # shipping worker's turn has settled, and
+#                                     # verifies the release on its next boot
+#                                     # (src/jarvis/release.py). This is what lets a
+#                                     # work order that ships a release report its own
+#                                     # success: restarting jarvis.service from here
+#                                     # kills every worker in its cgroup, including
+#                                     # the one running this script.
 #
 # Env:
 #   PRODUCTION_CODE   production root (default: ~/workspace/production)
+#   JARVIS_HOME       state root for the --stage marker (default: ~/.jarvis)
 set -euo pipefail
 
 DRY_RUN=0
+STAGE=0
+WO_ID=""
 BUMP_OR_VERSION=""
-for arg in "$@"; do
-  case "$arg" in
+while [ $# -gt 0 ]; do
+  case "$1" in
     --dry-run) DRY_RUN=1 ;;
-    *) BUMP_OR_VERSION="$arg" ;;
+    --stage)   STAGE=1 ;;
+    --wo)      shift; WO_ID="${1:-}" ;;
+    *) BUMP_OR_VERSION="$1" ;;
   esac
+  shift
 done
+if [ "$STAGE" = 1 ] && [ -z "$WO_ID" ]; then
+  printf '\033[1;31m✗ %s\033[0m\n' \
+    "--stage requires --wo <work-order-id>: the daemon needs to know which work order to wait for and settle" >&2
+  exit 1
+fi
 
 REPO="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 cd "$REPO"
@@ -204,6 +227,38 @@ if [ ! -f "$PROD_CONFIG" ]; then
 }
 JSON
   fi
+fi
+
+# --- 5b. --stage: stop here and hand the restarts to the daemon ------------------
+#
+# Everything that had to happen has happened: the tag is on origin and production's
+# checkout + venv are on the new version. What remains — restarting the services and
+# telling the user — is exactly what a Jarvis-hosted session cannot survive doing, so
+# in stage mode we record the hand-off and exit. The daemon (src/jarvis/release.py)
+# restarts jarvis-ui.service and jarvis.service once the shipping worker's turn has
+# settled, verifies the release on its next boot (pyproject version on disk +
+# ExecMainStartTimestamp on BOTH units), settles the work order, and notifies.
+if [ "$STAGE" = 1 ]; then
+  JARVIS_HOME_DIR="${JARVIS_HOME:-$HOME/.jarvis}"
+  MARKER="$JARVIS_HOME_DIR/run/pending_release.json"
+  say "staging: writing release marker $MARKER"
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '  [dry-run] write %s (state: staged, wo: %s, tag: %s)\n' \
+      "$MARKER" "$WO_ID" "$TAG"
+  else
+    mkdir -p "$JARVIS_HOME_DIR/run"
+    printf '{"wo_id": "%s", "project": "jarvis_os", "version": "%s", "tag": "%s", "staged_at": %s, "state": "staged"}\n' \
+      "$WO_ID" "$VERSION" "$TAG" "$(date +%s)" > "$MARKER"
+  fi
+  say "staged $TAG → $PROD_DIR — services NOT restarted"
+  say "what happens next:"
+  say "  1. end this session's turn (e.g. jarvis wo finish $WO_ID \"...\") — the daemon"
+  say "     will not restart anything while $WO_ID still has a turn running"
+  say "  2. the daemon restarts jarvis-ui.service, then jarvis.service (detached)"
+  say "  3. on boot, the new daemon verifies $TAG is live on both units, settles"
+  say "     $WO_ID, and sends the release notification"
+  [ "$DRY_RUN" = 1 ] && say "(dry-run: no changes were made)"
+  exit 0
 fi
 
 # --- 6. restart the UI (safe to do inline: it does not host this script) ---------

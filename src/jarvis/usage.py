@@ -295,44 +295,55 @@ def _usage_of(path: Path) -> Usage:
     return usage
 
 
-def index_sessions(root: Path | None = None) -> dict[str, Path]:
-    """Map every session id Claude Code has a transcript for to that transcript.
+def index_sessions(root: Path | None = None) -> dict[str, list[Path]]:
+    """Map every session id Claude Code has a transcript for to its transcript files.
 
     Built in one pass rather than globbing per work order: session ids are UUIDs and
     so globally unique, but the directory they live under is the slugified cwd the
     session was CREATED in, which for a worker is its worktree — not something Jarvis
     can reconstruct reliably once the worktree is gone.
+
+    A LIST of files per id, because that cwd can change between segments of one
+    session, leaving a file under each slug. wo-2fa7c0e9's did — repo root, then its
+    worktree — and an index that kept one path per id read that work order as $0.51 /
+    1 turn where the true figure was three times that.
     """
     root = root or transcript_root()
-    index: dict[str, Path] = {}
+    index: dict[str, list[Path]] = {}
     if not root.is_dir():
         return index
     for project_dir in root.iterdir():
         if not project_dir.is_dir():
             continue
         for path in project_dir.glob("*.jsonl"):
-            index[path.stem] = path
+            index.setdefault(path.stem, []).append(path)
     return index
 
 
 def read_session(session_id: str, root: Path | None = None,
-                 index: dict[str, Path] | None = None) -> SessionUsage:
+                 index: dict[str, list[Path]] | None = None) -> SessionUsage:
     """Spend for one session id, subagents included but reported separately."""
     result = SessionUsage(session_id=session_id)
     if index is None:
         index = index_sessions(root)
-    path = index.get(session_id)
-    if path is None:
+    paths = index.get(session_id)
+    if not paths:
         return result
     result.found = True
-    result.main = _usage_of(path)
-    # Claude Code writes each subagent's own transcript beside the parent's, under a
-    # directory named for the parent session.
-    subagent_dir = path.with_suffix("") / "subagents"
-    if subagent_dir.is_dir():
-        for sub in sorted(subagent_dir.glob("*.jsonl")):
-            sub_usage = _usage_of(sub)
-            if sub_usage.messages:
-                result.subagents = result.subagents + sub_usage
-                result.subagent_count += 1
+    for path in sorted(paths):
+        result.main = result.main + _usage_of(path)
+        # Claude Code writes each subagent's own transcript beside the parent's, under
+        # a directory named for the parent session — beside whichever segment the
+        # subagent was spawned from.
+        subagent_dir = path.with_suffix("") / "subagents"
+        if subagent_dir.is_dir():
+            for sub in sorted(subagent_dir.glob("*.jsonl")):
+                sub_usage = _usage_of(sub)
+                if sub_usage.messages:
+                    result.subagents = result.subagents + sub_usage
+                    result.subagent_count += 1
+    # A further segment file exists only because the session was resumed under a
+    # different cwd, so each one is a turn boundary the cache-read comparison cannot
+    # see (it never compares across files).
+    result.main.resume_boundaries += len(paths) - 1
     return result

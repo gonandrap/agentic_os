@@ -188,12 +188,18 @@ def test_the_worker_briefing_ranks_serena_over_grep(project):
 
     prompt = build_worker_prompt(wo, spec, [])
 
+    # The worker core carries the posture as a hook; the full briefing moved behind
+    # `jarvis brief navigation` (worker_brief.navigation_section — single source).
     assert "Serena first, grep second" in prompt
-    assert "find_referencing_symbols" in prompt
+    assert "`navigation`" in prompt
+
+    from jarvis import worker_brief
+    section = worker_brief.render_section("navigation")
+    assert "find_referencing_symbols" in section
     # Conditional, because Jarvis configures no MCP server itself: an unconditional
     # instruction would be a lie in every project that has no Serena.
-    assert "If this project has Serena" in prompt
-    assert "no Serena" in prompt
+    assert "If this project has Serena" in section
+    assert "no Serena" in section
 
 
 def test_the_planner_briefing_ranks_serena_too(project):

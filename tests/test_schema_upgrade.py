@@ -178,6 +178,37 @@ def test_the_central_database_from_the_live_release_upgrades_in_full(
     }
 
 
+def test_the_usage_json_column_reaches_a_database_that_already_has_wo_turns(tmp_path):
+    """`wo_turns` already ships in the live release, so `usage_json` cannot arrive
+    with the `CREATE TABLE` — it must be in `ADDED_COLUMNS`.
+
+    The stale database is built by dropping the column from today's schema rather
+    than from a frozen asset: the project asset (0.1.11) predates `wo_turns`
+    entirely, so the upgrade it exercises creates the whole table fresh and would
+    pass with `ADDED_COLUMNS` forgotten — exactly the silent failure this file
+    exists to catch.
+    """
+    proj = tmp_path / "legacy"
+    (proj / ".jarvis").mkdir(parents=True)
+    ProjectStore(proj).close()                      # today's schema...
+    conn = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
+    conn.execute("ALTER TABLE wo_turns DROP COLUMN usage_json")   # ...aged one release
+    conn.commit()
+    conn.close()
+
+    store = ProjectStore(proj)                      # the upgrade
+    try:
+        assert "usage_json" in schema_of(store.conn)["wo_turns"]
+        # and it round-trips on the upgraded database
+        wo = store.create_work_order(title="after the upgrade", description="")
+        turn = store.create_turn(wo["id"], kind="dispatch", prompt="go")
+        store.finish_turn(turn["id"], "done", result="ok",
+                          usage_json='{"input": 2, "output": 941}')
+        assert store.latest_turn(wo["id"])["usage_json"] == '{"input": 2, "output": 941}'
+    finally:
+        store.close()
+
+
 def test_the_columns_the_turn_runtime_reads_survive_the_upgrade(tmp_path):
     """The specific fields this transport depends on, named so a failure says which.
 

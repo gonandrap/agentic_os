@@ -143,6 +143,61 @@ def test_a_broken_transcript_read_never_takes_the_work_order_page_down(
     assert "fleet →" not in page.text
 
 
+def add_recorded_turn(project, wo_id: str, cost: float, peak: int,
+                      window: int = 1_000_000) -> None:
+    """A settled turn with its recorded usage envelope, as `_reap` would leave it."""
+    store = ProjectStore(project)
+    try:
+        kind = "message" if store.list_turns(wo_id) else "dispatch"
+        turn = store.create_turn(wo_id, kind=kind, prompt="p")
+        usage = {"total_cost_usd": cost, "input": 2, "cache_write": 2558,
+                 "cache_read": 45689, "cache_1h": 2558, "cache_5m": 0, "output": 941,
+                 "api_calls": 1, "context_peak": peak, "context_window": window,
+                 "duration_api_ms": 1000, "cost_by_model": {"claude-opus-5": cost}}
+        store.finish_turn(turn["id"], "done", result="r", cost_usd=cost, num_turns=1,
+                          usage_json=json.dumps(usage))
+    finally:
+        store.close()
+
+
+def test_cost_page_links_each_work_order_to_its_turn_drilldown(client, project,
+                                                               transcript):
+    wo = ops.create_work_order("proj_a", "drillable")
+    transcript("sess-drill", write_tok=1_000, out=10)
+    give_session(project, wo["id"], "sess-drill")
+
+    page = client.get("/cost")
+    assert page.status_code == 200
+    assert f'/cost/proj_a/{wo["id"]}' in page.text
+
+
+def test_the_drilldown_shows_the_turn_table_and_context_growth(client, project):
+    """The page this feature exists for: a bloated work order's cost curve, turn by
+    turn — each turn's own cost and its context peak against the model's window."""
+    wo = ops.create_work_order("proj_a", "bloating one")
+    add_recorded_turn(project, wo["id"], 0.05, 48_000)
+    add_recorded_turn(project, wo["id"], 0.07, 90_000)
+
+    page = client.get(f"/cost/proj_a/{wo['id']}")
+    assert page.status_code == 200
+    assert "exact" in page.text                       # provenance: recorded
+    assert "dispatch" in page.text and "message" in page.text
+    assert "9.0%" in page.text                        # /context occupancy, turn 2
+    assert "48k" in page.text and "90k" in page.text  # peak per turn: growth visible
+
+
+def test_the_drilldown_labels_a_transcript_only_work_order_an_estimate(
+        client, project, transcript):
+    """The fallback path must never dress an estimate up as the record."""
+    wo = ops.create_work_order("proj_a", "pre capture")
+    transcript("sess-pre", write_tok=200_000, out=10_000)
+    give_session(project, wo["id"], "sess-pre")
+
+    page = client.get(f"/cost/proj_a/{wo['id']}")
+    assert page.status_code == 200
+    assert "estimate" in page.text
+
+
 def test_the_cost_tab_is_reachable_from_every_page(client):
     """A surface nobody can find is the bug this work order was filed about."""
     assert '<a href="/cost"' in client.get("/").text

@@ -110,7 +110,10 @@ def test_dispatch_flow(started, fake_claude, project):
     assert "Bash(jarvis *)" in settings["permissions"]["allow"]
     assert argv[-2] == "--", "the prompt must stay fenced off from variadic options"
     prompt = argv[-1]
-    assert "add feature X" in prompt and "OPERATION.md" in prompt
+    # The OPERATION.md mirror line lives in the fetched `contract` section since the
+    # minimal-core split; the dispatched prompt's load-bearing mark is the on-demand
+    # section index instead.
+    assert "add feature X" in prompt and "jarvis brief" in prompt
 
     # the turn is on the record as turn 1 of the conversation
     turn = store.latest_turn(wo["id"])
