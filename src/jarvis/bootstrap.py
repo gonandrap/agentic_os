@@ -314,6 +314,12 @@ def _gates_section(project: ProjectSpec) -> str:
         "command goes through unchanged. So when a gate fires on something you know ships",
         "nothing, do not reword the command to slip past it. File the request, say plainly",
         "why it performs no privileged action, and end your turn.",
+        "",
+        "A dismissal clears a command *string*; it does not reset the review state of the",
+        "action that string talks about. So never open a second request for a privileged",
+        "action while an equivalent one is still pending or escalated — a dismissal is not",
+        "permission to re-file. If the first request stalled for want of evidence, send the",
+        "evidence to the reviewer and leave the original request standing.",
     ]
     return "\n".join(lines)
 

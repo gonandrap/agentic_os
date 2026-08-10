@@ -707,6 +707,16 @@ def _gate_briefing(wo: dict[str, Any], project: ProjectSpec) -> list[str]:
         "command as written. So if a gate fires on something you know ships nothing, do "
         "not reword the command to get around it — file it, say plainly why it performs "
         "no privileged action, and end your turn.",
+        "",
+        # A dismissed command is frequently a `jarvis gate request` for a real action, so
+        # "run it as written" and "never file a duplicate" collide unless the limit is
+        # stated here, next to the permission it qualifies.
+        "A dismissal clears a command STRING; it does not reset the review state of the "
+        "action that string talks about. So NEVER open a second request for a privileged "
+        "action while an equivalent one is still pending or escalated — a dismissal is "
+        "not permission to re-file. If the first request stalled because it was missing "
+        "evidence, send that evidence to the reviewer (`jarvis wo ask`, or `jarvis "
+        "notify` if the user has to see it) and leave the original standing.",
     ]
     return lines
 
