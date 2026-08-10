@@ -2,6 +2,7 @@
 
 Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
+  jarvis cost [project|wo-id|fo-id]       what the work has cost in tokens
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
   jarvis fo create|list|show|plan|approve|cancel        feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
@@ -30,6 +31,27 @@ def _print(data: Any, as_json: bool) -> None:
         print(json.dumps(data, indent=2, default=str))
     else:
         _pretty(data)
+
+
+def _with_readable_digest(q: dict[str, Any]) -> dict[str, Any]:
+    """A Neo question row with its dashboard digest decoded, for HUMAN output only.
+
+    `questions.digest` holds JSON, and printing it as one long line is the opposite of
+    what a digest is for. Decoded into a nested block when there is one, replaced by the
+    recorded reason when the attempt failed, dropped entirely when it was never
+    attempted. `--json` never comes through here: a row dump is the row as stored.
+    """
+    from . import digest as digest_mod
+
+    row = dict(q)
+    view = digest_mod.decode(row.get("digest"))
+    failed = digest_mod.failure_reason(row.get("digest"))
+    row.pop("digest", None)
+    if view:
+        row["digest (dashboard only — Neo read the question above in full)"] = view
+    elif failed:
+        row["digest"] = f"(not produced: {failed})"
+    return row
 
 
 def _pretty(data: Any, indent: int = 0) -> None:
@@ -126,6 +148,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--repair", action="store_true",
                     help="apply the repairs instead of only reporting them")
     sp.add_argument("--catalog", help="catalog to read the fleet from")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("cost", help="what the fleet's work has cost in tokens")
+    sp.add_argument("target", nargs="?",
+                    help="a project, a work-order id, or a feature-order id "
+                         "(default: the whole fleet)")
+    sp.add_argument("--limit", type=int, default=50,
+                    help="work orders per project to measure (default: 50)")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
@@ -581,6 +611,59 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 print(f"    → {'fixed' if res['repair'] else 'would fix'}: {v['repair']}")
     _print_orphans(orphans)
     return 1
+
+
+def _tok(n: int) -> str:
+    """Token counts, at the magnitude a reader can hold in their head."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
+
+
+def cmd_cost(args: argparse.Namespace) -> int:
+    from . import ops
+    target = args.target
+    # One argument, three kinds of thing. Ids are prefixed and projects are not, so
+    # this never has to guess: anything that is not `wo-…`/`fo-…` is a project name.
+    is_id = bool(target) and target.split("-")[0] in ("wo", "fo")
+    res = ops.cost_report(project=None if is_id else target,
+                          target=target if is_id else None, limit=args.limit)
+    if args.json:
+        _print(res, True)
+        return 0
+
+    units = res["units"]
+    totals = res["totals"]
+    if not units:
+        print(f"no work orders found for {res['scope']}")
+        return 0
+    header = f"{res['scope']} — {res['measured']} measured"
+    if res["unmeasured"]:
+        header += f", {res['unmeasured']} with no transcript left"
+    print(f"{header}\n")
+    print(f"{'$':>7} {'turns':>5} {'output':>7} {'re-write':>9}  work order")
+    for u in units:
+        if not u["found"]:
+            print(f"{'—':>7} {'—':>5} {'—':>7} {'—':>9}  {u['id']}  {u['title'][:44]}")
+            continue
+        print(f"{u['list_cost_usd']:>7.2f} {u['turns']:>5} "
+              f"{_tok(u['output']):>7} {_tok(u['rewrite_excess']):>9}  "
+              f"{u['id']}  {u['title'][:44]}")
+
+    print(f"\ntotal ~${totals['list_cost_usd']:.2f} at list prices "
+          f"({_tok(totals['billed_input'])} in, {_tok(totals['output'])} out)")
+    if totals["rewrite_excess"]:
+        print(f"  re-write tax  ~${totals['rewrite_cost_usd']:.2f} — "
+              f"{_tok(totals['rewrite_excess'])} tokens re-sent across "
+              f"{totals['resume_boundaries']} turn boundaries")
+    if totals["subagent_cost_usd"]:
+        print(f"  subagents     ~${totals['subagent_cost_usd']:.2f}")
+    # Said every time, not in the help text: the figure is the only number on screen,
+    # and a subscription user reading it as an invoice is the likeliest misreading.
+    print("\nList prices, as a common unit for comparing token kinds — not a bill.")
+    return 0
 
 
 def _print_orphans(orphans: list[dict]) -> None:
@@ -1040,12 +1123,15 @@ def cmd_neo(args: argparse.Namespace) -> int:
         if q is None:
             print(f"error: neo question {args.question_id} not found", file=sys.stderr)
             return 1
+        # `--json` gets the row exactly as it is stored; the human rendering gets the
+        # dashboard digest decoded rather than as one long line of JSON.
+        row = q if args.json else _with_readable_digest(q)
         if not args.panel:
-            _print(q, args.json)
+            _print(row, args.json)
         elif args.json:
             _print({**q, "panel_opinions": opinions}, True)
         else:
-            _print(q, False)
+            _print(row, False)
             print("\nPanel deliberation:")
             for o in opinions:
                 route = f" route={o['route']}" if o["route"] else ""
@@ -1217,6 +1303,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_status(args)
         if args.cmd == "doctor":
             return cmd_doctor(args)
+        if args.cmd == "cost":
+            return cmd_cost(args)
         if args.cmd == "adopt":
             return cmd_adopt(args)
         if args.cmd == "wo":

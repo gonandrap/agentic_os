@@ -1,5 +1,40 @@
 {% extends "base.html" %}
 {% block title %}Neo — Jarvis{% endblock %}
+
+{#
+  ONE QUESTION, AS THE USER READS IT.
+
+  A worker can paste a 7,000-character brief into `jarvis wo ask`, and until this macro
+  existed the page rendered every one of those characters inline. So: the digest when
+  there is one (see src/jarvis/digest.py), the question in full when there isn't, and in
+  BOTH cases the exact prompt Neo received behind a disclosure. The disclosure is
+  unconditional on purpose — it is the answer to "what did the digest leave out?", and a
+  control that only appears sometimes is not one the reader learns to trust.
+#}
+{% macro question_body(q) %}
+  {% if q.digest_view %}
+  <div class="digest">
+    <p class="headline"><strong>Q:</strong> {{ q.digest_view.headline }}</p>
+    {% if q.digest_view.bullets %}
+    <ul>{% for b in q.digest_view.bullets %}<li>{{ b }}</li>{% endfor %}</ul>
+    {% endif %}
+    {% if q.digest_view.options %}
+    <p class="label">Options</p>
+    <ol>{% for o in q.digest_view.options %}<li>{{ o }}</li>{% endfor %}</ol>
+    {% endif %}
+    {% if q.digest_view.recommendation %}
+    <div class="rec"><span class="label">Recommended</span>{{ q.digest_view.recommendation }}</div>
+    {% endif %}
+  </div>
+  {% else %}
+  <div style="margin:6px 0"><strong>Q:</strong> {{ q.question }}</div>
+  {% endif %}
+  <details class="disclosure">
+    <summary>Full question context sent to Neo{% if q.digest_view %} — it read all of it{% endif %}</summary>
+    <pre class="request-text">{{ q.full_context }}</pre>
+  </details>
+{% endmacro %}
+
 {% block content %}
 
 {# How the panel reached one answer. COLLAPSED, and absent entirely for a question no
@@ -44,6 +79,15 @@
   {{ counts.get('unreviewed', 0) }} awaiting review ·
   {{ learnings|length }} learnings)</span>
 </p>
+
+{% set digested = (escalated + unreviewed) | selectattr('digest_view') | list %}
+{% if digested %}
+<p class="sub" style="margin:-10px 0 0">
+  {{ digested|length }} over-long question{{ '' if digested|length == 1 else 's' }} below
+  {{ 'has' if digested|length == 1 else 'have' }} been cut down to the decision —
+  {{ digest_credit }}. Neo read the full text; so can you, from the button under each.
+</p>
+{% endif %}
 
 {% if in_flight %}
 <h2>With Neo right now</h2>
@@ -90,7 +134,7 @@
       {{ fmt_age(q.ts) }} ago
       {% if q.status == 'failed' %} · <span class="tone-bad">✗ neo call failed</span>{% endif %}
     </div>
-    <div style="margin:6px 0"><strong>Q:</strong> {{ q.question }}</div>
+    {{ question_body(q) }}
     <div class="sub">Why escalated: {{ q.answer_reason or '—' }}</div>
     {{ deliberation(opinions.get(q.id)) }}
     {% if q.kind == 'approval' %}
@@ -117,7 +161,7 @@
     <div class="who">#{{ q.id }} · {{ q.project }} ·
       <a href="/wo/{{ q.project }}/{{ q.wo_id }}" class="mono">{{ q.wo_id }}</a> ·
       answered {{ fmt_age(q.answered_at) }} ago</div>
-    <div style="margin:6px 0"><strong>Q:</strong> {{ q.question }}</div>
+    {{ question_body(q) }}
     <div style="margin:6px 0"><strong>Neo:</strong> {{ q.answer }}</div>
     {% if q.answer_reason %}<div class="sub">Reasoning: {{ q.answer_reason }}</div>{% endif %}
     {{ deliberation(opinions.get(q.id)) }}

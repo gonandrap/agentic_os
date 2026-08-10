@@ -2137,3 +2137,122 @@ def promote_backlog(item_id: str, force: bool = False,
                 "forced_over_blockers": [b["id"] for b in blockers] if force else []}
     finally:
         central.close()
+
+
+# -- token accounting ----------------------------------------------------------------------------
+
+def _unit_row(name: str, wo: dict[str, Any], index: dict[str, Path]) -> dict[str, Any]:
+    """One work order's spend, flattened for a table."""
+    from . import usage as usage_mod
+
+    session = usage_mod.read_session(wo.get("session_id") or "", index=index)
+    total = session.total
+    return {
+        "id": wo["id"], "project": name, "title": wo["title"],
+        "status": wo["status"], "kind": wo.get("kind") or "worker",
+        "found": session.found,
+        # A session's turn count is its resume boundaries plus the opening turn; see
+        # `usage.Usage.resume_boundaries` for why the boundaries are counted that way.
+        "turns": total.resume_boundaries + 1 if session.found else 0,
+        "subagent_count": session.subagent_count,
+        "subagent_cost_usd": round(session.subagents.list_cost_usd, 2),
+        **total.as_dict(),
+    }
+
+
+def cost_report(project: str | None = None, target: str | None = None,
+                limit: int = 50, include_hidden: bool = True) -> dict[str, Any]:
+    """What the fleet's work has cost in tokens, read back from Claude Code's transcripts.
+
+    `target` is a work-order or feature-order id for a single unit — a feature order
+    rolls up its planner and every child, which is the only way to see what a planned
+    feature actually cost. Otherwise this reports every work order that still has a
+    transcript, dearest first.
+
+    Hidden work orders are INCLUDED by default, unlike every other listing: hiding is a
+    gesture about attention, and a hidden work order's tokens were spent just the same.
+    A cost report that quietly omitted them would understate the bill in exactly the
+    case where someone is trying to find out where the bill came from.
+
+    The transcripts belong to Claude Code, not to Jarvis, and it prunes them on its own
+    schedule. A work order whose transcript is gone reports `found: false` rather than
+    zero: an unmeasurable cost and a zero cost are different answers, and rendering them
+    the same would turn a gap in the evidence into a claim about the spend.
+    """
+    from . import usage as usage_mod
+
+    index = usage_mod.index_sessions()
+    paths = registered_project_paths()
+    if project and project not in paths:
+        raise OpsError(f"project {project!r} not registered (known: {sorted(paths)})")
+    if target:
+        return _cost_for_target(target, project, index)
+
+    scope = {project: paths[project]} if project else paths
+    units: list[dict[str, Any]] = []
+    for name, path in sorted(scope.items()):
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            for wo in store.list_work_orders(limit=limit, include_hidden=include_hidden):
+                units.append(_unit_row(name, wo, index))
+        finally:
+            store.close()
+    units.sort(key=lambda u: u["list_cost_usd"], reverse=True)
+    return {"scope": project or "fleet", "units": units, **_rollup(units)}
+
+
+def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
+    """Totals over the units that could actually be measured.
+
+    Unmeasured units are counted separately rather than summed as zero, so the report
+    can say how much of the fleet its total is speaking for.
+    """
+    measured = [u for u in units if u["found"]]
+    return {
+        "measured": len(measured),
+        "unmeasured": len(units) - len(measured),
+        "totals": {
+            "list_cost_usd": round(sum(u["list_cost_usd"] for u in measured), 2),
+            "rewrite_cost_usd": round(sum(u["rewrite_cost_usd"] for u in measured), 2),
+            "rewrite_excess": sum(u["rewrite_excess"] for u in measured),
+            "resume_boundaries": sum(u["resume_boundaries"] for u in measured),
+            "subagent_cost_usd": round(sum(u["subagent_cost_usd"] for u in measured), 2),
+            "output": sum(u["output"] for u in measured),
+            "billed_input": sum(u["billed_input"] for u in measured),
+        },
+    }
+
+
+def _cost_for_target(target: str, project: str | None,
+                     index: dict[str, Path]) -> dict[str, Any]:
+    """One work order, or a feature order rolled up over its planner and children.
+
+    The feature order is tried FIRST. A feature order and a work order cannot share an
+    id, but `find_work_order` raises the more familiar error, and resolving the work
+    order first would report a planner's own spend under the feature order's id — the
+    one number a reader of `jarvis cost fo-…` is least likely to want.
+    """
+    try:
+        name, path, fo = find_feature_order(target, project)
+    except OpsError:
+        name, _path, wo = find_work_order(target, project)
+        row = _unit_row(name, wo, index)
+        return {"scope": target, "units": [row], **_rollup([row])}
+
+    store = ProjectStore(path)
+    try:
+        units = []
+        planner_id = fo.get("plan_wo_id")
+        if planner_id:
+            try:
+                units.append(_unit_row(name, store.get_work_order(planner_id), index))
+            except KeyError:
+                pass
+        units.extend(_unit_row(name, child, index)
+                     for child in store.feature_children(fo["id"]))
+    finally:
+        store.close()
+    return {"scope": fo["id"], "title": fo["title"], "status": fo["status"],
+            "units": units, **_rollup(units)}

@@ -7,6 +7,8 @@ One process, one poll loop over every project in the catalog. Per tick, in this 
   4. dispatch pending work orders (respecting per-project concurrency) — last, so it
      sees the concurrency slots steps 2 and 3 just freed
   5. let Neo (the OS answerer agent) drain queued worker questions
+  5b. shorten over-long answered questions for the dashboard (src/jarvis/digest.py) —
+     display only, on its own thread, and nothing the OS acts on depends on it
 
 Every PR_POLL_EVERY_TICKS ticks it additionally:
   6. asks GitHub what happened to the pull requests its work orders are parked behind,
@@ -53,6 +55,13 @@ RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injec
 #: only ever gets set wrong.
 PR_POLL_EVERY_TICKS = 24
 
+#: How many dashboard digests one batch may produce. Bounds the cost of the FIRST batch
+#: on an instance upgrading into the feature with a backlog of long questions already in
+#: `neo.db` — the rest are picked up on later ticks and render in full until then. It is
+#: not a rate limit on steady state: questions long enough to earn a digest arrive at a
+#: rate of a few a day.
+DIGEST_BATCH = 5
+
 
 class Daemon:
     def __init__(self, catalog: Catalog, poll_interval: float = 5.0):
@@ -66,6 +75,13 @@ class Daemon:
         # keeps the shared persona+learnings prefix inside the prompt-cache TTL.
         self.neo_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="neo")
         self.neo_draining = False
+        # Dashboard digests run on their OWN thread, not Neo's. They are display work on
+        # questions that have already been answered, so they must never delay a worker
+        # parked waiting for an answer — and they use a different model and a different
+        # system prompt, so interleaving them into the drain would cost Neo its warm
+        # prefix on every other call.
+        self.digest_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="digest")
+        self.digesting = False
         # Invariant violations already reported this run, so a standing problem is
         # surfaced once instead of every tick. Keyed by (invariant, wo_id).
         self.reported_violations: set[tuple[str, str | None]] = set()
@@ -99,6 +115,7 @@ class Daemon:
                 time.sleep(max(0.2, self.poll_interval - elapsed))
         finally:
             self.neo_pool.shutdown(wait=False)
+            self.digest_pool.shutdown(wait=False)
             self._remove_pidfile()
             log.info("jarvisd stopped")
 
@@ -179,6 +196,9 @@ class Daemon:
                 log.exception("project %s tick failed", project.name)
 
         self.neo_tick()
+        # After the drain is kicked, never before: a question digested this tick is one
+        # whose answer has already landed, and the drain is what lands it.
+        self.digest_tick()
 
         from .notify import route_new_inbox
         route_new_inbox(self.central, self.catalog)
@@ -322,8 +342,21 @@ class Daemon:
         No roster lookup any more, and no thread pool: a turn is a detached process, so
         launching one is instant and the only thing delivery has to wait for is the
         previous turn of the SAME work order finishing (`worker_session.busy`).
+
+        **Everything queued for one work order goes out as ONE turn.** Every turn
+        boundary re-sends the whole accumulated conversation at the 1.25x cache-WRITE
+        rate instead of reading it at 0.1x — measured at ~12% of this project's entire
+        token spend, and ~2x the context per boundary in practice (see `usage.py` and
+        `jarvis cost`). Delivering three queued comments as three turns therefore costs
+        three of those, for content the worker would rather read together anyway: it can
+        act on the whole of what the user said instead of starting down the first
+        message's path and being interrupted twice.
+
+        The coalescing is per work order, not global — two work orders' messages are
+        independent conversations and must stay separate turns.
         """
-        for msg in store.queued_messages():
+        pending: dict[str, list[dict[str, Any]]] = {}
+        for msg in store.queued_messages():  # chronological, so the joins stay in order
             try:
                 wo = store.get_work_order(msg["wo_id"])
             except KeyError:
@@ -333,24 +366,34 @@ class Daemon:
                 continue  # not dispatched yet; the worker prompt will carry it instead
             if worker_session.busy(store, wo["id"]):
                 continue  # mid-turn: one turn at a time, and resume would refuse anyway
-            self._deliver(project, store, wo, dict(msg))
+            pending.setdefault(wo["id"], []).append(dict(msg))
+        for wo_id, msgs in pending.items():
+            self._deliver(project, store, store.get_work_order(wo_id), msgs)
 
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
-                 msg: dict) -> None:
-        log.info("[%s] delivering message %s to %s", project.name, msg["id"], wo["id"])
-        store.add_event(wo["id"], "delivering", {"msg_id": msg["id"]})
+                 msgs: list[dict[str, Any]]) -> None:
+        ids = [m["id"] for m in msgs]
+        log.info("[%s] delivering message(s) %s to %s", project.name, ids, wo["id"])
+        store.add_event(wo["id"], "delivering", {"msg_ids": ids})
+        # A blank line between messages and nothing else. Anything framing them — a
+        # count, a header, "message 2 of 3" — is text the worker can mistake for an
+        # instruction from the user, and the user wrote none of it.
+        text = "\n\n".join(m["content"] for m in msgs)
         try:
-            turn = worker_session.send(store, project, wo, msg["content"],
-                                       msg_id=msg["id"])
+            turn = worker_session.send(store, project, wo, text, msg_id=ids[0])
         except claude_cli.ClaudeCliError as e:
-            log.error("[%s] delivery of message %s failed: %s", project.name,
-                      msg["id"], e)
-            store.mark_message(msg["id"], "failed")
+            log.error("[%s] delivery of message(s) %s failed: %s", project.name, ids, e)
+            for msg_id in ids:
+                store.mark_message(msg_id, "failed")
             store.flag_attention(wo["id"], f"message delivery failed: {e}")
             return
-        store.mark_message(msg["id"], "delivered")
+        # Every message in the turn is delivered, not just the one the turn row names:
+        # a message left `queued` here would be re-sent on the next tick, so the worker
+        # would read it twice and pay a second boundary for the privilege.
+        for msg_id in ids:
+            store.mark_message(msg_id, "delivered")
         store.add_event(wo["id"], "message_delivered",
-                        {"msg_id": msg["id"], "turn": turn["seq"]})
+                        {"msg_ids": ids, "turn": turn["seq"]})
         # The work order is moving again, whatever it had settled into. A user who sends
         # a message to a finished work order means it to continue, and the turn is
         # already out — leaving the status settled would make the record lie.
@@ -447,6 +490,68 @@ class Daemon:
         finally:
             store.close()
             central.close()
+
+    # -- 5b. dashboard digests (display only — see `jarvis.digest`) -------------------
+
+    def digest_tick(self) -> None:
+        """Shorten over-long questions for the `/neo` page, off the critical path.
+
+        This produces NOTHING the OS acts on. It exists because a 7,000-character
+        question renders as a wall the user scrolls past, and a review they scroll past
+        is a review Neo never gets corrected by. Neo itself still reads every question
+        in full, and the page keeps the verbatim text one disclosure away.
+
+        Off when Neo is off, and off when `digest_model` is empty — the one knob that
+        turns the extra calls off entirely. The guard mirrors `neo_tick`'s: at most one
+        batch in flight, so a slow model cannot pile ticks on top of each other.
+        """
+        cfg = self.catalog.os.neo
+        if not cfg.enabled or not cfg.digest_model or self.digesting:
+            return
+        from . import digest as digest_mod
+        from .neo_store import NeoStore
+
+        store = NeoStore()
+        try:
+            pending = bool(store.questions_needing_digest(digest_mod.MIN_CHARS, limit=1))
+        finally:
+            store.close()
+        if not pending:
+            return
+        self.digesting = True
+        future = self.digest_pool.submit(self._digest_batch)
+        future.add_done_callback(lambda f: setattr(self, "digesting", False))
+
+    def _digest_batch(self) -> None:
+        """Digest the questions waiting for one (runs on the single digest thread).
+
+        The batch is capped so one tick cannot spend an unbounded number of calls the
+        first time a long-running instance upgrades into this feature — the rest are
+        picked up next tick, and until then they render in full.
+        """
+        from . import digest as digest_mod
+        from .neo_store import NeoStore
+
+        model = self.catalog.os.neo.digest_model
+        store = NeoStore()  # thread-local connection
+        try:
+            for q in store.questions_needing_digest(digest_mod.MIN_CHARS,
+                                                    limit=DIGEST_BATCH):
+                try:
+                    view = digest_mod.summarise(q["question"], model=model)
+                except Exception as e:  # noqa: BLE001 — a digest is never worth a crash
+                    # Recorded, not retried: see `digest.encode_failure`. The page falls
+                    # back to the full question, which is what it showed before.
+                    log.warning("digest failed for neo question %s: %s", q["id"], e)
+                    store.set_digest(q["id"], digest_mod.encode_failure(str(e)))
+                    continue
+                store.set_digest(q["id"], digest_mod.encode(view))
+                log.info("digested neo question %s (%d chars)",
+                         q["id"], len(q["question"]))
+        except Exception:  # noqa: BLE001 — the daemon must survive anything
+            log.exception("digest batch failed")
+        finally:
+            store.close()
 
     @staticmethod
     def _panel_answer(cfg: Any) -> Any:
