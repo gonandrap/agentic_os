@@ -157,7 +157,7 @@ def instance_badge() -> dict[str, str | bool]:
     they are in the dev sandbox. Both facts are read once per process: neither the
     environment nor the installed version can change under a running server.
 
-    The version is the *installed* one, never a constant in the source: on `main` the
+    The version is the running one, never a constant in the source: on `main` the
     version string deliberately lags the shipped tag (only release branches carry the
     bump), so a literal would be wrong in exactly the place it matters most.
     """
@@ -168,8 +168,23 @@ def instance_badge() -> dict[str, str | bool]:
     except Exception:  # noqa: BLE001 — see gate_badge: a badge must not 500 a page
         version = "unknown"
     return {"env": env, "prod": env == PRODUCTION, "version": version,
+            "shown": _version_for_badge(version),
             "label": "prod" if env == PRODUCTION else "dev",
             "detail": f"{env} · {detail} · version {version}"}
+
+
+def _version_for_badge(version: str) -> str:
+    """`0.5.0` → `v0.5.0`; `dev-a1b2c3d` → `a1b2c3d`.
+
+    `bugreport.jarvis_version` reports a release as a bare number and everything else
+    as `dev-<sha>` (a dev build is not "0.5.0 plus a bit"). The badge already says
+    which instance this is, so pasting that in raw would read `dev · vdev-a1b2c3d` —
+    the word twice, and a `v` in front of a commit sha. Only a real version number
+    gets the `v`; the tooltip carries the string unaltered either way.
+    """
+    if version.startswith("dev-"):
+        return version[len("dev-"):]
+    return f"v{version}" if version[:1].isdigit() else version
 
 
 def _false_positive_rate(rows: list) -> str | None:

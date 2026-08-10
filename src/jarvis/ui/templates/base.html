@@ -172,7 +172,7 @@
   <header id="live-chrome">
     <span class="wordmark"><span class="caret">&gt;</span> JARVIS</span>
     <span class="instance{{ ' prod' if instance.prod }}" title="{{ instance.detail }}"
-      >{{ instance.label }} · v{{ instance.version }}</span>
+      >{{ instance.label }} · {{ instance.shown }}</span>
     <span class="daemon {{ 'up' if daemon_up else 'down' }}">
       {{ '● daemon up' if daemon_up else '○ daemon down' }}
     </span>
