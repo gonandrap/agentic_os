@@ -12,9 +12,12 @@ import re
 import shutil
 import signal
 import subprocess
+import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 #: `claude` location override, mirroring bugreport's GH_BIN_ENV. Tests point it at a
@@ -353,6 +356,151 @@ def read_turn_result(outfile: Path, errfile: Path | None = None) -> TurnResult |
         num_turns=data.get("num_turns"),
         subtype=data.get("subtype") or "",
     )
+
+
+# -- the usage limit ----------------------------------------------------------------
+#
+# Claude Code refuses a turn outright once the account's usage window is spent, and it
+# says so *in the turn's own result* rather than on stderr. The refusal is free and
+# instant — `duration_api_ms: 0`, `total_cost_usd: 0` — so from the outside it is
+# indistinguishable from any other `is_error` turn, and Jarvis used to fail the work
+# order and wait for a human to come back after midnight and retry it by hand.
+#
+# The message carries the one fact needed to recover unattended: WHEN the window
+# reopens. Parsing it here, deterministically and with no LLM anywhere, is what lets
+# `worker_session.retry_at` and `Daemon.retry_rate_limited` resume the conversation by
+# themselves. Observed live on wo-2fa7c0e9 turn 4:
+#
+#     You've hit your session limit · resets 11:50pm (America/Los_Angeles)
+
+
+@dataclass(frozen=True)
+class UsageLimit:
+    """A turn Claude Code refused because the usage window is spent.
+
+    `reset_at` is the epoch moment the window reopens, or None when the message named a
+    reset but no time this parser could read — the caller then falls back to a fixed
+    delay rather than guessing a moment.
+    """
+
+    message: str
+    reset_at: float | None
+
+
+#: The oldest shape, and the only one that states the moment unambiguously:
+#: "Claude AI usage limit reached|1786344785".
+_LIMIT_EPOCH_RE = re.compile(r"usage limit reached\s*\|\s*(\d{10,13})", re.IGNORECASE)
+
+#: The phrasings Claude Code uses for a spent window. Deliberately narrow: this runs
+#: against the error text of EVERY failed turn, which can be a tail of the worker's own
+#: stderr, and a false positive here would retry a genuinely broken turn for ever.
+_LIMIT_RE = re.compile(
+    r"\b(?:session|usage|weekly|monthly|opus|sonnet|\d+\s*-?\s*hour)\s+limit\b",
+    re.IGNORECASE,
+)
+
+#: The moment named beside it: "resets 11:50pm (America/Los_Angeles)", "resets at 3am",
+#: "resets Aug 14 at 9am". Every part after the hour is optional because the CLI drops
+#: whichever ones it considers obvious.
+_RESET_RE = re.compile(
+    r"""resets?\s+(?:at\s+)?
+        (?:(?P<month>[A-Za-z]{3,9})\s+(?P<day>\d{1,2})\s*,?\s*(?:at\s+)?)?
+        (?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*
+        (?P<ampm>[ap]\.?m\.?)?
+        (?:\s*\((?P<tz>[^)]{1,64})\))?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+
+
+def usage_limit(text: str | None, *, now: float | None = None) -> UsageLimit | None:
+    """Read a failed turn's error as a usage-limit refusal, or None if it is not one.
+
+    None is the answer for every ordinary failure, so callers can use this as the
+    predicate itself. A message that names a limit but no reset at all is also None:
+    prose about limits (a worker's own log line, a stderr tail) mentions the word far
+    more often than the CLI refuses a turn, and "resets …" is what tells the two apart.
+    """
+    if not text:
+        return None
+    epoch = _LIMIT_EPOCH_RE.search(text)
+    if epoch:
+        raw = int(epoch.group(1))
+        # 13 digits is milliseconds, 10 is seconds; both shapes have been seen.
+        return UsageLimit(message=_summarise(text),
+                          reset_at=float(raw / 1000 if raw > 1e11 else raw))
+    if not _LIMIT_RE.search(text):
+        return None
+    reset = _RESET_RE.search(text)
+    if reset is None:
+        return None
+    return UsageLimit(message=_summarise(text),
+                      reset_at=_reset_moment(reset, time.time() if now is None else now))
+
+
+def _summarise(text: str) -> str:
+    return " ".join(text.split())[:200]
+
+
+def _reset_moment(m: re.Match[str], now: float) -> float | None:
+    """The epoch moment a "resets …" clause names, or None if it does not name one.
+
+    The clause gives a wall-clock time in some timezone and, at most, a day — never a
+    year — so the moment is resolved against `now`: the next occurrence of that clock
+    time, in that zone. That is exactly the rule a human applies reading it, and it is
+    why an unparseable zone falls back to the daemon's own clock rather than to UTC.
+    """
+    hour = int(m.group("hour"))
+    minute = int(m.group("minute") or 0)
+    ampm = (m.group("ampm") or "").replace(".", "").lower()
+    if minute > 59:
+        return None
+    if ampm:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if ampm == "pm" else 0)
+    elif hour > 23:
+        return None
+    ref = datetime.fromtimestamp(now, _zone(m.group("tz")))
+    month = _MONTHS.get((m.group("month") or "")[:3].lower())
+    day = int(m.group("day") or 0)
+    if month and day:
+        try:
+            when = ref.replace(month=month, day=day, hour=hour, minute=minute,
+                               second=0, microsecond=0)
+        except ValueError:
+            return None  # e.g. "Feb 30"
+        # A date with no year is next year's when it has already gone past — the
+        # December-to-January case, and the only one worth handling.
+        if when < ref - timedelta(days=180):
+            try:
+                when = when.replace(year=when.year + 1)
+            except ValueError:
+                return None  # Feb 29 into a non-leap year
+    else:
+        when = ref.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if when <= ref:
+            when += timedelta(days=1)  # "resets 3am" said at 4pm means tomorrow
+    return when.timestamp()
+
+
+def _zone(name: str | None) -> tzinfo | None:
+    """The named timezone, or the machine's own if it is missing or unknown.
+
+    Falling back to local rather than UTC is the conservative choice: the daemon runs on
+    the same machine the user reads the clock on, so a mis-parse lands minutes or hours
+    out instead of half a day, and the retry floor absorbs the rest.
+    """
+    if name:
+        try:
+            return ZoneInfo(name.strip())
+        except (KeyError, ValueError, OSError):
+            pass
+    return datetime.now().astimezone().tzinfo
 
 
 def process_alive(pid: int | None) -> bool:

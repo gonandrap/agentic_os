@@ -240,6 +240,22 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
         sys.stderr.write(
             f"Error: Session {sid} is currently running as a background agent (bg).\n")
         sys.exit(1)
+    # THE USAGE LIMIT, AND IT REFUSES BEFORE THE TRANSCRIPT IS WRITTEN — which is the
+    # property the retry path turns on. The real CLI never reaches the API (0ms, $0), so
+    # an opening turn refused this way leaves no session to `--resume`, and
+    # `worker_session.retry` has to re-open with `--session-id` instead. Writing the log
+    # first here would make the fake's opening refusal resumable and quietly hide that.
+    if os.environ.get("FAKE_CLAUDE_TURN") == "rate_limit":
+        reset = os.environ.get("FAKE_CLAUDE_LIMIT_RESET",
+                               "11:50pm (America/Los_Angeles)")
+        print(json.dumps({
+            "type": "result", "subtype": "success", "is_error": True,
+            "session_id": sid, "num_turns": 1, "total_cost_usd": 0,
+            "duration_api_ms": 0,
+            # Verbatim from wo-2fa7c0e9 turn 4, middle dot included.
+            "result": "You've hit your session limit · resets " + reset,
+        }))
+        sys.exit(0)
     with open(log, "a") as f:
         f.write(json.dumps(prompt) + "\n")
     seq = sum(1 for _ in open(log))
@@ -614,8 +630,24 @@ def fake_claude(tmp_path, monkeypatch):
         def turns_fail(self, mode: str = "fail") -> None:
             """Make subsequent turns fail. `fail` = non-zero exit, `silent` = exits
             writing nothing at all (a crashed process), `error` = a well-formed result
-            with `is_error`."""
+            with `is_error`, `rate_limit` = the CLI refusing the turn because the
+            account's usage window is spent (see `turns_rate_limited`)."""
             monkeypatch.setenv("FAKE_CLAUDE_TURN", mode)
+
+        def turns_rate_limited(self, reset: str = "11:50pm (America/Los_Angeles)"
+                               ) -> None:
+            """Refuse every subsequent turn for the usage limit, resetting at `reset`.
+
+            Call `turns_recover()` to reopen the window — which is what the OS is
+            waiting for, so it is also how a test proves the retry works rather than
+            just that it happens.
+            """
+            monkeypatch.setenv("FAKE_CLAUDE_LIMIT_RESET", reset)
+            monkeypatch.setenv("FAKE_CLAUDE_TURN", "rate_limit")
+
+        def turns_recover(self) -> None:
+            """Undo `turns_fail`/`turns_rate_limited`: turns succeed again."""
+            monkeypatch.delenv("FAKE_CLAUDE_TURN", raising=False)
 
         def hold_turns(self) -> Path:
             """Make subsequent turns block until the returned path is deleted, so a

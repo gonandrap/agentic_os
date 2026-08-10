@@ -29,11 +29,16 @@ in `INVARIANTS`. Give it a stable id — ids appear in work order timelines and 
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
-from . import db
-from .project_store import DEPENDENCY_DEAD_STATUSES, UNGOVERNED_ORIGINS
+from . import db, worker_session
+from .project_store import (
+    ACTIVE_STATUSES,
+    DEPENDENCY_DEAD_STATUSES,
+    UNGOVERNED_ORIGINS,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .project_store import ProjectStore
@@ -183,6 +188,9 @@ def status_label(store: ProjectStore, wo: dict[str, Any]) -> str:
     and its own header disagreed about what needed the user because each derived it
     separately — see the FEATURED_STATUSES fix in PR 65.)
     """
+    if wo["status"] in ACTIVE_STATUSES:
+        note = rate_limit_note(store, wo)
+        return f"{wo['status']} — {note}" if note else wo["status"]
     if wo["status"] != "pending":
         return wo["status"]
     blockers = store.unfinished_dependencies(wo["id"])
@@ -199,6 +207,29 @@ def status_label(store: ProjectStore, wo: dict[str, Any]) -> str:
         return (f"pending — waiting for a slot in {parent} "
                 f"({active}/{limit} children running)")
     return "pending"
+
+
+def rate_limit_note(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """Why this work order is not moving and when it will move again — or "" normally.
+
+    `running` alone promises "a worker is working on this", which is a lie for a
+    conversation Claude Code refused because the usage window is spent. It keeps its
+    status and its slot on purpose — a refused turn changed nothing, and
+    `Daemon.retry_rate_limited` relaunches it — but the user looking at a dashboard at
+    midnight is owed the reason nothing is happening, and the time it will happen again.
+
+    Every surface renders this one string (the CLI through `status_label`, the dashboard
+    through `ops.os_status`) so they cannot disagree about the answer. Local wall-clock,
+    not the timezone the CLI quoted: the reader is at this machine, and a time they have
+    to convert is a time they will misread.
+    """
+    if wo["status"] not in ACTIVE_STATUSES:
+        return ""
+    pause = worker_session.rate_limit_pause(store, wo["id"])
+    if pause is None or pause.exhausted:
+        return ""
+    when = time.strftime("%H:%M", time.localtime(pause.retry_at))
+    return f"Claude usage limit reached, retrying by itself at {when}"
 
 
 def _slot_cap(store: ProjectStore, wo: dict[str, Any]) -> tuple[str, int, int] | None:

@@ -918,6 +918,20 @@ class ProjectStore:
         ).fetchall()
         return db.rows_to_dicts(rows)
 
+    def recent_turns(self, wo_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        """The conversation's most recent turns, newest first.
+
+        Not `list_turns(...)[-n:]`: that one's LIMIT applies to the ascending scan, so on
+        a long conversation it returns the FIRST hundred turns and the tail is exactly
+        what is missing. The only reader that wants the tail is the rate-limit streak
+        counter (`worker_session.rate_limit_streak`), and it wants it cheap.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq DESC LIMIT ?",
+            (wo_id, limit),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
     # -- notifications outbox --------------------------------------------------
 
     def add_notification(self, title: str, body: str = "", level: str = "info",

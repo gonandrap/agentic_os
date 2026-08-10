@@ -12,6 +12,7 @@ prose. Debug entries are held back unless explicitly requested.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 # Plumbing: how a message got carried, which session was bound, when a turn ended.
@@ -48,6 +49,13 @@ def event_level(kind: str) -> str:
     if kind.startswith("hook:") or kind in DEBUG_KINDS:
         return "debug"
     return "signal"
+
+
+def _clock(reset_at: Any) -> str:
+    """A usage-limit reset moment as local wall-clock, or "" if there was none."""
+    if not isinstance(reset_at, (int, float)):
+        return ""
+    return time.strftime("%H:%M", time.localtime(float(reset_at)))
 
 
 def _payload(event: dict[str, Any]) -> dict[str, Any]:
@@ -92,6 +100,22 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any],
         return "Worker dispatched", p.get("worktree") or ""
     if kind == "turn_failed":
         return "Worker turn failed", (p.get("error") or "")[:200]
+    # The usage-limit trio. Deliberately NOT filed under "Worker turn failed": nothing
+    # about the work went wrong, the turn was refused before it ran, and the OS puts
+    # itself right. What the reader needs is the pause, the resume, and — only if it
+    # comes to that — the point at which the OS gave up and it became their problem.
+    if kind == "rate_limited":
+        when = _clock(p.get("reset_at"))
+        return ("Paused — Claude usage limit",
+                f"{p.get('error') or ''}"
+                + (f" · resuming after {when}" if when else ""))
+    if kind == "rate_limit_retry":
+        attempt = p.get("attempt")
+        return ("Resumed after the usage limit",
+                f"attempt {attempt}" if attempt else "")
+    if kind == "rate_limit_exhausted":
+        return ("Still refused after retrying",
+                f"{p.get('attempts')} usage-limit retries: {p.get('error') or ''}")
     if kind == "turn_cancelled":
         return "Worker turn cancelled", ""
     if kind == "attention":

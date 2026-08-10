@@ -12,7 +12,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import ops
+from .. import invariants, ops
 from ..central_store import CentralStore
 from ..daemon import daemon_running
 from ..paths import PRODUCTION, deployment_env, logs_dir
@@ -377,6 +377,9 @@ def create_app() -> FastAPI:
             # Inside the store's lifetime: the label reads the dependencies' own rows.
             blocked = {wo["id"]: ops.blocked_by(store, wo) for wo in wos}
             blocked = {k: v for k, v in blocked.items() if v}
+            # Same lifetime, same reason: the note reads this work order's last turn.
+            rate_limits = {wo["id"]: invariants.rate_limit_note(store, wo) for wo in wos}
+            rate_limits = {k: v for k, v in rate_limits.items() if v}
             visible_counts = store.status_counts()
             all_counts = store.status_counts(include_hidden=True)
             counts = all_counts if show_hidden else visible_counts
@@ -397,6 +400,7 @@ def create_app() -> FastAPI:
         return render(request, "project.html", project_name=name, path=paths[name],
                       featured=featured, rest=rest, open_counts=open_counts,
                       backlog=backlog, show_hidden=show_hidden, blocked=blocked,
+                      rate_limits=rate_limits,
                       hidden_count=hidden_count, settled=settled, revealed=revealed,
                       features=features)
 
@@ -447,10 +451,14 @@ def create_app() -> FastAPI:
             # the reason it stopped belongs on the page it stopped on.
             store.expire_approvals()
             approvals = store.list_approvals(wo_id)
+            # Why a `running` work order has nothing running. Same idea as the gate
+            # line above: the reason it stopped belongs on the page it stopped on.
+            rate_limit = invariants.rate_limit_note(store, wo)
         finally:
             store.close()
         show_debug = debug not in ("", "0", "false")
         return render(request, "work_order.html", project=pname, wo=wo,
+                      rate_limit=rate_limit,
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug,
                                               questions=ops.neo_question_texts(wo_id)),
