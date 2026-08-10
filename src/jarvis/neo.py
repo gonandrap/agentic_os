@@ -85,8 +85,77 @@ Either may carry one optional cleanup dispatch:
   "dispatch": {"title": "<short: which record is wrong>", "description": "<the full brief>"}"""
 
 
+# The learnings block is the one part of Neo's prompt that grows without limit. Every
+# `jarvis neo learn` appends an entry IN FULL, `learnings_limit` bounds the row count and
+# nothing bounded the size, and unlike the project knowledge base — which ships workers an
+# index and lets them fetch what they need — Neo cannot look anything up: its calls run
+# headless with the question as their only input, so an index would be no index at all.
+# Measured on the production ledger, 16 learnings were 23.4k of a 27.2k-character system
+# prompt, and that rides on EVERY Neo call — five times over on a panel round.
+#
+# 20,000 IS A CEILING, NOT A CUT, AND THE DIFFERENCE IS THE POINT. Neo's whole job is to
+# spend its own tokens so the user does not spend attention, and at measured production
+# rates the entire headless side of the OS — Neo, digests, the panel — is 2.5% of the
+# fleet's bill. Trading a third of the user's accumulated rulings for ~1% of spend would
+# be a bad deal. What is NOT acceptable is the unbounded case: nothing stopped this block
+# reaching 100k, and at that size it is both expensive and unreadable by the model. So the
+# budget is set just under today's ledger — it evicts the six oldest entries now and holds
+# the line from here.
+#
+# WATCH THE CLIFF WHEN TUNING THIS. Eviction is by age and the entries differ in size by
+# more than 10x (479 chars against 5,266 on the same ledger), so one bloated learning can
+# displace ten good ones and a small budget change can move the count a long way: 24,000
+# keeps all 16, 20,000 keeps 10, 16,000 keeps 5. The real remedy is distilling the giants
+# rather than raising this number — filed as a backlog item.
+LEARNINGS_CHAR_BUDGET = 20000
+
+
+def render_learnings(rows: list[dict[str, Any]],
+                     budget: int = LEARNINGS_CHAR_BUDGET) -> list[str]:
+    """The learnings block, capped in characters, newest kept.
+
+    OLDEST-FIRST TRUNCATION, for the same reason `NeoStore.learnings` returns rows
+    oldest-first: the block is append-only, so an ordinary new learning extends the
+    cached prompt prefix instead of rewriting it. Dropping from the FRONT is what keeps
+    that true — trimming the newest would move the boundary on every single addition.
+    Going over budget shifts the prefix once, exactly as overflowing `learnings_limit`
+    already did.
+
+    THE OMISSION IS STATED, and it is stated LAST. Silence would be the worse failure:
+    the persona above tells Neo that a budget which quietly truncates something the user
+    mandated is worse than no budget, and a ruling that vanished without trace is that
+    failure with no way to notice it. Last, because the note is the only line whose text
+    changes when the drop count changes — everything above it stays byte-identical and
+    stays cached.
+
+    THE NEWEST ENTRY IS ALWAYS KEPT, even alone over budget. A learning the user recorded
+    a minute ago is the likeliest one the next question turns on, and a block that came
+    back empty because a single entry was too long would be a silent, total regression
+    dressed up as a cap.
+    """
+    if not rows:
+        return ["(none yet — escalate when unsure)"]
+    lines = [f"- [{r['project'] or 'global'}] {r['content']}" for r in rows]
+    kept: list[str] = []
+    spent = 0
+    for line in reversed(lines):  # newest first, so the oldest fall off the end
+        if kept and spent + len(line) > budget:
+            break
+        spent += len(line)
+        kept.append(line)
+    kept.reverse()
+    dropped = len(lines) - len(kept)
+    if dropped:
+        kept.append(
+            f"({dropped} older learning{'s' if dropped > 1 else ''} not shown — this "
+            f"block is capped at {budget} characters. Ask the user rather than assume "
+            f"nothing was ever ruled on a point you cannot see.)")
+    return kept
+
+
 def build_system_prompt(store: NeoStore, project: str, learnings_limit: int = 50,
-                        kind: str = "question") -> str:
+                        kind: str = "question",
+                        learnings_chars: int = LEARNINGS_CHAR_BUDGET) -> str:
     """Persona + learnings. Byte-stable across questions (per project and kind) so
     consecutive headless calls of the same kind share a cached prompt prefix.
 
@@ -102,12 +171,8 @@ def build_system_prompt(store: NeoStore, project: str, learnings_limit: int = 50
     persona = {"approval": REVIEWER_PERSONA, "plan": PLAN_REVIEWER_PERSONA}.get(
         kind, PERSONA)
     parts = [persona, "", "# Learnings (from the user's reviews of your past answers)"]
-    rows = store.learnings(project, limit=learnings_limit)
-    if not rows:
-        parts.append("(none yet — escalate when unsure)")
-    for r in rows:
-        scope = r["project"] or "global"
-        parts.append(f"- [{scope}] {r['content']}")
+    parts += render_learnings(store.learnings(project, limit=learnings_limit),
+                              budget=learnings_chars)
     return "\n".join(parts)
 
 
