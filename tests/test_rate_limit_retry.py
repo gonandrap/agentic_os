@@ -67,15 +67,100 @@ def test_reads_the_epoch_shape():
     assert ms is not None and ms.reset_at == 1786344785.0
 
 
+#: EVERY rate-limit label Claude Code can put in this message, read out of the CLI's own
+#: string table (2.1.226, the `HUt` map) rather than guessed at. The message is
+#: assembled as `You've hit your ${label} · resets ${when}`, so the label is the only
+#: part that varies by which window was spent — and two of these are MODEL names, which
+#: is exactly why the matcher keys on the shape and not on the words.
+LIMIT_LABELS = [
+    ("five_hour", "session limit"),
+    ("seven_day", "weekly limit"),
+    ("seven_day_opus", "Opus limit"),
+    ("seven_day_sonnet", "Sonnet limit"),
+    ("seven_day_overage_included", "Fable 5 limit"),
+    ("overage", "usage credit limit"),
+]
+
+
+@pytest.mark.parametrize("kind,label", LIMIT_LABELS, ids=[k for k, _ in LIMIT_LABELS])
+def test_every_limit_type_is_recognised(kind, label):
+    """The 5-hour window, the 7-day window, the per-model ones and usage credits. An
+    enumeration of the WORDS would have to grow with the model line-up; this must not."""
+    limit = claude_cli.usage_limit(
+        f"You've hit your {label} · resets 11:50pm (America/Los_Angeles)")
+    assert limit is not None, f"{kind} ({label!r}) was not recognised as a usage limit"
+    assert limit.reset_at is not None
+
+
+def test_an_unreleased_model_name_is_recognised_too():
+    """The label carries a model name, so the next one has not been written yet. Keying
+    on 'limit … resets' rather than on the name is what makes that a non-event."""
+    limit = claude_cli.usage_limit(
+        "You've hit your Quintessence 9 limit · resets 11:50pm (America/Los_Angeles)")
+    assert limit is not None and limit.reset_at is not None
+
+
 def test_reads_a_dated_reset():
+    """Over 24h away the CLI switches to `toLocaleString("en-US", {month:"short",
+    day:"numeric", hour:"numeric", minute:"2-digit", hour12:true})`, which is the
+    ordinary rendering for the 7-day window."""
     tz = ZoneInfo("America/New_York")
     now = datetime(2026, 8, 10, 12, 0, tzinfo=tz).timestamp()
     limit = claude_cli.usage_limit(
-        "You've reached your weekly limit · resets Aug 14 at 9am (America/New_York)",
+        "You've hit your weekly limit · resets Aug 14, 9:50am (America/New_York)",
         now=now)
     assert limit is not None and limit.reset_at is not None
     when = datetime.fromtimestamp(limit.reset_at, tz)
-    assert (when.month, when.day, when.hour) == (8, 14, 9)
+    assert (when.month, when.day, when.hour, when.minute) == (8, 14, 9, 50)
+
+
+def test_reads_a_dated_reset_with_the_minutes_dropped():
+    """The formatter omits minutes when they are zero, in both renderings."""
+    tz = ZoneInfo("America/New_York")
+    now = datetime(2026, 8, 10, 12, 0, tzinfo=tz).timestamp()
+    limit = claude_cli.usage_limit(
+        "You've hit your weekly limit · resets Aug 14, 9am (America/New_York)", now=now)
+    assert limit is not None and limit.reset_at is not None
+    when = datetime.fromtimestamp(limit.reset_at, tz)
+    assert (when.month, when.day, when.hour, when.minute) == (8, 14, 9, 0)
+
+
+def test_reads_a_reset_that_crosses_the_year():
+    """The formatter adds the year only when the reset lands in a different one — a
+    7-day window spent in late December. Read it, do not skip it: an unread year parses
+    as the HOUR and schedules the retry for tonight instead of next year."""
+    tz = ZoneInfo("America/New_York")
+    now = datetime(2026, 12, 30, 12, 0, tzinfo=tz).timestamp()
+    limit = claude_cli.usage_limit(
+        "You've hit your weekly limit · resets Jan 3, 2027, 11:50pm (America/New_York)",
+        now=now)
+    assert limit is not None and limit.reset_at is not None
+    when = datetime.fromtimestamp(limit.reset_at, tz)
+    assert (when.year, when.month, when.day, when.hour) == (2027, 1, 3, 23)
+
+
+def test_reads_a_relative_reset():
+    """Fast mode renders a duration instead of a clock: "· resets in 2h 15m"."""
+    now = 1_800_000_000.0
+    limit = claude_cli.usage_limit("You've hit your fast limit · resets in 2h 15m",
+                                   now=now)
+    assert limit is not None
+    assert limit.reset_at == now + 2 * 3600 + 15 * 60
+    day = claude_cli.usage_limit("You've hit your weekly limit · resets in 1d 3h",
+                                 now=now)
+    assert day is not None and day.reset_at == now + 86400 + 3 * 3600
+
+
+@pytest.mark.parametrize("message", [
+    # A spend cap does not reopen on its own — the suffix says so, offering an action
+    # instead of a reset. Retrying it would spin until the cap, and the user would never
+    # be told the one thing they need to know.
+    "You've hit your monthly spend limit. /model to switch models.",
+    "You've hit your individual spend limit · run /usage-credits to raise it",
+    "You've hit your org's monthly spend limit · ask your admin for a higher limit",
+])
+def test_a_spend_cap_is_left_for_the_user(message):
+    assert claude_cli.usage_limit(message) is None
 
 
 def test_reads_a_reset_with_no_timezone_against_the_local_clock():
@@ -96,6 +181,14 @@ def test_reads_a_reset_with_no_timezone_against_the_local_clock():
     # exactly the failure mode a loose matcher would cause.
     "TypeError: session limit must be an int, see docs/limits.md",
     "Traceback: usage limit exceeded in customer code",
+    # NEAR MISSES. Matching by shape rather than by wording widened the net, so these
+    # pin where the edge now is: the word and a reset in the same breath are not enough,
+    # a readable MOMENT has to follow. Without that gate the first of these — a worker
+    # talking about this very feature — would park its own work order for an hour.
+    "the rate limit reset logic in daemon.py:942 returns early",
+    "AssertionError: limit reset failed",
+    "429 Too Many Requests: quota limit exceeded; reset window unknown",
+    "RateLimitError: limit 40000 tokens, resets per minute",
 ])
 def test_ordinary_failures_are_not_usage_limits(error):
     assert claude_cli.usage_limit(error) is None

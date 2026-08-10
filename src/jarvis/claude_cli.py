@@ -372,6 +372,35 @@ def read_turn_result(outfile: Path, errfile: Path | None = None) -> TurnResult |
 # themselves. Observed live on wo-2fa7c0e9 turn 4:
 #
 #     You've hit your session limit · resets 11:50pm (America/Los_Angeles)
+#
+# THE MESSAGE IS ASSEMBLED, NOT WRITTEN, and matching the assembly is what makes this
+# survive the next model launch. Read out of the CLI's own string table (2.1.226): the
+# body is `You've hit your ${label}${suffix}`, the label comes from ONE table keyed by
+# rate-limit type, and the suffix is ` · resets ${when}`.
+#
+#     five_hour                   session limit        <- the 5-hour window
+#     seven_day                   weekly limit         <- the 7-day window
+#     seven_day_opus              Opus limit
+#     seven_day_sonnet            Sonnet limit
+#     seven_day_overage_included  Fable 5 limit        <- per-MODEL, and it is named
+#     overage                     usage credit limit
+#
+# So the label carries a MODEL NAME that changes with the fleet, and enumerating the
+# words in it is a guarantee of missing the next one — this parser did miss "Fable 5
+# limit" and "usage credit limit" until the user asked. What does not change is the
+# shape: the word "limit", then "resets", then a moment. That pair is what is matched.
+#
+# The suffix is also the reason a SPEND cap is deliberately left alone. Those render
+# ` · run /usage-credits to raise it` instead of a reset, so they never match, and they
+# should not: a spend cap does not reopen on its own and the user has to act.
+#
+# The moment itself has three renderings, all three handled (`_reset_moment`), because
+# the CLI picks between them by how far away the reset is:
+#
+#     under 24h    resets 11:50pm (America/Los_Angeles)      <- the 5-hour case
+#     over 24h     resets Aug 14, 9:50am (America/Los_Angeles)  <- typically the 7-day
+#     new year     resets Dec 31, 2027, 11:50pm (…)
+#     relative     resets in 2h 15m                          <- fast mode
 
 
 @dataclass(frozen=True)
@@ -387,24 +416,45 @@ class UsageLimit:
     reset_at: float | None
 
 
-#: The oldest shape, and the only one that states the moment unambiguously:
-#: "Claude AI usage limit reached|1786344785".
+#: The legacy shape, and the only one that states the moment unambiguously:
+#: "Claude AI usage limit reached|1786344785". Kept as a belt-and-braces branch, NOT
+#: verified: that literal is absent from 2.1.226's string table (the only
+#: "usage limit reached" in there is inside Claude Code's own auth-error classifier),
+#: so it is either gone or composed somewhere strings cannot see. It costs one regex and
+#: it is the shape older tooling keys on, so removing it would only lose coverage.
 _LIMIT_EPOCH_RE = re.compile(r"usage limit reached\s*\|\s*(\d{10,13})", re.IGNORECASE)
 
-#: The phrasings Claude Code uses for a spent window. Deliberately narrow: this runs
-#: against the error text of EVERY failed turn, which can be a tail of the worker's own
-#: stderr, and a false positive here would retry a genuinely broken turn for ever.
-_LIMIT_RE = re.compile(
-    r"\b(?:session|usage|weekly|monthly|opus|sonnet|\d+\s*-?\s*hour)\s+limit\b",
-    re.IGNORECASE,
+#: A spent window, matched by SHAPE rather than by wording: the word "limit" and then a
+#: reset, close together. Matching the label instead would mean listing the model names
+#: it can contain ("Fable 5 limit", "Opus limit", …) and silently missing whichever one
+#: ships next — see the table above.
+#:
+#: The proximity is what keeps this honest. It runs against the error text of EVERY
+#: failed turn, which can be a tail of the worker's own stderr, and a false positive
+#: would retry a genuinely broken turn until the cap stops it. Prose mentioning a limit
+#: does not go on to name a reset time sixty characters later; this message always does.
+_LIMIT_RE = re.compile(r"\blimits?\b.{0,60}?\bresets?\b", re.IGNORECASE | re.DOTALL)
+
+#: "resets in 2h 15m" — the relative rendering (fast mode). The easiest of the three:
+#: no timezone, no calendar, nothing to resolve against a clock that might disagree.
+_RESET_IN_RE = re.compile(
+    r"""resets?\s+in\s+
+        (?:(?P<days>\d+)\s*d\b\s*)?
+        (?:(?P<hours>\d+)\s*h\b\s*)?
+        (?:(?P<minutes>\d+)\s*m\b\s*)?
+        (?:(?P<seconds>\d+)\s*s\b)?
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
-#: The moment named beside it: "resets 11:50pm (America/Los_Angeles)", "resets at 3am",
-#: "resets Aug 14 at 9am". Every part after the hour is optional because the CLI drops
-#: whichever ones it considers obvious.
+#: The absolute renderings: "resets 11:50pm (America/Los_Angeles)" under 24h,
+#: "resets Aug 14, 9:50am (…)" over it, and the same with a year when the reset falls in
+#: the next one. Every part before the hour is optional because the CLI drops whichever
+#: ones it judges obvious, and the minutes go too when they are zero ("resets 3pm").
 _RESET_RE = re.compile(
     r"""resets?\s+(?:at\s+)?
-        (?:(?P<month>[A-Za-z]{3,9})\s+(?P<day>\d{1,2})\s*,?\s*(?:at\s+)?)?
+        (?:(?P<month>[A-Za-z]{3,9})\s+(?P<day>\d{1,2})\s*,?\s*
+           (?:(?P<year>\d{4})\s*,?\s*)?(?:at\s+)?)?
         (?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*
         (?P<ampm>[ap]\.?m\.?)?
         (?:\s*\((?P<tz>[^)]{1,64})\))?
@@ -435,11 +485,27 @@ def usage_limit(text: str | None, *, now: float | None = None) -> UsageLimit | N
                           reset_at=float(raw / 1000 if raw > 1e11 else raw))
     if not _LIMIT_RE.search(text):
         return None
+    ref = time.time() if now is None else now
+    # The relative form first: "resets in 2h 15m" needs no timezone and no calendar, so
+    # where it is offered it is the more trustworthy of the two.
+    relative = _RESET_IN_RE.search(text)
+    if relative and any(relative.group(g) for g in
+                        ("days", "hours", "minutes", "seconds")):
+        return UsageLimit(message=_summarise(text),
+                          reset_at=ref + _duration(relative))
     reset = _RESET_RE.search(text)
     if reset is None:
         return None
-    return UsageLimit(message=_summarise(text),
-                      reset_at=_reset_moment(reset, time.time() if now is None else now))
+    return UsageLimit(message=_summarise(text), reset_at=_reset_moment(reset, ref))
+
+
+def _duration(m: re.Match[str]) -> float:
+    """Seconds in a "2d 3h 15m" clause. Absent units are zero, never an error: the CLI
+    drops the ones that would read as zero rather than printing them."""
+    return (int(m.group("days") or 0) * 86400
+            + int(m.group("hours") or 0) * 3600
+            + int(m.group("minutes") or 0) * 60
+            + int(m.group("seconds") or 0))
 
 
 def _summarise(text: str) -> str:
@@ -449,10 +515,16 @@ def _summarise(text: str) -> str:
 def _reset_moment(m: re.Match[str], now: float) -> float | None:
     """The epoch moment a "resets …" clause names, or None if it does not name one.
 
-    The clause gives a wall-clock time in some timezone and, at most, a day — never a
-    year — so the moment is resolved against `now`: the next occurrence of that clock
-    time, in that zone. That is exactly the rule a human applies reading it, and it is
-    why an unparseable zone falls back to the daemon's own clock rather than to UTC.
+    The clause gives a wall-clock time in some timezone and, usually, no date at all, so
+    the moment is resolved against `now`: the next occurrence of that clock time, in that
+    zone. That is exactly the rule a human applies reading it, and it is why an
+    unparseable zone falls back to the daemon's own clock rather than to UTC.
+
+    A date appears once the reset is more than 24h away, which is the ordinary case for
+    the 7-day window, and a YEAR appears with it only when the reset falls in the next
+    one. The year is read rather than skipped because skipping it does not fail loudly:
+    "Aug 14, 2027, 9:50am" would otherwise parse its year as the hour and quietly
+    schedule a retry for 8pm tonight.
     """
     hour = int(m.group("hour"))
     minute = int(m.group("minute") or 0)
@@ -469,14 +541,16 @@ def _reset_moment(m: re.Match[str], now: float) -> float | None:
     month = _MONTHS.get((m.group("month") or "")[:3].lower())
     day = int(m.group("day") or 0)
     if month and day:
+        year = int(m.group("year") or 0)
         try:
-            when = ref.replace(month=month, day=day, hour=hour, minute=minute,
-                               second=0, microsecond=0)
+            when = ref.replace(year=year or ref.year, month=month, day=day, hour=hour,
+                               minute=minute, second=0, microsecond=0)
         except ValueError:
             return None  # e.g. "Feb 30"
         # A date with no year is next year's when it has already gone past — the
-        # December-to-January case, and the only one worth handling.
-        if when < ref - timedelta(days=180):
+        # December-to-January case, and the only one worth handling. When the message
+        # states the year there is nothing to infer, so this must not fire.
+        if not year and when < ref - timedelta(days=180):
             try:
                 when = when.replace(year=when.year + 1)
             except ValueError:
