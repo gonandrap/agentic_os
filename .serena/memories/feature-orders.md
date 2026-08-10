@@ -259,3 +259,13 @@ question from 21,250 to 1,999 input tokens (−90.6%). Four rules now hold:
 
 `evals/test_question_diet_budget.py` pins the ratio on a production-shaped synthetic
 plan and prints the readings from the module fixture's teardown.
+
+The other half of the diet's bargain is graded: `evals/llm/test_plan_review_judgment.py`
+(opt-in, JARVIS_EVALS_LLM=1) runs seven skeleton questions through the REAL
+`kind="plan"` path — release-blocked recall, escalation choice, release willingness,
+reason quality — and `tests/test_plan_review_eval_harness.py` keeps it honest for free
+(gate spelling, battery skeleton-shaped by construction, canned-model smoke of the
+plumbing). CALIBRATION FACT the scope-gap scenario encodes: an ask half-covered by a
+plan is a REJECT (planner's call) when re-decomposing fits under the child cap, and an
+ESCALATE only when folding the missing half in would exceed it — Neo graded the
+3-child version of that fixture correctly against the eval's own expectation.
