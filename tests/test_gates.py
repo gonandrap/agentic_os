@@ -9,10 +9,14 @@ these tests pin both directions: what must be gated, and what must never be.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
 from jarvis import gates
+from jarvis.bootstrap import _gates_section
+from jarvis.catalog import ProjectSpec
+from jarvis.dispatch import _gate_briefing
 from jarvis.hooks import preflight_decision
 from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
@@ -700,6 +704,62 @@ def test_dismissal_message_says_nothing_was_authorised_and_nothing_refused(gated
     assert "nothing was authorised and nothing was refused" in body
     assert "grep -rn shipit.sh src/" in body
     assert "Do not retry it as-is" not in body
+
+
+def test_dismissal_message_forbids_re_filing_over_a_live_request(gated):
+    """A dismissal clears a command STRING, not the review state of the action it names.
+
+    The trap this pins, observed live on wo-54ee37c1 (gates 23 and 24, production 0.4.0):
+    the dismissed command was a `jarvis gate request` for a genuinely privileged action,
+    the recogniser having fired on the action quoted inside the argument. "Run it again,
+    exactly as written" then reads as "re-file", and the real action was already sitting
+    escalated with the user — so obeying would have opened a second, better-argued request
+    while the first was undecided. That is reviewer-shopping in effect however innocently
+    it is meant, so the limit belongs in the message the worker actually reads.
+
+    That particular vector is already closed on main: `scannable()` blanks quoted spans,
+    so the gate-23 command classifies as ALLOWED here and only still fires on the deployed
+    0.4.0. The rule is not scoped to it. Any dismissal says "run it again", every recogniser
+    fix is one regression away from re-opening a vector, and the collision costs a
+    privileged action being reviewed twice — so this is pinned against the general case,
+    using a false positive that does still fire today.
+    """
+    gated.attempt("cat scripts/shipit.sh")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+
+    gates.apply_decision(gated.store, approval["id"], verdict="dismissed",
+                         reason="reading the deploy script ships nothing",
+                         decided_by="neo")
+
+    body = gated.store.queued_messages(gated.wo["id"])[0]["content"]
+    # The permission survives — this is still a false positive, not a refusal.
+    assert "Run it again, exactly as written" in body
+    # ...but no longer unqualified.
+    assert "pending or escalated" in body
+    assert "did not reset the review state" in body
+    assert "leave the original standing" in body
+
+
+def test_every_worker_facing_surface_states_the_no_duplicate_request_rule():
+    """Three surfaces tell a worker what a dismissal means, and they can drift apart.
+
+    `dismissed_message` is read at the moment of the dismissal, the dispatch briefing at
+    the top of every worker's first turn, and OPERATION.md's gates section whenever the
+    worker goes looking. A worker that re-files on the strength of whichever one it read
+    causes the same duplicate request, so all three carry the rule or none of them does.
+    """
+    spec = ProjectSpec(name="proj_a", path=Path("/tmp/proj_a"), description="", gates=ALL_GATES)
+    surfaces = {
+        "dismissed_message": gates.dismissed_message(
+            {"id": 1, "kind": "release", "command": "grep -rn shipit.sh src/"},
+            reason="the literal appears inside a search pattern", by="neo"),
+        "dispatch briefing": "\n".join(_gate_briefing({"id": "wo-1"}, spec)),
+        "OPERATION.md gates section": _gates_section(spec),
+    }
+
+    for name, text in surfaces.items():
+        assert "pending or escalated" in text, f"{name} omits the no-duplicate rule"
+        assert "second request" in text, f"{name} does not name the failure it prevents"
 
 
 def test_a_dismissal_is_not_recorded_as_a_gate_decision(gated):
