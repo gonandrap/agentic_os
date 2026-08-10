@@ -15,7 +15,7 @@ from fastapi.templating import Jinja2Templates
 from .. import ops
 from ..central_store import CentralStore
 from ..daemon import daemon_running
-from ..paths import logs_dir
+from ..paths import PRODUCTION, deployment_env, logs_dir
 from ..project_store import (
     FO_OPEN_STATUSES,
     OPEN_STATUSES,
@@ -148,6 +148,45 @@ def log_ui_error(request: Request, exc: BaseException) -> None:
         pass
 
 
+def instance_badge() -> dict[str, str | bool]:
+    """Which Jarvis this dashboard is driving, for the header.
+
+    Production and development are the same code in two checkouts on one machine
+    (docs/DEPLOYMENT.md), and their dashboards are otherwise identical — so the badge
+    is the only thing stopping someone from acting on the live fleet while believing
+    they are in the dev sandbox. Both facts are read once per process: neither the
+    environment nor the installed version can change under a running server.
+
+    The version is the running one, never a constant in the source: on `main` the
+    version string deliberately lags the shipped tag (only release branches carry the
+    bump), so a literal would be wrong in exactly the place it matters most.
+    """
+    from ..bugreport import jarvis_version
+    env, detail = deployment_env()
+    try:
+        version = jarvis_version()
+    except Exception:  # noqa: BLE001 — see gate_badge: a badge must not 500 a page
+        version = "unknown"
+    return {"env": env, "prod": env == PRODUCTION, "version": version,
+            "shown": _version_for_badge(version),
+            "label": "prod" if env == PRODUCTION else "dev",
+            "detail": f"{env} · {detail} · version {version}"}
+
+
+def _version_for_badge(version: str) -> str:
+    """`0.5.0` → `v0.5.0`; `dev-a1b2c3d` → `a1b2c3d`.
+
+    `bugreport.jarvis_version` reports a release as a bare number and everything else
+    as `dev-<sha>` (a dev build is not "0.5.0 plus a bit"). The badge already says
+    which instance this is, so pasting that in raw would read `dev · vdev-a1b2c3d` —
+    the word twice, and a `v` in front of a commit sha. Only a real version number
+    gets the `v`; the tooltip carries the string unaltered either way.
+    """
+    if version.startswith("dev-"):
+        return version[len("dev-"):]
+    return f"v{version}" if version[:1].isdigit() else version
+
+
 def _false_positive_rate(rows: list) -> str | None:
     """"3 of 11 (27%)" — how often the gate fired on a command that ships nothing.
 
@@ -218,6 +257,7 @@ def create_app() -> FastAPI:
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         fo_status_meta=FO_STATUS_META, level_tone=LEVEL_TONE, fmt_age=fmt_age,
+        instance=instance_badge(),
     )
 
     def render(request: Request, template: str, active: str = "dashboard",

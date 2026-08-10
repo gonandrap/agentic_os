@@ -1280,3 +1280,79 @@ def test_knowledge_page_pin_toggle(client):
     client.post("/knowledge/pin", data={"kn_id": row["id"], "pinned": "0"})
     fresh = central.get_knowledge(row["id"])
     assert fresh is not None and not has_tag(fresh["tags"], PINNED_TAG)
+
+
+# -- which instance is this? -----------------------------------------------------
+
+def _chrome(jarvis_home, catalog_file, path="/"):
+    """The rendered header, from a freshly built app (the badge is read once)."""
+    ops.start_os(str(catalog_file), foreground=True)
+    c = TestClient(create_app(), follow_redirects=False)
+    return c.get(path).text
+
+
+def test_header_names_a_dev_instance_and_its_version(
+        jarvis_home, fake_claude, catalog_file, monkeypatch):
+    """Two checkouts of the same code on one machine render identical dashboards;
+    the badge is what stops someone acting on the live fleet from the wrong one."""
+    from jarvis import bugreport
+
+    monkeypatch.delenv("JARVIS_ENV", raising=False)
+    monkeypatch.setenv("PRODUCTION_CODE", str(jarvis_home / "not-production"))
+    monkeypatch.setattr(bugreport, "jarvis_version", lambda: "dev-a1b2c3d")
+    html = _chrome(jarvis_home, catalog_file)
+
+    # a dev build has no release number — the sha is the version, and the badge does
+    # not say "dev" twice
+    assert "dev · a1b2c3d" in html
+    assert "vdev-" not in html
+    assert 'class="instance"' in html  # muted: dev must not wear the prod colour
+
+
+def test_header_marks_a_production_instance(
+        jarvis_home, fake_claude, catalog_file, monkeypatch):
+    from jarvis import bugreport
+
+    monkeypatch.setenv("JARVIS_ENV", "production")
+    monkeypatch.setattr(bugreport, "jarvis_version", lambda: "0.5.0")
+    html = _chrome(jarvis_home, catalog_file)
+
+    assert "prod · v0.5.0" in html
+    assert 'class="instance prod"' in html
+
+
+def test_a_hand_edited_release_still_says_so_in_the_badge(
+        jarvis_home, fake_claude, catalog_file, monkeypatch):
+    """`-dirty` means the production checkout is no longer the release it claims to
+    be. It reaches bug reports already; the header is where someone would see it."""
+    from jarvis import bugreport
+
+    monkeypatch.setenv("JARVIS_ENV", "production")
+    monkeypatch.setattr(bugreport, "jarvis_version", lambda: "0.5.0-dirty")
+    html = _chrome(jarvis_home, catalog_file)
+
+    assert "prod · v0.5.0-dirty" in html
+
+
+def test_instance_badge_is_on_every_page_with_a_diagnosable_tooltip(
+        jarvis_home, fake_claude, catalog_file, monkeypatch):
+    """It lives in the base template, so it cannot go missing on the page someone
+    happens to deep-link into out of a Telegram alert."""
+    monkeypatch.setenv("JARVIS_ENV", "production")
+    for path in ("/", "/inbox", "/backlog", "/knowledge", "/neo", "/gates"):
+        html = _chrome(jarvis_home, catalog_file, path)
+        assert 'class="instance prod"' in html, path
+        assert "title=\"production · JARVIS_ENV=production · version " in html, path
+
+
+def test_version_lookup_failure_does_not_break_the_header(
+        jarvis_home, fake_claude, catalog_file, monkeypatch):
+    from jarvis import bugreport
+
+    def boom():
+        raise RuntimeError("no dist metadata")
+
+    monkeypatch.setattr(bugreport, "jarvis_version", boom)
+    html = _chrome(jarvis_home, catalog_file)
+    assert "· unknown" in html
+    assert 'class="instance"' in html

@@ -16,9 +16,17 @@ running fleet.
 | Git | branch `main` (trunk) | detached at tag `jarvis-X.Y.Z` |
 | Run | `uv run jarvis …` (manual) | `systemctl --user … jarvis` / `jarvis-ui` (services) |
 | `JARVIS_HOME` | `~/.jarvis` (default) | `$PRODUCTION_CODE/state` |
+| `JARVIS_ENV` | unset | `production` (set by the units) |
 | Catalog | `catalogs/gonzalo.json` (empty / test projects) | `$PRODUCTION_CODE/config/catalog.json` (real fleet) |
 | Secrets | none | `$PRODUCTION_CODE/secrets/jarvis.env` |
 | UI port | 8788 | 8787 |
+
+Both dashboards say which one they are, in the header: an amber **`prod`** badge on
+production, a muted **`dev`** one otherwise, each followed by the running version
+(hover for the full detail). `JARVIS_ENV` decides when it is set; otherwise the code's
+own location does — a checkout under `$PRODUCTION_CODE/jarvis_os` is production — so an
+instance deployed before this existed still labels itself correctly. Anything
+undetectable reads as `dev`, never as `prod`.
 
 `JARVIS_HOME` is what keeps them apart: separate pidfiles, databases, and logs, so both
 daemons can run at once without clashing. The dev catalog and `MIGRATION.md` are
