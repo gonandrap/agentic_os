@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}cost — Jarvis{% endblock %}
+{% block content %}
+
+<h2>What the work cost — {{ report.scope }}</h2>
+
+{# The scope switcher. A plain link row rather than a form: there is one parameter and
+   the whole page is a GET, so a link is the honest control. #}
+<div class="panel" style="padding: 10px 16px;">
+  <span class="kv">
+    <a href="/cost">{{ '● ' if not project }}fleet</a>
+    {% for p in projects %}
+      · <a href="/cost?project={{ p }}">{{ '● ' if project == p }}{{ p }}</a>
+    {% endfor %}
+  </span>
+</div>
+
+<div class="panel" style="margin-top: 14px; padding: 14px 16px;">
+  <p style="margin: 0 0 6px; font-size: 22px;" class="mono">
+    ~${{ '%.2f'|format(totals.list_cost_usd) }}</p>
+  <p class="kv mono" style="margin: 0;">
+    {{ fmt_tok(totals.billed_input) }} in · {{ fmt_tok(totals.output) }} out ·
+    {{ report.measured }} work order{{ 's' if report.measured != 1 }} measured
+    {%- if report.unmeasured %}, {{ report.unmeasured }} whose transcript Claude Code has
+      already pruned{% endif %}
+  </p>
+  {% if totals.rewrite_excess %}
+  <p class="kv" style="margin: 8px 0 0;">
+    <strong>Re-write tax ~${{ '%.2f'|format(totals.rewrite_cost_usd) }}</strong> —
+    {{ fmt_tok(totals.rewrite_excess) }} tokens re-sent across
+    {{ totals.resume_boundaries }} turn boundar{{ 'ies' if totals.resume_boundaries != 1 else 'y' }}.
+    Every worker turn after the first re-sends the whole conversation at the cache-write
+    rate. The cause is upstream and Jarvis cannot fix it — what it can do is cost fewer
+    boundaries, which is why batching feedback into one message is cheaper than three.
+  </p>
+  {% endif %}
+  {% if totals.subagent_cost_usd %}
+  <p class="kv" style="margin: 6px 0 0;">
+    Subagents ~${{ '%.2f'|format(totals.subagent_cost_usd) }} of that.
+  </p>
+  {% endif %}
+</div>
+
+<div class="panel" style="margin-top: 14px;">
+  {% for u in units %}
+  <div class="row">
+    <span class="mono" style="width: 76px; text-align: right; color: var(--ink);">
+      {%- if u.found %}${{ '%.2f'|format(u.list_cost_usd) }}{% else %}—{% endif -%}
+    </span>
+    {# A work order title is a whole paragraph of user intent often enough that letting
+       it wrap turns this table into a wall. Clamped rather than truncated server-side:
+       the full text stays in the DOM for search and for the hover title. #}
+    <div class="grow">
+      <a href="/wo/{{ u.project }}/{{ u.id }}" title="{{ u.title }}"
+         style="display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+        >{{ u.title }}</a>
+      <div class="sub mono">{{ u.id }} · {{ u.project }} ·
+        {%- if u.found %}
+          {{ u.turns }} turn{{ 's' if u.turns != 1 }} ·
+          {{ fmt_tok(u.billed_input) }} in / {{ fmt_tok(u.output) }} out ·
+          peak context {{ fmt_tok(u.context_peak) }}
+          {%- if u.rewrite_excess %} · re-write {{ fmt_tok(u.rewrite_excess) }}{% endif %}
+          {%- if u.subagent_count %} · {{ u.subagent_count }} subagent{{ 's' if u.subagent_count != 1 }}{% endif %}
+        {%- else %}
+          no transcript left to measure
+        {%- endif %}
+      </div>
+    </div>
+    {% set m = status_meta.get(u.status, {'word': u.status, 'icon': '•', 'tone': 'muted'}) %}
+    <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
+  </div>
+  {% else %}
+  <div class="empty">no work orders to measure</div>
+  {% endfor %}
+</div>
+
+{# Said on the page, not only in the docs: this figure is the only number on screen and
+   a subscription user reading it as an invoice is the likeliest misreading. #}
+<p class="sub" style="margin-top: 14px;">
+  Anthropic list prices, as a common unit for comparing a cache-read token with an output
+  token — not a bill. Read back from Claude Code's own session transcripts; Jarvis stores
+  no usage of its own, so a work order whose transcript has been pruned reads “—” rather
+  than zero.
+</p>
+
+{% endblock %}

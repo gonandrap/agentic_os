@@ -241,6 +241,39 @@ def _digest_credit() -> str:
     return digest.skill_attribution()
 
 
+def fmt_tok(n: int | None) -> str:
+    """Token counts, at the magnitude a reader actually compares — 1.3M, 47k, 812.
+
+    Mirrors `cli._tok`, deliberately as a second small implementation rather than an
+    import: the CLI's is a private helper of a module the UI has no other reason to
+    load, and the shared thing here is a formatting convention, not behaviour.
+    """
+    if not n:
+        return "0"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
+
+
+def wo_cost(wo_id: str, project: str) -> dict | None:
+    """One work order's spend, or None if it cannot be measured or read.
+
+    NEVER RAISES, and that is the whole contract. This is a read of Claude Code's
+    transcripts — files Jarvis does not own, that it prunes on its own schedule, and
+    whose format is not Jarvis's to guarantee. The work order page has to render when a
+    worker is blocked on a gate, and a page that 500s because a JSONL file moved would
+    take that decision surface down with it. None means "no figure to show" and the
+    template simply omits the line.
+    """
+    try:
+        units = ops.cost_report(target=wo_id, project=project)["units"]
+    except Exception:  # noqa: BLE001 — see docstring
+        return None
+    return units[0] if units and units[0].get("found") else None
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None)
 
@@ -258,6 +291,7 @@ def create_app() -> FastAPI:
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         fo_status_meta=FO_STATUS_META, level_tone=LEVEL_TONE, fmt_age=fmt_age,
         instance=instance_badge(),
+        fmt_tok=fmt_tok,
     )
 
     def render(request: Request, template: str, active: str = "dashboard",
@@ -422,7 +456,25 @@ def create_app() -> FastAPI:
                                               questions=ops.neo_question_texts(wo_id)),
                       debug=show_debug, debug_count=count_debug(events),
                       messages=messages, assumptions=assumptions,
-                      approvals=approvals)
+                      approvals=approvals, cost=wo_cost(wo_id, pname))
+
+    @app.get("/cost", response_class=HTMLResponse)
+    def cost_page(request: Request, project: str = ""):
+        """What the fleet's work cost, dearest first — the dashboard half of `jarvis cost`.
+
+        Its own page rather than a column on the dashboard: this reads and parses every
+        session transcript Claude Code still holds (~0.4s for a fleet of sixty), and the
+        dashboard re-reads itself every 15 seconds. Spend is a question someone asks
+        deliberately, not one worth paying for on every pulse.
+        """
+        try:
+            report = ops.cost_report(project=project or None)
+        except ops.OpsError as e:
+            return render(request, "error.html", message=str(e))
+        return render(request, "cost.html", active="cost", report=report,
+                      units=report["units"], totals=report["totals"],
+                      project=project,
+                      projects=sorted(ops.registered_project_paths()))
 
     @app.get("/inbox", response_class=HTMLResponse)
     def inbox(request: Request):
