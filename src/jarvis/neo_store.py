@@ -125,6 +125,11 @@ ADDED_COLUMNS = {
         # exists for, so they must not be exempt from it.
         "attempts": "INTEGER NOT NULL DEFAULT 0",
         "claimed_at": "REAL",
+        # The dashboard's shortened rendering of an over-long question, as JSON — see
+        # `jarvis.digest`. NULL means "never attempted", which is what every row that
+        # predates this feature is, and what the daemon looks for. It is a DISPLAY
+        # artefact: nothing that reaches Neo, a worker or a learning is built from it.
+        "digest": "TEXT",
     },
     "learnings": {
         "seat": "TEXT NOT NULL DEFAULT ''",
@@ -249,6 +254,42 @@ class NeoStore:
             "UPDATE questions SET status=?, answer_reason=COALESCE(NULLIF(?,''), answer_reason) WHERE id=?",
             (status, reason, question_id),
         )
+
+    # -- digests (the dashboard's shortened rendering — see `jarvis.digest`) ----
+
+    def set_digest(self, question_id: int, digest: str) -> None:
+        """Record the digest, or the recorded failure to produce one.
+
+        Either way the column stops being NULL, which is what takes the row out of
+        `questions_needing_digest`. Writing the failure is deliberate: see
+        `digest.encode_failure`.
+        """
+        self.conn.execute("UPDATE questions SET digest=? WHERE id=?",
+                          (digest, question_id))
+
+    def questions_needing_digest(self, min_chars: int,
+                                 limit: int = 20) -> list[dict[str, Any]]:
+        """Long questions the user will actually be shown, that nobody has digested yet.
+
+        THE STATUS FILTER IS THE COST CONTROL. A digest is one extra model call, so only
+        the questions that reach a human's eyes on the `/neo` page earn one: the ones
+        escalated to them, the ones that failed, and the answers awaiting their review.
+        A question still `queued` or `answering` is deliberately excluded — it renders as
+        a 160-character line in the in-flight strip and is about to change status anyway.
+
+        Newest first: the questions the user is looking at now are the ones worth
+        spending the call on if the batch is capped.
+        """
+        return db.rows_to_dicts(self.conn.execute(
+            """SELECT * FROM questions
+                WHERE digest IS NULL
+                  AND LENGTH(question) >= ?
+                  AND (status IN ('escalated', 'failed')
+                       OR (status = 'answered' AND answered_by = 'neo'
+                           AND review_status = 'unreviewed'))
+             ORDER BY ts DESC LIMIT ?""",
+            (min_chars, limit),
+        ).fetchall())
 
     def purge_work_order(self, wo_id: str) -> int:
         """Forget the questions asked by a deleted work order.
@@ -460,3 +501,29 @@ class NeoStore:
             "SELECT * FROM learnings ORDER BY ts DESC LIMIT ?", (limit,)
         ).fetchall()
         return db.rows_to_dicts(rows)
+
+    # -- export ------------------------------------------------------------------
+
+    #: The tables `export` dumps, in the order they appear in the document.
+    EXPORT_TABLES = ("questions", "learnings", "panel_opinions")
+
+    def export(self) -> dict[str, list[dict[str, Any]]]:
+        """The whole ledger: every table, every row, every column, no truncation.
+
+        Prime directive 1 forbids reading `neo.db` directly, so this is the only way
+        anything outside the OS gets at Neo's record — the panel eval replaying the
+        question corpus is the first caller (`jarvis neo export --json`).
+
+        `SELECT *` rather than a hand-written column list is deliberate. A column added
+        to any of these tables ships in the export the day it lands, instead of being
+        silently dropped until someone notices the field they wanted was never there.
+
+        The document carries NO wall-clock field and every table is ordered by `id`, so
+        two consecutive exports of an unchanged database are byte-identical and a diff
+        between two of them shows only what actually changed.
+        """
+        return {
+            table: db.rows_to_dicts(
+                self.conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall())
+            for table in self.EXPORT_TABLES
+        }

@@ -6,6 +6,7 @@ notification inbox, the backlog (with dependencies), and the knowledge base.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,58 @@ from .paths import central_db_path, ensure_home
 # Tag marking knowledge mirrored out of a Claude Code memory file rather than typed
 # by a worker via `jarvis learn add`.
 MEMORY_TAG = "claude-memory"
+
+# Tag marking knowledge that is injected into every worker prompt in full, instead of
+# only as a headline in the index. Reserved for safety rails a worker must not be able
+# to miss by failing to search.
+PINNED_TAG = "pinned"
+
+# How much of an entry survives into the index line. Long enough for a full short
+# learning (most are one sentence), short enough that 40 of them cost ~1.5k tokens.
+HEADLINE_CHARS = 160
+
+
+def split_tags(tags: str) -> list[str]:
+    return [t for t in (s.strip() for s in (tags or "").split(",")) if t]
+
+
+def has_tag(tags: str, tag: str) -> bool:
+    return tag in split_tags(tags)
+
+
+def headline(content: str, limit: int = HEADLINE_CHARS) -> str:
+    """One-line gist of an entry: its first line, truncated.
+
+    Mirrored memory files are whole documents; taking the first line keeps a 4 KB entry
+    from costing 4 KB in an index whose entire point is to be cheap.
+    """
+    text = " ".join((content or "").strip().split("\n", 1)[0].split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+@dataclass
+class KnowledgeBrief:
+    """What a worker prompt says about the knowledge base.
+
+    Deliberately *not* the knowledge itself: `pinned` carries full text for the few
+    entries that were curated as unmissable, `digest` carries headlines + ids so the
+    worker can fetch what it needs, and `overflow` names the topics that did not fit
+    so nothing is silently invisible.
+    """
+    project: str
+    total: int = 0
+    pinned: list[dict[str, Any]] = field(default_factory=list)
+    digest: list[dict[str, Any]] = field(default_factory=list)
+    overflow: list[tuple[str, int]] = field(default_factory=list)
+
+    @property
+    def overflow_count(self) -> int:
+        return sum(n for _, n in self.overflow)
+
+    def __bool__(self) -> bool:
+        return self.total > 0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -329,15 +382,165 @@ class CentralStore:
         ).fetchall()
         return db.rows_to_dicts(rows)
 
-    def search_knowledge(self, term: str, limit: int = 50) -> list[dict[str, Any]]:
+    def get_knowledge(self, kid: str) -> dict[str, Any] | None:
+        """One entry by id — what an index headline cashes in to. Retired entries are
+        returned carrying their retirement metadata; the caller marks them."""
+        row = self.conn.execute("SELECT * FROM knowledge WHERE id=?", (kid,)).fetchone()
+        return dict(row) if row else None
+
+    def search_knowledge(self, term: str, limit: int = 50, project: str | None = None,
+                         topic: str | None = None) -> list[dict[str, Any]]:
         """Free-text search. The AUDIT surface: retired entries are included, carrying
-        their `retired_at` and `retired_reason`."""
-        like = f"%{term}%"
-        rows = self.conn.execute(
-            "SELECT * FROM knowledge WHERE content LIKE ? OR topic LIKE ? OR tags LIKE ? ORDER BY ts DESC LIMIT ?",
-            (like, like, like, limit),
-        ).fetchall()
-        return db.rows_to_dicts(rows)
+        their `retired_at` and `retired_reason`.
+
+        Also the worker's on-demand retrieval verb, which is why retired rows stay in:
+        a worker that looked something up and got nothing back would conclude the OS
+        knows nothing about it, when the truth is that it knew and changed its mind.
+        The row says which, and `cli.cmd_learn` marks it. `project` scopes to that
+        project + global; omit it to search the whole fleet (cross-project learnings
+        are often the point).
+
+        **Words are ORed and the result is ranked by how many of them a row matched**,
+        rather than the whole term being one `LIKE '%…%'`. A single word behaves exactly
+        as it always did; the difference is a query like "cents rounding format", which
+        under phrase matching required that literal string and so returned nothing at
+        all. That is how real agents search — the retrieval eval
+        (evals/llm/test_knowledge_retrieval_judgment.py) scored 2/7 on phrase matching
+        purely because natural multi-word queries retrieved nothing — and an index whose
+        lookup verb only answers single keywords is not a lookup verb.
+
+        Still substring matching per word, so it has no stemming and no synonyms:
+        "rounding" does not find "rounded" on its own, it survives only by riding along
+        with the other words in the query. FTS5 is the real fix and is on the backlog.
+        """
+        words = [w for w in (term or "").split() if w] or [""]
+        # score = how many of the query's words this row matched anywhere
+        score = " + ".join(
+            "(CASE WHEN content LIKE ? OR topic LIKE ? OR tags LIKE ? THEN 1 ELSE 0 END)"
+            for _ in words)
+        params: list[Any] = []
+        for w in words:
+            params += [f"%{w}%"] * 3
+        q = [f"SELECT *, ({score}) AS _score FROM knowledge WHERE _score > 0"]
+        if project is not None:
+            q.append("AND (project=? OR project='')")
+            params.append(project)
+        if topic is not None:
+            q.append("AND topic=?")
+            params.append(topic)
+        q.append("ORDER BY _score DESC, ts DESC LIMIT ?")
+        params.append(limit)
+        rows = db.rows_to_dicts(self.conn.execute(" ".join(q), params).fetchall())
+        for row in rows:  # ranking is how the list is ordered, not a field of an entry
+            row.pop("_score", None)
+        return rows
+
+    def set_knowledge_tags(self, kid: str, tags: str) -> dict[str, Any] | None:
+        self.conn.execute("UPDATE knowledge SET tags=? WHERE id=?", (tags, kid))
+        return self.get_knowledge(kid)
+
+    def pin_knowledge(self, kid: str, pinned: bool = True) -> dict[str, Any] | None:
+        """Add/remove the `pinned` tag — the switch between 'injected in full into every
+        worker prompt' and 'a headline in the index'."""
+        row = self.get_knowledge(kid)
+        if row is None:
+            return None
+        tags = split_tags(row["tags"])
+        if pinned and PINNED_TAG not in tags:
+            tags.append(PINNED_TAG)
+        elif not pinned and PINNED_TAG in tags:
+            tags.remove(PINNED_TAG)
+        return self.set_knowledge_tags(kid, ",".join(tags))
+
+    def count_knowledge(self, project: str, include_retired: bool = False) -> int:
+        retired = "" if include_retired else " AND retired_at IS NULL"
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS n FROM knowledge WHERE (project=? OR project=''){retired}",
+            (project,),
+        ).fetchone()
+        return int(row["n"])
+
+    def knowledge_topics(self, project: str | None = None,
+                         include_retired: bool = False) -> list[tuple[str, int]]:
+        """(topic, count) for a project + global entries, biggest topic first.
+
+        Retired entries are excluded by default: this feeds both the prompt's overflow
+        roll-call and `jarvis learn topics`, and a topic whose only entries were
+        retracted should not advertise itself as somewhere to go looking.
+        """
+        conds, params = [], []
+        if project is not None:
+            conds.append("(project=? OR project='')")
+            params.append(project)
+        if not include_retired:
+            conds.append("retired_at IS NULL")
+        q = "SELECT topic, COUNT(*) AS n FROM knowledge"
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        q += " GROUP BY topic ORDER BY n DESC, topic"
+        return [(r["topic"], int(r["n"]))
+                for r in self.conn.execute(q, params).fetchall()]
+
+    def knowledge_brief(self, project: str, pinned_limit: int = 8,
+                        digest_limit: int = 40,
+                        digest_chars: int = 4000) -> KnowledgeBrief:
+        """Build the bounded prompt view of the knowledge base.
+
+        Cost is capped by `pinned_limit` + `digest_chars` no matter how large the base
+        grows; what does not fit degrades to a topic roll-call rather than disappearing.
+
+        This is a PROMPT feed, so it inherits `relevant_knowledge`'s rule: retired
+        entries never appear. An index headline is still the prompt — retracting a
+        ruling has to remove it from the map as well as from the payload, or the worker
+        reads the superseded headline and goes looking for the entry behind it.
+        """
+        brief = KnowledgeBrief(project=project, total=self.count_knowledge(project))
+        if brief.total == 0:
+            return brief
+
+        rows = db.rows_to_dicts(self.conn.execute(
+            "SELECT * FROM knowledge WHERE (project=? OR project='')"
+            " AND retired_at IS NULL ORDER BY ts DESC",
+            (project,),
+        ).fetchall())
+
+        rest: list[dict[str, Any]] = []
+        for row in rows:
+            if has_tag(row["tags"], PINNED_TAG) and len(brief.pinned) < pinned_limit:
+                brief.pinned.append(row)
+            else:
+                rest.append(row)
+
+        # Selection is round-robin across topics, not straight recency. The index is a
+        # map of what the OS knows; letting the one busiest topic consume the whole
+        # budget would hide the existence of every other topic — and "I didn't know
+        # there was anything to look up" is the exact failure this replaces.
+        by_topic: dict[str, list[dict[str, Any]]] = {}
+        for row in rest:  # rest is already recency-ordered, so each bucket is too
+            by_topic.setdefault(row["topic"], []).append(row)
+
+        selected: list[dict[str, Any]] = []
+        spent = 0
+        full = False
+        while not full and any(by_topic.values()):
+            for bucket in by_topic.values():
+                if not bucket:
+                    continue
+                line = headline(bucket[0]["content"])
+                if len(selected) >= digest_limit or spent + len(line) > digest_chars:
+                    full = True
+                    break
+                spent += len(line)
+                selected.append({**bucket.pop(0), "headline": line})
+
+        # Render grouped: recency picks *what* is shown, topic decides *where* it sits.
+        order = {t: i for i, t in enumerate(by_topic)}
+        brief.digest = sorted(selected, key=lambda r: (order[r["topic"]], -r["ts"]))
+        brief.overflow = sorted(
+            ((t, len(rows)) for t, rows in by_topic.items() if rows),
+            key=lambda kv: (-kv[1], kv[0]),
+        )
+        return brief
 
     # -- os state ----------------------------------------------------------------------
 

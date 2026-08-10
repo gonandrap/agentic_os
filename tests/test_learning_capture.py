@@ -180,7 +180,7 @@ def test_worker_prompt_points_memory_at_the_knowledge_base(project):
     from jarvis.dispatch import build_worker_prompt
 
     spec = ProjectSpec(name="proj_a", path=project, description="")
-    prompt = build_worker_prompt({"id": "wo-1", "title": "t", "description": "d"}, spec, [])
+    prompt = build_worker_prompt({"id": "wo-1", "title": "t", "description": "d"}, spec)
     assert "jarvis learn add" in prompt
     lowered = prompt.lower()
     assert "memory" in lowered
@@ -196,9 +196,13 @@ def test_captured_learning_is_offered_to_the_next_worker(wo, project, memory_dir
     central = CentralStore()
     try:
         rows = central.relevant_knowledge("proj_a", limit=8)
+        # a mirrored memory file is a whole document, so the next worker gets it as an
+        # indexed headline it can pull in full — not pasted into its prompt
+        brief = central.knowledge_brief("proj_a")
     finally:
         central.close()
     assert any("PRs #1-#2 are unmerged." in r["content"] for r in rows)
+    assert any(k["topic"] == "project_tesis" for k in brief.digest)
 
 
 def test_timeline_renders_the_capture(wo, project, memory_dir):

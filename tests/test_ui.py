@@ -373,6 +373,76 @@ def test_neo_tab_review_flow(client, daemon, project):
     assert "Always CSV" in page.text
 
 
+#: A question of the shape that made this necessary — Neo question #53 was ~7,000
+#: characters of feature-order brief, rendered inline, and the user could not keep up.
+LONG_QUESTION = ("Should the exporter emit CSV or JSON, given the constraints below? "
+                 * 30)
+
+
+def test_neo_tab_shortens_an_over_long_question_and_keeps_the_full_text_one_click_away(
+        client, daemon, project):
+    """The whole feature, end to end, with its control.
+
+    The page must show the SHORTENED question — and the verbatim text must still be
+    reachable from it. Asserting only the first half cannot tell "correctly shortened"
+    from "the question was lost", which is the failure that would actually hurt: the
+    user reviews Neo's answers from this page, and an answer to a question they can no
+    longer read is not reviewable.
+    """
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], LONG_QUESTION)
+    daemon._neo_drain()                 # answered, awaiting the user's review
+    daemon.digest_tick()
+    daemon.digest_pool.shutdown(wait=True)
+
+    page = client.get("/neo").text
+    assert "digest of:" in page                       # the shortened rendering
+    assert "cut down to the decision" in page            # ...and it says that it is one
+    assert "i-have-adhd" in page                      # attribution for the style
+    # THE CONTROL: the verbatim question is on the page, inside the disclosure.
+    assert "Full question context sent to Neo" in page
+    body = page.split("Full question context sent to Neo", 1)[1]
+    assert LONG_QUESTION.strip() in body
+    assert f"Work order: {wo['id']}" in body          # the prompt Neo got, not just the text
+
+
+def test_neo_tab_shows_a_short_question_in_full_and_still_offers_the_disclosure(
+        client, daemon, project):
+    """No digest, no loss: a question under the threshold renders exactly as it did
+    before this existed. The disclosure is there anyway — it carries the work-order
+    context, which the page never shows otherwise, and a control that appears only
+    sometimes is not one the reader learns to trust."""
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "CSV or JSON?")
+    daemon._neo_drain()
+    daemon.digest_tick()
+    daemon.digest_pool.shutdown(wait=True)
+
+    page = client.get("/neo").text
+    assert "CSV or JSON?" in page
+    assert "digest of:" not in page
+    assert "cut down to the decision" not in page   # nothing was, so the page says nothing
+    assert "Full question context sent to Neo" in page
+
+
+def test_neo_tab_falls_back_to_the_full_question_when_the_digest_failed(
+        client, daemon, project):
+    """A recorded digest failure must render as today's page, not as a blank box."""
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], LONG_QUESTION + " FORCE_DIGEST_FAIL")
+    daemon._neo_drain()
+    daemon.digest_tick()
+    daemon.digest_pool.shutdown(wait=True)
+
+    page = client.get("/neo").text
+    assert LONG_QUESTION.strip() in page
+    assert "digest of:" not in page
+    assert "cut down to the decision" not in page
+
+
 def test_neo_tab_escalation_answer_flow(client, daemon, project):
     wo = ops.create_work_order("proj_a", "prod thing")
     daemon.tick()
@@ -388,6 +458,62 @@ def test_neo_tab_escalation_answer_flow(client, daemon, project):
         assert any("Wait for the window" in c for c in contents)
     finally:
         store.close()
+
+
+def test_neo_tab_shows_panel_deliberation_collapsed(client, daemon, project):
+    """The deliberation is on the page the user already reads, folded shut.
+
+    A tab of its own would be a new place to spend exactly the attention the panel
+    exists to protect, so this is a `<details>` on `/neo` and nothing more.
+
+    The marker is "Panel deliberation", NOT the bare word "panel": `neo.html` has used
+    a CSS class named `panel` for its generic box since long before this existed, so a
+    test keyed on that string would pass against an unchanged template.
+    """
+    from jarvis.neo_store import NeoStore
+
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "CSV or JSON?")
+    daemon._neo_drain()
+
+    before = client.get("/neo").text
+    assert "Panel deliberation" not in before      # no opinions ⇒ no block at all
+
+    neo = NeoStore()
+    try:
+        neo.record_opinion(1, "premise", reply="the question is real", verdict="",
+                           route="panel", model="sonnet", latency_ms=311)
+        neo.record_opinion(1, "blast", reply="CSV is reversible", verdict="answer",
+                           status="abstained", model="opus", latency_ms=812)
+    finally:
+        neo.close()
+
+    page = client.get("/neo").text
+    assert "Panel deliberation" in page
+    assert "<details" in page
+    for seat in ("premise", "blast"):
+        assert seat in page
+    assert "311ms" in page and "812ms" in page
+    assert "abstained" in page
+    assert "the question is real" in page          # the seat's raw reply, on demand
+
+
+def test_neo_tab_labels_a_seat_scoped_learning(client):
+    """Unlabelled, a learning only one seat reads would display as a rule the whole of
+    Neo follows — the opposite of what it is."""
+    from jarvis.neo_store import NeoStore
+
+    neo = NeoStore()
+    try:
+        neo.add_learning("A grep naming shipit ships nothing", seat="blast")
+        neo.add_learning("Prefer uv over pip")
+    finally:
+        neo.close()
+    page = client.get("/neo").text
+    assert "blast seat" in page
+    # the control: the global row is on the same page and carries no seat label
+    assert "Prefer uv over pip" in page
 
 
 def test_neo_teach_directly(client):
@@ -1131,3 +1257,26 @@ def test_the_attention_strip_links_a_rolled_up_feature_to_its_page(client, daemo
 
     assert f'/fo/proj_a/{fo["id"]}' in page
     assert "1 of its work orders need you" in page
+def test_knowledge_page_pin_toggle(client):
+    """Pinning is the switch between 'in every worker prompt verbatim' and 'an index
+    line the worker looks up' — so it has to be operable without touching SQLite."""
+    from jarvis.central_store import PINNED_TAG, CentralStore, has_tag
+
+    central = CentralStore()
+    row = central.add_knowledge("never deploy on a Friday", project="proj_a",
+                                topic="deploy")
+
+    page = client.get("/knowledge")
+    assert "never deploy on a Friday" in page.text
+    assert row["id"] in page.text            # the id the worker would `learn show`
+    assert "index" in page.text.lower()      # the page explains the new contract
+
+    r = client.post("/knowledge/pin", data={"kn_id": row["id"], "pinned": "1"})
+    assert r.status_code == 303
+    fresh = central.get_knowledge(row["id"])
+    assert fresh is not None and has_tag(fresh["tags"], PINNED_TAG)
+    assert "unpin" in client.get("/knowledge").text
+
+    client.post("/knowledge/pin", data={"kn_id": row["id"], "pinned": "0"})
+    fresh = central.get_knowledge(row["id"])
+    assert fresh is not None and not has_tag(fresh["tags"], PINNED_TAG)

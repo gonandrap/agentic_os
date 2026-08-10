@@ -267,6 +267,28 @@ elif "-p" in argv and "--resume" not in argv:
     # verdict driven by the prompt so tests control escalation.
     prompt = argv[argv.index("-p") + 1]
     system = opt("--append-system-prompt", "")
+    # A DASHBOARD DIGEST, AND IT COMES FIRST FOR THE SAME REASON THE SEAT BRANCH DOES:
+    # the call is identified by its system prompt, never by the user prompt — which is
+    # the worker's question verbatim, so a digest of a gate question would otherwise
+    # fall through to the gate branch below and answer with a verdict.
+    if "# Jarvis dashboard digest" in system:
+        if "FORCE_DIGEST_FAIL" in prompt:
+            sys.stderr.write("digest call failed (test-forced)\n"); sys.exit(1)
+        if "FORCE_DIGEST_GARBAGE" in prompt:
+            # No `headline`: the shape the validator must refuse. `structured.request`
+            # retries once and then raises, which is what the daemon records.
+            print(json.dumps({"result": json.dumps({"bullets": ["a", "b"]})}))
+            sys.exit(0)
+        head = prompt.strip().splitlines()[0][:80]
+        print(json.dumps({"result": json.dumps({
+            "headline": f"digest of: {head}",
+            # Seven, so a test can prove the FIVE-item cap is enforced in the validator
+            # and not merely requested in the prompt.
+            "bullets": [f"point {i}" for i in range(1, 8)],
+            "options": ["option A — cheap", "option B — thorough"],
+            "recommendation": "option A",
+        })}))
+        sys.exit(0)
     # A PANEL SEAT, AND THIS BRANCH COMES FIRST DELIBERATELY. Seat identity travels in
     # --append-system-prompt, never in the user prompt: a premise-seat call on a gate
     # question carries "PRIVILEGED ACTION REQUEST" in its prompt, so without this the
@@ -301,6 +323,9 @@ elif "-p" in argv and "--resume" not in argv:
                 reply["verdict"] = "dismiss"
             elif "FORCE_PROPOSE_APPROVE" in prompt:
                 reply["verdict"] = "approve"
+            if "FORCE_FRAME_ESCALATE" in prompt:
+                reply = {"escalate": True, "answer": "", "route": "panel",
+                         "reason": "test-forced escalation on the framing"}
         elif seat == "chair":
             reply = {"escalate": False, "answer": f"synthesised decision on: {tail}",
                      "reason": "the panel's verdict"}
@@ -312,10 +337,33 @@ elif "-p" in argv and "--resume" not in argv:
             elif "FORCE_CHAIR_DISMISS" in prompt:
                 reply["verdict"] = "dismiss"
         else:
-            # The three seats that arrive with the next work order: no verdict shape of
-            # their own yet, but a distinct reply so "the seats deliberated" is provable.
-            reply = {"escalate": False, "answer": f"{seat}-finding for: {tail}",
-                     "reason": f"{seat} finding"}
+            # `record`, `blast` and `taste`. No verdict of their own — the arbitration
+            # reads `escalate`, `veto` and `contradiction`, never a verdict — but a reply
+            # that differs per seat, so "the seats deliberated" is provable rather than
+            # assumed.
+            #
+            # NO SEAT NAME APPEARS IN ANY OF THESE, and for these three that is
+            # load-bearing twice over: the delivered message must name no seat, AND a
+            # forced escalation delivers the forcing seat's own `reason` verbatim, so a
+            # canned reason reading "blast finding" would fail the no-leak assertion for
+            # the fake's prose instead of for the code's.
+            finding = {"record": "what was already settled",
+                       "blast": "what it costs if wrong",
+                       "taste": "what the user meant"}[seat]
+            reply = {"escalate": False, "answer": f"{finding}, for: {tail}",
+                     "reason": f"a reading of {finding}"}
+            if seat == "blast" and "FORCE_RADIUS_ESCALATE" in prompt:
+                reply = {"escalate": True, "veto": False, "answer": "",
+                         "reason": "test-forced escalation on the cost of being wrong"}
+            elif seat == "blast" and "FORCE_RADIUS_VETO" in prompt:
+                reply = {"escalate": False, "veto": True, "answer": "",
+                         "reason": "test-forced veto of the proposal on the table"}
+            elif seat == "record" and "FORCE_LEDGER_CONTRADICTION" in prompt:
+                reply = {"escalate": False, "contradiction": "unresolvable", "answer": "",
+                         "reason": "test-forced unresolvable contradiction"}
+            elif seat == "taste" and "FORCE_INTENT_ESCALATE" in prompt:
+                reply = {"escalate": True, "veto": True, "answer": "",
+                         "reason": "test-forced objection that must force nothing"}
         print(json.dumps({"result": json.dumps(reply)}))
         sys.exit(0)
     if "FORCE_FAIL" in prompt:

@@ -144,10 +144,18 @@ jarvis neo retract <id> --reason "…"       # retire a ruling the user has REVE
                                            # contradicts something they told you before.
 jarvis inbox / jarvis inbox ack [id]
 jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--force]
-jarvis learn add "insight" [--project p] / list [--project p] / search <term>
+jarvis learn add "insight" [--project p] [--pin] / search <term> [--project p]
+jarvis learn show <kn-id> / list [--topic t] / topics / pin <id> / unpin <id>
+                                           # worker prompts carry an INDEX of the
+                                           # knowledge base (headline + id, bounded);
+                                           # workers fetch full text on demand.
+                                           # `pin` = ride along verbatim in every
+                                           # prompt — safety rails only.
 jarvis learn retract <id> --reason "…"     # same for the knowledge base: retire a
                                            # superseded entry so it stops reaching
-                                           # workers, without erasing that it was true
+                                           # workers — it leaves the index too, not
+                                           # just the payload — without erasing that
+                                           # it was true
 jarvis bug report "title" -d "..." -e "expected" -a "actual" [--steps "..."]
                                            # a bug in the OS itself -> GitHub issue on
                                            # the (PUBLIC) tracker + Telegram ping.
@@ -155,6 +163,17 @@ jarvis bug report "title" -d "..." -e "expected" -a "actual" [--steps "..."]
 jarvis doctor [project] [--repair]         # check the OS's own post-conditions;
                                            # read-only unless --repair. The daemon runs
                                            # the same checks every reconcile tick.
+jarvis cost [project|wo-id|fo-id]          # what the work cost in tokens, read back
+                                           # from Claude Code's transcripts (the OS
+                                           # stores no usage of its own). A feature
+                                           # order rolls up its planner AND children —
+                                           # the planner is usually the dearest session
+                                           # of an unfinished one. Breaks out the
+                                           # RE-WRITE TAX: every turn after the first
+                                           # re-sends the whole conversation at the
+                                           # cache-WRITE rate, ~12% of fleet spend.
+                                           # Dollars are list prices, a common unit for
+                                           # comparing token kinds — not a bill.
 jarvis adopt <path>                        # migrate a project into the OS
 jarvis ui                                  # dashboard at http://127.0.0.1:8787
 ```

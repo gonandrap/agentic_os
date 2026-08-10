@@ -2,12 +2,13 @@
 
 Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
+  jarvis cost [project|wo-id|fo-id]       what the work has cost in tokens
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
   jarvis fo create|list|show|plan|approve|cancel        feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
-  jarvis neo list|show|review|answer|learnings|learn
+  jarvis neo list|show|review|answer|learnings|learn|export
   jarvis backlog add|list|promote|done
-  jarvis learn add|list|search
+  jarvis learn add|list|search|show|topics|pin|unpin
   jarvis notify / jarvis inbox
   jarvis bug report                       file a Jarvis OS bug (GitHub issue + ping)
   jarvis ui                               web dashboard
@@ -30,6 +31,27 @@ def _print(data: Any, as_json: bool) -> None:
         print(json.dumps(data, indent=2, default=str))
     else:
         _pretty(data)
+
+
+def _with_readable_digest(q: dict[str, Any]) -> dict[str, Any]:
+    """A Neo question row with its dashboard digest decoded, for HUMAN output only.
+
+    `questions.digest` holds JSON, and printing it as one long line is the opposite of
+    what a digest is for. Decoded into a nested block when there is one, replaced by the
+    recorded reason when the attempt failed, dropped entirely when it was never
+    attempted. `--json` never comes through here: a row dump is the row as stored.
+    """
+    from . import digest as digest_mod
+
+    row = dict(q)
+    view = digest_mod.decode(row.get("digest"))
+    failed = digest_mod.failure_reason(row.get("digest"))
+    row.pop("digest", None)
+    if view:
+        row["digest (dashboard only — Neo read the question above in full)"] = view
+    elif failed:
+        row["digest"] = f"(not produced: {failed})"
+    return row
 
 
 def _pretty(data: Any, indent: int = 0) -> None:
@@ -63,6 +85,18 @@ def _age(ts: float | None) -> str:
     if delta < 129600:
         return f"{delta / 3600:.1f}h"
     return f"{delta / 86400:.1f}d"
+
+
+def _stamp(ts: float | None) -> str:
+    """An absolute local timestamp, for records read as a ledger rather than a feed.
+
+    `_age` answers "is this stale?" and is right for anything in flight. A learning is
+    not in flight: what a reader wants of it is WHEN it was recorded, so they can line
+    it up against the decision that produced it.
+    """
+    if not ts:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
 STATUS_ICON = {
@@ -114,6 +148,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--repair", action="store_true",
                     help="apply the repairs instead of only reporting them")
     sp.add_argument("--catalog", help="catalog to read the fleet from")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("cost", help="what the fleet's work has cost in tokens")
+    sp.add_argument("target", nargs="?",
+                    help="a project, a work-order id, or a feature-order id "
+                         "(default: the whole fleet)")
+    sp.add_argument("--limit", type=int, default=50,
+                    help="work orders per project to measure (default: 50)")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
@@ -357,12 +399,29 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--project", default="", help="omit for a global learning")
     k.add_argument("--topic", default="")
     k.add_argument("--tags", default="")
-    k = kn.add_parser("list")
-    k.add_argument("--project")
-    k = kn.add_parser("search")
+    k.add_argument("--pin", action="store_true",
+                   help="inject this entry verbatim into every worker prompt "
+                        "(reserve for safety rails; everything else is looked up)")
+    k = kn.add_parser("list", help="headlines only unless --full")
+    k.add_argument("--project", help="this project + global entries")
+    k.add_argument("--topic")
+    k.add_argument("--full", action="store_true", help="full text instead of headlines")
+    k.add_argument("--limit", type=int, default=100)
+    k = kn.add_parser("search", help="full text of entries matching a term")
     k.add_argument("term")
+    k.add_argument("--project", help="this project + global entries")
+    k.add_argument("--topic")
+    k.add_argument("--limit", type=int, default=20)
+    k = kn.add_parser("show", help="full text of specific entries, by id")
+    k.add_argument("ids", nargs="+")
+    k = kn.add_parser("topics", help="topics and how many entries each holds")
+    k.add_argument("--project")
+    k = kn.add_parser("pin", help="always inject this entry in full")
+    k.add_argument("kn_id")
+    k = kn.add_parser("unpin", help="demote to an index headline")
+    k.add_argument("kn_id")
     k = kn.add_parser("retract", help="retire a superseded entry (kept for the record, "
-                                      "dropped from worker prompts)")
+                                      "dropped from worker prompts and the index)")
     k.add_argument("knowledge_id")
     k.add_argument("--reason", required=True,
                    help="what supersedes it — this is kept beside the entry for ever")
@@ -374,15 +433,27 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--all", action="store_true", help="include reviewed items")
     n = ne.add_parser("show", help="one question with Neo's full answer")
     n.add_argument("question_id", type=int)
+    n.add_argument("--panel", action="store_true",
+                   help="also show how the panel deliberated: one line per seat")
     n = ne.add_parser("review", help="approve or correct one of Neo's answers")
     n.add_argument("question_id", type=int)
     n.add_argument("--correct", metavar="FEEDBACK",
                    help="reject the answer and teach Neo what you would have said")
+    n.add_argument("--seat", metavar="NAME", default="",
+                   help="teach only this panel seat, not all of them (the seat must "
+                        "have opined on this question — see `neo show --panel`)")
     n = ne.add_parser("answer", help="answer a question Neo escalated to you")
     n.add_argument("question_id", type=int)
     n.add_argument("text")
     n = ne.add_parser("learnings", help="what Neo has learned from your reviews")
     n.add_argument("--project", default="")
+    n.add_argument("--seat", metavar="NAME", default="",
+                   help="also show learnings scoped to this panel seat (global rows "
+                        "alone are shown without it)")
+    n.add_argument("--json", action="store_true", help="machine-readable output")
+    n = ne.add_parser("export", help="Neo's whole ledger as one document: every "
+                                     "question, learning and panel opinion")
+    n.add_argument("--json", action="store_true", help="machine-readable output")
     n = ne.add_parser("learn", help="teach Neo directly (no question needed)")
     n.add_argument("content")
     n.add_argument("--project", default="")
@@ -540,6 +611,59 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 print(f"    → {'fixed' if res['repair'] else 'would fix'}: {v['repair']}")
     _print_orphans(orphans)
     return 1
+
+
+def _tok(n: int) -> str:
+    """Token counts, at the magnitude a reader can hold in their head."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
+
+
+def cmd_cost(args: argparse.Namespace) -> int:
+    from . import ops
+    target = args.target
+    # One argument, three kinds of thing. Ids are prefixed and projects are not, so
+    # this never has to guess: anything that is not `wo-…`/`fo-…` is a project name.
+    is_id = bool(target) and target.split("-")[0] in ("wo", "fo")
+    res = ops.cost_report(project=None if is_id else target,
+                          target=target if is_id else None, limit=args.limit)
+    if args.json:
+        _print(res, True)
+        return 0
+
+    units = res["units"]
+    totals = res["totals"]
+    if not units:
+        print(f"no work orders found for {res['scope']}")
+        return 0
+    header = f"{res['scope']} — {res['measured']} measured"
+    if res["unmeasured"]:
+        header += f", {res['unmeasured']} with no transcript left"
+    print(f"{header}\n")
+    print(f"{'$':>7} {'turns':>5} {'output':>7} {'re-write':>9}  work order")
+    for u in units:
+        if not u["found"]:
+            print(f"{'—':>7} {'—':>5} {'—':>7} {'—':>9}  {u['id']}  {u['title'][:44]}")
+            continue
+        print(f"{u['list_cost_usd']:>7.2f} {u['turns']:>5} "
+              f"{_tok(u['output']):>7} {_tok(u['rewrite_excess']):>9}  "
+              f"{u['id']}  {u['title'][:44]}")
+
+    print(f"\ntotal ~${totals['list_cost_usd']:.2f} at list prices "
+          f"({_tok(totals['billed_input'])} in, {_tok(totals['output'])} out)")
+    if totals["rewrite_excess"]:
+        print(f"  re-write tax  ~${totals['rewrite_cost_usd']:.2f} — "
+              f"{_tok(totals['rewrite_excess'])} tokens re-sent across "
+              f"{totals['resume_boundaries']} turn boundaries")
+    if totals["subagent_cost_usd"]:
+        print(f"  subagents     ~${totals['subagent_cost_usd']:.2f}")
+    # Said every time, not in the help text: the figure is the only number on screen,
+    # and a subscription user reading it as an invoice is the likeliest misreading.
+    print("\nList prices, as a common unit for comparing token kinds — not a bill.")
+    return 0
 
 
 def _print_orphans(orphans: list[dict]) -> None:
@@ -888,22 +1012,62 @@ def cmd_backlog(args: argparse.Namespace) -> int:
 
 
 def cmd_learn(args: argparse.Namespace) -> int:
-    from .central_store import CentralStore
+    from .central_store import PINNED_TAG, CentralStore, has_tag, headline, split_tags
+    from .ops import OpsError
+
+    def digested(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Index form: enough to decide whether to fetch the entry, not the entry.
+
+        `retired` rides along because `list` is an audit surface that shows retracted
+        entries: a headline is short enough to be mistaken for standing advice, so the
+        one field that says otherwise has to survive the truncation.
+        """
+        out = []
+        for r in rows:
+            row = {"id": r["id"], "project": r["project"] or "global", "topic": r["topic"],
+                   "pinned": has_tag(r["tags"], PINNED_TAG),
+                   "headline": headline(r["content"])}
+            if r.get("retired_at"):
+                row["retired"] = r["retired_reason"] or "(no reason recorded)"
+            out.append(row)
+        return out
+
     central = CentralStore()
     try:
         if args.kn_cmd == "add":
+            tags = split_tags(args.tags)
+            if args.pin and PINNED_TAG not in tags:
+                tags.append(PINNED_TAG)
             _print(central.add_knowledge(args.content, project=args.project,
-                                         topic=args.topic, tags=args.tags), args.json)
+                                         topic=args.topic, tags=",".join(tags)), args.json)
         elif args.kn_cmd == "list":
-            # An audit surface, so retired entries are listed too — `--project` would
-            # otherwise hide them, `search_knowledge` already shows them, and the same
-            # command answering two different questions is worse than either.
-            rows = (central.relevant_knowledge(args.project, limit=100,
-                                               include_retired=True)
-                    if args.project else central.search_knowledge("", limit=100))
-            _print(rows, args.json)
+            # An audit surface, so retired entries are listed too — `search_knowledge`
+            # is the unfiltered read, and `digested` marks what was retracted so a
+            # headline cannot pass for standing advice.
+            rows = central.search_knowledge("", limit=args.limit, project=args.project,
+                                            topic=args.topic)
+            _print(rows if args.full else digested(rows), args.json)
         elif args.kn_cmd == "search":
-            _print(central.search_knowledge(args.term), args.json)
+            rows = central.search_knowledge(args.term, limit=args.limit,
+                                            project=args.project, topic=args.topic)
+            if not rows and not args.json:
+                print(f"no knowledge matching {args.term!r} — "
+                      f"try `jarvis learn topics` for what is recorded")
+            _print(rows, args.json)
+        elif args.kn_cmd == "show":
+            rows = [r for r in (central.get_knowledge(i) for i in args.ids) if r]
+            missing = set(args.ids) - {r["id"] for r in rows}
+            if missing:
+                raise OpsError(f"unknown knowledge id(s): {', '.join(sorted(missing))}")
+            _print(rows, args.json)
+        elif args.kn_cmd == "topics":
+            _print([{"topic": t or "(no topic)", "entries": n}
+                    for t, n in central.knowledge_topics(args.project)], args.json)
+        elif args.kn_cmd in ("pin", "unpin"):
+            row = central.pin_knowledge(args.kn_id, pinned=args.kn_cmd == "pin")
+            if row is None:
+                raise OpsError(f"unknown knowledge id {args.kn_id!r}")
+            _print(row, args.json)
         elif args.kn_cmd == "retract":
             try:
                 row = central.retract_knowledge(args.knowledge_id, args.reason)
@@ -949,23 +1113,49 @@ def cmd_neo(args: argparse.Namespace) -> int:
         neo = NeoStore()
         try:
             q = neo.get(args.question_id)
+            # Read the deliberation only when it is asked for. Panel opinions are
+            # inspectable on demand and never pushed, and that starts here: without
+            # `--panel` the document is exactly the question record, so nothing
+            # consuming it starts carrying deliberation it never asked to see.
+            opinions = neo.opinions(args.question_id) if q and args.panel else []
         finally:
             neo.close()
         if q is None:
             print(f"error: neo question {args.question_id} not found", file=sys.stderr)
             return 1
-        _print(q, args.json)
+        # `--json` gets the row exactly as it is stored; the human rendering gets the
+        # dashboard digest decoded rather than as one long line of JSON.
+        row = q if args.json else _with_readable_digest(q)
+        if not args.panel:
+            _print(row, args.json)
+        elif args.json:
+            _print({**q, "panel_opinions": opinions}, True)
+        else:
+            _print(row, False)
+            print("\nPanel deliberation:")
+            for o in opinions:
+                route = f" route={o['route']}" if o["route"] else ""
+                print(f"  {o['seat']:<8} {o['status']:<9} "
+                      f"verdict={o['verdict'] or '—':<9} "
+                      f"{o['latency_ms']}ms{route}")
+            if not opinions:
+                print("  no panel ran on this question — Neo answered it single-agent")
     elif args.neo_cmd == "review":
         _print(ops.neo_review(args.question_id, approved=args.correct is None,
-                              feedback=args.correct or ""), args.json)
+                              feedback=args.correct or "", seat=args.seat or ""),
+               args.json)
     elif args.neo_cmd == "answer":
         _print(ops.neo_answer_escalated(args.question_id, args.text), args.json)
     elif args.neo_cmd == "learnings":
+        # The seat scope is additive and the default is NARROW: no `--seat` shows the
+        # global rows alone, exactly as Neo's own single-agent prompt sees them.
+        ops.validate_seat(args.seat or "")
         neo = NeoStore()
         try:
             # An audit surface: retired learnings are listed, marked, and shown with the
             # reason they were retired. Neo's PROMPT gets the filtered default.
-            rows = neo.learnings(args.project, limit=200, include_retired=True)
+            rows = neo.learnings(args.project, limit=200, seat=args.seat or "",
+                                 include_retired=True)
         finally:
             neo.close()
         if args.json:
@@ -976,10 +1166,13 @@ def cmd_neo(args: argparse.Namespace) -> int:
                 retired = (f" [retired: {r['retired_reason']}]"
                            if r["retired_at"] else "")
                 bullet = "⊘" if r["retired_at"] else "•"
-                print(f"{bullet} #{r['id']} [{scope}] ({r['source']}) "
-                      f"{r['content']}{retired}")
+                seat = f" · {r['seat']} seat" if r["seat"] else ""
+                print(f"{bullet} #{r['id']} {_stamp(r['ts'])} [{scope}{seat}] "
+                      f"({r['source']}) {r['content']}{retired}")
             if not rows:
                 print("Neo has no learnings yet — review its answers to teach it")
+    elif args.neo_cmd == "export":
+        _print(ops.neo_export(), args.json)
     elif args.neo_cmd == "learn":
         neo = NeoStore()
         try:
@@ -1110,6 +1303,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_status(args)
         if args.cmd == "doctor":
             return cmd_doctor(args)
+        if args.cmd == "cost":
+            return cmd_cost(args)
         if args.cmd == "adopt":
             return cmd_adopt(args)
         if args.cmd == "wo":

@@ -129,6 +129,12 @@ class NeoConfig:
     # Filed as bl-9a925d2e. Do not quietly start honouring it: a knob nobody could use
     # that suddenly bites changes live Neo behaviour under cover of an unrelated change.
     timeout: int = 300
+    # Which model shortens an over-long question for the dashboard (`jarvis.digest`).
+    # A cheap one on purpose: the digest is display-only — it never reaches Neo, a
+    # worker or a learning — so this is a formatting job, not a judgement one.
+    # SET IT TO "" TO TURN DIGESTING OFF: no model named, no call made, and the page
+    # falls back to rendering every question in full, which is what it did before.
+    digest_model: str = "haiku"
     panel: PanelConfig = field(default_factory=PanelConfig)
 
 
@@ -145,7 +151,11 @@ class OsConfig:
     # Where notification deep links point. Empty = http://127.0.0.1:<ui_port>;
     # set it when the UI is reachable under another host (tunnel, LAN, reverse proxy).
     ui_base_url: str = ""
-    knowledge_inject_limit: int = 8
+    # Knowledge reaches workers as an index they query on demand, so prompt cost stays
+    # flat as the base grows. Only entries tagged `pinned` are pasted in full.
+    knowledge_inject_limit: int = 8      # max pinned entries injected verbatim
+    knowledge_digest_limit: int = 40     # max index lines
+    knowledge_digest_chars: int = 4000   # hard char budget for those lines
     neo: NeoConfig = field(default_factory=NeoConfig)
 
 
@@ -242,6 +252,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         model=neo_raw.get("model", "opus"),
         learnings_limit=int(neo_raw.get("learnings_limit", 50)),
         timeout=int(neo_raw.get("timeout", 300)),
+        digest_model=str(neo_raw.get("digest_model", "haiku")),
         panel=_parse_panel(neo_raw.get("panel", {})),
     )
 
@@ -255,7 +266,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         telegram_chat_id_env=telegram.get("chat_id_env", "JARVIS_TELEGRAM_CHAT_ID"),
         ui_port=ui.get("port", 8787),
         ui_base_url=str(ui.get("base_url", "") or "").rstrip("/"),
-        knowledge_inject_limit=os_raw.get("knowledge_inject_limit", 8),
+        knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
+        knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 40)),
+        knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 4000)),
         neo=neo_cfg,
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:

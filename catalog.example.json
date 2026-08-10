@@ -14,12 +14,17 @@
       }
     },
     "ui": { "port": 8787, "base_url": "http://127.0.0.1:8787" },
+    "$comment_knowledge": "worker prompts get an INDEX of the knowledge base and fetch entries on demand; inject_limit caps the entries pinned in verbatim",
     "knowledge_inject_limit": 8,
+    "knowledge_digest_limit": 40,
+    "knowledge_digest_chars": 4000,
     "neo": {
       "$comment": "Neo answers worker questions on your behalf; review its answers in the UI's neo tab",
       "enabled": true,
       "model": "opus",
-      "learnings_limit": 50
+      "learnings_limit": 50,
+      "$comment_digest": "which model shortens an over-long question for the neo tab; \"\" turns it off and every question renders in full",
+      "digest_model": "haiku"
     }
   },
   "projects": [

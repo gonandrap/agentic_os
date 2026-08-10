@@ -1,7 +1,7 @@
 # Jarvis OS codebase map
 
 `jarvis-os` Python package, stdlib-only core (argparse + sqlite3 + json). Source in
-`src/jarvis/`, 23 modules. Read this instead of re-exploring the tree.
+`src/jarvis/`, 24 modules. Read this instead of re-exploring the tree.
 
 ## Modules (responsibility — key symbols — intra-package imports)
 
@@ -39,7 +39,11 @@
 
 **Storage (import only `db` + `paths`):**
 - `central_store.py` — OS-wide DB. `CentralStore`:63, `upsert_project()`:75, `add_inbox()`:103,
-  `add_backlog()`/`list_backlog()`:158/179, `relevant_knowledge()`:226, `get_state`/`set_state`:250/244.
+  `add_backlog()`/`list_backlog()`, `relevant_knowledge()`, `get_state`/`set_state`.
+  Knowledge reaches prompts as a bounded INDEX, never as content: `headline()`,
+  `KnowledgeBrief`, `knowledge_brief()` (pinned tier + topic-round-robin index +
+  overflow roll-call, all excluding retired entries), `get_knowledge()`,
+  `pin_knowledge()`, `knowledge_topics()`.
 - `project_store.py` — per-project DB + the WO state machine. `WO_STATUSES`:16,
   `OPEN_STATUSES`:26, `ProjectStore`:110, `create_work_order()`:133, `claim_next_pending()`:207,
   `set_status()`:235, `add_event()`:282, `delete_work_order()`:258.
@@ -47,6 +51,17 @@
   `review()`:153, `add_learning()`/`learnings()`:166/175.
 
 **Adapters:**
+- `digest.py` — shorten an over-long worker question for the `/neo` page. One strict-JSON
+  call (`structured.request`, `attempts=2`) whose system prompt is the vendored
+  `i-have-adhd` output style (`assets/digest/`, MIT — NOT under `assets/agents|skills/`,
+  which bootstrap copytrees into every project). `summarise()`, `validate()`,
+  `needs_digest()`, `MIN_CHARS = 800`, `encode`/`decode`/`encode_failure`,
+  `DIGEST_HEADER` (the test fake keys on it). DISPLAY ONLY: nothing here reaches Neo, a
+  worker or a learning, so a bad digest costs a confusing paragraph and never a decision;
+  every failure path ends with the full question rendered. Produced asynchronously by
+  `Daemon.digest_tick`/`_digest_batch` into `questions.digest`, one attempt per question
+  ever (a recorded failure is what stops the retry loop). Off with
+  `os.neo.digest_model = ""`. Covered by `tests/test_digest.py`.
 - `bootstrap.py` — make a project OS-ready (settings injection, gitignore, README/OPERATION.md,
   workspace trust, `.jarvis/`). `bootstrap_project()`:226, `build_settings()`:66,
   `settings_drift()`:76, `deep_merge()`:50, `BootstrapReport`:38, `TEMPLATE_VERSION = 2`:24.
@@ -86,7 +101,8 @@
   `mem:work-order-lifecycle`.
 - `dispatch.py` — composes what the worker is TOLD (prompt, settings, resolved
   model/effort/permission mode) and hands the running of it to `worker_session`.
-  `dispatch_work_order()`, `build_worker_prompt()`, `_write_worker_settings()`,
+  `dispatch_work_order()`, `build_worker_prompt()`, `_planner_prompt()`,
+  `_common_briefing()`, `render_knowledge_block()`, `_write_worker_settings()`,
   `worker_name()`.
 - `ops.py` (620 L) — business logic shared by CLI and UI. `start_os()`:63,
   `create_work_order()`:261, `finish()`:374, `find_work_order()`:281, `os_status()`:142, `OpsError`:31.
