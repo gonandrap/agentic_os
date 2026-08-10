@@ -20,12 +20,10 @@ user as an attention item.
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from typing import Any
 
-from . import claude_cli
+from . import claude_cli, structured
 from .neo_store import NeoStore
 
 log = logging.getLogger("neo")
@@ -47,10 +45,44 @@ Rules:
 - ESCALATE (do not answer) when the question involves: production systems or live
   credentials; spending money; deleting or publishing anything; legal/people matters;
   or a genuine preference you have no learning about and cannot infer.
-- Output STRICT JSON, nothing else:
-  {"escalate": false, "answer": "<the decision, addressed to the worker>", "reason": "<one line why>"}
+
+LENGTH IS CAPPED. The user reads these answers to stay across the fleet, so an
+answer they will not finish is an answer that did not land.
+- When you AGREE with what the worker recommended: name the option and give ONE LINE
+  of explanation. Nothing more. Do not restate their reasoning back at them.
+- When you OVERRIDE the worker — a different option, or conditions attached — you get
+  AT MOST 50 WORDS of explanation in total, however many points you are making.
+- `reason` is always one line, on answers and escalations alike.
+- These are budgets for your EXPLANATION, not for the decision: state every call the
+  worker asked you to make. Cut the justification, never the answer.
+- The worker can ask again. A follow-up costs it about a minute; an answer the user
+  skims past costs more. Say so if you cut something they may need.
+- EXEMPT from the budgets: wording a learning below requires you to state VERBATIM.
+  When a learning fixes the words, quote them in full and do not count it against the
+  50 words — a budget that silently truncates a phrase the user mandated is worse than
+  no budget.
+
+WHEN THE LEDGER CONTRADICTS ITSELF, DISPATCH A CLEANUP. The learnings below and the
+project knowledge base are the OS's memory, and they are append-only: a superseded
+ruling stays visible next to the one that replaced it until someone writes the
+correction. If, while answering, you find that two entries genuinely conflict, or that
+one is stale, or that the worker's question only arose because the record is unclear,
+add a `dispatch` object to your JSON. That files a work order to fix the record, ALREADY
+APPROVED by you — the worker it goes to will not come back to ask whether it may.
+- Only for a contradiction you can point at. Not for a gap, not for a record you merely
+  wish were fuller, and never as a way to defer the question you were actually asked.
+- Answer the worker's question in `answer` regardless. The cleanup is separate work.
+- `description` is the whole brief: which entries conflict, quoted; which one the user
+  actually settled on and when; what the corrected record should say. The cleanup
+  worker sees only that text. The remedy is to APPEND a superseding entry — the stores
+  have no retraction — so say plainly what it should say.
+
+Output STRICT JSON, nothing else:
+  {"escalate": false, "answer": "<the decision, addressed to the worker — 1 line of explanation if you agree with its recommendation, 50 words max if you override it>", "reason": "<one line why>"}
   or
-  {"escalate": true, "answer": "", "reason": "<one line why the user must decide>"}"""
+  {"escalate": true, "answer": "", "reason": "<one line why the user must decide>"}
+Either may carry one optional cleanup dispatch:
+  "dispatch": {"title": "<short: which record is wrong>", "description": "<the full brief>"}"""
 
 
 def build_system_prompt(store: NeoStore, project: str, learnings_limit: int = 50,
@@ -58,13 +90,17 @@ def build_system_prompt(store: NeoStore, project: str, learnings_limit: int = 50
     """Persona + learnings. Byte-stable across questions (per project and kind) so
     consecutive headless calls of the same kind share a cached prompt prefix.
 
-    Approval requests get the gate-reviewer persona instead of the answerer one: the
-    general persona is told to escalate anything that publishes or touches production,
-    which is right for open questions and would send every release straight to the user.
+    Each kind gets its own persona, and for the same reason in both cases: the general
+    answerer persona is told to escalate anything that publishes or touches production,
+    which is right for open questions and would send every release — and every plan
+    whose children mention shipping — straight to the user, which is the attention cost
+    both features exist to remove.
     """
     from .gates import REVIEWER_PERSONA
+    from .plans import PLAN_REVIEWER_PERSONA
 
-    persona = REVIEWER_PERSONA if kind == "approval" else PERSONA
+    persona = {"approval": REVIEWER_PERSONA, "plan": PLAN_REVIEWER_PERSONA}.get(
+        kind, PERSONA)
     parts = [persona, "", "# Learnings (from the user's reviews of your past answers)"]
     rows = store.learnings(project, limit=learnings_limit)
     if not rows:
@@ -86,31 +122,100 @@ def build_question_prompt(q: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+# What Neo may write in `verdict`, and the status it means. Both the bare verb and the
+# past participle are accepted: the persona asks for "approve", the database stores
+# "approved", and a model that writes the other one is not making a mistake worth
+# escalating over.
+_VERDICT_ALIASES = {
+    "approve": "approved", "approved": "approved",
+    "deny": "denied", "denied": "denied", "reject": "denied", "rejected": "denied",
+    "dismiss": "dismissed", "dismissed": "dismissed",
+}
+
+
+def _gate_verdict(data: dict[str, Any]) -> str:
+    """The gate verdict Neo reached: `approved`, `denied` or `dismissed`.
+
+    Reads the `verdict` field, falling back to the older boolean `approve`. The fallback
+    is not politeness — it is required during a release. Neo's persona lives in the
+    deployed code but its LEARNINGS live in the production state directory, so the two
+    can disagree across an upgrade in either direction: a Neo still emitting the old
+    shape must keep working, and a `verdict` this build did not expect must not silently
+    open a gate.
+
+    Anything unrecognised falls back to the boolean, which defaults to False. Output that
+    says nothing intelligible therefore denies rather than approves: the only way through
+    a gate is an explicit yes.
+    """
+    raw = data.get("verdict")
+    if isinstance(raw, str):
+        verdict = _VERDICT_ALIASES.get(raw.strip().lower())
+        if verdict:
+            return verdict
+    return "approved" if bool(data.get("approve", False)) else "denied"
+
+
+def parse_dispatch(data: Any) -> dict[str, str] | None:
+    """Normalise the optional `dispatch` block — Neo filing a pre-approved work order
+    to correct a self-contradicting ledger (see PERSONA).
+
+    A dispatch with no title is dropped rather than guessed at: the title is what the
+    user sees in `jarvis wo list`, and "(untitled)" work orders appearing on their own
+    is how a helpful feature becomes noise.
+    """
+    if not isinstance(data, dict):
+        return None
+    title = str(data.get("title") or "").strip()
+    if not title:
+        return None
+    return {"title": title[:200],
+            "description": str(data.get("description") or "").strip()}
+
+
+def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalise a parsed Neo reply into the verdict dict, or raise.
+
+    `escalate` is the field that says this is a Neo verdict at all rather than some other
+    JSON object the model happened to emit, so its absence is a bad shape, not a default.
+    """
+    if "escalate" not in data:
+        raise structured.InvalidOutput("no `escalate` field in Neo's reply")
+    verdict = _gate_verdict(data)
+    return {
+        "escalate": bool(data.get("escalate")),
+        "answer": str(data.get("answer") or ""),
+        "reason": str(data.get("reason") or ""),
+        "verdict": verdict,
+        "approve": verdict == "approved",
+        "dispatch": parse_dispatch(data.get("dispatch")),
+    }
+
+
+def _unparseable_verdict(raw: str) -> dict[str, Any]:
+    """The fail-safe: output Neo cannot be held to becomes an escalation to the user.
+
+    Deliberately NOT a retry. An answer nobody can read must never reach a worker as an
+    answer, and asking again would spend a call to find that out — so this path fails
+    toward the user's attention, which is the failure the OS can recover from.
+    """
+    return {"escalate": True, "answer": "", "approve": False, "verdict": "denied",
+            "dispatch": None,
+            "reason": f"unparseable Neo output: {(raw or '')[:120]}"}
 
 
 def parse_verdict(raw: str) -> dict[str, Any]:
     """Parse Neo's strict-JSON reply, tolerating fenced or chatty output.
     Unparseable output is treated as an escalation — never deliver garbage.
 
-    `approve` carries the verdict on an approval request. It defaults to False, so
-    output that omits it never opens a gate: the only way through is an explicit yes.
+    `verdict` carries the ruling on an approval request; `approve` is kept alongside it
+    as the boolean the old contract used, so callers that only ask "did this open a
+    gate" still read correctly. Note that a dismissal leaves `approve` False: it clears
+    the command without authorising anything, and code that conflates the two would put
+    an approval back into the audit trail.
+
+    `dispatch` is absent on almost every answer; None means "nothing to clean up".
     """
-    m = _JSON_RE.search(raw or "")
-    if m:
-        try:
-            data = json.loads(m.group(0))
-            if isinstance(data, dict) and "escalate" in data:
-                return {
-                    "escalate": bool(data.get("escalate")),
-                    "answer": str(data.get("answer") or ""),
-                    "reason": str(data.get("reason") or ""),
-                    "approve": bool(data.get("approve", False)),
-                }
-        except json.JSONDecodeError:
-            pass
-    return {"escalate": True, "answer": "", "approve": False,
-            "reason": f"unparseable Neo output: {(raw or '')[:120]}"}
+    return structured.coerce(raw, _validate_verdict, on_invalid=_unparseable_verdict)
 
 
 def answer_question(store: NeoStore, q: dict[str, Any], model: str,
@@ -131,21 +236,35 @@ def answer_question(store: NeoStore, q: dict[str, Any], model: str,
 
 
 def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
-                deliver: Any = None, max_questions: int = 50) -> list[dict[str, Any]]:
+                deliver: Any = None, max_questions: int = 50,
+                answer: Any = None) -> list[dict[str, Any]]:
     """Answer every queued question in FIFO order, back-to-back.
 
     `deliver(question, verdict)` is called per question with the outcome — the
     daemon uses it to route answers to workers and escalations to the user. The
     drain is sequential BY DESIGN: ordering + tight spacing keep Neo's shared
     prompt prefix warm in the Anthropic cache.
+
+    `answer(store, question, model, learnings_limit) -> verdict` is HOW a question gets
+    answered, defaulting to `answer_question` — one headless call, one agent. It is the
+    seam the multi-agent panel is injected through (`daemon._neo_drain` passes
+    `panel.decide` bound to the catalog when the panel is enabled).
+
+    THE SEAM IS A KEYWORD RATHER THAN AN IMPORT, AND THAT IS THE WHOLE POINT. The design
+    says "`answer_question` becomes a caller of the panel" and "if the panel's first seat
+    fails, fall back to today's single-agent path" — which taken literally is `neo`
+    importing `panel` while `panel` imports `neo`, an import cycle in a codebase that has
+    none. This module must never know that panels exist; falling back to the single agent
+    is then simply not passing `answer=`.
     """
+    answer = answer or answer_question
     results = []
     for _ in range(max_questions):
         q = store.claim_next()
         if q is None:
             break
         try:
-            verdict = answer_question(store, q, model, learnings_limit)
+            verdict = answer(store, q, model, learnings_limit)
         except claude_cli.ClaudeCliError as e:
             log.error("neo failed answering question %s: %s", q["id"], e)
             store.mark(q["id"], "failed", reason=str(e))
@@ -159,12 +278,14 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             store.mark(q["id"], "escalated", reason=verdict["reason"])
             log.info("neo escalated question %s: %s", q["id"], verdict["reason"])
         else:
-            # An approval's decision lives in `approve`, not in prose. Record it as the
-            # answer too so `jarvis neo show` and the review surfaces read plainly.
-            answer = verdict["answer"]
-            if q.get("kind") == "approval":
-                answer = "APPROVED" if verdict.get("approve") else "DENIED"
-            store.record_answer(q["id"], answer, answered_by="neo",
+            # `text`, not `answer`: `answer` is the injected answerer above, and rebinding
+            # it here made the second question of every drain call a string.
+            text = verdict["answer"]
+            if q.get("kind") in ("approval", "plan"):
+                # A ruling lives in `verdict`, not in prose. Record it as the answer too
+                # so `jarvis neo show` and the review surfaces read plainly.
+                text = (verdict.get("verdict") or "denied").upper()
+            store.record_answer(q["id"], text, answered_by="neo",
                                 reason=verdict["reason"])
             log.info("neo answered question %s (%s)", q["id"], q.get("kind") or "question")
         if deliver:

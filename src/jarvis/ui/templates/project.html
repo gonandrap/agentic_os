@@ -3,17 +3,70 @@
 {% block content %}
 
 <h2>{{ project_name }} <span class="kv mono">{{ path }}</span></h2>
+{# Everything open that the user can act on gets a row: a decision they owe (needs
+   review, waiting on them), a running worker, a pull request waiting to be merged.
+   Only work the OS has not started yet — pending, dispatching — collapses to a count,
+   along with the settled orders that are the bulk of any project with history. Every
+   link carries the hidden flag through, so expanding a group does not silently undo
+   "show hidden too". #}
+{% set collapsed = '/project/' + project_name + ('?hidden=1' if show_hidden else '') %}
+{% set keep = '&hidden=1' if show_hidden else '' %}
+{% macro count_line(groups) %}
+  {% for status, n in groups %}
+    {%- set word = status_meta.get(status, {}).get('word', status) -%}
+    {%- if revealed == status -%}
+      <strong>{{ n }} {{ word }}</strong> (<a href="{{ collapsed }}">collapse</a>)
+    {%- else -%}
+      <a href="/project/{{ project_name }}?show={{ status }}{{ keep }}"
+         title="Show the {{ n }} {{ word }} work order(s) as well">{{ n }} {{ word }}</a>
+    {%- endif -%}
+    {{ ' · ' if not loop.last }}
+  {% endfor %}
+{% endmacro %}
+{% if open_counts or settled %}
+<p class="sub">
+  {{ count_line(open_counts + settled) }}
+  ·
+  {% if revealed == 'all' %}
+    <a href="{{ collapsed }}">collapse them again</a>
+  {% else %}
+    <a href="/project/{{ project_name }}?show=all{{ keep }}">show all</a>
+  {% endif %}
+</p>
+{% endif %}
 <p class="sub">
   {% if show_hidden %}
     Showing hidden work orders too ·
-    <a href="/project/{{ project_name }}">hide them again</a>
+    <a href="/project/{{ project_name }}{{ '?show=' + revealed if revealed }}">hide them again</a>
   {% elif hidden_count %}
     {{ hidden_count }} hidden ·
-    <a href="/project/{{ project_name }}?hidden=1">show</a>
+    <a href="/project/{{ project_name }}?hidden=1{{ '&show=' + revealed if revealed }}">show</a>
   {% endif %}
 </p>
+{# Feature orders sit ABOVE the work orders and do not expand into their children here:
+   the children are already in the listing below as ordinary work orders, and printing
+   the same tree twice on one page is how a page stops being read. The tree is on the
+   feature's own page. #}
+{% if features %}
+<h3>Feature orders</h3>
 <div class="panel">
-  {% for wo in wos %}
+  {% for fo in features %}
+    {% set fm = fo_status_meta.get(fo.status, {'word': fo.status, 'icon': '•', 'tone': 'muted'}) %}
+    <div class="row">
+      <span class="st tone-{{ fm.tone }}"><span class="i">{{ fm.icon }}</span>{{ fm.word }}</span>
+      <div class="grow">
+        <a href="/fo/{{ project_name }}/{{ fo.id }}" class="mono">{{ fo.id }}</a> {{ fo.title }}
+        <span class="sub">{{ fo.progress.label }}</span>
+        {% if fo.needs_attention %}<div class="sub tone-warn">◭ {{ fo.attention_reason }}</div>{% endif %}
+      </div>
+      <span class="sub mono">{{ fmt_age(fo.created_at) }}</span>
+    </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="panel">
+  {% for wo in featured + rest %}
     {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
     {% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
     <div class="row">
@@ -21,6 +74,15 @@
       <div class="grow">
         <a href="/wo/{{ project_name }}/{{ wo.id }}" class="mono">{{ wo.id }}</a> {{ wo.title }}
         {% if wo.hidden %}<span class="badge outside" title="hidden">🙈 hidden</span>{% endif %}
+        {% if wo.status == 'waiting_pr_merge' and wo.pr_url %}
+          <div class="sub">⑃ <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a></div>
+        {% endif %}
+        {% if blocked.get(wo.id) %}
+          <div class="sub">⊘ blocked by:
+            {% for b in blocked[wo.id] %}<a class="mono"
+              href="/wo/{{ project_name }}/{{ b.id }}">{{ b.id }}</a> ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}
+          </div>
+        {% endif %}
         {% if wo.needs_attention %}<div class="sub tone-warn">◭ {{ wo.attention_reason }}</div>{% endif %}
       </div>
       <span class="badge {{ 'framework' if o.framework else 'outside' }}">
@@ -28,9 +90,27 @@
       <span class="sub mono">{{ fmt_age(wo.created_at) }}</span>
     </div>
   {% else %}
-    <div class="empty">no work orders yet</div>
+    <div class="empty">
+      {% if open_counts or settled %}nothing running and nothing waiting on you — the rest is counted above
+      {% else %}no work orders yet{% endif %}
+    </div>
   {% endfor %}
 </div>
+
+{# Your own Claude sessions, fetched after this page has rendered: listing them shells
+   out to the Claude CLI, and a slow or missing CLI must not hold up the work orders
+   above. Without JS the panel simply is not there — `jarvis wo inject` does the same. #}
+<div id="sessions-panel"></div>
+<noscript><p class="sub">To hand one of your own Claude sessions to Jarvis:
+  <span class="mono">jarvis wo inject &lt;session-id&gt;</span></p></noscript>
+<script>
+(function () {
+  fetch("/project/{{ project_name }}/sessions", { cache: "no-store", credentials: "same-origin" })
+    .then(function (res) { return res.ok ? res.text() : ""; })
+    .then(function (html) { document.getElementById("sessions-panel").innerHTML = html; })
+    .catch(function () { /* no panel is better than a broken page */ });
+})();
+</script>
 
 {% if backlog %}
 <h2>Open backlog for this project</h2>

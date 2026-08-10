@@ -25,16 +25,16 @@ import json
 
 import pytest
 
-from jarvis import ops
+from jarvis import db, ops
 from jarvis.hooks import handle_hook
 from jarvis.invariants import check_project, true_blockers
 from jarvis.project_store import ProjectStore
 
-from test_pipeline import _add_adhoc, started  # noqa: F401
+from test_pipeline import _add_session, _inject, started  # noqa: F401
 
 
-def _adhoc_wo(store: ProjectStore) -> dict:
-    return [w for w in store.list_work_orders() if w["origin"] == "adhoc"][0]
+def _injected_wo(store: ProjectStore) -> dict:
+    return [w for w in store.list_work_orders() if w["origin"] == "injected"][0]
 
 
 def _drop_session(fake_claude, sid: str) -> None:
@@ -53,10 +53,10 @@ def _age_out(store: ProjectStore, wo_id: str, seconds: float = 400.0) -> None:
     )
 
 
-# -- 1. an ad-hoc session is not a worker under contract ------------------------------
+# -- 1. an injected session is not a worker under contract ----------------------------
 
 
-def test_adopted_session_going_idle_is_not_held_to_the_contract(
+def test_injected_session_going_idle_is_not_held_to_the_contract(
     started, fake_claude, project
 ):
     """The user's own session ends a turn. That is not an anomaly — it is a turn ending.
@@ -66,22 +66,20 @@ def test_adopted_session_going_idle_is_not_held_to_the_contract(
     user was talking to at the time.
     """
     daemon = started
-    _add_adhoc(fake_claude, project, "working", sid="adhoc-1", name="my manual hack")
-    daemon.tick_count = 0
-    daemon.tick()
+    _inject(fake_claude, project, "working", sid="adhoc-1", name="my manual hack")
 
     store = ProjectStore(project)
     fake_claude.set_session_state("adhoc-1", "done")
     daemon.tick_count = 0
     daemon.tick()
 
-    fresh = store.get_work_order(_adhoc_wo(store)["id"])
+    fresh = store.get_work_order(_injected_wo(store)["id"])
     assert fresh["status"] == "completed"
     assert not fresh["needs_attention"]
     assert not true_blockers(store, fresh)
 
 
-def test_adopted_session_removed_from_agents_view_is_not_a_failure(
+def test_injected_session_removed_from_agents_view_is_not_a_failure(
     started, fake_claude, project
 ):
     """Deleting your own background session is a normal thing to do, not a fault.
@@ -90,12 +88,11 @@ def test_adopted_session_removed_from_agents_view_is_not_a_failure(
     user cleaned up short-lived sessions in `claude agents` after the work was done.
     """
     daemon = started
-    _add_adhoc(fake_claude, project, "working", sid="adhoc-1", name="serena-and-mode-split-1e")
-    daemon.tick_count = 0
-    daemon.tick()
+    _inject(fake_claude, project, "working", sid="adhoc-1",
+            name="serena-and-mode-split-1e")
 
     store = ProjectStore(project)
-    wo_id = _adhoc_wo(store)["id"]
+    wo_id = _injected_wo(store)["id"]
     _drop_session(fake_claude, "adhoc-1")
     _age_out(store, wo_id)
     daemon.tick_count = 0
@@ -151,9 +148,11 @@ def test_a_dispatched_worker_idle_without_finish_is_still_flagged(
     assert "without `jarvis wo finish`" in fresh["attention_reason"]
 
 
-def test_true_blockers_does_not_invent_a_contract_for_adhoc(project):
+@pytest.mark.parametrize("origin", ["injected", "adhoc"])
+def test_true_blockers_does_not_invent_a_contract(project, origin):
+    """Both the session the user handed over and the legacy one Jarvis took."""
     store = ProjectStore(project)
-    wo = store.create_work_order("a session I started myself", origin="adhoc")
+    wo = store.create_work_order("a session I started myself", origin=origin)
     store.set_status(wo["id"], "needs_review")
     assert true_blockers(store, store.get_work_order(wo["id"])) == []
 
@@ -161,20 +160,21 @@ def test_true_blockers_does_not_invent_a_contract_for_adhoc(project):
     assert true_blockers(store, store.get_work_order(wo["id"])) == []
 
 
-def test_a_blocked_adhoc_session_still_asks_for_you(project):
-    """Not everything about an ad-hoc session is noise: stuck on a prompt is real."""
+@pytest.mark.parametrize("origin", ["injected", "adhoc"])
+def test_a_blocked_session_still_asks_for_you(project, origin):
+    """Not everything about these is noise: stuck on a prompt is real."""
     store = ProjectStore(project)
-    wo = store.create_work_order("my manual hack", origin="adhoc")
+    wo = store.create_work_order("my manual hack", origin=origin)
     store.set_status(wo["id"], "waiting_input")
     assert true_blockers(store, store.get_work_order(wo["id"])) == [
         "worker is waiting on your input"
     ]
 
 
-def test_adhoc_assumptions_are_never_swallowed(project):
-    """An ad-hoc session that used `jarvis wo assume` still gets its review."""
+def test_injected_assumptions_are_never_swallowed(project):
+    """An injected session that used `jarvis wo assume` still gets its review."""
     store = ProjectStore(project)
-    wo = store.create_work_order("adopted session", origin="adhoc")
+    wo = store.create_work_order("injected session", origin="injected")
     store.add_assumption(wo["id"], "picked postgres over sqlite")
     store.set_status(wo["id"], "needs_review")
     assert true_blockers(store, store.get_work_order(wo["id"])) == [
@@ -189,10 +189,10 @@ def test_the_wreckage_already_on_disk_is_repaired(project):
     staring at the same dashboard.
     """
     store = ProjectStore(project)
-    gone = store.create_work_order("serena-and-mode-split-1e", origin="adhoc")
+    gone = store.create_work_order("serena-and-mode-split-1e", origin="injected")
     store.set_status(gone["id"], "failed")
     store.flag_attention(gone["id"], "worker session disappeared")
-    idle = store.create_work_order("adversarial design review jarvis", origin="adhoc")
+    idle = store.create_work_order("adversarial design review jarvis", origin="injected")
     store.set_status(idle["id"], "needs_review")
     store.flag_attention(idle["id"], "worker idle without `jarvis wo finish`")
 
@@ -219,23 +219,107 @@ def test_repair_is_only_proposed_when_repair_is_off(project):
     assert store.get_work_order(wo["id"])["status"] == "failed"  # untouched
 
 
+# -- 3. the sessions Jarvis adopted before it stopped adopting -------------------------
+
+
+def test_legacy_adopted_rows_are_let_go_on_upgrade(project):
+    """Rows from the auto-adoption era have nothing tracking them any more.
+
+    `Daemon.track_injected_sessions` follows `injected` rows only, so an `adhoc` row left
+    in `waiting_input` would ask the user for something forever — about a session that
+    may have ended weeks ago. "worker is waiting on your input" is a genuine blocker
+    whoever started the session, so `true_blockers` will not quieten it; the row has to
+    be closed.
+    """
+    store = ProjectStore(project)
+    blocked = store.create_work_order("my manual hack", origin="adhoc")
+    store.set_status(blocked["id"], "waiting_input")
+    store.flag_attention(blocked["id"], "session blocked (permission or input needed)")
+    live = store.create_work_order("serena-and-mode-split-1e", origin="adhoc")
+    store.set_status(live["id"], "running")
+
+    violations = check_project(store, repair=True)
+
+    assert {v.invariant for v in violations} == {"INV-ADHOC-LEGACY-RETIRED"}
+    for wo_id in (blocked["id"], live["id"]):
+        fresh = store.get_work_order(wo_id)
+        assert fresh["status"] == "completed"
+        assert not fresh["needs_attention"]
+        assert not true_blockers(store, fresh)
+        # auditable: the record says the upgrade closed it, not the session
+        why = [db.from_json(e["payload"], {}).get("why", "")
+               for e in store.list_events(wo_id) if e["kind"] == "session_retired"]
+        assert why and "issue 47" in why[0]
+    # ...and a re-run is a no-op, not a per-tick alarm
+    assert check_project(store, repair=True) == []
+
+
+def test_legacy_retirement_leaves_the_record_and_its_assumptions_alone(project):
+    """Closing the demand for the user must not close the work, or lose the history."""
+    store = ProjectStore(project)
+    pending = store.create_work_order("a session that asked something", origin="adhoc")
+    store.add_assumption(pending["id"], "picked postgres over sqlite")
+    store.set_status(pending["id"], "waiting_input")
+    kept = store.create_work_order("my manual hack", origin="adhoc")
+    store.set_status(kept["id"], "running")
+    store.record_agent_reply(kept["id"], "here is what I found")
+
+    check_project(store, repair=True)
+
+    # the one with a question outstanding is left exactly where it is: the user owes it
+    # an answer, and that is a real blocker rather than adoption noise
+    assert store.get_work_order(pending["id"])["status"] == "waiting_input"
+    assert len(store.pending_assumptions(pending["id"])) == 1
+    # the retired one keeps everything it learned
+    assert [m["content"] for m in store.list_messages(kept["id"])] == \
+        ["here is what I found"]
+
+
+def test_injected_rows_are_not_swept_up_by_the_upgrade(project):
+    """The user handed these over deliberately and they are still tracked."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("my manual hack", origin="injected")
+    store.set_status(wo["id"], "running")
+
+    assert check_project(store, repair=True) == []
+    assert store.get_work_order(wo["id"])["status"] == "running"
+
+
+def test_legacy_adopted_rows_are_not_tracked_from_the_roster(started, fake_claude,
+                                                             project):
+    """The retirement has to stick: if the tracker still followed `adhoc` rows it would
+    reopen every one whose session is still alive, on the very next tick."""
+    daemon = started
+    _inject(fake_claude, project, "working", sid="live-1")  # something to track
+    store = ProjectStore(project)
+    legacy = store.create_work_order("my manual hack", origin="adhoc")
+    store.update_work_order(legacy["id"], session_id="legacy-1")
+    store.set_status(legacy["id"], "completed")
+    _add_session(fake_claude, project, "working", sid="legacy-1", name="my manual hack")
+
+    daemon.tick_count = 0
+    daemon.tick()
+
+    assert store.get_work_order(legacy["id"])["status"] == "completed"
+
+
 def test_session_end_hook_bills_nobody(project):
     """SessionEnd is inert under headless turns, and that is load-bearing twice over.
 
     It fires at the end of every turn now, so the settlement it used to do would file a
     healthy dispatched work order for review after turn one — and it had the ad-hoc bug
     too, billing a session the user started themselves against a contract it never
-    received. Retirement is `Daemon.adopt_sessions`'s job, from the roster.
+    received. Retirement is `Daemon.track_injected_sessions`'s job, from the roster.
     """
     store = ProjectStore(project)
-    adhoc = store.create_work_order("my manual hack", origin="adhoc")
-    store.update_work_order(adhoc["id"], session_id="adhoc-1")
-    store.set_status(adhoc["id"], "running")
+    injected = store.create_work_order("my manual hack", origin="injected")
+    store.update_work_order(injected["id"], session_id="adhoc-1")
+    store.set_status(injected["id"], "running")
     dispatched = store.create_work_order("a real work order", origin="jarvis")
     store.update_work_order(dispatched["id"], session_id="wo-sess-1")
     store.set_status(dispatched["id"], "running")
 
-    for wo, sid in ((adhoc, "adhoc-1"), (dispatched, "wo-sess-1")):
+    for wo, sid in ((injected, "adhoc-1"), (dispatched, "wo-sess-1")):
         handle_hook(
             {"hook_event_name": "SessionEnd", "session_id": sid, "cwd": str(project)},
             {"JARVIS_PROJECT_PATH": str(project)},

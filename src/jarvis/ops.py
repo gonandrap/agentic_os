@@ -22,11 +22,18 @@ from .catalog import (
     load_catalog,
     worker_stalls_on_prompts,
 )
+from . import db, invariants
+from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import CentralStore
 from .daemon import daemon_running
-from .invariants import true_blockers
+from .invariants import PR_CLOSED_BLOCKER, true_blockers
 from .paths import daemon_pidfile, ensure_home, logs_dir
-from .project_store import OPEN_STATUSES, ProjectStore
+from .project_store import (
+    FO_OPEN_STATUSES,
+    FO_TERMINAL_STATUSES,
+    OPEN_STATUSES,
+    ProjectStore,
+)
 
 
 class OpsError(RuntimeError):
@@ -299,8 +306,23 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 # work order's own flag as well says the same thing twice and buries
                 # the actionable line.
                 gate_held = {a["wo_id"] for a in store.escalated_approvals()}
+                # A feature order contributes ONE line to the strip, never one per child.
+                # Its children keep their own flags — nothing is cleared, and they are
+                # right there on the feature's page — but they are rolled up here rather
+                # than listed. The comment on `waiting_pr_merge` in project_store.py
+                # articulates the fear precisely: a strip that names everything is a strip
+                # that stops being read, and a six-child feature is six lines for what the
+                # user experiences as one piece of work.
+                #
+                # This is a change to how attention is PRESENTED. `true_blockers` stays
+                # the single source of truth for whether a work order needs anyone, and
+                # `jarvis wo list` still shows every flagged child individually.
+                rolled_up: dict[str, list[dict[str, Any]]] = {}
                 for wo in flagged.values():
                     if wo["id"] in gate_held:
+                        continue
+                    if wo.get("parent_id"):
+                        rolled_up.setdefault(wo["parent_id"], []).append(wo)
                         continue
                     item = {
                         "project": p["name"], "wo_id": wo["id"],
@@ -314,14 +336,63 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     if wo["status"] == "waiting_input" and wo["session_id"]:
                         item["attach"] = f"claude --resume {wo['session_id']}"
                     attention.append(item)
+                features = store.list_feature_orders(statuses=FO_OPEN_STATUSES)
+                # Which feature orders get a line: the open ones, plus any that is asking
+                # for the user or holds a flagged child. Both additions are about the same
+                # status — `failed` is SETTLED, and it is also the one a feature order
+                # raises its own flag in and the one that always leaves flagged children
+                # behind. Scanning only the open list would drop the flag on the floor at
+                # the moment it means the most, and would let those children back into the
+                # strip individually just as the rollup was carrying the most lines.
+                by_id = {fo["id"]: fo for fo in features}
+                for fo in store.flagged_feature_orders():
+                    by_id.setdefault(fo["id"], fo)
+                for parent_id in rolled_up:
+                    if parent_id not in by_id:
+                        try:
+                            by_id[parent_id] = store.get_feature_order(parent_id)
+                        except KeyError:  # deleted out from under its children
+                            by_id[parent_id] = {}
+                for fo_id, fo in by_id.items():
+                    kids = rolled_up.get(fo_id, [])
+                    if not fo or not (fo["needs_attention"] or kids):
+                        continue
+                    reasons = []
+                    if fo["needs_attention"] and fo["attention_reason"]:
+                        reasons.append(fo["attention_reason"])
+                    if kids:
+                        reasons.append(
+                            f"{len(kids)} of its work orders need you: "
+                            + ", ".join(f"{k['id']} ({k['attention_reason']})"
+                                        for k in kids)
+                        )
+                    progress = feature_progress(store, fo)
+                    attention.append({
+                        "project": p["name"], "wo_id": None, "fo_id": fo_id,
+                        "title": fo["title"], "status": f"feature:{fo['status']}",
+                        "reason": f"{progress['label']} — " + "; ".join(reasons),
+                        "rolled_up": [k["id"] for k in kids],
+                        "decide": f"jarvis fo show {fo_id}",
+                    })
                 drift = settings_drift(path / ".claude" / "settings.json")
                 projects.append({
                     "name": p["name"], "path": p["path"],
                     "description": p["description"],
                     "summary": summary,
+                    "feature_orders": [
+                        {**{k: fo[k] for k in ("id", "title", "status",
+                                               "needs_attention", "attention_reason")},
+                         "progress": feature_progress(store, fo)}
+                        for fo in features
+                    ],
                     "open_work_orders": [
-                        {k: wo[k] for k in ("id", "title", "status", "origin",
-                                            "needs_attention", "attention_reason")}
+                        {**{k: wo[k] for k in ("id", "title", "status", "origin",
+                                               "needs_attention", "attention_reason",
+                                               "pr_url")},
+                         # Why a pending work order is not starting. Derived here, with
+                         # the store open, so every surface reading os_status gets the
+                         # same answer as `jarvis wo list` instead of deriving its own.
+                         "blocked_by": blocked_by(store, wo)}
                         for wo in open_wos
                     ],
                     "settings_drift": drift,
@@ -350,10 +421,12 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         try:
             neo_counts = neo.counts()
             for q in neo.list_questions(statuses=("escalated", "failed")):
-                if q.get("kind") == "approval":
-                    # Gate escalations get their own item below, with the command to run.
+                if q.get("kind") in ("approval", "plan"):
+                    # Both of these are reported by the thing that actually carries the
+                    # decision — the gate item below, or the feature order above.
                     # Reported here too, they would tell the user to `jarvis neo answer`
-                    # a question whose real resolution is `jarvis gate approve`.
+                    # a question whose real resolution is `jarvis gate approve` or
+                    # `jarvis fo approve`.
                     continue
                 attention.append({
                     "project": q["project"], "wo_id": q["wo_id"],
@@ -367,11 +440,17 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         # Gates Neo sent up. These are the only approval requests that cost the user
         # anything: the rest were decided without them, which is the point.
         gate_items = []
+        # Gate requests that turned out not to be gated actions at all. Reported as a
+        # number and never as an attention item: a classifier defect is the OS's problem,
+        # not the user's, but the rate is the one signal that says whether the
+        # recognisers are getting better.
+        false_positives = 0
         for name, path in registered_project_paths().items():
             if not path.is_dir():
                 continue
             store = ProjectStore(path)
             try:
+                false_positives += store.dismissed_count()
                 for a in store.escalated_approvals():
                     gate_items.append({
                         "project": name, "wo_id": a["wo_id"],
@@ -399,7 +478,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             },
             "backlog": {"open": len(backlog_open)},
             "neo": neo_counts,
-            "gates": {"awaiting_you": len(gate_items)},
+            "gates": {"awaiting_you": len(gate_items),
+                      "false_positives": false_positives},
             "healthy": pid is not None and not attention,
         }
     finally:
@@ -421,7 +501,8 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       origin: str = "jarvis", model: str | None = None,
                       effort: str | None = None, permission_mode: str | None = None,
                       append_system_prompt: str | None = None,
-                      backlog_id: str | None = None) -> dict[str, Any]:
+                      backlog_id: str | None = None,
+                      depends_on: list[str] | None = None) -> dict[str, Any]:
     paths = registered_project_paths()
     if project_name not in paths:
         raise OpsError(f"project {project_name!r} not registered "
@@ -432,9 +513,27 @@ def create_work_order(project_name: str, title: str, description: str = "",
             title=title, description=description, origin=origin, model=model,
             effort=effort, permission_mode=permission_mode,
             append_system_prompt=append_system_prompt, backlog_id=backlog_id,
+            depends_on=depends_on,
         )
+    except (KeyError, ValueError) as e:
+        # A dependency on a work order in another project cannot be honoured — the edge
+        # is resolved inside one project database — so say which project was searched
+        # rather than letting a bare KeyError reach the terminal as a traceback.
+        raise OpsError(f"cannot create the work order: {e} "
+                       f"(dependencies are resolved within {project_name!r})") from e
     finally:
         store.close()
+
+
+def blocked_by(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
+    """Unfinished dependencies, without a query for the overwhelming majority.
+
+    `depends_on` is already on the row, so a work order with no edges — nearly all of
+    them — is answered from memory rather than costing a lookup per listing entry.
+    """
+    if not store.dependencies(wo):
+        return []
+    return store.unfinished_dependencies(wo["id"])
 
 
 def find_work_order(wo_id: str, project_name: str | None = None
@@ -460,6 +559,163 @@ def find_work_order(wo_id: str, project_name: str | None = None
         finally:
             store.close()
     raise OpsError(f"work order {wo_id!r} not found in any registered project")
+
+
+def _project_for_cwd(cwd: str, paths: dict[str, Path]) -> str | None:
+    """Which registered project owns this directory, if any.
+
+    Longest match wins, so a project nested inside another resolves to the inner one
+    rather than to whichever happened to be checked first.
+    """
+    best: tuple[int, str] | None = None
+    for name, path in paths.items():
+        root = str(path)
+        if cwd == root or cwd.startswith(root.rstrip("/") + "/"):
+            if best is None or len(root) > best[0]:
+                best = (len(root), name)
+    return best[1] if best else None
+
+
+def injectable_sessions(project_name: str, timeout: int = 5) -> dict[str, Any]:
+    """The user's live Claude sessions under a project that Jarvis is not tracking.
+
+    Read-only, and deliberately fail-soft: this feeds a dashboard panel, and shelling out
+    to `claude agents --json` on a web request must never be the reason a page breaks. On
+    any failure it returns an `error` for the template to show inline instead of raising.
+    """
+    from . import claude_cli
+
+    paths = registered_project_paths()
+    if project_name not in paths:
+        return {"sessions": [], "error": f"project {project_name!r} is not registered"}
+    if not claude_cli.available():
+        return {"sessions": [], "error": "the `claude` CLI is not on PATH"}
+    try:
+        roster = claude_cli.list_background_sessions(timeout=timeout)
+    except claude_cli.ClaudeCliError as e:
+        return {"sessions": [], "error": f"could not list sessions: {e}"}
+
+    store = ProjectStore(paths[project_name])
+    try:
+        known = {wo["session_id"] for wo in store.list_work_orders(include_hidden=True)
+                 if wo.get("session_id")}
+    finally:
+        store.close()
+    root = str(paths[project_name])
+    return {"sessions": [
+        {"session_id": s.session_id, "bg_id": s.id, "name": s.name, "state": s.state,
+         "cwd": s.cwd, "started_at": s.started_at}
+        for s in roster
+        if s.session_id and s.session_id not in known and not s.is_finished
+        and (s.cwd == root or s.cwd.startswith(root.rstrip("/") + "/"))
+    ], "error": ""}
+
+
+def inject_session(session_id: str, project_name: str | None = None,
+                   title: str | None = None) -> dict[str, Any]:
+    """Hand a Claude session the user started over to Jarvis, as a work order.
+
+    This is the ONLY way a session the user opened enters the OS. Jarvis does not adopt
+    sessions it finds any more (GitHub issue 47): one running under a registered project
+    path is the user's private conversation until they say otherwise.
+
+    Injection creates the record and nothing else. It does not rename the session, does
+    not send it a turn, and writes nothing into it — the first write is the user's own
+    `jarvis wo send` / `jarvis wo resume-auto`, which is a separate, explicit act. From
+    here the daemon tracks the session's state (running / blocked / ended) and, exactly
+    as before, never holds it to the worker contract.
+    """
+    from . import claude_cli
+
+    if not claude_cli.available():
+        raise OpsError("the `claude` CLI is not on PATH, so its sessions cannot be read")
+    try:
+        roster = claude_cli.list_background_sessions()
+    except claude_cli.ClaudeCliError as e:
+        raise OpsError(f"could not list Claude sessions: {e}") from e
+
+    # Accept either identifier: `claude agents --json` reports both a session id and its
+    # own agent id, and the two namespaces do not overlap.
+    match = next((s for s in roster if s.session_id == session_id), None) \
+        or next((s for s in roster if s.id == session_id), None)
+    if match is None:
+        raise OpsError(
+            f"no Claude session {session_id!r} — `claude agents` lists the live ones"
+        )
+    if not match.session_id:
+        raise OpsError(f"session {session_id!r} has no session id yet; try again once "
+                       f"it has started")
+
+    paths = registered_project_paths()
+    if project_name:
+        if project_name not in paths:
+            raise OpsError(f"project {project_name!r} not registered "
+                           f"(known: {sorted(paths)})")
+        target = project_name
+    else:
+        target = _project_for_cwd(match.cwd, paths) or ""
+        if not target:
+            raise OpsError(
+                f"session {session_id!r} runs in {match.cwd!r}, which is not inside any "
+                f"registered project — pass --project to say where it belongs"
+            )
+
+    store = ProjectStore(paths[target])
+    try:
+        # Re-injecting is a no-op rather than an error: the point is that Jarvis knows
+        # about the session, and it already does. A duplicate row would split its history.
+        existing = store.find_by_session(match.session_id)
+        if existing:
+            note = f"already tracked as {existing['id']} ({existing['origin']})"
+            # Re-injecting a session that was retired when it went idle picks tracking
+            # back up. The daemon cannot do this on its own any more: it stops reading
+            # the roster once a project has no live injected session, which is what keeps
+            # `claude agents --json` off the tick for everyone who never injects.
+            if (existing["origin"] == "injected" and existing["status"] == "completed"
+                    and match.is_active):
+                store.set_status(existing["id"], "running")
+                store.add_event(existing["id"], "session_injected",
+                                {"session_id": match.session_id, "state": match.state,
+                                 "reopened": True})
+                note = f"{existing['id']} was retired when the session went idle; "
+                note += "it is running again, so tracking has resumed"
+            return {"project": target, "wo_id": existing["id"],
+                    "title": existing["title"],
+                    "status": store.get_work_order(existing["id"])["status"],
+                    "session_id": match.session_id, "already_known": True,
+                    "note": note}
+        # Mirror the session's current state, exactly as the daemon's tracker would. The
+        # status goes in at INSERT time: a row that is `pending` for even one daemon tick
+        # would be claimed and dispatched, which is a worker turn in the user's session.
+        status = ("waiting_input" if match.is_blocked
+                  else "completed" if match.is_finished else "running")
+        wo = store.create_work_order(
+            title=title or match.name or f"session {match.id}",
+            description=(
+                "A Claude session the user started themselves and handed to Jarvis "
+                "with `jarvis wo inject`. Jarvis did not dispatch it: it never received "
+                "the worker briefing, so it owes no `jarvis wo finish` and its ending is "
+                "not a failure."
+            ),
+            origin="injected",
+            status=status,
+            session_id=match.session_id,
+        )
+        store.add_event(wo["id"], "session_injected", {
+            "session_id": match.session_id, "bg_id": match.id, "cwd": match.cwd,
+            "state": match.state, "name": match.name,
+        })
+        if match.is_blocked:
+            store.flag_attention(wo["id"],
+                                 "session blocked (permission or input needed)")
+        fresh = store.get_work_order(wo["id"])
+        return {"project": target, "wo_id": fresh["id"], "title": fresh["title"],
+                "status": fresh["status"], "session_id": match.session_id,
+                "already_known": False,
+                "note": "the session was not written to — `jarvis wo send "
+                        f"{fresh['id']} \"…\"` is what starts driving it"}
+    finally:
+        store.close()
 
 
 def send_message(wo_id: str, content: str, source: str = "jarvis",
@@ -534,20 +790,43 @@ def assume(wo_id: str, content: str) -> dict[str, Any]:
     return {"project": name, "wo_id": wo_id, "recorded": content}
 
 
-def finish(wo_id: str, summary: str) -> dict[str, Any]:
+def finish(wo_id: str, summary: str, pr_url: str | None = None) -> dict[str, Any]:
+    """The worker reporting its own result.
+
+    `pr_url` is what separates "delivered" from "delivered and merged": a work order
+    that ends in a pull request is not finished until a human merges it, so it settles
+    into `waiting_pr_merge` and stays on the open list with the link, instead of going
+    to `completed` and disappearing into the settled group nobody reads. The merge is
+    what ends it: `Daemon.poll_pull_requests` watches the PR and completes the work
+    order itself, and `jarvis wo done` remains the manual exit for a PR that will never
+    merge.
+
+    Pending assumptions still outrank it: those are a decision the OS is waiting on,
+    and a PR the user merges before deciding them accepts them by the back door. That
+    makes `review_work_order` the only route back for such a work order, and it is that
+    function's job to do the parking skipped here.
+    """
     name, path, wo = find_work_order(wo_id)
     store = ProjectStore(path)
     try:
-        store.update_work_order(wo_id, result_summary=summary)
+        fields: dict[str, Any] = {"result_summary": summary}
+        if pr_url:
+            fields["pr_url"] = pr_url
+        store.update_work_order(wo_id, **fields)
         if store.pending_assumptions(wo_id):
             store.set_status(wo_id, "needs_review")
             store.flag_attention(wo_id, "assumptions pending review")
             status = "needs_review"
+        elif pr_url:
+            store.set_status(wo_id, "waiting_pr_merge")
+            store.clear_attention(wo_id)
+            status = "waiting_pr_merge"
         else:
             store.set_status(wo_id, "completed")
             store.clear_attention(wo_id)
             status = "completed"
-        store.add_event(wo_id, "finished", {"summary": summary})
+        store.add_event(wo_id, "finished", {"summary": summary,
+                                            **({"pr_url": pr_url} if pr_url else {})})
     finally:
         store.close()
     if wo.get("backlog_id") and status == "completed":
@@ -556,7 +835,143 @@ def finish(wo_id: str, summary: str) -> dict[str, Any]:
             central.mark_backlog(wo["backlog_id"], "done")
         finally:
             central.close()
-    return {"project": name, "wo_id": wo_id, "status": status}
+    return {"project": name, "wo_id": wo_id, "status": status,
+            **({"pr_url": pr_url} if pr_url else {})}
+
+
+def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """The user closing a work order themselves: "this is finished, stop tracking it".
+
+    Distinct from all three neighbours, which is why it exists. `finish` is the *worker*
+    reporting its own result and carries a summary the user does not have. `cancel` says
+    the work should not happen, which is the wrong thing to record about work that did.
+    `hide` only stops showing the record, leaving it open forever.
+
+    Two behaviours it borrows deliberately:
+
+    - It stops the worker, exactly as `cancel` does. A work order nobody is reading any
+      more must not leave a process burning tokens and editing its worktree.
+    - It refuses while assumptions are pending, exactly as `ack_attention` does. Those
+      are decisions the OS is waiting on, and closing over them would silently accept
+      them on the user's behalf. `jarvis wo review` is the way through.
+
+    An existing `result_summary` is left alone: whatever the worker last reported is
+    still the truest thing on the record, and this is not a claim about the outcome.
+    """
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        if store.pending_assumptions(wo_id):
+            raise OpsError(
+                f"{wo_id} is waiting on a decision (assumptions pending review) — "
+                f"marking it done would accept them silently. Use `jarvis wo review "
+                f"{wo_id}` to accept, or `--reject` to send it back."
+            )
+        stopped = close_out(store, wo, "marked_done", why="work order marked done")
+    finally:
+        store.close()
+    mark_backlog_done(wo)
+    return {"project": name, "wo_id": wo_id, "title": wo["title"],
+            "status": "completed", "was": wo["status"],
+            "session_stopped": stopped["stopped"]}
+
+
+def close_out(store: ProjectStore, wo: dict[str, Any], event: str, *, why: str,
+              payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Settle a work order as `completed` and take its worker down with it.
+
+    The mechanics shared by every "this is over, and it went fine" path: `jarvis wo
+    done` (the user saying so) and a merged pull request (GitHub saying so). Both end
+    the same way and must keep ending the same way — the only difference between them
+    is `event`, which is what the timeline shows for who decided.
+
+    Does NOT check pending assumptions: the two callers disagree about that. `mark_done`
+    refuses over them, because closing by hand would accept them silently; the merge
+    poller never sees one, because `finish` routes a work order with assumptions to
+    `needs_review` instead of parking it behind its PR.
+
+    Callers own the backlog side (`mark_backlog_done`), since they hold the row.
+    """
+    stopped = stop_worker_session(wo, store)
+    store.set_status(wo["id"], "completed")
+    store.clear_attention(wo["id"])
+    store.add_event(wo["id"], event, {**(payload or {}), "was": wo["status"],
+                                      "session_stopped": stopped["stopped"]})
+    if stopped["stopped"]:
+        store.add_event(wo["id"], "session_stopped",
+                        {**{k: v for k, v in stopped.items() if k != "stopped"},
+                         "reason": why})
+    return stopped
+
+
+def mark_backlog_done(wo: dict[str, Any]) -> None:
+    """Close the backlog item a work order was promoted from, if it came from one."""
+    if not wo.get("backlog_id"):
+        return
+    central = CentralStore()
+    try:
+        central.mark_backlog(wo["backlog_id"], "done")
+    finally:
+        central.close()
+
+
+def complete_merged(store: ProjectStore, wo: dict[str, Any],
+                    merged_at: str | None = None) -> dict[str, Any]:
+    """The pull request landed: end the work order, exactly as the user closing it does.
+
+    This is the whole point of polling GitHub. `jarvis wo finish --pr` parks a work
+    order in `waiting_pr_merge` precisely because the merge is the real ending, and
+    until now the OS could not see that ending happen — so every finished work order
+    sat on the open list until the user hand-typed `jarvis wo done`. On a fleet where
+    one work order can depend on another having landed, that hand-typing is the
+    schedule, which is why this had to exist before work orders could depend on
+    each other at all.
+
+    Records `pr_merged` rather than `marked_done`: the record must not claim the user
+    did something they did not do.
+    """
+    store.update_work_order(wo["id"], pr_state="MERGED")
+    stopped = close_out(store, wo, "pr_merged", why="pull request merged",
+                        payload={"pr_url": wo.get("pr_url"), "merged_at": merged_at})
+    mark_backlog_done(wo)
+    return {"wo_id": wo["id"], "status": "completed", "was": wo["status"],
+            "pr_url": wo.get("pr_url"), "merged_at": merged_at,
+            "session_stopped": stopped["stopped"]}
+
+
+def record_pr_closed(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
+    """The pull request was closed without merging: the delivered work was refused.
+
+    The opposite of `complete_merged` and not a variant of it. Nothing landed, so the
+    work order cannot be completed; and leaving it in `waiting_pr_merge` would keep it
+    in a merge queue waiting for a merge that is never coming. It goes to `needs_review`
+    and asks for the user, which is what the attention list is for — someone shut this
+    pull request on purpose and only they know whether the work should be redone,
+    redirected or dropped.
+
+    The worker is left alone: it finished long ago, and there is nothing here for it to
+    do without a human deciding what "refused" means. `jarvis wo send` restarts it if
+    the answer is "try again", `jarvis wo done` closes it if the answer is "drop it".
+    """
+    store.update_work_order(wo["id"], pr_state="CLOSED")
+    store.add_event(wo["id"], "pr_closed", {"pr_url": wo.get("pr_url"),
+                                            "was": wo["status"]})
+    store.set_status(wo["id"], "needs_review")
+    store.flag_attention(wo["id"], PR_CLOSED_BLOCKER)
+    return {"wo_id": wo["id"], "status": "needs_review", "was": wo["status"],
+            "pr_url": wo.get("pr_url")}
+
+
+def _awaiting_merge(wo: dict[str, Any]) -> bool:
+    """True when this work order's ending is still a pull request nobody has merged.
+
+    The condition for putting a work order into `waiting_pr_merge` from anywhere other
+    than `finish`. `pr_state` is what the merge poll last saw, and both of its values
+    rule the merge queue out: MERGED already ended the work order, and CLOSED means the
+    pull request is never merging — parking on a closed PR would put the work order back
+    in front of a poll whose only possible move is to flag it for the user again.
+    """
+    return bool(wo.get("pr_url")) and wo.get("pr_state") not in ("MERGED", "CLOSED")
 
 
 def stop_worker_session(wo: dict[str, Any], store: ProjectStore) -> dict[str, Any]:
@@ -698,6 +1113,42 @@ def hide_work_order(wo_id: str, hidden: bool = True,
             "hidden": bool(hidden)}
 
 
+def unblock_work_order(wo_id: str, drop_all: bool = False,
+                       project_name: str | None = None) -> dict[str, Any]:
+    """Cut the dependency edges holding a pending work order back.
+
+    By default only the edges that can never clear — a dependency cancelled, failed or
+    deleted — because those are the ones that strand it; a dependency still working is
+    doing exactly what the edge was drawn for and releasing the dependent early would
+    hand it a worktree without the code it was told to build on. `drop_all` is the
+    override for a user who wants it to run anyway, and says so.
+    """
+    from . import invariants
+
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        blockers = store.unfinished_dependencies(wo_id)
+        if not blockers:
+            raise OpsError(f"{wo_id} is not blocked by anything")
+        cut = blockers if drop_all else invariants.dead_dependencies(store, wo)
+        if not cut:
+            raise OpsError(
+                f"{wo_id} is waiting on work that is still live "
+                f"({', '.join(d['id'] for d in blockers)}), not stranded. "
+                f"Pass --all to cut those edges anyway."
+            )
+        remaining = store.drop_dependencies(wo_id, [d["id"] for d in cut])
+        # The stranding was the blocker; with the edge gone the work order is ordinary
+        # pending again, and leaving the flag up would keep asking about a settled thing.
+        if not remaining:
+            store.clear_attention(wo_id)
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "title": wo["title"],
+            "dropped": [d["id"] for d in cut], "still_blocked_by": remaining}
+
+
 def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """Erase a work order everywhere: project DB, central inbox/backlog, Neo's questions.
 
@@ -738,6 +1189,16 @@ def review_work_order(wo_id: str, accept: bool = True,
     need two more commands: it becomes a Neo learning (so the decisions the user makes
     today train the agent meant to make them tomorrow), and on a rejection it is
     delivered to the still-open worker as guidance.
+
+    Accepting settles the work order the way `finish` would have if the assumptions had
+    never existed — which for a work order behind an unmerged pull request is
+    `waiting_pr_merge`, NOT `completed`. `finish` deliberately routes a work order with
+    pending assumptions to `needs_review` even when it carries a PR (the decision
+    outranks the merge), so this review is the only route back and it owes that work
+    order the parking `finish` skipped. Completing it here loses the PR twice: off the
+    user's open list, and out of `Daemon.poll_pull_requests`, which only ever looks at
+    `waiting_pr_merge` — so the merge that should have ended the work order unattended
+    ends nothing.
     """
     name, path, wo = find_work_order(wo_id)
     store = ProjectStore(path)
@@ -745,9 +1206,11 @@ def review_work_order(wo_id: str, accept: bool = True,
         pending = store.pending_assumptions(wo_id)
         for a in pending:
             store.review_assumption(a["id"], "accepted" if accept else "rejected")
+        status = wo["status"]
         if wo["status"] == "needs_review":
             if accept:
-                store.set_status(wo_id, "completed")
+                status = "waiting_pr_merge" if _awaiting_merge(wo) else "completed"
+                store.set_status(wo_id, status)
                 store.clear_attention(wo_id)
             elif not feedback:
                 # With feedback the guidance is delivered below, so the work order is
@@ -758,7 +1221,8 @@ def review_work_order(wo_id: str, accept: bool = True,
     finally:
         store.close()
 
-    out = {"project": name, "wo_id": wo_id, "reviewed": len(pending), "accepted": accept}
+    out = {"project": name, "wo_id": wo_id, "reviewed": len(pending), "accepted": accept,
+           "status": status}
     if not feedback:
         return out
 
@@ -784,7 +1248,393 @@ def review_work_order(wo_id: str, accept: bool = True,
     return out
 
 
+# -- feature orders --------------------------------------------------------------------------
+
+def create_feature_order(project_name: str, title: str, description: str = "",
+                         origin: str = "jarvis",
+                         backlog_id: str | None = None,
+                         max_parallel: int | None = None) -> dict[str, Any]:
+    """File the coarse ask. Nothing is decomposed here — the daemon opens a planner.
+
+    Deliberately the same shape as `create_work_order`, because the whole point of the
+    `jarvis fo` surface is that a user who knows `jarvis wo` already knows it. What the
+    user types is identical; what the OS does with it is not.
+
+    `max_parallel` caps how many of this feature's children run at once. It is the USER's
+    knob, not the planner's (ruled 2026-08-03): the design calls slot budgeting the
+    planner's job, but a planner that budgets its own slots can hand itself the whole
+    project's concurrency, and it would become one more thing the plan validator has to
+    police. NULL — the default — means the project-wide `max_concurrent` is the only cap,
+    which is exactly the behaviour every feature order had before this existed.
+    """
+    paths = registered_project_paths()
+    if project_name not in paths:
+        raise OpsError(f"project {project_name!r} not registered "
+                       f"(known: {sorted(paths)}). Run `jarvis start` first.")
+    if max_parallel is not None and max_parallel < 1:
+        raise OpsError("--max-parallel must be at least 1 (omit it for no cap)")
+    if not (description or "").strip():
+        # A work order can survive a bare title — a human reads it and fills the gaps.
+        # A feature order cannot: its first reader is a planner in a fresh session with
+        # no memory of the conversation that produced it, and a planner given four words
+        # will decompose four words.
+        raise OpsError(
+            f"a feature order needs a description: the planner sees only this text, "
+            f"and it is what the whole decomposition is built from. Use "
+            f"`jarvis fo create {project_name} \"{title[:40]}\" -d \"...\"`."
+        )
+    store = ProjectStore(paths[project_name])
+    try:
+        return store.create_feature_order(title=title, description=description,
+                                          origin=origin, backlog_id=backlog_id,
+                                          max_parallel=max_parallel)
+    finally:
+        store.close()
+
+
+def find_feature_order(fo_id: str, project_name: str | None = None
+                       ) -> tuple[str, Path, dict[str, Any]]:
+    """Locate a feature order across all registered projects. Mirrors
+    `find_work_order`, including its guard: callers only catch `OpsError`, so an
+    unregistered name must not surface as a bare `KeyError`."""
+    paths = registered_project_paths()
+    if project_name and project_name not in paths:
+        raise OpsError(f"project {project_name!r} not registered "
+                       f"(known: {sorted(paths)})")
+    candidates = {project_name: paths[project_name]} if project_name else paths
+    for name, path in candidates.items():
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            return name, path, store.get_feature_order(fo_id)
+        except KeyError:
+            continue
+        finally:
+            store.close()
+    raise OpsError(f"feature order {fo_id!r} not found in any registered project")
+
+
+def feature_progress(store: ProjectStore, fo: dict[str, Any]) -> dict[str, Any]:
+    """How far along this feature order is, derived from its children every time.
+
+    Never stored. The feature order's status says which PHASE it is in; the counts say
+    where inside the phase it is, and they are a fact about the child rows — the same
+    reasoning that keeps "blocked" out of `WO_STATUSES`. A stored 3/6 is a 3/6 that goes
+    wrong the first time somebody cancels a child by hand.
+    """
+    children = store.feature_children(fo["id"])
+    done = sum(1 for c in children if c["status"] == "completed")
+    return {
+        "children": len(children),
+        "done": done,
+        "needs_attention": sum(1 for c in children if c["needs_attention"]),
+        "running": sum(1 for c in children
+                       if c["status"] in ("dispatching", "running", "waiting_input")),
+        "awaiting_merge": sum(1 for c in children if c["status"] == "waiting_pr_merge"),
+        "failed": sum(1 for c in children if c["status"] in ("failed", "cancelled")),
+        "label": f"{done}/{len(children)} done" if children else "no children yet",
+    }
+
+
+def list_feature_orders(project_name: str | None = None,
+                        include_settled: bool = False) -> list[dict[str, Any]]:
+    paths = registered_project_paths()
+    if project_name:
+        if project_name not in paths:
+            raise OpsError(f"project {project_name!r} not registered")
+        paths = {project_name: paths[project_name]}
+    out = []
+    for name, path in sorted(paths.items()):
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            statuses = None if include_settled else FO_OPEN_STATUSES
+            for fo in store.list_feature_orders(statuses=statuses):
+                out.append({"project": name, **fo,
+                            "progress": feature_progress(store, fo)})
+        finally:
+            store.close()
+    return out
+
+
+def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """The feature order, its plan and its children — the tree, in one call."""
+    from . import plans
+
+    name, path, fo = find_feature_order(fo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        plan = db.from_json(fo.get("plan"), None)
+        children = [
+            {**{k: c[k] for k in ("id", "title", "status", "needs_attention",
+                                  "attention_reason", "pr_url")},
+             "depends_on": store.dependencies(c),
+             "status_label": invariants.status_label(store, c)}
+            for c in store.feature_children(fo_id)
+        ]
+        planner = None
+        if fo.get("plan_wo_id"):
+            try:
+                p = store.get_work_order(fo["plan_wo_id"])
+                planner = {k: p[k] for k in ("id", "title", "status", "result_summary")}
+            except KeyError:
+                planner = None  # deleted out from under it; the link was released
+        return {
+            "project": name, **fo,
+            "plan": plan,
+            "plan_text": "\n".join(plans.render_plan(plan)) if plan else "",
+            "planner": planner,
+            "children": children,
+            "progress": feature_progress(store, fo),
+            # Only meaningful next to `max_parallel`, but returned unconditionally so a
+            # caller never has to branch on whether the key is there.
+            "active_children": store.count_active_children(fo_id),
+        }
+    finally:
+        store.close()
+
+
+def submit_plan(fo_id: str, doc: Any,
+                project_name: str | None = None) -> dict[str, Any]:
+    """(Planners) hand back the decomposition. The planner's terminal action.
+
+    Three things happen here and the order matters. The plan is validated first, so a
+    bad plan costs a revision and nothing else — no work order, no Neo call, no state to
+    unwind. Then it is stored and queued for review. Only then is the planner's work
+    order settled: `jarvis fo plan` IS its `jarvis wo finish`, which is why the planner
+    briefing tells it not to call the latter. A rejection later re-opens the same session
+    through the ordinary message path, so settling now costs the revision nothing.
+    """
+    from . import plans
+    from .neo_store import NeoStore
+
+    name, path, fo = find_feature_order(fo_id, project_name)
+    if fo["status"] not in ("planning", "plan_review"):
+        raise OpsError(
+            f"{fo_id} is {fo['status']}, so it is not waiting for a plan "
+            f"(a plan can be submitted while it is `planning`, or resubmitted while it "
+            f"is `plan_review`)"
+        )
+    try:
+        plan = plans.parse_plan(doc)
+    except plans.PlanError as e:
+        raise OpsError(
+            f"the plan was not accepted, and nothing was created. Fix all of these and "
+            f"resubmit:\n  - " + "\n  - ".join(e.problems)
+        ) from e
+
+    # The design document is snapshotted NOW, from the planner's own tree, because the
+    # children never see that tree: the doc rides in the stored plan and dispatch
+    # materialises it into a path every child worker can read. Refusing a dangling name
+    # here costs the planner one revision; accepting it would cost every child a brief
+    # that references a document none of them has.
+    if plan.get("design_doc"):
+        candidates = []
+        if fo.get("plan_wo_id"):
+            candidates.append(path / ".claude" / "worktrees" / fo["plan_wo_id"]
+                              / plan["design_doc"])
+        candidates.append(path / plan["design_doc"])
+        existing = next((c for c in candidates if c.is_file()), None)
+        if existing is None:
+            raise OpsError(
+                f"the plan names design_doc {plan['design_doc']!r} but no such file "
+                f"exists — write it before submitting (looked in: "
+                + ", ".join(str(c) for c in candidates) + ")"
+            )
+        plan["design_doc_content"] = existing.read_text()
+
+    # The planner is who Neo's question hangs off: it is a real work order, it is who
+    # receives a rejection, and it is what `jarvis neo list` can link back to. A feature
+    # order whose planner was deleted still submits — the question just names the feature
+    # order instead of a row that no longer exists.
+    planner_id = fo.get("plan_wo_id") or fo_id
+    question = plans.build_plan_question(fo, plan)
+    neo = NeoStore()
+    try:
+        q = neo.ask(name, planner_id, question, kind="plan")
+    finally:
+        neo.close()
+
+    store = ProjectStore(path)
+    try:
+        store.update_feature_order(fo_id, plan=db.to_json(plan),
+                                   plan_question_id=q["id"])
+        store.set_feature_status(fo_id, "plan_review")
+        store.clear_feature_attention(fo_id)
+        if fo.get("plan_wo_id"):
+            store.add_event(fo["plan_wo_id"], "plan_submitted", {
+                "feature_order": fo_id, "children": len(plan["children"]),
+                "neo_question_id": q["id"],
+            })
+    finally:
+        store.close()
+
+    out = {"project": name, "fo_id": fo_id, "status": "plan_review",
+           "children": len(plan["children"]), "neo_question_id": q["id"],
+           "note": "queued for review — end your turn. If it is sent back, the reason "
+                   "arrives as your next user turn and you revise from this session."}
+    if fo.get("plan_wo_id"):
+        # The planner has no more to say until the review lands, and a work order left
+        # `running` with no turn in flight is what the reconciler calls idle.
+        out["planner"] = finish(
+            fo["plan_wo_id"],
+            f"submitted a plan for {fo_id}: {len(plan['children'])} work orders",
+        )
+    return out
+
+
+def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
+                decided_by: str = "user",
+                project_name: str | None = None) -> dict[str, Any]:
+    """Release a submitted plan, or send it back. Neo's path and the user's, shared.
+
+    One function for both deciders on purpose: the escalation exists because Neo
+    declined to take a decision, not because the decision changed shape, and two
+    implementations of "release the plan" would be two chances to disagree about what
+    releasing means.
+
+    Releasing creates every child at once (`ProjectStore.create_plan_children`) and moves
+    the feature order to `executing`; the ordinary claim-time dependency filter takes it
+    from there, so no scheduler is added anywhere. Rejecting returns it to `planning` and
+    delivers the reason to the planner as a message, which re-opens its existing session
+    rather than starting a cold one.
+    """
+    from . import plans
+    from .neo_store import NeoStore
+
+    name, path, fo = find_feature_order(fo_id, project_name)
+    if fo["status"] != "plan_review":
+        raise OpsError(f"{fo_id} is {fo['status']}, not awaiting a plan review")
+    if not accept and not feedback.strip():
+        raise OpsError(
+            "a rejection needs feedback — the planner sees only your reason, and "
+            "without it the revision is a guess"
+        )
+    plan = db.from_json(fo.get("plan"), None)
+    if not plan:
+        raise OpsError(f"{fo_id} has no stored plan to review")
+
+    store = ProjectStore(path)
+    try:
+        if accept:
+            children = store.create_plan_children(
+                fo_id, plans.creation_order(plan["children"]))
+            store.set_feature_status(fo_id, "executing")
+            store.clear_feature_attention(fo_id)
+        else:
+            children = []
+            store.set_feature_status(fo_id, "planning")
+            store.clear_feature_attention(fo_id)
+        if fo.get("plan_wo_id"):
+            store.add_event(fo["plan_wo_id"], "plan_reviewed", {
+                "feature_order": fo_id, "accepted": accept, "by": decided_by,
+                "reason": feedback, "children": [c["id"] for c in children],
+            })
+    finally:
+        store.close()
+
+    # Close the review question whichever way it went, so `jarvis neo list` stops
+    # showing a decision that has been taken. Only if it is still open: Neo's own
+    # verdicts are already recorded by the drain loop.
+    if fo.get("plan_question_id"):
+        neo = NeoStore()
+        try:
+            q = neo.get(fo["plan_question_id"])
+            if q and q["status"] in ("queued", "answering", "escalated"):
+                neo.record_answer(q["id"], "APPROVED" if accept else "REJECTED",
+                                  answered_by=decided_by, reason=feedback)
+        finally:
+            neo.close()
+
+    out = {"project": name, "fo_id": fo_id, "accepted": accept, "by": decided_by,
+           "status": "executing" if accept else "planning",
+           "children": [{"id": c["id"], "title": c["title"],
+                         "depends_on": db.from_json(c["depends_on"], [])}
+                        for c in children]}
+    if not accept and fo.get("plan_wo_id"):
+        try:
+            out["delivered"] = send_message(
+                fo["plan_wo_id"],
+                f"The plan for {fo_id} was sent back by {decided_by}. Revise it and "
+                f"resubmit with `jarvis fo plan {fo_id} --from-file <file>`.\n\n"
+                f"Reason: {feedback}",
+                source="jarvis", project_name=name,
+            )
+        except OpsError as e:
+            out["delivery_error"] = str(e)
+    return out
+
+
+def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """The user stopping a feature order, and everything it has running.
+
+    A feature order that stopped while its planner and four children kept going would be
+    a label, not a cancellation — so this reaches down. Every non-terminal work order it
+    owns (the planner included) is cancelled through the ordinary `cancel` path, which is
+    what stops the sessions; nothing here reimplements that.
+    """
+    name, path, fo = find_feature_order(fo_id, project_name)
+    if fo["status"] in FO_TERMINAL_STATUSES:
+        raise OpsError(f"{fo_id} is already {fo['status']}")
+    store = ProjectStore(path)
+    try:
+        owned = store.feature_children(fo_id)
+        if fo.get("plan_wo_id"):
+            try:
+                owned.append(store.get_work_order(fo["plan_wo_id"]))
+            except KeyError:
+                pass
+        stop_ids = [w["id"] for w in owned if w["status"] in OPEN_STATUSES]
+        store.set_feature_status(fo_id, "cancelled")
+        store.clear_feature_attention(fo_id)
+    finally:
+        store.close()
+    for wo_id in stop_ids:
+        cancel(wo_id)
+    return {"project": name, "fo_id": fo_id, "title": fo["title"],
+            "status": "cancelled", "cancelled_work_orders": stop_ids}
+
+
 # -- Neo (OS answerer agent) ---------------------------------------------------------------------
+
+#: The most of a referenced section that rides to Neo. A section this long is a design
+#: document wearing one heading; the cut is announced in the context, never silent.
+SECTION_SNAPSHOT_CHARS = 6000
+
+
+def _resolve_section(path: Path, wo: dict[str, Any], ref_path: str,
+                     which: str) -> str | None:
+    """The referenced section's text, read from wherever this worker can see the file.
+
+    Tried in the order the file is most likely to be authoritative: the worker's own
+    worktree, the project tree, then the materialised feature snapshot under
+    `.jarvis/features/` (where dispatch puts a parent feature's design document).
+    """
+    from . import sections
+
+    candidates = []
+    if Path(ref_path).is_absolute():
+        candidates.append(Path(ref_path))
+    else:
+        if wo.get("worktree"):
+            candidates.append(path / ".claude" / "worktrees" / wo["worktree"] / ref_path)
+        candidates.append(path / ref_path)
+        if wo.get("parent_id"):
+            candidates.append(path / ".jarvis" / "features" / wo["parent_id"]
+                              / Path(ref_path).name)
+    for candidate in candidates:
+        if candidate.is_file():
+            section = sections.extract_section(candidate.read_text(), which)
+            if section is not None:
+                if len(section) > SECTION_SNAPSHOT_CHARS:
+                    section = (section[:SECTION_SNAPSHOT_CHARS]
+                               + "\n[… section truncated — it is longer than "
+                                 f"{SECTION_SNAPSHOT_CHARS} characters]")
+                return section
+    return None
+
 
 def ask_question(wo_id: str, question: str, project_name: str | None = None) -> dict[str, Any]:
     """(Workers) queue a question for Neo instead of stalling on the user.
@@ -792,11 +1642,35 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
     The work order flips to waiting_input WITHOUT flagging user attention — Neo
     exists precisely to keep these off the user's plate. The answer arrives as the
     worker's next user turn via the normal message-delivery path.
+
+    A question is one paragraph that may reference a design artifact section in-text
+    (`from section 3 of design doc "docs/specs/x.md"`). The reference is resolved HERE,
+    at ask time: the section — and only the section — is snapshotted into the question's
+    context, so Neo reads exactly the design context the paragraph argues from while the
+    recorded question stays a paragraph.
     """
+    from . import sections
     from .neo_store import NeoStore
+
+    if len(question) > QUESTION_MAX_CHARS:
+        raise OpsError(
+            f"that question is {len(question)} characters; the cap is "
+            f"{QUESTION_MAX_CHARS}. A question to Neo is one paragraph — the decision, "
+            f"the options, your recommendation — arguing from a design artifact it "
+            f"references in-text, e.g. `from section 3 of design doc "
+            f"\"docs/specs/feature.md\": …`. The referenced section is delivered to "
+            f"whoever answers, alongside your paragraph; you do not need to paste it."
+        )
 
     name, path, wo = find_work_order(wo_id, project_name)
     context = f"{wo['title']}\n{(wo.get('description') or '')[:800]}"
+    for ref_path, which in sections.find_refs(question):
+        section = _resolve_section(path, wo, ref_path, which)
+        if section is not None:
+            context += f"\n\nReferenced artifact — {ref_path} § {which}:\n{section}"
+        else:
+            context += (f"\n\n(the question references {ref_path!r} section {which!r}, "
+                        f"which could not be resolved — no such file or section)")
     neo = NeoStore()
     try:
         q = neo.ask(name, wo_id, question, context=context)
@@ -804,13 +1678,46 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
         neo.close()
     store = ProjectStore(path)
     try:
-        store.add_event(wo_id, "question_asked", {"neo_question_id": q["id"]})
+        # The text, not just the id: the question lives in Neo's separate DB, so a
+        # timeline built from the project store alone could never show what was asked.
+        store.add_event(wo_id, "question_asked",
+                        {"neo_question_id": q["id"], "question": question})
         if wo["status"] == "running":
             store.set_status(wo_id, "waiting_input")
     finally:
         store.close()
-    return {"project": name, "wo_id": wo_id, "question_id": q["id"],
-            "note": "queued for Neo — end your turn; the answer arrives as your next user turn"}
+    out = {"project": name, "wo_id": wo_id, "question_id": q["id"],
+           "note": "queued for Neo — end your turn; the answer arrives as your next user turn"}
+    if len(question) > QUESTION_WARN_CHARS:
+        out["warning"] = (
+            f"that question is {len(question)} characters — aim for one paragraph, and "
+            f"reference the design artifact section it argues from in-text instead of "
+            f"pasting context (the cap is {QUESTION_MAX_CHARS})"
+        )
+    return out
+
+
+def neo_question_texts(wo_id: str) -> dict[int, str]:
+    """{question_id: question} for back-filling a timeline. Never raises.
+
+    `question_asked` events written before the text was stored in their payload carry
+    only the id, and the text is in Neo's DB. Every surface that renders a timeline
+    passes this in so those older entries still read as questions. Failure to open
+    Neo's DB must not take `jarvis wo show` (or the work order page) down with it —
+    a timeline missing one detail beats no timeline at all.
+    """
+    from .neo_store import NeoStore
+
+    try:
+        neo = NeoStore()
+    except Exception:  # noqa: BLE001 — best-effort enrichment, see docstring
+        return {}
+    try:
+        return neo.question_texts(wo_id)
+    except Exception:  # noqa: BLE001
+        return {}
+    finally:
+        neo.close()
 
 
 def neo_status() -> dict[str, Any]:
@@ -822,12 +1729,55 @@ def neo_status() -> dict[str, Any]:
         neo.close()
 
 
-def neo_review(question_id: int, approved: bool, feedback: str = "") -> dict[str, Any]:
+def neo_export() -> dict[str, list[dict[str, Any]]]:
+    """Neo's whole ledger as one stable document — see `NeoStore.export`.
+
+    No filters and no truncation: this is the export path, not a listing.
+    """
+    from .neo_store import NeoStore
+
+    neo = NeoStore()
+    try:
+        return neo.export()
+    finally:
+        neo.close()
+
+
+def validate_seat(seat: str) -> None:
+    """Refuse a seat name the panel does not have, BEFORE anything is written.
+
+    An unknown seat is a typo, and a typo that is accepted writes a learning into a
+    prefix no seat will ever read — invisible, and indistinguishable from the lesson
+    having been lost.
+    """
+    from .neo_store import SEATS
+
+    if seat and seat not in SEATS:
+        raise OpsError(f"unknown panel seat {seat!r} — the seats are: {', '.join(SEATS)}")
+
+
+def neo_review(question_id: int, approved: bool, feedback: str = "",
+               seat: str = "") -> dict[str, Any]:
     """Review one of Neo's answers. A correction becomes a learning (Neo's own DB)
-    and, when the work order is still open, is forwarded to the worker as guidance."""
+    and, when the work order is still open, is forwarded to the worker as guidance.
+
+    `seat` routes that learning to one panel seat's prompt prefix instead of to every
+    seat, so a correction teaches the seat that got this decision wrong. It is REFUSED
+    unless that seat actually opined on this question: a correction aimed at a seat
+    which never saw the question teaches the wrong reader, and the ledger acquires a
+    lesson nobody can act on. That covers two cases — no panel ran at all (Neo answered
+    single-agent), and a panel that ran without this seat (the fast route runs `premise`
+    alone, which the design expects to be the common case).
+    """
     from . import neo as neo_mod
     from .neo_store import NeoStore
 
+    # Every refusal below happens before the first write: a rejected review must leave
+    # the question unreviewed and the ledger untouched, not half-applied.
+    validate_seat(seat)
+    if seat and approved:
+        raise OpsError("--seat scopes a correction, and an approval records no learning "
+                       "to scope — approve it, or say what Neo should have answered")
     if not approved and not feedback.strip():
         raise OpsError("a correction needs feedback — what should Neo have said?")
     neo = NeoStore()
@@ -837,12 +1787,25 @@ def neo_review(question_id: int, approved: bool, feedback: str = "") -> dict[str
             raise OpsError(f"neo question {question_id} not found")
         if q["status"] != "answered":
             raise OpsError(f"neo question {question_id} is {q['status']}, not answered")
+        if seat:
+            opined = [o["seat"] for o in neo.opinions(question_id)]
+            if not opined:
+                raise OpsError(
+                    f"no panel ran on neo question {question_id}, so there is no "
+                    f"{seat!r} seat to correct — Neo answered it single-agent. Drop "
+                    f"--seat to teach every seat, or use `jarvis neo learn`.")
+            if seat not in opined:
+                raise OpsError(
+                    f"the {seat!r} seat did not opine on neo question {question_id}, so "
+                    f"it never saw the question — the seats that did: "
+                    f"{', '.join(opined)}. Drop --seat to teach every seat.")
         q = neo.review(question_id, approved, feedback)
         learning = None
         if not approved:
             learning = neo.add_learning(
                 neo_mod.learning_from_review(q, feedback),
                 project=q["project"], source="review", question_id=question_id,
+                seat=seat,
             )
     finally:
         neo.close()
@@ -863,6 +1826,7 @@ def neo_review(question_id: int, approved: bool, feedback: str = "") -> dict[str
     return {"question_id": question_id,
             "review": "approved" if approved else "corrected",
             "learning_recorded": learning is not None,
+            "learning_seat": seat or "all seats",
             "forwarded_to_worker": forwarded}
 
 
@@ -976,18 +1940,30 @@ def request_gate_approval(wo_id: str, command: str, why: str = "", evidence: str
                     "next user turn"}
 
 
-def decide_gate(approval_id: int, approved: bool, reason: str = "",
+def decide_gate(approval_id: int, verdict: str, reason: str = "",
                 project_name: str | None = None) -> dict[str, Any]:
-    """(User) open or refuse a gate directly, whatever Neo did or didn't say.
+    """(User) rule on a gate directly, whatever Neo did or didn't say.
 
-    Also the resolution path for an escalation: Neo declining leaves the request pending
-    precisely so this can close it.
+    `verdict` is `approved`, `denied` or `dismissed`. Also the resolution path for an
+    escalation: Neo declining leaves the request pending precisely so this can close it.
     """
     from . import gates
+
     from .neo_store import NeoStore
 
-    if not approved and not reason.strip():
+    if verdict not in gates.VERDICTS:
+        raise OpsError(f"unknown verdict {verdict!r} — expected one of "
+                       f"{list(gates.VERDICTS)}")
+    # A denial needs a reason because the worker has to act on it. A dismissal needs one
+    # for a different reason: the text IS the defect report on the recogniser, and it is
+    # the only record of what went wrong that anyone reading the false-positive count
+    # will ever be able to inspect.
+    if verdict == "denied" and not reason.strip():
         raise OpsError("a denial needs a reason — the worker acts on it")
+    if verdict == "dismissed" and not reason.strip():
+        raise OpsError("a dismissal needs a reason — it is the report on what the gate's "
+                       "recogniser got wrong, and the only note attached to the "
+                       "false-positive count")
 
     name, path, approval = _find_approval(approval_id, project_name)
     if approval["status"] != "pending":
@@ -997,7 +1973,7 @@ def decide_gate(approval_id: int, approved: bool, reason: str = "",
         )
     store = ProjectStore(path)
     try:
-        gates.apply_decision(store, approval_id, approved=approved,
+        gates.apply_decision(store, approval_id, verdict=verdict,
                              reason=reason or "approved by the user", decided_by="user")
         store.clear_attention(approval["wo_id"])
     finally:
@@ -1008,13 +1984,12 @@ def decide_gate(approval_id: int, approved: bool, reason: str = "",
         qid = approval["neo_question_id"]
         q = neo.get(qid) if qid else None
         if q and q["status"] in ("queued", "answering", "escalated", "failed"):
-            neo.record_answer(qid, "APPROVED" if approved else "DENIED",
-                              answered_by="user", reason=reason)
+            neo.record_answer(qid, verdict.upper(), answered_by="user", reason=reason)
             neo.review(qid, approved=True)  # user-authored ⇒ nothing to review
     finally:
         neo.close()
     return {"project": name, "wo_id": approval["wo_id"], "approval_id": approval_id,
-            "decision": "approved" if approved else "denied",
+            "decision": verdict,
             "command": approval["command"],
             "delivery": "jarvisd delivers the verdict when the worker is idle"}
 
@@ -1111,7 +2086,20 @@ def show_gate(approval_id: int, project_name: str | None = None) -> dict[str, An
 
 # -- backlog ------------------------------------------------------------------------------------
 
-def promote_backlog(item_id: str, force: bool = False) -> dict[str, Any]:
+def promote_backlog(item_id: str, force: bool = False,
+                    as_feature: bool = False,
+                    max_parallel: int | None = None) -> dict[str, Any]:
+    """Turn an intake item into committed work.
+
+    `as_feature` is the whole of the backlog's involvement with feature orders, and the
+    backlog is deliberately left alone otherwise: it stays an OS-wide intake list of
+    things that are not yet anybody's work, and a feature order is committed work. The
+    only thing that changes is which of the two a promotion produces.
+    """
+    if max_parallel is not None and not as_feature:
+        # Refused rather than ignored: a work order has no children to cap, so silently
+        # dropping the flag would promote something other than what was asked for.
+        raise OpsError("--max-parallel applies to a feature order; add --as feature")
     central = CentralStore()
     try:
         item = central.get_backlog(item_id)
@@ -1126,6 +2114,20 @@ def promote_backlog(item_id: str, force: bool = False) -> dict[str, Any]:
                 + ", ".join(f"{b['id']} ({b['status']})" for b in blockers)
                 + " — finish them first or use --force"
             )
+        if as_feature:
+            fo = create_feature_order(
+                item["project"], item["title"], description=item["description"],
+                origin="jarvis", backlog_id=item_id, max_parallel=max_parallel,
+            )
+            # `promoted_wo_id` takes the feature order's id: the column records what the
+            # item BECAME, and widening it to a second nullable column would leave every
+            # reader having to check both to answer one question.
+            central.mark_backlog(item_id, "promoted", promoted_wo_id=fo["id"])
+            return {"backlog_id": item_id, "fo_id": fo["id"],
+                    "project": item["project"],
+                    "forced_over_blockers": [b["id"] for b in blockers] if force else [],
+                    "note": "a planner will decompose it; the plan comes back for "
+                            "review before any work order is created"}
         wo = create_work_order(
             item["project"], item["title"], description=item["description"],
             origin="jarvis", backlog_id=item_id,
@@ -1135,3 +2137,122 @@ def promote_backlog(item_id: str, force: bool = False) -> dict[str, Any]:
                 "forced_over_blockers": [b["id"] for b in blockers] if force else []}
     finally:
         central.close()
+
+
+# -- token accounting ----------------------------------------------------------------------------
+
+def _unit_row(name: str, wo: dict[str, Any], index: dict[str, Path]) -> dict[str, Any]:
+    """One work order's spend, flattened for a table."""
+    from . import usage as usage_mod
+
+    session = usage_mod.read_session(wo.get("session_id") or "", index=index)
+    total = session.total
+    return {
+        "id": wo["id"], "project": name, "title": wo["title"],
+        "status": wo["status"], "kind": wo.get("kind") or "worker",
+        "found": session.found,
+        # A session's turn count is its resume boundaries plus the opening turn; see
+        # `usage.Usage.resume_boundaries` for why the boundaries are counted that way.
+        "turns": total.resume_boundaries + 1 if session.found else 0,
+        "subagent_count": session.subagent_count,
+        "subagent_cost_usd": round(session.subagents.list_cost_usd, 2),
+        **total.as_dict(),
+    }
+
+
+def cost_report(project: str | None = None, target: str | None = None,
+                limit: int = 50, include_hidden: bool = True) -> dict[str, Any]:
+    """What the fleet's work has cost in tokens, read back from Claude Code's transcripts.
+
+    `target` is a work-order or feature-order id for a single unit — a feature order
+    rolls up its planner and every child, which is the only way to see what a planned
+    feature actually cost. Otherwise this reports every work order that still has a
+    transcript, dearest first.
+
+    Hidden work orders are INCLUDED by default, unlike every other listing: hiding is a
+    gesture about attention, and a hidden work order's tokens were spent just the same.
+    A cost report that quietly omitted them would understate the bill in exactly the
+    case where someone is trying to find out where the bill came from.
+
+    The transcripts belong to Claude Code, not to Jarvis, and it prunes them on its own
+    schedule. A work order whose transcript is gone reports `found: false` rather than
+    zero: an unmeasurable cost and a zero cost are different answers, and rendering them
+    the same would turn a gap in the evidence into a claim about the spend.
+    """
+    from . import usage as usage_mod
+
+    index = usage_mod.index_sessions()
+    paths = registered_project_paths()
+    if project and project not in paths:
+        raise OpsError(f"project {project!r} not registered (known: {sorted(paths)})")
+    if target:
+        return _cost_for_target(target, project, index)
+
+    scope = {project: paths[project]} if project else paths
+    units: list[dict[str, Any]] = []
+    for name, path in sorted(scope.items()):
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            for wo in store.list_work_orders(limit=limit, include_hidden=include_hidden):
+                units.append(_unit_row(name, wo, index))
+        finally:
+            store.close()
+    units.sort(key=lambda u: u["list_cost_usd"], reverse=True)
+    return {"scope": project or "fleet", "units": units, **_rollup(units)}
+
+
+def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
+    """Totals over the units that could actually be measured.
+
+    Unmeasured units are counted separately rather than summed as zero, so the report
+    can say how much of the fleet its total is speaking for.
+    """
+    measured = [u for u in units if u["found"]]
+    return {
+        "measured": len(measured),
+        "unmeasured": len(units) - len(measured),
+        "totals": {
+            "list_cost_usd": round(sum(u["list_cost_usd"] for u in measured), 2),
+            "rewrite_cost_usd": round(sum(u["rewrite_cost_usd"] for u in measured), 2),
+            "rewrite_excess": sum(u["rewrite_excess"] for u in measured),
+            "resume_boundaries": sum(u["resume_boundaries"] for u in measured),
+            "subagent_cost_usd": round(sum(u["subagent_cost_usd"] for u in measured), 2),
+            "output": sum(u["output"] for u in measured),
+            "billed_input": sum(u["billed_input"] for u in measured),
+        },
+    }
+
+
+def _cost_for_target(target: str, project: str | None,
+                     index: dict[str, Path]) -> dict[str, Any]:
+    """One work order, or a feature order rolled up over its planner and children.
+
+    The feature order is tried FIRST. A feature order and a work order cannot share an
+    id, but `find_work_order` raises the more familiar error, and resolving the work
+    order first would report a planner's own spend under the feature order's id — the
+    one number a reader of `jarvis cost fo-…` is least likely to want.
+    """
+    try:
+        name, path, fo = find_feature_order(target, project)
+    except OpsError:
+        name, _path, wo = find_work_order(target, project)
+        row = _unit_row(name, wo, index)
+        return {"scope": target, "units": [row], **_rollup([row])}
+
+    store = ProjectStore(path)
+    try:
+        units = []
+        planner_id = fo.get("plan_wo_id")
+        if planner_id:
+            try:
+                units.append(_unit_row(name, store.get_work_order(planner_id), index))
+            except KeyError:
+                pass
+        units.extend(_unit_row(name, child, index)
+                     for child in store.feature_children(fo["id"]))
+    finally:
+        store.close()
+    return {"scope": fo["id"], "title": fo["title"], "status": fo["status"],
+            "units": units, **_rollup(units)}

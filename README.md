@@ -45,8 +45,9 @@ catalog and Jarvis:
   (`jarvis notify`) that fans out to your inbox, logs, Telegram, or desktop.
 - **Centralizes the backlog** — deferred work from any project lands in one
   dependency-aware backlog you can promote into work orders with one command.
-- **Shares knowledge** — learnings reported by workers in one project are injected into
-  future work orders in every project.
+- **Shares knowledge** — learnings reported by workers in one project are indexed into
+  future work orders in every project, and workers pull the full text on demand, so the
+  base can grow without inflating every prompt.
 - **Keeps you in the loop** — `jarvis status` (or the web dashboard) shows the whole
   fleet and flags exactly what needs your attention: assumptions to review, blocked
   workers, unacked alerts.
@@ -119,7 +120,8 @@ jarvis start --catalog ~/.jarvis/catalog.json
 ```
 
 This bootstraps every project (README check, OPERATION.md contract, `.jarvis/` state
-dir, injected `.claude/settings.json`, and workspace trust) and starts the daemon.
+dir, injected `.claude/settings.json` and `.claude/skills/`, and workspace trust) and
+starts the daemon.
 Listing a project in the catalog trusts its workspace for you — no per-project trust
 dialog.
 
@@ -147,14 +149,14 @@ also watch and join them from `claude agents`.
 |---|---|
 | **Catalog** | JSON file declaring projects, models, settings overrides |
 | **Work order** | A unit of work; one worker agent, one git worktree, full audit trail |
-| **Origin badge** | `jarvis`/`ui` = framework-created; `manual`/`adhoc` = flagged ⚠ in UI and status |
-| **Ad-hoc adoption** | A background session Jarvis didn't spawn is adopted so it shows up in status and the dashboard. It's a mirror, not a dispatch: it never got the worker contract, so it owes no `jarvis wo finish` and its session ending is not a failure |
+| **Origin badge** | `jarvis`/`ui`/`injected` = you or the framework put it there; `manual`/`adhoc` = flagged ⚠ in UI and status |
+| **Injection** | Your own Claude sessions are yours: Jarvis never adopts one it finds. Hand one over with `jarvis wo inject <session-id>` (or the button on the project page) and it gets a work order that shows up in status and on the dashboard. That's a mirror, not a dispatch: it never got the worker contract, so it owes no `jarvis wo finish` and its session ending is not a failure. Injecting writes nothing into the session — the first write is your own `jarvis wo send` |
 | **OPERATION.md** | Per-project contract every worker follows (assumptions, backlog, learnings, notify) |
 | **ASSUMPTIONS.md** | Per-project log of decisions workers made autonomously, pending your review |
 | **Neo** | OS-level answerer agent: workers ask (`jarvis wo ask`), Neo answers as you; you review its answers (UI neo tab) and corrections become its learnings |
 | **Inbox** | Central notification stream (`jarvis inbox`), fanned out to sinks |
 | **Backlog** | Central deferred-work list with dependencies (`jarvis backlog`) |
-| **Knowledge** | Central learnings injected into future work orders (`jarvis learn`) |
+| **Knowledge** | Central learnings. Worker prompts carry an *index* (headline + id, bounded); workers fetch full text on demand with `jarvis learn search`/`show`. Entries you pin ride along verbatim |
 
 ## Worker contract
 
@@ -164,10 +166,17 @@ Every worker must (enforced by OPERATION.md + dispatch prompt):
 jarvis wo assume  <wo-id> "assumed X because Y"      # every autonomous decision
 jarvis wo ask     <wo-id> "blocking question"        # Neo (or you) answers next turn
 jarvis backlog add <project> "deferred thing"        # instead of "future work" notes
+jarvis learn search "<term>" --project <p>           # READ before you touch an area
+jarvis learn show <kn-id>                            # full text behind an index headline
 jarvis learn add "reusable insight" --project <p>    # share with other projects
 jarvis notify --level critical "prod is down" "..."  # human attention
 jarvis wo finish  <wo-id> --summary "delivered ..."  # completion signal
+jarvis wo finish  <wo-id> --summary "..." --pr <url> # …and it's waiting on your merge
 ```
+
+The PR title must start with the work order id — `[wo-1234abcd] what it does` — so the
+pull request is traceable back to the work order by people who never see Jarvis. The
+`gh pr create` hook enforces it.
 
 A work order is the representation of its worker's conversation. The final assistant
 message of every worker turn is captured verbatim into the record, so `jarvis wo show`
@@ -177,6 +186,22 @@ replacement.
 
 Assumptions flip the work order to `needs_review` — visible in `jarvis status`, the
 dashboard, and (if configured) Telegram.
+
+A work order finished with `--pr` lands in `waiting_pr_merge` instead of `completed`: it
+stays on the open list with its link until the pull request is dealt with. It never
+raises the attention flag — it is a merge queue, not a blocker — and the dashboard gives
+those a row each, right after the running workers, with everything else open folded into
+a count.
+
+You do not have to close them by hand. Every couple of minutes the daemon asks `gh` what
+happened to each parked pull request: **merged** ends the work order silently (and the
+backlog item behind it) — you performed the merge, you do not need telling — while
+**closed without merging** sends it to `needs_review` and asks for you,
+since work that was delivered and then refused is exactly what the attention list is
+for. `jarvis wo done` still works and is the way out when a pull request will never
+merge. If `gh` is missing or unauthenticated the OS says so once, in the inbox, rather
+than quietly looking like a feature it no longer has — a daemon often cannot reach
+`gh`'s keyring, so a service environment wants `GH_TOKEN` set.
 
 Attention is re-derived from state on every reconcile tick, so it can't be cleared by
 hand — the next tick puts it back. `jarvis wo ack <id>` (or **Got it** on the work order

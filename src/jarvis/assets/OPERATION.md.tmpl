@@ -20,6 +20,10 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
 
 - **Work in your assigned worktree** (you are started in it). Commit your work; push
   and open a PR following this repo's conventions. Never push to main.
+- **Title the PR `[$JARVIS_WO_ID] <what it does>`** — the work order id verbatim, in
+  square brackets, first. That prefix is what ties the pull request back to the work
+  order for everyone who never sees Jarvis, so `gh pr create` with any other title is
+  blocked by the hook.
 - **Route any doubt to Neo — it is your first responder**:
   `jarvis wo ask "$JARVIS_WO_ID" "<your question>"`, then end your turn.
 
@@ -51,6 +55,13 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
   guess you are hoping nobody checks — if you are guessing, ask instead.
 - **File deferred work in the central backlog** instead of leaving "future work" notes:
   `jarvis backlog add {project_name} "<title>" --description "<details>"`
+- **Read the knowledge base before you act.** It reaches you as an *index* of headlines
+  at the end of your prompt, not as the knowledge itself. Look up any area you are about
+  to touch:
+  `jarvis learn search "<term>" --project {project_name}` · `jarvis learn show <id>` ·
+  `jarvis learn list --project {project_name} --topic <t>` · `jarvis learn topics`
+  A past worker probably already paid for the lesson. Never assume an index headline is
+  the whole entry.
 - **Report reusable learnings** (patterns, gotchas, good practices) to the OS knowledge
   base so other projects benefit:
   `jarvis learn add "<what you learned>" --project {project_name} --topic "<topic>"`
@@ -64,6 +75,41 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
 - **Summarize your result** when done:
   `jarvis wo finish "$JARVIS_WO_ID" --summary "<what was delivered, where>"`
   then write your full answer as the last thing you say.
+
+  If you opened a pull request, pass it as well: `--pr <url>`. The work order then
+  parks in **waiting for PR merge** — it stays on the user's open list with the link
+  until they merge it, instead of settling as completed work nobody is looking at.
+
+## Navigating the code: Serena first, grep second
+
+If this project has Serena — its symbol tools appear in your tool list, or
+`.serena/project.yml` is in the repo — **use it to find code, and do not grep for
+symbols.**
+
+Serena carries a language-server symbol index, so it answers the questions you actually
+have as facts, in one call:
+
+- `list_memories` / `read_memory` **first** on a mapped project. Its architecture is
+  already written down; rediscovering it is the most expensive thing you can do with
+  your context.
+- `find_symbol` instead of `grep -rn "def foo"`.
+- `find_referencing_symbols` instead of grepping for call sites.
+  There is **no grep equivalent** for this one: a caller that spells the name
+  differently, or reaches the symbol through an import alias, is invisible to a text
+  search and present here.
+- `get_symbols_overview` before opening a file whole.
+- If the symbol tools report that no project is active, `activate_project` on the repo
+  root first.
+
+`search_for_pattern` (Serena's own) and `Grep` are for **genuine text questions** — a
+config key, an error string, a TODO. Text search is not wrong; it is the wrong tool for
+finding code, because it answers "where does this string appear" and leaves you to
+rebuild "where is this defined and who calls it" out of the hits.
+
+If this project has no Serena, `Glob` and `Grep` are the fallback and there is nothing to
+apologise for — just expect to work harder for a less complete picture. If you learn
+something durable about the codebase, write it back (`write_memory`, or
+`jarvis learn add`) so the next session inherits it instead of deriving it again.
 
 ## What the outside world sees
 

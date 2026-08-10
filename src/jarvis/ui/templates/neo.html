@@ -1,6 +1,75 @@
 {% extends "base.html" %}
 {% block title %}Neo — Jarvis{% endblock %}
+
+{#
+  ONE QUESTION, AS THE USER READS IT.
+
+  A worker can paste a 7,000-character brief into `jarvis wo ask`, and until this macro
+  existed the page rendered every one of those characters inline. So: the digest when
+  there is one (see src/jarvis/digest.py), the question in full when there isn't, and in
+  BOTH cases the exact prompt Neo received behind a disclosure. The disclosure is
+  unconditional on purpose — it is the answer to "what did the digest leave out?", and a
+  control that only appears sometimes is not one the reader learns to trust.
+#}
+{% macro question_body(q) %}
+  {% if q.digest_view %}
+  <div class="digest">
+    <p class="headline"><strong>Q:</strong> {{ q.digest_view.headline }}</p>
+    {% if q.digest_view.bullets %}
+    <ul>{% for b in q.digest_view.bullets %}<li>{{ b }}</li>{% endfor %}</ul>
+    {% endif %}
+    {% if q.digest_view.options %}
+    <p class="label">Options</p>
+    <ol>{% for o in q.digest_view.options %}<li>{{ o }}</li>{% endfor %}</ol>
+    {% endif %}
+    {% if q.digest_view.recommendation %}
+    <div class="rec"><span class="label">Recommended</span>{{ q.digest_view.recommendation }}</div>
+    {% endif %}
+  </div>
+  {% else %}
+  <div style="margin:6px 0"><strong>Q:</strong> {{ q.question }}</div>
+  {% endif %}
+  <details class="disclosure">
+    <summary>Full question context sent to Neo{% if q.digest_view %} — it read all of it{% endif %}</summary>
+    <pre class="request-text">{{ q.full_context }}</pre>
+  </details>
+{% endmacro %}
+
 {% block content %}
+
+{# How the panel reached one answer. COLLAPSED, and absent entirely for a question no
+   panel deliberated on: deliberation is stored and inspectable on demand, never pushed.
+   A section of the page that showed it open would spend exactly the attention the panel
+   exists to protect — the thing to review is still the chair's answer, not the seats'.
+   `rows` is passed in rather than looked up, so the macro renders nothing by
+   construction when there is nothing to render. #}
+{% macro deliberation(rows) %}
+{% if rows %}
+<details style="margin-top:6px">
+  <summary class="sub">Panel deliberation — {{ rows|length }} seat{{ '' if rows|length == 1 else 's' }}</summary>
+  <table>
+    <tr><th>seat</th><th>status</th><th>verdict</th><th>route</th><th>latency</th><th>model</th></tr>
+    {% for o in rows %}
+    <tr>
+      <td class="mono">{{ o.seat }}</td>
+      <td class="mono">
+        {% if o.status == 'ok' %}<span class="st tone-ok"><span class="i">✓</span>ok</span>
+        {% elif o.status == 'abstained' %}<span class="st tone-muted"><span class="i">◌</span>abstained</span>
+        {% else %}<span class="st tone-bad"><span class="i">✗</span>{{ o.status }}</span>{% endif %}
+      </td>
+      <td class="mono">{{ o.verdict or '—' }}</td>
+      <td class="mono">{{ o.route or '—' }}</td>
+      <td class="mono">{{ o.latency_ms }}ms</td>
+      <td class="mono">{{ o.model or '—' }}</td>
+    </tr>
+    {% if o.reply %}
+    <tr><td colspan="6"><pre class="request-text">{{ o.reply }}</pre></td></tr>
+    {% endif %}
+    {% endfor %}
+  </table>
+</details>
+{% endif %}
+{% endmacro %}
 
 <p class="kv" style="margin-top:18px">
   Neo answers worker questions on your behalf. Review every answer below — approvals
@@ -10,6 +79,15 @@
   {{ counts.get('unreviewed', 0) }} awaiting review ·
   {{ learnings|length }} learnings)</span>
 </p>
+
+{% set digested = (escalated + unreviewed) | selectattr('digest_view') | list %}
+{% if digested %}
+<p class="sub" style="margin:-10px 0 0">
+  {{ digested|length }} over-long question{{ '' if digested|length == 1 else 's' }} below
+  {{ 'has' if digested|length == 1 else 'have' }} been cut down to the decision —
+  {{ digest_credit }}. Neo read the full text; so can you, from the button under each.
+</p>
+{% endif %}
 
 {% if in_flight %}
 <h2>With Neo right now</h2>
@@ -23,6 +101,7 @@
       <a href="/wo/{{ q.project }}/{{ q.wo_id }}">{{ q.wo_id }}</a> ·
       waiting {{ fmt_age(q.ts) }}</span>
   </div>
+  {{ deliberation(opinions.get(q.id)) }}
   {% endfor %}
 </div>
 <p class="sub">The worker that asked is parked until Neo replies. If these sit here,
@@ -55,8 +134,9 @@
       {{ fmt_age(q.ts) }} ago
       {% if q.status == 'failed' %} · <span class="tone-bad">✗ neo call failed</span>{% endif %}
     </div>
-    <div style="margin:6px 0"><strong>Q:</strong> {{ q.question }}</div>
+    {{ question_body(q) }}
     <div class="sub">Why escalated: {{ q.answer_reason or '—' }}</div>
+    {{ deliberation(opinions.get(q.id)) }}
     {% if q.kind == 'approval' %}
     {# Answering here would send the worker a message and leave the gate shut: only
        `decide_gate` records the verdict the hook checks. Send them where it counts. #}
@@ -81,9 +161,10 @@
     <div class="who">#{{ q.id }} · {{ q.project }} ·
       <a href="/wo/{{ q.project }}/{{ q.wo_id }}" class="mono">{{ q.wo_id }}</a> ·
       answered {{ fmt_age(q.answered_at) }} ago</div>
-    <div style="margin:6px 0"><strong>Q:</strong> {{ q.question }}</div>
+    {{ question_body(q) }}
     <div style="margin:6px 0"><strong>Neo:</strong> {{ q.answer }}</div>
     {% if q.answer_reason %}<div class="sub">Reasoning: {{ q.answer_reason }}</div>{% endif %}
+    {{ deliberation(opinions.get(q.id)) }}
     <div style="display:flex; gap:10px; margin-top:8px; align-items:flex-start">
       <form method="post" action="/neo/{{ q.id }}/review" class="inline">
         <input type="hidden" name="decision" value="approve">
@@ -119,6 +200,9 @@
       </td>
       <td class="mono">{{ fmt_age(q.ts) }}</td>
     </tr>
+    {% if opinions.get(q.id) %}
+    <tr><td colspan="7">{{ deliberation(opinions.get(q.id)) }}</td></tr>
+    {% endif %}
     {% else %}
     <tr><td colspan="7" class="empty">Neo hasn't handled anything yet</td></tr>
     {% endfor %}
@@ -131,6 +215,9 @@
   <div class="row">
     <span class="badge {{ 'framework' if l.source == 'review' else '' }}">{{ l.source }}</span>
     <span class="grow">{{ l.content }}</span>
+    {# A seat-scoped learning is read by that seat alone. Unlabelled it would read as a
+       rule the whole of Neo follows, which is the opposite of what it is. #}
+    {% if l.seat %}<span class="badge outside">{{ l.seat }} seat</span>{% endif %}
     <span class="sub mono">{{ l.project or 'global' }}</span>
   </div>
   {% else %}

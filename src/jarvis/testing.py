@@ -266,6 +266,106 @@ elif "-p" in argv and "--resume" not in argv:
     # headless one-shot (`claude -p ...`) — Neo's answering path. Deterministic
     # verdict driven by the prompt so tests control escalation.
     prompt = argv[argv.index("-p") + 1]
+    system = opt("--append-system-prompt", "")
+    # A DASHBOARD DIGEST, AND IT COMES FIRST FOR THE SAME REASON THE SEAT BRANCH DOES:
+    # the call is identified by its system prompt, never by the user prompt — which is
+    # the worker's question verbatim, so a digest of a gate question would otherwise
+    # fall through to the gate branch below and answer with a verdict.
+    if "# Jarvis dashboard digest" in system:
+        if "FORCE_DIGEST_FAIL" in prompt:
+            sys.stderr.write("digest call failed (test-forced)\n"); sys.exit(1)
+        if "FORCE_DIGEST_GARBAGE" in prompt:
+            # No `headline`: the shape the validator must refuse. `structured.request`
+            # retries once and then raises, which is what the daemon records.
+            print(json.dumps({"result": json.dumps({"bullets": ["a", "b"]})}))
+            sys.exit(0)
+        head = prompt.strip().splitlines()[0][:80]
+        print(json.dumps({"result": json.dumps({
+            "headline": f"digest of: {head}",
+            # Seven, so a test can prove the FIVE-item cap is enforced in the validator
+            # and not merely requested in the prompt.
+            "bullets": [f"point {i}" for i in range(1, 8)],
+            "options": ["option A — cheap", "option B — thorough"],
+            "recommendation": "option A",
+        })}))
+        sys.exit(0)
+    # A PANEL SEAT, AND THIS BRANCH COMES FIRST DELIBERATELY. Seat identity travels in
+    # --append-system-prompt, never in the user prompt: a premise-seat call on a gate
+    # question carries "PRIVILEGED ACTION REQUEST" in its prompt, so without this the
+    # branch below would answer it with a well-formed gate verdict AND NO `route` KEY —
+    # after which a lenient `panel.decide` defaults the route and the test passes having
+    # exercised nothing.
+    seat = next((s for s in ("premise", "record", "blast", "taste", "chair")
+                 if ("# Neo panel seat: " + s) in system), None)
+    if seat:
+        # Per-seat failure, NOT the shared FORCE_FAIL below: that one keys on the user
+        # prompt, which every seat on one question shares, so it could only ever fail all
+        # of them at once. A degradation test needs to fail exactly one.
+        if seat in [s for s in os.environ.get("FAKE_SEAT_FAIL", "").split(",") if s]:
+            sys.stderr.write(f"seat {seat} failed (test-forced)\n"); sys.exit(1)
+        if "FORCE_SEAT_GARBAGE" in prompt and seat == "premise":
+            print(json.dumps({"result": "the premise here is, well, hard to say"}))
+            sys.exit(0)
+        tail = prompt.splitlines()[-1][:60]
+        # NOTE: no seat name appears in any `answer` below, and that is load-bearing
+        # rather than tidy. Panel deliberation must never reach the worker, and the test
+        # that pins it asserts no seat name is in the delivered message — a canned answer
+        # containing the word "chair" would fail it for the wrong reason and, worse, a
+        # later loosening of that assertion would go unnoticed.
+        if seat == "premise":
+            reply = {"escalate": False, "answer": f"first-read decision on: {tail}",
+                     "reason": "premise finding", "route": "panel"}
+            if "FORCE_ROUTE_FAST" in prompt:
+                reply["route"] = "fast"
+            if "FORCE_NO_ROUTE" in prompt:
+                reply.pop("route")
+            if "FORCE_PROPOSE_DISMISS" in prompt:
+                reply["verdict"] = "dismiss"
+            elif "FORCE_PROPOSE_APPROVE" in prompt:
+                reply["verdict"] = "approve"
+            if "FORCE_FRAME_ESCALATE" in prompt:
+                reply = {"escalate": True, "answer": "", "route": "panel",
+                         "reason": "test-forced escalation on the framing"}
+        elif seat == "chair":
+            reply = {"escalate": False, "answer": f"synthesised decision on: {tail}",
+                     "reason": "the panel's verdict"}
+            if "FORCE_CHAIR_ESCALATE" in prompt:
+                reply = {"escalate": True, "answer": "",
+                         "reason": "test-forced escalation by the panel"}
+            elif "FORCE_CHAIR_APPROVE" in prompt:
+                reply["verdict"] = "approve"
+            elif "FORCE_CHAIR_DISMISS" in prompt:
+                reply["verdict"] = "dismiss"
+        else:
+            # `record`, `blast` and `taste`. No verdict of their own — the arbitration
+            # reads `escalate`, `veto` and `contradiction`, never a verdict — but a reply
+            # that differs per seat, so "the seats deliberated" is provable rather than
+            # assumed.
+            #
+            # NO SEAT NAME APPEARS IN ANY OF THESE, and for these three that is
+            # load-bearing twice over: the delivered message must name no seat, AND a
+            # forced escalation delivers the forcing seat's own `reason` verbatim, so a
+            # canned reason reading "blast finding" would fail the no-leak assertion for
+            # the fake's prose instead of for the code's.
+            finding = {"record": "what was already settled",
+                       "blast": "what it costs if wrong",
+                       "taste": "what the user meant"}[seat]
+            reply = {"escalate": False, "answer": f"{finding}, for: {tail}",
+                     "reason": f"a reading of {finding}"}
+            if seat == "blast" and "FORCE_RADIUS_ESCALATE" in prompt:
+                reply = {"escalate": True, "veto": False, "answer": "",
+                         "reason": "test-forced escalation on the cost of being wrong"}
+            elif seat == "blast" and "FORCE_RADIUS_VETO" in prompt:
+                reply = {"escalate": False, "veto": True, "answer": "",
+                         "reason": "test-forced veto of the proposal on the table"}
+            elif seat == "record" and "FORCE_LEDGER_CONTRADICTION" in prompt:
+                reply = {"escalate": False, "contradiction": "unresolvable", "answer": "",
+                         "reason": "test-forced unresolvable contradiction"}
+            elif seat == "taste" and "FORCE_INTENT_ESCALATE" in prompt:
+                reply = {"escalate": True, "veto": True, "answer": "",
+                         "reason": "test-forced objection that must force nothing"}
+        print(json.dumps({"result": json.dumps(reply)}))
+        sys.exit(0)
     if "FORCE_FAIL" in prompt:
         sys.stderr.write("model call failed (test-forced)\n"); sys.exit(1)
     if "FORCE_ESCALATE" in prompt:
@@ -276,22 +376,51 @@ elif "-p" in argv and "--resume" not in argv:
         sys.exit(0)
     elif "PRIVILEGED ACTION REQUEST" in prompt:
         # A gate review, which speaks a different verdict shape: the decision lives in
-        # `approve`, not in prose. Default is to escalate, matching the real reviewer's
+        # `verdict`, not in prose. Default is to escalate, matching the real reviewer's
         # instruction to send anything it cannot verify to the user — a fake that
         # approved by default would let every gate test pass without asserting anything.
         if "FORCE_APPROVE" in prompt:
-            verdict = {"escalate": False, "approve": True,
+            verdict = {"escalate": False, "verdict": "approve",
                        "reason": "test-forced approval"}
         elif "FORCE_DENY" in prompt:
-            verdict = {"escalate": False, "approve": False,
+            verdict = {"escalate": False, "verdict": "deny",
                        "reason": "test-forced denial"}
+        elif "FORCE_DISMISS" in prompt:
+            verdict = {"escalate": False, "verdict": "dismiss",
+                       "reason": "test-forced dismissal: not a privileged action"}
+        elif "FORCE_LEGACY_APPROVE" in prompt:
+            # An older Neo that has never heard of `verdict`. Kept as a distinct switch
+            # because the two contracts must coexist across a release: the persona ships
+            # in the code, Neo's learnings live in the production state directory.
+            verdict = {"escalate": False, "approve": True,
+                       "reason": "test-forced approval, pre-`verdict` shape"}
         else:
-            verdict = {"escalate": True, "approve": False,
+            verdict = {"escalate": True, "verdict": "deny",
                        "reason": "test default: gate reviews escalate unless forced"}
+    elif "Release this plan?" in prompt:
+        # A feature order's plan review — the third question kind, and the third verdict
+        # shape. Same defaulting rule as the gate above and for the same reason: a fake
+        # that released plans by default would let a feature-order test pass while
+        # asserting nothing about the review.
+        if "FORCE_APPROVE" in prompt:
+            verdict = {"escalate": False, "verdict": "approve",
+                       "reason": "test-forced plan release"}
+        elif "FORCE_REJECT" in prompt:
+            verdict = {"escalate": False, "verdict": "reject",
+                       "reason": "test-forced rejection: child two needs more context"}
+        else:
+            verdict = {"escalate": True, "verdict": "reject",
+                       "reason": "test default: plan reviews escalate unless forced"}
     else:
         verdict = {"escalate": False,
                    "answer": f"neo-decision for: {prompt.splitlines()[-1][:60]}",
                    "reason": "test verdict"}
+    if "FORCE_DISPATCH" in prompt:
+        # Neo spotting a self-contradicting ledger and filing the pre-approved cleanup.
+        # Rides on top of whatever verdict was chosen above, because the real thing does
+        # too: answering and noticing the record is wrong are independent.
+        verdict["dispatch"] = {"title": "test-forced ledger cleanup",
+                               "description": "entries A and B contradict; B won"}
     print(json.dumps({"result": json.dumps(verdict)}))
 else:
     sys.stderr.write(f"fake claude: unhandled argv {argv}\n"); sys.exit(2)
@@ -299,7 +428,7 @@ else:
 
 
 FAKE_GH = r'''#!/usr/bin/env python3
-"""Fake `gh` CLI for tests: records invocations, prints an issue URL."""
+"""Fake `gh` CLI for tests: records invocations, files issues, serves PR states."""
 import json, os, sys
 
 state_dir = os.environ["FAKE_GH_DIR"]
@@ -314,6 +443,16 @@ if fail:
     sys.exit(1)
 if argv[:2] == ["issue", "create"]:
     print(os.environ["FAKE_GH_ISSUE_URL"])
+elif argv[:2] == ["pr", "view"]:
+    # `gh pr view <url> --json state,mergedAt`. The roster comes from the fixture; a URL
+    # nobody registered gets gh's own "no pull requests found" shape, because a test
+    # about an unreadable PR should exercise the same path a real deleted one does.
+    prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
+    pr = prs.get(argv[2] if len(argv) > 2 else "")
+    if pr is None:
+        sys.stderr.write("no pull requests found for this URL\n")
+        sys.exit(1)
+    print(json.dumps(pr))
 else:
     sys.stderr.write(f"fake gh: unhandled argv {argv}\n")
     sys.exit(2)
@@ -336,6 +475,7 @@ def fake_gh(tmp_path, monkeypatch):
     class Handle:
         dir = gdir
         issue_url = url
+        prs: dict[str, dict] = {}
 
         @property
         def calls(self) -> list[dict]:
@@ -347,6 +487,13 @@ def fake_gh(tmp_path, monkeypatch):
         def fail(self, message: str) -> None:
             """Make every subsequent `gh` call fail with `message` on stderr."""
             monkeypatch.setenv("FAKE_GH_FAIL", message)
+
+        def set_pr(self, pr_url: str, state: str,
+                   merged_at: str | None = None) -> None:
+            """Register what `gh pr view <pr_url>` answers. Re-calling re-states it,
+            which is how a test walks a pull request from OPEN to MERGED."""
+            self.prs[pr_url] = {"state": state, "mergedAt": merged_at}
+            monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
 
     return Handle()
 
@@ -454,6 +601,15 @@ def fake_claude(tmp_path, monkeypatch):
                             path.read_text().splitlines() if line]
                 for path in sorted(tdir.iterdir())
             }
+
+        def fail_seat(self, *seats: str) -> None:
+            """Make the named panel seats' calls fail, and only those.
+
+            Per-seat rather than the shared `FORCE_FAIL`, which keys on the user prompt —
+            identical across every seat on one question — and so could only fail the whole
+            panel at once. Degradation is per seat: one seat abstains and the rest proceed.
+            """
+            monkeypatch.setenv("FAKE_SEAT_FAIL", ",".join(seats))
 
         def turns_fail(self, mode: str = "fail") -> None:
             """Make subsequent turns fail. `fail` = non-zero exit, `silent` = exits

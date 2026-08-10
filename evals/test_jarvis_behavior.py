@@ -218,7 +218,10 @@ def test_prompt_contract(fleet, fake_claude):
         lambda c: "--session-id" in c["argv"])[0]["argv"][-1]
     for must in ("upgrade deps", "careful please", f"jarvis wo assume {wo['id']}",
                  f"jarvis wo ask {wo['id']}", f"jarvis wo finish {wo['id']}",
-                 "never bump major versions", "Never push to main"):
+                 "never bump major versions", "Never push to main",
+                 # the knowledge base must arrive as something the worker can query,
+                 # not only as whatever happened to fit in the prompt
+                 "jarvis learn search", "jarvis learn show <id>"):
         assert must in prompt, f"contract element missing: {must}"
 
 
@@ -293,16 +296,26 @@ def test_backlog_closure(fleet):
         central.close()
 
 
-@scenario("jarvis/safety-rails", "unmanaged bg sessions are adopted and badged ad-hoc")
-def test_adhoc_visibility(fleet, fake_claude):
+@scenario("jarvis/safety-rails",
+          "the user's own sessions are left alone until they inject one")
+def test_sessions_are_opt_in(fleet, fake_claude):
+    """A session running in a project directory belongs to whoever started it.
+
+    Jarvis used to adopt these on sight and then drive them — renaming the session and
+    resuming it headlessly with a worker briefing, so the user's own conversation got
+    turns they never typed (GitHub issue 47). Now it is theirs until they hand it over.
+    """
     d = fleet["daemon"]
     claude_cli.spawn_background(prompt="rogue", cwd=fleet["a"], name="side quest")
     d.tick_count = 0
     d.tick()
     store = ProjectStore(fleet["a"])
     try:
-        adhoc = [w for w in store.list_work_orders() if w["origin"] == "adhoc"]
-        assert len(adhoc) == 1 and adhoc[0]["title"] == "side quest"
+        assert store.list_work_orders() == []
+        sid = [s for s in fake_claude.sessions if s["name"] == "side quest"][0]
+        ops.inject_session(sid["sessionId"])
+        injected = [w for w in store.list_work_orders() if w["origin"] == "injected"]
+        assert len(injected) == 1 and injected[0]["title"] == "side quest"
     finally:
         store.close()
 

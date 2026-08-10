@@ -235,8 +235,15 @@ def test_live_sync_updates_state_but_keeps_the_half_typed_order(page, server, pr
     page.fill(f"{form} input[name='title']", "half-typed order")
     page.fill(f"{form} textarea[name='description']", "context I am still writing")
 
-    # state changes underneath the open page
+    # state changes underneath the open page. A running work order, so it lands as a
+    # row: the dashboard collapses everything open that is not running or waiting on a
+    # merge, and a brand-new one is neither.
     wo = ops.create_work_order("proj_a", "landed while you were typing")
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "running")
+    finally:
+        store.close()
     page.evaluate("window.jarvisLiveSync()")
 
     # the live region picked the new work order up...
@@ -248,3 +255,40 @@ def test_live_sync_updates_state_but_keeps_the_half_typed_order(page, server, pr
     assert page.input_value(f"{form} textarea[name='description']") == (
         "context I am still writing"
     )
+
+
+#: The shape of question that made the digest necessary — Neo question #53 was ~7,000
+#: characters of feature-order brief rendered inline on this page.
+LONG_QUESTION = ("Should the exporter emit CSV or JSON, given the constraints below? "
+                 * 30)
+
+
+def test_a_long_neo_question_is_collapsed_and_the_full_text_opens_from_the_page(
+        page, server, daemon, project):
+    """The disclosure is a zero-JS `<details>`, so whether it actually HIDES the
+    verbatim question is a browser fact: it is in the DOM either way, and only a real
+    layout engine can say it is not on screen. That is exactly the property the feature
+    is for — the user must not have to scroll past 7,000 characters.
+
+    Both halves in one test: hidden to begin with, and one click away — a page that
+    dropped the question entirely would pass the first assertion perfectly.
+    """
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], LONG_QUESTION)
+    daemon._neo_drain()
+    daemon.digest_tick()
+    daemon.digest_pool.shutdown(wait=True)
+
+    page.goto(server + "/neo")
+    digest_block = page.locator(".digest").first
+    assert digest_block.is_visible()
+    assert "digest of:" in digest_block.inner_text()
+    assert len(digest_block.locator("li").all()) <= 7   # 5 bullets + 2 options, capped
+
+    verbatim = page.locator(".disclosure .request-text").first
+    assert not verbatim.is_visible()                    # collapsed: the point of it all
+    page.locator(".disclosure summary").first.click()
+    assert verbatim.is_visible()
+    assert LONG_QUESTION.strip() in verbatim.inner_text()
+    assert wo["id"] in verbatim.inner_text()            # the prompt Neo got, not a copy

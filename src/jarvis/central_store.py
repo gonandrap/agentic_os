@@ -6,6 +6,7 @@ notification inbox, the backlog (with dependencies), and the knowledge base.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,58 @@ from .paths import central_db_path, ensure_home
 # Tag marking knowledge mirrored out of a Claude Code memory file rather than typed
 # by a worker via `jarvis learn add`.
 MEMORY_TAG = "claude-memory"
+
+# Tag marking knowledge that is injected into every worker prompt in full, instead of
+# only as a headline in the index. Reserved for safety rails a worker must not be able
+# to miss by failing to search.
+PINNED_TAG = "pinned"
+
+# How much of an entry survives into the index line. Long enough for a full short
+# learning (most are one sentence), short enough that 40 of them cost ~1.5k tokens.
+HEADLINE_CHARS = 160
+
+
+def split_tags(tags: str) -> list[str]:
+    return [t for t in (s.strip() for s in (tags or "").split(",")) if t]
+
+
+def has_tag(tags: str, tag: str) -> bool:
+    return tag in split_tags(tags)
+
+
+def headline(content: str, limit: int = HEADLINE_CHARS) -> str:
+    """One-line gist of an entry: its first line, truncated.
+
+    Mirrored memory files are whole documents; taking the first line keeps a 4 KB entry
+    from costing 4 KB in an index whose entire point is to be cheap.
+    """
+    text = " ".join((content or "").strip().split("\n", 1)[0].split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+@dataclass
+class KnowledgeBrief:
+    """What a worker prompt says about the knowledge base.
+
+    Deliberately *not* the knowledge itself: `pinned` carries full text for the few
+    entries that were curated as unmissable, `digest` carries headlines + ids so the
+    worker can fetch what it needs, and `overflow` names the topics that did not fit
+    so nothing is silently invisible.
+    """
+    project: str
+    total: int = 0
+    pinned: list[dict[str, Any]] = field(default_factory=list)
+    digest: list[dict[str, Any]] = field(default_factory=list)
+    overflow: list[tuple[str, int]] = field(default_factory=list)
+
+    @property
+    def overflow_count(self) -> int:
+        return sum(n for _, n in self.overflow)
+
+    def __bool__(self) -> bool:
+        return self.total > 0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -53,7 +106,9 @@ CREATE TABLE IF NOT EXISTS knowledge (
     ts REAL NOT NULL,
     topic TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL,
-    tags TEXT NOT NULL DEFAULT ''
+    tags TEXT NOT NULL DEFAULT '',
+    retired_at REAL,                        -- NULL = standing; set = superseded
+    retired_reason TEXT                     -- why, in the user's words
 );
 CREATE TABLE IF NOT EXISTS os_state (
     key TEXT PRIMARY KEY,
@@ -63,6 +118,20 @@ CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
 CREATE INDEX IF NOT EXISTS idx_backlog_project ON backlog(project, status);
 """
 
+# Columns added after the first release, exactly as in `neo_store` and `project_store`.
+# `CREATE TABLE IF NOT EXISTS` is a NO-OP on a table that already exists, so a column
+# added to SCHEMA alone reaches new installs only and every live `os.db` fails on read.
+# Until this existed `os.db` had no upgrade path at all — `CentralStore.__init__` ran
+# `executescript(SCHEMA)` and nothing else — which is why the first column ever added to
+# it had to bring the mechanism with it.
+ADDED_COLUMNS = {
+    "knowledge": {
+        # Retraction. NULL on every pre-existing row, which reads as "standing".
+        "retired_at": "REAL",
+        "retired_reason": "TEXT",
+    },
+}
+
 
 class CentralStore:
     def __init__(self, path: Path | None = None):
@@ -70,6 +139,17 @@ class CentralStore:
         self.db_path = path or central_db_path()
         self.conn = db.connect(self.db_path)
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        for table, columns in ADDED_COLUMNS.items():
+            have = {
+                r["name"]
+                for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, decl in columns.items():
+                if name not in have:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def close(self) -> None:
         self.conn.close()
@@ -227,6 +307,33 @@ class CentralStore:
         )
         return {"id": kid, "project": project, "topic": topic, "content": content, "tags": tags}
 
+    def retract_knowledge(self, knowledge_id: str, reason: str) -> dict[str, Any]:
+        """Retire a knowledge entry the user has superseded. NOT a delete.
+
+        The row stays in the table and keeps being returned by `search_knowledge` — the
+        audit trail — while `relevant_knowledge` stops offering it to workers.
+
+        Retracting an already-retired entry RAISES rather than re-stamping it: the
+        original reason and timestamp record when the user changed their mind.
+        """
+        if not reason.strip():
+            raise ValueError("a retraction needs a reason: what supersedes this entry?")
+        row = self.conn.execute(
+            "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"knowledge entry {knowledge_id!r} not found")
+        if row["retired_at"] is not None:
+            raise ValueError(
+                f"knowledge entry {knowledge_id!r} was already retired: "
+                f"{row['retired_reason']!r}")
+        self.conn.execute(
+            "UPDATE knowledge SET retired_at=?, retired_reason=? WHERE id=?",
+            (db.now(), reason.strip(), knowledge_id),
+        )
+        return dict(self.conn.execute(
+            "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)).fetchone())
+
     def record_memory_file(self, content: str, project: str = "", topic: str = "",
                            tags: str = MEMORY_TAG) -> bool:
         """Mirror a mirrored-from-a-file memory into the knowledge base.
@@ -235,10 +342,18 @@ class CentralStore:
         replaced rather than appended — otherwise every edit would push older
         learnings out of the recency window with near-duplicates of itself.
         Returns False when nothing changed.
+
+        THE SELECT SKIPS RETIRED ROWS, so the next rewrite of a retracted memory file
+        INSERTs a fresh live row instead of writing into the retired one. Replacing a
+        retired row in place would turn one retraction into a permanent, silent mute on
+        a file the worker keeps updating — every later version written somewhere no
+        prompt reads, with no signal to anyone. A retraction is a statement about the
+        TEXT that was retired, not about the file (ruled by Neo, question 56). Steady
+        state is still at most one live row per (project, topic, tags), plus history.
         """
         row = self.conn.execute(
             "SELECT id, content FROM knowledge WHERE project=? AND topic=? AND tags=?"
-            " ORDER BY ts DESC LIMIT 1",
+            " AND retired_at IS NULL ORDER BY ts DESC LIMIT 1",
             (project, topic, tags),
         ).fetchone()
         if row is not None and row["content"] == content:
@@ -250,21 +365,182 @@ class CentralStore:
         self.add_knowledge(content, project=project, topic=topic, tags=tags)
         return True
 
-    def relevant_knowledge(self, project: str, limit: int = 8) -> list[dict[str, Any]]:
-        """Project-specific + global entries, most recent first."""
+    def relevant_knowledge(self, project: str, limit: int = 8,
+                           include_retired: bool = False) -> list[dict[str, Any]]:
+        """Project-specific + global entries, most recent first.
+
+        This is the PROMPT feed — `dispatch.build_worker_prompt` offers it to every
+        worker — so retired entries are excluded by default. `jarvis learn list` passes
+        `include_retired=True` and marks them; `search_knowledge` is the unfiltered
+        audit surface.
+        """
+        retired = "" if include_retired else " AND retired_at IS NULL"
         rows = self.conn.execute(
-            "SELECT * FROM knowledge WHERE project=? OR project='' ORDER BY ts DESC LIMIT ?",
+            f"SELECT * FROM knowledge WHERE (project=? OR project='')"
+            f"{retired} ORDER BY ts DESC LIMIT ?",
             (project, limit),
         ).fetchall()
         return db.rows_to_dicts(rows)
 
-    def search_knowledge(self, term: str, limit: int = 50) -> list[dict[str, Any]]:
-        like = f"%{term}%"
-        rows = self.conn.execute(
-            "SELECT * FROM knowledge WHERE content LIKE ? OR topic LIKE ? OR tags LIKE ? ORDER BY ts DESC LIMIT ?",
-            (like, like, like, limit),
-        ).fetchall()
-        return db.rows_to_dicts(rows)
+    def get_knowledge(self, kid: str) -> dict[str, Any] | None:
+        """One entry by id — what an index headline cashes in to. Retired entries are
+        returned carrying their retirement metadata; the caller marks them."""
+        row = self.conn.execute("SELECT * FROM knowledge WHERE id=?", (kid,)).fetchone()
+        return dict(row) if row else None
+
+    def search_knowledge(self, term: str, limit: int = 50, project: str | None = None,
+                         topic: str | None = None) -> list[dict[str, Any]]:
+        """Free-text search. The AUDIT surface: retired entries are included, carrying
+        their `retired_at` and `retired_reason`.
+
+        Also the worker's on-demand retrieval verb, which is why retired rows stay in:
+        a worker that looked something up and got nothing back would conclude the OS
+        knows nothing about it, when the truth is that it knew and changed its mind.
+        The row says which, and `cli.cmd_learn` marks it. `project` scopes to that
+        project + global; omit it to search the whole fleet (cross-project learnings
+        are often the point).
+
+        **Words are ORed and the result is ranked by how many of them a row matched**,
+        rather than the whole term being one `LIKE '%…%'`. A single word behaves exactly
+        as it always did; the difference is a query like "cents rounding format", which
+        under phrase matching required that literal string and so returned nothing at
+        all. That is how real agents search — the retrieval eval
+        (evals/llm/test_knowledge_retrieval_judgment.py) scored 2/7 on phrase matching
+        purely because natural multi-word queries retrieved nothing — and an index whose
+        lookup verb only answers single keywords is not a lookup verb.
+
+        Still substring matching per word, so it has no stemming and no synonyms:
+        "rounding" does not find "rounded" on its own, it survives only by riding along
+        with the other words in the query. FTS5 is the real fix and is on the backlog.
+        """
+        words = [w for w in (term or "").split() if w] or [""]
+        # score = how many of the query's words this row matched anywhere
+        score = " + ".join(
+            "(CASE WHEN content LIKE ? OR topic LIKE ? OR tags LIKE ? THEN 1 ELSE 0 END)"
+            for _ in words)
+        params: list[Any] = []
+        for w in words:
+            params += [f"%{w}%"] * 3
+        q = [f"SELECT *, ({score}) AS _score FROM knowledge WHERE _score > 0"]
+        if project is not None:
+            q.append("AND (project=? OR project='')")
+            params.append(project)
+        if topic is not None:
+            q.append("AND topic=?")
+            params.append(topic)
+        q.append("ORDER BY _score DESC, ts DESC LIMIT ?")
+        params.append(limit)
+        rows = db.rows_to_dicts(self.conn.execute(" ".join(q), params).fetchall())
+        for row in rows:  # ranking is how the list is ordered, not a field of an entry
+            row.pop("_score", None)
+        return rows
+
+    def set_knowledge_tags(self, kid: str, tags: str) -> dict[str, Any] | None:
+        self.conn.execute("UPDATE knowledge SET tags=? WHERE id=?", (tags, kid))
+        return self.get_knowledge(kid)
+
+    def pin_knowledge(self, kid: str, pinned: bool = True) -> dict[str, Any] | None:
+        """Add/remove the `pinned` tag — the switch between 'injected in full into every
+        worker prompt' and 'a headline in the index'."""
+        row = self.get_knowledge(kid)
+        if row is None:
+            return None
+        tags = split_tags(row["tags"])
+        if pinned and PINNED_TAG not in tags:
+            tags.append(PINNED_TAG)
+        elif not pinned and PINNED_TAG in tags:
+            tags.remove(PINNED_TAG)
+        return self.set_knowledge_tags(kid, ",".join(tags))
+
+    def count_knowledge(self, project: str, include_retired: bool = False) -> int:
+        retired = "" if include_retired else " AND retired_at IS NULL"
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS n FROM knowledge WHERE (project=? OR project=''){retired}",
+            (project,),
+        ).fetchone()
+        return int(row["n"])
+
+    def knowledge_topics(self, project: str | None = None,
+                         include_retired: bool = False) -> list[tuple[str, int]]:
+        """(topic, count) for a project + global entries, biggest topic first.
+
+        Retired entries are excluded by default: this feeds both the prompt's overflow
+        roll-call and `jarvis learn topics`, and a topic whose only entries were
+        retracted should not advertise itself as somewhere to go looking.
+        """
+        conds, params = [], []
+        if project is not None:
+            conds.append("(project=? OR project='')")
+            params.append(project)
+        if not include_retired:
+            conds.append("retired_at IS NULL")
+        q = "SELECT topic, COUNT(*) AS n FROM knowledge"
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        q += " GROUP BY topic ORDER BY n DESC, topic"
+        return [(r["topic"], int(r["n"]))
+                for r in self.conn.execute(q, params).fetchall()]
+
+    def knowledge_brief(self, project: str, pinned_limit: int = 8,
+                        digest_limit: int = 40,
+                        digest_chars: int = 4000) -> KnowledgeBrief:
+        """Build the bounded prompt view of the knowledge base.
+
+        Cost is capped by `pinned_limit` + `digest_chars` no matter how large the base
+        grows; what does not fit degrades to a topic roll-call rather than disappearing.
+
+        This is a PROMPT feed, so it inherits `relevant_knowledge`'s rule: retired
+        entries never appear. An index headline is still the prompt — retracting a
+        ruling has to remove it from the map as well as from the payload, or the worker
+        reads the superseded headline and goes looking for the entry behind it.
+        """
+        brief = KnowledgeBrief(project=project, total=self.count_knowledge(project))
+        if brief.total == 0:
+            return brief
+
+        rows = db.rows_to_dicts(self.conn.execute(
+            "SELECT * FROM knowledge WHERE (project=? OR project='')"
+            " AND retired_at IS NULL ORDER BY ts DESC",
+            (project,),
+        ).fetchall())
+
+        rest: list[dict[str, Any]] = []
+        for row in rows:
+            if has_tag(row["tags"], PINNED_TAG) and len(brief.pinned) < pinned_limit:
+                brief.pinned.append(row)
+            else:
+                rest.append(row)
+
+        # Selection is round-robin across topics, not straight recency. The index is a
+        # map of what the OS knows; letting the one busiest topic consume the whole
+        # budget would hide the existence of every other topic — and "I didn't know
+        # there was anything to look up" is the exact failure this replaces.
+        by_topic: dict[str, list[dict[str, Any]]] = {}
+        for row in rest:  # rest is already recency-ordered, so each bucket is too
+            by_topic.setdefault(row["topic"], []).append(row)
+
+        selected: list[dict[str, Any]] = []
+        spent = 0
+        full = False
+        while not full and any(by_topic.values()):
+            for bucket in by_topic.values():
+                if not bucket:
+                    continue
+                line = headline(bucket[0]["content"])
+                if len(selected) >= digest_limit or spent + len(line) > digest_chars:
+                    full = True
+                    break
+                spent += len(line)
+                selected.append({**bucket.pop(0), "headline": line})
+
+        # Render grouped: recency picks *what* is shown, topic decides *where* it sits.
+        order = {t: i for i, t in enumerate(by_topic)}
+        brief.digest = sorted(selected, key=lambda r: (order[r["topic"]], -r["ts"]))
+        brief.overflow = sorted(
+            ((t, len(rows)) for t, rows in by_topic.items() if rows),
+            key=lambda kv: (-kv[1], kv[0]),
+        )
+        return brief
 
     # -- os state ----------------------------------------------------------------------
 

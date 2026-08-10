@@ -90,8 +90,14 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any]) -> dict[str, Any]:
     conservative choice, it is a guaranteed stall. Only `adhoc` rows reach here with the
     column unset — dispatch persists the resolved value back onto dispatched ones — and
     resolving it here keeps the column's NULL meaningful.
+
+    `add_dirs` is the one flag that now depends on the work order's KIND: a planner also
+    reaches the architect and test-lead seat definitions, and an ordinary worker does not
+    (design decision 4). Because a resumed turn re-derives its flags from argv, this is
+    also what keeps the seats available on the planner's second and later turns — dropping
+    the kind here would make them vanish after turn 1.
     """
-    from .bootstrap import install_agent_skills
+    from .bootstrap import install_agent_assets
     from .dispatch import _write_worker_settings
 
     return {
@@ -102,7 +108,7 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any]) -> dict[str, Any]:
         "append_system_prompt": (wo.get("append_system_prompt")
                                  or project.worker.append_system_prompt),
         "settings_file": _write_worker_settings(project, wo),
-        "add_dirs": [install_agent_skills(project.path)],
+        "add_dirs": install_agent_assets(project.path, wo.get("kind") or "worker"),
     }
 
 

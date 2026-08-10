@@ -136,6 +136,31 @@
                   max-height: 340px; overflow: auto; white-space: pre-wrap;
                   word-break: break-word; }
   details > summary { cursor: pointer; }
+
+  /* A long worker question, cut down to what the user has to decide on (see
+     src/jarvis/digest.py). The verbatim text is always one disclosure away, and this
+     styling must never look like the whole story. */
+  .digest { margin: 8px 0 4px; }
+  .digest .headline { margin: 0 0 8px; font-size: 15.5px; line-height: 1.45; }
+  .digest ul, .digest ol { margin: 0 0 10px; padding-left: 22px; }
+  .digest li { margin: 3px 0; }
+  .digest .label { font-family: var(--mono); font-size: 11px; color: var(--ink-3);
+                   letter-spacing: 0.12em; text-transform: uppercase; margin: 0 0 4px; }
+  .digest .rec { margin: 0 0 8px; padding: 8px 12px; border-radius: 6px;
+                 background: color-mix(in srgb, var(--amber) 10%, var(--surface));
+                 border-left: 3px solid var(--amber); }
+  .digest .rec .label { display: block; color: var(--amber-ink); }
+  /* The escape hatch back to the verbatim text. Styled as a button, not as a line of
+     prose: it is the control that makes shortening safe, so it has to look pressable. */
+  .disclosure { margin-top: 8px; }
+  .disclosure > summary { display: inline-block; list-style: none;
+                          background: var(--raised); color: var(--ink-2);
+                          border: 1px solid var(--line); border-radius: 6px;
+                          padding: 4px 11px; font: 12px var(--mono); }
+  .disclosure > summary::-webkit-details-marker { display: none; }
+  .disclosure > summary::before { content: "▸ "; color: var(--ink-3); }
+  .disclosure[open] > summary::before { content: "▾ "; }
+  .disclosure > summary:hover { color: var(--ink); border-color: var(--ink-3); }
   @media (prefers-reduced-motion: no-preference) {
     .pulse { animation: pulse 2.4s ease-in-out infinite; }
     @keyframes pulse { 50% { opacity: 0.45; } }

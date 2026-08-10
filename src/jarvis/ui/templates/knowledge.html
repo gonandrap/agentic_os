@@ -2,19 +2,41 @@
 {% block title %}Knowledge — Jarvis{% endblock %}
 {% block content %}
 
-<h2>Knowledge base</h2>
+<h2>Knowledge base <span class="sub">({{ rows|length }} entries)</span></h2>
+<p class="sub">
+  Workers get this as an <strong>index</strong> and pull entries on demand
+  (<code>jarvis learn search</code> / <code>jarvis learn show &lt;id&gt;</code>), so the
+  base can grow without inflating every prompt. <strong>Pinned</strong> entries are the
+  exception — they are pasted verbatim into every worker prompt. Pin sparingly: safety
+  rails only.
+</p>
+
+{% if topics %}
+<div class="panel">
+  <b>topics</b>
+  <span class="sub">{% for t, n in topics %}{{ t or '(none)' }} ({{ n }}){% if not loop.last %} · {% endif %}{% endfor %}</span>
+</div>
+{% endif %}
+
 <div class="panel">
   <table>
-    <tr><th>scope</th><th>topic</th><th>learning</th><th>age</th></tr>
+    <tr><th>scope</th><th>topic</th><th>learning</th><th>age</th><th></th></tr>
     {% for k in rows %}
     <tr>
       <td class="mono">{{ k.project or 'global' }}</td>
       <td class="mono">{{ k.topic or '–' }}</td>
-      <td>{{ k.content }}</td>
+      <td>{% if k.pinned %}📌 {% endif %}{{ k.content }}<div class="sub mono">{{ k.id }}</div></td>
       <td class="mono sub">{{ fmt_age(k.ts) }}</td>
+      <td>
+        <form method="post" action="/knowledge/pin">
+          <input type="hidden" name="kn_id" value="{{ k.id }}">
+          <input type="hidden" name="pinned" value="{{ '0' if k.pinned else '1' }}">
+          <button title="{{ 'stop injecting this into every worker prompt' if k.pinned else 'inject this into every worker prompt verbatim' }}">{{ 'unpin' if k.pinned else 'pin' }}</button>
+        </form>
+      </td>
     </tr>
     {% else %}
-    <tr><td colspan="4" class="empty">nothing learned yet — workers report with <code>jarvis learn add</code></td></tr>
+    <tr><td colspan="5" class="empty">nothing learned yet — workers report with <code>jarvis learn add</code></td></tr>
     {% endfor %}
   </table>
 </div>

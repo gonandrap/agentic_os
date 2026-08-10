@@ -33,15 +33,28 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from . import db
+from .project_store import DEPENDENCY_DEAD_STATUSES, UNGOVERNED_ORIGINS
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .project_store import ProjectStore
 
 # Statuses where the user is the one holding the work up. A `running` worker is not
-# blocked on anything the user can see, and a `pending` one hasn't started.
-BLOCKED_STATUSES = ("waiting_input", "needs_review", "failed")
+# blocked on anything the user can see. `pending` used to be excluded on the same
+# reasoning — it hasn't started, so nobody is waiting on a decision — and dependency
+# edges broke that: a pending work order whose dependency was cancelled will never
+# start, and only the user can choose between cancelling it and cutting the edge.
+# This tuple must cover every status `true_blockers` can return a blocker for, or the
+# blocker is derived correctly and then never surfaced.
+BLOCKED_STATUSES = ("waiting_input", "needs_review", "failed", "pending")
 # Statuses where nothing can possibly be pending: the work order is over.
 TERMINAL_STATUSES = ("completed", "cancelled")
+
+#: What a work order says when the pull request it was parked behind was closed without
+#: being merged. Lives here rather than at the call site because `true_blockers` is the
+#: only source of attention reasons — INV-ATTENTION-REASON rewrites any flag it cannot
+#: derive, so a reason raised by `Daemon.poll_pull_requests` and not repeated here would
+#: silently become "finished without a completion signal" on the next reconcile tick.
+PR_CLOSED_BLOCKER = "pull request closed without merging — the work was not accepted"
 
 
 @dataclass
@@ -67,6 +80,29 @@ class Violation:
         return f"{self.invariant} — {where}{self.detail}{fixed}"
 
 
+#: What a FEATURE order says when one of its children ended badly. Two reasons rather
+#: than one because they ask the user for different things: a failed child is a problem
+#: to diagnose, a cancelled one is a decision already taken whose consequences for the
+#: rest of the feature have not been. Both are formatted with the child's id.
+#:
+#: Unlike the two constants around them these are NOT re-derived by `true_blockers` —
+#: that function answers "what does this WORK ORDER need from me", and a feature order is
+#: not a work order, so INV-ATTENTION-REASON never sees these and cannot relabel them.
+#: They live here anyway so that every reason the OS puts in front of the user is written
+#: in one file. If a feature-order invariant is ever added, it inherits the obligation:
+#: whatever derives the flag has to be able to produce these strings.
+FEATURE_CHILD_FAILED = "{id} failed — this feature cannot finish without it"
+FEATURE_CHILD_CANCELLED = ("{id} was cancelled — this feature will not deliver what the "
+                           "plan promised")
+
+#: What a work order says when something it depends on can never complete. A dependency
+#: that is `cancelled` or `failed` will not come back, so the dependent would sit in
+#: `pending` for ever with nothing on its face to say why — the stranded row the
+#: feature-order design warns about. Same rule as PR_CLOSED_BLOCKER above: an attention
+#: reason must be re-derivable by `true_blockers` or the next tick relabels it.
+DEAD_DEPENDENCY_BLOCKER = "blocked by a dependency that can never complete"
+
+
 # -- the derivation everything else is checked against ------------------------------
 
 
@@ -90,12 +126,12 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
             f"gate approval needed: {approval['kind']} (request {approval['id']})"
         )
     # Two of the blockers below only exist because Jarvis dispatched the worker and
-    # briefed it on the contract (`jarvis wo finish`, worktree, OPERATION.md). An
-    # adopted ad-hoc session got none of that — no JARVIS_WO_ID, no briefing — so it
-    # cannot signal completion and its session ending is not a failure. Holding it to
-    # the contract anyway made every adopted session a guaranteed attention item.
-    # Adoption exists for visibility; see Daemon.retire_adhoc.
-    governed = wo.get("origin") != "adhoc"
+    # briefed it on the contract (`jarvis wo finish`, worktree, OPERATION.md). A session
+    # the user started and injected got none of that — no JARVIS_WO_ID, no briefing — so
+    # it cannot signal completion and its session ending is not a failure. Holding it to
+    # the contract anyway made every such session a guaranteed attention item.
+    # See Daemon.retire_ungoverned.
+    governed = wo.get("origin") not in UNGOVERNED_ORIGINS
     if governed and wo["status"] == "failed":
         blockers.append("worker failed — review and retry")
     # Blocked on a prompt is real whoever started the session: nobody else can unstick it.
@@ -104,13 +140,86 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     # until Neo either decides or escalates (handled above).
     if wo["status"] == "waiting_input" and not _waiting_on_neo_gate(store, wo):
         blockers.append("worker is waiting on your input")
+    # A dependency that will never complete. Ordinary blocking is silent on purpose —
+    # `pending — blocked by …` is a listing label, not a decision anyone owes — but a
+    # dependency that is cancelled or failed cannot clear itself, so the work order will
+    # wait for ever and only the user can choose between cancelling it and cutting the
+    # edge (`jarvis wo unblock`). That is the difference between waiting and stranded.
+    if wo["status"] == "pending" and dead_dependencies(store, wo):
+        blockers.append(DEAD_DEPENDENCY_BLOCKER)
     if governed and wo["status"] == "needs_review" and not pending:
-        blockers.append("finished without a completion signal — review the session")
+        # Two very different ways to arrive at `needs_review` without an assumption to
+        # decide, and they ask the user for opposite things. A closed pull request means
+        # the work WAS delivered and then refused, so there is nothing to review in the
+        # session — the question is what to do about the refusal.
+        if wo.get("pr_state") == "CLOSED":
+            blockers.append(PR_CLOSED_BLOCKER)
+        else:
+            blockers.append("finished without a completion signal — review the session")
     # What the user has already looked at and dismissed stops being a blocker — but only
     # exactly that. Anything new still gets through (a pending assumption never can be
     # acknowledged away; `jarvis wo ack` refuses).
     acked = db.from_json(wo.get("acknowledged_blockers"), []) or []
     return [b for b in blockers if b not in acked]
+
+
+def dead_dependencies(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
+    """Dependencies of this work order that can never be satisfied.
+
+    Cancelled, failed, or deleted out from under it. Anything else is merely not done
+    yet, which is the normal condition of a dependency and asks nothing of anyone.
+    """
+    return [dep for dep in store.unfinished_dependencies(wo["id"])
+            if dep["status"] in DEPENDENCY_DEAD_STATUSES or dep["status"] == "missing"]
+
+
+def status_label(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """How this work order's status should read to a human.
+
+    `pending` alone promises "will start as soon as a slot frees", which is a lie for a
+    row that is waiting on another work order — possibly for days. Every surface that
+    prints a status renders it through here, so the CLI listing, `jarvis status` and the
+    dashboard cannot drift apart on the answer. (They have before: a dashboard listing
+    and its own header disagreed about what needed the user because each derived it
+    separately — see the FEATURED_STATUSES fix in PR 65.)
+    """
+    if wo["status"] != "pending":
+        return wo["status"]
+    blockers = store.unfinished_dependencies(wo["id"])
+    if blockers:
+        return f"pending — blocked by {', '.join(dep['id'] for dep in blockers)}"
+    # Ranked below the dependency label deliberately: a work order waiting on a sibling's
+    # merge is not going to start when a slot frees, so naming the slot would be the less
+    # true of the two answers. Neither raises attention — a slot always frees, so this is
+    # the system working, not a decision anyone owes (the same rule that keeps a merely
+    # unfinished dependency silent).
+    cap = _slot_cap(store, wo)
+    if cap:
+        parent, limit, active = cap
+        return (f"pending — waiting for a slot in {parent} "
+                f"({active}/{limit} children running)")
+    return "pending"
+
+
+def _slot_cap(store: ProjectStore, wo: dict[str, Any]) -> tuple[str, int, int] | None:
+    """`(feature id, max_parallel, active children)` when this work order's feature order
+    is already running as many children as it allows, else None.
+
+    A parentless work order — nearly all of them — is answered from the row it was handed
+    and costs no query, the same shape `ops.blocked_by` uses for `depends_on`.
+    """
+    parent = wo.get("parent_id")
+    if not parent or wo.get("kind") != "worker":
+        return None
+    try:
+        fo = store.get_feature_order(parent)
+    except KeyError:
+        return None
+    limit = fo.get("max_parallel")
+    if not limit:
+        return None
+    active = store.count_active_children(parent)
+    return (parent, int(limit), active) if active >= limit else None
 
 
 def _mentions_assumptions(reason: str | None) -> bool:
@@ -163,16 +272,16 @@ def check_attention_reason_is_true(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_adhoc_not_governed(store: ProjectStore) -> Iterator[Violation]:
-    """INV-ADHOC-NOT-GOVERNED — an adopted session must not be judged as a worker.
+    """INV-ADHOC-NOT-GOVERNED — an injected session must not be judged as a worker.
 
-    The reconciler adopts background sessions it finds in a project directory so they
-    show up in `jarvis status` and on the dashboard. That is a *mirror*, not a
-    dispatch: the session was started by the user in `claude agents`, never received
-    the worker contract, and has no way to call `jarvis wo finish`. Judging it against
-    that contract parked it in `needs_review` ("worker idle without `jarvis wo finish`")
-    the moment it ended a turn, and in `failed` ("worker session disappeared") the
-    moment the user cleaned it up — one live fleet accumulated fifteen of these, one of
-    which was the session the user was talking to.
+    A session the user started and handed over with `jarvis wo inject` is a *mirror*,
+    not a dispatch: it never received the worker contract and has no way to call
+    `jarvis wo finish`. Judging it against that contract parked it in `needs_review`
+    ("worker idle without `jarvis wo finish`") the moment it ended a turn, and in
+    `failed` ("worker session disappeared") the moment the user cleaned it up — one live
+    fleet accumulated fifteen of these, one of which was the session the user was
+    talking to. (Back then Jarvis adopted these sessions on its own; it no longer does,
+    which is why `adhoc` rows still on disk get the same treatment as `injected` ones.)
 
     `true_blockers` stops *new* ones. This retires the records already on disk, so the
     fix reaches a running fleet on the next reconcile tick instead of waiting for the
@@ -185,15 +294,62 @@ def check_adhoc_not_governed(store: ProjectStore) -> Iterator[Violation]:
     """
     for wo in store.list_work_orders(statuses=("failed", "needs_review"),
                                      include_hidden=True):
-        if wo["origin"] != "adhoc" or store.pending_assumptions(wo["id"]):
+        if (wo["origin"] not in UNGOVERNED_ORIGINS
+                or store.pending_assumptions(wo["id"])):
             continue
         store.set_status(wo["id"], "completed")
         store.clear_attention(wo["id"])
         yield Violation(
             invariant="INV-ADHOC-NOT-GOVERNED",
             wo_id=wo["id"],
-            detail=f"adopted ad-hoc session held to the worker contract "
+            detail=f"{wo['origin']} session held to the worker contract "
                    f"({wo.get('attention_reason') or wo['status']})",
+            repaired=True,
+            repair="retired to completed; attention cleared",
+            context={"was": wo["status"], "reason": wo.get("attention_reason")},
+        )
+
+
+def check_legacy_adhoc_retired(store: ProjectStore) -> Iterator[Violation]:
+    """INV-ADHOC-LEGACY-RETIRED — a session Jarvis adopted on its own is let go.
+
+    Jarvis used to adopt every Claude session running under a registered project path
+    into an `origin="adhoc"` work order, and then track it. It no longer does: adoption
+    is now the user's explicit act (`jarvis wo inject`), so nothing follows those rows
+    any more.
+
+    That is why leaving them alone is not the neutral option. A row parked in
+    `waiting_input` is a genuine user blocker — "worker is waiting on your input" is
+    true whoever started the session, so `true_blockers` does not suppress it — and with
+    nothing left to refresh it, it would ask for the user forever, about a session that
+    may have ended weeks ago. This closes them once, at the point of upgrade.
+
+    Repairable: the record, its timeline, its captured replies and any assumptions all
+    stay exactly as they are; only the demand for the user goes away, which is the same
+    treatment `Daemon.retire_ungoverned` gives a session that ends normally. A row with
+    assumptions still pending is left alone: the user owes it an answer, and that is a
+    real blocker, not adoption noise.
+
+    Idempotent: a retired row is `completed`, so a re-run finds nothing. Only `adhoc`
+    rows are touched — `injected` ones were handed over deliberately and are still
+    tracked.
+    """
+    # Adoption only ever produced these two statuses, and no path moves an adhoc row to
+    # `pending`/`dispatching`. `failed`/`needs_review` are INV-ADHOC-NOT-GOVERNED's.
+    for wo in store.list_work_orders(statuses=("running", "waiting_input"),
+                                     include_hidden=True):
+        if wo["origin"] != "adhoc" or store.pending_assumptions(wo["id"]):
+            continue
+        why = ("Jarvis no longer adopts sessions on its own (GitHub issue 47); "
+               "this record was closed by the upgrade, not by anything the session did")
+        store.set_status(wo["id"], "completed")
+        store.clear_attention(wo["id"])
+        store.add_event(wo["id"], "session_retired", {"why": why, "was": wo["status"]})
+        yield Violation(
+            invariant="INV-ADHOC-LEGACY-RETIRED",
+            wo_id=wo["id"],
+            detail=f"auto-adopted session still open ({wo['status']}) with nothing "
+                   f"left to track it",
             repaired=True,
             repair="retired to completed; attention cleared",
             context={"was": wo["status"], "reason": wo.get("attention_reason")},
@@ -373,6 +529,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
     check_attention_reason_is_true,
     check_adhoc_not_governed,      # retire before the flag checks judge the leftovers
+    check_legacy_adhoc_retired,    # ...and before them, let go of what nothing tracks
     check_no_phantom_attention,
     check_blocked_work_is_surfaced,
     check_attention_has_reason,

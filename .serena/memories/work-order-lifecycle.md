@@ -16,10 +16,34 @@ through `ProjectStore.set_status()` — nothing writes status directly.
    hands off to `worker_session.start()`, then sets `running`.
 4. **`waiting_input`** — `hooks.py` on a `Notification`, or the reconciler when the
    work order is parked on a privileged-action gate.
-5. **`needs_review` / `completed` / `failed`** — settled by
+5. **`needs_review` / `waiting_pr_merge` / `completed` / `failed`** — settled by
    `Daemon.settle_work_order()` from the latest **turn row**, see below.
 6. **Close-out** — `ops.review_work_order()`, `cancel()`, `hide_work_order()`,
-   `delete_work_order()`.
+   `delete_work_order()`, and `mark_done()` (the user's own "this is finished", and the
+   only way out of `waiting_pr_merge`).
+
+**`waiting_pr_merge`** is set by `jarvis wo finish --pr <url>` (`ops.finish`, which
+stores `work_orders.pr_url`). It is an OPEN status that deliberately raises **no**
+attention flag — `invariants.true_blockers` has no branch for it, on purpose: it is a
+merge queue the user works through in the dashboard, not a decision blocking the fleet.
+Pending assumptions outrank it (`needs_review` wins).
+
+`Daemon.poll_pull_requests` is what ends it, on its own `PR_POLL_EVERY_TICKS` (24, ~2min)
+cadence — the only step in the OS that leaves the machine. It runs
+`github.pr_view` (`gh pr view <url> --json state,mergedAt`) for each parked work order
+and writes the answer to `work_orders.pr_state`:
+
+* MERGED → `ops.complete_merged` — `completed`, event `pr_merged`, backlog item closed,
+  worker stopped. Deliberately the same close-out as `jarvis wo done`
+  (`ops.close_out`), with a different event so the record does not claim the user did it.
+* CLOSED unmerged → `ops.record_pr_closed` — `needs_review` + attention. The reason is
+  `invariants.PR_CLOSED_BLOCKER` and it MUST stay a `true_blockers` branch:
+  INV-ATTENTION-REASON rewrites any reason that derivation does not produce.
+* OPEN → nothing written.
+
+Skipped entirely when no work order is parked, so an idle fleet spawns no subprocess.
+A `gh` that cannot answer warns ONCE per project per daemon run (`pr_poll_warned`) and
+leaves the work order parked; `jarvis wo done` is still the manual way out.
 
 ## The transport: headless turns (replaced background sessions, 2026-08-01)
 
@@ -61,6 +85,16 @@ from the transcript, so anything omitted vanishes from that turn onwards.
 **The `--` fence is load-bearing.** `--add-dir` AND `--tools` are variadic; an unfenced
 prompt is swallowed as an option value.
 
+**The knowledge base is INDEXED into the briefing, not pasted into it.**
+`CentralStore.knowledge_brief()` returns a bounded `KnowledgeBrief`; `render_knowledge_block()`
+renders it inside `_common_briefing()`, so worker AND planner prompts get it. Three tiers:
+entries tagged `pinned` in full (cap `os.knowledge_inject_limit`), then one headline + id per
+entry selected **round-robin across topics** (caps `os.knowledge_digest_limit`/`_chars`), then
+a by-topic count of what did not fit. Retired entries appear in none of them — retraction has
+to remove a ruling from the map as well as the payload. Workers cash an id in with
+`jarvis learn show|search|list|topics`. Prompt cost is therefore flat in the size of the base;
+the worker that needs an entry pays one tool call for it.
+
 **Worktree**: turn 1 runs with `cwd=project.path` + `--worktree <wo-id>`; later turns run
 with `cwd=<that worktree>` and no flag (transcripts are keyed by creation cwd).
 
@@ -86,22 +120,33 @@ fire on EVERY turn** (`SessionStart.source == "resume"` from turn 2 on).
 | `failed` | `failed` + attention + notification |
 | `done` + queued messages | untouched; the next turn goes out this tick |
 | `done` + `result_summary` + pending assumptions | `needs_review` |
+| `done` + `result_summary` + `pr_url` | `waiting_pr_merge` (re-settles here every tick) |
 | `done` + `result_summary` | `completed` |
 | `done` + pending approvals | `waiting_input` (parked on a gate — compliance) |
 | `done`, none of the above | `needs_review` "idle without `jarvis wo finish`" |
 
 `settle_turns` and `deliver_messages` run on **every** tick (cheap: a signal and a file
-read). Only `adopt_sessions` + `check_invariants` stay on the `RECONCILE_EVERY_TICKS`
-cadence, because only they need `claude agents --json`.
+read). Only `track_injected_sessions` + `check_invariants` stay on the
+`RECONCILE_EVERY_TICKS` cadence, and only the first needs `claude agents --json` — which
+it skips entirely on ticks where no project has a live `injected` row.
 
-## Background sessions still exist — for the USER only
+## Background sessions still exist — for the USER only, and only if handed over
 
-`claude agents --json` now contains only sessions the user started. `Daemon.adopt_sessions`
-mirrors them as `origin="adhoc"` work orders for visibility and never holds them to the
-worker contract (`retire_adhoc`, `INV-ADHOC-NOT-GOVERNED`).
+`claude agents --json` contains only sessions the user started. Jarvis does **not** adopt
+them (GitHub issue 47): a session the user opened is theirs — not seen, not named, not
+flagged, and above all not written into. `jarvis wo inject <session-id>`
+(`ops.inject_session`, plus the panel on the project page) is the only way one enters the
+OS. It creates the record and nothing else: no rename, no turn. From then on
+`Daemon.track_injected_sessions` follows the session's state, and the row is never held to
+the worker contract (`retire_ungoverned`, `INV-ADHOC-NOT-GOVERNED`).
+
+`origin="injected"` is the new marker; `origin="adhoc"` is the legacy one from the
+auto-adoption era. Both are in `project_store.UNGOVERNED_ORIGINS` and get the same
+"not a worker" treatment, but only `injected` is tracked — `INV-ADHOC-LEGACY-RETIRED`
+closes leftover `adhoc` rows once on upgrade, and tracking them too would reopen them.
 
 **Migration is automatic**: `worker_session._release_background_owner()` fires when a work
-order has no turn on record (a legacy dispatched one, or an adopted one) and `claude stop`s
+order has no turn on record (a legacy dispatched one, or an injected one) and `claude stop`s
 whatever background agent owns its session before resuming — which a headless resume
 requires anyway. `jarvis doctor` lists leftover `[WO …]` agents with no open work order
 (`ops.orphaned_worker_sessions`) but never stops them.
@@ -111,6 +156,6 @@ requires anyway. `jarvis doctor` lists leftover `[WO …]` agents with no open w
 - `run_headless()` — `claude -p <prompt> --output-format json …` — Neo and the LLM evals.
   Note a worker turn is also a `-p` call now, so code/tests telling them apart must key on
   the presence of `--session-id`/`--resume`, not on `-p`.
-- `spawn_background()` / `list_background_sessions()` / `stop_session()` — ad-hoc adoption
-  and the migration path only.
+- `spawn_background()` / `list_background_sessions()` / `stop_session()` — injected-session
+  tracking and the migration path only.
 - Deleted with the old transport: `job_result()`, `jobs_dir()`, `send_to_session()`.

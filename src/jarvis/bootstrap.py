@@ -25,7 +25,20 @@ from .paths import project_state_dir
 # v5 = v4's privileged-action gates section + the decision-routing rewrite (Neo as
 # first responder). Both landed as "v4" on separate branches, so a project that
 # regenerated against either one would have skipped the other's content.
-TEMPLATE_VERSION = 5
+# v6 = the `dismissed` gate verdict. A worker that does not know a false positive has an
+# outcome other than "denied" reasonably concludes the command is forbidden and starts
+# rewording it to get past the recogniser, which is the one response that must not be
+# learned. Bumping the version is what pushes that paragraph into every managed repo.
+# v7 = the `[<wo-id>] ` pull request title rule, and `jarvis wo finish --pr`. Numbered 7
+# rather than 6 because the `dismissed` paragraph above ALSO landed as v6, on another
+# branch — exactly the collision the v5 note describes, caught this time in a merge
+# instead of by a project that silently skipped one branch's content.
+# v8 = "Serena first, grep second". A worker cannot be given this posture by withholding a
+# tool the way the planning seats are — it needs Grep and Bash to do its job — so ranking
+# the tools in prose is the only lever, and it has to reach every managed repo to be worth
+# anything. Stated conditionally: Jarvis configures no MCP server itself, so whether a
+# worker has Serena depends on the user's own Claude config and on the project.
+TEMPLATE_VERSION = 8
 ASSETS = Path(__file__).parent / "assets"
 
 
@@ -38,27 +51,86 @@ def jarvis_hook_command() -> str:
     return f"{sys.executable} -m jarvis.cli _hook"
 
 
-def install_agent_skills(project_path: Path) -> Path:
-    """Materialize the OS-provided agent skills for a project; return the directory to
-    hand Claude via `--add-dir`.
+def _rebuild(src: Path, root: Path, leaf: str) -> Path:
+    """Rebuild `root/.claude/<leaf>/` from `src`, wholesale. Returns `root`.
 
-    Getting a skill in front of a worker is awkward: workers run in a fresh git
-    worktree, so an untracked `.claude/skills/` in the main checkout never reaches
-    them, and no settings key can declare an extra skills directory (checked against
-    the CLI). What does work — verified live — is `--add-dir X`, which loads skills
-    from `X/.claude/skills/`. So the OS keeps its skills inside the project's
-    gitignored `.jarvis/` tree and points every worker at them on spawn.
-
-    The tree is generated, never authored: it is rebuilt on each dispatch so a stale
-    or locally mangled copy heals itself.
+    Generated, never authored: the whole destination is dropped and recopied on each
+    dispatch, so a stale or locally mangled copy heals itself.
     """
-    root = project_state_dir(project_path) / "agent-skills"
-    dest = root / ".claude" / "skills"
+    dest = root / ".claude" / leaf
     if dest.exists():
         shutil.rmtree(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(ASSETS / "skills", dest)
+    shutil.copytree(src, dest)
     return root
+
+
+def install_agent_assets(project_path: Path, kind: str = "worker") -> list[Path]:
+    """Materialize the OS-provided agent assets for a work order of `kind`; return the
+    directories to hand Claude via `--add-dir`.
+
+    Getting an asset in front of a worker is awkward: workers run in a fresh git
+    worktree, so an untracked `.claude/` in the main checkout never reaches them, and no
+    settings key can declare an extra skills directory (checked against the CLI). What
+    does work — verified live, with a negative control — is `--add-dir X`, which loads
+    skills from `X/.claude/skills/` and subagent definitions from `X/.claude/agents/`.
+    So the OS keeps both inside the project's gitignored `.jarvis/` tree and points each
+    worker at whichever it is entitled to on spawn.
+
+    **Two roots, not one, and the split is load-bearing.** Skills go to every worker;
+    the planning seats go to planners only (the design's decision 4 — an ordinary worker
+    is an individual with one job and gets no profile). Putting the seats in the skills
+    root and omitting them for workers would mean the worker path had to DELETE
+    `agents/` to keep owning its whole generated tree — and that delete would land while
+    a concurrently-dispatched planner turn was reading it. Separate roots make the two
+    populations independent, so neither dispatch can disturb the other.
+    """
+    roots = [_rebuild(ASSETS / "skills",
+                      project_state_dir(project_path) / "agent-skills", "skills")]
+    if kind == "planner":
+        roots.append(_rebuild(ASSETS / "agents",
+                              project_state_dir(project_path) / "agent-seats", "agents"))
+    return roots
+
+
+def _tree_matches(src: Path, dest: Path) -> bool:
+    """Same set of files, same bytes — used to avoid rewriting an already-current skill."""
+    rel = {p.relative_to(src) for p in src.rglob("*") if p.is_file()}
+    if rel != {p.relative_to(dest) for p in dest.rglob("*") if p.is_file()}:
+        return False
+    return all((src / r).read_bytes() == (dest / r).read_bytes() for r in rel)
+
+
+def install_project_skills(project_path: Path) -> list[str]:
+    """Install the OS's user-facing skills into the project itself; return the names
+    written (empty when everything was already current).
+
+    Different audience from `install_agent_assets`, so a different delivery. Those are
+    for the workers Jarvis dispatches and ride in on `--add-dir` at spawn time. These are
+    for the sessions the *user* opens by hand, which get no such flag and only ever load
+    `<project>/.claude/skills/` — so they are written into the project, next to the
+    `.claude/settings.json` bootstrap already injects there. Like that file they are
+    untracked and not gitignored: the OS leaves it to the project whether to commit them.
+
+    Only the subdirectories the OS owns are touched. `<project>/.claude/skills/` is where
+    users keep their own skills, so this never clears the tree — contrast
+    `install_agent_assets`, which owns its whole (gitignored, generated) destination and
+    rebuilds it wholesale.
+    """
+    written: list[str] = []
+    root = project_path / ".claude" / "skills"
+    for src in sorted(p for p in (ASSETS / "project-skills").iterdir() if p.is_dir()):
+        dest = root / src.name
+        if dest.exists():
+            if _tree_matches(src, dest):
+                continue
+            # No catalog knob customizes a skill, so a local edit is drift, not
+            # configuration — preserving it would mean the OS could never ship a fix.
+            shutil.rmtree(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, dest)
+        written.append(src.name)
+    return written
 
 
 @dataclass
@@ -234,6 +306,20 @@ def _gates_section(project: ProjectSpec) -> str:
         "that exact command — the grant is scoped to that one string and expires, so do",
         "not reword it. If denied, fix what the reason names; retrying unchanged will be",
         "blocked again.",
+        "",
+        "There is a third verdict, **dismissed**. The gate recognises commands by matching",
+        "text, so it sometimes fires on one that merely *names* a privileged action — a",
+        "release script inside a grep pattern, a path quoted in a PR body. That is a defect",
+        "in the OS, not a refusal: the reviewer dismisses it, nothing is authorised, and the",
+        "command goes through unchanged. So when a gate fires on something you know ships",
+        "nothing, do not reword the command to slip past it. File the request, say plainly",
+        "why it performs no privileged action, and end your turn.",
+        "",
+        "A dismissal clears a command *string*; it does not reset the review state of the",
+        "action that string talks about. So never open a second request for a privileged",
+        "action while an equivalent one is still pending or escalated — a dismissal is not",
+        "permission to re-file. If the first request stalled for want of evidence, send the",
+        "evidence to the reviewer and leave the original request standing.",
     ]
     return "\n".join(lines)
 
@@ -290,6 +376,15 @@ def ensure_trust(project: ProjectSpec, report: BootstrapReport) -> None:
     report.note("trusted workspace in ~/.claude.json (hasTrustDialogAccepted)")
 
 
+def ensure_project_skills(project: ProjectSpec, report: BootstrapReport) -> None:
+    """Give the user's own sessions in this project the OS skills meant for them."""
+    written = install_project_skills(project.path)
+    if written:
+        report.note("installed .claude/skills/: " + ", ".join(written))
+    else:
+        report.note(".claude/skills/ already up to date")
+
+
 def ensure_state_dir(project: ProjectSpec, report: BootstrapReport) -> None:
     state = project.path / ".jarvis"
     if not state.exists():
@@ -311,7 +406,8 @@ def bootstrap_project(project: ProjectSpec, force_config: bool = False,
         readme = project.path / "README.md"
         if not readme.exists():
             report.note("would generate README.md stub")
-        report.note("would write OPERATION.md, .jarvis/, .gitignore entry, settings.json")
+        report.note("would write OPERATION.md, .jarvis/, .gitignore entry, settings.json, "
+                    ".claude/skills/")
         if workspace_trusted(project.path) is not True:
             report.note("would trust workspace in ~/.claude.json")
         return report
@@ -320,5 +416,6 @@ def bootstrap_project(project: ProjectSpec, force_config: bool = False,
     ensure_state_dir(project, report)
     ensure_gitignore(project, report)
     inject_settings(project, report, force=force_config)
+    ensure_project_skills(project, report)
     ensure_trust(project, report)
     return report

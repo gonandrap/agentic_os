@@ -17,6 +17,11 @@
       <li>
         {% if a.wo_id %}
           <a href="/wo/{{ a.project }}/{{ a.wo_id }}" class="mono">{{ a.wo_id }}</a>
+        {% elif a.fo_id %}
+          {# One line for the whole feature, its flagged children rolled into the reason.
+             The link goes to the feature page, which is where they are individually
+             reachable — that page is what makes the rollup safe to collapse. #}
+          <a href="/fo/{{ a.project }}/{{ a.fo_id }}" class="mono">{{ a.fo_id }}</a>
         {% endif %}
         <strong>{{ a.project }}</strong> — {{ a.title }}
         <div class="sub">{{ a.reason }}
@@ -72,24 +77,54 @@
 </div>
 
 <h2>Open work orders</h2>
+{# The decisions you owe, then what is being worked on now, then what is waiting for you
+   to merge it — those are the rows. Only the statuses the OS has not started yet collapse
+   into a count you can expand: those are waiting on the OS, not on you. #}
+{% if rest_counts %}
+<p class="sub">
+  {% for status, n in rest_counts %}
+    {%- set word = status_meta.get(status, {}).get('word', status) -%}
+    {%- if revealed == status -%}
+      <strong>{{ n }} {{ word }}</strong> (<a href="/">collapse</a>)
+    {%- else -%}
+      <a href="/?show={{ status }}" title="Show the {{ n }} {{ word }} work order(s) as well">{{ n }} {{ word }}</a>
+    {%- endif -%}
+    {{ ' · ' if not loop.last }}
+  {% endfor %}
+  ·
+  {% if revealed == 'all' %}<a href="/">collapse them again</a>
+  {% else %}<a href="/?show=all">show all</a>{% endif %}
+</p>
+{% endif %}
 <div class="panel">
-  {% set open_any = namespace(v=false) %}
-  {% for p in st.projects %}{% for wo in p.open_work_orders %}
-    {% set open_any.v = true %}
+  {% for wo in featured + rest %}
     {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
     {% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
     <div class="row">
       <span class="st tone-{{ m.tone }} {{ 'pulse' if wo.status == 'running' }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
       <div class="grow">
-        <a href="/wo/{{ p.name }}/{{ wo.id }}" class="mono">{{ wo.id }}</a>
+        <a href="/wo/{{ wo.project }}/{{ wo.id }}" class="mono">{{ wo.id }}</a>
         {{ wo.title }}
-        <span class="sub">· {{ p.name }}</span>
+        <span class="sub">· {{ wo.project }}</span>
+        {% if wo.status == 'waiting_pr_merge' and wo.pr_url %}
+          <div class="sub">⑃ <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a></div>
+        {% endif %}
+        {% if wo.blocked_by %}
+          <div class="sub">⊘ blocked by:
+            {% for b in wo.blocked_by %}<a class="mono"
+              href="/wo/{{ wo.project }}/{{ b.id }}">{{ b.id }}</a> ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}
+          </div>
+        {% endif %}
       </div>
       <span class="badge {{ 'framework' if o.framework else 'outside' }}">
         {{ '⚙ ' if o.framework else '⚠ ' }}{{ o.word }}</span>
     </div>
-  {% endfor %}{% endfor %}
-  {% if not open_any.v %}<div class="empty">no open work orders</div>{% endif %}
+  {% else %}
+    <div class="empty">
+      {% if rest_counts %}nothing running and nothing waiting on you — the rest is counted above
+      {% else %}no open work orders{% endif %}
+    </div>
+  {% endfor %}
 </div>
 
 </div><!-- /live-top -->
@@ -107,6 +142,27 @@
     <div style="display: flex; gap: 10px; align-items: flex-start;">
       <textarea name="description" placeholder="details, context, constraints (optional)"></textarea>
       <button type="submit" class="primary">Create work order</button>
+    </div>
+  </form>
+</div>
+
+{# The coarse ask, for work that is bigger than one session. Deliberately a SECOND form
+   rather than a checkbox on the one above: the two produce different things, and the
+   description field is optional there and required here — a feature order's first
+   reader is a planner in a fresh session, and it will decompose four words. #}
+<h2>New feature order</h2>
+<div class="panel" style="padding: 14px 16px;">
+  <form method="post" action="/fo/create">
+    <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+      <select name="project" required style="max-width: 220px;">
+        {% for p in st.projects %}<option value="{{ p.name }}">{{ p.name }}</option>{% endfor %}
+      </select>
+      <input type="text" name="title" placeholder="the whole feature" required>
+    </div>
+    <div style="display: flex; gap: 10px; align-items: flex-start;">
+      <textarea name="description" required
+                placeholder="the whole ask — the planner sees only this text, and the plan is built from it"></textarea>
+      <button type="submit" class="primary">Plan it</button>
     </div>
   </form>
 </div>

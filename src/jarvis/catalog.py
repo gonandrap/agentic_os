@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .gates import GateConfig
+from .neo_store import Q_KINDS, SEATS
 
 # Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
 VALID_PERMISSION_MODES = {
@@ -78,13 +79,63 @@ class ProjectSpec:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+# The seats the panel runs by default. Deliberately NOT `neo_store.SEATS`: `record`,
+# `blast` and `taste` have no definition shipped yet, and a default roster naming safety
+# seats that cannot run would be worse than a short one that says what it is.
+DEFAULT_ROSTER = ("premise", "chair")
+
+# Which question kinds the panel may answer by default. `plan` is excluded on purpose: a
+# feature order's plan review has its own reviewed persona (`plans.PLAN_REVIEWER_PERSONA`)
+# that the seats' mandates say nothing about, so including it would silently swap a
+# reviewed persona for one written for a different job on the day someone enables this.
+DEFAULT_PANEL_KINDS = ("question", "approval")
+
+# Per-seat call timeout. Well below Neo's own 300s: the seats run concurrently but inside
+# the daemon's single Neo thread, so the whole FIFO drain — and every worker parked behind
+# it — waits on the slowest seat.
+DEFAULT_PANEL_TIMEOUT = 120
+
+
+@dataclass
+class PanelConfig:
+    """Neo answering as a panel of profiled seats instead of as one agent.
+
+    SHIPS DISABLED, and that is a requirement rather than caution: at this default the
+    OS's behaviour must be byte-identical to the single-agent path — same number of
+    Claude calls, same system prompt, same message to the worker. Enabling it is a
+    catalog edit, gated on a measurement that does not exist yet.
+
+    `seat_models` and `chair_model` are both empty by default, meaning "use
+    `NeoConfig.model`"; a nested dataclass cannot see its parent's field at construction,
+    so the fallback is resolved where it is used (`panel.seat_model`).
+    """
+
+    enabled: bool = False
+    roster: tuple[str, ...] = DEFAULT_ROSTER
+    seat_models: dict[str, str] = field(default_factory=dict)
+    chair_model: str = ""
+    timeout: int = DEFAULT_PANEL_TIMEOUT
+    kinds: tuple[str, ...] = DEFAULT_PANEL_KINDS
+    fast_path: bool = True
+
+
 @dataclass
 class NeoConfig:
     """Neo, the OS answerer agent (responds to worker questions as the user)."""
     enabled: bool = True
     model: str = "opus"
     learnings_limit: int = 50
+    # NOTE: parsed and never read — Neo's calls take `run_headless`'s own 300s default.
+    # Filed as bl-9a925d2e. Do not quietly start honouring it: a knob nobody could use
+    # that suddenly bites changes live Neo behaviour under cover of an unrelated change.
     timeout: int = 300
+    # Which model shortens an over-long question for the dashboard (`jarvis.digest`).
+    # A cheap one on purpose: the digest is display-only — it never reaches Neo, a
+    # worker or a learning — so this is a formatting job, not a judgement one.
+    # SET IT TO "" TO TURN DIGESTING OFF: no model named, no call made, and the page
+    # falls back to rendering every question in full, which is what it did before.
+    digest_model: str = "haiku"
+    panel: PanelConfig = field(default_factory=PanelConfig)
 
 
 @dataclass
@@ -100,7 +151,11 @@ class OsConfig:
     # Where notification deep links point. Empty = http://127.0.0.1:<ui_port>;
     # set it when the UI is reachable under another host (tunnel, LAN, reverse proxy).
     ui_base_url: str = ""
-    knowledge_inject_limit: int = 8
+    # Knowledge reaches workers as an index they query on demand, so prompt cost stays
+    # flat as the base grows. Only entries tagged `pinned` are pasted in full.
+    knowledge_inject_limit: int = 8      # max pinned entries injected verbatim
+    knowledge_digest_limit: int = 40     # max index lines
+    knowledge_digest_chars: int = 4000   # hard char budget for those lines
     neo: NeoConfig = field(default_factory=NeoConfig)
 
 
@@ -132,6 +187,53 @@ def load_catalog(path: str | Path) -> Catalog:
     return parse_catalog(data, source_path=path)
 
 
+def _parse_panel(raw: Any) -> PanelConfig:
+    """`os.neo.panel`, validated against the vocabularies it names.
+
+    A roster naming a seat that does not exist, or a kind that is not a question kind, is
+    a CatalogError rather than a silently dropped entry — the same rule an invalid
+    `permission_mode` follows, and for a sharper reason here: every seat past `premise` is
+    a safety check, so a typo that quietly drops one removes a check and tells nobody.
+
+    `neo_store.SEATS` is the vocabulary, NOT the set of seats shipped in this build. A
+    roster may name a seat whose definition arrives in a later release: that is a config
+    written ahead of the code, and it is caught loudly at run time (the seat records a
+    `failed` opinion and the panel proceeds) rather than refusing to boot the whole fleet
+    over a name the OS does recognise.
+    """
+    if not isinstance(raw, dict):
+        raise _err('"os.neo.panel" must be an object')
+    roster = tuple(raw.get("roster", DEFAULT_ROSTER))
+    unknown = [s for s in roster if s not in SEATS]
+    if unknown:
+        raise _err(f"os.neo.panel.roster names unknown seat(s) {unknown} "
+                   f"(known: {list(SEATS)})")
+    seat_models = raw.get("seat_models", {}) or {}
+    if not isinstance(seat_models, dict):
+        raise _err('"os.neo.panel.seat_models" must be an object')
+    unknown = [s for s in seat_models if s not in SEATS]
+    if unknown:
+        raise _err(f"os.neo.panel.seat_models names unknown seat(s) {unknown} "
+                   f"(known: {list(SEATS)})")
+    kinds = tuple(raw.get("kinds", DEFAULT_PANEL_KINDS))
+    unknown = [k for k in kinds if k not in Q_KINDS]
+    if unknown:
+        raise _err(f"os.neo.panel.kinds names unknown question kind(s) {unknown} "
+                   f"(known: {list(Q_KINDS)})")
+    timeout = int(raw.get("timeout", DEFAULT_PANEL_TIMEOUT))
+    if timeout < 1:
+        raise _err("os.neo.panel.timeout must be >= 1")
+    return PanelConfig(
+        enabled=bool(raw.get("enabled", False)),
+        roster=roster,
+        seat_models={k: str(v) for k, v in seat_models.items()},
+        chair_model=str(raw.get("chair_model", "") or ""),
+        timeout=timeout,
+        kinds=kinds,
+        fast_path=bool(raw.get("fast_path", True)),
+    )
+
+
 def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     if not isinstance(data, dict):
         raise _err("top level must be an object")
@@ -150,6 +252,8 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         model=neo_raw.get("model", "opus"),
         learnings_limit=int(neo_raw.get("learnings_limit", 50)),
         timeout=int(neo_raw.get("timeout", 300)),
+        digest_model=str(neo_raw.get("digest_model", "haiku")),
+        panel=_parse_panel(neo_raw.get("panel", {})),
     )
 
     os_cfg = OsConfig(
@@ -162,7 +266,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         telegram_chat_id_env=telegram.get("chat_id_env", "JARVIS_TELEGRAM_CHAT_ID"),
         ui_port=ui.get("port", 8787),
         ui_base_url=str(ui.get("base_url", "") or "").rstrip("/"),
-        knowledge_inject_limit=os_raw.get("knowledge_inject_limit", 8),
+        knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
+        knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 40)),
+        knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 4000)),
         neo=neo_cfg,
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
