@@ -2141,7 +2141,8 @@ def promote_backlog(item_id: str, force: bool = False,
 
 # -- token accounting ----------------------------------------------------------------------------
 
-def _unit_row(name: str, wo: dict[str, Any], index: dict[str, Path]) -> dict[str, Any]:
+def _unit_row(name: str, wo: dict[str, Any],
+              index: dict[str, list[Path]]) -> dict[str, Any]:
     """One work order's spend, flattened for a table."""
     from . import usage as usage_mod
 
@@ -2226,7 +2227,7 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _cost_for_target(target: str, project: str | None,
-                     index: dict[str, Path]) -> dict[str, Any]:
+                     index: dict[str, list[Path]]) -> dict[str, Any]:
     """One work order, or a feature order rolled up over its planner and children.
 
     The feature order is tried FIRST. A feature order and a work order cannot share an
