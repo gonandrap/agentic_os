@@ -198,6 +198,48 @@ def test_an_empty_subagent_transcript_is_not_counted_as_an_agent(transcripts):
     assert usage.read_session("s1").subagent_count == 0
 
 
+# -- sessions split across project directories ----------------------------------------
+
+
+def test_a_session_split_across_project_dirs_sums_every_segment(transcripts):
+    """Claude Code keys the transcript directory on the segment's cwd, so one session
+    id can leave files under two slugs — wo-2fa7c0e9's did (repo root, then its
+    worktree), and keeping one path per session id read that work order as $0.51 /
+    1 turn when the true figure was three times that.
+
+    Paired with a single-segment session in one of the same directories, which must
+    not double.
+    """
+    transcripts("split", [row("m1", write=100, read=0, out=10)], slug="-repo")
+    transcripts("split", [row("m2", write=50, read=400, out=20)],
+                slug="-repo-worktree")
+    transcripts("solo", [row("m3", out=5)], slug="-repo")
+
+    split = usage.read_session("split").total
+    assert split.messages == 2
+    assert split.cache_write == 150
+    assert split.cache_read == 400
+    assert split.output == 30
+    # A second file exists only because the session was resumed somewhere else, so
+    # the file boundary itself counts as one resume even though no cache drop is
+    # visible across separately-read files.
+    assert split.resume_boundaries == 1
+
+    assert usage.read_session("solo").total.output == 5
+
+
+def test_subagents_are_found_beside_every_segment(transcripts):
+    """Each segment directory can hold its own subagent transcripts."""
+    transcripts("split", [row("m1", write=100)], slug="-repo",
+                subagents={"agent-aaa": [row("sa1", out=5)]})
+    transcripts("split", [row("m2", write=50)], slug="-repo-worktree",
+                subagents={"agent-bbb": [row("sb1", out=7)]})
+
+    session = usage.read_session("split")
+    assert session.subagent_count == 2
+    assert session.subagents.output == 12
+
+
 # -- missing evidence -----------------------------------------------------------------
 
 

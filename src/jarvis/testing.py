@@ -273,10 +273,32 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
                           "is_error": True, "result": "model call failed",
                           "session_id": sid}))
         sys.exit(0)
+    # The usage envelope mirrors the real CLI's result JSON (verified against a live
+    # turn), so the whole reap-and-record path runs against the true field shape in
+    # every pipeline test — `iterations` is one entry per API call, and the context
+    # at a call is its input + cache_read + cache_creation.
     print(json.dumps({
         "type": "result", "subtype": "success", "is_error": False,
         "session_id": sid, "result": f"final: {prompt[:60]}",
         "num_turns": seq, "total_cost_usd": 0.01,
+        "duration_api_ms": 1200, "duration_ms": 1500,
+        "usage": {
+            "input_tokens": 3, "cache_creation_input_tokens": 1000,
+            "cache_read_input_tokens": 2000, "output_tokens": 100,
+            "service_tier": "standard",
+            "cache_creation": {"ephemeral_1h_input_tokens": 1000,
+                               "ephemeral_5m_input_tokens": 0},
+            "iterations": [{"type": "message", "input_tokens": 3,
+                            "output_tokens": 100,
+                            "cache_read_input_tokens": 2000,
+                            "cache_creation_input_tokens": 1000,
+                            "cache_creation": {"ephemeral_1h_input_tokens": 1000,
+                                               "ephemeral_5m_input_tokens": 0}}],
+        },
+        "modelUsage": {"claude-fake-1": {
+            "inputTokens": 3, "outputTokens": 100, "cacheReadInputTokens": 2000,
+            "cacheCreationInputTokens": 1000, "costUSD": 0.01,
+            "contextWindow": 200000, "maxOutputTokens": 32000}},
     }))
 elif "-p" in argv and "--resume" not in argv:
     # headless one-shot (`claude -p ...`) — Neo's answering path. Deterministic

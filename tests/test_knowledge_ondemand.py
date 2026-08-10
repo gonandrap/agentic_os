@@ -160,8 +160,10 @@ def test_prompt_teaches_on_demand_retrieval(jarvis_home):
     assert "jarvis learn search" in prompt
     assert "jarvis learn show <id>" in prompt
     assert "INDEX, not the knowledge" in prompt
-    # and the contract itself must carry the read verb, not only the write verb
-    contract = prompt[prompt.index("# Operating contract"):prompt.index("# What the outside")]
+    # and the contract itself must carry the read verb, not only the write verb.
+    # The core contract now ends where the on-demand section index begins
+    # (worker_brief.section_index) — the record prose moved behind `jarvis brief`.
+    contract = prompt[prompt.index("# Operating contract"):prompt.index("# Full briefings")]
     assert "jarvis learn search" in contract
     assert "jarvis learn add" in contract
 
