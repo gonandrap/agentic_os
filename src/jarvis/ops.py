@@ -23,6 +23,7 @@ from .catalog import (
     worker_stalls_on_prompts,
 )
 from . import db, invariants
+from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import CentralStore
 from .daemon import daemon_running
 from .invariants import PR_CLOSED_BLOCKER, true_blockers
@@ -1424,6 +1425,26 @@ def submit_plan(fo_id: str, doc: Any,
             f"resubmit:\n  - " + "\n  - ".join(e.problems)
         ) from e
 
+    # The design document is snapshotted NOW, from the planner's own tree, because the
+    # children never see that tree: the doc rides in the stored plan and dispatch
+    # materialises it into a path every child worker can read. Refusing a dangling name
+    # here costs the planner one revision; accepting it would cost every child a brief
+    # that references a document none of them has.
+    if plan.get("design_doc"):
+        candidates = []
+        if fo.get("plan_wo_id"):
+            candidates.append(path / ".claude" / "worktrees" / fo["plan_wo_id"]
+                              / plan["design_doc"])
+        candidates.append(path / plan["design_doc"])
+        existing = next((c for c in candidates if c.is_file()), None)
+        if existing is None:
+            raise OpsError(
+                f"the plan names design_doc {plan['design_doc']!r} but no such file "
+                f"exists — write it before submitting (looked in: "
+                + ", ".join(str(c) for c in candidates) + ")"
+            )
+        plan["design_doc_content"] = existing.read_text()
+
     # The planner is who Neo's question hangs off: it is a real work order, it is who
     # receives a rejection, and it is what `jarvis neo list` can link back to. A feature
     # order whose planner was deleted still submits — the question just names the feature
@@ -1578,17 +1599,78 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
 
 # -- Neo (OS answerer agent) ---------------------------------------------------------------------
 
+#: The most of a referenced section that rides to Neo. A section this long is a design
+#: document wearing one heading; the cut is announced in the context, never silent.
+SECTION_SNAPSHOT_CHARS = 6000
+
+
+def _resolve_section(path: Path, wo: dict[str, Any], ref_path: str,
+                     which: str) -> str | None:
+    """The referenced section's text, read from wherever this worker can see the file.
+
+    Tried in the order the file is most likely to be authoritative: the worker's own
+    worktree, the project tree, then the materialised feature snapshot under
+    `.jarvis/features/` (where dispatch puts a parent feature's design document).
+    """
+    from . import sections
+
+    candidates = []
+    if Path(ref_path).is_absolute():
+        candidates.append(Path(ref_path))
+    else:
+        if wo.get("worktree"):
+            candidates.append(path / ".claude" / "worktrees" / wo["worktree"] / ref_path)
+        candidates.append(path / ref_path)
+        if wo.get("parent_id"):
+            candidates.append(path / ".jarvis" / "features" / wo["parent_id"]
+                              / Path(ref_path).name)
+    for candidate in candidates:
+        if candidate.is_file():
+            section = sections.extract_section(candidate.read_text(), which)
+            if section is not None:
+                if len(section) > SECTION_SNAPSHOT_CHARS:
+                    section = (section[:SECTION_SNAPSHOT_CHARS]
+                               + "\n[… section truncated — it is longer than "
+                                 f"{SECTION_SNAPSHOT_CHARS} characters]")
+                return section
+    return None
+
+
 def ask_question(wo_id: str, question: str, project_name: str | None = None) -> dict[str, Any]:
     """(Workers) queue a question for Neo instead of stalling on the user.
 
     The work order flips to waiting_input WITHOUT flagging user attention — Neo
     exists precisely to keep these off the user's plate. The answer arrives as the
     worker's next user turn via the normal message-delivery path.
+
+    A question is one paragraph that may reference a design artifact section in-text
+    (`from section 3 of design doc "docs/specs/x.md"`). The reference is resolved HERE,
+    at ask time: the section — and only the section — is snapshotted into the question's
+    context, so Neo reads exactly the design context the paragraph argues from while the
+    recorded question stays a paragraph.
     """
+    from . import sections
     from .neo_store import NeoStore
+
+    if len(question) > QUESTION_MAX_CHARS:
+        raise OpsError(
+            f"that question is {len(question)} characters; the cap is "
+            f"{QUESTION_MAX_CHARS}. A question to Neo is one paragraph — the decision, "
+            f"the options, your recommendation — arguing from a design artifact it "
+            f"references in-text, e.g. `from section 3 of design doc "
+            f"\"docs/specs/feature.md\": …`. The referenced section is delivered to "
+            f"whoever answers, alongside your paragraph; you do not need to paste it."
+        )
 
     name, path, wo = find_work_order(wo_id, project_name)
     context = f"{wo['title']}\n{(wo.get('description') or '')[:800]}"
+    for ref_path, which in sections.find_refs(question):
+        section = _resolve_section(path, wo, ref_path, which)
+        if section is not None:
+            context += f"\n\nReferenced artifact — {ref_path} § {which}:\n{section}"
+        else:
+            context += (f"\n\n(the question references {ref_path!r} section {which!r}, "
+                        f"which could not be resolved — no such file or section)")
     neo = NeoStore()
     try:
         q = neo.ask(name, wo_id, question, context=context)
@@ -1604,8 +1686,15 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
             store.set_status(wo_id, "waiting_input")
     finally:
         store.close()
-    return {"project": name, "wo_id": wo_id, "question_id": q["id"],
-            "note": "queued for Neo — end your turn; the answer arrives as your next user turn"}
+    out = {"project": name, "wo_id": wo_id, "question_id": q["id"],
+           "note": "queued for Neo — end your turn; the answer arrives as your next user turn"}
+    if len(question) > QUESTION_WARN_CHARS:
+        out["warning"] = (
+            f"that question is {len(question)} characters — aim for one paragraph, and "
+            f"reference the design artifact section it argues from in-text instead of "
+            f"pasting context (the cap is {QUESTION_MAX_CHARS})"
+        )
+    return out
 
 
 def neo_question_texts(wo_id: str) -> dict[int, str]:

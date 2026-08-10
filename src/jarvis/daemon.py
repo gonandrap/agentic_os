@@ -448,10 +448,16 @@ class Daemon:
                 elif q.get("kind") == "plan":
                     self._deliver_plan_verdict(central, store, pstore, q, verdict)
                 elif verdict["escalate"]:
+                    # A headline, never the verbatim question: this row's job is to get
+                    # the user's attention, and every inbox row reaches every sink
+                    # (Telegram included). Production question #67 was 84KB; the full
+                    # text is one `jarvis neo show` away.
+                    head = q["question"].strip().splitlines()[0][:200]
                     central.add_inbox(
                         project=q["project"], level="warning",
                         title=f"Neo escalated a question from {q['wo_id']}",
-                        body=f"Q: {q['question']}\nWhy: {verdict['reason']}\n"
+                        body=f"Q: {head}\nWhy: {(verdict['reason'] or '')[:200]}\n"
+                             f"Read it in full: jarvis neo show {q['id']}\n"
                              f"Answer it with: jarvis neo answer {q['id']} \"...\"",
                         wo_id=q["wo_id"],
                     )

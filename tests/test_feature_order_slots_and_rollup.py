@@ -63,7 +63,7 @@ def a_feature(daemon, store, *keys: str, max_parallel: int | None = None) -> dic
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK,
                                   max_parallel=max_parallel)
     daemon.tick()
-    ops.submit_plan(fo["id"], {"summary": "an exporter",
+    ops.submit_plan(fo["id"], {"summary": "an exporter FORCE_APPROVE",
                                "children": [child(k) for k in keys]})
     daemon._neo_drain()
     return store.get_feature_order(fo["id"])
@@ -210,7 +210,7 @@ def test_a_child_blocked_on_a_dependency_says_that_instead(started, store):
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK,
                                   max_parallel=1)
     started.tick()
-    ops.submit_plan(fo["id"], {"summary": "an exporter",
+    ops.submit_plan(fo["id"], {"summary": "an exporter FORCE_APPROVE",
                                "children": [child("schema"),
                                             child("api", needs=["schema"])]})
     started._neo_drain()
