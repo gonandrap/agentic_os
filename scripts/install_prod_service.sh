@@ -56,10 +56,29 @@ echo "PATH=$RUNTIME_PATH  UI_PORT=$UI_PORT"
 
 systemctl --user daemon-reload
 systemctl --user enable  jarvis.service jarvis-ui.service
-systemctl --user restart jarvis.service jarvis-ui.service
+
+# Restart order matters, for the same reason it does in scripts/shipit.sh: run from a
+# Claude session that Jarvis spawned, this script lives inside jarvis.service's cgroup,
+# and restarting that unit SIGTERMs the script mid-way. So restart the UI (which never
+# hosts us) first, then hand the daemon's restart to a transient unit outside our
+# cgroup and do nothing afterwards that we would mind losing.
+systemctl --user restart jarvis-ui.service
 sleep 2
-systemctl --user --no-pager --lines=4 status jarvis.service jarvis-ui.service || true
+systemctl --user --no-pager --lines=4 status jarvis-ui.service || true
 
 if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
   echo "NOTE: linger is OFF — services stop at logout. Enable with: sudo loginctl enable-linger $USER"
 fi
+
+if command -v systemd-run >/dev/null 2>&1; then
+  systemd-run --user --collect --unit=jarvis-install-restart \
+    --description='install_prod_service: restart jarvis.service' \
+    /bin/sh -c 'sleep 3; systemctl --user restart jarvis.service'
+  echo "queued: jarvis.service restarts in ~3s — check with: systemctl --user status jarvis"
+else
+  echo "systemd-run unavailable — restarting jarvis.service inline (this script may be killed)"
+  systemctl --user restart jarvis.service
+  sleep 2
+  systemctl --user --no-pager --lines=4 status jarvis.service || true
+fi
+

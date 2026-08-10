@@ -206,19 +206,37 @@ JSON
   fi
 fi
 
-# --- 6. restart services if installed -------------------------------------------
-restarted=0
-for svc in jarvis.service jarvis-ui.service; do
-  if systemctl --user list-unit-files "$svc" 2>/dev/null | grep -q "$svc"; then
-    say "restarting $svc"
-    run "systemctl --user restart '$svc'"
-    restarted=1
-  fi
-done
-if [ "$restarted" = 1 ]; then
+# --- 6. restart the UI (safe to do inline: it does not host this script) ---------
+#
+# WHY THE DAEMON IS NOT RESTARTED HERE. shipit is usually run from a Claude session
+# that Jarvis itself spawned, and such a session lives inside jarvis.service's cgroup.
+# `systemctl --user restart jarvis.service` therefore SIGTERMs this very script: the
+# daemon comes back on the new tag, everything the script had left to do never runs.
+# That is exactly how 0.5.0 shipped half-applied — the daemon restarted, the script
+# died, and jarvis-ui.service kept serving the old code.
+#
+# So the restart step is split in two, and the daemon goes LAST (step 8), detached:
+#   * jarvis-ui.service never hosts us → restart it inline and verify it here;
+#   * jarvis.service may host us → hand its restart to a transient systemd unit that
+#     lives outside our cgroup, after everything else is done.
+unit_installed() {  # unit_installed <unit>; a dry run always prints the full plan
+  if [ "$DRY_RUN" = 1 ]; then return 0; fi
+  systemctl --user list-unit-files "$1" 2>/dev/null | grep -q "$1"
+}
+
+UI_SVC="jarvis-ui.service"
+DAEMON_SVC="jarvis.service"
+
+any_installed=0
+if unit_installed "$UI_SVC"; then
+  any_installed=1
+  say "restarting $UI_SVC"
+  run "systemctl --user restart '$UI_SVC'"
   [ "$DRY_RUN" = 1 ] || sleep 2
-  run "systemctl --user --no-pager --lines=0 status jarvis.service jarvis-ui.service || true"
-else
+  run "systemctl --user --no-pager --lines=0 status '$UI_SVC' || true"
+fi
+if unit_installed "$DAEMON_SVC"; then any_installed=1; fi
+if [ "$any_installed" = 0 ]; then
   say "services not installed — run scripts/install_prod_service.sh once to enable them"
 fi
 
@@ -248,4 +266,22 @@ notify_telegram
 
 say "shipped $TAG → $PROD_DIR"
 [ "$DRY_RUN" = 1 ] && say "(dry-run: no changes were made)"
+
+# --- 8. restart the daemon LAST, detached from this script ----------------------
+# Nothing may follow this step: if we are running inside jarvis.service's cgroup the
+# restart kills us. `systemd-run --user` puts the restart in its own transient unit,
+# outside our cgroup, so it completes whether or not we survive; the short sleep lets
+# this script print its last line and exit cleanly first.
+if unit_installed "$DAEMON_SVC"; then
+  if [ "$DRY_RUN" != 1 ] && ! command -v systemd-run >/dev/null 2>&1; then
+    say "systemd-run unavailable — restarting $DAEMON_SVC inline (this script may be killed)"
+    run "systemctl --user restart '$DAEMON_SVC'"
+  else
+    say "restarting $DAEMON_SVC (detached — this script may live in its cgroup)"
+    run "systemd-run --user --collect --unit='jarvis-shipit-restart-${VERSION//./-}' \
+           --description='shipit $TAG: restart $DAEMON_SVC' \
+           /bin/sh -c 'sleep 3; systemctl --user restart $DAEMON_SVC'"
+    say "  queued: $DAEMON_SVC restarts in ~3s — check with: systemctl --user status $DAEMON_SVC"
+  fi
+fi
 exit 0
