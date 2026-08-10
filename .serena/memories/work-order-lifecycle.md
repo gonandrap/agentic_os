@@ -136,14 +136,31 @@ it skips entirely on ticks where no project has a live `injected` row.
 Claude Code refuses a turn outright once the account's window is spent. The refusal is
 free and instant (`duration_api_ms: 0`, `total_cost_usd: 0`) and arrives as the turn's
 own result — `is_error: true`, `subtype: "success"`, body
-`You've hit your session limit · resets 11:50pm (America/Los_Angeles)`. A second shape
-exists: `Claude AI usage limit reached|<epoch>` (seconds or ms).
+`You've hit your session limit · resets 11:50pm (America/Los_Angeles)`.
 
-`claude_cli.usage_limit(text) -> UsageLimit | None` parses it and resolves the reset
-clause to an epoch moment (next occurrence of that clock time in that zone; an unknown
-zone falls back to LOCAL, never UTC). It is deliberately narrow — it runs against the
-error text of every failed turn, which can be a tail of the worker's own stderr — so a
-limit phrase with no `resets` clause is **not** a match.
+**The message is assembled, so match its SHAPE and never its words.** From 2.1.226's
+string table (`WJe`, map `HUt`): `You've hit your ${label} · resets ${when}`, where the
+label is keyed by rate-limit type — `five_hour` → "session limit", `seven_day` →
+"weekly limit", `seven_day_opus` → "Opus limit", `seven_day_sonnet` → "Sonnet limit",
+`seven_day_overage_included` → **"Fable 5 limit"**, `overage` → "usage credit limit".
+Two of those carry a MODEL name, so a word list rots at the next launch — it already
+missed the last two. `claude_cli._LIMIT_RE` therefore matches "limit" … "resets" within
+60 chars, and the reset having to PARSE is the real false-positive gate (it is what
+keeps a worker's own `the rate limit reset logic in daemon.py:942` out).
+
+Spend caps deliberately do **not** match: they render `· run /usage-credits to raise it`
+instead of a reset, and they do not reopen on their own — the user has to act.
+
+`claude_cli.usage_limit(text) -> UsageLimit | None` resolves four renderings, which the
+CLI's formatter (`dye`) picks between by distance: `11:50pm (TZ)` under 24h;
+`Aug 14, 9:50am (TZ)` over it (the ordinary 7-day case); `Jan 3, 2027, 11:50pm (TZ)`
+when it crosses a year — **read that year, an unread one parses as the HOUR**; and
+`resets in 2h 15m` (fast mode). Minutes are dropped when zero. An unknown timezone falls
+back to LOCAL, never UTC. `Claude AI usage limit reached|<epoch>` is a legacy branch,
+kept but UNVERIFIED — that literal is absent from 2.1.226.
+
+To re-verify on a new CLI: `strings -n 8 ~/.local/share/claude/versions/<v> > /tmp/cc.txt`
+then search with python `re` (shell grep fights the `${}` and backticks).
 
 `worker_session.rate_limit_pause(store, wo_id) -> RateLimitPause | None` is the state.
 **There is no column, no flag and no status for it**: the whole condition is re-derived
