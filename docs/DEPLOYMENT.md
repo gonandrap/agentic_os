@@ -100,6 +100,24 @@ journalctl --user -u jarvis-ui -f           # follow UI logs
 `Restart=always` + `RestartSec=5` + `StartLimitIntervalSec=0` means each is brought
 back up whenever it exits, indefinitely (recovery).
 
+### Restarting `jarvis.service` from a session Jarvis spawned
+
+A Claude session that the daemon started lives **inside `jarvis.service`'s cgroup**, so
+`systemctl --user restart jarvis.service` kills that session along with whatever script
+it was running. This is what left 0.5.0 half-applied: the deploy script restarted the
+daemon, died, and never reached `jarvis-ui.service`.
+
+`scripts/shipit.sh` and `scripts/install_prod_service.sh` both handle it the same way —
+the UI restarts inline, the daemon restarts **last**, detached into a transient unit:
+
+```bash
+systemd-run --user --collect --unit=jarvis-restart \
+  /bin/sh -c 'sleep 3; systemctl --user restart jarvis.service'
+```
+
+Do the same by hand if you are restarting the daemon from inside one of its own
+sessions; a plain `systemctl --user restart jarvis` is only safe from your own shell.
+
 ## Rollback
 
 Redeploy a previous tag, or point production back and restart:
