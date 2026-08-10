@@ -41,6 +41,7 @@ its reply on each deploy.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -242,11 +243,16 @@ def _reap(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any]:
         error = _stderr_tail(turn) or "the turn's process ended without writing a result"
         store.add_event(wo_id, "turn_failed", {"seq": turn["seq"], "error": error[:500]})
         return store.finish_turn(turn["id"], "failed", error=error)
+    # Recorded on BOTH outcomes: a failed turn's tokens were spent just the same — the
+    # turn that motivated this hit a 429 having already paid $0.07 for the attempt.
+    usage_json = json.dumps(result.usage) if result.usage else None
     if not result.ok:
         store.add_event(wo_id, "turn_failed",
                         {"seq": turn["seq"], "error": result.error[:500]})
         return store.finish_turn(turn["id"], "failed", error=result.error,
-                                 result=result.result or None)
+                                 result=result.result or None,
+                                 cost_usd=result.cost_usd, num_turns=result.num_turns,
+                                 usage_json=usage_json)
 
     reply = result.result or _last_assistant_message(store, wo_id, turn)
     if reply:
@@ -256,7 +262,8 @@ def _reap(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any]:
         "cost_usd": result.cost_usd, "turns": result.num_turns,
     })
     return store.finish_turn(turn["id"], "done", result=reply or "",
-                             cost_usd=result.cost_usd, num_turns=result.num_turns)
+                             cost_usd=result.cost_usd, num_turns=result.num_turns,
+                             usage_json=usage_json)
 
 
 def _last_assistant_message(store: ProjectStore, wo_id: str,

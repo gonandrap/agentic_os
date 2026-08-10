@@ -65,6 +65,26 @@ failed deploy. Confirm it afterwards from a fresh session:
 systemctl --user status jarvis --no-pager --lines=0   # active, and started just now
 ```
 
+## Shipping from a work order: use `--stage`
+
+A worker session lives inside `jarvis.service`'s cgroup, so even the detached restart
+kills it mid-final-turn and the work order lands as `failed` despite a perfect deploy
+(this is exactly what happened to 0.5.1). A Jarvis-dispatched work order must therefore
+run the staged mode instead:
+
+```bash
+scripts/shipit.sh --stage 1.4.0 --wo <your-wo-id>
+```
+
+`--stage` performs every step **except** the service restarts and the Telegram notify,
+then writes `$JARVIS_HOME/run/pending_release.json`. From there the OS finishes the
+job itself: the daemon restarts the services only after your work order's turn has
+settled (so finish the work order promptly after staging), verifies the release on its
+next boot (version on disk + fresh start timestamps on both units), settles the work
+order as completed, and notifies the user. Do not restart anything yourself and do not
+wait around for the restart — stage, `jarvis wo finish`, done. Interactive user
+sessions (not spawned by Jarvis) may keep using the classic mode above.
+
 ## First-time production setup (once)
 
 If `jarvis.service` isn't installed yet, after the first `shipit` run:

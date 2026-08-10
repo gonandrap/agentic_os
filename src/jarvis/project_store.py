@@ -232,6 +232,13 @@ CREATE TABLE IF NOT EXISTS wo_turns (
     error TEXT,
     cost_usd REAL,
     num_turns INTEGER,
+    -- The turn's exact accounting, compacted from the result JSON the `claude` CLI
+    -- wrote to `outfile` (see claude_cli.derive_turn_usage): cost, tokens by class
+    -- with the ephemeral 1h/5m split, per-API-call context peak, context window.
+    -- The outfile stays the source of truth; this is the copy that outlives it.
+    -- NULL means "not recorded" — a turn reaped before this column existed (readers
+    -- lazily backfill it from the outfile while that survives) — never zero spend.
+    usage_json TEXT,
     outfile TEXT NOT NULL DEFAULT '',
     errfile TEXT NOT NULL DEFAULT ''
 );
@@ -293,6 +300,11 @@ ADDED_COLUMNS = {
         "parent_id": "TEXT REFERENCES feature_orders(id)",
         # `worker` or `planner` — see WO_KINDS.
         "kind": "TEXT NOT NULL DEFAULT 'worker'",
+    },
+    "wo_turns": {
+        # See the CREATE TABLE comment. Live databases already have `wo_turns`, so the
+        # column only reaches them through here.
+        "usage_json": "TEXT",
     },
     "approvals": {
         # Which SEAT attempted the command, when a subagent did. NULL means the session's
@@ -891,14 +903,20 @@ class ProjectStore:
 
     def finish_turn(self, turn_id: int, state: str, result: str | None = None,
                     error: str | None = None, cost_usd: float | None = None,
-                    num_turns: int | None = None) -> dict[str, Any]:
+                    num_turns: int | None = None,
+                    usage_json: str | None = None) -> dict[str, Any]:
         assert state in ("done", "failed"), state
         self.conn.execute(
             """UPDATE wo_turns SET state=?, ended_at=?, result=?, error=?, cost_usd=?,
-                                   num_turns=? WHERE id=?""",
-            (state, db.now(), result, error, cost_usd, num_turns, turn_id),
+                                   num_turns=?, usage_json=? WHERE id=?""",
+            (state, db.now(), result, error, cost_usd, num_turns, usage_json, turn_id),
         )
         return self.get_turn(turn_id)  # type: ignore[return-value]
+
+    def set_turn_usage(self, turn_id: int, usage_json: str) -> None:
+        """Backfill a settled turn's recorded usage (parsed late from its outfile)."""
+        self.conn.execute("UPDATE wo_turns SET usage_json=? WHERE id=?",
+                          (usage_json, turn_id))
 
     def latest_turn(self, wo_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(

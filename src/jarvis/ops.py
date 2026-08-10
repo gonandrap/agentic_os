@@ -155,7 +155,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
     the same checks with repair enabled on every reconcile tick — this is the manual
     handle for "is the OS lying to me right now?".
     """
-    from .invariants import check_catalog, check_project
+    from .invariants import check_catalog, check_project, check_release_marker
 
     # Catalog-level checks run whenever a catalog is resolvable at all: a gate that can
     # never open is a fault in the configuration, visible before any work order exists.
@@ -218,6 +218,20 @@ def run_doctor(project: str | None = None, repair: bool = False,
                 {"invariant": v.invariant, "wo_id": v.wo_id, "detail": v.detail,
                  "repaired": v.repaired, "repair": v.repair}
                 for v in violations
+            ],
+        })
+    # OS-level state under $JARVIS_HOME, owned by no project: a pending-release marker
+    # stuck in flight. Reported under its own heading; never repaired (which half of
+    # the hand-off died is not derivable from the file).
+    os_violations = check_release_marker()
+    if os_violations:
+        total += len(os_violations)
+        results.append({
+            "project": "(os)",
+            "violations": [
+                {"invariant": v.invariant, "wo_id": v.wo_id, "detail": v.detail,
+                 "repaired": v.repaired, "repair": v.repair}
+                for v in os_violations
             ],
         })
     out = {"repair": repair, "violations": total, "projects": results}
@@ -2141,13 +2155,122 @@ def promote_backlog(item_id: str, force: bool = False,
 
 # -- token accounting ----------------------------------------------------------------------------
 
-def _unit_row(name: str, wo: dict[str, Any],
-              index: dict[str, list[Path]]) -> dict[str, Any]:
-    """One work order's spend, flattened for a table."""
+#: The turn states whose spend is final. A running turn has no result JSON yet, so it
+#: can be listed but never counted.
+_SETTLED_TURN_STATES = ("done", "failed")
+
+
+def _turn_usage(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any] | None:
+    """A settled turn's recorded usage envelope, lazily backfilled from its outfile.
+
+    Rows reaped before `usage_json` existed carry NULL — but their outfile usually
+    still holds the full result JSON, so the first read parses it and writes the
+    envelope back. That is the whole migration story: history for every past work
+    order is recoverable on demand, and once written back it outlives the file.
+    """
+    raw = turn.get("usage_json")
+    if raw:
+        return db.from_json(raw, None)
+    if turn.get("state") not in _SETTLED_TURN_STATES or not turn.get("outfile"):
+        return None
+    from . import claude_cli
+
+    result = claude_cli.read_turn_result(Path(turn["outfile"]))
+    if result is None or not result.usage:
+        return None
+    store.set_turn_usage(turn["id"], db.to_json(result.usage))
+    return result.usage
+
+
+def _turn_row(turn: dict[str, Any], u: dict[str, Any] | None) -> dict[str, Any]:
+    """One turn, flattened for the per-turn table. `recorded` is the honesty bit."""
+    duration = None
+    if turn.get("ended_at") and turn.get("started_at"):
+        duration = round(turn["ended_at"] - turn["started_at"], 1)
+    row = {
+        "seq": turn["seq"], "kind": turn["kind"], "state": turn["state"],
+        "started_at": turn["started_at"], "ended_at": turn.get("ended_at"),
+        "duration_s": duration, "cost_usd": turn.get("cost_usd"),
+        "recorded": u is not None,
+    }
+    if u is None:
+        return row
+    window = u.get("context_window") or 0
+    peak = u.get("context_peak") or 0
+    row.update({
+        "cost_usd": turn["cost_usd"] if turn.get("cost_usd") is not None
+        else u.get("total_cost_usd"),
+        "input": u.get("input") or 0,
+        "cache_write": u.get("cache_write") or 0,
+        "cache_read": u.get("cache_read") or 0,
+        "cache_1h": u.get("cache_1h") or 0,
+        "cache_5m": u.get("cache_5m") or 0,
+        "output": u.get("output") or 0,
+        "api_calls": u.get("api_calls"),
+        "context_peak": peak,
+        "context_window": window or None,
+        # The /context statistic: how full the model's window was at this turn's
+        # largest call. This is the column that shows a work order bloating.
+        "context_pct": round(100 * peak / window, 1) if window else None,
+        "duration_api_ms": u.get("duration_api_ms"),
+    })
+    return row
+
+
+def _turn_rows(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
+    return [_turn_row(t, _turn_usage(store, t)) for t in store.list_turns(wo_id)]
+
+
+def _turn_summary(rows: list[dict[str, Any]]) -> tuple[str, int, int,
+                                                       dict[str, Any] | None]:
+    """(provenance, recorded, settled, exact totals) over one work order's turns.
+
+    Provenance is the label that keeps the two accounting systems from being silently
+    mixed: `recorded` — every settled turn has the CLI's own numbers (exact);
+    `mixed` — some do and some exist only in transcripts, so no single total is
+    honest; `transcript` — nothing recorded, only the estimate (sessions predating
+    turn capture, or never Jarvis-driven).
+    """
+    settled = [r for r in rows if r["state"] in _SETTLED_TURN_STATES]
+    recorded = [r for r in rows if r["recorded"]]
+    if recorded and len(recorded) == len(settled):
+        provenance = "recorded"
+    elif recorded:
+        provenance = "mixed"
+    else:
+        provenance = "transcript"
+    totals = None
+    if recorded:
+        windows = [r["context_window"] for r in recorded if r.get("context_window")]
+        totals = {
+            # Exact aggregation IS the sum of the turns — nothing is re-derived.
+            "cost_usd": round(sum(r["cost_usd"] or 0 for r in recorded), 4),
+            "input": sum(r["input"] for r in recorded),
+            "cache_write": sum(r["cache_write"] for r in recorded),
+            "cache_read": sum(r["cache_read"] for r in recorded),
+            "cache_1h": sum(r["cache_1h"] for r in recorded),
+            "cache_5m": sum(r["cache_5m"] for r in recorded),
+            "output": sum(r["output"] for r in recorded),
+            "api_calls": sum(r["api_calls"] or 0 for r in recorded),
+            "context_peak": max(r["context_peak"] for r in recorded),
+            "context_window": max(windows) if windows else None,
+        }
+    return provenance, len(recorded), len(settled), totals
+
+
+def _unit_row(name: str, wo: dict[str, Any], index: dict[str, list[Path]],
+              turn_rows: list[dict[str, Any]] = ()) -> dict[str, Any]:
+    """One work order's spend, flattened for a table.
+
+    The transcript figures stay the body of the row (they are the only source with a
+    subagent split and the re-write tax); the recorded figures ride along with their
+    provenance label so a reader can tell an exact number from an estimate.
+    """
     from . import usage as usage_mod
 
     session = usage_mod.read_session(wo.get("session_id") or "", index=index)
     total = session.total
+    provenance, recorded, settled, rec_totals = _turn_summary(list(turn_rows))
     return {
         "id": wo["id"], "project": name, "title": wo["title"],
         "status": wo["status"], "kind": wo.get("kind") or "worker",
@@ -2157,6 +2280,10 @@ def _unit_row(name: str, wo: dict[str, Any],
         "turns": total.resume_boundaries + 1 if session.found else 0,
         "subagent_count": session.subagent_count,
         "subagent_cost_usd": round(session.subagents.list_cost_usd, 2),
+        "provenance": provenance,
+        "recorded_turns": recorded,
+        "settled_turns": settled,
+        "recorded_cost_usd": round(rec_totals["cost_usd"], 4) if rec_totals else 0.0,
         **total.as_dict(),
     }
 
@@ -2197,7 +2324,7 @@ def cost_report(project: str | None = None, target: str | None = None,
         store = ProjectStore(path)
         try:
             for wo in store.list_work_orders(limit=limit, include_hidden=include_hidden):
-                units.append(_unit_row(name, wo, index))
+                units.append(_unit_row(name, wo, index, _turn_rows(store, wo["id"])))
         finally:
             store.close()
     units.sort(key=lambda u: u["list_cost_usd"], reverse=True)
@@ -2215,6 +2342,11 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
         "measured": len(measured),
         "unmeasured": len(units) - len(measured),
         "totals": {
+            # Over ALL units, not just measured ones: the recorded figure comes from
+            # the OS's own turn rows, which survive transcript pruning — that
+            # independence is the point of recording.
+            "recorded_cost_usd": round(
+                sum(u.get("recorded_cost_usd") or 0 for u in units), 2),
             "list_cost_usd": round(sum(u["list_cost_usd"] for u in measured), 2),
             "rewrite_cost_usd": round(sum(u["rewrite_cost_usd"] for u in measured), 2),
             "rewrite_excess": sum(u["rewrite_excess"] for u in measured),
@@ -2238,9 +2370,20 @@ def _cost_for_target(target: str, project: str | None,
     try:
         name, path, fo = find_feature_order(target, project)
     except OpsError:
-        name, _path, wo = find_work_order(target, project)
-        row = _unit_row(name, wo, index)
-        return {"scope": target, "units": [row], **_rollup([row])}
+        name, wo_path, wo = find_work_order(target, project)
+        store = ProjectStore(wo_path)
+        try:
+            rows = _turn_rows(store, wo["id"])
+        finally:
+            store.close()
+        unit = _unit_row(name, wo, index, rows)
+        provenance, recorded, settled, rec_totals = _turn_summary(rows)
+        # The per-turn breakdown is the single-work-order payload: it is what shows
+        # WHERE in a bloated work order the cost rose, turn by turn.
+        return {"scope": target, "units": [unit], **_rollup([unit]),
+                "turns_detail": rows, "provenance": provenance,
+                "turns_recorded": recorded, "turns_settled": settled,
+                "recorded_totals": rec_totals}
 
     store = ProjectStore(path)
     try:
@@ -2248,10 +2391,11 @@ def _cost_for_target(target: str, project: str | None,
         planner_id = fo.get("plan_wo_id")
         if planner_id:
             try:
-                units.append(_unit_row(name, store.get_work_order(planner_id), index))
+                units.append(_unit_row(name, store.get_work_order(planner_id), index,
+                                       _turn_rows(store, planner_id)))
             except KeyError:
                 pass
-        units.extend(_unit_row(name, child, index)
+        units.extend(_unit_row(name, child, index, _turn_rows(store, child["id"]))
                      for child in store.feature_children(fo["id"]))
     finally:
         store.close()

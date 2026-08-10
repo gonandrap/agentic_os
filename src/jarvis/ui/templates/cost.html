@@ -64,6 +64,10 @@
         {%- else %}
           no transcript left to measure
         {%- endif %}
+        {# the drill-down: turn-by-turn cost and context growth. Present even when the
+           transcript is gone — recorded turn rows are the OS's own and outlive it. #}
+        · <a href="/cost/{{ u.project }}/{{ u.id }}"
+          >turns{% if u.recorded_turns %} ({{ u.recorded_turns }} recorded){% endif %} →</a>
       </div>
     </div>
     {% set m = status_meta.get(u.status, {'word': u.status, 'icon': '•', 'tone': 'muted'}) %}

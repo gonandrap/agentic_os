@@ -29,6 +29,7 @@ in `INVARIANTS`. Give it a stable id — ids appear in work order timelines and 
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
@@ -523,6 +524,63 @@ def check_catalog(catalog: Any, project: str | None = None) -> list[Violation]:
             continue
         found.extend(check_gate_deny_conflict(spec))
     return found
+
+
+# -- OS-level checks ($JARVIS_HOME state, not any project's database) -----------------
+
+#: How long a pending-release marker may sit in flight before it is a fault. The whole
+#: staged flow is minutes end to end (worker settles → restart → boot verification), so
+#: an hour means a hand-off was dropped: the daemon never ran, the restart never landed,
+#: or the boot check never fired.
+RELEASE_MARKER_STALE_AFTER = 3600.0
+
+
+def check_release_marker(now: float | None = None) -> list[Violation]:
+    """INV-RELEASE-MARKER-STALE — a staged release must not sit unapplied for an hour.
+
+    The marker (`$JARVIS_HOME/run/pending_release.json`) is a hand-off between the
+    deploy script's `--stage` mode and the daemon (src/jarvis/release.py): `staged`
+    waits for the shipping worker to settle, `restarting` waits for the new daemon to
+    verify on boot. Both are meant to clear within minutes, so either state an hour on
+    is a release the fleet believes is in flight and nothing is advancing.
+
+    `failed_verification` is deliberately NOT flagged: that state already raised
+    attention on the work order and an inbox warning when it was written, and it stays
+    on disk until a human resolves it — reporting it hourly would say the same thing
+    twice. An unreadable marker IS flagged, whatever it says: no state can clear it.
+
+    OS-level, not per-project (it reads $JARVIS_HOME, not a project store), so it is
+    not in `INVARIANTS`; `ops.run_doctor` calls it directly.
+
+    Not repairable: which half of the hand-off died is not derivable from the file.
+    """
+    from . import release
+
+    marker = release.read_marker()
+    if marker is None:
+        if release.marker_path().exists():
+            return [Violation(
+                invariant="INV-RELEASE-MARKER-STALE",
+                detail=f"{release.marker_path()} exists but is not readable JSON — "
+                       f"no release state can act on it",
+            )]
+        return []
+    state = marker.get("state")
+    if state not in ("staged", "restarting"):
+        return []
+    now = now if now is not None else time.time()
+    reference = float(marker.get("restart_at") or marker.get("staged_at") or 0)
+    age = now - reference
+    if age <= RELEASE_MARKER_STALE_AFTER:
+        return []
+    return [Violation(
+        invariant="INV-RELEASE-MARKER-STALE",
+        wo_id=marker.get("wo_id"),
+        detail=(f"pending release {marker.get('tag')} has been {state!r} for "
+                f"{int(age // 60)} minutes — the daemon should have applied and "
+                f"verified it within minutes (marker: {release.marker_path()})"),
+        context={"state": state, "tag": marker.get("tag"), "age_seconds": int(age)},
+    )]
 
 
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (

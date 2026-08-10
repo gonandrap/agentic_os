@@ -147,3 +147,29 @@ What NOT to do, per the measurements: do not shrink the description field by pol
 shaving the briefing's token count (kn-1485b845: rounding error). The scarce resources
 are user attention and wall clock; the mechanisms above spend both only when a real
 question exists.
+
+## Addendum — what this same work order then implemented (user-directed)
+
+After review, the user directed implementation, not just analysis. Shipped in the same
+PR, in three workstreams:
+
+1. **Staged self-ship** (`src/jarvis/release.py`, deploy-script `--stage <ver> --wo
+   <id>` mode): the work order deploys code and writes
+   `$JARVIS_HOME/run/pending_release.json`; the daemon restarts the services only once
+   the shipping worker's turn has settled, and on boot verifies version-on-disk plus
+   fresh `ExecMainStartTimestamp` on both units, settles the work order and notifies
+   the user (attention + kept marker on failure; doctor invariant for stale markers).
+   The cgroup fix (bl-a9589e0e) remains open and worthwhile — staging removes the need
+   for a self-ship to survive, not the fleet-wide kill on deploys.
+2. **Exact per-turn cost accounting**: the `claude -p --output-format json` envelope
+   (total_cost_usd, token classes incl. ephemeral 1h/5m, per-API-call context sizes,
+   context window) is recorded per turn in `wo_turns.usage_json` (done *and* failed
+   turns), lazily backfilled for history from the turn files on disk, and rendered as
+   per-turn tables in `jarvis cost <wo-id>` and a per-WO UI drill-down with the context
+   growth curve. Provenance is explicit: `recorded` (exact) vs `transcript` (the old
+   estimator, now fallback-only) — never silently mixed.
+3. **Minimal worker briefing**: the opening prompt shrank ~50% (6,032 → 3,069 chars
+   bare; contract core budget-asserted < 2,500 chars) to a load-bearing core plus a
+   section index; `jarvis brief <section> [--wo id]` serves the full text on demand
+   from the same single-sourced module, with a free composition test in CI and an
+   opt-in A/B eval (kn-ea760e6e method) for the behavioral comparison.

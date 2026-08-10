@@ -309,7 +309,13 @@ def test_the_contracts_teach_the_reference_shape_not_paste_everything():
     for prompt in (worker, planner):
         assert "everything needed to decide INSIDE the question text" not in prompt
         assert "one paragraph" in prompt
-        assert 'section 3 of design doc "docs/specs/feature.md"' in prompt
+    # The planner keeps its full prompt; the worker's core is compressed and the
+    # reference example moved into the full contract section behind `jarvis brief`
+    # (worker_brief.contract_section — single source with the CLI).
+    from jarvis import worker_brief
+    worker_contract = worker_brief.render_section("contract", wo_id="wo-1", project="p")
+    for text in (planner, worker_contract):
+        assert 'section 3 of design doc "docs/specs/feature.md"' in text
     # The planner is told the design doc carries the shared context now.
     assert "design_doc" in planner
     assert "Repetition is cheap" not in planner

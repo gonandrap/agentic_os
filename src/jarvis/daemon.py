@@ -89,6 +89,9 @@ class Daemon:
         # credentials, an unreachable host). Same idea: say it once, not every 2 minutes
         # forever. Reset by restarting the daemon, which is also what fixes it.
         self.pr_poll_warned: set[str] = set()
+        # The systemd seam for staged releases (src/jarvis/release.py). None means the
+        # real thing; tests inject a fake so no test can ever touch real systemctl.
+        self.release_runner: Any = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -104,6 +107,11 @@ class Daemon:
         signal.signal(signal.SIGINT, self._on_signal)
         log.info("jarvisd started (pid=%s, projects=%s)",
                  os.getpid(), [p.name for p in self.catalog.projects])
+        # Before the first tick: if the boot we are living through IS a staged
+        # release's restart, prove the release applied and settle its work order —
+        # otherwise the reconciler reaps the dead shipping turn first and files the
+        # very "failed — review and retry" this flow exists to prevent.
+        self.verify_pending_release()
         try:
             while not self.stop_requested:
                 started = time.monotonic()
@@ -195,6 +203,11 @@ class Daemon:
             except Exception:  # noqa: BLE001
                 log.exception("project %s tick failed", project.name)
 
+        # After the project loop, so `running_turns` reflects the turns settlement just
+        # reaped: the staged-release restart must only fire once the shipping worker's
+        # turn has genuinely ended (src/jarvis/release.py).
+        self.release_tick()
+
         self.neo_tick()
         # After the drain is kicked, never before: a question digested this tick is one
         # whose answer has already landed, and the drain is what lands it.
@@ -217,6 +230,31 @@ class Daemon:
                 )
             except claude_cli.ClaudeCliError as e:
                 log.error("[%s] dispatch of %s failed: %s", project.name, wo["id"], e)
+
+    # -- staged releases (thin hooks; all logic in src/jarvis/release.py) --------------
+
+    def _release_store(self, project_name: str) -> ProjectStore | None:
+        """The marker names its project; this is how release.py reaches its store."""
+        for p in self.catalog.projects:
+            if p.name == project_name and p.path.is_dir():
+                return self.store_for(p)
+        return None
+
+    def verify_pending_release(self) -> None:
+        from . import release
+
+        try:
+            release.verify_on_boot(self._release_store, runner=self.release_runner)
+        except Exception:  # noqa: BLE001 — a broken marker must not stop the daemon
+            log.exception("release boot verification failed")
+
+    def release_tick(self) -> None:
+        from . import release
+
+        try:
+            release.maybe_restart(self._release_store, runner=self.release_runner)
+        except Exception:  # noqa: BLE001
+            log.exception("release restart check failed")
 
     # -- 4a. feature orders: open a planner ------------------------------------------
 

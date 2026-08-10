@@ -252,6 +252,62 @@ class TurnResult:
     cost_usd: float | None = None
     num_turns: int | None = None
     subtype: str = ""
+    #: Compact usage envelope derived from the result JSON (see `derive_turn_usage`).
+    #: None when the CLI emitted no `usage` object — old outfiles, crashed turns.
+    usage: dict[str, Any] | None = None
+
+
+def derive_turn_usage(data: dict[str, Any]) -> dict[str, Any] | None:
+    """The turn's exact accounting, compacted from one result envelope.
+
+    The raw JSON on disk (`<project>/.jarvis/turns/<wo>/<seq>.json`) stays the source
+    of truth; this dict is what `wo_turns.usage_json` persists so the record outlives
+    the file. Exact by construction — every number is the CLI's own, never a list-price
+    estimate:
+
+    * token classes come from `usage`, ephemeral 1h/5m split included;
+    * `iterations` carries one entry per API call, so the context at a call is that
+      iteration's input + cache_read + cache_creation — `context_peak` is the max,
+      which is the /context statistic, available headlessly;
+    * `context_window` and per-model `costUSD` come from `modelUsage`.
+
+    Returns None when there is no `usage` object to read (a result written before the
+    CLI carried usage, or a crashed turn) — an absence, never a zero.
+    """
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    cache_creation = usage.get("cache_creation") or {}
+    iterations = [i for i in (usage.get("iterations") or []) if isinstance(i, dict)]
+    contexts = [
+        (i.get("input_tokens") or 0)
+        + (i.get("cache_read_input_tokens") or 0)
+        + (i.get("cache_creation_input_tokens") or 0)
+        for i in iterations
+    ] or [
+        # No per-call breakdown: the whole-turn totals still bound the context.
+        (usage.get("input_tokens") or 0)
+        + (usage.get("cache_read_input_tokens") or 0)
+        + (usage.get("cache_creation_input_tokens") or 0)
+    ]
+    models = {name: mu for name, mu in (data.get("modelUsage") or {}).items()
+              if isinstance(mu, dict)}
+    windows = [mu["contextWindow"] for mu in models.values() if mu.get("contextWindow")]
+    return {
+        "total_cost_usd": data.get("total_cost_usd"),
+        "input": usage.get("input_tokens") or 0,
+        "cache_write": usage.get("cache_creation_input_tokens") or 0,
+        "cache_read": usage.get("cache_read_input_tokens") or 0,
+        "cache_1h": cache_creation.get("ephemeral_1h_input_tokens") or 0,
+        "cache_5m": cache_creation.get("ephemeral_5m_input_tokens") or 0,
+        "output": usage.get("output_tokens") or 0,
+        "api_calls": len(iterations) or data.get("num_turns"),
+        "context_peak": max(contexts),
+        "context_window": max(windows) if windows else None,
+        "duration_api_ms": data.get("duration_api_ms"),
+        "cost_by_model": {name: mu["costUSD"] for name, mu in models.items()
+                          if mu.get("costUSD") is not None},
+    }
 
 
 def turn_args(
@@ -352,6 +408,9 @@ def read_turn_result(outfile: Path, errfile: Path | None = None) -> TurnResult |
         cost_usd=data.get("total_cost_usd"),
         num_turns=data.get("num_turns"),
         subtype=data.get("subtype") or "",
+        # Derived on the failed path too: the usage rides on a failed result JSON just
+        # the same (a 429'd turn has already paid for everything up to the refusal).
+        usage=derive_turn_usage(data),
     )
 
 
