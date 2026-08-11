@@ -104,6 +104,22 @@ and the default allowlists `repl_main_thread*`, `sdk`, `auto_mode`, `memdir_rele
 `querySource` — a headless worker turn matches, which is why every write above is a 1h one.
 (Usage overage already forces 5m; that is the 3.1M of 5m writes in the corpus.)
 
+**Verified live, not inferred.** A settings-file `env` block is not obviously the same thing
+as the CLI's own `process.env` at request-build time — Jarvis's existing env vars are all
+read by *child* processes (hooks, Bash tool calls), so none of them proves this path. Two
+`claude -p` runs on a scratch directory, differing only in `--settings`:
+
+| arm | cache write | `ephemeral_1h` | `ephemeral_5m` |
+|---|---:|---:|---:|
+| control, no settings file | 8,774 | **8,774** | 0 |
+| `FORCE_PROMPT_CACHING_5M=1` via `--settings` | 26,962 | **0** | **26,962** |
+
+(The write sizes differ because each arm used a unique `--append-system-prompt` marker to
+force a fresh write; the TTL split is the variable under test, and it flips completely.)
+The mechanism in the binary is `Object.assign(process.env, filterSettingsEnv(...))` at
+settings-load time, which precedes request construction — and `br()` accepts `"1"`,
+`"true"`, `"yes"`, `"on"`, so the value matters too.
+
 **More importantly, the boundary would have been cold anyway.** Classifying every cold
 boundary in every transcript — an API call that writes >40k while reading <40k — by the gap
 that preceded it:
