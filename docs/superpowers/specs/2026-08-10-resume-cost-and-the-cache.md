@@ -294,7 +294,7 @@ So this is an upstream defect, correctly diagnosed and not actionable from here.
 lever Jarvis has is the one already taken: carry less context across each boundary, and pay
 1.25× rather than 2× for the write.
 
-## Proposal — surviving compaction without losing the thread
+## Surviving compaction without losing the thread — SHIPPED
 
 Auto-compaction (now on at 150k) summarizes the conversation and discards the rest. The
 concern is exactly right: a model-written summary can drop the details a mid-task worker
@@ -316,19 +316,42 @@ already holds all of that as structured state, so the re-injection can be **dete
 rather than summarized**: `jarvis wo show <id>` plus the operating contract, rendered from
 the record, with no summarization loss and no second model call.
 
-The buildable shape, using hooks Jarvis already installs:
+### What was built
 
-1. **`PreCompact`** — `jarvis wo checkpoint <wo-id>` writes a marker into the work-order
-   timeline (so the record shows the worker was compacted, which today it never learns) and
-   drops a flag file under `.jarvis/`.
-2. **`PostToolUse`** — on the first tool call after the flag appears, return the work-order
-   brief as `hookSpecificOutput.additionalContext` and clear the flag. This lands *inside*
-   the same turn, which `UserPromptExpansion` would not.
+Two hooks and a flag file, in `hooks.py`:
 
-Cost is bounded and one-off: the brief is a few thousand tokens against the 150k the
-compaction just reclaimed. The risk to weigh before building it is that a hook which
-injects on a tool result is a hook that can inject at a bad moment; it wants a test that
-the flag is cleared exactly once.
+1. **`PreCompact`** records a `compacted` event on the work-order timeline — the record
+   never learned this before — and writes `.jarvis/compaction/<wo-id>.pending`.
+2. **`PostToolUse`** spends the flag on the next tool call and returns the brief as
+   `hookSpecificOutput.additionalContext`. This lands *inside* the compacted turn, which
+   `UserPromptExpansion` would not.
+
+The brief is rendered from the record: work-order id, title, status, branch, worktree, PR,
+the **pending assumptions by name** (so the worker does not record them a second time), the
+original description **verbatim**, and `worker_brief.core_contract` — the same operating
+contract the opening prompt carries.
+
+**The `PostToolUse` matcher had to widen** from `Write|Edit|NotebookEdit` to unmatched. A
+compacted worker's next call is almost always `Bash`; waiting for a file edit would leave
+it running blind until it happened to make one. That costs one `stat()` per tool call —
+`_post_tool_compaction` checks the flag before opening the database, so the hot path does
+not touch SQLite.
+
+**Spent exactly once**, by `unlink()` rather than a read: re-injecting on every tool call
+would re-grow the context the compaction just reclaimed. The flag is unlinked *before* the
+brief is rendered, so a failure while rendering costs one re-assertion rather than
+repeating forever. Nine tests cover it, including a second compaction re-arming; the
+exactly-once property, the verbatim description and the timeline event were each
+mutation-checked.
+
+Cost is bounded and one-off: a few thousand tokens against the 150k the compaction just
+reclaimed.
+
+**Not yet verified against a live compaction.** The hooks are exercised against synthetic
+payloads, and `PreCompact`'s payload shape (`trigger`, `custom_instructions`) is taken from
+the CLI's own hook table rather than from an observed firing. If it never fires in headless
+`-p` mode, the failure is silent — the flag is never written and nothing is injected — so
+the first real 150k work order is the thing to watch.
 
 ## What was considered and not shipped
 
