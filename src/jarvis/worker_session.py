@@ -114,6 +114,13 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any]) -> dict[str, Any]:
     (design decision 4). Because a resumed turn re-derives its flags from argv, this is
     also what keeps the seats available on the planner's second and later turns — dropping
     the kind here would make them vanish after turn 1.
+
+    `autocompact_window` is the one flag read from the CATALOG on every turn rather than
+    from the work-order row. Model, effort and permission mode are resolved onto the row
+    at dispatch so a running work order keeps the briefing it started with; this is the
+    opposite case on purpose. It is a spend control, not a property of the task, so
+    lowering it in the catalog must reach the long-running work orders that are the
+    reason to lower it — not just the ones dispatched afterwards.
     """
     from .bootstrap import install_agent_assets
     from .dispatch import _write_worker_settings
@@ -127,6 +134,7 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any]) -> dict[str, Any]:
                                  or project.worker.append_system_prompt),
         "settings_file": _write_worker_settings(project, wo),
         "add_dirs": install_agent_assets(project.path, wo.get("kind") or "worker"),
+        "autocompact_window": project.worker.autocompact_window,
     }
 
 

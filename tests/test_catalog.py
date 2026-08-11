@@ -2,7 +2,12 @@ import json
 
 import pytest
 
-from jarvis.catalog import CatalogError, load_catalog, parse_catalog
+from jarvis.catalog import (
+    DEFAULT_AUTOCOMPACT_WINDOW,
+    CatalogError,
+    load_catalog,
+    parse_catalog,
+)
 from jarvis.neo_store import SEATS
 
 
@@ -45,6 +50,62 @@ def test_max_concurrent_config():
     assert cat.projects[1].max_concurrent == 8
 
 
+def test_autocompact_is_bounded_by_default():
+    """The context bound is ON for a catalog that says nothing about it.
+
+    This is the whole point of the setting: cache READ is 56% of the fleet's bill and
+    it is linear in context size, so a default of "no bound" leaves the bleed running
+    until someone remembers a flag.
+    """
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    # The literal, not the constant: asserting the constant against itself would hold
+    # even if someone set it to None, which is the one change this test exists to catch.
+    assert cat.os.default_autocompact_window == 150_000
+    assert cat.projects[0].worker.autocompact_window == 150_000
+    assert DEFAULT_AUTOCOMPACT_WINDOW == 150_000
+
+
+def test_autocompact_fleet_default_and_project_override():
+    cat = parse_catalog({
+        "os": {"defaults": {"autocompact_window": 200_000}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},                       # inherits the fleet
+            {"name": "b", "path": "/tmp/b",
+             "worker": {"autocompact_window": 400_000}},           # raises it
+        ],
+    })
+    assert cat.os.default_autocompact_window == 200_000
+    assert cat.projects[0].worker.autocompact_window == 200_000
+    assert cat.projects[1].worker.autocompact_window == 400_000
+
+
+def test_a_project_opts_out_with_an_explicit_null():
+    """null is the opt-out, and it must survive a non-null fleet default.
+
+    The `or`-style fallback that reads fine for model and effort is wrong here: 0 and
+    None both mean "no bound", so a project's null has to beat the fleet's number
+    rather than fall through to it.
+    """
+    cat = parse_catalog({
+        "os": {"defaults": {"autocompact_window": 150_000}},
+        "projects": [{"name": "a", "path": "/tmp/a",
+                      "worker": {"autocompact_window": None}}],
+    })
+    assert cat.projects[0].worker.autocompact_window is None
+
+
+def test_absent_and_null_are_different():
+    """Silence inherits the bound; only an explicit null removes it."""
+    cat = parse_catalog({
+        "projects": [
+            {"name": "a", "path": "/tmp/a", "worker": {}},
+            {"name": "b", "path": "/tmp/b", "worker": {"autocompact_window": None}},
+        ],
+    })
+    assert cat.projects[0].worker.autocompact_window == 150_000
+    assert cat.projects[1].worker.autocompact_window is None
+
+
 @pytest.mark.parametrize("bad,msg", [
     ({"projects": "nope"}, "projects"),
     ({"projects": [{"path": "/x"}]}, "name"),
@@ -52,6 +113,14 @@ def test_max_concurrent_config():
     ({"projects": [{"name": "a", "path": "/x"}, {"name": "a", "path": "/y"}]}, "duplicate"),
     ({"projects": [{"name": "a", "path": "/x", "worker": {"permission_mode": "yolo"}}]}, "permission_mode"),
     ({"projects": [{"name": "a", "path": "/x", "max_concurrent": 0}]}, "max_concurrent"),
+    # Outside the range `claude --autocompact` accepts: caught at boot, not on the
+    # first dispatch, because the CLI's rejection would surface as a dead worker.
+    ({"os": {"defaults": {"autocompact_window": 50_000}}}, "autocompact_window"),
+    ({"os": {"defaults": {"autocompact_window": 2_000_000}}}, "autocompact_window"),
+    ({"projects": [{"name": "a", "path": "/x",
+                    "worker": {"autocompact_window": 99_999}}]}, "autocompact_window"),
+    ({"projects": [{"name": "a", "path": "/x",
+                    "worker": {"autocompact_window": "150k"}}]}, "autocompact_window"),
 ])
 def test_invalid_catalogs(bad, msg):
     with pytest.raises(CatalogError, match=msg):
