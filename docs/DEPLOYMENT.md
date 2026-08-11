@@ -146,6 +146,30 @@ journalctl --user -u jarvis-ui -f           # follow UI logs
 `Restart=always` + `RestartSec=5` + `StartLimitIntervalSec=0` means each is brought
 back up whenever it exits, indefinitely (recovery).
 
+### The unit's PATH is the whole fleet's PATH
+
+`Environment=PATH=` in `jarvis.service` is the only PATH the daemon has, and every
+worker it spawns inherits it. A `systemd --user` service gets none of a login shell's
+PATH, so a tool you can run by hand may still be invisible to the fleet — and the
+symptom is not an error, it is a feature that quietly never happens. Issue #90:
+`gh` is a snap at `/snap/bin/gh`, `/snap/bin` was not on the unit's PATH, and
+auto-complete-on-merge was off for every project for a release.
+
+`scripts/install_prod_service.sh` builds that PATH — prod venv first, then the
+directories of `uv`, `claude`, `node` and `gh` as it finds them, then a fixed fallback
+list (`/snap/bin`, `~/.local/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`). It prints
+whether the result can resolve `gh` and says so loudly when it cannot. Re-run it
+whenever a tool the fleet needs moves or is newly installed:
+
+```bash
+scripts/install_prod_service.sh --dry-run --unit-dir /tmp/units   # see the PATH first
+systemctl --user show jarvis.service -p Environment               # what is live now
+```
+
+If a tool lives somewhere the script does not look, add its directory to that fallback
+list — and to `GH_SEARCH_DIRS` in `src/jarvis/bugreport.py`, its mirror, which is what
+lets an already-installed daemon find `gh` without being re-installed.
+
 ### Restarting `jarvis.service` from a session Jarvis spawned
 
 A Claude session that the daemon started lives **inside `jarvis.service`'s cgroup**, so

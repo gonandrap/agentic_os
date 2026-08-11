@@ -1115,20 +1115,24 @@ class Daemon:
         Once is the other half of that — a broken `gh` is broken on every poll, and an
         inbox entry every two minutes is how an inbox stops being read.
 
-        The likely cause is documented in `bugreport.create_issue` and worth repeating
-        in the body: a daemon-spawned process often cannot reach `gh`'s keyring
-        credentials, so the service environment needs `GH_TOKEN`.
+        The hint at the end has to match the failure. `GhUnavailable` already carries a
+        full PATH diagnosis (`bugreport.gh_missing_message`), so appending the keyring
+        advice to it would tell the user to fix credentials for a binary that was never
+        found — the misdiagnosis issue #90 was filed about.
         """
+        from . import github
+
         if project.name in self.pr_poll_warned:
             return
         self.pr_poll_warned.add(project.name)
         log.warning("[%s] pull-request polling unavailable: %s", project.name, error)
+        hint = ("" if isinstance(error, github.GhUnavailable) else
+                " If this is the daemon, `gh`'s keyring credentials may be out of "
+                "reach — set GH_TOKEN in the service environment.")
         store.add_notification(
             title=f"auto-complete on merge is off for {project.name}",
             body=(f"{error}\n\nWork orders parked behind a pull request will stay on "
-                  f"the open list until you close them with `jarvis wo done`. If this "
-                  f"is the daemon, `gh`'s keyring credentials may be out of reach — "
-                  f"set GH_TOKEN in the service environment."),
+                  f"the open list until you close them with `jarvis wo done`.{hint}"),
             level="warning", source="pr-poll",
         )
 
