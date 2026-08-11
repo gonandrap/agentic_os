@@ -33,6 +33,18 @@ BUG_LABEL = "bug"
 #: `gh` location override, mirroring JARVIS_CLAUDE_BIN.
 GH_BIN_ENV = "JARVIS_GH_BIN"
 
+#: Where to look for `gh` when PATH does not have it. A systemd --user service inherits
+#: none of a login shell's PATH, so a snap-installed `gh` (/snap/bin/gh — the default on
+#: Ubuntu) is invisible to the daemon and to every worker it spawns: PR-merge polling
+#: goes silently off and `jarvis bug report` fails fleet-wide (issues #41, #90).
+#:
+#: The service PATH is the real fix and `scripts/install_prod_service.sh` writes it —
+#: THIS LIST IS MIRRORED THERE, keep the two in step. This scan is the second half: it
+#: heals a daemon whose unit was rendered before that fix, without a re-install. It
+#: cannot help workers, which shell out to a bare `gh` from bash; only the unit's PATH
+#: reaches those.
+GH_SEARCH_DIRS = ("/snap/bin", "~/.local/bin", "/usr/local/bin", "/usr/bin", "/bin")
+
 
 class BugReportError(RuntimeError):
     """Filing the bug failed; nothing was reported to anyone."""
@@ -156,7 +168,46 @@ def bug_repo() -> str:
 
 
 def gh_bin() -> str:
-    return os.environ.get(GH_BIN_ENV) or shutil.which("gh") or "gh"
+    """Where `gh` is: the override, then PATH, then the well-known locations.
+
+    Falls back to the bare name so callers still produce a recognisable command line in
+    an error; `gh_missing_message` is what explains it. Deliberately uncached — a
+    long-running daemon should pick up a `gh` that appeared after it started.
+    """
+    override = os.environ.get(GH_BIN_ENV)
+    if override:
+        return override
+    found = shutil.which("gh")
+    if found:
+        return found
+    for d in GH_SEARCH_DIRS:
+        candidate = Path(d).expanduser() / "gh"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return "gh"
+
+
+def gh_missing_message(consequence: str) -> str:
+    """Why `gh` could not be run — written for someone who probably HAS it installed.
+
+    The old wording ("install the GitHub CLI") sent the user to reinstall software that
+    was already there and authenticated; on this fleet the cause has never once been a
+    missing CLI, it has been a PATH that a systemd unit never inherited (#41, #90). So
+    name what was searched, put the PATH fix first, and leave "install it" as the last
+    resort it actually is.
+    """
+    searched = os.environ.get("PATH", "") or "(empty)"
+    extra = ", ".join(GH_SEARCH_DIRS)
+    return (
+        f"`gh` is not on this process's PATH — {consequence}.\n"
+        f"PATH searched: {searched}\n"
+        f"Also checked: {extra}\n"
+        "If `command -v gh` finds it in a login shell (a snap install lands in "
+        "/snap/bin), this is a PATH problem and not a missing tool: re-run "
+        "scripts/install_prod_service.sh to rebuild the service PATH, or set "
+        f"{GH_BIN_ENV} to gh's absolute path. Install the GitHub CLI "
+        "(https://cli.github.com) only if that lookup finds nothing either."
+    )
 
 
 def render_body(*, description: str, expected: str, actual: str, version: str,
@@ -209,10 +260,7 @@ def create_issue(title: str, body: str, repo: str, label: str = BUG_LABEL) -> st
         proc = subprocess.run(cmd, input=body, capture_output=True, text=True,
                               timeout=60)
     except FileNotFoundError as e:
-        raise BugReportError(
-            f"`gh` not found ({gh_bin()}) — install the GitHub CLI "
-            "(https://cli.github.com) so Jarvis can file issues"
-        ) from e
+        raise BugReportError(gh_missing_message("so Jarvis cannot file issues")) from e
     except subprocess.TimeoutExpired as e:
         raise BugReportError("`gh issue create` timed out after 60s") from e
     if proc.returncode != 0:

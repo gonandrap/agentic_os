@@ -290,12 +290,94 @@ def test_a_failed_filing_does_not_notify(reporting):
         central.close()
 
 
-def test_a_missing_gh_explains_how_to_fix_it(reporting, monkeypatch):
+def test_a_missing_gh_blames_path_not_the_user_s_installation(reporting, monkeypatch):
+    """Issue #90: `gh` WAS installed (a snap), it was simply absent from the systemd
+    unit's PATH — and the old message sent the user off to reinstall it. The diagnosis
+    has to name what was searched, or the reader has no way to reach that conclusion."""
     monkeypatch.setenv("JARVIS_GH_BIN", "/nonexistent/gh")
+    monkeypatch.setenv("PATH", "/opt/only-this-dir")
+
     with pytest.raises(bugreport.BugReportError) as e:
         bugreport.report_bug(title="t", description="d", expected="e", actual="a")
+
     msg = str(e.value)
-    assert "gh" in msg and ("install" in msg or "not found" in msg)
+    assert "PATH" in msg, "the message must name PATH as the cause"
+    assert "/opt/only-this-dir" in msg, "the PATH actually searched must be shown"
+    assert "/snap/bin" in msg, "the extra locations checked must be shown"
+    assert "JARVIS_GH_BIN" in msg and "install_prod_service.sh" in msg
+
+
+# -- finding `gh` ---------------------------------------------------------------
+#
+# The daemon runs under systemd --user, which hands it none of a login shell's PATH.
+# On Ubuntu `gh` is a snap in /snap/bin, so PATH lookup alone found nothing and both
+# PR-merge polling and `jarvis bug report` were off fleet-wide (issues #41, #90). The
+# service unit's PATH is the primary fix; this scan is what heals a daemon whose unit
+# was rendered before it.
+
+
+@pytest.fixture()
+def no_gh_on_path(monkeypatch, tmp_path):
+    """No override, and a PATH with no `gh` in it. Returns a dir to plant one in."""
+    monkeypatch.delenv(bugreport.GH_BIN_ENV, raising=False)
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    hidden = tmp_path / "snap-ish"
+    hidden.mkdir()
+    return hidden
+
+
+def _plant_gh(directory) -> str:
+    import stat
+    binpath = directory / "gh"
+    binpath.write_text("#!/bin/sh\nexit 0\n")
+    binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+    return str(binpath)
+
+
+def test_gh_is_found_in_a_well_known_directory_when_path_has_it_not(
+        no_gh_on_path, monkeypatch):
+    planted = _plant_gh(no_gh_on_path)
+    monkeypatch.setattr(bugreport, "GH_SEARCH_DIRS", (str(no_gh_on_path),))
+
+    assert bugreport.gh_bin() == planted
+
+
+def test_path_still_wins_over_the_fallback_scan(no_gh_on_path, monkeypatch, tmp_path):
+    """The scan is a last resort: whatever the operator put on PATH is the real answer,
+    and a stale copy in /usr/bin must not shadow it."""
+    on_path = tmp_path / "real-bin"
+    on_path.mkdir()
+    preferred = _plant_gh(on_path)
+    _plant_gh(no_gh_on_path)
+    monkeypatch.setenv("PATH", str(on_path))
+    monkeypatch.setattr(bugreport, "GH_SEARCH_DIRS", (str(no_gh_on_path),))
+
+    assert bugreport.gh_bin() == preferred
+
+
+def test_the_override_beats_everything(no_gh_on_path, monkeypatch):
+    """JARVIS_GH_BIN is how the test-isolation gate keeps a test off the real tracker,
+    so a fallback that could out-vote it would be a hole in that gate."""
+    _plant_gh(no_gh_on_path)
+    monkeypatch.setattr(bugreport, "GH_SEARCH_DIRS", (str(no_gh_on_path),))
+    monkeypatch.setenv(bugreport.GH_BIN_ENV, "/somewhere/else/gh")
+
+    assert bugreport.gh_bin() == "/somewhere/else/gh"
+
+
+def test_a_non_executable_file_named_gh_is_not_gh(no_gh_on_path, monkeypatch):
+    (no_gh_on_path / "gh").write_text("this is a config file, not the CLI\n")
+    monkeypatch.setattr(bugreport, "GH_SEARCH_DIRS", (str(no_gh_on_path),))
+
+    assert bugreport.gh_bin() == "gh"
+
+
+def test_the_search_list_covers_the_snap_default():
+    """The list is mirrored in scripts/install_prod_service.sh; /snap/bin is the entry
+    issue #90 turned on, and dropping it silently re-breaks the fleet."""
+    assert "/snap/bin" in bugreport.GH_SEARCH_DIRS
 
 
 # -- the CLI --------------------------------------------------------------------

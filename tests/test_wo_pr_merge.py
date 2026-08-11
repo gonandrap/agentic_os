@@ -351,8 +351,36 @@ def test_an_unreadable_gh_warns_once_and_leaves_the_work_order_parked(
     warnings = [n for n in store.unrouted_notifications() if n["source"] == "pr-poll"]
     assert len(warnings) == 1
     assert "auto-complete on merge is off" in warnings[0]["title"]
-    assert "GH_TOKEN" in warnings[0]["body"]
+    assert "GH_TOKEN" in warnings[0]["body"], "a gh that RAN and failed is credentials"
     assert store.get_work_order(parked["id"])["status"] == "waiting_pr_merge"
+
+
+def test_a_gh_that_is_not_there_is_diagnosed_as_path_not_credentials(
+        started, project, parked, monkeypatch):
+    """Issue #90. `gh` never ran, so the keyring cannot be the problem — and the user
+    who acts on 'set GH_TOKEN' spends their afternoon on the wrong thing while the real
+    cause (the systemd unit's PATH) sits there unmentioned."""
+    monkeypatch.setenv("JARVIS_GH_BIN", "/nonexistent/gh")
+    monkeypatch.setenv("PATH", "/opt/only-this-dir")
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    body = [n for n in store.unrouted_notifications()
+            if n["source"] == "pr-poll"][0]["body"]
+    assert "PATH" in body and "/opt/only-this-dir" in body
+    assert "install_prod_service.sh" in body
+    assert "GH_TOKEN" not in body, "gh never ran; credentials advice is a wrong lead"
+
+
+def test_a_missing_gh_raises_the_type_that_says_so(monkeypatch):
+    """The daemon branches on this type to pick its remedy, so it is part of the
+    contract and not an implementation detail of `pr_view`."""
+    monkeypatch.setenv("JARVIS_GH_BIN", "/nonexistent/gh")
+
+    with pytest.raises(github.GhUnavailable):
+        github.pr_view(PR)
+    assert issubclass(github.GhUnavailable, github.GitHubError)
 
 
 def test_one_unreadable_pr_does_not_hide_the_others(started, project, fake_gh, parked):
