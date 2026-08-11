@@ -41,18 +41,25 @@ actually put on the wire for that call.
 resume** was to `SendMessage` all three "the session limit is restored — continue" (12:42:27,
 12:42:31, 12:42:33). Each of those is a full conversation of its own, and each resumed cold.
 
-Weighted as input-equivalents (cache-write 1.25×, cache-read 0.1×, output 5×), those two
-minutes cost ~1.68M tokens, of which **78% is cache creation**. That is the spike.
+Weighted as input-equivalents (cache-write **2×** — see Finding 2b on the TTL — cache-read
+0.1×, output 5×), those two minutes cost ~2.46M tokens, of which **85% is cache creation**.
+That is the spike.
 
-It does not stop at two minutes, and after ~3 minutes the larger term flips:
+It does not stop at two minutes, and around the ten-minute mark the larger term flips:
 
 | window | calls | cache-create | cache-read | weighted | dominant term |
 |---|---:|---:|---:|---:|---|
-| 2 min | 23 | 1,042,376 | 3,142,570 | 1.68M | writes (78%) |
-| 5 min | 64 | 1,105,733 | 10,583,197 | 2.78M | writes (50%) |
-| 15 min | 146 | 1,184,173 | 26,304,623 | 4.71M | **reads (56%)** |
+| 2 min | 23 | 1,042,376 | 3,142,570 | 2.46M | writes (85%) |
+| 5 min | 64 | 1,105,733 | 10,583,197 | 3.61M | writes (61%) |
+| 15 min | 146 | 1,184,173 | 26,304,623 | 5.60M | **reads (47%)**, writes 42% |
 
 146 API calls in fifteen minutes, each re-reading a 250–290k context.
+
+> **Correction.** The first version of this document weighted cache writes at 1.25×. That
+> is the **5-minute** TTL rate; every write in these transcripts is a **1-hour** write,
+> which costs **2×**. The table above is corrected. The error understated the boundary
+> term and moved the read/write crossover earlier; it does not change any conclusion, and
+> it makes the case for both fixes below stronger rather than weaker.
 
 ## Finding 2 — the wait did not cause the cold cache, and no threshold could have
 
@@ -63,6 +70,39 @@ Two independent corrections to the proposed fix:
 this machine: 60.7M tokens written at 1h TTL against 3.1M at 5m. (5m appears only in usage
 overage.) A 4.5-minute rule would throw away a *warm* cache for ~55 minutes of every hour —
 and one hour is the longest TTL the API offers, so nothing could have survived a 4h41m wait.
+
+### Finding 2b — the 1-hour TTL is bought and almost never used
+
+The TTL is not just "long enough"; it is **priced**. A prompt-cache write costs **1.25×**
+base input at the 5-minute TTL and **2×** at the 1-hour TTL. A read costs 0.1× under either.
+So the longer window is a 60% surcharge on every write, and it earns that only for reads
+that land more than five minutes after the write.
+
+Across all 1,075 transcripts, grouping every warm read by the gap since the previous call
+in its session:
+
+| gap since previous call | reads | share | read tokens | share |
+|---|---:|---:|---:|---:|
+| under 1 min | 10,834 | 92.8% | 1,405,514,413 | **92.4%** |
+| 1–5 min | 659 | 5.6% | 88,135,184 | 5.8% |
+| 5–15 min | 74 | 0.6% | 6,461,298 | 0.4% |
+| 15–60 min | 23 | 0.2% | 2,433,208 | 0.2% |
+| over 1 hour | 80 | 0.7% | 1,635,882 | 0.1% |
+
+**98.1% of cache-read tokens would have been served by a 5-minute TTL.** The reads that
+matter are the agentic loop *inside* one turn — seconds apart — not the gap between turns.
+And the gap between turns is a cold boundary regardless (Finding 2), so the long window
+cannot rescue it; it only makes the write that follows 60% dearer.
+
+Costed over that corpus at Opus list prices: the 1h premium was **~$232**, against **~$162**
+of reads that would have missed on a 5m TTL and been re-written. Net saving ≈ **$70**, about
+5% of the cached-token bill. Small — because reads dominate everything — but free.
+
+**Shipped:** `FORCE_PROMPT_CACHING_5M=1` in every worker's settings env. Claude Code decides
+the TTL in `L0e` (2.1.227): this env var forces 5m, `ENABLE_PROMPT_CACHING_1H` forces 1h,
+and the default allowlists `repl_main_thread*`, `sdk`, `auto_mode`, `memdir_relevance` by
+`querySource` — a headless worker turn matches, which is why every write above is a 1h one.
+(Usage overage already forces 5m; that is the 3.1M of 5m writes in the corpus.)
 
 **More importantly, the boundary would have been cold anyway.** Classifying every cold
 boundary in every transcript — an API call that writes >40k while reading <40k — by the gap
@@ -104,11 +144,59 @@ double-writes and absent from `wo-67d4f8b0`'s single ones is an MCP server finis
 connection **between** the two calls and injecting tool schemas plus instructions ahead of
 the conversation.
 
-That is a correlation across four boundaries, not a controlled result — recorded as the
-leading hypothesis, not as fact. What *is* established is the rate and the cost: fleet-wide,
-**25 of 252 cold boundaries write the context twice** and one writes it three or more times,
-totalling 4.45M redundant tokens, 13% of all cold-boundary cache creation. It is upstream
-behaviour; Jarvis cannot fix it, only carry less context into it.
+**This is now settled, and the mechanism is documented rather than inferred.** Prompt
+caching is a prefix match over `tools` → `system` → `messages`, and the invalidation
+hierarchy is published:
+
+| what changed | tools cache | system cache | messages cache |
+|---|:--:|:--:|:--:|
+| **tool definitions (add/remove/reorder)** | ❌ | ❌ | ❌ |
+| model switch | ❌ | ❌ | ❌ |
+| system prompt content | ✅ | ❌ | ❌ |
+| message content | ✅ | ✅ | ❌ |
+
+`tools` renders at position 0, so **adding a tool invalidates everything** — the whole
+conversation is re-written. An MCP server finishing its connection mid-turn does exactly
+that: it adds entries to the tools array and an instructions block to the system prompt.
+
+That also resolves the anomaly that kept this a hypothesis. `wo-67d4f8b0` called
+`ToolSearch` between its two calls and stayed **warm** — because tool search is documented
+to *append* discovered schemas rather than swap the tool set, specifically to preserve the
+cache. Server connection and tool search look identical in the transcript (both emit a
+`deferred_tools_delta`) and have opposite cache effects. That is why the correlation looked
+contradictory, and why the resolution is a documentation question rather than an experiment.
+
+The volume is not marginal: **1,402 `deferred_tools_delta` and 716 `mcp_instructions_delta`
+events fleet-wide, 1,191 of them carrying names** — i.e. actually changing what the model
+can see. Cost: **25 of 252 cold boundaries write the context twice** and one writes it three
+or more times, totalling 4.45M redundant tokens, 13% of all cold-boundary cache creation.
+
+Jarvis cannot change when a server connects, but it does control **which servers a worker
+carries** — see the next section. `bl-7674c1f9` is closed by this finding.
+
+## Finding 4 — workers pay for MCP servers they do not use
+
+Every tool call in every transcript, split by kind:
+
+| | calls | share |
+|---|---:|---:|
+| all tool calls | 13,061 | |
+| **MCP tool calls** | **287** | **2.2%** |
+| transcripts using any MCP tool | 42 of 1,075 | 3.9% |
+
+By server: `serena` 277, `claude-in-chrome` 6, `context7` 3, `Google Drive` 1. Serena is
+96% of all MCP use, and it is the one the project's own `CLAUDE.md` instructs workers to
+prefer for code navigation — it earns its place. The rest amount to **ten calls in 1,075
+sessions**, while every server in the set contributes tool schemas and an instructions
+block to the front of every prompt, and every server that connects mid-turn re-writes the
+whole conversation (Finding 3).
+
+**Not shipped, proposed.** Jarvis does not currently control the worker MCP set at all — a
+worker inherits the machine's global configuration. `claude --strict-mcp-config
+--mcp-config <file>` would let the catalog declare exactly which servers a worker gets. The
+recommendation is Serena only. This is left as a proposal rather than shipped because it
+narrows what every worker in the fleet can reach, and the measurement above says the prize
+is prompt-prefix cost and boundary stability, not a capability the fleet is using.
 
 ## What shipped: a bound on how large a worker's conversation may grow
 
@@ -159,6 +247,72 @@ The window is re-read from the catalog on **every** turn rather than frozen onto
 order row at dispatch, which is the opposite of how model, effort and permission mode
 behave. It is a spend control, not a property of the task: tightening it has to reach the
 long-running work orders that are the reason to tighten it.
+
+## Why `git status` is in the system prompt, and why Jarvis cannot take it out
+
+It is an anti-pattern, and Anthropic's own prompt-caching guidance says so in as many
+words: *"Keep the system prompt frozen. Don't interpolate 'current date: X', 'mode: Y' into
+the system prompt — those sit at the front of the prefix and invalidate everything
+downstream."* Claude Code interpolates `cwd`, env info, memory paths and **git status**
+into exactly that position. A worker changes its git status by doing its job, so the
+worker's own work invalidates its own cache, every turn.
+
+Per the hierarchy above, a system-prompt change spares the tools cache but takes system and
+messages with it — the entire conversation. That is the whole of Finding 2.
+
+**Three exits, all closed:**
+
+- `--exclude-dynamic-system-prompt-sections` moves the volatile block into the first user
+  message. Tested on `wo-eb9b6337` (`kn-625e79f1`): the surviving prefix grew from 15,461
+  to 17,180 tokens and the boundary stayed cold, because the relocated text still changes
+  and still sits ahead of the conversation. It is for cross-user prefix sharing, not for
+  resuming one conversation.
+- `--system-prompt` replaces the default wholesale and would remove the section — along
+  with every tool-use instruction Claude Code's own harness depends on. Not a trade worth
+  making to save a cache.
+- The API has a proper fix — mid-conversation `{"role": "system"}` messages, which append
+  after the cached prefix instead of editing the front of it — but it is available to
+  *API callers*. Jarvis shells out to `claude`; it does not build the request.
+
+So this is an upstream defect, correctly diagnosed and not actionable from here. The only
+lever Jarvis has is the one already taken: carry less context across each boundary, and pay
+1.25× rather than 2× for the write.
+
+## Proposal — surviving compaction without losing the thread
+
+Auto-compaction (now on at 150k) summarizes the conversation and discards the rest. The
+concern is exactly right: a model-written summary can drop the details a mid-task worker
+needs. The proposed shape — write a summary before, inject it back after — is sound, but
+one of its two halves cannot be built as described, and the other can be much better than a
+summary.
+
+**`PostCompact` cannot inject.** It fires after compaction and receives the summary, but
+`hookSpecificOutput.additionalContext` — the only context-injection channel hooks have — is
+accepted on `UserPromptExpansion`, `SessionStart`, `Setup`, `SubagentStart`, `PostToolUse`,
+`PostToolUseFailure`, `PostToolBatch`, `Stop`, `SubagentStop` and `Notification`, and
+**not** on `PostCompact` (verified against the hook output schema in 2.1.227). A design
+that injects from `PostCompact` silently does nothing.
+
+**Jarvis should not be writing a summary at all.** Claude Code already summarizes the
+conversation; what a compacted worker actually loses is the *contract* — its work-order id,
+the finishing protocol, its pending assumptions, its branch and PR, the gate rules. Jarvis
+already holds all of that as structured state, so the re-injection can be **deterministic
+rather than summarized**: `jarvis wo show <id>` plus the operating contract, rendered from
+the record, with no summarization loss and no second model call.
+
+The buildable shape, using hooks Jarvis already installs:
+
+1. **`PreCompact`** — `jarvis wo checkpoint <wo-id>` writes a marker into the work-order
+   timeline (so the record shows the worker was compacted, which today it never learns) and
+   drops a flag file under `.jarvis/`.
+2. **`PostToolUse`** — on the first tool call after the flag appears, return the work-order
+   brief as `hookSpecificOutput.additionalContext` and clear the flag. This lands *inside*
+   the same turn, which `UserPromptExpansion` would not.
+
+Cost is bounded and one-off: the brief is a few thousand tokens against the 150k the
+compaction just reclaimed. The risk to weigh before building it is that a hook which
+injects on a tool result is a hook that can inject at a bad moment; it wants a test that
+the flag is cleared exactly once.
 
 ## What was considered and not shipped
 

@@ -109,6 +109,21 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # as env rather than being looked up per hook call: the hook runs on every Bash
         # command and must not load and parse the catalog to decide it has nothing to do.
         "JARVIS_GATES": project.gates.to_json(),
+        # Buy the cheap cache, not the long one. A prompt-cache WRITE costs 1.25x base
+        # input at the 5-minute TTL and 2x at the one-hour TTL; a READ costs 0.1x under
+        # either. Claude Code opts a `claude -p` session into the 1h TTL by default
+        # (`L0e` in 2.1.227, allowlisted by querySource), and for a Jarvis worker that
+        # is 60% extra on every write in exchange for a window almost nothing uses:
+        # measured across all 1,075 transcripts on this machine, 98.1% of cache-read
+        # tokens are read within FIVE MINUTES of the previous call, and 92.4% within
+        # one minute — because the reads that matter are the agentic loop inside a
+        # single turn, not the gap between turns. The gap between turns is a cold
+        # boundary either way (kn-625e79f1: git status moves in the system prompt), so
+        # the long TTL cannot rescue it and only inflates the write that follows.
+        # Costed at Opus list prices over that same corpus: the 1h premium was ~$232,
+        # against ~$162 of reads that would have missed on a 5m TTL and been rewritten
+        # — a net saving, and it is a one-line reversal if that ever inverts.
+        "FORCE_PROMPT_CACHING_5M": "1",
     })
     settings["env"] = env
     out = project.path / ".jarvis" / "worker-settings" / f"{wo['id']}.json"
