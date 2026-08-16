@@ -95,6 +95,18 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         if rule not in allow:
             allow.append(rule)
 
+    # THE prefix-stability lever. Claude Code builds a git-status snapshot (branch,
+    # `status --short`, last five commits) into the dynamic half of the system prompt
+    # and rebuilds it per process — and a worker turn IS a process (`-p --resume`). So
+    # the worker dirties its tree, the snapshot changes, the system prompt changes, and
+    # the cached prefix for the entire conversation dies at every turn boundary. This
+    # setting is the only switch that removes the snapshot; measured on 2.1.233, turn 2
+    # of a resumed worker goes from writing 10,983 / reading 15,995 tokens to writing
+    # 552 / reading 26,113. It also drops the CLI's own git and commit/PR instruction
+    # blocks, which `worker_brief.git_briefing` restates as static text on
+    # --append-system-prompt (tests/test_stable_prefix.py holds the two together).
+    settings["includeGitInstructions"] = False
+
     env = dict(settings.get("env") or {})
     env.update({
         "JARVIS_WO_ID": wo["id"],

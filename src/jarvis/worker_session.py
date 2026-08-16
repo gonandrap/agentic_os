@@ -93,6 +93,18 @@ def worktree_path(project: ProjectSpec, wo: dict[str, Any]) -> Path | None:
     return path if path.is_dir() else None
 
 
+def _append_system_prompt(*parts: str | None) -> str:
+    """Join the pieces of `--append-system-prompt` into one stable block.
+
+    Jarvis's own git briefing comes first and the project's standing instructions
+    second, so the order is fixed by construction rather than by whichever happens to
+    be set: appending a project's instructions to the end of a static prefix keeps the
+    common part of the prompt identical across every work order in the fleet, which is
+    the same cache-prefix argument that motivates the briefing in the first place.
+    """
+    return "\n\n".join(p.strip() for p in parts if p and p.strip())
+
+
 def briefing_for(project: ProjectSpec, wo: dict[str, Any]) -> dict[str, Any]:
     """The flags every turn of this work order is launched with.
 
@@ -109,6 +121,13 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any]) -> dict[str, Any]:
     column unset — dispatch persists the resolved value back onto dispatched ones — and
     resolving it here keeps the column's NULL meaningful.
 
+    `append_system_prompt` is COMPOSED here rather than passed through: Jarvis's static
+    git briefing plus whatever standing instructions the work order or project carry.
+    The briefing exists because dispatch switches off Claude Code's own git blocks to
+    keep the system prompt from moving between turns (see `_write_worker_settings`), and
+    re-derivation is exactly why it has to be rebuilt here — a turn that composed it
+    differently would move the prefix it was added to protect.
+
     `add_dirs` is the one flag that now depends on the work order's KIND: a planner also
     reaches the architect and test-lead seat definitions, and an ordinary worker does not
     (design decision 4). Because a resumed turn re-derives its flags from argv, this is
@@ -124,14 +143,17 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any]) -> dict[str, Any]:
     """
     from .bootstrap import install_agent_assets
     from .dispatch import _write_worker_settings
+    from .worker_brief import git_briefing
 
+    model = wo.get("model") or project.worker.model
     return {
-        "model": wo.get("model") or project.worker.model,
+        "model": model,
         "effort": wo.get("effort") or project.worker.effort,
         "permission_mode": (wo.get("permission_mode")
                             or project.worker.permission_mode),
-        "append_system_prompt": (wo.get("append_system_prompt")
-                                 or project.worker.append_system_prompt),
+        "append_system_prompt": _append_system_prompt(
+            git_briefing(model),
+            wo.get("append_system_prompt") or project.worker.append_system_prompt),
         "settings_file": _write_worker_settings(project, wo),
         "add_dirs": install_agent_assets(project.path, wo.get("kind") or "worker"),
         "autocompact_window": project.worker.autocompact_window,
