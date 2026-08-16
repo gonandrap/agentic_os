@@ -33,6 +33,14 @@ An approval authorises one command, for one work order, for a short window
 not silently become "and also cut a release", or "and merge whatever you like tomorrow".
 Matching is on the exact command string for that reason: a grant is a receipt for a
 specific act, not a capability the worker keeps.
+
+## Where the recognisers went
+
+They are no longer here. What counts as an *attempt* at a privileged action is data in
+`os.db`, seeded from the constants that used to live in this file and grown from the
+dismissal verdicts this module records — see `gate_rules.py` for why, and for the safety
+net (canaries) that makes a self-modifying classifier something other than a hole. This
+file keeps the lifecycle: what a gate MEANS, who reviews it, and what a verdict does.
 """
 
 from __future__ import annotations
@@ -42,8 +50,25 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterable
 
+from .gate_rules import (  # re-exported: this is still the module callers import
+    KIND_NAMES,
+    KINDS,
+    GateKind,
+    RuleSet,
+    reads_only,
+    scannable,
+)
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .central_store import CentralStore
     from .project_store import ProjectStore
+
+__all__ = [
+    "APPROVAL_STATUSES", "GRANT_MAX_USES", "GRANT_TTL_SECONDS", "GateConfig",
+    "GateKind", "GatedAction", "KINDS", "KIND_NAMES", "REVIEWER_PERSONA", "RuleSet",
+    "VERDICTS", "apply_decision", "build_request_question", "classify",
+    "deny_conflicts", "file_request", "reads_only", "scannable", "summarise",
+]
 
 # How long an approval stays usable, and how many attempts it covers. The window is
 # short because it is a receipt for an act the worker is about to perform, not standing
@@ -73,72 +98,6 @@ APPROVAL_STATUSES = ("pending", "approved", "denied", "dismissed", "expired")
 # records no authorisation, and is counted separately so the false-positive rate is a
 # number someone can watch rather than an anecdote.
 VERDICTS = ("approved", "denied", "dismissed")
-
-
-@dataclass(frozen=True)
-class GateKind:
-    """One class of privileged action, and how to recognise an attempt at it."""
-
-    name: str
-    # What the action does, in the terms whoever reviews it needs. Rendered into the
-    # request Neo sees, so it must read as a claim about consequences.
-    summary: str
-    patterns: tuple[str, ...]
-    # Literals that, appearing in a project's `permissions.deny` rules, mean the deny
-    # will shadow this gate — the call is blocked before the hook's `allow` is even
-    # consulted, so approval can never take effect. Listed explicitly rather than
-    # derived from `patterns`, because deriving them turns common words like "start"
-    # into false alarms on rules like `Bash(npm start*)`.
-    conflict_markers: tuple[str, ...] = ()
-
-
-# Default recognisers. Deliberately broad: a false positive costs one Neo review, a
-# false negative lets a worker ship unreviewed. Anchored on the verbs that actually
-# publish something, so ordinary work (pushing a feature branch, force-pushing one's own
-# PR branch, running tests) never trips a gate.
-KINDS: tuple[GateKind, ...] = (
-    GateKind(
-        name="pr_merge",
-        summary="merge a pull request into the default branch",
-        patterns=(
-            r"\bgh\s+pr\s+merge\b",
-            r"\bgh\s+api\b[^\n]*\bpulls/\d+/merge\b",
-        ),
-        conflict_markers=("gh pr merge", "pulls/"),
-    ),
-    GateKind(
-        name="release",
-        summary="cut a release and deploy it (this reaches the live production fleet)",
-        patterns=(
-            r"shipit",                      # the OS's own release script
-            r"\bgh\s+release\s+create\b",
-            r"\bnpm\s+publish\b",
-            r"\b(twine|uv)\s+publish\b",
-            r"\bgit\s+push\b[^\n]*--(tags|follow-tags)\b",
-        ),
-        conflict_markers=("shipit", "gh release", "npm publish", "twine publish",
-                          "uv publish", "--tags", "--follow-tags"),
-    ),
-    GateKind(
-        name="service_restart",
-        summary="restart or stop a system service (this interrupts the running fleet)",
-        patterns=(
-            r"\bsystemctl\b[^\n]*\b(restart|stop|start|disable|enable)\b",
-        ),
-        conflict_markers=("systemctl",),
-    ),
-    GateKind(
-        name="push_protected",
-        summary="push directly to a protected branch, bypassing review",
-        patterns=(
-            r"\bgit\s+push\b[^\n]*\b(origin\s+)?(main|master)\b",
-            r"\bgit\s+push\b[^\n]*\bHEAD:(refs/heads/)?(main|master)\b",
-        ),
-        conflict_markers=("git push",),
-    ),
-)
-
-KIND_NAMES = tuple(k.name for k in KINDS)
 
 
 @dataclass(frozen=True)
@@ -227,138 +186,41 @@ class GatedAction:
     summary: str
     command: str
     matched: str  # the pattern that fired — shown to the reviewer, and to the user
+    # Which row of the rule base fired. `builtin` rules are seeded, `neo`/`user` ones were
+    # learned; a reviewer looking at a request deserves to know which, because "the OS has
+    # always thought this" and "the OS decided this last Tuesday" are different claims.
+    rule_id: str = ""
 
 
-# Quoted spans are data, not code. `'…'` is literal; `"…"` may interpolate, but a gated
-# verb inside it is still an argument, not a command — unless a shell re-parses it, which
-# is what _SHELL_INVOKER catches below.
-_QUOTED = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"", re.DOTALL)
-
-# …with one exception: these hand their quoted payload back to a shell to execute, so
-# there the quotes are code after all. Scan such commands whole.
-_SHELL_INVOKER = re.compile(
-    r"\b(?:ba|z|k|da|a)?sh\s+(?:-[a-zA-Z]*\s+)*-[a-zA-Z]*c\b|\beval\b|\bxargs\b",
-    re.IGNORECASE,
-)
+_SUMMARIES = {k.name: k.summary for k in KINDS}
 
 
-def scannable(command: str) -> str:
-    """The part of `command` that could actually *execute* something.
-
-    Blanks quoted arguments so that merely naming a privileged action doesn't trip its
-    gate — `git commit -m "document systemctl restart"` writes a commit message, and
-    `jarvis learn add "…never run the release script…"` writes a note. Both used to be
-    gated as the real thing, which cost a Neo review and stalled the worker for nothing.
-
-    A quoted payload IS code when something re-parses it (`sh -c`, `eval`, `xargs`), so
-    those are scanned whole. Erring that way is deliberate: a spurious gate costs one
-    review, a missed one ships unreviewed code.
-    """
-    if _SHELL_INVOKER.search(command):
-        return command
-    # Replace rather than delete, so neighbouring tokens can't fuse into a false match.
-    return _QUOTED.sub(" ", command)
-
-
-# Tools that read and cannot execute. A privileged action named in an *argument* to one
-# of these is a mention, not an attempt: `cat scripts/shipit.sh` prints the release
-# script, and printing it ships nothing.
-#
-# `scannable()` already covers the quoted case, and cannot cover this one — the thing
-# being named here is a *path*, and nobody quotes paths. That gap gated three commands
-# on wo-52a6164d alone (`cat …/skills/shipit/SKILL.md`, `grep … scripts/shipit.sh`),
-# each costing a Neo review and, until the status fix below, a spurious attention item.
-#
-# Membership is decided by what a tool CAN do, never by what it is usually used for.
-# `find` has `-exec`, `awk` has `system()`, `xargs` and `eval` re-parse their input,
-# `git` pushes, and `sed -i` writes — none of them are here or can be.
-_READERS = frozenset({
-    "cat", "tac", "head", "tail", "nl", "wc", "ls", "stat", "file", "diff", "cmp",
-    "grep", "egrep", "fgrep", "rg", "ag", "cut", "sort", "uniq", "tr", "column",
-    "jq", "yq", "basename", "dirname", "realpath", "readlink", "echo", "printf",
-    "pwd", "tree", "strings", "od", "xxd", "md5sum", "sha256sum", "cksum", "du", "df",
-    "which", "sed",
-})
-
-# Wrappers that run whatever follows them without changing what it can do, so the
-# reader test applies to the word after them instead.
-_TRANSPARENT = frozenset({"command", "builtin", "time", "nice", "ionice", "sudo", "env"})
-
-# A substitution runs a command to build an argument, so the reader in front of it is
-# no longer the only thing executing. `cat $(which shipit)` reads; `cat <(./shipit.sh)`
-# ships. Neither is worth telling apart — both leave reader territory.
-_SUBSTITUTION = re.compile(r"\$\(|`|<\(|>\(")
-
-# Where one command ends and the next begins. `&` splits only when it starts a
-# background job: in `2>&1` it is part of a redirection, and splitting there would leave
-# `2>` looking like a command name and fail every reader that redirects its stderr.
-_SEPARATORS = re.compile(r"\|\||&&|[|;\n]|(?<![<>&])&")
-
-_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-
-
-def reads_only(command: str) -> bool:
-    """True when every command in `command` can read but not execute.
-
-    The exemption is all-or-nothing across the pipeline on purpose: a reader piping into
-    a shell (`cat scripts/shipit.sh | bash`) is the obvious bypass, and one non-reading
-    segment anywhere is enough to lose it. So the only commands this clears are ones
-    that cannot run the thing they name — which is why it is safe to apply to every
-    gate rather than just `release`.
-
-    Unrecognised syntax fails the test rather than passing it: a name carrying a slash
-    is not the `cat` on PATH but something in the tree that merely shares its name, and
-    an empty segment means the split found something this parser does not model.
-    """
-    if _SUBSTITUTION.search(command) or _SHELL_INVOKER.search(command):
-        return False
-    # Split the *masked* command: a separator inside a quoted argument starts no new
-    # command, and `grep "a\|b" f | head` used to be torn in half at the alternation.
-    # Only command names and flags are read below, and neither is ever quoted.
-    segments = [s.strip() for s in _SEPARATORS.split(_QUOTED.sub(" ", command))]
-    if not any(segments):
-        return False
-    for segment in segments:
-        if not segment:
-            continue
-        words = segment.lstrip("({ ").split()
-        while words and (_ASSIGNMENT.match(words[0])
-                         or words[0].lstrip("\\") in _TRANSPARENT):
-            words = words[1:]
-        if not words:
-            return False
-        name = words[0].lstrip("\\")
-        if name not in _READERS:
-            return False
-        # `sed -n '1,20p' f` reads; `sed -i s/a/b/ f` rewrites the file.
-        if name == "sed" and any(w.startswith("-i") or w == "--in-place"
-                                 for w in words[1:]):
-            return False
-    return True
-
-
-def classify(command: str, config: GateConfig) -> GatedAction | None:
+def classify(command: str, config: GateConfig, rules: RuleSet | None = None,
+             central: CentralStore | None = None) -> GatedAction | None:
     """The gate this Bash command trips, or None.
 
-    Matches the whole command rather than parsed segments: a gated action hidden in a
-    pipeline, a subshell or behind `&&` is the same action, and a classifier that only
-    understands well-formed simple commands is a classifier with a bypass. Quoted
-    arguments are blanked first — see `scannable` — and commands that can only read are
-    exempt outright, see `reads_only`.
+    The recognisers come from the rule base rather than from this file — `rules` is what
+    the OS currently believes, learned exemptions included. Omitting it loads them, which
+    is the right default for a caller that just wants an answer and the wrong one for the
+    hook, which already has a store open and should not pay for a second.
+
+    Passing `central` in addition lets a cleared command be *counted*: an exemption that
+    never fires is a rule that generalised nothing, and that is worth being able to see.
     """
     if not command or not config.enabled:
         return None
-    if reads_only(command):
+    ruleset = rules if rules is not None else RuleSet.load(central)
+    decision = ruleset.decide(command, config.enabled, config.extra_patterns)
+    if central is not None:
+        for rule_id, _, _ in decision.cleared:
+            if rule_id != "catalog":
+                central.record_gate_rule_hit(rule_id)
+    if decision.match is None:
         return None
-    haystack = scannable(command)
-    for kind in KINDS:
-        if kind.name not in config.enabled:
-            continue
-        for pattern in (*kind.patterns, *config.extra_patterns.get(kind.name, ())):
-            if re.search(pattern, haystack, re.IGNORECASE):
-                return GatedAction(kind=kind.name, summary=kind.summary,
-                                   command=command.strip(), matched=pattern)
-    return None
+    return GatedAction(kind=decision.match.kind,
+                       summary=_SUMMARIES.get(decision.match.kind, decision.match.kind),
+                       command=command.strip(), matched=decision.match.pattern,
+                       rule_id=decision.match.rule_id)
 
 
 # -- misconfiguration that silently shuts a gate --------------------------------------
@@ -446,6 +308,22 @@ false positive, DISMISS is the only honest verdict available; do not approve it 
 records an authorisation that never happened) and do not deny it (that tells the worker
 it misbehaved and blocks a command that was always fine).
 
+WHEN YOU DISMISS, TEACH THE CLASSIFIER. Add an `exempt_pattern`: a regular expression
+describing the FAMILY of commands this one belongs to, so the next worker to write
+something of the same shape is not blocked and you are not asked again. This is the only
+route by which the OS gets better at this; a dismissal without one fixes a single command
+string and nothing else.
+
+- Describe the shape, not the instance. `git commit -F -` with a release path in the
+  message body is a family; that exact commit message is not.
+- Anchor it on literal text. A pattern with no literal in it is not a description of a
+  family, it is the gate switched off, and the OS will refuse it.
+- Never write one that would match a command that really does perform the action. The OS
+  tests every pattern you propose against commands that must always be gated and drops it
+  if it fails, but do not rely on that: it is a backstop, not a reviewer.
+- Omit the field entirely if you cannot describe the family safely. The OS falls back to
+  a structural rule it derives itself, which is narrower and always safe.
+
 HARD LIMIT on dismissal, and it is absolute: a command that ACTUALLY invokes the deploy
 or release script, ACTUALLY merges a pull request, or ACTUALLY restarts or stops a
 service is a genuine privileged action, however routine or well-justified it looks. It
@@ -513,7 +391,7 @@ Output STRICT JSON, nothing else:
   {"escalate": false, "verdict": "approve",  "reason": "<one line: what you verified>"}
   {"escalate": false, "verdict": "deny",     "reason": "<one line: what is wrong>"}
   {"escalate": false, "verdict": "dismiss",  "reason": "<one line: why this command \
-performs no privileged action>"}
+performs no privileged action>", "exempt_pattern": "<regex for the family, or omit>"}
   {"escalate": true,  "verdict": "deny",     "reason": "<one line: why the user must \
 decide>"}"""
 
@@ -713,7 +591,26 @@ def denied_message(approval: dict[str, Any], reason: str, by: str) -> str:
 # better-argued request for it while the first is undecided. That is reviewer-shopping in
 # effect, whatever the worker intended, so the message has to rule it out where the worker
 # reads it rather than leaving it to a learning nobody consults mid-turn.
-def dismissed_message(approval: dict[str, Any], reason: str, by: str) -> str:
+def dismissed_message(approval: dict[str, Any], reason: str, by: str,
+                      learned: dict[str, Any] | None = None) -> str:
+    # What the OS learned is told to the worker, not just written to the record. A worker
+    # that has just lost a turn to a false positive is the one participant who can tell
+    # whether the generalisation is right, and it is about to write a PR body and a
+    # summary describing this work — the same prose that tripped the gate in the first
+    # place.
+    footer = ""
+    if learned and learned.get("learned"):
+        footer = (f"\n\nThe OS learned from this. Rule {learned['learned']} now clears "
+                  f"{learned.get('rule') or 'commands of this shape'}, for every work "
+                  f"order and every project, so nobody has to re-litigate it. Inspect it "
+                  f"with `jarvis gate rules`.")
+    elif learned and learned.get("notes"):
+        footer = ("\n\nThe OS could not generalise this dismissal into a standing rule: "
+                  + "; ".join(learned["notes"]) + ". The command itself is still cleared.")
+    return _dismissed_body(approval, reason, by) + footer
+
+
+def _dismissed_body(approval: dict[str, Any], reason: str, by: str) -> str:
     return (
         f"[Gate {approval['id']} DISMISSED by {by} — not a privileged action] {reason}\n\n"
         f"The OS matched this command as `{approval['kind']}` by mistake. It performs no "
@@ -740,8 +637,50 @@ _VERDICT_MESSAGE = {
 }
 
 
+def learn_from_dismissal(central: CentralStore, approval: dict[str, Any],
+                         reason: str, decided_by: str,
+                         exempt_pattern: str = "",
+                         project: str = "") -> dict[str, Any]:
+    """Turn a dismissal into a standing rule, and report what happened either way.
+
+    This is the feedback loop, and it is three lines of consequence: a reviewer said "the
+    classifier was wrong about this shape", and the classifier now knows. Before this
+    existed the same reviewer said the same thing on four requests in one work order, and
+    the OS forgot each time.
+
+    Never raises. A rule base that cannot be written to is a degradation — the gate still
+    works, it just stops learning — and turning it into an exception would convert a
+    missed improvement into a failed verdict, blocking a worker over the OS's own
+    bookkeeping.
+    """
+    from . import gate_rules
+
+    try:
+        ruleset = RuleSet.load(central)
+        proposal = gate_rules.propose_exemption(
+            ruleset, command=approval["command"], kind=approval["kind"],
+            pattern=approval["matched"], reason=reason, exempt_pattern=exempt_pattern,
+            approval_id=approval["id"], wo_id=approval["wo_id"], project=project,
+        )
+        if proposal.rule is None:
+            return {"learned": None, "notes": proposal.notes}
+        row = central.add_gate_rule(
+            proposal.rule["role"], proposal.rule["test"], proposal.rule["pattern"],
+            kind=proposal.rule["kind"], summary=proposal.rule["summary"],
+            source=proposal.rule["source"], project=proposal.rule["project"],
+            wo_id=proposal.rule["wo_id"], approval_id=proposal.rule["approval_id"],
+            reason=f"{decided_by}: {reason}",
+        )
+        return {"learned": row["id"], "notes": proposal.notes,
+                "rule": gate_rules.Rule.from_row(row).render()}
+    except Exception as e:  # noqa: BLE001 — see the docstring
+        return {"learned": None, "notes": [f"the rule base could not be updated: {e!r}"]}
+
+
 def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
-                   reason: str, decided_by: str) -> dict[str, Any]:
+                   reason: str, decided_by: str,
+                   central: CentralStore | None = None,
+                   exempt_pattern: str = "", project: str = "") -> dict[str, Any]:
     """Record a verdict and queue the worker's resume message.
 
     Shared by Neo's drain and the user's `jarvis gate approve/deny/dismiss`, so a gate
@@ -751,14 +690,33 @@ def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
     are not the same event: `gate_decided` is the record of a privileged action being
     ruled on, and folding false positives into it would inflate exactly the audit trail
     the separate verdict exists to keep honest.
+
+    A dismissal ALSO teaches the classifier — see `learn_from_dismissal`. What was learned
+    (or why nothing could be) rides on the same event rather than a new one, so that the
+    timeline reads as one fact about one request: the recogniser was wrong, and here is
+    what the OS did about it.
     """
     if verdict not in VERDICTS:
         raise ValueError(f"unknown verdict {verdict!r} — expected one of {list(VERDICTS)}")
     approval = store.decide_approval(approval_id, verdict=verdict, reason=reason,
                                      decided_by=decided_by)
-    store.queue_message(approval["wo_id"],
-                        _VERDICT_MESSAGE[verdict](approval, reason, decided_by),
-                        source="gate")
+    learned: dict[str, Any] = {}
+    if verdict == "dismissed":
+        from .central_store import CentralStore as _CS
+
+        own = central is None
+        store_c = central or _CS()
+        try:
+            learned = learn_from_dismissal(store_c, approval, reason, decided_by,
+                                           exempt_pattern=exempt_pattern,
+                                           project=project)
+        finally:
+            if own:
+                store_c.close()
+    message = (dismissed_message(approval, reason, decided_by, learned)
+               if verdict == "dismissed"
+               else _VERDICT_MESSAGE[verdict](approval, reason, decided_by))
+    store.queue_message(approval["wo_id"], message, source="gate")
     if verdict == "dismissed":
         store.add_event(approval["wo_id"], "gate_dismissed", {
             "approval_id": approval_id,
@@ -767,6 +725,9 @@ def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
             "command": approval["command"],
             "matched": approval["matched"],
             "reason": reason,
+            "learned_rule": learned["learned"],
+            "learned": learned.get("rule", ""),
+            "learn_notes": learned["notes"],
         })
     else:
         store.add_event(approval["wo_id"], "gate_decided", {

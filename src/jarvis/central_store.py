@@ -148,6 +148,43 @@ CREATE TABLE IF NOT EXISTS agent_calls (
     output INTEGER NOT NULL DEFAULT 0,
     usage_json TEXT
 );
+-- What the OS believes is a privileged action, and what it has LEARNED is not.
+--
+-- The recognisers behind the gates used to be regex tuples in `gates.KINDS`, and the
+-- problem with that was not the regexes — it was that the table had no writer. Every
+-- false positive was reviewed by Neo, correctly identified, dismissed, and forgotten;
+-- the next work order in the next project tripped the same gate on the same shape. The
+-- only path from "the reviewer knows this is harmless" to "the OS stops asking" ran
+-- through a human filing a work order to widen a pattern.
+--
+-- Central rather than per-project, and that is the whole point rather than a filing
+-- decision: a dismissal in one project has to settle the question for the next one.
+-- The `project`/`wo_id`/`approval_id` columns are provenance — where this was learned —
+-- not scope.
+--
+-- Three roles, and the third is what makes the first two safe to change: `match`
+-- recognises an attempt, `exempt` clears a mention, and `canary` is a command that must
+-- always gate, which every proposed exemption is tested against before it may exist.
+-- See gate_rules.py.
+CREATE TABLE IF NOT EXISTS gate_rules (
+    id TEXT PRIMARY KEY,
+    ts REAL NOT NULL,
+    role TEXT NOT NULL,                     -- match | exempt | canary
+    kind TEXT NOT NULL DEFAULT '',          -- gate name; '' on an exemption = every gate
+    test TEXT NOT NULL,                     -- regex | signature | command
+    pattern TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'builtin', -- builtin | neo | user
+    project TEXT NOT NULL DEFAULT '',       -- provenance, never scope
+    wo_id TEXT NOT NULL DEFAULT '',
+    approval_id INTEGER,                    -- the dismissal this was learned from
+    reason TEXT NOT NULL DEFAULT '',        -- the reviewer's words, verbatim
+    hits INTEGER NOT NULL DEFAULT 0,        -- how often it has cleared a command
+    last_hit REAL,
+    retired_at REAL,                        -- NULL = in force; set = retracted
+    retired_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_gate_rules_role ON gate_rules(role, kind);
 CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
 CREATE INDEX IF NOT EXISTS idx_backlog_project ON backlog(project, status);
 CREATE INDEX IF NOT EXISTS idx_agent_calls_wo ON agent_calls(wo_id, ts);
@@ -175,6 +212,7 @@ class CentralStore:
         self.conn = db.connect(self.db_path)
         self.conn.executescript(SCHEMA)
         self._migrate()
+        self._seed_gate_rules()
 
     def _migrate(self) -> None:
         for table, columns in ADDED_COLUMNS.items():
@@ -584,6 +622,97 @@ class CentralStore:
         return brief
 
     # -- the OS's own Claude spend -----------------------------------------------------
+
+    # -- gate rules (what counts as a privileged action; see gate_rules.py) ----
+
+    def _seed_gate_rules(self) -> None:
+        """Write the builtin recognisers and canaries, once.
+
+        Guarded by a version key for speed — this runs on every open — but correctness
+        rests on the ids, not the guard. They are derived from the rule's content, so an
+        insert that has already happened is ignored rather than replayed, and a builtin
+        rule the user retracted stays retracted across upgrades and restarts. A random
+        id here would silently restore a retired recogniser on every release.
+        """
+        from . import gate_rules
+
+        if self.get_state("gate_rules_seed") == gate_rules.SEED_VERSION:
+            return
+        now = db.now()
+        for row in gate_rules.seed_rows():
+            self.conn.execute(
+                """INSERT OR IGNORE INTO gate_rules
+                   (id, ts, role, kind, test, pattern, summary, source)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (row["id"], now, row["role"], row["kind"], row["test"], row["pattern"],
+                 row.get("summary", ""), row.get("source", "builtin")),
+            )
+        self.set_state("gate_rules_seed", gate_rules.SEED_VERSION)
+
+    def add_gate_rule(self, role: str, test: str, pattern: str, *, kind: str = "",
+                      summary: str = "", source: str = "user", project: str = "",
+                      wo_id: str = "", approval_id: int | None = None,
+                      reason: str = "", rule_id: str | None = None) -> dict[str, Any]:
+        rid = rule_id or db.new_id("gr")
+        self.conn.execute(
+            """INSERT INTO gate_rules
+               (id, ts, role, kind, test, pattern, summary, source, project, wo_id,
+                approval_id, reason)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (rid, db.now(), role, kind, test, pattern, summary, source, project, wo_id,
+             approval_id, reason),
+        )
+        return self.get_gate_rule(rid)  # type: ignore[return-value]
+
+    def get_gate_rule(self, rule_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM gate_rules WHERE id=?",
+                                (rule_id,)).fetchone()
+        return dict(row) if row else None
+
+    def gate_rules(self, role: str | None = None, kind: str | None = None,
+                   include_retired: bool = False) -> list[dict[str, Any]]:
+        q = "SELECT * FROM gate_rules WHERE 1=1"
+        params: list[Any] = []
+        if not include_retired:
+            q += " AND retired_at IS NULL"
+        if role:
+            q += " AND role=?"
+            params.append(role)
+        if kind:
+            q += " AND kind=?"
+            params.append(kind)
+        q += " ORDER BY role, kind, ts"
+        return db.rows_to_dicts(self.conn.execute(q, params).fetchall())
+
+    def retract_gate_rule(self, rule_id: str, reason: str) -> dict[str, Any]:
+        """Retire a rule without erasing that it was once in force.
+
+        The same shape as `retract_knowledge`, for the same reason: both ledgers are
+        append-only, and a rule that turned out to be wrong has to stop applying without
+        the record losing what the OS believed and acted on while it did.
+        """
+        rule = self.get_gate_rule(rule_id)
+        if rule is None:
+            raise KeyError(f"gate rule {rule_id} not found")
+        if rule["retired_at"] is not None:
+            raise ValueError(f"gate rule {rule_id} is already retracted")
+        self.conn.execute(
+            "UPDATE gate_rules SET retired_at=?, retired_reason=? WHERE id=?",
+            (db.now(), reason, rule_id),
+        )
+        return self.get_gate_rule(rule_id)  # type: ignore[return-value]
+
+    def record_gate_rule_hit(self, rule_id: str) -> None:
+        """Count an exemption actually clearing a command.
+
+        The counterpart to `dismissed_count()`: that number is what the classifier still
+        gets wrong, this one is what it has stopped getting wrong. A learned rule with no
+        hits is a rule that generalised nothing.
+        """
+        self.conn.execute(
+            "UPDATE gate_rules SET hits = hits + 1, last_hit=? WHERE id=?",
+            (db.now(), rule_id),
+        )
 
     def add_agent_call(self, kind: str, *, project: str = "", wo_id: str = "",
                        label: str = "", model: str = "", question_id: int | None = None,

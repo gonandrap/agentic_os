@@ -153,7 +153,7 @@ def gate_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any
     if not config:
         return None  # project hasn't opted in
     command = (payload.get("tool_input") or {}).get("command") or ""
-    action = gates.classify(command, config)
+    action = _classify(command, config)
     if action is None:
         return None
 
@@ -165,6 +165,36 @@ def gate_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any
             f"({e!r}), so it is blocked. This is a fault in Jarvis, not a verdict on "
             f"your request — report it with your `report-jarvis-bug` skill."
         )
+
+
+def _classify(command: str, config: Any) -> Any:
+    """Classify against the LIVE rule base, and count any exemption that fires.
+
+    The rules are in `os.db` because they change — a dismissal in another project may
+    already have settled this command's shape. Reading them here is what makes that
+    learning reach the one place it matters, the hook that would otherwise block a worker
+    mid-turn.
+
+    A database this cannot read falls back to the seeded recognisers, which is the safe
+    direction and not an obvious one: the fallback restores every recogniser and no
+    exemption, so a broken `os.db` makes the gate over-eager rather than absent. A worker
+    pays for a spurious review; nothing ships unreviewed.
+    """
+    from . import gates
+    from .central_store import CentralStore
+    from .gate_rules import RuleSet
+
+    try:
+        central = CentralStore()
+    except Exception:  # noqa: BLE001 — see the docstring
+        return gates.classify(command, config, rules=RuleSet.from_seeds())
+    try:
+        return gates.classify(command, config, rules=RuleSet.load(central),
+                              central=central)
+    except Exception:  # noqa: BLE001
+        return gates.classify(command, config, rules=RuleSet.from_seeds())
+    finally:
+        central.close()
 
 
 def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],

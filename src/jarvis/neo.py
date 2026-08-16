@@ -253,6 +253,11 @@ def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
         "verdict": verdict,
         "approve": verdict == "approved",
         "dispatch": parse_dispatch(data.get("dispatch")),
+        # Carried through unvalidated on purpose: whether a proposed exemption may exist
+        # is decided by `gate_rules.propose_exemption`, against canary commands this layer
+        # knows nothing about. Truncating it is the only judgement made here, and that is
+        # about the size of a database column, not the content of a rule.
+        "exempt_pattern": str(data.get("exempt_pattern") or "")[:400],
     }
 
 

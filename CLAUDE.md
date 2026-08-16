@@ -130,6 +130,19 @@ jarvis gate dismiss <id> --reason "…"      # NOT a gated action: the recognise
                                            # counted separately so the false-positive
                                            # rate is visible. Never approve or deny one:
                                            # both write something false into the record.
+                                           # A dismissal also TEACHES the recogniser: the
+                                           # OS derives a standing rule from the shape and
+                                           # stops asking about it, fleet-wide.
+jarvis gate rules                          # what the OS believes is privileged, and what
+                                           # it has learned is not. Seeded from the
+                                           # builtins, grown from dismissals. The last
+                                           # line is the one to read: whether every
+                                           # command that MUST gate still does.
+jarvis gate rule-retract <id> --reason "…" # the user overruling a rule the OS learned.
+                                           # Retracting an exemption re-arms a gate
+jarvis gate explain "<command>"            # why a command would or would not be gated —
+                                           # paste the exact string from a gate record
+                                           # instead of guessing at a false positive
 jarvis neo list                            # Neo's Q&A: pending reviews + escalations
 jarvis neo review <qid> [--correct "…"]    # approve or teach; corrections become learnings
 jarvis neo answer <qid> "…"                # answer a question Neo escalated to the user
