@@ -4,6 +4,13 @@
 **Companions:** `docs/superpowers/specs/2026-08-09-where-the-tokens-go.md` (kn-1485b845),
 `docs/superpowers/specs/2026-08-08-token-spend-findings.md` (kn-625e79f1)
 
+> **Corrected 2026-08-15 (wo-5722b6dc).** This document concludes that git status in the
+> system prompt is upstream and has no exit. That is wrong: `includeGitInstructions:
+> false` removes the snapshot itself, not just the instructions, and makes a resumed
+> worker's boundary warm. Everything else here — the TTL multipliers, the double-write
+> mechanism, the MCP census, the compaction checkpoint — stands. See
+> `docs/superpowers/specs/2026-08-15-a-stable-prefix-for-resumed-workers.md`.
+
 ## The report
 
 Both work orders were parked on the 5-hour Claude usage limit at ~08:00 local. The window

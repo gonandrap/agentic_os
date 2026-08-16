@@ -37,6 +37,82 @@ PROJECT_PLACEHOLDER = "<project>"
 CORE_BUDGET_CHARS = 2500
 
 
+# -- the git briefing, replacing Claude Code's own ---------------------------------------
+
+# Model id -> the name Claude Code puts in the Co-Authored-By trailer, copied from the
+# CLI's own table (2.1.233) so a Jarvis-written commit is indistinguishable from one
+# written under the built-in instructions. Longest-prefix matched, so a dated id like
+# `claude-haiku-4-5-20251001` resolves; anything unrecognised — including a floating
+# alias such as `opus`, whose target only the CLI knows — falls back to the CLI's own
+# fallback, plain "Claude". A generic trailer is correct; a wrong model name is not.
+MODEL_ATTRIBUTION_NAMES: dict[str, str] = {
+    "claude-fable-5": "Claude Fable 5",
+    "claude-mythos-5": "Claude Mythos 5",
+    "claude-opus-5": "Claude Opus 5",
+    "claude-opus-4-8": "Claude Opus 4.8",
+    "claude-sonnet-5": "Claude Sonnet 5",
+    "claude-sonnet-4-6": "Claude Sonnet 4.6",
+    "claude-haiku-4-5": "Claude Haiku 4.5",
+}
+
+#: The PR footer, verbatim from the CLI bundle.
+PR_ATTRIBUTION = "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+
+
+def attribution_name(model: str | None) -> str:
+    """The display name for the Co-Authored-By trailer."""
+    m = (model or "").strip().lower()
+    hit = [k for k in MODEL_ATTRIBUTION_NAMES if m.startswith(k)]
+    return MODEL_ATTRIBUTION_NAMES[max(hit, key=len)] if hit else "Claude"
+
+
+def git_briefing(model: str | None = None) -> str:
+    """The git conventions, as a STATIC block Jarvis owns.
+
+    Workers run with `includeGitInstructions: false`, which switches off three things
+    the CLI would otherwise build into the system prompt: the git-status snapshot, the
+    long "Committing changes with git" workflow, and the lean "# Git" block carrying
+    the attribution trailers. The snapshot is the reason — it is recomputed from the
+    working tree at every `--resume`, so it changed the moment the worker edited a
+    file, and a changed system prompt invalidates the cached prefix for the ENTIRE
+    conversation. Measured on 2.1.233: turn 2 of a resumed worker wrote 10,983 tokens
+    and read 15,995 (the static prompt alone) with the snapshot on, against 552 written
+    and 26,113 read with it off. See docs/superpowers/specs/
+    2026-08-15-a-stable-prefix-for-resumed-workers.md.
+
+    The other two blocks are collateral, so this restates them — which is the whole
+    trick, and the linked best-practice rule: the same content, from a surface that
+    cannot move between turns. It is parameterised only by the work order's model,
+    which is frozen at dispatch (and is part of the cache key anyway), so the rendered
+    text is byte-identical for every turn of a given work order.
+
+    Deliberately NOT a copy of the CLI's "commit only when the user asks": for a worker
+    the work order IS the ask, and the operating contract already tells it to commit and
+    open a PR. Copying that line verbatim would have the system prompt contradict the
+    contract.
+    """
+    return "\n".join([
+        "# Git",
+        "",
+        "Claude Code's built-in git instructions and its git-status snapshot are "
+        "switched off for you on purpose: both are rebuilt from the working tree on "
+        "every turn, and that churn invalidated the prompt cache for your whole "
+        "conversation each time you resumed. This block replaces them and is identical "
+        "on every turn. Run `git status` / `git log` yourself whenever you need the "
+        "state of the tree — it is not in your prompt.",
+        "",
+        "- Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not "
+        "supported in this environment.",
+        "- Use the `gh` CLI for GitHub operations (PRs, issues, API).",
+        "- Commit your work and open a PR when the task is done — your work order is "
+        "the ask. Never commit to or push the default branch.",
+        "- End git commit messages with:",
+        f"Co-Authored-By: {attribution_name(model)} <noreply@anthropic.com>",
+        "- End PR bodies with:",
+        PR_ATTRIBUTION,
+    ])
+
+
 class UnknownSection(KeyError):
     """Asked for a briefing section that does not exist."""
 

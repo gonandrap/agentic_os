@@ -91,6 +91,18 @@ on every turn rather than resolved onto the work-order row at dispatch — it is
 control, so tightening it must reach work orders already running. Why it exists and what it saves:
 `kn-81a91bac`, `docs/superpowers/specs/2026-08-10-resume-cost-and-the-cache.md`.
 
+**Workers run with `includeGitInstructions: false`** (written by
+`dispatch._write_worker_settings`). It is a CACHE lever, not a git preference: Claude Code
+rebuilds a git-status snapshot into the system prompt once per process, a worker turn IS a
+process, and the worker changes that snapshot by editing files — so the cached prefix for
+the whole conversation died at every turn boundary. Measured on 2.1.233: turn 2 goes from
+writing 10,983 / reading 15,995 to writing 552 / reading 26,113. The same gate removes the
+CLI's git and commit/PR blocks, so `worker_brief.git_briefing()` restates them as static
+text on `--append-system-prompt` (composed in `briefing_for`, project instructions appended
+after it). `tests/test_stable_prefix.py` holds the flag and the briefing together — the
+flag alone silently strips the attribution trailers from every fleet commit and PR.
+Write-up: `docs/superpowers/specs/2026-08-15-a-stable-prefix-for-resumed-workers.md`.
+
 **The `--` fence is load-bearing.** `--add-dir` AND `--tools` are variadic; an unfenced
 prompt is swallowed as an option value.
 
