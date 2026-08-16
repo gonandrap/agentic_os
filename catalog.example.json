@@ -6,7 +6,7 @@
       "permission_mode": "auto",
       "max_concurrent": 5,
       "$comment_autocompact": "how large a worker's conversation may grow before Claude Code compacts it (claude --autocompact). Every API call re-reads the whole conversation, so this multiplies into the bill on every call; 100000-1000000, or null for the model's own window",
-      "autocompact_window": 150000
+      "autocompact_window": 400000
     },
     "notifications": {
       "sinks": ["log", "telegram"],
