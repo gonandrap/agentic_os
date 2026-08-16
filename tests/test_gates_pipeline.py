@@ -386,13 +386,13 @@ def test_gate_listing_and_show_surface_the_request(fleet):
 def test_neo_dismisses_a_false_positive_and_the_command_runs(fleet):
     """The counterpart of `test_neo_approves_and_the_retry_goes_through`, for the case
     where the premise was wrong: the command never performed a privileged action."""
-    # A plain grep. It trips the `release` gate only because the deploy script's name
-    # appears in the search pattern — this exact shape is what filed the real requests
-    # that were denied once and approved once.
-    command = "grep -rn shipit.sh src/jarvis/gates.py"
+    # A test run. It trips the `release` gate only because the deploy script's name
+    # appears in a `-k` selector — the same shape that filed the real requests that
+    # were denied once and approved once. `reads_only` cannot clear it: pytest executes.
+    command = "uv run pytest tests/test_release_staging.py -k shipit"
     ops.request_gate_approval(
         fleet.wo_id, command,
-        why="FORCE_DISMISS — this greps a file; it performs no privileged action",
+        why="FORCE_DISMISS — this runs a test; it performs no privileged action",
     )
     assert _decision(fleet.attempt(command)) == "deny"
 
@@ -422,7 +422,7 @@ def test_a_dismissal_costs_the_user_no_inbox_item(fleet):
     an inbox item for that spends the user's attention on an OS bug, which is the exact
     cost the gate exists to avoid. The rate is surfaced as a count instead.
     """
-    ops.request_gate_approval(fleet.wo_id, "grep -rn shipit.sh src/jarvis/gates.py",
+    ops.request_gate_approval(fleet.wo_id, "uv run pytest tests/test_release_staging.py -k shipit",
                               why="FORCE_DISMISS — read-only")
     fleet.daemon._neo_drain()
 
@@ -440,7 +440,7 @@ def test_a_dismissal_costs_the_user_no_inbox_item(fleet):
 def test_a_dismissal_by_neo_still_lands_as_an_approval_answer_on_the_record(fleet):
     """`jarvis neo review` reads the answer text, so the third verdict has to appear
     there — otherwise a dismissal reads as a denial in Neo's own history."""
-    ops.request_gate_approval(fleet.wo_id, "grep -rn shipit.sh src/jarvis/gates.py",
+    ops.request_gate_approval(fleet.wo_id, "uv run pytest tests/test_release_staging.py -k shipit",
                               why="FORCE_DISMISS — read-only")
     fleet.daemon._neo_drain()
 
@@ -453,12 +453,12 @@ def test_a_dismissal_by_neo_still_lands_as_an_approval_answer_on_the_record(flee
 
 
 def test_user_can_dismiss_a_gate_the_classifier_got_wrong(fleet):
-    command = "grep -rn shipit.sh src/jarvis/gates.py"
+    command = "uv run pytest tests/test_release_staging.py -k shipit"
     fleet.attempt(command)
     approval = fleet.approval()
 
     ops.decide_gate(approval["id"], verdict="dismissed",
-                    reason="the literal is inside a grep pattern; this reads a file")
+                    reason="the literal is a -k test selector; this runs a test")
 
     assert _decision(fleet.attempt(command)) == "allow"
     assert fleet.approval()["status"] == "dismissed"
@@ -472,7 +472,7 @@ def test_user_can_dismiss_a_gate_the_classifier_got_wrong(fleet):
 def test_dismissal_requires_a_reason(fleet):
     """The reason IS the defect report on the recogniser, and the only note attached to
     the false-positive count anyone will later read."""
-    fleet.attempt("grep -rn shipit.sh src/jarvis/gates.py")
+    fleet.attempt("uv run pytest tests/test_release_staging.py -k shipit")
     approval = fleet.approval()
     with pytest.raises(ops.OpsError, match="needs a reason"):
         ops.decide_gate(approval["id"], verdict="dismissed", reason="  ")
@@ -492,7 +492,7 @@ def test_the_false_positive_rate_is_reportable_across_the_fleet(fleet):
     It is the signal for whether the recognisers are improving, so it has to survive
     both the expiry sweep and a mix of other verdicts in the same table.
     """
-    fleet.attempt("grep -rn shipit.sh src/jarvis/gates.py")
+    fleet.attempt("uv run pytest tests/test_release_staging.py -k shipit")
     ops.decide_gate(fleet.approval()["id"], verdict="dismissed", reason="a grep")
     ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh",
                               why="FORCE_APPROVE — ready")
