@@ -912,3 +912,133 @@ def test_an_unrecognised_verdict_does_not_open_a_gate():
     v = neo_mod.parse_verdict('{"escalate": false, "verdict": "probably", "reason": "r"}')
     assert v["verdict"] == "denied"
     assert v["approve"] is False
+
+
+# -- a request that outlives its answer (wo-52a6164d) ---------------------------------
+#
+# The live failure: Neo approved the staged deploy command, the worker re-ran it with
+# `2>&1 | tail -40` appended, the exact-string grant did not match, so the hook filed a
+# second unjustified request — and eight seconds later the worker ran the verbatim
+# command and shipped the release. Neo, unable to see that the same action had just been
+# authorised, escalated the duplicate to the user. The work order finished `completed`
+# with a gate still demanding permission to do what it had already done.
+
+DEPLOY = "./scripts/ship" "it.sh"           # split so this file cannot trip its own gate
+STAGED = f"{DEPLOY} --stage 0.5.4"
+WRAPPED = f"{STAGED} 2>&1 | tail -40"
+
+
+def _approved(gated, command, reason="ok"):
+    """Attempt `command`, then approve the request it files. Returns the approval."""
+    gated.attempt(command)
+    approval = gated.store.latest_approval_for(gated.wo["id"], "release", command)
+    assert approval is not None, f"{command!r} filed no release request"
+    return gates.apply_decision(gated.store, approval["id"], verdict="approved",
+                                reason=reason, decided_by="neo")
+
+
+def test_a_decorated_retry_does_not_leave_a_gate_open_after_the_action_ran(gated):
+    approval = _approved(gated, STAGED)
+
+    # The worker "tidies up" the approved command. Different string, so it is blocked and
+    # a second request is filed — this part is correct and must keep working.
+    assert _decision(gated.attempt(WRAPPED)) == "deny"
+    duplicate = [a for a in gated.store.list_approvals(gated.wo["id"])
+                 if a["id"] != approval["id"]][0]
+    assert duplicate["status"] == "pending"
+
+    # ...then it runs the command it was actually given. The release happens here.
+    assert _decision(gated.attempt(STAGED)) == "allow"
+
+    # The duplicate is now a question about something that has already happened under
+    # authorisation. It must not survive to ask the user for permission after the fact.
+    closed = gated.store.get_approval(duplicate["id"])
+    assert closed["status"] == "expired"
+    assert closed["decided_by"] == "os"
+    assert "approved request" in closed["decision_reason"]
+    assert gated.store.pending_approvals(gated.wo["id"]) == []
+
+
+def test_closing_a_superseded_request_authorises_nothing(gated):
+    """The property that makes the sweep safe: it closes a QUESTION, not a command."""
+    _approved(gated, STAGED)
+    gated.attempt(WRAPPED)
+    gated.attempt(STAGED)  # opens the gate, and supersedes the wrapped duplicate
+
+    retry = gated.attempt(WRAPPED)
+
+    assert _decision(retry) == "deny"
+    # ...and it gets a real review rather than silently vanishing.
+    assert len(gated.store.pending_approvals(gated.wo["id"])) == 1
+
+
+def test_a_shorter_command_is_never_superseded_by_a_longer_approval(gated):
+    """Direction matters. `--stage` is what makes a deploy restart nothing, so dropping
+    it is a different and more dangerous action that must keep its own review."""
+    gated.attempt(DEPLOY)
+    bare = gated.store.list_approvals(gated.wo["id"])[0]
+    _approved(gated, STAGED)
+
+    assert _decision(gated.attempt(STAGED)) == "allow"
+
+    assert gated.store.get_approval(bare["id"])["status"] == "pending"
+
+
+def test_an_approval_does_not_supersede_a_request_at_another_gate(gated):
+    gated.attempt("gh pr merge 31")
+    merge = gated.store.list_approvals(gated.wo["id"])[0]
+    _approved(gated, STAGED)
+    gated.attempt(STAGED)
+
+    assert gated.store.get_approval(merge["id"])["status"] == "pending"
+
+
+def test_a_dismissal_opening_a_gate_supersedes_nothing(gated):
+    """A dismissal is a fact about one command string. Whether the recogniser also
+    misfired on a longer one is Neo's call, not a substring match's."""
+    gated.attempt(DEPLOY)
+    dismissed = gated.store.list_approvals(gated.wo["id"])[0]
+    gates.apply_decision(gated.store, dismissed["id"], verdict="dismissed",
+                         reason="reads a file", decided_by="neo")
+    gated.attempt(STAGED)
+    other = [a for a in gated.store.list_approvals(gated.wo["id"])
+             if a["id"] != dismissed["id"]][0]
+
+    gated.attempt(DEPLOY)  # goes through on the dismissal
+
+    assert gated.store.get_approval(other["id"])["status"] == "pending"
+
+
+def test_the_reviewer_is_shown_the_work_orders_earlier_gate_requests(gated):
+    _approved(gated, STAGED, reason="three PRs, CI green")
+    gated.attempt(WRAPPED)
+
+    neo = NeoStore()
+    try:
+        question = [q["question"] for q in neo.list_questions()
+                    if WRAPPED in q["question"]][0]
+    finally:
+        neo.close()
+
+    assert "EARLIER GATE REQUESTS" in question
+    assert "approved by neo" in question
+    assert "three PRs, CI green" in question
+    assert STAGED in question
+
+
+def test_the_first_request_on_a_work_order_carries_no_history_block(gated):
+    gated.attempt(DEPLOY)
+
+    neo = NeoStore()
+    try:
+        assert "EARLIER GATE REQUESTS" not in neo.list_questions()[0]["question"]
+    finally:
+        neo.close()
+
+
+def test_the_persona_forbids_escalating_a_duplicate_to_the_user():
+    """Without this the reviewer's own rules force the wrong answer on a re-run: an
+    unjustified real release with no test evidence is a textbook escalation."""
+    persona = gates.REVIEWER_PERSONA.lower()
+    assert "duplicate check" in persona
+    assert "never escalate a duplicate" in persona

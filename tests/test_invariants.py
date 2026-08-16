@@ -165,6 +165,77 @@ def test_a_specific_permission_reason_is_left_alone(project):
         "Claude needs permission to run npm test")
 
 
+def _finished_with_a_gate_still_pending(store: ProjectStore, escalated: bool = True):
+    """The state wo-52a6164d ended in: shipped, completed, still asking permission."""
+    wo = store.create_work_order("ship a new version to production")
+    approval = store.add_approval(wo["id"], "release", "scripts/deploy.sh 0.5.4")
+    if escalated:
+        store.mark_approval_escalated(approval["id"], "no justification was filed")
+        store.flag_attention(
+            wo["id"], f"gate approval escalated by Neo: release (request {approval['id']})")
+    store.update_work_order(wo["id"], result_summary="staged 0.5.4")
+    store.set_status(wo["id"], "completed")
+    return wo, approval
+
+
+def test_a_finished_work_order_stops_asking_for_permission(project):
+    """A gate is a control on something about to happen. Once the work order is over
+    there is no worker left to run the command, so an approval could permit nothing and
+    a denial could stop nothing — but the user was still being asked."""
+    store = ProjectStore(project)
+    wo, approval = _finished_with_a_gate_still_pending(store)
+
+    violations = check_project(store, repair=True)
+
+    # The gate is closed first, so the attention sweep that follows sees the truth.
+    assert [v.invariant for v in violations] == ["INV-GATE-ORPHAN",
+                                                 "INV-ATTENTION-PHANTOM"]
+    assert violations[0].repaired
+    closed = store.get_approval(approval["id"])
+    assert closed["status"] == "expired"
+    assert closed["decided_by"] == "os"
+    assert store.pending_approvals(wo["id"]) == []
+    # ...and with the blocker gone, the attention flag goes down with it.
+    assert true_blockers(store, store.get_work_order(wo["id"])) == []
+    assert not store.get_work_order(wo["id"])["needs_attention"]
+
+
+def test_closing_an_orphan_gate_records_no_verdict(project):
+    """Nobody authorised anything. The record must not be readable as if they had."""
+    store = ProjectStore(project)
+    _, approval = _finished_with_a_gate_still_pending(store)
+
+    check_project(store, repair=True)
+
+    closed = store.get_approval(approval["id"])
+    assert closed["status"] not in ("approved", "denied", "dismissed")
+    # A dismissal would also have inflated the classifier false-positive count.
+    assert store.dismissed_count() == 0
+
+
+def test_an_orphan_gate_is_reported_but_not_closed_in_reporting_mode(project):
+    store = ProjectStore(project)
+    _, approval = _finished_with_a_gate_still_pending(store)
+
+    violations = check_project(store, repair=False)
+
+    assert "INV-GATE-ORPHAN" in [v.invariant for v in violations]
+    assert store.get_approval(approval["id"])["status"] == "pending"
+
+
+def test_a_gate_pending_on_live_work_is_left_alone(project):
+    """The whole point of the gate: while the worker is still there, the question is
+    real and must keep waiting for an answer."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship it")
+    approval = store.add_approval(wo["id"], "release", "scripts/deploy.sh 0.5.4")
+    store.set_status(wo["id"], "waiting_input")
+
+    check_project(store, repair=True)
+
+    assert store.get_approval(approval["id"])["status"] == "pending"
+
+
 def test_phantom_attention_on_a_finished_order_is_cleared(project):
     """The 'I acked it and it is still in my face' case."""
     store = ProjectStore(project)

@@ -387,6 +387,43 @@ def check_legacy_adhoc_retired(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+def check_no_orphan_gate_requests(store: ProjectStore) -> Iterator[Violation]:
+    """INV-GATE-ORPHAN — a gate request must not outlive the work order that filed it.
+
+    A gate is a control on something about to happen. Once its work order is completed,
+    cancelled or failed there is no worker left to run the command, so an approval could
+    permit nothing and a denial could stop nothing — and yet the request keeps sitting in
+    `jarvis gate list --pending`, and if Neo escalated it, in the user's attention list
+    and inbox, asking them to authorise an action that has either already happened or
+    never will.
+
+    That is the state wo-52a6164d ended in: `completed`, the release shipped, and a
+    pending gate still demanding permission to ship it. Read from the outside, the gate
+    looks like it failed to hold — which is worse than a missing control, because it
+    teaches the operator that the ones still standing mean nothing either.
+
+    Repairable: close the request as superseded. It is not a verdict and authorises
+    nothing (see `ProjectStore.supersede_approval`); the command string stays blocked.
+    """
+    for wo in store.list_work_orders(statuses=TERMINAL_STATUSES, include_hidden=True):
+        for approval in store.pending_approvals(wo["id"]):
+            store.supersede_approval(approval["id"], (
+                f"work order is {wo['status']} — no worker is left to run this command, "
+                f"so there is nothing to authorise or refuse"
+            ))
+            yield Violation(
+                invariant="INV-GATE-ORPHAN",
+                wo_id=wo["id"],
+                detail=f"{wo['status']} work order still had gate request "
+                       f"{approval['id']} ({approval['kind']}) pending"
+                       + (" and escalated to the user" if approval["escalated"] else ""),
+                repaired=True,
+                repair=f"request {approval['id']} closed as superseded",
+                context={"approval_id": approval["id"], "kind": approval["kind"],
+                         "escalated": bool(approval["escalated"])},
+            )
+
+
 def check_no_phantom_attention(store: ProjectStore) -> Iterator[Violation]:
     """INV-ATTENTION-PHANTOM — a work order with nothing pending must not ask for you.
 
@@ -615,6 +652,8 @@ def check_release_marker(now: float | None = None) -> list[Violation]:
 
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
+    check_no_orphan_gate_requests,  # ...and gates before the flag checks: an orphan
+                                    # request is a blocker they would otherwise believe
     check_attention_reason_is_true,
     check_adhoc_not_governed,      # retire before the flag checks judge the leftovers
     check_legacy_adhoc_retired,    # ...and before them, let go of what nothing tracks
@@ -654,7 +693,7 @@ class _ReadOnly:
     """
 
     _BLOCKED = ("flag_attention", "clear_attention", "add_assumption", "add_event",
-                "set_status", "update_work_order")
+                "set_status", "update_work_order", "supersede_approval")
 
     def __init__(self, store: ProjectStore):
         self._store = store

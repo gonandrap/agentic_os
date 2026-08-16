@@ -1097,6 +1097,42 @@ class ProjectStore:
         )
         return self.get_approval(approval_id)  # type: ignore[return-value]
 
+    def supersede_approval(self, approval_id: int, reason: str) -> dict[str, Any]:
+        """Close a pending request that no longer has an answer worth giving.
+
+        Each of the three verdicts says something about the REQUEST: approved and denied
+        permit or refuse it, dismissed calls the classifier wrong about it. This says
+        something about the world around it instead — the action already ran under a
+        separate approval, or the work order that filed this is over — so none of the
+        three would be true, and writing one of them anyway is how a record ends up
+        claiming a deploy was authorised twice.
+
+        It lands in `expired`, the one existing status that already means "never decided,
+        and can no longer be", and it authorises NOTHING: the command string stays
+        blocked, so a worker that retries files a fresh request and gets a real review.
+        That is the property that makes superseding safe to do automatically.
+
+        A no-op on anything already decided — a verdict is never overwritten.
+        """
+        approval = self.get_approval(approval_id)
+        if approval is None:
+            raise KeyError(f"approval {approval_id} not found")
+        if approval["status"] != "pending":
+            return approval
+        self.conn.execute(
+            """UPDATE approvals SET status='expired', decided_by='os',
+                                    decision_reason=?, decided_at=?, expires_at=NULL
+               WHERE id=?""",
+            (reason, db.now(), approval_id),
+        )
+        self.add_event(approval["wo_id"], "gate_superseded", {
+            "approval_id": approval_id,
+            "kind": approval["kind"],
+            "command": approval["command"],
+            "reason": reason,
+        })
+        return self.get_approval(approval_id)  # type: ignore[return-value]
+
     def usable_grant(self, wo_id: str, kind: str, command: str) -> dict[str, Any] | None:
         """The decided request that lets this exact command through right now, or None.
 
