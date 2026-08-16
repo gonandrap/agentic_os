@@ -558,7 +558,8 @@ def create_app() -> FastAPI:
         return render(request, "cost_wo.html", active="cost", report=report,
                       unit=report["units"][0], turns=turns, project=name,
                       bar_scale=scale,
-                      os_calls=report.get("os_calls_detail") or [])
+                      os_calls=report.get("os_calls_detail") or [],
+                      subproc=report.get("subproc_detail") or [])
 
     @app.get("/inbox", response_class=HTMLResponse)
     def inbox(request: Request):

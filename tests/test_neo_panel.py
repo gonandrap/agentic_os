@@ -645,7 +645,7 @@ def test_the_per_seat_timeout_reaches_the_model_call(store, monkeypatch):
     seen: list[int] = []
 
     def recorder(prompt, system_prompt=None, model=None, timeout=300, cwd=None,
-                 tools=None):
+                 tools=None, **kwargs):
         seen.append(timeout)
         return panel.claude_cli.HeadlessResult(
             text=json.dumps({"escalate": False, "answer": "a", "reason": "r"}))

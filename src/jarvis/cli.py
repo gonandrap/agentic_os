@@ -729,6 +729,27 @@ def _print_os_calls(res: dict) -> None:
               f"{'s' if kind['calls'] != 1 else ''}, ~${kind['cost_usd']:.2f}")
 
 
+def _print_subprocess_calls(res: dict) -> None:
+    """What the worker spent in `claude` processes it spawned itself, by what ran them.
+
+    A separate block from `_print_os_calls` because it is a separate class of spend, and
+    grouped rather than listed because one eval suite is forty calls. This is the table
+    that answers "the worker only took nine turns, so why did this cost five dollars".
+    """
+    rows = res.get("subproc_detail") or []
+    if not rows:
+        return
+    unit = (res.get("units") or [{}])[0]
+    print(f"\nclaude processes this worker spawned — "
+          f"~${unit.get('subproc_cost_usd', 0):.2f} of the total:")
+    print(f"{'ran by':>16} {'calls':>6} {'$':>7} {'in':>8} {'out':>7}  model")
+    for r in rows:
+        failed = f"  ({r['failed']} failed)" if r["failed"] else ""
+        print(f"{r['label'][:16]:>16} {r['calls']:>6} {r['list_cost_usd']:>7.2f} "
+              f"{_tok(r['billed_input']):>8} {_tok(r['output']):>7}  "
+              f"{r['model'][:28]}{failed}")
+
+
 def cmd_cost(args: argparse.Namespace) -> int:
     from . import ops
     target = args.target
@@ -750,22 +771,26 @@ def cmd_cost(args: argparse.Namespace) -> int:
     if res["unmeasured"]:
         header += f", {res['unmeasured']} with no transcript left"
     print(f"{header}\n")
-    # `$` is the whole bill — the worker's conversation plus what Jarvis itself spent on
-    # the order — and `jarvis` is how much of that was Jarvis. A work order whose
-    # transcript is gone can still show the second: the OS recorded those calls itself.
-    print(f"{'$':>7} {'jarvis':>7} {'turns':>5} {'output':>7} {'re-write':>9}  work order")
+    # `$` is the whole bill — the worker's conversation, what Jarvis itself spent on the
+    # order, and what the worker spent below itself. `jarvis` and `sub` are how much of
+    # it was each. A work order whose transcript is gone can still show those two: both
+    # were recorded as they happened rather than read back from a file.
+    print(f"{'$':>7} {'jarvis':>7} {'sub':>7} {'turns':>5} {'output':>7} "
+          f"{'re-write':>9}  work order")
     for u in units:
         os_cost = f"{u['os_cost_usd']:.2f}" if u["os_calls"] else "—"
+        sub_cost = f"{u['subproc_cost_usd']:.2f}" if u.get("subproc_calls") else "—"
         if not u["found"]:
-            print(f"{'—':>7} {os_cost:>7} {'—':>5} {'—':>7} {'—':>9}  "
+            print(f"{'—':>7} {os_cost:>7} {sub_cost:>7} {'—':>5} {'—':>7} {'—':>9}  "
                   f"{u['id']}  {u['title'][:44]}")
             continue
-        print(f"{u['total_cost_usd']:>7.2f} {os_cost:>7} {u['turns']:>5} "
+        print(f"{u['total_cost_usd']:>7.2f} {os_cost:>7} {sub_cost:>7} {u['turns']:>5} "
               f"{_tok(u['output']):>7} {_tok(u['rewrite_excess']):>9}  "
               f"{u['id']}  {u['title'][:44]}")
 
     _print_turn_table(res)
     _print_os_calls(res)
+    _print_subprocess_calls(res)
 
     print(f"\ntotal ~${totals['total_cost_usd']:.2f} at list prices")
     print(f"  workers       ~${totals['list_cost_usd']:.2f} "
@@ -775,6 +800,13 @@ def cmd_cost(args: argparse.Namespace) -> int:
               f"{totals['os_calls']} call{'s' if totals['os_calls'] != 1 else ''} "
               f"(Neo answering, panel seats, digests), "
               f"{_tok(totals['os_billed_input'])} in, {_tok(totals['os_output'])} out")
+    if totals.get("subproc_calls"):
+        print(f"  subprocesses  ~${totals['subproc_cost_usd']:.2f} — "
+              f"{totals['subproc_calls']} claude "
+              f"process{'es' if totals['subproc_calls'] != 1 else ''} the workers "
+              f"spawned themselves (eval suites, scripts), "
+              f"{_tok(totals['subproc_billed_input'])} in, "
+              f"{_tok(totals['subproc_output'])} out")
     if totals["rewrite_excess"]:
         print(f"  re-write tax  ~${totals['rewrite_cost_usd']:.2f} — "
               f"{_tok(totals['rewrite_excess'])} tokens re-sent across "
@@ -786,9 +818,12 @@ def cmd_cost(args: argparse.Namespace) -> int:
         print(f"  OS overhead   ~${unattributed['os_cost_usd']:.2f} — "
               f"{unattributed['os_calls']} calls no work order caused "
               f"(already in the total above)")
-    # Said every time, not in the help text: the figure is the only number on screen,
-    # and a subscription user reading it as an invoice is the likeliest misreading.
-    print("\nList prices, as a common unit for comparing token kinds — not a bill.")
+    # Both said every time rather than in the help text, and for the same reason: the
+    # figures are the only numbers on screen, and reading them as an invoice — or as the
+    # whole spend — is the likeliest misreading in each direction.
+    if res.get("floor_reason"):
+        print(f"\nEvery figure above is {res['floor_reason']}.")
+    print("List prices, as a common unit for comparing token kinds — not a bill.")
     return 0
 
 
