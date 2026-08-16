@@ -65,8 +65,8 @@ FULL_ROSTER = ("premise", "record", "blast", "taste", "chair")
 GATE_QUESTION = (
     "PRIVILEGED ACTION REQUEST\n\n"
     "The worker for work order wo-1 tried to run:\n\n"
-    "    grep -rn shipit src/jarvis/gates.py\n\n"
-    "Why: searching for the release-script references.\n"
+    "    uv run pytest tests/test_release_staging.py -k shipit\n\n"
+    "Why: running the release-staging tests.\n"
 )
 
 
@@ -647,9 +647,10 @@ def test_the_per_seat_timeout_reaches_the_model_call(store, monkeypatch):
     def recorder(prompt, system_prompt=None, model=None, timeout=300, cwd=None,
                  tools=None):
         seen.append(timeout)
-        return json.dumps({"escalate": False, "answer": "a", "reason": "r"})
+        return panel.claude_cli.HeadlessResult(
+            text=json.dumps({"escalate": False, "answer": "a", "reason": "r"}))
 
-    monkeypatch.setattr(panel.claude_cli, "run_headless", recorder)
+    monkeypatch.setattr(panel.claude_cli, "run_headless_result", recorder)
     q = claim(store, "which delimiter?")
 
     panel.decide(store, q, cfg(timeout=17))
@@ -1034,7 +1035,7 @@ def test_a_dismissed_gate_reaches_the_worker_through_the_normal_path(
     wo = ops.create_work_order("proj_a", "ship it")
     daemon.tick()
     ops.request_gate_approval(
-        wo["id"], "grep -rn shipit src/jarvis/gates.py",
+        wo["id"], "uv run pytest tests/test_release_staging.py -k shipit",
         why="FORCE_ROUTE_FAST FORCE_PROPOSE_DISMISS — this searches for a name",
         evidence="no release is cut")
 

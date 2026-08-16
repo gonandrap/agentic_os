@@ -197,6 +197,10 @@ class Opinion:
     #: not. Derived, in-memory, and deliberately not a column: the store records what the
     #: seat said, and this is about whether it said anything.
     replied: bool = True
+    #: What this seat's call cost (`claude_cli.derive_turn_usage` envelope), carried here
+    #: rather than written where it is produced: `_run_seat` runs on a pool thread and
+    #: touches no database. `_record` persists it on the calling thread with the rest.
+    usage: dict[str, Any] | None = None
 
     @property
     def data(self) -> dict[str, Any] | None:
@@ -229,23 +233,24 @@ def _run_seat(seat: str, prompt: str, system: str, model: str, timeout: int,
         return int((time.monotonic() - started) * 1000)
 
     try:
-        raw = claude_cli.run_headless(prompt, system_prompt=system, model=model,
-                                      timeout=timeout, cwd=cwd)
+        result = claude_cli.run_headless_result(prompt, system_prompt=system, model=model,
+                                                timeout=timeout, cwd=cwd)
     except claude_cli.ClaudeCliError as e:
         log.warning("panel seat %s abstained: %s", seat, e)
         return Opinion(seat=seat, raw=str(e), status="abstained", model=model,
                        latency_ms=elapsed(), replied=False)
+    raw, usage = result.text, result.usage
     data = structured.parse_json_object(raw)
     if not isinstance(data, dict):
         return Opinion(seat=seat, raw=raw, status="failed", model=model,
-                       latency_ms=elapsed())
-    return Opinion(seat=seat, raw=raw, model=model, latency_ms=elapsed(),
+                       latency_ms=elapsed(), usage=usage)
+    return Opinion(seat=seat, raw=raw, model=model, latency_ms=elapsed(), usage=usage,
                    verdict=str(data.get("verdict") or "").strip(),
                    route=str(data.get("route") or "").strip().lower())
 
 
 def _round(store: NeoStore, q: dict[str, Any], cfg: NeoConfig,
-           seats: list[str]) -> list[Opinion]:
+           seats: list[str], record: Any = None) -> list[Opinion]:
     """Run every seat blind, concurrently, and record what each said.
 
     Concurrent INSIDE the daemon's single Neo thread: the queue still drains FIFO, one
@@ -288,14 +293,31 @@ def _round(store: NeoStore, q: dict[str, Any], cfg: NeoConfig,
             opinions = [futures[seat].result() for seat in seats if seat in futures]
     opinions += missing
     for op in opinions:
-        _record(store, q, op)
+        _record(store, q, op, record)
     return opinions
 
 
-def _record(store: NeoStore, q: dict[str, Any], op: Opinion) -> None:
+def _record(store: NeoStore, q: dict[str, Any], op: Opinion,
+            record: Any = None) -> None:
+    """Persist one seat's contribution: what it said, and what it cost.
+
+    ONE ROW PER SEAT in `agent_calls`, never one per question. Whether the panel earns
+    its price is exactly the question of what the seats cost against what the single
+    agent would have, and an aggregate cannot answer it — nor say which seat is the
+    expensive one. A seat that never replied (`missing`, or a call that errored) has no
+    usage to record, so it does not get a row: it cost nothing.
+    """
+    from . import agent_usage
+
     store.record_opinion(q["id"], op.seat, reply=op.raw, verdict=op.verdict,
                          route=op.route, status=op.status, model=op.model,
                          latency_ms=op.latency_ms)
+    if op.usage is None:
+        return
+    (record or agent_usage.record)(
+        "panel_seat", usage=op.usage, project=q.get("project") or "",
+        wo_id=q.get("wo_id") or "", label=op.seat, model=op.model,
+        question_id=q.get("id"), ok=op.status == "ok")
 
 
 def _question_prompt(q: dict[str, Any]) -> str:
@@ -477,7 +499,8 @@ def arbitrate(opinions: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
 # -- the entry point ------------------------------------------------------------------------
 
 
-def decide(store: NeoStore, q: dict[str, Any], cfg: NeoConfig) -> dict[str, Any]:
+def decide(store: NeoStore, q: dict[str, Any], cfg: NeoConfig,
+           record: Any = None) -> dict[str, Any]:
     """Answer one claimed question with the panel. Injected via `neo.drain_queue(answer=…)`.
 
     Returns EXACTLY what `neo.parse_verdict` returns — `escalate`, `answer`, `reason`,
@@ -502,7 +525,7 @@ def decide(store: NeoStore, q: dict[str, Any], cfg: NeoConfig) -> dict[str, Any]
     # blind round over the whole roster would make a fast dismissal — the ~95% case on the
     # OS's highest-volume channel — cost four calls instead of one, which is the exact
     # regression the fast path exists to avoid.
-    opinions = _round(store, q, cfg, [s for s in roster if s == "premise"])
+    opinions = _round(store, q, cfg, [s for s in roster if s == "premise"], record)
     premise = next((op for op in opinions if op.seat == "premise"), None)
 
     if premise is None or not premise.replied:
@@ -516,7 +539,8 @@ def decide(store: NeoStore, q: dict[str, Any], cfg: NeoConfig) -> dict[str, Any]
         # falls back here.
         log.warning("panel: no usable premise opinion for question %s; "
                     "falling back to the single agent", q["id"])
-        verdict = neo.answer_question(store, q, cfg.model, cfg.learnings_limit)
+        verdict = neo.answer_question(store, q, cfg.model, cfg.learnings_limit,
+                                      record=record)
         return {**verdict, "panel": _summary("single", opinions)}
 
     route, _ = _premise_route(premise, kind, cfg)
@@ -531,7 +555,7 @@ def decide(store: NeoStore, q: dict[str, Any], cfg: NeoConfig) -> dict[str, Any]
     # knowledge, and agreement is only evidence if no seat could read another's answer.
     rest = [s for s in roster if s != "premise"]
     if rest:
-        opinions = [*opinions, *_round(store, q, cfg, rest)]
+        opinions = [*opinions, *_round(store, q, cfg, rest, record)]
 
     forced = arbitrate([{"seat": op.seat, "status": op.status, "reply": op.raw}
                         for op in opinions])
@@ -545,7 +569,7 @@ def decide(store: NeoStore, q: dict[str, Any], cfg: NeoConfig) -> dict[str, Any]
                  "the chair was not run", q["id"])
         return {**forced, "panel": _summary("panel", opinions)}
 
-    chair = _run_chair(store, q, cfg, opinions)
+    chair = _run_chair(store, q, cfg, opinions, record)
     opinions = [*opinions, chair]
     return {**neo.parse_verdict(chair.raw), "panel": _summary("panel", opinions)}
 
@@ -555,7 +579,7 @@ def _summary(route: str, opinions: list[Opinion]) -> dict[str, Any]:
 
 
 def _run_chair(store: NeoStore, q: dict[str, Any], cfg: NeoConfig,
-               opinions: list[Opinion]) -> Opinion:
+               opinions: list[Opinion], record: Any = None) -> Opinion:
     """Synthesise. The chair is the one seat that is not blind — that is its whole job.
 
     A chair that cannot be reached is total failure, not a seat abstaining: there is no
@@ -569,18 +593,19 @@ def _run_chair(store: NeoStore, q: dict[str, Any], cfg: NeoConfig,
     prompt = build_chair_prompt(q, opinions)
     started = time.monotonic()
     try:
-        raw = claude_cli.run_headless(prompt, system_prompt=system, model=model,
-                                      timeout=cfg.panel.timeout, cwd=ensure_home())
+        result = claude_cli.run_headless_result(prompt, system_prompt=system, model=model,
+                                                timeout=cfg.panel.timeout,
+                                                cwd=ensure_home())
     except claude_cli.ClaudeCliError as e:
         op = Opinion(seat="chair", raw=str(e), status="abstained", model=model,
                      latency_ms=int((time.monotonic() - started) * 1000))
-        _record(store, q, op)
+        _record(store, q, op, record)
         raise
-    data = structured.parse_json_object(raw) or {}
-    op = Opinion(seat="chair", raw=raw, model=model,
+    data = structured.parse_json_object(result.text) or {}
+    op = Opinion(seat="chair", raw=result.text, model=model, usage=result.usage,
                  latency_ms=int((time.monotonic() - started) * 1000),
                  verdict=str(data.get("verdict") or "").strip())
-    _record(store, q, op)
+    _record(store, q, op, record)
     return op
 
 

@@ -273,7 +273,8 @@ def fmt_dur(seconds: float | None) -> str:
 
 
 def wo_cost(wo_id: str, project: str) -> dict | None:
-    """One work order's spend, or None if it cannot be measured or read.
+    """One work order's spend — the worker's and Jarvis's own — or None if neither can
+    be read.
 
     NEVER RAISES, and that is the whole contract. This is a read of Claude Code's
     transcripts — files Jarvis does not own, that it prunes on its own schedule, and
@@ -286,7 +287,9 @@ def wo_cost(wo_id: str, project: str) -> dict | None:
         units = ops.cost_report(target=wo_id, project=project)["units"]
     except Exception:  # noqa: BLE001 — see docstring
         return None
-    return units[0] if units and units[0].get("found") else None
+    # `measurable`, not `found`: a work order whose transcript Claude Code has pruned may
+    # still have cost Neo four calls, and that half is the OS's own record.
+    return units[0] if units and units[0].get("measurable") else None
 
 
 def create_app() -> FastAPI:
@@ -523,7 +526,8 @@ def create_app() -> FastAPI:
                     + [t.get("context_peak") or 0 for t in turns] + [1])
         return render(request, "cost_wo.html", active="cost", report=report,
                       unit=report["units"][0], turns=turns, project=name,
-                      bar_scale=scale)
+                      bar_scale=scale,
+                      os_calls=report.get("os_calls_detail") or [])
 
     @app.get("/inbox", response_class=HTMLResponse)
     def inbox(request: Request):

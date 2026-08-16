@@ -79,9 +79,10 @@ def test_a_canned_model_drives_the_real_plumbing(eval_module, tmp_path, monkeypa
     def canned(prompt, system_prompt=None, model=None, timeout=300, cwd=None,
                tools=None):
         calls.append({"prompt": prompt, "system": system_prompt or ""})
-        return '{"escalate": false, "verdict": "approve", "reason": "canned"}'
+        return claude_cli.HeadlessResult(
+            text='{"escalate": false, "verdict": "approve", "reason": "canned"}')
 
-    monkeypatch.setattr(claude_cli, "run_headless", canned)
+    monkeypatch.setattr(claude_cli, "run_headless_result", canned)
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     verdicts = eval_module.collect_verdicts("canned-model", tmp_path)
 

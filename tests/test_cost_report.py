@@ -318,6 +318,37 @@ def test_the_cli_prints_the_per_turn_table(store, transcripts, capsys):
     assert "0.07" in out                        # the second turn's own cost
 
 
+def test_the_cli_shows_what_jarvis_spent_beside_what_the_worker_did(store, transcripts,
+                                                                    capsys):
+    """A `jarvis` column and a `jarvis itself` total line, so the OS's own spend is not
+    silently folded into the worker's — or, worse, silently dropped.
+
+    Its own column rather than a footnote: on a short work order that asked Neo three
+    questions, the OS's half is most of the bill.
+    """
+    from jarvis import agent_usage, cli
+
+    wo = store.create_work_order("asked for help", "")
+    add_turn(store, wo["id"], recorded_usage(0.05))
+    give_session(store, wo["id"], "sess-helped")
+    transcripts("sess-helped", [assistant_row("m1", write=10_000, out=500)])
+    for seat in ("premise", "blast"):
+        agent_usage.record("panel_seat", project="proj_a", wo_id=wo["id"], label=seat,
+                           model="claude-opus-5",
+                           usage={"total_cost_usd": 0.01, "input": 10,
+                                  "cache_write": 4_000, "cache_read": 9_000,
+                                  "output": 800})
+
+    assert cli.main(["cost", wo["id"]]) == 0
+
+    out = capsys.readouterr().out
+    assert "jarvis" in out
+    assert "jarvis itself" in out and "2 calls" in out
+    # Call by call, naming the seat: five seats on one gate review is the shape that
+    # explains a bill nobody can otherwise account for.
+    assert "premise" in out and "blast" in out
+
+
 def test_the_cli_declares_a_mixed_record(store, transcripts, capsys):
     from jarvis import cli
 

@@ -114,8 +114,43 @@ CREATE TABLE IF NOT EXISTS os_state (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+-- One Claude call the OS made on its OWN behalf, and the work order it was made for.
+--
+-- A work order's spend is not just its worker's turns: every question it asked Neo, every
+-- seat of the panel that deliberated on it, every digest written for the dashboard is a
+-- `claude -p` call Jarvis paid for BECAUSE of that work order. Those calls have no session
+-- Jarvis owns and no transcript it can attribute, so unlike worker turns they cannot be
+-- recovered after the fact — recording them at the moment they happen is the only way they
+-- are ever counted. `usage.py`'s opening line ("Jarvis records no token usage of its own")
+-- stopped being true here.
+--
+-- Central rather than per-project or in `neo.db`: Neo, the panel and the digest are three
+-- subsystems and future OS calls will be a fourth, and os.db is the store that already
+-- unifies across projects and already carries the work order's purge path.
+--
+-- Token classes are columns AND `usage_json` on purpose: the columns are what the fleet
+-- report sums in SQL over every work order at once, and the JSON keeps the full envelope
+-- (the ephemeral 1h/5m split, the per-call context peak) for anyone reading one call.
+CREATE TABLE IF NOT EXISTS agent_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    project TEXT NOT NULL DEFAULT '',
+    wo_id TEXT NOT NULL DEFAULT '',         -- '' = OS work no work order caused
+    kind TEXT NOT NULL,                     -- neo_answer | panel_seat | digest | ...
+    label TEXT NOT NULL DEFAULT '',         -- the seat name, or whatever names the call
+    model TEXT NOT NULL DEFAULT '',
+    question_id INTEGER,                    -- the neo.db question, where there is one
+    ok INTEGER NOT NULL DEFAULT 1,
+    cost_usd REAL,                          -- the CLI's own figure — exact, not a proxy
+    input INTEGER NOT NULL DEFAULT 0,
+    cache_write INTEGER NOT NULL DEFAULT 0,
+    cache_read INTEGER NOT NULL DEFAULT 0,
+    output INTEGER NOT NULL DEFAULT 0,
+    usage_json TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
 CREATE INDEX IF NOT EXISTS idx_backlog_project ON backlog(project, status);
+CREATE INDEX IF NOT EXISTS idx_agent_calls_wo ON agent_calls(wo_id, ts);
 """
 
 # Columns added after the first release, exactly as in `neo_store` and `project_store`.
@@ -198,14 +233,20 @@ class CentralStore:
         Inbox items about a work order that no longer exists are noise, and a backlog
         item whose promoted order was deleted goes back to open rather than pointing
         at a ghost.
+
+        The OS's own calls for it go too: `wo delete` is documented as erasing the work
+        order and its whole history, and spend attributed to an id nothing can resolve
+        would sit in the fleet total for ever with no page able to explain it.
         """
         inbox = self.conn.execute("DELETE FROM inbox WHERE wo_id=?", (wo_id,)).rowcount
+        calls = self.conn.execute("DELETE FROM agent_calls WHERE wo_id=?",
+                                  (wo_id,)).rowcount
         backlog = self.conn.execute(
             """UPDATE backlog SET status='open', promoted_wo_id=NULL
                WHERE promoted_wo_id=? AND status='promoted'""",
             (wo_id,),
         ).rowcount
-        return {"inbox": inbox, "backlog_reopened": backlog}
+        return {"inbox": inbox, "agent_calls": calls, "backlog_reopened": backlog}
 
     def unacked_inbox(self, level: str | None = None) -> list[dict[str, Any]]:
         if level:
@@ -541,6 +582,69 @@ class CentralStore:
             key=lambda kv: (-kv[1], kv[0]),
         )
         return brief
+
+    # -- the OS's own Claude spend -----------------------------------------------------
+
+    def add_agent_call(self, kind: str, *, project: str = "", wo_id: str = "",
+                       label: str = "", model: str = "", question_id: int | None = None,
+                       ok: bool = True,
+                       usage: dict[str, Any] | None = None) -> int:
+        """Record one Claude call the OS made itself. See the `agent_calls` schema.
+
+        `usage` is a `claude_cli.derive_turn_usage` envelope, or None for a call that
+        produced none (it errored, or the CLI reported nothing). A None-usage row is
+        still WORTH WRITING: it says a call was made and cost something unknown, which
+        is a different fact from no call at all, and `ok=False` is what tells a reader
+        which. Token columns stay zero there, so it cannot inflate a total.
+        """
+        u = usage or {}
+        cur = self.conn.execute(
+            """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model,
+                                        question_id, ok, cost_usd, input, cache_write,
+                                        cache_read, output, usage_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (db.now(), project, wo_id, kind, label, model, question_id, 1 if ok else 0,
+             u.get("total_cost_usd"), u.get("input") or 0, u.get("cache_write") or 0,
+             u.get("cache_read") or 0, u.get("output") or 0,
+             db.to_json(usage) if usage else None),
+        )
+        return int(cur.lastrowid or 0)
+
+    def agent_calls(self, wo_id: str | None = None, project: str | None = None,
+                    limit: int = 500) -> list[dict[str, Any]]:
+        """The OS's calls, newest first — for one work order, one project, or all."""
+        where, params = [], []
+        if wo_id is not None:
+            where.append("wo_id=?")
+            params.append(wo_id)
+        if project is not None:
+            where.append("project=?")
+            params.append(project)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        return db.rows_to_dicts(self.conn.execute(
+            f"SELECT * FROM agent_calls {clause} ORDER BY ts DESC LIMIT ?",
+            (*params, limit)).fetchall())
+
+    def agent_call_totals(self, project: str | None = None) -> list[dict[str, Any]]:
+        """Every work order's OS spend, summed in SQL, grouped by kind and model.
+
+        Grouped rather than flat because both consumers need the grouping: the report
+        prices each group at its own model's list rate (a digest on Haiku is not Opus
+        waste), and the per-work-order view shows what the spend went ON — five panel
+        seats reads very differently from one Neo answer.
+
+        One query for the whole fleet: the alternative is a query per work order, and
+        the cost report walks every work order there is.
+        """
+        clause = "WHERE project=?" if project else ""
+        params = (project,) if project else ()
+        return db.rows_to_dicts(self.conn.execute(
+            f"""SELECT wo_id, kind, model, COUNT(*) AS calls,
+                       SUM(cost_usd) AS cost_usd, SUM(input) AS input,
+                       SUM(cache_write) AS cache_write, SUM(cache_read) AS cache_read,
+                       SUM(output) AS output, SUM(1 - ok) AS failed
+                FROM agent_calls {clause}
+                GROUP BY wo_id, kind, model""", params).fetchall())
 
     # -- os state ----------------------------------------------------------------------
 

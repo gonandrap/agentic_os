@@ -23,6 +23,13 @@ from jarvis.project_store import ProjectStore
 
 ALL_GATES = gates.GateConfig(enabled=frozenset(gates.KIND_NAMES))
 
+# A classifier false positive that survives `reads_only` — the exemption below covers
+# `cat scripts/shipit.sh` and `grep … scripts/shipit.sh`, which is exactly the point of
+# it, so the dismissal tests need one it cannot reach. `uv run pytest` really does
+# execute something, and what it executes is a test: gated, and not a release.
+FALSE_POSITIVE = "uv run pytest tests/test_release_staging.py -k shipit"
+OTHER_FALSE_POSITIVE = "uv run pytest evals/ -k shipit"
+
 
 def _decision(result):
     """The permissionDecision a hook result carries, or None for 'no opinion'."""
@@ -592,13 +599,13 @@ def test_missing_justification_is_flagged_to_the_reviewer(gated):
 
 def test_dismissed_command_goes_through_without_recording_an_approval(gated):
     """The whole point: unblock the command, authorise nothing."""
-    gated.attempt("grep -rn shipit.sh src/jarvis/gates.py")
+    gated.attempt(FALSE_POSITIVE)
     approval = gated.store.list_approvals(gated.wo["id"])[0]
 
     gates.apply_decision(gated.store, approval["id"], verdict="dismissed",
-                         reason="a grep pattern, not a release", decided_by="neo")
+                         reason="a test selector, not a release", decided_by="neo")
 
-    result = gated.attempt("grep -rn shipit.sh src/jarvis/gates.py")
+    result = gated.attempt(FALSE_POSITIVE)
     assert _decision(result) == "allow"
     # The allow REASON is the audit record of why the command ran. "approved" here
     # would be the exact false entry this verdict exists to keep out of the log.
@@ -618,7 +625,7 @@ def test_a_dismissal_never_expires(gated, monkeypatch):
     """
     from jarvis import db
 
-    gated.attempt("grep -rn shipit.sh src/")
+    gated.attempt(FALSE_POSITIVE)
     approval = gated.store.list_approvals(gated.wo["id"])[0]
     gates.apply_decision(gated.store, approval["id"], verdict="dismissed",
                          reason="not a release", decided_by="neo")
@@ -626,19 +633,19 @@ def test_a_dismissal_never_expires(gated, monkeypatch):
 
     monkeypatch.setattr(db, "now", lambda: approval["ts"] + 400 * 86400)
 
-    assert _decision(gated.attempt("grep -rn shipit.sh src/")) == "allow"
+    assert _decision(gated.attempt(FALSE_POSITIVE)) == "allow"
     # ...and no second request was filed, because nothing needed re-deciding.
     assert len(gated.store.list_approvals(gated.wo["id"])) == 1
 
 
 def test_a_dismissal_is_not_use_limited(gated):
     """An approval is spent after GRANT_MAX_USES. A false positive is not a budget."""
-    gated.attempt("grep -rn shipit.sh src/")
+    gated.attempt(FALSE_POSITIVE)
     approval = gated.store.list_approvals(gated.wo["id"])[0]
     gates.apply_decision(gated.store, approval["id"], verdict="dismissed",
                          reason="not a release", decided_by="neo")
 
-    allowed = sum(_decision(gated.attempt("grep -rn shipit.sh src/")) == "allow"
+    allowed = sum(_decision(gated.attempt(FALSE_POSITIVE)) == "allow"
                   for _ in range(gates.GRANT_MAX_USES + 3))
 
     assert allowed == gates.GRANT_MAX_USES + 3
@@ -653,13 +660,13 @@ def test_the_expiry_sweep_leaves_dismissed_rows_alone(gated):
     rows migrate out of `dismissed`, which is the one number that says whether the
     recognisers are improving.
     """
-    gated.attempt("grep -rn shipit.sh src/")
+    gated.attempt(FALSE_POSITIVE)
     approval = gated.store.list_approvals(gated.wo["id"])[0]
     gates.apply_decision(gated.store, approval["id"], verdict="dismissed",
                          reason="not a release", decided_by="neo")
     # Spend it well past what would exhaust an approval.
     for _ in range(gates.GRANT_MAX_USES + 2):
-        gated.attempt("grep -rn shipit.sh src/")
+        gated.attempt(FALSE_POSITIVE)
 
     gated.store.expire_approvals()
 
@@ -672,37 +679,37 @@ def test_a_dismissal_does_not_widen_beyond_the_exact_command(gated):
     """Scope is what keeps an unbounded dismissal safe, so it is pinned hard.
 
     Without a clock, the exact-string match on one work order IS the containment. A
-    dismissal that leaked to a prefix would turn "that grep is harmless" into standing
+    dismissal that leaked to a prefix would turn "that test run is harmless" into standing
     permission for anything starting with the same words.
     """
-    gated.attempt("grep -rn shipit.sh src/")
+    gated.attempt(FALSE_POSITIVE)
     approval = gated.store.list_approvals(gated.wo["id"])[0]
     gates.apply_decision(gated.store, approval["id"], verdict="dismissed",
                          reason="not a release", decided_by="neo")
 
-    assert _decision(gated.attempt("grep -rn shipit.sh src/")) == "allow"
+    assert _decision(gated.attempt(FALSE_POSITIVE)) == "allow"
     # Extra arguments, a different target, and a genuinely privileged command that
     # happens to share the dismissed one's opening words: all re-gated.
-    assert _decision(gated.attempt("grep -rn shipit.sh src/ && ./scripts/shipit.sh")) == "deny"
-    assert _decision(gated.attempt("grep -rn shipit.sh docs/")) == "deny"
+    assert _decision(gated.attempt(f"{FALSE_POSITIVE} && ./scripts/shipit.sh")) == "deny"
+    assert _decision(gated.attempt(OTHER_FALSE_POSITIVE)) == "deny"
     assert _decision(gated.attempt("./scripts/shipit.sh")) == "deny"
 
 
 def test_dismissal_message_says_nothing_was_authorised_and_nothing_refused(gated):
     """A worker told only "proceed" learns the gate is a formality; one told "denied"
     learns to avoid a command that was always fine. It must be told neither."""
-    gated.attempt("grep -rn shipit.sh src/")
+    gated.attempt(FALSE_POSITIVE)
     approval = gated.store.list_approvals(gated.wo["id"])[0]
 
     gates.apply_decision(gated.store, approval["id"], verdict="dismissed",
-                         reason="the literal appears inside a search pattern",
+                         reason="the literal is a -k test selector",
                          decided_by="neo")
 
     body = gated.store.queued_messages(gated.wo["id"])[0]["content"]
     assert "DISMISSED" in body
-    assert "the literal appears inside a search pattern" in body
+    assert "the literal is a -k test selector" in body
     assert "nothing was authorised and nothing was refused" in body
-    assert "grep -rn shipit.sh src/" in body
+    assert FALSE_POSITIVE in body
     assert "Do not retry it as-is" not in body
 
 
@@ -724,11 +731,11 @@ def test_dismissal_message_forbids_re_filing_over_a_live_request(gated):
     privileged action being reviewed twice — so this is pinned against the general case,
     using a false positive that does still fire today.
     """
-    gated.attempt("cat scripts/shipit.sh")
+    gated.attempt(FALSE_POSITIVE)
     approval = gated.store.list_approvals(gated.wo["id"])[0]
 
     gates.apply_decision(gated.store, approval["id"], verdict="dismissed",
-                         reason="reading the deploy script ships nothing",
+                         reason="running the test suite ships nothing",
                          decided_by="neo")
 
     body = gated.store.queued_messages(gated.wo["id"])[0]["content"]
@@ -751,8 +758,8 @@ def test_every_worker_facing_surface_states_the_no_duplicate_request_rule():
     spec = ProjectSpec(name="proj_a", path=Path("/tmp/proj_a"), description="", gates=ALL_GATES)
     surfaces = {
         "dismissed_message": gates.dismissed_message(
-            {"id": 1, "kind": "release", "command": "grep -rn shipit.sh src/"},
-            reason="the literal appears inside a search pattern", by="neo"),
+            {"id": 1, "kind": "release", "command": FALSE_POSITIVE},
+            reason="the literal is a -k test selector", by="neo"),
         "dispatch briefing": "\n".join(_gate_briefing({"id": "wo-1"}, spec)),
         "OPERATION.md gates section": _gates_section(spec),
     }
@@ -765,7 +772,7 @@ def test_every_worker_facing_surface_states_the_no_duplicate_request_rule():
 def test_a_dismissal_is_not_recorded_as_a_gate_decision(gated):
     """`gate_decided` is the record of a privileged action being ruled on. Folding false
     positives into it inflates exactly the audit trail this verdict protects."""
-    gated.attempt("grep -rn shipit.sh src/")
+    gated.attempt(FALSE_POSITIVE)
     approval = gated.store.list_approvals(gated.wo["id"])[0]
 
     gates.apply_decision(gated.store, approval["id"], verdict="dismissed",
@@ -779,11 +786,11 @@ def test_a_dismissal_is_not_recorded_as_a_gate_decision(gated):
 def test_the_timeline_does_not_call_a_dismissed_run_an_approved_command(gated):
     from jarvis import timeline
 
-    gated.attempt("grep -rn shipit.sh src/")
+    gated.attempt(FALSE_POSITIVE)
     approval = gated.store.list_approvals(gated.wo["id"])[0]
     gates.apply_decision(gated.store, approval["id"], verdict="dismissed",
                          reason="not a release", decided_by="neo")
-    gated.attempt("grep -rn shipit.sh src/")
+    gated.attempt(FALSE_POSITIVE)
 
     rendered = timeline.build_timeline(
         gated.store.get_work_order(gated.wo["id"]),
@@ -858,7 +865,7 @@ def test_the_persona_offers_dismissal_as_a_json_verdict():
 def test_the_request_shows_the_reviewer_which_recogniser_fired(gated):
     """The premise check is unanswerable without it: 'does this command really do that'
     needs to know what 'that' was matched on."""
-    action = gates.classify("grep -rn shipit.sh src/", ALL_GATES)
+    action = gates.classify(FALSE_POSITIVE, ALL_GATES)
     assert action is not None
     text = gates.build_request_question(action, gated.wo, justification="read-only")
     assert action.matched in text
@@ -1054,3 +1061,108 @@ def test_the_persona_accepts_ci_as_a_releases_only_evidence():
     assert "never escalate one for lacking it" in persona
     # ...and it stays scoped to releases rather than excusing every request.
     assert "release of already-merged code" in persona
+
+
+# -- reading a release script is not running one ---------------------------------------
+
+
+@pytest.mark.parametrize("command", [
+    # Every one of these was gated on wo-52a6164d, the 0.5.4 self-ship: the `release`
+    # recogniser matches the literal `shipit` anywhere, and a path argument to a reader
+    # is a mention, not an invocation. Two of them cost a Neo review each and left the
+    # work order reading `waiting_input` for forty minutes while it worked.
+    "cat /home/gonzalo/workspace/agentic_os/.claude/skills/shipit/SKILL.md 2>&1",
+    'grep -n "stage\\|--wo\\|pending_release" scripts/shipit.sh | head -50',
+    "head -120 scripts/shipit.sh",
+    "tail -n 40 scripts/shipit.sh",
+    "wc -l scripts/shipit.sh",
+    "ls -la .claude/skills/shipit/",
+    "cat scripts/shipit.sh | head -60 | tail -20",
+    "diff scripts/shipit.sh /tmp/shipit.sh.bak",
+    "sed -n '120,200p' scripts/shipit.sh",
+    "cat deploy/jarvis.service.template",       # names systemctl units
+    "grep -rn 'npm publish' package.json",
+])
+def test_reading_a_privileged_script_is_not_performing_it(command):
+    assert gates.classify(command, ALL_GATES) is None, f"{command!r} must not be gated"
+
+
+@pytest.mark.parametrize("command", [
+    # The exemption covers commands that cannot execute anything. The moment one
+    # segment can, it is gone — a reader piping into a shell is the classic bypass.
+    "cat scripts/shipit.sh | bash",
+    "cat scripts/shipit.sh | sh",
+    "head -1 scripts/shipit.sh && ./scripts/shipit.sh",
+    "cat README.md; bash scripts/shipit.sh",
+    "grep -q x file && npm publish",
+    "cat $(which shipit)",                      # command substitution runs something
+    "cat <(bash scripts/shipit.sh)",            # ...so does process substitution
+    "./scripts/shipit.sh",
+    "sed -i 's/0.5.3/0.5.4/' scripts/shipit.sh",  # -i writes; not a reader
+])
+def test_the_read_only_exemption_never_covers_a_command_that_can_execute(command):
+    assert gates.classify(command, ALL_GATES) is not None, f"{command!r} must be gated"
+
+
+# -- a decided gate stops the work order reading `waiting_input` -----------------------
+
+
+@pytest.mark.parametrize("verdict", ["approved", "denied", "dismissed"])
+def test_a_decided_gate_puts_the_work_order_back_to_running(gated, verdict):
+    """The reversal of `gates.request`, which parked it there in the first place.
+
+    Left un-reversed, the status outlived the wait: on wo-52a6164d two dismissals
+    inside one turn left the work order `waiting_input` while the worker ran on, and
+    the invariant checker turned that into "worker is waiting on your input" — asking
+    the user to unstick a worker that had never stalled.
+    """
+    gated.attempt("./scripts/shipit.sh")
+    assert gated.store.get_work_order(gated.wo["id"])["status"] == "waiting_input"
+
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+    gates.apply_decision(gated.store, approval["id"], verdict=verdict,
+                         reason="because", decided_by="neo")
+
+    assert gated.store.get_work_order(gated.wo["id"])["status"] == "running"
+
+
+def test_a_gate_still_under_review_keeps_the_work_order_waiting(gated):
+    """One verdict does not end the wait when another request is still out."""
+    gated.attempt("./scripts/shipit.sh")
+    gated.attempt("gh pr merge 31")
+    first, second = sorted(gated.store.list_approvals(gated.wo["id"]),
+                           key=lambda a: a["id"])
+
+    gates.apply_decision(gated.store, first["id"], verdict="dismissed",
+                         reason="reads a file", decided_by="neo")
+    assert gated.store.get_work_order(gated.wo["id"])["status"] == "waiting_input"
+
+    gates.apply_decision(gated.store, second["id"], verdict="approved",
+                         reason="tests pass", decided_by="neo")
+    assert gated.store.get_work_order(gated.wo["id"])["status"] == "running"
+
+
+def test_deciding_a_gate_does_not_reopen_a_settled_work_order(gated):
+    """Only the status the gate itself set is reversed. A work order that has moved on
+    — cancelled, finished, parked for review — keeps where it got to."""
+    gated.attempt("./scripts/shipit.sh")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+    gated.store.set_status(gated.wo["id"], "cancelled")
+
+    gates.apply_decision(gated.store, approval["id"], verdict="denied",
+                         reason="no", decided_by="neo")
+
+    assert gated.store.get_work_order(gated.wo["id"])["status"] == "cancelled"
+
+
+def test_a_dismissed_gate_asks_nothing_of_the_user(gated):
+    """The whole point of `dismissed`: an OS classifier defect costs no attention."""
+    from jarvis import invariants
+
+    gated.attempt("./scripts/shipit.sh")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+    gates.apply_decision(gated.store, approval["id"], verdict="dismissed",
+                         reason="reads a file", decided_by="neo")
+
+    wo = gated.store.get_work_order(gated.wo["id"])
+    assert invariants.true_blockers(gated.store, wo) == []

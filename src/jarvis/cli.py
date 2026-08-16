@@ -696,6 +696,29 @@ def _print_turn_table(res: dict) -> None:
         print(f"\n{line}")
 
 
+def _print_os_calls(res: dict) -> None:
+    """What Jarvis itself spent on this work order, call by call.
+
+    Only on the single-work-order view, and only when there is something to show. This is
+    the table that answers "why did an order I never touched cost three dollars" — five
+    panel seats on one gate review is a shape a total can never make visible.
+    """
+    rows = res.get("os_calls_detail") or []
+    if not rows:
+        return
+    unit = (res.get("units") or [{}])[0]
+    print(f"\njarvis's own calls for this work order — ~${unit.get('os_cost_usd', 0):.2f} "
+          f"of the total, recorded as they happened:")
+    print(f"{'kind':>12} {'what':>10} {'$':>7} {'in':>8} {'out':>7}  model")
+    for r in rows:
+        print(f"{r['kind']:>12} {r['label'][:10]:>10} {r['list_cost_usd']:>7.2f} "
+              f"{_tok(r['billed_input']):>8} {_tok(r['output']):>7}  {r['model'][:28]}"
+              f"{'' if r['ok'] else '  (failed)'}")
+    for kind in unit.get("os_by_kind") or []:
+        print(f"  {kind['label']}: {kind['calls']} call"
+              f"{'s' if kind['calls'] != 1 else ''}, ~${kind['cost_usd']:.2f}")
+
+
 def cmd_cost(args: argparse.Namespace) -> int:
     from . import ops
     target = args.target
@@ -717,25 +740,42 @@ def cmd_cost(args: argparse.Namespace) -> int:
     if res["unmeasured"]:
         header += f", {res['unmeasured']} with no transcript left"
     print(f"{header}\n")
-    print(f"{'$':>7} {'turns':>5} {'output':>7} {'re-write':>9}  work order")
+    # `$` is the whole bill — the worker's conversation plus what Jarvis itself spent on
+    # the order — and `jarvis` is how much of that was Jarvis. A work order whose
+    # transcript is gone can still show the second: the OS recorded those calls itself.
+    print(f"{'$':>7} {'jarvis':>7} {'turns':>5} {'output':>7} {'re-write':>9}  work order")
     for u in units:
+        os_cost = f"{u['os_cost_usd']:.2f}" if u["os_calls"] else "—"
         if not u["found"]:
-            print(f"{'—':>7} {'—':>5} {'—':>7} {'—':>9}  {u['id']}  {u['title'][:44]}")
+            print(f"{'—':>7} {os_cost:>7} {'—':>5} {'—':>7} {'—':>9}  "
+                  f"{u['id']}  {u['title'][:44]}")
             continue
-        print(f"{u['list_cost_usd']:>7.2f} {u['turns']:>5} "
+        print(f"{u['total_cost_usd']:>7.2f} {os_cost:>7} {u['turns']:>5} "
               f"{_tok(u['output']):>7} {_tok(u['rewrite_excess']):>9}  "
               f"{u['id']}  {u['title'][:44]}")
 
     _print_turn_table(res)
+    _print_os_calls(res)
 
-    print(f"\ntotal ~${totals['list_cost_usd']:.2f} at list prices "
+    print(f"\ntotal ~${totals['total_cost_usd']:.2f} at list prices")
+    print(f"  workers       ~${totals['list_cost_usd']:.2f} "
           f"({_tok(totals['billed_input'])} in, {_tok(totals['output'])} out)")
+    if totals["os_calls"]:
+        print(f"  jarvis itself ~${totals['os_cost_usd']:.2f} — "
+              f"{totals['os_calls']} call{'s' if totals['os_calls'] != 1 else ''} "
+              f"(Neo answering, panel seats, digests), "
+              f"{_tok(totals['os_billed_input'])} in, {_tok(totals['os_output'])} out")
     if totals["rewrite_excess"]:
         print(f"  re-write tax  ~${totals['rewrite_cost_usd']:.2f} — "
               f"{_tok(totals['rewrite_excess'])} tokens re-sent across "
               f"{totals['resume_boundaries']} turn boundaries")
     if totals["subagent_cost_usd"]:
         print(f"  subagents     ~${totals['subagent_cost_usd']:.2f}")
+    unattributed = res.get("os_unattributed") or {}
+    if unattributed.get("os_calls"):
+        print(f"  OS overhead   ~${unattributed['os_cost_usd']:.2f} — "
+              f"{unattributed['os_calls']} calls no work order caused "
+              f"(already in the total above)")
     # Said every time, not in the help text: the figure is the only number on screen,
     # and a subscription user reading it as an invoice is the likeliest misreading.
     print("\nList prices, as a common unit for comparing token kinds — not a bill.")

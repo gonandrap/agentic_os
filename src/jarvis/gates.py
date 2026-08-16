@@ -260,15 +260,95 @@ def scannable(command: str) -> str:
     return _QUOTED.sub(" ", command)
 
 
+# Tools that read and cannot execute. A privileged action named in an *argument* to one
+# of these is a mention, not an attempt: `cat scripts/shipit.sh` prints the release
+# script, and printing it ships nothing.
+#
+# `scannable()` already covers the quoted case, and cannot cover this one — the thing
+# being named here is a *path*, and nobody quotes paths. That gap gated three commands
+# on wo-52a6164d alone (`cat …/skills/shipit/SKILL.md`, `grep … scripts/shipit.sh`),
+# each costing a Neo review and, until the status fix below, a spurious attention item.
+#
+# Membership is decided by what a tool CAN do, never by what it is usually used for.
+# `find` has `-exec`, `awk` has `system()`, `xargs` and `eval` re-parse their input,
+# `git` pushes, and `sed -i` writes — none of them are here or can be.
+_READERS = frozenset({
+    "cat", "tac", "head", "tail", "nl", "wc", "ls", "stat", "file", "diff", "cmp",
+    "grep", "egrep", "fgrep", "rg", "ag", "cut", "sort", "uniq", "tr", "column",
+    "jq", "yq", "basename", "dirname", "realpath", "readlink", "echo", "printf",
+    "pwd", "tree", "strings", "od", "xxd", "md5sum", "sha256sum", "cksum", "du", "df",
+    "which", "sed",
+})
+
+# Wrappers that run whatever follows them without changing what it can do, so the
+# reader test applies to the word after them instead.
+_TRANSPARENT = frozenset({"command", "builtin", "time", "nice", "ionice", "sudo", "env"})
+
+# A substitution runs a command to build an argument, so the reader in front of it is
+# no longer the only thing executing. `cat $(which shipit)` reads; `cat <(./shipit.sh)`
+# ships. Neither is worth telling apart — both leave reader territory.
+_SUBSTITUTION = re.compile(r"\$\(|`|<\(|>\(")
+
+# Where one command ends and the next begins. `&` splits only when it starts a
+# background job: in `2>&1` it is part of a redirection, and splitting there would leave
+# `2>` looking like a command name and fail every reader that redirects its stderr.
+_SEPARATORS = re.compile(r"\|\||&&|[|;\n]|(?<![<>&])&")
+
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def reads_only(command: str) -> bool:
+    """True when every command in `command` can read but not execute.
+
+    The exemption is all-or-nothing across the pipeline on purpose: a reader piping into
+    a shell (`cat scripts/shipit.sh | bash`) is the obvious bypass, and one non-reading
+    segment anywhere is enough to lose it. So the only commands this clears are ones
+    that cannot run the thing they name — which is why it is safe to apply to every
+    gate rather than just `release`.
+
+    Unrecognised syntax fails the test rather than passing it: a name carrying a slash
+    is not the `cat` on PATH but something in the tree that merely shares its name, and
+    an empty segment means the split found something this parser does not model.
+    """
+    if _SUBSTITUTION.search(command) or _SHELL_INVOKER.search(command):
+        return False
+    # Split the *masked* command: a separator inside a quoted argument starts no new
+    # command, and `grep "a\|b" f | head` used to be torn in half at the alternation.
+    # Only command names and flags are read below, and neither is ever quoted.
+    segments = [s.strip() for s in _SEPARATORS.split(_QUOTED.sub(" ", command))]
+    if not any(segments):
+        return False
+    for segment in segments:
+        if not segment:
+            continue
+        words = segment.lstrip("({ ").split()
+        while words and (_ASSIGNMENT.match(words[0])
+                         or words[0].lstrip("\\") in _TRANSPARENT):
+            words = words[1:]
+        if not words:
+            return False
+        name = words[0].lstrip("\\")
+        if name not in _READERS:
+            return False
+        # `sed -n '1,20p' f` reads; `sed -i s/a/b/ f` rewrites the file.
+        if name == "sed" and any(w.startswith("-i") or w == "--in-place"
+                                 for w in words[1:]):
+            return False
+    return True
+
+
 def classify(command: str, config: GateConfig) -> GatedAction | None:
     """The gate this Bash command trips, or None.
 
     Matches the whole command rather than parsed segments: a gated action hidden in a
     pipeline, a subshell or behind `&&` is the same action, and a classifier that only
     understands well-formed simple commands is a classifier with a bypass. Quoted
-    arguments are blanked first — see `scannable`.
+    arguments are blanked first — see `scannable` — and commands that can only read are
+    exempt outright, see `reads_only`.
     """
     if not command or not config.enabled:
+        return None
+    if reads_only(command):
         return None
     haystack = scannable(command)
     for kind in KINDS:
@@ -696,6 +776,27 @@ def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
             "kind": approval["kind"],
             "reason": reason,
         })
+    # Reverse what `request` did to the status. It parked the work order in
+    # `waiting_input` because a gate request is a wait; the verdict ends the wait, and a
+    # status that outlives it is read as a USER blocker by everything downstream —
+    # `jarvis status`, the dashboard, and `invariants.true_blockers`, which renders it as
+    # "worker is waiting on your input".
+    #
+    # That reading is wrong in both directions. A worker is very often still mid-turn
+    # here: the hook reports the verdict inline, so a dismissal never interrupted it at
+    # all. And when it did end its turn, what it waits on is the queued verdict message —
+    # the OS's move, not the user's. On wo-52a6164d (the 0.5.4 self-ship) two dismissals
+    # inside one turn left the work order reading `waiting_input` for forty minutes while
+    # it worked, and the user was asked to unstick a worker that had never stalled.
+    #
+    # Narrow on both sides. Only from `waiting_input`, so a work order that has since
+    # been cancelled or settled keeps where it got to; and only once nothing else is out,
+    # since a second request still with Neo — or one escalated to the user, which
+    # `pending_approvals` also returns — is still a genuine wait.
+    wo_id = approval["wo_id"]
+    if (store.get_work_order(wo_id)["status"] == "waiting_input"
+            and not store.pending_approvals(wo_id)):
+        store.set_status(wo_id, "running")
     return approval
 
 
