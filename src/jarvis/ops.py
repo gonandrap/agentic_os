@@ -315,6 +315,25 @@ def ui_health() -> dict[str, Any]:
     }
 
 
+def _neo_attention() -> tuple[dict[str, int], list[dict[str, Any]]]:
+    """`(counts, questions Neo handed back to the user)` — one open of Neo's DB.
+
+    `approval` and `plan` questions are dropped here rather than at the display: both are
+    reported by the thing that actually carries the decision (the gate item, the feature
+    order), and telling the user to `jarvis neo answer` a question whose real resolution
+    is `jarvis gate approve` sends them to the wrong command.
+    """
+    from .neo_store import NeoStore
+
+    neo = NeoStore()
+    try:
+        return (neo.counts(),
+                [q for q in neo.list_questions(statuses=("escalated", "failed"))
+                 if q.get("kind") not in ("approval", "plan")])
+    finally:
+        neo.close()
+
+
 def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
     central = CentralStore()
     try:
@@ -328,6 +347,13 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             mode_by_project = {ps.name: ps.worker.permission_mode for ps in _cat.projects}
         except (OpsError, CatalogError):
             mode_by_project = {}
+        # Read Neo's questions BEFORE the project loop, not after it: a question Neo sent
+        # up already gets its own attention line below, carrying the text and the
+        # `jarvis neo answer` command, and the work order it came from must not add a
+        # second line saying the same thing less well. Same rule, and the same shape, as
+        # `gate_held` inside the loop.
+        neo_counts, escalated_questions = _neo_attention()
+        neo_held = {q["wo_id"] for q in escalated_questions}
         for p in central.list_projects():
             if p["status"] != "active":
                 continue
@@ -363,7 +389,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 # `jarvis wo list` still shows every flagged child individually.
                 rolled_up: dict[str, list[dict[str, Any]]] = {}
                 for wo in flagged.values():
-                    if wo["id"] in gate_held:
+                    if wo["id"] in gate_held or wo["id"] in neo_held:
                         continue
                     if wo.get("parent_id"):
                         rolled_up.setdefault(wo["parent_id"], []).append(wo)
@@ -379,6 +405,14 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     # headless, so the session is free to be opened directly between turns.
                     if wo["status"] == "waiting_input" and wo["session_id"]:
                         item["attach"] = f"claude --resume {wo['session_id']}"
+                        # …and `jarvis wo resume-auto` ONLY where a prompt is possible at
+                        # all. Offered unconditionally, it sent the user at a command that
+                        # flips `auto` to `auto` and sends a message — no recovery, one
+                        # conversation re-sent at the cache-write rate, and a worker that
+                        # was waiting correctly interrupted (GitHub issue 100).
+                        mode = mode_by_project.get(p["name"])
+                        if mode and worker_stalls_on_prompts(mode):
+                            item["resume_auto"] = f"jarvis wo resume-auto {wo['id']}"
                     attention.append(item)
                 features = store.list_feature_orders(statuses=FO_OPEN_STATUSES)
                 # Which feature orders get a line: the open ones, plus any that is asking
@@ -463,27 +497,15 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 store.close()
         inbox = central.unacked_inbox()
         backlog_open = central.list_backlog(status="open")
-        from .neo_store import NeoStore
-        neo = NeoStore()
-        try:
-            neo_counts = neo.counts()
-            for q in neo.list_questions(statuses=("escalated", "failed")):
-                if q.get("kind") in ("approval", "plan"):
-                    # Both of these are reported by the thing that actually carries the
-                    # decision — the gate item below, or the feature order above.
-                    # Reported here too, they would tell the user to `jarvis neo answer`
-                    # a question whose real resolution is `jarvis gate approve` or
-                    # `jarvis fo approve`.
-                    continue
-                attention.append({
-                    "project": q["project"], "wo_id": q["wo_id"],
-                    "title": f"Neo escalated: {q['question'][:80]}",
-                    "status": "neo_escalated",
-                    "reason": q.get("answer_reason") or "Neo declined to answer for you",
-                    "neo_question_id": q["id"],
-                })
-        finally:
-            neo.close()
+        for q in escalated_questions:
+            attention.append({
+                "project": q["project"], "wo_id": q["wo_id"],
+                "title": f"Neo escalated: {q['question'][:80]}",
+                "status": "neo_escalated",
+                "reason": q.get("answer_reason") or "Neo declined to answer for you",
+                "neo_question_id": q["id"],
+                "decide": f"jarvis neo answer {q['id']} \"…\"",
+            })
         # Gates Neo sent up. These are the only approval requests that cost the user
         # anything: the rest were decided without them, which is the point.
         gate_items = []
@@ -802,19 +824,125 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
             "delivery": "jarvisd delivers when the worker is idle"}
 
 
-def resume_in_auto(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
-    """Recover a worker stalled on a permission prompt: flip it to `auto` mode and
-    nudge it to continue. jarvisd delivers the nudge by resume-forking the worker's
-    session (reading the now-`auto` mode), so it stops re-prompting on routine tools.
-    The nudge clears the attention flag via the normal send path.
+def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
+    """What this work order is actually waiting for, and whether a nudge could help.
+
+    `{"what": <slug>, "detail": <sentence naming the way through>, "stalled": bool}`.
+    `stalled` is the narrow claim "nothing is coming for this by itself" — the only
+    condition under which sending it a message is a repair rather than an interruption.
+
+    Ordered like `invariants.true_blockers`, most-actionable first, and it agrees with it
+    by construction on everything both can see. It goes further deliberately: that
+    function answers "does this need the USER", and this one answers "what is this
+    waiting for", which for most of these is Neo, the daemon, or nothing at all.
+    """
+    from .invariants import awaiting_neo, neo_question_blocker
+    from .neo_store import USER_HELD_Q_STATUSES
+
+    wo_id = wo["id"]
+    pending = store.pending_assumptions(wo_id)
+    if pending:
+        return {"what": "assumptions", "stalled": False,
+                "detail": f"{len(pending)} assumption(s) await your review — "
+                          f"`jarvis wo review {wo_id}`"}
+    escalated = store.escalated_approvals(wo_id)
+    if escalated:
+        return {"what": "gate_escalated", "stalled": False,
+                "detail": f"a gate Neo sent up to you — `jarvis gate approve "
+                          f"{escalated[0]['id']} --reason \"…\"` (or `deny`)"}
+    if store.pending_approvals(wo_id):
+        return {"what": "gate_with_neo", "stalled": False,
+                "detail": "a privileged-action gate that is with Neo — the verdict "
+                          "reaches the worker by itself"}
+    question = awaiting_neo(wo_id)
+    if question is not None:
+        if question["status"] in USER_HELD_Q_STATUSES:
+            return {"what": "neo_escalated", "stalled": False,
+                    "detail": neo_question_blocker(question)}
+        return {"what": "neo_question", "stalled": False,
+                "detail": f"Neo is answering question {question['id']} — the answer "
+                          f"arrives as the worker's next turn by itself"}
+    queued = store.queued_messages(wo_id)
+    if queued:
+        return {"what": "queued_message", "stalled": False,
+                "detail": f"{len(queued)} message(s) queued — jarvisd delivers them "
+                          f"when the worker is idle"}
+    # A live turn means "working" for every status EXCEPT `waiting_input`, where it means
+    # the opposite: a permission prompt blocks INSIDE the turn, so the process is alive
+    # and going nowhere. That is the one case this command was written for, and reading
+    # the turn row the other way round would make it refuse the only thing it can fix.
+    turn = store.latest_turn(wo_id)
+    if (turn is not None and turn["state"] == "running"
+            and wo["status"] != "waiting_input"):
+        return {"what": "turn_running", "stalled": False,
+                "detail": "a turn is in flight — the worker is working"}
+    if wo["status"] in ("completed", "cancelled", "failed", "waiting_pr_merge",
+                        "needs_review"):
+        return {"what": wo["status"], "stalled": False,
+                "detail": f"the work order is {wo['status']} — nothing is running to "
+                          f"nudge"}
+    if wo["status"] == "pending":
+        return {"what": "pending", "stalled": False,
+                "detail": "not dispatched yet — no worker exists to nudge"}
+    return {"what": "prompt", "stalled": True,
+            "detail": "nothing else accounts for it: an unanswered permission prompt "
+                      "is what is left"}
+
+
+def resume_in_auto(wo_id: str, project_name: str | None = None,
+                   force: bool = False) -> dict[str, Any]:
+    """Diagnose what a work order is waiting on, and unstick it only if a nudge can.
+
+    THE PREMISE OF THIS COMMAND IS USUALLY FALSE, which is why it diagnoses first. It
+    was written to recover a worker stalled on a permission prompt, by flipping it to
+    `auto` and nudging it. But `auto` is the fleet-wide default
+    (`catalog.DEFAULT_PERMISSION_MODE`) and no project overrides it, so the flip is
+    `auto → auto` — and a worker in a mode that never prompts has never stalled on one.
+    All the command actually did was send a message, and a message is not free: every
+    turn boundary re-sends the whole conversation at the cache-write rate (~12% of fleet
+    spend), and the nudge lands on a worker that was very often mid-wait and correct. On
+    wo-52a6164d it was run against a worker that had never stalled, was mid-turn, and
+    finished the release unaided half an hour later (GitHub issue 100).
+
+    So: report what the work order is really waiting on, and refuse to nudge when the
+    mode already cannot prompt and something else — Neo, the daemon, a turn in flight —
+    is what it waits for. `force=True` sends the nudge anyway, for the user who has
+    diagnosed it themselves and wants the worker poked.
     """
     name, path, wo = find_work_order(wo_id, project_name)
     store = ProjectStore(path)
     try:
-        previous = wo["permission_mode"]
-        store.update_work_order(wo_id, permission_mode="auto")
-        store.add_event(wo_id, "permission_mode_changed",
-                        {"from": previous, "to": "auto", "by": "resume_in_auto"})
+        wait = waiting_on(store, wo)
+        mode = wo["permission_mode"] or _project_permission_mode(name)
+    finally:
+        store.close()
+    could_prompt = worker_stalls_on_prompts(mode) if mode else True
+    out = {"project": name, "wo_id": wo_id, "permission_mode": mode,
+           "waiting_on": wait["what"], "diagnosis": wait["detail"]}
+    if not force and not could_prompt and not wait["stalled"]:
+        # The no-op case, reported rather than performed. Recorded on the timeline too:
+        # "the user asked what was wrong and the OS said nothing was" is part of this
+        # work order's history, and it is the evidence that the nudge did not happen.
+        store = ProjectStore(path)
+        try:
+            store.add_event(wo_id, "resume_auto_declined",
+                            {"permission_mode": mode, "waiting_on": wait["what"]})
+        finally:
+            store.close()
+        out.update({
+            "nudged": False, "changed": False,
+            "note": f"nothing to unstick — workers here already run in {mode!r}, which "
+                    f"never prompts, so there is no permission prompt to clear. "
+                    f"{wait['detail']}. Nudge it anyway with --force.",
+        })
+        return out
+    previous = wo["permission_mode"]
+    store = ProjectStore(path)
+    try:
+        if previous != "auto":
+            store.update_work_order(wo_id, permission_mode="auto")
+            store.add_event(wo_id, "permission_mode_changed",
+                            {"from": previous, "to": "auto", "by": "resume_in_auto"})
     finally:
         store.close()
     send_message(
@@ -823,8 +951,31 @@ def resume_in_auto(wo_id: str, project_name: str | None = None) -> dict[str, Any
         "git) run without asking. Please continue the work order.",
         source="jarvis", project_name=name,
     )
-    return {"project": name, "wo_id": wo_id, "permission_mode": "auto",
-            "note": "flipped to auto and nudged; jarvisd resumes the worker when idle"}
+    out.update({
+        "nudged": True, "changed": previous != "auto", "permission_mode": "auto",
+        "note": ("flipped to auto and nudged; jarvisd resumes the worker when idle"
+                 if previous != "auto" else
+                 f"mode was already 'auto' — nothing to flip; nudged anyway "
+                 f"({'--force' if force else wait['detail']})"),
+    })
+    return out
+
+
+def _project_permission_mode(project_name: str) -> str | None:
+    """The mode this project's workers run in, from the catalog — None if unreadable.
+
+    A work order's own `permission_mode` is usually NULL and resolved against this at
+    send time (`worker_session.turn_args`), so the column alone cannot answer "can this
+    worker be prompted at all".
+    """
+    try:
+        catalog = resolve_catalog()
+    except (OpsError, CatalogError):
+        return None
+    for spec in catalog.projects:
+        if spec.name == project_name:
+            return spec.worker.permission_mode
+    return None
 
 
 def assume(wo_id: str, content: str) -> dict[str, Any]:
@@ -1910,7 +2061,10 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
         neo.close()
     delivery = send_message(q["wo_id"], f"[Answer from the user] {answer}",
                             project_name=q["project"])
-    # The escalation is handled — release the work order from the attention list.
+    # The escalation is handled — release the work order from the attention list, AND
+    # from the status that put it there. Clearing the flag alone lasted exactly one
+    # reconcile tick: `true_blockers` derives the flag from `waiting_input`, so the
+    # answered work order asked for the user again seconds later (GitHub issue 100).
     try:
         _, path, _ = find_work_order(q["wo_id"], q["project"])
         store = ProjectStore(path)
@@ -1918,6 +2072,7 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
             store.clear_attention(q["wo_id"])
             store.add_event(q["wo_id"], "escalation_answered",
                             {"neo_question_id": question_id})
+            invariants.end_wait_if_nothing_is_out(store, q["wo_id"])
         finally:
             store.close()
     except OpsError:

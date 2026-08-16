@@ -78,7 +78,11 @@
      states get the invitation and the active ones get the bare id above. The
      `waiting_input` case has its own richer block further down, beside the action that
      resolves it natively; keeping it out of ACTIVE_STATUSES here is what stops the two
-     from rendering the same line twice. #}
+     from rendering the same line twice. That block now renders only for a work order
+     actually blocked on a prompt — and the silence is right for the rest: a work order
+     parked on Neo is one whose session the daemon is about to resume with the answer,
+     which is precisely the second-driver hazard this rule exists for. The id itself is
+     still above, to copy. #}
   {% if wo.session_id and wo.status not in active_statuses %}
     <p class="kv">Resume this session (from its worktree):
       <code class="sid">claude --resume {{ wo.session_id }}</code></p>
@@ -93,11 +97,17 @@
       </form>
       {% endif %}
     </p>
-    {% if wo.status == 'waiting_input' and wo.session_id %}
+    {# The escape hatch, and ONLY for the one thing it can fix. `waiting.what == 'prompt'`
+       means nothing else accounts for the wait — no gate, no question with Neo, no queued
+       message, no turn in flight. Offered for every `waiting_input` work order, as it
+       used to be, it told the reader their worker was blocked on a permission prompt
+       whenever it was in fact waiting on Neo, and offered a button that flips `auto` to
+       `auto` (GitHub issue 100). #}
+    {% if wo.status == 'waiting_input' and wo.session_id and waiting.what == 'prompt' %}
     <div class="row" style="gap: 10px; flex-wrap: wrap; align-items: center;">
       <span class="sub">Blocked on a permission prompt, which can't be approved from
         here — open the session and answer it natively (from its worktree):</span>
-      <code class="mono" style="user-select: all;">claude --resume {{ wo.session_id }}</code>
+      <code class="sid">claude --resume {{ wo.session_id }}</code>
       <span class="sub">or</span>
       <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/resume-auto">
         <button class="primary" title="Flip this work order to auto mode and resume it">
@@ -105,6 +115,12 @@
       </form>
     </div>
     {% endif %}
+  {% endif %}
+  {# What a `waiting_input` work order is actually waiting for, flagged or not. Its status
+     reads "Waiting on you" everywhere, and for the whole time Neo holds its question that
+     is simply false. #}
+  {% if wo.status == 'waiting_input' and waiting.what != 'prompt' %}
+    <p class="sub"><span class="i">◔</span>{{ waiting.detail }}</p>
   {% endif %}
   {% if wo.result_summary %}
     <p class="kv"><strong>Result:</strong> {{ wo.result_summary }}</p>

@@ -753,11 +753,11 @@ def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
     # Narrow on both sides. Only from `waiting_input`, so a work order that has since
     # been cancelled or settled keeps where it got to; and only once nothing else is out,
     # since a second request still with Neo — or one escalated to the user, which
-    # `pending_approvals` also returns — is still a genuine wait.
-    wo_id = approval["wo_id"]
-    if (store.get_work_order(wo_id)["status"] == "waiting_input"
-            and not store.pending_approvals(wo_id)):
-        store.set_status(wo_id, "running")
+    # `pending_approvals` also returns — is still a genuine wait. `end_wait_if_nothing_is_out`
+    # counts an unanswered Neo QUESTION as out too: this work order can be waiting on both.
+    from .invariants import end_wait_if_nothing_is_out
+
+    end_wait_if_nothing_is_out(store, approval["wo_id"])
     return approval
 
 

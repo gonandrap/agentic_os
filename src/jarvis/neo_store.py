@@ -25,6 +25,17 @@ Q_STATUSES = (
 # Review lifecycle of an answered question.
 REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
 
+# The two halves of "still open", and WHO is holding it. The split is what lets the rest
+# of the OS tell a work order parked on its delegate from one parked on the user:
+# `jarvis wo ask` exists to keep a decision off the user's plate, so while Neo has the
+# question nothing may ask for them — and the moment Neo hands it back, something must.
+#
+# `failed` sits with the user deliberately. It is where `reclaim_stale` puts a question
+# Neo could not answer after MAX_ANSWER_ATTEMPTS, and nothing else will pick it up.
+NEO_HELD_Q_STATUSES = ("queued", "answering")
+USER_HELD_Q_STATUSES = ("escalated", "failed")
+OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
+
 # What Neo is being asked for. `question` is an open decision ("which library?");
 # `approval` is a privileged-action gate ("may I merge this PR?"); `plan` is a feature
 # order's decomposition ("release these six work orders?"). Each of the latter two gets
@@ -303,6 +314,24 @@ class NeoStore:
             (wo_id,),
         )
         return self.conn.execute("DELETE FROM questions WHERE wo_id=?", (wo_id,)).rowcount
+
+    def open_questions(self, wo_id: str) -> list[dict[str, Any]]:
+        """Questions this work order is still parked on, oldest first.
+
+        `kind='question'` only, and that exclusion is load-bearing rather than tidy. An
+        `approval` question shadows a row in the PROJECT store's approvals table, which
+        `invariants.true_blockers` already reads (`_waiting_on_neo_gate`,
+        `escalated_approvals`); returning it here too would report one gate twice, in two
+        different vocabularies. A `plan` question hangs off the planner work order, and
+        that work order calls `jarvis wo finish` as it submits — it is never left waiting.
+        """
+        return db.rows_to_dicts(self.conn.execute(
+            f"""SELECT * FROM questions
+                WHERE wo_id=? AND kind='question'
+                  AND status IN ({','.join('?' for _ in OPEN_Q_STATUSES)})
+                ORDER BY ts""",
+            (wo_id, *OPEN_Q_STATUSES),
+        ).fetchall())
 
     def question_texts(self, wo_id: str) -> dict[int, str]:
         """{question_id: question} for one work order — the timeline's back-fill.

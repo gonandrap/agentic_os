@@ -273,10 +273,13 @@ def build_parser() -> argparse.ArgumentParser:
     ij.add_argument("--title", help="work order title (default: the session's name)")
 
     ra = wo.add_parser("resume-auto",
-                       help="unstick a worker blocked on a permission prompt: flip it "
-                            "to auto mode and resume it")
+                       help="say what a work order is really waiting on, and unstick it "
+                            "if it is a permission prompt (nothing else can be)")
     ra.add_argument("wo_id")
     ra.add_argument("--project")
+    ra.add_argument("--force", action="store_true",
+                    help="send the nudge even when nothing is stuck — it costs a full "
+                         "re-send of the worker's conversation")
 
     # feature orders -------------------------------------------------------------------
     # Parallel to `wo` on purpose: a user who knows the work-order surface should not
@@ -585,7 +588,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"  • [{a['project']}]{' ' + ident if ident else ''} {a['title']} "
                   f"— {a['reason']}")
             if a.get("attach"):
-                print(f"      approve it: {a['attach']}  ·  or `jarvis wo resume-auto {a['wo_id']}`")
+                # `resume_auto` is present only where a permission prompt is possible at
+                # all. Where it is not — everywhere in a fleet running `auto` — naming it
+                # sent the user at a command that could not help (GitHub issue 100).
+                alt = (f"  ·  or `{a['resume_auto']}`" if a.get("resume_auto") else "")
+                print(f"      open it: {a['attach']}{alt}")
             if a.get("decide"):
                 # A gate item carries the command to run AND the request to read; a
                 # feature order's `decide` is already the whole instruction. Keyed on
@@ -1165,7 +1172,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
         _print(ops.inject_session(args.session_id, project_name=args.project,
                                   title=args.title), args.json)
     elif args.wo_cmd == "resume-auto":
-        _print(ops.resume_in_auto(args.wo_id, project_name=args.project), args.json)
+        _print(ops.resume_in_auto(args.wo_id, project_name=args.project,
+                                  force=args.force), args.json)
     return 0
 
 

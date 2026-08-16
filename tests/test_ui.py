@@ -178,6 +178,26 @@ def test_resume_command_is_offered_only_when_no_turn_can_be_in_flight(
         assert f"claude --resume {sid}" in page, f"ready to run once {status}"
 
 
+def test_a_work_order_parked_on_neo_is_not_called_blocked(client, daemon, project):
+    """The same page, the same status, a different wait — GitHub issue 100.
+
+    `waiting_input` is where `jarvis wo ask` parks a work order too, and the block above
+    told the reader it was blocked on a permission prompt whenever it was in fact waiting
+    on Neo, over a button that flips `auto` to `auto`. What the page owes here is who has
+    it.
+    """
+    wo = ops.create_work_order("proj_a", "build the exporter")
+    daemon.tick()
+    ops.ask_question(wo["id"], "Should the export default to CSV or JSON?")
+
+    detail = client.get(f"/wo/proj_a/{wo['id']}")
+
+    assert detail.status_code == 200
+    assert "Blocked on a permission prompt" not in detail.text
+    assert f"/wo/proj_a/{wo['id']}/resume-auto" not in detail.text
+    assert "Neo is answering question 1" in detail.text
+
+
 def test_wo_page_anchors_pending_at_what_needs_the_user(client, daemon):
     """Notifications deep-link to #pending; it must land on the live ask, and the
     page must never emit two of them."""

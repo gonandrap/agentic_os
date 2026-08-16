@@ -536,12 +536,15 @@ def create_app() -> FastAPI:
             # Why a `running` work order has nothing running. Same idea as the gate
             # line above: the reason it stopped belongs on the page it stopped on.
             rate_limit = invariants.rate_limit_note(store, wo)
+            # And why a `waiting_input` one is not in fact waiting on the reader. Both
+            # notes are display; `true_blockers` decides what actually costs attention.
+            waiting = ops.waiting_on(store, wo)
         finally:
             store.close()
         show_debug = debug not in ("", "0", "false")
         bill = wo_bill(wo_id, pname)
         return render(request, "work_order.html", project=pname, wo=wo,
-                      rate_limit=rate_limit,
+                      rate_limit=rate_limit, waiting=waiting,
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug,
                                               questions=ops.neo_question_texts(wo_id)),
