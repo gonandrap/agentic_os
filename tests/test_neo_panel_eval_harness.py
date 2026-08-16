@@ -214,19 +214,19 @@ def test_the_eval_does_not_reach_the_single_agent_directly(tree) -> None:
 
 
 def test_the_meter_wrapping_the_model_still_calls_the_model(tree) -> None:
-    """The eval wraps `claude_cli.run_headless` to count calls and to take one seat down.
+    """The eval wraps `claude_cli.run_headless_result` to count calls and take a seat down.
     A wrapper that stopped delegating would turn every paid assertion into a measurement
     of the wrapper — the most expensive way possible to test nothing."""
     meter = next((n for n in ast.walk(tree)
                   if isinstance(n, ast.ClassDef) and n.name == "Meter"), None)
-    assert meter is not None, "the Meter that wraps run_headless is gone"
+    assert meter is not None, "the Meter that wraps run_headless_result is gone"
     call = next((n for n in meter.body
                  if isinstance(n, ast.FunctionDef) and n.name == "__call__"), None)
     assert call is not None, "Meter no longer implements __call__"
     delegates = [c for c in ast.walk(call)
                  if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
                  and c.func.attr == "_real"]
-    assert delegates, "Meter.__call__ never delegates to the real run_headless"
+    assert delegates, "Meter.__call__ never delegates to the real run_headless_result"
 
 
 def test_every_test_carries_a_scenario_marker(eval_module) -> None:

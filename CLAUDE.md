@@ -163,9 +163,16 @@ jarvis bug report "title" -d "..." -e "expected" -a "actual" [--steps "..."]
 jarvis doctor [project] [--repair]         # check the OS's own post-conditions;
                                            # read-only unless --repair. The daemon runs
                                            # the same checks every reconcile tick.
-jarvis cost [project|wo-id|fo-id]          # what the work cost in tokens, read back
-                                           # from Claude Code's transcripts (the OS
-                                           # stores no usage of its own). A feature
+jarvis cost [project|wo-id|fo-id]          # what the work cost in tokens. TWO HALVES,
+                                           # shown split and added: the WORKER's own
+                                           # session, read back from Claude Code's
+                                           # transcripts, and what JARVIS ITSELF spent
+                                           # on that order — every Neo answer, every
+                                           # panel seat, every dashboard digest, each
+                                           # recorded as it happens. A work order that
+                                           # asked Neo four questions paid for four
+                                           # calls, and the `jarvis` column is where
+                                           # they show up. A feature
                                            # order rolls up its planner AND children —
                                            # the planner is usually the dearest session
                                            # of an unfinished one. Breaks out the

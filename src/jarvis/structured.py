@@ -93,7 +93,8 @@ def request(prompt: str, *, validate: Callable[[dict[str, Any]], Any],
             system_prompt: str | None = None, model: str | None = None,
             attempts: int = 1, on_invalid: Callable[[str], Any] | None = None,
             timeout: int = 300, cwd: Path | None = None,
-            call: Callable[..., str] = claude_cli.run_headless) -> Any:
+            call: Callable[..., Any] = claude_cli.run_headless_result,
+            on_usage: Callable[[Any], None] | None = None) -> Any:
     """Ask a model for strict JSON and return the validated value.
 
     Makes at most `attempts` calls. Each failed attempt appends the validator's complaint
@@ -101,20 +102,28 @@ def request(prompt: str, *, validate: Callable[[dict[str, Any]], Any],
     again from scratch. After the last attempt the reply goes through `coerce`, so
     `on_invalid` decides between a fallback value and a raised exception.
 
-    `call` is the model transport, defaulting to `claude_cli.run_headless`; it is called
-    as `call(prompt, system_prompt=…, model=…, timeout=…, cwd=…)`. Override it to strip
-    the callee's tools (`functools.partial(claude_cli.run_headless, tools="")`) or, in a
-    test, to record what was asked. Transport failures — `claude_cli.ClaudeCliError` —
-    propagate untouched: a call that never happened is not invalid output, and callers
-    already tell those two apart (see `neo.drain_queue`).
+    `call` is the model transport, defaulting to `claude_cli.run_headless_result`; it is
+    called as `call(prompt, system_prompt=…, model=…, timeout=…, cwd=…)`. Override it to
+    strip the callee's tools (`functools.partial(claude_cli.run_headless_result,
+    tools="")`) or, in a test, to record what was asked. A transport that returns a bare
+    string still works — see `claude_cli.unpack_headless`. Transport failures —
+    `claude_cli.ClaudeCliError` — propagate untouched: a call that never happened is not
+    invalid output, and callers already tell those two apart (see `neo.drain_queue`).
+
+    `on_usage(envelope)` is called ONCE PER ATTEMPT, before the reply is validated. A
+    retry is a second call the OS paid for, and an accounting that only recorded the
+    attempt that happened to parse would quietly under-report exactly the calls that went
+    worst. See `agent_usage`.
     """
     if attempts < 1:
         raise ValueError(f"attempts must be at least 1, got {attempts}")
     complaint = ""
     for attempt in range(1, attempts + 1):
         ask = f"{prompt}\n\n{RETRY_NOTE}{complaint}" if complaint else prompt
-        raw = call(ask, system_prompt=system_prompt, model=model,
-                   timeout=timeout, cwd=cwd)
+        raw, usage = claude_cli.unpack_headless(
+            call(ask, system_prompt=system_prompt, model=model, timeout=timeout, cwd=cwd))
+        if on_usage is not None and usage is not None:
+            on_usage(usage)
         if attempt == attempts:
             return coerce(raw, validate, on_invalid=on_invalid)
         try:

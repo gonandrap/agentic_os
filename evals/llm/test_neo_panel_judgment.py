@@ -190,8 +190,8 @@ def _seat_of(system_prompt: str) -> str:
 
 
 class Meter:
-    """Wraps `claude_cli.run_headless`: counts the calls a decision costs, and can force
-    exactly one seat to fail.
+    """Wraps `claude_cli.run_headless_result`: counts the calls a decision costs, and can
+    force exactly one seat to fail.
 
     Wrapping the real function rather than replacing it — every call underneath still
     reaches a real model, so what is graded is the real panel. The counting exists only to
@@ -199,12 +199,12 @@ class Meter:
     """
 
     def __init__(self, fail_seat: str = ""):
-        self._real = claude_cli.run_headless
+        self._real = claude_cli.run_headless_result
         self.fail_seat = fail_seat
         self.calls: list[str] = []
 
     def __call__(self, prompt: str, system_prompt: str | None = None,
-                 **kwargs: Any) -> str:
+                 **kwargs: Any) -> Any:
         seat = _seat_of(system_prompt or "")
         if seat and seat == self.fail_seat:
             # Not counted: no call was made, and the cost reading must not bill for one.
@@ -319,8 +319,8 @@ def runs(tmp_path_factory, request):
     os.environ["JARVIS_HOME"] = str(home)
     store = NeoStore(home / "neo.db")
     meter = Meter()
-    real = claude_cli.run_headless
-    claude_cli.run_headless = meter  # type: ignore[assignment]
+    real = claude_cli.run_headless_result
+    claude_cli.run_headless_result = meter  # type: ignore[assignment]
     out: dict[str, Run] = {}
     try:
         cfg = _cfg()
@@ -346,7 +346,7 @@ def runs(tmp_path_factory, request):
         meter.fail_seat = ""
         return out
     finally:
-        claude_cli.run_headless = real  # type: ignore[assignment]
+        claude_cli.run_headless_result = real  # type: ignore[assignment]
         store.close()
         if out:
             _report(request.config, out)
