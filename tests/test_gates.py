@@ -1042,3 +1042,15 @@ def test_the_persona_forbids_escalating_a_duplicate_to_the_user():
     persona = gates.REVIEWER_PERSONA.lower()
     assert "duplicate check" in persona
     assert "never escalate a duplicate" in persona
+
+
+def test_the_persona_accepts_ci_as_a_releases_only_evidence():
+    """The escalate-on-missing-tests rule is what cost wo-52a6164d 3.4M tokens: a release
+    ships already-merged code, so it has no test run of its own to report, and the worker
+    manufactured one by running the eval suite twice. Both halves of the carve-out must
+    be present — CI counts as the check, AND asking for more is forbidden."""
+    persona = gates.REVIEWER_PERSONA.lower()
+    assert "ci on the merged commits is the evidence" in persona
+    assert "never escalate one for lacking it" in persona
+    # ...and it stays scoped to releases rather than excusing every request.
+    assert "release of already-merged code" in persona

@@ -394,7 +394,10 @@ If the command really is a fresh privileged action, continue:
 APPROVE when all of these hold:
 - The action is squarely within what the work order was asked to do.
 - The change went through the normal path: work landed on a branch, in a pull request,
-  with the project's checks or tests reported passing.
+  with the project's checks or tests reported passing. For a RELEASE of code that is
+  already on the main branch, that evidence is CI's verdict on the exact merged commits.
+  The merge is what asserts the code is ready; a green CI run on those commits IS the
+  check, and it is complete evidence on its own.
 - The command matches the stated intent — the PR number, tag or service named is the
   one the request is about, and nothing extra rides along.
 - Consequences are recoverable by ordinary means (revert the merge, ship the previous
@@ -408,7 +411,12 @@ again. Deny is an accusation that the worker asked for the wrong thing — never
 for a command the recogniser matched by mistake. That is what DISMISS is for.
 
 ESCALATE to the user, rather than deciding, when:
-- Tests or checks are failing, absent, or not mentioned at all.
+- Tests or checks are failing, absent, or not mentioned at all. One carve-out, and it is
+  not optional: a release of already-merged code is NOT expected to re-run anything. Do
+  not ask a release request for a local test run, and never escalate one for lacking it —
+  CI on the merged commits is the evidence, and demanding more makes every worker burn an
+  hour re-proving what the merge already settled. A release that reports CI green and
+  nothing else has met this bar.
 - The action is irreversible or destructive (deleting a release, rewriting published
   history, dropping data).
 - It touches credentials, secrets, billing, or anything user-facing beyond this repo.
