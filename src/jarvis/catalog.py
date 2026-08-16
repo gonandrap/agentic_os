@@ -51,6 +51,58 @@ def worker_stalls_on_prompts(mode: str) -> bool:
 DEFAULT_MAX_CONCURRENT = 5
 
 
+# How large a worker's conversation is allowed to grow before Claude Code compacts it
+# (`claude --autocompact <tokens>`). This is the single biggest lever the OS has on its
+# own bill and it is on by default — see
+# docs/superpowers/specs/2026-08-10-resume-cost-and-the-cache.md.
+#
+# WHY A NUMBER AND NOT "auto": left alone, a worker on a 1M-token model does not compact
+# until ~800k, so every API call it makes re-reads the whole conversation. Cache READ is
+# 56% of everything Jarvis spends (kn-1485b845) and it is linear in this number: 146 API
+# calls against a 250-290k context cost 26.3M read tokens in fifteen minutes, measured on
+# wo-996c7344 and wo-67d4f8b0. Bounding the context bounds every one of those reads.
+#
+# WHAT THE NUMBER MEANS: it is the effective context WINDOW, not the trigger point. The
+# CLI takes min(model window, this) and arms auto-compact at a model-table fraction of
+# it, so 150,000 caps a worker's context a little under 150k rather than at it.
+#
+# THE COST OF SETTING IT TOO LOW is a worker that compacts mid-task and loses detail, so
+# this is deliberately well above the ~93-105k a typical work order opens at and above
+# the median turn; the orders it will bite are the long ones that are expensive for
+# exactly this reason. The CLI accepts 100k-1M and rejects anything outside; a project
+# can raise it, or set it to null to opt out and take the model's own window.
+DEFAULT_AUTOCOMPACT_WINDOW = 150_000
+AUTOCOMPACT_MIN = 100_000    # `claude --autocompact` rejects anything under this
+AUTOCOMPACT_MAX = 1_000_000  # ... or over this
+
+
+_MISSING = object()
+
+
+def _parse_autocompact(raw: dict[str, Any], key: str, where: str,
+                       default: int | None) -> int | None:
+    """Validate an autocompact window. An explicit null means "no bound".
+
+    Raises ValueError; callers wrap it with `_err` so the message carries the field.
+    Absent and null are deliberately DIFFERENT here: absent inherits the default (which
+    is a real bound), null is the opt-out. A project that wants the model's own window
+    back has to say so, because silence must not disable a cost control.
+    """
+    value = raw.get(key, _MISSING)
+    if value is _MISSING:
+        return default
+    if value is None or value is False:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{where} must be a whole number of tokens or null, "
+                         f"got {value!r}")
+    if not AUTOCOMPACT_MIN <= value <= AUTOCOMPACT_MAX:
+        raise ValueError(
+            f"{where} must be between {AUTOCOMPACT_MIN} and {AUTOCOMPACT_MAX} tokens "
+            f"(the range `claude --autocompact` accepts), got {value}")
+    return value
+
+
 class CatalogError(ValueError):
     """Raised when the catalog file is invalid."""
 
@@ -61,6 +113,8 @@ class WorkerDefaults:
     effort: str | None = None
     permission_mode: str = DEFAULT_PERMISSION_MODE
     append_system_prompt: str | None = None
+    # None = no bound (the model's own window stands). See DEFAULT_AUTOCOMPACT_WINDOW.
+    autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
 
 
 @dataclass
@@ -144,6 +198,7 @@ class OsConfig:
     default_effort: str | None = None
     default_permission_mode: str = DEFAULT_PERMISSION_MODE
     default_max_concurrent: int = DEFAULT_MAX_CONCURRENT
+    default_autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
     notification_sinks: list[str] = field(default_factory=lambda: ["log"])
     telegram_token_env: str = "JARVIS_TELEGRAM_TOKEN"
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
@@ -174,6 +229,14 @@ class Catalog:
 
 def _err(msg: str) -> CatalogError:
     return CatalogError(f"catalog error: {msg}")
+
+
+def _autocompact_or_err(raw: dict[str, Any], key: str, where: str,
+                        default: int | None) -> int | None:
+    try:
+        return _parse_autocompact(raw, key, where, default)
+    except ValueError as e:
+        raise _err(str(e)) from e
 
 
 def load_catalog(path: str | Path) -> Catalog:
@@ -261,6 +324,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         default_effort=defaults.get("effort"),
         default_permission_mode=defaults.get("permission_mode", DEFAULT_PERMISSION_MODE),
         default_max_concurrent=int(defaults.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),
+        default_autocompact_window=_autocompact_or_err(
+            defaults, "autocompact_window", "os.defaults.autocompact_window",
+            DEFAULT_AUTOCOMPACT_WINDOW),
         notification_sinks=notif.get("sinks", ["log"]),
         telegram_token_env=telegram.get("token_env", "JARVIS_TELEGRAM_TOKEN"),
         telegram_chat_id_env=telegram.get("chat_id_env", "JARVIS_TELEGRAM_CHAT_ID"),
@@ -310,6 +376,10 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             effort=w.get("effort", os_cfg.default_effort),
             permission_mode=pmode,
             append_system_prompt=w.get("append_system_prompt"),
+            autocompact_window=_autocompact_or_err(
+                w, "autocompact_window",
+                f"project {name}: worker.autocompact_window",
+                os_cfg.default_autocompact_window),
         )
         try:
             gate_cfg = GateConfig.parse(p.get("gates"))

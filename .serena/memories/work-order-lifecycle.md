@@ -79,8 +79,17 @@ reconciliation are all **gone**, not ported.
 
 **Every turn re-sends the full briefing** (`worker_session.briefing_for` →
 `claude_cli._briefing_args`): model, effort, permission mode, appended system prompt,
-settings file, `--add-dir` skills. A resumed session re-derives all of it from argv, not
-from the transcript, so anything omitted vanishes from that turn onwards.
+settings file, `--add-dir` skills, `--autocompact`. A resumed session re-derives all of it
+from argv, not from the transcript, so anything omitted vanishes from that turn onwards.
+
+**`--autocompact` bounds how large the conversation may grow** — default 150,000
+(`catalog.DEFAULT_AUTOCOMPACT_WINDOW`), fleet-wide `os.defaults.autocompact_window`,
+per project `worker.autocompact_window`, explicit `null` to opt out. It is the effective
+context WINDOW, not the trigger: the CLI takes `min(model window, this)` and arms
+compaction at a fraction of it. Alone among the briefing flags it is read from the CATALOG
+on every turn rather than resolved onto the work-order row at dispatch — it is a spend
+control, so tightening it must reach work orders already running. Why it exists and what it saves:
+`kn-81a91bac`, `docs/superpowers/specs/2026-08-10-resume-cost-and-the-cache.md`.
 
 **The `--` fence is load-bearing.** `--add-dir` AND `--tools` are variadic; an unfenced
 prompt is swallowed as an option value.

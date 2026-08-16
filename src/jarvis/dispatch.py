@@ -109,6 +109,11 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # as env rather than being looked up per hook call: the hook runs on every Bash
         # command and must not load and parse the catalog to decide it has nothing to do.
         "JARVIS_GATES": project.gates.to_json(),
+        # Buy the 5-minute prompt cache (write 1.25x) instead of the 1-hour one (2x),
+        # which Claude Code would otherwise pick for a headless session. Measurements
+        # and the reversal criteria: docs/superpowers/specs/
+        # 2026-08-10-resume-cost-and-the-cache.md, and kn-f94abf34.
+        "FORCE_PROMPT_CACHING_5M": "1",
     })
     settings["env"] = env
     out = project.path / ".jarvis" / "worker-settings" / f"{wo['id']}.json"

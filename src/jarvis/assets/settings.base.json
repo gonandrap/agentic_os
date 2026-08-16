@@ -17,8 +17,15 @@
     ],
     "PostToolUse": [
       {
-        "$comment": "Mirrors Claude Code's own memory files into the OS knowledge base.",
-        "matcher": "Write|Edit|NotebookEdit",
+        "$comment": "Two jobs: mirror Claude Code's own memory files into the OS knowledge base, and re-assert the work-order record on the first tool call after a compaction. Unmatched (every tool) for the second one — a compacted worker's next call is usually Bash, and waiting for a file edit would leave it running blind until it made one. Costs one stat() per tool call until a PreCompact arms it.",
+        "hooks": [
+          { "type": "command", "command": "__JARVIS_HOOK_CMD__", "timeout": 30 }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "$comment": "Arms the re-assertion above. PreCompact cannot inject context and neither can PostCompact, so this only records and flags; PostToolUse delivers.",
         "hooks": [
           { "type": "command", "command": "__JARVIS_HOOK_CMD__", "timeout": 30 }
         ]

@@ -29,6 +29,8 @@ VARIADIC = {"--add-dir", "--tools"}
 SINGLE_VALUE = {
     "--name", "-n", "--resume", "--session-id", "--worktree", "--model", "--effort",
     "--permission-mode", "--append-system-prompt", "--settings", "--output-format",
+    # `--autocompact <auto|tokens>` (checked against `claude --help` on 2.1.227)
+    "--autocompact",
 }
 
 
@@ -210,3 +212,50 @@ def test_worktree_is_only_created_on_the_opening_turn(tmp_path) -> None:
     so passing the flag again would be asking for a worktree that already exists."""
     assert "--worktree" in turn_argv(resume=False, worktree="wo-abc123")
     assert "--worktree" not in turn_argv(resume=True)
+
+
+# -- the context bound ------------------------------------------------------------------
+
+
+def test_autocompact_rides_on_every_turn_including_resumes() -> None:
+    """The context bound must be re-passed on turn 2+, not just at dispatch.
+
+    A resumed session re-derives its flags from argv (kn-6352bc0f). Passing
+    `--autocompact` only on the opening turn would let the conversation past the bound
+    from turn two onwards — which is precisely the turn range that grows, and precisely
+    the range this flag exists to bound.
+    """
+    for resume in (False, True):
+        argv = turn_argv(resume=resume, autocompact_window=150_000)
+        assert argv[argv.index("--autocompact") + 1] == "150000", (
+            f"resume={resume}: argv={argv}")
+
+
+def test_no_autocompact_flag_when_the_project_opted_out() -> None:
+    """None means "say nothing", so the CLI's own default (the model's window) stands.
+
+    Emitting `--autocompact 0` or `--autocompact auto` instead would be a different
+    thing: the CLI rejects 0, and `auto` is a mode, not "unset".
+    """
+    assert "--autocompact" not in turn_argv(resume=True, autocompact_window=None)
+
+
+def test_autocompact_reaches_every_launch_path(fake_claude, tmp_path) -> None:
+    """Guard the shared helper: both spawners must emit it, not just the turn path.
+
+    `_briefing_args` exists so a new way to start a worker cannot forget a flag. A fix
+    applied to `turn_args` alone would pass the test above and still silently drop the
+    bound on any other path.
+    """
+    claude_cli.spawn_background(prompt="hi", cwd=tmp_path, name="n",
+                                autocompact_window=150_000)
+    assert "--autocompact" in _argv(fake_claude)
+    assert "--autocompact" in turn_argv(resume=True, autocompact_window=150_000)
+
+
+def test_the_prompt_survives_the_bound(tmp_path) -> None:
+    """The new flag is single-valued, so it must not eat the prompt."""
+    prompt = "Do the thing."
+    argv = turn_argv(prompt=prompt, autocompact_window=150_000,
+                     add_dirs=[tmp_path])
+    assert commander_positionals(argv) == [prompt], f"argv={argv}"

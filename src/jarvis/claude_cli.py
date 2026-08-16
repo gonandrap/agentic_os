@@ -145,6 +145,7 @@ def _briefing_args(
     append_system_prompt: str | None = None,
     settings_file: Path | None = None,
     add_dirs: list[Path] | None = None,
+    autocompact_window: int | None = None,
 ) -> list[str]:
     """The flags that constitute a worker's briefing, in one place.
 
@@ -154,6 +155,12 @@ def _briefing_args(
     (initial dispatch, bg resume-fork, headless resume) must pass the same set, or
     the worker silently loses the project's standing instructions and the OS skills
     from that turn onwards. Shared here so a new launch path cannot forget one.
+
+    `autocompact_window` is here for that same re-derivation reason and it is the
+    load-bearing case: it caps how large the conversation may grow, so a turn that
+    omitted it would let the context past the bound and every later turn would carry
+    the excess for the rest of the work order's life. None means "no flag", which is
+    the CLI's own behaviour — the model's full window, no early compaction.
 
     Callers must not append a bare positional after these: `--add-dir` is variadic
     and would swallow it (fence with `--` first, as spawn_background does).
@@ -169,6 +176,12 @@ def _briefing_args(
         args += ["--append-system-prompt", append_system_prompt]
     if settings_file:
         args += ["--settings", str(settings_file)]
+    if autocompact_window:
+        # `--autocompact <auto|tokens>`, single-valued. The CLI parses a bare integer
+        # and rejects anything outside 100k-1M; `catalog._parse_autocompact` enforces
+        # the same range up front so a bad catalog fails at boot rather than on the
+        # first dispatch.
+        args += ["--autocompact", str(autocompact_window)]
     for d in add_dirs or []:
         args += ["--add-dir", str(d)]
     return args
@@ -186,6 +199,7 @@ def spawn_background(
     settings_file: Path | None = None,
     resume_session_id: str | None = None,
     add_dirs: list[Path] | None = None,
+    autocompact_window: int | None = None,
 ) -> str | None:
     """Spawn a native Claude Code background session; returns the job id if the
     CLI reported one.
@@ -215,7 +229,7 @@ def spawn_background(
     if worktree:
         args += ["--worktree", worktree]
     args += _briefing_args(model, effort, permission_mode, append_system_prompt,
-                           settings_file, add_dirs)
+                           settings_file, add_dirs, autocompact_window)
     # `--` fences the prompt off from option parsing. Without it a variadic option
     # (`--add-dir <directories...>` is one) keeps consuming positionals and swallows
     # the prompt as a directory: the session boots with nothing to do and parks at
@@ -325,6 +339,7 @@ def turn_args(
     append_system_prompt: str | None = None,
     settings_file: Path | None = None,
     add_dirs: list[Path] | None = None,
+    autocompact_window: int | None = None,
 ) -> list[str]:
     """argv for one worker turn. Split out from `spawn_turn` so tests can assert on it.
 
@@ -341,7 +356,7 @@ def turn_args(
     if worktree:
         args += ["--worktree", worktree]
     args += _briefing_args(model, effort, permission_mode, append_system_prompt,
-                           settings_file, add_dirs)
+                           settings_file, add_dirs, autocompact_window)
     # Same fence, same reason as `spawn_background`: `--add-dir` and `--tools` are both
     # variadic and will eat the prompt as an option value if it arrives bare. Nothing
     # may be appended after this.

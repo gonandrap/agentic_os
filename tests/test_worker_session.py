@@ -340,3 +340,87 @@ def test_a_legacy_bg_session_is_released_before_its_next_turn(fleet, fake_claude
     assert store.get_work_order(wo["id"])["session_id"] == sess["sessionId"]
     # and the roster is never consulted again for this work order
     assert store.get_work_order(wo["id"])["job_id"] is None
+
+
+# -- the context bound reaches the CLI, from the catalog, on every turn ------------------
+
+
+def _autocompact_of(argv: list[str]) -> str | None:
+    return argv[argv.index("--autocompact") + 1] if "--autocompact" in argv else None
+
+
+def test_every_turn_carries_the_projects_context_bound(fleet, fake_claude,
+                                                       settle_turns):
+    """Dispatch AND the resumed turns after it must both pass `--autocompact`.
+
+    The bound is what keeps a worker's context — and therefore the cache-read charge on
+    every API call it makes — from growing without limit. `briefing_for` is rebuilt per
+    turn precisely so a resume cannot drop it.
+    """
+    store, project = fleet["store"], fleet["project"]
+    wo = _wo(fleet)
+    expected = str(project.worker.autocompact_window)
+    assert project.worker.autocompact_window, "the fleet default should be a real bound"
+
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+    worker_session.send(store, project, store.get_work_order(wo["id"]), "carry on")
+    assert settle_turns(store)
+
+    windows = [_autocompact_of(c["argv"]) for c in fake_claude.calls if "-p" in c["argv"]]
+    assert windows and all(w == expected for w in windows), (
+        f"a turn was launched without the context bound: {windows}")
+
+
+def test_lowering_the_bound_reaches_a_running_work_order(fleet, fake_claude,
+                                                         settle_turns):
+    """The bound is read from the CATALOG each turn, not frozen onto the row.
+
+    Model, effort and permission mode ARE frozen at dispatch, so this is a deliberate
+    difference: a spend control that only applied to work orders dispatched afterwards
+    would miss the long-running ones that are the reason to tighten it.
+    """
+    store, project = fleet["store"], fleet["project"]
+    wo = _wo(fleet)
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+
+    project.worker.autocompact_window = 100_000  # the user tightens it mid-flight
+    worker_session.send(store, project, store.get_work_order(wo["id"]), "carry on")
+    assert settle_turns(store)
+
+    assert _autocompact_of(fake_claude.calls[-1]["argv"]) == "100000"
+
+
+def test_opting_out_emits_no_flag_at_all(fleet, fake_claude, settle_turns):
+    """A project that sets the window to null gets the CLI's own default back."""
+    store, project = fleet["store"], fleet["project"]
+    project.worker.autocompact_window = None
+    wo = _wo(fleet)
+
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+
+    assert _autocompact_of(fake_claude.calls[-1]["argv"]) is None
+
+
+def test_workers_buy_the_five_minute_cache_not_the_one_hour_one(fleet, settle_turns):
+    """A cache WRITE costs 1.25x base input at the 5-minute TTL and 2x at the 1-hour one.
+
+    Claude Code opts a headless session into the 1h TTL by default. Measured across
+    every transcript on the machine, 98.1% of cache-READ tokens land within five
+    minutes of the previous call, so the longer window is bought and almost never
+    used — and the gap it exists to cover (a turn boundary) is cold anyway because
+    git status moves in the system prompt (kn-625e79f1).
+
+    Asserting the literal, not a constant: this is a cost decision, and it should
+    take a deliberate edit and a fresh measurement to reverse.
+    """
+    store, project = fleet["store"], fleet["project"]
+    wo = _wo(fleet)
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+
+    settings = json.loads(
+        (fleet["path"] / ".jarvis" / "worker-settings" / f"{wo['id']}.json").read_text())
+    assert settings["env"]["FORCE_PROMPT_CACHING_5M"] == "1"
