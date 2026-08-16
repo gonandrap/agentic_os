@@ -58,13 +58,20 @@ is therefore the slowest battery here (seven agent runs, ~10 minutes) and the on
 that needs `--permission-mode auto` — the same mode dispatch gives every real worker,
 since a non-interactive session cannot answer a permission prompt.
 
-**Setting `JARVIS_HOME` before an eval run is not optional on branches without the
-repo-root isolation gate.** Workers inherit `JARVIS_HOME=<production state>`, and an
-eval that opens a `CentralStore` without overriding it writes the live fleet:
+`tests/test_knowledge_retrieval_eval_harness.py` is its free companion, and this eval
+needs one more than the others: its grading apparatus is bespoke (a generated `jarvis`
+shim, a call log, mtimes compared against it) and its subject is the only caller in the
+repo of `run_headless(permission_mode=…, env_extra=…)`. Both can break without a single
+other test noticing. The companion drives the shim end-to-end against a seeded store,
+checks each case is still rigged (the deciding text off the headline, the `applied()`
+predicate false before and true after), and asserts the subject is configured the way
+dispatch configures a real worker.
 
-```bash
-JARVIS_HOME=$(mktemp -d) JARVIS_EVALS_LLM=1 pytest evals/llm -q
-```
+Its sandbox `JARVIS_HOME` is passed to the subject explicitly, never exported by the
+harness: the runner keeps the throwaway home the repo-root isolation gate (`#36`,
+`tests/test_isolation_gate.py`) gave it, and the subject gets its own through
+`env_extra`. Two stores, one variable, neither process fighting the other for it — and
+no eval run can reach production state even if the gate were removed.
 
 ## Reading the scorecard
 
