@@ -188,6 +188,25 @@ systemd-run --user --collect --unit=jarvis-restart \
 Do the same by hand if you are restarting the daemon from inside one of its own
 sessions; a plain `systemctl --user restart jarvis` is only safe from your own shell.
 
+### You should not need `journalctl` to find out something broke
+
+The journal is for following along live. Everything the OS needs you to *know* it
+mirrors into `$JARVIS_HOME/logs/`, because the journal is invisible to `jarvis`
+commands and to every agent working in the fleet:
+
+| File | What |
+|---|---|
+| `jarvisd.log` | the daemon |
+| `notifications.log` | every notification that went out, and any deep link withheld because it would have dead-ended |
+| `ui.log` | one entry per unhandled dashboard error, with traceback |
+| `ui-access.log` | one line per dashboard request (the auto-refresh poll is skipped unless it fails) |
+
+`ui.log` is *read back*, not just written: the daemon raises a `jarvis inbox` item —
+and so a Telegram alert — for each new dashboard error, `jarvis status` counts recent
+ones as an attention item, and `jarvis doctor` reports them as `INV-UI-HEALTHY`. A 500
+on the dashboard reaches you the same way a daemon problem does. Both UI logs rotate at
+512 KiB into a single `.1` sibling, so a crash loop cannot fill the state directory.
+
 ## Rollback
 
 Redeploy a previous tag, or point production back and restart:

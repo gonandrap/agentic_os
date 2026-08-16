@@ -2,7 +2,7 @@
 
 Central state lives under $JARVIS_HOME (default ~/.jarvis):
     os.db            central database (projects, inbox, backlog, knowledge)
-    logs/            daemon + notification logs
+    logs/            jarvisd.log, notifications.log, ui.log, ui-access.log
     run/             daemon pidfile
 Per-project state lives under <project>/.jarvis/ (gitignored):
     jarvis.db        work orders, events, messages, notifications, assumptions

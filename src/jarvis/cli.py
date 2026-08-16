@@ -609,8 +609,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print("✓ all OS invariants hold")
         _print_orphans(orphans)
         return 0
-    verb = "repaired" if res["repair"] else "found (run with --repair to fix)"
+    # Only offer --repair when something here is actually repairable: OS-level
+    # violations never are, and a suggestion that does nothing teaches the user to
+    # ignore the line.
+    fixable = any(v["repaired"] for p in res["projects"] for v in p["violations"])
+    verb = ("repaired" if res["repair"]
+            else "found (run with --repair to fix)" if fixable else "found")
     print(f"⚠ {res['violations']} invariant violation(s) {verb}:\n")
+    for v in res.get("os", []):
+        # OS-level: not about any one project (the dashboard being down, say), and
+        # never auto-repairable — there is nothing to derive, only someone to tell.
+        print(f"• [os] {v['invariant']}")
+        print(f"    {v['detail']}")
     for p in res["projects"]:
         if p.get("error"):
             print(f"• {p['project']}: {p['error']}")

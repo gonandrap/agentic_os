@@ -80,7 +80,7 @@ redirected away from a home that actually had an `os.db` in it.
 | `tests/test_catalog.py` (8) | `catalog.py` — `load_catalog`, `parse_catalog`, `CatalogError` |
 | `tests/test_stores.py` (9) | `central_store.py` + `project_store.py`, incl. the WO status machine |
 | `tests/test_timeline.py` (12) | `timeline.py` — `build_timeline`, `event_level` |
-| `tests/test_notify.py` (6) | `notify.py` + catalog UI config |
+| `tests/test_notify.py` (9) | `notify.py` + catalog UI config + deep-link validation |
 | `tests/test_neo.py` (13) | `neo.py`, `neo_store.py`, and their `ops`/`daemon` integration |
 | `tests/test_pipeline.py` (~35) | end-to-end: `ops`, `daemon`, `dispatch`, `hooks`, `claude_cli` (fake), stores |
 | `tests/test_worker_session.py` (12) | the conversation layer: minting, launching, reaping, stalling, cancelling, liveness, and the migration off background sessions |
@@ -88,6 +88,8 @@ redirected away from a home that actually had an `os.db` in it.
 | `tests/test_wo_cancel.py` (6) | cancel/delete take the worker down (turn process group, plus a legacy bg agent) |
 | `tests/test_wo_hide_delete.py` (13) | `ops.hide/delete_work_order` + `cli` + cascade across all three stores |
 | `tests/test_ui.py` (18) | `ui/app.py` via `TestClient`, actions routed through `ops` |
+| `tests/test_uilog.py` (9) | `uilog.py` — the `ui.log` format contract and its resume cursor |
+| `tests/test_ui_observability.py` (10) | a dashboard 500 reaching the inbox, `jarvis status`, `jarvis doctor`, and the access log |
 | `tests/test_shipit.py` (9) | `scripts/shipit.sh` (shell, not a Python module) |
 | `tests/test_isolation_gate.py` (21) | the gate above: `JARVIS_HOME`, both external sinks, `gh`, `claude` |
 | `tests/test_state_isolation.py` (3) | the same invariant from the store side — `CentralStore`/`NeoStore` resolve their paths at construction, so the guard has to be in the environment |
@@ -95,6 +97,11 @@ redirected away from a home that actually had an `os.db` in it.
 Thin spots: no dedicated tests for `paths.py`, `db.py`, or `cli.py` (only via
 `test_wo_hide_delete.py`). `claude_cli.py` is exercised through the fake plus
 `test_worker_spawn_args.py`.
+
+**Never call `monkeypatch.undo()`.** Every fixture in a test shares one `monkeypatch`
+instance, so `undo()` also reverts the `JARVIS_HOME` that `jarvis_home` set — and the rest
+of the test then reads and writes the real fleet's state directory. To restore one patched
+attribute, capture the original and `setattr` it back.
 
 ## LLM-graded persona evals — read before editing CLAUDE.md
 
