@@ -98,13 +98,20 @@
   {% if cost %}
   <p class="kv mono" style="margin-bottom:0;">
     <span title="Anthropic list prices, as a common unit for comparing token kinds — not a bill. The worker's own conversation plus everything Jarvis spent on this order.">~${{ '%.2f'|format(cost.total_cost_usd) }}</span>
-    {# The split the total hides: what the worker cost, and what the OS cost answering
-       for it. A reader who only sees one number concludes Neo is free. #}
-    {%- if cost.os_calls %}
+    {# The split the total hides: what the worker cost, what the OS cost answering for
+       it, and what the worker spent below itself. A reader who only sees one number
+       concludes Neo is free and that an eval suite costs nothing. #}
+    {%- if cost.os_calls or cost.subproc_calls %}
       · <span title="The worker's own session.">worker
         {% if cost.found %}~${{ '%.2f'|format(cost.list_cost_usd) }}{% else %}not measurable{% endif %}</span>
+    {%- endif %}
+    {%- if cost.os_calls %}
       · <span title="Neo answering this work order's questions, the panel's seats deliberating on them, and the dashboard digests written for them.">jarvis
         ~${{ '%.2f'|format(cost.os_cost_usd) }} / {{ cost.os_calls }} call{{ 's' if cost.os_calls != 1 }}</span>
+    {%- endif %}
+    {%- if cost.subproc_calls %}
+      · <span title="claude processes this worker's own tool calls spawned — an eval suite, a script. Their tokens are this work order's cost, recorded as each call returned.">subprocesses
+        ~${{ '%.2f'|format(cost.subproc_cost_usd) }} / {{ cost.subproc_calls }} call{{ 's' if cost.subproc_calls != 1 }}</span>
     {%- endif %}
     · {{ fmt_tok(cost.billed_input) }} in / {{ fmt_tok(cost.output) }} out
     · {{ cost.turns }} turn{{ 's' if cost.turns != 1 }}

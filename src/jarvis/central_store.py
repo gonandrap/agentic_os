@@ -626,12 +626,18 @@ class CentralStore:
             (*params, limit)).fetchall())
 
     def agent_call_totals(self, project: str | None = None) -> list[dict[str, Any]]:
-        """Every work order's OS spend, summed in SQL, grouped by kind and model.
+        """Every work order's recorded spend, summed in SQL, grouped by kind/label/model.
 
-        Grouped rather than flat because both consumers need the grouping: the report
+        Grouped rather than flat because every consumer needs the grouping: the report
         prices each group at its own model's list rate (a digest on Haiku is not Opus
         waste), and the per-work-order view shows what the spend went ON — five panel
         seats reads very differently from one Neo answer.
+
+        `label` joins the key so the WORKER-SUBPROCESS class can be broken down by what
+        ran the calls ("pytest: 40 calls") without a second query and, more importantly,
+        without a row limit: this is a sum, and a truncated sum understates exactly the
+        expensive work order someone is investigating. Consumers that only want kind and
+        model re-aggregate in Python, so the finer key costs them nothing.
 
         One query for the whole fleet: the alternative is a query per work order, and
         the cost report walks every work order there is.
@@ -639,12 +645,12 @@ class CentralStore:
         clause = "WHERE project=?" if project else ""
         params = (project,) if project else ()
         return db.rows_to_dicts(self.conn.execute(
-            f"""SELECT wo_id, kind, model, COUNT(*) AS calls,
+            f"""SELECT wo_id, kind, label, model, COUNT(*) AS calls,
                        SUM(cost_usd) AS cost_usd, SUM(input) AS input,
                        SUM(cache_write) AS cache_write, SUM(cache_read) AS cache_read,
                        SUM(output) AS output, SUM(1 - ok) AS failed
                 FROM agent_calls {clause}
-                GROUP BY wo_id, kind, model""", params).fetchall())
+                GROUP BY wo_id, kind, label, model""", params).fetchall())
 
     # -- os state ----------------------------------------------------------------------
 

@@ -301,3 +301,60 @@ def test_the_cost_tab_is_reachable_from_every_page(client):
     """A surface nobody can find is the bug this work order was filed about."""
     assert '<a href="/cost"' in client.get("/").text
     assert 'class="here"' in client.get("/cost").text
+
+
+def add_subprocess_calls(wo_id: str, n: int = 4, label: str = "pytest") -> None:
+    """Spend the worker made BELOW itself — `claude` processes its own tool call ran."""
+    from jarvis import agent_usage
+
+    for _ in range(n):
+        agent_usage.record(agent_usage.WORKER_SUBPROCESS, project="proj_a", wo_id=wo_id,
+                           label=label, model="claude-opus-5",
+                           usage={"total_cost_usd": 0.03, "input": 10,
+                                  "cache_write": 4_000, "cache_read": 12_000,
+                                  "output": 900})
+
+
+def test_the_cost_page_shows_subprocess_spend_as_its_own_class(client, project,
+                                                               transcript):
+    """Three figures under the headline, not two. A work order that ran an eval suite and
+    one that asked Neo four questions are spending differently, and folding them together
+    loses exactly the distinction someone reading an expensive work order came for."""
+    wo = ops.create_work_order("proj_a", "shipped the release")
+    transcript("sess-shipped", write_tok=100_000, out=5_000)
+    give_session(project, wo["id"], "sess-shipped")
+    add_os_calls(wo["id"], neo_calls=1)
+    add_subprocess_calls(wo["id"], n=4)
+
+    page = client.get("/cost")
+    assert page.status_code == 200
+    assert "subprocesses ~$" in page.text
+    assert "4 claude processes" in page.text
+    # Still counted apart from Jarvis's own overhead, which was one call, not five.
+    assert "1 call" in page.text
+
+
+def test_the_drilldown_groups_subprocess_spend_by_what_ran_it(client, project):
+    """One `pytest evals/llm` is forty calls. The OS's per-call table is the right shape
+    for five panel seats and the wrong one for forty eval scenarios."""
+    wo = ops.create_work_order("proj_a", "ran the evals")
+    add_recorded_turn(project, wo["id"], 0.05, 48_000)
+    add_subprocess_calls(wo["id"], n=40, label="pytest")
+
+    page = client.get(f"/cost/proj_a/{wo['id']}")
+    assert page.status_code == 200
+    assert "claude processes it spawned itself" in page.text
+    assert "pytest" in page.text and "40" in page.text
+
+
+def test_every_cost_surface_says_the_figure_is_a_floor(client, project):
+    """Unconditional, and identical on both pages — `ops.COST_FLOOR_NOTE` is the single
+    source. A caveat that appears in one surface and not another is one the reader learns
+    to ignore."""
+    wo = ops.create_work_order("proj_a", "nothing spent below itself")
+    add_recorded_turn(project, wo["id"], 0.05, 48_000)
+
+    for url in ("/cost", f"/cost/proj_a/{wo['id']}"):
+        page = client.get(url)
+        assert page.status_code == 200
+        assert "is a floor" in page.text, url

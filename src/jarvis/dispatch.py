@@ -66,6 +66,7 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     """
     import json as _json
 
+    from . import agent_usage
     from .bootstrap import build_settings
     from .paths import jarvis_home
 
@@ -114,6 +115,13 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         "JARVIS_PROJECT_PATH": str(project.path),
         # The worker's jarvis calls must hit the same central state as the daemon.
         "JARVIS_HOME": str(jarvis_home()),
+        # Where TOKEN ACCOUNTING goes, pinned separately from JARVIS_HOME and read by
+        # `agent_usage` alone. The two are the same value here and diverge in exactly
+        # one place: a test run inside this worker, whose isolation gate redirects
+        # JARVIS_HOME away from live state. Real tokens billed by an opt-in LLM eval
+        # are still this work order's cost, and without this they were spent into a
+        # tmp directory and deleted (issue #103). See `agent_usage.SPEND_HOME_ENV`.
+        agent_usage.SPEND_HOME_ENV: str(jarvis_home()),
         # Workers call `jarvis …` from Bash (contract); make sure it resolves even
         # though the Claude supervisor daemon has its own PATH.
         "PATH": _worker_path(),

@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from . import agent_usage
 from .bugreport import GH_BIN_ENV
 from .claude_cli import CLAUDE_BIN_ENV
 from .notify import DISABLE_EXTERNAL_SINKS_ENV
@@ -78,6 +79,11 @@ def gate_test_environment(root: Path | None = None) -> Path:
     * ``claude`` — a test that forgets `fake_claude` would spawn real background agents
       against real projects and bill real tokens. Left alone when `JARVIS_EVALS_LLM` is
       set, since the LLM-graded evals exist to call the real model.
+    * ``JARVIS_SPEND_HOME`` — where `agent_usage` files token-accounting rows. Redirected
+      with the home in every ordinary run, so a suite against the fake `claude` cannot
+      write invented spend into live state. Lifted only when the run BOTH reaches the
+      real model and belongs to a work order — see `_bills_real_tokens`, and note it
+      opens the usage-row write path alone, not the store or the sinks.
 
     The gate is a floor, not a substitute for per-test isolation: the autouse
     `jarvis_home` fixture still gives each test its own home under its own tmp_path, so
@@ -108,7 +114,29 @@ def gate_environment(root: Path) -> dict[str, str]:
     }
     if not os.environ.get(LLM_EVALS_ENV):
         env[CLAUDE_BIN_ENV] = str(_blocked_bin(root, "claude", BLOCKED_CLAUDE))
+    if not _bills_real_tokens():
+        # Token accounting is redirected with everything else by default, so a suite
+        # running against the fake `claude` cannot write invented rows into live state.
+        env[agent_usage.SPEND_HOME_ENV] = str(root / "jarvis-home")
     return env
+
+
+def _bills_real_tokens() -> bool:
+    """Is this run spending real money that a real work order will be charged for?
+
+    The one carve-out in the gate's accounting redirect, and it needs BOTH halves.
+    `JARVIS_EVALS_LLM` says the run reaches the real model — the same signal that
+    already stops the gate replacing the `claude` binary, for the same reason: these
+    evals exist to call it. `JARVIS_WO_ID` says a work order is paying, which is who
+    the row would be filed against. An ad-hoc eval run by a human has no work order and
+    stays fully sandboxed; a worker's eval run has both and its spend reaches the ledger
+    that the `jarvis cost` for that work order reads (ruled on wo-76e021aa, issue #103).
+
+    Deliberately narrow: this opens the usage-row write path and nothing else. Every
+    other route out of the sandbox — the notification sinks, `gh`, the rest of the
+    central store — stays shut in both cases.
+    """
+    return bool(os.environ.get(LLM_EVALS_ENV) and os.environ.get("JARVIS_WO_ID"))
 
 
 def _blocked_bin(root: Path, name: str, source: str) -> Path:
@@ -583,9 +611,16 @@ def jarvis_home(tmp_path, monkeypatch):
 
     Per-test rather than per-session so two tests that both forget the fixture cannot
     collide in one shared home.
+
+    Token accounting follows the home unless the run is genuinely billing a work order
+    for real tokens (`gate_environment._bills_real_tokens`), which no ordinary test is.
+    Without moving it, a test asserting on `agent_calls` would look in its own home while
+    the rows landed in the gate's shared one.
     """
     home = tmp_path / "jarvis-home"
     monkeypatch.setenv("JARVIS_HOME", str(home))
+    if not _bills_real_tokens():
+        monkeypatch.setenv(agent_usage.SPEND_HOME_ENV, str(home))
     return home
 
 

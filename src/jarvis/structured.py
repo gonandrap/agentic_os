@@ -29,10 +29,17 @@ from __future__ import annotations
 
 import json
 import re
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
 from . import claude_cli
+
+#: The default transport. `attribute=False` because every caller of `request` that pays
+#: for its calls binds them itself through `on_usage`, and the transport's own
+#: attribution would then write a second row for the same tokens. A caller that wants
+#: the transport to account for it should pass `call=claude_cli.run_headless_result`.
+DEFAULT_CALL = partial(claude_cli.run_headless_result, attribute=False)
 
 #: One JSON object out of possibly-fenced, possibly-chatty output. GREEDY on purpose:
 #: it spans from the first `{` to the LAST `}`, so a nested object survives and a
@@ -93,7 +100,7 @@ def request(prompt: str, *, validate: Callable[[dict[str, Any]], Any],
             system_prompt: str | None = None, model: str | None = None,
             attempts: int = 1, on_invalid: Callable[[str], Any] | None = None,
             timeout: int = 300, cwd: Path | None = None,
-            call: Callable[..., Any] = claude_cli.run_headless_result,
+            call: Callable[..., Any] = DEFAULT_CALL,
             on_usage: Callable[[Any], None] | None = None) -> Any:
     """Ask a model for strict JSON and return the validated value.
 
@@ -102,7 +109,7 @@ def request(prompt: str, *, validate: Callable[[dict[str, Any]], Any],
     again from scratch. After the last attempt the reply goes through `coerce`, so
     `on_invalid` decides between a fallback value and a raised exception.
 
-    `call` is the model transport, defaulting to `claude_cli.run_headless_result`; it is
+    `call` is the model transport, defaulting to `DEFAULT_CALL`; it is
     called as `call(prompt, system_prompt=…, model=…, timeout=…, cwd=…)`. Override it to
     strip the callee's tools (`functools.partial(claude_cli.run_headless_result,
     tools="")`) or, in a test, to record what was asked. A transport that returns a bare

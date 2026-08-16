@@ -100,7 +100,11 @@ Output STRICT JSON, nothing else, with exactly these keys:
 #: `src/jarvis/panel.py` will go and READ `src/jarvis/panel.py`, and then the page shows
 #: the reader a description of the code instead of a shortening of the question — a
 #: failure mode that looks like a good answer, which is the worst kind.
-CALL = partial(claude_cli.run_headless_result, tools="")
+#:
+#: `attribute=False` for the same reason as Neo's and the panel's calls: the daemon binds
+#: this call's work order itself, through `structured.request`'s `on_usage` seam, and the
+#: transport's own attribution would be a second row for the same tokens.
+CALL = partial(claude_cli.run_headless_result, tools="", attribute=False)
 
 
 class DigestError(RuntimeError):
