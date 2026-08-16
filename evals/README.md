@@ -16,13 +16,15 @@ pytest evals -q
 
 **LLM-graded evals** (`evals/llm/`) — batteries against the real `claude` CLI, judging
 the parts only a model can get wrong: Neo's escalation judgment, adherence to
-learnings, the Jarvis persona's route-don't-do discipline, and the worker contract's
-assume-vs-ask judgment. They cost tokens and need a logged-in Claude Code, so they are
+learnings, the Jarvis persona's route-don't-do discipline, the worker contract's
+assume-vs-ask judgment, and whether a worker handed a knowledge *index* actually
+retrieves from it. They cost tokens and need a logged-in Claude Code, so they are
 opt-in:
 
 ```bash
 JARVIS_EVALS_LLM=1 pytest evals/llm -q            # default model: sonnet
 JARVIS_EVALS_LLM=1 JARVIS_EVALS_MODEL=opus pytest evals/llm -q
+JARVIS_EVALS_LLM=1 pytest evals/llm -q -s         # -s for the per-case breakdown
 ```
 
 Run the LLM layer before changing any persona/prompt text (Neo's PERSONA, the worker
@@ -48,6 +50,21 @@ that contradicts itself.
 this eval is still wired — that its skip gate reads exactly `JARVIS_EVALS_LLM`, that the
 batteries are non-empty module-level literals with no production path in them, and that
 `panel.decide` is what it calls.
+
+`test_knowledge_retrieval.py` is the odd one out: its subject is **tooled and does real
+work** in a throwaway sandbox with a real `jarvis` on its PATH, because asking a
+tool-less model "what command would you run?" primes the very answer being graded. It
+is therefore the slowest battery here (seven agent runs, ~10 minutes) and the only one
+that needs `--permission-mode auto` — the same mode dispatch gives every real worker,
+since a non-interactive session cannot answer a permission prompt.
+
+**Setting `JARVIS_HOME` before an eval run is not optional on branches without the
+repo-root isolation gate.** Workers inherit `JARVIS_HOME=<production state>`, and an
+eval that opens a `CentralStore` without overriding it writes the live fleet:
+
+```bash
+JARVIS_HOME=$(mktemp -d) JARVIS_EVALS_LLM=1 pytest evals/llm -q
+```
 
 ## Reading the scorecard
 
