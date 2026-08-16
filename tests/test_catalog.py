@@ -60,9 +60,9 @@ def test_autocompact_is_bounded_by_default():
     cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
     # The literal, not the constant: asserting the constant against itself would hold
     # even if someone set it to None, which is the one change this test exists to catch.
-    assert cat.os.default_autocompact_window == 150_000
-    assert cat.projects[0].worker.autocompact_window == 150_000
-    assert DEFAULT_AUTOCOMPACT_WINDOW == 150_000
+    assert cat.os.default_autocompact_window == 400_000
+    assert cat.projects[0].worker.autocompact_window == 400_000
+    assert DEFAULT_AUTOCOMPACT_WINDOW == 400_000
 
 
 def test_autocompact_fleet_default_and_project_override():
@@ -71,12 +71,14 @@ def test_autocompact_fleet_default_and_project_override():
         "projects": [
             {"name": "a", "path": "/tmp/a"},                       # inherits the fleet
             {"name": "b", "path": "/tmp/b",
-             "worker": {"autocompact_window": 400_000}},           # raises it
+             "worker": {"autocompact_window": 600_000}},           # raises it
         ],
     })
+    # None of the three is DEFAULT_AUTOCOMPACT_WINDOW: an override that silently fell
+    # back to the module default would otherwise pass this test.
     assert cat.os.default_autocompact_window == 200_000
     assert cat.projects[0].worker.autocompact_window == 200_000
-    assert cat.projects[1].worker.autocompact_window == 400_000
+    assert cat.projects[1].worker.autocompact_window == 600_000
 
 
 def test_a_project_opts_out_with_an_explicit_null():
@@ -102,7 +104,7 @@ def test_absent_and_null_are_different():
             {"name": "b", "path": "/tmp/b", "worker": {"autocompact_window": None}},
         ],
     })
-    assert cat.projects[0].worker.autocompact_window == 150_000
+    assert cat.projects[0].worker.autocompact_window == 400_000
     assert cat.projects[1].worker.autocompact_window is None
 
 

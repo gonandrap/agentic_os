@@ -224,6 +224,13 @@ is why contexts of 250–585k are normal today and why every API call re-reads o
 Jarvis now passes it on **every** worker turn, from `claude_cli._briefing_args` so no launch
 path can forget it (the rule `kn-6352bc0f` set), defaulting to **150,000**.
 
+> **Superseded 2026-08-15 (wo-6808dd2d): the default is now 400,000.** The mechanism, the
+> configuration and the measurements below are unchanged and still describe the fleet as it
+> was measured; only the number moved. At 400,000 the sessions the bound bites are the 1%
+> that peak over 300k rather than the 10% that peak over 120k, so the saving quantified
+> below is correspondingly smaller — the bound still halves the ~800k an unbounded worker
+> would reach, and it no longer truncates the long orders that were losing detail to it.
+
 **What that costs, measured against all 1,070 sessions on disk:**
 
 | peak context of a session | sessions | |
@@ -250,7 +257,7 @@ a ceiling.
 ### Configuration
 
 ```json
-"os":       { "defaults": { "autocompact_window": 150000 } },
+"os":       { "defaults": { "autocompact_window": 400000 } },
 "projects": [ { "name": "x", "worker": { "autocompact_window": null } } ]
 ```
 
@@ -296,7 +303,7 @@ lever Jarvis has is the one already taken: carry less context across each bounda
 
 ## Surviving compaction without losing the thread — SHIPPED
 
-Auto-compaction (now on at 150k) summarizes the conversation and discards the rest. The
+Auto-compaction (now on at 400k) summarizes the conversation and discards the rest. The
 concern is exactly right: a model-written summary can drop the details a mid-task worker
 needs. The proposed shape — write a summary before, inject it back after — is sound, but
 one of its two halves cannot be built as described, and the other can be much better than a
@@ -344,14 +351,14 @@ repeating forever. Nine tests cover it, including a second compaction re-arming;
 exactly-once property, the verbatim description and the timeline event were each
 mutation-checked.
 
-Cost is bounded and one-off: a few thousand tokens against the 150k the compaction just
+Cost is bounded and one-off: a few thousand tokens against the context the compaction just
 reclaimed.
 
 **Not yet verified against a live compaction.** The hooks are exercised against synthetic
 payloads, and `PreCompact`'s payload shape (`trigger`, `custom_instructions`) is taken from
 the CLI's own hook table rather than from an observed firing. If it never fires in headless
 `-p` mode, the failure is silent — the flag is never written and nothing is injected — so
-the first real 150k work order is the thing to watch.
+the first work order that actually reaches the window is the thing to watch.
 
 ## What was considered and not shipped
 

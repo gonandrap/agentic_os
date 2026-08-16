@@ -64,14 +64,18 @@ DEFAULT_MAX_CONCURRENT = 5
 #
 # WHAT THE NUMBER MEANS: it is the effective context WINDOW, not the trigger point. The
 # CLI takes min(model window, this) and arms auto-compact at a model-table fraction of
-# it, so 150,000 caps a worker's context a little under 150k rather than at it.
+# it, so 400,000 caps a worker's context a little under 400k rather than at it.
 #
-# THE COST OF SETTING IT TOO LOW is a worker that compacts mid-task and loses detail, so
-# this is deliberately well above the ~93-105k a typical work order opens at and above
-# the median turn; the orders it will bite are the long ones that are expensive for
-# exactly this reason. The CLI accepts 100k-1M and rejects anything outside; a project
-# can raise it, or set it to null to opt out and take the model's own window.
-DEFAULT_AUTOCOMPACT_WINDOW = 150_000
+# WHY 400,000 AND NOT LESS: the cost of setting it too low is a worker that compacts
+# mid-task and loses detail. The first value shipped was 150,000, which sits close enough
+# to real work to bite — 10% of sessions peak over 120k and 6% over 150k (kn-f94abf34) —
+# so the orders it truncated were the long ones, exactly where losing detail hurts most.
+# 400,000 is the user's ruling on wo-6808dd2d. It still halves what an unbounded worker on
+# a 1M model would reach (~800k before it compacts at all), so the bound and its linear
+# saving on every cache read remain; it just leaves compaction an exception rather than a
+# routine event. The CLI accepts 100k-1M and rejects anything outside; a project can move
+# it either way, or set it to null to opt out and take the model's own window.
+DEFAULT_AUTOCOMPACT_WINDOW = 400_000
 AUTOCOMPACT_MIN = 100_000    # `claude --autocompact` rejects anything under this
 AUTOCOMPACT_MAX = 1_000_000  # ... or over this
 

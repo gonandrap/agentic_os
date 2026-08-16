@@ -82,7 +82,7 @@ reconciliation are all **gone**, not ported.
 settings file, `--add-dir` skills, `--autocompact`. A resumed session re-derives all of it
 from argv, not from the transcript, so anything omitted vanishes from that turn onwards.
 
-**`--autocompact` bounds how large the conversation may grow** — default 150,000
+**`--autocompact` bounds how large the conversation may grow** — default 400,000
 (`catalog.DEFAULT_AUTOCOMPACT_WINDOW`), fleet-wide `os.defaults.autocompact_window`,
 per project `worker.autocompact_window`, explicit `null` to opt out. It is the effective
 context WINDOW, not the trigger: the CLI takes `min(model window, this)` and arms
