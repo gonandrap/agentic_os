@@ -77,7 +77,7 @@ def test_a_canned_model_drives_the_real_plumbing(eval_module, tmp_path, monkeypa
     calls = []
 
     def canned(prompt, system_prompt=None, model=None, timeout=300, cwd=None,
-               tools=None):
+               tools=None, **kwargs):
         calls.append({"prompt": prompt, "system": system_prompt or ""})
         return claude_cli.HeadlessResult(
             text='{"escalate": false, "verdict": "approve", "reason": "canned"}')

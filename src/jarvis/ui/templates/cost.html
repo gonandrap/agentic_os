@@ -21,14 +21,15 @@
   {# Tokens for BOTH halves, because the figure above them is both halves. Quoting the
      workers' tokens under a total that includes the OS's would not add up. #}
   <p class="kv mono" style="margin: 0;">
-    {{ fmt_tok(totals.billed_input + totals.os_billed_input) }} in ·
-    {{ fmt_tok(totals.output + totals.os_output) }} out ·
+    {{ fmt_tok(totals.billed_input + totals.os_billed_input + totals.subproc_billed_input) }} in ·
+    {{ fmt_tok(totals.output + totals.os_output + totals.subproc_output) }} out ·
     {{ report.measured }} work order{{ 's' if report.measured != 1 }} measured
     {%- if report.unmeasured %}, {{ report.unmeasured }} whose transcript Claude Code has
       already pruned{% endif %}
   </p>
-  {# The split, stated right under the headline: the workers' own conversations, and what
-     the OS spent answering for them. Both halves are list-priced, so they add up. #}
+  {# The split, stated right under the headline: the workers' own conversations, what the
+     OS spent answering for them, and what they spent below themselves. All three are
+     list-priced, so they add up. #}
   <div class="kv" style="margin: 10px 0 0; display: flex; gap: 22px; flex-wrap: wrap;">
     <span class="mono"><strong>workers ~${{ '%.2f'|format(totals.list_cost_usd) }}</strong>
       <span class="sub">the sessions Jarvis dispatched</span></span>
@@ -36,6 +37,12 @@
       <span class="sub">
         {%- if totals.os_calls %}{{ totals.os_calls }} call{{ 's' if totals.os_calls != 1 }} —
           Neo answering, panel seats, digests
+        {%- else %}nothing recorded yet{% endif %}</span></span>
+    <span class="mono"><strong>subprocesses ~${{ '%.2f'|format(totals.subproc_cost_usd) }}</strong>
+      <span class="sub">
+        {%- if totals.subproc_calls %}{{ totals.subproc_calls }}
+          claude process{{ 'es' if totals.subproc_calls != 1 }} the workers spawned
+          themselves — eval suites, scripts
         {%- else %}nothing recorded yet{% endif %}</span></span>
   </div>
   {% if totals.os_calls %}
@@ -99,6 +106,11 @@
           ({{ u.os_calls }} call{{ 's' if u.os_calls != 1 }}
           {%- for k in u.os_by_kind %}{{ ', ' if not loop.first else ': ' }}{{ k.calls }} {{ k.label }}{% endfor %})
         {%- endif %}
+        {#- And what the worker spent below itself. Its own clause rather than folded in
+            with jarvis's: an eval suite and a Neo question are not the same spending. -#}
+        {%- if u.subproc_calls %} · subprocesses ~${{ '%.2f'|format(u.subproc_cost_usd) }}
+          ({{ u.subproc_calls }} claude process{{ 'es' if u.subproc_calls != 1 }})
+        {%- endif %}
         {# the drill-down: turn-by-turn cost and context growth. Present even when the
            transcript is gone — recorded turn rows are the OS's own and outlive it. #}
         · <a href="/cost/{{ u.project }}/{{ u.id }}"
@@ -121,6 +133,13 @@
   transcripts, so a work order whose transcript has been pruned reads “—” rather than
   zero; Jarvis's own calls are recorded by the OS as it makes them, so those are shown
   even there (as “$x+”: the jarvis half is known, the worker half is not).
+</p>
+
+{# Unconditional, and phrased the same as `jarvis cost` prints it — `ops.COST_FLOOR_NOTE`
+   is the single source. A caveat that appears in one surface and not another is a caveat
+   the reader learns to ignore. #}
+<p class="sub" style="margin-top: 6px;">
+  Every figure on this page is {{ report.floor_reason }}.
 </p>
 
 {% endblock %}

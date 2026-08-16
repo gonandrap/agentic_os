@@ -64,8 +64,24 @@
     created {{ fmt_age(wo.created_at) }} ago · updated {{ fmt_age(wo.updated_at) }} ago
     {% if wo.model %} · model {{ wo.model }}{% endif %}
     {% if wo.worktree %} · worktree {{ wo.worktree }}{% endif %}
-    {% if wo.session_id %} · session {{ wo.session_id[:8] }}…{% endif %}
+    {# Never abbreviated. A session id is something the reader COPIES into
+       `claude --resume`, not something they recognise, and half of one is no use to
+       anybody. `user-select: all` makes a single click take the whole id. #}
+    {% if wo.session_id %} · session <span class="sid"
+      title="The Claude session this work order runs in — one id for its whole life. Click to select it whole."
+      >{{ wo.session_id }}</span>{% endif %}
   </p>
+  {# The command the id exists for, ready to run — but only once no worker turn can be
+     in flight. While the work order is dispatching or running, a second driver on the
+     same session is how one ends up forked off a dead conversation, so the settled
+     states get the invitation and the active ones get the bare id above. The
+     `waiting_input` case has its own richer block further down, beside the action that
+     resolves it natively; keeping it out of ACTIVE_STATUSES here is what stops the two
+     from rendering the same line twice. #}
+  {% if wo.session_id and wo.status not in active_statuses %}
+    <p class="kv">Resume this session (from its worktree):
+      <code class="sid">claude --resume {{ wo.session_id }}</code></p>
+  {% endif %}
   {% if wo.needs_attention %}
     <p class="st tone-warn"{% if pending == 'attention' %} id="pending"{% endif %}>
       <span class="i">◭</span>{{ wo.attention_reason }}
@@ -98,13 +114,20 @@
   {% if cost %}
   <p class="kv mono" style="margin-bottom:0;">
     <span title="Anthropic list prices, as a common unit for comparing token kinds — not a bill. The worker's own conversation plus everything Jarvis spent on this order.">~${{ '%.2f'|format(cost.total_cost_usd) }}</span>
-    {# The split the total hides: what the worker cost, and what the OS cost answering
-       for it. A reader who only sees one number concludes Neo is free. #}
-    {%- if cost.os_calls %}
+    {# The split the total hides: what the worker cost, what the OS cost answering for
+       it, and what the worker spent below itself. A reader who only sees one number
+       concludes Neo is free and that an eval suite costs nothing. #}
+    {%- if cost.os_calls or cost.subproc_calls %}
       · <span title="The worker's own session.">worker
         {% if cost.found %}~${{ '%.2f'|format(cost.list_cost_usd) }}{% else %}not measurable{% endif %}</span>
+    {%- endif %}
+    {%- if cost.os_calls %}
       · <span title="Neo answering this work order's questions, the panel's seats deliberating on them, and the dashboard digests written for them.">jarvis
         ~${{ '%.2f'|format(cost.os_cost_usd) }} / {{ cost.os_calls }} call{{ 's' if cost.os_calls != 1 }}</span>
+    {%- endif %}
+    {%- if cost.subproc_calls %}
+      · <span title="claude processes this worker's own tool calls spawned — an eval suite, a script. Their tokens are this work order's cost, recorded as each call returned.">subprocesses
+        ~${{ '%.2f'|format(cost.subproc_cost_usd) }} / {{ cost.subproc_calls }} call{{ 's' if cost.subproc_calls != 1 }}</span>
     {%- endif %}
     · {{ fmt_tok(cost.billed_input) }} in / {{ fmt_tok(cost.output) }} out
     · {{ cost.turns }} turn{{ 's' if cost.turns != 1 }}

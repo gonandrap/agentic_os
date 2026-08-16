@@ -650,6 +650,66 @@ def check_release_marker(now: float | None = None) -> list[Violation]:
     )]
 
 
+# -- OS-level invariants --------------------------------------------------------------
+#
+# The project checks above are predicates over one project's store. These are predicates
+# over the OS itself, so they take no store and run once per `jarvis doctor`, not once
+# per project. They are never repairable: nothing here has a resolution derivable from
+# state — a crashed dashboard needs a person.
+#
+# `check_release_marker` above is the same class of check but predates this registry and
+# is still called directly by `ops.run_doctor`; it takes a `now` override the registry
+# has no way to pass.
+
+
+def check_ui_healthy() -> Iterator[Violation]:
+    """INV-UI-HEALTHY — the OS's own dashboard must not be throwing 500s.
+
+    The dashboard used to fail in a blind spot: uvicorn printed the traceback to the
+    systemd journal and nothing else recorded it, so an HTTP 500 on the work-order page
+    was invisible to `jarvis status`, to `jarvis doctor`, to the inbox and to every
+    agent that can read `$JARVIS_HOME` but not `journalctl`. A user who was not already
+    tailing a log had no way to learn the web UI was broken. `uilog` now keeps the
+    errors next to the databases; this is the check that reads them back.
+
+    Not repairable: reported only. The window is `uilog.ERROR_WINDOW_SECONDS`, so this
+    clears itself once the dashboard has been quiet for a day.
+    """
+    from . import uilog
+
+    recent, total = uilog.recent_errors()
+    if not total:
+        return
+    hours = int(uilog.ERROR_WINDOW_SECONDS / 3600)
+    yield Violation(
+        invariant="INV-UI-HEALTHY",
+        detail=f"the dashboard raised {total} unhandled error"
+               f"{'s' if total != 1 else ''} in the last {hours}h "
+               f"(latest: {recent[0].summary}) — see {uilog.ui_log_path()}",
+        context={"count": total, "log": str(uilog.ui_log_path()),
+                 "recent": [e.as_dict() for e in recent]},
+    )
+
+
+OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
+    check_ui_healthy,
+)
+
+
+def check_os() -> list[Violation]:
+    """Run the OS-level invariants. Read-only by construction."""
+    found: list[Violation] = []
+    for check in OS_INVARIANTS:
+        try:
+            found.extend(check())
+        except Exception as e:  # noqa: BLE001 — one broken check must not hide the rest
+            found.append(Violation(
+                invariant=getattr(check, "__name__", "unknown"),
+                detail=f"invariant raised {e!r}",
+            ))
+    return found
+
+
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
     check_no_orphan_gate_requests,  # ...and gates before the flag checks: an orphan

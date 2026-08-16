@@ -156,7 +156,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
     the same checks with repair enabled on every reconcile tick — this is the manual
     handle for "is the OS lying to me right now?".
     """
-    from .invariants import check_catalog, check_project, check_release_marker
+    from .invariants import check_catalog, check_os, check_project, check_release_marker
 
     # Catalog-level checks run whenever a catalog is resolvable at all: a gate that can
     # never open is a fault in the configuration, visible before any work order exists.
@@ -185,7 +185,11 @@ def run_doctor(project: str | None = None, repair: bool = False,
         if not rows:
             raise OpsError(f"unknown project: {project}")
 
-    results, total = [], 0
+    # OS-level checks first: they are about the OS itself (is the dashboard alive?),
+    # not about any one project, and `--project` must not filter them out — a fleet
+    # scoped to one project still wants to know its web UI is broken.
+    os_found = check_os()
+    results, total = [], len(os_found)
     for p in rows:
         if p["status"] != "active":
             continue
@@ -235,7 +239,13 @@ def run_doctor(project: str | None = None, repair: bool = False,
                 for v in os_violations
             ],
         })
-    out = {"repair": repair, "violations": total, "projects": results}
+    out = {
+        "repair": repair,
+        "violations": total,
+        "os": [{"invariant": v.invariant, "detail": v.detail, "repaired": v.repaired,
+                "repair": v.repair, "context": v.context} for v in os_found],
+        "projects": results,
+    }
     orphans = orphaned_worker_sessions()
     if orphans:
         out["orphaned_sessions"] = orphans
@@ -284,6 +294,25 @@ def orphaned_worker_sessions() -> list[dict[str, Any]]:
          "stop": f"claude stop {s.id}"}
         for s in named if s.session_id not in live_sessions
     ]
+
+
+def ui_health() -> dict[str, Any]:
+    """How the dashboard is doing, from its own log on disk.
+
+    Deliberately a plain read of `$JARVIS_HOME/logs/ui.log`: the UI runs in a separate
+    process (its own systemd unit in production) so there is no live handle to ask, and
+    the log is the only channel that survives it crashing outright.
+    """
+    from . import uilog
+
+    recent, total = uilog.recent_errors()
+    return {
+        "errors": total,
+        "window_seconds": uilog.ERROR_WINDOW_SECONDS,
+        "log": str(uilog.ui_log_path()),
+        "access_log": str(uilog.access_log_path()),
+        "recent": [{**e.as_dict(), "summary": e.summary} for e in recent],
+    }
 
 
 def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
@@ -481,12 +510,26 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             finally:
                 store.close()
         attention.extend(gate_items)
+        # The dashboard is part of the OS, so its failures belong in the OS's pulse.
+        # Until this, a 500 on the work-order page was known only to the systemd
+        # journal — `jarvis status` reported a healthy fleet while the UI was down.
+        ui = ui_health()
+        if ui["errors"]:
+            attention.append({
+                "project": "os", "wo_id": None,
+                "title": "dashboard errors", "status": "ui",
+                "reason": f"{ui['errors']} unhandled error"
+                          f"{'s' if ui['errors'] != 1 else ''} in the last "
+                          f"{int(ui['window_seconds'] / 3600)}h — latest: "
+                          f"{ui['recent'][0]['summary']}. Full traceback: {ui['log']}",
+            })
         return {
             "daemon": {
                 "running": pid is not None,
                 "pid": pid,
                 "catalog": central.get_state("catalog_path"),
             },
+            "ui": ui,
             "projects": projects,
             "attention": attention,
             "inbox": {
@@ -2262,6 +2305,27 @@ def _turn_summary(rows: list[dict[str, Any]]) -> tuple[str, int, int,
     return provenance, len(recorded), len(settled), totals
 
 
+def _partition_calls(
+    groups: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split one work order's `agent_calls` groups into (the OS's, the worker's own).
+
+    Both live in the same table because both are recorded the same way and for the same
+    reason, and both belong to the same work order. They are reported apart because they
+    are different SHAPES of spend: what Jarvis spent thinking about the order, and what
+    the order's own worker spent one process further down its tree. A work order that
+    ran an eval suite and one that asked Neo four questions have nothing in common, and
+    a single column would say they did (issue #103).
+    """
+    from . import agent_usage
+
+    os_side, worker_side = [], []
+    for g in groups:
+        target = worker_side if agent_usage.is_subprocess(g.get("kind") or "") else os_side
+        target.append(g)
+    return os_side, worker_side
+
+
 def _os_spend(groups: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """One work order's OS-side spend, from its `agent_calls` groups.
 
@@ -2275,6 +2339,27 @@ def _os_spend(groups: Sequence[dict[str, Any]]) -> dict[str, Any]:
     Priced PER MODEL GROUP: the digest and the panel's seats routinely run on a cheaper
     model than Neo, and pricing the fleet's OS spend at one blended rate would make the
     cheap calls look expensive and hide the dear ones.
+    """
+    return _call_spend(groups, "os")
+
+
+def _subproc_spend(groups: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """The same arithmetic, over the `claude` processes the WORKER spawned beneath itself.
+
+    Same table, same pricing, its own prefix — the third class of spend on a work order,
+    beside the worker's own conversation and Jarvis's overhead. What it counts is every
+    descendant call that came through Jarvis's transport; a bare `claude -p` from a shell
+    is invisible to it, which is why `cost_report` marks the whole report a floor.
+    """
+    return _call_spend(groups, "subproc")
+
+
+def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]:
+    """Sum and price one class of `agent_calls` groups under `<prefix>_…` keys.
+
+    Shared by `_os_spend` and `_subproc_spend`: the two classes differ in what they mean
+    and where they are shown, never in how a token is counted or priced, and two copies
+    of this loop would be two places for those to drift apart.
     """
     from . import agent_usage
     from . import usage as usage_mod
@@ -2306,15 +2391,15 @@ def _os_spend(groups: Sequence[dict[str, Any]]) -> dict[str, Any]:
         entry["billed_input"] += u.billed_input
         entry["output"] += u.output
     return {
-        "os_calls": calls,
-        "os_failed_calls": failed,
-        "os_cost_usd": round(total.list_cost_usd, 4),
-        "os_recorded_cost_usd": round(exact, 4),
-        "os_billed_input": total.billed_input,
-        "os_output": total.output,
-        "os_total_tokens": total.total_tokens,
-        # Dearest first: the whole point of the split is to say where OS spend goes.
-        "os_by_kind": sorted(by_kind.values(), key=lambda k: -k["cost_usd"]),
+        f"{prefix}_calls": calls,
+        f"{prefix}_failed_calls": failed,
+        f"{prefix}_cost_usd": round(total.list_cost_usd, 4),
+        f"{prefix}_recorded_cost_usd": round(exact, 4),
+        f"{prefix}_billed_input": total.billed_input,
+        f"{prefix}_output": total.output,
+        f"{prefix}_total_tokens": total.total_tokens,
+        # Dearest first: the whole point of the split is to say where the spend goes.
+        f"{prefix}_by_kind": sorted(by_kind.values(), key=lambda k: -k["cost_usd"]),
     }
 
 
@@ -2327,19 +2412,23 @@ def _unit_row(name: str, wo: dict[str, Any], index: dict[str, list[Path]],
     subagent split and the re-write tax); the recorded figures ride along with their
     provenance label so a reader can tell an exact number from an estimate.
 
-    THREE TOTALS, and the difference between them is the point. `list_cost_usd` is what
+    FOUR TOTALS, and the differences between them are the point. `list_cost_usd` is what
     the WORKER's own conversation cost. `os_cost_usd` is what Jarvis spent on this work
     order behind the worker's back — Neo answering it, the panel deliberating on it, the
-    digest shortening it. `total_cost_usd` is the two together, and it is the number that
-    answers "what did this work order cost". A reader who only ever sees the first one
-    concludes the OS is free.
+    digest shortening it. `subproc_cost_usd` is what the worker spent BELOW itself, in
+    `claude` processes its own tool calls spawned: an eval suite, a script, a nested
+    harness. `total_cost_usd` is all three, and it is the number that answers "what did
+    this work order cost". A reader who only ever sees the first one concludes the OS is
+    free and that a work order which ran the eval suite twice was cheap.
     """
     from . import usage as usage_mod
 
     session = usage_mod.read_session(wo.get("session_id") or "", index=index)
     total = session.total
     provenance, recorded, settled, rec_totals = _turn_summary(list(turn_rows))
-    os_spend = _os_spend(list(os_groups))
+    os_groups_only, subproc_groups = _partition_calls(list(os_groups))
+    os_spend = _os_spend(os_groups_only)
+    subproc_spend = _subproc_spend(subproc_groups)
     worker_cost = total.list_cost_usd if session.found else 0.0
     recorded_cost = round(rec_totals["cost_usd"], 4) if rec_totals else 0.0
     return {
@@ -2356,18 +2445,33 @@ def _unit_row(name: str, wo: dict[str, Any], index: dict[str, list[Path]],
         "settled_turns": settled,
         "recorded_cost_usd": recorded_cost,
         **os_spend,
-        # Estimate + estimate, both at list prices. A work order whose transcript is
-        # gone still reports its OS spend here: that half was recorded by the OS itself
-        # and does not depend on a file Claude Code is free to prune.
-        "total_cost_usd": round(worker_cost + os_spend["os_cost_usd"], 4),
+        **subproc_spend,
+        # Estimate + estimate + estimate, all at list prices. A work order whose
+        # transcript is gone still reports the recorded halves here: those were written
+        # down by the OS itself and do not depend on a file Claude Code is free to prune.
+        "total_cost_usd": round(worker_cost + os_spend["os_cost_usd"]
+                                + subproc_spend["subproc_cost_usd"], 4),
         "total_recorded_cost_usd": round(recorded_cost
-                                         + os_spend["os_recorded_cost_usd"], 4),
+                                         + os_spend["os_recorded_cost_usd"]
+                                         + subproc_spend["subproc_recorded_cost_usd"], 4),
         # Is there anything to show at all? `found` alone answered that before the OS's
         # own calls were counted, and would now hide a work order whose transcript is
-        # pruned but which cost Neo five calls.
-        "measurable": bool(session.found or os_spend["os_calls"] or recorded),
+        # pruned but which cost Neo five calls — or which spent its whole bill in
+        # subprocesses.
+        "measurable": bool(session.found or os_spend["os_calls"]
+                           or subproc_spend["subproc_calls"] or recorded),
         **total.as_dict(),
     }
+
+
+#: Why every figure in a cost report is a lower bound, said the same way in every
+#: surface that renders one. Carried in the payload rather than written into the CLI so
+#: the dashboard and any JSON consumer state it identically — a caveat that appears in
+#: one renderer and not another is a caveat the reader learns to ignore.
+COST_FLOOR_NOTE = (
+    "a floor: `claude` processes a worker spawns outside Jarvis's own transport "
+    "(a bare `claude -p` from a shell) leave nothing behind that names a work order"
+)
 
 
 def cost_report(project: str | None = None, target: str | None = None,
@@ -2392,7 +2496,16 @@ def cost_report(project: str | None = None, target: str | None = None,
     The OS's OWN spend on each work order (`agent_calls` — Neo, the panel, the digest) is
     read alongside and reported both separately and in the total. It does not come from
     transcripts, so it survives pruning and is present even on a unit that reports
-    `found: false`.
+    `found: false`. So is the third class, `subproc_…`: the `claude` processes the WORKER
+    spawned beneath itself, recorded the same way and kept apart because an eval suite and
+    a Neo question are not the same kind of spending.
+
+    EVERY FIGURE HERE IS A FLOOR, and the report says so rather than implying otherwise.
+    A worker can reach the model without going through Jarvis's transport — a bare
+    `claude -p` in a shell command — and such a call leaves nothing behind that names a
+    work order. The marker is unconditional on purpose: a heuristic that tried to guess
+    whether any escaped would be blind in exactly the cases it was meant to catch, and a
+    flat statement is always true and costs one line (ruled on wo-76e021aa, issue #103).
     """
     from . import usage as usage_mod
 
@@ -2420,7 +2533,8 @@ def cost_report(project: str | None = None, target: str | None = None,
     # otherwise a work order that asked Neo twenty questions sorts as though it were cheap.
     units.sort(key=lambda u: u["total_cost_usd"], reverse=True)
     return {"scope": project or "fleet", "units": units,
-            **_rollup(units), "os_unattributed": _os_unattributed(os_groups)}
+            **_rollup(units), "os_unattributed": _os_unattributed(os_groups),
+            "floor": True, "floor_reason": COST_FLOOR_NOTE}
 
 
 def _os_groups(project: str | None = None) -> dict[str, list[dict[str, Any]]]:
@@ -2461,6 +2575,7 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
     # Over ALL units, not just measured ones, for the same reason `recorded_cost_usd` is:
     # `agent_calls` is the OS's own record and does not depend on a transcript surviving.
     os_cost = round(sum(u.get("os_cost_usd") or 0 for u in units), 2)
+    subproc_cost = round(sum(u.get("subproc_cost_usd") or 0 for u in units), 2)
     return {
         "measured": len(measured),
         "unmeasured": len(units) - len(measured),
@@ -2471,14 +2586,22 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "recorded_cost_usd": round(
                 sum(u.get("recorded_cost_usd") or 0 for u in units), 2),
             "list_cost_usd": worker_cost,
-            # The headline: workers plus everything the OS spent on their behalf.
-            "total_cost_usd": round(worker_cost + os_cost, 2),
+            # The headline: workers, everything the OS spent on their behalf, and
+            # everything they spent below themselves.
+            "total_cost_usd": round(worker_cost + os_cost + subproc_cost, 2),
             "os_cost_usd": os_cost,
             "os_recorded_cost_usd": round(
                 sum(u.get("os_recorded_cost_usd") or 0 for u in units), 2),
             "os_calls": sum(u.get("os_calls") or 0 for u in units),
             "os_billed_input": sum(u.get("os_billed_input") or 0 for u in units),
             "os_output": sum(u.get("os_output") or 0 for u in units),
+            "subproc_cost_usd": subproc_cost,
+            "subproc_recorded_cost_usd": round(
+                sum(u.get("subproc_recorded_cost_usd") or 0 for u in units), 2),
+            "subproc_calls": sum(u.get("subproc_calls") or 0 for u in units),
+            "subproc_billed_input": sum(
+                u.get("subproc_billed_input") or 0 for u in units),
+            "subproc_output": sum(u.get("subproc_output") or 0 for u in units),
             "rewrite_cost_usd": round(sum(u["rewrite_cost_usd"] for u in measured), 2),
             "rewrite_excess": sum(u["rewrite_excess"] for u in measured),
             "resume_boundaries": sum(u["resume_boundaries"] for u in measured),
@@ -2508,17 +2631,22 @@ def _cost_for_target(target: str, project: str | None,
         finally:
             store.close()
         os_groups = _os_groups()
-        unit = _unit_row(name, wo, index, rows, os_groups.get(wo["id"], ()))
+        wo_groups = os_groups.get(wo["id"], ())
+        unit = _unit_row(name, wo, index, rows, wo_groups)
         provenance, recorded, settled, rec_totals = _turn_summary(rows)
         # The per-turn breakdown is the single-work-order payload: it is what shows
         # WHERE in a bloated work order the cost rose, turn by turn. `os_calls_detail`
         # is its counterpart for the other half of the bill — call by call, so a work
-        # order that cost four rounds of Neo says so.
+        # order that cost four rounds of Neo says so. `subproc_detail` is the third:
+        # grouped rather than listed, because one `pytest evals/llm` is forty calls and
+        # "pytest: 40 calls, $3.10" is the fact, not forty near-identical rows.
         return {"scope": target, "units": [unit], **_rollup([unit]),
                 "turns_detail": rows, "provenance": provenance,
                 "turns_recorded": recorded, "turns_settled": settled,
                 "recorded_totals": rec_totals,
-                "os_calls_detail": _os_calls_detail(wo["id"])}
+                "os_calls_detail": _os_calls_detail(wo["id"]),
+                "subproc_detail": _subproc_detail(_partition_calls(list(wo_groups))[1]),
+                "floor": True, "floor_reason": COST_FLOOR_NOTE}
 
     os_groups = _os_groups()
     store = ProjectStore(path)
@@ -2538,7 +2666,8 @@ def _cost_for_target(target: str, project: str | None,
     finally:
         store.close()
     return {"scope": fo["id"], "title": fo["title"], "status": fo["status"],
-            "units": units, **_rollup(units)}
+            "units": units, **_rollup(units),
+            "floor": True, "floor_reason": COST_FLOOR_NOTE}
 
 
 def _os_calls_detail(wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
@@ -2547,6 +2676,10 @@ def _os_calls_detail(wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
     Flattened for a table the same way `_turn_row` flattens a turn, and priced in the
     report's own currency so a reader can compare a Neo answer with a worker turn without
     doing the arithmetic in their head. `cost_usd` stays the CLI's exact figure beside it.
+
+    The worker's OWN subprocess calls are filtered out and summarised by `_subproc_detail`
+    instead. One row per call is the right shape for five panel seats and the wrong one
+    for an eval suite, which would bury them under two hundred lines saying `pytest`.
     """
     from . import agent_usage
     from . import usage as usage_mod
@@ -2558,6 +2691,8 @@ def _os_calls_detail(wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
         central.close()
     out = []
     for row in rows:
+        if agent_usage.is_subprocess(row["kind"]):
+            continue
         u = usage_mod.priced(row["model"] or "unknown", input=row["input"],
                              cache_write=row["cache_write"],
                              cache_read=row["cache_read"], output=row["output"])
@@ -2575,3 +2710,33 @@ def _os_calls_detail(wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
             "context_peak": envelope.get("context_peak") or 0,
         })
     return out
+
+
+def _subproc_detail(groups: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """What the worker spent below itself, by what ran it, dearest first.
+
+    Grouped rather than listed because of the shape of what is being counted: an OS call
+    is a deliberate, countable act (five seats on one gate review) and a subprocess call
+    comes in batches — one `pytest evals/llm` is forty. The label is the program name
+    `claude_cli._attribute_subprocess` captured, so a line reads "pytest: 40 calls,
+    ~$3.10", which is the sentence a reader of an expensive work order actually wants.
+
+    Built from the groups `agent_call_totals` already summed in SQL rather than from
+    rows, so there is no limit to truncate against and no second query.
+    """
+    from . import usage as usage_mod
+
+    out = []
+    for g in groups:
+        u = usage_mod.priced(
+            g.get("model") or "unknown", input=g.get("input") or 0,
+            cache_write=g.get("cache_write") or 0, cache_read=g.get("cache_read") or 0,
+            output=g.get("output") or 0, messages=g.get("calls") or 0)
+        out.append({
+            "label": g.get("label") or "claude -p", "model": g.get("model") or "",
+            "calls": g.get("calls") or 0, "failed": g.get("failed") or 0,
+            "cost_usd": round(g.get("cost_usd") or 0.0, 4),
+            "list_cost_usd": round(u.list_cost_usd, 4),
+            "billed_input": u.billed_input, "output": u.output,
+        })
+    return sorted(out, key=lambda g: -g["list_cost_usd"])

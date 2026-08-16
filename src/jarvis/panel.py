@@ -233,8 +233,10 @@ def _run_seat(seat: str, prompt: str, system: str, model: str, timeout: int,
         return int((time.monotonic() - started) * 1000)
 
     try:
+        # `attribute=False`: the caller records this seat itself, by name. See `neo`.
         result = claude_cli.run_headless_result(prompt, system_prompt=system, model=model,
-                                                timeout=timeout, cwd=cwd)
+                                                timeout=timeout, cwd=cwd,
+                                                attribute=False)
     except claude_cli.ClaudeCliError as e:
         log.warning("panel seat %s abstained: %s", seat, e)
         return Opinion(seat=seat, raw=str(e), status="abstained", model=model,
@@ -595,7 +597,7 @@ def _run_chair(store: NeoStore, q: dict[str, Any], cfg: NeoConfig,
     try:
         result = claude_cli.run_headless_result(prompt, system_prompt=system, model=model,
                                                 timeout=cfg.panel.timeout,
-                                                cwd=ensure_home())
+                                                cwd=ensure_home(), attribute=False)
     except claude_cli.ClaudeCliError as e:
         op = Opinion(seat="chair", raw=str(e), status="abstained", model=model,
                      latency_ms=int((time.monotonic() - started) * 1000))
