@@ -4,7 +4,6 @@ the same ops functions as the CLI. Binds to localhost by default (no auth in MVP
 from __future__ import annotations
 
 import time
-import traceback
 from collections import Counter
 from pathlib import Path
 
@@ -12,10 +11,10 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import invariants, ops
+from .. import invariants, ops, uilog
 from ..central_store import CentralStore
 from ..daemon import daemon_running
-from ..paths import PRODUCTION, deployment_env, logs_dir
+from ..paths import PRODUCTION, deployment_env
 from ..project_store import (
     FO_OPEN_STATUSES,
     OPEN_STATUSES,
@@ -127,25 +126,17 @@ def fmt_age(ts: float | None) -> str:
     return f"{int(d / 86400)}d"
 
 
-def log_ui_error(request: Request, exc: BaseException) -> None:
-    """Append a dashboard failure to `$JARVIS_HOME/logs/ui.log`.
+#: Paths the access log ignores while they succeed. `/api/status` is the dashboard's own
+#: 15-second refresh poll — left in, it is ~95% of the lines and buries the thing the
+#: access log exists to show: which pages the *user* actually opened. Failures are logged
+#: whatever the path, so a broken poll still leaves a trace.
+QUIET_PATHS = ("/api/status",)
 
-    Uvicorn already prints the traceback on stdout, but in production that is the
-    systemd journal — outside the OS's own state directory, so neither `jarvis`
-    commands nor the agents reading `logs/` can see that the UI ever broke. The
-    daemon keeps `jarvisd.log` next to the databases for exactly this reason; the
-    dashboard now does the same.
-    """
-    try:
-        d = logs_dir()
-        d.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        with (d / "ui.log").open("a") as f:
-            f.write(f"{stamp} [ERROR] {request.method} {request.url.path} — "
-                    f"{type(exc).__name__}: {exc}\n{tb}")
-    except Exception:  # noqa: BLE001 — logging must never mask the original failure
-        pass
+
+def _rel_url(request: Request) -> str:
+    """Path plus query — `?error=…` is often the whole story of a failed click."""
+    q = request.url.query
+    return request.url.path + (f"?{q}" if q else "")
 
 
 def instance_badge() -> dict[str, str | bool]:
@@ -333,15 +324,41 @@ def create_app() -> FastAPI:
         """Last line of defence: a bare "Internal Server Error" tells the user
         nothing, and a dead-end deep link out of a Telegram alert is exactly where
         they land. Name the failure on the page and put the traceback on disk."""
-        log_ui_error(request, exc)
+        uilog.record_error(request.method, request.url.path, exc)
         message = (f"Something went wrong loading {request.url.path} — "
                    f"{type(exc).__name__}: {exc}. "
-                   "The full traceback is in $JARVIS_HOME/logs/ui.log.")
+                   f"The full traceback is in {uilog.ui_log_path()}, and the daemon "
+                   "will raise it in `jarvis inbox` on its next tick.")
         try:
             return render(request, "error.html", message=message, status_code=500)
         except Exception:  # noqa: BLE001 — the chrome itself may be what broke
             return HTMLResponse(f"<h1>Something went wrong</h1><p>{message}</p>",
                                 status_code=500)
+
+    @app.middleware("http")
+    async def access_log(request: Request, call_next):
+        """One line per request in `$JARVIS_HOME/logs/ui-access.log`.
+
+        Uvicorn runs at log_level='warning' and its access log would go to the journal
+        anyway. Without this there is no record of which deep links were followed or
+        which of them failed, which is what made "I clicked the link and got an internal
+        server error" impossible to place in time.
+        """
+        t0 = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            # The handler above renders the page, but it runs *outside* this middleware
+            # (ServerErrorMiddleware is outermost), so this is the only place that sees
+            # both the failure and the elapsed time.
+            uilog.record_access(request.method, _rel_url(request), 500,
+                                (time.perf_counter() - t0) * 1000)
+            raise
+        if response.status_code >= 400 or request.url.path not in QUIET_PATHS:
+            uilog.record_access(request.method, _rel_url(request),
+                                response.status_code,
+                                (time.perf_counter() - t0) * 1000)
+        return response
 
     # -- pages ------------------------------------------------------------------
 
@@ -459,7 +476,21 @@ def create_app() -> FastAPI:
         try:
             pname, path, wo = ops.find_work_order(wo_id, name)
         except ops.OpsError as e:
-            return render(request, "error.html", message=str(e))
+            # Almost every visitor who lands here followed a deep link out of a
+            # notification, so the useful answer is "your link is stale", not the
+            # lookup's own phrasing. Say which half of the link went bad.
+            known = sorted(ops.registered_project_paths())
+            if name not in known:
+                hint = (f"This link points at project {name!r}, which the OS does not "
+                        f"know about — it was never registered, or it has since been "
+                        f"removed from the catalog. Registered projects: "
+                        f"{', '.join(known) or 'none'}.")
+            else:
+                hint = (f"Project {name!r} is registered, but it has no work order "
+                        f"{wo_id!r} — the link is from before it existed, or the work "
+                        f"order was deleted (`jarvis wo delete` erases the record).")
+            return render(request, "error.html", message=str(e), hint=hint,
+                          status_code=404)
         store = ProjectStore(path)
         try:
             events = store.list_events(wo_id)

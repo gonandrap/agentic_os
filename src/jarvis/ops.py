@@ -156,7 +156,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
     the same checks with repair enabled on every reconcile tick — this is the manual
     handle for "is the OS lying to me right now?".
     """
-    from .invariants import check_catalog, check_project, check_release_marker
+    from .invariants import check_catalog, check_os, check_project, check_release_marker
 
     # Catalog-level checks run whenever a catalog is resolvable at all: a gate that can
     # never open is a fault in the configuration, visible before any work order exists.
@@ -185,7 +185,11 @@ def run_doctor(project: str | None = None, repair: bool = False,
         if not rows:
             raise OpsError(f"unknown project: {project}")
 
-    results, total = [], 0
+    # OS-level checks first: they are about the OS itself (is the dashboard alive?),
+    # not about any one project, and `--project` must not filter them out — a fleet
+    # scoped to one project still wants to know its web UI is broken.
+    os_found = check_os()
+    results, total = [], len(os_found)
     for p in rows:
         if p["status"] != "active":
             continue
@@ -235,7 +239,13 @@ def run_doctor(project: str | None = None, repair: bool = False,
                 for v in os_violations
             ],
         })
-    out = {"repair": repair, "violations": total, "projects": results}
+    out = {
+        "repair": repair,
+        "violations": total,
+        "os": [{"invariant": v.invariant, "detail": v.detail, "repaired": v.repaired,
+                "repair": v.repair, "context": v.context} for v in os_found],
+        "projects": results,
+    }
     orphans = orphaned_worker_sessions()
     if orphans:
         out["orphaned_sessions"] = orphans
@@ -284,6 +294,25 @@ def orphaned_worker_sessions() -> list[dict[str, Any]]:
          "stop": f"claude stop {s.id}"}
         for s in named if s.session_id not in live_sessions
     ]
+
+
+def ui_health() -> dict[str, Any]:
+    """How the dashboard is doing, from its own log on disk.
+
+    Deliberately a plain read of `$JARVIS_HOME/logs/ui.log`: the UI runs in a separate
+    process (its own systemd unit in production) so there is no live handle to ask, and
+    the log is the only channel that survives it crashing outright.
+    """
+    from . import uilog
+
+    recent, total = uilog.recent_errors()
+    return {
+        "errors": total,
+        "window_seconds": uilog.ERROR_WINDOW_SECONDS,
+        "log": str(uilog.ui_log_path()),
+        "access_log": str(uilog.access_log_path()),
+        "recent": [{**e.as_dict(), "summary": e.summary} for e in recent],
+    }
 
 
 def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
@@ -481,12 +510,26 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             finally:
                 store.close()
         attention.extend(gate_items)
+        # The dashboard is part of the OS, so its failures belong in the OS's pulse.
+        # Until this, a 500 on the work-order page was known only to the systemd
+        # journal — `jarvis status` reported a healthy fleet while the UI was down.
+        ui = ui_health()
+        if ui["errors"]:
+            attention.append({
+                "project": "os", "wo_id": None,
+                "title": "dashboard errors", "status": "ui",
+                "reason": f"{ui['errors']} unhandled error"
+                          f"{'s' if ui['errors'] != 1 else ''} in the last "
+                          f"{int(ui['window_seconds'] / 3600)}h — latest: "
+                          f"{ui['recent'][0]['summary']}. Full traceback: {ui['log']}",
+            })
         return {
             "daemon": {
                 "running": pid is not None,
                 "pid": pid,
                 "catalog": central.get_state("catalog_path"),
             },
+            "ui": ui,
             "projects": projects,
             "attention": attention,
             "inbox": {
