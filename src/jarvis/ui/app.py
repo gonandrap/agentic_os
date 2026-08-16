@@ -17,6 +17,7 @@ from ..central_store import CentralStore
 from ..daemon import daemon_running
 from ..paths import PRODUCTION, deployment_env, logs_dir
 from ..project_store import (
+    ACTIVE_STATUSES,
     FO_OPEN_STATUSES,
     OPEN_STATUSES,
     TERMINAL_STATUSES,
@@ -308,6 +309,9 @@ def create_app() -> FastAPI:
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         fo_status_meta=FO_STATUS_META, level_tone=LEVEL_TONE, fmt_age=fmt_age,
+        # "a worker turn may be in flight right now", so the page can withhold the
+        # `claude --resume` invitation rather than put a second driver on one session.
+        active_statuses=ACTIVE_STATUSES,
         instance=instance_badge(),
         fmt_tok=fmt_tok, fmt_dur=fmt_dur,
     )

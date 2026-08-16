@@ -138,6 +138,46 @@ def test_waiting_input_wo_shows_resume_hint_and_auto_action(client, daemon, proj
     assert fresh["needs_attention"] == 0
 
 
+def test_wo_page_shows_the_whole_session_id(client, daemon, project):
+    """The session id is a thing to COPY, not to recognise — an abbreviation is
+    useless to `claude --resume`, so the metadata line carries every character
+    whatever the work order's status."""
+    sid = "8a53d05e-6f2b-4c19-9a7d-3e51b0c4f7d2"
+    wo = ops.create_work_order("proj_a", "long-running task")
+    daemon.tick()
+    store = ProjectStore(project)
+    store.update_work_order(wo["id"], session_id=sid)
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert sid in page
+    assert "8a53d05e…" not in page
+
+
+def test_resume_command_is_offered_only_when_no_turn_can_be_in_flight(
+        client, daemon, project):
+    """Settled work orders get the whole `claude --resume` line, ready to run — that
+    is what the id is FOR. An active one gets the id and no invitation: a headless
+    turn may be running, and a second driver on one session is how a work order ends
+    up forked off a dead conversation (kn-04e97789)."""
+    sid = "8a53d05e-6f2b-4c19-9a7d-3e51b0c4f7d2"
+    wo = ops.create_work_order("proj_a", "some task")
+    daemon.tick()
+    store = ProjectStore(project)
+    store.update_work_order(wo["id"], session_id=sid)
+
+    for status in ("dispatching", "running"):
+        store.set_status(wo["id"], status)
+        page = client.get(f"/wo/proj_a/{wo['id']}").text
+        assert sid in page, f"the id itself is always shown ({status})"
+        assert f"claude --resume {sid}" not in page, f"no invitation while {status}"
+
+    for status in ("needs_review", "waiting_pr_merge", "completed", "failed",
+                   "cancelled"):
+        store.set_status(wo["id"], status)
+        page = client.get(f"/wo/proj_a/{wo['id']}").text
+        assert f"claude --resume {sid}" in page, f"ready to run once {status}"
+
+
 def test_wo_page_anchors_pending_at_what_needs_the_user(client, daemon):
     """Notifications deep-link to #pending; it must land on the live ask, and the
     page must never emit two of them."""
