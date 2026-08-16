@@ -641,12 +641,12 @@ def test_dismiss_from_the_dashboard_clears_the_command_without_approving_it(gate
     approve does to the record."""
     from jarvis.hooks import preflight_decision
 
-    command = "grep -rn shipit.sh src/jarvis/gates.py"
-    approval = gated.request(command=command, why="read-only, greps a file")
+    command = "uv run pytest tests/test_release_staging.py -k shipit"
+    approval = gated.request(command=command, why="this runs a test; the literal is a -k selector")
 
     r = gated.client.post(f"/gates/{approval['id']}/decide",
                           data={"decision": "dismiss",
-                                "reason": "the literal is inside a search pattern",
+                                "reason": "the literal is a -k test selector",
                                 "project": "proj_a", "next": "/gates"})
     assert r.status_code == 303
 
@@ -672,7 +672,7 @@ def test_dismiss_from_the_dashboard_clears_the_command_without_approving_it(gate
 def test_dismiss_from_the_dashboard_needs_a_reason(gated):
     """The reason is the defect report on the recogniser — the only thing attached to
     the false-positive count that says what actually went wrong."""
-    approval = gated.request(command="grep -rn shipit.sh src/")
+    approval = gated.request(command="uv run pytest tests/test_release_staging.py -k shipit")
 
     r = gated.client.post(f"/gates/{approval['id']}/decide",
                           data={"decision": "dismiss", "reason": " ",
