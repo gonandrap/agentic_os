@@ -97,7 +97,15 @@
      are different answers. #}
   {% if cost %}
   <p class="kv mono" style="margin-bottom:0;">
-    <span title="Anthropic list prices, as a common unit for comparing token kinds — not a bill.">~${{ '%.2f'|format(cost.list_cost_usd) }}</span>
+    <span title="Anthropic list prices, as a common unit for comparing token kinds — not a bill. The worker's own conversation plus everything Jarvis spent on this order.">~${{ '%.2f'|format(cost.total_cost_usd) }}</span>
+    {# The split the total hides: what the worker cost, and what the OS cost answering
+       for it. A reader who only sees one number concludes Neo is free. #}
+    {%- if cost.os_calls %}
+      · <span title="The worker's own session.">worker
+        {% if cost.found %}~${{ '%.2f'|format(cost.list_cost_usd) }}{% else %}not measurable{% endif %}</span>
+      · <span title="Neo answering this work order's questions, the panel's seats deliberating on them, and the dashboard digests written for them.">jarvis
+        ~${{ '%.2f'|format(cost.os_cost_usd) }} / {{ cost.os_calls }} call{{ 's' if cost.os_calls != 1 }}</span>
+    {%- endif %}
     · {{ fmt_tok(cost.billed_input) }} in / {{ fmt_tok(cost.output) }} out
     · {{ cost.turns }} turn{{ 's' if cost.turns != 1 }}
     {%- if cost.subagent_count %} · {{ cost.subagent_count }} subagent{{ 's' if cost.subagent_count != 1 }}

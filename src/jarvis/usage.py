@@ -1,15 +1,21 @@
-"""Token accounting: what a work order actually cost.
+"""Token accounting: what a WORKER's conversation actually cost.
 
-Jarvis records no token usage of its own — nothing in the three databases has ever
-carried a token count — so the only ledger is the one Claude Code already keeps: a
-JSONL transcript per session under `~/.claude/projects/<slug>/<session-id>.jsonl`,
-with a `usage` object on every assistant message. This module reads those and
-attributes the spend back to the work order that caused it, via
-`work_orders.session_id`.
+This module reads the ledger Claude Code keeps for a worker's session: a JSONL
+transcript per session under `~/.claude/projects/<slug>/<session-id>.jsonl`, with a
+`usage` object on every assistant message. It attributes that spend back to the work
+order that caused it, via `work_orders.session_id`.
 
 Read-only, and deliberately outside the store layer: it derives a fact about a work
 order from a file Jarvis does not own and cannot repair, so there is nothing to
 persist and nothing to reconcile.
+
+THIS IS NOT THE WHOLE BILL, and it never was. A work order also costs whatever Jarvis
+itself spent on it — Neo answering its questions, the panel's seats deliberating, the
+digest shortening the result for the dashboard. Those are one-shot `claude -p` calls
+with no session Jarvis owns and nothing in their transcripts naming a work order, so
+they cannot be recovered this way at all: they are recorded as they happen, in
+`agent_usage`, and `ops.cost_report` adds the two together (and shows the split, because
+"the OS spent a third of this work order's tokens on itself" is the fact worth seeing).
 
 ## The re-write tax, and why it gets its own number
 
@@ -292,6 +298,33 @@ def _usage_of(path: Path) -> Usage:
         if cost:
             usage.cost_by_model[model] = usage.cost_by_model.get(model, 0.0) + cost
     usage.rewrite_excess = max(0, usage.cache_write - usage.context_peak)
+    return usage
+
+
+def priced(model: str, *, input: int = 0, cache_write: int = 0, cache_read: int = 0,
+           output: int = 0, messages: int = 0) -> Usage:
+    """Token counts a caller already holds, priced the same way a transcript's are.
+
+    The OS's own calls (`agent_usage`) arrive as counts from the CLI's result JSON rather
+    than as transcript rows, and their exact dollar figure comes from the CLI too. This
+    exists so they can ALSO be expressed in this module's currency — Anthropic list
+    prices — because that is the only way OS spend and worker spend can be added into one
+    number without mixing an exact figure with an estimate. The two accountings are kept
+    side by side everywhere else for the same reason; see `ops._turn_summary`.
+
+    No `context_peak` and no `rewrite_excess`: both are properties of a CONVERSATION, and
+    a one-shot OS call has none. Leaving them zero is what keeps a hundred Neo calls from
+    reading as a re-write problem they cannot have.
+    """
+    in_rate, out_rate = price_for(model)
+    usage = Usage(messages=messages, input=input, cache_write=cache_write,
+                  cache_read=cache_read, output=output)
+    cost = (input * in_rate
+            + cache_write * in_rate * CACHE_WRITE_RATE
+            + cache_read * in_rate * CACHE_READ_RATE
+            + output * out_rate) / 1e6
+    if cost:
+        usage.cost_by_model[model] = cost
     return usage
 
 

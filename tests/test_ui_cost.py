@@ -198,6 +198,105 @@ def test_the_drilldown_labels_a_transcript_only_work_order_an_estimate(
     assert "estimate" in page.text
 
 
+# -- what Jarvis itself spent ---------------------------------------------------------
+#
+# The half of the bill that had no surface at all: Neo answering the work order's
+# questions, the panel's seats deliberating on them, the digest shortening the result.
+# The page has to show the TOTAL and the SPLIT — a total alone hides that the OS spends
+# on a work order at all, and a worker figure alone reads as the whole bill.
+
+
+def add_os_calls(wo_id: str, *, seats: int = 0, neo_calls: int = 0,
+                 output: int = 1_000) -> None:
+    """Record OS-side calls against a work order, as the daemon's would be."""
+    from jarvis import agent_usage
+
+    for i in range(neo_calls):
+        agent_usage.record("neo_answer", project="proj_a", wo_id=wo_id,
+                           label="question", model="claude-opus-5", question_id=i + 1,
+                           usage={"total_cost_usd": 0.02, "input": 10,
+                                  "cache_write": 5_000, "cache_read": 20_000,
+                                  "output": output})
+    for seat in ("premise", "record", "blast", "taste", "chair")[:seats]:
+        agent_usage.record("panel_seat", project="proj_a", wo_id=wo_id, label=seat,
+                           model="claude-opus-5", question_id=1,
+                           usage={"total_cost_usd": 0.01, "input": 10,
+                                  "cache_write": 2_000, "cache_read": 8_000,
+                                  "output": output})
+
+
+def test_the_cost_page_splits_the_fleet_total_into_workers_and_jarvis(
+        client, project, transcript):
+    wo = ops.create_work_order("proj_a", "an ask that asked back")
+    transcript("sess-split", write_tok=100_000, out=5_000)
+    give_session(project, wo["id"], "sess-split")
+    add_os_calls(wo["id"], neo_calls=2, seats=5)
+
+    page = client.get("/cost")
+    assert page.status_code == 200
+    assert "workers ~$" in page.text and "jarvis ~$" in page.text
+    assert "7 calls" in page.text
+    # And per work order, with what the spend went ON: five seats is a shape a total
+    # can never make visible.
+    assert "5 panel seat" in page.text and "2 Neo answering" in page.text
+
+
+def test_a_work_order_with_no_transcript_still_shows_what_jarvis_spent_on_it(
+        client, project):
+    """The OS's own calls are the OS's own record. They do not depend on a file Claude
+    Code is free to prune, so pruning must not hide them."""
+    wo = ops.create_work_order("proj_a", "pruned but not free")
+    give_session(project, wo["id"], "sess-long-gone")
+    add_os_calls(wo["id"], neo_calls=3)
+
+    fleet = client.get("/cost")
+    # "$x+": the jarvis half is known, the worker half is not — never a bare total that
+    # would read as the whole bill.
+    assert "+" in fleet.text and "no transcript left to measure" in fleet.text
+    assert "jarvis ~$" in fleet.text
+
+    page = client.get(f"/wo/proj_a/{wo['id']}")
+    assert "jarvis" in page.text and "3 calls" in page.text
+    assert "not measurable" in page.text
+
+
+def test_the_work_order_page_shows_the_split_not_just_the_total(client, project,
+                                                                transcript):
+    wo = ops.create_work_order("proj_a", "priced with help")
+    transcript("sess-helped", write_tok=200_000, out=10_000)
+    give_session(project, wo["id"], "sess-helped")
+    add_os_calls(wo["id"], neo_calls=1)
+
+    page = client.get(f"/wo/proj_a/{wo['id']}")
+    assert page.status_code == 200
+    assert "worker" in page.text and "jarvis" in page.text and "1 call" in page.text
+
+
+def test_the_drilldown_lists_jarvis_own_calls_one_row_per_seat(client, project):
+    """The table that answers "why did an order I never touched cost three dollars"."""
+    wo = ops.create_work_order("proj_a", "panelled")
+    add_recorded_turn(project, wo["id"], 0.05, 48_000)
+    add_os_calls(wo["id"], seats=5, neo_calls=1)
+
+    page = client.get(f"/cost/proj_a/{wo['id']}")
+    assert page.status_code == 200
+    assert "What jarvis itself spent on" in page.text
+    for seat in ("premise", "record", "blast", "taste", "chair"):
+        assert seat in page.text
+    assert "panel seat 5" in page.text
+
+
+def test_the_drilldown_says_so_when_jarvis_spent_nothing(client, project):
+    """Zero here is a real answer — the work order asked Neo nothing — and it is worth
+    saying, because the reader's next question is where the rest went."""
+    wo = ops.create_work_order("proj_a", "self-sufficient")
+    add_recorded_turn(project, wo["id"], 0.05, 48_000)
+
+    page = client.get(f"/cost/proj_a/{wo['id']}")
+    assert page.status_code == 200
+    assert "asked Neo nothing" in page.text
+
+
 def test_the_cost_tab_is_reachable_from_every_page(client):
     """A surface nobody can find is the bug this work order was filed about."""
     assert '<a href="/cost"' in client.get("/").text

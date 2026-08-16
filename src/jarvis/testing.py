@@ -161,6 +161,34 @@ with open(os.path.join(calls_dir, f"{time.time_ns()}-{os.getpid()}.json"), "w") 
 def opt(name, default=None):
     return argv[argv.index(name) + 1] if name in argv else default
 
+def emit_headless(result_text):
+    """A one-shot `claude -p --output-format json` envelope, usage included.
+
+    THE USAGE OBJECT IS NOT DECORATION. Every OS-side call (Neo, a panel seat, a digest)
+    reads it back and records what the call cost against the work order that caused it
+    (`agent_usage`), so a fake that emitted only `result` would leave that whole path
+    untested — and the numbers here are what the accounting assertions are written
+    against. Same field shape as the worker-turn envelope above, one API call's worth.
+    """
+    print(json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "session_id": "sess-headless", "result": result_text,
+        "num_turns": 1, "total_cost_usd": 0.002, "duration_api_ms": 400,
+        "usage": {
+            "input_tokens": 5, "cache_creation_input_tokens": 200,
+            "cache_read_input_tokens": 800, "output_tokens": 60,
+            "cache_creation": {"ephemeral_1h_input_tokens": 0,
+                               "ephemeral_5m_input_tokens": 200},
+            "iterations": [{"type": "message", "input_tokens": 5, "output_tokens": 60,
+                            "cache_read_input_tokens": 800,
+                            "cache_creation_input_tokens": 200}],
+        },
+        "modelUsage": {opt("--model", "claude-fake-1"): {
+            "inputTokens": 5, "outputTokens": 60, "cacheReadInputTokens": 800,
+            "cacheCreationInputTokens": 200, "costUSD": 0.002,
+            "contextWindow": 200000, "maxOutputTokens": 32000}},
+    }))
+
 if "--version" in argv:
     print("9.9.9 (fake claude)")
 elif argv[:1] == ["agents"]:
@@ -315,17 +343,17 @@ elif "-p" in argv and "--resume" not in argv:
         if "FORCE_DIGEST_GARBAGE" in prompt:
             # No `headline`: the shape the validator must refuse. `structured.request`
             # retries once and then raises, which is what the daemon records.
-            print(json.dumps({"result": json.dumps({"bullets": ["a", "b"]})}))
+            emit_headless(json.dumps({"bullets": ["a", "b"]}))
             sys.exit(0)
         head = prompt.strip().splitlines()[0][:80]
-        print(json.dumps({"result": json.dumps({
+        emit_headless(json.dumps({
             "headline": f"digest of: {head}",
             # Seven, so a test can prove the FIVE-item cap is enforced in the validator
             # and not merely requested in the prompt.
             "bullets": [f"point {i}" for i in range(1, 8)],
             "options": ["option A — cheap", "option B — thorough"],
             "recommendation": "option A",
-        })}))
+        }))
         sys.exit(0)
     # A PANEL SEAT, AND THIS BRANCH COMES FIRST DELIBERATELY. Seat identity travels in
     # --append-system-prompt, never in the user prompt: a premise-seat call on a gate
@@ -342,7 +370,7 @@ elif "-p" in argv and "--resume" not in argv:
         if seat in [s for s in os.environ.get("FAKE_SEAT_FAIL", "").split(",") if s]:
             sys.stderr.write(f"seat {seat} failed (test-forced)\n"); sys.exit(1)
         if "FORCE_SEAT_GARBAGE" in prompt and seat == "premise":
-            print(json.dumps({"result": "the premise here is, well, hard to say"}))
+            emit_headless("the premise here is, well, hard to say")
             sys.exit(0)
         tail = prompt.splitlines()[-1][:60]
         # NOTE: no seat name appears in any `answer` below, and that is load-bearing
@@ -402,7 +430,7 @@ elif "-p" in argv and "--resume" not in argv:
             elif seat == "taste" and "FORCE_INTENT_ESCALATE" in prompt:
                 reply = {"escalate": True, "veto": True, "answer": "",
                          "reason": "test-forced objection that must force nothing"}
-        print(json.dumps({"result": json.dumps(reply)}))
+        emit_headless(json.dumps(reply))
         sys.exit(0)
     if "FORCE_FAIL" in prompt:
         sys.stderr.write("model call failed (test-forced)\n"); sys.exit(1)
@@ -410,7 +438,7 @@ elif "-p" in argv and "--resume" not in argv:
         verdict = {"escalate": True, "answer": "",
                    "reason": "test-forced escalation"}
     elif "FORCE_GARBAGE" in prompt:
-        print(json.dumps({"result": "I think you should maybe do the thing?"}))
+        emit_headless("I think you should maybe do the thing?")
         sys.exit(0)
     elif "PRIVILEGED ACTION REQUEST" in prompt:
         # A gate review, which speaks a different verdict shape: the decision lives in
@@ -459,7 +487,7 @@ elif "-p" in argv and "--resume" not in argv:
         # too: answering and noticing the record is wrong are independent.
         verdict["dispatch"] = {"title": "test-forced ledger cleanup",
                                "description": "entries A and B contradict; B won"}
-    print(json.dumps({"result": json.dumps(verdict)}))
+    emit_headless(json.dumps(verdict))
 else:
     sys.stderr.write(f"fake claude: unhandled argv {argv}\n"); sys.exit(2)
 '''

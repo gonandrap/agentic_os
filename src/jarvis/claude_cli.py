@@ -711,10 +711,37 @@ def kill_process_group(pid: int | None) -> bool:
             return False
 
 
-def run_headless(prompt: str, system_prompt: str | None = None,
-                 model: str | None = None, cwd: Path | None = None,
-                 timeout: int = 300, tools: str | None = None) -> str:
-    """One-shot headless call (`claude -p`) returning the result text.
+@dataclass
+class HeadlessResult:
+    """One `claude -p` one-shot call: what it said, and what it cost.
+
+    `usage` is the SAME envelope `derive_turn_usage` compacts out of a worker turn's
+    result JSON, so the OS's own calls (Neo, the panel's seats, the digest) and its
+    workers' turns are accounted in one shape and can be added up together. None when
+    the CLI emitted no usage object — an old CLI, or output that did not parse as JSON
+    at all — which is an absence, never a zero.
+    """
+
+    text: str
+    usage: dict[str, Any] | None = None
+    session_id: str = ""
+    #: The model that actually served the call, read back from `modelUsage` where the
+    #: CLI reports it and falling back to the one that was asked for. Recorded because
+    #: the caller's `--model` may be an alias, and an OS call priced against the wrong
+    #: family is a wrong number in the only report that says what Jarvis costs.
+    model: str = ""
+
+
+def run_headless_result(prompt: str, system_prompt: str | None = None,
+                        model: str | None = None, cwd: Path | None = None,
+                        timeout: int = 300, tools: str | None = None) -> HeadlessResult:
+    """One-shot headless call (`claude -p`), with its accounting kept.
+
+    The transport every OS-side agent runs on — Neo, the panel's seats, the dashboard
+    digest. Same call `run_headless` makes; the difference is that the usage object the
+    CLI puts in its own result JSON is READ rather than thrown away. Jarvis spends real
+    tokens answering its workers' questions, and a spend nobody records is a spend
+    nobody can see (see `agent_usage`, which is where these envelopes are persisted).
 
     Used by Neo: the system prompt (persona + learnings) is byte-stable across
     calls, so consecutive invocations within the Anthropic cache TTL share a
@@ -738,9 +765,46 @@ def run_headless(prompt: str, system_prompt: str | None = None,
     out = _run(args, cwd=cwd, timeout=timeout)
     try:
         data = json.loads(out)
-        return data.get("result", "")
     except json.JSONDecodeError:
-        return out
+        # Not JSON at all: the text is still the answer (that is what `run_headless`
+        # has always returned here), and there is simply nothing to account.
+        return HeadlessResult(text=out, model=model or "")
+    if not isinstance(data, dict):
+        return HeadlessResult(text=out, model=model or "")
+    served = [name for name in (data.get("modelUsage") or {})]
+    return HeadlessResult(
+        text=data.get("result", ""),
+        usage=derive_turn_usage(data),
+        session_id=data.get("session_id") or "",
+        # One key is the ordinary case; more than one means the call was served by
+        # several models and no single name is honest, so the requested one stands.
+        model=(served[0] if len(served) == 1 else "") or model or "",
+    )
+
+
+def run_headless(prompt: str, system_prompt: str | None = None,
+                 model: str | None = None, cwd: Path | None = None,
+                 timeout: int = 300, tools: str | None = None) -> str:
+    """`run_headless_result`, keeping only the text.
+
+    Kept for callers that have nothing to account against — and for the `call=` seams,
+    whose fakes return a plain string. Anything the OS pays for should call
+    `run_headless_result` and record what comes back.
+    """
+    return run_headless_result(prompt, system_prompt=system_prompt, model=model,
+                               cwd=cwd, timeout=timeout, tools=tools).text
+
+
+def unpack_headless(value: HeadlessResult | str) -> tuple[str, dict[str, Any] | None]:
+    """(text, usage) from whichever of the two a transport seam returned.
+
+    The `call=` seam in `structured.request` predates usage capture and its test fakes
+    return bare strings. Rather than force every one of them to grow a dataclass, both
+    shapes are accepted here: a string is text with nothing to account.
+    """
+    if isinstance(value, HeadlessResult):
+        return value.text, value.usage
+    return value, None
 
 
 def session_transcript_path(cwd: Path, session_id: str) -> Path:

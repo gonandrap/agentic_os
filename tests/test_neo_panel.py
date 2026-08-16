@@ -647,9 +647,10 @@ def test_the_per_seat_timeout_reaches_the_model_call(store, monkeypatch):
     def recorder(prompt, system_prompt=None, model=None, timeout=300, cwd=None,
                  tools=None):
         seen.append(timeout)
-        return json.dumps({"escalate": False, "answer": "a", "reason": "r"})
+        return panel.claude_cli.HeadlessResult(
+            text=json.dumps({"escalate": False, "answer": "a", "reason": "r"}))
 
-    monkeypatch.setattr(panel.claude_cli, "run_headless", recorder)
+    monkeypatch.setattr(panel.claude_cli, "run_headless_result", recorder)
     q = claim(store, "which delimiter?")
 
     panel.decide(store, q, cfg(timeout=17))

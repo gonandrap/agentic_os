@@ -17,13 +17,39 @@
 
 <div class="panel" style="margin-top: 14px; padding: 14px 16px;">
   <p style="margin: 0 0 6px; font-size: 22px;" class="mono">
-    ~${{ '%.2f'|format(totals.list_cost_usd) }}</p>
+    ~${{ '%.2f'|format(totals.total_cost_usd) }}</p>
+  {# Tokens for BOTH halves, because the figure above them is both halves. Quoting the
+     workers' tokens under a total that includes the OS's would not add up. #}
   <p class="kv mono" style="margin: 0;">
-    {{ fmt_tok(totals.billed_input) }} in · {{ fmt_tok(totals.output) }} out ·
+    {{ fmt_tok(totals.billed_input + totals.os_billed_input) }} in ·
+    {{ fmt_tok(totals.output + totals.os_output) }} out ·
     {{ report.measured }} work order{{ 's' if report.measured != 1 }} measured
     {%- if report.unmeasured %}, {{ report.unmeasured }} whose transcript Claude Code has
       already pruned{% endif %}
   </p>
+  {# The split, stated right under the headline: the workers' own conversations, and what
+     the OS spent answering for them. Both halves are list-priced, so they add up. #}
+  <div class="kv" style="margin: 10px 0 0; display: flex; gap: 22px; flex-wrap: wrap;">
+    <span class="mono"><strong>workers ~${{ '%.2f'|format(totals.list_cost_usd) }}</strong>
+      <span class="sub">the sessions Jarvis dispatched</span></span>
+    <span class="mono"><strong>jarvis ~${{ '%.2f'|format(totals.os_cost_usd) }}</strong>
+      <span class="sub">
+        {%- if totals.os_calls %}{{ totals.os_calls }} call{{ 's' if totals.os_calls != 1 }} —
+          Neo answering, panel seats, digests
+        {%- else %}nothing recorded yet{% endif %}</span></span>
+  </div>
+  {% if totals.os_calls %}
+  <p class="kv" style="margin: 6px 0 0;">
+    That second figure is spend no work order's transcript contains: Neo, the panel and
+    the digest are one-shot calls with no session Jarvis owns, so they are recorded as
+    they happen ({{ fmt_tok(totals.os_billed_input) }} in ·
+    {{ fmt_tok(totals.os_output) }} out) and survive transcript pruning.
+    {%- if report.os_unattributed and report.os_unattributed.os_calls %}
+      {{ report.os_unattributed.os_calls }} of them
+      (~${{ '%.2f'|format(report.os_unattributed.os_cost_usd) }}) belong to no work order.
+    {%- endif %}
+  </p>
+  {% endif %}
   {% if totals.rewrite_excess %}
   <p class="kv" style="margin: 8px 0 0;">
     <strong>Re-write tax ~${{ '%.2f'|format(totals.rewrite_cost_usd) }}</strong> —
@@ -44,8 +70,11 @@
 <div class="panel" style="margin-top: 14px;">
   {% for u in units %}
   <div class="row">
-    <span class="mono" style="width: 76px; text-align: right; color: var(--ink);">
-      {%- if u.found %}${{ '%.2f'|format(u.list_cost_usd) }}{% else %}—{% endif -%}
+    <span class="mono" style="width: 76px; text-align: right; color: var(--ink);"
+          title="Worker plus jarvis. {% if u.os_calls %}~${{ '%.2f'|format(u.os_cost_usd) }} of it is jarvis.{% endif %}">
+      {%- if u.found %}${{ '%.2f'|format(u.total_cost_usd) }}
+      {%- elif u.os_calls %}${{ '%.2f'|format(u.os_cost_usd) }}+
+      {%- else %}—{% endif -%}
     </span>
     {# A work order title is a whole paragraph of user intent often enough that letting
        it wrap turns this table into a wall. Clamped rather than truncated server-side:
@@ -63,6 +92,12 @@
           {%- if u.subagent_count %} · {{ u.subagent_count }} subagent{{ 's' if u.subagent_count != 1 }}{% endif %}
         {%- else %}
           no transcript left to measure
+        {%- endif %}
+        {#- What Jarvis spent on this order, always shown when there is any: it is the
+            half nobody knew about, and on a short work order it can be most of the bill. -#}
+        {%- if u.os_calls %} · jarvis ~${{ '%.2f'|format(u.os_cost_usd) }}
+          ({{ u.os_calls }} call{{ 's' if u.os_calls != 1 }}
+          {%- for k in u.os_by_kind %}{{ ', ' if not loop.first else ': ' }}{{ k.calls }} {{ k.label }}{% endfor %})
         {%- endif %}
         {# the drill-down: turn-by-turn cost and context growth. Present even when the
            transcript is gone — recorded turn rows are the OS's own and outlive it. #}
@@ -82,9 +117,10 @@
    a subscription user reading it as an invoice is the likeliest misreading. #}
 <p class="sub" style="margin-top: 14px;">
   Anthropic list prices, as a common unit for comparing a cache-read token with an output
-  token — not a bill. Read back from Claude Code's own session transcripts; Jarvis stores
-  no usage of its own, so a work order whose transcript has been pruned reads “—” rather
-  than zero.
+  token — not a bill. A worker's spend is read back from Claude Code's own session
+  transcripts, so a work order whose transcript has been pruned reads “—” rather than
+  zero; Jarvis's own calls are recorded by the OS as it makes them, so those are shown
+  even there (as “$x+”: the jarvis half is known, the worker half is not).
 </p>
 
 {% endblock %}

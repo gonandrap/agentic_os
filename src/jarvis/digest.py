@@ -100,7 +100,7 @@ Output STRICT JSON, nothing else, with exactly these keys:
 #: `src/jarvis/panel.py` will go and READ `src/jarvis/panel.py`, and then the page shows
 #: the reader a description of the code instead of a shortening of the question — a
 #: failure mode that looks like a good answer, which is the worst kind.
-CALL = partial(claude_cli.run_headless, tools="")
+CALL = partial(claude_cli.run_headless_result, tools="")
 
 
 class DigestError(RuntimeError):
@@ -164,7 +164,8 @@ def validate(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def summarise(question: str, *, model: str, timeout: int = 120,
-              call: Callable[..., str] = CALL) -> dict[str, Any]:
+              call: Callable[..., Any] = CALL,
+              on_usage: Callable[[Any], None] | None = None) -> dict[str, Any]:
     """One digest for one question. Raises rather than returning a broken shape.
 
     Two attempts: unlike Neo's answering path — which must fail SAFE, turning garbage
@@ -186,6 +187,9 @@ def summarise(question: str, *, model: str, timeout: int = 120,
         # directory would pull that repo's CLAUDE.md into the prompt.
         cwd=ensure_home(),
         call=call,
+        # A digest is an extra call per question that the user never asked for, so what
+        # it costs belongs on the work order's bill beside the answer it shortens.
+        on_usage=on_usage,
     )
 
 

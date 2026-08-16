@@ -284,20 +284,32 @@ def parse_verdict(raw: str) -> dict[str, Any]:
 
 
 def answer_question(store: NeoStore, q: dict[str, Any], model: str,
-                    learnings_limit: int = 50, timeout: int = 300) -> dict[str, Any]:
-    """One Neo call for one claimed question. Returns the parsed verdict."""
+                    learnings_limit: int = 50, timeout: int = 300,
+                    record: Any = None) -> dict[str, Any]:
+    """One Neo call for one claimed question. Returns the parsed verdict.
+
+    `record(kind, usage=…, …)` is the accounting seam (`agent_usage.record` by default):
+    answering a worker's question costs tokens, and they belong to the work order that
+    asked. Recorded before the reply is parsed, because an unparseable answer was paid
+    for just the same.
+    """
+    from . import agent_usage
     from .paths import ensure_home
 
+    record = record or agent_usage.record
     system = build_system_prompt(store, q["project"], learnings_limit,
                                  kind=q.get("kind") or "question")
     prompt = build_question_prompt(q)
-    raw = claude_cli.run_headless(
+    result = claude_cli.run_headless_result(
         prompt, system_prompt=system, model=model, timeout=timeout,
         # Neutral cwd: running from a project dir would pull that repo's
         # CLAUDE.md/context into Neo's prompt (and break prefix stability).
         cwd=ensure_home(),
     )
-    return parse_verdict(raw)
+    record("neo_answer", usage=result, project=q.get("project") or "",
+           wo_id=q.get("wo_id") or "", label=q.get("kind") or "question",
+           model=result.model or model, question_id=q.get("id"))
+    return parse_verdict(result.text)
 
 
 def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,

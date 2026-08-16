@@ -643,6 +643,7 @@ class Daemon:
         first time a long-running instance upgrades into this feature — the rest are
         picked up next tick, and until then they render in full.
         """
+        from . import agent_usage
         from . import digest as digest_mod
         from .neo_store import NeoStore
 
@@ -652,7 +653,14 @@ class Daemon:
             for q in store.questions_needing_digest(digest_mod.MIN_CHARS,
                                                     limit=DIGEST_BATCH):
                 try:
-                    view = digest_mod.summarise(q["question"], model=model)
+                    view = digest_mod.summarise(
+                        q["question"], model=model,
+                        # The question knows which work order it came from, and the
+                        # transport does not — so the attribution is bound here.
+                        on_usage=agent_usage.recorder(
+                            "digest", project=q.get("project") or "",
+                            wo_id=q.get("wo_id") or "", model=model,
+                            question_id=q["id"]))
                 except Exception as e:  # noqa: BLE001 — a digest is never worth a crash
                     # Recorded, not retried: see `digest.encode_failure`. The page falls
                     # back to the full question, which is what it showed before.
