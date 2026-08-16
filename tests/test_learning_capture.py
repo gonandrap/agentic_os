@@ -167,12 +167,21 @@ def test_missing_memory_file_does_not_raise(wo, project, memory_dir):
 
 
 def test_injected_settings_register_the_posttooluse_hook(jarvis_home):
+    """The capture is only reachable if the settings fire the hook on a memory write.
+
+    Asserted as coverage rather than as a literal matcher string: the entry used to
+    match `Write|Edit|NotebookEdit` and is now unmatched, because the same hook also
+    carries the post-compaction brief and that must not wait for a file edit
+    (tests/test_compaction_checkpoint.py). Either shape satisfies this capture — what
+    would break it is an entry that stops covering the write tools.
+    """
     from jarvis.bootstrap import build_settings
 
     hooks = build_settings({})["hooks"]
     assert "PostToolUse" in hooks
-    matchers = [h.get("matcher", "") for h in hooks["PostToolUse"]]
-    assert any("Write" in m and "Edit" in m for m in matchers)
+    for tool in ("Write", "Edit", "NotebookEdit"):
+        assert any("matcher" not in h or tool in h["matcher"] for h in hooks["PostToolUse"]), (
+            f"no PostToolUse entry fires for {tool}, so memory writes go uncaptured")
 
 
 def test_worker_prompt_points_memory_at_the_knowledge_base(project):

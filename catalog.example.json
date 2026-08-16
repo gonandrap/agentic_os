@@ -4,7 +4,9 @@
     "defaults": {
       "model": "claude-opus-5",
       "permission_mode": "auto",
-      "max_concurrent": 5
+      "max_concurrent": 5,
+      "$comment_autocompact": "how large a worker's conversation may grow before Claude Code compacts it (claude --autocompact). Every API call re-reads the whole conversation, so this multiplies into the bill on every call; 100000-1000000, or null for the model's own window",
+      "autocompact_window": 150000
     },
     "notifications": {
       "sinks": ["log", "telegram"],
@@ -22,7 +24,9 @@
       "$comment": "Neo answers worker questions on your behalf; review its answers in the UI's neo tab",
       "enabled": true,
       "model": "opus",
-      "learnings_limit": 50
+      "learnings_limit": 50,
+      "$comment_digest": "which model shortens an over-long question for the neo tab; \"\" turns it off and every question renders in full",
+      "digest_model": "haiku"
     }
   },
   "projects": [

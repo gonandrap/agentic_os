@@ -16,9 +16,17 @@ running fleet.
 | Git | branch `main` (trunk) | detached at tag `jarvis-X.Y.Z` |
 | Run | `uv run jarvis …` (manual) | `systemctl --user … jarvis` / `jarvis-ui` (services) |
 | `JARVIS_HOME` | `~/.jarvis` (default) | `$PRODUCTION_CODE/state` |
+| `JARVIS_ENV` | unset | `production` (set by the units) |
 | Catalog | `catalogs/gonzalo.json` (empty / test projects) | `$PRODUCTION_CODE/config/catalog.json` (real fleet) |
 | Secrets | none | `$PRODUCTION_CODE/secrets/jarvis.env` |
 | UI port | 8788 | 8787 |
+
+Both dashboards say which one they are, in the header: an amber **`prod`** badge on
+production, a muted **`dev`** one otherwise, each followed by the running version
+(hover for the full detail). `JARVIS_ENV` decides when it is set; otherwise the code's
+own location does — a checkout under `$PRODUCTION_CODE/jarvis_os` is production — so an
+instance deployed before this existed still labels itself correctly. Anything
+undetectable reads as `dev`, never as `prod`.
 
 `JARVIS_HOME` is what keeps them apart: separate pidfiles, databases, and logs, so both
 daemons can run at once without clashing. The dev catalog and `MIGRATION.md` are
@@ -60,6 +68,52 @@ intentionally lags behind the shipped one.
 > `release` and refs named `release/…` (a file/directory conflict), so the release line
 > is the versioned `release/jarvis-X.Y.Z` branches plus `jarvis-X.Y.Z` tags.
 
+### Staged releases (`--stage`) — shipping from a work order
+
+A worker `claude` process lives inside `jarvis.service`'s cgroup, so a release run
+from a Jarvis-dispatched work order kills its own worker when the daemon restarts:
+the final turn dies mid-report, and the work order settles `failed` even though the
+release fully applied (that is exactly how v0.5.1 shipped — see
+`docs/superpowers/specs/2026-08-10-why-a-self-ship-reports-failure.md`). A self-ship
+therefore **stages** instead of restarting:
+
+```bash
+scripts/shipit.sh --stage 1.4.0 --wo wo-abc12345
+```
+
+This performs every release step — preconditions, release branch, bump + tag, push,
+deploy of the tag to `$PRODUCTION_CODE/jarvis_os`, `uv sync` — **except** the service
+restarts and the Telegram notify, then writes a marker file
+`$JARVIS_HOME/run/pending_release.json`:
+
+```json
+{"wo_id": "wo-abc12345", "project": "jarvis_os", "version": "1.4.0",
+ "tag": "jarvis-1.4.0", "staged_at": 1786500000, "state": "staged"}
+```
+
+The daemon finishes the job (`src/jarvis/release.py`):
+
+1. **Restart, once the worker has settled.** Every reconcile tick the daemon checks
+   the marker; when it is `staged` and the named work order has **no running turn**
+   — i.e. the shipping worker has finished reporting — it appends a timeline event,
+   rewrites the marker to `restarting`, restarts `jarvis-ui.service` inline and hands
+   `jarvis.service` to a detached `systemd-run` unit (the restart outlives the daemon
+   it kills).
+2. **Verify on boot.** The new daemon, before its first tick, checks that the
+   production checkout's `pyproject.toml` version equals the marker's **and** that
+   `ExecMainStartTimestamp` of *both* units is newer than the restart (never
+   `is-active`, never `git describe` — both lie during a half-apply). On success it
+   settles the work order as `completed`, sends the release notification through the
+   normal inbox → sinks path, and deletes the marker. On failure the marker becomes
+   `state: "failed_verification"` with the reason, the work order gets an attention
+   flag and a warning notification, and the marker is **never deleted automatically**
+   — resolve it by hand, then remove the file.
+
+A marker stuck in `staged`/`restarting` for over an hour is flagged by
+`jarvis doctor` (`INV-RELEASE-MARKER-STALE`). A plain `scripts/shipit.sh` run without
+`--stage` behaves exactly as described above: restarts and notify included — use that
+from your own shell.
+
 ## First-time production setup
 
 ```bash
@@ -91,6 +145,48 @@ journalctl --user -u jarvis-ui -f           # follow UI logs
 
 `Restart=always` + `RestartSec=5` + `StartLimitIntervalSec=0` means each is brought
 back up whenever it exits, indefinitely (recovery).
+
+### The unit's PATH is the whole fleet's PATH
+
+`Environment=PATH=` in `jarvis.service` is the only PATH the daemon has, and every
+worker it spawns inherits it. A `systemd --user` service gets none of a login shell's
+PATH, so a tool you can run by hand may still be invisible to the fleet — and the
+symptom is not an error, it is a feature that quietly never happens. Issue #90:
+`gh` is a snap at `/snap/bin/gh`, `/snap/bin` was not on the unit's PATH, and
+auto-complete-on-merge was off for every project for a release.
+
+`scripts/install_prod_service.sh` builds that PATH — prod venv first, then the
+directories of `uv`, `claude`, `node` and `gh` as it finds them, then a fixed fallback
+list (`/snap/bin`, `~/.local/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`). It prints
+whether the result can resolve `gh` and says so loudly when it cannot. Re-run it
+whenever a tool the fleet needs moves or is newly installed:
+
+```bash
+scripts/install_prod_service.sh --dry-run --unit-dir /tmp/units   # see the PATH first
+systemctl --user show jarvis.service -p Environment               # what is live now
+```
+
+If a tool lives somewhere the script does not look, add its directory to that fallback
+list — and to `GH_SEARCH_DIRS` in `src/jarvis/bugreport.py`, its mirror, which is what
+lets an already-installed daemon find `gh` without being re-installed.
+
+### Restarting `jarvis.service` from a session Jarvis spawned
+
+A Claude session that the daemon started lives **inside `jarvis.service`'s cgroup**, so
+`systemctl --user restart jarvis.service` kills that session along with whatever script
+it was running. This is what left 0.5.0 half-applied: the deploy script restarted the
+daemon, died, and never reached `jarvis-ui.service`.
+
+`scripts/shipit.sh` and `scripts/install_prod_service.sh` both handle it the same way —
+the UI restarts inline, the daemon restarts **last**, detached into a transient unit:
+
+```bash
+systemd-run --user --collect --unit=jarvis-restart \
+  /bin/sh -c 'sleep 3; systemctl --user restart jarvis.service'
+```
+
+Do the same by hand if you are restarting the daemon from inside one of its own
+sessions; a plain `systemctl --user restart jarvis` is only safe from your own shell.
 
 ## Rollback
 

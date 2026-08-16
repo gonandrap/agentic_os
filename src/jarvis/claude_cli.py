@@ -12,9 +12,12 @@ import re
 import shutil
 import signal
 import subprocess
+import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 #: `claude` location override, mirroring bugreport's GH_BIN_ENV. Tests point it at a
@@ -142,6 +145,7 @@ def _briefing_args(
     append_system_prompt: str | None = None,
     settings_file: Path | None = None,
     add_dirs: list[Path] | None = None,
+    autocompact_window: int | None = None,
 ) -> list[str]:
     """The flags that constitute a worker's briefing, in one place.
 
@@ -151,6 +155,12 @@ def _briefing_args(
     (initial dispatch, bg resume-fork, headless resume) must pass the same set, or
     the worker silently loses the project's standing instructions and the OS skills
     from that turn onwards. Shared here so a new launch path cannot forget one.
+
+    `autocompact_window` is here for that same re-derivation reason and it is the
+    load-bearing case: it caps how large the conversation may grow, so a turn that
+    omitted it would let the context past the bound and every later turn would carry
+    the excess for the rest of the work order's life. None means "no flag", which is
+    the CLI's own behaviour — the model's full window, no early compaction.
 
     Callers must not append a bare positional after these: `--add-dir` is variadic
     and would swallow it (fence with `--` first, as spawn_background does).
@@ -166,6 +176,12 @@ def _briefing_args(
         args += ["--append-system-prompt", append_system_prompt]
     if settings_file:
         args += ["--settings", str(settings_file)]
+    if autocompact_window:
+        # `--autocompact <auto|tokens>`, single-valued. The CLI parses a bare integer
+        # and rejects anything outside 100k-1M; `catalog._parse_autocompact` enforces
+        # the same range up front so a bad catalog fails at boot rather than on the
+        # first dispatch.
+        args += ["--autocompact", str(autocompact_window)]
     for d in add_dirs or []:
         args += ["--add-dir", str(d)]
     return args
@@ -183,6 +199,7 @@ def spawn_background(
     settings_file: Path | None = None,
     resume_session_id: str | None = None,
     add_dirs: list[Path] | None = None,
+    autocompact_window: int | None = None,
 ) -> str | None:
     """Spawn a native Claude Code background session; returns the job id if the
     CLI reported one.
@@ -212,7 +229,7 @@ def spawn_background(
     if worktree:
         args += ["--worktree", worktree]
     args += _briefing_args(model, effort, permission_mode, append_system_prompt,
-                           settings_file, add_dirs)
+                           settings_file, add_dirs, autocompact_window)
     # `--` fences the prompt off from option parsing. Without it a variadic option
     # (`--add-dir <directories...>` is one) keeps consuming positionals and swallows
     # the prompt as a directory: the session boots with nothing to do and parks at
@@ -252,6 +269,62 @@ class TurnResult:
     cost_usd: float | None = None
     num_turns: int | None = None
     subtype: str = ""
+    #: Compact usage envelope derived from the result JSON (see `derive_turn_usage`).
+    #: None when the CLI emitted no `usage` object — old outfiles, crashed turns.
+    usage: dict[str, Any] | None = None
+
+
+def derive_turn_usage(data: dict[str, Any]) -> dict[str, Any] | None:
+    """The turn's exact accounting, compacted from one result envelope.
+
+    The raw JSON on disk (`<project>/.jarvis/turns/<wo>/<seq>.json`) stays the source
+    of truth; this dict is what `wo_turns.usage_json` persists so the record outlives
+    the file. Exact by construction — every number is the CLI's own, never a list-price
+    estimate:
+
+    * token classes come from `usage`, ephemeral 1h/5m split included;
+    * `iterations` carries one entry per API call, so the context at a call is that
+      iteration's input + cache_read + cache_creation — `context_peak` is the max,
+      which is the /context statistic, available headlessly;
+    * `context_window` and per-model `costUSD` come from `modelUsage`.
+
+    Returns None when there is no `usage` object to read (a result written before the
+    CLI carried usage, or a crashed turn) — an absence, never a zero.
+    """
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    cache_creation = usage.get("cache_creation") or {}
+    iterations = [i for i in (usage.get("iterations") or []) if isinstance(i, dict)]
+    contexts = [
+        (i.get("input_tokens") or 0)
+        + (i.get("cache_read_input_tokens") or 0)
+        + (i.get("cache_creation_input_tokens") or 0)
+        for i in iterations
+    ] or [
+        # No per-call breakdown: the whole-turn totals still bound the context.
+        (usage.get("input_tokens") or 0)
+        + (usage.get("cache_read_input_tokens") or 0)
+        + (usage.get("cache_creation_input_tokens") or 0)
+    ]
+    models = {name: mu for name, mu in (data.get("modelUsage") or {}).items()
+              if isinstance(mu, dict)}
+    windows = [mu["contextWindow"] for mu in models.values() if mu.get("contextWindow")]
+    return {
+        "total_cost_usd": data.get("total_cost_usd"),
+        "input": usage.get("input_tokens") or 0,
+        "cache_write": usage.get("cache_creation_input_tokens") or 0,
+        "cache_read": usage.get("cache_read_input_tokens") or 0,
+        "cache_1h": cache_creation.get("ephemeral_1h_input_tokens") or 0,
+        "cache_5m": cache_creation.get("ephemeral_5m_input_tokens") or 0,
+        "output": usage.get("output_tokens") or 0,
+        "api_calls": len(iterations) or data.get("num_turns"),
+        "context_peak": max(contexts),
+        "context_window": max(windows) if windows else None,
+        "duration_api_ms": data.get("duration_api_ms"),
+        "cost_by_model": {name: mu["costUSD"] for name, mu in models.items()
+                          if mu.get("costUSD") is not None},
+    }
 
 
 def turn_args(
@@ -266,6 +339,7 @@ def turn_args(
     append_system_prompt: str | None = None,
     settings_file: Path | None = None,
     add_dirs: list[Path] | None = None,
+    autocompact_window: int | None = None,
 ) -> list[str]:
     """argv for one worker turn. Split out from `spawn_turn` so tests can assert on it.
 
@@ -282,7 +356,7 @@ def turn_args(
     if worktree:
         args += ["--worktree", worktree]
     args += _briefing_args(model, effort, permission_mode, append_system_prompt,
-                           settings_file, add_dirs)
+                           settings_file, add_dirs, autocompact_window)
     # Same fence, same reason as `spawn_background`: `--add-dir` and `--tools` are both
     # variadic and will eat the prompt as an option value if it arrives bare. Nothing
     # may be appended after this.
@@ -352,7 +426,229 @@ def read_turn_result(outfile: Path, errfile: Path | None = None) -> TurnResult |
         cost_usd=data.get("total_cost_usd"),
         num_turns=data.get("num_turns"),
         subtype=data.get("subtype") or "",
+        # Derived on the failed path too: the usage rides on a failed result JSON just
+        # the same (a 429'd turn has already paid for everything up to the refusal).
+        usage=derive_turn_usage(data),
     )
+
+
+# -- the usage limit ----------------------------------------------------------------
+#
+# Claude Code refuses a turn outright once the account's usage window is spent, and it
+# says so *in the turn's own result* rather than on stderr. The refusal is free and
+# instant — `duration_api_ms: 0`, `total_cost_usd: 0` — so from the outside it is
+# indistinguishable from any other `is_error` turn, and Jarvis used to fail the work
+# order and wait for a human to come back after midnight and retry it by hand.
+#
+# The message carries the one fact needed to recover unattended: WHEN the window
+# reopens. Parsing it here, deterministically and with no LLM anywhere, is what lets
+# `worker_session.retry_at` and `Daemon.retry_rate_limited` resume the conversation by
+# themselves. Observed live on wo-2fa7c0e9 turn 4:
+#
+#     You've hit your session limit · resets 11:50pm (America/Los_Angeles)
+#
+# THE MESSAGE IS ASSEMBLED, NOT WRITTEN, and matching the assembly is what makes this
+# survive the next model launch. Read out of the CLI's own string table (2.1.226): the
+# body is `You've hit your ${label}${suffix}`, the label comes from ONE table keyed by
+# rate-limit type, and the suffix is ` · resets ${when}`.
+#
+#     five_hour                   session limit        <- the 5-hour window
+#     seven_day                   weekly limit         <- the 7-day window
+#     seven_day_opus              Opus limit
+#     seven_day_sonnet            Sonnet limit
+#     seven_day_overage_included  Fable 5 limit        <- per-MODEL, and it is named
+#     overage                     usage credit limit
+#
+# So the label carries a MODEL NAME that changes with the fleet, and enumerating the
+# words in it is a guarantee of missing the next one — this parser did miss "Fable 5
+# limit" and "usage credit limit" until the user asked. What does not change is the
+# shape: the word "limit", then "resets", then a moment. That pair is what is matched.
+#
+# The suffix is also the reason a SPEND cap is deliberately left alone. Those render
+# ` · run /usage-credits to raise it` instead of a reset, so they never match, and they
+# should not: a spend cap does not reopen on its own and the user has to act.
+#
+# The moment itself has three renderings, all three handled (`_reset_moment`), because
+# the CLI picks between them by how far away the reset is:
+#
+#     under 24h    resets 11:50pm (America/Los_Angeles)      <- the 5-hour case
+#     over 24h     resets Aug 14, 9:50am (America/Los_Angeles)  <- typically the 7-day
+#     new year     resets Dec 31, 2027, 11:50pm (…)
+#     relative     resets in 2h 15m                          <- fast mode
+
+
+@dataclass(frozen=True)
+class UsageLimit:
+    """A turn Claude Code refused because the usage window is spent.
+
+    `reset_at` is the epoch moment the window reopens, or None when the message named a
+    reset but no time this parser could read — the caller then falls back to a fixed
+    delay rather than guessing a moment.
+    """
+
+    message: str
+    reset_at: float | None
+
+
+#: The legacy shape, and the only one that states the moment unambiguously:
+#: "Claude AI usage limit reached|1786344785". Kept as a belt-and-braces branch, NOT
+#: verified: that literal is absent from 2.1.226's string table (the only
+#: "usage limit reached" in there is inside Claude Code's own auth-error classifier),
+#: so it is either gone or composed somewhere strings cannot see. It costs one regex and
+#: it is the shape older tooling keys on, so removing it would only lose coverage.
+_LIMIT_EPOCH_RE = re.compile(r"usage limit reached\s*\|\s*(\d{10,13})", re.IGNORECASE)
+
+#: A spent window, matched by SHAPE rather than by wording: the word "limit" and then a
+#: reset, close together. Matching the label instead would mean listing the model names
+#: it can contain ("Fable 5 limit", "Opus limit", …) and silently missing whichever one
+#: ships next — see the table above.
+#:
+#: The proximity is what keeps this honest. It runs against the error text of EVERY
+#: failed turn, which can be a tail of the worker's own stderr, and a false positive
+#: would retry a genuinely broken turn until the cap stops it. Prose mentioning a limit
+#: does not go on to name a reset time sixty characters later; this message always does.
+_LIMIT_RE = re.compile(r"\blimits?\b.{0,60}?\bresets?\b", re.IGNORECASE | re.DOTALL)
+
+#: "resets in 2h 15m" — the relative rendering (fast mode). The easiest of the three:
+#: no timezone, no calendar, nothing to resolve against a clock that might disagree.
+_RESET_IN_RE = re.compile(
+    r"""resets?\s+in\s+
+        (?:(?P<days>\d+)\s*d\b\s*)?
+        (?:(?P<hours>\d+)\s*h\b\s*)?
+        (?:(?P<minutes>\d+)\s*m\b\s*)?
+        (?:(?P<seconds>\d+)\s*s\b)?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+#: The absolute renderings: "resets 11:50pm (America/Los_Angeles)" under 24h,
+#: "resets Aug 14, 9:50am (…)" over it, and the same with a year when the reset falls in
+#: the next one. Every part before the hour is optional because the CLI drops whichever
+#: ones it judges obvious, and the minutes go too when they are zero ("resets 3pm").
+_RESET_RE = re.compile(
+    r"""resets?\s+(?:at\s+)?
+        (?:(?P<month>[A-Za-z]{3,9})\s+(?P<day>\d{1,2})\s*,?\s*
+           (?:(?P<year>\d{4})\s*,?\s*)?(?:at\s+)?)?
+        (?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*
+        (?P<ampm>[ap]\.?m\.?)?
+        (?:\s*\((?P<tz>[^)]{1,64})\))?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+
+
+def usage_limit(text: str | None, *, now: float | None = None) -> UsageLimit | None:
+    """Read a failed turn's error as a usage-limit refusal, or None if it is not one.
+
+    None is the answer for every ordinary failure, so callers can use this as the
+    predicate itself. A message that names a limit but no reset at all is also None:
+    prose about limits (a worker's own log line, a stderr tail) mentions the word far
+    more often than the CLI refuses a turn, and "resets …" is what tells the two apart.
+    """
+    if not text:
+        return None
+    epoch = _LIMIT_EPOCH_RE.search(text)
+    if epoch:
+        raw = int(epoch.group(1))
+        # 13 digits is milliseconds, 10 is seconds; both shapes have been seen.
+        return UsageLimit(message=_summarise(text),
+                          reset_at=float(raw / 1000 if raw > 1e11 else raw))
+    if not _LIMIT_RE.search(text):
+        return None
+    ref = time.time() if now is None else now
+    # The relative form first: "resets in 2h 15m" needs no timezone and no calendar, so
+    # where it is offered it is the more trustworthy of the two.
+    relative = _RESET_IN_RE.search(text)
+    if relative and any(relative.group(g) for g in
+                        ("days", "hours", "minutes", "seconds")):
+        return UsageLimit(message=_summarise(text),
+                          reset_at=ref + _duration(relative))
+    reset = _RESET_RE.search(text)
+    if reset is None:
+        return None
+    return UsageLimit(message=_summarise(text), reset_at=_reset_moment(reset, ref))
+
+
+def _duration(m: re.Match[str]) -> float:
+    """Seconds in a "2d 3h 15m" clause. Absent units are zero, never an error: the CLI
+    drops the ones that would read as zero rather than printing them."""
+    return (int(m.group("days") or 0) * 86400
+            + int(m.group("hours") or 0) * 3600
+            + int(m.group("minutes") or 0) * 60
+            + int(m.group("seconds") or 0))
+
+
+def _summarise(text: str) -> str:
+    return " ".join(text.split())[:200]
+
+
+def _reset_moment(m: re.Match[str], now: float) -> float | None:
+    """The epoch moment a "resets …" clause names, or None if it does not name one.
+
+    The clause gives a wall-clock time in some timezone and, usually, no date at all, so
+    the moment is resolved against `now`: the next occurrence of that clock time, in that
+    zone. That is exactly the rule a human applies reading it, and it is why an
+    unparseable zone falls back to the daemon's own clock rather than to UTC.
+
+    A date appears once the reset is more than 24h away, which is the ordinary case for
+    the 7-day window, and a YEAR appears with it only when the reset falls in the next
+    one. The year is read rather than skipped because skipping it does not fail loudly:
+    "Aug 14, 2027, 9:50am" would otherwise parse its year as the hour and quietly
+    schedule a retry for 8pm tonight.
+    """
+    hour = int(m.group("hour"))
+    minute = int(m.group("minute") or 0)
+    ampm = (m.group("ampm") or "").replace(".", "").lower()
+    if minute > 59:
+        return None
+    if ampm:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if ampm == "pm" else 0)
+    elif hour > 23:
+        return None
+    ref = datetime.fromtimestamp(now, _zone(m.group("tz")))
+    month = _MONTHS.get((m.group("month") or "")[:3].lower())
+    day = int(m.group("day") or 0)
+    if month and day:
+        year = int(m.group("year") or 0)
+        try:
+            when = ref.replace(year=year or ref.year, month=month, day=day, hour=hour,
+                               minute=minute, second=0, microsecond=0)
+        except ValueError:
+            return None  # e.g. "Feb 30"
+        # A date with no year is next year's when it has already gone past — the
+        # December-to-January case, and the only one worth handling. When the message
+        # states the year there is nothing to infer, so this must not fire.
+        if not year and when < ref - timedelta(days=180):
+            try:
+                when = when.replace(year=when.year + 1)
+            except ValueError:
+                return None  # Feb 29 into a non-leap year
+    else:
+        when = ref.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if when <= ref:
+            when += timedelta(days=1)  # "resets 3am" said at 4pm means tomorrow
+    return when.timestamp()
+
+
+def _zone(name: str | None) -> tzinfo | None:
+    """The named timezone, or the machine's own if it is missing or unknown.
+
+    Falling back to local rather than UTC is the conservative choice: the daemon runs on
+    the same machine the user reads the clock on, so a mis-parse lands minutes or hours
+    out instead of half a day, and the retry floor absorbs the rest.
+    """
+    if name:
+        try:
+            return ZoneInfo(name.strip())
+        except (KeyError, ValueError, OSError):
+            pass
+    return datetime.now().astimezone().tzinfo
 
 
 def process_alive(pid: int | None) -> bool:

@@ -352,6 +352,140 @@ def capture_memory_write(payload: dict[str, Any], env: dict[str, str]) -> dict[s
     return {"captured": topic, "wo_id": wo_id}
 
 
+# -- surviving compaction ---------------------------------------------------------------
+#
+# Design and the measurements behind it:
+# docs/superpowers/specs/2026-08-10-resume-cost-and-the-cache.md
+#
+# Two hooks, one flag file. `PreCompact` cannot inject anything and `PostCompact` cannot
+# either (`additionalContext` is not accepted on that event), so the re-assertion rides
+# the next `PostToolUse` — which is also what puts it INSIDE the turn that was compacted
+# rather than at the start of the next one.
+
+
+def compaction_flag(root: Path, wo_id: str) -> Path:
+    return root / ".jarvis" / "compaction" / f"{wo_id}.pending"
+
+
+def note_compaction(payload: dict[str, Any], root: Path,
+                    store: ProjectStore, wo_id: str) -> None:
+    """PreCompact: record that it happened and arm the re-assertion."""
+    store.add_event(wo_id, "compacted", {
+        "trigger": payload.get("trigger"),
+        "custom_instructions": payload.get("custom_instructions") or None,
+    })
+    flag = compaction_flag(root, wo_id)
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text(payload.get("trigger") or "auto")
+
+
+def compaction_brief(store: ProjectStore, wo: dict[str, Any], project: str) -> str:
+    """What a compacted worker must not have to rediscover.
+
+    Deliberately NOT a summary of the conversation — Claude Code already wrote one, and
+    a second model call would only add loss. This is the part a summary cannot be trusted
+    to carry: the identifiers and the contract, rendered from the record Jarvis already
+    holds, so it is exact by construction.
+    """
+    wo_id = wo["id"]
+    lines = [
+        "# Your context was just compacted — re-asserting the parts that must be exact",
+        "",
+        f"You are the worker for **{wo_id}** in project **{project}**: {wo['title']}",
+    ]
+    for label, key in (("Branch", "branch"), ("Worktree", "worktree"), ("PR", "pr_url")):
+        if wo.get(key):
+            lines.append(f"- {label}: `{wo[key]}`")
+    lines.append(f"- Status: {wo['status']}")
+
+    pending = store.pending_assumptions(wo_id)
+    if pending:
+        lines += ["", f"**{len(pending)} assumption(s) already recorded and still "
+                      "pending review** — do not record these again:"]
+        lines += [f"- {a['content'][:200]}" for a in pending[:10]]
+
+    if wo.get("description"):
+        lines += ["", "## The original ask, verbatim", "", wo["description"]]
+
+    lines += ["", *worker_brief_core(wo_id, wo["title"], project)]
+    return "\n".join(lines)
+
+
+def worker_brief_core(wo_id: str, title: str, project: str) -> list[str]:
+    from .worker_brief import core_contract
+    return core_contract(wo_id, title, project, has_knowledge=True)
+
+
+def resume_after_compaction(env: dict[str, str], root: Path, store: ProjectStore,
+                            wo: dict[str, Any]) -> dict[str, Any] | None:
+    """PostToolUse: if a compaction was armed, spend the flag and re-assert the record.
+
+    Spent exactly once — the flag is unlinked before the brief is built, so a failure
+    while rendering costs the re-assertion rather than repeating it on every tool call
+    for the rest of the work order.
+    """
+    flag = compaction_flag(root, wo["id"])
+    try:
+        flag.unlink()
+    except OSError:
+        return None  # not armed (the common case), or already spent
+    store.add_event(wo["id"], "compaction_brief_injected", {})
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": compaction_brief(
+                store, wo, env.get("JARVIS_PROJECT", "")),
+        },
+    }
+
+
+def _compaction_context(env: dict[str, str], cwd: Path) -> tuple[Path, str] | None:
+    """(project root, wo id) for a dispatched worker, or None for anything else."""
+    wo_id = env.get("JARVIS_WO_ID")
+    if not wo_id:
+        return None  # interactive session — Jarvis does not manage its context
+    root_env = env.get("JARVIS_PROJECT_PATH")
+    root = Path(root_env) if root_env else find_project_root(cwd)
+    if root is None or not (root / ".jarvis").is_dir():
+        return None
+    return root, wo_id
+
+
+def _pre_compact(payload: dict[str, Any], env: dict[str, str],
+                 cwd: Path) -> dict[str, Any] | None:
+    ctx = _compaction_context(env, cwd)
+    if ctx is None:
+        return None
+    root, wo_id = ctx
+    store = ProjectStore(root)
+    try:
+        store.get_work_order(wo_id)
+        note_compaction(payload, root, store, wo_id)
+    except KeyError:
+        return None  # adhoc/unknown work order — nothing to re-assert later
+    finally:
+        store.close()
+    return {"wo_id": wo_id, "event": "PreCompact"}
+
+
+def _post_tool_compaction(env: dict[str, str], cwd: Path) -> dict[str, Any] | None:
+    """Hot path: this runs after EVERY tool call, so it costs one `stat` until a
+    compaction has actually armed it. The database is not opened otherwise."""
+    ctx = _compaction_context(env, cwd)
+    if ctx is None:
+        return None
+    root, wo_id = ctx
+    if not compaction_flag(root, wo_id).exists():
+        return None
+    store = ProjectStore(root)
+    try:
+        return resume_after_compaction(env, root, store, store.get_work_order(wo_id))
+    except KeyError:
+        return None
+    finally:
+        store.close()
+
+
 def find_project_root(cwd: Path) -> Path | None:
     """Map a hook cwd (possibly a worktree under .claude/worktrees/) to the project
     root that holds .jarvis/."""
@@ -389,7 +523,13 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
         return preflight_decision(payload, env)
 
     if event == "PostToolUse":
-        return capture_memory_write(payload, env)
+        # The memory mirror is a side effect and runs either way; only one of the two
+        # can own the hook's return value, and a pending compaction outranks it.
+        captured = capture_memory_write(payload, env)
+        return _post_tool_compaction(env, cwd) or captured
+
+    if event == "PreCompact":
+        return _pre_compact(payload, env, cwd)
 
     root_env = env.get("JARVIS_PROJECT_PATH")
     root = Path(root_env) if root_env else find_project_root(cwd)

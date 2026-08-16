@@ -163,6 +163,17 @@ jarvis bug report "title" -d "..." -e "expected" -a "actual" [--steps "..."]
 jarvis doctor [project] [--repair]         # check the OS's own post-conditions;
                                            # read-only unless --repair. The daemon runs
                                            # the same checks every reconcile tick.
+jarvis cost [project|wo-id|fo-id]          # what the work cost in tokens, read back
+                                           # from Claude Code's transcripts (the OS
+                                           # stores no usage of its own). A feature
+                                           # order rolls up its planner AND children —
+                                           # the planner is usually the dearest session
+                                           # of an unfinished one. Breaks out the
+                                           # RE-WRITE TAX: every turn after the first
+                                           # re-sends the whole conversation at the
+                                           # cache-WRITE rate, ~12% of fleet spend.
+                                           # Dollars are list prices, a common unit for
+                                           # comparing token kinds — not a bill.
 jarvis adopt <path>                        # migrate a project into the OS
 jarvis ui                                  # dashboard at http://127.0.0.1:8787
 ```

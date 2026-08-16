@@ -40,6 +40,14 @@
   .daemon { font-family: var(--mono); font-size: 12.5px; }
   .daemon.up { color: var(--green); } .daemon.down { color: var(--red); }
 
+  /* which Jarvis is this? prod must be unmistakable — dev stays quiet on purpose */
+  .instance { font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.08em;
+              white-space: nowrap; padding: 2px 9px; border-radius: 99px;
+              border: 1px solid var(--line); color: var(--ink-3); cursor: default; }
+  .instance.prod { font-weight: 700; color: var(--amber-ink);
+                   border-color: color-mix(in srgb, var(--amber) 60%, transparent);
+                   background: color-mix(in srgb, var(--amber) 18%, var(--surface)); }
+
   /* the signature: attention strip */
   .attention { border-radius: 8px; margin: 18px 0; overflow: hidden; }
   .attention.hot { border: 1px solid color-mix(in srgb, var(--amber) 45%, transparent); }
@@ -128,6 +136,31 @@
                   max-height: 340px; overflow: auto; white-space: pre-wrap;
                   word-break: break-word; }
   details > summary { cursor: pointer; }
+
+  /* A long worker question, cut down to what the user has to decide on (see
+     src/jarvis/digest.py). The verbatim text is always one disclosure away, and this
+     styling must never look like the whole story. */
+  .digest { margin: 8px 0 4px; }
+  .digest .headline { margin: 0 0 8px; font-size: 15.5px; line-height: 1.45; }
+  .digest ul, .digest ol { margin: 0 0 10px; padding-left: 22px; }
+  .digest li { margin: 3px 0; }
+  .digest .label { font-family: var(--mono); font-size: 11px; color: var(--ink-3);
+                   letter-spacing: 0.12em; text-transform: uppercase; margin: 0 0 4px; }
+  .digest .rec { margin: 0 0 8px; padding: 8px 12px; border-radius: 6px;
+                 background: color-mix(in srgb, var(--amber) 10%, var(--surface));
+                 border-left: 3px solid var(--amber); }
+  .digest .rec .label { display: block; color: var(--amber-ink); }
+  /* The escape hatch back to the verbatim text. Styled as a button, not as a line of
+     prose: it is the control that makes shortening safe, so it has to look pressable. */
+  .disclosure { margin-top: 8px; }
+  .disclosure > summary { display: inline-block; list-style: none;
+                          background: var(--raised); color: var(--ink-2);
+                          border: 1px solid var(--line); border-radius: 6px;
+                          padding: 4px 11px; font: 12px var(--mono); }
+  .disclosure > summary::-webkit-details-marker { display: none; }
+  .disclosure > summary::before { content: "▸ "; color: var(--ink-3); }
+  .disclosure[open] > summary::before { content: "▾ "; }
+  .disclosure > summary:hover { color: var(--ink); border-color: var(--ink-3); }
   @media (prefers-reduced-motion: no-preference) {
     .pulse { animation: pulse 2.4s ease-in-out infinite; }
     @keyframes pulse { 50% { opacity: 0.45; } }
@@ -138,6 +171,8 @@
 <div class="shell">
   <header id="live-chrome">
     <span class="wordmark"><span class="caret">&gt;</span> JARVIS</span>
+    <span class="instance{{ ' prod' if instance.prod }}" title="{{ instance.detail }}"
+      >{{ instance.label }} · {{ instance.shown }}</span>
     <span class="daemon {{ 'up' if daemon_up else 'down' }}">
       {{ '● daemon up' if daemon_up else '○ daemon down' }}
     </span>
@@ -148,6 +183,7 @@
       <a href="/inbox" class="{{ 'here' if active == 'inbox' }}">inbox</a>
       <a href="/backlog" class="{{ 'here' if active == 'backlog' }}">backlog</a>
       <a href="/knowledge" class="{{ 'here' if active == 'knowledge' }}">knowledge</a>
+      <a href="/cost" class="{{ 'here' if active == 'cost' }}">cost</a>
     </nav>
   </header>
   {% if request.query_params.get('error') %}

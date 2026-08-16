@@ -522,10 +522,19 @@ def denied_message(approval: dict[str, Any], reason: str, by: str) -> str:
     )
 
 
-# A dismissal has to tell the worker two things a grant does not: that nothing was
-# authorised, and that nothing about its request was wrong. A worker told only "you may
-# proceed" learns to treat the gate as a formality; a worker told "you were denied"
-# learns to avoid a command that was always fine. Neither is true here.
+# A dismissal has to tell the worker three things a grant does not: that nothing was
+# authorised, that nothing about its request was wrong, and that clearing a command
+# string is not the same as clearing the action the string talks ABOUT. A worker told
+# only "you may proceed" learns to treat the gate as a formality; a worker told "you were
+# denied" learns to avoid a command that was always fine. Neither is true here.
+#
+# The third one is the trap that produced this wording. A dismissed command is very often
+# a `jarvis gate request` for some genuinely privileged action — the recogniser fires on
+# the action named inside the quoted argument. "Run it again" then reads as "re-file",
+# and if the real action is ALREADY sitting with a reviewer the worker opens a second,
+# better-argued request for it while the first is undecided. That is reviewer-shopping in
+# effect, whatever the worker intended, so the message has to rule it out where the worker
+# reads it rather than leaving it to a learning nobody consults mid-turn.
 def dismissed_message(approval: dict[str, Any], reason: str, by: str) -> str:
     return (
         f"[Gate {approval['id']} DISMISSED by {by} — not a privileged action] {reason}\n\n"
@@ -534,6 +543,13 @@ def dismissed_message(approval: dict[str, Any], reason: str, by: str) -> str:
         f"a defect in the gate's recogniser, not a verdict on your request.\n\n"
         f"Run it again, exactly as written, and it will go through:\n"
         f"    {approval['command']}\n\n"
+        f"One limit on that. This cleared a command STRING; it did not reset the review "
+        f"state of any privileged action the string refers to. If an equivalent request "
+        f"for that action is already pending or escalated, do NOT run this again — it "
+        f"would open a second request while the first is undecided. Close the gap on the "
+        f"request that already exists instead: send the reviewer what it was missing "
+        f"(`jarvis wo ask`, or `jarvis notify` if the user has to see it) and leave the "
+        f"original standing.\n\n"
         f"The dismissal covers this exact command string for this work order and does "
         f"not expire. Anything that genuinely does ship code still needs a real request."
     )

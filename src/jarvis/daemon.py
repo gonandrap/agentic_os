@@ -7,6 +7,14 @@ One process, one poll loop over every project in the catalog. Per tick, in this 
   4. dispatch pending work orders (respecting per-project concurrency) — last, so it
      sees the concurrency slots steps 2 and 3 just freed
   5. let Neo (the OS answerer agent) drain queued worker questions
+  5b. shorten over-long answered questions for the dashboard (src/jarvis/digest.py) —
+     display only, on its own thread, and nothing the OS acts on depends on it
+
+Every RATE_LIMIT_EVERY_TICKS ticks it additionally:
+  2b. relaunches the turns Claude Code refused because the account's usage window was
+     spent, once that window has reopened — the OS's one self-healing loop, and the
+     reason a work order that runs out of tokens at midnight is working again by
+     morning without anyone retrying it by hand
 
 Every PR_POLL_EVERY_TICKS ticks it additionally:
   6. asks GitHub what happened to the pull requests its work orders are parked behind,
@@ -39,7 +47,12 @@ from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
 from .paths import daemon_pidfile, ensure_home, logs_dir
-from .project_store import PRE_APPROVED_KEY, UNGOVERNED_ORIGINS, ProjectStore
+from .project_store import (
+    ACTIVE_STATUSES,
+    PRE_APPROVED_KEY,
+    UNGOVERNED_ORIGINS,
+    ProjectStore,
+)
 
 log = logging.getLogger("jarvisd")
 
@@ -52,6 +65,22 @@ RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injec
 #: limit. Not catalog-configurable on purpose: a knob nobody will tune is a knob that
 #: only ever gets set wrong.
 PR_POLL_EVERY_TICKS = 24
+
+#: Look for a work order parked on the Claude usage limit every N ticks — one minute at
+#: the default 5s interval, which is the cadence the feature was asked for. Its own
+#: cadence rather than the reconcile one, and a cheap one to run: the reset moment is a
+#: wall-clock time the OS already parsed out of the refusal, so the pass compares it to
+#: the clock and relaunches. No subprocess, no network, one indexed query per active
+#: work order. A minute of extra wait after a five-hour window is nothing, and checking
+#: every tick would only mean twelve times the queries for the same answer.
+RATE_LIMIT_EVERY_TICKS = 12
+
+#: How many dashboard digests one batch may produce. Bounds the cost of the FIRST batch
+#: on an instance upgrading into the feature with a backlog of long questions already in
+#: `neo.db` — the rest are picked up on later ticks and render in full until then. It is
+#: not a rate limit on steady state: questions long enough to earn a digest arrive at a
+#: rate of a few a day.
+DIGEST_BATCH = 5
 
 
 class Daemon:
@@ -66,6 +95,13 @@ class Daemon:
         # keeps the shared persona+learnings prefix inside the prompt-cache TTL.
         self.neo_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="neo")
         self.neo_draining = False
+        # Dashboard digests run on their OWN thread, not Neo's. They are display work on
+        # questions that have already been answered, so they must never delay a worker
+        # parked waiting for an answer — and they use a different model and a different
+        # system prompt, so interleaving them into the drain would cost Neo its warm
+        # prefix on every other call.
+        self.digest_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="digest")
+        self.digesting = False
         # Invariant violations already reported this run, so a standing problem is
         # surfaced once instead of every tick. Keyed by (invariant, wo_id).
         self.reported_violations: set[tuple[str, str | None]] = set()
@@ -73,6 +109,9 @@ class Daemon:
         # credentials, an unreachable host). Same idea: say it once, not every 2 minutes
         # forever. Reset by restarting the daemon, which is also what fixes it.
         self.pr_poll_warned: set[str] = set()
+        # The systemd seam for staged releases (src/jarvis/release.py). None means the
+        # real thing; tests inject a fake so no test can ever touch real systemctl.
+        self.release_runner: Any = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -88,6 +127,11 @@ class Daemon:
         signal.signal(signal.SIGINT, self._on_signal)
         log.info("jarvisd started (pid=%s, projects=%s)",
                  os.getpid(), [p.name for p in self.catalog.projects])
+        # Before the first tick: if the boot we are living through IS a staged
+        # release's restart, prove the release applied and settle its work order —
+        # otherwise the reconciler reaps the dead shipping turn first and files the
+        # very "failed — review and retry" this flow exists to prevent.
+        self.verify_pending_release()
         try:
             while not self.stop_requested:
                 started = time.monotonic()
@@ -99,6 +143,7 @@ class Daemon:
                 time.sleep(max(0.2, self.poll_interval - elapsed))
         finally:
             self.neo_pool.shutdown(wait=False)
+            self.digest_pool.shutdown(wait=False)
             self._remove_pidfile()
             log.info("jarvisd stopped")
 
@@ -122,6 +167,7 @@ class Daemon:
         self.tick_count += 1
         reconcile = self.tick_count % RECONCILE_EVERY_TICKS == 1
         poll_prs = self.tick_count % PR_POLL_EVERY_TICKS == 1
+        retry_limits = self.tick_count % RATE_LIMIT_EVERY_TICKS == 1
         # `None` means "the roster was not read this tick" — either nothing is injected
         # or the listing failed — and is NOT the same as an empty roster, which would
         # mean every injected session ended. Session tracking is skipped on None.
@@ -153,6 +199,12 @@ class Daemon:
                 # interval instead of one reconcile interval, and it is why delivery no
                 # longer has to wait for a roster refresh either.
                 self.settle_turns(project, store)
+                # Before delivery, not after: a work order whose window has just
+                # reopened must re-send the turn it was refused BEFORE any newer
+                # message goes out, or the user's earlier message — already marked
+                # delivered, and living only on that turn row — would be skipped.
+                if retry_limits:
+                    self.retry_rate_limited(project, store)
                 self.deliver_messages(project, store)
                 # Before dispatch, not after: a planner filed this tick is an ordinary
                 # pending work order, so it is claimed by the same pass rather than
@@ -178,7 +230,15 @@ class Daemon:
             except Exception:  # noqa: BLE001
                 log.exception("project %s tick failed", project.name)
 
+        # After the project loop, so `running_turns` reflects the turns settlement just
+        # reaped: the staged-release restart must only fire once the shipping worker's
+        # turn has genuinely ended (src/jarvis/release.py).
+        self.release_tick()
+
         self.neo_tick()
+        # After the drain is kicked, never before: a question digested this tick is one
+        # whose answer has already landed, and the drain is what lands it.
+        self.digest_tick()
 
         from .notify import route_new_inbox
         route_new_inbox(self.central, self.catalog)
@@ -197,6 +257,31 @@ class Daemon:
                 )
             except claude_cli.ClaudeCliError as e:
                 log.error("[%s] dispatch of %s failed: %s", project.name, wo["id"], e)
+
+    # -- staged releases (thin hooks; all logic in src/jarvis/release.py) --------------
+
+    def _release_store(self, project_name: str) -> ProjectStore | None:
+        """The marker names its project; this is how release.py reaches its store."""
+        for p in self.catalog.projects:
+            if p.name == project_name and p.path.is_dir():
+                return self.store_for(p)
+        return None
+
+    def verify_pending_release(self) -> None:
+        from . import release
+
+        try:
+            release.verify_on_boot(self._release_store, runner=self.release_runner)
+        except Exception:  # noqa: BLE001 — a broken marker must not stop the daemon
+            log.exception("release boot verification failed")
+
+    def release_tick(self) -> None:
+        from . import release
+
+        try:
+            release.maybe_restart(self._release_store, runner=self.release_runner)
+        except Exception:  # noqa: BLE001
+            log.exception("release restart check failed")
 
     # -- 4a. feature orders: open a planner ------------------------------------------
 
@@ -314,6 +399,46 @@ class Daemon:
             )
             store.mark_notification_routed(n["id"])
 
+    # -- 2b. self-healing after the usage limit ---------------------------------------
+
+    def retry_rate_limited(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Relaunch the turns Claude Code refused, once the usage window has reopened.
+
+        The OS's only loop that repairs a work order without being asked, and it is
+        deterministic end to end: the refusal states when the window reopens, that
+        moment was parsed out of the message at reap time, and this compares it to the
+        clock. No LLM is consulted and none could help — the decision is a comparison.
+
+        Every work order this touches is in an ACTIVE status, because the settler
+        deliberately did not fail it (see `settle_work_order`). Retrying is safe to do
+        blind: a refused turn was never sent and never billed, so the relaunch is the
+        first time the worker sees that prompt, not a second delivery of it.
+        """
+        for wo in store.list_work_orders(statuses=ACTIVE_STATUSES):
+            if wo["origin"] in UNGOVERNED_ORIGINS:
+                continue  # the user's own session; Jarvis does not drive it
+            try:
+                pause = worker_session.rate_limit_pause(store, wo["id"])
+                if pause is None or pause.exhausted or not pause.due():
+                    continue
+                turn = worker_session.retry(store, project, wo, pause.turn)
+            except claude_cli.ClaudeCliError as e:
+                # Not fatal and not the user's problem yet: the next pass tries again,
+                # and the streak cap is what stops this going round for ever.
+                log.warning("[%s] usage-limit retry of %s failed: %s",
+                            project.name, wo["id"], e)
+                continue
+            except Exception:  # noqa: BLE001 — one work order must not stall the rest
+                log.exception("[%s] usage-limit retry of %s failed", project.name,
+                              wo["id"])
+                continue
+            log.info("[%s] %s resumed after the usage limit (attempt %s, turn %s)",
+                     project.name, wo["id"], pause.attempts, turn["seq"])
+            store.add_event(wo["id"], "rate_limit_retry", {
+                "seq": turn["seq"], "retried_seq": pause.turn["seq"],
+                "attempt": pause.attempts,
+            })
+
     # -- 3. message delivery ----------------------------------------------------------
 
     def deliver_messages(self, project: ProjectSpec, store: ProjectStore) -> None:
@@ -322,8 +447,21 @@ class Daemon:
         No roster lookup any more, and no thread pool: a turn is a detached process, so
         launching one is instant and the only thing delivery has to wait for is the
         previous turn of the SAME work order finishing (`worker_session.busy`).
+
+        **Everything queued for one work order goes out as ONE turn.** Every turn
+        boundary re-sends the whole accumulated conversation at the 1.25x cache-WRITE
+        rate instead of reading it at 0.1x — measured at ~12% of this project's entire
+        token spend, and ~2x the context per boundary in practice (see `usage.py` and
+        `jarvis cost`). Delivering three queued comments as three turns therefore costs
+        three of those, for content the worker would rather read together anyway: it can
+        act on the whole of what the user said instead of starting down the first
+        message's path and being interrupted twice.
+
+        The coalescing is per work order, not global — two work orders' messages are
+        independent conversations and must stay separate turns.
         """
-        for msg in store.queued_messages():
+        pending: dict[str, list[dict[str, Any]]] = {}
+        for msg in store.queued_messages():  # chronological, so the joins stay in order
             try:
                 wo = store.get_work_order(msg["wo_id"])
             except KeyError:
@@ -333,24 +471,43 @@ class Daemon:
                 continue  # not dispatched yet; the worker prompt will carry it instead
             if worker_session.busy(store, wo["id"]):
                 continue  # mid-turn: one turn at a time, and resume would refuse anyway
-            self._deliver(project, store, wo, dict(msg))
+            pause = worker_session.rate_limit_pause(store, wo["id"])
+            if pause is not None and not pause.exhausted:
+                # Parked on the usage limit. The refused turn has to go out first —
+                # it is holding a message already marked `delivered`, so sending this
+                # one now would silently jump the queue. Held, not dropped: the same
+                # queue delivers it as the next turn once the retry gets through.
+                # Once the retries are EXHAUSTED this stops applying, which is what
+                # keeps the manual escape hatch (`jarvis wo send … "retry"`) working.
+                continue
+            pending.setdefault(wo["id"], []).append(dict(msg))
+        for wo_id, msgs in pending.items():
+            self._deliver(project, store, store.get_work_order(wo_id), msgs)
 
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
-                 msg: dict) -> None:
-        log.info("[%s] delivering message %s to %s", project.name, msg["id"], wo["id"])
-        store.add_event(wo["id"], "delivering", {"msg_id": msg["id"]})
+                 msgs: list[dict[str, Any]]) -> None:
+        ids = [m["id"] for m in msgs]
+        log.info("[%s] delivering message(s) %s to %s", project.name, ids, wo["id"])
+        store.add_event(wo["id"], "delivering", {"msg_ids": ids})
+        # A blank line between messages and nothing else. Anything framing them — a
+        # count, a header, "message 2 of 3" — is text the worker can mistake for an
+        # instruction from the user, and the user wrote none of it.
+        text = "\n\n".join(m["content"] for m in msgs)
         try:
-            turn = worker_session.send(store, project, wo, msg["content"],
-                                       msg_id=msg["id"])
+            turn = worker_session.send(store, project, wo, text, msg_id=ids[0])
         except claude_cli.ClaudeCliError as e:
-            log.error("[%s] delivery of message %s failed: %s", project.name,
-                      msg["id"], e)
-            store.mark_message(msg["id"], "failed")
+            log.error("[%s] delivery of message(s) %s failed: %s", project.name, ids, e)
+            for msg_id in ids:
+                store.mark_message(msg_id, "failed")
             store.flag_attention(wo["id"], f"message delivery failed: {e}")
             return
-        store.mark_message(msg["id"], "delivered")
+        # Every message in the turn is delivered, not just the one the turn row names:
+        # a message left `queued` here would be re-sent on the next tick, so the worker
+        # would read it twice and pay a second boundary for the privilege.
+        for msg_id in ids:
+            store.mark_message(msg_id, "delivered")
         store.add_event(wo["id"], "message_delivered",
-                        {"msg_id": msg["id"], "turn": turn["seq"]})
+                        {"msg_ids": ids, "turn": turn["seq"]})
         # The work order is moving again, whatever it had settled into. A user who sends
         # a message to a finished work order means it to continue, and the turn is
         # already out — leaving the status settled would make the record lie.
@@ -405,10 +562,16 @@ class Daemon:
                 elif q.get("kind") == "plan":
                     self._deliver_plan_verdict(central, store, pstore, q, verdict)
                 elif verdict["escalate"]:
+                    # A headline, never the verbatim question: this row's job is to get
+                    # the user's attention, and every inbox row reaches every sink
+                    # (Telegram included). Production question #67 was 84KB; the full
+                    # text is one `jarvis neo show` away.
+                    head = q["question"].strip().splitlines()[0][:200]
                     central.add_inbox(
                         project=q["project"], level="warning",
                         title=f"Neo escalated a question from {q['wo_id']}",
-                        body=f"Q: {q['question']}\nWhy: {verdict['reason']}\n"
+                        body=f"Q: {head}\nWhy: {(verdict['reason'] or '')[:200]}\n"
+                             f"Read it in full: jarvis neo show {q['id']}\n"
                              f"Answer it with: jarvis neo answer {q['id']} \"...\"",
                         wo_id=q["wo_id"],
                     )
@@ -441,6 +604,68 @@ class Daemon:
         finally:
             store.close()
             central.close()
+
+    # -- 5b. dashboard digests (display only — see `jarvis.digest`) -------------------
+
+    def digest_tick(self) -> None:
+        """Shorten over-long questions for the `/neo` page, off the critical path.
+
+        This produces NOTHING the OS acts on. It exists because a 7,000-character
+        question renders as a wall the user scrolls past, and a review they scroll past
+        is a review Neo never gets corrected by. Neo itself still reads every question
+        in full, and the page keeps the verbatim text one disclosure away.
+
+        Off when Neo is off, and off when `digest_model` is empty — the one knob that
+        turns the extra calls off entirely. The guard mirrors `neo_tick`'s: at most one
+        batch in flight, so a slow model cannot pile ticks on top of each other.
+        """
+        cfg = self.catalog.os.neo
+        if not cfg.enabled or not cfg.digest_model or self.digesting:
+            return
+        from . import digest as digest_mod
+        from .neo_store import NeoStore
+
+        store = NeoStore()
+        try:
+            pending = bool(store.questions_needing_digest(digest_mod.MIN_CHARS, limit=1))
+        finally:
+            store.close()
+        if not pending:
+            return
+        self.digesting = True
+        future = self.digest_pool.submit(self._digest_batch)
+        future.add_done_callback(lambda f: setattr(self, "digesting", False))
+
+    def _digest_batch(self) -> None:
+        """Digest the questions waiting for one (runs on the single digest thread).
+
+        The batch is capped so one tick cannot spend an unbounded number of calls the
+        first time a long-running instance upgrades into this feature — the rest are
+        picked up next tick, and until then they render in full.
+        """
+        from . import digest as digest_mod
+        from .neo_store import NeoStore
+
+        model = self.catalog.os.neo.digest_model
+        store = NeoStore()  # thread-local connection
+        try:
+            for q in store.questions_needing_digest(digest_mod.MIN_CHARS,
+                                                    limit=DIGEST_BATCH):
+                try:
+                    view = digest_mod.summarise(q["question"], model=model)
+                except Exception as e:  # noqa: BLE001 — a digest is never worth a crash
+                    # Recorded, not retried: see `digest.encode_failure`. The page falls
+                    # back to the full question, which is what it showed before.
+                    log.warning("digest failed for neo question %s: %s", q["id"], e)
+                    store.set_digest(q["id"], digest_mod.encode_failure(str(e)))
+                    continue
+                store.set_digest(q["id"], digest_mod.encode(view))
+                log.info("digested neo question %s (%d chars)",
+                         q["id"], len(q["question"]))
+        except Exception:  # noqa: BLE001 — the daemon must survive anything
+            log.exception("digest batch failed")
+        finally:
+            store.close()
 
     @staticmethod
     def _panel_answer(cfg: Any) -> Any:
@@ -757,11 +982,30 @@ class Daemon:
             return
 
         if turn["state"] == "failed":
+            # Refused for the usage limit, not broken: leave the work order exactly
+            # where it is and let `retry_rate_limited` relaunch it when the window
+            # reopens. Failing it would strand its dependents (`failed` is a
+            # DEPENDENCY_DEAD_STATUS), fail its parent feature order, and flag the user
+            # for something that fixes itself — and the flag would come straight back
+            # every reconcile tick, because `true_blockers` derives it from the status.
+            pause = worker_session.rate_limit_pause(store, wo["id"])
+            if pause and not pause.exhausted:
+                return
             if wo["status"] != "failed":
                 store.set_status(wo["id"], "failed")
                 store.flag_attention(wo["id"], "worker turn failed — review and retry")
+                if pause:
+                    # Retried until the OS ran out of patience. Say so plainly: the
+                    # message the user needs is "this is not going to fix itself", and
+                    # a bare "worker turn failed" would send them looking for a bug in
+                    # the work instead of at the account's limits.
+                    store.add_event(wo["id"], "rate_limit_exhausted",
+                                    {"attempts": pause.attempts,
+                                     "error": pause.message})
                 store.add_notification(
-                    title=f"{wo['id']} worker turn failed",
+                    title=(f"{wo['id']} still refused after "
+                           f"{pause.attempts} usage-limit retries" if pause
+                           else f"{wo['id']} worker turn failed"),
                     body=(turn.get("error") or "no error recorded")[:500],
                     level="warning", wo_id=wo["id"], source="reconciler",
                 )
@@ -871,20 +1115,24 @@ class Daemon:
         Once is the other half of that — a broken `gh` is broken on every poll, and an
         inbox entry every two minutes is how an inbox stops being read.
 
-        The likely cause is documented in `bugreport.create_issue` and worth repeating
-        in the body: a daemon-spawned process often cannot reach `gh`'s keyring
-        credentials, so the service environment needs `GH_TOKEN`.
+        The hint at the end has to match the failure. `GhUnavailable` already carries a
+        full PATH diagnosis (`bugreport.gh_missing_message`), so appending the keyring
+        advice to it would tell the user to fix credentials for a binary that was never
+        found — the misdiagnosis issue #90 was filed about.
         """
+        from . import github
+
         if project.name in self.pr_poll_warned:
             return
         self.pr_poll_warned.add(project.name)
         log.warning("[%s] pull-request polling unavailable: %s", project.name, error)
+        hint = ("" if isinstance(error, github.GhUnavailable) else
+                " If this is the daemon, `gh`'s keyring credentials may be out of "
+                "reach — set GH_TOKEN in the service environment.")
         store.add_notification(
             title=f"auto-complete on merge is off for {project.name}",
             body=(f"{error}\n\nWork orders parked behind a pull request will stay on "
-                  f"the open list until you close them with `jarvis wo done`. If this "
-                  f"is the daemon, `gh`'s keyring credentials may be out of reach — "
-                  f"set GH_TOKEN in the service environment."),
+                  f"the open list until you close them with `jarvis wo done`.{hint}"),
             level="warning", source="pr-poll",
         )
 

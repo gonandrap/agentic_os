@@ -55,7 +55,14 @@ def child(key: str, needs: list[str] | None = None, extra: str = "") -> dict:
 
 
 def a_plan(*children: dict, **extra) -> dict:
-    return {"summary": "an exporter", "children": list(children), **extra}
+    # The fake Neo reads the plan-review QUESTION, which is a skeleton without the
+    # briefs (wo-e4a359cb) — a FORCE_* marker buried in a child's description would
+    # never reach it. Surface any marker into the summary, which the skeleton carries.
+    markers = " ".join(sorted({m for c in children
+                               for m in ("FORCE_APPROVE", "FORCE_REJECT")
+                               if m in c["description"]}))
+    return {"summary": f"an exporter {markers}".strip(),
+            "children": list(children), **extra}
 
 
 ASK = ("Add a CSV exporter to the reporting module, with a command that calls it and "
@@ -129,7 +136,7 @@ def test_the_planner_carries_the_ask_verbatim_and_a_planner_briefing(planning, s
     assert f"jarvis fo plan {fo['id']} --from-file" in prompt
     assert "Do not build the feature" in prompt
     # The rule the whole plan lives or dies on has to be in there.
-    assert "sees its own description and nothing else" in prompt
+    assert "sees its own description plus the design document, and nothing else" in prompt
     # And it must NOT be told to finish the ordinary way, because `fo plan` is its finish.
     assert "Do not run `jarvis wo finish`" in prompt
 

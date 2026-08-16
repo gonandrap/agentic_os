@@ -164,6 +164,15 @@ def parse_plan(raw: Any) -> dict[str, Any]:
     for cycle in find_cycles(children):
         problems.append(f"dependency cycle: {' -> '.join(cycle)}")
 
+    design_doc = str(raw.get("design_doc") or "").strip()
+    if design_doc:
+        parts_of = design_doc.replace("\\", "/").split("/")
+        if design_doc.startswith(("/", "\\")) or ".." in parts_of:
+            problems.append(
+                f"`design_doc` must be a path relative to the repository root, with no "
+                f"`..` segments, got {design_doc!r}"
+            )
+
     justification = str(raw.get("justification") or "").strip()
     if len(children) > CHILD_CAP and not justification:
         problems.append(
@@ -177,6 +186,11 @@ def parse_plan(raw: Any) -> dict[str, Any]:
     return {
         "summary": str(raw.get("summary") or "").strip(),
         "justification": justification,
+        # The feature's design document, relative to the repository root. Optional but
+        # first-class: `fo plan` snapshots its content and dispatch materialises it for
+        # every child, which is what lets a child brief REFERENCE its sections instead
+        # of duplicating them — the duplication that took plan-review questions to 84KB.
+        "design_doc": design_doc,
         "children": children,
     }
 
@@ -314,14 +328,17 @@ APPROVE when all of these hold:
 - **The edges are the real ones.** A child depends on another only where it genuinely
   needs its code, since an edge costs a merge cycle of waiting. Equally, work that truly
   needs a schema change must not be running in parallel with it.
-- **Each description stands alone.** The child worker sees its own description and
-  nothing else — not this plan, not its siblings. Read the descriptions ASSUMING that,
-  and ask whether a competent stranger could carry each one out. A description that
-  merely reads well is not the same as one that is sufficient.
+- **Each child is nameable from its line.** You see one line per child — title,
+  edges, acceptance — and NOT the full briefs: those were validated mechanically
+  (they stand alone, or this never reached you) and are withheld on purpose, because
+  yours is a review of the decomposition, not of prose. If a title plus its
+  acceptance line does not tell you what that child ships, reject and say which
+  child — a piece the reviewer cannot name from one line is a piece the planner has
+  not cut cleanly.
 
 REJECT when the plan can be fixed by the planner: scope drift, a missing piece, children
-too coarse or too fine, an edge that should not be there, a description that assumes
-context it does not carry. Say plainly and specifically what is wrong — your reason
+too coarse or too fine, an edge that should not be there, a child line that does not say
+what it ships. Say plainly and specifically what is wrong — your reason
 reaches the planner as its next turn, and it revises in the same session, so a precise
 rejection is cheap and a vague one costs a whole round trip.
 
@@ -346,12 +363,17 @@ decide>"}"""
 
 
 def build_plan_question(fo: dict[str, Any], plan: dict[str, Any]) -> str:
-    """The submitted plan as the reviewer reads it.
+    """The submitted plan as the reviewer reads it — a SKELETON, never the full briefs.
 
     Whoever decides — Neo, or the user once Neo escalates — sees only this text and never
-    the planner's session, so it has to carry the whole case: the ask as the user wrote
-    it, then the decomposition. The ask comes FIRST and verbatim, because the one
-    judgement being asked for is whether the second answers the first.
+    the planner's session, so it carries the case: the ask as the user wrote it, then the
+    decomposition. The ask comes FIRST and verbatim, because the one judgement being
+    asked for is whether the second answers the first.
+
+    The full child briefs are deliberately NOT here. Production questions #65–#67
+    reached 84KB by inlining every brief — text the user already reads through
+    `jarvis fo show` and the dashboard, and that Neo's review of the DECOMPOSITION does
+    not need. The briefs stay in the stored plan; the question names where.
     """
     parts = [
         f"FEATURE ORDER {fo['id']} — {fo['title']}",
@@ -359,12 +381,34 @@ def build_plan_question(fo: dict[str, Any], plan: dict[str, Any]) -> str:
         "The ask, as the user wrote it:",
         fo.get("description") or "(none given)",
         "",
-        f"The plan the planner submitted ({len(plan.get('children') or [])} children):",
-        *render_plan(plan),
+        f"The plan the planner submitted ({len(plan.get('children') or [])} children), "
+        f"one line per child — the full briefs were validated mechanically and live in "
+        f"the stored plan (jarvis fo show {fo['id']}):",
+        *render_plan_skeleton(plan),
         "",
         "Release this plan?",
     ]
     return "\n".join(parts)
+
+
+def render_plan_skeleton(plan: dict[str, Any]) -> list[str]:
+    """One line per child: key, title, edges, acceptance. Never the description."""
+    lines = []
+    if plan.get("summary"):
+        lines.append(plan["summary"])
+        lines.append("")
+    if plan.get("design_doc"):
+        lines.append(f"Design document: {plan['design_doc']}")
+        lines.append("")
+    for child in plan.get("children") or []:
+        needs = f" (needs {', '.join(child['needs'])})" if child.get("needs") else ""
+        lines.append(f"- [{child['key']}] {child['title']}{needs}")
+        if child.get("acceptance"):
+            lines.append(f"    done when: {child['acceptance']}")
+    if plan.get("justification"):
+        lines += ["", f"Justification for {len(plan['children'])} children: "
+                      f"{plan['justification']}"]
+    return lines
 
 
 def render_plan(plan: dict[str, Any]) -> list[str]:
@@ -377,6 +421,9 @@ def render_plan(plan: dict[str, Any]) -> list[str]:
     lines = []
     if plan.get("summary"):
         lines.append(plan["summary"])
+        lines.append("")
+    if plan.get("design_doc"):
+        lines.append(f"Design document: {plan['design_doc']}")
         lines.append("")
     for child in plan.get("children") or []:
         needs = f" (needs {', '.join(child['needs'])})" if child.get("needs") else ""

@@ -30,8 +30,12 @@ to). Then `git pull` so local `main` equals `origin/main`.
 5. Deploys the tag to `$PRODUCTION_CODE/jarvis_os` from `origin` (clone on first run,
    then `git fetch` + `checkout <tag>` + `uv sync --frozen`), creating a default
    production catalog if none exists.
-6. Restarts the production services (`jarvis.service`, `jarvis-ui.service`) if installed.
+6. Restarts `jarvis-ui.service` (if installed) and verifies it.
 7. Notifies Telegram (best-effort; sources `$PRODUCTION_CODE/secrets/jarvis.env`).
+8. Restarts `jarvis.service` **last, detached** into a transient `systemd-run` unit.
+   A session Jarvis spawned lives inside that unit's cgroup, so restarting it inline
+   SIGTERMs the script mid-deploy — which is how 0.5.0 shipped half-applied. Nothing
+   may be added after this step.
 
 Production's `origin` is the GitHub remote, so what runs in prod is exactly what is on
 the remote — every release is reproducible from a fresh clone. `main`'s `pyproject`
@@ -51,7 +55,35 @@ scripts/shipit.sh --dry-run       # preview; changes nothing
 
 Always run `--dry-run` first if the user is unsure of the version, show them the plan,
 then run for real. After shipping, report: the version/tag, the release branch, the prod
-directory, and the `jarvis.service` status.
+directory, and the `jarvis-ui.service` status.
+
+The daemon restart is queued (step 8) and lands a few seconds after the script exits —
+**and if you were run by Jarvis, it kills this session**, which is by design and not a
+failed deploy. Confirm it afterwards from a fresh session:
+
+```bash
+systemctl --user status jarvis --no-pager --lines=0   # active, and started just now
+```
+
+## Shipping from a work order: use `--stage`
+
+A worker session lives inside `jarvis.service`'s cgroup, so even the detached restart
+kills it mid-final-turn and the work order lands as `failed` despite a perfect deploy
+(this is exactly what happened to 0.5.1). A Jarvis-dispatched work order must therefore
+run the staged mode instead:
+
+```bash
+scripts/shipit.sh --stage 1.4.0 --wo <your-wo-id>
+```
+
+`--stage` performs every step **except** the service restarts and the Telegram notify,
+then writes `$JARVIS_HOME/run/pending_release.json`. From there the OS finishes the
+job itself: the daemon restarts the services only after your work order's turn has
+settled (so finish the work order promptly after staging), verifies the release on its
+next boot (version on disk + fresh start timestamps on both units), settles the work
+order as completed, and notifies the user. Do not restart anything yourself and do not
+wait around for the restart — stage, `jarvis wo finish`, done. Interactive user
+sessions (not spawned by Jarvis) may keep using the classic mode above.
 
 ## First-time production setup (once)
 

@@ -26,19 +26,42 @@
 #   scripts/shipit.sh 1.2.0           # release an explicit version
 #   scripts/shipit.sh patch|minor|major
 #   scripts/shipit.sh --dry-run [ver] # print what would happen, change nothing
+#   scripts/shipit.sh --stage <ver> --wo <wo-id>
+#                                     # SELF-SHIP mode: everything above EXCEPT the
+#                                     # service restarts and the Telegram notify.
+#                                     # Writes $JARVIS_HOME/run/pending_release.json;
+#                                     # the daemon performs the restarts once the
+#                                     # shipping worker's turn has settled, and
+#                                     # verifies the release on its next boot
+#                                     # (src/jarvis/release.py). This is what lets a
+#                                     # work order that ships a release report its own
+#                                     # success: restarting jarvis.service from here
+#                                     # kills every worker in its cgroup, including
+#                                     # the one running this script.
 #
 # Env:
 #   PRODUCTION_CODE   production root (default: ~/workspace/production)
+#   JARVIS_HOME       state root for the --stage marker (default: ~/.jarvis)
 set -euo pipefail
 
 DRY_RUN=0
+STAGE=0
+WO_ID=""
 BUMP_OR_VERSION=""
-for arg in "$@"; do
-  case "$arg" in
+while [ $# -gt 0 ]; do
+  case "$1" in
     --dry-run) DRY_RUN=1 ;;
-    *) BUMP_OR_VERSION="$arg" ;;
+    --stage)   STAGE=1 ;;
+    --wo)      shift; WO_ID="${1:-}" ;;
+    *) BUMP_OR_VERSION="$1" ;;
   esac
+  shift
 done
+if [ "$STAGE" = 1 ] && [ -z "$WO_ID" ]; then
+  printf '\033[1;31m✗ %s\033[0m\n' \
+    "--stage requires --wo <work-order-id>: the daemon needs to know which work order to wait for and settle" >&2
+  exit 1
+fi
 
 REPO="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 cd "$REPO"
@@ -206,19 +229,69 @@ JSON
   fi
 fi
 
-# --- 6. restart services if installed -------------------------------------------
-restarted=0
-for svc in jarvis.service jarvis-ui.service; do
-  if systemctl --user list-unit-files "$svc" 2>/dev/null | grep -q "$svc"; then
-    say "restarting $svc"
-    run "systemctl --user restart '$svc'"
-    restarted=1
+# --- 5b. --stage: stop here and hand the restarts to the daemon ------------------
+#
+# Everything that had to happen has happened: the tag is on origin and production's
+# checkout + venv are on the new version. What remains — restarting the services and
+# telling the user — is exactly what a Jarvis-hosted session cannot survive doing, so
+# in stage mode we record the hand-off and exit. The daemon (src/jarvis/release.py)
+# restarts jarvis-ui.service and jarvis.service once the shipping worker's turn has
+# settled, verifies the release on its next boot (pyproject version on disk +
+# ExecMainStartTimestamp on BOTH units), settles the work order, and notifies.
+if [ "$STAGE" = 1 ]; then
+  JARVIS_HOME_DIR="${JARVIS_HOME:-$HOME/.jarvis}"
+  MARKER="$JARVIS_HOME_DIR/run/pending_release.json"
+  say "staging: writing release marker $MARKER"
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '  [dry-run] write %s (state: staged, wo: %s, tag: %s)\n' \
+      "$MARKER" "$WO_ID" "$TAG"
+  else
+    mkdir -p "$JARVIS_HOME_DIR/run"
+    printf '{"wo_id": "%s", "project": "jarvis_os", "version": "%s", "tag": "%s", "staged_at": %s, "state": "staged"}\n' \
+      "$WO_ID" "$VERSION" "$TAG" "$(date +%s)" > "$MARKER"
   fi
-done
-if [ "$restarted" = 1 ]; then
+  say "staged $TAG → $PROD_DIR — services NOT restarted"
+  say "what happens next:"
+  say "  1. end this session's turn (e.g. jarvis wo finish $WO_ID \"...\") — the daemon"
+  say "     will not restart anything while $WO_ID still has a turn running"
+  say "  2. the daemon restarts jarvis-ui.service, then jarvis.service (detached)"
+  say "  3. on boot, the new daemon verifies $TAG is live on both units, settles"
+  say "     $WO_ID, and sends the release notification"
+  [ "$DRY_RUN" = 1 ] && say "(dry-run: no changes were made)"
+  exit 0
+fi
+
+# --- 6. restart the UI (safe to do inline: it does not host this script) ---------
+#
+# WHY THE DAEMON IS NOT RESTARTED HERE. shipit is usually run from a Claude session
+# that Jarvis itself spawned, and such a session lives inside jarvis.service's cgroup.
+# `systemctl --user restart jarvis.service` therefore SIGTERMs this very script: the
+# daemon comes back on the new tag, everything the script had left to do never runs.
+# That is exactly how 0.5.0 shipped half-applied — the daemon restarted, the script
+# died, and jarvis-ui.service kept serving the old code.
+#
+# So the restart step is split in two, and the daemon goes LAST (step 8), detached:
+#   * jarvis-ui.service never hosts us → restart it inline and verify it here;
+#   * jarvis.service may host us → hand its restart to a transient systemd unit that
+#     lives outside our cgroup, after everything else is done.
+unit_installed() {  # unit_installed <unit>; a dry run always prints the full plan
+  if [ "$DRY_RUN" = 1 ]; then return 0; fi
+  systemctl --user list-unit-files "$1" 2>/dev/null | grep -q "$1"
+}
+
+UI_SVC="jarvis-ui.service"
+DAEMON_SVC="jarvis.service"
+
+any_installed=0
+if unit_installed "$UI_SVC"; then
+  any_installed=1
+  say "restarting $UI_SVC"
+  run "systemctl --user restart '$UI_SVC'"
   [ "$DRY_RUN" = 1 ] || sleep 2
-  run "systemctl --user --no-pager --lines=0 status jarvis.service jarvis-ui.service || true"
-else
+  run "systemctl --user --no-pager --lines=0 status '$UI_SVC' || true"
+fi
+if unit_installed "$DAEMON_SVC"; then any_installed=1; fi
+if [ "$any_installed" = 0 ]; then
   say "services not installed — run scripts/install_prod_service.sh once to enable them"
 fi
 
@@ -248,4 +321,22 @@ notify_telegram
 
 say "shipped $TAG → $PROD_DIR"
 [ "$DRY_RUN" = 1 ] && say "(dry-run: no changes were made)"
+
+# --- 8. restart the daemon LAST, detached from this script ----------------------
+# Nothing may follow this step: if we are running inside jarvis.service's cgroup the
+# restart kills us. `systemd-run --user` puts the restart in its own transient unit,
+# outside our cgroup, so it completes whether or not we survive; the short sleep lets
+# this script print its last line and exit cleanly first.
+if unit_installed "$DAEMON_SVC"; then
+  if [ "$DRY_RUN" != 1 ] && ! command -v systemd-run >/dev/null 2>&1; then
+    say "systemd-run unavailable — restarting $DAEMON_SVC inline (this script may be killed)"
+    run "systemctl --user restart '$DAEMON_SVC'"
+  else
+    say "restarting $DAEMON_SVC (detached — this script may live in its cgroup)"
+    run "systemd-run --user --collect --unit='jarvis-shipit-restart-${VERSION//./-}' \
+           --description='shipit $TAG: restart $DAEMON_SVC' \
+           /bin/sh -c 'sleep 3; systemctl --user restart $DAEMON_SVC'"
+    say "  queued: $DAEMON_SVC restarts in ~3s — check with: systemctl --user status $DAEMON_SVC"
+  fi
+fi
 exit 0

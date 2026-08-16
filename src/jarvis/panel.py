@@ -161,16 +161,18 @@ def build_seat_system_prompt(store: NeoStore, project: str, seat: str,
     `store.learnings(project, seat=seat)` returns the global learnings PLUS this seat's.
     The default (no seat) returns only the global ones, which is what keeps a seat-scoped
     correction out of the single-agent path's cached prefix.
+
+    The character budget comes from `neo.render_learnings` rather than being reimplemented
+    here: a panel round pays for the block once PER SEAT, so the one prompt component that
+    grows without limit is worth five times as much here as it is on the single-agent path.
     """
+    from . import neo
+
     _, mandate = definition(seat)
     parts = [SEAT_HEADER.format(seat=seat), "", mandate, "",
              "# Learnings (from the user's reviews of your past answers)"]
-    rows = store.learnings(project, limit=learnings_limit, seat=seat)
-    if not rows:
-        parts.append("(none yet — escalate when unsure)")
-    for r in rows:
-        scope = r["project"] or "global"
-        parts.append(f"- [{scope}] {r['content']}")
+    parts += neo.render_learnings(
+        store.learnings(project, limit=learnings_limit, seat=seat))
     return "\n".join(parts)
 
 

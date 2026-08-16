@@ -109,6 +109,11 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # as env rather than being looked up per hook call: the hook runs on every Bash
         # command and must not load and parse the catalog to decide it has nothing to do.
         "JARVIS_GATES": project.gates.to_json(),
+        # Buy the 5-minute prompt cache (write 1.25x) instead of the 1-hour one (2x),
+        # which Claude Code would otherwise pick for a headless session. Measurements
+        # and the reversal criteria: docs/superpowers/specs/
+        # 2026-08-10-resume-cost-and-the-cache.md, and kn-f94abf34.
+        "FORCE_PROMPT_CACHING_5M": "1",
     })
     settings["env"] = env
     out = project.path / ".jarvis" / "worker-settings" / f"{wo['id']}.json"
@@ -121,48 +126,6 @@ def worker_name(wo: dict[str, Any]) -> str:
     """Background session display name. The `[WO <id>]` prefix is the visible marker
     (in the agents view and UI) that this session is framework-managed."""
     return f"[WO {wo['id']}] {wo['title'][:60]}"
-
-
-def _read_knowledge_bullet(brief: KnowledgeBrief | None, project_name: str) -> list[str]:
-    """The contract's READ half — omitted entirely when there is no index.
-
-    Both knowledge bullets are conditional for the same reason: telling a worker to
-    consult an index that is not in its prompt is worse than saying nothing. It made a
-    subject in `evals/llm/test_worker_judgment.py` (which briefs with an empty base)
-    answer a branch-naming call with `jarvis learn search "branch name"` — going to look
-    something up in a knowledge base that did not exist, instead of recording the call.
-    """
-    if not brief:
-        return []
-    return [
-        f"- READ the OS knowledge base on demand — it is INDEXED at the end of this "
-        f"prompt, not pasted into it: `jarvis learn show <id>` for an entry the index "
-        f"lists, `jarvis learn search \"<term>\" --project {project_name}` to sweep "
-        f"for one. Look up any area you are about to touch BEFORE you touch it, and "
-        f"before you ask or assume about it — a past worker probably already paid for "
-        f"the lesson. The headline is a truncated first line, never the whole entry: "
-        f"if a headline looks relevant, fetch it rather than acting on the summary.",
-    ]
-
-
-def _lookup_first_bullet(brief: KnowledgeBrief | None) -> list[str]:
-    """Ordering rule under the "ask Neo" bullet: a lookup is not a doubt.
-
-    Scoped to headlines that actually match, and explicitly NOT a licence to go
-    searching instead of recording a call made with no doubt — both clauses are there
-    because the first draft cost `worker-llm/assume-recall` a point.
-    """
-    if not brief:
-        return []
-    return [
-        "  - But LOOK IT UP FIRST if a headline in the knowledge-base index below names "
-        "the area you are unsure about: fetch that entry (`jarvis learn show <id>`) "
-        "before you ask. A lookup is not a doubt — re-deciding what a past worker "
-        "already recorded spends Neo's or the user's attention for nothing. This "
-        "applies only when a headline actually matches; when nothing in the index "
-        "fits, ask, and never let it become a reason to go looking instead of "
-        "recording a call you made with no doubt.",
-    ]
 
 
 def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str]:
@@ -216,19 +179,52 @@ def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str
     return lines
 
 
+def materialize_design_doc(store: ProjectStore, project: ProjectSpec,
+                           wo: dict[str, Any]) -> dict[str, str] | None:
+    """Put the parent feature's design document where this child worker can read it.
+
+    A child's worktree branches from the default branch, but the design document lives
+    on the PLANNER's unmerged branch — so the snapshot taken at `fo plan` time is
+    written under the project's shared `.jarvis/` tree, which workers already read
+    (agent skills live there). Returns `{repo_path, path}` for the prompt, or None when
+    the work order has no parent or its plan names no document. Idempotent: later
+    dispatches of siblings rewrite the same bytes.
+    """
+    from . import db
+
+    if not wo.get("parent_id") or wo.get("kind") == "planner":
+        return None
+    fo = store.get_feature_order(wo["parent_id"])
+    plan = db.from_json((fo or {}).get("plan"), {}) or {}
+    if not (fo and plan.get("design_doc") and plan.get("design_doc_content")):
+        return None
+    target = (project.path / ".jarvis" / "features" / fo["id"]
+              / Path(plan["design_doc"]).name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(plan["design_doc_content"])
+    return {"repo_path": plan["design_doc"], "path": str(target)}
+
+
 def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
-                        knowledge: KnowledgeBrief | None = None) -> str:
+                        knowledge: KnowledgeBrief | None = None,
+                        design_doc: dict[str, str] | None = None) -> str:
     """What the worker is told, composed from the work order and its project.
 
-    Two kinds of work order get two contracts (`project_store.WO_KINDS`). Everything
-    around the contract — the pre-approval marker, the gate briefing, the knowledge base,
-    "what the outside world sees" — is identical for both, and deliberately so: a planner
-    is an ordinary session that happens to produce a plan, and every surface the OS
-    already gives a worker (asking Neo, assumptions, the gate, the timeline,
-    cancellation) applies to it unchanged.
+    Two kinds of work order get two shapes. A WORKER opens with the minimum — its
+    identity, the work order, a compressed contract of only the load-bearing
+    invariants — plus an index of the full briefings it can fetch on demand with
+    `jarvis brief <section>` (single-sourced in `worker_brief`, so the CLI and this
+    prompt cannot drift). A PLANNER keeps its full prompt: one session per feature,
+    already reviewed as a unit. The surfaces around the contract — the pre-approval
+    marker and the knowledge index — are identical for both.
     """
     if wo.get("kind") == "planner":
         return _planner_prompt(wo, project, knowledge)
+    from . import worker_brief
+    from .gates import KINDS
+
+    live_gates = tuple(k.name for k in KINDS
+                       if k.name in project.gates.enabled) if project.gates else ()
     parts = [
         f"You are the worker agent for Jarvis work order `{wo['id']}` in project "
         f"`{project.name}`.",
@@ -236,131 +232,53 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"# Work order: {wo['title']}",
         "",
         wo.get("description") or "(no further description — the title is the task)",
+        *([
+            "",
+            "# Design document",
+            f"Your brief references sections of this feature's design document "
+            f"(`{design_doc['repo_path']}`). A snapshot is materialised at "
+            f"{design_doc['path']} — read the sections your brief names rather than "
+            f"the whole document, and treat it as read-only: the authoritative copy "
+            f"is on the planner's branch.",
+        ] if design_doc else []),
         "",
-        "# Operating contract",
-        "You MUST follow this contract (it mirrors the project's OPERATION.md — do "
-        "not go looking for that file, everything you need is here):",
-        "- Work only inside your assigned worktree (you start in it). Commit your "
-        "work and open a PR per this repo's conventions. Never push to main.",
-        f"- **The PR title MUST start with `[{wo['id']}] `** — e.g. "
-        f"`[{wo['id']}] {wo['title'][:40]}`. It is what ties the pull request back to "
-        f"this work order for everyone who never sees Jarvis. `gh pr create` with any "
-        f"other title is blocked.",
-        f"- **Neo is your first responder. Any doubt goes to it.** Not just the big "
-        f"calls — any point where you are not sure. `jarvis wo ask {wo['id']} "
-        f"\"<your question>\"`, then END YOUR TURN. The answer arrives as your next "
-        f"user turn, usually within a minute, from Neo (the user's delegate) or the "
-        f"user. This is the normal, expected way to work: it is not an escalation, it "
-        f"does not interrupt the user, and it costs you about a minute. Put "
-        f"everything needed to decide INSIDE the question text — whoever answers sees "
-        f"only that text, never your session — with the concrete options and your "
-        f"recommendation.",
-        "  - The trigger is DOUBT, not importance. If you catch yourself weighing "
-        "options, thinking \"either would work\", or picking one because you have to "
-        "pick something, you are in doubt: ask. Ask BEFORE you build on it, not "
-        "after.",
-        *_lookup_first_bullet(knowledge),
-        "  - Do not talk yourself out of asking. \"It's reversible\", \"it's only an "
-        "implementation detail\", \"I'll note it as an assumption\" — those are "
-        "rationalisations for guessing. Almost everything is reversible; that is not "
-        "the question. The question is whether you would be REBUILDING if you guessed "
-        "wrong.",
-        f"- `jarvis wo assume {wo['id']} \"...\"` is for the OTHER case, and it "
-        f"should be RARE: a call you made with NO doubt — you followed an existing "
-        f"convention, the work order implied it, the codebase left one sensible "
-        f"option. Record EVERY such call, including the small and obvious ones "
-        f"(naming, file layout, which convention you followed, how you split the "
-        f"commits): recording is cheap and the work order record is the only audit "
-        f"trail anyone gets. An assumption is a disclosure of something you were SURE "
-        f"about. It is never a guess you are hoping nobody checks — if you are "
-        f"guessing, ask instead.",
-        f"- File deferred work instead of leaving notes: `jarvis backlog add "
-        f"{project.name} \"...\"`",
-        *_read_knowledge_bullet(knowledge, project.name),
-        # "WRITE to it" only parses when the READ bullet is there to be "it"; with no
-        # index the bullet stands alone, exactly as it did before this change
-        f"- {'WRITE to it: the' if knowledge else 'The'} OS knowledge base is the ONLY "
-        f"memory that survives you: "
-        f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`. "
-        f"Anything durable you learn — project state, gotchas, conventions, decisions "
-        f"— goes there. Your own memory files, notes and scratch docs are invisible to "
-        f"the user, to Neo and to the next worker (Jarvis mirrors any memory file you "
-        f"do write, but say it here and it lands intact).",
-        f"- Alert the human when needed: `jarvis notify --project {project.name} "
-        f"--level warning|critical \"title\" \"body\"`",
-        "- Hit a bug in Jarvis OS itself (a `jarvis` command fails, hangs, or does the "
-        "wrong thing)? Use your `report-jarvis-bug` skill, then carry on with this work "
-        "order. Bugs in THIS project are not Jarvis OS bugs — those go to the backlog.",
-        f"- When done, ALWAYS run: `jarvis wo finish {wo['id']} --summary \"...\"` and "
-        f"then write your full answer as the last thing you say. If you opened a pull "
-        f"request, pass it too: `--pr <url>`. That parks the work order in 'waiting for "
-        f"PR merge', where it stays on the user's open list with the link until they "
-        f"merge it, instead of settling as completed work nobody is looking at.",
+        *worker_brief.core_contract(wo["id"], wo["title"], project.name,
+                                    bool(knowledge), live_gates),
         "",
-        "# What the outside world sees",
-        "The work order record IS this conversation, as far as anyone else is concerned. "
-        "The last message of every turn you take is captured verbatim into it, and the "
-        "user and Neo make their decisions from that record — neither will ever open "
-        "this session. So end every turn with the complete answer: findings, caveats, "
-        "uncertainties, what you did NOT do, and absolute paths. `--summary` is a "
-        "one-line headline for that answer, never a substitute for it — anything that "
-        "lives only in the summary is the only thing anyone reads, so a detail you drop "
-        "there is a detail that ceases to exist.",
+        *worker_brief.section_index(wo["id"], gated=bool(project.gates)),
+    ]
+    pre_approved = _pre_approval(wo)
+    if pre_approved:
+        parts += ["", *_pre_approved_briefing(pre_approved)]
+    parts += [
         "",
         "Work autonomously toward a complete end-to-end solution unless this work "
         "order says otherwise. User feedback may arrive as new user turns; treat it "
         "as authoritative for this work order.",
     ]
-    return "\n".join(_common_briefing(parts, wo, project, knowledge))
+    if knowledge:
+        parts += render_knowledge_block(knowledge, project.name)
+    return "\n".join(parts)
 
 
 def _navigation_briefing() -> list[str]:
-    """Serena before grep, for every session Jarvis dispatches.
+    """Serena before grep — the full text lives in `worker_brief` (single source
+    with `jarvis brief navigation`); this shape survives for the planner's
+    `_common_briefing` tail."""
+    from . import worker_brief
 
-    This is prose rather than a capability restriction, and it has to be: a worker needs
-    `Grep` and `Bash` to do its actual job, so the seats' trick of simply not granting
-    the tool is not available here. What IS available is saying which tool answers the
-    question — and the two do not answer the same question. `find_referencing_symbols`
-    has no grep equivalent at all.
-
-    It is stated conditionally because Jarvis knows nothing about Serena: there is no
-    `mcpServers` key in `settings.base.json` and no mention of it anywhere in `src/`, so
-    whether a worker has it depends entirely on the user's own Claude configuration and
-    on whether the project has been indexed. An instruction that assumed it would be a
-    lie in most adopted projects; one that ranks it when present costs nothing when it is
-    absent.
-    """
-    return [
-        "# Navigating the code: Serena first, grep second",
-        "If this project has Serena (its symbol tools appear in your tool list, or "
-        "`.serena/project.yml` is in the repo), use it to find code and do NOT grep for "
-        "symbols. Serena has a language-server symbol index, so `find_symbol`, "
-        "`get_symbols_overview` and especially `find_referencing_symbols` answer where "
-        "something is defined and who calls it as facts, in one call. Grep answers a "
-        "different question — where a string appears — and you then have to rebuild the "
-        "answer from hits that miss every caller spelling the name differently.",
-        "",
-        "- `list_memories` / `read_memory` FIRST on a mapped project: its architecture is "
-        "already written down, and rediscovering it is the most expensive thing you can "
-        "do with your context.",
-        "- `find_symbol` instead of `grep -rn \"def foo\"`; "
-        "`find_referencing_symbols` instead of grepping for call sites — that one has no "
-        "grep equivalent; `get_symbols_overview` before opening a file whole.",
-        "- `search_for_pattern` (Serena's own) or `Grep` for GENUINE text questions: a "
-        "config key, an error string, a TODO. Text search is not wrong, it is just the "
-        "wrong tool for finding code.",
-        "- If the symbol tools say no project is active, `activate_project` on the repo "
-        "root first.",
-        "",
-        "If the project has no Serena, `Glob` and `Grep` are the fallback and there is "
-        "nothing to apologise for — just expect to work harder for a less complete "
-        "picture.",
-    ]
+    return worker_brief.navigation_section().splitlines()
 
 
 def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
                      knowledge: KnowledgeBrief | None = None) -> list[str]:
-    """The tail every briefing carries, whatever the work order's kind."""
+    """The full-briefing tail — now only the PLANNER's prompt carries it inline.
+
+    A worker's prompt reaches the same text through `worker_brief.section_index`
+    and `jarvis brief <section>` instead; the pre-approval marker and the knowledge
+    index are the parts a worker still gets inline, composed in
+    `build_worker_prompt` directly.
+    """
     parts += ["", *_navigation_briefing()]
     pre_approved = _pre_approval(wo)
     if pre_approved:
@@ -470,6 +388,8 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "```json",
         "{",
         '  "summary": "one line: what this feature is, once it is all done",',
+        '  "design_doc": "docs/specs/<feature>.md — the design document your briefs '
+        'reference, relative to the repo root",',
         '  "justification": "only if you exceed the child cap — why it cannot be fewer",',
         '  "children": [',
         "    {",
@@ -489,13 +409,25 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"edges, and a child does not start until everything it needs has completed and "
         f"merged.",
         "",
-        "## Every child's description must stand alone",
-        "This is the rule the whole plan lives or dies on. Each child is dispatched into "
-        "a NEW session with a worker that sees its own description and nothing else — "
-        "not this plan, not this conversation, not what its siblings are doing, not the "
-        "feature order. Anything you know because you read the whole feature has to be "
-        "written INTO each child that needs it, even where that means repeating "
-        "yourself across children. Repetition is cheap; a worker guessing is not.",
+        "## The design document carries the shared context; each brief stands alone on "
+        "top of it",
+        "Write the feature's design document FIRST — a markdown file in your worktree "
+        "(convention: `docs/`), with numbered sections — and name it in the plan's "
+        "`design_doc` field. Everything you know because you read the whole feature — "
+        "the architecture, the data model, the interfaces, the traps — goes THERE, "
+        "once. Do not repeat it into every child: that duplication is what took "
+        "plan-review questions to 84KB.",
+        "",
+        "Each child is dispatched into a NEW session with a worker that sees its own "
+        "description plus the design document, and nothing else — not this plan, not "
+        "this conversation, not what its siblings are doing. The OS snapshots the "
+        "document when you submit and materialises it where every child worker can "
+        "read it. So a description is a BRIEF, not an encyclopedia: the goal, the "
+        "scope boundary (what this piece must not touch), what done means, and "
+        "explicit references to the design document's sections by number for "
+        "everything deeper (`the state machine is design doc section 3`). It must "
+        "still stand alone as INSTRUCTIONS — a stranger must know what to do from the "
+        "description; the document is where they read how it fits.",
         "",
         "So: no \"as discussed in the plan\", no \"same as the previous work order\", no "
         "\"as described above\". Those are rejected mechanically, before anything is "
@@ -531,8 +463,11 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"next user turn, usually within a minute. The trigger is DOUBT, not importance. "
         f"For a planner the highest-value questions are about SCOPE — whether a piece "
         f"belongs in this feature at all — because that is the one thing you cannot "
-        f"recover from by revising the decomposition. Put everything needed to decide "
-        f"inside the question text; whoever answers sees only that text.",
+        f"recover from by revising the decomposition. A question is one paragraph: the "
+        f"decision, the options, your recommendation — arguing from your design "
+        f"document by section in-text (e.g. `from section 3 of design doc "
+        f"\"docs/specs/feature.md\": …`), never by pasting it; the referenced section "
+        f"is delivered to whoever answers automatically.",
         f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
         f"Record every one, including the small ones.",
         f"- Work only inside your worktree (you start in it).",
@@ -617,40 +552,15 @@ def _gate_briefing(wo: dict[str, Any], project: ProjectSpec) -> list[str]:
     Worth stating explicitly: a worker that believes releases are simply forbidden will
     finish the work order with "someone should ship this" rather than asking, and the
     gate never gets used. The point of the gate is that the answer is "yes, with review".
-    """
-    from .gates import KINDS
 
-    live = [k for k in KINDS if k.name in project.gates.enabled]
-    lines = [
-        "# Privileged actions (gated, NOT forbidden)",
-        "These actions are reviewed before they run — an independent reviewer (Neo, the "
-        "user's delegate) decides, and approval lets you proceed:",
-    ]
-    lines += [f"- `{k.name}` — {k.summary}" for k in live]
-    lines += [
-        "",
-        "Attempting one directly is safe: the attempt is blocked, a request is filed "
-        "automatically, and you are told to wait. But you make a much stronger case by "
-        "asking first, because the reviewer sees ONLY the text you write:",
-        f"    jarvis gate request {wo['id']} \"<the exact command>\" "
-        f"--why \"<why this is ready>\" --evidence \"<PR number, test results, checks>\"",
-        "",
-        "Then END YOUR TURN. The verdict arrives as your next user turn. If approved, run "
-        "that exact command — the approval is scoped to that one string and expires, so "
-        "do not reword it. If denied, fix what the reason names; do not retry as-is.",
-        "",
-        # Without this the worker reads a gate on a `grep` as a judgement on its work and
-        # starts rewording harmless commands to sneak past the recogniser. Naming the
-        # third outcome is what makes "just file it and wait" the obvious move instead.
-        "A third verdict exists: DISMISSED. The recogniser matches text, so it sometimes "
-        "fires on a command that merely NAMES one of these actions — a release script "
-        "inside a grep pattern, a path quoted in a PR body. That is an OS bug, not a "
-        "refusal: the reviewer dismisses it, nothing is authorised, and you may run the "
-        "command as written. So if a gate fires on something you know ships nothing, do "
-        "not reword the command to get around it — file it, say plainly why it performs "
-        "no privileged action, and end your turn.",
-    ]
-    return lines
+    The full text lives in `worker_brief.gates_section` (single source with
+    `jarvis brief gates`); this shape survives for the planner's `_common_briefing`
+    tail and for tests that compare the worker-facing gate surfaces.
+    """
+    from . import worker_brief
+
+    return worker_brief.gates_section(
+        wo["id"], enabled=tuple(project.gates.enabled)).splitlines()
 
 
 def dispatch_work_order(
@@ -675,7 +585,8 @@ def dispatch_work_order(
         digest_limit=cfg.knowledge_digest_limit,
         digest_chars=cfg.knowledge_digest_chars,
     )
-    prompt = build_worker_prompt(wo, project, knowledge)
+    prompt = build_worker_prompt(wo, project, knowledge,
+                                 design_doc=materialize_design_doc(store, project, wo))
 
     # Resolved onto the row before the turn is launched, so every later turn rebuilds the
     # same briefing from the record rather than re-reading a catalog that may have moved.

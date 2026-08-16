@@ -11,6 +11,8 @@ Type=simple
 WorkingDirectory=@PROD_DIR@
 Environment=JARVIS_HOME=@PROD_ROOT@/state
 Environment=PRODUCTION_CODE=@PROD_ROOT@
+# Marks this instance as the live fleet — see paths.deployment_env.
+Environment=JARVIS_ENV=production
 Environment=PATH=@PATH@
 # Leading '-' → optional: the daemon still starts if secrets are absent (Telegram just skips).
 EnvironmentFile=-@PROD_ROOT@/secrets/jarvis.env

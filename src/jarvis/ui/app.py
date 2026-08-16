@@ -12,10 +12,10 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import ops
+from .. import invariants, ops
 from ..central_store import CentralStore
 from ..daemon import daemon_running
-from ..paths import logs_dir
+from ..paths import PRODUCTION, deployment_env, logs_dir
 from ..project_store import (
     FO_OPEN_STATUSES,
     OPEN_STATUSES,
@@ -148,6 +148,45 @@ def log_ui_error(request: Request, exc: BaseException) -> None:
         pass
 
 
+def instance_badge() -> dict[str, str | bool]:
+    """Which Jarvis this dashboard is driving, for the header.
+
+    Production and development are the same code in two checkouts on one machine
+    (docs/DEPLOYMENT.md), and their dashboards are otherwise identical — so the badge
+    is the only thing stopping someone from acting on the live fleet while believing
+    they are in the dev sandbox. Both facts are read once per process: neither the
+    environment nor the installed version can change under a running server.
+
+    The version is the running one, never a constant in the source: on `main` the
+    version string deliberately lags the shipped tag (only release branches carry the
+    bump), so a literal would be wrong in exactly the place it matters most.
+    """
+    from ..bugreport import jarvis_version
+    env, detail = deployment_env()
+    try:
+        version = jarvis_version()
+    except Exception:  # noqa: BLE001 — see gate_badge: a badge must not 500 a page
+        version = "unknown"
+    return {"env": env, "prod": env == PRODUCTION, "version": version,
+            "shown": _version_for_badge(version),
+            "label": "prod" if env == PRODUCTION else "dev",
+            "detail": f"{env} · {detail} · version {version}"}
+
+
+def _version_for_badge(version: str) -> str:
+    """`0.5.0` → `v0.5.0`; `dev-a1b2c3d` → `a1b2c3d`.
+
+    `bugreport.jarvis_version` reports a release as a bare number and everything else
+    as `dev-<sha>` (a dev build is not "0.5.0 plus a bit"). The badge already says
+    which instance this is, so pasting that in raw would read `dev · vdev-a1b2c3d` —
+    the word twice, and a `v` in front of a commit sha. Only a real version number
+    gets the `v`; the tooltip carries the string unaltered either way.
+    """
+    if version.startswith("dev-"):
+        return version[len("dev-"):]
+    return f"v{version}" if version[:1].isdigit() else version
+
+
 def _false_positive_rate(rows: list) -> str | None:
     """"3 of 11 (27%)" — how often the gate fired on a command that ships nothing.
 
@@ -176,6 +215,80 @@ def gate_badge() -> int | None:
         return None
 
 
+def _decorate_question(q: dict) -> dict:
+    """Add the two display-only fields the `/neo` question blocks render.
+
+    `digest_view` is the shortened rendering (`jarvis.digest`), or None when there
+    isn't one — never attempted, attempted and failed, or the row predates the feature.
+    The template shows the full question in every one of those cases, so a page with no
+    digests anywhere is the page as it was before this existed.
+
+    `full_context` is what the disclosure reveals: EXACTLY the question-specific prompt
+    Neo was sent, built by the same function that builds it for the call. Not the system
+    prompt — that is the persona plus every learning, identical on every question, and
+    putting it here would bury the one thing the user opened the disclosure to read.
+    Building it here rather than storing it means it cannot drift from what Neo gets.
+    """
+    from .. import digest, neo
+    q["digest_view"] = digest.decode(q.get("digest"))
+    q["full_context"] = neo.build_question_prompt(q)
+    return q
+
+
+def _digest_credit() -> str:
+    """Attribution for the vendored output style, shown once on the page."""
+    from .. import digest
+    return digest.skill_attribution()
+
+
+def fmt_tok(n: int | None) -> str:
+    """Token counts, at the magnitude a reader actually compares — 1.3M, 47k, 812.
+
+    Mirrors `cli._tok`, deliberately as a second small implementation rather than an
+    import: the CLI's is a private helper of a module the UI has no other reason to
+    load, and the shared thing here is a formatting convention, not behaviour.
+    """
+    if not n:
+        return "0"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
+
+
+def fmt_dur(seconds: float | None) -> str:
+    """Turn durations at a readable magnitude — 1.2h, 4m, 15s.
+
+    Mirrors `cli._dur` the same way `fmt_tok` mirrors `cli._tok`: the shared thing is
+    a formatting convention, not behaviour.
+    """
+    if seconds is None:
+        return "—"
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}h"
+    if seconds >= 60:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds:.0f}s"
+
+
+def wo_cost(wo_id: str, project: str) -> dict | None:
+    """One work order's spend, or None if it cannot be measured or read.
+
+    NEVER RAISES, and that is the whole contract. This is a read of Claude Code's
+    transcripts — files Jarvis does not own, that it prunes on its own schedule, and
+    whose format is not Jarvis's to guarantee. The work order page has to render when a
+    worker is blocked on a gate, and a page that 500s because a JSONL file moved would
+    take that decision surface down with it. None means "no figure to show" and the
+    template simply omits the line.
+    """
+    try:
+        units = ops.cost_report(target=wo_id, project=project)["units"]
+    except Exception:  # noqa: BLE001 — see docstring
+        return None
+    return units[0] if units and units[0].get("found") else None
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None)
 
@@ -192,6 +305,8 @@ def create_app() -> FastAPI:
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         fo_status_meta=FO_STATUS_META, level_tone=LEVEL_TONE, fmt_age=fmt_age,
+        instance=instance_badge(),
+        fmt_tok=fmt_tok, fmt_dur=fmt_dur,
     )
 
     def render(request: Request, template: str, active: str = "dashboard",
@@ -277,6 +392,9 @@ def create_app() -> FastAPI:
             # Inside the store's lifetime: the label reads the dependencies' own rows.
             blocked = {wo["id"]: ops.blocked_by(store, wo) for wo in wos}
             blocked = {k: v for k, v in blocked.items() if v}
+            # Same lifetime, same reason: the note reads this work order's last turn.
+            rate_limits = {wo["id"]: invariants.rate_limit_note(store, wo) for wo in wos}
+            rate_limits = {k: v for k, v in rate_limits.items() if v}
             visible_counts = store.status_counts()
             all_counts = store.status_counts(include_hidden=True)
             counts = all_counts if show_hidden else visible_counts
@@ -297,6 +415,7 @@ def create_app() -> FastAPI:
         return render(request, "project.html", project_name=name, path=paths[name],
                       featured=featured, rest=rest, open_counts=open_counts,
                       backlog=backlog, show_hidden=show_hidden, blocked=blocked,
+                      rate_limits=rate_limits,
                       hidden_count=hidden_count, settled=settled, revealed=revealed,
                       features=features)
 
@@ -347,16 +466,64 @@ def create_app() -> FastAPI:
             # the reason it stopped belongs on the page it stopped on.
             store.expire_approvals()
             approvals = store.list_approvals(wo_id)
+            # Why a `running` work order has nothing running. Same idea as the gate
+            # line above: the reason it stopped belongs on the page it stopped on.
+            rate_limit = invariants.rate_limit_note(store, wo)
         finally:
             store.close()
         show_debug = debug not in ("", "0", "false")
         return render(request, "work_order.html", project=pname, wo=wo,
+                      rate_limit=rate_limit,
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug,
                                               questions=ops.neo_question_texts(wo_id)),
                       debug=show_debug, debug_count=count_debug(events),
                       messages=messages, assumptions=assumptions,
-                      approvals=approvals)
+                      approvals=approvals, cost=wo_cost(wo_id, pname))
+
+    @app.get("/cost", response_class=HTMLResponse)
+    def cost_page(request: Request, project: str = ""):
+        """What the fleet's work cost, dearest first — the dashboard half of `jarvis cost`.
+
+        Its own page rather than a column on the dashboard: this reads and parses every
+        session transcript Claude Code still holds (~0.4s for a fleet of sixty), and the
+        dashboard re-reads itself every 15 seconds. Spend is a question someone asks
+        deliberately, not one worth paying for on every pulse.
+        """
+        try:
+            report = ops.cost_report(project=project or None)
+        except ops.OpsError as e:
+            return render(request, "error.html", message=str(e))
+        return render(request, "cost.html", active="cost", report=report,
+                      units=report["units"], totals=report["totals"],
+                      project=project,
+                      projects=sorted(ops.registered_project_paths()))
+
+    @app.get("/cost/{name}/{wo_id}", response_class=HTMLResponse)
+    def cost_wo_page(request: Request, name: str, wo_id: str):
+        """One work order's spend, turn by turn — where a bloated order shows itself.
+
+        The rows come from the recorded result JSON of each turn (exact), with the
+        context peak drawn as a bar against the model's window so the growth across
+        turns is visible at a glance. Provenance is stated on the page: turns that
+        exist only in transcripts are listed as the estimates they are, never merged
+        into the recorded figures.
+        """
+        try:
+            report = ops.cost_report(target=wo_id, project=name)
+        except ops.OpsError as e:
+            return render(request, "error.html", message=str(e))
+        if "turns_detail" not in report:
+            return render(request, "error.html",
+                          message=f"{wo_id} has no per-turn view (only work orders do)")
+        turns = report["turns_detail"]
+        # Bars are scaled to the context window when any turn reports one, else to the
+        # largest peak on the page — growth stays comparable either way.
+        scale = max([t.get("context_window") or 0 for t in turns]
+                    + [t.get("context_peak") or 0 for t in turns] + [1])
+        return render(request, "cost_wo.html", active="cost", report=report,
+                      unit=report["units"][0], turns=turns, project=name,
+                      bar_scale=scale)
 
     @app.get("/inbox", response_class=HTMLResponse)
     def inbox(request: Request):
@@ -436,10 +603,12 @@ def create_app() -> FastAPI:
                     opinions[q["id"]] = rows
         finally:
             neo.close()
+        for q in escalated + unreviewed:
+            _decorate_question(q)
         return render(request, "neo.html", active="neo", counts=counts,
                       in_flight=in_flight, escalated=escalated,
                       unreviewed=unreviewed, history=history, learnings=learnings,
-                      opinions=opinions)
+                      opinions=opinions, digest_credit=_digest_credit())
 
     @app.get("/gates", response_class=HTMLResponse)
     def gates_page(request: Request):

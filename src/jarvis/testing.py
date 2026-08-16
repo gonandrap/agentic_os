@@ -240,6 +240,22 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
         sys.stderr.write(
             f"Error: Session {sid} is currently running as a background agent (bg).\n")
         sys.exit(1)
+    # THE USAGE LIMIT, AND IT REFUSES BEFORE THE TRANSCRIPT IS WRITTEN — which is the
+    # property the retry path turns on. The real CLI never reaches the API (0ms, $0), so
+    # an opening turn refused this way leaves no session to `--resume`, and
+    # `worker_session.retry` has to re-open with `--session-id` instead. Writing the log
+    # first here would make the fake's opening refusal resumable and quietly hide that.
+    if os.environ.get("FAKE_CLAUDE_TURN") == "rate_limit":
+        reset = os.environ.get("FAKE_CLAUDE_LIMIT_RESET",
+                               "11:50pm (America/Los_Angeles)")
+        print(json.dumps({
+            "type": "result", "subtype": "success", "is_error": True,
+            "session_id": sid, "num_turns": 1, "total_cost_usd": 0,
+            "duration_api_ms": 0,
+            # Verbatim from wo-2fa7c0e9 turn 4, middle dot included.
+            "result": "You've hit your session limit · resets " + reset,
+        }))
+        sys.exit(0)
     with open(log, "a") as f:
         f.write(json.dumps(prompt) + "\n")
     seq = sum(1 for _ in open(log))
@@ -257,16 +273,60 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
                           "is_error": True, "result": "model call failed",
                           "session_id": sid}))
         sys.exit(0)
+    # The usage envelope mirrors the real CLI's result JSON (verified against a live
+    # turn), so the whole reap-and-record path runs against the true field shape in
+    # every pipeline test — `iterations` is one entry per API call, and the context
+    # at a call is its input + cache_read + cache_creation.
     print(json.dumps({
         "type": "result", "subtype": "success", "is_error": False,
         "session_id": sid, "result": f"final: {prompt[:60]}",
         "num_turns": seq, "total_cost_usd": 0.01,
+        "duration_api_ms": 1200, "duration_ms": 1500,
+        "usage": {
+            "input_tokens": 3, "cache_creation_input_tokens": 1000,
+            "cache_read_input_tokens": 2000, "output_tokens": 100,
+            "service_tier": "standard",
+            "cache_creation": {"ephemeral_1h_input_tokens": 1000,
+                               "ephemeral_5m_input_tokens": 0},
+            "iterations": [{"type": "message", "input_tokens": 3,
+                            "output_tokens": 100,
+                            "cache_read_input_tokens": 2000,
+                            "cache_creation_input_tokens": 1000,
+                            "cache_creation": {"ephemeral_1h_input_tokens": 1000,
+                                               "ephemeral_5m_input_tokens": 0}}],
+        },
+        "modelUsage": {"claude-fake-1": {
+            "inputTokens": 3, "outputTokens": 100, "cacheReadInputTokens": 2000,
+            "cacheCreationInputTokens": 1000, "costUSD": 0.01,
+            "contextWindow": 200000, "maxOutputTokens": 32000}},
     }))
 elif "-p" in argv and "--resume" not in argv:
     # headless one-shot (`claude -p ...`) — Neo's answering path. Deterministic
     # verdict driven by the prompt so tests control escalation.
     prompt = argv[argv.index("-p") + 1]
     system = opt("--append-system-prompt", "")
+    # A DASHBOARD DIGEST, AND IT COMES FIRST FOR THE SAME REASON THE SEAT BRANCH DOES:
+    # the call is identified by its system prompt, never by the user prompt — which is
+    # the worker's question verbatim, so a digest of a gate question would otherwise
+    # fall through to the gate branch below and answer with a verdict.
+    if "# Jarvis dashboard digest" in system:
+        if "FORCE_DIGEST_FAIL" in prompt:
+            sys.stderr.write("digest call failed (test-forced)\n"); sys.exit(1)
+        if "FORCE_DIGEST_GARBAGE" in prompt:
+            # No `headline`: the shape the validator must refuse. `structured.request`
+            # retries once and then raises, which is what the daemon records.
+            print(json.dumps({"result": json.dumps({"bullets": ["a", "b"]})}))
+            sys.exit(0)
+        head = prompt.strip().splitlines()[0][:80]
+        print(json.dumps({"result": json.dumps({
+            "headline": f"digest of: {head}",
+            # Seven, so a test can prove the FIVE-item cap is enforced in the validator
+            # and not merely requested in the prompt.
+            "bullets": [f"point {i}" for i in range(1, 8)],
+            "options": ["option A — cheap", "option B — thorough"],
+            "recommendation": "option A",
+        })}))
+        sys.exit(0)
     # A PANEL SEAT, AND THIS BRANCH COMES FIRST DELIBERATELY. Seat identity travels in
     # --append-system-prompt, never in the user prompt: a premise-seat call on a gate
     # question carries "PRIVILEGED ACTION REQUEST" in its prompt, so without this the
@@ -592,8 +652,24 @@ def fake_claude(tmp_path, monkeypatch):
         def turns_fail(self, mode: str = "fail") -> None:
             """Make subsequent turns fail. `fail` = non-zero exit, `silent` = exits
             writing nothing at all (a crashed process), `error` = a well-formed result
-            with `is_error`."""
+            with `is_error`, `rate_limit` = the CLI refusing the turn because the
+            account's usage window is spent (see `turns_rate_limited`)."""
             monkeypatch.setenv("FAKE_CLAUDE_TURN", mode)
+
+        def turns_rate_limited(self, reset: str = "11:50pm (America/Los_Angeles)"
+                               ) -> None:
+            """Refuse every subsequent turn for the usage limit, resetting at `reset`.
+
+            Call `turns_recover()` to reopen the window — which is what the OS is
+            waiting for, so it is also how a test proves the retry works rather than
+            just that it happens.
+            """
+            monkeypatch.setenv("FAKE_CLAUDE_LIMIT_RESET", reset)
+            monkeypatch.setenv("FAKE_CLAUDE_TURN", "rate_limit")
+
+        def turns_recover(self) -> None:
+            """Undo `turns_fail`/`turns_rate_limited`: turns succeed again."""
+            monkeypatch.delenv("FAKE_CLAUDE_TURN", raising=False)
 
         def hold_turns(self) -> Path:
             """Make subsequent turns block until the returned path is deleted, so a

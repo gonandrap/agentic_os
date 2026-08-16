@@ -55,6 +55,10 @@
       <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a>
       {%- if wo.status == 'waiting_pr_merge' %} — merge it, then "Mark done".{% endif %}</p>
   {% endif %}
+  {% if rate_limit %}
+    <p class="kv">⏳ {{ rate_limit }} — the turn was refused before it ran, so nothing
+      was lost and nothing is owed from you. It picks up where it left off.</p>
+  {% endif %}
   {% if wo.description %}<p class="kv" style="white-space: pre-wrap;">{{ wo.description }}</p>{% endif %}
   <p class="kv mono">
     created {{ fmt_age(wo.created_at) }} ago · updated {{ fmt_age(wo.updated_at) }} ago
@@ -87,6 +91,22 @@
   {% endif %}
   {% if wo.result_summary %}
     <p class="kv"><strong>Result:</strong> {{ wo.result_summary }}</p>
+  {% endif %}
+  {# What this one work order cost, read back from Claude Code's transcript. Absent
+     rather than zero when the transcript is gone: an unmeasurable cost and a zero cost
+     are different answers. #}
+  {% if cost %}
+  <p class="kv mono" style="margin-bottom:0;">
+    <span title="Anthropic list prices, as a common unit for comparing token kinds — not a bill.">~${{ '%.2f'|format(cost.list_cost_usd) }}</span>
+    · {{ fmt_tok(cost.billed_input) }} in / {{ fmt_tok(cost.output) }} out
+    · {{ cost.turns }} turn{{ 's' if cost.turns != 1 }}
+    {%- if cost.subagent_count %} · {{ cost.subagent_count }} subagent{{ 's' if cost.subagent_count != 1 }}
+      (~${{ '%.2f'|format(cost.subagent_cost_usd) }}){% endif %}
+    {%- if cost.rewrite_excess %} ·
+      <span title="Every turn after the first re-sends the whole conversation at the cache-write rate. Jarvis cannot fix the cause — it can only cost fewer turn boundaries.">re-write
+      tax ~${{ '%.2f'|format(cost.rewrite_cost_usd) }}</span>{% endif %}
+    · <a href="/cost">fleet →</a>
+  </p>
   {% endif %}
 </div>
 

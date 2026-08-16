@@ -2,6 +2,7 @@
 
 Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
+  jarvis cost [project|wo-id|fo-id]       what the work has cost in tokens
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
   jarvis fo create|list|show|plan|approve|cancel        feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
@@ -30,6 +31,27 @@ def _print(data: Any, as_json: bool) -> None:
         print(json.dumps(data, indent=2, default=str))
     else:
         _pretty(data)
+
+
+def _with_readable_digest(q: dict[str, Any]) -> dict[str, Any]:
+    """A Neo question row with its dashboard digest decoded, for HUMAN output only.
+
+    `questions.digest` holds JSON, and printing it as one long line is the opposite of
+    what a digest is for. Decoded into a nested block when there is one, replaced by the
+    recorded reason when the attempt failed, dropped entirely when it was never
+    attempted. `--json` never comes through here: a row dump is the row as stored.
+    """
+    from . import digest as digest_mod
+
+    row = dict(q)
+    view = digest_mod.decode(row.get("digest"))
+    failed = digest_mod.failure_reason(row.get("digest"))
+    row.pop("digest", None)
+    if view:
+        row["digest (dashboard only — Neo read the question above in full)"] = view
+    elif failed:
+        row["digest"] = f"(not produced: {failed})"
+    return row
 
 
 def _pretty(data: Any, indent: int = 0) -> None:
@@ -126,6 +148,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--repair", action="store_true",
                     help="apply the repairs instead of only reporting them")
     sp.add_argument("--catalog", help="catalog to read the fleet from")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("cost", help="what the fleet's work has cost in tokens")
+    sp.add_argument("target", nargs="?",
+                    help="a project, a work-order id, or a feature-order id "
+                         "(default: the whole fleet)")
+    sp.add_argument("--limit", type=int, default=50,
+                    help="work orders per project to measure (default: 50)")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
@@ -396,6 +426,17 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--reason", required=True,
                    help="what supersedes it — this is kept beside the entry for ever")
 
+    # brief ---------------------------------------------------------------------------------
+    bf = sub.add_parser(
+        "brief",
+        help="(workers) print one full briefing section on demand — the worker "
+             "prompt carries a compressed core plus an index of these")
+    bf.add_argument("section", nargs="?", default="",
+                    help="one of: contract, gates, record, navigation, knowledge; "
+                         "omit to list them")
+    bf.add_argument("--wo", default="", metavar="WO_ID",
+                    help="render with this work order's real ids")
+
     # neo -----------------------------------------------------------------------------------
     ne = sub.add_parser("neo", help="Neo: the OS answerer agent (answers workers as you)"
                         ).add_subparsers(dest="neo_cmd", required=True)
@@ -581,6 +622,124 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 print(f"    → {'fixed' if res['repair'] else 'would fix'}: {v['repair']}")
     _print_orphans(orphans)
     return 1
+
+
+def _tok(n: int) -> str:
+    """Token counts, at the magnitude a reader can hold in their head."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
+
+
+def _dur(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}h"
+    if seconds >= 60:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds:.0f}s"
+
+
+def _print_turn_table(res: dict) -> None:
+    """The per-turn breakdown of one work order, from the recorded result JSON.
+
+    Provenance is announced before any number: `recorded` rows are the CLI's own
+    accounting (exact), everything else is the transcript estimate, and a mixed
+    record says so out loud rather than adding the two systems into one figure.
+    """
+    rows = res.get("turns_detail") or []
+    provenance = res.get("provenance")
+    if not rows:
+        if provenance == "transcript":
+            print("\nno turns on record — the figures above are transcript estimates "
+                  "(this session predates turn capture, or was never Jarvis-driven)")
+        return
+    print()
+    if provenance == "recorded":
+        print("per-turn, recorded from the CLI's own result JSON — exact:")
+    elif provenance == "mixed":
+        print(f"⚠ {res['turns_recorded']} of {res['turns_settled']} settled turns are "
+              "recorded — the rest exist only as transcript estimates, so the table "
+              "below and the totals above are two different accountings:")
+    else:
+        print("no recorded turns — figures above are transcript estimates; "
+              "the turn list below carries timings only:")
+    print(f"{'turn':>4} {'kind':>8} {'dur':>6} {'$':>7} {'in':>6} {'cache-w':>8} "
+          f"{'1h/5m':>12} {'cache-r':>8} {'out':>7} {'calls':>5}  context")
+    for r in rows:
+        if not r["recorded"]:
+            print(f"{r['seq']:>4} {r['kind']:>8} {_dur(r['duration_s']):>6} "
+                  f"{'—':>7} {'—':>6} {'—':>8} {'—':>12} {'—':>8} {'—':>7} {'—':>5}  "
+                  f"not recorded ({r['state']})")
+            continue
+        ctx = _tok(r["context_peak"])
+        if r.get("context_pct") is not None:
+            ctx += (f" ({r['context_pct']:.0f}% of "
+                    f"{_tok(r['context_window'])} window)")
+        split = f"{_tok(r['cache_1h'])}/{_tok(r['cache_5m'])}"
+        calls = str(r["api_calls"]) if r.get("api_calls") else "—"
+        print(f"{r['seq']:>4} {r['kind']:>8} {_dur(r['duration_s']):>6} "
+              f"{(r['cost_usd'] or 0):>7.2f} {_tok(r['input']):>6} "
+              f"{_tok(r['cache_write']):>8} {split:>12} {_tok(r['cache_read']):>8} "
+              f"{_tok(r['output']):>7} {calls:>5}  {ctx}")
+    rec = res.get("recorded_totals")
+    if rec:
+        line = (f"recorded total ${rec['cost_usd']:.2f} — {rec['api_calls']} API "
+                f"call{'s' if rec['api_calls'] != 1 else ''}, "
+                f"context peak {_tok(rec['context_peak'])}")
+        if rec.get("context_window"):
+            line += (f" ({100 * rec['context_peak'] / rec['context_window']:.0f}% of "
+                     f"the {_tok(rec['context_window'])} window)")
+        print(f"\n{line}")
+
+
+def cmd_cost(args: argparse.Namespace) -> int:
+    from . import ops
+    target = args.target
+    # One argument, three kinds of thing. Ids are prefixed and projects are not, so
+    # this never has to guess: anything that is not `wo-…`/`fo-…` is a project name.
+    is_id = bool(target) and target.split("-")[0] in ("wo", "fo")
+    res = ops.cost_report(project=None if is_id else target,
+                          target=target if is_id else None, limit=args.limit)
+    if args.json:
+        _print(res, True)
+        return 0
+
+    units = res["units"]
+    totals = res["totals"]
+    if not units:
+        print(f"no work orders found for {res['scope']}")
+        return 0
+    header = f"{res['scope']} — {res['measured']} measured"
+    if res["unmeasured"]:
+        header += f", {res['unmeasured']} with no transcript left"
+    print(f"{header}\n")
+    print(f"{'$':>7} {'turns':>5} {'output':>7} {'re-write':>9}  work order")
+    for u in units:
+        if not u["found"]:
+            print(f"{'—':>7} {'—':>5} {'—':>7} {'—':>9}  {u['id']}  {u['title'][:44]}")
+            continue
+        print(f"{u['list_cost_usd']:>7.2f} {u['turns']:>5} "
+              f"{_tok(u['output']):>7} {_tok(u['rewrite_excess']):>9}  "
+              f"{u['id']}  {u['title'][:44]}")
+
+    _print_turn_table(res)
+
+    print(f"\ntotal ~${totals['list_cost_usd']:.2f} at list prices "
+          f"({_tok(totals['billed_input'])} in, {_tok(totals['output'])} out)")
+    if totals["rewrite_excess"]:
+        print(f"  re-write tax  ~${totals['rewrite_cost_usd']:.2f} — "
+              f"{_tok(totals['rewrite_excess'])} tokens re-sent across "
+              f"{totals['resume_boundaries']} turn boundaries")
+    if totals["subagent_cost_usd"]:
+        print(f"  subagents     ~${totals['subagent_cost_usd']:.2f}")
+    # Said every time, not in the help text: the figure is the only number on screen,
+    # and a subscription user reading it as an invoice is the likeliest misreading.
+    print("\nList prices, as a common unit for comparing token kinds — not a bill.")
+    return 0
 
 
 def _print_orphans(orphans: list[dict]) -> None:
@@ -1000,6 +1159,51 @@ def cmd_learn(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_brief(args: argparse.Namespace) -> int:
+    """`jarvis brief <section> [--wo <wo-id>]` — one full briefing section, on demand.
+
+    Read-only and total: a worker mid-session fetches these against the index its
+    opening prompt carries, so the command must always answer — real ids when it can
+    resolve them (the --wo flag, or the env dispatch gave this worker), placeholders
+    when it cannot, and never an error for a section that exists.
+    """
+    import os
+
+    from . import worker_brief
+
+    if not args.section:
+        for name in worker_brief.section_names():
+            print(f"{name:<12} {worker_brief.SECTION_HOOKS[name]}")
+        return 0
+    if args.section not in worker_brief.section_names():
+        print(f"unknown section {args.section!r} — valid sections: "
+              + ", ".join(worker_brief.section_names()), file=sys.stderr)
+        return 1
+
+    wo_id = args.wo or os.environ.get("JARVIS_WO_ID") or None
+    project = os.environ.get("JARVIS_PROJECT") or None
+    if args.wo:
+        # Resolve the project from the work order when the OS knows it; a worker
+        # holding a valid id must never be failed by a lookup miss.
+        try:
+            from . import ops
+            project, _path, _wo = ops.find_work_order(args.wo)
+        except Exception:  # noqa: BLE001 — placeholders are the graceful floor
+            pass
+    gates_enabled: tuple[str, ...] | None = None
+    gates_env = os.environ.get("JARVIS_GATES")
+    if gates_env:
+        try:
+            from .gates import GateConfig
+            gates_enabled = tuple(GateConfig.from_json(gates_env).enabled)
+        except Exception:  # noqa: BLE001
+            gates_enabled = None
+
+    print(worker_brief.render_section(args.section, wo_id=wo_id, project=project,
+                                      gates_enabled=gates_enabled))
+    return 0
+
+
 def cmd_neo(args: argparse.Namespace) -> int:
     from . import ops
     from .neo_store import NeoStore
@@ -1040,12 +1244,15 @@ def cmd_neo(args: argparse.Namespace) -> int:
         if q is None:
             print(f"error: neo question {args.question_id} not found", file=sys.stderr)
             return 1
+        # `--json` gets the row exactly as it is stored; the human rendering gets the
+        # dashboard digest decoded rather than as one long line of JSON.
+        row = q if args.json else _with_readable_digest(q)
         if not args.panel:
-            _print(q, args.json)
+            _print(row, args.json)
         elif args.json:
             _print({**q, "panel_opinions": opinions}, True)
         else:
-            _print(q, False)
+            _print(row, False)
             print("\nPanel deliberation:")
             for o in opinions:
                 route = f" route={o['route']}" if o["route"] else ""
@@ -1217,6 +1424,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_status(args)
         if args.cmd == "doctor":
             return cmd_doctor(args)
+        if args.cmd == "cost":
+            return cmd_cost(args)
         if args.cmd == "adopt":
             return cmd_adopt(args)
         if args.cmd == "wo":
@@ -1227,6 +1436,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_gate(args)
         if args.cmd == "backlog":
             return cmd_backlog(args)
+        if args.cmd == "brief":
+            return cmd_brief(args)
         if args.cmd == "learn":
             return cmd_learn(args)
         if args.cmd == "neo":

@@ -29,11 +29,16 @@ in `INVARIANTS`. Give it a stable id — ids appear in work order timelines and 
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
-from . import db
-from .project_store import DEPENDENCY_DEAD_STATUSES, UNGOVERNED_ORIGINS
+from . import db, worker_session
+from .project_store import (
+    ACTIVE_STATUSES,
+    DEPENDENCY_DEAD_STATUSES,
+    UNGOVERNED_ORIGINS,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .project_store import ProjectStore
@@ -183,6 +188,9 @@ def status_label(store: ProjectStore, wo: dict[str, Any]) -> str:
     and its own header disagreed about what needed the user because each derived it
     separately — see the FEATURED_STATUSES fix in PR 65.)
     """
+    if wo["status"] in ACTIVE_STATUSES:
+        note = rate_limit_note(store, wo)
+        return f"{wo['status']} — {note}" if note else wo["status"]
     if wo["status"] != "pending":
         return wo["status"]
     blockers = store.unfinished_dependencies(wo["id"])
@@ -199,6 +207,29 @@ def status_label(store: ProjectStore, wo: dict[str, Any]) -> str:
         return (f"pending — waiting for a slot in {parent} "
                 f"({active}/{limit} children running)")
     return "pending"
+
+
+def rate_limit_note(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """Why this work order is not moving and when it will move again — or "" normally.
+
+    `running` alone promises "a worker is working on this", which is a lie for a
+    conversation Claude Code refused because the usage window is spent. It keeps its
+    status and its slot on purpose — a refused turn changed nothing, and
+    `Daemon.retry_rate_limited` relaunches it — but the user looking at a dashboard at
+    midnight is owed the reason nothing is happening, and the time it will happen again.
+
+    Every surface renders this one string (the CLI through `status_label`, the dashboard
+    through `ops.os_status`) so they cannot disagree about the answer. Local wall-clock,
+    not the timezone the CLI quoted: the reader is at this machine, and a time they have
+    to convert is a time they will misread.
+    """
+    if wo["status"] not in ACTIVE_STATUSES:
+        return ""
+    pause = worker_session.rate_limit_pause(store, wo["id"])
+    if pause is None or pause.exhausted:
+        return ""
+    when = time.strftime("%H:%M", time.localtime(pause.retry_at))
+    return f"Claude usage limit reached, retrying by itself at {when}"
 
 
 def _slot_cap(store: ProjectStore, wo: dict[str, Any]) -> tuple[str, int, int] | None:
@@ -523,6 +554,63 @@ def check_catalog(catalog: Any, project: str | None = None) -> list[Violation]:
             continue
         found.extend(check_gate_deny_conflict(spec))
     return found
+
+
+# -- OS-level checks ($JARVIS_HOME state, not any project's database) -----------------
+
+#: How long a pending-release marker may sit in flight before it is a fault. The whole
+#: staged flow is minutes end to end (worker settles → restart → boot verification), so
+#: an hour means a hand-off was dropped: the daemon never ran, the restart never landed,
+#: or the boot check never fired.
+RELEASE_MARKER_STALE_AFTER = 3600.0
+
+
+def check_release_marker(now: float | None = None) -> list[Violation]:
+    """INV-RELEASE-MARKER-STALE — a staged release must not sit unapplied for an hour.
+
+    The marker (`$JARVIS_HOME/run/pending_release.json`) is a hand-off between the
+    deploy script's `--stage` mode and the daemon (src/jarvis/release.py): `staged`
+    waits for the shipping worker to settle, `restarting` waits for the new daemon to
+    verify on boot. Both are meant to clear within minutes, so either state an hour on
+    is a release the fleet believes is in flight and nothing is advancing.
+
+    `failed_verification` is deliberately NOT flagged: that state already raised
+    attention on the work order and an inbox warning when it was written, and it stays
+    on disk until a human resolves it — reporting it hourly would say the same thing
+    twice. An unreadable marker IS flagged, whatever it says: no state can clear it.
+
+    OS-level, not per-project (it reads $JARVIS_HOME, not a project store), so it is
+    not in `INVARIANTS`; `ops.run_doctor` calls it directly.
+
+    Not repairable: which half of the hand-off died is not derivable from the file.
+    """
+    from . import release
+
+    marker = release.read_marker()
+    if marker is None:
+        if release.marker_path().exists():
+            return [Violation(
+                invariant="INV-RELEASE-MARKER-STALE",
+                detail=f"{release.marker_path()} exists but is not readable JSON — "
+                       f"no release state can act on it",
+            )]
+        return []
+    state = marker.get("state")
+    if state not in ("staged", "restarting"):
+        return []
+    now = now if now is not None else time.time()
+    reference = float(marker.get("restart_at") or marker.get("staged_at") or 0)
+    age = now - reference
+    if age <= RELEASE_MARKER_STALE_AFTER:
+        return []
+    return [Violation(
+        invariant="INV-RELEASE-MARKER-STALE",
+        wo_id=marker.get("wo_id"),
+        detail=(f"pending release {marker.get('tag')} has been {state!r} for "
+                f"{int(age // 60)} minutes — the daemon should have applied and "
+                f"verified it within minutes (marker: {release.marker_path()})"),
+        context={"state": state, "tag": marker.get("tag"), "age_seconds": int(age)},
+    )]
 
 
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (

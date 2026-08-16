@@ -198,6 +198,50 @@ def test_staged_authored_edits_outside_the_list_still_block_a_release(tmp_path):
     assert "README.md" in (r.stdout + r.stderr)
 
 
+def test_daemon_restart_is_detached_from_this_script(tmp_path):
+    """The 0.5.0 ship was half-applied by this exact trap.
+
+    shipit is usually run from a Claude session that Jarvis itself spawned, and that
+    session lives inside `jarvis.service`'s cgroup — so `systemctl --user restart
+    jarvis.service` SIGTERMs the running script. The daemon restart must therefore be
+    handed to a transient systemd unit that lives OUTSIDE our cgroup, so it completes
+    whether or not we survive it.
+    """
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", "0.2.0")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "systemd-run --user" in out
+    assert "restart jarvis.service" in out
+    # never restarted inline: that is the command that kills us
+    assert "systemctl --user restart 'jarvis.service'" not in out
+
+
+def test_everything_else_finishes_before_the_daemon_restart(tmp_path):
+    """Order is the other half of the fix.
+
+    Whatever the script still has to do after restarting the daemon is work it may
+    never get to. The UI restart and the Telegram notification must both happen first.
+    """
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", "0.2.0")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    daemon = out.index("systemd-run --user")
+    assert out.index("jarvis-ui.service") < daemon
+    assert out.lower().index("telegram") < daemon
+
+
+def test_ui_restarts_inline_and_is_verified(tmp_path):
+    """The UI never hosts this script, so its restart can be run and checked here."""
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", "0.2.0")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "systemctl --user restart 'jarvis-ui.service'" in out
+    assert "status 'jarvis-ui.service'" in out
+
+
 def test_explicit_version_is_respected(tmp_path):
     repo = _make_repo(tmp_path)
     _git(repo, "tag", "-a", "jarvis-0.1.2", "-m", "x")

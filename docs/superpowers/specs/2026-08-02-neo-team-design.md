@@ -309,13 +309,20 @@ the daemon's `deliver`, the gate path, the CLI, the dashboard — needs to know 
 
 | Seat | May force | May veto | May never |
 |---|---|---|---|
-| `premise` | `dismiss` (proposal) | — | override the HARD LIMIT |
+| `premise` | `escalate`, `dismiss` (proposal) | — | override the HARD LIMIT |
 | `record` | `escalate` | — | silently decide against a standing ruling |
 | `blast` | `escalate` | `dismiss`, `approve` | force an approval |
 | `taste` | — | — | block a decision |
 
+**Read this table as what each seat may force *beyond* the universal escalate right, not
+as the complete list of what it may do.** The rule under "The fast path" above governs:
+*any seat that later returns `escalate` wins*. So `premise`, `record` and `blast` each
+force `escalate` simply by returning it, and the rows above add what else that seat may
+force. `taste` is the sole exception — it forces nothing and vetoes nothing, deliberately,
+and that is a negative control worth keeping as one.
+
 All vetoes point toward the safe direction only. Nothing in the panel can open a gate that
-a single Neo would have kept shut.
+a single Neo would have kept shut, and nothing in it can force an approval.
 
 ### Degradation
 

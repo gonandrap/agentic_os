@@ -15,6 +15,7 @@ from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
 from jarvis.hooks import handle_hook
+from jarvis import worker_session
 from jarvis.invariants import true_blockers
 from jarvis.project_store import ProjectStore
 
@@ -109,7 +110,10 @@ def test_dispatch_flow(started, fake_claude, project):
     assert "Bash(jarvis *)" in settings["permissions"]["allow"]
     assert argv[-2] == "--", "the prompt must stay fenced off from variadic options"
     prompt = argv[-1]
-    assert "add feature X" in prompt and "OPERATION.md" in prompt
+    # The OPERATION.md mirror line lives in the fetched `contract` section since the
+    # minimal-core split; the dispatched prompt's load-bearing mark is the on-demand
+    # section index instead.
+    assert "add feature X" in prompt and "jarvis brief" in prompt
 
     # the turn is on the record as turn 1 of the conversation
     turn = store.latest_turn(wo["id"])
@@ -295,17 +299,38 @@ def test_hook_noop_for_non_worker_sessions(started, project):
 
 
 def test_message_delivery_when_idle(started, fake_claude, project, settle_turns):
+    """A message waits for the turn in flight, then rides the next one.
+
+    Turn one is held open explicitly (`hold_turns`) rather than left to be slow. It used
+    to be neither: the fake exits the moment it has written its result, so by the second
+    tick turn one had usually finished, `settle_turns` reaped it and the message went out
+    inside that very tick. The assertion below passed anyway — a turn is a DETACHED
+    process, so it records itself a moment after the call that launched it returns, and
+    reading the call log straight away races that write (see `turn_calls`). It was
+    reading an empty log, not an undelivered message, and CI eventually lost the race and
+    failed on 3.11 alone.
+    """
     daemon = started
+    gate = fake_claude.hold_turns()
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
     sid = store.get_work_order(wo["id"])["session_id"]
+    assert turn_calls(fake_claude, resumed=False, expect=1), "turn one never launched"
 
     ops.send_message(wo["id"], "please also update the docs", source="ui")
     daemon.tick_count = 0
     daemon.tick()  # turn one is still in flight → nothing deliverable yet
-    assert turn_calls(fake_claude, resumed=True) == []
+    # Asserted on rows the daemon writes SYNCHRONOUSLY, never on the call log: a turn
+    # records itself from its own detached process, so "no resumed call yet" is true for
+    # a moment even when delivery did happen, and a negative read of it can only ever
+    # fail by luck. These two cannot race — if the guard goes, `_deliver` marks the
+    # message and opens turn 2 before `tick()` returns.
+    assert worker_session.busy(store, wo["id"]), "turn one should still be in flight"
+    assert store.latest_turn(wo["id"])["seq"] == 1, "a second turn was opened mid-turn"
+    assert [m["status"] for m in store.list_messages(wo["id"])] == ["queued"]
 
+    gate.unlink()  # let turn one finish; later turns run without holding
     assert settle_turns(store)
     daemon.tick_count = 0
     daemon.tick()
@@ -324,6 +349,75 @@ def test_message_delivery_when_idle(started, fake_claude, project, settle_turns)
     replies = [m["content"] for m in store.list_messages(wo["id"])
                if m["direction"] == "agent_to_user"]
     assert any("update the docs" in r for r in replies), replies
+
+
+def test_queued_messages_for_one_work_order_deliver_as_a_single_turn(
+        started, fake_claude, project, settle_turns):
+    """Three comments cost one turn boundary, not three.
+
+    Every boundary re-sends the whole accumulated conversation at the cache-WRITE rate
+    (~12% of this project's token spend; `jarvis cost` breaks it out), so delivering
+    each queued message as its own turn multiplies that by the number of messages —
+    for content the worker is better off reading together anyway.
+
+    Both halves are asserted: exactly ONE resumed turn, and all three messages present
+    in it and marked delivered. Counting turns alone would pass against a delivery path
+    that dropped two of the messages, which is the failure this coalescing could
+    plausibly introduce.
+    """
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    assert settle_turns(store)
+
+    for text in ("first thought", "second thought", "third thought"):
+        ops.send_message(wo["id"], text, source="ui")
+    daemon.tick_count = 0
+    daemon.tick()
+
+    resumes = turn_calls(fake_claude, resumed=True, expect=1)
+    assert len(resumes) == 1, "each queued message opened its own turn"
+    prompt = resumes[0]["argv"][-1]
+    for text in ("first thought", "second thought", "third thought"):
+        assert text in prompt
+    # In the order the user sent them, so the worker reads a conversation and not a bag.
+    assert prompt.index("first") < prompt.index("second") < prompt.index("third")
+
+    queued = [m for m in store.list_messages(wo["id"])
+              if m["direction"] == "user_to_agent"]
+    assert [m["status"] for m in queued] == ["delivered"] * 3, (
+        "a message left queued would be re-delivered next tick, and read twice")
+
+
+def test_two_work_orders_messages_stay_separate_turns(started, fake_claude, project,
+                                                      settle_turns):
+    """The coalescing is per work order. Two conversations must not be spliced.
+
+    The negative control for the test above: joining everything queued would also
+    satisfy "one turn per tick", and would be catastrophic.
+    """
+    daemon = started
+    first = ops.create_work_order("proj_a", "task one")
+    second = ops.create_work_order("proj_a", "task two")
+    daemon.tick()
+    store = ProjectStore(project)
+    assert settle_turns(store)
+
+    ops.send_message(first["id"], "for the first", source="ui")
+    ops.send_message(second["id"], "for the second", source="ui")
+    daemon.tick_count = 0
+    daemon.tick()
+
+    resumes = turn_calls(fake_claude, resumed=True, expect=2)
+    prompts = {r["argv"][r["argv"].index("--resume") + 1]: r["argv"][-1]
+               for r in resumes}
+    assert len(prompts) == 2
+    sessions = {wo["id"]: store.get_work_order(wo["id"])["session_id"]
+                for wo in (first, second)}
+    assert "for the first" in prompts[sessions[first["id"]]]
+    assert "for the second" not in prompts[sessions[first["id"]]]
+    assert "for the second" in prompts[sessions[second["id"]]]
 
 
 def test_session_id_never_moves_across_turns(started, fake_claude, project,

@@ -37,6 +37,14 @@ entry per project:
   per project if you want (e.g. `acceptEdits`, `plan`).
 - `max_concurrent` — simultaneous work orders for this project; the rest queue.
   Defaults to `5` (or the fleet-wide `os.defaults.max_concurrent`).
+- `worker.autocompact_window` — how large a worker's conversation may grow before
+  Claude Code compacts it, passed straight to `claude --autocompact`. **`150000` by
+  default**, and that default is a cost control rather than a preference: every API
+  call a worker makes re-reads its whole conversation, so the context size multiplies
+  into the bill on every call, and cache reads are 56% of what the fleet spends. Raise
+  it for a project whose work genuinely needs a longer memory (the CLI accepts
+  `100000`–`1000000`), or set it to `null` to opt out and take the model's own window.
+  Measurements: `docs/superpowers/specs/2026-08-10-resume-cost-and-the-cache.md`.
 - `settings_overrides` — project-specific hooks/permissions merged on top of the OS
   baseline (e.g. credential guards for a production repo).
 - `append_system_prompt` — hard constraints every worker must hear

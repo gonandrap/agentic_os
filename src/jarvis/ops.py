@@ -23,6 +23,7 @@ from .catalog import (
     worker_stalls_on_prompts,
 )
 from . import db, invariants
+from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import CentralStore
 from .daemon import daemon_running
 from .invariants import PR_CLOSED_BLOCKER, true_blockers
@@ -154,7 +155,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
     the same checks with repair enabled on every reconcile tick — this is the manual
     handle for "is the OS lying to me right now?".
     """
-    from .invariants import check_catalog, check_project
+    from .invariants import check_catalog, check_project, check_release_marker
 
     # Catalog-level checks run whenever a catalog is resolvable at all: a gate that can
     # never open is a fault in the configuration, visible before any work order exists.
@@ -217,6 +218,20 @@ def run_doctor(project: str | None = None, repair: bool = False,
                 {"invariant": v.invariant, "wo_id": v.wo_id, "detail": v.detail,
                  "repaired": v.repaired, "repair": v.repair}
                 for v in violations
+            ],
+        })
+    # OS-level state under $JARVIS_HOME, owned by no project: a pending-release marker
+    # stuck in flight. Reported under its own heading; never repaired (which half of
+    # the hand-off died is not derivable from the file).
+    os_violations = check_release_marker()
+    if os_violations:
+        total += len(os_violations)
+        results.append({
+            "project": "(os)",
+            "violations": [
+                {"invariant": v.invariant, "wo_id": v.wo_id, "detail": v.detail,
+                 "repaired": v.repaired, "repair": v.repair}
+                for v in os_violations
             ],
         })
     out = {"repair": repair, "violations": total, "projects": results}
@@ -391,7 +406,10 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                          # Why a pending work order is not starting. Derived here, with
                          # the store open, so every surface reading os_status gets the
                          # same answer as `jarvis wo list` instead of deriving its own.
-                         "blocked_by": blocked_by(store, wo)}
+                         "blocked_by": blocked_by(store, wo),
+                         # Same rule, for the other reason a work order can be sitting
+                         # still: parked on the Claude usage limit, retrying at N.
+                         "rate_limit": invariants.rate_limit_note(store, wo)}
                         for wo in open_wos
                     ],
                     "settings_drift": drift,
@@ -1424,6 +1442,26 @@ def submit_plan(fo_id: str, doc: Any,
             f"resubmit:\n  - " + "\n  - ".join(e.problems)
         ) from e
 
+    # The design document is snapshotted NOW, from the planner's own tree, because the
+    # children never see that tree: the doc rides in the stored plan and dispatch
+    # materialises it into a path every child worker can read. Refusing a dangling name
+    # here costs the planner one revision; accepting it would cost every child a brief
+    # that references a document none of them has.
+    if plan.get("design_doc"):
+        candidates = []
+        if fo.get("plan_wo_id"):
+            candidates.append(path / ".claude" / "worktrees" / fo["plan_wo_id"]
+                              / plan["design_doc"])
+        candidates.append(path / plan["design_doc"])
+        existing = next((c for c in candidates if c.is_file()), None)
+        if existing is None:
+            raise OpsError(
+                f"the plan names design_doc {plan['design_doc']!r} but no such file "
+                f"exists — write it before submitting (looked in: "
+                + ", ".join(str(c) for c in candidates) + ")"
+            )
+        plan["design_doc_content"] = existing.read_text()
+
     # The planner is who Neo's question hangs off: it is a real work order, it is who
     # receives a rejection, and it is what `jarvis neo list` can link back to. A feature
     # order whose planner was deleted still submits — the question just names the feature
@@ -1578,17 +1616,78 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
 
 # -- Neo (OS answerer agent) ---------------------------------------------------------------------
 
+#: The most of a referenced section that rides to Neo. A section this long is a design
+#: document wearing one heading; the cut is announced in the context, never silent.
+SECTION_SNAPSHOT_CHARS = 6000
+
+
+def _resolve_section(path: Path, wo: dict[str, Any], ref_path: str,
+                     which: str) -> str | None:
+    """The referenced section's text, read from wherever this worker can see the file.
+
+    Tried in the order the file is most likely to be authoritative: the worker's own
+    worktree, the project tree, then the materialised feature snapshot under
+    `.jarvis/features/` (where dispatch puts a parent feature's design document).
+    """
+    from . import sections
+
+    candidates = []
+    if Path(ref_path).is_absolute():
+        candidates.append(Path(ref_path))
+    else:
+        if wo.get("worktree"):
+            candidates.append(path / ".claude" / "worktrees" / wo["worktree"] / ref_path)
+        candidates.append(path / ref_path)
+        if wo.get("parent_id"):
+            candidates.append(path / ".jarvis" / "features" / wo["parent_id"]
+                              / Path(ref_path).name)
+    for candidate in candidates:
+        if candidate.is_file():
+            section = sections.extract_section(candidate.read_text(), which)
+            if section is not None:
+                if len(section) > SECTION_SNAPSHOT_CHARS:
+                    section = (section[:SECTION_SNAPSHOT_CHARS]
+                               + "\n[… section truncated — it is longer than "
+                                 f"{SECTION_SNAPSHOT_CHARS} characters]")
+                return section
+    return None
+
+
 def ask_question(wo_id: str, question: str, project_name: str | None = None) -> dict[str, Any]:
     """(Workers) queue a question for Neo instead of stalling on the user.
 
     The work order flips to waiting_input WITHOUT flagging user attention — Neo
     exists precisely to keep these off the user's plate. The answer arrives as the
     worker's next user turn via the normal message-delivery path.
+
+    A question is one paragraph that may reference a design artifact section in-text
+    (`from section 3 of design doc "docs/specs/x.md"`). The reference is resolved HERE,
+    at ask time: the section — and only the section — is snapshotted into the question's
+    context, so Neo reads exactly the design context the paragraph argues from while the
+    recorded question stays a paragraph.
     """
+    from . import sections
     from .neo_store import NeoStore
+
+    if len(question) > QUESTION_MAX_CHARS:
+        raise OpsError(
+            f"that question is {len(question)} characters; the cap is "
+            f"{QUESTION_MAX_CHARS}. A question to Neo is one paragraph — the decision, "
+            f"the options, your recommendation — arguing from a design artifact it "
+            f"references in-text, e.g. `from section 3 of design doc "
+            f"\"docs/specs/feature.md\": …`. The referenced section is delivered to "
+            f"whoever answers, alongside your paragraph; you do not need to paste it."
+        )
 
     name, path, wo = find_work_order(wo_id, project_name)
     context = f"{wo['title']}\n{(wo.get('description') or '')[:800]}"
+    for ref_path, which in sections.find_refs(question):
+        section = _resolve_section(path, wo, ref_path, which)
+        if section is not None:
+            context += f"\n\nReferenced artifact — {ref_path} § {which}:\n{section}"
+        else:
+            context += (f"\n\n(the question references {ref_path!r} section {which!r}, "
+                        f"which could not be resolved — no such file or section)")
     neo = NeoStore()
     try:
         q = neo.ask(name, wo_id, question, context=context)
@@ -1604,8 +1703,15 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
             store.set_status(wo_id, "waiting_input")
     finally:
         store.close()
-    return {"project": name, "wo_id": wo_id, "question_id": q["id"],
-            "note": "queued for Neo — end your turn; the answer arrives as your next user turn"}
+    out = {"project": name, "wo_id": wo_id, "question_id": q["id"],
+           "note": "queued for Neo — end your turn; the answer arrives as your next user turn"}
+    if len(question) > QUESTION_WARN_CHARS:
+        out["warning"] = (
+            f"that question is {len(question)} characters — aim for one paragraph, and "
+            f"reference the design artifact section it argues from in-text instead of "
+            f"pasting context (the cap is {QUESTION_MAX_CHARS})"
+        )
+    return out
 
 
 def neo_question_texts(wo_id: str) -> dict[int, str]:
@@ -2048,3 +2154,253 @@ def promote_backlog(item_id: str, force: bool = False,
                 "forced_over_blockers": [b["id"] for b in blockers] if force else []}
     finally:
         central.close()
+
+
+# -- token accounting ----------------------------------------------------------------------------
+
+#: The turn states whose spend is final. A running turn has no result JSON yet, so it
+#: can be listed but never counted.
+_SETTLED_TURN_STATES = ("done", "failed")
+
+
+def _turn_usage(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any] | None:
+    """A settled turn's recorded usage envelope, lazily backfilled from its outfile.
+
+    Rows reaped before `usage_json` existed carry NULL — but their outfile usually
+    still holds the full result JSON, so the first read parses it and writes the
+    envelope back. That is the whole migration story: history for every past work
+    order is recoverable on demand, and once written back it outlives the file.
+    """
+    raw = turn.get("usage_json")
+    if raw:
+        return db.from_json(raw, None)
+    if turn.get("state") not in _SETTLED_TURN_STATES or not turn.get("outfile"):
+        return None
+    from . import claude_cli
+
+    result = claude_cli.read_turn_result(Path(turn["outfile"]))
+    if result is None or not result.usage:
+        return None
+    store.set_turn_usage(turn["id"], db.to_json(result.usage))
+    return result.usage
+
+
+def _turn_row(turn: dict[str, Any], u: dict[str, Any] | None) -> dict[str, Any]:
+    """One turn, flattened for the per-turn table. `recorded` is the honesty bit."""
+    duration = None
+    if turn.get("ended_at") and turn.get("started_at"):
+        duration = round(turn["ended_at"] - turn["started_at"], 1)
+    row = {
+        "seq": turn["seq"], "kind": turn["kind"], "state": turn["state"],
+        "started_at": turn["started_at"], "ended_at": turn.get("ended_at"),
+        "duration_s": duration, "cost_usd": turn.get("cost_usd"),
+        "recorded": u is not None,
+    }
+    if u is None:
+        return row
+    window = u.get("context_window") or 0
+    peak = u.get("context_peak") or 0
+    row.update({
+        "cost_usd": turn["cost_usd"] if turn.get("cost_usd") is not None
+        else u.get("total_cost_usd"),
+        "input": u.get("input") or 0,
+        "cache_write": u.get("cache_write") or 0,
+        "cache_read": u.get("cache_read") or 0,
+        "cache_1h": u.get("cache_1h") or 0,
+        "cache_5m": u.get("cache_5m") or 0,
+        "output": u.get("output") or 0,
+        "api_calls": u.get("api_calls"),
+        "context_peak": peak,
+        "context_window": window or None,
+        # The /context statistic: how full the model's window was at this turn's
+        # largest call. This is the column that shows a work order bloating.
+        "context_pct": round(100 * peak / window, 1) if window else None,
+        "duration_api_ms": u.get("duration_api_ms"),
+    })
+    return row
+
+
+def _turn_rows(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
+    return [_turn_row(t, _turn_usage(store, t)) for t in store.list_turns(wo_id)]
+
+
+def _turn_summary(rows: list[dict[str, Any]]) -> tuple[str, int, int,
+                                                       dict[str, Any] | None]:
+    """(provenance, recorded, settled, exact totals) over one work order's turns.
+
+    Provenance is the label that keeps the two accounting systems from being silently
+    mixed: `recorded` — every settled turn has the CLI's own numbers (exact);
+    `mixed` — some do and some exist only in transcripts, so no single total is
+    honest; `transcript` — nothing recorded, only the estimate (sessions predating
+    turn capture, or never Jarvis-driven).
+    """
+    settled = [r for r in rows if r["state"] in _SETTLED_TURN_STATES]
+    recorded = [r for r in rows if r["recorded"]]
+    if recorded and len(recorded) == len(settled):
+        provenance = "recorded"
+    elif recorded:
+        provenance = "mixed"
+    else:
+        provenance = "transcript"
+    totals = None
+    if recorded:
+        windows = [r["context_window"] for r in recorded if r.get("context_window")]
+        totals = {
+            # Exact aggregation IS the sum of the turns — nothing is re-derived.
+            "cost_usd": round(sum(r["cost_usd"] or 0 for r in recorded), 4),
+            "input": sum(r["input"] for r in recorded),
+            "cache_write": sum(r["cache_write"] for r in recorded),
+            "cache_read": sum(r["cache_read"] for r in recorded),
+            "cache_1h": sum(r["cache_1h"] for r in recorded),
+            "cache_5m": sum(r["cache_5m"] for r in recorded),
+            "output": sum(r["output"] for r in recorded),
+            "api_calls": sum(r["api_calls"] or 0 for r in recorded),
+            "context_peak": max(r["context_peak"] for r in recorded),
+            "context_window": max(windows) if windows else None,
+        }
+    return provenance, len(recorded), len(settled), totals
+
+
+def _unit_row(name: str, wo: dict[str, Any], index: dict[str, list[Path]],
+              turn_rows: list[dict[str, Any]] = ()) -> dict[str, Any]:
+    """One work order's spend, flattened for a table.
+
+    The transcript figures stay the body of the row (they are the only source with a
+    subagent split and the re-write tax); the recorded figures ride along with their
+    provenance label so a reader can tell an exact number from an estimate.
+    """
+    from . import usage as usage_mod
+
+    session = usage_mod.read_session(wo.get("session_id") or "", index=index)
+    total = session.total
+    provenance, recorded, settled, rec_totals = _turn_summary(list(turn_rows))
+    return {
+        "id": wo["id"], "project": name, "title": wo["title"],
+        "status": wo["status"], "kind": wo.get("kind") or "worker",
+        "found": session.found,
+        # A session's turn count is its resume boundaries plus the opening turn; see
+        # `usage.Usage.resume_boundaries` for why the boundaries are counted that way.
+        "turns": total.resume_boundaries + 1 if session.found else 0,
+        "subagent_count": session.subagent_count,
+        "subagent_cost_usd": round(session.subagents.list_cost_usd, 2),
+        "provenance": provenance,
+        "recorded_turns": recorded,
+        "settled_turns": settled,
+        "recorded_cost_usd": round(rec_totals["cost_usd"], 4) if rec_totals else 0.0,
+        **total.as_dict(),
+    }
+
+
+def cost_report(project: str | None = None, target: str | None = None,
+                limit: int = 50, include_hidden: bool = True) -> dict[str, Any]:
+    """What the fleet's work has cost in tokens, read back from Claude Code's transcripts.
+
+    `target` is a work-order or feature-order id for a single unit — a feature order
+    rolls up its planner and every child, which is the only way to see what a planned
+    feature actually cost. Otherwise this reports every work order that still has a
+    transcript, dearest first.
+
+    Hidden work orders are INCLUDED by default, unlike every other listing: hiding is a
+    gesture about attention, and a hidden work order's tokens were spent just the same.
+    A cost report that quietly omitted them would understate the bill in exactly the
+    case where someone is trying to find out where the bill came from.
+
+    The transcripts belong to Claude Code, not to Jarvis, and it prunes them on its own
+    schedule. A work order whose transcript is gone reports `found: false` rather than
+    zero: an unmeasurable cost and a zero cost are different answers, and rendering them
+    the same would turn a gap in the evidence into a claim about the spend.
+    """
+    from . import usage as usage_mod
+
+    index = usage_mod.index_sessions()
+    paths = registered_project_paths()
+    if project and project not in paths:
+        raise OpsError(f"project {project!r} not registered (known: {sorted(paths)})")
+    if target:
+        return _cost_for_target(target, project, index)
+
+    scope = {project: paths[project]} if project else paths
+    units: list[dict[str, Any]] = []
+    for name, path in sorted(scope.items()):
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            for wo in store.list_work_orders(limit=limit, include_hidden=include_hidden):
+                units.append(_unit_row(name, wo, index, _turn_rows(store, wo["id"])))
+        finally:
+            store.close()
+    units.sort(key=lambda u: u["list_cost_usd"], reverse=True)
+    return {"scope": project or "fleet", "units": units, **_rollup(units)}
+
+
+def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
+    """Totals over the units that could actually be measured.
+
+    Unmeasured units are counted separately rather than summed as zero, so the report
+    can say how much of the fleet its total is speaking for.
+    """
+    measured = [u for u in units if u["found"]]
+    return {
+        "measured": len(measured),
+        "unmeasured": len(units) - len(measured),
+        "totals": {
+            # Over ALL units, not just measured ones: the recorded figure comes from
+            # the OS's own turn rows, which survive transcript pruning — that
+            # independence is the point of recording.
+            "recorded_cost_usd": round(
+                sum(u.get("recorded_cost_usd") or 0 for u in units), 2),
+            "list_cost_usd": round(sum(u["list_cost_usd"] for u in measured), 2),
+            "rewrite_cost_usd": round(sum(u["rewrite_cost_usd"] for u in measured), 2),
+            "rewrite_excess": sum(u["rewrite_excess"] for u in measured),
+            "resume_boundaries": sum(u["resume_boundaries"] for u in measured),
+            "subagent_cost_usd": round(sum(u["subagent_cost_usd"] for u in measured), 2),
+            "output": sum(u["output"] for u in measured),
+            "billed_input": sum(u["billed_input"] for u in measured),
+        },
+    }
+
+
+def _cost_for_target(target: str, project: str | None,
+                     index: dict[str, list[Path]]) -> dict[str, Any]:
+    """One work order, or a feature order rolled up over its planner and children.
+
+    The feature order is tried FIRST. A feature order and a work order cannot share an
+    id, but `find_work_order` raises the more familiar error, and resolving the work
+    order first would report a planner's own spend under the feature order's id — the
+    one number a reader of `jarvis cost fo-…` is least likely to want.
+    """
+    try:
+        name, path, fo = find_feature_order(target, project)
+    except OpsError:
+        name, wo_path, wo = find_work_order(target, project)
+        store = ProjectStore(wo_path)
+        try:
+            rows = _turn_rows(store, wo["id"])
+        finally:
+            store.close()
+        unit = _unit_row(name, wo, index, rows)
+        provenance, recorded, settled, rec_totals = _turn_summary(rows)
+        # The per-turn breakdown is the single-work-order payload: it is what shows
+        # WHERE in a bloated work order the cost rose, turn by turn.
+        return {"scope": target, "units": [unit], **_rollup([unit]),
+                "turns_detail": rows, "provenance": provenance,
+                "turns_recorded": recorded, "turns_settled": settled,
+                "recorded_totals": rec_totals}
+
+    store = ProjectStore(path)
+    try:
+        units = []
+        planner_id = fo.get("plan_wo_id")
+        if planner_id:
+            try:
+                units.append(_unit_row(name, store.get_work_order(planner_id), index,
+                                       _turn_rows(store, planner_id)))
+            except KeyError:
+                pass
+        units.extend(_unit_row(name, child, index, _turn_rows(store, child["id"]))
+                     for child in store.feature_children(fo["id"]))
+    finally:
+        store.close()
+    return {"scope": fo["id"], "title": fo["title"], "status": fo["status"],
+            "units": units, **_rollup(units)}
