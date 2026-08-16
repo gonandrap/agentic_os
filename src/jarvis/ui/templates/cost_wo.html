@@ -94,6 +94,38 @@
   {% endif %}
 </div>
 
+{# The third class. Its own panel for the same reason the one above has one: this is the
+   worker's OWN spend, one process further down its tree, and a work order that ran an
+   eval suite is spending nothing like one that asked Neo four questions. Grouped by what
+   ran the calls rather than listed — a single `pytest evals/llm` is forty of them. #}
+{% if subproc %}
+<div class="panel" style="margin-top: 14px; padding: 14px 16px;">
+  <p class="kv" style="margin: 0 0 8px;">
+    <strong>What {{ unit.id }} spent in claude processes it spawned itself:
+      ~${{ '%.2f'|format(unit.subproc_cost_usd) }}</strong>
+    across {{ unit.subproc_calls }} call{{ 's' if unit.subproc_calls != 1 }}
+    ({{ fmt_tok(unit.subproc_billed_input) }} in ·
+    {{ fmt_tok(unit.subproc_output) }} out)
+  </p>
+  <div style="overflow-x: auto;">
+    <table>
+      <tr><th>ran by</th><th>calls</th><th>$</th><th>in</th><th>out</th><th>model</th></tr>
+      {% for s in subproc %}
+      <tr>
+        <td class="mono">{{ s.label }}{% if s.failed %}
+          <span class="sub">({{ s.failed }} failed)</span>{% endif %}</td>
+        <td class="mono">{{ s.calls }}</td>
+        <td class="mono">{{ '%.2f'|format(s.list_cost_usd) }}</td>
+        <td class="mono">{{ fmt_tok(s.billed_input) }}</td>
+        <td class="mono">{{ fmt_tok(s.output) }}</td>
+        <td class="mono sub">{{ s.model or '—' }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+</div>
+{% endif %}
+
 {% if turns %}
 <div class="panel" style="margin-top: 14px; overflow-x: auto;">
   <table>
@@ -147,6 +179,10 @@
   the worker ran — dollars at list prices, a common unit, not a bill. “context” is the
   largest single API call of the turn against the model's window: the headless
   /context statistic, and the column that shows a work order bloating.
+</p>
+
+<p class="sub" style="margin-top: 6px;">
+  Every figure on this page is {{ report.floor_reason }}.
 </p>
 
 {% endblock %}
