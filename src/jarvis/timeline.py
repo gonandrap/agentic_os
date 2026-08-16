@@ -158,6 +158,11 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any],
         return (f"Not a privileged action — the `{p.get('kind') or 'gate'}` gate matched "
                 f"this by mistake ({p.get('by') or '?'})",
                 p.get("reason") or "")
+    if kind == "gate_superseded":
+        # Neither a verdict nor a dismissal: the question stopped being answerable. Said
+        # plainly so the record cannot be read as "someone approved this quietly".
+        return (f"Gate request closed unanswered — the `{p.get('kind') or 'gate'}` "
+                f"question no longer applies", p.get("reason") or "")
     if kind == "gate_escalated":
         return "Gate approval escalated to you", p.get("reason") or ""
     if kind == "gate_opened":

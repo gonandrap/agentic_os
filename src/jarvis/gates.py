@@ -454,10 +454,30 @@ mentions it, it runs it — assume the privileged reading and review it properly
 
 If the command really does perform the action, continue:
 
+SECOND, THE DUPLICATE CHECK — was this already decided?
+
+The request below lists the work order's earlier gate requests. Read it. A grant is
+scoped to an EXACT command string, so a worker that reruns an approved command with a
+pipe, a redirect or a `2>&1` appended trips the gate a second time and files what looks
+like a brand-new, unjustified request for an action you already authorised — and if that
+earlier grant has uses spent, the action has ALREADY RUN.
+
+Never escalate a duplicate to the user: they have answered this question once, and asking
+again about something already done is worse than useless, because it reads as though the
+gate failed to hold. Judge it against the earlier verdict instead. If that verdict was
+approve and the extra text changes nothing about what executes, approve it too, saying
+which request it repeats. If the addition does something the approval did not cover, deny
+it and say what is new. If the earlier verdict was deny, deny it again.
+
+If the command really is a fresh privileged action, continue:
+
 APPROVE when all of these hold:
 - The action is squarely within what the work order was asked to do.
 - The change went through the normal path: work landed on a branch, in a pull request,
-  with the project's checks or tests reported passing.
+  with the project's checks or tests reported passing. For a RELEASE of code that is
+  already on the main branch, that evidence is CI's verdict on the exact merged commits.
+  The merge is what asserts the code is ready; a green CI run on those commits IS the
+  check, and it is complete evidence on its own.
 - The command matches the stated intent — the PR number, tag or service named is the
   one the request is about, and nothing extra rides along.
 - Consequences are recoverable by ordinary means (revert the merge, ship the previous
@@ -471,7 +491,12 @@ again. Deny is an accusation that the worker asked for the wrong thing — never
 for a command the recogniser matched by mistake. That is what DISMISS is for.
 
 ESCALATE to the user, rather than deciding, when:
-- Tests or checks are failing, absent, or not mentioned at all.
+- Tests or checks are failing, absent, or not mentioned at all. One carve-out, and it is
+  not optional: a release of already-merged code is NOT expected to re-run anything. Do
+  not ask a release request for a local test run, and never escalate one for lacking it —
+  CI on the merged commits is the evidence, and demanding more makes every worker burn an
+  hour re-proving what the merge already settled. A release that reports CI green and
+  nothing else has met this bar.
 - The action is irreversible or destructive (deleting a release, rewriting published
   history, dropping data).
 - It touches credentials, secrets, billing, or anything user-facing beyond this repo.
@@ -493,14 +518,45 @@ performs no privileged action>"}
 decide>"}"""
 
 
+HISTORY_LIMIT = 8
+
+
+def render_history(rows: Iterable[dict[str, Any]]) -> list[str]:
+    """The work order's earlier gate requests, as the reviewer's duplicate check.
+
+    Without this a reviewer judges every request as if it were the first. That is how
+    wo-52a6164d escalated a release to the user thirty-seven seconds after Neo had
+    approved the same release: the worker re-ran the approved command with `| tail -40`
+    appended, the exact-string grant did not match, the hook filed an unjustified request
+    — and "unjustified real release" is a textbook escalation when you cannot see that
+    the identical action was authorised a moment ago and has already run.
+    """
+    rows = [r for r in rows][:HISTORY_LIMIT]
+    if not rows:
+        return []
+    out = ["", "EARLIER GATE REQUESTS ON THIS WORK ORDER (newest first). Check this one "
+           "against them before deciding — a repeat of an action already decided is not "
+           "a new question:"]
+    for r in rows:
+        spent = f", {r['uses']} of {r['max_uses']} uses spent" if r.get("uses") else ""
+        by = f" by {r['decided_by']}" if r.get("decided_by") else ""
+        out.append(f"  request {r['id']} — {r['kind']}: {r['status']}{by}{spent}")
+        out.append(f"      command: {r['command'][:300]}")
+        if r.get("decision_reason"):
+            out.append(f"      reason: {r['decision_reason'][:300]}")
+    return out
+
+
 def build_request_question(action: GatedAction, wo: dict[str, Any],
                            justification: str, evidence: str = "",
-                           agent_type: str | None = None) -> str:
+                           agent_type: str | None = None,
+                           history: Iterable[dict[str, Any]] = ()) -> str:
     """Render the approval request Neo (or the user) reads.
 
     Whoever decides sees only this text — never the worker's session — so it has to
     carry the case by itself: what is being attempted, under which work order, why the
-    worker believes it is ready, and whatever it offered as proof.
+    worker believes it is ready, whatever it offered as proof, and what this same work
+    order has already been told about the same gate.
 
     `agent_type` names the SEAT when a subagent tripped the gate. The work order still
     owns the request — its lead is answerable for what its team did — but the reviewer
@@ -527,6 +583,7 @@ def build_request_question(action: GatedAction, wo: dict[str, Any],
     if evidence.strip():
         parts += ["", "Evidence the worker supplied (branch, PR, test results):",
                   evidence.strip()[:2000]]
+    parts += render_history(history)
     parts += [
         "",
         "Decide: dismiss it if the command performs no privileged action and the "
@@ -557,6 +614,8 @@ def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any]
     `agent_type` reaches here only from the hook: `jarvis gate request` is a shell
     command, so whoever ran it had a shell, and the seats have none.
     """
+    # Read before the insert, so the reviewer's history is everything BUT this request.
+    history = store.list_approvals(wo["id"], limit=HISTORY_LIMIT)
     approval = store.add_approval(
         wo["id"], action.kind, action.command, matched=action.matched,
         justification=justification, evidence=evidence, max_uses=max_uses,
@@ -564,7 +623,7 @@ def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any]
     )
     question = neo.ask(
         project, wo["id"],
-        build_request_question(action, wo, justification, evidence, agent_type),
+        build_request_question(action, wo, justification, evidence, agent_type, history),
         context=f"{wo.get('title') or ''}\n{(wo.get('description') or '')[:800]}",
         kind="approval",
     )
@@ -575,6 +634,45 @@ def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any]
     if wo.get("status") in ("running", "dispatching"):
         store.set_status(wo["id"], "waiting_input")
     return approval, question
+
+
+# -- opening the gate ------------------------------------------------------------------
+
+
+def open_gate(store: ProjectStore, grant: dict[str, Any]) -> dict[str, Any]:
+    """Spend one use of a grant, and close the requests it has just made moot.
+
+    The second half is what stops a work order finishing while a gate for the very action
+    it completed is still sitting in the user's attention list. A grant is scoped to an
+    exact command string, so the worker that retries an approved command with a pipe
+    appended files a second request for the same action — and then, string mismatch
+    resolved, runs the approved one anyway. The moment that grant opens, the second
+    request is a question about something that has already happened under authorisation.
+
+    Only requests of the same kind whose command CONTAINS the approved command are
+    closed: the approved action plus decoration, never the reverse (a shorter command is
+    a different action — dropping `--stage` from a deploy is what restarts the fleet).
+    Closing authorises nothing, so the narrow risk of closing one too many is bounded:
+    the command stays blocked and a retry files a fresh request for a real review.
+
+    Only an `approved` grant supersedes. A dismissal says the recogniser was wrong about
+    one string; whether it was also wrong about a different string is Neo's call, not a
+    substring match's.
+    """
+    approval = store.consume_grant(grant["id"])
+    if approval["status"] != "approved":
+        return approval
+    for pending in store.pending_approvals(approval["wo_id"]):
+        if pending["id"] == approval["id"] or pending["kind"] != approval["kind"]:
+            continue
+        if approval["command"] not in pending["command"]:
+            continue
+        store.supersede_approval(pending["id"], (
+            f"the same {approval['kind']} action ran under approved request "
+            f"{approval['id']}, which this command only wraps — nothing is left to "
+            f"authorise or refuse, and no authorisation is implied by closing it"
+        ))
+    return approval
 
 
 # -- deciding ------------------------------------------------------------------------
