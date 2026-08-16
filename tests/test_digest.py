@@ -166,8 +166,13 @@ def test_unparseable_output_is_refused_rather_than_half_rendered():
 def test_the_call_strips_the_callees_tools():
     """A tooled callee asked to shorten a question about `src/jarvis/panel.py` goes and
     reads `src/jarvis/panel.py`, and the page then shows a description of the code
-    instead of a shortening of the question — a failure that looks like a good answer."""
-    assert digest.CALL.keywords == {"tools": ""}
+    instead of a shortening of the question — a failure that looks like a good answer.
+
+    `attribute=False` rides along for a different reason: the daemon binds this call's
+    work order itself through `on_usage`, and leaving the transport's own attribution on
+    would write a second `agent_calls` row for the same tokens.
+    """
+    assert digest.CALL.keywords == {"tools": "", "attribute": False}
 
 
 def test_the_threshold_is_what_stops_a_one_line_question_costing_a_call():

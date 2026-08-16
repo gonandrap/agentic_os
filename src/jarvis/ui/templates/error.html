@@ -2,5 +2,6 @@
 {% block title %}Error — Jarvis{% endblock %}
 {% block content %}
 <div class="error-flash">{{ message }}</div>
+{% if hint %}<p class="sub">{{ hint }}</p>{% endif %}
 <p><a href="/">← back to the dashboard</a></p>
 {% endblock %}

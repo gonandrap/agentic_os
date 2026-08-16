@@ -240,6 +240,13 @@ class Daemon:
         # whose answer has already landed, and the drain is what lands it.
         self.digest_tick()
 
+        # Before routing: a dashboard failure raised here goes out with this tick's
+        # notifications instead of waiting for the next one.
+        try:
+            self.check_ui_log()
+        except Exception:  # noqa: BLE001 — never let the UI watch stall the tick
+            log.exception("ui log check failed")
+
         from .notify import route_new_inbox
         route_new_inbox(self.central, self.catalog)
 
@@ -385,6 +392,49 @@ class Daemon:
             self.central.mark_backlog(fo["backlog_id"], "done")
         except Exception:  # noqa: BLE001 — a stale backlog id must not stop the settle
             log.exception("could not close backlog item %s", fo["backlog_id"])
+
+    # -- 0. the dashboard ----------------------------------------------------------
+
+    def check_ui_log(self) -> int:
+        """Raise an inbox item for dashboard errors nobody has been told about yet.
+
+        The UI is a separate process (its own systemd unit in production) that can only
+        shout into `$JARVIS_HOME/logs/ui.log`. Nothing read that file, so a 500 on the
+        work-order page reached exactly one place: the systemd journal. The user's
+        report was "when I click on the link I get an internal server error" — the OS
+        itself had no idea. The daemon is the component that turns things it notices
+        into things the user is told about, so it is the right one to watch the log.
+
+        Runs immediately before `route_new_inbox`, so an error found here goes out with
+        this tick's notifications rather than waiting for the next one — hence section 0
+        rather than a number of its own in the ordering below.
+
+        Exactly-once by a cursor in `os_state`, not by scanning a time window: a
+        standing error must not re-notify every five seconds. Returns the number of new
+        errors found.
+        """
+        from . import uilog
+
+        errors, cursor = uilog.read_errors(self.central.get_state("ui_log_cursor") or "")
+        self.central.set_state("ui_log_cursor", cursor)
+        if not errors:
+            return 0
+        # One item per batch, not per error: a crash loop must not flood the inbox
+        # (and Telegram) with hundreds of identical alerts.
+        latest = errors[-1]
+        paths = sorted({e.path for e in errors})
+        body = (f"Latest: {latest.summary}\n"
+                f"Affected: {', '.join(paths[:5])}"
+                f"{f' (+{len(paths) - 5} more)' if len(paths) > 5 else ''}\n"
+                f"Traceback: {uilog.ui_log_path()}")
+        self.central.add_inbox(
+            project="os", level="warning",
+            title=f"dashboard raised {len(errors)} unhandled error"
+                  f"{'s' if len(errors) != 1 else ''}",
+            body=body,
+        )
+        log.warning("dashboard errors: %d new (latest: %s)", len(errors), latest.summary)
+        return len(errors)
 
     # -- 1. notifications ----------------------------------------------------------
 

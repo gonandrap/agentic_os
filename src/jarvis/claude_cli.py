@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
@@ -732,9 +733,55 @@ class HeadlessResult:
     model: str = ""
 
 
+def _attribute_subprocess(result: HeadlessResult, record: Any = None) -> None:
+    """Record a headless call made from inside a work order's process tree.
+
+    A worker's environment carries `JARVIS_WO_ID` (`dispatch._write_worker_settings`),
+    and a `--settings` env block reaches the CLI's own `process.env`, not just its
+    children — so every subprocess the worker spawns inherits it, however deep. Its
+    presence here therefore means one thing: this call is being made BENEATH a worker,
+    and its tokens are that work order's cost.
+
+    Nothing else can establish that. The call gets a session id Jarvis never minted, a
+    transcript under whatever cwd it ran in, and no mention of a work order anywhere in
+    it — the same dead end that forced the OS's own calls to be recorded at the moment
+    they return (`agent_usage`). Recorded here, on the one seam every Jarvis-transport
+    call passes through, rather than at each caller: the callers are eval suites and
+    scripts that have no idea they are inside a work order.
+
+    `ok` follows whether an envelope came back at all: a call the CLI answered with
+    something unparseable was paid for just the same, and a zero-token row that says so
+    is a different fact from no row.
+    """
+    wo_id = os.environ.get("JARVIS_WO_ID", "").strip()
+    if not wo_id:
+        return
+    from . import agent_usage
+
+    # What RAN the call, not where it ran. An eval suite's cwd is a fresh pytest tmp dir
+    # per scenario, so labelling by directory yields forty labels naming nothing; the
+    # program name groups the forty into the one line a reader wants ("pytest: 44 calls").
+    label = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else ""
+    (record or agent_usage.record)(
+        agent_usage.WORKER_SUBPROCESS, usage=result.usage,
+        project=os.environ.get("JARVIS_PROJECT", ""), wo_id=wo_id,
+        label=label or "claude -p", model=model_of(result), ok=bool(result.usage))
+
+
+def model_of(result: HeadlessResult) -> str:
+    """The model to price a headless call at. `"unknown"` when it was never captured.
+
+    Never `""`: an empty model prices at ZERO in `usage.price_for` (that branch is for
+    `<synthetic>`, which was never billed), so a real call whose model went unrecorded
+    would silently cost nothing — the exact bug this accounting exists to fix.
+    """
+    return result.model or "unknown"
+
+
 def run_headless_result(prompt: str, system_prompt: str | None = None,
                         model: str | None = None, cwd: Path | None = None,
-                        timeout: int = 300, tools: str | None = None) -> HeadlessResult:
+                        timeout: int = 300, tools: str | None = None,
+                        attribute: bool = True, record: Any = None) -> HeadlessResult:
     """One-shot headless call (`claude -p`), with its accounting kept.
 
     The transport every OS-side agent runs on — Neo, the panel's seats, the dashboard
@@ -754,6 +801,12 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
     about *that*. Note this is availability, not permission: `--allowedTools`
     and `--disallowedTools` do not remove a tool, and under
     `permissions.defaultMode: auto` they do not stop it being used either.
+
+    `attribute` is the accounting for calls made from INSIDE a work order — see
+    `_attribute_subprocess`. It defaults ON because the callers that need it are eval
+    suites and scripts that do not know they are inside one; the OS's OWN call sites
+    (Neo, the panel's seats, the digest) switch it OFF because they record themselves,
+    with the work order and the question they were made for, which this seam cannot know.
     """
     args: list[str] = ["-p", prompt, "--output-format", "json"]
     if system_prompt:
@@ -763,36 +816,47 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
     if tools is not None:  # "" is meaningful: it disables every tool
         args += ["--tools", tools]
     out = _run(args, cwd=cwd, timeout=timeout)
+    data: Any = None
     try:
         data = json.loads(out)
     except json.JSONDecodeError:
-        # Not JSON at all: the text is still the answer (that is what `run_headless`
-        # has always returned here), and there is simply nothing to account.
-        return HeadlessResult(text=out, model=model or "")
+        pass
     if not isinstance(data, dict):
-        return HeadlessResult(text=out, model=model or "")
-    served = [name for name in (data.get("modelUsage") or {})]
-    return HeadlessResult(
-        text=data.get("result", ""),
-        usage=derive_turn_usage(data),
-        session_id=data.get("session_id") or "",
-        # One key is the ordinary case; more than one means the call was served by
-        # several models and no single name is honest, so the requested one stands.
-        model=(served[0] if len(served) == 1 else "") or model or "",
-    )
+        # Not JSON at all, or not an object: the text is still the answer (that is what
+        # `run_headless` has always returned here), and there is nothing to account.
+        result = HeadlessResult(text=out, model=model or "")
+    else:
+        served = [name for name in (data.get("modelUsage") or {})]
+        result = HeadlessResult(
+            text=data.get("result", ""),
+            usage=derive_turn_usage(data),
+            session_id=data.get("session_id") or "",
+            # One key is the ordinary case; more than one means the call was served by
+            # several models and no single name is honest, so the requested one stands.
+            model=(served[0] if len(served) == 1 else "") or model or "",
+        )
+    if attribute:
+        _attribute_subprocess(result, record)
+    return result
 
 
 def run_headless(prompt: str, system_prompt: str | None = None,
                  model: str | None = None, cwd: Path | None = None,
-                 timeout: int = 300, tools: str | None = None) -> str:
+                 timeout: int = 300, tools: str | None = None,
+                 attribute: bool = True, record: Any = None) -> str:
     """`run_headless_result`, keeping only the text.
 
     Kept for callers that have nothing to account against — and for the `call=` seams,
     whose fakes return a plain string. Anything the OS pays for should call
     `run_headless_result` and record what comes back.
+
+    It still ATTRIBUTES, though, and that is the point of passing the flags through: the
+    LLM-graded evals reach the model through this wrapper, and they are the spend issue
+    #103 was filed about.
     """
     return run_headless_result(prompt, system_prompt=system_prompt, model=model,
-                               cwd=cwd, timeout=timeout, tools=tools).text
+                               cwd=cwd, timeout=timeout, tools=tools,
+                               attribute=attribute, record=record).text
 
 
 def unpack_headless(value: HeadlessResult | str) -> tuple[str, dict[str, Any] | None]:

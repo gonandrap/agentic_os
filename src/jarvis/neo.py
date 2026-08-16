@@ -305,6 +305,10 @@ def answer_question(store: NeoStore, q: dict[str, Any], model: str,
         # Neutral cwd: running from a project dir would pull that repo's
         # CLAUDE.md/context into Neo's prompt (and break prefix stability).
         cwd=ensure_home(),
+        # This call records itself, three lines down, with the question it answered.
+        # Leaving the transport's own attribution on would double-count it whenever the
+        # daemon's environment happens to carry a work order — see `claude_cli`.
+        attribute=False,
     )
     record("neo_answer", usage=result, project=q.get("project") or "",
            wo_id=q.get("wo_id") or "", label=q.get("kind") or "question",
