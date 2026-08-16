@@ -594,7 +594,12 @@ def test_follow_up_turn_is_briefed_like_the_first(started, fake_claude, project,
 
     call = turn_calls(fake_claude, resumed=True, expect=1)[-1]
     argv = call["argv"]
-    assert argv[argv.index("--append-system-prompt") + 1] == "never touch production"
+    # Jarvis's static git briefing rides in front of the project's own instructions
+    # (tests/test_stable_prefix.py); what matters here is that the project's text is
+    # still there on turn two, where it would otherwise silently vanish.
+    appended = argv[argv.index("--append-system-prompt") + 1]
+    assert appended.endswith("never touch production")
+    assert appended.startswith("# Git")
     assert argv[argv.index("--model") + 1] == "opus"
     assert argv[argv.index("--add-dir") + 1].endswith("agent-skills")
     # The work order carries no permission_mode of its own, so the follow-up must fall
