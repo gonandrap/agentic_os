@@ -19,6 +19,30 @@ Releases never bypass code review, and **git is the source of truth**.
 push the branch → PR against `main` → CI green → merge (the user merges, or tells you
 to). Then `git pull` so local `main` equals `origin/main`.
 
+### A release re-verifies nothing. It stops at CI status.
+
+`main` is ready **by assumption**: nothing lands there except through a pull request with
+CI green. A release therefore runs **no** tests of its own — not `pytest`, not the LLM
+evals, not a quick smoke run, not "just the fast ones to be safe". Shipping is a deploy,
+not a second opinion.
+
+The evidence a release stands on is CI's verdict on the exact commits being shipped,
+which you **read** rather than produce: `gh pr checks <pr-number>` for each PR in the
+release, or the recent runs on `main`. That is the whole verification step, and it costs
+seconds. Put those results in the gate request (`--evidence`) — the reviewer sees only
+what you write, and CI green on the merged commits is complete evidence for a release.
+You will not be asked for more.
+
+If CI is red, or never ran on those commits, **stop and tell the user**. That is not a
+cue to run the suite locally and ship on your own say-so: a local green run says nothing
+about what CI would have said, and substitutes your judgement for the check the user
+actually relies on.
+
+Why this is spelled out: wo-52a6164d shipped 0.5.4 by running the scripted suite, then
+the opt-in LLM eval suite, then re-running that suite against the previous tag as an A/B
+comparison — 55 minutes and 3.4M tokens to re-establish what the merge had already
+established.
+
 **Part B — `scripts/shipit.sh` cuts and deploys the release:**
 
 1. Refuses to run on a dirty tree, without an `origin` remote, or when `HEAD` is not
