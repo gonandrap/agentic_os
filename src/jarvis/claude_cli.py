@@ -781,7 +781,9 @@ def model_of(result: HeadlessResult) -> str:
 def run_headless_result(prompt: str, system_prompt: str | None = None,
                         model: str | None = None, cwd: Path | None = None,
                         timeout: int = 300, tools: str | None = None,
-                        attribute: bool = True, record: Any = None) -> HeadlessResult:
+                        attribute: bool = True, record: Any = None,
+                        permission_mode: str | None = None,
+                        env_extra: dict[str, str] | None = None) -> HeadlessResult:
     """One-shot headless call (`claude -p`), with its accounting kept.
 
     The transport every OS-side agent runs on — Neo, the panel's seats, the dashboard
@@ -807,6 +809,14 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
     suites and scripts that do not know they are inside one; the OS's OWN call sites
     (Neo, the panel's seats, the digest) switch it OFF because they record themselves,
     with the work order and the question they were made for, which this seam cannot know.
+
+    `permission_mode` and `env_extra` exist for the other direction: running a
+    subject that is *supposed* to touch the machine, in a controlled one. A
+    headless callee cannot answer a permission prompt any more than a `--bg`
+    worker can, so a tooled call needs the same `auto` mode dispatch gives real
+    workers; `env_extra` is how the sandbox gets on its PATH. Note it does NOT
+    suppress attribution: a measured subject still spends the work order's tokens,
+    and `env_extra` overriding `PATH` leaves `JARVIS_WO_ID` untouched.
     """
     args: list[str] = ["-p", prompt, "--output-format", "json"]
     if system_prompt:
@@ -815,7 +825,9 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
         args += ["--model", model]
     if tools is not None:  # "" is meaningful: it disables every tool
         args += ["--tools", tools]
-    out = _run(args, cwd=cwd, timeout=timeout)
+    if permission_mode:
+        args += ["--permission-mode", permission_mode]
+    out = _run(args, cwd=cwd, timeout=timeout, env_extra=env_extra)
     data: Any = None
     try:
         data = json.loads(out)
@@ -843,7 +855,9 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
 def run_headless(prompt: str, system_prompt: str | None = None,
                  model: str | None = None, cwd: Path | None = None,
                  timeout: int = 300, tools: str | None = None,
-                 attribute: bool = True, record: Any = None) -> str:
+                 attribute: bool = True, record: Any = None,
+                 permission_mode: str | None = None,
+                 env_extra: dict[str, str] | None = None) -> str:
     """`run_headless_result`, keeping only the text.
 
     Kept for callers that have nothing to account against — and for the `call=` seams,
@@ -852,11 +866,15 @@ def run_headless(prompt: str, system_prompt: str | None = None,
 
     It still ATTRIBUTES, though, and that is the point of passing the flags through: the
     LLM-graded evals reach the model through this wrapper, and they are the spend issue
-    #103 was filed about.
+    #103 was filed about. `permission_mode`/`env_extra` ride through for the same
+    callers — the retrieval eval's tooled subject is both the thing being measured and,
+    when the eval runs inside a work order, a real charge against it.
     """
     return run_headless_result(prompt, system_prompt=system_prompt, model=model,
                                cwd=cwd, timeout=timeout, tools=tools,
-                               attribute=attribute, record=record).text
+                               attribute=attribute, record=record,
+                               permission_mode=permission_mode,
+                               env_extra=env_extra).text
 
 
 def unpack_headless(value: HeadlessResult | str) -> tuple[str, dict[str, Any] | None]:
