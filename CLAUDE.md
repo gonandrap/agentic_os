@@ -108,7 +108,17 @@ jarvis wo hide <id> / unhide <id>          # declutter: keeps the record, drops 
                                            # listings, the summary and the attention list
 jarvis wo delete <id> --yes                # irreversible: erases the WO and its whole
                                            # history (timeline, messages, assumptions)
-jarvis wo resume-auto <id>                 # unstick a worker blocked on a permission prompt (flip to auto + resume)
+jarvis wo resume-auto <id>                 # what is this work order ACTUALLY waiting on?
+                                           # Says so — a Neo question, a gate, a queued
+                                           # message, a turn in flight, or nothing — and
+                                           # nudges the worker only when a permission
+                                           # prompt is the last explanation left. In a
+                                           # fleet running `auto` (the default) nothing
+                                           # can prompt, so the nudge it used to send
+                                           # unconditionally only interrupted workers
+                                           # that were waiting correctly and re-sent
+                                           # their whole conversation. `--force` sends
+                                           # it anyway.
 jarvis wo inject <session-id>              # hand the user's OWN Claude session to Jarvis.
                                            # Jarvis never adopts a session it finds: one
                                            # the user started is theirs. Injecting only

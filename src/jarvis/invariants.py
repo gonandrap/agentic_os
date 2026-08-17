@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from . import db, worker_session
+from .neo_store import USER_HELD_Q_STATUSES
 from .project_store import (
     ACTIVE_STATUSES,
     DEPENDENCY_DEAD_STATUSES,
@@ -140,11 +141,31 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     if governed and wo["status"] == "failed":
         blockers.append("worker failed — review and retry")
     # Blocked on a prompt is real whoever started the session: nobody else can unstick it.
-    # A worker waiting on a gate that is still with Neo is the exception: routing those
-    # away from the user is the entire point of having a delegate, so it stays silent
-    # until Neo either decides or escalates (handled above).
-    if wo["status"] == "waiting_input" and not _waiting_on_neo_gate(store, wo):
-        blockers.append("worker is waiting on your input")
+    # A worker waiting on the DELEGATE is the exception, and there are two ways to be
+    # waiting on it — a gate still with Neo, and a question still with Neo. Routing both
+    # away from the user is the entire point of having a delegate, so each stays silent
+    # until Neo either decides or hands it back.
+    #
+    # The question half is what GitHub issue 100 was: `jarvis wo ask` parks the work
+    # order here without flagging attention, and this line put the flag straight back on
+    # the next tick — "worker is waiting on your input" about a worker waiting on Neo,
+    # steering the user at `jarvis wo resume-auto`, which cannot help. Three of five
+    # sampled `jarvis_os` work orders had it.
+    if wo["status"] == "waiting_input":
+        question = awaiting_neo(wo["id"])
+        if question is not None and question["status"] in USER_HELD_Q_STATUSES:
+            # Neo handed the decision back. That IS the user's, and it gets a reason
+            # naming the question rather than the generic one below, which would send
+            # them looking for a session to type into.
+            blockers.append(neo_question_blocker(question))
+        elif (question is None and not _waiting_on_neo_gate(store, wo)
+                and not store.queued_messages(wo["id"])):
+            # A queued message is the reply already on its way: `ops.send_message` clears
+            # the flag the moment the user writes it, and this line put it back on the
+            # next tick — for the seconds between queueing and delivery, the user was
+            # asked again for something they had just done. A delivery that FAILS raises
+            # its own, more specific flag (`Daemon._deliver`), so nothing is lost.
+            blockers.append("worker is waiting on your input")
     # A dependency that will never complete. Ordinary blocking is silent on purpose —
     # `pending — blocked by …` is a listing label, not a decision anyone owes — but a
     # dependency that is cancelled or failed cannot clear itself, so the work order will
@@ -189,7 +210,7 @@ def status_label(store: ProjectStore, wo: dict[str, Any]) -> str:
     separately — see the FEATURED_STATUSES fix in PR 65.)
     """
     if wo["status"] in ACTIVE_STATUSES:
-        note = rate_limit_note(store, wo)
+        note = rate_limit_note(store, wo) or neo_wait_note(wo)
         return f"{wo['status']} — {note}" if note else wo["status"]
     if wo["status"] != "pending":
         return wo["status"]
@@ -232,6 +253,24 @@ def rate_limit_note(store: ProjectStore, wo: dict[str, Any]) -> str:
     return f"Claude usage limit reached, retrying by itself at {when}"
 
 
+def neo_wait_note(wo: dict[str, Any]) -> str:
+    """"with Neo …" for a work order parked on a question — or "" for anything else.
+
+    `waiting_input` renders as "Waiting on you" everywhere (`timeline.STATUS_LABEL`), and
+    for the whole time Neo holds a question that label is false: it can be minutes, and
+    the user reads it as a demand. The note says who actually has it. Display only — what
+    costs attention is `true_blockers`, and nothing here changes that.
+    """
+    if wo["status"] != "waiting_input":
+        return ""
+    question = awaiting_neo(wo["id"])
+    if question is None:
+        return ""
+    if question["status"] in USER_HELD_Q_STATUSES:
+        return f"Neo handed question {question['id']} back to you"
+    return f"with Neo — it is answering question {question['id']}"
+
+
 def _slot_cap(store: ProjectStore, wo: dict[str, Any]) -> tuple[str, int, int] | None:
     """`(feature id, max_parallel, active children)` when this work order's feature order
     is already running as many children as it allows, else None.
@@ -261,6 +300,85 @@ def _waiting_on_neo_gate(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """True when this work order is parked on a privileged-action request that Neo has
     not answered yet. Not a user blocker: Neo is the one holding it."""
     return any(not a["escalated"] for a in store.pending_approvals(wo["id"]))
+
+
+def awaiting_neo(wo_id: str) -> dict[str, Any] | None:
+    """The question this work order is parked on, or None — read from Neo's own DB.
+
+    THE ONE PREDICATE for "is this work order waiting on the delegate rather than on the
+    user", and the answer to the same false page arriving from three directions at once
+    (GitHub issue 100): `true_blockers` below, the idle-`Notification` branch of
+    `hooks.handle`, and `Daemon.settle_work_order` each decided independently what an
+    idle `waiting_input` worker meant, and each decided "the user". `ops.ask_question`
+    flips the status to `waiting_input` WITHOUT flagging attention precisely so that it
+    does not — and all three undid that within a tick of the worker ending its turn.
+
+    Read `q["status"]` to know who is holding it: `neo_store.NEO_HELD_Q_STATUSES` is
+    Neo's and costs the user nothing, `USER_HELD_Q_STATUSES` is the user's.
+
+    Cross-DB and deliberately so — a question's state lives in `neo.db` and mirroring it
+    into a column here would drift the first time a daemon dies between the two writes.
+    The cost is bounded by the callers: every one of them asks only about a work order
+    already sitting in `waiting_input`, which is a handful of rows fleet-wide.
+
+    Best-effort, and it fails TOWARDS the user: an unreadable `neo.db` returns None, so
+    the generic blocker surfaces and the work order is visible-but-mislabelled rather
+    than silently stalled. That is the direction `check_blocked_work_is_surfaced` calls
+    the dangerous one.
+    """
+    from .neo_store import NeoStore
+
+    try:
+        neo = NeoStore()
+    except Exception:  # noqa: BLE001 — see docstring: never take a caller down with us
+        return None
+    try:
+        open_questions = neo.open_questions(wo_id)
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        neo.close()
+    return open_questions[0] if open_questions else None
+
+
+def end_wait_if_nothing_is_out(store: ProjectStore, wo_id: str) -> bool:
+    """Take a work order out of `waiting_input` once nothing is holding it there.
+
+    Every wait in the OS parks the work order here — `gates.request`, `ops.ask_question`
+    — and every one of them has to end it again, because a status that outlives its wait
+    is read as a USER blocker by everything downstream: `jarvis status`, the dashboard,
+    and `true_blockers` above, which renders it as "worker is waiting on your input".
+
+    One function for all of them, because the condition is not per-wait: what ends a wait
+    is that NOTHING is out, and a gate verdict delivered while a question is still with
+    Neo has not ended anything. Three call sites had three copies of a two-thirds-right
+    version of this (`gates.apply_decision`, `Daemon._neo_drain`, and `neo_answer_escalated`,
+    which had none at all and left the flag to come straight back on the next tick).
+
+    Narrow on the other side too: only FROM `waiting_input`, so a work order cancelled or
+    settled while it waited keeps where it got to. Returns whether it moved.
+    """
+    if store.get_work_order(wo_id)["status"] != "waiting_input":
+        return False
+    if store.pending_approvals(wo_id) or awaiting_neo(wo_id):
+        return False
+    store.set_status(wo_id, "running")
+    return True
+
+
+def neo_question_blocker(question: dict[str, Any]) -> str:
+    """The attention reason for a question Neo has handed back to the user.
+
+    One function so the reason `Daemon._neo_drain` writes at escalation time and the one
+    `true_blockers` re-derives on every tick afterwards are the same string — kn-78346a2d:
+    a flag whose reason `true_blockers` cannot re-derive is relabelled behind the user's
+    back, and the relabelling is silent.
+    """
+    if question["status"] == "failed":
+        return (f"Neo could not answer question {question['id']} — "
+                f"answer it: `jarvis neo answer {question['id']} \"…\"`")
+    return (f"Neo escalated question {question['id']} to you — "
+            f"answer it: `jarvis neo answer {question['id']} \"…\"`")
 
 
 # -- invariants ---------------------------------------------------------------------

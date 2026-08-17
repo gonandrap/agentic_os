@@ -544,6 +544,25 @@ def _is_current_session(store: ProjectStore, wo_id: str, session_id: str) -> boo
     return not bound or not session_id or bound == session_id
 
 
+def _parked_on_the_delegate(store: ProjectStore, wo_id: str) -> str:
+    """What Neo is holding for this work order — "" when nothing is.
+
+    Only ever consulted for a `waiting_input` work order, which is the state both waits
+    put it in (`ops.ask_question`, `gates.request`). A `running` worker's Notification is
+    a real mid-work block until proven otherwise, and swallowing that would strand it.
+    """
+    if store.get_work_order(wo_id)["status"] != "waiting_input":
+        return ""
+    from .invariants import awaiting_neo
+
+    question = awaiting_neo(wo_id)
+    if question is not None:
+        return f"neo question {question['id']} ({question['status']})"
+    if store.pending_approvals(wo_id):
+        return "a privileged-action gate awaiting a verdict"
+    return ""
+
+
 def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
     event = payload.get("hook_event_name", "")
     session_id = payload.get("session_id", "")
@@ -628,6 +647,21 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
                 store.add_event(wo_id, "notification_ignored", {
                     "message": payload.get("message"),
                     "reason": f"work order already {wo['status']}",
+                })
+                return {"wo_id": wo_id, "event": event, "ignored": True}
+            # The same reasoning one status further in. A worker that ended its turn on
+            # `jarvis wo ask` or on a gate request is SITTING in `waiting_input` with a
+            # live session, so the test above lets it through — and a minute later Claude
+            # Code's idle prompt stamps "Claude is waiting for your input" over a work
+            # order that is waiting on Neo. It is the delegate's whole purpose that this
+            # costs the user nothing (GitHub issue 100), and where Neo has already handed
+            # the question back the flag it overwrites is the better one: it names the
+            # question and the command that answers it.
+            parked = _parked_on_the_delegate(store, wo_id)
+            if parked:
+                store.add_event(wo_id, "notification_ignored", {
+                    "message": payload.get("message"),
+                    "reason": f"idle prompt while parked on {parked}",
                 })
                 return {"wo_id": wo_id, "event": event, "ignored": True}
             message = payload.get("message") or "Worker needs attention"

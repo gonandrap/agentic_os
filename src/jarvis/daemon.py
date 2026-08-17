@@ -644,6 +644,7 @@ class Daemon:
 
     def _neo_drain(self) -> None:
         """Answer every queued question in order (runs on the single neo thread)."""
+        from . import invariants
         from . import neo as neo_mod
         from .neo_store import NeoStore
 
@@ -675,8 +676,15 @@ class Daemon:
                         wo_id=q["wo_id"],
                     )
                     if pstore:
+                        # The reason `invariants.true_blockers` re-derives for this
+                        # question, not a second phrasing of it: a flag whose reason that
+                        # function cannot reproduce is silently relabelled on the next
+                        # reconcile tick (kn-78346a2d).
                         pstore.flag_attention(
-                            q["wo_id"], f"question escalated by Neo: {q['question'][:80]}"
+                            q["wo_id"],
+                            invariants.neo_question_blocker(
+                                {**q, "status": "failed" if verdict.get("failed")
+                                                else "escalated"}),
                         )
                 elif pstore:
                     pstore.queue_message(
@@ -685,6 +693,11 @@ class Daemon:
                     )
                     pstore.add_event(q["wo_id"], "neo_answered",
                                      {"neo_question_id": q["id"]})
+                    # End the wait the question started, exactly as a gate verdict ends a
+                    # gate's. The answer is out; what the work order waits on now is the
+                    # OS delivering it, and `waiting_input` outliving that reads as a
+                    # USER blocker on every surface that renders it.
+                    invariants.end_wait_if_nothing_is_out(pstore, q["wo_id"])
                 if pstore and q.get("kind") not in ("approval", "plan"):
                     self._dispatch_neo_cleanup(pstore, q, verdict)
             finally:
@@ -1050,6 +1063,8 @@ class Daemon:
 
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
                           wo: dict) -> None:
+        from .invariants import awaiting_neo
+
         turn = store.latest_turn(wo["id"])
         if turn is None:
             if time.time() - wo["updated_at"] <= 300:
@@ -1139,9 +1154,17 @@ class Daemon:
             else:
                 store.set_status(wo["id"], "completed")
                 store.clear_attention(wo["id"])
-        elif store.pending_approvals(wo["id"]):
-            # Parked on a privileged-action gate: it was told to end its turn and wait
-            # for the verdict, so an idle worker here is compliance, not abandonment.
+        elif store.pending_approvals(wo["id"]) or awaiting_neo(wo["id"]):
+            # Parked on the delegate — a privileged-action gate awaiting a verdict, or a
+            # question awaiting an answer. Either way the worker was TOLD to end its turn
+            # and wait, so an idle worker here is compliance, not abandonment.
+            #
+            # The question half was missing, and the `else` below caught those instead:
+            # a `jarvis wo ask` whose answer had not landed by the time the turn settled
+            # was filed as `needs_review — worker idle without jarvis wo finish` and put
+            # in front of the user, for a worker doing exactly what the contract asks of
+            # it (GitHub issue 100). Only the tightness of the Neo drain loop kept that
+            # rare; a slow or disabled Neo makes it every `wo ask`.
             if fresh["status"] != "waiting_input":
                 store.set_status(wo["id"], "waiting_input")
         else:
