@@ -275,6 +275,15 @@ class TurnResult:
     usage: dict[str, Any] | None = None
 
 
+#: Which reading of a result envelope produced a stored `usage_json`. Bumped when the
+#: MEANING of the numbers changes, so a persisted row can be re-derived rather than
+#: silently compared against rows counted a different way.
+#:
+#: 1 — token totals taken from the envelope's top-level `usage` object.
+#: 2 — token totals taken from `modelUsage`, which is what the turn actually spent.
+USAGE_SCHEMA_VERSION = 2
+
+
 def derive_turn_usage(data: dict[str, Any]) -> dict[str, Any] | None:
     """The turn's exact accounting, compacted from one result envelope.
 
@@ -283,17 +292,39 @@ def derive_turn_usage(data: dict[str, Any]) -> dict[str, Any] | None:
     the file. Exact by construction — every number is the CLI's own, never a list-price
     estimate:
 
-    * token classes come from `usage`, ephemeral 1h/5m split included;
+    * token totals come from `modelUsage`, summed across the models the turn used, and
+      `by_model` keeps them split (a turn that fell back to a cheaper model is a fact
+      about the bill, not noise);
     * `iterations` carries one entry per API call, so the context at a call is that
       iteration's input + cache_read + cache_creation — `context_peak` is the max,
       which is the /context statistic, available headlessly;
+    * the ephemeral 1h/5m split comes from `usage.cache_creation`, the only place it is
+      reported at all;
     * `context_window` and per-model `costUSD` come from `modelUsage`.
 
-    Returns None when there is no `usage` object to read (a result written before the
-    CLI carried usage, or a crashed turn) — an absence, never a zero.
+    WHY `modelUsage` AND NOT `usage`. The top-level `usage` object is NOT the turn's
+    total — measured over the 186 live result files that carry both, it runs at 33-60%
+    of `modelUsage`, which in turn agrees to the TOKEN with the transcript that
+    `usage.read_session` derives independently, and whose `costUSD` sums to
+    `total_cost_usd` to the cent. Two independent sources agreeing settled it (Neo,
+    question 121 on wo-4576667e). Dollars were never wrong — they come from
+    `total_cost_usd` — so what this corrects is every token figure the OS has recorded.
+
+    THE 1h/5m SPLIT IS A SAMPLE, not a partition of `cache_write`: it is reported for
+    whatever part of the turn the top-level `usage` speaks for, and `cache_1h + cache_5m`
+    is therefore usually less than `cache_write`. `usage.write_rate` uses its RATIO for
+    exactly that reason, and the two must not be presented as adding up to the whole.
+
+    Returns None when there is neither a `modelUsage` block nor a `usage` object (a
+    result written before the CLI carried either, or a crashed turn) — an absence,
+    never a zero. When only `usage` is present the totals fall back to it and the
+    envelope is stamped version 1, which is the honest label for those numbers.
     """
-    usage = data.get("usage")
-    if not isinstance(usage, dict):
+    raw_usage = data.get("usage")
+    usage: dict[str, Any] = raw_usage if isinstance(raw_usage, dict) else {}
+    models = {name: mu for name, mu in (data.get("modelUsage") or {}).items()
+              if isinstance(mu, dict)}
+    if not usage and not models:
         return None
     cache_creation = usage.get("cache_creation") or {}
     iterations = [i for i in (usage.get("iterations") or []) if isinstance(i, dict)]
@@ -308,23 +339,44 @@ def derive_turn_usage(data: dict[str, Any]) -> dict[str, Any] | None:
         + (usage.get("cache_read_input_tokens") or 0)
         + (usage.get("cache_creation_input_tokens") or 0)
     ]
-    models = {name: mu for name, mu in (data.get("modelUsage") or {}).items()
-              if isinstance(mu, dict)}
     windows = [mu["contextWindow"] for mu in models.values() if mu.get("contextWindow")]
+    by_model = [
+        {
+            "model": name,
+            "input": mu.get("inputTokens") or 0,
+            "cache_write": mu.get("cacheCreationInputTokens") or 0,
+            "cache_read": mu.get("cacheReadInputTokens") or 0,
+            "output": mu.get("outputTokens") or 0,
+            "cost_usd": mu.get("costUSD"),
+            "context_window": mu.get("contextWindow"),
+        }
+        for name, mu in models.items()
+    ]
+    if by_model:
+        totals = {c: sum(m[c] for m in by_model)
+                  for c in ("input", "cache_write", "cache_read", "output")}
+        version = USAGE_SCHEMA_VERSION
+    else:
+        totals = {
+            "input": usage.get("input_tokens") or 0,
+            "cache_write": usage.get("cache_creation_input_tokens") or 0,
+            "cache_read": usage.get("cache_read_input_tokens") or 0,
+            "output": usage.get("output_tokens") or 0,
+        }
+        version = 1
     return {
+        "usage_v": version,
         "total_cost_usd": data.get("total_cost_usd"),
-        "input": usage.get("input_tokens") or 0,
-        "cache_write": usage.get("cache_creation_input_tokens") or 0,
-        "cache_read": usage.get("cache_read_input_tokens") or 0,
+        **totals,
         "cache_1h": cache_creation.get("ephemeral_1h_input_tokens") or 0,
         "cache_5m": cache_creation.get("ephemeral_5m_input_tokens") or 0,
-        "output": usage.get("output_tokens") or 0,
         "api_calls": len(iterations) or data.get("num_turns"),
         "context_peak": max(contexts),
         "context_window": max(windows) if windows else None,
         "duration_api_ms": data.get("duration_api_ms"),
         "cost_by_model": {name: mu["costUSD"] for name, mu in models.items()
                           if mu.get("costUSD") is not None},
+        "by_model": by_model,
     }
 
 

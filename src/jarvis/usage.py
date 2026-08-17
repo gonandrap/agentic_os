@@ -55,6 +55,18 @@ this session's boundaries were stark.
 The dollar figures are Anthropic list prices, and the user is on a subscription: they
 are a common unit that lets a cache-read token be compared with an output token, not
 an invoice. Tokens are the primary figure everywhere; cost is derived and labelled.
+
+## A cache write is priced by its TTL, and Jarvis bought the expensive one for months
+
+A prompt-cache WRITE costs 1.25x base input at the 5-MINUTE TTL and 2x at the ONE-HOUR
+TTL; a read is 0.1x under either (kn-f94abf34, measured over 1,075 transcripts). Every
+write a Jarvis worker made before `FORCE_PROMPT_CACHING_5M` shipped was a 1h write, so
+pricing them all at 1.25x understated the largest avoidable line in the bill by up to
+60% of itself. Both rates live here and the SPLIT decides: `cache_creation` carries
+`ephemeral_1h_input_tokens` and `ephemeral_5m_input_tokens`, per assistant message in a
+transcript and per turn in a result envelope, and where it is present it is used. Where
+it is absent — an old row, a caller that has counts and nothing else — the 5-minute rate
+is the floor and the estimate stays where it always was, rather than guessing upward.
 """
 
 from __future__ import annotations
@@ -62,6 +74,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -76,8 +89,49 @@ PRICES: dict[str, tuple[float, float]] = {
     "haiku": (1.0, 5.0),
 }
 DEFAULT_PRICE = PRICES["opus"]
-CACHE_WRITE_RATE = 1.25  # x input price
-CACHE_READ_RATE = 0.10  # x input price
+CACHE_WRITE_RATE = 1.25  # x input price, at the 5-minute TTL
+CACHE_WRITE_1H_RATE = 2.0  # x input price, at the 1-hour TTL
+CACHE_READ_RATE = 0.10  # x input price, under either TTL
+
+#: The four things a bill can be charged for, in the order they are rendered. Named here
+#: because every surface that breaks a line item down by class walks this list, and a
+#: class that exists in one renderer and not another is a token the reader cannot find.
+TOKEN_CLASSES = ("input", "cache_write", "cache_read", "output")
+
+
+def write_rate(cache_write: int, cache_1h: int = 0, cache_5m: int = 0) -> float:
+    """The multiple of base input price one cache-write token cost, given the TTL split.
+
+    The split is often a SAMPLE rather than the whole: a turn's result envelope reports
+    `cache_creation` for part of the turn while `modelUsage` reports the total written.
+    Its RATIO is what is used, applied to the whole — an 87/13 sample of a turn that
+    wrote 1.9M tokens prices those 1.9M at 1.89x. With no split at all the 5-minute rate
+    stands, which is the floor and what this module has always charged.
+    """
+    known = cache_1h + cache_5m
+    if not cache_write or known <= 0:
+        return CACHE_WRITE_RATE
+    share_1h = min(1.0, max(0.0, cache_1h / known))
+    return CACHE_WRITE_RATE + share_1h * (CACHE_WRITE_1H_RATE - CACHE_WRITE_RATE)
+
+
+def class_costs(model: str, *, input: int = 0, cache_write: int = 0, cache_read: int = 0,
+                output: int = 0, cache_1h: int = 0, cache_5m: int = 0) -> dict[str, float]:
+    """What each class of token cost, at list — the line items of a bill.
+
+    One dict per call site rather than a single total, because "where did the money go"
+    is answered by the classes and not by their sum: a session whose bill is 70% cache
+    READ is behaving, and one whose bill is 70% cache WRITE is paying the re-write tax.
+    Keys are `TOKEN_CLASSES`, so a renderer can walk them without knowing the rates.
+    """
+    in_rate, out_rate = price_for(model)
+    return {
+        "input": input * in_rate / 1e6,
+        "cache_write": (cache_write * in_rate
+                        * write_rate(cache_write, cache_1h, cache_5m) / 1e6),
+        "cache_read": cache_read * in_rate * CACHE_READ_RATE / 1e6,
+        "output": output * out_rate / 1e6,
+    }
 
 
 def transcript_root() -> Path:
@@ -128,11 +182,34 @@ class Usage:
     rewrite_excess: int = 0
     resume_boundaries: int = 0
     cost_by_model: dict[str, float] = field(default_factory=dict)
+    #: The TTL split of `cache_write`, where the source reported one. Their sum can be
+    #: LESS than `cache_write` (a partial sample) and is zero when nothing is known —
+    #: which is why they are kept beside it rather than instead of it. See `write_rate`.
+    cache_1h: int = 0
+    cache_5m: int = 0
+    #: What each class of token cost, at list, summed as usages merge. Carried rather
+    #: than re-derived from the totals because the write rate depends on a TTL split
+    #: that is exact per message and only approximate once messages are added together.
+    cost_by_class: dict[str, float] = field(default_factory=dict)
+    #: TOKENS by model — `{model: {input, cache_write, cache_read, output, ...}}`, the
+    #: same classes as the fields above. `cost_by_model` was never enough to subtract
+    #: one usage from another: the bill splits a turn into the agents that ran inside it
+    #: by taking the turn's totals MINUS its subagents', and a subtraction that mixes
+    #: models would move tokens between price bands. Per model, it cannot.
+    tokens_by_model: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def __add__(self, other: Usage) -> Usage:
         merged = dict(self.cost_by_model)
         for model, cost in other.cost_by_model.items():
             merged[model] = merged.get(model, 0.0) + cost
+        classes = dict(self.cost_by_class)
+        for name, cost in other.cost_by_class.items():
+            classes[name] = classes.get(name, 0.0) + cost
+        tokens = {m: dict(counts) for m, counts in self.tokens_by_model.items()}
+        for model, counts in other.tokens_by_model.items():
+            into = tokens.setdefault(model, {})
+            for name, value in counts.items():
+                into[name] = into.get(name, 0) + value
         return Usage(
             messages=self.messages + other.messages,
             input=self.input + other.input,
@@ -143,6 +220,10 @@ class Usage:
             rewrite_excess=self.rewrite_excess + other.rewrite_excess,
             resume_boundaries=self.resume_boundaries + other.resume_boundaries,
             cost_by_model=merged,
+            cache_1h=self.cache_1h + other.cache_1h,
+            cache_5m=self.cache_5m + other.cache_5m,
+            cost_by_class=classes,
+            tokens_by_model=tokens,
         )
 
     @property
@@ -159,14 +240,22 @@ class Usage:
         return sum(self.cost_by_model.values())
 
     @property
+    def cached_input(self) -> int:
+        """Input tokens the cache served or stored — everything but the fresh ones."""
+        return self.cache_write + self.cache_read
+
+    @property
     def rewrite_cost_usd(self) -> float:
         """What the re-written tokens cost ABOVE what reading them would have cost.
 
         Priced at the blended input rate of the models actually used, so a session
-        that ran on Haiku is not charged Opus waste.
+        that ran on Haiku is not charged Opus waste, and at the write rate the TTL
+        split actually implies: at the 1-hour TTL a re-write is 20x a read, not 12.5x.
         """
         rate = self._blended_input_rate()
-        return self.rewrite_excess * (CACHE_WRITE_RATE - CACHE_READ_RATE) * rate / 1e6
+        excess = write_rate(self.cache_write, self.cache_1h, self.cache_5m) \
+            - CACHE_READ_RATE
+        return self.rewrite_excess * excess * rate / 1e6
 
     def _blended_input_rate(self) -> float:
         models = [m for m in self.cost_by_model if price_for(m)[0]]
@@ -181,7 +270,10 @@ class Usage:
             "cache_write": self.cache_write,
             "cache_read": self.cache_read,
             "output": self.output,
+            "cache_1h": self.cache_1h,
+            "cache_5m": self.cache_5m,
             "billed_input": self.billed_input,
+            "cached_input": self.cached_input,
             "total_tokens": self.total_tokens,
             "context_peak": self.context_peak,
             "rewrite_excess": self.rewrite_excess,
@@ -189,6 +281,41 @@ class Usage:
             "list_cost_usd": round(self.list_cost_usd, 2),
             "rewrite_cost_usd": round(self.rewrite_cost_usd, 2),
             "cost_by_model": {m: round(c, 2) for m, c in self.cost_by_model.items()},
+            "cost_by_class": {c: round(v, 4) for c, v in self.cost_by_class.items()},
+        }
+
+
+@dataclass
+class Subagent:
+    """One subagent the session spawned, with enough about it to name a bill line.
+
+    `agent_type` and `description` come from the `.meta.json` Claude Code writes beside
+    each subagent transcript — "Explore", "Find worker session creation code". Without
+    them a bill can only offer `agent-ac837f05`, which answers "how much" and not the
+    question anyone actually has, which is "on what".
+
+    `started_at` is a unix timestamp, used to charge the subagent to the TURN it ran in
+    (the same last-turn-started-by-then rule everything else on the bill uses).
+    """
+
+    agent_id: str
+    agent_type: str = ""
+    description: str = ""
+    started_at: float = 0.0
+    ended_at: float = 0.0
+    usage: Usage = field(default_factory=Usage)
+
+    @property
+    def label(self) -> str:
+        name = self.agent_type or "subagent"
+        return f"{name} · {self.description}" if self.description else name
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "agent_id": self.agent_id, "agent_type": self.agent_type,
+            "description": self.description, "label": self.label,
+            "started_at": self.started_at, "ended_at": self.ended_at,
+            "usage": self.usage.as_dict(),
         }
 
 
@@ -205,6 +332,10 @@ class SessionUsage:
     subagents: Usage = field(default_factory=Usage)
     subagent_count: int = 0
     found: bool = False
+    #: One entry per subagent, in the order the transcripts were read. `subagents` is
+    #: their sum and stays the figure everything else uses; this is what lets the bill
+    #: put each of them on its own row instead of reporting a lump.
+    each_subagent: list[Subagent] = field(default_factory=list)
 
     @property
     def total(self) -> Usage:
@@ -217,8 +348,63 @@ class SessionUsage:
             "subagent_count": self.subagent_count,
             "main": self.main.as_dict(),
             "subagents": self.subagents.as_dict(),
+            "each_subagent": [s.as_dict() for s in self.each_subagent],
             "total": self.total.as_dict(),
         }
+
+
+def _subagent_detail(path: Path, sub_usage: Usage) -> Subagent:
+    """Name and time one subagent transcript, from its meta file and its own rows.
+
+    Both sources are best-effort: a subagent whose meta file is missing still gets a
+    line, named for its file, because dropping it would take its tokens off the bill.
+    """
+    meta: dict[str, Any] = {}
+    meta_path = path.with_suffix(".meta.json")
+    try:
+        meta = json.loads(meta_path.read_text()) or {}
+    except (OSError, ValueError):
+        meta = {}
+    started, ended = _time_span(path)
+    return Subagent(
+        agent_id=path.stem,
+        agent_type=str(meta.get("agentType") or ""),
+        description=str(meta.get("description") or ""),
+        started_at=started, ended_at=ended, usage=sub_usage,
+    )
+
+
+def _time_span(path: Path) -> tuple[float, float]:
+    """When a transcript's rows start and end, as unix timestamps (0 if unreadable)."""
+    first = last = 0.0
+    try:
+        handle = path.open(errors="replace")
+    except OSError:
+        return (0.0, 0.0)
+    with handle:
+        for line in handle:
+            if '"timestamp"' not in line:
+                continue
+            try:
+                stamp = json.loads(line).get("timestamp")
+            except ValueError:
+                continue
+            when = _parse_stamp(stamp)
+            if when:
+                first = first or when
+                last = when
+    return (first, last)
+
+
+def _parse_stamp(stamp: Any) -> float:
+    if not isinstance(stamp, str):
+        return 0.0
+    try:
+        # Claude Code writes RFC-3339 with a literal Z, which `fromisoformat` accepts
+        # only from 3.11; the replace keeps this working the same on either.
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
@@ -261,6 +447,16 @@ def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
             for key, value in usage.items():
                 if isinstance(value, int):
                     entry[key] = max(entry.get(key, 0), value)
+            # The TTL of the cache write, one level down. Flattened in rather than
+            # skipped with the rest of the nested values: it is not a detail but a
+            # PRICE — the same token costs 1.25x or 2x depending on which of these two
+            # it landed in (kn-f94abf34), and it is exact per message here.
+            creation = usage.get("cache_creation")
+            if isinstance(creation, dict):
+                for key in ("ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"):
+                    value = creation.get(key)
+                    if isinstance(value, int):
+                        entry[key] = max(entry.get(key, 0), value)
     return [by_id[mid] for mid in order]
 
 
@@ -276,10 +472,19 @@ def _usage_of(path: Path) -> Usage:
         write = message.get("cache_creation_input_tokens", 0)
         read = message.get("cache_read_input_tokens", 0)
         out = message.get("output_tokens", 0)
+        hour = message.get("ephemeral_1h_input_tokens", 0)
+        five = message.get("ephemeral_5m_input_tokens", 0)
         usage.input += plain
         usage.cache_write += write
         usage.cache_read += read
         usage.output += out
+        usage.cache_1h += hour
+        usage.cache_5m += five
+        counts = usage.tokens_by_model.setdefault(model, {})
+        for name, value in (("input", plain), ("cache_write", write),
+                            ("cache_read", read), ("output", out),
+                            ("cache_1h", hour), ("cache_5m", five)):
+            counts[name] = counts.get(name, 0) + value
         usage.context_peak = max(usage.context_peak, plain + write + read)
         # A turn boundary shows up as the cache going BACKWARDS: this call read less
         # of the prefix than the one before it did. Counting the drops rather than
@@ -288,13 +493,14 @@ def _usage_of(path: Path) -> Usage:
         if previous_read is not None and read < previous_read:
             usage.resume_boundaries += 1
         previous_read = read
-        in_rate, out_rate = price_for(model)
-        cost = (
-            plain * in_rate
-            + write * in_rate * CACHE_WRITE_RATE
-            + read * in_rate * CACHE_READ_RATE
-            + out * out_rate
-        ) / 1e6
+        # Per MESSAGE, where the TTL split is exact rather than a sample — which is the
+        # most accurate this estimate can be made without the CLI's own figure.
+        classes = class_costs(model, input=plain, cache_write=write, cache_read=read,
+                              output=out, cache_1h=hour, cache_5m=five)
+        for name, value in classes.items():
+            if value:
+                usage.cost_by_class[name] = usage.cost_by_class.get(name, 0.0) + value
+        cost = sum(classes.values())
         if cost:
             usage.cost_by_model[model] = usage.cost_by_model.get(model, 0.0) + cost
     usage.rewrite_excess = max(0, usage.cache_write - usage.context_peak)
@@ -302,7 +508,8 @@ def _usage_of(path: Path) -> Usage:
 
 
 def priced(model: str, *, input: int = 0, cache_write: int = 0, cache_read: int = 0,
-           output: int = 0, messages: int = 0) -> Usage:
+           output: int = 0, messages: int = 0, cache_1h: int = 0,
+           cache_5m: int = 0) -> Usage:
     """Token counts a caller already holds, priced the same way a transcript's are.
 
     The OS's own calls (`agent_usage`) arrive as counts from the CLI's result JSON rather
@@ -316,13 +523,14 @@ def priced(model: str, *, input: int = 0, cache_write: int = 0, cache_read: int 
     a one-shot OS call has none. Leaving them zero is what keeps a hundred Neo calls from
     reading as a re-write problem they cannot have.
     """
-    in_rate, out_rate = price_for(model)
     usage = Usage(messages=messages, input=input, cache_write=cache_write,
-                  cache_read=cache_read, output=output)
-    cost = (input * in_rate
-            + cache_write * in_rate * CACHE_WRITE_RATE
-            + cache_read * in_rate * CACHE_READ_RATE
-            + output * out_rate) / 1e6
+                  cache_read=cache_read, output=output, cache_1h=cache_1h,
+                  cache_5m=cache_5m)
+    classes = class_costs(model, input=input, cache_write=cache_write,
+                          cache_read=cache_read, output=output,
+                          cache_1h=cache_1h, cache_5m=cache_5m)
+    usage.cost_by_class = {name: value for name, value in classes.items() if value}
+    cost = sum(classes.values())
     if cost:
         usage.cost_by_model[model] = cost
     return usage
@@ -375,6 +583,7 @@ def read_session(session_id: str, root: Path | None = None,
                 if sub_usage.messages:
                     result.subagents = result.subagents + sub_usage
                     result.subagent_count += 1
+                    result.each_subagent.append(_subagent_detail(sub, sub_usage))
     # A further segment file exists only because the session was resumed under a
     # different cwd, so each one is a turn boundary the cache-read comparison cannot
     # see (it never compares across files).

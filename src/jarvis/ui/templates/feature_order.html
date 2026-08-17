@@ -18,6 +18,10 @@
   · {{ fo.active_children }}/{{ fo.max_parallel }} slots in use
   {% endif %}
   · {{ fmt_age(fo.created_at) }}
+  {# What the whole feature has cost so far — its planner and every child, down to each
+     of their turns. One link rather than a figure: reading it costs a pass over every
+     child's transcript, and this page is opened to decide a plan, not to audit spend. #}
+  · <a href="/cost/{{ project }}/{{ fo.id }}">its bill →</a>
 </p>
 
 {% if error %}<div class="panel"><div class="row tone-bad">✗ {{ error }}</div></div>{% endif %}

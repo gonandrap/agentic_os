@@ -347,7 +347,16 @@ def test_the_cli_shows_the_class_and_says_the_figure_is_a_floor(spent, capsys):
     cli.main(["cost", wo["id"]])
 
     out = capsys.readouterr().out
-    assert "claude processes this worker spawned" in out
+    assert "claude processes the worker spawned itself" in out
     assert "pytest" in out
-    assert "subprocesses  ~$" in out
+    # Its own class on the bill, never folded into Jarvis's overhead — an eval suite and
+    # a Neo question are not the same shape of spend (issue #103). This work order spent
+    # in NO other way, and the bill says which classes are empty rather than leaving
+    # their absence to be guessed at.
+    assert "what Jarvis spent on this order" in out
+    # This work order was dispatched but its turn never settled, so the worker's own
+    # half is genuinely unmeasurable — and the bill says which classes are empty rather
+    # than leaving their absence to be read as an omission.
+    assert "not on this bill" in out
+    assert "nothing measurable" in out
     assert "Every figure above is a floor" in out

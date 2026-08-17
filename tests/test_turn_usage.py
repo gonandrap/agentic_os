@@ -95,6 +95,90 @@ def test_read_turn_result_carries_the_usage_envelope(tmp_path):
     assert u["cost_by_model"] == {"claude-opus-5": pytest.approx(0.0719595)}
 
 
+def test_token_totals_come_from_model_usage_not_from_the_usage_object(tmp_path):
+    """THE CORRECTION, pinned against the shape that hid it for months.
+
+    The result envelope's top-level `usage` object is not the turn's total. Measured
+    over the 186 live result files that carry both, it runs at 33-60% of `modelUsage` —
+    which agrees to the TOKEN with the transcript `usage.read_session` derives
+    independently, and whose `costUSD` sums to `total_cost_usd` to the cent. So the
+    totals come from `modelUsage`, and this fixture makes the two DIFFER, because a
+    fixture where they agree cannot fail if the wrong one is read (which is exactly how
+    the original went unnoticed: every test fixture had them equal).
+
+    Dollars were never wrong — they come from `total_cost_usd` — so what this pins is
+    every token figure the OS records. Ruled on question 121, wo-4576667e.
+    """
+    out = tmp_path / "1.json"
+    out.write_text(json.dumps(result_json(**{
+        "usage": {  # the tail of the turn only, as the CLI reports it
+            "input_tokens": 26, "cache_creation_input_tokens": 96_343,
+            "cache_read_input_tokens": 950_329, "output_tokens": 11_212,
+            "cache_creation": {"ephemeral_1h_input_tokens": 96_343,
+                               "ephemeral_5m_input_tokens": 0},
+            "iterations": [{"input_tokens": 2, "output_tokens": 947,
+                            "cache_read_input_tokens": 109_799,
+                            "cache_creation_input_tokens": 2_009}],
+        },
+        "modelUsage": {  # what the whole turn actually spent
+            "claude-opus-5": {
+                "inputTokens": 82, "outputTokens": 46_562,
+                "cacheReadInputTokens": 2_981_947, "cacheCreationInputTokens": 225_603,
+                "costUSD": 4.4267385, "contextWindow": 1_000_000},
+        },
+    })))
+
+    u = claude_cli.read_turn_result(out).usage
+
+    assert u["input"] == 82
+    assert u["cache_write"] == 225_603
+    assert u["cache_read"] == 2_981_947
+    assert u["output"] == 46_562
+    assert u["usage_v"] == claude_cli.USAGE_SCHEMA_VERSION
+    # The two things `modelUsage` does not carry still come from `usage`: the ephemeral
+    # TTL split (which decides the PRICE of a cache write) and the per-call context.
+    assert u["cache_1h"] == 96_343 and u["cache_5m"] == 0
+    assert u["context_peak"] == 2 + 109_799 + 2_009
+
+
+def test_a_turn_that_used_two_models_keeps_them_apart(tmp_path):
+    """One line per model. A turn that fell back to a cheaper one is a fact about the
+    bill, and a blended total prices half of it at the wrong rate."""
+    out = tmp_path / "1.json"
+    out.write_text(json.dumps(result_json(**{"modelUsage": {
+        "claude-opus-5": {"inputTokens": 10, "outputTokens": 500,
+                          "cacheReadInputTokens": 1_000,
+                          "cacheCreationInputTokens": 100, "costUSD": 0.05,
+                          "contextWindow": 1_000_000},
+        "claude-haiku-4-5-20251001": {"inputTokens": 5, "outputTokens": 50,
+                                      "cacheReadInputTokens": 200,
+                                      "cacheCreationInputTokens": 20, "costUSD": 0.001,
+                                      "contextWindow": 200_000},
+    }})))
+
+    u = claude_cli.read_turn_result(out).usage
+
+    assert {m["model"] for m in u["by_model"]} == {"claude-opus-5",
+                                                  "claude-haiku-4-5-20251001"}
+    assert u["output"] == 550          # the sum, and the split is kept beside it
+    assert u["context_window"] == 1_000_000  # the largest, not the last
+
+
+def test_a_result_with_no_model_usage_says_which_reading_it_is(tmp_path):
+    """The fallback is honest rather than absent: those numbers are the old reading,
+    they understate the turn, and the version marker is how a reader can tell."""
+    out = tmp_path / "1.json"
+    data = result_json()
+    data.pop("modelUsage")
+    out.write_text(json.dumps(data))
+
+    u = claude_cli.read_turn_result(out).usage
+
+    assert u["usage_v"] == 1
+    assert u["cache_read"] == 45689     # from `usage`, because there is nothing else
+    assert u["by_model"] == []
+
+
 def test_context_peak_is_the_max_over_iterations(tmp_path):
     """`iterations` is what gives the exact per-call context size — the /context
     statistic, headlessly. The peak is the largest call, not the sum."""

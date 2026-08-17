@@ -10,6 +10,7 @@ than no report at all, because it invites a conclusion about where the tokens we
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -17,8 +18,9 @@ from jarvis import ops, usage
 from jarvis.project_store import ProjectStore
 
 
-def assistant_row(mid: str, *, write: int = 0, read: int = 0, out: int = 0) -> dict:
-    return {
+def assistant_row(mid: str, *, write: int = 0, read: int = 0, out: int = 0,
+                  at: float | None = None) -> dict:
+    row = {
         "type": "assistant",
         "message": {
             "id": mid, "model": "claude-opus-5",
@@ -26,6 +28,13 @@ def assistant_row(mid: str, *, write: int = 0, read: int = 0, out: int = 0) -> d
                       "cache_read_input_tokens": read, "output_tokens": out},
         },
     }
+    if at is not None:
+        # A subagent is charged to the turn that was running when it STARTED, so a test
+        # about that attribution needs to place its rows on the clock — in the same
+        # RFC-3339-with-a-Z shape Claude Code writes.
+        row["timestamp"] = (datetime.fromtimestamp(at, tz=timezone.utc)
+                            .isoformat().replace("+00:00", "Z"))
+    return row
 
 
 @pytest.fixture()
@@ -34,9 +43,23 @@ def transcripts(tmp_path, monkeypatch):
     (root / "-proj").mkdir(parents=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
 
-    def write(session_id: str, rows: list[dict]):
+    def write(session_id: str, rows: list[dict],
+              subagents: list[list[dict]] | None = None):
         (root / "-proj" / f"{session_id}.jsonl").write_text(
             "".join(json.dumps(r) + "\n" for r in rows))
+        # Claude Code files a subagent's own transcript beside its parent's, under a
+        # directory named for the parent session. `usage.read_session` reads them from
+        # there, which is the only reason a subagent's share can be told apart at all.
+        for i, sub in enumerate(subagents or []):
+            # Either a bare list of rows or (rows, meta): the meta file is what names a
+            # subagent's row on the bill, and most tests do not care what it is called.
+            sub_rows, meta = sub if isinstance(sub, tuple) else (sub, None)
+            sub_dir = root / "-proj" / session_id / "subagents"
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            (sub_dir / f"agent-{i}.jsonl").write_text(
+                "".join(json.dumps(r) + "\n" for r in sub_rows))
+            if meta is not None:
+                (sub_dir / f"agent-{i}.meta.json").write_text(json.dumps(meta))
 
     return write
 
@@ -302,7 +325,13 @@ def test_the_fleet_rollup_carries_the_recorded_cost(store, transcripts):
     assert by_id[other["id"]]["provenance"] == "transcript"
 
 
-def test_the_cli_prints_the_per_turn_table(store, transcripts, capsys):
+def test_the_cli_prints_the_bill_turn_by_turn(store, transcripts, capsys):
+    """`jarvis cost <id>` is the bill, and the terminal gets the same one the page does.
+
+    Both views, both totals and the reconciliation, because a CLI that showed a subset
+    would be a second accounting of the same tokens — which is the thing this whole
+    surface exists to stop.
+    """
     from jarvis import cli
 
     wo = store.create_work_order("printable", "")
@@ -312,10 +341,16 @@ def test_the_cli_prints_the_per_turn_table(store, transcripts, capsys):
     assert cli.main(["cost", wo["id"]]) == 0
 
     out = capsys.readouterr().out
-    assert "recorded" in out
+    assert "by who spent it" in out and "turn by turn" in out
+    assert "turn 1" in out and "turn 2" in out
     assert "dispatch" in out and "message" in out
-    assert "9%" in out                          # context occupancy of the 1M window
+    assert "adds up" in out                     # the reconciliation, stated
     assert "0.07" in out                        # the second turn's own cost
+    # The bloat signal survives the rewrite, outside the bill and labelled as not a
+    # charge: the same context is re-read on every call of a turn.
+    assert "9%" in out and "context peak" in out
+    # Every class of token, priced — the line items that make it a bill at all.
+    assert "cache write" in out and "cache read" in out and "fresh input" in out
 
 
 def test_the_cli_shows_what_jarvis_spent_beside_what_the_worker_did(store, transcripts,
@@ -342,25 +377,35 @@ def test_the_cli_shows_what_jarvis_spent_beside_what_the_worker_did(store, trans
     assert cli.main(["cost", wo["id"]]) == 0
 
     out = capsys.readouterr().out
-    assert "jarvis" in out
-    assert "jarvis itself" in out and "2 calls" in out
-    # Call by call, naming the seat: five seats on one gate review is the shape that
+    assert "what Jarvis spent on this order" in out and "2 calls" in out
+    # Seat by seat, one line each: five seats on one gate review is the shape that
     # explains a bill nobody can otherwise account for.
     assert "premise" in out and "blast" in out
+    # And the worker's own half beside it, never folded together.
+    assert "the worker's own session" in out
 
 
 def test_the_cli_declares_a_mixed_record(store, transcripts, capsys):
+    """A turn whose result JSON is gone is a line on the bill, not a silent omission.
+
+    Its spend is the difference between the transcript and the turns that ARE recorded,
+    which is the only place it survives at all — and the page says both that the line is
+    an estimate and that the turn exists.
+    """
     from jarvis import cli
 
     wo = store.create_work_order("half", "")
+    give_session(store, wo["id"], "sess-half")
+    transcripts("sess-half", [assistant_row("m1", write=80_000, out=4_000)])
     add_turn(store, wo["id"], recorded_usage(0.05))
     add_turn(store, wo["id"], None)
 
     assert cli.main(["cost", wo["id"]]) == 0
 
     out = capsys.readouterr().out
-    assert "1 of 2" in out
+    assert "no result JSON left" in out
     assert "not recorded" in out
+    assert "no longer have the result JSON" in out
 
 
 # -- the tax, end to end --------------------------------------------------------------
