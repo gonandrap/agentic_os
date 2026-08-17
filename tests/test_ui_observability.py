@@ -8,6 +8,8 @@ seeing "Internal Server Error". Each test below covers one surface that was blin
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 pytest.importorskip("fastapi")
@@ -92,6 +94,36 @@ def test_a_crash_loop_raises_one_item_not_hundreds(started, catalog_file):
     assert len(items) == 1
     assert "50 unhandled errors" in items[0]["title"]
     assert "+45 more" in items[0]["body"]
+
+
+def test_the_first_tick_ever_does_not_alert_on_a_log_full_of_history(started,
+                                                                    catalog_file):
+    """What 0.5.5 actually did to production. This watcher shipped a release after the
+    writer it reads, so the first tick met an existing `ui.log`, found no cursor in
+    `os_state`, resumed at byte 0 and sent the user a Telegram alert for four errors
+    that had been fixed for a week — a "the dashboard is broken" page about a dashboard
+    that was serving HTTP 200. Every fresh install walks into the same trap.
+    """
+    uilog.ui_log_path().parent.mkdir(parents=True, exist_ok=True)
+    old = time.strftime(uilog._STAMP, time.localtime(time.time() - 7 * 24 * 3600))
+    with uilog.ui_log_path().open("a") as f:
+        for i in range(4):
+            f.write(f"{old} [ERROR] GET /neo — UndefinedError: 'opinions{i}' undefined\n"
+                    "    Traceback (most recent call last):\n")
+
+    d = Daemon(load_catalog(catalog_file))
+    assert d.check_ui_log() == 0
+
+    central = CentralStore()
+    try:
+        assert central.unacked_inbox() == []
+    finally:
+        central.close()
+
+    # And the cursor moved on, so a genuine error after it is still the next thing the
+    # user hears about — the history is skipped, not the file.
+    uilog.record_error("GET", "/neo", _boom("a real, current failure"))
+    assert d.check_ui_log() == 1
 
 
 def test_the_ui_watch_never_stalls_the_tick(started, catalog_file, monkeypatch):

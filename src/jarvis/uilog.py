@@ -155,8 +155,11 @@ def _parse(text: str) -> list[UiError]:
     return errors
 
 
-def read_errors(cursor: str = "") -> tuple[list[UiError], str]:
-    """Errors written since `cursor`, plus the cursor to resume from.
+def read_errors(cursor: str = "",
+                within_seconds: float = ERROR_WINDOW_SECONDS,
+                ) -> tuple[list[UiError], str]:
+    """Errors written since `cursor` and newer than `within_seconds`, plus the cursor
+    to resume from.
 
     The daemon stores the returned cursor so each error is announced exactly once —
     without it, one standing failure would re-notify on every five-second tick.
@@ -166,6 +169,22 @@ def read_errors(cursor: str = "") -> tuple[list[UiError], str]:
     of much the same size and the daemon would then silently seek past real errors. Any
     mismatch restarts from the top, so the failure mode is re-announcing a handful of
     entries rather than going quiet — the right direction for an alerting path.
+
+    That restart is also why the age bound exists. Resuming from the top is right about
+    *which bytes* to re-read and silent about *when* they were written, so anything that
+    puts the reader back at zero — rotation, a truncated log, a fresh install, a lost
+    `os_state` — announces the file's entire history as though it had just happened.
+    Jarvis 0.5.5 shipped this reader a release after the writer it reads, so the first
+    tick on a production box found a week-old `ui.log`, had no cursor yet, and alerted
+    the user to four errors that had been fixed for a week.
+
+    The bound is the entries' age rather than the absence of a cursor, because "no
+    cursor, so skip to EOF" would be silent about a crash loop happening right now — the
+    one failure mode this module refuses. On the normal incremental path the filter is a
+    no-op: those entries are seconds old. It bites only when the reader restarts, and
+    then it drops exactly what `recent_errors` and `os_status` already decline to
+    report. A daemon that was down longer than the window is its own alert; backfilling
+    UI errors from an outage is not this function's job.
     """
     p = ui_log_path()
     if not p.exists():
@@ -176,8 +195,13 @@ def read_errors(cursor: str = "") -> tuple[list[UiError], str]:
         offset = _resume_at(cursor, st, head)
         f.seek(offset)
         raw = f.read()
-    return (_parse(raw.decode("utf-8", errors="replace")),
-            _cursor(offset + len(raw), st, head))
+    cutoff = time.time() - within_seconds
+    errors = [e for e in _parse(raw.decode("utf-8", errors="replace"))
+              if e.ts >= cutoff]
+    # The cursor advances past the entries the filter dropped: they have been read and
+    # dismissed, and re-reading them into the same silence every five seconds is work
+    # the daemon does not need to repeat.
+    return errors, _cursor(offset + len(raw), st, head)
 
 
 _HEAD_BYTES = 512
