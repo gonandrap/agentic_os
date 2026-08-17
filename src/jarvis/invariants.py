@@ -602,6 +602,61 @@ def check_catalog(catalog: Any, project: str | None = None) -> list[Violation]:
 RELEASE_MARKER_STALE_AFTER = 3600.0
 
 
+def check_gate_canaries() -> Iterator[Violation]:
+    """INV-GATE-CANARY — every command that must gate still gates.
+
+    The gate recognisers are no longer constants; they are rows the OS writes itself when
+    a reviewer dismisses a false positive (see gate_rules.py). That is the point — it is
+    how the classifier stops re-asking a question already answered — and it is also the
+    one change that could quietly disarm a gate. A learned exemption is canary-tested
+    before it is admitted, but "tested once, at birth" is not the property worth having:
+    rules accumulate, a later one can interact with an earlier one, and a user may retract
+    a recogniser without seeing what it was holding up.
+
+    So the check is re-derived from the LIVE table, and it asks the only question that
+    matters about a self-modifying classifier: does a real `shipit`, a real `gh pr merge`,
+    a real `systemctl restart` still get stopped? Failure here means something can now
+    ship unreviewed, which is the failure this whole subsystem exists to prevent, and it
+    is invisible from every other surface — nothing looks wrong when a gate simply never
+    fires.
+
+    WHERE IT RUNS, precisely, because the answer is narrower than "continuously" and the
+    difference matters to anyone relying on it. This is an `OS_INVARIANTS` member, and
+    `check_os()` is called by `jarvis doctor` — NOT by the daemon's reconcile tick, which
+    runs the per-project `INVARIANTS` only. So this is a periodic audit the user (or a
+    cron) triggers, not a live guard.
+
+    That is sufficient because it is the third line of defence, not the first two. A rule
+    is canary-tested before it is ever admitted (`gate_rules.propose_exemption`), and
+    `ops.retract_gate_rule` re-runs the whole set the moment a recogniser is retracted and
+    hands the failures straight back to whoever retracted it. What is left for this check
+    is slow drift — rules accumulating until two of them interact — which is exactly the
+    kind of fault an audit catches and a per-tick check would only find sooner.
+
+    Not repairable automatically: which rule to retract is a judgement about what the user
+    meant, and the wrong choice re-breaks the thing the exemption was fixing.
+    """
+    from .central_store import CentralStore
+    from .gate_rules import RuleSet
+
+    central = CentralStore()
+    try:
+        failures = RuleSet.load(central).check_canaries()
+    finally:
+        central.close()
+    for f in failures:
+        yield Violation(
+            invariant="INV-GATE-CANARY",
+            detail=(
+                f"`{f['command'].splitlines()[0]}` must always trip the "
+                f"`{f['kind']}` gate, and no longer does: {f['why']}. Inspect the rule "
+                f"base with `jarvis gate rules` and retract what cleared it with "
+                f"`jarvis gate rule-retract <id> --reason \"...\"`."
+            ),
+            context=f,
+        )
+
+
 def check_release_marker(now: float | None = None) -> list[Violation]:
     """INV-RELEASE-MARKER-STALE — a staged release must not sit unapplied for an hour.
 
@@ -693,6 +748,7 @@ def check_ui_healthy() -> Iterator[Violation]:
 
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
+    check_gate_canaries,
 )
 
 

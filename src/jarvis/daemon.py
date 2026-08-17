@@ -963,7 +963,9 @@ class Daemon:
         ruling = verdict.get("verdict") or ("approved" if verdict.get("approve")
                                             else "denied")
         gates.apply_decision(pstore, approval["id"], verdict=ruling,
-                             reason=verdict["reason"], decided_by="neo")
+                             reason=verdict["reason"], decided_by="neo",
+                             central=central, project=q["project"],
+                             exempt_pattern=verdict.get("exempt_pattern", ""))
         # A shipped release is something the user wants to know happened, even when they
         # did not have to authorise it — that is the trade for spending none of their
         # attention on the approval itself.

@@ -6,6 +6,8 @@ Grouped commands:
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
   jarvis fo create|list|show|plan|approve|cancel        feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
+  jarvis gate rules|rule-retract|explain  what counts as privileged, and what the OS
+                                          has LEARNED does not
   jarvis neo list|show|review|answer|learnings|learn|export
   jarvis backlog add|list|promote|done
   jarvis learn add|list|search|show|topics|pin|unpin
@@ -365,6 +367,26 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("approval_id", type=int)
     g.add_argument("--reason", required=True,
                    help="what the recogniser got wrong — this is the defect report")
+    g.add_argument("--project")
+    g = ga.add_parser(
+        "rules",
+        help="the rule base: what counts as a privileged action, and what has been "
+             "LEARNED not to. Seeded from the builtins, grown from dismissals",
+    )
+    g.add_argument("--role", choices=("match", "exempt", "canary"))
+    g.add_argument("--kind", help="one gate name")
+    g.add_argument("--all", action="store_true", help="include retracted rules")
+    g = ga.add_parser("rule-retract",
+                      help="retire a rule: it stops applying, the record keeps that it "
+                           "once did")
+    g.add_argument("rule_id")
+    g.add_argument("--reason", required=True)
+    g = ga.add_parser(
+        "explain",
+        help="why a command would or would not trip a gate — paste the exact string "
+             "from a gate record to diagnose a false positive",
+    )
+    g.add_argument("command")
     g.add_argument("--project")
 
     # backlog ---------------------------------------------------------------------------
@@ -1229,6 +1251,48 @@ GATE_ICON = {"pending": "⏸", "approved": "✅", "denied": "⛔", "dismissed": 
              "expired": "⌛"}
 
 
+_ROLE_ICON = {"match": "✋", "exempt": "✓", "canary": "🔒"}
+
+
+def _print_gate_rules(data: dict) -> None:
+    """The rule base, grouped by role.
+
+    Canaries print last and without ceremony. They are not rules anyone consults; they
+    are the reason the other two groups can be changed at all, and the line that matters
+    about them is the one at the bottom saying they all still hold.
+    """
+    rules = data["rules"]
+    if not rules:
+        print("no gate rules")
+        return
+    for role in ("match", "exempt", "canary"):
+        group = [r for r in rules if r["role"] == role]
+        if not group:
+            continue
+        label = {"match": "recognisers", "exempt": "exemptions (learned)",
+                 "canary": "canaries — must always gate"}[role]
+        print(f"\n{label}  ({len(group)})")
+        for r in group:
+            retired = " ⊘ retracted" if r["retired_at"] else ""
+            hits = f" · {r['hits']} hits" if r["hits"] else ""
+            src = r["source"]
+            origin = f" · from gate {r['approval_id']}" if r["approval_id"] else ""
+            print(f"  {_ROLE_ICON[role]} {r['id']} [{r['kind'] or 'any'}] "
+                  f"{src}{origin}{hits}{retired}")
+            print(f"      {r['rendered'].splitlines()[0]}")
+            if r["reason"]:
+                print(f"      ↳ {r['reason']}")
+            if r["retired_at"]:
+                print(f"      ↳ retracted: {r['retired_reason']}")
+    failures = data["canary_failures"]
+    if failures:
+        print(f"\n⚠ {len(failures)} command(s) that MUST gate no longer do:")
+        for f in failures:
+            print(f"    {f['command'].splitlines()[0]} ({f['kind']}): {f['why']}")
+    else:
+        print("\n✓ every command that must gate still gates")
+
+
 def cmd_gate(args: argparse.Namespace) -> int:
     from . import ops
 
@@ -1285,6 +1349,38 @@ def cmd_gate(args: argparse.Namespace) -> int:
                 if q.get("answer"):
                     print(f"\nVerdict: {q['answer']} ({q.get('answered_by')})")
                     print(f"Reason: {q.get('answer_reason')}")
+    elif args.ga_cmd == "rules":
+        data = ops.list_gate_rules(role=args.role, kind=args.kind,
+                                   include_retired=args.all)
+        if args.json:
+            _print(data, True)
+        else:
+            _print_gate_rules(data)
+    elif args.ga_cmd == "rule-retract":
+        data = ops.retract_gate_rule(args.rule_id, args.reason)
+        if args.json:
+            _print(data, True)
+        else:
+            print(f"✓ {data['rule']['id']} retracted — {data['note']}")
+            for f in data["canary_failures"]:
+                print(f"⚠ {f['command'].splitlines()[0]} ({f['kind']}): {f['why']}")
+    elif args.ga_cmd == "explain":
+        data = ops.explain_gate(args.command, project_name=args.project)
+        if args.json:
+            _print(data, True)
+        else:
+            verdict = (f"GATED as `{data['gate']}`" if data["gated"]
+                       else "not gated")
+            print(f"{'✋' if data['gated'] else '✓'} {verdict}")
+            for line in data["trace"]:
+                print(f"    · {line}")
+            if data["gated"]:
+                print(f"    the literal appears {data['where']}")
+                print("    a dismissal of this " + (
+                    "COULD be generalised into a standing rule"
+                    if data["learnable"] else
+                    "could NOT be generalised — the literal is where the shell would "
+                    "run it"))
     elif args.ga_cmd in ("approve", "deny", "dismiss"):
         verdict = {"approve": "approved", "deny": "denied",
                    "dismiss": "dismissed"}[args.ga_cmd]

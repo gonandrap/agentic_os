@@ -473,6 +473,14 @@ def gates_section(wo_id: str = WO_PLACEHOLDER,
         "it — file it, say plainly why it performs no privileged action, and end "
         "your turn.",
         "",
+        "Filing it is worth more than it used to be. A dismissal now TEACHES the "
+        "recogniser: the OS derives a standing rule from the shape of what was "
+        "wrongly matched, so the next worker writing something similar — in this "
+        "project or any other — is never blocked at all. Rewording to dodge the "
+        "gate teaches it nothing and leaves the defect in place for everyone else. "
+        "To see why a command was matched before you file, run `jarvis gate "
+        "explain \"<the exact command>\"`.",
+        "",
         "A dismissal clears a command STRING; it does not reset the review state "
         "of the action that string talks about. So NEVER open a second request for "
         "a privileged action while an equivalent one is still pending or escalated "
