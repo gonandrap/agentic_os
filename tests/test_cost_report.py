@@ -10,6 +10,7 @@ than no report at all, because it invites a conclusion about where the tokens we
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -17,8 +18,9 @@ from jarvis import ops, usage
 from jarvis.project_store import ProjectStore
 
 
-def assistant_row(mid: str, *, write: int = 0, read: int = 0, out: int = 0) -> dict:
-    return {
+def assistant_row(mid: str, *, write: int = 0, read: int = 0, out: int = 0,
+                  at: float | None = None) -> dict:
+    row = {
         "type": "assistant",
         "message": {
             "id": mid, "model": "claude-opus-5",
@@ -26,6 +28,13 @@ def assistant_row(mid: str, *, write: int = 0, read: int = 0, out: int = 0) -> d
                       "cache_read_input_tokens": read, "output_tokens": out},
         },
     }
+    if at is not None:
+        # A subagent is charged to the turn that was running when it STARTED, so a test
+        # about that attribution needs to place its rows on the clock — in the same
+        # RFC-3339-with-a-Z shape Claude Code writes.
+        row["timestamp"] = (datetime.fromtimestamp(at, tz=timezone.utc)
+                            .isoformat().replace("+00:00", "Z"))
+    return row
 
 
 @pytest.fixture()
@@ -41,11 +50,16 @@ def transcripts(tmp_path, monkeypatch):
         # Claude Code files a subagent's own transcript beside its parent's, under a
         # directory named for the parent session. `usage.read_session` reads them from
         # there, which is the only reason a subagent's share can be told apart at all.
-        for i, sub_rows in enumerate(subagents or []):
+        for i, sub in enumerate(subagents or []):
+            # Either a bare list of rows or (rows, meta): the meta file is what names a
+            # subagent's row on the bill, and most tests do not care what it is called.
+            sub_rows, meta = sub if isinstance(sub, tuple) else (sub, None)
             sub_dir = root / "-proj" / session_id / "subagents"
             sub_dir.mkdir(parents=True, exist_ok=True)
             (sub_dir / f"agent-{i}.jsonl").write_text(
                 "".join(json.dumps(r) + "\n" for r in sub_rows))
+            if meta is not None:
+                (sub_dir / f"agent-{i}.meta.json").write_text(json.dumps(meta))
 
     return write
 

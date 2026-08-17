@@ -19,7 +19,7 @@ import json
 
 import pytest
 
-from jarvis import agent_usage, bill as bill_mod, ops
+from jarvis import agent_usage, bill as bill_mod, ops, usage
 from jarvis.central_store import CentralStore
 from jarvis.project_store import ProjectStore
 
@@ -205,38 +205,136 @@ def test_a_running_turn_is_called_running_not_lost(store, wo, transcripts):
     assert not any("no result JSON left" in label for label in labels)
 
 
-# -- what must NOT be added ------------------------------------------------------------
+# -- the agents: a partition, never an addition ---------------------------------------
 
 
-def test_subagents_are_a_share_of_the_worker_not_a_line_of_their_own(store, wo,
-                                                                     transcripts):
-    """A subagent's tokens are already inside the turn that spawned it.
+def with_a_subagent(store, wo, transcripts, *, started: float = 1_000.0):
+    """One recorded turn that spawned one named subagent inside it.
 
-    `modelUsage` — the source of a turn's totals — counts them, which is exactly why the
-    recorded turns agree with the transcript to the token. Adding the transcript's
-    subagent figure as a line would count that spend twice.
+    The turn's own envelope COVERS the subagent — `modelUsage` counts every model call
+    the turn made, its subagents' included, which is exactly why the recorded turns of a
+    live work order agree with its transcript to the token. So the subagent's row has to
+    come OUT of the turn, and this fixture is built so that a bill which added it
+    instead would be visibly, arithmetically wrong.
     """
     give_session(store, wo["id"], "sess-subs")
-    transcripts("sess-subs", [assistant_row("m1", write=2_558, read=45_689, out=941)],
-                subagents=[[assistant_row("s1", write=10_000, out=500)]])
-    # The turn's recorded envelope COVERS the subagent: `modelUsage` counts every model
-    # call the turn made, its subagents' included, which is why the recorded turns of a
-    # live work order agree with its transcript (main + subagents) to the token.
+    transcripts(
+        "sess-subs",
+        [assistant_row("m1", write=2_558, read=45_689, out=941, at=started + 1)],
+        subagents=[([assistant_row("s1", write=10_000, out=500, at=started + 5)],
+                    {"agentType": "Explore", "description": "find the login bug"})])
+    turn = add_turn(store, wo["id"], dict(recorded_usage(0.05), input=0,
+                                          cache_write=12_558, cache_read=45_689,
+                                          output=1_441))
+    at(store, turn["id"], started, started + 60)
+    return turn
+
+
+def test_a_subagent_gets_its_own_row_inside_the_turn_that_spawned_it(store, wo,
+                                                                     transcripts):
+    """The user's ask: subagents are another layer of granularity, not a footnote.
+
+    Named from the meta file Claude Code writes beside the transcript, so the row says
+    what the subagent was FOR — "Explore · find the login bug" — and not just that some
+    agent cost some tokens.
+    """
+    with_a_subagent(store, wo, transcripts)
+
+    b = ops.bill(wo["id"])
+
+    worker = next(line for line in b["actors"] if line["key"] == "worker")
+    turn_line = worker["children"][0]
+    rows = {child["label"]: child for child in turn_line["children"]}
+    assert set(rows) == {"the lead agent", "Explore · find the login bug"}
+    # The subagent's own transcript figures, to the token — not a share of anything.
+    assert rows["Explore · find the login bug"]["tokens"]["cache_write"] == 10_000
+    assert rows["Explore · find the login bug"]["tokens"]["output"] == 500
+    # And the lead is the REMAINDER, so the two together are the turn the CLI recorded.
+    assert rows["the lead agent"]["tokens"]["cache_write"] == 2_558
+    assert rows["the lead agent"]["tokens"]["output"] == 941
+    assert turn_line["tokens"]["total"] == 12_558 + 45_689 + 1_441
+
+
+def test_every_agent_added_up_is_the_workers_whole_session(store, wo, transcripts):
+    """The identity the user stated, checked in the payload and asserted here.
+
+    "Sum the usage of all agents for a work order and it equals the total minus the OS's
+    usage" — which is the worker's actor line, since the OS's half of an order is what
+    Jarvis spent on it plus the claude processes the worker launched itself.
+    """
+    with_a_subagent(store, wo, transcripts)
+    os_call(wo["id"], ts=1_010.0)  # the OS half, so the subtraction is not trivially 0
+
+    b = ops.bill(wo["id"])
+
+    worker = next(line for line in b["actors"] if line["key"] == "worker")
+    others = b["total"]["tokens"]["total"] - worker["tokens"]["total"]
+    assert others > 0
+    assert sum(line["tokens"]["total"] for line in b["agents"]) == worker["tokens"]["total"]
+    assert {line["label"] for line in b["agents"]} == {
+        "the lead agent", "Explore · find the login bug"}
+    # The lead reads first: a bill is read top-down and the agent that ran the order
+    # belongs at the top of its own list.
+    assert b["agents"][0]["label"] == "the lead agent"
+    assert b["checks"]["balanced"]
+
+
+def test_a_subagent_bigger_than_its_turn_cannot_inflate_the_bill(store, wo,
+                                                                 transcripts):
+    """The failure mode a partition must not have: growing when you look closer.
+
+    Two sources disagree here — the subagent's transcript claims more than the turn's
+    own envelope contains — and the rule is that the TURN is the budget. The subagent
+    takes what is there, the lead gets nothing, and the excess is reported rather than
+    added.
+    """
+    give_session(store, wo["id"], "sess-big")
+    transcripts("sess-big", [assistant_row("m1", write=100, at=1_001)],
+                subagents=[([assistant_row("s1", write=99_999, out=1, at=1_005)],
+                            {"agentType": "Task"})])
+    turn = add_turn(store, wo["id"], dict(recorded_usage(0.05), input=0, cache_write=100,
+                                          cache_read=0, output=0))
+    at(store, turn["id"], 1_000.0, 1_060.0)
+
+    b = ops.bill(wo["id"])
+
+    worker = next(line for line in b["actors"] if line["key"] == "worker")
+    turn_line = next(c for c in worker["children"] if c["label"] == "turn 1")
+    # The turn is what the CLI recorded, not that plus what the subagent claims. Its
+    # rows are a partition of it: the subagent takes the 100 there are, the lead gets 0.
+    assert turn_line["tokens"]["cache_write"] == 100
+    # The subagent took all 100 there were, so there is no lead row: a line charging
+    # nothing is not a fact about the order, it is a row of zeroes.
+    assert {c["label"]: c["tokens"]["cache_write"] for c in turn_line["children"]} == {
+        "Task": 100}
+    assert b["checks"]["balanced"]
+    assert any("could not be taken out of the turn" in note for note in b["notes"])
+    # The 99,899 tokens the subagent claims beyond the turn are not lost either: the
+    # transcript knows the session spent them, and the gap line is where a session that
+    # spent more than its recorded turns has always been charged.
+    gap = next(c for c in worker["children"] if c["label"] != "turn 1")
+    assert gap["tokens"]["cache_write"] == 99_999
+
+
+def test_a_turn_that_spawned_nothing_gets_no_agent_level(store, wo, transcripts):
+    """A level that always says "the lead agent" and nothing else is noise.
+
+    The same rule the per-model level follows: a breakdown earns its place by
+    distinguishing something from something.
+    """
+    give_session(store, wo["id"], "sess-plain")
+    transcripts("sess-plain", [assistant_row("m1", write=12_558, read=45_689, out=1_441)])
     add_turn(store, wo["id"], dict(recorded_usage(0.05), input=0, cache_write=12_558,
                                    cache_read=45_689, output=1_441))
 
     b = ops.bill(wo["id"])
 
-    assert b["subagents"]["count"] == 1
-    assert b["subagents"]["list_usd"] > 0
-    # Reported, and NOT a line: the worker's own total is the transcript's whole total,
-    # subagents included, not that total plus them again.
-    labels = [leaf["label"] for leaf in leaves({"children": b["actors"]})]
-    assert not any("subagent" in label.lower() for label in labels)
     worker = next(line for line in b["actors"] if line["key"] == "worker")
-    assert worker["tokens"]["total"] == 12_558 + 45_689 + 1_441
-    # One turn, one line: the subagent produced no second charge anywhere.
-    assert len(leaves(worker)) == 1
+    assert worker["children"][0]["children"] == []
+    # It still has an agent row in the agents view — one agent ran it, and a view that
+    # omitted the only agent of a plain order would break the identity above.
+    assert [line["label"] for line in b["agents"]] == ["the lead agent"]
+    assert b["agents"][0]["tokens"]["total"] == worker["tokens"]["total"]
 
 
 def test_an_unrecorded_turn_is_charged_from_the_transcript_not_dropped(store, wo,
@@ -358,3 +456,80 @@ def test_a_stale_envelope_with_no_outfile_is_kept_and_flagged(store, wo):
 
     assert worker["usage_versions"] == [1]
     assert worker["tokens"]["total"] > 0
+
+
+# -- the seal: a bill is worked out once, when the order settles -----------------------
+
+
+def test_a_settled_orders_bill_is_frozen_and_survives_the_evidence(store, wo,
+                                                                   transcripts,
+                                                                   monkeypatch):
+    """The defect this closes: a bill computed on demand gets CHEAPER as it ages.
+
+    Claude Code prunes session transcripts and result JSONs on its own schedule, so an
+    order costed live months later reports whatever happens to be left — a smaller
+    number, with no indication that it is smaller. The bill is sealed when the order
+    settles and read back from the seal after that.
+    """
+    give_session(store, wo["id"], "sess-seal")
+    transcripts("sess-seal", [assistant_row("m1", write=12_558, read=45_689, out=1_441)])
+    add_turn(store, wo["id"], dict(recorded_usage(0.05), input=0, cache_write=12_558,
+                                   cache_read=45_689, output=1_441))
+    store.set_status(wo["id"], "completed")
+
+    sealed = bill_mod.seal("proj_a", store.project_path, store.get_work_order(wo["id"]))
+    before = sealed["total"]["tokens"]["total"]
+    assert before == 12_558 + 45_689 + 1_441
+
+    # Now take the evidence away, exactly as Claude Code's own pruning does.
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(store.project_path / "gone"))
+    store.conn.execute("UPDATE wo_turns SET usage_json=NULL, outfile=''")
+    store.conn.commit()
+
+    assert ops.bill(wo["id"])["total"]["tokens"]["total"] == before
+    assert ops.bill(wo["id"])["accuracy"]["sealed_at"]
+    # ...and the proof that the seal is doing the work: recomputing now finds nothing.
+    assert ops.bill(wo["id"], live=True)["total"]["tokens"]["total"] == 0
+
+
+def test_the_daemon_seals_every_settled_order_and_only_once(store, wo, project,
+                                                            transcripts):
+    """Sealed by the reconcile tick rather than at each of the six places an order can
+    settle — one place to get right, and it catches the orders that settled before this
+    existed, while their evidence is still on disk."""
+    from jarvis.daemon import Daemon
+
+    give_session(store, wo["id"], "sess-tick")
+    transcripts("sess-tick", [assistant_row("m1", write=1_000, out=10)])
+    add_turn(store, wo["id"], dict(recorded_usage(0.05), input=0, cache_write=1_000,
+                                   cache_read=0, output=10))
+    open_wo = store.create_work_order("still running", "")
+    store.set_status(open_wo["id"], "running")
+    store.set_status(wo["id"], "completed")
+
+    daemon = Daemon.__new__(Daemon)
+    daemon.seal_bills(project, store)
+
+    sealed = store.get_work_order(wo["id"])
+    assert sealed["bill_json"] and sealed["bill_sealed_at"]
+    # An open order is not sealed: it has not finished spending.
+    assert store.get_work_order(open_wo["id"])["bill_json"] is None
+    # Idempotent — and cheap, because a sealed order leaves the queue for good.
+    assert store.unsealed_terminal_orders() == []
+    was = sealed["bill_sealed_at"]
+    daemon.seal_bills(project, store)
+    assert store.get_work_order(wo["id"])["bill_sealed_at"] == was
+
+
+def test_an_unsealed_old_order_is_costed_live_and_says_what_it_lost(store, wo):
+    """The user's rule for orders that predate the seal: a simplified bill, with a
+    disclaimer that it is inaccurate — never a smaller number presented as a total."""
+    add_turn(store, wo["id"], recorded_usage(0.05))  # pre-fix row, no outfile
+    store.set_status(wo["id"], "completed")
+
+    b = ops.bill(wo["id"])
+
+    assert b["accuracy"]["live"] is True
+    assert b["accuracy"]["sealed_at"] is None
+    assert b["accuracy"]["complete"] is False
+    assert any("modelUsage" in gap for gap in b["accuracy"]["gaps"])

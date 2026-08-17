@@ -756,14 +756,36 @@ def _print_bill_line(line: dict, depth: int = 0) -> None:
     unit = line.get("unit")
     count = ""
     # "turn 4 (1 turn)" says nothing twice. A count earns its place when there is more
-    # than one of something, or when the thing counted is not already in the label.
-    if line["calls"] and not (line["calls"] == 1 and unit == "turn"):
+    # than one of something, or when the thing counted is not already in the label. An
+    # empty unit means the line MIXES kinds — a turn and the OS calls it caused — and
+    # "11 charges" would be a number about nothing, so it is left off rather than
+    # guessed at. (The page does the same; the two renderers must not disagree.)
+    if line["calls"] and unit != "" and not (line["calls"] == 1 and unit == "turn"):
         count = f" ({line['calls']} {unit or 'charge'}"
         count += "s)" if line["calls"] != 1 else ")"
     print(f"{line['cost']['list_usd']:>9.3f} {_tok(line['tokens']['total']):>8}  "
           f"{pad}{line['label']}{count}")
     for child in line.get("children") or []:
         _print_bill_line(child, depth + 1)
+
+
+def _print_provenance(acc: dict) -> None:
+    """When this bill was worked out, and what it could not see.
+
+    The same sentences the page prints, for the same reason: a caveat that appears in
+    one renderer and not the other is one the reader learns to ignore.
+    """
+    import time as _time
+
+    if acc.get("sealed_at"):
+        when = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(acc["sealed_at"]))
+        print(f"  sealed when this order settled, on {when} — the records behind it "
+              f"expire, this figure does not")
+    elif acc.get("live"):
+        print("  worked out just now, from records that are still live; sealed "
+              "automatically once the order settles")
+    for gap in acc.get("gaps") or []:
+        print(f"  ⚠ {gap}")
 
 
 def _print_bill(bill: dict) -> None:
@@ -786,12 +808,15 @@ def _print_bill(bill: dict) -> None:
     print(headline)
     checks = bill.get("checks") or {}
     if checks.get("balanced"):
-        print("✓ every line below adds up to that, by actor and turn by turn")
+        print("✓ every line below adds up to that — by actor, turn by turn, and agent "
+              "by agent")
     else:
         for problem in checks.get("problems") or []:
             print(f"✗ {problem}")
+    _print_provenance(bill.get("accuracy") or {})
     for view, caption in (("actors", "by who spent it"),
                           ("turns", "the same tokens, turn by turn"),
+                          ("agents", "agent by agent — the lead, then what it spawned"),
                           ("orders", "the orders under it")):
         lines = bill.get(view) or []
         if not lines:
@@ -862,8 +887,9 @@ def _print_bill(bill: dict) -> None:
               f"cache would have served at a tenth of the price.")
     subagents = bill.get("subagents") or {}
     if subagents.get("count"):
-        print(f"subagents ~${subagents['list_usd']:.2f} of the worker's own line "
-              f"({subagents['count']} of them) — already inside it, never added twice")
+        print(f"{subagents['count']} subagent(s), ~${subagents['list_usd']:.2f}, "
+              f"itemised above under the turn each ran in — drawn out of that turn's "
+              f"total, never added to it")
     for note in bill.get("notes") or []:
         print(f"\n⚠ {note}")
     print(f"\nEvery figure above is {bill['floor_reason']}.")

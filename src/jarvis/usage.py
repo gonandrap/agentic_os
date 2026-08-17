@@ -74,6 +74,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -190,6 +191,12 @@ class Usage:
     #: than re-derived from the totals because the write rate depends on a TTL split
     #: that is exact per message and only approximate once messages are added together.
     cost_by_class: dict[str, float] = field(default_factory=dict)
+    #: TOKENS by model — `{model: {input, cache_write, cache_read, output, ...}}`, the
+    #: same classes as the fields above. `cost_by_model` was never enough to subtract
+    #: one usage from another: the bill splits a turn into the agents that ran inside it
+    #: by taking the turn's totals MINUS its subagents', and a subtraction that mixes
+    #: models would move tokens between price bands. Per model, it cannot.
+    tokens_by_model: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def __add__(self, other: Usage) -> Usage:
         merged = dict(self.cost_by_model)
@@ -198,6 +205,11 @@ class Usage:
         classes = dict(self.cost_by_class)
         for name, cost in other.cost_by_class.items():
             classes[name] = classes.get(name, 0.0) + cost
+        tokens = {m: dict(counts) for m, counts in self.tokens_by_model.items()}
+        for model, counts in other.tokens_by_model.items():
+            into = tokens.setdefault(model, {})
+            for name, value in counts.items():
+                into[name] = into.get(name, 0) + value
         return Usage(
             messages=self.messages + other.messages,
             input=self.input + other.input,
@@ -211,6 +223,7 @@ class Usage:
             cache_1h=self.cache_1h + other.cache_1h,
             cache_5m=self.cache_5m + other.cache_5m,
             cost_by_class=classes,
+            tokens_by_model=tokens,
         )
 
     @property
@@ -273,6 +286,40 @@ class Usage:
 
 
 @dataclass
+class Subagent:
+    """One subagent the session spawned, with enough about it to name a bill line.
+
+    `agent_type` and `description` come from the `.meta.json` Claude Code writes beside
+    each subagent transcript — "Explore", "Find worker session creation code". Without
+    them a bill can only offer `agent-ac837f05`, which answers "how much" and not the
+    question anyone actually has, which is "on what".
+
+    `started_at` is a unix timestamp, used to charge the subagent to the TURN it ran in
+    (the same last-turn-started-by-then rule everything else on the bill uses).
+    """
+
+    agent_id: str
+    agent_type: str = ""
+    description: str = ""
+    started_at: float = 0.0
+    ended_at: float = 0.0
+    usage: Usage = field(default_factory=Usage)
+
+    @property
+    def label(self) -> str:
+        name = self.agent_type or "subagent"
+        return f"{name} · {self.description}" if self.description else name
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "agent_id": self.agent_id, "agent_type": self.agent_type,
+            "description": self.description, "label": self.label,
+            "started_at": self.started_at, "ended_at": self.ended_at,
+            "usage": self.usage.as_dict(),
+        }
+
+
+@dataclass
 class SessionUsage:
     """One session's spend, with its subagents kept separate.
 
@@ -285,6 +332,10 @@ class SessionUsage:
     subagents: Usage = field(default_factory=Usage)
     subagent_count: int = 0
     found: bool = False
+    #: One entry per subagent, in the order the transcripts were read. `subagents` is
+    #: their sum and stays the figure everything else uses; this is what lets the bill
+    #: put each of them on its own row instead of reporting a lump.
+    each_subagent: list[Subagent] = field(default_factory=list)
 
     @property
     def total(self) -> Usage:
@@ -297,8 +348,63 @@ class SessionUsage:
             "subagent_count": self.subagent_count,
             "main": self.main.as_dict(),
             "subagents": self.subagents.as_dict(),
+            "each_subagent": [s.as_dict() for s in self.each_subagent],
             "total": self.total.as_dict(),
         }
+
+
+def _subagent_detail(path: Path, sub_usage: Usage) -> Subagent:
+    """Name and time one subagent transcript, from its meta file and its own rows.
+
+    Both sources are best-effort: a subagent whose meta file is missing still gets a
+    line, named for its file, because dropping it would take its tokens off the bill.
+    """
+    meta: dict[str, Any] = {}
+    meta_path = path.with_suffix(".meta.json")
+    try:
+        meta = json.loads(meta_path.read_text()) or {}
+    except (OSError, ValueError):
+        meta = {}
+    started, ended = _time_span(path)
+    return Subagent(
+        agent_id=path.stem,
+        agent_type=str(meta.get("agentType") or ""),
+        description=str(meta.get("description") or ""),
+        started_at=started, ended_at=ended, usage=sub_usage,
+    )
+
+
+def _time_span(path: Path) -> tuple[float, float]:
+    """When a transcript's rows start and end, as unix timestamps (0 if unreadable)."""
+    first = last = 0.0
+    try:
+        handle = path.open(errors="replace")
+    except OSError:
+        return (0.0, 0.0)
+    with handle:
+        for line in handle:
+            if '"timestamp"' not in line:
+                continue
+            try:
+                stamp = json.loads(line).get("timestamp")
+            except ValueError:
+                continue
+            when = _parse_stamp(stamp)
+            if when:
+                first = first or when
+                last = when
+    return (first, last)
+
+
+def _parse_stamp(stamp: Any) -> float:
+    if not isinstance(stamp, str):
+        return 0.0
+    try:
+        # Claude Code writes RFC-3339 with a literal Z, which `fromisoformat` accepts
+        # only from 3.11; the replace keeps this working the same on either.
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
@@ -374,6 +480,11 @@ def _usage_of(path: Path) -> Usage:
         usage.output += out
         usage.cache_1h += hour
         usage.cache_5m += five
+        counts = usage.tokens_by_model.setdefault(model, {})
+        for name, value in (("input", plain), ("cache_write", write),
+                            ("cache_read", read), ("output", out),
+                            ("cache_1h", hour), ("cache_5m", five)):
+            counts[name] = counts.get(name, 0) + value
         usage.context_peak = max(usage.context_peak, plain + write + read)
         # A turn boundary shows up as the cache going BACKWARDS: this call read less
         # of the prefix than the one before it did. Counting the drops rather than
@@ -472,6 +583,7 @@ def read_session(session_id: str, root: Path | None = None,
                 if sub_usage.messages:
                     result.subagents = result.subagents + sub_usage
                     result.subagent_count += 1
+                    result.each_subagent.append(_subagent_detail(sub, sub_usage))
     # A further segment file exists only because the session was resumed under a
     # different cwd, so each one is a turn boundary the cache-read comparison cannot
     # see (it never compares across files).

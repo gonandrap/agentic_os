@@ -127,6 +127,10 @@ class Item:
     usage_v: int | None = None
 
 
+#: "no item has proposed a note yet", which is not the same as "the items disagree".
+_UNSET = object()
+
+
 def _zero_tokens() -> dict[str, int]:
     return {c: 0 for c in usage_mod.TOKEN_CLASSES}
 
@@ -134,7 +138,7 @@ def _zero_tokens() -> dict[str, int]:
 def _line(key: str, label: str, note: str = "") -> dict[str, Any]:
     """An empty line item. Everything on it accumulates as items are folded in."""
     return {
-        "key": key, "label": label, "note": note,
+        "key": key, "label": label, "note": note, "_note": _UNSET,
         "calls": 0,
         "tokens": {**_zero_tokens(), "cache_1h": 0, "cache_5m": 0,
                    "billed_input": 0, "cached_input": 0, "total": 0},
@@ -164,6 +168,10 @@ def _add_item(line: dict[str, Any], item: Item) -> None:
     line["calls"] += item.calls
     if item.calls:
         line["unit"] = item.unit if line["unit"] in (None, item.unit) else ""
+    # A note explains a line only while every item on it says the same thing. The first
+    # item proposes one; a later one that disagrees withdraws it, because a parent whose
+    # children are a lead agent and a subagent is neither and must not claim to be.
+    line["_note"] = item.note if line["_note"] in (_UNSET, item.note) else ""
     # Priced PER ITEM, not from the folded totals: the write rate depends on a TTL split
     # that is exact for one item and only a ratio once items on different models and
     # different TTLs are added together.
@@ -210,22 +218,48 @@ def _fold(items: Sequence[Item], key: Any, label: Any, note: Any = None,
                 else:
                     index[path[:i]]["children"].append(line)
             _add_item(line, item)
+    for line in index.values():
+        _settle_note(line)
     return roots
+
+
+def _settle_note(line: dict[str, Any]) -> None:
+    """Adopt the items' agreed note, unless the fold already gave the line one."""
+    proposed = line.pop("_note", _UNSET)
+    if not line["note"] and isinstance(proposed, str):
+        line["note"] = proposed
 
 
 def _total_line(items: Sequence[Item], label: str) -> dict[str, Any]:
     line = _line("total", label)
     for item in items:
         _add_item(line, item)
+    line.pop("_note", None)
     return line
 
 
 # -- gathering the leaves -----------------------------------------------------------
 
 
+#: The agent that IS the session — the one whose turns Jarvis drives, as opposed to the
+#: ones it spawned with the Task tool. Named on its own row only when there is something
+#: to distinguish it from; a turn that spawned nothing is the lead agent entire.
+LEAD = "the lead agent"
+LEAD_NOTE = ("the session's own conversation, with everything its subagents spent taken "
+             "out and given their own rows")
+SUBAGENT_NOTE = ("spawned by the lead agent — its tokens are part of the total of the "
+                 "turn it ran in, not on top of it")
+
+
 def _turn_items(turn_rows: Sequence[dict[str, Any]],
                 session: Any) -> tuple[list[Item], list[str]]:
-    """The worker's own spend, one item per (turn, model), plus what the turns missed.
+    """The worker's own spend, split turn by turn and then AGENT by agent.
+
+    A turn's recorded total (`modelUsage`) already contains everything its subagents
+    spent, so the agents under a turn are a PARTITION of it, never additions to it: the
+    subagent rows are subtracted out of the turn and the lead agent gets the remainder.
+    That is what makes the user's identity hold — add up every agent row of a work order
+    and you have the worker's whole session, exactly, with no double count possible.
 
     THE SECOND HALF IS THE POINT. A work order whose result JSONs have been pruned has
     turns on record with no usage on them; the session transcript still knows what the
@@ -238,6 +272,8 @@ def _turn_items(turn_rows: Sequence[dict[str, Any]],
     items: list[Item] = []
     notes: list[str] = []
     recorded = _zero_tokens()
+    subs_by_turn = _subagents_by_turn(turn_rows, session)
+    stranded = 0
     for row in turn_rows:
         if not row.get("recorded"):
             continue
@@ -246,38 +282,18 @@ def _turn_items(turn_rows: Sequence[dict[str, Any]],
             **{c: row.get(c) or 0 for c in usage_mod.TOKEN_CLASSES},
             "cost_usd": row.get("cost_usd"),
         }]
-        # The turn's exact dollar figure belongs to the turn, not to each model in it,
-        # so it is charged once — to the dearest model line — while the token counts
-        # split. Splitting the dollars per model would invent a precision the CLI's
-        # own per-model `costUSD` may not agree with once rounded.
-        for i, m in enumerate(models):
+        for m in models:
             for cls in usage_mod.TOKEN_CLASSES:
                 recorded[cls] += m.get(cls) or 0
-            first = i == 0
-            name = m.get("model") or "unknown"
-            # A level per model ONLY when the turn used more than one. A turn that ran
-            # on a single model would otherwise get a child that repeats it and says
-            # nothing; the model is on the line either way (`models`).
-            leaf: tuple[str, ...] = (name,) if len(models) > 1 else ()
-            items.append(Item(
-                path=(WORKER, f"turn {row['seq']}") + leaf,
-                inner=(WORKER,) + leaf,
-                turn=row["seq"], model=m.get("model") or "",
-                input=m.get("input") or 0, cache_write=m.get("cache_write") or 0,
-                cache_read=m.get("cache_read") or 0, output=m.get("output") or 0,
-                # The TTL split is reported once per turn, for part of it; it rides on
-                # the first model line so its ratio prices that turn's writes.
-                cache_1h=(row.get("cache_1h") or 0) if first else 0,
-                cache_5m=(row.get("cache_5m") or 0) if first else 0,
-                exact_usd=(m.get("cost_usd") if m.get("cost_usd") is not None
-                           else (row.get("cost_usd") if first else None)),
-                # ONE, not the turn's API-call count: the countable act on a worker
-                # line is the turn, so the actor line reads "6 turns" rather than "6
-                # calls" — which is a different number and a different claim.
-                calls=1 if first else 0, unit="turn",
-                usage_v=row.get("usage_v") or 1,
-                note=f"{row['kind']} turn",
-            ))
+        turn_items, missed = _agent_items(row, models, subs_by_turn.get(row["seq"], []))
+        stranded += missed
+        items.extend(turn_items)
+    if stranded:
+        notes.append(
+            f"{stranded:,} tokens a subagent's own transcript reports could not be taken "
+            "out of the turn it ran in, because the turn's own total does not contain "
+            "them. They stay inside the turn rather than being added to it: a bill that "
+            "grew when it looked closer would not be a bill.")
     if not session.found:
         return items, notes
     whole = session.total
@@ -319,6 +335,112 @@ def _turn_items(turn_rows: Sequence[dict[str, Any]],
             calls=len(unrecorded) or 1, unit="turn", note=note,
             **gap))
     return items, notes
+
+
+def _subagents_by_turn(turn_rows: Sequence[dict[str, Any]],
+                       session: Any) -> dict[int, list[Any]]:
+    """Which turn each subagent ran in — the last one that had started when it began.
+
+    The same rule the OS's own calls are attributed by (question 121), applied to the
+    one other thing on a bill that has a timestamp and no turn id. A subagent that lands
+    outside every turn, or on a turn with nothing recorded, is left where it already is:
+    inside the transcript figure the gap line charges.
+    """
+    locate = _turn_locator(turn_rows)
+    recorded = {r["seq"] for r in turn_rows if r.get("recorded")}
+    out: dict[int, list[Any]] = {}
+    for sub in getattr(session, "each_subagent", []) or []:
+        # A subagent that spent nothing gets no row. Claude Code leaves a transcript
+        # behind for an agent that was aborted before its first API call — real on
+        # wo-cd73c537, where one of the three carries only synthetic messages — and a
+        # row charging nothing would split a turn into "the lead agent" and an absence.
+        if not sub.usage.total_tokens:
+            continue
+        seq = locate(sub.started_at)
+        if seq in recorded:
+            out.setdefault(seq, []).append(sub)
+    return out
+
+
+def _agent_items(row: dict[str, Any], models: Sequence[dict[str, Any]],
+                 subs: Sequence[Any]) -> tuple[list[Item], int]:
+    """One turn, split into the agents that ran inside it. Returns (items, stranded).
+
+    The turn's totals are the budget and the subagents are drawn from it PER MODEL and
+    per class, in order, each taking at most what is left. So the rows always sum back
+    to the turn no matter how the two sources disagree, and what a subagent's transcript
+    claims beyond the turn's own total is reported as stranded rather than added — the
+    two directions of the same rule that keeps this a bill and not a growing estimate.
+
+    The turn's exact dollar figure is split across the rows in proportion to what they
+    cost at list. Tokens are the figure that reconciles and dollars are derived and
+    labelled (kn-e6bb1166): the turn line keeps the CLI's figure to the cent, and each
+    row under it carries its share of it rather than nothing at all.
+    """
+    budget = {(m.get("model") or "unknown"): {c: m.get(c) or 0
+                                              for c in usage_mod.TOKEN_CLASSES}
+              for m in models}
+    drafts: list[tuple[str, str, dict[str, int], str]] = []
+    stranded = 0
+    for sub in subs:
+        for model, counts in (sub.usage.tokens_by_model or {}).items():
+            key = model if model in budget else next(iter(budget), "unknown")
+            left = budget.get(key)
+            if left is None:
+                stranded += sum(counts.get(c, 0) for c in usage_mod.TOKEN_CLASSES)
+                continue
+            take = {}
+            for cls in usage_mod.TOKEN_CLASSES:
+                want = counts.get(cls, 0)
+                got = min(want, left[cls])
+                left[cls] -= got
+                take[cls] = got
+                stranded += want - got
+            if any(take.values()):
+                drafts.append((sub.label, model, take, "subagent"))
+    for model, left in budget.items():
+        if any(left.values()) or not drafts:
+            drafts.append((LEAD, model, dict(left), "lead"))
+    # Priced first, so the turn's one exact figure can be shared out by what each row
+    # is worth. `list_usd` of a whole turn is never zero unless the turn is.
+    priced = [(d, sum(usage_mod.class_costs(d[1], **d[2]).values())) for d in drafts]
+    total_list = sum(p for _, p in priced) or 1.0
+    exact = row.get("cost_usd")
+    # The agent level only when it DISTINGUISHES something: a turn whose only agent is
+    # the lead would get a child that repeats the turn and says nothing, the same rule
+    # the per-model level follows. A turn whose only agent is a SUBAGENT still gets one
+    # — dropping that level would let a turn consumed entirely by a subagent look like
+    # ordinary lead spend, which is the opposite of what these rows are for.
+    labels = {d[0] for d, _ in priced}
+    named = len(labels) > 1 or labels != {LEAD}
+    items: list[Item] = []
+    charged_turn = False
+    for i, ((label, model, take, role), list_usd) in enumerate(priced):
+        first = i == 0
+        # The countable act on a worker line is the TURN — an actor line reads "6 turns"
+        # and not "6 calls", which is a different number and a different claim. A
+        # subagent is not a second countable act inside its turn: it is part of the one
+        # turn already counted, so it carries no count of its own and the turn line
+        # keeps saying "1 turn" instead of collapsing to a meaningless "2 charges".
+        counts = role == "lead" and not charged_turn
+        charged_turn = charged_turn or counts
+        leaf: tuple[str, ...] = (label,) if named else ()
+        items.append(Item(
+            path=(WORKER, f"turn {row['seq']}") + leaf,
+            inner=(WORKER,) + leaf,
+            turn=row["seq"], model=model if model != "unknown" else "",
+            **take,
+            # The TTL split is reported once per turn, for part of it; it rides on the
+            # first row so its ratio prices that turn's writes.
+            cache_1h=(row.get("cache_1h") or 0) if first else 0,
+            cache_5m=(row.get("cache_5m") or 0) if first else 0,
+            exact_usd=None if exact is None else exact * list_usd / total_list,
+            calls=1 if counts else 0, unit="turn",
+            usage_v=row.get("usage_v") or 1,
+            note=(SUBAGENT_NOTE if role == "subagent" else
+                  LEAD_NOTE if named else f"{row['kind']} turn"),
+        ))
+    return items, stranded
 
 
 def _call_items(rows: Sequence[dict[str, Any]],
@@ -430,7 +552,25 @@ def compose(items: Sequence[Item], turn_rows: Sequence[dict[str, Any]],
                         label=lambda p: _actor_label(p[-1]),
                         note=lambda p: ACTOR_NOTES.get(p[-1], "") if len(p) == 1 else ""),
         "turns": by_turn,
+        "agents": _agent_view(items),
     }
+
+
+def _agent_view(items: Sequence[Item]) -> list[dict[str, Any]]:
+    """The worker's session by AGENT — the lead, then each subagent it spawned.
+
+    A third fold of the same leaves, and the one that answers the identity the user
+    stated: add up every agent of a work order and the sum is the worker's whole
+    session — the order's total less what Jarvis spent on it and less the claude
+    processes the worker itself launched. `reconcile` checks exactly that.
+    """
+    worker = [i for i in items if i.path and i.path[0] == WORKER]
+    view = _fold(worker, key=lambda i: (i.inner[1] if len(i.inner) > 1 else LEAD,),
+                 label=lambda p: str(p[-1]))
+    # The lead first, then the subagents in the order they were spawned; a bill reads
+    # top-down and the agent that ran the order belongs at the top of its own list.
+    view.sort(key=lambda line: (line["label"] != LEAD,))
+    return view
 
 
 def _seq_of(key: str) -> float:
@@ -445,8 +585,16 @@ def _actor_label(segment: Any) -> str:
     return ACTOR_LABELS.get(str(segment), str(segment))
 
 
-def build(target: str, project: str | None = None) -> dict[str, Any]:
+def build(target: str, project: str | None = None, *,
+          live: bool = False) -> dict[str, Any]:
     """The bill for one order, work or feature, resolved by id.
+
+    A SEALED bill is returned as it was sealed. A bill is computed from sources that
+    expire — Claude Code prunes transcripts and result JSONs on its own schedule — so
+    recomputing a finished order's bill every time it is looked at means the answer
+    quietly shrinks as the evidence ages. It is frozen when the order settles instead,
+    and only an open order is costed live. `live=True` recomputes anyway, which is what
+    sealing itself does and what a test comparing the two needs.
 
     The feature order is tried FIRST, for the reason `ops._cost_for_target` gives: the
     two id spaces cannot collide, but resolving the work order first would answer
@@ -455,11 +603,78 @@ def build(target: str, project: str | None = None) -> dict[str, Any]:
     from . import ops
 
     try:
-        name, path, fo = ops.find_feature_order(target, project)
+        name, path, order = ops.find_feature_order(target, project)
+        feature = True
     except ops.OpsError:
-        name, wo_path, wo = ops.find_work_order(target, project)
-        return for_work_order(name, wo_path, wo)
-    return for_feature_order(name, path, fo)
+        name, path, order = ops.find_work_order(target, project)
+        feature = False
+    if not live:
+        sealed = unseal(order)
+        if sealed is not None:
+            return sealed
+    if feature:
+        return for_feature_order(name, path, order)
+    return for_work_order(name, path, order)
+
+
+def unseal(order: dict[str, Any]) -> dict[str, Any] | None:
+    """The bill frozen onto this order when it settled, if there is one."""
+    raw = order.get("bill_json")
+    if not raw:
+        return None
+    payload = db.from_json(raw, None)
+    if not isinstance(payload, dict) or not payload.get("total"):
+        return None
+    payload["accuracy"] = {**(payload.get("accuracy") or {}),
+                           "sealed_at": order.get("bill_sealed_at"), "live": False}
+    return payload
+
+
+def seal(project: str, path: Path, order: dict[str, Any], *,
+         feature: bool = False, index: dict[str, list[Path]] | None = None
+         ) -> dict[str, Any]:
+    """Compute a settled order's bill and freeze it onto the order. Idempotent.
+
+    Called by the daemon a tick or two after an order settles, and again for every
+    order that settled before this existed — which is the only way those get an
+    accurate bill at all, since the evidence for them is still on disk today and will
+    not be next month.
+    """
+    from .project_store import ProjectStore
+
+    payload = (for_feature_order(project, path, order, index=index) if feature
+               else for_work_order(project, path, order, index=index))
+    store = ProjectStore(path)
+    try:
+        store.seal_bill(order["id"], db.to_json(payload), feature=feature)
+    finally:
+        store.close()
+    payload["accuracy"]["sealed_at"] = db.now()
+    payload["accuracy"]["live"] = False
+    return payload
+
+
+def _accuracy(payload: dict[str, Any], turn_rows: Sequence[dict[str, Any]],
+              session: Any) -> dict[str, Any]:
+    """What this bill could not see — the disclaimer, computed rather than assumed.
+
+    A bill sealed at completion is complete. One reconstructed later from whatever
+    survived is not, and the honest thing is to say which parts are missing rather than
+    to present a smaller number with the same confidence.
+    """
+    gaps: list[str] = []
+    if turn_rows and not session.found:
+        gaps.append("Claude Code's transcript for the worker's session is gone, so any "
+                    "turn without a result JSON of its own could not be counted at all.")
+    if 1 in (payload["total"].get("usage_versions") or []):
+        gaps.append("Some turns were counted before the modelUsage fix and their result "
+                    "JSON is gone too, so their tokens are the old, low reading — a "
+                    "floor, not a total.")
+    if any("no result JSON left" in (line.get("label") or "")
+           for line in payload.get("turns") or []):
+        gaps.append("Some turns no longer have the result JSON the CLI wrote; their "
+                    "spend is estimated from the transcript, at list prices.")
+    return {"sealed_at": None, "live": True, "complete": not gaps, "gaps": gaps}
 
 
 def for_work_order(project: str, path: Path, wo: dict[str, Any],
@@ -498,6 +713,7 @@ def for_work_order(project: str, path: Path, wo: dict[str, Any],
             f"Only the most recent {CALL_LIMIT} recorded calls are on this bill.")
     _annotate_turns(payload, turn_rows)
     payload["checks"] = reconcile(payload)
+    payload["accuracy"] = _accuracy(payload, turn_rows, session)
     payload["floor_reason"] = ops.COST_FLOOR_NOTE
     return payload
 
@@ -531,11 +747,14 @@ def for_feature_order(project: str, path: Path, fo: dict[str, Any],
     index = index if index is not None else usage_mod.index_sessions()
     orders = [for_work_order(project, path, child, index=index) for child in children]
     items: list[Item] = []
+    agent_items: list[Item] = []
     for order, child in zip(orders, children):
         for line in order["actors"]:
             # Re-charged as one item per leaf of the child's own tree, so the feature's
             # by-actor view is the same fold over the same facts one level up.
             items.extend(_relabel(line, child["id"]))
+        for line in order.get("agents") or []:
+            agent_items.extend(_relabel(line, child["id"], prefix=(child["id"],)))
     payload = {
         "kind": "feature_order",
         "scope": fo["id"], "id": fo["id"], "title": fo["title"],
@@ -545,11 +764,27 @@ def for_feature_order(project: str, path: Path, fo: dict[str, Any],
                         label=lambda p: _actor_label(p[-1]),
                         note=lambda p: ACTOR_NOTES.get(p[-1], "") if len(p) == 1 else ""),
         "turns": [],
+        # Every agent the feature ran, one order at a time. The identity holds a level
+        # up unchanged: these sum to the feature's workers, and each order below has the
+        # same view over its own turns.
+        "agents": _fold(agent_items, key=lambda i: i.path,
+                        label=lambda p: str(p[-1])),
         "orders": orders,
         "notes": [],
         "checks": {},
     }
     payload["checks"] = reconcile(payload)
+    # A feature's accuracy is the worst of its children's: one order whose transcript is
+    # gone makes the feature's total a floor, and saying so on the feature is the only
+    # place the reader of the feature will see it.
+    gaps: list[str] = []
+    for order in orders:
+        for gap in (order.get("accuracy") or {}).get("gaps") or []:
+            entry = f"{order['id']}: {gap}"
+            if entry not in gaps:
+                gaps.append(entry)
+    payload["accuracy"] = {"sealed_at": None, "live": True,
+                           "complete": not gaps, "gaps": gaps}
     payload["floor_reason"] = ops.COST_FLOOR_NOTE
     return payload
 
@@ -585,14 +820,14 @@ def _relabel(line: dict[str, Any], wo_id: str, prefix: tuple[str, ...] = ()
 
 
 def _worker_extras(session: Any) -> dict[str, Any]:
-    """The two facts about a worker's session that are not line items.
+    """The facts about a worker's session that live beside the line items.
 
-    Neither is an addend and both are constantly mistaken for one. SUBAGENTS are a
-    SHARE of the worker's own turns (their tokens are already inside `modelUsage`), so
-    they are reported as "of which", never added. The RE-WRITE TAX is a share too — the
-    part of the cache-write charge that paid to re-send context a warm cache would have
-    served — and the user's second question was what it even is, so the sentence that
-    says it travels with the number.
+    SUBAGENTS now have rows of their own — under the turn they ran in, drawn out of that
+    turn's total rather than added to it — so this is the headline over those rows, not
+    a substitute for them. THE RE-WRITE TAX has no rows and cannot: it is a SHARE of the
+    cache-write charge already on the bill, the part that paid to re-send context a warm
+    cache would have served, and the user's second question was what it even is, so the
+    sentence that says so travels with the number.
     """
     total = session.total
     return {
@@ -653,7 +888,34 @@ def reconcile(payload: dict[str, Any], tolerance: float = 1e-6) -> dict[str, Any
                             f"{total['cost']['list_usd']}")
         for line in lines:
             problems.extend(_check_children(line))
+    problems.extend(_check_agents(payload))
     return {"balanced": not problems, "problems": problems}
+
+
+def _check_agents(payload: dict[str, Any]) -> list[str]:
+    """The user's identity: every agent added up IS the worker's whole session.
+
+    Stated on wo-4576667e as "sum the usage of all agents for a work order and it equals
+    the total minus the OS's". Checked against the worker's actor line, which is that
+    difference — the total less what Jarvis spent on the order and less the claude
+    processes the worker spawned. Checked and not merely arranged: subagent rows are
+    subtracted out of a turn's own total, and an off-by-one in that subtraction is
+    exactly the kind of error a bill must not be able to ship.
+    """
+    agents = payload.get("agents") or []
+    if not agents:
+        return []
+    worker = next((line for line in payload.get("actors") or []
+                   if line["key"] == WORKER), None)
+    if worker is None:
+        return ["agents: there are agent rows but no worker line to match them to"]
+    problems = []
+    for cls in (*usage_mod.TOKEN_CLASSES, "total"):
+        summed = sum(line["tokens"][cls] for line in agents)
+        if summed != worker["tokens"][cls]:
+            problems.append(f"agents: {cls} sums to {summed}, the worker's session is "
+                            f"{worker['tokens'][cls]}")
+    return problems
 
 
 def _check_children(line: dict[str, Any]) -> list[str]:

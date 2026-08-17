@@ -127,6 +127,15 @@ def fmt_age(ts: float | None) -> str:
     return f"{int(d / 86400)}d"
 
 
+def fmt_ts(ts: float | None) -> str:
+    """An absolute local date-time. `fmt_age` answers "how long ago", which is the right
+    question for a running thing and the wrong one for a bill: a sealed bill's date is a
+    fact about the record, not a countdown, and "412d" is not a date anyone can cite."""
+    if not ts:
+        return "–"
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
 #: Paths the access log ignores while they succeed. `/api/status` is the dashboard's own
 #: 15-second refresh poll — left in, it is ~95% of the lines and buries the thing the
 #: access log exists to show: which pages the *user* actually opened. Failures are logged
@@ -324,7 +333,7 @@ def create_app() -> FastAPI:
         # `claude --resume` invitation rather than put a second driver on one session.
         active_statuses=ACTIVE_STATUSES,
         instance=instance_badge(),
-        fmt_tok=fmt_tok, fmt_dur=fmt_dur,
+        fmt_tok=fmt_tok, fmt_dur=fmt_dur, fmt_ts=fmt_ts,
     )
 
     def render(request: Request, template: str, active: str = "dashboard",

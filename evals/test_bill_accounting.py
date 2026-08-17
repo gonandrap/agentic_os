@@ -20,10 +20,11 @@ reader, not just the arithmetic at the end.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
-from jarvis import agent_usage, db, ops
+from jarvis import agent_usage, db, ops, usage
 from jarvis.central_store import CentralStore
 from jarvis.project_store import ProjectStore
 
@@ -61,6 +62,65 @@ def raw_spend(project_path, wo_id: str) -> dict[str, int]:
     return totals
 
 
+def stamp(when: float) -> str:
+    return (datetime.fromtimestamp(when, tz=timezone.utc)
+            .isoformat().replace("+00:00", "Z"))
+
+
+def message_row(mid: str, when: float, **tokens) -> dict:
+    return {
+        "type": "assistant", "timestamp": stamp(when),
+        "message": {"id": mid, "model": "claude-fake-1",
+                    "usage": {"input_tokens": tokens.get("input", 0),
+                              "cache_creation_input_tokens": tokens.get("write", 0),
+                              "cache_read_input_tokens": tokens.get("read", 0),
+                              "output_tokens": tokens.get("out", 0)}},
+    }
+
+
+def plant_subagent(fleet, root, wo_id: str, *, write: int, out: int,
+                   agent_type: str = "Explore",
+                   description: str = "check the schema") -> None:
+    """Write the session transcript Claude Code would have written, subagent and all.
+
+    Not a stub of `read_session`: the eval is about whether the OS finds a subagent
+    where the tool ACTUALLY puts it — beside the parent transcript, under a directory
+    named for the parent session, with a `.meta.json` naming what it was for.
+
+    The two files together are built to sum to what the turns already recorded, because
+    that is the real relationship: `modelUsage` counts subagents, so a session's
+    transcript (main + subagents) equals its turns. Planting a subagent whose tokens
+    were NOT already inside the turn would be testing a situation that cannot happen and
+    would hide the double count this partition exists to prevent.
+    """
+    store = ProjectStore(fleet["path"])
+    try:
+        wo = store.get_work_order(wo_id)
+        turns = store.list_turns(wo_id)
+        recorded = {"input": 0, "write": 0, "read": 0, "out": 0}
+        for turn in turns:
+            envelope = db.from_json(turn.get("usage_json"), None) or {}
+            recorded["input"] += envelope.get("input") or 0
+            recorded["write"] += envelope.get("cache_write") or 0
+            recorded["read"] += envelope.get("cache_read") or 0
+            recorded["out"] += envelope.get("output") or 0
+    finally:
+        store.close()
+    started = (turns[0].get("started_at") or 0) + 1
+    project_dir = root / "-proj"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    parent = project_dir / f"{wo['session_id']}.jsonl"
+    parent.write_text(json.dumps(message_row(
+        "main-1", started, input=recorded["input"], write=recorded["write"] - write,
+        read=recorded["read"], out=recorded["out"] - out)) + "\n")
+    sub_dir = parent.with_suffix("") / "subagents"
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    (sub_dir / "agent-eval01.jsonl").write_text(
+        json.dumps(message_row("sub-1", started + 1, write=write, out=out)) + "\n")
+    (sub_dir / "agent-eval01.meta.json").write_text(
+        json.dumps({"agentType": agent_type, "description": description}))
+
+
 def bill_tokens(b: dict) -> dict[str, int]:
     return {cls: b["total"]["tokens"][cls]
             for cls in ("input", "cache_write", "cache_read", "output")}
@@ -71,6 +131,17 @@ def os_call(wo_id: str, kind: str, label: str = "", **over) -> None:
                        model="claude-fake-1", question_id=over.pop("question_id", None),
                        usage={"total_cost_usd": 0.02, "input": 7, "cache_write": 900,
                               "cache_read": 4_000, "output": 250, **over})
+
+
+@pytest.fixture()
+def transcripts(tmp_path, monkeypatch):
+    """A transcript tree of this eval's own. The fake `claude` writes no session file,
+    so anything about reading one has to plant it — and must never be able to reach the
+    real `~/.claude/projects` while doing so."""
+    root = tmp_path / "transcripts"
+    root.mkdir()
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    return root
 
 
 @pytest.fixture()
@@ -241,3 +312,59 @@ def test_one_payload_behind_both_surfaces(fleet, settle_turns, capsys):
 
     assert printed["total"]["tokens"] == b["total"]["tokens"]
     assert printed["checks"]["balanced"]
+
+
+@scenario("bill accounting", "agents sum to the worker, subagents included")
+def test_every_agent_of_an_order_is_the_workers_whole_session(fleet, settle_turns,
+                                                              transcripts):
+    """The identity the user stated, through the real dispatch path.
+
+    A subagent transcript is planted beside the worker's session exactly where Claude
+    Code writes one, so `read_session` finds it the way it does in production. The claim
+    under test is not "the numbers look right" but that the agent rows are a PARTITION:
+    they sum to the worker's session, and the worker plus the OS is the order.
+    """
+    wo = dispatched(fleet, settle_turns, "an order that spawned help")
+    os_call(wo["id"], "neo_answer", "question", question_id=1)
+    plant_subagent(fleet, transcripts, wo["id"], write=400, out=30)
+
+    b = ops.bill(wo["id"], live=True)
+
+    worker = next(line for line in b["actors"] if line["key"] == "worker")
+    agents = sum(line["tokens"]["total"] for line in b["agents"])
+    assert agents == worker["tokens"]["total"]
+    assert worker["tokens"]["total"] < b["total"]["tokens"]["total"]  # the OS spent too
+    # The subagent is itemised and named, and the worker's total did NOT grow by it:
+    # its tokens were already inside the turn's own modelUsage figure.
+    labels = {line["label"] for line in b["agents"]}
+    assert "Explore · check the schema" in labels
+    assert bill_tokens(b) == raw_spend(fleet["path"], wo["id"])
+    assert b["checks"]["balanced"], b["checks"]["problems"]
+
+
+@scenario("bill accounting", "a settled order's bill is sealed, not recomputed")
+def test_the_daemon_seals_a_settled_orders_bill(fleet, settle_turns):
+    """A bill is built from evidence that expires. The tick freezes it while it is
+    still there, and every later reading comes from the freeze — which is the only
+    reason the figure a user cites today is the figure they can cite next year."""
+    wo = dispatched(fleet, settle_turns, "an order to be sealed")
+    os_call(wo["id"], "neo_answer", "question", question_id=1)
+    ops.finish(wo["id"], summary="done")
+    live = ops.bill(wo["id"], live=True)
+
+    store = ProjectStore(fleet["path"])
+    try:
+        fleet["daemon"].seal_bills(fleet["daemon"].catalog.projects[0], store)
+        row = store.get_work_order(wo["id"])
+    finally:
+        store.close()
+
+    assert row["bill_json"] and row["bill_sealed_at"]
+    sealed = ops.bill(wo["id"])
+    assert sealed["total"]["tokens"] == live["total"]["tokens"]
+    assert sealed["accuracy"]["sealed_at"] == row["bill_sealed_at"]
+    assert sealed["checks"]["balanced"], sealed["checks"]["problems"]
+    # The seal is the whole payload, not a headline: everything the page draws survives.
+    assert sealed["actors"] and sealed["turns"] and sealed["agents"]
+    assert sum(line["tokens"]["total"] for line in sealed["turns"]) \
+        == sealed["total"]["tokens"]["total"]

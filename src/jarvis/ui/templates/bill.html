@@ -148,14 +148,24 @@
 </div>
 {% endif %}
 
-{% if bill.subagents and bill.subagents.count %}
-<p class="sub" style="margin-top: 14px;">
-  {{ bill.subagents.count }} subagent{{ 's' if bill.subagents.count != 1 }} ran inside
-  this worker's turns, for about ${{ '%.2f'|format(bill.subagents.list_usd) }} of the
-  worker's own line. Not a line of its own: a subagent's tokens are already inside the
-  turn that spawned it, and adding them again would count them twice.
-</p>
 {% endif %}
+
+{# The third fold, and the identity the user named: agents ARE the worker's session.
+   Kept below the two the page opens with, because "who" and "when" are the questions a
+   reader arrives with — but on the same page and out of a disclosure, because a
+   subagent that quietly cost a third of the order is the thing they came to find. #}
+{% set worker = bill.actors|selectattr('key', 'equalto', 'worker')|list|first %}
+{% if bill.agents and worker %}
+<h2>Agent by agent</h2>
+<p class="sub" style="margin: -4px 0 0;">
+  The lead agent — the session Jarvis drives — and every subagent it spawned, each drawn
+  OUT of the turn it ran in rather than added to it. Add these up and you have the
+  worker's whole session, exactly:
+  <span class="mono">{{ fmt_tok(bill.total.tokens.total) }} for the order
+    − {{ fmt_tok(bill.total.tokens.total - worker.tokens.total) }} spent by the OS and by
+    the worker's own subprocesses = {{ fmt_tok(worker.tokens.total) }}</span>.
+</p>
+{{ bill_ui.view(bill.agents, worker, 'every agent of ' ~ bill.id) }}
 {% endif %}
 
 {% for note in bill.notes %}

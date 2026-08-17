@@ -2496,7 +2496,8 @@ COST_FLOOR_NOTE = (
 )
 
 
-def bill(target: str, project: str | None = None) -> dict[str, Any]:
+def bill(target: str, project: str | None = None, *,
+         live: bool = False) -> dict[str, Any]:
     """The itemised bill for one order — see `jarvis.bill`.
 
     `cost_report` answers "what did the fleet cost" and is the right shape for a
@@ -2504,10 +2505,14 @@ def bill(target: str, project: str | None = None) -> dict[str, Any]:
     a page you can expand. One thin wrapper rather than a second import path, so every
     surface — the CLI, the dashboard, anything later — reaches it the way it reaches
     everything else in the OS.
+
+    A settled order's bill was sealed when it settled and comes back as it was sealed;
+    `live=True` recomputes it from whatever survives today, which is what a test that
+    compares the two needs and what nothing else should ask for.
     """
     from .bill import build
 
-    return build(target, project)
+    return build(target, project, live=live)
 
 
 def cost_report(project: str | None = None, target: str | None = None,

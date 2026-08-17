@@ -112,13 +112,17 @@
   `read_session()`, `index_sessions()`, `priced()`, `TOKEN_CLASSES`.
 - `agent_usage.py` — the OS's own calls (`agent_calls` in os.db): Neo answers, panel
   seats, digests, and worker SUBPROCESS calls.
-- `bill.py` — **the bill**: one flat `Item` list folded twice (by actor, by turn) so the
-  turns provably sum to the order. `build()`, `for_work_order()`, `for_feature_order()`,
-  `compose()`, `_fold()`, `reconcile()`. Rendered identically by `jarvis cost <id>`
-  (`cli._print_bill`) and `/cost/<project>/<id>` (`ui/templates/bill.html` +
-  `_bill.html` macros). See `kn-4b436376`; token totals come from the envelope's
+- `bill.py` — **the bill**: one flat `Item` list folded THREE ways (by actor, by turn,
+  by agent) so each view provably sums to the order. `build()`, `for_work_order()`,
+  `for_feature_order()`, `compose()`, `_fold()`, `_agent_items()`, `reconcile()`,
+  `seal()`/`unseal()`. Rendered identically by `jarvis cost <id>` (`cli._print_bill`)
+  and `/cost/<project>/<id>` (`ui/templates/bill.html` + `_bill.html` macros).
+  Three rulings a reader needs first: token totals come from the envelope's
   `modelUsage`, NOT its top-level `usage` (`kn-0e1bf210`,
-  `claude_cli.USAGE_SCHEMA_VERSION`).
+  `claude_cli.USAGE_SCHEMA_VERSION`); a settled order's bill is SEALED into
+  `work_orders.bill_json` by `Daemon.seal_bills` and never recomputed (`kn-3629fa87`);
+  subagents are a PARTITION of the turn they ran in, drawn out of it, never added
+  (`kn-7a2180ba`). Shape and fold rules: `kn-4b436376`.
 
 **Middle:**
 - `worker_session.py` — **the conversation layer**: the ONLY module that knows how a
