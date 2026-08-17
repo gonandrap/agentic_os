@@ -6,6 +6,8 @@ Grouped commands:
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
   jarvis fo create|list|show|plan|approve|cancel        feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
+  jarvis gate rules|rule-retract|explain  what counts as privileged, and what the OS
+                                          has LEARNED does not
   jarvis neo list|show|review|answer|learnings|learn|export
   jarvis backlog add|list|promote|done
   jarvis learn add|list|search|show|topics|pin|unpin
@@ -365,6 +367,26 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("approval_id", type=int)
     g.add_argument("--reason", required=True,
                    help="what the recogniser got wrong — this is the defect report")
+    g.add_argument("--project")
+    g = ga.add_parser(
+        "rules",
+        help="the rule base: what counts as a privileged action, and what has been "
+             "LEARNED not to. Seeded from the builtins, grown from dismissals",
+    )
+    g.add_argument("--role", choices=("match", "exempt", "canary"))
+    g.add_argument("--kind", help="one gate name")
+    g.add_argument("--all", action="store_true", help="include retracted rules")
+    g = ga.add_parser("rule-retract",
+                      help="retire a rule: it stops applying, the record keeps that it "
+                           "once did")
+    g.add_argument("rule_id")
+    g.add_argument("--reason", required=True)
+    g = ga.add_parser(
+        "explain",
+        help="why a command would or would not trip a gate — paste the exact string "
+             "from a gate record to diagnose a false positive",
+    )
+    g.add_argument("command")
     g.add_argument("--project")
 
     # backlog ---------------------------------------------------------------------------
@@ -750,12 +772,167 @@ def _print_subprocess_calls(res: dict) -> None:
               f"{r['model'][:28]}{failed}")
 
 
+def _print_bill_line(line: dict, depth: int = 0) -> None:
+    """One line of the bill tree, and everything under it."""
+    pad = "  " * depth
+    unit = line.get("unit")
+    count = ""
+    # "turn 4 (1 turn)" says nothing twice. A count earns its place when there is more
+    # than one of something, or when the thing counted is not already in the label. An
+    # empty unit means the line MIXES kinds — a turn and the OS calls it caused — and
+    # "11 charges" would be a number about nothing, so it is left off rather than
+    # guessed at. (The page does the same; the two renderers must not disagree.)
+    if line["calls"] and unit != "" and not (line["calls"] == 1 and unit == "turn"):
+        count = f" ({line['calls']} {unit or 'charge'}"
+        count += "s)" if line["calls"] != 1 else ")"
+    print(f"{line['cost']['list_usd']:>9.3f} {_tok(line['tokens']['total']):>8}  "
+          f"{pad}{line['label']}{count}")
+    for child in line.get("children") or []:
+        _print_bill_line(child, depth + 1)
+
+
+def _print_provenance(acc: dict) -> None:
+    """When this bill was worked out, and what it could not see.
+
+    The same sentences the page prints, for the same reason: a caveat that appears in
+    one renderer and not the other is one the reader learns to ignore.
+    """
+    import time as _time
+
+    if acc.get("sealed_at"):
+        when = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(acc["sealed_at"]))
+        print(f"  sealed when this order settled, on {when} — the records behind it "
+              f"expire, this figure does not")
+    elif acc.get("live"):
+        print("  worked out just now, from records that are still live; sealed "
+              "automatically once the order settles")
+    for gap in acc.get("gaps") or []:
+        print(f"  ⚠ {gap}")
+
+
+def _print_bill(bill: dict) -> None:
+    """One order's itemised bill — the same payload the dashboard renders.
+
+    Both views are printed, because both answer a question the other cannot: who spent
+    it, and when. They are two foldings of one set of charges, so they come to the same
+    number, and `checks` says so on the page rather than leaving it to be trusted.
+    """
+    total = bill["total"]
+    print(f"{bill['scope']} — {bill['title']}\n")
+    exact = total["cost"]["exact_usd"]
+    headline = (f"~${total['cost']['list_usd']:.2f} at list prices · "
+                f"{_tok(total['tokens']['total'])} tokens")
+    if exact and not total["exact_missing"]:
+        headline += f" · the claude CLI billed ${exact:.2f} for it"
+    elif exact:
+        headline += (f" · ${exact:.2f} of it has the CLI's own figure, "
+                     f"{total['exact_missing']} line(s) do not")
+    print(headline)
+    checks = bill.get("checks") or {}
+    if checks.get("balanced"):
+        print("✓ every line below adds up to that — by actor, turn by turn, and agent "
+              "by agent")
+    else:
+        for problem in checks.get("problems") or []:
+            print(f"✗ {problem}")
+    _print_provenance(bill.get("accuracy") or {})
+    for view, caption in (("actors", "by who spent it"),
+                          ("turns", "the same tokens, turn by turn"),
+                          ("agents", "agent by agent — the lead, then what it spawned"),
+                          ("orders", "the orders under it")):
+        lines = bill.get(view) or []
+        if not lines:
+            continue
+        print(f"\n{caption}:")
+        print(f"{'$':>9} {'tokens':>8}")
+        if view == "orders":
+            for order in lines:
+                _print_bill_line(order["total"])
+            continue
+        for line in lines:
+            _print_bill_line(line)
+    rows = bill.get("turn_rows") or []
+    if rows:
+        # Not a charge and deliberately outside the bill: the same context is re-read on
+        # every API call of a turn, and what was PAID for is the reading. This is the
+        # /context statistic — the column that shows an order bloating, which is the
+        # other reason someone runs this command.
+        print("\nhow the context grew (not a charge — the largest single API call of "
+              "each turn):")
+        print(f"{'turn':>4} {'kind':>8} {'dur':>6} {'calls':>6}  context peak")
+        for r in rows:
+            if not r["recorded"]:
+                print(f"{r['seq']:>4} {r['kind']:>8} {_dur(r['duration_s']):>6} "
+                      f"{'—':>6}  not recorded ({r['state']})")
+                continue
+            ctx = _tok(r["context_peak"])
+            if r.get("context_pct") is not None:
+                ctx += (f" ({r['context_pct']:.0f}% of "
+                        f"{_tok(r['context_window'])} window)")
+            print(f"{r['seq']:>4} {r['kind']:>8} {_dur(r['duration_s']):>6} "
+                  f"{r['api_calls'] or '—':>6}  {ctx}")
+    print(f"\nwhat each class of token cost ({_tok(total['tokens']['total'])} in all):")
+    classes = (
+        ("input", "fresh input", "base input rate — never cached"),
+        ("cache_write", "cache write", "1.25x base input at the 5-minute TTL, 2x at 1h"),
+        ("cache_read", "cache read", "0.1x base input — served from the cache"),
+        ("output", "output", "output rate, what the model wrote"),
+    )
+    for cls, label, why in classes:
+        print(f"{total['cost']['by_class'][cls]:>9.3f} "
+              f"{_tok(total['tokens'][cls]):>8}  {label:<12} {why}")
+    # What is NOT here, named. An absent line reads as an omission, and "was nothing at
+    # all spent on the OS?" was one of the four questions this surface exists to answer.
+    # Said in the terminal exactly as the page says it: a caveat that appears in one
+    # renderer and not the other is one the reader learns to ignore.
+    absent = {
+        "worker": "the worker's own session — nothing measurable (never dispatched, or "
+                  "its transcript and every turn's result JSON are gone)",
+        "jarvis": "jarvis spent nothing of its own — no Neo question, no panel, no "
+                  "digest",
+        "subprocesses": "no claude processes the worker spawned itself were recorded",
+    }
+    present = {line["key"] for line in bill.get("actors") or []}
+    missing = [text for key, text in absent.items() if key not in present]
+    if missing and bill["kind"] == "work_order":
+        print("\nnot on this bill:")
+        for text in missing:
+            print(f"  · {text}")
+    rewrite = bill.get("rewrite") or {}
+    if rewrite.get("tokens"):
+        print(f"\nre-write tax ~${rewrite['list_usd']:.2f} — "
+              f"{_tok(rewrite['tokens'])} tokens of context re-sent to the cache across "
+              f"{rewrite['boundaries']} turn "
+              f"boundar{'ies' if rewrite['boundaries'] != 1 else 'y'}. "
+              f"Not an extra charge: it is the "
+              f"part of the cache-write line above that paid to send context a warm "
+              f"cache would have served at a tenth of the price.")
+    subagents = bill.get("subagents") or {}
+    if subagents.get("count"):
+        print(f"{subagents['count']} subagent(s), ~${subagents['list_usd']:.2f}, "
+              f"itemised above under the turn each ran in — drawn out of that turn's "
+              f"total, never added to it")
+    for note in bill.get("notes") or []:
+        print(f"\n⚠ {note}")
+    print(f"\nEvery figure above is {bill['floor_reason']}.")
+    print("List prices, as a common unit for comparing token kinds — not a bill.")
+
+
 def cmd_cost(args: argparse.Namespace) -> int:
     from . import ops
     target = args.target
     # One argument, three kinds of thing. Ids are prefixed and projects are not, so
     # this never has to guess: anything that is not `wo-…`/`fo-…` is a project name.
     is_id = bool(target) and target.split("-")[0] in ("wo", "fo")
+    if is_id:
+        # One order asks "where did MY tokens go", which is the bill's question. The
+        # fleet view below asks "which orders cost the most", which is the report's.
+        bill = ops.bill(target)
+        if args.json:
+            _print(bill, True)
+            return 0
+        _print_bill(bill)
+        return 0
     res = ops.cost_report(project=None if is_id else target,
                           target=target if is_id else None, limit=args.limit)
     if args.json:
@@ -1074,6 +1251,48 @@ GATE_ICON = {"pending": "⏸", "approved": "✅", "denied": "⛔", "dismissed": 
              "expired": "⌛"}
 
 
+_ROLE_ICON = {"match": "✋", "exempt": "✓", "canary": "🔒"}
+
+
+def _print_gate_rules(data: dict) -> None:
+    """The rule base, grouped by role.
+
+    Canaries print last and without ceremony. They are not rules anyone consults; they
+    are the reason the other two groups can be changed at all, and the line that matters
+    about them is the one at the bottom saying they all still hold.
+    """
+    rules = data["rules"]
+    if not rules:
+        print("no gate rules")
+        return
+    for role in ("match", "exempt", "canary"):
+        group = [r for r in rules if r["role"] == role]
+        if not group:
+            continue
+        label = {"match": "recognisers", "exempt": "exemptions (learned)",
+                 "canary": "canaries — must always gate"}[role]
+        print(f"\n{label}  ({len(group)})")
+        for r in group:
+            retired = " ⊘ retracted" if r["retired_at"] else ""
+            hits = f" · {r['hits']} hits" if r["hits"] else ""
+            src = r["source"]
+            origin = f" · from gate {r['approval_id']}" if r["approval_id"] else ""
+            print(f"  {_ROLE_ICON[role]} {r['id']} [{r['kind'] or 'any'}] "
+                  f"{src}{origin}{hits}{retired}")
+            print(f"      {r['rendered'].splitlines()[0]}")
+            if r["reason"]:
+                print(f"      ↳ {r['reason']}")
+            if r["retired_at"]:
+                print(f"      ↳ retracted: {r['retired_reason']}")
+    failures = data["canary_failures"]
+    if failures:
+        print(f"\n⚠ {len(failures)} command(s) that MUST gate no longer do:")
+        for f in failures:
+            print(f"    {f['command'].splitlines()[0]} ({f['kind']}): {f['why']}")
+    else:
+        print("\n✓ every command that must gate still gates")
+
+
 def cmd_gate(args: argparse.Namespace) -> int:
     from . import ops
 
@@ -1130,6 +1349,38 @@ def cmd_gate(args: argparse.Namespace) -> int:
                 if q.get("answer"):
                     print(f"\nVerdict: {q['answer']} ({q.get('answered_by')})")
                     print(f"Reason: {q.get('answer_reason')}")
+    elif args.ga_cmd == "rules":
+        data = ops.list_gate_rules(role=args.role, kind=args.kind,
+                                   include_retired=args.all)
+        if args.json:
+            _print(data, True)
+        else:
+            _print_gate_rules(data)
+    elif args.ga_cmd == "rule-retract":
+        data = ops.retract_gate_rule(args.rule_id, args.reason)
+        if args.json:
+            _print(data, True)
+        else:
+            print(f"✓ {data['rule']['id']} retracted — {data['note']}")
+            for f in data["canary_failures"]:
+                print(f"⚠ {f['command'].splitlines()[0]} ({f['kind']}): {f['why']}")
+    elif args.ga_cmd == "explain":
+        data = ops.explain_gate(args.command, project_name=args.project)
+        if args.json:
+            _print(data, True)
+        else:
+            verdict = (f"GATED as `{data['gate']}`" if data["gated"]
+                       else "not gated")
+            print(f"{'✋' if data['gated'] else '✓'} {verdict}")
+            for line in data["trace"]:
+                print(f"    · {line}")
+            if data["gated"]:
+                print(f"    the literal appears {data['where']}")
+                print("    a dismissal of this " + (
+                    "COULD be generalised into a standing rule"
+                    if data["learnable"] else
+                    "could NOT be generalised — the literal is where the shell would "
+                    "run it"))
     elif args.ga_cmd in ("approve", "deny", "dismiss"):
         verdict = {"approve": "approved", "deny": "denied",
                    "dismiss": "dismissed"}[args.ga_cmd]

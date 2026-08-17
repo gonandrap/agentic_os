@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_bill.html" as bill_ui %}
 {% block title %}{{ wo.id }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -108,35 +109,17 @@
   {% if wo.result_summary %}
     <p class="kv"><strong>Result:</strong> {{ wo.result_summary }}</p>
   {% endif %}
-  {# What this one work order cost, read back from Claude Code's transcript. Absent
-     rather than zero when the transcript is gone: an unmeasurable cost and a zero cost
-     are different answers. #}
-  {% if cost %}
+  {# What this one work order cost. Deliberately TWO NUMBERS and a link: the total in
+     tokens and the total in dollars. Everything else — who spent it, on what, turn by
+     turn, and what each class of token cost — is one click away on the bill, where
+     there is room to itemise it. The line this replaced tried to say all of it at once
+     and answered none of it (wo-4576667e). Absent rather than zero when there is
+     nothing measurable: an unmeasurable cost and a zero cost are different answers. #}
+  {% if bill %}
   <p class="kv mono" style="margin-bottom:0;">
-    <span title="Anthropic list prices, as a common unit for comparing token kinds — not a bill. The worker's own conversation plus everything Jarvis spent on this order.">~${{ '%.2f'|format(cost.total_cost_usd) }}</span>
-    {# The split the total hides: what the worker cost, what the OS cost answering for
-       it, and what the worker spent below itself. A reader who only sees one number
-       concludes Neo is free and that an eval suite costs nothing. #}
-    {%- if cost.os_calls or cost.subproc_calls %}
-      · <span title="The worker's own session.">worker
-        {% if cost.found %}~${{ '%.2f'|format(cost.list_cost_usd) }}{% else %}not measurable{% endif %}</span>
-    {%- endif %}
-    {%- if cost.os_calls %}
-      · <span title="Neo answering this work order's questions, the panel's seats deliberating on them, and the dashboard digests written for them.">jarvis
-        ~${{ '%.2f'|format(cost.os_cost_usd) }} / {{ cost.os_calls }} call{{ 's' if cost.os_calls != 1 }}</span>
-    {%- endif %}
-    {%- if cost.subproc_calls %}
-      · <span title="claude processes this worker's own tool calls spawned — an eval suite, a script. Their tokens are this work order's cost, recorded as each call returned.">subprocesses
-        ~${{ '%.2f'|format(cost.subproc_cost_usd) }} / {{ cost.subproc_calls }} call{{ 's' if cost.subproc_calls != 1 }}</span>
-    {%- endif %}
-    · {{ fmt_tok(cost.billed_input) }} in / {{ fmt_tok(cost.output) }} out
-    · {{ cost.turns }} turn{{ 's' if cost.turns != 1 }}
-    {%- if cost.subagent_count %} · {{ cost.subagent_count }} subagent{{ 's' if cost.subagent_count != 1 }}
-      (~${{ '%.2f'|format(cost.subagent_cost_usd) }}){% endif %}
-    {%- if cost.rewrite_excess %} ·
-      <span title="Every turn after the first re-sends the whole conversation at the cache-write rate. Jarvis cannot fix the cause — it can only cost fewer turn boundaries.">re-write
-      tax ~${{ '%.2f'|format(cost.rewrite_cost_usd) }}</span>{% endif %}
-    · <a href="/cost">fleet →</a>
+    <span title="Anthropic list prices, as a common unit for comparing token kinds — not a bill.">~${{ '%.2f'|format(bill.total.cost.list_usd) }}</span>
+    · {{ fmt_tok(bill.total.tokens.total) }} tokens
+    · <a href="/cost/{{ project }}/{{ wo.id }}">details →</a>
   </p>
   {% endif %}
 </div>
@@ -202,8 +185,20 @@
   {% for msg in messages %}
   <div class="msg {{ 'user' if msg.direction == 'user_to_agent' }}">
     <div class="who">{{ 'you → worker' if msg.direction == 'user_to_agent' else 'worker → you' }}
-      · via {{ msg.source }} · {{ msg.status }} · {{ fmt_age(msg.ts) }} ago</div>
+      · via {{ msg.source }} · {{ msg.status }} · {{ fmt_age(msg.ts) }} ago
+      {#- What answering this message cost. It is the TURN's line, not a second
+          accounting of the message: a message is an ask, and the turn it set going is
+          what was paid for. Shown here because this is where the reader already is. -#}
+      {%- set line = turn_lines.get(msg.id) %}
+      {%- if line %} · <span class="mono">{{ bill_ui.money(line.cost.list_usd) }}
+        · {{ fmt_tok(line.tokens.total) }} tokens</span>{% endif %}</div>
     <div style="white-space: pre-wrap;">{{ msg.content }}</div>
+    {% if line %}
+    <details style="margin-top: 6px;">
+      <summary class="sub">what {{ line.label }} cost — the same line as on the bill</summary>
+      <div style="padding: 4px 0 2px;">{{ bill_ui.breakdown(line) }}</div>
+    </details>
+    {% endif %}
   </div>
   {% else %}
   <div class="empty">no messages yet</div>
@@ -215,6 +210,19 @@
     </form>
   </div>
 </div>
+
+{% if bill and bill.turns %}
+{# The same bill as `/cost/<project>/<id>`, turn by turn, on the page the reader is
+   already on. Expandable rather than printed: the numbers are here for the turn that
+   looks wrong, and a page that opens with a token table buries the conversation. #}
+<h2>Spend, turn by turn</h2>
+{{ bill_ui.view(bill.turns, bill.total, 'total for ' ~ wo.id) }}
+<p class="sub" style="margin-top: 8px;">
+  Every token this work order spent is on exactly one of those lines — the worker's own
+  turns, what Jarvis spent answering it, and what the worker's tool calls spawned
+  beneath it. <a href="/cost/{{ project }}/{{ wo.id }}">The full bill →</a>
+</p>
+{% endif %}
 
 <h2>Timeline</h2>
 <div class="panel">

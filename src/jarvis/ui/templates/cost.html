@@ -111,10 +111,11 @@
         {%- if u.subproc_calls %} · subprocesses ~${{ '%.2f'|format(u.subproc_cost_usd) }}
           ({{ u.subproc_calls }} claude process{{ 'es' if u.subproc_calls != 1 }})
         {%- endif %}
-        {# the drill-down: turn-by-turn cost and context growth. Present even when the
-           transcript is gone — recorded turn rows are the OS's own and outlive it. #}
+        {# the drill-down: the itemised bill, down to each turn and each call. Present
+           even when the transcript is gone — recorded turn rows and the OS's own call
+           records outlive it. #}
         · <a href="/cost/{{ u.project }}/{{ u.id }}"
-          >turns{% if u.recorded_turns %} ({{ u.recorded_turns }} recorded){% endif %} →</a>
+          >bill{% if u.recorded_turns %} ({{ u.recorded_turns }} turns recorded){% endif %} →</a>
       </div>
     </div>
     {% set m = status_meta.get(u.status, {'word': u.status, 'icon': '•', 'tone': 'muted'}) %}

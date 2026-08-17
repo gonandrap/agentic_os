@@ -2033,11 +2033,14 @@ def decide_gate(approval_id: int, verdict: str, reason: str = "",
             + (f" (by {approval['decided_by']})" if approval["decided_by"] else "")
         )
     store = ProjectStore(path)
+    central = CentralStore()
     try:
         gates.apply_decision(store, approval_id, verdict=verdict,
-                             reason=reason or "approved by the user", decided_by="user")
+                             reason=reason or "approved by the user", decided_by="user",
+                             central=central, project=name)
         store.clear_attention(approval["wo_id"])
     finally:
+        central.close()
         store.close()
     # The user has decided, so Neo's queued question (if it is still waiting) is moot.
     neo = NeoStore()
@@ -2130,6 +2133,109 @@ def list_gates(project_name: str | None = None, wo_id: str | None = None,
     return out
 
 
+def list_gate_rules(role: str | None = None, kind: str | None = None,
+                    include_retired: bool = False) -> dict[str, Any]:
+    """The rule base: what the OS believes is privileged, and what it has learned is not.
+
+    Returned with the canary report attached, because the two are only meaningful
+    together. "Fourteen exemptions" is a number nobody can act on; "fourteen exemptions
+    and every command that must gate still gates" is the claim the user is actually
+    owed.
+    """
+    from .gate_rules import ROLES, Rule, RuleSet
+
+    if role and role not in ROLES:
+        raise OpsError(f"unknown role {role!r} — expected one of {list(ROLES)}")
+    central = CentralStore()
+    try:
+        rows = central.gate_rules(role=role, kind=kind, include_retired=include_retired)
+        live = RuleSet.load(central)
+    finally:
+        central.close()
+    return {
+        "rules": [{**r, "rendered": Rule.from_row(r).render()} for r in rows],
+        "canary_failures": live.check_canaries(),
+    }
+
+
+def retract_gate_rule(rule_id: str, reason: str) -> dict[str, Any]:
+    """Retire a rule the user has overruled.
+
+    Retracting an EXEMPTION re-arms a gate, and needs no further thought. Retracting a
+    RECOGNISER disarms one, so the canary report is re-run afterwards and returned: if
+    the removal left a command that must gate ungated, the user finds out in the same
+    breath rather than the next time something ships unreviewed.
+    """
+    from .gate_rules import RuleSet
+
+    if not reason.strip():
+        raise OpsError("a retraction needs a reason — it is the only record of why the "
+                       "OS stopped believing something it acted on")
+    central = CentralStore()
+    try:
+        try:
+            rule = central.retract_gate_rule(rule_id, reason.strip())
+        except KeyError as e:
+            raise OpsError(str(e)) from e
+        except ValueError as e:
+            raise OpsError(str(e)) from e
+        failures = RuleSet.load(central).check_canaries()
+    finally:
+        central.close()
+    return {"rule": rule, "canary_failures": failures,
+            "note": ("retracted — it no longer applies, and the record keeps that it "
+                     "once did")}
+
+
+def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any]:
+    """Why this command would, or would not, trip a gate.
+
+    The diagnostic that a false positive used to require reading source code to get. A
+    gate record holds the exact string that fired, so pasting it here is a mechanical
+    two-minute answer to "why was this blocked" — which is the difference between
+    reporting a classifier defect and guessing at one.
+    """
+    from .gate_rules import (
+        KIND_NAMES,
+        RuleSet,
+        command_names,
+        reads_only,
+        scannable,
+        shape_of,
+    )
+
+    # Without a project, every gate is treated as live: the question being asked is what
+    # the RULES say, and answering it against an empty enabled-set would return "nothing
+    # fires" for a command that fires four gates in any project that has them on.
+    config = _project_gate_config(project_name) if project_name else None
+    enabled = config.enabled if config else frozenset(KIND_NAMES)
+    extra = config.extra_patterns if config else {}
+    central = CentralStore()
+    try:
+        rules = RuleSet.load(central)
+    finally:
+        central.close()
+    decision = rules.decide(command, enabled, extra)
+    out: dict[str, Any] = {
+        "command": command,
+        "gates_enabled": sorted(enabled),
+        "reads_only": reads_only(command),
+        "commands_in_chain": sorted(command_names(command)),
+        "scanned": scannable(command),
+        "trace": list(decision.trace),
+        "cleared_by": [{"rule": r, "kind": k, "pattern": p} for r, k, p in decision.cleared],
+        "gated": decision.match is not None,
+    }
+    if decision.match:
+        shape = shape_of(command, decision.match.pattern)
+        out["gate"] = decision.match.kind
+        out["matched"] = decision.match.pattern
+        out["rule"] = decision.match.rule_id
+        out["where"] = shape.describe() if shape else "unknown"
+        out["learnable"] = bool(shape and shape.exemptible)
+    return out
+
+
 def show_gate(approval_id: int, project_name: str | None = None) -> dict[str, Any]:
     """One approval request in full, including the text the reviewer saw."""
     from .neo_store import NeoStore
@@ -2208,23 +2314,35 @@ _SETTLED_TURN_STATES = ("done", "failed")
 
 
 def _turn_usage(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any] | None:
-    """A settled turn's recorded usage envelope, lazily backfilled from its outfile.
+    """A settled turn's recorded usage envelope, lazily (re-)derived from its outfile.
 
-    Rows reaped before `usage_json` existed carry NULL — but their outfile usually
-    still holds the full result JSON, so the first read parses it and writes the
-    envelope back. That is the whole migration story: history for every past work
-    order is recoverable on demand, and once written back it outlives the file.
+    Two migrations run through this one seam, and both are lazy for the same reason —
+    the outfile is still on disk for the overwhelming majority of turns, so history is
+    recoverable on demand and, once written back, outlives the file:
+
+    * Rows reaped before `usage_json` existed carry NULL.
+    * Rows written before `USAGE_SCHEMA_VERSION` 2 carry token totals read from the
+      result envelope's top-level `usage` object, which counts a fraction of the turn
+      (see `claude_cli.derive_turn_usage`). They are re-derived rather than trusted: a
+      table holding two incompatible counts in one column cannot be summed at all.
+
+    A stale envelope whose outfile is gone is returned AS IT IS, still stamped with its
+    old version, because a wrong number that says which reading produced it can be
+    labelled on the page — Neo asked for exactly that on question 121 — while dropping
+    it would report a turn that certainly cost something as having cost nothing.
     """
-    raw = turn.get("usage_json")
-    if raw:
-        return db.from_json(raw, None)
-    if turn.get("state") not in _SETTLED_TURN_STATES or not turn.get("outfile"):
-        return None
     from . import claude_cli
 
+    raw = turn.get("usage_json")
+    stored = db.from_json(raw, None) if raw else None
+    if isinstance(stored, dict) and \
+            stored.get("usage_v", 1) >= claude_cli.USAGE_SCHEMA_VERSION:
+        return stored
+    if turn.get("state") not in _SETTLED_TURN_STATES or not turn.get("outfile"):
+        return stored
     result = claude_cli.read_turn_result(Path(turn["outfile"]))
     if result is None or not result.usage:
-        return None
+        return stored
     store.set_turn_usage(turn["id"], db.to_json(result.usage))
     return result.usage
 
@@ -2239,6 +2357,9 @@ def _turn_row(turn: dict[str, Any], u: dict[str, Any] | None) -> dict[str, Any]:
         "started_at": turn["started_at"], "ended_at": turn.get("ended_at"),
         "duration_s": duration, "cost_usd": turn.get("cost_usd"),
         "recorded": u is not None,
+        # Which message set this turn going, where one did. It is the join that lets a
+        # message on the work order page show what answering it cost.
+        "msg_id": turn.get("msg_id"),
     }
     if u is None:
         return row
@@ -2247,6 +2368,13 @@ def _turn_row(turn: dict[str, Any], u: dict[str, Any] | None) -> dict[str, Any]:
     row.update({
         "cost_usd": turn["cost_usd"] if turn.get("cost_usd") is not None
         else u.get("total_cost_usd"),
+        # Which reading of the result envelope these numbers came from. A row still on
+        # version 1 counted a fraction of its turn and could not be re-derived (its
+        # outfile is gone), so every surface that shows it has to be able to say so.
+        "usage_v": u.get("usage_v") or 1,
+        # The turn's spend split by the model that served it — the CLI's own per-model
+        # accounting, which is where the token totals now come from.
+        "by_model": u.get("by_model") or [],
         "input": u.get("input") or 0,
         "cache_write": u.get("cache_write") or 0,
         "cache_read": u.get("cache_read") or 0,
@@ -2472,6 +2600,25 @@ COST_FLOOR_NOTE = (
     "a floor: `claude` processes a worker spawns outside Jarvis's own transport "
     "(a bare `claude -p` from a shell) leave nothing behind that names a work order"
 )
+
+
+def bill(target: str, project: str | None = None, *,
+         live: bool = False) -> dict[str, Any]:
+    """The itemised bill for one order — see `jarvis.bill`.
+
+    `cost_report` answers "what did the fleet cost" and is the right shape for a
+    listing; this answers "where did THIS order's tokens go" and is the right shape for
+    a page you can expand. One thin wrapper rather than a second import path, so every
+    surface — the CLI, the dashboard, anything later — reaches it the way it reaches
+    everything else in the OS.
+
+    A settled order's bill was sealed when it settled and comes back as it was sealed;
+    `live=True` recomputes it from whatever survives today, which is what a test that
+    compares the two needs and what nothing else should ask for.
+    """
+    from .bill import build
+
+    return build(target, project, live=live)
 
 
 def cost_report(project: str | None = None, target: str | None = None,
