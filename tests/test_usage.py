@@ -23,21 +23,26 @@ from jarvis import usage
 
 
 def row(mid: str, *, write: int = 0, read: int = 0, out: int = 0, plain: int = 0,
-        model: str = "claude-opus-5") -> dict:
-    """One assistant row, in the shape Claude Code writes."""
+        model: str = "claude-opus-5", ttl_1h: int = 0, ttl_5m: int = 0) -> dict:
+    """One assistant row, in the shape Claude Code writes.
+
+    `cache_creation` — the TTL the write bought — is nested one level down and is only
+    written when a test asks for it, because most rows in the wild predate it and the
+    module has to price those too.
+    """
+    usage_obj: dict = {
+        "input_tokens": plain,
+        "cache_creation_input_tokens": write,
+        "cache_read_input_tokens": read,
+        "output_tokens": out,
+    }
+    if ttl_1h or ttl_5m:
+        usage_obj["cache_creation"] = {"ephemeral_1h_input_tokens": ttl_1h,
+                                       "ephemeral_5m_input_tokens": ttl_5m}
     return {
         "type": "assistant",
         "timestamp": "2026-08-09T00:00:00.000Z",
-        "message": {
-            "id": mid,
-            "model": model,
-            "usage": {
-                "input_tokens": plain,
-                "cache_creation_input_tokens": write,
-                "cache_read_input_tokens": read,
-                "output_tokens": out,
-            },
-        },
+        "message": {"id": mid, "model": model, "usage": usage_obj},
     }
 
 
@@ -294,6 +299,48 @@ def test_cache_reads_are_a_tenth_and_writes_are_a_quarter_more(transcripts):
     assert usage.read_session("s1").total.list_cost_usd == pytest.approx(0.5)
     transcripts("s2", [row("m1", write=1_000_000)])
     assert usage.read_session("s2").total.list_cost_usd == pytest.approx(6.25)
+
+
+def test_a_one_hour_cache_write_costs_twice_input_not_a_quarter_more(transcripts):
+    """The TTL is a PRICE, and Jarvis bought the expensive one for months.
+
+    1.25x at the 5-minute TTL, 2x at the one-hour one (kn-f94abf34, measured over 1,075
+    transcripts). Every write a worker made before `FORCE_PROMPT_CACHING_5M` shipped was
+    a 1h write, so pricing them all at 1.25x understated the largest avoidable line in
+    the bill by 60% of itself. The split is reported per message and is used where it is
+    there.
+    """
+    transcripts("s1", [row("m1", write=1_000_000, ttl_1h=1_000_000)])
+    assert usage.read_session("s1").total.list_cost_usd == pytest.approx(10.0)
+    transcripts("s2", [row("m1", write=1_000_000, ttl_5m=1_000_000)])
+    assert usage.read_session("s2").total.list_cost_usd == pytest.approx(6.25)
+    # Half and half prices in between, and a message with no split at all stays on the
+    # 5-minute rate — the floor, and what this module has always charged.
+    transcripts("s3", [row("m1", write=1_000_000, ttl_1h=500_000, ttl_5m=500_000)])
+    assert usage.read_session("s3").total.list_cost_usd == pytest.approx(8.125)
+
+
+def test_the_split_is_a_ratio_when_it_covers_only_part_of_the_write(transcripts):
+    """A turn's envelope reports the split for PART of the turn while `modelUsage`
+    reports the whole; the ratio is what carries over, applied to all of it."""
+    priced = usage.priced("claude-opus-5", cache_write=1_000_000,
+                          cache_1h=80_000, cache_5m=20_000)
+    # 80% of the sample was 1h, so the whole million is priced at 1.25 + 0.8*0.75.
+    assert priced.list_cost_usd == pytest.approx(1_000_000 * 5 * 1.85 / 1e6)
+
+
+def test_the_bill_says_what_each_class_of_token_cost(transcripts):
+    """The line items. A total says how much; only the classes say where it went — and
+    they are priced 20x apart, so which one dominates IS the finding."""
+    transcripts("s1", [row("m1", plain=1_000, write=100_000, read=2_000_000,
+                           out=10_000)])
+    classes = usage.read_session("s1").total.cost_by_class
+    assert classes["input"] == pytest.approx(0.005)
+    assert classes["cache_write"] == pytest.approx(0.625)
+    assert classes["cache_read"] == pytest.approx(1.0)
+    assert classes["output"] == pytest.approx(0.25)
+    assert sum(classes.values()) == pytest.approx(
+        usage.read_session("s1").total.list_cost_usd)
 
 
 # -- merging --------------------------------------------------------------------------

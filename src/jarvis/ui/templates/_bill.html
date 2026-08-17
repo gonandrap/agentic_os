@@ -1,0 +1,185 @@
+{# The bill, as reusable parts: one line of a tree, and the itemisation inside it.
+
+   Imported by the bill page, the work order page and the feature order page, so that
+   "the same view for the whole order and for one turn of it" is one implementation
+   rather than three that drift. Every disclosure is a plain <details>: this dashboard
+   has no JavaScript, and expanding a bill must not be the thing that introduces it. #}
+
+{# A dollar figure. Never bare: `~` means it is priced at list rather than billed. #}
+{% macro money(usd, exact=false) -%}
+  {%- if exact %}${{ '%.2f'|format(usd) }}{% else %}~${{ '%.2f'|format(usd) }}{% endif -%}
+{%- endmacro %}
+
+{# The line items INSIDE one line: what each class of token cost, and at what rate.
+   This is the answer to "where was the money spent" — a bill whose only number is a
+   total explains nothing, and the four classes are priced 20x apart. #}
+{% macro breakdown(line) %}
+{% set t = line.tokens %}{% set c = line.cost.by_class %}
+<table style="margin: 4px 0 0; font-size: 13px;">
+  <tr><th style="text-align:left">what</th><th style="text-align:right">tokens</th>
+      <th style="text-align:right">rate</th><th style="text-align:right">at list</th>
+      <th style="text-align:left"></th></tr>
+  <tr><td>fresh input</td>
+      <td class="mono" style="text-align:right">{{ fmt_tok(t.input) }}</td>
+      <td class="mono sub" style="text-align:right">1×</td>
+      <td class="mono" style="text-align:right">${{ '%.3f'|format(c.input) }}</td>
+      <td class="sub">never cached — sent and read once</td></tr>
+  <tr><td>cache write</td>
+      <td class="mono" style="text-align:right">{{ fmt_tok(t.cache_write) }}</td>
+      <td class="mono sub" style="text-align:right">1.25–2×</td>
+      <td class="mono" style="text-align:right">${{ '%.3f'|format(c.cache_write) }}</td>
+      <td class="sub">stored in the prompt cache: 1.25× at the 5-minute TTL, 2× at the
+        one-hour one{% if t.cache_1h or t.cache_5m %} —
+        {{ fmt_tok(t.cache_1h) }} of it 1h, {{ fmt_tok(t.cache_5m) }} 5m,
+        where the CLI reported the split{% endif %}</td></tr>
+  <tr><td>cache read</td>
+      <td class="mono" style="text-align:right">{{ fmt_tok(t.cache_read) }}</td>
+      <td class="mono sub" style="text-align:right">0.1×</td>
+      <td class="mono" style="text-align:right">${{ '%.3f'|format(c.cache_read) }}</td>
+      <td class="sub">served from the cache — a tenth of the price of sending it</td></tr>
+  <tr><td>output</td>
+      <td class="mono" style="text-align:right">{{ fmt_tok(t.output) }}</td>
+      <td class="mono sub" style="text-align:right">—</td>
+      <td class="mono" style="text-align:right">${{ '%.3f'|format(c.output) }}</td>
+      <td class="sub">what the model wrote</td></tr>
+  <tr style="border-top: 1px solid var(--line)">
+      <td><strong>total</strong></td>
+      <td class="mono" style="text-align:right"><strong>{{ fmt_tok(t.total) }}</strong></td>
+      <td></td>
+      <td class="mono" style="text-align:right">
+        <strong>${{ '%.3f'|format(line.cost.list_usd) }}</strong></td>
+      <td class="sub">
+        {%- if line.exact_missing == 0 %}the CLI billed
+          ${{ '%.3f'|format(line.cost.exact_usd) }} for it
+        {%- elif line.cost.exact_usd %}the CLI's own figure covers
+          ${{ '%.3f'|format(line.cost.exact_usd) }} of this; the rest is priced at list
+        {%- else %}priced at list — no billed figure for this line{% endif -%}
+      </td></tr>
+</table>
+{% if line.models %}
+<p class="sub mono" style="margin: 4px 0 0;">
+  {{ line.models|join(' · ') }}
+  {%- if 1 in line.usage_versions %} · <span class="tone-warn">counted the old way</span>
+    — this line's result JSON is gone, so its tokens are the pre-fix reading and are
+    understated{% endif %}</p>
+{% endif %}
+{% endmacro %}
+
+{# One line of the tree, and everything under it. Recursive: the shape is the same at
+   every depth, which is the point — a feature order, an order, a turn and one seat of
+   a panel are all "some tokens, itemised". #}
+{% macro line(l, depth=0) %}
+<div style="border-top: 1px solid var(--line); padding: 8px 16px 8px {{ 16 + depth * 18 }}px;">
+  <details>
+    <summary>
+      <span style="display:inline-flex; gap:12px; align-items:baseline; width: calc(100% - 24px);">
+        <span class="grow" style="flex:1; min-width:0;">{{ l.label }}
+          {#- "turn 4 · 1 turn" says nothing twice: a count earns its place when there
+              is more than one of something, or when the label does not already name
+              the thing counted. An empty unit means the line MIXES kinds — a turn and
+              the subagents inside it — and "2 charges" would be a number about nothing,
+              so it is left off rather than guessed at. -#}
+          {%- if l.calls and l.unit != '' and not (l.calls == 1 and l.unit == 'turn') %} <span class="sub">·
+            {{- ' ' }}{{ l.calls }} {{ (l.unit or 'charge') }}{{- 's' if l.calls != 1 }}
+          </span>{% endif %}
+        </span>
+        <span class="mono sub" style="white-space:nowrap;">{{ fmt_tok(l.tokens.total) }}</span>
+        <span class="mono" style="white-space:nowrap; width: 76px; text-align:right;">
+          {{ money(l.cost.list_usd) }}</span>
+      </span>
+    </summary>
+    <div style="padding: 2px 0 6px;">
+      {% if l.note %}<p class="sub" style="margin: 2px 0 6px;">{{ l.note }}</p>{% endif %}
+      {{ breakdown(l) }}
+    </div>
+  </details>
+</div>
+{% for child in l.children %}{{ line(child, depth + 1) }}{% endfor %}
+{% endmacro %}
+
+{# A whole view — the by-actor tree or the by-turn tree — with its total under it, so
+   the claim "these add up" is checkable on the page and not only in a test. #}
+{% macro view(lines, total, caption) %}
+<div class="panel" style="margin-top: 10px;">
+  {% for l in lines %}{{ line(l) }}{% else %}
+  <div class="empty">nothing recorded</div>
+  {% endfor %}
+  <div class="row" style="border-top: 1px solid var(--line);">
+    <span class="grow"><strong>{{ caption }}</strong></span>
+    <span class="mono sub">{{ fmt_tok(total.tokens.total) }}</span>
+    <span class="mono" style="width: 76px; text-align: right;">
+      <strong>{{ money(total.cost.list_usd) }}</strong></span>
+  </div>
+</div>
+{% endmacro %}
+
+{# The headline: one dollar figure, one token figure, and the split the user asked to
+   see beside it — never a total whose tokens belong to something else. #}
+{% macro headline(bill) %}
+<div class="panel" style="margin-top: 14px; padding: 14px 16px;">
+  <p style="margin: 0 0 4px; font-size: 24px;" class="mono">
+    {{ money(bill.total.cost.list_usd) }}
+    <span class="sub" style="font-size: 15px;">·
+      {{ fmt_tok(bill.total.tokens.total) }} tokens</span></p>
+  <p class="kv mono" style="margin: 0 0 8px;">
+    {%- for l in bill.actors %}{{ l.label }} {{ money(l.cost.list_usd) }}
+      ({{ fmt_tok(l.tokens.total) }}){{ '  ·  ' if not loop.last }}{% endfor %}
+  </p>
+  <p class="sub" style="margin: 0;">
+    {%- if bill.total.exact_missing == 0 %}
+      The <code>claude</code> CLI's own billed figure for all of it is
+      ${{ '%.2f'|format(bill.total.cost.exact_usd) }}; the figure above re-prices the
+      same tokens at Anthropic list prices, which is the only currency every line can
+      be expressed in.
+    {%- elif bill.total.cost.exact_usd %}
+      The CLI's own billed figure covers
+      ${{ '%.2f'|format(bill.total.cost.exact_usd) }} of this;
+      {{ bill.total.exact_missing }} line{{ 's' if bill.total.exact_missing != 1 }}
+      could only be priced at list.
+    {%- else %}
+      Priced at Anthropic list prices — no billed figure survives for this order.
+    {%- endif %}
+  </p>
+  {# The self-check. Stated on the page rather than kept in a test, because "every token
+     is accounted for" is the claim this page makes and an unverifiable claim is a
+     slogan. #}
+  <p class="kv" style="margin: 8px 0 0;">
+    {%- if bill.checks.balanced %}
+      <span class="tone-ok">✓</span> <span class="sub">Every line below adds up to this
+      total — by actor, turn by turn, and agent by agent, all three.</span>
+    {%- else %}
+      <span class="tone-bad">✗ These lines do not add up:</span>
+      <span class="sub">{{ bill.checks.problems|join('; ') }}</span>
+    {%- endif %}
+  </p>
+  {{ provenance(bill.accuracy) }}
+</div>
+{% endmacro %}
+
+{# WHEN this bill was worked out, and what it could not see. A bill is sealed the moment
+   its order settles, because the evidence behind it — Claude Code's transcripts and the
+   CLI's result JSONs — is pruned on a schedule nobody controls. A figure computed today
+   from month-old sources is not the same claim as one frozen on the day, and the page
+   must not present them as if it were. #}
+{% macro provenance(acc) %}
+{% if acc %}
+<p class="kv sub" style="margin: 6px 0 0;">
+  {%- if acc.sealed_at %}
+    Sealed when this order settled, on {{ fmt_ts(acc.sealed_at) }}, and shown as sealed —
+    the records behind it expire, this figure does not.
+  {%- elif acc.live %}
+    Worked out just now, from records that are still live. It is sealed automatically
+    once the order settles.
+  {%- endif %}
+</p>
+{% if not acc.complete %}
+<div class="panel" style="margin: 8px 0 0; padding: 8px 10px; border-color: var(--warn);">
+  <p class="kv" style="margin: 0 0 4px;"><span class="tone-warn">This bill is a floor,
+    not a total.</span></p>
+  <ul class="sub" style="margin: 0; padding-left: 18px;">
+    {% for gap in acc.gaps %}<li>{{ gap }}</li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
+{% endif %}
+{% endmacro %}

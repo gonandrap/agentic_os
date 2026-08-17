@@ -224,6 +224,10 @@ class Daemon:
                     # handed and no others.
                     if sessions_by_project is not None:
                         self.track_injected_sessions(project, store, sessions_by_project)
+                    # After settlement, so an order that finished this tick is billed on
+                    # this tick — the evidence a bill is built from starts expiring the
+                    # moment the work stops.
+                    self.seal_bills(project, store)
                     # Last: check the state everything above just produced.
                     self.check_invariants(project, store)
                 self.central.touch_project(project.name)
@@ -249,6 +253,49 @@ class Daemon:
 
         from .notify import route_new_inbox
         route_new_inbox(self.central, self.catalog)
+
+    def seal_bills(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Freeze the bill of every order that has settled and has none yet.
+
+        A bill is built from Claude Code's session transcripts and the result JSONs the
+        CLI writes, and Claude Code prunes both on its own schedule. An order costed on
+        demand therefore gets CHEAPER the longer you leave it — not because it spent
+        less but because the evidence went away. Sealing at completion is what makes the
+        figure survive; doing it here rather than at each of the six places an order can
+        settle is what makes it impossible to forget one.
+
+        A few per tick: the first run after this ships meets every order the project has
+        ever completed, and a bill reads files off disk. The backlog drains within the
+        hour and nothing else waits on it.
+        """
+        from . import bill as bill_mod, db, usage
+
+        pending = store.unsealed_terminal_orders()
+        features = store.unsealed_terminal_features()
+        if not pending and not features:
+            return
+        # One index of Claude Code's transcript tree for the whole batch: it walks every
+        # project directory there is, and five orders would otherwise walk it five times.
+        index = usage.index_sessions()
+        for order in pending:
+            try:
+                bill_mod.seal(project.name, project.path, order, index=index)
+            except Exception:  # noqa: BLE001 — a bill must never stall the tick
+                log.exception("sealing the bill for %s failed", order["id"])
+                # Sealed EMPTY rather than left pending, so one order that cannot be
+                # costed does not park itself at the head of the queue and block every
+                # order behind it on every tick from now on.
+                store.seal_bill(order["id"], db.to_json(
+                    {"error": "this bill could not be computed when the order settled"}))
+        for feature in features:
+            try:
+                bill_mod.seal(project.name, project.path, feature,
+                              feature=True, index=index)
+            except Exception:  # noqa: BLE001
+                log.exception("sealing the bill for %s failed", feature["id"])
+                store.seal_bill(feature["id"], db.to_json(
+                    {"error": "this bill could not be computed when the order settled"}),
+                    feature=True)
 
     # -- 4. dispatch -------------------------------------------------------------
 

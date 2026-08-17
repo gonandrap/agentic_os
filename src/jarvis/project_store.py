@@ -300,6 +300,21 @@ ADDED_COLUMNS = {
         "parent_id": "TEXT REFERENCES feature_orders(id)",
         # `worker` or `planner` — see WO_KINDS.
         "kind": "TEXT NOT NULL DEFAULT 'worker'",
+        # THE SEALED BILL (`bill.build`), written once the order reaches a terminal
+        # status and never recomputed. The sources a bill is built from all expire:
+        # Claude Code prunes session transcripts and result JSONs on its own schedule,
+        # so an order costed on demand quietly SHRINKS as its evidence ages. Sealing it
+        # at completion is what makes "what did this cost" answerable a year later.
+        # NULL means not sealed yet — an open order, or one that completed before this
+        # column existed — and those are costed live, with the shortfall named.
+        "bill_json": "TEXT",
+        "bill_sealed_at": "REAL",
+    },
+    "feature_orders": {
+        # Same, one level up: a feature's bill is its children's, and children can be
+        # deleted. See the work_orders comment.
+        "bill_json": "TEXT",
+        "bill_sealed_at": "REAL",
     },
     "wo_turns": {
         # See the CREATE TABLE comment. Live databases already have `wo_turns`, so the
@@ -590,6 +605,36 @@ class ProjectStore:
         assert status in WO_STATUSES, status
         self.update_work_order(wo_id, status=status, **extra)
         self.add_event(wo_id, "status", {"status": status})
+
+    def seal_bill(self, order_id: str, payload_json: str, *, feature: bool = False,
+                  at: float | None = None) -> None:
+        """Freeze one order's bill. Written once; a re-seal would only lose detail."""
+        fields = {"bill_json": payload_json, "bill_sealed_at": at or db.now()}
+        if feature:
+            self.update_feature_order(order_id, **fields)
+        else:
+            self.update_work_order(order_id, **fields)
+
+    def unsealed_terminal_orders(self, limit: int = 5) -> list[dict[str, Any]]:
+        """Settled orders with no bill on record yet — oldest first, so a backlog drains.
+
+        Bounded because the first tick after this ships meets every order the project
+        has ever completed, and each bill reads transcripts off disk. A few per tick
+        costs nothing and clears a hundred orders in an hour.
+        """
+        marks = ", ".join("?" for _ in TERMINAL_STATUSES)
+        rows = self.conn.execute(
+            f"SELECT * FROM work_orders WHERE status IN ({marks}) AND bill_json IS NULL"
+            " ORDER BY updated_at LIMIT ?", (*TERMINAL_STATUSES, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def unsealed_terminal_features(self, limit: int = 2) -> list[dict[str, Any]]:
+        marks = ", ".join("?" for _ in FO_TERMINAL_STATUSES)
+        rows = self.conn.execute(
+            f"SELECT * FROM feature_orders WHERE status IN ({marks}) AND bill_json IS"
+            " NULL ORDER BY updated_at LIMIT ?", (*FO_TERMINAL_STATUSES, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def flag_attention(self, wo_id: str, reason: str) -> None:
         self.update_work_order(wo_id, needs_attention=1, attention_reason=reason)

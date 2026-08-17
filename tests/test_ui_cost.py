@@ -102,16 +102,70 @@ def test_cost_page_can_be_scoped_to_one_project(client, project, transcript):
     assert "not registered" in unknown.text
 
 
-def test_the_work_order_page_shows_what_that_work_order_cost(client, project,
-                                                             transcript):
+def test_the_work_order_page_shows_two_numbers_and_a_way_in(client, project,
+                                                            transcript):
+    """Total tokens, total dollars, and a link. Nothing else.
+
+    The line this replaced tried to say the whole bill in one row — worker, jarvis,
+    tokens, turns, re-write tax — and a reader could not answer any of the four
+    questions it raised (wo-4576667e). The itemisation moved to the bill, which has
+    room for it; what stays here is the two figures and the door.
+    """
     wo = ops.create_work_order("proj_a", "priced task")
     transcript("sess-priced", write_tok=200_000, out=10_000)
     give_session(project, wo["id"], "sess-priced")
 
     page = client.get(f"/wo/proj_a/{wo['id']}")
     assert page.status_code == 200
-    assert "200k in / 10k out" in page.text
-    assert "1 turn" in page.text
+    assert "210k tokens" in page.text
+    assert f'href="/cost/proj_a/{wo["id"]}"' in page.text
+    assert "details →" in page.text
+
+
+def test_the_work_order_page_bills_each_turn_where_the_reader_already_is(client,
+                                                                         project):
+    """The same bill, turn by turn, on the page the conversation is on.
+
+    Asked for explicitly (wo-4576667e): the bill has to be readable for the whole order
+    AND for one turn of it, and the turns have to add up to the order. Expandable, so a
+    page opened to read a conversation does not open on a token table.
+    """
+    wo = ops.create_work_order("proj_a", "billed in place")
+    add_recorded_turn(project, wo["id"], 0.05, 48_000)
+    add_recorded_turn(project, wo["id"], 0.07, 90_000)
+
+    page = client.get(f"/wo/proj_a/{wo['id']}")
+    assert page.status_code == 200
+    assert "Spend, turn by turn" in page.text
+    assert "turn 1" in page.text and "turn 2" in page.text
+    assert "<details>" in page.text                  # expandable, and no JavaScript
+    assert "cache write" in page.text                # the line items, in place
+    assert "Every token this work order spent is on exactly one of those lines" \
+        in page.text
+
+
+def test_a_message_carries_what_answering_it_cost(client, project):
+    """A message is an ask; the turn it set going is what was paid for.
+
+    Shown on the message and labelled as the turn's line, never as a second charge —
+    `wo_turns.msg_id` is the join, and the figure is the one already in the totals.
+    """
+    wo = ops.create_work_order("proj_a", "asked and answered")
+    add_recorded_turn(project, wo["id"], 0.05, 48_000)
+    store = ProjectStore(project)
+    try:
+        msg_id = store.queue_message(wo["id"], "please also do X", source="ui")
+        turn = store.list_turns(wo["id"])[0]
+        store.conn.execute("UPDATE wo_turns SET msg_id=? WHERE id=?",
+                           (msg_id, turn["id"]))
+        store.conn.commit()
+    finally:
+        store.close()
+
+    page = client.get(f"/wo/proj_a/{wo['id']}")
+    assert page.status_code == 200
+    assert "please also do X" in page.text
+    assert "the same line as on the bill" in page.text
 
 
 def test_a_work_order_with_no_transcript_shows_no_cost_line_at_all(client, project,
@@ -120,7 +174,7 @@ def test_a_work_order_with_no_transcript_shows_no_cost_line_at_all(client, proje
     wo = ops.create_work_order("proj_a", "never dispatched")
     page = client.get(f"/wo/proj_a/{wo['id']}")
     assert page.status_code == 200
-    assert "fleet →" not in page.text
+    assert "details →" not in page.text
 
 
 def test_a_broken_transcript_read_never_takes_the_work_order_page_down(
@@ -195,7 +249,11 @@ def test_the_drilldown_labels_a_transcript_only_work_order_an_estimate(
 
     page = client.get(f"/cost/proj_a/{wo['id']}")
     assert page.status_code == 200
-    assert "estimate" in page.text
+    assert "the conversation, from its transcript" in page.text
+    assert "no turns on record at all" in page.text
+    # The spend is real and itemised even so, and it lands on the line that says it
+    # belongs to no turn rather than being quietly attributed to one.
+    assert "outside any turn" in page.text
 
 
 # -- what Jarvis itself spent ---------------------------------------------------------
@@ -255,46 +313,70 @@ def test_a_work_order_with_no_transcript_still_shows_what_jarvis_spent_on_it(
     assert "+" in fleet.text and "no transcript left to measure" in fleet.text
     assert "jarvis ~$" in fleet.text
 
+    # The work order page keeps its two figures; the bill is where the halves are named,
+    # and the OS's half is on it even though the transcript is gone.
     page = client.get(f"/wo/proj_a/{wo['id']}")
-    assert "jarvis" in page.text and "3 calls" in page.text
-    assert "not measurable" in page.text
+    assert "details →" in page.text
+    bill = client.get(f"/cost/proj_a/{wo['id']}")
+    assert "what Jarvis spent on this order" in bill.text
+    assert "3 calls" in bill.text
 
 
-def test_the_work_order_page_shows_the_split_not_just_the_total(client, project,
-                                                                transcript):
+def test_the_bill_names_every_actor_and_the_tokens_each_spent(client, project,
+                                                              transcript):
+    """The user's fourth question: where are the tokens per actor.
+
+    A dollar figure per half was never the missing thing — the tokens were, because a
+    total in tokens beside a total in dollars that describe different scopes is what
+    made the old line unreadable.
+    """
     wo = ops.create_work_order("proj_a", "priced with help")
     transcript("sess-helped", write_tok=200_000, out=10_000)
     give_session(project, wo["id"], "sess-helped")
     add_os_calls(wo["id"], neo_calls=1)
 
-    page = client.get(f"/wo/proj_a/{wo['id']}")
+    page = client.get(f"/cost/proj_a/{wo['id']}")
     assert page.status_code == 200
-    assert "worker" in page.text and "jarvis" in page.text and "1 call" in page.text
+    assert "worker&#39;s own session" in page.text  # Jinja escapes the apostrophe
+    assert "what Jarvis spent on this order" in page.text
+    assert "1 call" in page.text
+    # Tokens beside dollars on every actor line, not only on the headline.
+    assert "210k" in page.text and "26k" in page.text
 
 
-def test_the_drilldown_lists_jarvis_own_calls_one_row_per_seat(client, project):
-    """The table that answers "why did an order I never touched cost three dollars"."""
+def test_the_bill_gives_each_panel_seat_its_own_line(client, project):
+    """The standing ruling — one row per seat, never one per question — rendered.
+
+    Which seat is dear is exactly what a panel's price is asked about, and an aggregate
+    answers it for none of them.
+    """
     wo = ops.create_work_order("proj_a", "panelled")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
     add_os_calls(wo["id"], seats=5, neo_calls=1)
 
     page = client.get(f"/cost/proj_a/{wo['id']}")
     assert page.status_code == 200
-    assert "What jarvis itself spent on" in page.text
+    assert "what Jarvis spent on this order" in page.text
     for seat in ("premise", "record", "blast", "taste", "chair"):
         assert seat in page.text
-    assert "panel seat 5" in page.text
+    assert "panel seat" in page.text and "5 calls" in page.text
 
 
-def test_the_drilldown_says_so_when_jarvis_spent_nothing(client, project):
+def test_the_bill_says_so_when_jarvis_spent_nothing(client, project):
     """Zero here is a real answer — the work order asked Neo nothing — and it is worth
-    saying, because the reader's next question is where the rest went."""
+    saying, because a line that is simply absent reads as a line that was left out.
+
+    This is the user's first question about the old surface ("not a single token spent
+    on the OS that wasn't jarvis?"): what is NOT on the bill has to be named too.
+    """
     wo = ops.create_work_order("proj_a", "self-sufficient")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
 
     page = client.get(f"/cost/proj_a/{wo['id']}")
     assert page.status_code == 200
-    assert "asked Neo nothing" in page.text
+    assert "What is not on this bill" in page.text
+    assert "asked Neo no questions" in page.text
+    assert "outside Jarvis's transport" in page.text  # literal prose, not escaped
 
 
 def test_the_cost_tab_is_reachable_from_every_page(client):
@@ -343,8 +425,8 @@ def test_the_drilldown_groups_subprocess_spend_by_what_ran_it(client, project):
 
     page = client.get(f"/cost/proj_a/{wo['id']}")
     assert page.status_code == 200
-    assert "claude processes it spawned itself" in page.text
-    assert "pytest" in page.text and "40" in page.text
+    assert "claude processes the worker spawned itself" in page.text
+    assert "pytest" in page.text and "40 calls" in page.text
 
 
 def test_every_cost_surface_says_the_figure_is_a_floor(client, project):
