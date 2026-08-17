@@ -1,0 +1,175 @@
+{% extends "base.html" %}
+{% import "_bill.html" as bill_ui %}
+{% block title %}bill — {{ bill.id }} — Jarvis{% endblock %}
+{% block content %}
+
+<h2>What {{ bill.id }} cost</h2>
+
+<div class="panel" style="padding: 10px 16px;">
+  <span class="kv">
+    <a href="/cost{{ '?project=' ~ bill.project if bill.project }}">← all work orders</a> ·
+    {% if bill.kind == 'feature_order' %}
+      <a href="/fo/{{ bill.project }}/{{ bill.id }}" class="mono">{{ bill.id }}</a>
+    {% else %}
+      <a href="/wo/{{ bill.project }}/{{ bill.id }}" class="mono">{{ bill.id }}</a>
+    {% endif %} ·
+    {{ bill.title }}
+  </span>
+</div>
+
+{{ bill_ui.headline(bill) }}
+
+{# The bill proper. By actor first, because "who spent it" is the question a reader
+   arrives with; the same tokens re-grouped by turn follow, because "when" is the
+   question they leave with. #}
+<h2>The bill — by who spent it</h2>
+{{ bill_ui.view(bill.actors, bill.total, 'total for ' ~ bill.id) }}
+
+{# What is NOT here, said out loud. The question that prompted this page was "not a
+   single token spent on the OS that wasn't jarvis?" — and the honest answer is a list
+   of the things that would appear if they had spent anything, plus the two that never
+   can. An absence nobody names reads as an omission. #}
+{% set present = bill.actors|map(attribute='key')|list %}
+<h2>What is not on this bill</h2>
+<div class="panel" style="padding: 14px 16px;">
+  <ul style="margin: 0; padding-left: 18px;">
+    {% if 'worker' not in present %}
+    <li class="sub">The worker's own session — nothing measurable. Either it was never
+      dispatched, or Claude Code has pruned the transcript AND the result JSON of every
+      turn is gone.</li>
+    {% endif %}
+    {% if 'jarvis' not in present %}
+    <li class="sub">Jarvis's own calls — <strong>nothing</strong>.
+      This order asked Neo no questions, no panel deliberated on it, and nothing was
+      digested for it. Every question a worker asks costs one Neo call (five when the
+      panel sits), and they would be itemised here.</li>
+    {% endif %}
+    {% if 'subprocesses' not in present %}
+    <li class="sub">Claude processes the worker spawned itself —
+      <strong>nothing recorded</strong>. An eval suite or a script run through Jarvis's
+      transport would be itemised here.</li>
+    {% endif %}
+    <li class="sub">Any <code>claude</code> call made outside Jarvis's transport — a
+      bare <code>claude -p</code> from a shell leaves nothing behind that names an
+      order, so it cannot be counted at all. This is why every figure here is a floor.</li>
+    <li class="sub">The user's own Jarvis sessions. Talking to Jarvis in a terminal or
+      the desktop app is not an order's spend and is never attributed to one.</li>
+  </ul>
+</div>
+
+{% if bill.kind == 'feature_order' %}
+<h2>The orders under it</h2>
+<div class="panel">
+  {% for order in bill.orders %}
+  <div class="row">
+    <span class="mono" style="width: 76px; text-align: right;">
+      {{ bill_ui.money(order.total.cost.list_usd) }}</span>
+    <div class="grow">
+      <a href="/cost/{{ order.project }}/{{ order.id }}">{{ order.title }}</a>
+      <div class="sub mono">{{ order.id }} ·
+        {{ fmt_tok(order.total.tokens.total) }} tokens ·
+        {{ order.turns|length }} turn{{ 's' if order.turns|length != 1 }} ·
+        <a href="/cost/{{ order.project }}/{{ order.id }}">its own bill →</a></div>
+    </div>
+    {% set m = status_meta.get(order.status, {'word': order.status, 'icon': '•', 'tone': 'muted'}) %}
+    <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
+  </div>
+  {% else %}
+  <div class="empty">this feature order has no work orders yet</div>
+  {% endfor %}
+</div>
+{% else %}
+
+<h2>The same tokens, turn by turn</h2>
+<p class="sub" style="margin: -4px 0 0;">
+  Every charge above appears exactly once below, on the turn that caused it — a worker
+  turn's own tokens, plus whatever Jarvis and the worker's subprocesses spent while it
+  ran or because of what it asked. Which is why the two totals are the same number.
+</p>
+{{ bill_ui.view(bill.turns, bill.total, 'total for ' ~ bill.id) }}
+
+{% if turn_rows %}
+<h2>How the context grew</h2>
+<div class="panel" style="overflow-x: auto;">
+  <table>
+    <tr><th>turn</th><th>kind</th><th>when</th><th>dur</th><th>API calls</th>
+      <th>context peak</th></tr>
+    {% for t in turn_rows %}
+    <tr>
+      <td class="mono">{{ t.seq }}</td>
+      <td class="mono">{{ t.kind }}</td>
+      <td class="mono" style="white-space: nowrap;">{{ fmt_age(t.started_at) }}</td>
+      <td class="mono">{{ fmt_dur(t.duration_s) }}</td>
+      <td class="mono">{{ t.api_calls or '—' }}</td>
+      <td>
+        {% if t.recorded %}
+        <span class="mono" style="white-space: nowrap;">{{ fmt_tok(t.context_peak) }}
+          {%- if t.context_pct is not none %} · {{ t.context_pct }}%{% endif %}</span>
+        {# the growth curve: one bar per turn, same scale all the way down #}
+        <div style="background: var(--raised); border: 1px solid var(--line);
+                    border-radius: 3px; height: 9px; width: 140px; margin-top: 3px;">
+          <div style="background: var(--cyan); height: 100%; border-radius: 3px;
+                      width: {{ (100 * t.context_peak / bar_scale)|round(1) }}%;"></div>
+        </div>
+        {% else %}
+        <span class="sub">not recorded ({{ t.state }})</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+<p class="sub" style="margin-top: 8px;">
+  “context peak” is the largest single API call of the turn against the model's window —
+  the headless <code>/context</code> statistic, and the column that shows an order
+  bloating. It is not a charge and appears nowhere in the bill above: the same context
+  is re-read on every call of the turn, and the bill counts what was read.
+</p>
+{% endif %}
+
+{% if bill.rewrite and bill.rewrite.tokens %}
+<h2>The re-write tax — {{ bill_ui.money(bill.rewrite.list_usd) }} of the above</h2>
+<div class="panel" style="padding: 14px 16px;">
+  <p class="kv" style="margin: 0 0 6px;">
+    <strong>Not an extra charge — a part of the cache-write line, named.</strong>
+    {{ fmt_tok(bill.rewrite.tokens) }} tokens of this order's context were sent to be
+    cached MORE THAN ONCE, across {{ bill.rewrite.boundaries }} turn
+    boundar{{ 'ies' if bill.rewrite.boundaries != 1 else 'y' }}.
+  </p>
+  <p class="sub" style="margin: 0;">
+    Every turn is a separate <code>claude --resume</code> process. Claude Code puts
+    <code>git status</code> in its system prompt, so a worker — whose job is editing
+    files — presents a different prompt prefix on its next turn, the cached conversation
+    is invalidated, and the whole of it is re-sent at the cache-WRITE rate (1.25–2×)
+    instead of being served at the cache-READ rate (0.1×). The cause is upstream and
+    Jarvis cannot fix it; what it can do is cost fewer boundaries, which is why sending
+    a worker one message beats sending it three.
+  </p>
+</div>
+{% endif %}
+
+{% if bill.subagents and bill.subagents.count %}
+<p class="sub" style="margin-top: 14px;">
+  {{ bill.subagents.count }} subagent{{ 's' if bill.subagents.count != 1 }} ran inside
+  this worker's turns, for about ${{ '%.2f'|format(bill.subagents.list_usd) }} of the
+  worker's own line. Not a line of its own: a subagent's tokens are already inside the
+  turn that spawned it, and adding them again would count them twice.
+</p>
+{% endif %}
+{% endif %}
+
+{% for note in bill.notes %}
+<p class="sub" style="margin-top: 10px;">⚠ {{ note }}</p>
+{% endfor %}
+
+<p class="sub" style="margin-top: 14px;">
+  Dollars are Anthropic list prices, a common unit for comparing a cache-read token with
+  an output token — not an invoice. Tokens are the figure that always reconciles; where
+  the <code>claude</code> CLI recorded its own billed figure it is shown beside them.
+</p>
+
+<p class="sub" style="margin-top: 6px;">
+  Every figure on this page is {{ bill.floor_reason }}.
+</p>
+
+{% endblock %}

@@ -333,6 +333,13 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
     # turn), so the whole reap-and-record path runs against the true field shape in
     # every pipeline test — `iterations` is one entry per API call, and the context
     # at a call is its input + cache_read + cache_creation.
+    #
+    # `modelUsage` IS DELIBERATELY LARGER THAN `usage`, in the same proportion the real
+    # CLI reports (measured over 186 live result files: the top-level object runs at
+    # 33-60% of the turn's true total, because it speaks for the tail of the turn while
+    # `modelUsage` speaks for all of it). A fake whose two agreed is what let the OS
+    # record the wrong one for months: every fixture agreed, so no test could tell which
+    # was being read. Keep them apart — three API calls' worth against one call's tail.
     print(json.dumps({
         "type": "result", "subtype": "success", "is_error": False,
         "session_id": sid, "result": f"final: {prompt[:60]}",
@@ -352,8 +359,8 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
                                                "ephemeral_5m_input_tokens": 0}}],
         },
         "modelUsage": {"claude-fake-1": {
-            "inputTokens": 3, "outputTokens": 100, "cacheReadInputTokens": 2000,
-            "cacheCreationInputTokens": 1000, "costUSD": 0.01,
+            "inputTokens": 9, "outputTokens": 300, "cacheReadInputTokens": 6000,
+            "cacheCreationInputTokens": 3000, "costUSD": 0.01,
             "contextWindow": 200000, "maxOutputTokens": 32000}},
     }))
 elif "-p" in argv and "--resume" not in argv:

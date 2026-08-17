@@ -264,9 +264,8 @@ def fmt_dur(seconds: float | None) -> str:
     return f"{seconds:.0f}s"
 
 
-def wo_cost(wo_id: str, project: str) -> dict | None:
-    """One work order's spend — the worker's and Jarvis's own — or None if neither can
-    be read.
+def wo_bill(wo_id: str, project: str) -> dict | None:
+    """One work order's itemised bill, or None if there is nothing measurable to show.
 
     NEVER RAISES, and that is the whole contract. This is a read of Claude Code's
     transcripts — files Jarvis does not own, that it prunes on its own schedule, and
@@ -274,14 +273,35 @@ def wo_cost(wo_id: str, project: str) -> dict | None:
     worker is blocked on a gate, and a page that 500s because a JSONL file moved would
     take that decision surface down with it. None means "no figure to show" and the
     template simply omits the line.
+
+    A bill with no tokens on it is None too: an order whose transcript has been pruned
+    and which cost the OS nothing has nothing to itemise, and a page of zeroes reads as
+    a claim that it was free.
     """
     try:
-        units = ops.cost_report(target=wo_id, project=project)["units"]
+        bill = ops.bill(wo_id, project=project)
     except Exception:  # noqa: BLE001 — see docstring
         return None
-    # `measurable`, not `found`: a work order whose transcript Claude Code has pruned may
-    # still have cost Neo four calls, and that half is the OS's own record.
-    return units[0] if units and units[0].get("measurable") else None
+    return bill if bill["total"]["tokens"]["total"] else None
+
+
+def turn_lines_by_message(bill: dict | None) -> dict[int, dict]:
+    """message id → the bill line for the turn that message set going.
+
+    So the conversation can carry its own cost: a message is the ASK, and what it cost
+    is the turn that answered it — the same line, the same numbers, shown where the
+    reader is already looking rather than only on a separate page. Never a second
+    accounting: it is a reference to a line that is already in the totals, which is why
+    the page says "the turn it started" rather than presenting it as the message's own.
+    """
+    if not bill:
+        return {}
+    out: dict[int, dict] = {}
+    for line in bill.get("turns") or []:
+        msg_id = (line.get("turn") or {}).get("msg_id")
+        if msg_id:
+            out[msg_id] = line
+    return out
 
 
 def create_app() -> FastAPI:
@@ -510,6 +530,7 @@ def create_app() -> FastAPI:
         finally:
             store.close()
         show_debug = debug not in ("", "0", "false")
+        bill = wo_bill(wo_id, pname)
         return render(request, "work_order.html", project=pname, wo=wo,
                       rate_limit=rate_limit,
                       timeline=build_timeline(wo, events, messages,
@@ -517,7 +538,8 @@ def create_app() -> FastAPI:
                                               questions=ops.neo_question_texts(wo_id)),
                       debug=show_debug, debug_count=count_debug(events),
                       messages=messages, assumptions=assumptions,
-                      approvals=approvals, cost=wo_cost(wo_id, pname))
+                      approvals=approvals, bill=bill,
+                      turn_lines=turn_lines_by_message(bill))
 
     @app.get("/cost", response_class=HTMLResponse)
     def cost_page(request: Request, project: str = ""):
@@ -537,33 +559,27 @@ def create_app() -> FastAPI:
                       project=project,
                       projects=sorted(ops.registered_project_paths()))
 
-    @app.get("/cost/{name}/{wo_id}", response_class=HTMLResponse)
-    def cost_wo_page(request: Request, name: str, wo_id: str):
-        """One work order's spend, turn by turn — where a bloated order shows itself.
+    @app.get("/cost/{name}/{order_id}", response_class=HTMLResponse)
+    def bill_page(request: Request, name: str, order_id: str):
+        """One order's itemised bill — the page that answers "where did my tokens go".
 
-        The rows come from the recorded result JSON of each turn (exact), with the
-        context peak drawn as a bar against the model's window so the growth across
-        turns is visible at a glance. Provenance is stated on the page: turns that
-        exist only in transcripts are listed as the estimates they are, never merged
-        into the recorded figures.
+        Work orders and feature orders share it, because the question and the answer's
+        shape are the same and only the depth differs: a feature order's bill expands
+        into its orders, each order's into its turns, each turn's into the worker, the
+        OS calls it caused and the processes it spawned. `jarvis.bill` reconciles every
+        level before rendering, and the page states the result rather than assuming it.
         """
         try:
-            report = ops.cost_report(target=wo_id, project=name)
+            bill = ops.bill(order_id, project=name)
         except ops.OpsError as e:
-            return render(request, "error.html", message=str(e))
-        if "turns_detail" not in report:
-            return render(request, "error.html",
-                          message=f"{wo_id} has no per-turn view (only work orders do)")
-        turns = report["turns_detail"]
+            return render(request, "error.html", message=str(e), status_code=404)
+        turn_rows = bill.get("turn_rows") or []
         # Bars are scaled to the context window when any turn reports one, else to the
         # largest peak on the page — growth stays comparable either way.
-        scale = max([t.get("context_window") or 0 for t in turns]
-                    + [t.get("context_peak") or 0 for t in turns] + [1])
-        return render(request, "cost_wo.html", active="cost", report=report,
-                      unit=report["units"][0], turns=turns, project=name,
-                      bar_scale=scale,
-                      os_calls=report.get("os_calls_detail") or [],
-                      subproc=report.get("subproc_detail") or [])
+        scale = max([t.get("context_window") or 0 for t in turn_rows]
+                    + [t.get("context_peak") or 0 for t in turn_rows] + [1])
+        return render(request, "bill.html", active="cost", bill=bill, project=name,
+                      turn_rows=turn_rows, bar_scale=scale)
 
     @app.get("/inbox", response_class=HTMLResponse)
     def inbox(request: Request):

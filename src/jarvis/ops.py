@@ -2208,23 +2208,35 @@ _SETTLED_TURN_STATES = ("done", "failed")
 
 
 def _turn_usage(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any] | None:
-    """A settled turn's recorded usage envelope, lazily backfilled from its outfile.
+    """A settled turn's recorded usage envelope, lazily (re-)derived from its outfile.
 
-    Rows reaped before `usage_json` existed carry NULL — but their outfile usually
-    still holds the full result JSON, so the first read parses it and writes the
-    envelope back. That is the whole migration story: history for every past work
-    order is recoverable on demand, and once written back it outlives the file.
+    Two migrations run through this one seam, and both are lazy for the same reason —
+    the outfile is still on disk for the overwhelming majority of turns, so history is
+    recoverable on demand and, once written back, outlives the file:
+
+    * Rows reaped before `usage_json` existed carry NULL.
+    * Rows written before `USAGE_SCHEMA_VERSION` 2 carry token totals read from the
+      result envelope's top-level `usage` object, which counts a fraction of the turn
+      (see `claude_cli.derive_turn_usage`). They are re-derived rather than trusted: a
+      table holding two incompatible counts in one column cannot be summed at all.
+
+    A stale envelope whose outfile is gone is returned AS IT IS, still stamped with its
+    old version, because a wrong number that says which reading produced it can be
+    labelled on the page — Neo asked for exactly that on question 121 — while dropping
+    it would report a turn that certainly cost something as having cost nothing.
     """
-    raw = turn.get("usage_json")
-    if raw:
-        return db.from_json(raw, None)
-    if turn.get("state") not in _SETTLED_TURN_STATES or not turn.get("outfile"):
-        return None
     from . import claude_cli
 
+    raw = turn.get("usage_json")
+    stored = db.from_json(raw, None) if raw else None
+    if isinstance(stored, dict) and \
+            stored.get("usage_v", 1) >= claude_cli.USAGE_SCHEMA_VERSION:
+        return stored
+    if turn.get("state") not in _SETTLED_TURN_STATES or not turn.get("outfile"):
+        return stored
     result = claude_cli.read_turn_result(Path(turn["outfile"]))
     if result is None or not result.usage:
-        return None
+        return stored
     store.set_turn_usage(turn["id"], db.to_json(result.usage))
     return result.usage
 
@@ -2239,6 +2251,9 @@ def _turn_row(turn: dict[str, Any], u: dict[str, Any] | None) -> dict[str, Any]:
         "started_at": turn["started_at"], "ended_at": turn.get("ended_at"),
         "duration_s": duration, "cost_usd": turn.get("cost_usd"),
         "recorded": u is not None,
+        # Which message set this turn going, where one did. It is the join that lets a
+        # message on the work order page show what answering it cost.
+        "msg_id": turn.get("msg_id"),
     }
     if u is None:
         return row
@@ -2247,6 +2262,13 @@ def _turn_row(turn: dict[str, Any], u: dict[str, Any] | None) -> dict[str, Any]:
     row.update({
         "cost_usd": turn["cost_usd"] if turn.get("cost_usd") is not None
         else u.get("total_cost_usd"),
+        # Which reading of the result envelope these numbers came from. A row still on
+        # version 1 counted a fraction of its turn and could not be re-derived (its
+        # outfile is gone), so every surface that shows it has to be able to say so.
+        "usage_v": u.get("usage_v") or 1,
+        # The turn's spend split by the model that served it — the CLI's own per-model
+        # accounting, which is where the token totals now come from.
+        "by_model": u.get("by_model") or [],
         "input": u.get("input") or 0,
         "cache_write": u.get("cache_write") or 0,
         "cache_read": u.get("cache_read") or 0,
@@ -2472,6 +2494,20 @@ COST_FLOOR_NOTE = (
     "a floor: `claude` processes a worker spawns outside Jarvis's own transport "
     "(a bare `claude -p` from a shell) leave nothing behind that names a work order"
 )
+
+
+def bill(target: str, project: str | None = None) -> dict[str, Any]:
+    """The itemised bill for one order — see `jarvis.bill`.
+
+    `cost_report` answers "what did the fleet cost" and is the right shape for a
+    listing; this answers "where did THIS order's tokens go" and is the right shape for
+    a page you can expand. One thin wrapper rather than a second import path, so every
+    surface — the CLI, the dashboard, anything later — reaches it the way it reaches
+    everything else in the OS.
+    """
+    from .bill import build
+
+    return build(target, project)
 
 
 def cost_report(project: str | None = None, target: str | None = None,
