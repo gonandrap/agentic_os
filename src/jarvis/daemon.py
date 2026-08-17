@@ -457,8 +457,10 @@ class Daemon:
         rather than a number of its own in the ordering below.
 
         Exactly-once by a cursor in `os_state`, not by scanning a time window: a
-        standing error must not re-notify every five seconds. Returns the number of new
-        errors found.
+        standing error must not re-notify every five seconds. `read_errors` additionally
+        drops anything older than its reporting window, which is what stops the *first*
+        tick after a fresh install — or after any loss of the cursor — from announcing a
+        log's whole history as news. Returns the number of new errors found.
         """
         from . import uilog
 

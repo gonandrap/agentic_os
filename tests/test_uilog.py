@@ -78,6 +78,66 @@ def test_a_replaced_log_restarts_from_the_top_instead_of_going_silent(jarvis_hom
     assert [e.path for e in errors] == ["/two"]
 
 
+def _write_entry(when: str, path: str) -> None:
+    """One well-formed entry at an arbitrary timestamp — `record_error` only ever
+    stamps *now*, and ageing is exactly what these tests are about."""
+    with uilog.ui_log_path().open("a") as f:
+        f.write(f"{when} [ERROR] GET {path} — RuntimeError: stale\n"
+                "    Traceback (most recent call last):\n")
+
+
+def _stamp(seconds_ago: float) -> str:
+    return time.strftime(uilog._STAMP, time.localtime(time.time() - seconds_ago))
+
+
+def test_a_cold_start_does_not_announce_a_log_full_of_history(jarvis_home):
+    """The 0.5.5 regression: `check_ui_log` shipped a release *after* the log writer,
+    so the first tick found a week-old `ui.log`, had no cursor, resumed at byte 0 and
+    alerted the user to four errors that had been fixed for a week. An announcement is
+    for what is broken NOW; the same trap waits on every fresh install and on any loss
+    of `os_state`.
+    """
+    uilog.ui_log_path().parent.mkdir(parents=True, exist_ok=True)
+    for i in range(4):
+        _write_entry(_stamp(7 * 24 * 3600), f"/neo{i}")
+
+    errors, cursor = uilog.read_errors()
+
+    assert errors == []
+    # The cursor still advances past them: they are read and dismissed, not re-read
+    # into the same silence on every one of the daemon's five-second ticks.
+    assert cursor.startswith(f"{uilog.ui_log_path().stat().st_size}:")
+
+
+def test_a_cold_start_still_announces_a_recent_error(jarvis_home):
+    """The bound is the entries' age, not the absence of a cursor. Skipping straight to
+    EOF whenever `os_state` has no cursor would be simpler and would go silent on a live
+    crash loop — the one failure mode this module refuses.
+    """
+    uilog.ui_log_path().parent.mkdir(parents=True, exist_ok=True)
+    _write_entry(_stamp(7 * 24 * 3600), "/ancient")
+    _write_entry(_stamp(60), "/still-broken")
+
+    errors, _ = uilog.read_errors()
+
+    assert [e.path for e in errors] == ["/still-broken"]
+
+
+def test_a_replaced_log_re_announces_only_what_is_still_recent(jarvis_home):
+    """The age bound and the restart-from-the-top rule have to compose: rotation puts
+    the reader back at byte 0, and without the filter that re-announces the file's whole
+    history a second time."""
+    uilog.record_error("GET", "/one", _boom("first"))
+    _, cursor = uilog.read_errors()
+
+    uilog.ui_log_path().write_text("")  # rotated out from under us
+    _write_entry(_stamp(7 * 24 * 3600), "/ancient")
+    uilog.record_error("GET", "/two", _boom("second"))
+
+    errors, _ = uilog.read_errors(cursor)
+    assert [e.path for e in errors] == ["/two"]
+
+
 def test_the_log_rotates_instead_of_growing_without_bound(jarvis_home, monkeypatch):
     """A dashboard stuck in a crash loop must not fill the state directory."""
     monkeypatch.setattr(uilog, "MAX_BYTES", 400)
