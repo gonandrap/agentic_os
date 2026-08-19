@@ -316,7 +316,18 @@ def test_asking_when_already_approved_says_so(fleet):
 def test_worker_waiting_on_a_gate_is_not_filed_as_abandoned(fleet, fake_claude):
     """A worker that files a request and ends its turn, as instructed, goes idle. The
     reconciler used to read that as "finished without `jarvis wo finish`" and hand the
-    user a review for a work order that is simply waiting."""
+    user a review for a work order that is simply waiting.
+
+    Neo is switched off for this tick, and that is the PRECONDITION rather than tidying:
+    the claim is about a gate still awaiting a verdict. `Daemon.neo_tick` submits the
+    drain to a thread pool and returns, so with Neo on, whether a verdict lands before
+    the assertions below is a race — and either outcome of it flags attention
+    legitimately (an escalated verdict at `daemon.py:968`, a failed one at `:683`). The
+    race is invisible locally, where the drain always loses, and it cost the 3.13 shard
+    a red build on identical code that 3.11 and 3.12 passed: the signature kn-95a32178
+    names. Leaving it to chance would make this test pass for a reason it does not state.
+    """
+    fleet.daemon.catalog.os.neo.enabled = False
     ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh", why="a")
 
     store = fleet.store()
@@ -331,6 +342,9 @@ def test_worker_waiting_on_a_gate_is_not_filed_as_abandoned(fleet, fake_claude):
     store = fleet.store()
     try:
         wo = store.get_work_order(fleet.wo_id)
+        # The precondition, asserted rather than assumed: the gate is what this work
+        # order is waiting on, and nothing has decided it.
+        assert store.pending_approvals(fleet.wo_id)
         assert wo["status"] == "waiting_input"
         assert wo["needs_attention"] == 0
         assert "idle without" not in (wo["attention_reason"] or "")
