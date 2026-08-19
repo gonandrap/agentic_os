@@ -58,6 +58,26 @@ from . import db, usage as usage_mod
 #: understate exactly the expensive order someone is investigating, so `checks` says so.
 CALL_LIMIT = 20_000
 
+#: How many per-API-call rows one TURN carries into the sealed bill. A bill is frozen
+#: into `work_orders.bill_json` when the order settles, so this array is stored, not
+#: derived on demand — and a long turn can run to hundreds of calls, which is a size a
+#: seal should not grow without a bound. The ones kept are the DEAREST, because "which
+#: call cost that" is the question the list exists to answer; the rest are counted and
+#: their totals reported on `calls_folded`, never silently dropped.
+TURN_CALL_LIMIT = 200
+
+#: Schema version of a SEALED payload. A bill is frozen when its order settles, because
+#: every source it is built from expires (kn-3629fa87) — but that froze the SHAPE too,
+#: so a bill sealed before per-call rows existed could never have them, not even while
+#: the transcript behind it was still on disk. Bumping this re-derives such a seal ONCE,
+#: and only while recomputing still sees everything the seal holds; see `_upgrade_seal`.
+#: Bump it when a field is added that a reader of an old bill would otherwise never get.
+#:
+#: 1 — the original payload.
+#: 2 — per-API-call rows on each turn (`call_rows`), the `api_calls` count taken from
+#:     the transcript rather than from the envelope's sample, and `cost.write_rate`.
+PAYLOAD_VERSION = 2
+
 #: The actor a line belongs to. Three, because they are three different KINDS of spend
 #: and the user's first question about the old line was why the OS's half looked like
 #: one thing: the worker's own conversation, what Jarvis spent thinking about the order
@@ -131,6 +151,68 @@ class Item:
 _UNSET = object()
 
 
+#: What the `tokens` figure on every line of this bill counts. Said once, here, and
+#: printed by both renderers, because "tokens: 517k" on a turn that read 68k of context
+#: is a number nobody can interpret without it: it is a SUM OVER THE TURN'S API CALLS,
+#: not a size. The four classes are 20x apart in price, so their sum is a workload
+#: measure and never a context measure — `context peak` is the one that is a size.
+TOKENS_MEAN = ("every token the API billed for, of all four classes added together — "
+               "fresh input + cache write + cache read + output. It is a sum over the "
+               "API calls underneath, not a context size: a turn of 11 calls each "
+               "re-reading a 55k conversation reads 517k, and the biggest single call "
+               "is what 'context peak' reports")
+
+
+def write_rate_of(line: dict[str, Any]) -> float:
+    """The multiple this line's cache-write tokens were charged at.
+
+    Reads the exact token-weighted figure `_settle_rate` put on the line, and falls back
+    to the ratio of the line's own TTL split for a bill SEALED before that field existed
+    — every bill on disk today. The fallback is the same arithmetic `usage.write_rate`
+    does, one level coarser (a folded ratio rather than a per-item weighting), which is
+    close and never the wrong end of the range; defaulting to the 1.25x floor instead
+    would print `1.25x` beside a line whose own split says two thirds of it was 2x.
+    """
+    rate = line.get("cost", {}).get("write_rate")
+    if isinstance(rate, (int, float)) and rate:
+        return float(rate)
+    tokens = line["tokens"]
+    return usage_mod.write_rate(tokens["cache_write"], tokens.get("cache_1h", 0),
+                                tokens.get("cache_5m", 0))
+
+
+def rate_note(line: dict[str, Any], fmt: Any = None) -> str:
+    """Why this line's cache writes cost the multiple they cost.
+
+    A cache WRITE is 1.25x base input at the 5-minute TTL and 2x at the one-hour one,
+    and the split decides. Every surface used to print the range `1.25–2x` beside a
+    figure already computed from the split, which tells the reader the price list when
+    what they are looking at is the price paid — so the rate is now the number, and
+    this is the sentence under it. Three cases, and they are genuinely different: the
+    split was measured, it was measured for PART of the line (the CLI reports it for a
+    sample of a turn, so `write_rate` applies the sample's RATIO to the whole), or it
+    was not reported at all and 1.25x is a floor rather than a finding.
+    """
+    fmt = fmt or (lambda n: f"{n:,}")
+    tokens = line["tokens"]
+    written = tokens["cache_write"]
+    hour, five = tokens["cache_1h"], tokens["cache_5m"]
+    known = hour + five
+    if not written:
+        return "nothing was written to the cache on this line"
+    if not known:
+        return ("the CLI reported no TTL split for these, so they are charged at the "
+                "5-minute rate of 1.25x — a floor, not a measurement; had they been "
+                "1-hour writes they would have cost 2x")
+    measured = (f"{fmt(five)} at the 5-minute TTL (1.25x), {fmt(hour)} at the "
+                f"one-hour TTL (2x)")
+    if known < written:
+        return (f"the CLI reported the TTL split for {fmt(known)} of these "
+                f"{fmt(written)} tokens — {measured} — and that sample's ratio prices "
+                f"the whole line")
+    return f"as the CLI reported them: {measured}"
+
+
 def _zero_tokens() -> dict[str, int]:
     return {c: 0 for c in usage_mod.TOKEN_CLASSES}
 
@@ -142,7 +224,12 @@ def _line(key: str, label: str, note: str = "") -> dict[str, Any]:
         "calls": 0,
         "tokens": {**_zero_tokens(), "cache_1h": 0, "cache_5m": 0,
                    "billed_input": 0, "cached_input": 0, "total": 0},
-        "cost": {"list_usd": 0.0, "exact_usd": 0.0, "by_class": _zero_class_costs()},
+        # `write_rate` is the multiple of base input price this line's cache-WRITE
+        # tokens actually cost, settled from `_write_weighted` once the items are in.
+        # A number and not a range: the range 1.25–2x is the price LIST, and what a
+        # reader of one line wants is the price PAID (see `_settle_rate`).
+        "cost": {"list_usd": 0.0, "exact_usd": 0.0, "by_class": _zero_class_costs(),
+                 "write_rate": usage_mod.CACHE_WRITE_RATE, "_write_weighted": 0.0},
         "exact_missing": 0,
         "unit": None,
         "models": [],
@@ -179,6 +266,12 @@ def _add_item(line: dict[str, Any], item: Item) -> None:
         item.model or "unknown", input=item.input, cache_write=item.cache_write,
         cache_read=item.cache_read, output=item.output,
         cache_1h=item.cache_1h, cache_5m=item.cache_5m)
+    # The same per-item rate, kept token-weighted so the line can report the multiple
+    # it PAID rather than the range it might have paid. Weighted by tokens rather than
+    # by dollars so a line mixing an Opus turn and a Haiku one still reports the rate
+    # its cache-write tokens were charged at, not a figure the price bands have moved.
+    line["cost"]["_write_weighted"] += item.cache_write * usage_mod.write_rate(
+        item.cache_write, item.cache_1h, item.cache_5m)
     for cls, value in classes.items():
         line["cost"]["by_class"][cls] += value
     line["cost"]["list_usd"] += sum(classes.values())
@@ -220,6 +313,7 @@ def _fold(items: Sequence[Item], key: Any, label: Any, note: Any = None,
             _add_item(line, item)
     for line in index.values():
         _settle_note(line)
+        _settle_rate(line)
     return roots
 
 
@@ -230,11 +324,28 @@ def _settle_note(line: dict[str, Any]) -> None:
         line["note"] = proposed
 
 
+def _settle_rate(line: dict[str, Any]) -> None:
+    """Turn the weighted accumulator into the one number a reader wants: the rate paid.
+
+    A cache write is 1.25x base input at the 5-minute TTL and 2x at the one-hour one,
+    and every surface used to print that RANGE — on a line whose tokens were, to the
+    token, all 5-minute. The range is the price list; this is the invoice. Where the
+    source reported no TTL split at all the accumulator is the 1.25x floor `write_rate`
+    charges, and `tokens.cache_1h + tokens.cache_5m == 0` is how a renderer tells the
+    floor apart from a measurement (`rate_note`).
+    """
+    cost = line["cost"]
+    weighted = cost.pop("_write_weighted", 0.0)
+    written = line["tokens"]["cache_write"]
+    cost["write_rate"] = (weighted / written) if written else usage_mod.CACHE_WRITE_RATE
+
+
 def _total_line(items: Sequence[Item], label: str) -> dict[str, Any]:
     line = _line("total", label)
     for item in items:
         _add_item(line, item)
     line.pop("_note", None)
+    _settle_rate(line)
     return line
 
 
@@ -360,6 +471,85 @@ def _subagents_by_turn(turn_rows: Sequence[dict[str, Any]],
         if seq in recorded:
             out.setdefault(seq, []).append(sub)
     return out
+
+
+def _attach_calls(turn_rows: Sequence[dict[str, Any]], session_id: str,
+                  index: dict[str, list[Path]] | None) -> None:
+    """Put the LEAD agent's API calls on the turn each ran in, and fix the count.
+
+    The bill's finest grain was a turn, and a turn is an agent LOOP: the model answers,
+    a tool runs, the model is called again with the result appended. Every call re-sends
+    the conversation, so a turn's `cache_read` is a sum over its calls — 517k on a turn
+    whose largest single call read 59k — and with no per-call rows there was no way to
+    see that from the bill. The transcript has them, one assistant message per call, and
+    on wo-e23252e4 turn 1 the eleven of them sum to the CLI's own `modelUsage` totals to
+    the token in all four classes. So this is a PARTITION of a figure already on the
+    bill, in the sense kn-7a2180ba means it, and never an addend.
+
+    It also settles `api_calls`, which said 1 for that eleven-call turn: it came from
+    `usage.iterations` in the result envelope, and that array is a SAMPLE of a turn (one
+    entry, carrying 679 of the turn's 58,913 written tokens), not one entry per call.
+    Where the transcript survives the count is the number of calls found; where it does
+    not, the envelope's figure stands and `calls_source` says which is which, because a
+    count from a sample and a count from the calls themselves are not the same claim.
+    """
+    calls = usage_mod.session_calls(session_id, index=index) if session_id else []
+    for row in turn_rows:
+        row["calls_source"] = "envelope"
+    if not calls or not turn_rows:
+        return
+    locate = _turn_locator(turn_rows)
+    buckets: dict[int, list[Any]] = {}
+    for call in calls:
+        seq = locate(call.ts)
+        if seq is not None:
+            buckets.setdefault(seq, []).append(call)
+    for row in turn_rows:
+        found = buckets.get(row["seq"]) or []
+        if not found:
+            continue
+        kept, folded = found, None
+        if len(found) > TURN_CALL_LIMIT:
+            # The dearest calls, because "which call cost that" is what the list answers.
+            # What is dropped is SAID rather than silently truncated: a list that stops
+            # at 200 with no note reads as a turn that made 200 calls. Selected by
+            # IDENTITY, not equality — two calls of a turn can carry identical counts,
+            # and a value-based difference would drop both and unbalance the fold.
+            dearest = sorted(range(len(found)),
+                             key=lambda i: found[i].total_tokens,
+                             reverse=True)[:TURN_CALL_LIMIT]
+            chosen = set(dearest)
+            kept = [found[i] for i in sorted(chosen)]
+            rest = [found[i] for i in range(len(found)) if i not in chosen]
+            folded = {
+                "count": len(rest),
+                **{cls: sum(getattr(c, cls) for c in rest)
+                   for cls in usage_mod.TOKEN_CLASSES},
+                "total": sum(c.total_tokens for c in rest),
+            }
+        row["call_rows"] = [call.as_dict() for call in kept]
+        row["calls_folded"] = folded
+        row["api_calls"] = len(found)
+        row["calls_source"] = "transcript"
+        # What these calls come to, beside what the turn came to. They are the LEAD
+        # agent's calls only — a subagent writes its own transcript and has its own row
+        # — so on a turn that spawned one they cover less than the whole, and the honest
+        # thing is to publish the difference rather than to let two figures sit next to
+        # each other unexplained. `reconcile` checks the one direction that would be a
+        # bug: a partition may fall short of its total, never exceed it.
+        row["calls_cover"] = {
+            **{cls: sum(getattr(c, cls) for c in found)
+               for cls in usage_mod.TOKEN_CLASSES},
+            "total": sum(c.total_tokens for c in found),
+        }
+        # The context a turn actually reached, from the calls themselves. The envelope's
+        # figure was right here by luck — its one sampled iteration happened to be the
+        # turn's last and therefore its largest — and it is a floor in general.
+        row["context_peak"] = max(row.get("context_peak") or 0,
+                                  max(c.context for c in found))
+        window = row.get("context_window") or 0
+        if window:
+            row["context_pct"] = round(100 * row["context_peak"] / window, 1)
 
 
 def _agent_items(row: dict[str, Any], models: Sequence[dict[str, Any]],
@@ -611,10 +801,59 @@ def build(target: str, project: str | None = None, *,
     if not live:
         sealed = unseal(order)
         if sealed is not None:
-            return sealed
+            upgraded = _upgrade_seal(name, path, order, sealed, feature=feature)
+            return upgraded if upgraded is not None else sealed
     if feature:
         return for_feature_order(name, path, order)
     return for_work_order(name, path, order)
+
+
+def _upgrade_seal(project: str, path: Path, order: dict[str, Any],
+                  sealed: dict[str, Any], *, feature: bool) -> dict[str, Any] | None:
+    """Re-derive a seal written before this module computed a field it computes now.
+
+    Sealing exists because the evidence expires, and freezing the numbers froze the
+    SHAPE with them: a bill sealed before per-call rows existed could never show them,
+    not even on an order whose transcript was still on disk. So a stored payload carries
+    `PAYLOAD_VERSION`, and an older one is recomputed ONCE — under the same rule sealing
+    already encodes, and this is the whole of it: the fresh computation is adopted only
+    if it still sees at least as many tokens as the seal holds, in every class. The
+    moment the transcript is pruned, recomputing loses tokens, the test fails, and the
+    seal stands untouched for good. A bill must never shrink because someone looked at
+    it again (kn-3629fa87), and this cannot make it.
+
+    `bill_sealed_at` is preserved: WHEN this order settled is not changed by re-deriving
+    its payload, and `accuracy.resealed_at` records that the re-derivation happened, so
+    the page is not quietly claiming today's reading was taken back then.
+
+    Returns None when there is nothing to upgrade or the evidence has gone — the caller
+    keeps the seal. Never raises: a bill that cannot be upgraded is still a bill.
+    """
+    from .project_store import ProjectStore
+
+    if (sealed.get("payload_v") or 1) >= PAYLOAD_VERSION:
+        return None
+    try:
+        fresh = (for_feature_order(project, path, order) if feature
+                 else for_work_order(project, path, order))
+        stale, now = sealed["total"]["tokens"], fresh["total"]["tokens"]
+        if any(now.get(cls, 0) < stale.get(cls, 0)
+               for cls in (*usage_mod.TOKEN_CLASSES, "total")):
+            return None
+        at = order.get("bill_sealed_at")
+        # Stamped BEFORE it is written, so the record on disk says it was re-derived
+        # too. Setting it only on the returned copy would make the fact visible exactly
+        # once — to this reader — and invisible to the next one.
+        fresh["accuracy"] = {**fresh["accuracy"], "sealed_at": at, "live": False,
+                             "resealed_at": db.now()}
+        store = ProjectStore(path)
+        try:
+            store.seal_bill(order["id"], db.to_json(fresh), feature=feature, at=at)
+        finally:
+            store.close()
+    except Exception:  # noqa: BLE001 — an upgrade that fails must not cost the reader
+        return None                                        # the bill they already have
+    return fresh
 
 
 def unseal(order: dict[str, Any]) -> dict[str, Any] | None:
@@ -695,10 +934,15 @@ def for_work_order(project: str, path: Path, wo: dict[str, Any],
     finally:
         central.close()
     session = usage_mod.read_session(wo.get("session_id") or "", index=index)
+    # Per-API-call detail, sealed onto the turn rows. Done BEFORE the items are built so
+    # that `api_calls` and `context_peak` are settled once, on the rows every surface
+    # reads, rather than corrected differently in each renderer.
+    _attach_calls(turn_rows, wo.get("session_id") or "", index)
     worker_items, notes = _turn_items(turn_rows, session)
     items = [*worker_items, *_call_items(calls, _turn_locator(turn_rows))]
     payload = {
         "kind": "work_order",
+        "payload_v": PAYLOAD_VERSION,
         "scope": wo["id"], "id": wo["id"], "title": wo["title"],
         "status": wo["status"], "project": project,
         "session_found": session.found,
@@ -757,6 +1001,7 @@ def for_feature_order(project: str, path: Path, fo: dict[str, Any],
             agent_items.extend(_relabel(line, child["id"], prefix=(child["id"],)))
     payload = {
         "kind": "feature_order",
+        "payload_v": PAYLOAD_VERSION,
         "scope": fo["id"], "id": fo["id"], "title": fo["title"],
         "status": fo["status"], "project": project,
         "total": _total_line(items, fo["id"]),
@@ -889,7 +1134,31 @@ def reconcile(payload: dict[str, Any], tolerance: float = 1e-6) -> dict[str, Any
         for line in lines:
             problems.extend(_check_children(line))
     problems.extend(_check_agents(payload))
+    problems.extend(_check_calls(payload))
     return {"balanced": not problems, "problems": problems}
+
+
+def _check_calls(payload: dict[str, Any]) -> list[str]:
+    """Per-call rows are a PARTITION of their turn, so they may not exceed it.
+
+    Checked in one direction only, and deliberately. A shortfall is ordinary and has a
+    meaning — these are the lead agent's calls, and a turn that spawned subagents spent
+    more than its lead agent did — while an excess is the thing kn-7a2180ba forbids: a
+    bill that grows when you look closer. On wo-e23252e4 the two sides are equal to the
+    token in all four classes on all three turns, which is what makes the per-call view
+    worth showing at all.
+    """
+    problems: list[str] = []
+    for row in payload.get("turn_rows") or []:
+        cover = row.get("calls_cover")
+        if not cover:
+            continue
+        for cls in usage_mod.TOKEN_CLASSES:
+            if cover[cls] > (row.get(cls) or 0):
+                problems.append(
+                    f"turn {row['seq']}: its API calls total {cover[cls]} {cls}, more "
+                    f"than the turn's own {row.get(cls) or 0}")
+    return problems
 
 
 def _check_agents(payload: dict[str, Any]) -> list[str]:

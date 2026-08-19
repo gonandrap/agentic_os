@@ -88,7 +88,10 @@ def test_read_turn_result_carries_the_usage_envelope(tmp_path):
     assert u["cache_1h"] == 2558
     assert u["cache_5m"] == 0
     assert u["output"] == 941
-    assert u["api_calls"] == 1
+    # Absent, not 1: `iterations` samples a turn rather than listing its calls, so the
+    # envelope alone cannot count them. `bill._attach_calls` fills this from the
+    # transcript, where one assistant message is exactly one API call.
+    assert u["api_calls"] is None
     assert u["context_peak"] == 2 + 45689 + 2558
     assert u["context_window"] == 1000000
     assert u["duration_api_ms"] == 15049
@@ -180,8 +183,15 @@ def test_a_result_with_no_model_usage_says_which_reading_it_is(tmp_path):
 
 
 def test_context_peak_is_the_max_over_iterations(tmp_path):
-    """`iterations` is what gives the exact per-call context size — the /context
-    statistic, headlessly. The peak is the largest call, not the sum."""
+    """`iterations` bounds the peak from below — every entry is a real call — but it
+    does NOT count the turn's calls.
+
+    It was read as one-entry-per-call and it is not: across 199 live result files it
+    holds exactly one entry in 196 of them, so `api_calls` reported 1 for an eleven-call
+    turn (wo-e23252e4). The count now comes from the transcript, where one assistant
+    message is exactly one API call, and is left absent here rather than guessed —
+    `bill._attach_calls` fills it in. The peak is still the largest call, never the sum.
+    """
     iterations = [
         {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 1_000,
          "cache_creation_input_tokens": 500, "type": "message"},
@@ -195,7 +205,8 @@ def test_context_peak_is_the_max_over_iterations(tmp_path):
 
     u = claude_cli.read_turn_result(out).usage
 
-    assert u["api_calls"] == 3
+    assert u["api_calls"] is None, "a count this envelope cannot know is not guessed"
+    assert u["iterations_sampled"] == 3
     assert u["context_peak"] == 3 + 80_000 + 7_000
 
 

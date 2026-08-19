@@ -810,11 +810,53 @@ def _print_provenance(acc: dict) -> None:
         when = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(acc["sealed_at"]))
         print(f"  sealed when this order settled, on {when} — the records behind it "
               f"expire, this figure does not")
+        if acc.get("resealed_at"):
+            again = _time.strftime("%Y-%m-%d %H:%M",
+                                   _time.localtime(acc["resealed_at"]))
+            print(f"  re-derived on {again} to add detail the original seal predates; "
+                  f"adopted only because it still saw every token the seal held")
     elif acc.get("live"):
         print("  worked out just now, from records that are still live; sealed "
               "automatically once the order settles")
     for gap in acc.get("gaps") or []:
         print(f"  ⚠ {gap}")
+
+
+def _print_turn_calls(rows: list[dict]) -> None:
+    """Every API call of every turn — the grain under the turn.
+
+    A turn is an agent LOOP, not one call: the model answers, a tool runs, the model is
+    called again with the result appended. Each call re-sends the conversation, so a
+    turn's cache-read is a SUM over its calls, and until this table existed there was no
+    way to see that a turn reading 517k was eleven calls re-reading one 55k conversation.
+    `ctx` is what a single call carried and is the figure that grows down the table;
+    `read` is what that call was billed for reading, and the two are the same number once
+    the prefix is warm. The last column is where the money went, call by call.
+    """
+    detailed = [r for r in rows if r.get("call_rows")]
+    if not detailed:
+        return
+    print("\nevery API call, turn by turn (these sum to the turn — the lead agent's "
+          "calls; a subagent has rows of its own):")
+    print(f"{'turn':>4} {'call':>5} {'ctx':>8} {'read':>8} {'wrote':>8} {'out':>7}  "
+          f"model")
+    for r in detailed:
+        for n, c in enumerate(r["call_rows"], 1):
+            print(f"{r['seq']:>4} {n:>5} {_tok(c['context']):>8} "
+                  f"{_tok(c['cache_read']):>8} {_tok(c['cache_write']):>8} "
+                  f"{_tok(c['output']):>7}  {c['model']}")
+        folded = r.get("calls_folded")
+        if folded:
+            # Never a silent cap: a list that just stops reads as a complete one.
+            print(f"{r['seq']:>4} {'…':>5} {'—':>8} {_tok(folded['cache_read']):>8} "
+                  f"{_tok(folded['cache_write']):>8} {_tok(folded['output']):>7}  "
+                  f"{folded['count']} further calls, folded into this line")
+        cover = r.get("calls_cover") or {}
+        if cover and cover.get("total", 0) < (r.get("input", 0) + r.get("cache_write", 0)
+                                              + r.get("cache_read", 0)
+                                              + r.get("output", 0)):
+            print(f"{'':>4} {'':>5}  these are the lead agent's calls; the rest of "
+                  f"turn {r['seq']} is the subagents it spawned, itemised above")
 
 
 def _print_bill(bill: dict) -> None:
@@ -824,6 +866,8 @@ def _print_bill(bill: dict) -> None:
     it, and when. They are two foldings of one set of charges, so they come to the same
     number, and `checks` says so on the page rather than leaving it to be trusted.
     """
+    from . import bill as bill_mod
+
     total = bill["total"]
     print(f"{bill['scope']} — {bill['title']}\n")
     exact = total["cost"]["exact_usd"]
@@ -878,16 +922,23 @@ def _print_bill(bill: dict) -> None:
                         f"{_tok(r['context_window'])} window)")
             print(f"{r['seq']:>4} {r['kind']:>8} {_dur(r['duration_s']):>6} "
                   f"{r['api_calls'] or '—':>6}  {ctx}")
+        _print_turn_calls(rows)
     print(f"\nwhat each class of token cost ({_tok(total['tokens']['total'])} in all):")
+    # The cache-write rate is the one this order PAID, worked out from the TTL split the
+    # CLI reported, and never the range `1.25–2x` — printing the price list beside a
+    # figure computed from the split tells the reader nothing they were asking.
+    rate = bill_mod.write_rate_of(total)
     classes = (
         ("input", "fresh input", "base input rate — never cached"),
-        ("cache_write", "cache write", "1.25x base input at the 5-minute TTL, 2x at 1h"),
+        ("cache_write", "cache write",
+         f"{rate:.2f}x base input — {bill_mod.rate_note(total, _tok)}"),
         ("cache_read", "cache read", "0.1x base input — served from the cache"),
         ("output", "output", "output rate, what the model wrote"),
     )
     for cls, label, why in classes:
         print(f"{total['cost']['by_class'][cls]:>9.3f} "
               f"{_tok(total['tokens'][cls]):>8}  {label:<12} {why}")
+    print(f"\n'tokens' above is {bill_mod.TOKENS_MEAN}.")
     # What is NOT here, named. An absent line reads as an omission, and "was nothing at
     # all spent on the OS?" was one of the four questions this surface exists to answer.
     # Said in the terminal exactly as the page says it: a caveat that appears in one

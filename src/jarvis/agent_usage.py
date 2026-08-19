@@ -122,7 +122,8 @@ def is_subprocess(kind: str) -> bool:
 
 def record(kind: str, *, usage: Any = None, project: str = "", wo_id: str = "",
            label: str = "", model: str = "", question_id: int | None = None,
-           ok: bool = True, store: CentralStore | None = None) -> int | None:
+           ok: bool = True, session_id: str = "",
+           store: CentralStore | None = None) -> int | None:
     """Persist one OS-side Claude call. Returns the row id, or None if nothing was written.
 
     `usage` takes either a `claude_cli.derive_turn_usage` envelope or the
@@ -133,6 +134,12 @@ def record(kind: str, *, usage: Any = None, project: str = "", wo_id: str = "",
     """
     if isinstance(usage, claude_cli.HeadlessResult):
         model = model or usage.model
+        # The session the CLI minted for this call, taken here because this is the last
+        # place it exists: a one-shot `claude -p` returns it once and Jarvis keeps no
+        # other handle on it. It is what lets an OS call be opened up per API call the
+        # way a worker turn is — most are a single call, but a TOOLED one loops just as
+        # a worker does, and that is the one worth being able to expand.
+        session_id = session_id or usage.session_id
         usage = usage.usage
     if usage is not None and not isinstance(usage, dict):
         usage = None
@@ -144,7 +151,7 @@ def record(kind: str, *, usage: Any = None, project: str = "", wo_id: str = "",
         store = store or CentralStore(spend_db_path())
         return store.add_agent_call(kind, project=project, wo_id=wo_id, label=label,
                                     model=model, question_id=question_id, ok=ok,
-                                    usage=usage)
+                                    session_id=session_id, usage=usage)
     except Exception:  # noqa: BLE001 — see the module docstring: never raise
         log.warning("could not record %s usage for %s", kind, wo_id or "the OS",
                     exc_info=True)

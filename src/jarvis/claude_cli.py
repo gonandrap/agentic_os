@@ -295,9 +295,14 @@ def derive_turn_usage(data: dict[str, Any]) -> dict[str, Any] | None:
     * token totals come from `modelUsage`, summed across the models the turn used, and
       `by_model` keeps them split (a turn that fell back to a cheaper model is a fact
       about the bill, not noise);
-    * `iterations` carries one entry per API call, so the context at a call is that
-      iteration's input + cache_read + cache_creation — `context_peak` is the max,
-      which is the /context statistic, available headlessly;
+    * `iterations` is a SAMPLE of the turn, not a list of its API calls. It was read as
+      one-entry-per-call and it is not: across 199 live result files it holds exactly
+      one entry in 196 of them, and that entry covers the whole turn's cache-write in
+      only 4 — on wo-e23252e4 turn 1 it carried 679 of the turn's 58,913 written tokens
+      while the turn made ELEVEN calls. So it bounds `context_peak` from below (any real
+      call's context is a real context) and it cannot count calls at all; the count now
+      comes from the transcript, where one assistant message is exactly one API call
+      (`usage.calls_of`), and `api_calls` is left None here rather than guessed;
     * the ephemeral 1h/5m split comes from `usage.cache_creation`, the only place it is
       reported at all;
     * `context_window` and per-model `costUSD` come from `modelUsage`.
@@ -370,7 +375,13 @@ def derive_turn_usage(data: dict[str, Any]) -> dict[str, Any] | None:
         **totals,
         "cache_1h": cache_creation.get("ephemeral_1h_input_tokens") or 0,
         "cache_5m": cache_creation.get("ephemeral_5m_input_tokens") or 0,
-        "api_calls": len(iterations) or data.get("num_turns"),
+        # NOT the number of API calls, and it never was — see the note above. A count
+        # this envelope cannot know is left absent rather than guessed: `bill._attach_
+        # calls` fills it from the transcript, where one assistant message IS one call,
+        # and a turn whose transcript is gone honestly shows no count at all.
+        "api_calls": None,
+        "iterations_sampled": len(iterations),
+        "num_turns": data.get("num_turns"),
         "context_peak": max(contexts),
         "context_window": max(windows) if windows else None,
         "duration_api_ms": data.get("duration_api_ms"),
