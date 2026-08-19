@@ -320,6 +320,22 @@ ADDED_COLUMNS = {
         # See the CREATE TABLE comment. Live databases already have `wo_turns`, so the
         # column only reaches them through here.
         "usage_json": "TEXT",
+        # WHY THE FAILURE DIAGNOSIS IS STORED AND THE PAUSE IS NOT. A pause is a verdict
+        # — re-derived from the latest turn every time it is asked for, so it cannot go
+        # stale (see worker_session's note, and Neo's ruling on question 83). These two
+        # are the EVIDENCE that verdict is read from, and evidence has to be kept: they
+        # come off the CLI's result JSON, which Claude Code prunes on its own schedule,
+        # so a turn diagnosed from the file today is undiagnosable next week. Same rule
+        # that earned `usage_json` its column.
+        #
+        # `terminal_reason` is why the CLI's query loop stopped, verbatim; api_error,
+        # aborted_streaming, prompt_too_long, max_turns, completed and the rest of a
+        # closed set it defines. `api_error_status` is the HTTP status when the failure
+        # was an API error — 500+ is the transport and retriable, 429 is the usage
+        # window. NULL for both means "not recorded", which is a turn reaped before
+        # these columns existed, and never "nothing went wrong".
+        "terminal_reason": "TEXT",
+        "api_error_status": "INTEGER",
     },
     "approvals": {
         # Which SEAT attempted the command, when a subagent did. NULL means the session's
@@ -949,12 +965,16 @@ class ProjectStore:
     def finish_turn(self, turn_id: int, state: str, result: str | None = None,
                     error: str | None = None, cost_usd: float | None = None,
                     num_turns: int | None = None,
-                    usage_json: str | None = None) -> dict[str, Any]:
+                    usage_json: str | None = None,
+                    terminal_reason: str | None = None,
+                    api_error_status: int | None = None) -> dict[str, Any]:
         assert state in ("done", "failed"), state
         self.conn.execute(
             """UPDATE wo_turns SET state=?, ended_at=?, result=?, error=?, cost_usd=?,
-                                   num_turns=?, usage_json=? WHERE id=?""",
-            (state, db.now(), result, error, cost_usd, num_turns, usage_json, turn_id),
+                                   num_turns=?, usage_json=?, terminal_reason=?,
+                                   api_error_status=? WHERE id=?""",
+            (state, db.now(), result, error, cost_usd, num_turns, usage_json,
+             terminal_reason or None, api_error_status, turn_id),
         )
         return self.get_turn(turn_id)  # type: ignore[return-value]
 
@@ -986,8 +1006,8 @@ class ProjectStore:
 
         Not `list_turns(...)[-n:]`: that one's LIMIT applies to the ascending scan, so on
         a long conversation it returns the FIRST hundred turns and the tail is exactly
-        what is missing. The only reader that wants the tail is the rate-limit streak
-        counter (`worker_session.rate_limit_streak`), and it wants it cheap.
+        what is missing. The only reader that wants the tail is the pause streak
+        counter (`worker_session.pause_streak`), and it wants it cheap.
         """
         rows = self.conn.execute(
             "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq DESC LIMIT ?",

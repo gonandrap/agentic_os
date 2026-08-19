@@ -100,22 +100,35 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any],
         return "Worker dispatched", p.get("worktree") or ""
     if kind == "turn_failed":
         return "Worker turn failed", (p.get("error") or "")[:200]
-    # The usage-limit trio. Deliberately NOT filed under "Worker turn failed": nothing
-    # about the work went wrong, the turn was refused before it ran, and the OS puts
-    # itself right. What the reader needs is the pause, the resume, and — only if it
-    # comes to that — the point at which the OS gave up and it became their problem.
-    if kind == "rate_limited":
+    # The self-healing trio. Deliberately NOT filed under "Worker turn failed": nothing
+    # about the WORK went wrong — the transport did, either by refusing the turn (the
+    # usage window) or by dropping it (the API) — and the OS puts itself right. What the
+    # reader needs is the pause, the resume, and only if it comes to that, the point at
+    # which the OS gave up and it became their problem.
+    #
+    # `reason` distinguishes the two. It is absent on rows written before transient
+    # retries existed, and those were all usage-limit ones, so its absence reads as that
+    # — which is why the legacy kinds below need no payload migration.
+    if kind in ("turn_paused", "rate_limited"):
+        if p.get("reason") == "transient":
+            status = f" {p['status']}" if p.get("status") else ""
+            return (f"Paused — Claude API error{status}",
+                    f"{p.get('error') or ''} · retrying shortly")
         when = _clock(p.get("reset_at"))
         return ("Paused — Claude usage limit",
                 f"{p.get('error') or ''}"
                 + (f" · resuming after {when}" if when else ""))
-    if kind == "rate_limit_retry":
+    if kind in ("turn_resumed", "rate_limit_retry"):
+        what = ("the Claude API error" if p.get("reason") == "transient"
+                else "the usage limit")
         attempt = p.get("attempt")
-        return ("Resumed after the usage limit",
-                f"attempt {attempt}" if attempt else "")
-    if kind == "rate_limit_exhausted":
-        return ("Still refused after retrying",
-                f"{p.get('attempts')} usage-limit retries: {p.get('error') or ''}")
+        of = f" of {p['of']}" if p.get("of") else ""
+        return (f"Resumed after {what}",
+                f"attempt {attempt}{of}" if attempt else "")
+    if kind in ("turn_retries_exhausted", "rate_limit_exhausted"):
+        what = ("Claude API" if p.get("reason") == "transient" else "usage-limit")
+        return ("Still failing after retrying",
+                f"{p.get('attempts')} {what} retries: {p.get('error') or ''}")
     if kind == "turn_cancelled":
         return "Worker turn cancelled", ""
     if kind == "attention":

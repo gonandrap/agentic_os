@@ -84,8 +84,8 @@
           </div>
         {% endif %}
         {# Not an attention item on purpose: the OS resumes this one itself. #}
-        {% if rate_limits.get(wo.id) %}
-          <div class="sub">⏳ {{ rate_limits[wo.id] }}</div>
+        {% if pauses.get(wo.id) %}
+          <div class="sub">⏳ {{ pauses[wo.id] }}</div>
         {% endif %}
         {% if wo.needs_attention %}<div class="sub tone-warn">◭ {{ wo.attention_reason }}</div>{% endif %}
       </div>
