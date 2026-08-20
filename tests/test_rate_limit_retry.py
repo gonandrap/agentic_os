@@ -6,7 +6,7 @@ it as `failed` and waited for a human to come back after the reset and retry by 
 
 Three layers, tested separately because they fail separately:
   * `claude_cli.usage_limit` — reading the refusal, and refusing to read anything else
-  * `worker_session.rate_limit_pause` — the state, re-derived from the last turn
+  * `worker_session.turn_pause` — the state, re-derived from the last turn
   * the daemon — pausing instead of failing, relaunching when the window reopens
 
 The end-to-end test is the one that matters: refuse a turn, reopen the window, tick, and
@@ -225,12 +225,12 @@ def _refused(store, wo_id="wo-test", error=LIVE_REFUSAL, kind="message"):
 
 
 def test_pause_is_none_for_a_healthy_or_ordinarily_broken_conversation(store):
-    assert worker_session.rate_limit_pause(store, "wo-test") is None
+    assert worker_session.turn_pause(store, "wo-test") is None
     turn = store.create_turn("wo-test", kind="dispatch", prompt="go")
     store.finish_turn(turn["id"], "done", result="did it")
-    assert worker_session.rate_limit_pause(store, "wo-test") is None
+    assert worker_session.turn_pause(store, "wo-test") is None
     _refused(store, error="turn reported is_error")
-    assert worker_session.rate_limit_pause(store, "wo-test") is None
+    assert worker_session.turn_pause(store, "wo-test") is None
 
 
 def test_pause_carries_the_reset_and_never_retries_instantly(store):
@@ -238,7 +238,7 @@ def test_pause_carries_the_reset_and_never_retries_instantly(store):
     past the moment it is parsed. The floor is what stops the first retry going out
     into the same refusal."""
     _refused(store, error="Claude AI usage limit reached|1000000000")  # long past
-    pause = worker_session.rate_limit_pause(store, "wo-test")
+    pause = worker_session.turn_pause(store, "wo-test")
     assert pause is not None
     assert pause.reset_at == 1000000000.0
     assert pause.retry_at >= pause.turn["ended_at"] + worker_session.RATE_LIMIT_MIN_DELAY
@@ -247,7 +247,7 @@ def test_pause_carries_the_reset_and_never_retries_instantly(store):
 
 def test_a_limit_with_no_readable_time_waits_the_fallback_delay(store):
     _refused(store, error="You've hit your session limit · resets 99pm")
-    pause = worker_session.rate_limit_pause(store, "wo-test")
+    pause = worker_session.turn_pause(store, "wo-test")
     assert pause is not None and pause.reset_at is None
     assert pause.retry_at == pytest.approx(
         pause.turn["ended_at"] + worker_session.RATE_LIMIT_FALLBACK_DELAY, abs=1)
@@ -256,13 +256,13 @@ def test_a_limit_with_no_readable_time_waits_the_fallback_delay(store):
 def test_the_streak_counts_off_the_end_and_resets_when_a_turn_gets_through(store):
     for _ in range(3):
         _refused(store)
-    assert worker_session.rate_limit_streak(store, "wo-test") == 3
-    assert worker_session.rate_limit_pause(store, "wo-test").attempts == 3
+    assert worker_session.pause_streak(store, "wo-test", worker_session.PAUSE_USAGE_LIMIT) == 3
+    assert worker_session.turn_pause(store, "wo-test").attempts == 3
     done = store.create_turn("wo-test", kind="message", prompt="ok")
     store.finish_turn(done["id"], "done", result="through")
-    assert worker_session.rate_limit_streak(store, "wo-test") == 0
+    assert worker_session.pause_streak(store, "wo-test", worker_session.PAUSE_USAGE_LIMIT) == 0
     _refused(store)
-    assert worker_session.rate_limit_streak(store, "wo-test") == 1
+    assert worker_session.pause_streak(store, "wo-test", worker_session.PAUSE_USAGE_LIMIT) == 1
 
 
 def test_the_streak_is_counted_off_the_tail_of_a_long_conversation(store):
@@ -272,13 +272,13 @@ def test_the_streak_is_counted_off_the_tail_of_a_long_conversation(store):
         turn = store.create_turn("wo-test", kind="message", prompt=f"turn {i}")
         store.finish_turn(turn["id"], "done", result="fine")
     _refused(store)
-    assert worker_session.rate_limit_streak(store, "wo-test") == 1
+    assert worker_session.pause_streak(store, "wo-test", worker_session.PAUSE_USAGE_LIMIT) == 1
 
 
 def test_retries_run_out(store):
     for _ in range(worker_session.MAX_RATE_LIMIT_RETRIES + 1):
         _refused(store)
-    assert worker_session.rate_limit_pause(store, "wo-test").exhausted
+    assert worker_session.turn_pause(store, "wo-test").exhausted
 
 
 # -- what the user is told -------------------------------------------------------------
@@ -288,7 +288,7 @@ def test_the_label_says_why_nothing_is_moving_and_when_it_will(store):
     store.set_status("wo-test", "running")
     _refused(store)
     wo = store.get_work_order("wo-test")
-    note = invariants.rate_limit_note(store, wo)
+    note = invariants.pause_note(store, wo)
     assert "usage limit" in note and "retrying by itself" in note
     assert invariants.status_label(store, wo).startswith("running — ")
 
@@ -302,7 +302,7 @@ def test_an_exhausted_pause_stops_claiming_it_will_retry(store):
     store.set_status("wo-test", "running")
     for _ in range(worker_session.MAX_RATE_LIMIT_RETRIES + 1):
         _refused(store)
-    assert invariants.rate_limit_note(store, store.get_work_order("wo-test")) == ""
+    assert invariants.pause_note(store, store.get_work_order("wo-test")) == ""
 
 
 # -- end to end ------------------------------------------------------------------------
@@ -321,7 +321,7 @@ def started(jarvis_home, fake_claude, catalog_file, project, monkeypatch):
 
 
 def _tick(daemon):
-    """One tick with the rate-limit pass ON — the daemon runs it every 12th tick."""
+    """One tick with the retry pass ON (the daemon runs it every RETRY_EVERY_TICKS)."""
     daemon.tick_count = 0
     daemon.tick()
 
@@ -345,7 +345,7 @@ def test_a_refused_work_order_resumes_itself(started, fake_claude, project,
     assert not row["needs_attention"], "the OS fixes this one itself; do not ask the user"
     assert store.latest_turn(wo["id"])["state"] == "failed"
     kinds = [e["kind"] for e in store.list_events(wo["id"])]
-    assert "rate_limited" in kinds and "turn_failed" not in kinds
+    assert "turn_paused" in kinds and "turn_failed" not in kinds
 
     # The window reopens. The refusal named a moment hours away, so the test moves the
     # clock the only way it can from out here: by rewriting the refusal to one whose
@@ -361,7 +361,7 @@ def test_a_refused_work_order_resumes_itself(started, fake_claude, project,
     _tick(daemon)
 
     events = [e["kind"] for e in store.list_events(wo["id"])]
-    assert "rate_limit_retry" in events
+    assert "turn_resumed" in events
     # The OPENING turn was refused before a transcript existed, so the retry has to
     # re-open the session rather than resume one that was never written — and under the
     # SAME id, which is immutable for the work order's whole life.
@@ -373,7 +373,7 @@ def test_a_refused_work_order_resumes_itself(started, fake_claude, project,
     assert store.latest_turn(wo["id"])["state"] == "done"
     # The pause is gone because the turn got through — there is no flag to clear and
     # nothing to reset, which is the whole point of deriving it from the last turn.
-    assert worker_session.rate_limit_pause(store, wo["id"]) is None
+    assert worker_session.turn_pause(store, wo["id"]) is None
     # And it settled the ordinary way. `needs_review` is what any turn that ends
     # without `jarvis wo finish` settles to; what matters here is that the usage limit
     # left no trace on where it ended up.
@@ -464,7 +464,7 @@ def test_retrying_stops_and_asks_for_the_user_when_it_never_clears(started, fake
     row = store.get_work_order(wo["id"])
     assert row["status"] == "failed"
     assert row["needs_attention"]
-    assert "rate_limit_exhausted" in [e["kind"] for e in store.list_events(wo["id"])]
+    assert "turn_retries_exhausted" in [e["kind"] for e in store.list_events(wo["id"])]
     store.close()
 
 

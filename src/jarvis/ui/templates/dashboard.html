@@ -109,11 +109,12 @@
         {% if wo.status == 'waiting_pr_merge' and wo.pr_url %}
           <div class="sub">⑃ <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a></div>
         {% endif %}
-        {# Still `running`, and nothing is running: Claude Code refused the turn because
-           the usage window is spent. The OS resumes it by itself, so this is an
-           explanation and not an ask — no attention flag, no action for the user. #}
-        {% if wo.rate_limit %}
-          <div class="sub">⏳ {{ wo.rate_limit }}</div>
+        {# Still `running`, and nothing is running: the transport lost the turn — the
+           usage window is spent, or the Claude API failed. The OS resumes it by itself,
+           so this is an explanation and not an ask — no attention flag, no action for
+           the user. #}
+        {% if wo.pause %}
+          <div class="sub">⏳ {{ wo.pause }}</div>
         {% endif %}
         {% if wo.blocked_by %}
           <div class="sub">⊘ blocked by:

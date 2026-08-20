@@ -210,7 +210,7 @@ def status_label(store: ProjectStore, wo: dict[str, Any]) -> str:
     separately — see the FEATURED_STATUSES fix in PR 65.)
     """
     if wo["status"] in ACTIVE_STATUSES:
-        note = rate_limit_note(store, wo) or neo_wait_note(wo)
+        note = pause_note(store, wo) or neo_wait_note(wo)
         return f"{wo['status']} — {note}" if note else wo["status"]
     if wo["status"] != "pending":
         return wo["status"]
@@ -230,27 +230,35 @@ def status_label(store: ProjectStore, wo: dict[str, Any]) -> str:
     return "pending"
 
 
-def rate_limit_note(store: ProjectStore, wo: dict[str, Any]) -> str:
+def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
     """Why this work order is not moving and when it will move again — or "" normally.
 
     `running` alone promises "a worker is working on this", which is a lie for a
-    conversation Claude Code refused because the usage window is spent. It keeps its
-    status and its slot on purpose — a refused turn changed nothing, and
-    `Daemon.retry_rate_limited` relaunches it — but the user looking at a dashboard at
+    conversation the transport dropped — the usage window spent, or the API itself
+    failing. It keeps its status and its slot on purpose (see `worker_session`, and
+    `Daemon.retry_paused_turns` relaunches it) — but the user looking at a dashboard at
     midnight is owed the reason nothing is happening, and the time it will happen again.
 
     Every surface renders this one string (the CLI through `status_label`, the dashboard
     through `ops.os_status`) so they cannot disagree about the answer. Local wall-clock,
     not the timezone the CLI quoted: the reader is at this machine, and a time they have
     to convert is a time they will misread.
+
+    The transient line names the attempt as well as the clock, because unlike a usage
+    window — which reopens once, at a stated time — a backoff can be on its fourth of
+    five, and "retrying at 14:07" without that reads as a promise it might not keep.
     """
     if wo["status"] not in ACTIVE_STATUSES:
         return ""
-    pause = worker_session.rate_limit_pause(store, wo["id"])
+    pause = worker_session.turn_pause(store, wo["id"])
     if pause is None or pause.exhausted:
         return ""
     when = time.strftime("%H:%M", time.localtime(pause.retry_at))
-    return f"Claude usage limit reached, retrying by itself at {when}"
+    if pause.reason == worker_session.PAUSE_USAGE_LIMIT:
+        return f"Claude usage limit reached, retrying by itself at {when}"
+    what = f"Claude API error {pause.status}" if pause.status else "Claude API error"
+    return (f"{what}, retrying by itself at {when} "
+            f"(attempt {pause.attempts} of {pause.max_attempts})")
 
 
 def neo_wait_note(wo: dict[str, Any]) -> str:

@@ -270,6 +270,16 @@ class TurnResult:
     cost_usd: float | None = None
     num_turns: int | None = None
     subtype: str = ""
+    #: Why the CLI's query loop stopped (`terminal_reason`), verbatim. One of a closed
+    #: set the CLI defines — `api_error`, `aborted_streaming`, `aborted_tools`,
+    #: `prompt_too_long`, `max_turns`, `completed`, … — and the first half of the
+    #: structured evidence `transient_failure` classifies a retriable turn from.
+    #: "" when the envelope carried none (a very old outfile, or a bypassed loop).
+    terminal_reason: str = ""
+    #: The HTTP status of the API error, when the failure was one. The CLI's own schema
+    #: documents it as "HTTP status code of the API error", and it is the other half of
+    #: that evidence: 500+ is the transport, 429 is the usage window.
+    api_error_status: int | None = None
     #: Compact usage envelope derived from the result JSON (see `derive_turn_usage`).
     #: None when the CLI emitted no `usage` object — old outfiles, crashed turns.
     usage: dict[str, Any] | None = None
@@ -490,10 +500,18 @@ def read_turn_result(outfile: Path, errfile: Path | None = None) -> TurnResult |
         cost_usd=data.get("total_cost_usd"),
         num_turns=data.get("num_turns"),
         subtype=data.get("subtype") or "",
+        terminal_reason=data.get("terminal_reason") or "",
+        api_error_status=_int_or_none(data.get("api_error_status")),
         # Derived on the failed path too: the usage rides on a failed result JSON just
         # the same (a 429'd turn has already paid for everything up to the refusal).
         usage=derive_turn_usage(data),
     )
+
+
+def _int_or_none(value: Any) -> int | None:
+    """`api_error_status` is declared nullable AND optional, so absent, null and a
+    number are all legal. Anything else is a shape this parser does not know."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 # -- the usage limit ----------------------------------------------------------------
@@ -506,7 +524,7 @@ def read_turn_result(outfile: Path, errfile: Path | None = None) -> TurnResult |
 #
 # The message carries the one fact needed to recover unattended: WHEN the window
 # reopens. Parsing it here, deterministically and with no LLM anywhere, is what lets
-# `worker_session.retry_at` and `Daemon.retry_rate_limited` resume the conversation by
+# `worker_session.turn_pause` and `Daemon.retry_paused_turns` resume the conversation by
 # themselves. Observed live on wo-2fa7c0e9 turn 4:
 #
 #     You've hit your session limit · resets 11:50pm (America/Los_Angeles)
@@ -713,6 +731,120 @@ def _zone(name: str | None) -> tzinfo | None:
         except (KeyError, ValueError, OSError):
             pass
     return datetime.now().astimezone().tzinfo
+
+
+# -- the transport failing under us ---------------------------------------------------
+#
+# The other way a turn dies without the work being wrong: the API was busy or broken.
+# `wo-4f460495` turn 2 hit a 500 five hours into a work order, and because nothing in
+# the OS recognised it the order sat in `failed` for TWENTY-SEVEN HOURS until the user
+# came back and typed "retry" by hand. Claude's models get busy; an OS that needs a
+# human for that is not self-healing.
+#
+# THIS ONE IS STRUCTURED, WHICH THE USAGE LIMIT WAS NOT. The result envelope carries two
+# fields the OS used to drop on the floor, both verified live on that very turn and both
+# in the CLI's own published result schema:
+#
+#     terminal_reason: "api_error"        # why the query loop stopped
+#     api_error_status: 500               # "HTTP status code of the API error"
+#
+# So there is no prose to parse. The usage-limit matcher above has to key on the SHAPE
+# of an assembled English sentence because the CLI states the reset nowhere else; here
+# the CLI hands over a status code, and matching an integer beats matching a sentence in
+# every way that matters — no model name to rot, no wording to change, no false positive
+# from a worker's own log line quoting an error it read.
+#
+# WHY 500-AND-UP AND NOTHING ELSE (Neo, question 126). Every failed turn the live fleet
+# has ever recorded — ten of them — is one of exactly three shapes:
+#
+#     api_error + 429                          6   the usage window; `usage_limit` owns it
+#     api_error + 500                          1   this, and it stalled for 27h
+#     aborted_streaming / aborted_tools        3   no status at all
+#
+# 429 is deliberately NOT retried here. It is the usage limit's own code, and the branch
+# above already handles the recoverable form of it; the form it declines to touch is a
+# SPEND cap, which never reopens on its own. Sending 429 down this path would auto-retry
+# a cap that needs the user, which is precisely the mistake `usage_limit` was written to
+# avoid.
+#
+# The aborts are excluded for a different reason: they land mid-tool-use, so the turn may
+# have half-run a side effect, and replaying that is worse than asking. They are also the
+# one class the CLI's own telemetry does not count as an error (`m3n` returns false for
+# both), which is a hint they are not simply "the API broke".
+#
+# THE TEXT BRANCH IS A FALLBACK, NOT THE MECHANISM. Two cases reach us with no status:
+# a turn reaped before these columns existed, and the CLI's own status-less transient
+# wordings — it assembles those from a fixed table, so they are matched as literals:
+#
+#     API Error: Connection to the API was lost (ECONNRESET). This is usually temporary…
+#     API Error: Repeated 529 Overloaded errors. The API is at capacity …
+#
+# Both are prefixed `API Error: `, which is what keeps prose that merely mentions one of
+# them (a worker's stderr, this very comment quoted into a log) from matching.
+
+
+#: The transient wordings the CLI assembles when the failure carried no HTTP status,
+#: read out of 2.1.235's string table. Anchored on the `API Error: ` prefix the CLI puts
+#: in front of every one of them, so only the CLI's own voice matches.
+_TRANSIENT_TEXT_RE = re.compile(
+    r"API Error:.{0,200}?(?:"
+    r"Connection to the API was lost"
+    r"|The API is at capacity"
+    r"|server-side issue, usually temporary"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+#: The status the CLI names in the message body when the envelope's own field is missing
+#: — "API Error: 500 Internal server error". Only 5xx: see the comment above on 429.
+_TRANSIENT_STATUS_RE = re.compile(r"API Error:\s*(5\d\d)\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class TransientFailure:
+    """A turn the transport lost, not one the work broke.
+
+    `status` is the HTTP status when there was one, and None for the connection-lost and
+    at-capacity shapes, which name no code. Nothing decides anything from it — it is
+    what the timeline shows the user so "retrying" is a claim they can check.
+    """
+
+    message: str
+    status: int | None
+
+
+def transient_failure(text: str | None, *, terminal_reason: str | None = None,
+                      api_error_status: int | None = None) -> TransientFailure | None:
+    """Read a failed turn as a transient transport failure, or None if it is not one.
+
+    None for every ordinary failure, so callers use it as the predicate itself — and
+    None for a usage-limit refusal too, which `usage_limit` owns end to end. The two are
+    checked in that order everywhere, and this function re-checks it rather than trusting
+    the caller: a 429 that reached here would otherwise auto-retry a spend cap.
+
+    Structured evidence wins whenever the envelope carried any. Only when it carried
+    none does the text get a look, which is what stops a worker's stderr quoting an
+    error message from parking its own work order on a retry loop.
+    """
+    if not text:
+        return None
+    if usage_limit(text) is not None:
+        return None  # the window, not the transport — the branch above owns it
+    if api_error_status is not None:
+        # The CLI said what happened. Believe it and read nothing into the prose.
+        if api_error_status < 500:
+            return None
+        return TransientFailure(message=_summarise(text), status=api_error_status)
+    if terminal_reason and terminal_reason != "api_error":
+        # It stopped for a reason it named, and that reason was not the API: an abort,
+        # a prompt too long, the turn cap. None of those get better by being repeated.
+        return None
+    named = _TRANSIENT_STATUS_RE.search(text)
+    if named:
+        return TransientFailure(message=_summarise(text), status=int(named.group(1)))
+    if _TRANSIENT_TEXT_RE.search(text):
+        return TransientFailure(message=_summarise(text), status=None)
+    return None
 
 
 def process_alive(pid: int | None) -> bool:

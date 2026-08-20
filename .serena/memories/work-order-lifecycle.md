@@ -152,7 +152,23 @@ read). Only `track_injected_sessions` + `check_invariants` stay on the
 `RECONCILE_EVERY_TICKS` cadence, and only the first needs `claude agents --json` — which
 it skips entirely on ticks where no project has a live `injected` row.
 
-## Self-healing after the Claude usage limit (wo-996c7344, PR 89)
+## Self-healing when the transport fails (usage limit: wo-996c7344, PR 89;
+## API errors: wo-50958234)
+
+TWO reasons a turn dies without the WORK being wrong, one shared mechanism. Both are
+`worker_session.PAUSE_*` values on one `TurnPause`, because four readers share the
+predicate and a second parallel one would be four more places to forget.
+
+| | usage limit | transient |
+|---|---|---|
+| what | the account's window is spent | a 500/529/dropped connection |
+| did it run? | **no** — 0ms, $0, nothing sent | **yes**, possibly for minutes and dollars |
+| when to retry | the moment the refusal names | `TRANSIENT_BACKOFF` = 60/120/360/600/1200s |
+| what to re-send | the prompt, verbatim | a continuation nudge (see below) |
+| cap | `MAX_RATE_LIMIT_RETRIES` (8) | 5, the length of the backoff |
+
+### The usage limit
+
 
 Claude Code refuses a turn outright once the account's window is spent. The refusal is
 free and instant (`duration_api_ms: 0`, `total_cost_usd: 0`) and arrives as the turn's
@@ -183,7 +199,35 @@ kept but UNVERIFIED — that literal is absent from 2.1.226.
 To re-verify on a new CLI: `strings -n 8 ~/.local/share/claude/versions/<v> > /tmp/cc.txt`
 then search with python `re` (shell grep fights the `${}` and backticks).
 
-`worker_session.rate_limit_pause(store, wo_id) -> RateLimitPause | None` is the state.
+### Reading an API failure — STRUCTURED, unlike the limit
+
+`claude_cli.transient_failure(text, *, terminal_reason, api_error_status)` needs no prose
+parsing: the result envelope carries the CLI's own diagnosis, and Jarvis used to drop it.
+Verified live on wo-4f460495 turn 2 — `terminal_reason: "api_error"`,
+`api_error_status: 500` (the CLI's schema documents that as "HTTP status code of the API
+error"). Both are now persisted on `wo_turns`, because the result file they come from is
+pruned by Claude Code while the verdict must stay re-derivable.
+
+**Retriable = `api_error_status >= 500`, and nothing else** (Neo, question 126). Every
+failed turn the fleet had ever recorded when this shipped — ten — was one of three
+shapes: `api_error`+429 (usage limit, 6), `api_error`+500 (1, the one that stalled 27h),
+and `aborted_streaming`/`aborted_tools` with no status (3).
+
+* **429 is excluded on purpose.** It is the limit's own code, and the form `usage_limit`
+  declines is a SPEND cap that never reopens by itself — backing off five times would
+  burn attempts on something only the user can clear. `transient_failure` re-checks
+  `usage_limit` itself so the ordering cannot be got wrong by a caller.
+* **Aborts are excluded** because they land mid-tool-use and a replay can re-run a side
+  effect. The CLI's own telemetry does not count them as errors either (`m3n`).
+
+A text branch (`_TRANSIENT_TEXT_RE`) catches the two status-less shapes the CLI
+assembles — `Connection to the API was lost`, `The API is at capacity` — and old rows
+predating the columns. It is anchored on the `API Error: ` prefix so a worker's own
+stderr quoting a 500 cannot park its own work order.
+
+### The shared state
+
+`worker_session.turn_pause(store, wo_id) -> TurnPause | None` is the state.
 **There is no column, no flag and no status for it**: the whole condition is re-derived
 from the latest turn each time it is asked for, per the rule in `project_store.py:281-285`
 ("`waiting_pr_merge` earned a status because nothing derived it; this does not").
@@ -198,25 +242,45 @@ predicate so they cannot drift:
 * `Daemon.deliver_messages` — HOLDS newer messages while paused, so the refused turn
   (which carries a message already marked `delivered`) goes out first. The hold lifts
   once retries are exhausted, which keeps `jarvis wo send … "retry"` working by hand.
-* `Daemon.retry_rate_limited` — relaunches via `worker_session.retry` every
-  `RATE_LIMIT_EVERY_TICKS` (12, ~1min).
-* `invariants.rate_limit_note` — the one user-facing string, rendered by
-  `status_label` (CLI) and `ops.os_status` → `open_work_orders[].rate_limit` (dashboard):
-  `running — Claude usage limit reached, retrying by itself at 23:50`.
+* `Daemon.retry_paused_turns` — relaunches via `worker_session.retry` every
+  `RETRY_EVERY_TICKS` (2, ~10s). It was 12 (~1min) while the usage limit was the only
+  reason; a 60s pass cannot honour a 60s backoff step.
+* `invariants.pause_note` — the one user-facing string, rendered by `status_label` (CLI)
+  and `ops.os_status` → `open_work_orders[].pause` (dashboard):
+  `running — Claude usage limit reached, retrying by itself at 23:50`, or
+  `running — Claude API error 500, retrying by itself at 14:07 (attempt 2 of 5)`.
 
 Constants in `worker_session.py`: `RATE_LIMIT_MIN_DELAY` (60s floor — the reset is a
 clock time rounded to the minute and can parse into the past), `RATE_LIMIT_FALLBACK_DELAY`
 (15min when no time is readable), `MAX_RATE_LIMIT_RETRIES` (8 consecutive refusals, then
-it fails for real with `rate_limit_exhausted`). `rate_limit_streak` counts off the tail
-via `ProjectStore.recent_turns` (NOT `list_turns`, whose LIMIT applies from the front).
+it fails for real). `pause_streak(store, wo_id, reason)` counts off the tail via
+`ProjectStore.recent_turns` (NOT `list_turns`, whose LIMIT applies from the front) and is
+**per reason**: a conversation that hit the limit and then a 500 is on its first 500, so
+the limit's attempts cannot cut the backoff short or start it already exhausted.
 
 `worker_session.retry` re-decides two flags **from the filesystem** rather than copying
-them off the refused turn: `--resume` only if `claude_cli.session_transcript_path` exists
+them off the dead turn: `--resume` only if `claude_cli.session_transcript_path` exists
 (a session never written cannot be resumed), and `--worktree` only if the worktree
 directory does not exist yet (that flag is what creates it).
 
-Timeline kinds: `rate_limited`, `rate_limit_retry`, `rate_limit_exhausted` — all signal,
-and `turn_failed` is deliberately NOT emitted for a refusal.
+**And it re-decides WHAT TO SEND** (Neo, question 126). Re-sending the prompt verbatim is
+right only for a turn refused before it ran. wo-4f460495's transcript held its prompt
+followed by ~55 messages and $1.99 of work, so re-sending there would duplicate a message
+the worker had already acted on. When `_reached_model(turn)` — `duration_api_ms > 0` from
+the stored usage envelope — AND the session exists, `retry` sends `_nudge(pause)` instead:
+"your previous turn was cut short … carry on … do not start again". This applies to the
+usage-limit path too; one refusal on record had already done 15s of work.
+
+Timeline kinds: `turn_paused`, `turn_resumed`, `turn_retries_exhausted`, each carrying
+`reason` in its payload — all signal, and `turn_failed` is deliberately NOT emitted.
+The legacy `rate_limited`/`rate_limit_retry`/`rate_limit_exhausted` kinds still RENDER
+(rows written before this) but are no longer written; an absent `reason` reads as the
+usage limit, which is what those rows all were.
+
+Tests: `tests/test_rate_limit_retry.py` and `tests/test_transient_retry.py`. The fake CLI
+has `turns_rate_limited()` (refuses BEFORE writing the transcript) and `turns_api_error()`
+(fails AFTER writing it, reporting API time) — that asymmetry is the property under test,
+so do not "tidy" it away.
 
 ## Background sessions still exist — for the USER only, and only if handed over
 
