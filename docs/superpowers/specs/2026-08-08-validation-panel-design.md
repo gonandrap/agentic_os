@@ -6,7 +6,7 @@ Feature order `fo-e353491c`. Planned by `wo-cd73c537`.
 
 > **Looking for the plan rather than the reasoning?**
 > [`2026-08-08-validation-panel-plan.md`](./2026-08-08-validation-panel-plan.md) is the same
-> thing in thirteen diagrams and almost no prose: the eleven work orders, their five waves,
+> thing in eleven rendered diagrams and almost no prose: the eleven work orders, their waves,
 > both state machines, and both round sequences. This document is the *why* behind each of
 > those decisions.
 
