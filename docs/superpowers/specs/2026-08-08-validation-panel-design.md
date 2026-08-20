@@ -4,6 +4,12 @@
 
 Feature order `fo-e353491c`. Planned by `wo-cd73c537`.
 
+> **Looking for the plan rather than the reasoning?**
+> [`2026-08-08-validation-panel-plan.md`](./2026-08-08-validation-panel-plan.md) is the same
+> thing in thirteen diagrams and almost no prose: the eleven work orders, their five waves,
+> both state machines, and both round sequences. This document is the *why* behind each of
+> those decisions.
+
 ---
 
 ## Problem
@@ -64,42 +70,38 @@ touching the others.
 
 ## What this proposes, in one picture
 
-```
-   ┌──────────────────┐                            ┌──────────────────────┐
-   │  THE IMPLEMENTOR │                            │  THE PROJECT MANAGER │
-   │                  │                            │                      │
-   │ a worker session │                            │ a session that owns  │
-   │ on its worktree  │                            │ one feature order's  │
-   │                  │                            │ follow-through       │
-   └───┬───────────▲──┘                            └──┬────────────────▲──┘
-       │           │                                  │                │
-  finish        role:                            finish             role:
-  --evidence    implementor                      --evidence         manager
-       │           │                                  │                │
-       ▼           │                                  ▼                │
-  ╔════════════════╧══════════════════════════════════════════════════╧═════╗
-  ║                          THE MESSAGE BUS                                ║
-  ║   envelopes addressed to a ROLE, delivered by a pure router.            ║
-  ║   Nothing below this line knows who is above it.                        ║
-  ╚═══════════════════════════╦═════════════════════════════════════════════╝
-                              │
-              ┌───────────────┴────────────────┐
-              │      THE ROUND MACHINE         │
-              │  collects evidence, fingerprints│
-              │  it, opens a round, counts them,│
-              │  decides when to give up        │
-              └───────────────┬────────────────┘
-                    packet    │    outcome
-                              ▼
-              ┌────────────────────────────────┐
-              │      THE VALIDATION PANEL      │
-              │  tester  security  architect   │
-              │        maintainer              │
-              │            │                   │
-              │       arbitrate()  ← veto table│
-              │            │                   │
-              │          chair                 │
-              └────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph SUB["The two submitters — the same shape, which is why one machine serves both"]
+        direction LR
+        IMPL["<b>THE IMPLEMENTOR</b><br/>a worker session<br/>on its own worktree"]
+        PM["<b>THE PROJECT MANAGER</b><br/>a session that owns one<br/>feature order's follow-through"]
+    end
+
+    BUS{{"<b>THE MESSAGE BUS</b><br/>envelopes addressed to a ROLE, delivered by a pure router<br/>nothing below this line knows who is above it"}}
+
+    ROUND["<b>THE ROUND MACHINE</b><br/>collects the evidence · fingerprints it · opens round N<br/>counts the rounds · decides when to give up"]
+
+    subgraph PANEL["<b>THE VALIDATION PANEL</b>"]
+        direction TB
+        SEATS["tester · security · architect · maintainer"]
+        ARB["arbitrate — the veto table"]
+        CHAIR["chair"]
+        SEATS --> ARB --> CHAIR
+    end
+
+    IMPL -- "finish --evidence" --> ROUND
+    PM -- "finish --evidence" --> ROUND
+    ROUND -- "packet" --> SEATS
+    CHAIR -- "outcome" --> ROUND
+    ROUND -- "a rejection, addressed to a role" --> BUS
+    BUS -- "role: implementor" --> IMPL
+    BUS -- "role: manager" --> PM
+
+    style BUS fill:#fff3cd,stroke:#856404,stroke-width:2px
+    style ROUND fill:#d1ecf1,stroke:#0c5460,stroke-width:2px
+    style PANEL fill:#e2e3f3,stroke:#383d75
+    style SUB fill:#e8f5e9,stroke:#2e7d32
 ```
 
 The implementor and the project manager are **the same shape**: a session that submits
@@ -194,20 +196,17 @@ the message queue already guarantees for `wo send`.
 
 A third `WO_KINDS` value. `WO_KINDS = ("worker", "planner", "manager")`.
 
-```
-  jarvis fo plan <fo-id> --from-file plan.json
-                │
-                ▼
-       Neo (or the user) releases the plan
-                │
-                ▼
-   ProjectStore.create_plan_children — ONE transaction
-                │
-        ┌───────┴────────┬─────────────────┐
-        ▼                ▼                 ▼
-   child wo #1  …   child wo #N      THE MANAGER ORDER
-   kind=worker      kind=worker      kind=manager
-   parent_id=fo     parent_id=fo     parent_id=fo
+```mermaid
+flowchart TB
+    A["jarvis fo plan fo-id --from-file plan.json"] --> B["Neo, or the user, releases the plan"]
+    B --> C["<b>ProjectStore.create_plan_children</b><br/>ONE transaction"]
+    C --> D["child wo 1<br/>kind=worker<br/>parent_id=fo"]
+    C --> E["…"]
+    C --> F["child wo N<br/>kind=worker<br/>parent_id=fo"]
+    C --> G["<b>THE MANAGER ORDER</b><br/>kind=manager<br/>parent_id=fo"]
+
+    style G fill:#fff3cd,stroke:#856404,stroke-width:2px
+    style C fill:#d1ecf1,stroke:#0c5460,stroke-width:2px
 ```
 
 It is created **in the same transaction** as the children, because a feature holding
@@ -236,12 +235,16 @@ all of them:
 `ACTIVE_STATUSES`, and `waiting_input` is one of them. A manager is *designed* to sit idle in
 `waiting_input` for the entire life of its feature. So:
 
-```
-   max_concurrent: 2
-   two feature orders in flight
-   → two managers parked in waiting_input
-   → count_active() == 2
-   → dispatch_pending never claims another work order. The project stops.
+```mermaid
+flowchart LR
+    A["max_concurrent: 2"] --> B["two feature orders in flight"]
+    B --> C["two managers parked in<br/>waiting_input, by design"]
+    C --> D{{"count_active has<br/><b>no kind filter</b>"}}
+    D --> E["count_active == 2"]
+    E --> F(["dispatch_pending never claims another<br/>work order. <b>The project stops.</b>"])
+
+    style D fill:#fff3cd,stroke:#856404,stroke-width:2px
+    style F fill:#f8d7da,stroke:#721c24,stroke-width:2px
 ```
 
 `count_active` must exclude `kind='manager'`. A coordinator is not a piece of the work —
@@ -435,33 +438,24 @@ global configuration rather than on anything Jarvis controls.
 
 The second duty the user specified, and a clean demonstration of principles 1 and 2.
 
-```
-  a child work order, having agreed a deferral with Neo:
+```mermaid
+flowchart TB
+    child["a child work order,<br/>having agreed a deferral with Neo"]
+    cmd["<b>jarvis wo defer</b> wo-id title --why … --neo-question id"]
+    env{{"envelope<br/>kind = deferral_request<br/><b>to_role = manager</b><br/>it names a ROLE, not a manager"}}
+    q{"the ROUTER asks:<br/>is the role filled?"}
+    yes["delivered to the manager as a message.<br/>The manager files the backlog item."]
+    no["<b>the router files it itself.</b><br/>Today's behaviour, exactly."]
+    row["backlog row, carrying the relationship:<br/>origin_wo_id — who suggested it<br/>origin_fo_id — which plan it came out of<br/>origin_note — the why, and the Neo question id"]
 
-      jarvis wo defer <wo-id> "title" --why "…" [--neo-question <id>]
-                          │
-                          │  posts an envelope. Names a ROLE, not a manager.
-                          ▼
-      ╔═══════════════════════════════════════════════════╗
-      ║  kind=deferral_request      to_role=manager        ║
-      ╚═══════════════════════╤═══════════════════════════╝
-                              │
-                  ┌───────────┴────────────┐
-        a manager exists            no manager
-        (the wo has a parent        (an ordinary standalone
-         feature order)              work order)
-                  │                         │
-                  ▼                         ▼
-     delivered to the manager      THE ROUTER files the
-     as a message; it files        backlog item itself.
-     the backlog item.             Today's behaviour, exactly.
-                  │                         │
-                  └───────────┬─────────────┘
-                              ▼
-              backlog row, carrying the relationship:
-                  origin_wo_id  — who suggested it
-                  origin_fo_id  — which plan it came out of
-                  origin_note   — the why, and the Neo question id
+    child --> cmd --> env --> q
+    q -- "yes — the wo has a parent feature order" --> yes
+    q -- "no — an ordinary standalone work order" --> no
+    yes --> row
+    no --> row
+
+    style env fill:#fff3cd,stroke:#856404,stroke-width:2px
+    style q fill:#d1ecf1,stroke:#0c5460,stroke-width:2px
 ```
 
 The `backlog` table today has **no relationship columns at all** (`id, project, title,
@@ -478,28 +472,32 @@ unchanged for a standalone work order today and for a feature child tomorrow.
 
 ## Where it plugs into the existing code
 
-```
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ daemon.py    the ONLY module that knows about all of them        │
-  │   _validator(cfg) → validation.decide or None                    │
-  │   settle_work_order: early-return on `validating`                │
-  │   settle_features:   route to `validating`, settle the manager   │
-  │   deliver_envelopes: the bus's tick                              │
-  └───┬──────────────┬───────────────┬───────────────┬───────────────┘
-      │              │               │               │
-  ┌───▼────┐  ┌──────▼──────┐  ┌─────▼──────┐  ┌─────▼────────┐
-  │ ops.py │  │  bus.py NEW │  │validation. │  │ project_store│
-  │ finish │  │  post()     │  │   py  NEW  │  │  rounds      │
-  │ review │  │  resolve()  │  │  decide()  │  │  opinions    │
-  │ defer  │  │  deliver()  │  │  arbitrate │  │  envelopes   │
-  └───┬────┘  └─────────────┘  └──┬─────┬───┘  └──────────────┘
-      │                           │     │
-  ┌───▼─────────────┐    ┌────────▼──┐  │ extracted from, and reused by
-  │ evidence.py NEW │    │seats.py NEW│ │  ┌──────────────────┐
-  │  collect_*()    │    │  Roster    │ └─▶│ panel.py         │
-  │  fingerprint()  │    │  run_blind │    │ (Neo — behaviour │
-  │  stdlib only    │    └────────────┘    │  unchanged)      │
-  └─────────────────┘                      └──────────────────┘
+```mermaid
+flowchart TB
+    D["<b>daemon.py</b> — the ONLY module that knows about all of them<br/>_validator(cfg) · settle_work_order early return<br/>settle_features routing · deliver_envelopes"]
+
+    OPS["<b>ops.py</b><br/>finish · review · defer"]
+    BUSM["<b>bus.py</b> NEW<br/>post() · resolve() · deliver()"]
+    VAL["<b>validation.py</b> NEW<br/>decide() · arbitrate()"]
+    PS["<b>project_store.py</b><br/>rounds · opinions · envelopes"]
+    EV["<b>evidence.py</b> NEW<br/>collect_*() · fingerprint()<br/>stdlib only"]
+    SE["<b>seats.py</b> NEW<br/>Roster · run_blind"]
+    NP["<b>panel.py</b><br/>Neo — behaviour unchanged"]
+
+    D --> OPS
+    D --> BUSM
+    D --> VAL
+    D --> PS
+    OPS --> EV
+    VAL --> SE
+    VAL --> EV
+    SE -. "extracted from, and reused by" .-> NP
+
+    style D fill:#d1ecf1,stroke:#0c5460,stroke-width:2px
+    style BUSM fill:#e8f5e9,stroke:#2e7d32
+    style VAL fill:#e8f5e9,stroke:#2e7d32
+    style EV fill:#e8f5e9,stroke:#2e7d32
+    style SE fill:#e8f5e9,stroke:#2e7d32
 ```
 
 `validation.py` must never import `neo`, `neo_store` or `panel`; `panel.py` must never
@@ -634,16 +632,54 @@ Neo has strictly less information than the panel that just failed to settle it. 
 
 Eleven work orders. Arrows are dependency edges.
 
-```
-   bus ──────────┬──────────────▶ loop ──┬──▶ entrypoints
-                 │           ▲           │
-   schema ───────┼───────────┤           ├──▶ panel ──┬──▶ eval
-                 │           │           │            │
-   evidence ─────┘───────────┘           └──▶ surfaces│
-                 │                                    │
-                 └──▶ manager ──┬──▶ deferral         │
-                                │                     │
-                                └──▶ feature-validation┘
+```mermaid
+flowchart LR
+    subgraph W1["WAVE 1 — three independent starts"]
+        bus["<b>1 · bus</b>"]
+        schema["<b>2 · schema</b>"]
+        evidence["<b>3 · evidence</b>"]
+    end
+    subgraph W2["WAVE 2 — the two engines"]
+        loop["<b>4 · loop</b>"]
+        manager["<b>7 · manager</b>"]
+    end
+    subgraph W3["WAVE 3"]
+        entry["<b>5 · entrypoints</b>"]
+        panel["<b>6 · panel</b>"]
+        defer["<b>8 · deferral</b>"]
+        surf["<b>10 · surfaces</b>"]
+    end
+    subgraph W4["WAVE 4"]
+        fval["<b>9 · feature-validation</b>"]
+    end
+    subgraph W5["WAVE 5"]
+        ev["<b>11 · eval</b>"]
+    end
+
+    bus --> loop
+    schema --> loop
+    evidence --> loop
+    bus --> manager
+    schema --> manager
+    loop --> entry
+    schema --> panel
+    evidence --> panel
+    loop --> panel
+    manager --> defer
+    schema --> surf
+    loop --> surf
+    manager --> surf
+    manager --> fval
+    panel --> fval
+    loop --> fval
+    panel --> ev
+    fval --> ev
+
+    style W1 fill:#e8f5e9,stroke:#2e7d32
+    style W2 fill:#d1ecf1,stroke:#0c5460
+    style W3 fill:#fff3cd,stroke:#856404
+    style W4 fill:#f8d7da,stroke:#721c24
+    style W5 fill:#e2e3f3,stroke:#383d75
 ```
 
 | # | child | delivers |
