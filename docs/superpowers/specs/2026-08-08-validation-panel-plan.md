@@ -51,9 +51,37 @@ flowchart TB
     style SUB fill:#e8f5e9,stroke:#2e7d32
 ```
 
+### What travels on the bus is typed
+
+The columns are `TEXT`, but no caller ever sees a string or a bare dict. The typing is at
+the boundary, which is where a wrong role or a mismatched payload can still be caught:
+
+```mermaid
+flowchart LR
+    CALL["a caller"] --> P["<b>post()</b> — the only writer<br/>takes a typed payload<br/><b>derives kind from its type</b>"]
+    P --> V{"validates"}
+    V -- "role not in ROLES" --> X(["BusError, at the call site"])
+    V -- "subject not exactly one id" --> X
+    V -- "payload of no known kind" --> X
+    V -- "ok" --> ROW["envelope row<br/>payload serialised"]
+    ROW --> RD["<b>deliver()</b> parses the payload<br/>back into its dataclass"]
+    RD --> BAD(["unparseable → undeliverable,<br/>never delivered as a malformed message"])
+
+    style P fill:#d1ecf1,stroke:#0c5460,stroke-width:2px
+    style X fill:#f8d7da,stroke:#721c24
+    style BAD fill:#fff3cd,stroke:#856404
+```
+
+`ROLES`, `ENVELOPE_KINDS` and `ENVELOPE_STATES` are module tuples — the same pattern as
+`project_store.WO_STATUSES`, and deliberately **not** SQL `CHECK` constraints: Jarvis has
+none anywhere today, and roles are *designed to grow*, so a `CHECK` on `to_role` would make
+adding a role a schema migration. A completeness test walks both vocabularies and fails if a
+kind has no payload type or a role has no routing branch, so the gap shows up in the suite
+rather than as an `undeliverable` row months later.
+
 ---
 
-## 2. The plan itself — 11 work orders, 5 waves
+## 2. The plan itself — 12 work orders, 5 waves
 
 Boxes are work orders. Arrows are dependency edges (`--depends-on`). A wave is everything
 that can run at the same time.
@@ -62,7 +90,7 @@ that can run at the same time.
 flowchart LR
     subgraph W1["WAVE 1 — foundations, no dependencies, all three run at once"]
         direction TB
-        bus["<b>1 · bus</b><br/>role-addressed envelopes<br/>+ the pure router"]
+        bus["<b>1 · bus</b><br/>typed, role-addressed envelopes<br/>the pure router · INV-ENVELOPE-STUCK"]
         schema["<b>2 · schema</b><br/>both validating statuses<br/>kind=manager · round tables · config"]
         evidence["<b>3 · evidence</b><br/>the evidence packet<br/>+ the round fingerprint"]
     end
@@ -70,7 +98,7 @@ flowchart LR
     subgraph W2["WAVE 2 — the two engines"]
         direction TB
         loop["<b>4 · loop</b><br/>the work-order round machine<br/>finish opens a round; the daemon runs it"]
-        manager["<b>7 · manager</b><br/>the project manager order<br/>+ the count_active exemption"]
+        manager["<b>7 · manager</b><br/>the project manager order<br/>count_active exemption · INV-MANAGER-SLOTS"]
     end
 
     subgraph W3["WAVE 3 — everything that hangs off the engines"]
@@ -79,6 +107,7 @@ flowchart LR
         panel["<b>6 · panel</b><br/>the validator seats<br/>arbitrate · validation.py"]
         defer["<b>8 · deferral</b><br/>jarvis wo defer<br/>+ backlog relationship columns"]
         surf["<b>10 · surfaces</b><br/>rounds, envelopes and the manager<br/>in the CLI and the dashboard"]
+        watch["<b>12 · watchdogs</b><br/>the three cross-cutting invariants<br/>that catch a silent stall"]
     end
 
     subgraph W4["WAVE 4 — the feature half"]
@@ -89,6 +118,8 @@ flowchart LR
         ev["<b>11 · eval</b><br/>a graded LLM eval of BOTH panels"]
     end
 
+    loop --> watch
+    manager --> watch
     bus --> loop
     schema --> loop
     evidence --> loop
@@ -125,11 +156,11 @@ the OS behaves exactly as it does today.*
 
 ---
 
-## 3. The 11 work orders
+## 3. The 12 work orders
 
 | # | key | title | depends on |
 |---|---|---|---|
-| 1 | `bus` | Build the message bus: role-addressed envelopes and a pure router | — |
+| 1 | `bus` | Build the message bus: typed, role-addressed envelopes and a pure router | — |
 | 2 | `schema` | Add both `validating` statuses, the `manager` work-order kind and the polymorphic validation tables | — |
 | 3 | `evidence` | Build the evidence packet and the round fingerprint | — |
 | 4 | `loop` | Build the work-order round machine: `finish` opens a round, the daemon runs the validator off-thread, the reconciler stands back | bus, schema, evidence |
@@ -140,6 +171,7 @@ the OS behaves exactly as it does today.*
 | 9 | `feature-validation` | Validate feature orders: the integrated diff, the feature round machine, and rejections routed to the manager | manager, panel, loop |
 | 10 | `surfaces` | Render validation rounds, envelopes and the manager order in the CLI and the dashboard | schema, loop, manager |
 | 11 | `eval` | Grade both validation panels with a synthetic LLM eval and prove the eval is wired | panel, feature-validation |
+| 12 | `watchdogs` | Catch the three ways a validation can stall while still looking like it is working | loop, manager |
 
 ---
 
@@ -310,14 +342,76 @@ a pass** — `arbitrate` has exactly one non-`None` return, and its outcome is `
 
 ---
 
-## 10. Where it lands in the existing code
+## 10. What keeps it from stalling silently
+
+`validating` raises no attention — that is the design. Which means a *stuck* `validating`
+looks exactly like a working one. Three new places work can stop, none of which reads as a
+failure:
+
+```mermaid
+flowchart TB
+    subgraph NEW["the new silent stalls"]
+        direction LR
+        A["a unit parked in <b>validating</b><br/>on a round that will never finish"]
+        B["an envelope parked in <b>queued</b><br/>that the router never picked up"]
+        C["a <b>manager</b> in waiting_input<br/>eating a dispatch slot"]
+    end
+    A --> A2(["looks like:<br/>validation in progress"])
+    B --> B2(["looks like:<br/>feedback delivered"])
+    C --> C2(["looks like:<br/>a quiet project"])
+
+    style NEW fill:#f8d7da,stroke:#721c24
+    style A2 fill:#fff3cd,stroke:#856404
+    style B2 fill:#fff3cd,stroke:#856404
+    style C2 fill:#fff3cd,stroke:#856404
+```
+
+So every new parked state gets a watchdog in `invariants.py` — steady-state predicates
+re-checked on every reconcile tick, no LLM, repairing only what is unambiguous:
+
+| id | fires when | does | ships in |
+|---|---|---|---|
+| `INV-ENVELOPE-STUCK` | an envelope is `queued` past the retry ceiling | **repairs** — retries, then marks `undeliverable` | 1 `bus`, wave 1 |
+| `INV-MANAGER-SLOTS` | `count_active()` ≠ active non-manager work orders | reports + attention — the canary for §12 | 7 `manager`, wave 2 |
+| `INV-VALIDATION-STRANDED` | a round is `pending` past `2 × timeout` | **repairs** — closes it `failed`, unit settles | 5 `entrypoints`, wave 3 |
+| `INV-VALIDATION-ORPHAN` | a unit is `validating` with no round row | reports + attention | 12 `watchdogs`, wave 3 |
+| `INV-VALIDATION-FEEDBACK-LOST` | a rejection's envelope reached nobody | reports + attention | 12 `watchdogs`, wave 3 |
+| `INV-MANAGER-MISSING` | a live feature has children but no manager | reports; `jarvis doctor --repair` creates it | 12 `watchdogs`, wave 3 |
+
+Everything that can go wrong ends at the same place:
+
+```mermaid
+flowchart LR
+    E{"what failed?"}
+    E -- "transport: panel unreachable" --> T["round <b>failed</b>, retry next tick<br/>consumes no round"]
+    T --> T2{"3 in a row?"}
+    T2 -- "no" --> T
+    T2 -- "yes" --> U
+    E -- "judgement: rejected max_rounds times" --> U
+    E -- "integrity: the fingerprint repeats" --> U
+    E -- "structural: a watchdog found a stall" --> U
+    U(["<b>escalate to the user</b><br/>needs_review + attention"])
+    N["<b>no path ends here:</b><br/>stuck, and looking like it works"]
+
+    style U fill:#d1ecf1,stroke:#0c5460,stroke-width:2px
+    style N fill:#f8d7da,stroke:#721c24,stroke-width:2px
+```
+
+**An unavailable validator must never read as a pass**, and **turning the feature off must
+not strand what is already running**: `os.validation.enabled` gates *opening* a round, never
+*settling* one, so flipping it to `false` mid-flight lets every open round finish and simply
+stops new ones. That makes the kill switch a safe stop instead of a trapdoor.
+
+---
+
+## 11. Where it lands in the existing code
 
 ```mermaid
 flowchart TB
     D["<b>daemon.py</b> — the ONLY module that knows about all of them<br/>_validator · settle_work_order early return · settle_features routing · deliver_envelopes"]
 
     OPS["<b>ops.py</b><br/>finish · review · defer"]
-    BUSM["<b>bus.py</b> NEW<br/>post · resolve · deliver"]
+    BUSM["<b>bus.py</b> NEW<br/>post · resolve · deliver<br/>typed payloads · ROLES · KINDS"]
     VAL["<b>validation.py</b> NEW<br/>decide · arbitrate"]
     PS["<b>project_store.py</b><br/>rounds · opinions · envelopes"]
     EV["<b>evidence.py</b> NEW<br/>collect · fingerprint<br/>stdlib only"]
@@ -347,30 +441,40 @@ check.
 
 ---
 
-## 11. The one thing that stops the fleet if it is missed
+## 12. The one thing that stops a project if it is missed
 
 ```mermaid
 flowchart LR
-    A["max_concurrent: 2"] --> B["two feature orders in flight"]
-    B --> C["two managers parked<br/>in waiting_input, by design"]
+    A["max_concurrent — <b>per project</b>,<br/>default 5"] --> B["N feature orders in flight<br/>in that project"]
+    B --> C["N managers parked<br/>in waiting_input, by design"]
     C --> D{{"count_active has<br/><b>no kind filter</b><br/>project_store.py:546"}}
-    D --> E["count_active == 2"]
-    E --> F(["dispatch_pending never claims<br/>another work order.<br/><b>The project stops.</b>"])
+    D --> E["N of the project's slots<br/>are permanently spent"]
+    E --> F(["at N = max_concurrent,<br/>dispatch_pending claims nothing.<br/><b>The project stops.</b>"])
 
     style D fill:#fff3cd,stroke:#856404,stroke-width:2px
     style F fill:#f8d7da,stroke:#721c24,stroke-width:2px
 ```
 
-Child 7 (`manager`) carries the fix: `count_active` must exclude `kind='manager'`. Every
-*other* kind filter in Jarvis is positive (`kind='worker'`, never `kind != …`), so a third
-kind is automatically excluded from all of them — this is the single exception, and it is a
-project-wide deadlock.
+**The cap is per project, not fleet-wide.** `Daemon.dispatch_pending` loops
+`while store.count_active() < project.max_concurrent` against that one project's store;
+`os.defaults.max_concurrent` only sets the default, which each project may override; nothing
+caps the fleet as a whole. So the damage is proportional rather than absolute — **every
+concurrent feature order in a project permanently costs that project one of its five
+slots.** Three features and it runs on two; five and it stops. Feature orders are the
+mechanism the OS offers for large work, so the projects most likely to run several at once
+are exactly the ones this strands.
+
+Child 7 (`manager`) carries the fix — `count_active` must exclude `kind='manager'` — and,
+because a silent stall deserves an alarm and not just a patch, the `INV-MANAGER-SLOTS`
+canary that fires if the exemption ever regresses. Every *other* kind filter in Jarvis is
+positive (`kind='worker'`, never `kind != …`), so a third kind is automatically excluded
+from all of them. This is the single exception.
 
 ---
 
-## 12. Why eleven and not eight
+## 13. Why twelve and not eight
 
-The cap is eight. This plan asks for eleven, and says so rather than hiding it in three
+The cap is eight. This plan asks for twelve, and says so rather than hiding it in four
 oversized children.
 
 ```mermaid
@@ -378,21 +482,29 @@ flowchart LR
     ask["the ask"] --> a["a messaging substrate<br/><i>bus</i>"]
     ask --> b["a new long-lived entity<br/><i>manager, deferral</i>"]
     ask --> c["two validation loops<br/>sharing one panel<br/><i>loop, panel, feature-validation</i>"]
-    a --> out(["11 children, each<br/>one session's work"])
+    ask --> d["watchdogs for every new<br/>state that can stall<br/><i>watchdogs</i>"]
+    a --> out(["12 children, each<br/>one session's work"])
     b --> out
     c --> out
+    d --> out
 ```
 
 The child cap exists to bound the blast radius of a plan nobody reads closely. The honest
-response to exceeding it is to say so and let the user decide — not to fold five children
+response to exceeding it is to say so and let the user decide — not to fold six children
 into three big ones. **`loop` in particular must not be split further**: `finish →
 validating`, the off-thread runner and the reconciler early return each leave a state where
 a finished work order is *lost* if shipped alone. Everything that can safely land after that
 seam is already split out into `entrypoints`.
 
+**Every watchdog ships in the wave that creates the state it guards** — three inside the
+child that owns that machinery, three as `watchdogs` because they are cross-cutting (each
+joins a round to an envelope, or a feature to its manager). None is deferred to the end. A
+watchdog that arrives after the state it guards is a watchdog that was not there for the
+first failure.
+
 ---
 
-## 13. What this plan does not know yet
+## 14. What this plan does not know yet
 
 | open question | where it gets answered |
 |---|---|
