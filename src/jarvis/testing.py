@@ -308,6 +308,7 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
             "type": "result", "subtype": "success", "is_error": True,
             "session_id": sid, "num_turns": 1, "total_cost_usd": 0,
             "duration_api_ms": 0,
+            "terminal_reason": "api_error", "api_error_status": 429,
             # Verbatim from wo-2fa7c0e9 turn 4, middle dot included.
             "result": "You've hit your session limit · resets " + reset,
         }))
@@ -328,6 +329,28 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
         print(json.dumps({"type": "result", "subtype": "error_during_execution",
                           "is_error": True, "result": "model call failed",
                           "session_id": sid}))
+        sys.exit(0)
+    # THE TRANSPORT BREAKING MID-TURN, and note where this sits: BELOW the transcript
+    # write, unlike the usage-limit refusal above it. That is the property under test.
+    # A 500 reaches us after the turn has run — the prompt is in the conversation and
+    # real work may already be done — which is exactly why the retry must nudge the
+    # worker to continue rather than re-send the prompt. A fake that refused this one
+    # early too would make both branches look identical and prove nothing.
+    if os.environ.get("FAKE_CLAUDE_TURN") == "api_error":
+        status = int(os.environ.get("FAKE_CLAUDE_API_ERROR_STATUS", "500"))
+        print(json.dumps({
+            "type": "result", "subtype": "success", "is_error": True,
+            "session_id": sid, "num_turns": 3, "total_cost_usd": 0.42,
+            # Non-zero, and load-bearing: `worker_session._reached_model` reads it to
+            # decide between the nudge and the verbatim re-send.
+            "duration_api_ms": 177098,
+            "terminal_reason": "api_error", "api_error_status": status,
+            "usage": {"input_tokens": 12, "output_tokens": 34},
+            # The shape the CLI assembles for a 5xx, verbatim from wo-4f460495 turn 2.
+            "result": f"API Error: {status} Internal server error. This is a "
+                      "server-side issue, usually temporary — try again in a "
+                      "moment. If it persists, check https://status.claude.com.",
+        }))
         sys.exit(0)
     # The usage envelope mirrors the real CLI's result JSON (verified against a live
     # turn), so the whole reap-and-record path runs against the true field shape in
@@ -723,7 +746,8 @@ def fake_claude(tmp_path, monkeypatch):
             """Make subsequent turns fail. `fail` = non-zero exit, `silent` = exits
             writing nothing at all (a crashed process), `error` = a well-formed result
             with `is_error`, `rate_limit` = the CLI refusing the turn because the
-            account's usage window is spent (see `turns_rate_limited`)."""
+            account's usage window is spent (see `turns_rate_limited`), `api_error` =
+            the API failing mid-turn (see `turns_api_error`)."""
             monkeypatch.setenv("FAKE_CLAUDE_TURN", mode)
 
         def turns_rate_limited(self, reset: str = "11:50pm (America/Los_Angeles)"
@@ -737,8 +761,20 @@ def fake_claude(tmp_path, monkeypatch):
             monkeypatch.setenv("FAKE_CLAUDE_LIMIT_RESET", reset)
             monkeypatch.setenv("FAKE_CLAUDE_TURN", "rate_limit")
 
+        def turns_api_error(self, status: int = 500) -> None:
+            """Break every subsequent turn with an API error, AFTER it has run.
+
+            The mirror image of `turns_rate_limited`, and the difference is the point:
+            this one writes the transcript and reports API time first, so the turn it
+            kills is one that really happened. `status` picks the code — pass 429 to
+            check that the usage-limit path keeps its claim on that one.
+            """
+            monkeypatch.setenv("FAKE_CLAUDE_API_ERROR_STATUS", str(status))
+            monkeypatch.setenv("FAKE_CLAUDE_TURN", "api_error")
+
         def turns_recover(self) -> None:
-            """Undo `turns_fail`/`turns_rate_limited`: turns succeed again."""
+            """Undo `turns_fail`/`turns_rate_limited`/`turns_api_error`: turns succeed
+            again."""
             monkeypatch.delenv("FAKE_CLAUDE_TURN", raising=False)
 
         def hold_turns(self) -> Path:

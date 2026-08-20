@@ -75,6 +75,19 @@ RATE_LIMIT_MIN_DELAY = 60
 #: retrying for ever would hide that behind a work order that looks busy and is not.
 MAX_RATE_LIMIT_RETRIES = 8
 
+#: The backoff for a turn the TRANSPORT lost — a 500, a 529, a dropped connection. One
+#: delay per attempt, in seconds, and its length is also the retry cap: five tries over
+#: about thirty-nine minutes, then it becomes the user's problem.
+#:
+#: Unlike the usage limit, nothing here states when the API will be well again, so there
+#: is no moment to wait for and the schedule has to be a guess. It is shaped like one:
+#: the first two are quick because most 500s are over in seconds and a work order that
+#: heals in a minute costs the user no attention at all, and the tail stretches out
+#: because a fault still there after ten minutes is an outage, and hammering an outage
+#: helps nobody. Claude Code already retries inside the turn before it gives up, so
+#: every delay here sits on top of a burst it has lost.
+TRANSIENT_BACKOFF = (60, 120, 360, 600, 1200)  # 1m, 2m, 6m, 10m, 20m
+
 
 def new_session_id() -> str:
     """Mint the session id for a work order. `--session-id` requires a valid UUID."""
@@ -294,21 +307,34 @@ def _reap(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any]:
     # turn that motivated this hit a 429 having already paid $0.07 for the attempt.
     usage_json = json.dumps(result.usage) if result.usage else None
     if not result.ok:
-        # A refusal for the usage limit is not a failure of the work, so it does not get
-        # "Worker turn failed" in the timeline — the turn row still records state
-        # `failed`, which is the plumbing truth, but the story the user reads is that
-        # the OS paused and will resume itself. Emitted here, where a turn is reaped
-        # exactly once, so a pause lasting hours says so once and not every tick.
+        # A turn lost to the usage window or to a broken API is not a failure of the
+        # work, so it does not get "Worker turn failed" in the timeline — the turn row
+        # still records state `failed`, which is the plumbing truth, but the story the
+        # user reads is that the OS paused and will resume itself. Emitted here, where a
+        # turn is reaped exactly once, so a pause lasting hours says so once and not
+        # every tick.
+        #
+        # Classified off the LIVE result rather than the row about to be written, which
+        # is the same evidence `_diagnose` will re-read later (the row carries both
+        # fields for exactly that reason) — but this is the one moment the stderr tail is
+        # also in hand.
         limit = claude_cli.usage_limit(result.error)
-        kind = "rate_limited" if limit else "turn_failed"
+        transient = None if limit else claude_cli.transient_failure(
+            result.error, terminal_reason=result.terminal_reason,
+            api_error_status=result.api_error_status)
         payload: dict[str, Any] = {"seq": turn["seq"], "error": result.error[:500]}
         if limit:
-            payload["reset_at"] = limit.reset_at
-        store.add_event(wo_id, kind, payload)
+            payload |= {"reason": PAUSE_USAGE_LIMIT, "reset_at": limit.reset_at}
+        elif transient:
+            payload |= {"reason": PAUSE_TRANSIENT, "status": transient.status}
+        store.add_event(wo_id, "turn_paused" if limit or transient else "turn_failed",
+                        payload)
         return store.finish_turn(turn["id"], "failed", error=result.error,
                                  result=result.result or None,
                                  cost_usd=result.cost_usd, num_turns=result.num_turns,
-                                 usage_json=usage_json)
+                                 usage_json=usage_json,
+                                 terminal_reason=result.terminal_reason,
+                                 api_error_status=result.api_error_status)
 
     reply = result.result or _last_assistant_message(store, wo_id, turn)
     if reply:
@@ -353,98 +379,195 @@ def is_stalled(turn: dict[str, Any] | None) -> bool:
                 and time.time() - turn["started_at"] > TURN_STALL_SECONDS)
 
 
-# -- parked on the usage limit -------------------------------------------------------
+# -- parked, and coming back by itself ------------------------------------------------
 #
-# A turn refused for the account's usage limit did not happen: nothing was sent, nothing
-# was billed, and the conversation is exactly where it was. Treating it as a failure
-# settles the work order into `failed`, which is a DEPENDENCY_DEAD_STATUS, fails the
-# parent feature order and puts a permanent attention flag on something that will be
-# fine again at 11:50pm. So the OS does not fail it at all: the work order stays in the
-# active status it already had and `Daemon.retry_rate_limited` relaunches the turn once
-# the window reopens.
+# TWO WAYS A TURN DIES WITHOUT THE WORK BEING WRONG, and neither is the work order's
+# fault, so neither should cost the user an evening.
 #
-# There is NO column and NO status for this. The whole condition is re-derived from the
+#   `usage_limit`  the account's window is spent. The turn did not happen at all:
+#                  nothing was sent, nothing was billed, and the CLI says WHEN the
+#                  window reopens, so the wait is a fact rather than a guess.
+#   `transient`    the transport broke — a 500, a 529, a dropped connection. The turn
+#                  DID happen, possibly at length, and nothing says when the API will
+#                  be well again, so the wait is a backoff (`TRANSIENT_BACKOFF`).
+#
+# Treating either as a failure settles the work order into `failed`, which is a
+# DEPENDENCY_DEAD_STATUS, fails the parent feature order and puts a permanent attention
+# flag on something that will be fine again in a minute. So the OS does not fail it at
+# all: the work order stays in the active status it already had and
+# `Daemon.retry_paused_turns` relaunches the turn when the wait is up.
+#
+# WHY ONE ABSTRACTION AND NOT TWO. The pause is read in four places — the settler,
+# message delivery, the retry pass and `invariants.status_label` — and every one of them
+# asks the same question ("is this work order coming back by itself, and when?"). A
+# second parallel predicate would mean four more call sites that could be updated one at
+# a time and drift, which is the exact failure the original design called out. So there
+# is ONE predicate, `turn_pause`, and the reason it returns is a field.
+#
+# There is still NO column and NO status for the pause itself. It is re-derived from the
 # latest turn every time it is asked for, which is the rule project_store.py states for
 # exactly this choice ("`waiting_pr_merge` earned a status because nothing derived it;
-# this does not"). Four readers share `rate_limit_pause` — the settler, message
-# delivery, the retry pass and `invariants.status_label` — so none of them can drift.
+# this does not"). What IS stored is the turn's own diagnosis — the CLI's
+# `terminal_reason` and `api_error_status` — because that is evidence, and the file it
+# came from gets pruned.
+
+#: The window is spent. Deterministic: the refusal names the moment it reopens.
+PAUSE_USAGE_LIMIT = "usage_limit"
+#: The API broke. Nothing names a moment, so `TRANSIENT_BACKOFF` picks one.
+PAUSE_TRANSIENT = "transient"
+
+#: What to call each reason in a sentence written for the user. Here rather than at each
+#: surface so the notification, the status note and the timeline cannot end up calling
+#: the same pause three different things.
+PAUSE_NOUN = {
+    PAUSE_USAGE_LIMIT: "usage-limit",
+    PAUSE_TRANSIENT: "Claude API",
+}
 
 
 @dataclass(frozen=True)
-class RateLimitPause:
-    """A work order waiting for the usage window to reopen."""
+class TurnPause:
+    """A work order that stopped for the transport, and is coming back on its own."""
 
-    #: The turn that was refused. Its `prompt` is what the retry re-sends.
+    #: `PAUSE_USAGE_LIMIT` or `PAUSE_TRANSIENT` — why it stopped, and which schedule
+    #: decided `retry_at`.
+    reason: str
+    #: The turn that died. Its `prompt` is what a retry re-sends, when it re-sends one.
     turn: dict[str, Any]
-    #: When the window reopens, as the CLI stated it. None when it named no readable time.
-    reset_at: float | None
-    #: The earliest moment the OS will relaunch — the reset plus the minimum floor.
+    #: The earliest moment the OS will relaunch.
     retry_at: float
-    #: Consecutive refusals, this one included.
+    #: Consecutive failures of this same kind, this one included.
     attempts: int
-    #: The refusal, verbatim and squeezed onto one line.
+    #: The failure, verbatim and squeezed onto one line.
     message: str
+    #: When the usage window reopens, as the CLI stated it. None for a transient failure,
+    #: and for a limit message that named a reset in no time this parser could read.
+    reset_at: float | None = None
+    #: The HTTP status, for a transient failure that carried one. Display only.
+    status: int | None = None
+
+    @property
+    def max_attempts(self) -> int:
+        return (MAX_RATE_LIMIT_RETRIES if self.reason == PAUSE_USAGE_LIMIT
+                else len(TRANSIENT_BACKOFF))
 
     @property
     def exhausted(self) -> bool:
         """Retried enough. The work order fails for real and asks for the user."""
-        return self.attempts > MAX_RATE_LIMIT_RETRIES
+        return self.attempts > self.max_attempts
 
     def due(self, now: float | None = None) -> bool:
         return (time.time() if now is None else now) >= self.retry_at
 
 
-def rate_limit_pause(store: ProjectStore, wo_id: str) -> RateLimitPause | None:
-    """This work order's usage-limit pause, or None if it is not in one.
+def turn_pause(store: ProjectStore, wo_id: str) -> TurnPause | None:
+    """This work order's pause, or None if it is not in one.
 
     None for every ordinary failure and for every healthy conversation, so callers use
     it as the predicate itself. Costs one indexed row in the common case: the streak is
-    only counted once the latest turn is already known to be a refusal.
+    only counted once the latest turn is already known to be one of these.
+
+    The usage limit is tested first and `claude_cli.transient_failure` re-tests it, so a
+    429 can never be read as a transient fault however this is called. That ordering is
+    load-bearing: the un-retryable form of a 429 is a SPEND cap, and backing off and
+    retrying one would burn five attempts on something only the user can clear.
     """
     turn = store.latest_turn(wo_id)
     if turn is None or turn["state"] != "failed":
         return None
-    limit = claude_cli.usage_limit(turn.get("error"))
-    if limit is None:
+    reason, ended = _diagnose(turn), turn.get("ended_at") or turn["started_at"]
+    if reason is None:
         return None
-    ended = turn.get("ended_at") or turn["started_at"]
-    when = (ended + RATE_LIMIT_FALLBACK_DELAY if limit.reset_at is None
-            else limit.reset_at)
-    return RateLimitPause(
+    if isinstance(reason, claude_cli.UsageLimit):
+        when = (ended + RATE_LIMIT_FALLBACK_DELAY if reason.reset_at is None
+                else reason.reset_at)
+        return TurnPause(
+            reason=PAUSE_USAGE_LIMIT,
+            turn=turn,
+            reset_at=reason.reset_at,
+            retry_at=max(when, ended + RATE_LIMIT_MIN_DELAY),
+            attempts=pause_streak(store, wo_id, PAUSE_USAGE_LIMIT),
+            message=reason.message,
+        )
+    attempts = pause_streak(store, wo_id, PAUSE_TRANSIENT)
+    # One delay per attempt, and the last one repeats — which it only can when the
+    # streak has already run past the cap, i.e. when `exhausted` is about to be true.
+    delay = TRANSIENT_BACKOFF[min(max(attempts, 1), len(TRANSIENT_BACKOFF)) - 1]
+    return TurnPause(
+        reason=PAUSE_TRANSIENT,
         turn=turn,
-        reset_at=limit.reset_at,
-        retry_at=max(when, ended + RATE_LIMIT_MIN_DELAY),
-        attempts=rate_limit_streak(store, wo_id),
-        message=limit.message,
+        retry_at=ended + delay,
+        attempts=attempts,
+        message=reason.message,
+        status=reason.status,
     )
 
 
-def rate_limit_streak(store: ProjectStore, wo_id: str) -> int:
-    """How many turns in a row this conversation has had refused for the limit.
+def _diagnose(turn: dict[str, Any]) -> claude_cli.UsageLimit | claude_cli.TransientFailure | None:
+    """Why this failed turn is worth retrying, or None if it is not.
+
+    One place, so the pause and the streak that counts it can never disagree about what
+    a given turn was. The usage limit goes first because its message is also an API
+    error and would otherwise be read as one.
+    """
+    error = turn.get("error")
+    limit = claude_cli.usage_limit(error)
+    if limit is not None:
+        return limit
+    return claude_cli.transient_failure(
+        error,
+        terminal_reason=turn.get("terminal_reason"),
+        api_error_status=turn.get("api_error_status"),
+    )
+
+
+def pause_streak(store: ProjectStore, wo_id: str, reason: str) -> int:
+    """How many turns in a row this conversation has lost to `reason`.
 
     Counted off the end of the conversation rather than stored, so it resets itself the
     moment one turn gets through — which is the only definition of "recovered" that does
     not need a column someone has to remember to clear.
+
+    The count stops at the first turn that was anything ELSE, a different pause reason
+    included: a conversation that hit the usage limit and then hit a 500 is on its first
+    500, and charging it the limit's attempts would cut its backoff short.
     """
+    want = claude_cli.UsageLimit if reason == PAUSE_USAGE_LIMIT else claude_cli.TransientFailure
     n = 0
     for turn in store.recent_turns(wo_id, limit=MAX_RATE_LIMIT_RETRIES + 2):
-        if turn["state"] != "failed" or claude_cli.usage_limit(turn.get("error")) is None:
+        if turn["state"] != "failed" or not isinstance(_diagnose(turn), want):
             break
         n += 1
     return n
 
 
 def retry(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
-          turn: dict[str, Any]) -> dict[str, Any]:
-    """Relaunch a turn that was refused before it ran. Same prompt, same conversation.
+          pause: TurnPause) -> dict[str, Any]:
+    """Relaunch a turn the transport lost. Same conversation, and usually same prompt.
 
-    The prompt is read back off the turn row, which is why nothing is lost when the
-    refused turn was carrying a user message: `Daemon._deliver` marks a message
-    `delivered` the instant the process starts, so the turn row is the only remaining
-    copy of what the worker never got to read.
+    WHAT IT RE-SENDS DEPENDS ON WHETHER THE TURN EVER REACHED THE MODEL (Neo, question
+    126). The prompt is read back off the turn row, which is why nothing is lost when the
+    lost turn was carrying a user message: `Daemon._deliver` marks a message `delivered`
+    the instant the process starts, so the turn row is the only remaining copy of what
+    the worker never got to read. Re-sending it verbatim is exactly right for a turn that
+    was refused BEFORE it ran — the conversation is untouched and the worker has still
+    never seen the message.
+
+    It is wrong for a turn that died in flight. Verified on wo-4f460495, the work order
+    that motivated this: its turn took a 500 after 350 seconds, and the session transcript
+    holds the prompt followed by ~55 messages and $1.99 of real work. Re-sending the
+    prompt there would put the same user message into the conversation a second time and
+    invite the worker to redo everything it had already done. So when the turn reached the
+    model, the retry resumes with a short continuation nudge instead (`_nudge`) and lets
+    the transcript speak for what was already said.
+
+    The test is `duration_api_ms`, which the CLI reports on the failed envelope too: a
+    refusal that never reached the API records 0 there (verified across every usage-limit
+    refusal the fleet has recorded), and a turn that got any distance records the time it
+    spent. It is read from the stored usage envelope, so it outlives the result file.
 
     Two flags have to be re-decided rather than copied off the original turn, because a
-    refusal can land on either side of both. Each is settled by asking the filesystem
+    failure can land on either side of both. Each is settled by asking the filesystem
     what actually exists, so the answer is a fact and not a guess about how far the CLI
     got before it gave up:
 
@@ -454,12 +577,53 @@ def retry(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
       directory exists asks for one that is already there. Once it exists the retry
       simply runs from inside it, which is what every later turn does anyway.
     """
+    turn = pause.turn
     started = _conversation_started(project, wo)
     tree = worktree_path(project, wo)
+    # Both halves are required. A turn can bill API time and still leave no session to
+    # resume (the opening turn, dying before the transcript lands), and nudging a
+    # conversation that does not exist would open one whose entire content is the nudge.
+    prompt = _nudge(pause) if started and _reached_model(turn) else turn["prompt"]
     return _launch(
-        store, project, wo, turn["prompt"], kind=turn["kind"], resume=started,
+        store, project, wo, prompt, kind=turn["kind"], resume=started,
         worktree=None if tree or turn["kind"] != "dispatch" else wo.get("worktree"),
         cwd=tree or project.path, msg_id=turn.get("msg_id"),
+    )
+
+
+def _reached_model(turn: dict[str, Any]) -> bool:
+    """Did this turn get as far as the API before it died?
+
+    False when there is no usage envelope at all: a turn reaped before that column
+    existed, or one that crashed without writing a result. Both are better served by the
+    verbatim re-send, which is the behaviour that was already there.
+    """
+    from . import db
+
+    usage = db.from_json(turn.get("usage_json"), None)
+    if not isinstance(usage, dict):
+        return False
+    return (usage.get("duration_api_ms") or 0) > 0
+
+
+def _nudge(pause: TurnPause) -> str:
+    """What a worker is told when its own turn is relaunched under it.
+
+    Addressed to the worker, not the user, and it has one job: make clear that the
+    conversation above is intact and that the interruption was the transport, so the
+    worker continues instead of starting again. It says what happened because a worker
+    that can see the gap in its own transcript will otherwise spend a turn working out
+    what it missed.
+    """
+    what = ("Claude's usage limit was reached" if pause.reason == PAUSE_USAGE_LIMIT
+            else f"the Claude API failed ({pause.message})")
+    return (
+        f"[Jarvis] Your previous turn was cut short because {what}. This was the "
+        "transport, not anything you or the work did, and nothing you had already "
+        "done was lost — the conversation above is intact and is where you left off. "
+        "Carry on from there and finish that turn. Do not start again and do not "
+        "repeat work that is already done; re-check the state on disk first if you "
+        "are unsure how far you got."
     )
 
 

@@ -21,6 +21,7 @@ SIGNAL_KINDS = [
     # itself right afterwards — that recovery is the answer to "why did it start again
     # on its own at midnight", which is a question only the timeline can answer.
     "rate_limited", "rate_limit_retry", "rate_limit_exhausted",
+    "turn_paused", "turn_resumed", "turn_retries_exhausted",
 ]
 DEBUG_KINDS = [
     "message_queued", "delivering", "message_delivered",
