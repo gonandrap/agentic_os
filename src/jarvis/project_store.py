@@ -624,7 +624,14 @@ class ProjectStore:
 
     def seal_bill(self, order_id: str, payload_json: str, *, feature: bool = False,
                   at: float | None = None) -> None:
-        """Freeze one order's bill. Written once; a re-seal would only lose detail."""
+        """Freeze one order's bill.
+
+        Written once at settle, and re-written only by `bill._upgrade_seal` — when the
+        stored payload predates a field the module now computes AND recomputing today
+        still sees at least as many tokens as the seal holds. Pass `at` to preserve the
+        original seal time through such an upgrade: WHEN the order settled has not
+        changed just because the payload was re-derived.
+        """
         fields = {"bill_json": payload_json, "bill_sealed_at": at or db.now()}
         if feature:
             self.update_feature_order(order_id, **fields)

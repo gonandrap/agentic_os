@@ -24,14 +24,14 @@
       <td class="mono sub" style="text-align:right">1×</td>
       <td class="mono" style="text-align:right">${{ '%.3f'|format(c.input) }}</td>
       <td class="sub">never cached — sent and read once</td></tr>
+  {# The rate is the one PAID, not the range it could have been: `cost.write_rate` is
+     the token-weighted multiple these very tokens were charged at, so this column and
+     the one beside it are the same arithmetic. `rate_note` says how it was arrived at. #}
   <tr><td>cache write</td>
       <td class="mono" style="text-align:right">{{ fmt_tok(t.cache_write) }}</td>
-      <td class="mono sub" style="text-align:right">1.25–2×</td>
+      <td class="mono sub" style="text-align:right">{{ '%.2f'|format(write_rate_of(line)) }}×</td>
       <td class="mono" style="text-align:right">${{ '%.3f'|format(c.cache_write) }}</td>
-      <td class="sub">stored in the prompt cache: 1.25× at the 5-minute TTL, 2× at the
-        one-hour one{% if t.cache_1h or t.cache_5m %} —
-        {{ fmt_tok(t.cache_1h) }} of it 1h, {{ fmt_tok(t.cache_5m) }} 5m,
-        where the CLI reported the split{% endif %}</td></tr>
+      <td class="sub">stored in the prompt cache — {{ rate_note(line, fmt_tok) }}</td></tr>
   <tr><td>cache read</td>
       <td class="mono" style="text-align:right">{{ fmt_tok(t.cache_read) }}</td>
       <td class="mono sub" style="text-align:right">0.1×</td>
@@ -101,6 +101,15 @@
    the claim "these add up" is checkable on the page and not only in a test. #}
 {% macro view(lines, total, caption) %}
 <div class="panel" style="margin-top: 10px;">
+  {# The two right-hand columns, named. Unlabelled they were a puzzle — "517k" on a turn
+     invites "517k of what?", and the answer (all four classes, summed over the turn's
+     API calls) is not guessable from a bare number. Said here once per view rather than
+     on every row. #}
+  <div class="row" style="border-bottom: 1px solid var(--line);">
+    <span class="grow sub">{{ tokens_mean }}</span>
+    <span class="mono sub">tokens</span>
+    <span class="mono sub" style="width: 76px; text-align: right;">at list</span>
+  </div>
   {% for l in lines %}{{ line(l) }}{% else %}
   <div class="empty">nothing recorded</div>
   {% endfor %}
@@ -167,6 +176,9 @@
   {%- if acc.sealed_at %}
     Sealed when this order settled, on {{ fmt_ts(acc.sealed_at) }}, and shown as sealed —
     the records behind it expire, this figure does not.
+    {%- if acc.resealed_at %} Re-derived on {{ fmt_ts(acc.resealed_at) }} to add detail
+    the original seal predates, and adopted only because recomputing still saw every
+    token the seal held.{% endif %}
   {%- elif acc.live %}
     Worked out just now, from records that are still live. It is sealed automatically
     once the order settles.

@@ -286,6 +286,55 @@ class Usage:
 
 
 @dataclass
+class Call:
+    """ONE API call — the finest grain there is, and the one a turn is made of.
+
+    A worker turn is a whole agent loop: the model answers, a tool runs, the model is
+    called again with the result appended, until it stops. Every one of those calls
+    re-sends the conversation so far, so a turn's `cache_read` is a SUM over its calls
+    and not a size — 11 calls each re-reading a 55k conversation read 517k between them,
+    which is the question this record exists to answer (wo-e23252e4, turn 1).
+
+    One per assistant message in the transcript, which is exactly one per API call: on
+    that turn the 11 messages' counts sum to the CLI's own `modelUsage` totals to the
+    token, in all four classes. `ts` is when the call landed, and is what buckets a call
+    into the turn it ran in — the same last-turn-started-by-then rule the rest of the
+    bill uses.
+    """
+
+    ts: float = 0.0
+    model: str = ""
+    input: int = 0
+    cache_write: int = 0
+    cache_read: int = 0
+    output: int = 0
+    cache_1h: int = 0
+    cache_5m: int = 0
+
+    @property
+    def context(self) -> int:
+        """What this one call was asked to read — its share of the window.
+
+        THE figure a turn's `cache_read` is not: the context is what ONE call carried,
+        and it is the number that says whether a conversation is getting too big.
+        """
+        return self.input + self.cache_write + self.cache_read
+
+    @property
+    def total_tokens(self) -> int:
+        return self.context + self.output
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "ts": self.ts, "model": self.model, "input": self.input,
+            "cache_write": self.cache_write, "cache_read": self.cache_read,
+            "output": self.output, "cache_1h": self.cache_1h,
+            "cache_5m": self.cache_5m, "context": self.context,
+            "total": self.total_tokens,
+        }
+
+
+@dataclass
 class Subagent:
     """One subagent the session spawned, with enough about it to name a bill line.
 
@@ -442,7 +491,11 @@ def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
                 continue
             entry = by_id.get(mid)
             if entry is None:
-                entry = by_id[mid] = {"model": message.get("model") or ""}
+                # `ts` rides along so a message can be placed in the TURN it ran in.
+                # First occurrence, not max: a message is rewritten as its text grows,
+                # and when the call LANDED is when its first row was written.
+                entry = by_id[mid] = {"model": message.get("model") or "",
+                                      "ts": _parse_stamp(row.get("timestamp"))}
                 order.append(mid)
             for key, value in usage.items():
                 if isinstance(value, int):
@@ -458,6 +511,47 @@ def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
                     if isinstance(value, int):
                         entry[key] = max(entry.get(key, 0), value)
     return [by_id[mid] for mid in order]
+
+
+def calls_of(path: Path | str) -> list[Call]:
+    """Every API call in one transcript, in the order they were made.
+
+    The same messages `_usage_of` totals, kept apart instead of added up. Deliberately a
+    second walk over the file rather than a second return value: the totals are read on
+    every cost surface there is and the per-call detail on one, and paying for the split
+    only where it is asked for keeps `read_session` the cheap thing it has to stay.
+    """
+    return [
+        Call(
+            ts=message.get("ts") or 0.0,
+            model=message.get("model") or "",
+            input=message.get("input_tokens", 0),
+            cache_write=message.get("cache_creation_input_tokens", 0),
+            cache_read=message.get("cache_read_input_tokens", 0),
+            output=message.get("output_tokens", 0),
+            cache_1h=message.get("ephemeral_1h_input_tokens", 0),
+            cache_5m=message.get("ephemeral_5m_input_tokens", 0),
+        )
+        for message in _assistant_messages(path)
+    ]
+
+
+def session_calls(session_id: str, root: Path | None = None,
+                  index: dict[str, list[Path]] | None = None) -> list[Call]:
+    """The LEAD agent's API calls for one session, across every segment of it.
+
+    The lead agent only: a subagent writes its own transcript, and its calls belong to
+    its own row on the bill rather than to the session's. That is what keeps these
+    reconcilable — they sum to the turn's line MINUS its subagents, which is exactly the
+    lead-agent line the bill already computes.
+    """
+    if index is None:
+        index = index_sessions(root)
+    calls: list[Call] = []
+    for path in sorted(index.get(session_id) or []):
+        calls.extend(calls_of(path))
+    calls.sort(key=lambda c: c.ts)
+    return calls
 
 
 def _usage_of(path: Path) -> Usage:

@@ -533,3 +533,192 @@ def test_an_unsealed_old_order_is_costed_live_and_says_what_it_lost(store, wo):
     assert b["accuracy"]["sealed_at"] is None
     assert b["accuracy"]["complete"] is False
     assert any("modelUsage" in gap for gap in b["accuracy"]["gaps"])
+
+
+# -- the grain under a turn: one row per API call ---------------------------------------
+
+
+def test_a_turns_api_calls_are_itemised_and_sum_back_to_the_turn(store, wo, transcripts):
+    """The defect the user found: a turn read 517k of context it never held at once.
+
+    A turn is an agent LOOP — the model answers, a tool runs, the model is called again
+    with the result appended — and every call re-sends the conversation. So a turn's
+    cache-read is a SUM over its calls, and with the turn as the finest grain there was
+    no way to see that from the bill. Each call now has a row, and they are a PARTITION
+    of the turn: they add up to it exactly, class by class.
+    """
+    give_session(store, wo["id"], "sess-calls")
+    # `peak=1_205` is what the envelope's one sampled iteration saw — a real call, so a
+    # real lower bound, but not the turn's largest. The transcript knows the largest.
+    turn = add_turn(store, wo["id"], dict(recorded_usage(0.05, peak=1_205), input=0,
+                                          cache_write=1_500, cache_read=2_200,
+                                          output=180, cache_1h=0, cache_5m=1_500))
+    # Three calls, one conversation growing under them — the real shape of a turn. Their
+    # timestamps have to fall INSIDE the turn: a call is charged to the last turn that
+    # had started when it landed, the same rule everything else on the bill uses.
+    began = turn["started_at"]
+    transcripts("sess-calls", [
+        assistant_row("m1", write=1_000, read=0, out=50, at=began + 1),
+        assistant_row("m2", write=200, read=1_000, out=60, at=began + 2),
+        assistant_row("m3", write=300, read=1_200, out=70, at=began + 3),
+    ])
+    store.set_status(wo["id"], "completed")
+
+    row = ops.bill(wo["id"], live=True)["turn_rows"][0]
+
+    assert row["api_calls"] == 3, "the count comes from the calls, not from a sample"
+    assert row["calls_source"] == "transcript"
+    assert [c["cache_read"] for c in row["call_rows"]] == [0, 1_000, 1_200]
+    # The identity that makes the view trustworthy: the calls ARE the turn.
+    for cls, total in (("cache_write", 1_500), ("cache_read", 2_200), ("output", 180)):
+        assert sum(c[cls] for c in row["call_rows"]) == total == row[cls]
+    # ...and the context peak is what ONE call carried, never their sum — raised here
+    # above the envelope's sampled 1_205 by the largest call the transcript knows of.
+    assert row["context_peak"] == 1_500
+    assert ops.bill(wo["id"], live=True)["checks"]["balanced"]
+
+
+def test_a_turn_with_more_calls_than_the_cap_says_what_it_folded(store, wo,
+                                                                 transcripts,
+                                                                 monkeypatch):
+    """A capped list that just stops reads as a complete one.
+
+    The cap exists because these rows are SEALED — a long turn would grow the seal
+    without bound — but what it drops has to be counted and shown, or the page quietly
+    understates a turn while looking exhaustive.
+    """
+    monkeypatch.setattr(bill_mod, "TURN_CALL_LIMIT", 2)
+    give_session(store, wo["id"], "sess-cap")
+    turn = add_turn(store, wo["id"], dict(recorded_usage(0.05), input=0,
+                                          cache_write=100, cache_read=20, output=4,
+                                          cache_1h=0, cache_5m=100))
+    transcripts("sess-cap", [
+        assistant_row(f"m{i}", write=10 * i, read=5, out=1,
+                      at=turn["started_at"] + i)
+        for i in range(1, 5)
+    ])
+    store.set_status(wo["id"], "completed")
+
+    row = ops.bill(wo["id"], live=True)["turn_rows"][0]
+
+    assert row["api_calls"] == 4, "the COUNT is never capped, only the rows"
+    assert len(row["call_rows"]) == 2
+    # The dearest are kept, because "which call cost that" is the question this answers.
+    assert [c["cache_write"] for c in row["call_rows"]] == [30, 40]
+    assert row["calls_folded"]["count"] == 2
+    assert row["calls_folded"]["cache_write"] == 10 + 20
+    # Nothing is lost: what is shown plus what is folded is still the whole turn.
+    shown = sum(c["cache_write"] for c in row["call_rows"])
+    assert shown + row["calls_folded"]["cache_write"] == 100
+
+
+def test_api_calls_is_absent_rather_than_guessed_when_the_transcript_is_gone(store, wo):
+    """`iterations` in a result envelope is a SAMPLE of a turn, not a list of its calls.
+
+    Measured over 199 live result files it holds exactly one entry in 196 of them, so
+    reading its length reported `1` for an eleven-call turn. A count that cannot be
+    known is now left absent — a dash on the page — rather than asserted wrongly.
+    """
+    add_turn(store, wo["id"], dict(recorded_usage(0.05), api_calls=None))
+    store.set_status(wo["id"], "completed")
+
+    row = ops.bill(wo["id"], live=True)["turn_rows"][0]
+
+    assert row["api_calls"] is None
+    assert row["calls_source"] == "envelope"
+    assert "call_rows" not in row
+
+
+def test_the_cache_write_rate_is_the_one_paid_not_the_range(store, wo):
+    """The user's complaint: a line whose tokens were all 5-minute said `1.25-2x`.
+
+    The range is the price LIST. What a reader of one line wants is the price PAID, and
+    it is already implied by the dollar figure beside it — the two disagreeing on the
+    same row is what made the range unreadable.
+    """
+    add_turn(store, wo["id"], dict(recorded_usage(0.05), cache_write=1_000,
+                                   cache_1h=0, cache_5m=1_000))
+    b = ops.bill(wo["id"], live=True)
+    assert bill_mod.write_rate_of(b["total"]) == pytest.approx(1.25)
+    assert "5-minute" in bill_mod.rate_note(b["total"])
+
+    # An all-1h line is the other end, and it must not read as 1.25x either.
+    wo2 = store.create_work_order("an hour", "")
+    add_turn(store, wo2["id"], dict(recorded_usage(0.05), cache_write=1_000,
+                                    cache_1h=1_000, cache_5m=0))
+    b2 = ops.bill(wo2["id"], live=True)
+    assert bill_mod.write_rate_of(b2["total"]) == pytest.approx(2.0)
+
+    # And a line the CLI reported no split for charges the floor, and SAYS it is a floor.
+    wo3 = store.create_work_order("unknown", "")
+    add_turn(store, wo3["id"], dict(recorded_usage(0.05), cache_write=1_000,
+                                    cache_1h=0, cache_5m=0))
+    b3 = ops.bill(wo3["id"], live=True)
+    assert bill_mod.write_rate_of(b3["total"]) == pytest.approx(1.25)
+    assert "floor" in bill_mod.rate_note(b3["total"])
+
+
+def test_an_old_seal_is_re_derived_while_the_evidence_survives(store, wo, transcripts):
+    """Sealing froze the numbers — and, until now, the SHAPE with them.
+
+    A bill sealed before per-call rows existed could never show them, not even on an
+    order whose transcript was still on disk. So the payload carries a version and an
+    older one is re-derived once, keeping the original seal time.
+    """
+    give_session(store, wo["id"], "sess-upgrade")
+    turn = add_turn(store, wo["id"], dict(recorded_usage(0.05), input=0,
+                                          cache_write=1_000, cache_read=600, output=50,
+                                          cache_1h=0, cache_5m=1_000))
+    transcripts("sess-upgrade", [
+        assistant_row("m1", write=600, read=0, out=20, at=turn["started_at"] + 1),
+        assistant_row("m2", write=400, read=600, out=30, at=turn["started_at"] + 2),
+    ])
+    store.set_status(wo["id"], "completed")
+    sealed = bill_mod.seal("proj_a", store.project_path, store.get_work_order(wo["id"]))
+    was_sealed_at = store.get_work_order(wo["id"])["bill_sealed_at"]
+
+    # Age the seal back to the shape this release replaces.
+    stale = {k: v for k, v in sealed.items() if k != "payload_v"}
+    for row in stale["turn_rows"]:
+        row.pop("call_rows", None)
+        row["api_calls"] = 1
+    store.seal_bill(wo["id"], json.dumps(stale), at=was_sealed_at)
+
+    upgraded = ops.bill(wo["id"])
+
+    assert upgraded["payload_v"] == bill_mod.PAYLOAD_VERSION
+    assert upgraded["turn_rows"][0]["api_calls"] == 2
+    assert upgraded["accuracy"]["resealed_at"]
+    # The seal TIME is preserved: re-deriving the payload did not move when it settled.
+    assert store.get_work_order(wo["id"])["bill_sealed_at"] == was_sealed_at
+    # Written back, so the next reader gets it without recomputing.
+    assert json.loads(store.get_work_order(wo["id"])["bill_json"])["payload_v"] == \
+        bill_mod.PAYLOAD_VERSION
+
+
+def test_an_old_seal_stands_once_the_evidence_is_gone(store, wo, transcripts,
+                                                      monkeypatch):
+    """The rule that keeps the upgrade safe: a bill must never shrink when re-read.
+
+    An upgrade is adopted only if recomputing still sees every token the seal holds. The
+    moment Claude Code prunes the transcript, it does not — and the old seal, shape and
+    all, is the better record.
+    """
+    give_session(store, wo["id"], "sess-pruned")
+    transcripts("sess-pruned", [assistant_row("m1", write=9_000, read=0, out=100)])
+    add_turn(store, wo["id"], None)  # no envelope: the transcript is the only source
+    store.set_status(wo["id"], "completed")
+    sealed = bill_mod.seal("proj_a", store.project_path, store.get_work_order(wo["id"]))
+    before = sealed["total"]["tokens"]["total"]
+    assert before == 9_100
+
+    stale = {k: v for k, v in sealed.items() if k != "payload_v"}
+    store.seal_bill(wo["id"], json.dumps(stale),
+                    at=store.get_work_order(wo["id"])["bill_sealed_at"])
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(store.project_path / "gone"))
+
+    b = ops.bill(wo["id"])
+
+    assert b["total"]["tokens"]["total"] == before, "the seal stood"
+    assert "payload_v" not in b, "and it was NOT re-derived from nothing"
+    assert not b["accuracy"].get("resealed_at")

@@ -100,7 +100,11 @@
       <td class="mono">{{ t.kind }}</td>
       <td class="mono" style="white-space: nowrap;">{{ fmt_age(t.started_at) }}</td>
       <td class="mono">{{ fmt_dur(t.duration_s) }}</td>
-      <td class="mono">{{ t.api_calls or '—' }}</td>
+      <td class="mono">{{ t.api_calls or '—' }}
+        {%- if t.calls_source == 'envelope' and t.api_calls %}
+          <span class="sub" title="counted from the result envelope, which reports a
+            sample of the turn rather than one entry per call — the transcript this
+            would be counted from is gone">?</span>{% endif %}</td>
       <td>
         {% if t.recorded %}
         <span class="mono" style="white-space: nowrap;">{{ fmt_tok(t.context_peak) }}
@@ -125,6 +129,57 @@
   bloating. It is not a charge and appears nowhere in the bill above: the same context
   is re-read on every call of the turn, and the bill counts what was read.
 </p>
+
+{# The grain UNDER the turn. A turn is an agent loop — the model answers, a tool runs,
+   the model is called again with the result appended — and every call re-sends the
+   conversation, which is why a turn's cache-read is a sum over its calls and not a
+   size. Rendered as a disclosure per turn because it is the answer to a question only
+   some readers have ("why did turn 1 read 517k?"), and one they cannot answer at all
+   without it. #}
+{% set detailed = turn_rows|selectattr('call_rows')|list %}
+{% if detailed %}
+<h2>Every API call</h2>
+<p class="sub" style="margin: -4px 0 10px;">
+  These sum to their turn, class by class — they are the LEAD agent's calls, so on a
+  turn that spawned subagents the difference is those, itemised in the bill above.
+  <code>context</code> is what one call carried; <code>read</code> is what it was billed
+  for reading. Watch the first call of each turn after the first: it writes the whole
+  conversation again instead of reading it, and that is the re-write tax below.
+</p>
+{% for t in detailed %}
+<details class="panel" style="margin-bottom: 8px; padding: 8px 16px;">
+  <summary>turn {{ t.seq }} · {{ t.kind }} —
+    <span class="mono">{{ t.api_calls }}</span> API calls,
+    <span class="mono">{{ fmt_tok(t.calls_cover.total) }}</span> tokens</summary>
+  <table style="margin-top: 6px; font-size: 13px;">
+    <tr><th style="text-align:right">call</th><th style="text-align:right">context</th>
+      <th style="text-align:right">read</th><th style="text-align:right">wrote</th>
+      <th style="text-align:right">output</th><th style="text-align:left">model</th></tr>
+    {% for c in t.call_rows %}
+    <tr>
+      <td class="mono sub" style="text-align:right">{{ loop.index }}</td>
+      <td class="mono" style="text-align:right">{{ fmt_tok(c.context) }}</td>
+      <td class="mono" style="text-align:right">{{ fmt_tok(c.cache_read) }}</td>
+      <td class="mono" style="text-align:right">{{ fmt_tok(c.cache_write) }}</td>
+      <td class="mono" style="text-align:right">{{ fmt_tok(c.output) }}</td>
+      <td class="mono sub">{{ c.model }}</td>
+    </tr>
+    {% endfor %}
+    {% if t.calls_folded %}
+    {# Never a silent cap: a table that just stops reads as a complete one. #}
+    <tr>
+      <td class="mono sub" style="text-align:right">…</td>
+      <td class="sub" style="text-align:right">—</td>
+      <td class="mono sub" style="text-align:right">{{ fmt_tok(t.calls_folded.cache_read) }}</td>
+      <td class="mono sub" style="text-align:right">{{ fmt_tok(t.calls_folded.cache_write) }}</td>
+      <td class="mono sub" style="text-align:right">{{ fmt_tok(t.calls_folded.output) }}</td>
+      <td class="sub">{{ t.calls_folded.count }} further calls, folded into this row</td>
+    </tr>
+    {% endif %}
+  </table>
+</details>
+{% endfor %}
+{% endif %}
 {% endif %}
 
 {% if bill.rewrite and bill.rewrite.tokens %}
@@ -140,7 +195,8 @@
     Every turn is a separate <code>claude --resume</code> process. Claude Code puts
     <code>git status</code> in its system prompt, so a worker — whose job is editing
     files — presents a different prompt prefix on its next turn, the cached conversation
-    is invalidated, and the whole of it is re-sent at the cache-WRITE rate (1.25–2×)
+    is invalidated, and the whole of it is re-sent at the cache-WRITE rate
+    ({{ '%.2f'|format(write_rate_of(bill.total)) }}× on this order)
     instead of being served at the cache-READ rate (0.1×). The cause is upstream and
     Jarvis cannot fix it; what it can do is cost fewer boundaries, which is why sending
     a worker one message beats sending it three.

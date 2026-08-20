@@ -11,7 +11,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import invariants, ops, uilog
+from .. import bill, invariants, ops, uilog
 from ..central_store import CentralStore
 from ..daemon import daemon_running
 from ..paths import PRODUCTION, deployment_env
@@ -334,6 +334,11 @@ def create_app() -> FastAPI:
         active_statuses=ACTIVE_STATUSES,
         instance=instance_badge(),
         fmt_tok=fmt_tok, fmt_dur=fmt_dur, fmt_ts=fmt_ts,
+        # The bill's two explanations, taken from the module that computes the numbers
+        # rather than written into the template: a caveat that says one thing on the
+        # page and another in the terminal is one the reader learns to ignore.
+        rate_note=bill.rate_note, tokens_mean=bill.TOKENS_MEAN,
+        write_rate_of=bill.write_rate_of,
     )
 
     def render(request: Request, template: str, active: str = "dashboard",

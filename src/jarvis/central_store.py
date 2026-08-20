@@ -140,6 +140,12 @@ CREATE TABLE IF NOT EXISTS agent_calls (
     label TEXT NOT NULL DEFAULT '',         -- the seat name, or whatever names the call
     model TEXT NOT NULL DEFAULT '',
     question_id INTEGER,                    -- the neo.db question, where there is one
+    -- The session the CLI minted for this one-shot call. Stored so an OS call can be
+    -- opened up per API CALL the same way a worker turn now can: its transcript is the
+    -- only place that detail exists, and this id is the only handle on it. Recorded at
+    -- the call because nothing can recover it afterwards — the same reason the token
+    -- counts beside it are.
+    session_id TEXT NOT NULL DEFAULT '',
     ok INTEGER NOT NULL DEFAULT 1,
     cost_usd REAL,                          -- the CLI's own figure — exact, not a proxy
     input INTEGER NOT NULL DEFAULT 0,
@@ -201,6 +207,12 @@ ADDED_COLUMNS = {
         # Retraction. NULL on every pre-existing row, which reads as "standing".
         "retired_at": "REAL",
         "retired_reason": "TEXT",
+    },
+    "agent_calls": {
+        # Which session the call ran in, so its per-API-call detail can be read back
+        # from the transcript. '' on every pre-existing row, which reads as "not
+        # recorded" — those calls keep their totals and simply cannot be expanded.
+        "session_id": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -716,7 +728,7 @@ class CentralStore:
 
     def add_agent_call(self, kind: str, *, project: str = "", wo_id: str = "",
                        label: str = "", model: str = "", question_id: int | None = None,
-                       ok: bool = True,
+                       ok: bool = True, session_id: str = "",
                        usage: dict[str, Any] | None = None) -> int:
         """Record one Claude call the OS made itself. See the `agent_calls` schema.
 
@@ -729,10 +741,11 @@ class CentralStore:
         u = usage or {}
         cur = self.conn.execute(
             """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model,
-                                        question_id, ok, cost_usd, input, cache_write,
-                                        cache_read, output, usage_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        question_id, ok, session_id, cost_usd, input,
+                                        cache_write, cache_read, output, usage_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (db.now(), project, wo_id, kind, label, model, question_id, 1 if ok else 0,
+             session_id,
              u.get("total_cost_usd"), u.get("input") or 0, u.get("cache_write") or 0,
              u.get("cache_read") or 0, u.get("output") or 0,
              db.to_json(usage) if usage else None),
