@@ -1428,3 +1428,34 @@ def test_version_lookup_failure_does_not_break_the_header(
     html = _chrome(jarvis_home, catalog_file)
     assert "· unknown" in html
     assert 'class="instance"' in html
+
+
+# -- units under validation -----------------------------------------------------------
+#
+# Templates index STATUS_META and FO_STATUS_META BY STATUS, so a status added to the
+# vocabulary without an entry in both does not degrade — it 500s the page, and it takes
+# every other work order in the project down with it.
+
+
+def test_a_validating_work_order_renders_everywhere_it_appears(client, project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship the exporter")
+    store.set_status(wo["id"], "validating")
+    store.open_validation_round(wo_id=wo["id"], fingerprint="abc")
+
+    for url in ("/", "/project/proj_a", f"/wo/proj_a/{wo['id']}"):
+        res = client.get(url)
+        assert res.status_code == 200, (url, res.status_code)
+    assert "under review" in client.get(f"/wo/proj_a/{wo['id']}").text
+
+
+def test_a_validating_feature_order_renders_everywhere_it_appears(client, project):
+    store = ProjectStore(project)
+    fo = store.create_feature_order("CSV export", description="the whole ask")
+    store.set_feature_status(fo["id"], "validating")
+    store.open_validation_round(fo_id=fo["id"], fingerprint="abc")
+
+    for url in ("/", "/project/proj_a", f"/fo/proj_a/{fo['id']}"):
+        res = client.get(url)
+        assert res.status_code == 200, (url, res.status_code)
+    assert "under review" in client.get(f"/fo/proj_a/{fo['id']}").text

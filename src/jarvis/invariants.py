@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from . import db, worker_session
+from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS
 from .neo_store import USER_HELD_Q_STATUSES
 from .project_store import (
     ACTIVE_STATUSES,
@@ -61,6 +62,19 @@ TERMINAL_STATUSES = ("completed", "cancelled")
 #: derive, so a reason raised by `Daemon.poll_pull_requests` and not repeated here would
 #: silently become "finished without a completion signal" on the next reconcile tick.
 PR_CLOSED_BLOCKER = "pull request closed without merging — the work was not accepted"
+
+#: What a work order says when the validation panel gave up on it: it kept resubmitting
+#: and the panel kept rejecting, until the round budget ran out. Nothing automatic is
+#: left to try, and only the user can say whether the work is good enough or the
+#: reviewer is wrong. Subject to exactly the obligation PR_CLOSED_BLOCKER describes
+#: above — INV-ATTENTION-REASON rewrites any attention reason `true_blockers` cannot
+#: re-derive, so repeating it here is mandatory rather than cosmetic.
+#:
+#: A round that is merely OPEN raises nothing at all: `validating` is the OS working,
+#: not a decision anyone owes, which is why that status is absent from BLOCKED_STATUSES
+#: and has no branch below.
+VALIDATION_STUCK_BLOCKER = ("the review could not be satisfied — the work needs your "
+                            "judgement")
 
 
 @dataclass
@@ -180,6 +194,13 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
         # session — the question is what to do about the refusal.
         if wo.get("pr_state") == "CLOSED":
             blockers.append(PR_CLOSED_BLOCKER)
+        elif _validation_escalated(store, wo):
+            # A third way in, and a more specific one: the panel ran its rounds and
+            # could not be satisfied. Ranked below the closed pull request — that is a
+            # fact about the outside world and supersedes whatever the panel thought —
+            # and above the generic line, which would send the user off to read a
+            # session whose story is already written down in the rounds.
+            blockers.append(VALIDATION_STUCK_BLOCKER)
         else:
             blockers.append("finished without a completion signal — review the session")
     # What the user has already looked at and dismissed stops being a blocker — but only
@@ -187,6 +208,17 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     # acknowledged away; `jarvis wo ack` refuses).
     acked = db.from_json(wo.get("acknowledged_blockers"), []) or []
     return [b for b in blockers if b not in acked]
+
+
+def _validation_escalated(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Did this work order's most recent validation round give up and ask for a human?
+
+    Only the LATEST round is consulted. An escalation ends the loop, so an older
+    escalated round with a newer one after it is not something the user still owes a
+    decision on — and a round that is still `pending` owes them nothing yet.
+    """
+    latest = store.latest_validation_round(wo_id=wo["id"])
+    return bool(latest and latest["outcome"] == "escalated")
 
 
 def dead_dependencies(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
@@ -209,6 +241,18 @@ def status_label(store: ProjectStore, wo: dict[str, Any]) -> str:
     and its own header disagreed about what needed the user because each derived it
     separately — see the FEATURED_STATUSES fix in PR 65.)
     """
+    # FIRST, and deliberately so. `validating` is in ACTIVE_STATUSES (it holds a slot),
+    # and everything past the two early returns below is unreachable for any status but
+    # `pending` — so a validating label written anywhere further down this function is
+    # dead code, and nothing else in this file would catch that.
+    if wo["status"] == "validating":
+        latest = store.latest_validation_round(wo_id=wo["id"])
+        round_no = latest["round"] if latest else 1
+        # The budget is the shipped default rather than this project's configured
+        # `os.validation.max_rounds`: every surface renders a status through here, and
+        # this function is handed a store and a row — no catalog is in reach, and
+        # threading one through every caller to print a number is not worth it.
+        return f"validating — review round {round_no} of {DEFAULT_VALIDATION_MAX_ROUNDS}"
     if wo["status"] in ACTIVE_STATUSES:
         note = pause_note(store, wo) or neo_wait_note(wo)
         return f"{wo['status']} — {note}" if note else wo["status"]

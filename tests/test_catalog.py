@@ -1,7 +1,9 @@
 import json
+from pathlib import Path
 
 import pytest
 
+import jarvis.catalog
 from jarvis.catalog import (
     DEFAULT_AUTOCOMPACT_WINDOW,
     CatalogError,
@@ -9,6 +11,7 @@ from jarvis.catalog import (
     parse_catalog,
 )
 from jarvis.neo_store import SEATS
+from jarvis.project_store import VALIDATOR_SEATS
 
 
 def test_minimal_catalog(tmp_path):
@@ -217,3 +220,84 @@ def test_panel_settings_round_trip():
     assert p.timeout == 90
     assert p.kinds == ("approval",)
     assert p.fast_path is False
+
+
+# -- the validation panel -------------------------------------------------------------
+
+
+def validation_of(raw):
+    return parse_catalog({"os": {"validation": raw}, "projects": []}).os.validation
+
+
+def test_validation_ships_disabled_with_every_default_spelled_out():
+    """All eight by value, not by shape.
+
+    `enabled` is the load-bearing one — at this default the OS must behave exactly as
+    it does today — but each of the others prices a round, and a default that drifted
+    would change fleet-wide spend without anyone editing a catalog.
+    """
+    v = parse_catalog({"projects": []}).os.validation
+    assert v.enabled is False
+    assert v.roster == ("tester", "security", "architect", "maintainer", "chair")
+    assert v.seat_models == {}
+    assert v.chair_model == ""
+    assert v.timeout == 300
+    assert v.max_rounds == 3
+    assert v.diff_chars == 60000
+    assert v.feature_units is True
+    # and an empty block is the same thing as no block at all
+    assert validation_of({}) == v
+
+
+def test_a_validator_roster_naming_an_unknown_seat_is_rejected_and_the_five_are_not():
+    """Paired on purpose. A validator strict enough to catch the typo is easy to write
+    and easy to write too strictly, and the failure mode of "too strict" is a fleet that
+    refuses to start — so the five legal names must be proved accepted in the same
+    breath as the illegal one is refused."""
+    assert validation_of({"roster": list(VALIDATOR_SEATS)}).roster == VALIDATOR_SEATS
+    with pytest.raises(CatalogError, match="tetser"):
+        validation_of({"roster": ["tetser", "chair"]})
+    with pytest.raises(CatalogError, match="scurity"):
+        validation_of({"seat_models": {"scurity": "haiku"}})
+
+
+def test_a_roster_naming_a_seat_whose_markdown_has_not_shipped_still_parses():
+    """`VALIDATOR_SEATS` is the VOCABULARY, not the set of seats shipped in this build.
+
+    No validator seat has a definition on disk yet — this work order lands before any of
+    them — so the five defaults are, right now, exactly the case of config written ahead
+    of the code. If parsing consulted the asset directory, the fleet would refuse to
+    start on its own default.
+    """
+    seats = Path(jarvis.catalog.__file__).parent / "assets" / "validator-seats"
+    assert not list(seats.glob("*.md")) if seats.exists() else True
+
+    assert validation_of({"enabled": True}).roster == VALIDATOR_SEATS
+
+
+def test_the_validation_block_must_be_an_object():
+    with pytest.raises(CatalogError, match="os.validation"):
+        parse_catalog({"os": {"validation": "yes please"}, "projects": []})
+
+
+def test_validation_settings_round_trip():
+    v = validation_of({"enabled": True, "roster": ["tester", "chair"],
+                       "seat_models": {"tester": "haiku"}, "chair_model": "opus",
+                       "timeout": 90, "max_rounds": 1, "diff_chars": 200,
+                       "feature_units": False})
+    assert v.enabled is True
+    assert v.roster == ("tester", "chair")
+    assert v.seat_models == {"tester": "haiku"}
+    assert v.chair_model == "opus"
+    assert v.timeout == 90
+    assert v.max_rounds == 1
+    assert v.diff_chars == 200
+    assert v.feature_units is False
+
+
+@pytest.mark.parametrize("key", ["timeout", "max_rounds", "diff_chars"])
+def test_a_validation_budget_below_one_is_rejected(key):
+    """Zero rounds is a review that never runs while claiming to; zero diff_chars is a
+    panel handed nothing, which the design says must never be asked to judge."""
+    with pytest.raises(CatalogError, match=f"os.validation.{key}"):
+        validation_of({key: 0})

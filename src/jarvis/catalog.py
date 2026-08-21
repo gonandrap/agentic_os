@@ -9,6 +9,7 @@ from typing import Any
 
 from .gates import GateConfig
 from .neo_store import Q_KINDS, SEATS
+from .project_store import VALIDATOR_SEATS
 
 # Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
 VALID_PERMISSION_MODES = {
@@ -177,6 +178,53 @@ class PanelConfig:
     fast_path: bool = True
 
 
+# The validation panel's default roster: every seat in the vocabulary. Unlike Neo's
+# DEFAULT_ROSTER, which is short because most of its seats have no definition shipped
+# yet, this one names all five — the panel's whole point is the four independent lenses
+# plus a chair, and a default that quietly dropped one would remove a check and tell
+# nobody. A seat whose markdown has not shipped yet still PARSES (see
+# `_parse_validation`); it fails loudly at run time instead of refusing to boot.
+DEFAULT_VALIDATION_ROSTER = VALIDATOR_SEATS
+
+# Per-seat call timeout, seconds. Longer than the Neo panel's 120: a validator seat
+# reads a diff of up to `diff_chars` before it says anything.
+DEFAULT_VALIDATION_TIMEOUT = 300
+
+# How many times a unit may be sent back before the loop gives up and asks a human.
+DEFAULT_VALIDATION_MAX_ROUNDS = 3
+
+# Truncation limit for the diff a seat is shown.
+DEFAULT_VALIDATION_DIFF_CHARS = 60000
+
+
+@dataclass
+class ValidationConfig:
+    """An independent panel judging a work order's or feature order's claim of done.
+
+    SHIPS DISABLED, and that is a requirement rather than caution: at this default the
+    OS must behave exactly as it does today — same statuses reached, same events, same
+    number of `claude` calls, and not one row in `validation_rounds`. A round is roughly
+    five headless calls over a diff of up to `diff_chars`, up to `max_rounds` times, on
+    every unit in the fleet, so enabling it is a catalog edit gated on a measurement.
+
+    `seat_models` and `chair_model` are empty by default, meaning "use the project's
+    model"; the fallback is resolved where it is used, not here, for the same reason
+    `PanelConfig` does it — a nested dataclass cannot see its parent's fields.
+    """
+
+    enabled: bool = False
+    roster: tuple[str, ...] = DEFAULT_VALIDATION_ROSTER
+    seat_models: dict[str, str] = field(default_factory=dict)
+    chair_model: str = ""
+    timeout: int = DEFAULT_VALIDATION_TIMEOUT
+    max_rounds: int = DEFAULT_VALIDATION_MAX_ROUNDS
+    diff_chars: int = DEFAULT_VALIDATION_DIFF_CHARS
+    # Whether a FEATURE order validates as a whole once its children are done, which is
+    # a separate question from whether its children each validated: the feature is the
+    # only level at which "does this add up to what was asked" can be judged.
+    feature_units: bool = True
+
+
 @dataclass
 class NeoConfig:
     """Neo, the OS answerer agent (responds to worker questions as the user)."""
@@ -216,6 +264,7 @@ class OsConfig:
     knowledge_digest_limit: int = 40     # max index lines
     knowledge_digest_chars: int = 4000   # hard char budget for those lines
     neo: NeoConfig = field(default_factory=NeoConfig)
+    validation: ValidationConfig = field(default_factory=ValidationConfig)
 
 
 @dataclass
@@ -301,6 +350,53 @@ def _parse_panel(raw: Any) -> PanelConfig:
     )
 
 
+def _parse_validation(raw: Any) -> ValidationConfig:
+    """`os.validation`, validated against the seat vocabulary it names.
+
+    Modelled on `_parse_panel`, and it makes the same distinction for the same reason:
+    `project_store.VALIDATOR_SEATS` is the VOCABULARY, not the set of seats whose
+    markdown ships in this build. A roster may name a seat whose definition arrives in a
+    later release — config written ahead of the code — and that must parse; the missing
+    definition is caught loudly at run time (the seat records a `failed` opinion and the
+    panel proceeds) rather than refusing to boot the whole fleet. A name that is not in
+    the vocabulary at all is a different thing: a typo that would silently remove a
+    reviewer, so it is a CatalogError naming it.
+    """
+    if not isinstance(raw, dict):
+        raise _err('"os.validation" must be an object')
+    roster = tuple(raw.get("roster", DEFAULT_VALIDATION_ROSTER))
+    unknown = [s for s in roster if s not in VALIDATOR_SEATS]
+    if unknown:
+        raise _err(f"os.validation.roster names unknown seat(s) {unknown} "
+                   f"(known: {list(VALIDATOR_SEATS)})")
+    seat_models = raw.get("seat_models", {}) or {}
+    if not isinstance(seat_models, dict):
+        raise _err('"os.validation.seat_models" must be an object')
+    unknown = [s for s in seat_models if s not in VALIDATOR_SEATS]
+    if unknown:
+        raise _err(f"os.validation.seat_models names unknown seat(s) {unknown} "
+                   f"(known: {list(VALIDATOR_SEATS)})")
+    timeout = int(raw.get("timeout", DEFAULT_VALIDATION_TIMEOUT))
+    if timeout < 1:
+        raise _err("os.validation.timeout must be >= 1")
+    max_rounds = int(raw.get("max_rounds", DEFAULT_VALIDATION_MAX_ROUNDS))
+    if max_rounds < 1:
+        raise _err("os.validation.max_rounds must be >= 1")
+    diff_chars = int(raw.get("diff_chars", DEFAULT_VALIDATION_DIFF_CHARS))
+    if diff_chars < 1:
+        raise _err("os.validation.diff_chars must be >= 1")
+    return ValidationConfig(
+        enabled=bool(raw.get("enabled", False)),
+        roster=roster,
+        seat_models={k: str(v) for k, v in seat_models.items()},
+        chair_model=str(raw.get("chair_model", "") or ""),
+        timeout=timeout,
+        max_rounds=max_rounds,
+        diff_chars=diff_chars,
+        feature_units=bool(raw.get("feature_units", True)),
+    )
+
+
 def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     if not isinstance(data, dict):
         raise _err("top level must be an object")
@@ -340,6 +436,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 40)),
         knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 4000)),
         neo=neo_cfg,
+        validation=_parse_validation(os_raw.get("validation", {})),
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")

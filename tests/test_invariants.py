@@ -13,7 +13,14 @@ from __future__ import annotations
 
 from jarvis import cli, ops
 from jarvis.hooks import handle_hook
-from jarvis.invariants import check_project, true_blockers
+from jarvis.invariants import (
+    BLOCKED_STATUSES,
+    PR_CLOSED_BLOCKER,
+    VALIDATION_STUCK_BLOCKER,
+    check_project,
+    status_label,
+    true_blockers,
+)
 from jarvis.project_store import ProjectStore
 
 IDLE_NOTIFICATION = "Claude is waiting for your input"
@@ -463,3 +470,68 @@ def test_doctor_reports_leftover_background_sessions(jarvis_home, fake_claude,
     # reported only — nothing was stopped
     assert len(fake_claude.sessions) == 3
     assert [c for c in fake_claude.calls if c["argv"][:1] == ["stop"]] == []
+
+
+# -- the validation panel ------------------------------------------------------------
+#
+# Two rules, and they pull in opposite directions: a round in flight must cost the user
+# nothing, and a round that gave up must reach them. Both are asserted in one call
+# sequence below, because a branch that was never written passes the first half alone.
+
+
+def test_a_validating_work_order_is_silent_until_the_panel_gives_up(project):
+    """The pairing IS the test.
+
+    Assert only the `validating` half and it passes against an implementation where the
+    escalation branch was never written — nothing raises attention, and nothing is
+    supposed to. So the same work order is walked from an open round to an escalated
+    one, and the blocker has to appear exactly once it does.
+    """
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship the thing")
+    store.update_work_order(wo["id"], result_summary="done")
+    store.set_status(wo["id"], "validating")
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="abc")
+
+    # a round in flight: the OS is working, and nobody owes anybody a decision
+    assert true_blockers(store, store.get_work_order(wo["id"])) == []
+    assert "validating" not in BLOCKED_STATUSES
+
+    # ...and the panel still deliberating, with the work order parked for review, is
+    # likewise not the user's problem yet
+    store.set_status(wo["id"], "needs_review")
+    assert true_blockers(store, store.get_work_order(wo["id"])) == [
+        "finished without a completion signal — review the session"]
+
+    # the panel gives up: now it is
+    store.close_validation_round(rnd["id"], "escalated", reason="three rounds, no deal")
+    assert true_blockers(store, store.get_work_order(wo["id"])) == [
+        VALIDATION_STUCK_BLOCKER]
+
+
+def test_a_closed_pull_request_outranks_an_escalated_review(project):
+    """Both branches live under the same `needs_review` roof, and the order matters: a
+    pull request shut without merging is a fact about the outside world, and it is the
+    thing the user has to act on whatever the panel thought."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship the thing")
+    store.set_status(wo["id"], "needs_review", pr_state="CLOSED")
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="abc")
+    store.close_validation_round(rnd["id"], "escalated")
+
+    assert true_blockers(store, store.get_work_order(wo["id"])) == [PR_CLOSED_BLOCKER]
+
+
+def test_the_validating_label_says_which_round_the_work_is_on(project):
+    """`status_label` early-returns for every status that is not `pending`, and
+    `validating` is in ACTIVE_STATUSES besides — so this branch is only reachable from
+    the very top of the function, and a label written anywhere else is dead code."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship the thing")
+    store.set_status(wo["id"], "validating")
+    for fp in ("first try", "second try"):
+        store.open_validation_round(wo_id=wo["id"], fingerprint=fp)
+
+    label = status_label(store, store.get_work_order(wo["id"]))
+
+    assert label == "validating — review round 2 of 3"

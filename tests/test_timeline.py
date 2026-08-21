@@ -194,3 +194,37 @@ def test_cli_wo_show_hides_debug_entries_by_default(jarvis_home, fake_claude,
     cli.main(["wo", "show", wo["id"], "--json", "--debug"])
     debug = _json.loads(capsys.readouterr().out)
     assert "turn_ended" in [e["kind"] for e in debug["timeline"]]
+
+
+def test_the_four_validation_events_read_as_four_different_things():
+    """The LABELS, not the level.
+
+    `event_level` returns "signal" for any kind it does not recognise, so asserting
+    these four are signal is vacuous — it passes just as well when `_describe` has never
+    heard of them and renders the raw kind beside a JSON blob. What has to be true is
+    that a reader can tell submitted from passed from rejected from escalated, so the
+    four rendered labels are asserted distinct, and one known-debug kind is asserted in
+    the same test to prove the classifier is still discriminating at all.
+    """
+    events = [
+        ev("validation_submitted", 1.0, round=2),
+        ev("validation_passed", 2.0, reason="tests cover the change"),
+        ev("validation_rejected", 3.0, reason="no test touches the new branch"),
+        ev("validation_escalated", 4.0, reason="three rounds, no new evidence"),
+    ]
+
+    entries = build_timeline({}, events, [])
+
+    labels = [e["label"] for e in entries]
+    assert len(set(labels)) == 4, labels
+    assert all(label and label != entries[i]["kind"]
+               for i, label in enumerate(labels)), labels
+    # the reason a rejection gives IS the ask the worker has to answer
+    assert entries[2]["detail"] == "no test touches the new branch"
+    assert entries[0]["detail"] == "round 2"
+    assert event_level("message_delivered") == "debug"
+
+
+def test_the_validating_status_change_has_a_human_label():
+    entry = build_timeline({}, [ev("status", 1.0, status="validating")], [])[0]
+    assert entry["label"] == "Under review by the validation panel"

@@ -32,6 +32,11 @@ STATUS_META = {
     "dispatching":   {"word": "dispatching", "icon": "◍", "tone": "active"},
     "running":       {"word": "running",     "icon": "●", "tone": "active"},
     "waiting_input": {"word": "waiting on you", "icon": "◉", "tone": "warn"},
+    # Toned `active`, not `warn`: a round in flight is the OS working, and nothing is
+    # being asked of the user. Templates index this dict BY STATUS — every one of them
+    # via `.get(status, <the raw status>)`, so the cost of a missing key is not a
+    # traceback but every surface quietly printing the bare word instead of the meaning.
+    "validating":    {"word": "under review",   "icon": "◑", "tone": "active"},
     "needs_review":  {"word": "needs review",   "icon": "◭", "tone": "warn"},
     "waiting_pr_merge": {"word": "waiting for PR merge", "icon": "⑃", "tone": "ok"},
     "completed":     {"word": "completed",   "icon": "✓", "tone": "ok"},
@@ -47,6 +52,9 @@ FO_STATUS_META = {
     "planning":    {"word": "planning",     "icon": "◍", "tone": "active"},
     "plan_review": {"word": "plan in review", "icon": "◭", "tone": "warn"},
     "executing":   {"word": "executing",    "icon": "●", "tone": "active"},
+    # A feature order validates as a whole once every child is done — same reading as
+    # the work-order entry above, one level up.
+    "validating":  {"word": "under review",  "icon": "◑", "tone": "active"},
     "completed":   {"word": "completed",    "icon": "✓", "tone": "ok"},
     "failed":      {"word": "failed",       "icon": "✗", "tone": "bad"},
     "cancelled":   {"word": "cancelled",    "icon": "–", "tone": "muted"},
