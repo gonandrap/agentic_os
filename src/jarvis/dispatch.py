@@ -225,21 +225,44 @@ def materialize_design_doc(store: ProjectStore, project: ProjectSpec,
     return {"repo_path": plan["design_doc"], "path": str(target)}
 
 
+def feature_context(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """The feature a MANAGER owns, with its live children. None for anything else.
+
+    Read at dispatch rather than snapshotted at creation, and passed in rather than
+    looked up inside `build_worker_prompt`, for the same two reasons
+    `materialize_design_doc` is shaped this way: the prompt builder stays a pure function
+    of its arguments, and the manager's children change under it — it files more of them
+    as the feature runs, so anything frozen at release would be wrong by its second turn.
+    """
+    if wo.get("kind") != "manager" or not wo.get("parent_id"):
+        return None
+    try:
+        fo = store.get_feature_order(wo["parent_id"])
+    except KeyError:
+        return None  # a briefing is not the place to raise on a deleted parent
+    return {"fo": fo, "children": store.feature_children(fo["id"])}
+
+
 def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
                         knowledge: KnowledgeBrief | None = None,
-                        design_doc: dict[str, str] | None = None) -> str:
+                        design_doc: dict[str, str] | None = None,
+                        feature: dict[str, Any] | None = None) -> str:
     """What the worker is told, composed from the work order and its project.
 
-    Two kinds of work order get two shapes. A WORKER opens with the minimum — its
+    Three kinds of work order get three shapes. A WORKER opens with the minimum — its
     identity, the work order, a compressed contract of only the load-bearing
     invariants — plus an index of the full briefings it can fetch on demand with
     `jarvis brief <section>` (single-sourced in `worker_brief`, so the CLI and this
     prompt cannot drift). A PLANNER keeps its full prompt: one session per feature,
-    already reviewed as a unit. The surfaces around the contract — the pre-approval
-    marker and the knowledge index — are identical for both.
+    already reviewed as a unit. A MANAGER gets neither: it writes no product code, so
+    every line of the worker contract about worktrees, pull requests and finishing would
+    be an instruction to do something it must not do. The surfaces around the contract —
+    the pre-approval marker and the knowledge index — are identical for all three.
     """
     if wo.get("kind") == "planner":
         return _planner_prompt(wo, project, knowledge)
+    if wo.get("kind") == "manager":
+        return _manager_prompt(wo, project, knowledge, feature)
     from . import worker_brief
     from .gates import KINDS
 
@@ -521,6 +544,117 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
     return "\n".join(_common_briefing(parts, wo, project, knowledge))
 
 
+def _manager_prompt(wo: dict[str, Any], project: ProjectSpec,
+                    knowledge: KnowledgeBrief | None = None,
+                    feature: dict[str, Any] | None = None) -> str:
+    """The briefing for a feature order's project manager.
+
+    Three things make it different from a worker's, and each is why the worker contract
+    cannot simply be reused with a line struck out:
+
+    * **It produces no code.** Every load-bearing sentence of `worker_brief.core_contract`
+      is about producing a change — the worktree, the `[wo-…]` pull request title,
+      `jarvis wo finish`. A manager that read them would open a pull request against a
+      feature it is supposed to be coordinating, which is the exact failure this branch
+      exists to prevent.
+    * **It is idle by design, and long-lived.** So the prompt says so in as many words.
+      A session told to work autonomously toward a complete solution will invent work
+      when its inbox is empty; this one is told that an empty inbox IS the finished state
+      between messages, and that it never settles itself (`Daemon.settle_features` closes
+      it when its feature closes).
+    * **It sees the feature, not a slice of it.** It is the only session that reasons
+      about the whole ask and every child at once, so both ride in the prompt — the ask
+      from the feature order, the children read live at dispatch (`feature_context`).
+
+    The last line of the contract is the one that keeps principle 1 of the design intact:
+    a manager does not learn who sends it messages. Everything it receives arrives as an
+    ordinary user turn through the message queue, posted to a ROLE by something that never
+    named this work order — and a manager that went looking for the sender would couple
+    the two ends the bus exists to keep apart.
+    """
+    fo = (feature or {}).get("fo") or {}
+    children = (feature or {}).get("children") or []
+    fo_id = wo.get("parent_id") or "?"
+    parts = [
+        f"You are the PROJECT MANAGER for Jarvis feature order `{fo_id}` in project "
+        f"`{project.name}`, running as work order `{wo['id']}`.",
+        "",
+        f"# Feature order: {fo.get('title') or wo['title']}",
+        "",
+        "## The original ask",
+        fo.get("description") or "(no further description — the title is the ask)",
+        "",
+        "## Its work orders",
+        *([f"- `{c['id']}` [{c['status']}] {c['title']}" for c in children]
+          or ["(none yet)"]),
+        "",
+        "# Your job: the feature's follow-through",
+        "You own this feature order's follow-through — not its code. **You will not "
+        "write product code and you will not open a pull request.** The children above "
+        "do that, each in its own session and its own worktree.",
+        "",
+        "**You will receive messages. Act on each one and end your turn.** Between "
+        "messages you are idle, and that is correct — it is what this session is for. "
+        "Do not go looking for work, do not review the children unasked, and do not try "
+        "to finish this work order: it ends when the feature ends, and the OS does that "
+        "for you.",
+        "",
+        "## Review feedback on the feature",
+        "An independent review of this feature as a whole can come back with concrete "
+        "asks. When it does, it arrives as a message. Decide what actually has to "
+        "change, then file a work order UNDER THIS FEATURE for each thing that does:",
+        "",
+        f"    jarvis wo create {project.name} \"<title>\" -d \"<the whole brief>\" "
+        f"--parent {fo_id}",
+        "",
+        "`--parent` is what makes it part of the feature: the feature waits for it and "
+        "shows it in its tree. Without the flag you would be filing unrelated work that "
+        "the feature settles without. The worker who picks it up sees only that "
+        "description and has never read this conversation — brief it as a stranger. Then "
+        "resubmit the feature's evidence once they have landed. Judge the feedback rather "
+        "than obeying it: if an ask is wrong, say so in your answer and say what you did "
+        "instead.",
+        "",
+        "## A deferral request",
+        "A work order may report something worth doing that is not its job. File it: "
+        f"`jarvis backlog add {project.name} \"...\"`, recording in the text which work "
+        f"order suggested it and that it came from {fo_id}. Filing it is the whole "
+        f"action — you are not being asked to schedule it.",
+        "",
+        "**You do not know who sends you these messages. Do not try to find out.** "
+        "Whoever it was addressed a role, not you, and never learns who read it.",
+        "",
+        "# Operating contract",
+        f"- **Neo is your first responder. Any doubt goes to it.** `jarvis wo ask "
+        f"{wo['id']} \"<your question>\"`, then END YOUR TURN; the answer arrives as your "
+        f"next user turn. The trigger is DOUBT, not importance. A question is one "
+        f"paragraph: the decision, the options, your recommendation.",
+        f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
+        f"Record every one: this work order's record is the only account anyone gets of "
+        f"why the feature changed shape.",
+        "- Do not run `jarvis wo finish` and do not open a pull request. Neither applies "
+        "to you.",
+        f"- Read what the fleet already knows before you decide anything: `jarvis learn "
+        f"search \"<term>\" --project {project.name}`."
+        if knowledge else
+        f"- Record what you learn: `jarvis learn add \"...\" --project {project.name}`.",
+        f"- Alert the human when needed: `jarvis notify --project {project.name} "
+        f"--level warning|critical \"title\" \"body\"`",
+        "- Hit a bug in Jarvis OS itself? Use your `report-jarvis-bug` skill, then carry "
+        "on.",
+        "",
+        "# What the outside world sees",
+        "The work order record IS this conversation, as far as anyone else is concerned. "
+        "The last message of every turn you take is captured verbatim into it, and the "
+        "user and Neo decide from that record — neither will ever open this session. End "
+        "every turn with the complete answer: what you were asked, what you decided, "
+        "what you filed, and what you deliberately did not do.",
+    ]
+    if knowledge:
+        parts += render_knowledge_block(knowledge, project.name)
+    return "\n".join(parts)
+
+
 def _pre_approval(wo: dict[str, Any]) -> dict[str, Any] | None:
     """The pre-approval marker, if this work order carries one.
 
@@ -606,7 +740,8 @@ def dispatch_work_order(
         digest_chars=cfg.knowledge_digest_chars,
     )
     prompt = build_worker_prompt(wo, project, knowledge,
-                                 design_doc=materialize_design_doc(store, project, wo))
+                                 design_doc=materialize_design_doc(store, project, wo),
+                                 feature=feature_context(store, wo))
 
     # Resolved onto the row before the turn is launched, so every later turn rebuilds the
     # same briefing from the record rather than re-reading a catalog that may have moved.
