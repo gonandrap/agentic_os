@@ -48,6 +48,8 @@ A work order in a TERMINAL status fills no role: it has no live session to resum
   rollback would take the count with it and INV-ENVELOPE-STUCK would never fire.
 * Layering: `bus.py` imports `project_store` and `central_store` and nothing above them.
   A test walks its AST (including function-body imports) to keep it that way.
-* `kind='manager'` is NOT in `WO_KINDS` yet — see `mem:work-order-lifecycle` and
-  kn-52e51faf: adding it before `count_active` excludes it stalls the project. The router
-  reads the column directly, so it is ready for the day that kind exists.
+* `manager` is in `WO_KINDS` (added by the validation layer's vocabulary, wo-3ce42dc7)
+  but nothing CREATES one yet, so `manager_work_order` returns None in practice and the
+  router treats it as an unfilled role. NOTE kn-52e51faf: `count_active` still has no
+  kind filter, so the day a manager order is actually created it will spend a
+  concurrency slot for the life of its feature.

@@ -1179,9 +1179,9 @@ class ProjectStore:
     def manager_work_order(self, fo_id: str) -> dict[str, Any] | None:
         """The work order that owns this feature's follow-through, whatever its status.
 
-        `kind='manager'` is not in WO_KINDS yet — the project manager order is a later
-        work order in this feature — so today this always returns None, and the router
-        treats that as an unfilled role. The status is deliberately NOT filtered here:
+        `manager` is in WO_KINDS, but nothing CREATES one yet — the project manager
+        order is a later work order in this feature — so today this always returns None
+        and the router treats that as an unfilled role. The status is NOT filtered here:
         the router has to tell "no manager was ever created" apart from "the manager was
         cancelled while its feature is still open", and those two are different verdicts.
         """

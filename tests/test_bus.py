@@ -64,14 +64,11 @@ def a_work_order(store, title="implement the thing", **kw):
 def a_manager(store, fo_id, status="waiting_input"):
     """A manager work order under `fo_id`.
 
-    Written with an UPDATE rather than `kind="manager"` on purpose: the project manager
-    order is a LATER work order in this feature, and adding the kind to WO_KINDS before
-    `count_active` learns to exclude it stalls the whole project (kn-52e51faf). The
-    router only ever asks the database what kind a row is, so this is the real thing as
-    far as routing is concerned.
+    `manager` joined WO_KINDS with the validation layer's vocabulary (wo-3ce42dc7), but
+    nothing creates one yet, so every manager in this file is built by hand. The router
+    only ever asks the database what kind a row is.
     """
-    wo_id = a_work_order(store, "own the feature", parent_id=fo_id)
-    store.conn.execute("UPDATE work_orders SET kind='manager' WHERE id=?", (wo_id,))
+    wo_id = a_work_order(store, "own the feature", parent_id=fo_id, kind="manager")
     store.set_status(wo_id, status)
     return wo_id
 
