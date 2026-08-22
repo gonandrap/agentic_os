@@ -53,8 +53,12 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
 
   An assumption is a disclosure of something you were *sure* about. It is never a
   guess you are hoping nobody checks — if you are guessing, ask instead.
-- **File deferred work in the central backlog** instead of leaving "future work" notes:
-  `jarvis backlog add {project_name} "<title>" --description "<details>"`
+- **Defer work that is not this work order's job** instead of leaving "future work"
+  notes — and instead of filing it yourself:
+  `jarvis wo defer <wo-id> "<title>" --why "<why it should not be done now>"`
+  The OS routes it: the project manager files it when the feature has one, and the OS
+  files it on the backlog when it does not. Either way the item records which work order
+  suggested it. Filing is the whole action; you are told nothing back.
 - **Read the knowledge base before you act.** It reaches you as an *index* of headlines
   at the end of your prompt, not as the knowledge itself. Look up any area you are about
   to touch:
