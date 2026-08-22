@@ -189,7 +189,7 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any],
                     f"by mistake", "no privileged action was authorised")
         return (f"Ran the approved {p.get('kind') or 'command'}",
                 f"use {p.get('use')} of {p.get('of')}")
-    # The validation loop. Four kinds rather than one with an outcome in the payload,
+    # The validation loop. Five kinds rather than one with an outcome in the payload,
     # because the four are the whole story a reader wants at a glance — and each gets a
     # LABEL of its own here. `event_level` returns "signal" for anything it does not
     # know, so these arriving unclassified would look fine on the timeline while
@@ -206,6 +206,17 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any],
         return "Validation rejected — sent back", p.get("reason") or ""
     if kind == "validation_escalated":
         return ("Validation gave up — over to you", p.get("reason") or "")
+    if kind == "validation_failed":
+        # A FIFTH kind, and the one most easily misread: nothing judged the work here.
+        # A reader who takes this for a rejection goes looking for something to fix that
+        # nobody ever asked for, so the two causes get two different sentences.
+        if p.get("cause") == "no_validator":
+            return ("Validation skipped — no validator was configured",
+                    p.get("reason") or "")
+        attempt = p.get("attempt")
+        return ("Validation could not be run — the reviewer was unreachable",
+                f"attempt {attempt}: {p.get('error') or ''}" if attempt
+                else (p.get("error") or ""))
     if kind == "finished":
         return "Finished", p.get("summary") or ""
     if kind == "marked_done":

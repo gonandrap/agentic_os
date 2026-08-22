@@ -1005,3 +1005,43 @@ def test_pretooluse_allows_worker_edits_in_own_worktree(tmp_path):
     not_wt = {"tool_name": "Write", "cwd": str(tmp_path),
               "tool_input": {"file_path": str(tmp_path / "f.txt")}}
     assert preflight_decision(not_wt, worker_env) is None
+
+
+def test_with_validation_disabled_finish_settles_exactly_as_before(
+        started, fake_claude, project, settle_turns):
+    """THE REGRESSION PIN FOR THE WHOLE VALIDATION FEATURE.
+
+    The panel ships disabled, and the promise at that default is not "roughly the same":
+    it is the same statuses, the same events, the same number of `claude` calls, not one
+    row in `validation_rounds` and not one envelope. If a change alters what a
+    default-configured OS does when a worker finishes, it is wrong, and this is where
+    that is caught.
+
+    Asserted on STORED ROWS and CALL COUNTS rather than on "it finished": validation
+    defaults off, so a test that merely reaches a good ending proves nothing about which
+    path produced it.
+    """
+    daemon = started
+    wo = ops.create_work_order("proj_a", "task")
+    daemon.tick()
+    store = ProjectStore(project)
+    calls_before = len(turn_calls(fake_claude, expect=1))
+
+    # `--evidence` is optional and predates nothing: passing it must not switch anything
+    # on by itself. Only the catalog flag may do that.
+    result = ops.finish(wo["id"], "done", evidence="ran the suite: 412 passed")
+    assert result["status"] == "completed"
+    assert settle_turns(store)
+    daemon.tick_count = 0
+    daemon.tick()
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "completed"
+    assert fresh["needs_attention"] == 0
+    kinds = [e["kind"] for e in store.list_events(wo["id"])]
+    assert "finished" in kinds
+    assert not [k for k in kinds if k.startswith("validation")]
+    assert store.validation_rounds(wo_id=wo["id"]) == []
+    assert store.envelopes(subject_wo_id=wo["id"]) == []
+    assert store.queued_messages(wo["id"]) == []
+    assert len(turn_calls(fake_claude)) == calls_before, "no extra claude call"

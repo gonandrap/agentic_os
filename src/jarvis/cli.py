@@ -230,6 +230,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the pull request this work order opened — parks it in "
                         "'waiting for PR merge' instead of completing it, so it stays "
                         "on the open list until the user merges")
+    f.add_argument("--evidence", default="", metavar="TEXT",
+                   help="how you tested this: what you ran and what it said. An "
+                        "independent reviewer reads it beside your diff")
 
     r = wo.add_parser("review", help="accept/reject a work order's pending assumptions")
     r.add_argument("wo_id")
@@ -1204,7 +1207,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
         _print(ops.ask_question(args.wo_id, args.question,
                                 project_name=args.project), args.json)
     elif args.wo_cmd == "finish":
-        _print(ops.finish(args.wo_id, args.summary, pr_url=args.pr or None), args.json)
+        _print(ops.finish(args.wo_id, args.summary, pr_url=args.pr or None,
+                          evidence=args.evidence), args.json)
     elif args.wo_cmd == "review":
         _print(ops.review_work_order(args.wo_id, accept=not args.reject,
                                      feedback=args.feedback), args.json)
