@@ -68,6 +68,12 @@
 - `hooks.py` — the `jarvis _hook` endpoint: PreToolUse preflight (gates → PR-title rule →
   auto-approvals) + session lifecycle → WO state.
   `handle_hook()`:100, `main_hook()`:183, `preflight_decision()`:55, `find_project_root()`:85.
+- `bus.py` — THE MESSAGE BUS: envelopes posted to a ROLE, delivered by a pure router, so
+  no entity addresses another directly. `post()` (derives `kind` from the payload type —
+  no `kind` parameter, by design), `resolve()` (implementor -> the subject WO; manager ->
+  the `kind='manager'` WO under its feature), `deliver()` (rides `queue_message`, one
+  transaction), `Subject`/`ReviewFeedback`/`DeferralRequest`, `DELIVERY_ATTEMPT_CEILING`.
+  Turned by `Daemon.deliver_envelopes`; watched by INV-ENVELOPE-STUCK. See `mem:message-bus`.
 - `invariants.py` — the OS's post-conditions, re-evaluated as steady-state predicates on
   every reconcile tick and by `jarvis doctor`. Per-project checks in `INVARIANTS` (take a
   `ProjectStore`, repair what is unambiguous); OS-wide checks in `OS_INVARIANTS` /

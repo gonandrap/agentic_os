@@ -1,7 +1,19 @@
+import sqlite3
+
 import pytest
 
 from jarvis.central_store import CentralStore
-from jarvis.project_store import ProjectStore
+from jarvis.project_store import (
+    ACTIVE_STATUSES,
+    FO_OPEN_STATUSES,
+    FO_STATUSES,
+    FO_TERMINAL_STATUSES,
+    OPEN_STATUSES,
+    TERMINAL_STATUSES,
+    WO_KINDS,
+    WO_STATUSES,
+    ProjectStore,
+)
 
 
 def test_work_order_lifecycle(project):
@@ -123,3 +135,172 @@ def test_status_counts_are_not_capped_by_the_listing_limit(project):
         "completed": 5, "pending": 1, "cancelled": 1,
     }
     assert len(store.list_work_orders(limit=2)) == 2  # the listing still pages
+
+
+# -- the validation panel's storage ---------------------------------------------------
+#
+# Rounds hang off EITHER a work order or a feature order. That polymorphism is where
+# every trap in this table lives, and each test below pairs the thing that must fail
+# with the thing that must still work — because the two obvious wrong schemas each pass
+# one half cleanly.
+
+
+def test_validating_sits_between_the_worker_and_the_review(project):
+    """The INDEX, not mere membership.
+
+    WO_STATUSES is the order the dashboard renders status counts in, so a status
+    appended at the end passes every `in` test and still reads wrong on the page.
+    """
+    assert WO_STATUSES.index("validating") == WO_STATUSES.index("needs_review") - 1
+    assert FO_STATUSES.index("validating") == FO_STATUSES.index("executing") + 1
+    assert FO_STATUSES.index("validating") == FO_STATUSES.index("completed") - 1
+    # A unit under validation holds a live session and must spend a concurrency slot,
+    # but it is not settled.
+    assert "validating" in OPEN_STATUSES and "validating" in ACTIVE_STATUSES
+    assert "validating" in FO_OPEN_STATUSES
+    assert "validating" not in TERMINAL_STATUSES
+    assert "validating" not in FO_TERMINAL_STATUSES
+
+
+def test_a_round_number_is_unique_per_subject_but_the_two_subjects_are_independent(
+        project):
+    """The partial indexes have to actually bite.
+
+    `UNIQUE (wo_id, fo_id, round)` is the natural-looking schema and it enforces
+    NOTHING: every row has a NULL in one id column and SQLite treats NULLs as distinct.
+    It would pass the coexistence half below — which is the half that feels interesting
+    — and fail both duplicate halves, so the three have to be asserted together.
+    """
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+    fo = store.create_feature_order("f")
+
+    # round 1 on each subject, side by side: independent counters, not one sequence
+    first = store.open_validation_round(wo_id=wo["id"], fingerprint="a")
+    other = store.open_validation_round(fo_id=fo["id"], fingerprint="b")
+    assert first["round"] == other["round"] == 1
+
+    with pytest.raises(sqlite3.IntegrityError):
+        store.conn.execute(
+            "INSERT INTO validation_rounds (wo_id, round, ts, fingerprint)"
+            " VALUES (?,1,1.0,'dup')", (wo["id"],))
+    with pytest.raises(sqlite3.IntegrityError):
+        store.conn.execute(
+            "INSERT INTO validation_rounds (fo_id, round, ts, fingerprint)"
+            " VALUES (?,1,1.0,'dup')", (fo["id"],))
+
+
+def test_a_round_belongs_to_exactly_one_subject(project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+    fo = store.create_feature_order("f")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        store.conn.execute(
+            "INSERT INTO validation_rounds (wo_id, fo_id, round, ts, fingerprint)"
+            " VALUES (?,?,1,1.0,'both')", (wo["id"], fo["id"]))
+    with pytest.raises(sqlite3.IntegrityError):
+        store.conn.execute(
+            "INSERT INTO validation_rounds (round, ts, fingerprint)"
+            " VALUES (1,1.0,'neither')")
+    # ...and the store's own methods refuse the same two before SQL ever sees them
+    with pytest.raises(ValueError):
+        store.open_validation_round(wo_id=wo["id"], fo_id=fo["id"], fingerprint="both")
+    with pytest.raises(ValueError):
+        store.validation_rounds()
+
+
+def test_deleting_a_work_order_takes_its_rounds_and_leaves_its_siblings(project):
+    store = ProjectStore(project)
+    doomed = store.create_work_order("doomed")
+    sibling = store.create_work_order("sibling")
+    for wo_id in (doomed["id"], sibling["id"]):
+        rnd = store.open_validation_round(wo_id=wo_id, fingerprint="f")
+        store.record_validation_opinion(rnd["id"], "tester", verdict="pass")
+
+    store.delete_work_order(doomed["id"])
+
+    assert store.validation_rounds(wo_id=doomed["id"]) == []
+    kept = store.validation_rounds(wo_id=sibling["id"])
+    assert len(kept) == 1
+    assert len(store.validation_opinions(kept[0]["id"])) == 1
+    assert store.conn.execute(
+        "SELECT COUNT(*) c FROM validation_opinions").fetchone()["c"] == 1
+
+
+def test_deleting_a_feature_order_takes_its_rounds_and_leaves_its_siblings(project):
+    store = ProjectStore(project)
+    doomed = store.create_feature_order("doomed")
+    sibling = store.create_feature_order("sibling")
+    for fo_id in (doomed["id"], sibling["id"]):
+        rnd = store.open_validation_round(fo_id=fo_id, fingerprint="f")
+        store.record_validation_opinion(rnd["id"], "chair", verdict="pass")
+
+    store.conn.execute("DELETE FROM feature_orders WHERE id=?", (doomed["id"],))
+
+    assert store.validation_rounds(fo_id=doomed["id"]) == []
+    kept = store.validation_rounds(fo_id=sibling["id"])
+    assert len(kept) == 1
+    assert len(store.validation_opinions(kept[0]["id"])) == 1
+
+
+def test_a_seat_speaking_twice_replaces_its_opinion(project):
+    """A retried seat must leave one row, not two: the arbiter counts verdicts."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="f")
+
+    store.record_validation_opinion(rnd["id"], "tester", reply="timed out",
+                                    status="failed")
+    store.record_validation_opinion(rnd["id"], "tester", reply="looks covered",
+                                    verdict="pass", model="opus", latency_ms=1200)
+    store.record_validation_opinion(rnd["id"], "security", verdict="reject")
+
+    opinions = store.validation_opinions(rnd["id"])
+    assert [o["seat"] for o in opinions] == ["tester", "security"]
+    assert opinions[0]["verdict"] == "pass" and opinions[0]["status"] == "ok"
+    assert opinions[0]["model"] == "opus" and opinions[0]["latency_ms"] == 1200
+
+
+def test_rounds_come_back_oldest_first_and_the_latest_is_the_highest(project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+    never_judged = store.create_work_order("untouched")
+    for n in range(1, 4):
+        store.open_validation_round(wo_id=wo["id"], fingerprint=f"f{n}")
+
+    assert [r["round"] for r in store.validation_rounds(wo_id=wo["id"])] == [1, 2, 3]
+    assert store.latest_validation_round(wo_id=wo["id"])["fingerprint"] == "f3"
+    # paired: a subject nobody has judged has no latest round rather than a stale one
+    assert store.latest_validation_round(wo_id=never_judged["id"]) is None
+
+
+def test_only_the_documented_outcomes_and_statuses_are_accepted(project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="f")
+    assert rnd["outcome"] == "pending"
+
+    store.close_validation_round(rnd["id"], "escalated", reason="three rounds, no deal")
+    closed = store.latest_validation_round(wo_id=wo["id"])
+    assert closed["outcome"] == "escalated"
+    assert closed["reason"] == "three rounds, no deal"
+    with pytest.raises(AssertionError):
+        store.close_validation_round(rnd["id"], "approved")   # a Neo word, not ours
+
+    store.record_validation_opinion(rnd["id"], "architect", status="abstained")
+    with pytest.raises(AssertionError):
+        store.record_validation_opinion(rnd["id"], "architect", status="timeout")
+    with pytest.raises(AssertionError):
+        store.record_validation_opinion(rnd["id"], "architect", verdict="approve")
+
+
+def test_the_manager_is_the_third_and_only_other_work_order_kind(project):
+    store = ProjectStore(project)
+    assert WO_KINDS == ("worker", "planner", "manager")
+
+    manager = store.create_work_order("own the feature", kind="manager")
+
+    assert store.get_work_order(manager["id"])["kind"] == "manager"
+    with pytest.raises(AssertionError):
+        store.create_work_order("x", kind="supervisor")

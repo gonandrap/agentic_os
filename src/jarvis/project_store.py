@@ -19,6 +19,13 @@ WO_STATUSES = (
     "dispatching",   # claimed by the daemon, worker being spawned
     "running",       # worker session active
     "waiting_input", # worker asked something / is blocked on the user
+    # The worker has claimed the job done and an independent panel is judging the
+    # claim (see the validation-panel design). Ordered here rather than appended
+    # because this tuple IS the order the dashboard renders status counts in, and a
+    # step that happens between "waiting on the user" and "needs your review" reads
+    # wrong anywhere else. Raises NO attention on its own: nobody is waiting on the
+    # user while a round is open.
+    "validating",
     "needs_review",  # finished but has pending assumptions or attention items
     # Worker done, PR open, waiting for the user to merge it. Deliberately NOT an
     # attention item (see invariants.true_blockers): it is a merge queue the user works
@@ -29,11 +36,29 @@ WO_STATUSES = (
     "failed",
     "cancelled",
 )
-OPEN_STATUSES = ("pending", "dispatching", "running", "waiting_input", "needs_review",
-                 "waiting_pr_merge")
+OPEN_STATUSES = ("pending", "dispatching", "running", "waiting_input", "validating",
+                 "needs_review", "waiting_pr_merge")
 # Settled: nothing more will happen to these on their own. They are the bulk of an old
 # project's history, so listings collapse them behind a count rather than printing them.
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
+
+# The seat names a validation panel may be rostered with. This is the VOCABULARY, not
+# the set whose markdown ships in a given build: a catalog may name a seat whose
+# definition arrives in a later release, and that must still parse (the seat records a
+# `failed` opinion at run time instead of refusing to boot the fleet). Mirrors
+# `neo_store.SEATS`, which `catalog.py` already imports for exactly the same job, and
+# lives beside the statuses rather than in `catalog.py` so the vocabulary sits with the
+# store that records what the seats say.
+VALIDATOR_SEATS = ("tester", "security", "architect", "maintainer", "chair")
+
+# How a round ended. `pending` is a round still open; `failed` is the panel itself
+# breaking (no seat answered), which is not the same as the work being `rejected`.
+VALIDATION_OUTCOMES = ("pending", "passed", "rejected", "escalated", "failed")
+# What one seat proposed. "" is a seat that offered none — it ran, but said nothing the
+# arbiter can count.
+VALIDATION_VERDICTS = ("pass", "reject", "")
+# ...and whether that seat's opinion is usable at all.
+VALIDATION_OPINION_STATUSES = ("ok", "abstained", "failed")
 
 # How the work order entered the system. jarvis/ui follow the framework; manual is a
 # direct DB insert; injected is a session the user started and then handed to Jarvis
@@ -61,14 +86,40 @@ UNGOVERNED_ORIGINS = ("adhoc", "injected")
 # names the planner: `parent_id` cannot tell the two apart (a feature order's CHILDREN
 # carry it too), and the briefing has to know which it is composing without querying
 # back up into a second table on every dispatch.
-WO_KINDS = ("worker", "planner")
+# `manager` is a long-lived coordinator session that owns one feature order's
+# follow-through: it stays open for the whole feature, receives what its children
+# report and decides what happens next, instead of finishing a job and exiting.
+WO_KINDS = ("worker", "planner", "manager")
 
 # A work order occupying a slot: dispatched, running, or waiting on something. One
 # constant rather than a literal at each site, because the two readers must agree — the
 # project-wide cap (`count_active`, spent by `Daemon.dispatch_pending`) and the
 # per-feature cap (`claim_next_pending`, spent by `feature_orders.max_parallel`) would
 # otherwise be free to mean different things by "active".
-ACTIVE_STATUSES = ("dispatching", "running", "waiting_input")
+#
+# `validating` counts: the work order still holds a live session the OS intends to
+# resume with the panel's verdict, so it must spend a slot. Without it a project capped
+# at two could pile six work orders into validation and then run five concurrent turns
+# the moment a tick rejected them.
+ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
+
+# -- the message bus (see bus.py, and the validation-panel design doc) ----------------
+#
+# Nothing addresses anything directly: a cross-entity message is an envelope posted to a
+# ROLE, and the router works out who fills it. These three tuples are that vocabulary.
+#
+# Module tuples, NOT SQL CHECK constraints, and deliberately so. No status column in this
+# codebase carries a CHECK; every one of them is a tuple here plus an `assert` at the
+# write site. More to the point, ENVELOPE_ROLES and ENVELOPE_KINDS are DESIGNED TO GROW —
+# the whole justification for a bus is that a new participant costs a routing rule — and a
+# CHECK on `to_role` would turn adding a role into a schema migration, which is exactly
+# the cost this design exists to avoid.
+ENVELOPE_ROLES = ("reviewer", "implementor", "manager")
+ENVELOPE_KINDS = ("review_feedback", "deferral_request")
+# queued -> delivered (a work order filled the role and was sent the message)
+#        -> handled_by_router (nobody filled it and the router acted itself)
+#        -> undeliverable (nobody filled it and nobody could act — see bus.deliver)
+ENVELOPE_STATES = ("queued", "delivered", "handled_by_router", "undeliverable")
 
 # Feature order lifecycle. Deliberately NOT a copy of WO_STATUSES: a feature order never
 # runs a session of its own, so most of a work order's states are meaningless for it.
@@ -77,11 +128,12 @@ FO_STATUSES = (
     "planning",     # the plan work order is running
     "plan_review",  # a plan was submitted; Neo is reviewing it, or it is escalated
     "executing",    # children dispatching / running
+    "validating",   # every child is done and the panel is judging the feature as a whole
     "completed",    # every child settled successfully
     "failed",       # a child failed or was cancelled
     "cancelled",    # the user stopped it
 )
-FO_OPEN_STATUSES = ("pending", "planning", "plan_review", "executing")
+FO_OPEN_STATUSES = ("pending", "planning", "plan_review", "executing", "validating")
 FO_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
 # Work-order metadata key: this work order was authorised by whoever filed it, so the
@@ -140,6 +192,10 @@ CREATE TABLE IF NOT EXISTS feature_orders (
     -- database is OS-wide and knows nothing about a project's tables.
     plan_question_id INTEGER,
     max_parallel INTEGER,                   -- slot cap for this feature's children (Phase 3)
+    -- The commit the feature's work is measured against: what the repository looked
+    -- like before any child ran, so a whole-feature diff can be taken later. Nullable,
+    -- and nothing writes it yet.
+    base_sha TEXT,
     needs_attention INTEGER NOT NULL DEFAULT 0,
     attention_reason TEXT,
     backlog_id TEXT,
@@ -178,6 +234,54 @@ CREATE TABLE IF NOT EXISTS assumptions (
     ts REAL NOT NULL,
     content TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' -- pending | accepted | rejected
+);
+-- One judging round over one working unit — a work order or a feature order — by the
+-- validation panel. ONE table for both, not two: the two loops record identical facts,
+-- and two tables would mean two of every reader, two renderers, and two chances to
+-- disagree about what a round is.
+--
+-- TWO NULLABLE FOREIGN KEYS rather than one polymorphic `subject_id`: a single id column
+-- cannot carry ON DELETE CASCADE, so deleting a work order would strand its rounds. The
+-- CHECK is what keeps exactly one of them set.
+CREATE TABLE IF NOT EXISTS validation_rounds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wo_id TEXT REFERENCES work_orders(id) ON DELETE CASCADE,
+    fo_id TEXT REFERENCES feature_orders(id) ON DELETE CASCADE,
+    round INTEGER NOT NULL,             -- 1-based, per subject
+    ts REAL NOT NULL,
+    fingerprint TEXT NOT NULL,          -- what was judged; a repeat means no new evidence
+    summary TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '',
+    pr_url TEXT,
+    -- pending | passed | rejected | escalated | failed
+    outcome TEXT NOT NULL DEFAULT 'pending',
+    reason TEXT NOT NULL DEFAULT '',    -- what was sent back
+    CHECK ((wo_id IS NULL) <> (fo_id IS NULL))
+);
+-- PARTIAL unique indexes, NOT `UNIQUE (wo_id, fo_id, round)`. SQLite treats NULLs as
+-- distinct in a UNIQUE constraint, and every row here has a NULL in one of the two id
+-- columns — so the three-column form would look perfectly correct and enforce NOTHING
+-- AT ALL on either loop, letting duplicate rounds insert on both.
+CREATE UNIQUE INDEX IF NOT EXISTS validation_rounds_wo
+    ON validation_rounds(wo_id, round) WHERE wo_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS validation_rounds_fo
+    ON validation_rounds(fo_id, round) WHERE fo_id IS NOT NULL;
+-- What one seat said in one round. Keyed on the ROUND, not on the subject: the nearest
+-- precedent (`neo_store.panel_opinions`) keys on the question because a Neo question has
+-- exactly one round of deliberation, whereas a validation has up to `max_rounds` — so
+-- `UNIQUE (subject, seat)` here would silently overwrite round one's opinions with round
+-- two's and leave no trace of either.
+CREATE TABLE IF NOT EXISTS validation_opinions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id INTEGER NOT NULL REFERENCES validation_rounds(id) ON DELETE CASCADE,
+    ts REAL NOT NULL,
+    seat TEXT NOT NULL,                 -- VALIDATOR_SEATS
+    reply TEXT NOT NULL DEFAULT '',     -- the seat's raw reply, verbatim
+    verdict TEXT NOT NULL DEFAULT '',   -- pass | reject | '' (none offered)
+    status TEXT NOT NULL DEFAULT 'ok',  -- ok | abstained | failed
+    model TEXT NOT NULL DEFAULT '',
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (round_id, seat)
 );
 -- Requests to perform a privileged action (merge a PR, cut a release). Filed by the
 -- PreToolUse gate when a worker attempts one, reviewed by Neo, and consumed by the
@@ -242,6 +346,32 @@ CREATE TABLE IF NOT EXISTS wo_turns (
     outfile TEXT NOT NULL DEFAULT '',
     errfile TEXT NOT NULL DEFAULT ''
 );
+-- THE MESSAGE BUS. One row is one message posted to a ROLE about a SUBJECT (a work
+-- order or a feature order), delivered by the router in bus.py. The sender never names
+-- a recipient and never learns who read it.
+--
+-- `delivered_wo_id` is written by the ROUTER and never by the sender. It is the only
+-- record of who read an envelope, and a sender able to set it would be a sender coupled
+-- to its recipient — the coupling this whole design exists to prevent.
+--
+-- The one CHECK is different in kind from the vocabulary tuples above: exactly-one-of-two
+-- parents is a structural invariant that never changes and that no Python writer can be
+-- trusted to re-derive.
+CREATE TABLE IF NOT EXISTS envelopes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    subject_wo_id TEXT REFERENCES work_orders(id) ON DELETE CASCADE,
+    subject_fo_id TEXT REFERENCES feature_orders(id) ON DELETE CASCADE,
+    from_role TEXT NOT NULL,
+    to_role TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL DEFAULT 'queued',
+    delivered_wo_id TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT '',
+    CHECK ((subject_wo_id IS NULL) <> (subject_fo_id IS NULL))
+);
 CREATE INDEX IF NOT EXISTS idx_turns_wo ON wo_turns(wo_id, seq);
 CREATE INDEX IF NOT EXISTS idx_turns_state ON wo_turns(state);
 CREATE INDEX IF NOT EXISTS idx_wo_status ON work_orders(status);
@@ -250,6 +380,9 @@ CREATE INDEX IF NOT EXISTS idx_msgs_status ON wo_messages(status);
 CREATE INDEX IF NOT EXISTS idx_notif_status ON notifications(status);
 CREATE INDEX IF NOT EXISTS idx_approvals_wo ON approvals(wo_id, status);
 CREATE INDEX IF NOT EXISTS idx_fo_status ON feature_orders(status);
+CREATE INDEX IF NOT EXISTS idx_validation_opinions ON validation_opinions(round_id);
+CREATE INDEX IF NOT EXISTS idx_envelopes_state ON envelopes(state, id);
+CREATE INDEX IF NOT EXISTS idx_envelopes_subject ON envelopes(subject_wo_id, subject_fo_id);
 """
 
 # Columns added after the first release. `CREATE TABLE IF NOT EXISTS` is a no-op on an
@@ -315,6 +448,9 @@ ADDED_COLUMNS = {
         # deleted. See the work_orders comment.
         "bill_json": "TEXT",
         "bill_sealed_at": "REAL",
+        # See the CREATE TABLE comment. A live database already has `feature_orders`,
+        # so the column only reaches it through here.
+        "base_sha": "TEXT",
     },
     "wo_turns": {
         # See the CREATE TABLE comment. Live databases already have `wo_turns`, so the
@@ -943,6 +1079,118 @@ class ProjectStore:
         ).fetchall()
         return db.rows_to_dicts(rows)
 
+    # -- envelopes (the message bus) --------------------------------------------
+
+    def post_envelope(self, *, from_role: str, to_role: str, kind: str,
+                      payload: dict[str, Any] | None = None,
+                      subject_wo_id: str | None = None,
+                      subject_fo_id: str | None = None) -> int:
+        """Queue one envelope. Returns its id.
+
+        Never resolves anything: who fills `to_role` is the router's question and it is
+        asked at delivery, not here (see bus.post). `delivered_wo_id` is left NULL for
+        the router to write, and there is deliberately no parameter for it.
+        """
+        assert from_role in ENVELOPE_ROLES, from_role
+        assert to_role in ENVELOPE_ROLES, to_role
+        assert kind in ENVELOPE_KINDS, kind
+        if bool(subject_wo_id) == bool(subject_fo_id):
+            raise ValueError("an envelope has exactly one subject: a work order or a "
+                             "feature order, never both and never neither")
+        cur = self.conn.execute(
+            """INSERT INTO envelopes (ts, subject_wo_id, subject_fo_id, from_role,
+                                      to_role, kind, payload)
+               VALUES (?,?,?,?,?,?,?)""",
+            (db.now(), subject_wo_id, subject_fo_id, from_role, to_role, kind,
+             db.to_json(payload or {})),
+        )
+        return int(cur.lastrowid)
+
+    def queued_envelopes(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Undelivered envelopes, oldest first.
+
+        Ordered by `(ts, id)` rather than `ts` alone: two envelopes posted in the same
+        transaction can share a timestamp to the microsecond, and the whole promise of
+        this queue is that a subject's messages arrive in the order they were posted.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM envelopes WHERE state='queued' ORDER BY ts, id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def mark_envelope(self, env_id: int, state: str, *,
+                      delivered_wo_id: str | None = None, note: str = "") -> None:
+        assert state in ENVELOPE_STATES, state
+        fields: dict[str, Any] = {"state": state, "note": note}
+        if delivered_wo_id is not None:
+            fields["delivered_wo_id"] = delivered_wo_id
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self.conn.execute(f"UPDATE envelopes SET {cols} WHERE id=?",
+                          (*fields.values(), env_id))
+
+    def bump_envelope_attempt(self, env_id: int) -> None:
+        """Count one routing attempt, successful or not.
+
+        Committed on its own, deliberately OUTSIDE the delivery transaction below: an
+        attempt that fails rolls the delivery back, and if the count went with it a
+        permanently unroutable envelope would retry for ever and INV-ENVELOPE-STUCK
+        would never see it.
+        """
+        self.conn.execute(
+            "UPDATE envelopes SET attempts = attempts + 1 WHERE id=?", (env_id,))
+
+    def deliver_envelope(self, env_id: int, wo_id: str, content: str,
+                         source: str = "bus", note: str = "") -> int:
+        """Hand one envelope to a work order's message queue. ONE transaction.
+
+        The `wo_messages` insert and the state change commit together or not at all. A
+        daemon that dies between them would otherwise redeliver an envelope the worker
+        has already been sent; dying before either redelivers the whole envelope, which
+        is correct and is what the queue already guarantees for `jarvis wo send`.
+        """
+        self.conn.execute("BEGIN")
+        try:
+            msg_id = self.queue_message(wo_id, content, source=source)
+            self.conn.execute(
+                "UPDATE envelopes SET state='delivered', delivered_wo_id=?, note=? "
+                "WHERE id=?", (wo_id, note, env_id))
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return msg_id
+
+    def envelopes(self, subject_wo_id: str | None = None,
+                  subject_fo_id: str | None = None,
+                  limit: int = 200) -> list[dict[str, Any]]:
+        """One subject's envelopes, oldest first. No subject means all of them."""
+        conds, params = [], []
+        if subject_wo_id:
+            conds.append("subject_wo_id=?"); params.append(subject_wo_id)
+        if subject_fo_id:
+            conds.append("subject_fo_id=?"); params.append(subject_fo_id)
+        where = f" WHERE {' AND '.join(conds)}" if conds else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM envelopes{where} ORDER BY ts, id LIMIT ?", (*params, limit)
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def manager_work_order(self, fo_id: str) -> dict[str, Any] | None:
+        """The work order that owns this feature's follow-through, whatever its status.
+
+        `manager` is in WO_KINDS, but nothing CREATES one yet — the project manager
+        order is a later work order in this feature — so today this always returns None
+        and the router treats that as an unfilled role. The status is NOT filtered here:
+        the router has to tell "no manager was ever created" apart from "the manager was
+        cancelled while its feature is still open", and those two are different verdicts.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM work_orders WHERE parent_id=? AND kind='manager' "
+            "ORDER BY created_at LIMIT 1", (fo_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
     # -- turns (the worker's conversation) --------------------------------------
 
     def create_turn(self, wo_id: str, kind: str, prompt: str,
@@ -1080,6 +1328,109 @@ class ProjectStore:
     def review_assumption(self, assumption_id: int, status: str) -> None:
         assert status in ("accepted", "rejected"), status
         self.conn.execute("UPDATE assumptions SET status=? WHERE id=?", (status, assumption_id))
+
+    # -- validation rounds (see the validation-panel design) ----------------------
+    #
+    # A round hangs off EITHER a work order or a feature order, never both and never
+    # neither, so every method that names a subject takes the two as keyword-only
+    # arguments and refuses anything but exactly one of them. That refusal is Python's
+    # job as well as the CHECK constraint's: the constraint catches a bad INSERT, this
+    # catches a bad SELECT, which would otherwise quietly return every round in the
+    # project.
+
+    @staticmethod
+    def _subject(wo_id: str | None, fo_id: str | None) -> tuple[str, str]:
+        """(column, id) for the one subject given. Raises if that is not exactly one."""
+        if (wo_id is None) == (fo_id is None):
+            raise ValueError("pass exactly one of wo_id / fo_id")
+        return ("wo_id", wo_id) if wo_id is not None else ("fo_id", fo_id)  # type: ignore[return-value]
+
+    def open_validation_round(self, *, wo_id: str | None = None,
+                              fo_id: str | None = None, fingerprint: str,
+                              summary: str = "", evidence: str = "",
+                              pr_url: str | None = None) -> dict[str, Any]:
+        """Start a round on one subject. The round number is derived, never passed in.
+
+        1-based and per subject, counted from what is already stored, so two rounds can
+        never disagree about which came first. The partial unique index is the backstop
+        if two ever race for the same number.
+        """
+        col, subject_id = self._subject(wo_id, fo_id)
+        row = self.conn.execute(
+            f"SELECT MAX(round) AS n FROM validation_rounds WHERE {col}=?", (subject_id,)
+        ).fetchone()
+        nxt = int(row["n"] or 0) + 1
+        cur = self.conn.execute(
+            f"""INSERT INTO validation_rounds ({col}, round, ts, fingerprint, summary,
+                                               evidence, pr_url)
+                VALUES (?,?,?,?,?,?,?)""",
+            (subject_id, nxt, db.now(), fingerprint, summary, evidence, pr_url),
+        )
+        return self.get_validation_round(int(cur.lastrowid))  # type: ignore[arg-type]
+
+    def get_validation_round(self, round_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM validation_rounds WHERE id=?", (round_id,)).fetchone()
+        return dict(row) if row else None
+
+    def close_validation_round(self, round_id: int, outcome: str,
+                               reason: str = "") -> None:
+        assert outcome in VALIDATION_OUTCOMES, outcome
+        self.conn.execute(
+            "UPDATE validation_rounds SET outcome=?, reason=? WHERE id=?",
+            (outcome, reason, round_id),
+        )
+
+    def validation_rounds(self, *, wo_id: str | None = None,
+                          fo_id: str | None = None) -> list[dict[str, Any]]:
+        """Every round on one subject, oldest first — the order they were judged in."""
+        col, subject_id = self._subject(wo_id, fo_id)
+        return db.rows_to_dicts(self.conn.execute(
+            f"SELECT * FROM validation_rounds WHERE {col}=? ORDER BY round",
+            (subject_id,),
+        ).fetchall())
+
+    def latest_validation_round(self, *, wo_id: str | None = None,
+                                fo_id: str | None = None) -> dict[str, Any] | None:
+        """The most recent round on one subject, or None if it has never been judged."""
+        col, subject_id = self._subject(wo_id, fo_id)
+        row = self.conn.execute(
+            f"SELECT * FROM validation_rounds WHERE {col}=? ORDER BY round DESC LIMIT 1",
+            (subject_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def record_validation_opinion(self, round_id: int, seat: str, *, reply: str = "",
+                                  verdict: str = "", status: str = "ok",
+                                  model: str = "", latency_ms: int = 0) -> None:
+        """What one seat said. Re-recording a seat REPLACES its opinion.
+
+        A seat that is re-run — a retry after a timeout — must leave one row, not two:
+        the arbiter counts verdicts, and a doubled seat would vote twice.
+        """
+        assert status in VALIDATION_OPINION_STATUSES, status
+        assert verdict in VALIDATION_VERDICTS, verdict
+        self.conn.execute(
+            """INSERT INTO validation_opinions
+                   (round_id, ts, seat, reply, verdict, status, model, latency_ms)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(round_id, seat) DO UPDATE SET
+                   ts=excluded.ts, reply=excluded.reply, verdict=excluded.verdict,
+                   status=excluded.status, model=excluded.model,
+                   latency_ms=excluded.latency_ms""",
+            (round_id, db.now(), seat, reply, verdict, status, model, latency_ms),
+        )
+
+    def validation_opinions(self, round_id: int) -> list[dict[str, Any]]:
+        """One round's opinions, in the order the seats first reported.
+
+        Ordered by `id` rather than `ts` so a partial re-run cannot reshuffle rows a
+        reader has already seen — the same rule `neo_store.opinions` follows.
+        """
+        return db.rows_to_dicts(self.conn.execute(
+            "SELECT * FROM validation_opinions WHERE round_id=? ORDER BY id",
+            (round_id,),
+        ).fetchall())
 
     # -- approvals (privileged-action gates; see gates.py) ------------------------
 
