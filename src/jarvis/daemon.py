@@ -3,7 +3,9 @@
 One process, one poll loop over every project in the catalog. Per tick, in this order:
   1. route project notification outboxes to the central inbox, then to sinks
   2. reap finished worker turns and settle their work orders against what came back
-  3. deliver queued user messages as the next turn of their conversation
+  3. route queued envelopes to whoever fills the role they name (src/jarvis/bus.py),
+     then deliver queued messages — the routed envelope among them — as the next
+     turn of their conversation
   4. dispatch pending work orders (respecting per-project concurrency) — last, so it
      sees the concurrency slots steps 2 and 3 just freed
   5. let Neo (the OS answerer agent) drain queued worker questions
@@ -43,7 +45,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from . import claude_cli, worker_session
+from . import bus, claude_cli, worker_session
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
@@ -211,6 +213,11 @@ class Daemon:
                 # delivered, and living only on that turn row — would be skipped.
                 if retry_paused:
                     self.retry_paused_turns(project, store)
+                # Before delivery, not after: an envelope BECOMES a queued message,
+                # so routing it first lets it go out as this tick's turn instead of
+                # waiting a whole poll interval for the next pass. With no envelope ever
+                # posted this is one indexed lookup that finds nothing.
+                self.deliver_envelopes(project, store)
                 self.deliver_messages(project, store)
                 # Before dispatch, not after: a planner filed this tick is an ordinary
                 # pending work order, so it is claimed by the same pass rather than
@@ -600,6 +607,30 @@ class Daemon:
             pending.setdefault(wo["id"], []).append(dict(msg))
         for wo_id, msgs in pending.items():
             self._deliver(project, store, store.get_work_order(wo_id), msgs)
+
+    def deliver_envelopes(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Route every queued envelope, oldest first (src/jarvis/bus.py).
+
+        The daemon is the only module that knows about the bus and its posters together:
+        the bus itself imports nothing above the two stores, so somebody has to turn its
+        queue. This is that somebody, and it is deliberately as thin as `route_outbox` —
+        every decision, including what to do when a role is unfilled, belongs to the
+        router.
+
+        `bus.deliver` handles its own failures (an envelope whose delivery raises stays
+        `queued` and is retried), so the guard here is for the unexpected only: one
+        envelope that blows up must not cost the project the rest of its tick.
+        """
+        for envelope in store.queued_envelopes():
+            try:
+                state = bus.deliver(store, self.central, envelope,
+                                    project=project.name)
+            except Exception:  # noqa: BLE001
+                log.exception("[%s] envelope %s could not be routed",
+                              project.name, envelope["id"])
+                continue
+            if state != "delivered":
+                log.info("[%s] envelope %s -> %s", project.name, envelope["id"], state)
 
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                  msgs: list[dict[str, Any]]) -> None:

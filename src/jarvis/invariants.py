@@ -711,6 +711,80 @@ def check_attention_has_reason(store: ProjectStore) -> Iterator[Violation]:
             )
 
 
+def check_envelopes_move(store: ProjectStore) -> Iterator[Violation]:
+    """INV-ENVELOPE-STUCK — an envelope must not sit in the queue for ever.
+
+    The message bus (src/jarvis/bus.py) is the pipe every cross-entity message in the
+    validation loop travels down, and a `queued` envelope is a message nobody will ever
+    receive. From the outside it looks exactly like one that was delivered: the row is
+    there, the payload is there, and nothing says the recipient never saw it. The bus has
+    to own that liveness itself rather than wait for a later feature to notice.
+
+    Predicate: still `queued` after `bus.DELIVERY_ATTEMPT_CEILING` routing attempts. The
+    daemon turns the queue every tick, so an envelope only accumulates attempts by
+    failing — a delivery that raised and rolled back, over and over.
+
+    Repairable, and unambiguously so, which is rare for this module: `bus.deliver` is
+    transactional and therefore safe to run again, so the repair is to attempt delivery
+    once more. If that attempt leaves it `queued` too, THAT was the final attempt and the
+    envelope is marked `undeliverable` with the reason in `note` — which is the whole
+    point, because an undeliverable message is a fact the record must carry, while a
+    queued one is a lie of omission.
+
+    Reported once by construction: every path out of here leaves the envelope in a state
+    that is no longer `queued`, so the next tick finds nothing to say.
+    """
+    from .bus import DELIVERY_ATTEMPT_CEILING, deliver
+
+    stuck = [e for e in store.queued_envelopes()
+             if int(e["attempts"] or 0) >= DELIVERY_ATTEMPT_CEILING]
+    if not stuck:
+        return
+    if getattr(store, "readonly", False):
+        # `jarvis doctor` without --repair. The retry would write to the CENTRAL store
+        # too (a deferral with no manager is filed as a backlog item), which no proxy
+        # over the project store can intercept — so the retry is described, not run.
+        for env in stuck:
+            yield _envelope_violation(env, repair="would retry delivery once more")
+        return
+
+    from .central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        for env in stuck:
+            try:
+                state = deliver(store, central, env)
+            except Exception as e:  # noqa: BLE001 — a broken route is what we are here for
+                state, why = "queued", f"delivery raised {e!r}"
+            else:
+                why = "delivery left it queued"
+            if state == "queued":
+                note = (f"undeliverable after {int(env['attempts'] or 0) + 1} attempts: "
+                        f"{why}")
+                store.mark_envelope(env["id"], "undeliverable", note=note)
+                repair = f"marked undeliverable — {why}"
+            else:
+                repair = f"retried; now {state}"
+            yield _envelope_violation(env, repair=repair)
+    finally:
+        central.close()
+
+
+def _envelope_violation(env: dict[str, Any], repair: str) -> Violation:
+    return Violation(
+        invariant="INV-ENVELOPE-STUCK",
+        wo_id=env["subject_wo_id"],
+        detail=(f"envelope {env['id']} ({env['kind']} to role {env['to_role']}) was "
+                f"still queued after {env['attempts']} delivery attempts"),
+        repaired=True,
+        repair=repair,
+        context={"envelope_id": env["id"], "kind": env["kind"],
+                 "to_role": env["to_role"], "attempts": env["attempts"],
+                 "subject_fo_id": env["subject_fo_id"]},
+    )
+
+
 # -- configuration checks (catalog, not database state) ------------------------------
 
 
@@ -946,6 +1020,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_no_phantom_attention,
     check_blocked_work_is_surfaced,
     check_attention_has_reason,
+    check_envelopes_move,          # last: it delivers, and delivery changes work orders
 )
 
 
@@ -979,7 +1054,18 @@ class _ReadOnly:
     """
 
     _BLOCKED = ("flag_attention", "clear_attention", "add_assumption", "add_event",
-                "set_status", "update_work_order", "supersede_approval")
+                "set_status", "update_work_order", "supersede_approval",
+                # The bus. `queue_message` is here because delivering an envelope IS a
+                # queued message, and a read-only doctor run must not send one.
+                "mark_envelope", "bump_envelope_attempt", "deliver_envelope",
+                "queue_message", "flag_feature_attention")
+
+    #: How a checker asks "am I allowed to change anything?". Needed by
+    #: `check_envelopes_move`, whose repair also writes to the CENTRAL store — a proxy
+    #: over the project store cannot intercept that, so the checker has to skip the work
+    #: rather than have it swallowed. Absent on a real ProjectStore, so `getattr(store,
+    #: "readonly", False)` is the test.
+    readonly = True
 
     def __init__(self, store: ProjectStore):
         self._store = store

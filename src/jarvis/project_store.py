@@ -103,6 +103,24 @@ WO_KINDS = ("worker", "planner", "manager")
 # the moment a tick rejected them.
 ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
 
+# -- the message bus (see bus.py, and the validation-panel design doc) ----------------
+#
+# Nothing addresses anything directly: a cross-entity message is an envelope posted to a
+# ROLE, and the router works out who fills it. These three tuples are that vocabulary.
+#
+# Module tuples, NOT SQL CHECK constraints, and deliberately so. No status column in this
+# codebase carries a CHECK; every one of them is a tuple here plus an `assert` at the
+# write site. More to the point, ENVELOPE_ROLES and ENVELOPE_KINDS are DESIGNED TO GROW —
+# the whole justification for a bus is that a new participant costs a routing rule — and a
+# CHECK on `to_role` would turn adding a role into a schema migration, which is exactly
+# the cost this design exists to avoid.
+ENVELOPE_ROLES = ("reviewer", "implementor", "manager")
+ENVELOPE_KINDS = ("review_feedback", "deferral_request")
+# queued -> delivered (a work order filled the role and was sent the message)
+#        -> handled_by_router (nobody filled it and the router acted itself)
+#        -> undeliverable (nobody filled it and nobody could act — see bus.deliver)
+ENVELOPE_STATES = ("queued", "delivered", "handled_by_router", "undeliverable")
+
 # Feature order lifecycle. Deliberately NOT a copy of WO_STATUSES: a feature order never
 # runs a session of its own, so most of a work order's states are meaningless for it.
 FO_STATUSES = (
@@ -328,6 +346,32 @@ CREATE TABLE IF NOT EXISTS wo_turns (
     outfile TEXT NOT NULL DEFAULT '',
     errfile TEXT NOT NULL DEFAULT ''
 );
+-- THE MESSAGE BUS. One row is one message posted to a ROLE about a SUBJECT (a work
+-- order or a feature order), delivered by the router in bus.py. The sender never names
+-- a recipient and never learns who read it.
+--
+-- `delivered_wo_id` is written by the ROUTER and never by the sender. It is the only
+-- record of who read an envelope, and a sender able to set it would be a sender coupled
+-- to its recipient — the coupling this whole design exists to prevent.
+--
+-- The one CHECK is different in kind from the vocabulary tuples above: exactly-one-of-two
+-- parents is a structural invariant that never changes and that no Python writer can be
+-- trusted to re-derive.
+CREATE TABLE IF NOT EXISTS envelopes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    subject_wo_id TEXT REFERENCES work_orders(id) ON DELETE CASCADE,
+    subject_fo_id TEXT REFERENCES feature_orders(id) ON DELETE CASCADE,
+    from_role TEXT NOT NULL,
+    to_role TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL DEFAULT 'queued',
+    delivered_wo_id TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT '',
+    CHECK ((subject_wo_id IS NULL) <> (subject_fo_id IS NULL))
+);
 CREATE INDEX IF NOT EXISTS idx_turns_wo ON wo_turns(wo_id, seq);
 CREATE INDEX IF NOT EXISTS idx_turns_state ON wo_turns(state);
 CREATE INDEX IF NOT EXISTS idx_wo_status ON work_orders(status);
@@ -337,6 +381,8 @@ CREATE INDEX IF NOT EXISTS idx_notif_status ON notifications(status);
 CREATE INDEX IF NOT EXISTS idx_approvals_wo ON approvals(wo_id, status);
 CREATE INDEX IF NOT EXISTS idx_fo_status ON feature_orders(status);
 CREATE INDEX IF NOT EXISTS idx_validation_opinions ON validation_opinions(round_id);
+CREATE INDEX IF NOT EXISTS idx_envelopes_state ON envelopes(state, id);
+CREATE INDEX IF NOT EXISTS idx_envelopes_subject ON envelopes(subject_wo_id, subject_fo_id);
 """
 
 # Columns added after the first release. `CREATE TABLE IF NOT EXISTS` is a no-op on an
@@ -1032,6 +1078,118 @@ class ProjectStore:
             "SELECT * FROM wo_messages WHERE wo_id=? ORDER BY ts LIMIT ?", (wo_id, limit)
         ).fetchall()
         return db.rows_to_dicts(rows)
+
+    # -- envelopes (the message bus) --------------------------------------------
+
+    def post_envelope(self, *, from_role: str, to_role: str, kind: str,
+                      payload: dict[str, Any] | None = None,
+                      subject_wo_id: str | None = None,
+                      subject_fo_id: str | None = None) -> int:
+        """Queue one envelope. Returns its id.
+
+        Never resolves anything: who fills `to_role` is the router's question and it is
+        asked at delivery, not here (see bus.post). `delivered_wo_id` is left NULL for
+        the router to write, and there is deliberately no parameter for it.
+        """
+        assert from_role in ENVELOPE_ROLES, from_role
+        assert to_role in ENVELOPE_ROLES, to_role
+        assert kind in ENVELOPE_KINDS, kind
+        if bool(subject_wo_id) == bool(subject_fo_id):
+            raise ValueError("an envelope has exactly one subject: a work order or a "
+                             "feature order, never both and never neither")
+        cur = self.conn.execute(
+            """INSERT INTO envelopes (ts, subject_wo_id, subject_fo_id, from_role,
+                                      to_role, kind, payload)
+               VALUES (?,?,?,?,?,?,?)""",
+            (db.now(), subject_wo_id, subject_fo_id, from_role, to_role, kind,
+             db.to_json(payload or {})),
+        )
+        return int(cur.lastrowid)
+
+    def queued_envelopes(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Undelivered envelopes, oldest first.
+
+        Ordered by `(ts, id)` rather than `ts` alone: two envelopes posted in the same
+        transaction can share a timestamp to the microsecond, and the whole promise of
+        this queue is that a subject's messages arrive in the order they were posted.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM envelopes WHERE state='queued' ORDER BY ts, id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def mark_envelope(self, env_id: int, state: str, *,
+                      delivered_wo_id: str | None = None, note: str = "") -> None:
+        assert state in ENVELOPE_STATES, state
+        fields: dict[str, Any] = {"state": state, "note": note}
+        if delivered_wo_id is not None:
+            fields["delivered_wo_id"] = delivered_wo_id
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self.conn.execute(f"UPDATE envelopes SET {cols} WHERE id=?",
+                          (*fields.values(), env_id))
+
+    def bump_envelope_attempt(self, env_id: int) -> None:
+        """Count one routing attempt, successful or not.
+
+        Committed on its own, deliberately OUTSIDE the delivery transaction below: an
+        attempt that fails rolls the delivery back, and if the count went with it a
+        permanently unroutable envelope would retry for ever and INV-ENVELOPE-STUCK
+        would never see it.
+        """
+        self.conn.execute(
+            "UPDATE envelopes SET attempts = attempts + 1 WHERE id=?", (env_id,))
+
+    def deliver_envelope(self, env_id: int, wo_id: str, content: str,
+                         source: str = "bus", note: str = "") -> int:
+        """Hand one envelope to a work order's message queue. ONE transaction.
+
+        The `wo_messages` insert and the state change commit together or not at all. A
+        daemon that dies between them would otherwise redeliver an envelope the worker
+        has already been sent; dying before either redelivers the whole envelope, which
+        is correct and is what the queue already guarantees for `jarvis wo send`.
+        """
+        self.conn.execute("BEGIN")
+        try:
+            msg_id = self.queue_message(wo_id, content, source=source)
+            self.conn.execute(
+                "UPDATE envelopes SET state='delivered', delivered_wo_id=?, note=? "
+                "WHERE id=?", (wo_id, note, env_id))
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return msg_id
+
+    def envelopes(self, subject_wo_id: str | None = None,
+                  subject_fo_id: str | None = None,
+                  limit: int = 200) -> list[dict[str, Any]]:
+        """One subject's envelopes, oldest first. No subject means all of them."""
+        conds, params = [], []
+        if subject_wo_id:
+            conds.append("subject_wo_id=?"); params.append(subject_wo_id)
+        if subject_fo_id:
+            conds.append("subject_fo_id=?"); params.append(subject_fo_id)
+        where = f" WHERE {' AND '.join(conds)}" if conds else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM envelopes{where} ORDER BY ts, id LIMIT ?", (*params, limit)
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def manager_work_order(self, fo_id: str) -> dict[str, Any] | None:
+        """The work order that owns this feature's follow-through, whatever its status.
+
+        `manager` is in WO_KINDS, but nothing CREATES one yet — the project manager
+        order is a later work order in this feature — so today this always returns None
+        and the router treats that as an unfilled role. The status is NOT filtered here:
+        the router has to tell "no manager was ever created" apart from "the manager was
+        cancelled while its feature is still open", and those two are different verdicts.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM work_orders WHERE parent_id=? AND kind='manager' "
+            "ORDER BY created_at LIMIT 1", (fo_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
     # -- turns (the worker's conversation) --------------------------------------
 
