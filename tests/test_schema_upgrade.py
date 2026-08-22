@@ -237,3 +237,61 @@ def test_the_columns_the_turn_runtime_reads_survive_the_upgrade(tmp_path):
         assert store.get_work_order(wo["id"])["session_id"] == "s-1"
     finally:
         store.close()
+
+
+def test_base_sha_reaches_a_database_that_already_has_feature_orders(tmp_path):
+    """`feature_orders` ships in the live release, so `base_sha` cannot arrive with the
+    `CREATE TABLE` — it must be in `ADDED_COLUMNS`.
+
+    Same construction, and the same reason, as the `usage_json` test above: the frozen
+    project asset (0.1.11) predates feature orders entirely, so the upgrade it exercises
+    creates the whole table fresh and would pass with `ADDED_COLUMNS` forgotten. The
+    stale database is therefore built by aging today's schema by one column instead.
+    """
+    proj = tmp_path / "legacy"
+    (proj / ".jarvis").mkdir(parents=True)
+    ProjectStore(proj).close()                      # today's schema...
+    conn = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
+    conn.execute("ALTER TABLE feature_orders DROP COLUMN base_sha")   # ...aged
+    conn.commit()
+    conn.close()
+
+    store = ProjectStore(proj)                      # the upgrade
+    try:
+        assert "base_sha" in schema_of(store.conn)["feature_orders"]
+        # and it round-trips on the upgraded database
+        fo = store.create_feature_order("CSV export", description="the whole ask")
+        assert store.get_feature_order(fo["id"])["base_sha"] is None
+        store.update_feature_order(fo["id"], base_sha="deadbeef")
+        assert store.get_feature_order(fo["id"])["base_sha"] == "deadbeef"
+    finally:
+        store.close()
+
+
+def test_the_validation_tables_and_their_partial_indexes_arrive_on_an_upgrade(tmp_path):
+    """A new TABLE arrives for free on `CREATE TABLE IF NOT EXISTS` — its INDEXES only
+    do if they are in `SCHEMA` too, and the whole polymorphic design rests on two
+    partial unique indexes that no column comparison would ever notice were missing."""
+    proj = tmp_path / "legacy"
+    (proj / ".jarvis").mkdir(parents=True)
+    old = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
+    old.executescript(SHIPPED_SCHEMA.read_text())
+    old.commit()
+    old.close()
+
+    store = ProjectStore(proj)                      # the upgrade
+    try:
+        after = schema_of(store.conn)
+        assert {"validation_rounds", "validation_opinions"} <= set(after)
+        indexes = {r[0] for r in store.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+        assert {"validation_rounds_wo", "validation_rounds_fo"} <= indexes
+        # and they bite on the upgraded database, not just exist on it
+        wo = store.create_work_order("after the upgrade")
+        store.open_validation_round(wo_id=wo["id"], fingerprint="a")
+        with pytest.raises(sqlite3.IntegrityError):
+            store.conn.execute(
+                "INSERT INTO validation_rounds (wo_id, round, ts, fingerprint)"
+                " VALUES (?,1,1.0,'dup')", (wo["id"],))
+    finally:
+        store.close()

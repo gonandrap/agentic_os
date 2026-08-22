@@ -34,6 +34,7 @@ STATUS_LABEL = {
     "dispatching": "Dispatching worker",
     "running": "Running",
     "waiting_input": "Waiting on you",
+    "validating": "Under review by the validation panel",
     "needs_review": "Needs your review",
     "completed": "Completed",
     "failed": "Failed",
@@ -188,6 +189,23 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any],
                     f"by mistake", "no privileged action was authorised")
         return (f"Ran the approved {p.get('kind') or 'command'}",
                 f"use {p.get('use')} of {p.get('of')}")
+    # The validation loop. Four kinds rather than one with an outcome in the payload,
+    # because the four are the whole story a reader wants at a glance — and each gets a
+    # LABEL of its own here. `event_level` returns "signal" for anything it does not
+    # know, so these arriving unclassified would look fine on the timeline while
+    # rendering as a bare kind and a JSON blob.
+    if kind == "validation_submitted":
+        rnd = p.get("round")
+        return ("Submitted for validation",
+                f"round {rnd}" if rnd else "")
+    if kind == "validation_passed":
+        return "Validation passed", p.get("reason") or ""
+    if kind == "validation_rejected":
+        # The reason IS the ask the worker has to answer, so unlike the "answered"
+        # kinds above it is shown here: nothing else in the timeline carries it.
+        return "Validation rejected — sent back", p.get("reason") or ""
+    if kind == "validation_escalated":
+        return ("Validation gave up — over to you", p.get("reason") or "")
     if kind == "finished":
         return "Finished", p.get("summary") or ""
     if kind == "marked_done":

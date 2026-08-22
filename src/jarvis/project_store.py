@@ -19,6 +19,13 @@ WO_STATUSES = (
     "dispatching",   # claimed by the daemon, worker being spawned
     "running",       # worker session active
     "waiting_input", # worker asked something / is blocked on the user
+    # The worker has claimed the job done and an independent panel is judging the
+    # claim (see the validation-panel design). Ordered here rather than appended
+    # because this tuple IS the order the dashboard renders status counts in, and a
+    # step that happens between "waiting on the user" and "needs your review" reads
+    # wrong anywhere else. Raises NO attention on its own: nobody is waiting on the
+    # user while a round is open.
+    "validating",
     "needs_review",  # finished but has pending assumptions or attention items
     # Worker done, PR open, waiting for the user to merge it. Deliberately NOT an
     # attention item (see invariants.true_blockers): it is a merge queue the user works
@@ -29,11 +36,29 @@ WO_STATUSES = (
     "failed",
     "cancelled",
 )
-OPEN_STATUSES = ("pending", "dispatching", "running", "waiting_input", "needs_review",
-                 "waiting_pr_merge")
+OPEN_STATUSES = ("pending", "dispatching", "running", "waiting_input", "validating",
+                 "needs_review", "waiting_pr_merge")
 # Settled: nothing more will happen to these on their own. They are the bulk of an old
 # project's history, so listings collapse them behind a count rather than printing them.
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
+
+# The seat names a validation panel may be rostered with. This is the VOCABULARY, not
+# the set whose markdown ships in a given build: a catalog may name a seat whose
+# definition arrives in a later release, and that must still parse (the seat records a
+# `failed` opinion at run time instead of refusing to boot the fleet). Mirrors
+# `neo_store.SEATS`, which `catalog.py` already imports for exactly the same job, and
+# lives beside the statuses rather than in `catalog.py` so the vocabulary sits with the
+# store that records what the seats say.
+VALIDATOR_SEATS = ("tester", "security", "architect", "maintainer", "chair")
+
+# How a round ended. `pending` is a round still open; `failed` is the panel itself
+# breaking (no seat answered), which is not the same as the work being `rejected`.
+VALIDATION_OUTCOMES = ("pending", "passed", "rejected", "escalated", "failed")
+# What one seat proposed. "" is a seat that offered none — it ran, but said nothing the
+# arbiter can count.
+VALIDATION_VERDICTS = ("pass", "reject", "")
+# ...and whether that seat's opinion is usable at all.
+VALIDATION_OPINION_STATUSES = ("ok", "abstained", "failed")
 
 # How the work order entered the system. jarvis/ui follow the framework; manual is a
 # direct DB insert; injected is a session the user started and then handed to Jarvis
@@ -61,14 +86,22 @@ UNGOVERNED_ORIGINS = ("adhoc", "injected")
 # names the planner: `parent_id` cannot tell the two apart (a feature order's CHILDREN
 # carry it too), and the briefing has to know which it is composing without querying
 # back up into a second table on every dispatch.
-WO_KINDS = ("worker", "planner")
+# `manager` is a long-lived coordinator session that owns one feature order's
+# follow-through: it stays open for the whole feature, receives what its children
+# report and decides what happens next, instead of finishing a job and exiting.
+WO_KINDS = ("worker", "planner", "manager")
 
 # A work order occupying a slot: dispatched, running, or waiting on something. One
 # constant rather than a literal at each site, because the two readers must agree — the
 # project-wide cap (`count_active`, spent by `Daemon.dispatch_pending`) and the
 # per-feature cap (`claim_next_pending`, spent by `feature_orders.max_parallel`) would
 # otherwise be free to mean different things by "active".
-ACTIVE_STATUSES = ("dispatching", "running", "waiting_input")
+#
+# `validating` counts: the work order still holds a live session the OS intends to
+# resume with the panel's verdict, so it must spend a slot. Without it a project capped
+# at two could pile six work orders into validation and then run five concurrent turns
+# the moment a tick rejected them.
+ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
 
 # Feature order lifecycle. Deliberately NOT a copy of WO_STATUSES: a feature order never
 # runs a session of its own, so most of a work order's states are meaningless for it.
@@ -77,11 +110,12 @@ FO_STATUSES = (
     "planning",     # the plan work order is running
     "plan_review",  # a plan was submitted; Neo is reviewing it, or it is escalated
     "executing",    # children dispatching / running
+    "validating",   # every child is done and the panel is judging the feature as a whole
     "completed",    # every child settled successfully
     "failed",       # a child failed or was cancelled
     "cancelled",    # the user stopped it
 )
-FO_OPEN_STATUSES = ("pending", "planning", "plan_review", "executing")
+FO_OPEN_STATUSES = ("pending", "planning", "plan_review", "executing", "validating")
 FO_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
 # Work-order metadata key: this work order was authorised by whoever filed it, so the
@@ -140,6 +174,10 @@ CREATE TABLE IF NOT EXISTS feature_orders (
     -- database is OS-wide and knows nothing about a project's tables.
     plan_question_id INTEGER,
     max_parallel INTEGER,                   -- slot cap for this feature's children (Phase 3)
+    -- The commit the feature's work is measured against: what the repository looked
+    -- like before any child ran, so a whole-feature diff can be taken later. Nullable,
+    -- and nothing writes it yet.
+    base_sha TEXT,
     needs_attention INTEGER NOT NULL DEFAULT 0,
     attention_reason TEXT,
     backlog_id TEXT,
@@ -178,6 +216,54 @@ CREATE TABLE IF NOT EXISTS assumptions (
     ts REAL NOT NULL,
     content TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' -- pending | accepted | rejected
+);
+-- One judging round over one working unit — a work order or a feature order — by the
+-- validation panel. ONE table for both, not two: the two loops record identical facts,
+-- and two tables would mean two of every reader, two renderers, and two chances to
+-- disagree about what a round is.
+--
+-- TWO NULLABLE FOREIGN KEYS rather than one polymorphic `subject_id`: a single id column
+-- cannot carry ON DELETE CASCADE, so deleting a work order would strand its rounds. The
+-- CHECK is what keeps exactly one of them set.
+CREATE TABLE IF NOT EXISTS validation_rounds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wo_id TEXT REFERENCES work_orders(id) ON DELETE CASCADE,
+    fo_id TEXT REFERENCES feature_orders(id) ON DELETE CASCADE,
+    round INTEGER NOT NULL,             -- 1-based, per subject
+    ts REAL NOT NULL,
+    fingerprint TEXT NOT NULL,          -- what was judged; a repeat means no new evidence
+    summary TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '',
+    pr_url TEXT,
+    -- pending | passed | rejected | escalated | failed
+    outcome TEXT NOT NULL DEFAULT 'pending',
+    reason TEXT NOT NULL DEFAULT '',    -- what was sent back
+    CHECK ((wo_id IS NULL) <> (fo_id IS NULL))
+);
+-- PARTIAL unique indexes, NOT `UNIQUE (wo_id, fo_id, round)`. SQLite treats NULLs as
+-- distinct in a UNIQUE constraint, and every row here has a NULL in one of the two id
+-- columns — so the three-column form would look perfectly correct and enforce NOTHING
+-- AT ALL on either loop, letting duplicate rounds insert on both.
+CREATE UNIQUE INDEX IF NOT EXISTS validation_rounds_wo
+    ON validation_rounds(wo_id, round) WHERE wo_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS validation_rounds_fo
+    ON validation_rounds(fo_id, round) WHERE fo_id IS NOT NULL;
+-- What one seat said in one round. Keyed on the ROUND, not on the subject: the nearest
+-- precedent (`neo_store.panel_opinions`) keys on the question because a Neo question has
+-- exactly one round of deliberation, whereas a validation has up to `max_rounds` — so
+-- `UNIQUE (subject, seat)` here would silently overwrite round one's opinions with round
+-- two's and leave no trace of either.
+CREATE TABLE IF NOT EXISTS validation_opinions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id INTEGER NOT NULL REFERENCES validation_rounds(id) ON DELETE CASCADE,
+    ts REAL NOT NULL,
+    seat TEXT NOT NULL,                 -- VALIDATOR_SEATS
+    reply TEXT NOT NULL DEFAULT '',     -- the seat's raw reply, verbatim
+    verdict TEXT NOT NULL DEFAULT '',   -- pass | reject | '' (none offered)
+    status TEXT NOT NULL DEFAULT 'ok',  -- ok | abstained | failed
+    model TEXT NOT NULL DEFAULT '',
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (round_id, seat)
 );
 -- Requests to perform a privileged action (merge a PR, cut a release). Filed by the
 -- PreToolUse gate when a worker attempts one, reviewed by Neo, and consumed by the
@@ -250,6 +336,7 @@ CREATE INDEX IF NOT EXISTS idx_msgs_status ON wo_messages(status);
 CREATE INDEX IF NOT EXISTS idx_notif_status ON notifications(status);
 CREATE INDEX IF NOT EXISTS idx_approvals_wo ON approvals(wo_id, status);
 CREATE INDEX IF NOT EXISTS idx_fo_status ON feature_orders(status);
+CREATE INDEX IF NOT EXISTS idx_validation_opinions ON validation_opinions(round_id);
 """
 
 # Columns added after the first release. `CREATE TABLE IF NOT EXISTS` is a no-op on an
@@ -315,6 +402,9 @@ ADDED_COLUMNS = {
         # deleted. See the work_orders comment.
         "bill_json": "TEXT",
         "bill_sealed_at": "REAL",
+        # See the CREATE TABLE comment. A live database already has `feature_orders`,
+        # so the column only reaches it through here.
+        "base_sha": "TEXT",
     },
     "wo_turns": {
         # See the CREATE TABLE comment. Live databases already have `wo_turns`, so the
@@ -1080,6 +1170,109 @@ class ProjectStore:
     def review_assumption(self, assumption_id: int, status: str) -> None:
         assert status in ("accepted", "rejected"), status
         self.conn.execute("UPDATE assumptions SET status=? WHERE id=?", (status, assumption_id))
+
+    # -- validation rounds (see the validation-panel design) ----------------------
+    #
+    # A round hangs off EITHER a work order or a feature order, never both and never
+    # neither, so every method that names a subject takes the two as keyword-only
+    # arguments and refuses anything but exactly one of them. That refusal is Python's
+    # job as well as the CHECK constraint's: the constraint catches a bad INSERT, this
+    # catches a bad SELECT, which would otherwise quietly return every round in the
+    # project.
+
+    @staticmethod
+    def _subject(wo_id: str | None, fo_id: str | None) -> tuple[str, str]:
+        """(column, id) for the one subject given. Raises if that is not exactly one."""
+        if (wo_id is None) == (fo_id is None):
+            raise ValueError("pass exactly one of wo_id / fo_id")
+        return ("wo_id", wo_id) if wo_id is not None else ("fo_id", fo_id)  # type: ignore[return-value]
+
+    def open_validation_round(self, *, wo_id: str | None = None,
+                              fo_id: str | None = None, fingerprint: str,
+                              summary: str = "", evidence: str = "",
+                              pr_url: str | None = None) -> dict[str, Any]:
+        """Start a round on one subject. The round number is derived, never passed in.
+
+        1-based and per subject, counted from what is already stored, so two rounds can
+        never disagree about which came first. The partial unique index is the backstop
+        if two ever race for the same number.
+        """
+        col, subject_id = self._subject(wo_id, fo_id)
+        row = self.conn.execute(
+            f"SELECT MAX(round) AS n FROM validation_rounds WHERE {col}=?", (subject_id,)
+        ).fetchone()
+        nxt = int(row["n"] or 0) + 1
+        cur = self.conn.execute(
+            f"""INSERT INTO validation_rounds ({col}, round, ts, fingerprint, summary,
+                                               evidence, pr_url)
+                VALUES (?,?,?,?,?,?,?)""",
+            (subject_id, nxt, db.now(), fingerprint, summary, evidence, pr_url),
+        )
+        return self.get_validation_round(int(cur.lastrowid))  # type: ignore[arg-type]
+
+    def get_validation_round(self, round_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM validation_rounds WHERE id=?", (round_id,)).fetchone()
+        return dict(row) if row else None
+
+    def close_validation_round(self, round_id: int, outcome: str,
+                               reason: str = "") -> None:
+        assert outcome in VALIDATION_OUTCOMES, outcome
+        self.conn.execute(
+            "UPDATE validation_rounds SET outcome=?, reason=? WHERE id=?",
+            (outcome, reason, round_id),
+        )
+
+    def validation_rounds(self, *, wo_id: str | None = None,
+                          fo_id: str | None = None) -> list[dict[str, Any]]:
+        """Every round on one subject, oldest first — the order they were judged in."""
+        col, subject_id = self._subject(wo_id, fo_id)
+        return db.rows_to_dicts(self.conn.execute(
+            f"SELECT * FROM validation_rounds WHERE {col}=? ORDER BY round",
+            (subject_id,),
+        ).fetchall())
+
+    def latest_validation_round(self, *, wo_id: str | None = None,
+                                fo_id: str | None = None) -> dict[str, Any] | None:
+        """The most recent round on one subject, or None if it has never been judged."""
+        col, subject_id = self._subject(wo_id, fo_id)
+        row = self.conn.execute(
+            f"SELECT * FROM validation_rounds WHERE {col}=? ORDER BY round DESC LIMIT 1",
+            (subject_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def record_validation_opinion(self, round_id: int, seat: str, *, reply: str = "",
+                                  verdict: str = "", status: str = "ok",
+                                  model: str = "", latency_ms: int = 0) -> None:
+        """What one seat said. Re-recording a seat REPLACES its opinion.
+
+        A seat that is re-run — a retry after a timeout — must leave one row, not two:
+        the arbiter counts verdicts, and a doubled seat would vote twice.
+        """
+        assert status in VALIDATION_OPINION_STATUSES, status
+        assert verdict in VALIDATION_VERDICTS, verdict
+        self.conn.execute(
+            """INSERT INTO validation_opinions
+                   (round_id, ts, seat, reply, verdict, status, model, latency_ms)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(round_id, seat) DO UPDATE SET
+                   ts=excluded.ts, reply=excluded.reply, verdict=excluded.verdict,
+                   status=excluded.status, model=excluded.model,
+                   latency_ms=excluded.latency_ms""",
+            (round_id, db.now(), seat, reply, verdict, status, model, latency_ms),
+        )
+
+    def validation_opinions(self, round_id: int) -> list[dict[str, Any]]:
+        """One round's opinions, in the order the seats first reported.
+
+        Ordered by `id` rather than `ts` so a partial re-run cannot reshuffle rows a
+        reader has already seen — the same rule `neo_store.opinions` follows.
+        """
+        return db.rows_to_dicts(self.conn.execute(
+            "SELECT * FROM validation_opinions WHERE round_id=? ORDER BY id",
+            (round_id,),
+        ).fetchall())
 
     # -- approvals (privileged-action gates; see gates.py) ------------------------
 
