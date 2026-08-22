@@ -1,4 +1,5 @@
 import json
+import re
 
 from jarvis.bootstrap import (
     bootstrap_project,
@@ -174,3 +175,102 @@ def test_operation_md_preserves_specifics(project):
     bootstrap_project(spec(project))
     assert "Run `make test` before shipping." in op.read_text()
     assert current in op.read_text().split("\n", 1)[0]
+
+
+# -- the worker contract: `jarvis wo finish --evidence` -------------------------------
+
+
+def _rendered_operation(project) -> str:
+    bootstrap_project(spec(project))
+    return (project / "OPERATION.md").read_text()
+
+
+def _evidence_prose(text: str, window: int = 900) -> str:
+    """The prose around `--evidence`, which is what the no-leaking rule governs.
+
+    The rest of either document is not in scope and must not be: OPERATION.md's Serena
+    section says "architecture" repeatedly, and a whole-document search would fail on
+    that rather than on anything about the reviewer.
+    """
+    at = text.index("--evidence")
+    return text[max(0, at - window):at + window]
+
+
+def _worker_prompt(project) -> str:
+    """What a running worker actually reads — the same call the daemon makes."""
+    from jarvis.dispatch import build_worker_prompt
+    from jarvis.project_store import ProjectStore
+
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("ship the thing")
+    finally:
+        store.close()
+    return build_worker_prompt(wo, spec(project))
+
+
+def test_both_worker_texts_teach_the_evidence_flag(project):
+    """OPERATION.md is what a worker reads if it goes LOOKING; the dispatched prompt is
+    what it reads without looking. They answer different questions and both have to
+    carry the flag, or the half that does not silently trains the behaviour we are
+    trying to end."""
+    op, prompt = _rendered_operation(project), _worker_prompt(project)
+
+    for text, where in ((op, "OPERATION.md"), (prompt, "the worker prompt")):
+        assert "--evidence" in text, f"{where} never mentions the flag"
+        # near the finishing paragraph, not filed off in a corner of its own
+        finish_at = text.index("jarvis wo finish")
+        assert 0 < text.index("--evidence") - finish_at < 1200, (
+            f"{where} mentions --evidence nowhere near `jarvis wo finish`")
+
+
+def test_neither_worker_text_reveals_who_reads_the_evidence(project):
+    """The implementor and the reviewer do not know about each other — a design rule,
+    not a style note. From the worker's side this is review feedback and nothing more.
+
+    PAIRED with the positive assertion on purpose: "the words panel, seat and validator
+    are absent" is satisfied perfectly by a paragraph that was never written, so the
+    absence proves nothing on its own.
+
+    Scoped to the evidence prose rather than the whole document, and on WORD boundaries:
+    OPERATION.md talks about a project's "architecture" all over its Serena section, and
+    an unanchored substring search would fail on that instead of on anything this rule
+    is about.
+    """
+    from jarvis.project_store import VALIDATOR_SEATS
+
+    for where, text in (("OPERATION.md", _rendered_operation(project)),
+                        ("the worker prompt", _worker_prompt(project))):
+        para = _evidence_prose(text)
+        assert "--evidence" in para, f"{where} never added the paragraph"
+        assert "review feedback" in para.lower(), (
+            f"{where} does not frame it as review feedback")
+        for word in ("panel", "seat", "seats", "validator", *VALIDATOR_SEATS):
+            assert not re.search(rf"\b{word}\b", para, re.I), (
+                f"{where} names {word!r} to the worker")
+
+
+def test_the_template_version_was_bumped_for_the_new_contract(project):
+    """Without the bump the paragraph never reaches an already-bootstrapped project —
+    the version comments in bootstrap.py are three separate records of exactly that
+    mistake. Pinned to the value this work order shipped, so a later edit to the
+    template that forgets the bump fails here rather than in production."""
+    from jarvis.bootstrap import TEMPLATE_VERSION
+
+    assert TEMPLATE_VERSION >= 9
+    assert f"template v{TEMPLATE_VERSION}" in _rendered_operation(project)
+
+
+def test_an_already_bootstrapped_project_is_regenerated_by_the_bump(project):
+    """The bump's whole job. A repo carrying the previous version's OPERATION.md is
+    rewritten on the next bootstrap and comes away with the new paragraph."""
+    bootstrap_project(spec(project))
+    op = project / "OPERATION.md"
+    from jarvis.bootstrap import TEMPLATE_VERSION
+    stale = op.read_text().replace(f"template v{TEMPLATE_VERSION}", "template v8")
+    op.write_text(stale.replace("--evidence", "--nothing-of-the-sort"))
+    assert "--evidence" not in op.read_text()
+
+    bootstrap_project(spec(project))
+
+    assert "--evidence" in op.read_text()

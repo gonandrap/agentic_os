@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from . import db, worker_session
-from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS
+from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS, DEFAULT_VALIDATION_TIMEOUT
 from .neo_store import USER_HELD_Q_STATUSES
 from .project_store import (
     ACTIVE_STATUSES,
@@ -794,6 +794,100 @@ def _envelope_violation(env: dict[str, Any], repair: str) -> Violation:
     )
 
 
+def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
+    """INV-VALIDATION-STRANDED — a unit under review must not sit in `validating` for ever.
+
+    `validating` is the one status in `ACTIVE_STATUSES` that nothing outside the daemon
+    can move. It raises no attention flag — a unit under review is the OS working, not a
+    decision anyone owes — and `Daemon.settle_work_order` returns early for it, so the
+    reconciler will not re-derive it either. Each of those is correct while a round is
+    genuinely in flight, and together they mean that a daemon which dies mid-round leaves
+    the unit invisibly stalled: `pending` round, no flag, no reconciliation, for ever.
+    That is precisely the failure this module exists to catch, and it is the worst shape
+    of it, because nothing else in the OS will ever look at the row again.
+
+    Predicate: the unit's status is `validating`, its LATEST round is still `pending`,
+    and that round was opened longer than twice `os.validation.timeout` ago. Twice rather
+    than once, because one timeout is what a single round is allowed to take — a round at
+    1.2x its budget is late, not abandoned, and closing it would cut off a review that
+    was about to return.
+
+    Repairable, and unambiguously so: the round is closed `failed`, which is the outcome
+    the daemon already uses for "nobody judged this". `failed` and not `escalated` —
+    `counted_validation_rounds` ignores it, so the interrupted round costs the submitter
+    nothing, and `Daemon.validation_tick` picks up `pending` AND `failed` rounds, so
+    closing it hands the unit straight back to the machinery that dropped it. Nothing
+    here judges the work; it only ends a round nobody is running.
+
+    Reported once by construction under repair: the round leaves `pending`, so the next
+    tick finds nothing. Under `jarvis doctor` without `--repair` the repair is described
+    and not applied — `close_validation_round` is blocked by `_ReadOnly`.
+
+    Covers FEATURE orders as well as work orders. Nothing sets a feature order to
+    `validating` yet; the loop that will is a sibling of the work order that added this,
+    and an invariant that silently covered half the units would be worse than none — the
+    half it missed would look checked.
+    """
+    per_round = _validation_timeout()
+    threshold = 2 * per_round
+    now = time.time()
+    cutoff = now - threshold
+    for kind, id_col, rows in (
+        ("work order", "wo_id", store.conn.execute(
+            "SELECT id FROM work_orders WHERE status='validating'").fetchall()),
+        ("feature order", "fo_id", store.conn.execute(
+            "SELECT id FROM feature_orders WHERE status='validating'").fetchall()),
+    ):
+        for row in rows:
+            unit_id = row["id"]
+            latest = store.latest_validation_round(**{id_col: unit_id})
+            if latest is None or latest["outcome"] != "pending":
+                continue
+            if float(latest["ts"] or 0) > cutoff:
+                continue  # late, not abandoned
+            age = int(now - float(latest["ts"] or 0))
+            store.close_validation_round(
+                int(latest["id"]), "failed",
+                f"the review was interrupted — round {latest['round']} was left open "
+                f"with nothing running it for {age}s")
+            yield Violation(
+                invariant="INV-VALIDATION-STRANDED",
+                wo_id=unit_id if id_col == "wo_id" else None,
+                detail=(
+                    f"{kind} {unit_id} has been `validating` on a `pending` round for "
+                    f"{age}s — more than twice the {per_round}s a round is given. "
+                    f"Nothing is judging it and nothing else will ever look at it: "
+                    f"`validating` raises no attention flag and the reconciler steps "
+                    f"over it. The daemon almost certainly restarted mid-round."
+                ),
+                repaired=True,
+                repair=(f"closed round {latest['round']} `failed` — the next tick "
+                        f"picks it up and runs it again"),
+                context={"round_id": latest["id"], "round": latest["round"],
+                         "age_seconds": age, "threshold_seconds": threshold,
+                         "unit": kind,
+                         "fo_id": None if id_col == "wo_id" else unit_id},
+            )
+
+
+def _validation_timeout() -> int:
+    """How long one validation round is allowed to take, per the live catalog.
+
+    Read from the catalog rather than taken from `DEFAULT_VALIDATION_TIMEOUT` because
+    this number decides a WRITE: a project that raised `os.validation.timeout` would
+    otherwise have its perfectly healthy long rounds closed out from under it by a
+    checker still using the shipped default. `status_label` makes the opposite call for
+    the opposite reason — it only prints a number.
+
+    Falls back to the default whenever no catalog can be read, which is
+    `validation_config`'s own contract: an invariant must never be the thing that raises.
+    """
+    from .ops import validation_config
+
+    timeout = getattr(validation_config(), "timeout", None)
+    return int(timeout) if timeout else DEFAULT_VALIDATION_TIMEOUT
+
+
 def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
     """INV-MANAGER-SLOTS — a project manager order must not spend a concurrency slot.
 
@@ -1088,6 +1182,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_attention_has_reason,
     check_manager_slots,           # a canary, not a state check: it repairs nothing and
                                    # is unaffected by the order it runs in
+    check_validation_progresses,   # after the flag checks: its repair touches no flag,
+                                   # and a `validating` row is invisible to all of them
     check_envelopes_move,          # last: it delivers, and delivery changes work orders
 )
 
@@ -1126,7 +1222,10 @@ class _ReadOnly:
                 # The bus. `queue_message` is here because delivering an envelope IS a
                 # queued message, and a read-only doctor run must not send one.
                 "mark_envelope", "bump_envelope_attempt", "deliver_envelope",
-                "queue_message", "flag_feature_attention")
+                "queue_message", "flag_feature_attention",
+                # INV-VALIDATION-STRANDED's repair. Reporting a stranded round must not
+                # be the thing that ends it.
+                "close_validation_round")
 
     #: How a checker asks "am I allowed to change anything?". Needed by
     #: `check_envelopes_move`, whose repair also writes to the CENTRAL store — a proxy

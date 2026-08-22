@@ -38,7 +38,12 @@ from .paths import project_state_dir
 # the tools in prose is the only lever, and it has to reach every managed repo to be worth
 # anything. Stated conditionally: Jarvis configures no MCP server itself, so whether a
 # worker has Serena depends on the user's own Claude config and on the project.
-TEMPLATE_VERSION = 8
+# v9 = `jarvis wo finish --evidence`. Workers did not know the flag existed, so every
+# submission arrived with no account of how the change was tested and the reviewer had
+# only the diff. Prose is the whole mechanism — the flag has been accepted since the
+# round machine landed — so it has to reach every managed repo to be worth anything,
+# which is what this bump is for.
+TEMPLATE_VERSION = 9
 ASSETS = Path(__file__).parent / "assets"
 
 
