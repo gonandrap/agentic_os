@@ -182,6 +182,10 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--depends-on", default="",
                    help="comma-separated work order ids that must COMPLETE before this "
                         "one is dispatched (same project only)")
+    c.add_argument("--parent", default="",
+                   help="file it UNDER this feature order: it becomes one of the "
+                        "feature's children, so the feature waits for it and shows it "
+                        "in its tree (the feature must still be open)")
 
     ub = wo.add_parser("unblock", help="cut the dependency edges holding a work order "
                                        "back (by default only the ones that can never "
@@ -1103,13 +1107,16 @@ def cmd_wo(args: argparse.Namespace) -> int:
 
     if args.wo_cmd == "create":
         deps = [d.strip() for d in args.depends_on.split(",") if d.strip()]
+        parent = (args.parent or "").strip()
         wo = ops.create_work_order(
             args.project, args.title, description=args.description, origin=args.origin,
             model=args.model, effort=args.effort, permission_mode=args.permission_mode,
             append_system_prompt=args.append_system_prompt, depends_on=deps,
+            parent_id=parent or None,
         )
         _print({"created": wo["id"], "project": args.project, "status": wo["status"],
                 "depends_on": deps,
+                **({"parent": parent} if parent else {}),
                 "note": (f"jarvisd will dispatch it once {', '.join(deps)} completes"
                          if deps else "jarvisd will dispatch it shortly")}, args.json)
 

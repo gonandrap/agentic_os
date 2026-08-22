@@ -337,6 +337,55 @@ def test_an_idle_manager_settles_to_waiting_input_without_attention(boot, store,
     assert idle["needs_attention"]
 
 
+def test_an_idle_manager_stays_unflagged_across_a_reconcile_tick(boot, store,
+                                                                 settle_turns):
+    """Settling it quietly is only half the job: `true_blockers` derives
+    "worker is waiting on your input" from the status alone, and INV-ATTENTION-MISSING
+    repairs any unflagged blocked work order — so before the `kind='manager'` exemption
+    the flag came straight back on the very next tick, which is where the user would
+    actually have seen it.
+
+    Paired in the same test with an ordinary worker parked in the SAME status, which must
+    still be flagged: the exemption has to buy accuracy, not silence.
+    """
+    from jarvis.invariants import true_blockers
+
+    daemon = boot(validation=True)
+    spec = daemon.catalog.project("proj_a")
+    fo_id = release(daemon, "CSV export", "one")
+    manager = store.manager_work_order(fo_id)
+    assert manager is not None
+    daemon.tick()
+    assert settle_turns(store), "the turns never ended"
+    daemon.settle_turns(spec, store)
+    assert store.get_work_order(manager["id"])["status"] == "waiting_input"
+
+    parked = ops.create_work_order("proj_a", "an ordinary worker",
+                                   description="something")
+    store.set_status(parked["id"], "waiting_input")
+    daemon.check_invariants(spec, store)  # what the reconcile tick runs
+
+    fresh = store.get_work_order(manager["id"])
+    assert not fresh["needs_attention"], "an idle manager is not a decision anyone owes"
+    assert true_blockers(store, fresh) == []
+    assert store.get_work_order(parked["id"])["needs_attention"], "the control"
+    assert manager["id"] not in [a["wo_id"] for a in ops.os_status()["attention"]]
+
+
+def test_a_manager_in_any_other_status_still_reaches_the_user(boot, store):
+    """The exemption is on `waiting_input`, not on the kind. A manager that FAILED is a
+    feature with no addressee left, which is exactly the thing the user has to know."""
+    from jarvis.invariants import true_blockers
+
+    daemon = boot(validation=True)
+    fo_id = release(daemon, "CSV export", "one")
+    manager = store.manager_work_order(fo_id)
+    assert manager is not None
+    store.set_status(manager["id"], "failed")
+
+    assert true_blockers(store, store.get_work_order(manager["id"])) != []
+
+
 # -- 5. the contract -------------------------------------------------------------------
 
 
@@ -359,6 +408,7 @@ def test_a_manager_is_told_the_feature_and_not_the_worker_contract(boot, store):
     assert "will not open a pull request" in prompt
     assert "open a PR" not in prompt
     assert f"jarvis wo finish {manager['id']}" not in prompt
+    assert f"--parent {fo_id}" in prompt, "the one way it can file remediation work"
 
     worker_prompt = dispatch.build_worker_prompt(child, spec)
 
@@ -382,7 +432,79 @@ def test_a_manager_gets_the_worker_assets_and_not_the_planning_seats(boot, proje
     assert not any("agent-seats" in str(r) for r in manager_roots)
 
 
-# -- 6. the bus finds it ---------------------------------------------------------------
+# -- 6. filing remediation work under the feature --------------------------------------
+
+
+def test_a_work_order_can_be_filed_under_an_open_feature(boot, store):
+    """What `--parent` buys, and it is the whole reason the manager's contract can be
+    carried out: a child the feature waits for and shows, not a stray work order beside
+    it. Paired with the same call without the flag, which is unchanged."""
+    daemon = boot(validation=True)
+    spec = daemon.catalog.project("proj_a")
+    fo_id = release(daemon, "CSV export", "one")
+    for c in store.feature_children(fo_id):
+        store.set_status(c["id"], "completed")
+
+    remediation = ops.create_work_order(
+        "proj_a", "cover the empty result set",
+        description="the review asked for a test over an empty result set",
+        parent_id=fo_id)
+    stray = ops.create_work_order("proj_a", "unrelated", description="something else")
+
+    assert remediation["parent_id"] == fo_id
+    assert remediation["kind"] == "worker"
+    assert stray["parent_id"] is None
+    assert remediation["id"] in [c["id"] for c in store.feature_children(fo_id)]
+
+    daemon.settle_features(spec, store)
+
+    assert store.get_feature_order(fo_id)["status"] == "executing", \
+        "the feature waits for the work its manager filed"
+
+
+def test_a_settled_feature_refuses_new_children(boot, store):
+    """Attaching a child to a completed feature would silently reopen a unit the user
+    has already been told about, and leave `settle_features` deciding what that means."""
+    daemon = boot(validation=True)
+    spec = daemon.catalog.project("proj_a")
+    fo_id = release(daemon, "CSV export", "one")
+    for c in store.feature_children(fo_id):
+        store.set_status(c["id"], "completed")
+    daemon.settle_features(spec, store)
+    assert store.get_feature_order(fo_id)["status"] == "completed"
+
+    with pytest.raises(ops.OpsError, match="nothing more can be filed"):
+        ops.create_work_order("proj_a", "too late", description="x", parent_id=fo_id)
+
+
+def test_the_cli_carries_the_parent_flag_through(boot, store, capsys):
+    """The manager reaches this through the CLI, not through `ops`, so the wiring is
+    pinned end to end — a flag parsed and dropped would leave the contract naming a
+    command that silently does the wrong thing."""
+    from jarvis import cli
+
+    daemon = boot(validation=True)
+    fo_id = release(daemon, "CSV export", "one")
+
+    assert cli.main(["wo", "create", "proj_a", "cover the empty result set",
+                     "-d", "the review asked for it", "--parent", fo_id]) == 0
+
+    out = capsys.readouterr().out
+    filed = store.feature_children(fo_id)[-1]
+    assert filed["title"] == "cover the empty result set"
+    assert filed["id"] in out and fo_id in out
+
+
+def test_filing_under_an_unknown_feature_says_so(boot):
+    """The CLI only catches OpsError, so a typo'd id must not surface as a KeyError
+    traceback in the terminal."""
+    boot(validation=True)
+
+    with pytest.raises(ops.OpsError, match="no feature order"):
+        ops.create_work_order("proj_a", "orphan", description="x", parent_id="fo-nope")
+
+
+# -- 7. the bus finds it ---------------------------------------------------------------
 
 
 def test_an_envelope_to_the_manager_role_is_delivered_to_the_manager(boot, store):

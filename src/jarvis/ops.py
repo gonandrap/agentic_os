@@ -602,18 +602,42 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       effort: str | None = None, permission_mode: str | None = None,
                       append_system_prompt: str | None = None,
                       backlog_id: str | None = None,
-                      depends_on: list[str] | None = None) -> dict[str, Any]:
+                      depends_on: list[str] | None = None,
+                      parent_id: str | None = None) -> dict[str, Any]:
+    """File a work order. `parent_id` files it UNDER a feature order.
+
+    Until now the only way a work order acquired a parent was a plan release, because the
+    only thing that filed one was a planner. A feature's project manager order files
+    remediation work as the feature runs — that is its whole job — and remediation that
+    landed outside the feature would not hold up its completion and would not appear in
+    its child tree, which is to say it would not be part of the feature at all.
+
+    An open feature order only: attaching a child to one that has already completed or
+    failed would silently reopen a settled unit, and `Daemon.settle_features` would then
+    have to decide what a new child means for a status the user has already been told.
+    """
     paths = registered_project_paths()
     if project_name not in paths:
         raise OpsError(f"project {project_name!r} not registered "
                        f"(known: {sorted(paths)}). Run `jarvis start` first.")
     store = ProjectStore(paths[project_name])
     try:
+        if parent_id:
+            try:
+                parent = store.get_feature_order(parent_id)
+            except KeyError as e:
+                raise OpsError(f"no feature order {parent_id!r} in {project_name!r} — "
+                               f"a child is filed under a feature of its own project") from e
+            if parent["status"] not in FO_OPEN_STATUSES:
+                raise OpsError(
+                    f"{parent_id} is {parent['status']}, so nothing more can be filed "
+                    f"under it — file this work order on its own, or open a new feature"
+                )
         return store.create_work_order(
             title=title, description=description, origin=origin, model=model,
             effort=effort, permission_mode=permission_mode,
             append_system_prompt=append_system_prompt, backlog_id=backlog_id,
-            depends_on=depends_on,
+            depends_on=depends_on, parent_id=parent_id,
         )
     except (KeyError, ValueError) as e:
         # A dependency on a work order in another project cannot be honoured — the edge

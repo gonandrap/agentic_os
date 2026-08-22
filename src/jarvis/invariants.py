@@ -165,7 +165,16 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     # the next tick — "worker is waiting on your input" about a worker waiting on Neo,
     # steering the user at `jarvis wo resume-auto`, which cannot help. Three of five
     # sampled `jarvis_os` work orders had it.
-    if wo["status"] == "waiting_input":
+    #
+    # A MANAGER is the second exception, and it is a stronger one: a project manager
+    # order sits in `waiting_input` for its feature's entire life, because acting on a
+    # message and then going idle is the whole of what it does. Nobody is waiting on the
+    # user for it — there is nothing to type into it — so without this every feature order
+    # in the fleet would carry a permanent false flag, put back by INV-ATTENTION-MISSING
+    # on the tick after `Daemon.settle_work_order` parked it. Narrow on purpose: a manager
+    # in any OTHER status is judged exactly like any other work order, so a failed one
+    # still reaches the user.
+    if wo["status"] == "waiting_input" and wo.get("kind") != "manager":
         question = awaiting_neo(wo["id"])
         if question is not None and question["status"] in USER_HELD_Q_STATUSES:
             # Neo handed the decision back. That IS the user's, and it gets a reason

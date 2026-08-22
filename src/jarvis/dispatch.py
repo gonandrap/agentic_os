@@ -602,9 +602,17 @@ def _manager_prompt(wo: dict[str, Any], project: ProjectSpec,
         "## Review feedback on the feature",
         "An independent review of this feature as a whole can come back with concrete "
         "asks. When it does, it arrives as a message. Decide what actually has to "
-        "change, file work orders under this feature to change it, and then resubmit the "
-        "feature's evidence once they have landed. Judge the feedback rather than "
-        "obeying it: if an ask is wrong, say so in your answer and say what you did "
+        "change, then file a work order UNDER THIS FEATURE for each thing that does:",
+        "",
+        f"    jarvis wo create {project.name} \"<title>\" -d \"<the whole brief>\" "
+        f"--parent {fo_id}",
+        "",
+        "`--parent` is what makes it part of the feature: the feature waits for it and "
+        "shows it in its tree. Without the flag you would be filing unrelated work that "
+        "the feature settles without. The worker who picks it up sees only that "
+        "description and has never read this conversation — brief it as a stranger. Then "
+        "resubmit the feature's evidence once they have landed. Judge the feedback rather "
+        "than obeying it: if an ask is wrong, say so in your answer and say what you did "
         "instead.",
         "",
         "## A deferral request",
