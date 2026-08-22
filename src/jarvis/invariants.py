@@ -52,6 +52,15 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # start, and only the user can choose between cancelling it and cutting the edge.
 # This tuple must cover every status `true_blockers` can return a blocker for, or the
 # blocker is derived correctly and then never surfaced.
+#
+# `validating` is the one deliberate exception, and it has to stay one. A unit under
+# review asks the user for nothing — that is the whole design — so listing it here would
+# have INV-ATTENTION-MISSING flag every healthy round in the fleet. `true_blockers` does
+# return a blocker for a validating work order in the two states where the review has
+# quietly stopped (see VALIDATION_ORPHAN_BLOCKER), and the price of the exception is that
+# those two blockers are surfaced by their own checkers — `check_validation_orphaned` and
+# `check_validation_feedback_lost` raise the flag themselves rather than leaving it to the
+# general one. Add a third such blocker and it inherits that obligation.
 BLOCKED_STATUSES = ("waiting_input", "needs_review", "failed", "pending")
 # Statuses where nothing can possibly be pending: the work order is over.
 TERMINAL_STATUSES = ("completed", "cancelled")
@@ -122,6 +131,39 @@ FEATURE_CHILD_CANCELLED = ("{id} was cancelled — this feature will not deliver
 #: reason must be re-derivable by `true_blockers` or the next tick relabels it.
 DEAD_DEPENDENCY_BLOCKER = "blocked by a dependency that can never complete"
 
+#: The two ways a unit parked in `validating` has quietly stopped being validated.
+#:
+#: `validating` raises no attention on purpose — a round in flight is the OS working, not
+#: a decision anyone owes — and that is exactly what makes these dangerous: on every human
+#: surface the OS has, a stalled `validating` and a working one look identical. There is
+#: no error, no flag and no inbox row. The failure mode is silence, so the only thing that
+#: can break it is a steady-state predicate that says the unit is parked and nothing is
+#: coming for it.
+#:
+#: One constant each, worn by BOTH units: a work order and a feature order park in the
+#: same status by the same mechanism and the sentence reads the same on either, so a
+#: second pair of identical strings would only be two places to edit. The obligations
+#: differ, though, and only on the work-order side: there, `true_blockers` re-derives
+#: these for the reason PR_CLOSED_BLOCKER gives — INV-ATTENTION-REASON rewrites any flag
+#: it cannot produce, and every other surface derives "what does this want from me" from
+#: it. `validating` is deliberately NOT in BLOCKED_STATUSES (see there), so unlike every
+#: other blocker these two are not surfaced by INV-ATTENTION-MISSING; the checkers below
+#: raise the flag themselves, on both units.
+VALIDATION_ORPHAN_BLOCKER = (
+    "parked for review with no review under way — nothing will move it again")
+VALIDATION_FEEDBACK_LOST_BLOCKER = (
+    "the review rejected this and the feedback reached nobody — it is waiting for a "
+    "fix it was never asked for")
+
+#: The third, which only a FEATURE order can say: it is holding children with no manager
+#: work order to route their rejections to. Not re-derived by `true_blockers` — that
+#: function answers "what does this WORK ORDER need from me" — and here for the reason
+#: the block above FEATURE_CHILD_FAILED gives: every reason the OS puts in front of the
+#: user is written in one file.
+FEATURE_MANAGER_MISSING = (
+    "no manager work order owns this feature, so it has nowhere to route a rejection "
+    "and will never finish validating")
+
 
 # -- the derivation everything else is checked against ------------------------------
 
@@ -189,6 +231,14 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
             # asked again for something they had just done. A delivery that FAILS raises
             # its own, more specific flag (`Daemon._deliver`), so nothing is lost.
             blockers.append("worker is waiting on your input")
+    # A unit parked in `validating` that nothing is actually validating. Silent for the
+    # healthy case by construction: a round in flight satisfies neither predicate, and
+    # `validating` asks the user for nothing while one is open.
+    if wo["status"] == "validating":
+        if validation_orphaned(store, wo_id=wo["id"]):
+            blockers.append(VALIDATION_ORPHAN_BLOCKER)
+        elif lost_feedback(store, wo_id=wo["id"]):
+            blockers.append(VALIDATION_FEEDBACK_LOST_BLOCKER)
     # A dependency that will never complete. Ordinary blocking is silent on purpose —
     # `pending — blocked by …` is a listing label, not a decision anyone owes — but a
     # dependency that is cancelled or failed cannot clear itself, so the work order will
@@ -228,6 +278,87 @@ def _validation_escalated(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """
     latest = store.latest_validation_round(wo_id=wo["id"])
     return bool(latest and latest["outcome"] == "escalated")
+
+
+#: Round outcomes after which a unit still sitting in `validating` has nothing coming.
+#:
+#: Narrower than "every outcome that is not `pending`", and the two it leaves out are
+#: left out because they are HEALTHY steady states that last at least a full tick:
+#:
+#: * `rejected` — the work order deliberately stays `validating` until the feedback
+#:   envelope is delivered and `Daemon._deliver` flips it. Setting it back at rejection
+#:   time would hand it to the next reconcile tick, which files it `waiting_pr_merge`
+#:   before the feedback has gone out. A rejection whose feedback reached nobody is
+#:   INV-VALIDATION-FEEDBACK-LOST's, and it says something far more useful about it.
+#: * `failed` — a transport outage closes the round `failed`, consumes no round, and is
+#:   retried on the next tick with the unit still parked. INV-VALIDATION-STRANDED owns
+#:   the case where that never resolves.
+#:
+#: Firing on either would put a permanent flag on healthy work orders — permanent because
+#: nothing clears an attention reason it cannot re-derive away, and violations dedupe on
+#: `Violation.key` for the life of the daemon. Decided with the user on wo-69a06ff4.
+#:
+#: THE GAP THIS LEAVES, named rather than hidden: a `rejected` round whose feedback
+#: envelope was never POSTED at all is reported by neither invariant — this one skips
+#: `rejected`, and `lost_feedback` deliberately requires an envelope to exist. That is a
+#: defect in the round machine rather than in delivery, and it belongs to the work order
+#: that owns the round machine.
+_REVIEW_IS_OVER = ("passed", "escalated")
+
+
+def validation_orphaned(store: ProjectStore, *, wo_id: str | None = None,
+                        fo_id: str | None = None) -> bool:
+    """Is this unit parked in `validating` with nothing left to move it on?
+
+    True when there is no round row at all, and true when the latest round reached a
+    verdict the unit should already have acted on — both leave it sitting in a status that
+    promises a verdict is coming when nothing is going to produce one. Says nothing about
+    the unit's status: the callers check that, because this is the harm condition only
+    while the unit is parked.
+    """
+    return _is_orphan(store.latest_validation_round(wo_id=wo_id, fo_id=fo_id))
+
+
+def _is_orphan(latest: dict[str, Any] | None) -> bool:
+    """The same question asked of a round row already in hand."""
+    return latest is None or latest["outcome"] in _REVIEW_IS_OVER
+
+
+def lost_feedback(store: ProjectStore, *, wo_id: str | None = None,
+                  fo_id: str | None = None) -> dict[str, Any] | None:
+    """The `review_feedback` envelope for this unit's latest rejection that reached
+    nobody, or None if there is no such rejection or the feedback got through.
+
+    Matched to the round by subject and round NUMBER, which is the only join there is:
+    an envelope records what it is about, never which row of `validation_rounds` produced
+    it. A round with several attempts at the same feedback counts as delivered if any one
+    of them arrived — the recipient was asked, however many envelopes it took.
+
+    The payload is read with `db.from_json` rather than `bus.parse_payload`: a payload
+    that no longer fits its dataclass raises, and an invariant that raises on malformed
+    data reports itself instead of the problem it exists to find. INV-ENVELOPE-STUCK
+    already marks that envelope `undeliverable`, which is a state this function reads.
+    """
+    from .bus import DELIVERY_ATTEMPT_CEILING
+
+    latest = store.latest_validation_round(wo_id=wo_id, fo_id=fo_id)
+    if latest is None or latest["outcome"] != "rejected":
+        return None
+    mine = [e for e in store.envelopes(subject_wo_id=wo_id, subject_fo_id=fo_id)
+            if e["kind"] == "review_feedback"
+            and db.from_json(e["payload"], {}).get("round") == latest["round"]]
+    if any(e["state"] == "delivered" for e in mine):
+        return None
+    for env in mine:
+        if env["state"] == "undeliverable":
+            return env
+        if (env["state"] == "queued"
+                and int(env["attempts"] or 0) >= DELIVERY_ATTEMPT_CEILING):
+            return env
+    # No envelope for this round at all is NOT this invariant's business: with validation
+    # disabled every rejection in the database is one, and a round whose feedback was
+    # never posted is a defect in the round machine rather than in delivery.
+    return None
 
 
 def dead_dependencies(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
@@ -851,6 +982,229 @@ def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
     )
 
 
+def check_validation_orphaned(store: ProjectStore) -> Iterator[Violation]:
+    """INV-VALIDATION-ORPHAN — a unit under review must have a review under way.
+
+    `validating` promises a verdict is coming. A unit in it with no open round is a unit
+    nothing will ever move again, and because that status deliberately raises no
+    attention, it looks exactly like one the panel is still thinking about — on the
+    dashboard, in `jarvis status` and in the attention list alike. Nothing else in the OS
+    can tell the two apart.
+
+    Predicate: status `validating`, and `latest_validation_round` returns either nothing
+    at all or a round that already reached a verdict the unit should have acted on — see
+    `_REVIEW_IS_OVER`, which is narrower than "not pending" and says why. Both units,
+    deliberately: a work order and a feature order park in the same status by the same
+    mechanism, and an invariant that covered one of them would leave the other silently
+    stalled with the checker's name on the box saying it was covered.
+
+    REPORTED, never repaired, and that is a rule rather than an omission. Un-parking the
+    unit correctly needs the status it came FROM — `running` for a worker mid-rejection,
+    `executing` for a feature — which is recoverable from the timeline but not from
+    current state. Rule 2 at the top of this file: a checker that guesses is worse than
+    one that asks, and this one would re-apply its guess on every tick for ever.
+
+    Attention IS raised, because a reported violation that shows up only in `jarvis
+    doctor` is a violation nobody reads. The flag is raised once and never clobbers a
+    reason already there, exactly as INV-ATTENTION-MISSING does.
+    """
+    for wo in store.list_work_orders(statuses=("validating",), include_hidden=True):
+        latest = store.latest_validation_round(wo_id=wo["id"])
+        if not _is_orphan(latest):
+            continue
+        if not wo["needs_attention"]:
+            store.flag_attention(wo["id"], VALIDATION_ORPHAN_BLOCKER)
+        yield Violation(
+            invariant="INV-VALIDATION-ORPHAN",
+            wo_id=wo["id"],
+            detail=(
+                f"work order is `validating` but "
+                f"{_no_round(latest)}, so no verdict is coming. Close it with `jarvis wo "
+                f"done {wo['id']}` if the work is finished, or re-run `jarvis wo finish` "
+                f"in its session to submit it for review again."
+            ),
+            repaired=False,
+            context={"unit": "work_order",
+                     "latest_outcome": latest["outcome"] if latest else None},
+        )
+    for fo in store.list_feature_orders(statuses=("validating",)):
+        latest = store.latest_validation_round(fo_id=fo["id"])
+        if not _is_orphan(latest):
+            continue
+        if not fo["needs_attention"]:
+            store.flag_feature_attention(fo["id"], VALIDATION_ORPHAN_BLOCKER)
+        yield Violation(
+            invariant="INV-VALIDATION-ORPHAN",
+            detail=(
+                f"feature order {fo['id']} is `validating` but "
+                f"{_no_round(latest)}, so no verdict is coming. Cancel it with `jarvis fo "
+                f"cancel {fo['id']}`, or decide from `jarvis fo show {fo['id']}` whether "
+                f"its children are done."
+            ),
+            repaired=False,
+            context={"unit": "feature_order", "fo_id": fo["id"],
+                     "latest_outcome": latest["outcome"] if latest else None},
+        )
+
+
+def _no_round(latest: dict[str, Any] | None) -> str:
+    """Why there is no review under way, in the words the reader needs."""
+    if latest is None:
+        return "no validation round was ever opened for it"
+    return (f"its last round (round {latest['round']}) already finished "
+            f"`{latest['outcome']}`")
+
+
+def check_validation_feedback_lost(store: ProjectStore) -> Iterator[Violation]:
+    """INV-VALIDATION-FEEDBACK-LOST — a rejection that reached nobody must not look
+    like one that was acted on.
+
+    The worst of the three, because nothing else in the OS will ever mention it. A round
+    is rejected, the feedback is posted to the bus, the bus cannot find anyone to give it
+    to — and the unit stays parked in `validating` waiting for a resubmission that nobody
+    was ever asked for. Every component behaved correctly; the resulting state is a lie,
+    which is the sentence this module opens with.
+
+    Predicate: the latest round is `rejected`, the unit is still parked, and its
+    `review_feedback` envelope for that round is `undeliverable` or still `queued` past
+    `bus.DELIVERY_ATTEMPT_CEILING`. INV-ENVELOPE-STUCK is what MOVES an envelope to
+    `undeliverable`; this is what makes that fact reach a human. The two are halves of one
+    guarantee and neither is redundant: the bus's own liveness check has no idea what the
+    envelope was about, and cannot know that a work order is now stuck for ever.
+
+    REPORTED, never repaired, with attention. Re-posting the envelope changes nothing if
+    the addressee is gone — `resolve` would return the same None — and inventing a
+    different addressee is precisely the sender-knows-the-recipient coupling the bus was
+    built to prevent.
+    """
+    for wo in store.list_work_orders(statuses=("validating",), include_hidden=True):
+        env = lost_feedback(store, wo_id=wo["id"])
+        if env is None:
+            continue
+        if not wo["needs_attention"]:
+            store.flag_attention(wo["id"], VALIDATION_FEEDBACK_LOST_BLOCKER)
+        yield Violation(
+            invariant="INV-VALIDATION-FEEDBACK-LOST",
+            wo_id=wo["id"],
+            detail=_lost_detail(env, f"Read the rejection with `jarvis wo show "
+                                     f"{wo['id']}` and pass it to the worker yourself "
+                                     f"with `jarvis wo send {wo['id']}`, or close it."),
+            repaired=False,
+            context=_lost_context(env, unit="work_order"),
+        )
+    for fo in store.list_feature_orders(statuses=("validating",)):
+        env = lost_feedback(store, fo_id=fo["id"])
+        if env is None:
+            continue
+        if not fo["needs_attention"]:
+            store.flag_feature_attention(fo["id"], VALIDATION_FEEDBACK_LOST_BLOCKER)
+        yield Violation(
+            invariant="INV-VALIDATION-FEEDBACK-LOST",
+            detail=f"feature order {fo['id']}: " + _lost_detail(
+                env, f"Read the rejection with `jarvis fo show {fo['id']}` and decide "
+                     f"there what should act on it, or cancel the feature."),
+            repaired=False,
+            context=_lost_context(env, unit="feature_order", fo_id=fo["id"]),
+        )
+
+
+def _lost_detail(env: dict[str, Any], next_step: str) -> str:
+    why = (f"it is {env['state']}" if env["state"] == "undeliverable"
+           else f"it is still queued after {env['attempts']} delivery attempts")
+    note = f" ({env['note']})" if env["note"] else ""
+    return (f"the review rejected this and the feedback never reached anyone: envelope "
+            f"{env['id']} to role {env['to_role']} — {why}{note}. Nobody has been asked "
+            f"to fix anything, so nothing will happen next. {next_step}")
+
+
+def _lost_context(env: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    return {"envelope_id": env["id"], "envelope_state": env["state"],
+            "to_role": env["to_role"], "attempts": env["attempts"], **extra}
+
+
+def check_manager_missing(store: ProjectStore) -> Iterator[Violation]:
+    """INV-MANAGER-MISSING — a live feature holding children must have a manager.
+
+    `create_plan_children` creates the manager inside the same transaction as the
+    children, all-or-nothing, so this state should be unreachable — which is the reason to
+    check it rather than a reason not to. A feature with children and no manager has
+    nowhere to route a panel rejection and nowhere to route a deferral: `bus.resolve`
+    returns None for role `manager`, every envelope addressed to it goes `undeliverable`,
+    and the feature simply never finishes validating. Nothing about that looks like a
+    fault from the outside.
+
+    Predicate: a feature order in `executing` or `validating`, with at least one child
+    (`feature_children`, which is `kind='worker'` — the planner and the manager are not
+    children), and no `kind='manager'` work order under it whatever that manager's status.
+    Settled features are excluded on purpose, and it is the difference between a useful
+    invariant and a useless one: `Daemon._close_feature_manager` cancels the manager when
+    its feature ends, so every completed or cancelled feature in a project's history
+    legitimately has no live one — and a feature planned before validation was switched on
+    never had one at all. Flagging those would bury the single case that matters.
+
+    REPORTED by default; repaired ONLY under `jarvis doctor --repair`. The repair creates
+    the manager work order, which the dispatcher then turns into a `claude` session, and
+    no watchdog in this codebase starts a process on its own — so the daemon's
+    `check_project(store, repair=True)` deliberately does not qualify. `allow_spawn` is
+    the flag, `ops.run_doctor` is the only caller that passes it, and it is off everywhere
+    else. Idempotent: once a manager exists the predicate is false, whatever its status,
+    so a second `--repair` run creates nothing.
+
+    Three callers, therefore three branches, and they are not interchangeable:
+    `--repair` creates it and says so; a read-only `jarvis doctor` DESCRIBES the repair,
+    which is the only reason the CLI offers `--repair`; and the daemon's tick reports it
+    and raises the feature's flag, having nothing it is allowed to do about it.
+    """
+    for fo in store.list_feature_orders(statuses=("executing", "validating")):
+        children = len(store.feature_children(fo["id"]))
+        if not children:
+            continue  # released with nothing in it; nothing to manage
+        if store.manager_work_order(fo["id"]):
+            continue
+        if getattr(store, "may_spawn", False):
+            manager = store.create_manager_order(fo["id"])
+            if (fo["attention_reason"] or "") == FEATURE_MANAGER_MISSING:
+                store.clear_feature_attention(fo["id"])
+            yield Violation(
+                invariant="INV-MANAGER-MISSING",
+                detail=_missing_detail(fo, children),
+                repaired=True,
+                repair=f"created manager work order {manager['id']}",
+                context={"fo_id": fo["id"], "manager_wo_id": manager["id"]},
+            )
+            continue
+        if getattr(store, "readonly", False):
+            # `jarvis doctor` without --repair, which must write nothing. The repair is
+            # DESCRIBED rather than run, exactly as `_ReadOnly` documents: `cmd_doctor`
+            # reads `repaired` to decide whether to offer `--repair` at all, so a
+            # violation this tool can fix and does not advertise teaches the user that
+            # the flag does nothing.
+            yield Violation(
+                invariant="INV-MANAGER-MISSING",
+                detail=_missing_detail(fo, children),
+                repaired=True,
+                repair="create the feature's manager work order",
+                context={"fo_id": fo["id"]},
+            )
+            continue
+        if not fo["needs_attention"]:
+            store.flag_feature_attention(fo["id"], FEATURE_MANAGER_MISSING)
+        yield Violation(
+            invariant="INV-MANAGER-MISSING",
+            detail=(_missing_detail(fo, children)
+                    + " Run `jarvis doctor --repair` to create one."),
+            repaired=False,
+            context={"fo_id": fo["id"]},
+        )
+
+
+def _missing_detail(fo: dict[str, Any], children: int) -> str:
+    return (f"feature order {fo['id']} is `{fo['status']}` with {children} child work "
+            f"order{'s' if children != 1 else ''} and no `kind='manager'` work order, so "
+            f"a rejection or a deferral raised against it has nowhere to go and it will "
+            f"never finish validating.")
+
+
 # -- configuration checks (catalog, not database state) ------------------------------
 
 
@@ -1088,18 +1442,43 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_attention_has_reason,
     check_manager_slots,           # a canary, not a state check: it repairs nothing and
                                    # is unaffected by the order it runs in
-    check_envelopes_move,          # last: it delivers, and delivery changes work orders
+    check_envelopes_move,          # it delivers, and delivery changes work orders — so
+                                   # it runs after everything that judges one...
+    # ...and BEFORE the three validation watchdogs, which is the one ordering constraint
+    # in this tuple that matters. INV-VALIDATION-FEEDBACK-LOST asks whether a rejection
+    # reached anyone, and the check above is what answers that question this tick: an
+    # envelope still `queued` at the ceiling is retried there, and only what that retry
+    # cannot deliver is `undeliverable`. Run first, this would raise the alarm on
+    # envelopes that were about to arrive. They are order-independent among themselves,
+    # and each raises its own attention flag rather than leaving it to
+    # check_blocked_work_is_surfaced, because `validating` is deliberately absent from
+    # BLOCKED_STATUSES (see there).
+    check_validation_orphaned,
+    check_validation_feedback_lost,
+    check_manager_missing,
 )
 
 
-def check_project(store: ProjectStore, repair: bool = True) -> list[Violation]:
+def check_project(store: ProjectStore, repair: bool = True, *,
+                  allow_spawn: bool = False) -> list[Violation]:
     """Run every invariant over one project. Returns the violations found.
 
     With `repair=False` the checks run against a read-only view of the store, so
     reporting never mutates state — that is what `jarvis doctor` uses before the user
     has decided whether to let it touch anything.
+
+    `allow_spawn` is the SECOND permission, and it is narrower than the first on purpose.
+    A handful of repairs would create a work order, which the dispatcher then turns into a
+    `claude` session — and no watchdog in this codebase starts a process on its own. The
+    daemon calls `check_project(store, repair=True)` on every reconcile tick and must
+    never do that; `ops.run_doctor` passes `allow_spawn=repair`, so those repairs happen
+    only when the user typed `jarvis doctor --repair` and is watching. Off by default, so
+    a new caller has to opt in deliberately rather than inherit the power by accident.
+    See `check_manager_missing`, which is the only checker that reads it today.
     """
     target = store if repair else _ReadOnly(store)
+    if repair and allow_spawn:
+        target = _Spawning(store)  # type: ignore[assignment]
     found: list[Violation] = []
     for check in INVARIANTS:
         try:
@@ -1110,6 +1489,24 @@ def check_project(store: ProjectStore, repair: bool = True) -> list[Violation]:
                 detail=f"invariant raised {e!r}",
             ))
     return found
+
+
+class _Spawning:
+    """Store proxy that says "this repair may create work a dispatcher will run".
+
+    Every write passes straight through — the point is the flag, not the interception.
+    A checker asks `getattr(store, "may_spawn", False)`, which is False on a real
+    ProjectStore and on `_ReadOnly` (whose `__getattr__` forwards the miss), so the
+    permission cannot be acquired by accident. The mirror image of `_ReadOnly.readonly`.
+    """
+
+    may_spawn = True
+
+    def __init__(self, store: ProjectStore):
+        self._store = store
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
 
 
 class _ReadOnly:

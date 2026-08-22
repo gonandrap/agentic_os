@@ -535,3 +535,440 @@ def test_the_validating_label_says_which_round_the_work_is_on(project):
     label = status_label(store, store.get_work_order(wo["id"]))
 
     assert label == "validating — review round 2 of 3"
+
+
+# -- the three validation watchdogs ---------------------------------------------------
+#
+# `validating` raises no attention on purpose, which is what makes a STUCK one dangerous:
+# on every human surface the OS has it is indistinguishable from a working one. There is
+# no error, no flag and no inbox row, so the only thing that can catch these is a
+# steady-state predicate. Each test below therefore pairs the broken state with the
+# healthy one it must stay silent on — an invariant is a predicate, and a test that only
+# shows it firing cannot tell a correct one from `return True`.
+
+
+def _round(store, *, wo_id=None, fo_id=None, outcome="pending", fingerprint="abc"):
+    rnd = store.open_validation_round(wo_id=wo_id, fo_id=fo_id, fingerprint=fingerprint)
+    if outcome != "pending":
+        store.close_validation_round(rnd["id"], outcome, reason="not good enough")
+    return store.get_validation_round(rnd["id"])
+
+
+def _feedback_envelope(store, rnd, *, state, attempts=0, wo_id=None, fo_id=None):
+    """A `review_feedback` envelope for one round, left in the state under test.
+
+    Posted through the bus so the payload is the shape the round machine will really
+    write — the join `lost_feedback` makes is on the round NUMBER inside that payload.
+    """
+    from jarvis.bus import ReviewFeedback, Subject, post
+
+    env_id = post(store, subject=Subject(wo_id=wo_id, fo_id=fo_id), from_role="reviewer",
+                  to_role="implementor" if wo_id else "manager",
+                  payload=ReviewFeedback(round=rnd["round"], outcome="rejected",
+                                         reason="tests are missing"))
+    if state != "queued":
+        store.mark_envelope(env_id, state, note="nobody fills that role")
+    for _ in range(attempts):
+        store.bump_envelope_attempt(env_id)
+    return env_id
+
+
+def _validating_wo(store, title="ship the thing"):
+    wo = store.create_work_order(title)
+    store.update_work_order(wo["id"], result_summary="done")
+    store.set_status(wo["id"], "validating")
+    return wo["id"]
+
+
+def _validating_fo(store, title="ship the exporter"):
+    fo = store.create_feature_order(title)
+    store.set_feature_status(fo["id"], "validating")
+    return fo["id"]
+
+
+def _fired(violations, invariant):
+    return [v for v in violations if v.invariant == invariant]
+
+
+# -- INV-VALIDATION-ORPHAN ------------------------------------------------------------
+
+
+def test_a_unit_parked_in_validating_with_no_round_is_reported_for_both_units(project):
+    """Both units in ONE test, because "covers half the units" is exactly what would
+    otherwise hide here: a work order and a feature order park in the same status by the
+    same mechanism, and an invariant covering one leaves the other silently stalled with
+    the checker's name on the box saying it was covered.
+
+    Paired with the healthy state of both, which is the whole point: a round in flight
+    is the OS working and must stay silent.
+    """
+    store = ProjectStore(project)
+    healthy_wo, healthy_fo = _validating_wo(store, "under review"), _validating_fo(store)
+    _round(store, wo_id=healthy_wo)
+    _round(store, fo_id=healthy_fo)
+
+    assert _fired(check_project(store, repair=True), "INV-VALIDATION-ORPHAN") == []
+
+    orphan_wo = _validating_wo(store, "parked with nothing running")
+    orphan_fo = _validating_fo(store, "a feature nobody is judging")
+
+    fired = _fired(check_project(store, repair=True), "INV-VALIDATION-ORPHAN")
+
+    assert len(fired) == 2
+    assert {v.wo_id for v in fired} == {orphan_wo, None}
+    assert {v.context["unit"] for v in fired} == {"work_order", "feature_order"}
+    assert orphan_fo in next(v.detail for v in fired if v.wo_id is None)
+    # ...and the healthy pair is still untouched by it
+    assert store.get_work_order(healthy_wo)["needs_attention"] == 0
+    assert store.get_feature_order(healthy_fo)["needs_attention"] == 0
+
+
+def test_a_settled_round_leaves_the_unit_just_as_orphaned(project):
+    """`latest_validation_round` returning a row is not the same as a review being under
+    way. A round that already passed, was rejected or gave up moves nothing."""
+    store = ProjectStore(project)
+    wo_id = _validating_wo(store)
+    rnd = _round(store, wo_id=wo_id)
+
+    assert _fired(check_project(store, repair=True), "INV-VALIDATION-ORPHAN") == []
+
+    store.close_validation_round(rnd["id"], "passed")
+
+    fired = _fired(check_project(store, repair=True), "INV-VALIDATION-ORPHAN")
+    assert len(fired) == 1
+    assert "already finished `passed`" in fired[0].detail
+
+
+def test_the_orphan_is_never_repaired_even_on_the_daemons_own_path(project):
+    """The daemon calls `check_project(store, repair=True)`, so this assertion is the one
+    that stops a future edit turning a report into a guess: un-parking the unit correctly
+    needs the status it came FROM, which is in the timeline and not in current state."""
+    store = ProjectStore(project)
+    wo_id = _validating_wo(store)
+
+    fired = _fired(check_project(store, repair=True), "INV-VALIDATION-ORPHAN")
+
+    assert [v.repaired for v in fired] == [False]
+    assert store.get_work_order(wo_id)["status"] == "validating"  # nothing moved
+    assert "jarvis wo done" in fired[0].detail  # ...but the reader is told what to do
+
+
+def test_the_orphan_raises_attention_that_the_next_tick_agrees_with(project,
+                                                                   catalog_file):
+    """Without this the flag survives exactly one tick: INV-ATTENTION-REASON rewrites any
+    attention reason `true_blockers` cannot re-derive."""
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+    from jarvis.invariants import VALIDATION_ORPHAN_BLOCKER
+
+    store = ProjectStore(project)
+    wo_id = _validating_wo(store)
+    check_project(store, repair=True)
+    assert store.get_work_order(wo_id)["attention_reason"] == VALIDATION_ORPHAN_BLOCKER
+    assert true_blockers(store, store.get_work_order(wo_id)) == [
+        VALIDATION_ORPHAN_BLOCKER]
+    store.close()
+
+    catalog = load_catalog(catalog_file)
+    spec = catalog.projects[0]
+    fresh = ProjectStore(spec.path)
+    Daemon(catalog).check_invariants(spec, fresh)
+
+    wo = fresh.get_work_order(wo_id)
+    assert wo["needs_attention"] == 1
+    assert wo["attention_reason"] == VALIDATION_ORPHAN_BLOCKER
+    assert "invariant" in [e["kind"] for e in fresh.list_events(wo_id)]
+
+
+# -- INV-VALIDATION-FEEDBACK-LOST -----------------------------------------------------
+
+
+def test_feedback_that_reached_nobody_is_reported_and_delivered_feedback_is_not(project):
+    """The pairing IS the test. All three envelope fates for the same rejection shape:
+    undeliverable and queued-past-the-ceiling are stalls nobody else will ever mention,
+    delivered is the loop working exactly as designed.
+
+    Read-only, because that is where the queued half is observable at all — see the test
+    below, which pins the reason.
+    """
+    from jarvis.bus import DELIVERY_ATTEMPT_CEILING
+
+    store = ProjectStore(project)
+    lost = _validating_wo(store, "rejected, feedback undeliverable")
+    stuck = _validating_wo(store, "rejected, feedback still queued")
+    fine = _validating_wo(store, "rejected, feedback delivered")
+    for wo_id, state, attempts in ((lost, "undeliverable", 1),
+                                   (stuck, "queued", DELIVERY_ATTEMPT_CEILING),
+                                   (fine, "delivered", 1)):
+        rnd = _round(store, wo_id=wo_id, outcome="rejected")
+        _feedback_envelope(store, rnd, state=state, attempts=attempts, wo_id=wo_id)
+
+    fired = _fired(check_project(store, repair=False), "INV-VALIDATION-FEEDBACK-LOST")
+
+    assert {v.wo_id for v in fired} == {lost, stuck}
+    assert all(v.repaired is False for v in fired)
+    assert all("never reached anyone" in v.detail for v in fired)
+
+
+def test_a_queued_envelope_the_bus_can_still_deliver_is_the_buss_problem_not_this_one(
+        project):
+    """The registration order, asserted rather than commented. INV-ENVELOPE-STUCK runs
+    first and RETRIES a queued envelope; only what that retry cannot place is
+    `undeliverable`. So on the daemon's repairing path the same work order that looks
+    lost in a read-only snapshot has its feedback delivered instead — and this invariant
+    must not have flagged it on the way past."""
+    from jarvis.bus import DELIVERY_ATTEMPT_CEILING
+
+    store = ProjectStore(project)
+    wo_id = _validating_wo(store, "rejected, feedback still queued")
+    rnd = _round(store, wo_id=wo_id, outcome="rejected")
+    env_id = _feedback_envelope(store, rnd, state="queued",
+                                attempts=DELIVERY_ATTEMPT_CEILING, wo_id=wo_id)
+
+    assert len(_fired(check_project(store, repair=False),
+                      "INV-VALIDATION-FEEDBACK-LOST")) == 1
+
+    fired = _fired(check_project(store, repair=True), "INV-VALIDATION-FEEDBACK-LOST")
+
+    assert fired == []
+    assert next(e for e in store.envelopes() if e["id"] == env_id)["state"] == "delivered"
+    assert store.get_work_order(wo_id)["needs_attention"] == 0
+
+
+def test_the_orphan_stays_silent_while_a_rejection_is_still_in_flight(project):
+    """The two round outcomes `validation_orphaned` deliberately does NOT treat as the
+    end of the review, paired with the two it does.
+
+    A rejected round leaves the work order parked until the feedback is delivered, and a
+    transport-failed round is retried on the next tick with the unit still parked — both
+    are the OS working, both last at least a full tick, and flagging either would put a
+    permanent attention flag on a healthy work order.
+    """
+    store = ProjectStore(project)
+    healthy = {outcome: _validating_wo(store, f"round {outcome}")
+               for outcome in ("rejected", "failed")}
+    ends = {outcome: _validating_wo(store, f"round {outcome}")
+            for outcome in ("passed", "escalated")}
+    for outcome, wo_id in {**healthy, **ends}.items():
+        _round(store, wo_id=wo_id, outcome=outcome)
+    # ...and the rejection's feedback is on its way, so nothing is lost either
+    _feedback_envelope(store, store.latest_validation_round(wo_id=healthy["rejected"]),
+                       state="delivered", wo_id=healthy["rejected"])
+
+    fired = _fired(check_project(store, repair=True), "INV-VALIDATION-ORPHAN")
+
+    assert {v.wo_id for v in fired} == set(ends.values())
+    assert all(store.get_work_order(wo_id)["needs_attention"] == 0
+               for wo_id in healthy.values())
+
+
+def test_feedback_still_queued_below_the_ceiling_is_the_bus_working(project):
+    """An envelope on its way is not an envelope that was lost. Firing here would put a
+    permanent flag on every rejection in the fleet for the seconds before it lands."""
+    from jarvis.bus import DELIVERY_ATTEMPT_CEILING
+
+    store = ProjectStore(project)
+    wo_id = _validating_wo(store)
+    rnd = _round(store, wo_id=wo_id, outcome="rejected")
+    env_id = _feedback_envelope(store, rnd, state="queued",
+                                attempts=DELIVERY_ATTEMPT_CEILING - 1, wo_id=wo_id)
+
+    assert _fired(check_project(store, repair=False),
+                  "INV-VALIDATION-FEEDBACK-LOST") == []
+
+    store.bump_envelope_attempt(env_id)
+
+    assert len(_fired(check_project(store, repair=False),
+                      "INV-VALIDATION-FEEDBACK-LOST")) == 1
+
+
+def test_lost_feedback_is_matched_to_its_own_round_on_a_feature_order_too(project):
+    """The join is subject AND round number: an envelope for round one that never
+    arrived says nothing about round two, which is the round the unit is actually
+    parked on."""
+    store = ProjectStore(project)
+    fo_id = _validating_fo(store)
+    first = _round(store, fo_id=fo_id, outcome="rejected", fingerprint="one")
+    _feedback_envelope(store, first, state="undeliverable", fo_id=fo_id)
+    second = _round(store, fo_id=fo_id, outcome="rejected", fingerprint="two")
+    _feedback_envelope(store, second, state="delivered", fo_id=fo_id)
+
+    assert _fired(check_project(store, repair=True),
+                  "INV-VALIDATION-FEEDBACK-LOST") == []
+
+    third = _round(store, fo_id=fo_id, outcome="rejected", fingerprint="three")
+    _feedback_envelope(store, third, state="undeliverable", fo_id=fo_id)
+
+    fired = _fired(check_project(store, repair=True), "INV-VALIDATION-FEEDBACK-LOST")
+    assert len(fired) == 1
+    assert fired[0].wo_id is None and fired[0].context["fo_id"] == fo_id
+    assert store.get_feature_order(fo_id)["needs_attention"] == 1
+
+
+def test_lost_feedback_raises_attention_the_next_tick_agrees_with(project, catalog_file):
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+    from jarvis.invariants import VALIDATION_FEEDBACK_LOST_BLOCKER
+
+    store = ProjectStore(project)
+    wo_id = _validating_wo(store)
+    rnd = _round(store, wo_id=wo_id, outcome="rejected")
+    _feedback_envelope(store, rnd, state="undeliverable", wo_id=wo_id)
+    check_project(store, repair=True)
+    assert true_blockers(store, store.get_work_order(wo_id)) == [
+        VALIDATION_FEEDBACK_LOST_BLOCKER]
+    store.close()
+
+    catalog = load_catalog(catalog_file)
+    spec = catalog.projects[0]
+    fresh = ProjectStore(spec.path)
+    Daemon(catalog).check_invariants(spec, fresh)
+
+    assert fresh.get_work_order(wo_id)["attention_reason"] == (
+        VALIDATION_FEEDBACK_LOST_BLOCKER)
+
+
+# -- INV-MANAGER-MISSING --------------------------------------------------------------
+
+
+def _feature_with_children(store, title, status="executing", n=2):
+    fo = store.create_feature_order(title)
+    store.set_feature_status(fo["id"], status)
+    for i in range(n):
+        store.create_work_order(f"{title} part {i}", parent_id=fo["id"])
+    return fo["id"]
+
+
+def test_a_live_feature_without_a_manager_is_reported_and_a_closed_one_is_not(project):
+    """Three features in one test, and the two silent ones are what make it a predicate.
+    A feature whose manager exists is healthy; a COMPLETED feature legitimately has none,
+    and an invariant that flagged every closed feature in a project's history would be
+    worse than no invariant at all."""
+    store = ProjectStore(project)
+    broken = _feature_with_children(store, "no manager, still running")
+    managed = _feature_with_children(store, "properly managed")
+    store.create_manager_order(managed)
+    done = _feature_with_children(store, "finished long ago")
+    store.set_feature_status(done, "completed")
+
+    fired = _fired(check_project(store, repair=True), "INV-MANAGER-MISSING")
+
+    assert [v.context["fo_id"] for v in fired] == [broken]
+    assert fired[0].repaired is False
+    assert store.get_feature_order(managed)["needs_attention"] == 0
+    assert store.get_feature_order(done)["needs_attention"] == 0
+    assert store.get_feature_order(broken)["needs_attention"] == 1
+
+
+def test_a_feature_with_no_children_has_nothing_to_manage(project):
+    """Released with nothing in it, or not released at all: no children means no
+    rejections to route, so there is nothing for a manager to own."""
+    store = ProjectStore(project)
+    empty = store.create_feature_order("released empty")["id"]
+    store.set_feature_status(empty, "executing")
+
+    assert _fired(check_project(store, repair=True), "INV-MANAGER-MISSING") == []
+
+    store.create_work_order("the first piece", parent_id=empty)
+
+    assert len(_fired(check_project(store, repair=True), "INV-MANAGER-MISSING")) == 1
+
+
+def test_the_daemons_tick_reports_the_missing_manager_but_never_creates_one(project,
+                                                                           catalog_file):
+    """No watchdog in this codebase starts a process on its own, and creating the manager
+    work order is starting one — the dispatcher picks it up on the next tick. The daemon
+    calls `check_project(repair=True)`, so `repair` alone must not be enough."""
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    store = ProjectStore(project)
+    fo_id = _feature_with_children(store, "no manager, still running")
+    store.close()
+
+    catalog = load_catalog(catalog_file)
+    spec = catalog.projects[0]
+    fresh = ProjectStore(spec.path)
+    Daemon(catalog).check_invariants(spec, fresh)
+
+    assert fresh.manager_work_order(fo_id) is None
+    assert fresh.get_feature_order(fo_id)["needs_attention"] == 1  # reported, not fixed
+
+
+def test_doctor_repair_creates_exactly_one_manager_and_only_once(project, catalog_file):
+    """The other half of the same rule: the user asking by hand IS the authorisation.
+    Idempotent because the predicate goes false the moment a manager exists."""
+    store = ProjectStore(project)
+    fo_id = _feature_with_children(store, "no manager, still running")
+    store.close()
+
+    cli.main(["doctor", "--repair", "--catalog", str(catalog_file)])
+
+    after = ProjectStore(project)
+    manager = after.manager_work_order(fo_id)
+    assert manager is not None and manager["kind"] == "manager"
+    assert after.get_feature_order(fo_id)["needs_attention"] == 0
+    after.close()
+
+    cli.main(["doctor", "--repair", "--catalog", str(catalog_file)])
+
+    again = ProjectStore(project)
+    managers = [w for w in again.list_work_orders(include_hidden=True)
+                if w["kind"] == "manager"]
+    assert [m["id"] for m in managers] == [manager["id"]]
+
+
+# -- the three together ---------------------------------------------------------------
+
+
+def test_doctor_without_repair_writes_nothing_for_any_of_the_three(project,
+                                                                  catalog_file, capsys):
+    """`jarvis doctor` is READ-ONLY without `--repair`, and each id has to reach the
+    reader — an invariant nobody can see fired is an invariant that did not fire."""
+    store = ProjectStore(project)
+    orphan = _validating_wo(store, "parked with nothing running")
+    lost = _validating_wo(store, "rejected, feedback undeliverable")
+    rnd = _round(store, wo_id=lost, outcome="rejected")
+    _feedback_envelope(store, rnd, state="undeliverable", wo_id=lost)
+    fo_id = _feature_with_children(store, "no manager, still running")
+    store.close()
+
+    rc = cli.main(["doctor", "--catalog", str(catalog_file)])
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    for invariant in ("INV-VALIDATION-ORPHAN", "INV-VALIDATION-FEEDBACK-LOST",
+                      "INV-MANAGER-MISSING"):
+        assert invariant in out
+    # ...and the one of the three that `--repair` CAN fix says so, which is the only
+    # thing that puts the offer in front of the user
+    assert "run with --repair to fix" in out
+    assert "would fix: create the feature's manager work order" in out
+    after = ProjectStore(project)
+    assert after.get_work_order(orphan)["needs_attention"] == 0
+    assert after.get_work_order(lost)["needs_attention"] == 0
+    assert after.get_feature_order(fo_id)["needs_attention"] == 0
+    assert after.manager_work_order(fo_id) is None
+
+
+def test_with_validation_disabled_none_of_the_three_can_fire(project, catalog_file):
+    """The feature ships with `os.validation.enabled` false, and at that default none of
+    the state these look for can exist: nothing sets a unit to `validating`, nothing
+    posts an envelope, and `create_plan_children` creates no manager. Asserted rather
+    than assumed — a watchdog that fires on healthy state spams the timeline for ever,
+    because violations dedupe on `Violation.key` and never expire.
+    """
+    from jarvis.catalog import load_catalog
+
+    assert load_catalog(catalog_file).os.validation.enabled is False
+
+    store = ProjectStore(project)
+    finished = store.create_work_order("shipped last week")
+    store.update_work_order(finished["id"], result_summary="done")
+    store.set_status(finished["id"], "completed")
+    store.set_status(store.create_work_order("still going")["id"], "running")
+
+    violations = check_project(store, repair=True)
+
+    assert [v.invariant for v in violations
+            if v.invariant.startswith(("INV-VALIDATION", "INV-MANAGER"))] == []

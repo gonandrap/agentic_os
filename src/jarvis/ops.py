@@ -216,7 +216,10 @@ def run_doctor(project: str | None = None, repair: bool = False,
             continue
         store = ProjectStore(path)
         try:
-            found = check_project(store, repair=repair)
+            # `allow_spawn=repair` and nowhere else: a repair that creates a work order
+            # the dispatcher will run is only allowed when the user asked for one by
+            # hand. The daemon's own `check_project(store, repair=True)` leaves it off.
+            found = check_project(store, repair=repair, allow_spawn=repair)
         finally:
             store.close()
         found = [*config_violations.pop(p["name"], []), *found]
