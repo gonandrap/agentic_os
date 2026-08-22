@@ -723,9 +723,25 @@ class ProjectStore:
         return dict(row) if row else None
 
     def count_active(self) -> int:
+        """How many work orders are spending one of this project's `max_concurrent` slots.
+
+        **Managers are exempt, and the exemption is load-bearing.** A project manager
+        order sits in `waiting_input` — an ACTIVE status — for the entire life of its
+        feature, because idle between messages is what it is FOR. Counted, two features in
+        flight would spend a `max_concurrent: 2` project's whole budget on two sessions
+        doing nothing, `Daemon.dispatch_pending` would never claim another work order, and
+        the project would stop with nothing on any surface saying why. A coordinator is
+        not a piece of the work — the same reasoning that already exempts the planner from
+        a feature's `max_parallel`, applied to the project-wide cap.
+
+        INV-MANAGER-SLOTS re-derives this from live state, because a regression here is
+        invisible from every other surface: nothing looks wrong when a project simply
+        stops claiming.
+        """
         marks = ",".join("?" for _ in ACTIVE_STATUSES)
         row = self.conn.execute(
-            f"SELECT COUNT(*) c FROM work_orders WHERE status IN ({marks})",
+            f"SELECT COUNT(*) c FROM work_orders "
+            f"WHERE status IN ({marks}) AND kind != 'manager'",
             ACTIVE_STATUSES,
         ).fetchone()
         return row["c"]
@@ -966,7 +982,8 @@ class ProjectStore:
         return dict(row) if row else None
 
     def create_plan_children(self, fo_id: str,
-                             ordered: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                             ordered: list[dict[str, Any]],
+                             manager: bool = False) -> list[dict[str, Any]]:
         """Turn an approved plan into work orders, in one transaction.
 
         `ordered` must already be in dependency order (`plans.creation_order`): each
@@ -981,6 +998,18 @@ class ProjectStore:
         All-or-nothing: a feature order holding three of its six children is worse than
         one holding none, because the three would start running against a plan that was
         never fully created.
+
+        `manager` adds this feature's PROJECT MANAGER ORDER to the same transaction: one
+        `kind='manager'` work order that owns the feature's follow-through and is the
+        addressee for anything the feature needs a human-shaped decision about — a panel
+        rejection, a deferral. It is created HERE rather than by the caller afterwards for
+        exactly the reason the children are created together: a feature holding children
+        but no manager is a feature whose rejections have nowhere to go. It is not in the
+        returned list, because that list is the plan the user reviewed and the manager is
+        not a piece of the work; `manager_work_order(fo_id)` is how you reach it.
+
+        The flag is off by default and its caller passes `os.validation.enabled`, so with
+        validation disabled this is the method it always was.
         """
         by_key: dict[str, str] = {}
         created: list[str] = []
@@ -996,11 +1025,40 @@ class ProjectStore:
                 )
                 by_key[child["key"]] = wo["id"]
                 created.append(wo["id"])
+            if manager:
+                self.create_manager_order(fo_id)
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
         return [self.get_work_order(wo_id) for wo_id in created]
+
+    def create_manager_order(self, fo_id: str) -> dict[str, Any]:
+        """The feature's project manager order. Opens no transaction of its own.
+
+        Called from inside `create_plan_children`'s transaction, so it must not BEGIN or
+        COMMIT anything: an all-or-nothing release is the whole point of creating it here.
+
+        The description is what a listing and `jarvis wo show` display. The manager's own
+        briefing is composed at dispatch by `dispatch.build_worker_prompt`, which reads
+        the feature's ask and the LIVE list of children rather than a snapshot taken now —
+        a manager files further children as the feature runs, so a snapshot would be wrong
+        by its second turn.
+        """
+        fo = self.get_feature_order(fo_id)
+        return self.create_work_order(
+            title=f"Manage {fo['title']}",
+            description=(
+                f"Own the follow-through for feature order {fo_id} ({fo['title']}).\n\n"
+                f"This work order writes no product code and opens no pull request. It "
+                f"receives what the feature needs decided, acts on each message, and "
+                f"files ordinary work orders under the feature when something has to "
+                f"change. Between messages it is idle, and that is correct."
+            ),
+            origin="jarvis",
+            parent_id=fo_id,
+            kind="manager",
+        )
 
     def feature_summary(self) -> dict[str, Any]:
         """How many feature orders sit in each status, and how many want the user."""
@@ -1179,9 +1237,10 @@ class ProjectStore:
     def manager_work_order(self, fo_id: str) -> dict[str, Any] | None:
         """The work order that owns this feature's follow-through, whatever its status.
 
-        `manager` is in WO_KINDS, but nothing CREATES one yet — the project manager
-        order is a later work order in this feature — so today this always returns None
-        and the router treats that as an unfilled role. The status is NOT filtered here:
+        One is created with the children when a plan is released and
+        `os.validation.enabled` is on (`create_plan_children`), so a feature planned with
+        validation off has none and the router treats that as an unfilled role — which is
+        every feature today. The status is NOT filtered here:
         the router has to tell "no manager was ever created" apart from "the manager was
         cancelled while its feature is still open", and those two are different verdicts.
         """

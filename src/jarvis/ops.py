@@ -67,6 +67,22 @@ def project_spec(catalog: Catalog, name: str) -> ProjectSpec:
         raise OpsError(str(e)) from e
 
 
+def validation_enabled() -> bool:
+    """Is `os.validation.enabled` on? False whenever the catalog cannot be read.
+
+    The validation layer ships DISABLED, and at that default the OS must behave exactly
+    as it does today. A catalog that has moved, been deleted or was never registered is
+    therefore answered `False` rather than raised: the alternative is a release path that
+    works today and fails tomorrow for a reason that has nothing to do with the plan being
+    released. The catalog file is read on demand rather than cached because the daemon may
+    be days old and the answer is only ever consulted at the moments a unit changes shape.
+    """
+    try:
+        return bool(resolve_catalog().os.validation.enabled)
+    except (OpsError, CatalogError, OSError, ValueError):
+        return False
+
+
 # -- OS lifecycle -------------------------------------------------------------------
 
 def start_os(catalog_path: str, force_config: bool = False,
@@ -1730,10 +1746,13 @@ def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
         raise OpsError(f"{fo_id} has no stored plan to review")
 
     store = ProjectStore(path)
+    manager: dict[str, Any] | None = None
     try:
         if accept:
             children = store.create_plan_children(
-                fo_id, plans.creation_order(plan["children"]))
+                fo_id, plans.creation_order(plan["children"]),
+                manager=validation_enabled())
+            manager = store.manager_work_order(fo_id)
             store.set_feature_status(fo_id, "executing")
             store.clear_feature_attention(fo_id)
         else:
@@ -1766,6 +1785,10 @@ def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
            "children": [{"id": c["id"], "title": c["title"],
                          "depends_on": db.from_json(c["depends_on"], [])}
                         for c in children]}
+    # Only when one exists, so a release with validation off returns the dict it always
+    # did — every caller reads this, including the CLI's JSON output.
+    if manager:
+        out["manager"] = manager["id"]
     if not accept and fo.get("plan_wo_id"):
         try:
             out["delivered"] = send_message(
@@ -1799,6 +1822,13 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
                 owned.append(store.get_work_order(fo["plan_wo_id"]))
             except KeyError:
                 pass
+        # The manager is not a child (`feature_children` filters to `kind='worker'`, and
+        # that filter is what keeps it from deadlocking feature completion), so it has to
+        # be reached explicitly — exactly like the planner above. A cancelled feature
+        # whose manager kept a session open would be a label, not a cancellation.
+        manager = store.manager_work_order(fo_id)
+        if manager:
+            owned.append(manager)
         stop_ids = [w["id"] for w in owned if w["status"] in OPEN_STATUSES]
         store.set_feature_status(fo_id, "cancelled")
         store.clear_feature_attention(fo_id)
