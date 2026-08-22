@@ -342,6 +342,24 @@ def test_backlog_show_renders_the_origin(store, central, tick, capsys):
     assert "origin" not in capsys.readouterr().out
 
 
+# -- the two contracts ---------------------------------------------------------------
+
+
+def test_the_worker_is_told_to_defer_rather_than_to_file_it_itself():
+    """The path needs callers, or it ships untested.
+
+    Workers filed deferred work with `jarvis backlog add` until this landed, and a
+    worker still told to do that would never post an envelope — the routing, the
+    relationship columns and the manager's half would all be dead code in production.
+    """
+    from jarvis import worker_brief
+
+    text = worker_brief.render_section("contract", wo_id="wo-936a13ca", project="proj_a")
+    assert "jarvis wo defer wo-936a13ca" in text
+    assert "--why" in text
+    assert "jarvis backlog add proj_a" not in text
+
+
 # -- the manager's contract ----------------------------------------------------------
 
 
