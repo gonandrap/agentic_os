@@ -334,6 +334,19 @@ One dataclass, two collectors, distinguished by a `unit` field.
 | `base` … `head` | merge base … worktree HEAD | the feature's `base_sha` … the default branch now |
 | `files`, `diff` | the worktree diff | the integrated diff of everything the children merged |
 | `children` | *(absent)* | each child's title, `result_summary` and declared evidence |
+| `diff_sha` | sha256 of the full diff **before** truncation | same |
+
+> **CORRECTION, 2026-08-20 (settled on wo-3806abda, Neo question 133).** The dataclass has
+> **NINE** fields, not eight: the ninth is `diff_sha: str`, added above. It is the sha256 of
+> the full diff **computed at collection time, before truncation**, and it exists because
+> [the fingerprint](#the-fingerprint) is defined over the pre-truncation diff while the
+> packet only ever carries the truncated one — as originally written, the formula could not
+> be computed from the pinned fields at all.
+>
+> **The packet NEVER carries the untruncated diff text.** Holding it in a `full_diff: str`
+> was considered and **rejected**: any later serialiser calling `dataclasses.asdict(packet)`
+> to build a seat prompt would then silently ship the untruncated diff and defeat
+> `diff_chars` entirely. A digest cannot leak that way.
 
 **The feature's `base_sha` is recorded when the feature enters `executing`** — the default
 branch's head at the moment its first child could start. Everything between that and the
@@ -365,7 +378,7 @@ itself was cut short.
 ## The fingerprint
 
 ```
-fingerprint = sha256( full diff content BEFORE truncation
+fingerprint = sha256( packet.diff_sha
                     + whitespace-normalised `declared` text )[:16]
 ```
 
@@ -382,6 +395,18 @@ fingerprint = sha256( full diff content BEFORE truncation
 Hashing `packet.diff` is the obvious implementation and it is wrong: the same tree would
 fingerprint differently at two truncation limits, making an integrity check depend on a
 display setting.
+
+> **CORRECTION, 2026-08-20 (settled on wo-3806abda, Neo question 133).** The formula above
+> is the corrected one. It previously read `sha256(full diff content BEFORE truncation + …)`,
+> which no field of [the evidence packet](#the-evidence-packet) could supply — the packet
+> holds the *truncated* diff plus `diff_chars`. The requirement this section has always
+> carried — that the fingerprint *hashes the full diff before truncation* — is satisfied
+> **via `diff_sha`**, the ninth packet field, and **not** by storing the full diff anywhere.
+>
+> This is integrity-equivalent to hashing the diff text: any change to the diff yields a
+> different `diff_sha`, hence a different fingerprint, so a resubmission that alters the
+> change still reads as new evidence and one that does not still reads as a repeat. It also
+> keeps the packet small enough to persist in a `validation_rounds` row.
 
 **A repeat escalates immediately and consumes no round**, compared against the
 **immediately preceding** round only. A submitter that legitimately reverts to an earlier

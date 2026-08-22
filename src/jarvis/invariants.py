@@ -165,7 +165,16 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     # the next tick — "worker is waiting on your input" about a worker waiting on Neo,
     # steering the user at `jarvis wo resume-auto`, which cannot help. Three of five
     # sampled `jarvis_os` work orders had it.
-    if wo["status"] == "waiting_input":
+    #
+    # A MANAGER is the second exception, and it is a stronger one: a project manager
+    # order sits in `waiting_input` for its feature's entire life, because acting on a
+    # message and then going idle is the whole of what it does. Nobody is waiting on the
+    # user for it — there is nothing to type into it — so without this every feature order
+    # in the fleet would carry a permanent false flag, put back by INV-ATTENTION-MISSING
+    # on the tick after `Daemon.settle_work_order` parked it. Narrow on purpose: a manager
+    # in any OTHER status is judged exactly like any other work order, so a failed one
+    # still reaches the user.
+    if wo["status"] == "waiting_input" and wo.get("kind") != "manager":
         question = awaiting_neo(wo["id"])
         if question is not None and question["status"] in USER_HELD_Q_STATUSES:
             # Neo handed the decision back. That IS the user's, and it gets a reason
@@ -785,6 +794,63 @@ def _envelope_violation(env: dict[str, Any], repair: str) -> Violation:
     )
 
 
+def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
+    """INV-MANAGER-SLOTS — a project manager order must not spend a concurrency slot.
+
+    `ProjectStore.count_active` is what `Daemon.dispatch_pending` compares against
+    `max_concurrent`, and it excludes `kind='manager'` on purpose: a manager sits in
+    `waiting_input` — an ACTIVE status — for the entire life of its feature, because idle
+    between messages is what it is FOR. Counted, two features in flight would spend a
+    `max_concurrent: 2` project's whole budget on two sessions doing nothing and the
+    project would stop claiming work altogether.
+
+    That failure is why this check exists rather than a comment. It degrades into "the
+    project has gone quiet", which nobody reports as a bug and no other surface shows —
+    there is no error, no flag and no stuck work order, just a queue that stops moving.
+    Written as a canary for the same reason `check_gate_canaries` is: the protection can
+    be regressed by an innocent-looking edit years from now, so it is re-derived from live
+    state instead of trusted.
+
+    Predicate: `count_active()` equals the number of work orders in ACTIVE_STATUSES whose
+    kind is not `manager`. Both sides are computed here, one through the method under test
+    and one directly in SQL, so the check cannot pass by sharing the bug — which is also
+    why it does not count `list_work_orders`, whose `limit` would quietly under-report on
+    exactly the busy project where a lost slot hurts most.
+
+    NOT repairable, and it must not try: a code regression is not derivable from state,
+    and there is nothing in the database to fix — writing to rows here would corrupt
+    healthy data in response to a bug in a query. The detail names `count_active` so
+    whoever reads `jarvis doctor` knows where to look.
+
+    Silent on healthy state, including the overwhelmingly common state of no manager at
+    all: with none, both sides count the same rows and the difference is zero.
+    """
+    counted = store.count_active()
+    marks = ",".join("?" for _ in ACTIVE_STATUSES)
+    row = store.conn.execute(
+        f"SELECT COUNT(*) c FROM work_orders "
+        f"WHERE status IN ({marks}) AND kind != 'manager'",
+        ACTIVE_STATUSES,
+    ).fetchone()
+    expected = int(row["c"])
+    if counted == expected:
+        return
+    yield Violation(
+        invariant="INV-MANAGER-SLOTS",
+        detail=(
+            f"`ProjectStore.count_active` returned {counted} where {expected} work "
+            f"orders are active and not managers: the manager exemption has regressed. "
+            f"A project manager order is designed to sit in `waiting_input` for its "
+            f"feature's whole life, so counting one spends a `max_concurrent` slot for "
+            f"ever and the project silently stops dispatching. Restore the "
+            f"`kind != 'manager'` filter in `count_active` (project_store.py); the "
+            f"reasoning is in that method's docstring and in work order wo-9652be2f."
+        ),
+        repaired=False,
+        context={"count_active": counted, "active_non_manager": expected},
+    )
+
+
 # -- configuration checks (catalog, not database state) ------------------------------
 
 
@@ -1020,6 +1086,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_no_phantom_attention,
     check_blocked_work_is_surfaced,
     check_attention_has_reason,
+    check_manager_slots,           # a canary, not a state check: it repairs nothing and
+                                   # is unaffected by the order it runs in
     check_envelopes_move,          # last: it delivers, and delivery changes work orders
 )
 

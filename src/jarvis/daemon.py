@@ -53,6 +53,7 @@ from .dispatch import dispatch_work_order
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     ACTIVE_STATUSES,
+    OPEN_STATUSES,
     PRE_APPROVED_KEY,
     UNGOVERNED_ORIGINS,
     ProjectStore,
@@ -495,13 +496,38 @@ class Daemon:
                 reason = template.format(id=first["id"])
                 store.set_feature_status(fo["id"], "failed")
                 store.flag_feature_attention(fo["id"], reason)
+                self._close_feature_manager(store, fo["id"])
                 log.info("[%s] feature %s failed: %s", project.name, fo["id"], reason)
             elif all(c["status"] == "completed" for c in children):
                 store.set_feature_status(fo["id"], "completed")
                 store.clear_feature_attention(fo["id"])
+                self._close_feature_manager(store, fo["id"])
                 self._close_feature_backlog(fo)
                 log.info("[%s] feature %s completed (%d work orders)", project.name,
                          fo["id"], len(children))
+
+    def _close_feature_manager(self, store: ProjectStore, fo_id: str) -> None:
+        """End the project manager order when its feature ends, whichever way it ended.
+
+        The manager is not a child (`feature_children` filters to `kind='worker'`), which
+        is what keeps it from deadlocking the completion just decided above — and the
+        price of that exemption is that nothing else would ever close it. Left alone it
+        would sit in `waiting_input` for ever against a settled feature: an open work
+        order on every listing, and a live addressee for envelopes about work that is
+        over.
+
+        `completed`, not `cancelled`, on both paths. The manager did its job whether or
+        not the feature delivered; a `cancelled` manager under a `failed` feature would
+        read as a second thing gone wrong. Nothing is flagged either way — the feature
+        order carries the flag, and a duplicate on the manager would ask the user to look
+        at the same event twice.
+        """
+        manager = store.manager_work_order(fo_id)
+        if not manager or manager["status"] not in OPEN_STATUSES:
+            return
+        store.set_status(manager["id"], "completed")
+        store.clear_attention(manager["id"])
+        store.add_event(manager["id"], "feature_settled", {"feature_order": fo_id})
 
     def _close_feature_backlog(self, fo: dict) -> None:
         """A feature order promoted from the backlog closes its item when it lands.
@@ -1526,6 +1552,16 @@ class Daemon:
             # in front of the user, for a worker doing exactly what the contract asks of
             # it (GitHub issue 100). Only the tightness of the Neo drain loop kept that
             # rare; a slow or disabled Neo makes it every `wo ask`.
+            if fresh["status"] != "waiting_input":
+                store.set_status(wo["id"], "waiting_input")
+        elif wo.get("kind") == "manager":
+            # A project manager order is idle BY DESIGN: it acts on a message and ends
+            # its turn, and between messages there is nothing for it to do. The default
+            # below would file that as `needs_review — worker idle without jarvis wo
+            # finish` on the manager's very first turn and again after every message it
+            # handled, so every feature order in the fleet would carry a permanent false
+            # flag. It never finishes itself either: `settle_features` completes it when
+            # its feature settles.
             if fresh["status"] != "waiting_input":
                 store.set_status(wo["id"], "waiting_input")
         else:
