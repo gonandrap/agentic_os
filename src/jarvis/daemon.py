@@ -41,11 +41,12 @@ import logging
 import os
 import signal
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from . import bus, claude_cli, worker_session
+from . import bus, claude_cli, db, worker_session
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
@@ -56,6 +57,9 @@ from .project_store import (
     UNGOVERNED_ORIGINS,
     ProjectStore,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .evidence import EvidencePacket
 
 log = logging.getLogger("jarvisd")
 
@@ -90,6 +94,48 @@ RETRY_EVERY_TICKS = 2
 #: rate of a few a day.
 DIGEST_BATCH = 5
 
+#: THE VALIDATION SEAM. A validator is any callable of
+#:
+#:     (ProjectStore, the round row, the evidence packet) -> {
+#:         "outcome": "passed" | "rejected" | "escalated",
+#:         "reason":  str,   # <= 1500 chars, second person, addressed to the submitter;
+#:                           # empty only when the outcome is "passed"
+#:         "seats":   [{"seat", "status", "verdict", "model", "latency_ms", "reply"}, …],
+#:     }
+#:
+#: and NOTHING else is known about it here — not that it calls a model, not that it has
+#: seats, not that it exists at all when `_validator` says None. That is what lets the
+#: panel be built, replaced or switched off without this module changing.
+Validator = Callable[[ProjectStore, dict, "EvidencePacket"], dict]
+
+#: THE REJECTION, WORDED ONCE. Nothing else may reformat it: a submitter that is told
+#: what to do differently every round learns to read past the words, and the two
+#: sentences at the end are the whole contract — resubmit through `finish`, and bring
+#: something new when you do.
+#:
+#: `bus.render` frames this the way it frames every payload, because the bus is payload
+#: agnostic by design and carries neither the work order id nor `max_rounds` (Neo,
+#: question 136). The framing is the envelope's; the words below are the reviewer's.
+REVIEW_FEEDBACK = """REVIEW FEEDBACK (round {n} of {max})
+{reason}
+
+Address this and then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."`
+again. Re-submitting without changed code or new evidence will end the review."""
+
+#: How many transport outages in a row one round survives before the OS gives up on it.
+#: An outage is not a verdict, so it consumes no round — but retrying for ever would
+#: park a work order in `validating` with nobody watching, which is the exact silent
+#: stall this feature exists to remove.
+VALIDATION_OUTAGE_LIMIT = 3
+
+#: Why a round closed with no verdict at all. Deliberately NOT phrased as a rejection:
+#: nothing judged this work, so there is nothing for its author to fix, and the reason
+#: has to say so plainly wherever it is read back (Neo, question 137).
+NO_VALIDATOR_REASON = (
+    "no validator was configured, so this round was never judged — the work order "
+    "settled exactly where it settles with validation switched off"
+)
+
 
 class Daemon:
     def __init__(self, catalog: Catalog, poll_interval: float = 5.0):
@@ -110,6 +156,20 @@ class Daemon:
         # prefix on every other call.
         self.digest_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="digest")
         self.digesting = False
+        # Validation runs off the tick thread for the same reason Neo does, only more
+        # so: a round is up to five headless calls at a 300s timeout each, and run
+        # inline it would freeze every project in the catalog behind one work order's
+        # review. One worker, because the point is to keep the tick moving rather than
+        # to validate a fleet at once.
+        self.validate_pool = ThreadPoolExecutor(max_workers=1,
+                                                thread_name_prefix="validate")
+        # Work orders whose round is in flight. Per work order rather than one global
+        # flag: two units may legitimately be under review at once, and a second tick
+        # must not start a second validation of the SAME one.
+        self.validating: set[str] = set()
+        # The validator seam (see `_validator`). None means "ask the catalog"; tests
+        # inject a callable here, exactly as `release_runner` injects systemd.
+        self.validator: Validator | None = None
         # Invariant violations already reported this run, so a standing problem is
         # surfaced once instead of every tick. Keyed by (invariant, wo_id).
         self.reported_violations: set[tuple[str, str | None]] = set()
@@ -219,6 +279,10 @@ class Daemon:
                 # posted this is one indexed lookup that finds nothing.
                 self.deliver_envelopes(project, store)
                 self.deliver_messages(project, store)
+                # After delivery, not before: an envelope this round machine posted on
+                # an earlier tick is already on its way to the worker, so the work order
+                # it rejected has left `validating` and is not looked at again here.
+                self.validation_tick(project, store)
                 # Before dispatch, not after: a planner filed this tick is an ordinary
                 # pending work order, so it is claimed by the same pass rather than
                 # waiting a whole poll interval to start.
@@ -631,6 +695,243 @@ class Daemon:
                 continue
             if state != "delivered":
                 log.info("[%s] envelope %s -> %s", project.name, envelope["id"], state)
+
+    # -- 3b. the validation round machine (see the validation-panel design) -----------
+
+    def validation_tick(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Judge every work order parked in `validating`, off this thread.
+
+        THE KILL SWITCH IS NOT CHECKED HERE, and that is the point of the whole design:
+        `os.validation.enabled` gates OPENING a round (`ops.finish`) and never settling
+        one. A user who turns the panel off at three in the morning because it is
+        misbehaving must not thereby strand every unit already inside it — so this
+        drains what is open either way, and a round with no validator settles its unit
+        exactly where the OS settles it with the feature switched off.
+
+        Everything expensive — collecting the diff, calling the seats — happens on the
+        pool thread. What is left here is one indexed query, so a fleet with nothing in
+        `validating` pays a lookup that finds nothing.
+        """
+        for wo in store.list_work_orders(statuses=("validating",), include_hidden=True):
+            wo_id = wo["id"]
+            if wo_id in self.validating:
+                continue  # its round is in flight; a second tick must not start another
+            round_row = store.latest_validation_round(wo_id=wo_id)
+            if round_row is None:
+                # In `validating` with no round at all: nothing this machine can judge.
+                # INV-VALIDATION-STRANDED (a later work order) is what finds these.
+                log.warning("[%s] %s is validating with no round on record",
+                            project.name, wo_id)
+                continue
+            if round_row["outcome"] not in ("pending", "failed"):
+                continue  # already judged — settlement is what moves it, not a re-run
+            self.validating.add(wo_id)
+            future = self.validate_pool.submit(
+                self._validate_work_order, project, wo_id, int(round_row["id"]))
+            future.add_done_callback(
+                lambda f, k=wo_id: self.validating.discard(k))
+
+    def _validate_work_order(self, project: ProjectSpec, wo_id: str,
+                             round_id: int) -> None:
+        """One round, start to finish (runs on the single validate thread).
+
+        **This opens its OWN store.** A sqlite connection belongs to the thread that
+        created it, and `db.connect` does not pass `check_same_thread=False`, so reusing
+        the daemon's would raise rather than corrupt — noisily, which is the good
+        outcome, but the round would die every time.
+
+        The round row itself was opened by `ops.finish` on the caller's thread, before
+        this was ever queued, so a crash in here leaves a `pending` round something can
+        find rather than a work order in `validating` with no trace of why.
+        """
+        from . import evidence as evidence_mod
+        from . import ops
+
+        cfg = self.catalog.os.validation
+        store = ProjectStore(project.path)  # thread-local connection — see the docstring
+        try:
+            wo = store.get_work_order(wo_id)
+            round_row = store.get_validation_round(round_id)
+            if round_row is None:  # pragma: no cover - deleted mid-flight
+                return
+            n, max_rounds = int(round_row["round"]), int(cfg.max_rounds)
+            packet = evidence_mod.collect_work_order(
+                project.path, wo, declared=str(round_row["evidence"] or ""),
+                diff_chars=cfg.diff_chars)
+
+            validator = (self.validator if self.validator is not None
+                         else self._validator(cfg))
+            if validator is None:
+                # Nothing to judge with — the panel is not wired in, or the user turned
+                # it off while this round was open. Closed `failed`, never `passed`: a
+                # round nobody judged must not read as a verdict on any surface.
+                store.close_validation_round(round_id, "failed", NO_VALIDATOR_REASON)
+                store.add_event(wo_id, "validation_failed",
+                                {"round": n, "cause": "no_validator",
+                                 "reason": NO_VALIDATOR_REASON})
+                ops.land_finished(store, wo)
+                log.info("[%s] %s: round %d settled unjudged (no validator)",
+                         project.name, wo_id, n)
+                return
+
+            # An EMPTY DIFF never reaches the validator. A reviewer handed nothing to
+            # review will approve it, and that single silent pass would make the whole
+            # feature theatre.
+            if not packet.files:
+                self._escalate(store, wo, round_id, n,
+                               "this submission changes no files, so there is nothing "
+                               "to review. Nobody has judged the work.")
+                return
+
+            # A REPEAT of the IMMEDIATELY PRECEDING round only. Compared against every
+            # earlier round it would punish a submitter that was told to go back to a
+            # shape it had already tried, which is a legitimate answer to feedback.
+            previous = self._preceding_round(store, wo_id, n)
+            if previous and previous["fingerprint"] == round_row["fingerprint"]:
+                self._escalate(
+                    store, wo, round_id, n,
+                    f"this submission is identical to round {previous['round']} — the "
+                    f"same changes and the same declared evidence — so the review has "
+                    f"nothing new to judge.")
+                return
+
+            try:
+                verdict = validator(store, dict(round_row), packet)
+            except claude_cli.ClaudeCliError as e:
+                self._validation_outage(store, wo, round_id, n, e)
+                return
+
+            for seat in verdict.get("seats") or ():
+                store.record_validation_opinion(
+                    round_id, str(seat.get("seat") or ""),
+                    reply=str(seat.get("reply") or ""),
+                    verdict=str(seat.get("verdict") or ""),
+                    status=str(seat.get("status") or "ok"),
+                    model=str(seat.get("model") or ""),
+                    latency_ms=int(seat.get("latency_ms") or 0))
+            outcome = str(verdict.get("outcome") or "")
+            reason = str(verdict.get("reason") or "")
+
+            if outcome == "passed":
+                store.close_validation_round(round_id, "passed", reason)
+                store.add_event(wo_id, "validation_passed",
+                                {"round": n, "round_id": round_id})
+                status = ops.land_finished(store, wo)
+                log.info("[%s] %s passed review in round %d -> %s",
+                         project.name, wo_id, n, status)
+            elif outcome == "rejected" and n < max_rounds:
+                self._reject(store, wo, round_id, n, max_rounds, reason)
+                log.info("[%s] %s rejected in round %d of %d",
+                         project.name, wo_id, n, max_rounds)
+            elif outcome == "rejected":
+                # The last round it had, and it was refused. Sending feedback now would
+                # ask for a resubmission there is no round left to judge.
+                self._escalate(store, wo, round_id, n, reason or (
+                    f"the review was not satisfied after {max_rounds} rounds."))
+            else:
+                # `escalated`, or anything the validator returned that is not a verdict
+                # this machine knows. Either way a human decides.
+                self._escalate(store, wo, round_id, n, reason or (
+                    "the review could not reach a verdict."))
+        except Exception:  # noqa: BLE001 — a round must never kill the daemon
+            log.exception("[%s] validating %s failed", project.name, wo_id)
+        finally:
+            store.close()
+
+    @staticmethod
+    def _preceding_round(store: ProjectStore, wo_id: str,
+                         n: int) -> dict[str, Any] | None:
+        """The round before this one, by number. None for the first."""
+        for row in store.validation_rounds(wo_id=wo_id):
+            if int(row["round"]) == n - 1:
+                return row
+        return None
+
+    @staticmethod
+    def _reject(store: ProjectStore, wo: dict, round_id: int, n: int, max_rounds: int,
+                reason: str) -> None:
+        """Close the round and send the feedback back — OVER THE BUS, never directly.
+
+        The round machine does not call `queue_message` and never names a work order as
+        a recipient: it posts an envelope to the role `implementor` and forgets. What
+        fills that role, and what happens when nothing does, is the router's business
+        (src/jarvis/bus.py) — which is the whole reason a rejection can serve a feature
+        order's manager tomorrow without a line changing here.
+        """
+        wo_id = wo["id"]
+        store.close_validation_round(round_id, "rejected", reason)
+        store.add_event(wo_id, "validation_rejected",
+                        {"round": n, "round_id": round_id, "of": max_rounds})
+        bus.post(store, subject=bus.Subject(wo_id=wo_id),
+                 from_role="reviewer", to_role="implementor",
+                 payload=bus.ReviewFeedback(
+                     round=n, outcome="rejected",
+                     reason=REVIEW_FEEDBACK.format(n=n, max=max_rounds, reason=reason,
+                                                   wo_id=wo_id)))
+
+    @staticmethod
+    def _escalate(store: ProjectStore, wo: dict, round_id: int, n: int,
+                  reason: str) -> None:
+        """Give up on this unit and ask the user.
+
+        The attention reason is `VALIDATION_STUCK_BLOCKER` VERBATIM, because
+        INV-ATTENTION-REASON rewrites any reason `invariants.true_blockers` cannot
+        re-derive — a better sentence here would simply be overwritten on the next
+        reconcile tick, and the user would read the generic one.
+        """
+        from .invariants import VALIDATION_STUCK_BLOCKER
+
+        wo_id = wo["id"]
+        store.close_validation_round(round_id, "escalated", reason)
+        store.add_event(wo_id, "validation_escalated",
+                        {"round": n, "round_id": round_id, "reason": reason})
+        store.set_status(wo_id, "needs_review")
+        store.flag_attention(wo_id, VALIDATION_STUCK_BLOCKER)
+
+    def _validation_outage(self, store: ProjectStore, wo: dict, round_id: int, n: int,
+                           error: Exception) -> None:
+        """The validator could not be reached. That is a transport failure, NOT a
+        verdict.
+
+        The round is marked `failed`, which `counted_validation_rounds` ignores, so the
+        outage costs the submitter nothing: the next tick picks the same round up and
+        tries again. Three in a row is where retrying stops — the outages are counted
+        from the events, so a daemon restart does not hand the round a fresh budget.
+        """
+        wo_id = wo["id"]
+        outages = 1 + sum(
+            1 for e in store.events_of_kind(wo_id, "validation_failed")
+            if db.from_json(e["payload"], {}).get("round") == n
+            and db.from_json(e["payload"], {}).get("cause") == "transport")
+        store.close_validation_round(
+            round_id, "failed", f"the validator could not be reached: {error}")
+        store.add_event(wo_id, "validation_failed",
+                        {"round": n, "cause": "transport", "attempt": outages,
+                         "error": str(error)[:500]})
+        if outages >= VALIDATION_OUTAGE_LIMIT:
+            self._escalate(
+                store, wo, round_id, n,
+                f"the review could not be run: the validator was unreachable "
+                f"{outages} times in a row. Nobody has judged the work.")
+
+    @staticmethod
+    def _validator(cfg: Any) -> Any:
+        """How a round is judged: the validation panel, or nothing. THE ONLY PLACE
+        validation is wired in.
+
+        Returns None when the panel is disabled, exactly as `_panel_answer` does — and
+        None again for now regardless, because the panel itself is a later work order in
+        this feature. A round with no validator settles its unit where the OS settles it
+        with validation switched off, so the seam being unwired costs nothing and hides
+        nothing.
+
+        **Replace this body with the import and the call and nothing else changes**: the
+        round machine takes a callable of `(store, round, packet) -> {"outcome",
+        "reason", "seats"}` and knows nothing else about who judges.
+        """
+        if not cfg.enabled:
+            return None
+        return None
 
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                  msgs: list[dict[str, Any]]) -> None:
@@ -1113,6 +1414,14 @@ class Daemon:
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
                           wo: dict) -> None:
         from .invariants import awaiting_neo
+
+        if wo["status"] == "validating":
+            # THE ROUND MACHINE OWNS THIS WORK ORDER. Everything below re-derives the
+            # outcome from the latest turn on EVERY tick — and that turn is a done one
+            # carrying a `result_summary` and a `pr_url`, so without this return the
+            # reconciler would set `waiting_pr_merge` on the very next tick and put
+            # unvalidated work on the user's merge queue. The runner is what moves it.
+            return
 
         turn = store.latest_turn(wo["id"])
         if turn is None:
