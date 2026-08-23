@@ -145,22 +145,15 @@
   {% endif %}
 </div>
 
-{# EVERY assumption, not just the ones still owed a decision — and outside the tabs,
-   because while any is unreviewed this panel is the page's ask.
-
-   It lists the reviewed ones too because the timeline now names an assumption by number
-   and says nothing else about it. Listing only the pending ones would leave
-   "Assumption #2 recorded" pointing at nothing the moment #2 was decided, which is
-   worse than the duplication removing the text was meant to fix. #}
+{# EVERY assumption, not just those still owed a decision: the timeline names them by
+   number and says nothing else, so the number has to stay resolvable — §4 of
+   docs/superpowers/specs/2026-08-23-the-work-order-record.md. #}
 {% if assumptions %}
 {% set a_title = 'Assumptions pending your review' if unreviewed
                  else 'Assumptions the worker recorded' %}
 <h2{% if pending == 'assumptions' %} id="pending"{% endif %}>{{ a_title }}</h2>
 <div class="panel">
-  {# The number is the one the timeline uses ("Assumption #2 recorded"), and it comes
-     from the store rather than from `loop.index`: this list can be filtered or a row
-     deleted, and a position recomputed here would disagree with what the timeline has
-     already said about an assumption nobody touched. #}
+  {# `a.n` from the store, never `loop.index`: this list can be filtered. #}
   {% for a in assumptions %}
   <div class="row"><span class="mono sub" style="min-width: 2.5em;">#{{ a.n }}</span>
     <div class="grow">{{ a.content }}</div>
@@ -221,12 +214,9 @@
 </div>
 {% endif %}
 
-{# THE THREE READINGS OF ONE WORK ORDER, as tabs rather than as a stack.
-   Conversation, spend and timeline are alternatives — a reader wants one of them at a
-   time — and stacked they cost a long scroll to reach the last. Everything ABOVE this
-   point stays outside the tabs on purpose: the header, the assumptions awaiting a
-   decision and the gates awaiting one are things the page is ASKING of the reader, and
-   an ask hidden behind a tab is an ask that does not happen. #}
+{# The three readings of one work order. Everything above stays outside the tabs — an
+   ask hidden behind a tab is an ask that does not happen. §6 of
+   docs/superpowers/specs/2026-08-23-the-work-order-record.md. #}
 <div class="tabbed" id="wo-tabs">
   <div class="tabs" role="tablist">
     <button role="tab" data-panel="tab-conversation" aria-selected="true"
@@ -246,9 +236,7 @@
 <h2>Conversation</h2>
 <div class="panel">
   {% for msg in messages %}
-  {# Who spoke, from the message's own `source` — the same rule the timeline uses
-     (`timeline._message_label`). "you → worker" on every inbound message was false for
-     the commonest one there is: Neo's answer to a worker's question. #}
+  {# Who spoke, from the message's own `source` — same rule as `timeline._message_label`. #}
   {% set who = ('neo → worker' if msg.source == 'neo' else 'you → worker')
                 if msg.direction == 'user_to_agent' else 'worker → you' %}
   <div class="msg {{ 'user' if msg.direction == 'user_to_agent' }}">
@@ -281,9 +269,7 @@
 </section>
 
 {% if bill and bill.turns %}
-{# The same bill as `/cost/<project>/<id>`, turn by turn, on the page the reader is
-   already on. Behind a tab rather than printed: the numbers are here for the turn that
-   looks wrong, and a page that opens with a token table buries the conversation. #}
+{# The same bill as `/cost/<project>/<id>`, on the page the reader is already on. #}
 <section class="tabpanel" id="tab-spend" role="tabpanel">
 <h2>Spend, turn by turn</h2>
 {{ bill_ui.view(bill.turns, bill.total, 'total for ' ~ wo.id) }}
@@ -302,9 +288,7 @@
     {% for e in timeline %}
     <li{% if e.level == 'debug' %} class="dbg"{% endif %}>
       {{ fmt_age(e.ts) }} ago — <strong>{{ e.label }}</strong>
-      {#- Where the entry points at a record of its own instead of reproducing it
-          (timeline._ref): a link, so the reader can go and read the whole of it —
-          a question together with its answer — rather than half of it here. -#}
+      {#- What the entry points at instead of reproducing (`timeline._ref`). -#}
       {%- if e.ref and e.ref.kind == 'neo_question' %}
       <a href="/neo/question/{{ e.ref.id }}">{{ e.ref.label }} →</a>{% endif %}
       {%- if e.detail %}
@@ -325,8 +309,7 @@
 </div>
 
 <script>
-// Tabs, added to a page that works without them. Nothing is hidden until `.js` is on
-// the container, so a browser that never runs this still gets all three sections.
+// Tabs. Nothing is hidden until `.js` is on the container — §6.
 (function () {
   var root = document.getElementById('wo-tabs');
   if (!root) return;
@@ -352,10 +335,7 @@
     t.addEventListener('click', function () { show(t.dataset.panel); });
   });
 
-  // Deep links must keep working. `#pending` — what every notification links to — and
-  // `#gate-<id>` land on elements that may now be inside a closed tab, so open whichever
-  // panel contains the target and then scroll to it. Without this the page would open on
-  // the conversation tab and the thing the user was sent here for would be invisible.
+  // Open whichever panel holds the hash target. On load AND on hashchange — §6.
   function follow() {
     var id = location.hash.slice(1);
     if (!id) return;

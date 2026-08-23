@@ -8,13 +8,8 @@ hooks, turn boundaries, session binding) exists to debug the circuitry.
 `build_timeline` merges events with the actual conversation and renders each entry as
 prose. Debug entries are held back unless explicitly requested.
 
-The second audience problem, and the one this module keeps getting wrong in the other
-direction: an entry that repeats text the reader is already looking at costs attention
-rather than losing it, so nothing fails and nobody reports it. Three did — the opening
-entry restated the work order's own description, an assumption restated the assumption
-listed a screen above, and a question was printed in full directly above its answer. The
-rule that replaced them: an entry says WHAT HAPPENED, and where the thing that happened
-has a record of its own, it POINTS at it (`_ref`) rather than reproducing it.
+An entry says WHAT HAPPENED and points at records rather than reproducing them:
+docs/superpowers/specs/2026-08-23-the-work-order-record.md §1, §3.
 """
 
 from __future__ import annotations
@@ -35,14 +30,9 @@ DEBUG_KINDS = frozenset({
     "hook_ignored",             # a hook from a session that is not this work order's
     "permission_mode_changed",  # worker permission plumbing
     "notification_ignored",     # idle prompt on an already-settled work order
-    # Both answer kinds are the SAME MOMENT as the message that carries the answer, and
-    # both writers queue that message in the same breath. Rendered as signal they cost
-    # the reader two lines for one event — "Neo answered the worker" with nothing under
-    # it, then the answer itself — and the second line is the one worth reading. So the
-    # bookkeeping is debug and the answer is the timeline entry; `_message_label` is
-    # what makes the surviving line say who actually spoke.
-    "neo_answered",             # Neo's answer went out — the message beneath it is the answer
-    "escalation_answered",      # the user's answer to an escalation, likewise
+    # Same moment as the message carrying the answer, so the message is the entry — §5.
+    "neo_answered",
+    "escalation_answered",
 })
 
 STATUS_LABEL = {
@@ -97,14 +87,7 @@ def _neo_question_id(p: dict[str, Any]) -> int | None:
 
 
 def _ref(kind: str, p: dict[str, Any]) -> dict[str, Any] | None:
-    """The record this entry POINTS AT, rather than reproduces, or None.
-
-    An entry carries a ref when the thing that happened has a home of its own that says
-    it better and says more: a question has an answer, and a timeline is the wrong place
-    to read a paragraph twice. Deliberately surface-neutral — `{kind, id, label}`, not a
-    URL — because the same entry is rendered by the dashboard, which has a page for it,
-    and by `jarvis wo show`, which has `jarvis neo show`.
-    """
+    """The record this entry points at, or None. Surface-neutral by design — §3."""
     if kind == "question_asked":
         qid = _neo_question_id(p)
         if qid is not None:
@@ -113,18 +96,9 @@ def _ref(kind: str, p: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
-    """(label, detail) in plain language for one event.
-
-    Reads the event's own payload and nothing else. It used to take the work order too,
-    for the `created` entry that restated its title and description; that entry now says
-    only that it happened, and the parameter went with it.
-    """
+    """(label, detail) in plain language for one event, from its payload alone."""
     if kind == "created":
-        # NO detail. The title and the description are the top of every surface that
-        # renders this timeline — the work order page, `jarvis wo show` — so repeating
-        # them as the first entry spends the reader's first scroll on text they have
-        # just read. What the entry is worth saying is that it happened, and when.
-        return "Work order created", ""
+        return "Work order created", ""  # the title and description are already above
     if kind == "status":
         status = p.get("status", "")
         return STATUS_LABEL.get(status, status or "Status changed"), ""
@@ -166,25 +140,14 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "attention":
         return "Needs you", p.get("reason") or ""
     if kind == "assumption":
-        # The number, not the text. Every surface that shows this timeline also lists
-        # the assumptions themselves, numbered the same way, so the text here was the
-        # same paragraph twice on one page. `n` is written by
-        # `ProjectStore.add_assumption`; `build_timeline` fills it in for rows written
-        # before it was.
-        n = p.get("n")
+        n = p.get("n")  # the number, not the text — §4
         return (f"Assumption #{n} recorded" if n else "Assumption recorded"), ""
     if kind == "question_asked":
-        # The question is NOT reproduced here. It has a record of its own that holds the
-        # answer beside it, and a reader following a timeline wants to know a question
-        # was asked and be able to go and read it — not to read a paragraph inline, then
-        # its answer again two lines down as a message. `_ref` is the way there; the text
-        # is the fallback for an event that somehow carries no question id.
+        # `_ref` is the way to it; the text is the fallback when there is no id — §3.
         if _neo_question_id(p) is not None:
             return "Worker asked a question", ""
         return "Worker asked a question", str(p.get("question") or "")
-    # Both "answered" kinds are debug (see DEBUG_KINDS): the answer is the message
-    # queued in the same breath, and that message is the timeline entry worth reading.
-    # They still render, with no detail, when debug entries are asked for.
+    # Debug (see DEBUG_KINDS); they still render, with no detail, when asked for.
     if kind == "neo_answered":
         return "Neo answered the worker", ""
     if kind == "neo_dispatched":
@@ -267,14 +230,7 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
 
 
 def _message_label(m: dict[str, Any]) -> str:
-    """Who is speaking, from the message's own `source`.
-
-    Every inbound message used to read "You → worker", which was false for the commonest
-    one of all: Neo's answer to a worker's question is queued by the daemon with
-    `source="neo"`. The timeline said the user had answered, and the separate
-    "Neo answered the worker" event beside it — now debug — was the only thing that said
-    otherwise. One line, correctly attributed, replaces both.
-    """
+    """Who is speaking, from the message's own `source` — §5."""
     if m.get("direction") != "user_to_agent":
         return "Worker → you"
     return "Neo → worker" if m.get("source") == "neo" else "You → worker"
@@ -285,11 +241,8 @@ def build_timeline(wo: dict[str, Any], events: list[dict[str, Any]],
                    *, include_debug: bool = False) -> list[dict[str, Any]]:
     """Merge events and conversation into time-ordered, human-readable entries.
 
-    Each entry: {ts, level, kind, label, detail, ref}. `ref` is None for most entries and
-    otherwise names a record this entry points at instead of reproducing (see `_ref`).
-    Debug entries are omitted unless `include_debug`.
-
-    This function stays pure — it never opens a store.
+    Each entry: {ts, level, kind, label, detail, ref}. Debug entries are omitted unless
+    `include_debug`. Stays pure — it never opens a store.
     """
     entries: list[dict[str, Any]] = []
     seen_assumptions = 0
@@ -297,11 +250,8 @@ def build_timeline(wo: dict[str, Any], events: list[dict[str, Any]],
         kind = e.get("kind", "")
         payload = _payload(e)
         if kind == "assumption":
-            # An assumption's number is its position among this work order's
-            # assumptions. `add_assumption` writes it into the payload; rows written
-            # before it did are numbered here, by the same rule and therefore to the
-            # same numbers — both count in `ts` order, which is the order the
-            # assumptions table is read back in.
+            # Rows written before `add_assumption` stored `n` are numbered here, by the
+            # same rule and therefore to the same numbers — §4.
             seen_assumptions += 1
             payload = {**payload, "n": payload.get("n") or seen_assumptions}
         level = event_level(kind)

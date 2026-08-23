@@ -541,11 +541,7 @@ def create_app() -> FastAPI:
         try:
             events = store.list_events(wo_id)
             messages = store.list_messages(wo_id)
-            # BOTH lists. `pending` is what the page still owes a decision on and
-            # decides whether the review form renders; `assumptions` is every one ever
-            # recorded, because the timeline names them by number and says nothing else
-            # about them — so a page that listed only the pending ones would leave
-            # "Assumption #2 recorded" pointing at nothing the moment #2 was reviewed.
+            # Both lists: `assumptions` is the record, `unreviewed` is the ask — §4.
             assumptions = store.all_assumptions(wo_id)
             unreviewed = store.pending_assumptions(wo_id)
             # A worker held at a gate looks identical to an idle one from here, so
@@ -700,11 +696,8 @@ def create_app() -> FastAPI:
     def neo_question_page(request: Request, question_id: int):
         """One question and its answer — where a work order's timeline sends the reader.
 
-        The timeline entry for `question_asked` names the question and points here
-        instead of reprinting it, because the question is only half of what the reader
-        wants: the other half is the answer, and until this page existed the only way to
-        see the two together was to scroll `/neo` looking for the id. `active="neo"`
-        keeps the nav lit on the section this belongs to.
+        The `question_asked` entry points here rather than reprinting the question: §3 of
+        docs/superpowers/specs/2026-08-23-the-work-order-record.md.
         """
         from ..neo_store import NeoStore
         neo = NeoStore()

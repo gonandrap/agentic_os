@@ -30,17 +30,10 @@ The rejections, and what each is guarding:
   so "as discussed in the plan" hands a worker a sentence pointing at a document it
   cannot open. This project has already recorded the general form of that lesson: the
   work order record must stand alone, because nobody reads worker transcripts.
-* **Children whose description does not stop.** The mirror of the one above, and not
-  its opposite: a brief must stand alone as INSTRUCTIONS, which is not a licence to
-  restate the design. Every child is dispatched with the feature's design document
-  materialised beside it, so a six-kilobyte brief that walks through that document
-  section by section is the same content stored twice, read twice, and revised once.
-  `MAX_DESCRIPTION_CHARS` is the ceiling.
-* **A plan with no design document and no plan to write one.** The ceiling above is
-  only affordable because a brief can CITE a document instead of carrying it, so the
-  document has to exist. A plan therefore names either the `design_doc` it was written
-  against or, in `design_doc_by`, the child that writes one — and in the second case
-  every other child must wait for it.
+* **Children whose description does not stop**, and **a plan with no design document
+  and no plan to write one.** The mirror of the rejection above and its consequence: a
+  brief must stand alone as INSTRUCTIONS, which is not a licence to restate the design.
+  See §2 of docs/superpowers/specs/2026-08-23-the-work-order-record.md.
 """
 
 from __future__ import annotations
@@ -59,19 +52,10 @@ CHILD_CAP = 8
 #: judging whether a real paragraph is *good* enough is Neo's job, not a character count.
 MIN_DESCRIPTION_CHARS = 80
 
-#: Longest a child brief may be. The ceiling exists because the floor's argument does
-#: NOT run in reverse: a description that has to stand alone is not therefore one that
-#: should carry the whole design. Every child is dispatched with the feature's design
-#: document materialised beside it (`dispatch.materialize_design_doc`), so a brief that
-#: restates that document is duplication the reader pays for twice — once on the work
-#: order page, once in the document — and duplication that goes stale the moment the
-#: document is revised.
-#:
-#: Mechanical rather than advisory on purpose. `_planner_prompt` has said "a description
-#: is a BRIEF, not an encyclopedia" since the design document field existed, and planners
-#: still shipped six-kilobyte briefs that restate their spec section by section — which
-#: is this module's own argument for why its checks are Python and not a reviewer's
-#: judgement, applied to the one rule that was left to prose.
+#: Longest a child brief may be. The floor's argument does NOT run in reverse: a
+#: description that must stand alone is not one that should carry the whole design, which
+#: is materialised beside every child anyway. See §2 of
+#: docs/superpowers/specs/2026-08-23-the-work-order-record.md.
 MAX_DESCRIPTION_CHARS = 1500
 
 #: Plan-local child keys. The planner names its children so it can wire `needs` between
@@ -230,24 +214,9 @@ def _spec_problems(design_doc: str, design_doc_by: str,
                    children: list[dict[str, Any]], known: set[str]) -> list[str]:
     """Every plan must stand on a design document — or produce one first.
 
-    A brief may cite the document instead of restating it (that is what
-    `MAX_DESCRIPTION_CHARS` makes compulsory), and a citation is only worth anything if
-    the document exists by the time the worker reads it. So a plan says one of two
-    things and never neither:
-
-    * `design_doc` — the document is written, it is in the planner's tree, and
-      `ops.submit_plan` snapshots it. The ordinary case.
-    * `design_doc_by` — there is no document yet, and THIS CHILD writes one. Then the
-      spec becomes part of the work rather than a thing everyone assumed existed.
-
-    Naming both is refused rather than merged: `ops.submit_plan` demands that a named
-    `design_doc` already exist on disk, so a plan claiming both a written document and a
-    child that writes it is a plan describing two different worlds.
-
-    The ordering check is what makes the second form real. A spec-writing child that its
-    siblings do not wait for is a spec written in parallel with the work it is supposed
-    to govern — the citations in those briefs would point at a file that is not there
-    yet. So every other child must reach it through the dependency graph.
+    The two forms, why naming both is refused, and why every sibling must wait for a
+    `design_doc_by` child: §2, §2.1 and §2.2 of
+    docs/superpowers/specs/2026-08-23-the-work-order-record.md.
     """
     if design_doc and design_doc_by:
         return [
@@ -287,9 +256,7 @@ def _spec_problems(design_doc: str, design_doc_by: str,
 def _transitive_needs(children: list[dict[str, Any]], key: str) -> set[str]:
     """Every child key `key` depends on, directly or through other children.
 
-    Walks only edges between known keys and tolerates a cycle: unknown ids and cycles
-    are reported by their own checks, and this one must still return an answer for the
-    same submission rather than recursing for ever.
+    Tolerates a cycle rather than recursing for ever; cycles have their own check — §2.2.
     """
     edges = {c["key"]: [d for d in c["needs"] if d != c["key"]] for c in children}
     reached: set[str] = set()

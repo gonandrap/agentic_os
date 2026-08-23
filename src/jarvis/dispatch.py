@@ -465,11 +465,10 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         "**Every plan stands on a design document, and the validator checks it.** If "
         "writing one yourself is genuinely not the right move — the feature is a set of "
-        "small independent fixes, or the spec is itself the thing that has to be worked "
-        "out against the code — then make writing it THE FIRST CHILD: name that child's "
-        "key in `design_doc_by` instead of naming a `design_doc`, and give every other "
-        "child a `needs` path back to it. A spec its siblings do not wait for is a spec "
-        "they cannot cite. Name one or the other; naming both is refused.",
+        "small independent fixes, or the spec is itself what has to be worked out "
+        "against the code — then make writing it THE FIRST CHILD: name that child's key "
+        "in `design_doc_by` instead of naming a `design_doc`, and give every other child "
+        "a `needs` path back to it. Name one or the other; naming both is refused.",
         "",
         "Each child is dispatched into a NEW session with a worker that sees its own "
         "description plus the design document, and nothing else — not this plan, not "

@@ -131,15 +131,12 @@ def test_message_plumbing_events_never_duplicate_the_message_itself():
 # above do) cannot see it — that is exactly how the empty "Worker asked a question"
 # entry shipped. These tests assert the DETAIL, so a key that goes unwritten fails here.
 #
-# The same trap has a second face, which the rest of this section is about: a detail
-# that DOES render, and renders text the reader is already looking at somewhere else on
-# the same page. That costs attention rather than losing it, so no assertion catches it
-# by accident — each of these names the surface the text is duplicated from.
+# Second face of the same trap: a detail that renders text the reader already has
+# elsewhere on the page. Each test below names the surface it is duplicated from — see
+# §7 of docs/superpowers/specs/2026-08-23-the-work-order-record.md.
 
 def test_question_asked_points_at_the_question_instead_of_reprinting_it():
-    """A question has an answer, and only its own record holds the two together. So the
-    entry carries a reference and the reader follows it — rather than reading the
-    question here and its answer again two lines down, as a message."""
+    """Only the question's own record holds it and its answer together."""
     events = [ev("question_asked", 1.0, neo_question_id=7,
                  question="CSV or JSON for the export default?")]
     entry = build_timeline({}, events, [])[0]
@@ -177,9 +174,7 @@ def test_assumptions_are_numbered_rather_than_repeated():
 
 
 def test_assumptions_written_before_they_were_numbered_are_numbered_here():
-    """Rows already on disk carry no `n`. Numbering them by position gives the same
-    answer as the writer's counter — both count in `ts` order, which is the order the
-    assumptions table is read back in — so the two surfaces cannot disagree."""
+    """Rows on disk carry no `n`; positional numbering gives the writer's answer."""
     events = [ev("assumption", 1.0, content="first"),
               ev("assumption", 2.0, content="second"),
               ev("assumption", 3.0, content="third", n=3)]
@@ -189,9 +184,7 @@ def test_assumptions_written_before_they_were_numbered_are_numbered_here():
 
 
 def test_neos_answer_is_one_line_and_says_neo_said_it():
-    """It used to be two, and the survivor was misattributed. `neo_answered` and the
-    message carrying the answer are the same moment, written in the same breath — so the
-    event is plumbing, and the message is labelled from its own `source`."""
+    """It used to be two lines, and the survivor was misattributed to the user."""
     events = [ev("question_asked", 1.0, neo_question_id=7),
               ev("neo_answered", 3.0, neo_question_id=7)]
     messages = [{"ts": 4.0, "direction": "user_to_agent", "source": "neo",
@@ -213,8 +206,7 @@ def test_the_user_answering_still_reads_as_the_user():
 
 
 def test_the_bookkeeping_is_still_on_the_record_for_anyone_who_asks():
-    """Debug, not deleted. The moment Neo answered is an audit fact; it is just not one
-    worth a line of the story directly above the answer itself."""
+    """Debug, not deleted — the moment Neo answered is an audit fact."""
     events = [ev("neo_answered", 3.0, neo_question_id=7),
               ev("escalation_answered", 5.0, neo_question_id=8)]
     entries = build_timeline({}, events, [], include_debug=True)

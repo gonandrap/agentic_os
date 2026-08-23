@@ -831,11 +831,10 @@ def settle_turns():
     return _settle_turns
 
 
-#: Where every fixture project keeps a design document, and what a test plan names in
-#: its `design_doc`. `plans.parse_plan` refuses a plan that stands on no design document
-#: and `ops.submit_plan` refuses one naming a file that is not on disk, so without a real
-#: file here every test that submits a plan would have to write one first — a fixture
-#: chore that says nothing about what the test is checking.
+#: Where every fixture project keeps a design document, and what a test plan names in its
+#: `design_doc`. Every plan must stand on one, so without a real file here each test that
+#: submits a plan would have to write one first. See §7 of
+#: docs/superpowers/specs/2026-08-23-the-work-order-record.md.
 FIXTURE_DESIGN_DOC = "docs/specs/exporter.md"
 
 FIXTURE_DESIGN_DOC_BODY = """# Exporter design
