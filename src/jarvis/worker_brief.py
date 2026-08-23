@@ -34,7 +34,14 @@ PROJECT_PLACEHOLDER = "<project>"
 #: Budget for the rendered core contract block (between "# Operating contract" and
 #: "# Full briefings"), excluding the work order's own description and the knowledge
 #: index. Enforced by tests/test_worker_brief.py.
-CORE_BUDGET_CHARS = 2500
+#:
+#: Raised from 2500 in wo-322cd6f8: the original figure was set against a 2080-char
+#: core, and PR 124's `--evidence` bullet spent all of that headroom. A bullet earns
+#: its place here only if a worker that lacks it does damage BEFORE it would think to
+#: fetch the section — which is why concision is here rather than fetch-only
+#: (docs/superpowers/specs/2026-08-22-agent-concision.md SS6). Raise it again only on
+#: that test, not to make room.
+CORE_BUDGET_CHARS = 2750
 
 
 # -- the git briefing, replacing Claude Code's own ---------------------------------------
@@ -232,12 +239,10 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             f"--why \"<why this is ready>\" --evidence \"<PR, tests, checks>\"` "
             f"(full protocol: `jarvis brief gates --wo {wo_id}`).",
         ] if gate_names else []),
-        f"- **Point, do not explain, and say each thing ONCE.** A code comment is "
-        f"one line naming the reason or citing a spec section; an explanation "
-        f"longer than that belongs in `docs/superpowers/specs/` and the comment "
-        f"cites it. A PR body hints at what to look at and what is risky — the "
-        f"diff explains itself. Never restate text already on this record. Full "
-        f"rules: `jarvis brief concision`.",
+        f"- **Point, do not explain; say each thing ONCE.** A code comment is one "
+        f"line citing the spec that explains it (`docs/superpowers/specs/`), not "
+        f"the explanation. A PR body hints; the diff explains. Never restate what "
+        f"is already on this record. Rules: `jarvis brief concision`.",
         f"- When done, ALWAYS run `jarvis wo finish {wo_id} --summary \"...\"` "
         f"(add `--pr <url>` if you opened a pull request) and then write your "
         f"complete answer as the last thing you say. The work order record IS this "

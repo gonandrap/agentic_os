@@ -123,8 +123,17 @@ The rules:
    summary are read together; text repeated across them is read twice and adds nothing
    the second time. Refer to what is already on the record instead of restating it.
 
-The core budget (`CORE_BUDGET_CHARS`) still holds; the bullet was written to fit inside
-the existing headroom rather than by raising the budget.
+The bullet is in the core rather than behind the fetch because of what a worker has to
+already suspect before it fetches. A worker in doubt fetches; a verbose worker is not in
+doubt, so `jarvis brief concision` would be read by everyone except the population it is
+aimed at — and the damage it prevents (the over-commented diff, the essay PR body) is done
+before anyone could tell it to look.
+
+That cost `CORE_BUDGET_CHARS`, raised 2500 to 2750. The 2500 figure was set against a
+2080-char core and PR 124's `--evidence` bullet spent the whole of that headroom while
+this work was in flight, so the merged core did not fit. The bullet was compressed from
+381 to 246 chars first; the remainder is the raise. The test for adding a bullet here is
+the paragraph above, not available headroom.
 
 ## S7. Re-probing S2
 

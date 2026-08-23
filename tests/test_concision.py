@@ -108,7 +108,7 @@ def test_the_core_carries_the_three_rules_without_a_fetch(project):
                             _spec(project))
     core = p[p.index("# Operating contract"):p.index("# Full briefings")]
     assert "docs/superpowers/specs/" in core          # comments cite a spec
-    assert "PR body" in core                          # the PR body hints
+    assert "A PR body hints" in core                  # the PR body hints
     assert "already on this record" in core           # say each thing once
     assert "jarvis brief concision" in core           # and the fetch is named
 
