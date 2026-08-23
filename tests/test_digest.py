@@ -63,12 +63,15 @@ def test_the_output_style_ships_and_is_the_upstream_file():
         "MIT License")
 
 
-def test_the_output_style_is_not_shipped_into_projects_as_a_skill_or_a_subagent(project):
+def test_the_vendored_bytes_are_not_shipped_into_projects(project):
     """`bootstrap` copytrees `assets/skills/`, `assets/agents/` and
-    `assets/project-skills/` WHOLESALE. A prompt dropped in any of them becomes a skill
-    every worker loads or a subagent every feature-order planner can invoke — the same
-    trap the Neo seats sidestep. This is one prompt for one internal call and belongs to
-    none of those populations.
+    `assets/project-skills/` WHOLESALE, so this file's verbatim bytes must not sit in
+    any of them: it is one prompt for one internal call, and a worker loading it as a
+    skill would be reading a style guide addressed to nobody.
+
+    Pinned on BYTES, not on the filename. The worker skill that ships the same rules
+    adapted for agents is called `i-have-adhd` too (spec 2026-08-22-agent-concision SS5),
+    and a name test would fail on it for a reason that was never the invariant.
 
     The negative half is paired with the positive one in the same test: "the file was
     copied nowhere" passes just as well for a file that does not exist at all.
@@ -78,11 +81,18 @@ def test_the_output_style_is_not_shipped_into_projects_as_a_skill_or_a_subagent(
     bootstrap.install_agent_assets(project, kind="worker")
     bootstrap.install_agent_assets(project, kind="planner")
     bootstrap.install_project_skills(project)
-    delivered = [p for p in project.rglob("*") if "adhd" in p.name.lower()]
+    verbatim = digest.SKILL_PATH.read_bytes()
+    delivered = [p for p in project.rglob("*")
+                 if p.is_file() and p.read_bytes() == verbatim]
     assert delivered == []
     # ...and here is where it does live, reachable by the one module that reads it.
     assert digest.SKILL_PATH.is_file()
     assert digest.SKILL_PATH.parent == bootstrap.ASSETS / "digest"
+    # The control: the adapted skill DID reach the worker tree, so "nothing was
+    # delivered" cannot be why the assertion above passed.
+    shipped = [p for p in project.rglob("i-have-adhd/SKILL.md")]
+    assert shipped, "the adapted worker skill did not reach the project at all"
+    assert all(p.read_bytes() != verbatim for p in shipped)
 
 
 def test_the_system_prompt_is_the_style_verbatim_behind_a_machine_readable_header():
