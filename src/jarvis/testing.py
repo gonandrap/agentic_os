@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from . import agent_usage
+from . import agent_usage, systemd_units
 from .bugreport import GH_BIN_ENV
 from .claude_cli import CLAUDE_BIN_ENV
 from .notify import DISABLE_EXTERNAL_SINKS_ENV
@@ -111,6 +111,13 @@ def gate_environment(root: Path) -> dict[str, str]:
         "JARVIS_HOME": str(root / "jarvis-home"),
         DISABLE_EXTERNAL_SINKS_ENV: "1",
         GH_BIN_ENV: str(_blocked_bin(root, "gh", BLOCKED_GH)),
+        # Worker turns stay on the plain-`Popen` transport for the whole suite. Without
+        # this the auto-detection would be RIGHT and that is the problem: a suite run by
+        # a Jarvis worker inherits the daemon's `.service` cgroup, so every fake-`claude`
+        # turn would register a real transient unit on the developer's machine. The
+        # systemd path is exercised by pointing `JARVIS_SYSTEMD_RUN_BIN` at a fake, which
+        # is the same shape as the `claude` and `gh` stubs above.
+        systemd_units.TRANSPORT_ENV: systemd_units.DIRECT,
     }
     if not os.environ.get(LLM_EVALS_ENV):
         env[CLAUDE_BIN_ENV] = str(_blocked_bin(root, "claude", BLOCKED_CLAUDE))
@@ -631,6 +638,167 @@ else:
     sys.stderr.write(f"fake gh: unhandled argv {argv}\n")
     sys.exit(2)
 '''
+
+
+FAKE_SYSTEMD_RUN = r"""#!/usr/bin/env python3
+'''Fake `systemd-run --user` for tests.
+
+Stands in for the real thing on the ONE property the transient-unit transport rests on:
+the command it starts does not inherit this process's environment. It gets a deliberately
+bare base plus exactly what `--setenv=` carried, which is what makes a test able to prove
+that JARVIS_HOME, the PATH the fleet depends on and the prompt-cache flag reach a worker
+turn — the failure mode a real systemd would only show in production.
+
+Registers the unit in $FAKE_SYSTEMD_DIR/units/<unit>.json so the fake `systemctl` beside
+it can answer MainPID/ActiveState and stop it. $FAKE_SYSTEMD_FAIL makes every call fail,
+which is how the fallback-to-Popen path is tested.
+'''
+import json, os, subprocess, sys
+
+state_dir = os.environ["FAKE_SYSTEMD_DIR"]
+units_dir = os.path.join(state_dir, "units")
+os.makedirs(units_dir, exist_ok=True)
+argv = sys.argv[1:]
+with open(os.path.join(state_dir, "run-calls.jsonl"), "a") as f:
+    f.write(json.dumps({"argv": argv}) + "\n")
+
+fail = os.environ.get("FAKE_SYSTEMD_FAIL")
+if fail:
+    sys.stderr.write(fail + "\n")
+    sys.exit(1)
+
+unit, workdir, stdout, stderr, setenv = None, None, None, None, {}
+rest = []
+i = 0
+while i < len(argv):
+    a = argv[i]
+    if a == "--":
+        rest = argv[i + 1:]
+        break
+    if a.startswith("--unit="):
+        unit = a.split("=", 1)[1]
+    elif a.startswith("--working-directory="):
+        workdir = a.split("=", 1)[1]
+    elif a.startswith("--setenv="):
+        k, _, v = a.split("=", 1)[1].partition("=")
+        setenv[k] = v
+    elif a.startswith("--property=StandardOutput=file:"):
+        stdout = a.split("file:", 1)[1]
+    elif a.startswith("--property=StandardError=file:"):
+        stderr = a.split("file:", 1)[1]
+    i += 1
+
+if not unit or not rest:
+    sys.stderr.write(f"fake systemd-run: unusable argv {argv}\n"); sys.exit(2)
+
+# A transient unit inherits the systemd USER MANAGER's environment, not the caller's.
+env = {k: os.environ[k] for k in ("PATH", "HOME", "XDG_RUNTIME_DIR", "LANG")
+       if k in os.environ}
+env.update(setenv)
+out = open(stdout, "w") if stdout else subprocess.DEVNULL
+err = open(stderr, "w") if stderr else subprocess.DEVNULL
+proc = subprocess.Popen(rest, cwd=workdir, env=env, stdin=subprocess.DEVNULL,
+                        stdout=out, stderr=err, start_new_session=True)
+with open(os.path.join(units_dir, unit + ".json"), "w") as f:
+    json.dump({"unit": unit, "pid": proc.pid, "argv": rest, "cwd": workdir,
+               "setenv": setenv}, f)
+"""
+
+
+FAKE_SYSTEMCTL = r"""#!/usr/bin/env python3
+'''Fake `systemctl --user` for tests: answers about units the fake systemd-run made.
+
+Only the three verbs the turn transport uses — `show -p MainPID`, `show -p ActiveState`
+and `stop`. An unknown unit answers exactly as a `--collect`ed one does: MainPID 0,
+ActiveState inactive. That is the normal case after a turn finishes, not an error.
+'''
+import json, os, signal, sys
+
+state_dir = os.environ["FAKE_SYSTEMD_DIR"]
+units_dir = os.path.join(state_dir, "units")
+argv = [a for a in sys.argv[1:] if a not in ("--user", "--no-block")]
+with open(os.path.join(state_dir, "ctl-calls.jsonl"), "a") as f:
+    f.write(json.dumps({"argv": sys.argv[1:]}) + "\n")
+
+def load(unit):
+    try:
+        with open(os.path.join(units_dir, unit + ".json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    # A detached child nobody waits on is a zombie, and signalling one succeeds.
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[-1].split()[0] != "Z"
+    except OSError:
+        return True
+
+if argv[:1] == ["show"]:
+    rec = load(argv[1])
+    up = bool(rec) and alive(rec["pid"])
+    if "--property=MainPID" in argv:
+        print(rec["pid"] if up else 0)
+    elif "--property=ActiveState" in argv:
+        print("active" if up else "inactive")
+    else:
+        sys.stderr.write(f"fake systemctl: unhandled show {argv}\n"); sys.exit(2)
+elif argv[:1] == ["stop"]:
+    rec = load(argv[1])
+    if rec and alive(rec["pid"]):
+        try:
+            os.killpg(os.getpgid(rec["pid"]), signal.SIGTERM)
+        except OSError:
+            pass
+else:
+    sys.stderr.write(f"fake systemctl: unhandled argv {argv}\n"); sys.exit(2)
+"""
+
+
+@pytest.fixture()
+def fake_systemd(tmp_path, monkeypatch):
+    """Put worker turns on the transient-unit transport, against a fake systemd.
+
+    The test-isolation gate pins every run to the direct transport (see
+    `gate_environment`), so a test that wants the systemd path has to say so — which is
+    this fixture. It flips `JARVIS_TURN_TRANSPORT` to `systemd`, so nothing here depends
+    on whether the machine running the suite happens to have a real one.
+    """
+    sdir = tmp_path / "fake-systemd"
+    (sdir / "units").mkdir(parents=True)
+    run_bin, ctl_bin = sdir / "systemd-run", sdir / "systemctl"
+    for path, body in ((run_bin, FAKE_SYSTEMD_RUN), (ctl_bin, FAKE_SYSTEMCTL)):
+        path.write_text(body)
+        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("FAKE_SYSTEMD_DIR", str(sdir))
+    monkeypatch.setenv(systemd_units.SYSTEMD_RUN_BIN_ENV, str(run_bin))
+    monkeypatch.setenv(systemd_units.SYSTEMCTL_BIN_ENV, str(ctl_bin))
+    monkeypatch.setenv(systemd_units.TRANSPORT_ENV, systemd_units.SYSTEMD)
+
+    class Handle:
+        dir = sdir
+
+        @property
+        def runs(self) -> list[dict]:
+            path = sdir / "run-calls.jsonl"
+            return ([json.loads(l) for l in path.read_text().splitlines()]
+                    if path.exists() else [])
+
+        @property
+        def units(self) -> dict[str, dict]:
+            return {p.stem: json.loads(p.read_text())
+                    for p in (sdir / "units").glob("*.json")}
+
+        def fail(self, message: str = "fake systemd-run: refused") -> None:
+            """Make every subsequent spawn fail, so the direct fallback is exercised."""
+            monkeypatch.setenv("FAKE_SYSTEMD_FAIL", message)
+
+    return Handle()
 
 
 @pytest.fixture()

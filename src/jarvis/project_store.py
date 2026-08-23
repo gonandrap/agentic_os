@@ -334,6 +334,12 @@ CREATE TABLE IF NOT EXISTS wo_turns (
     prompt TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'running',  -- running | done | failed
     pid INTEGER,
+    -- The transient systemd unit the turn runs in, when it got one (systemd_units).
+    -- NULL is the direct-Popen transport: a dev checkout, `start --foreground`, a host
+    -- without systemd, or a spawn that fell back. Recorded rather than re-derived from
+    -- the (wo, seq) naming convention, because `cancel` has to stop the unit that
+    -- actually exists.
+    unit TEXT,
     started_at REAL NOT NULL,
     ended_at REAL,
     exit_code INTEGER,
@@ -477,6 +483,9 @@ ADDED_COLUMNS = {
         # these columns existed, and never "nothing went wrong".
         "terminal_reason": "TEXT",
         "api_error_status": "INTEGER",
+        # See the CREATE TABLE comment. NULL on every row written before turns moved into
+        # their own units, which reads correctly as "the direct transport".
+        "unit": "TEXT",
     },
     "approvals": {
         # Which SEAT attempted the command, when a subagent did. NULL means the session's
@@ -1317,8 +1326,12 @@ class ProjectStore:
         row = self.conn.execute("SELECT * FROM wo_turns WHERE id=?", (turn_id,)).fetchone()
         return dict(row) if row else None
 
-    def set_turn_pid(self, turn_id: int, pid: int) -> None:
-        self.conn.execute("UPDATE wo_turns SET pid=? WHERE id=?", (pid, turn_id))
+    def set_turn_pid(self, turn_id: int, pid: int | None,
+                     unit: str | None = None) -> None:
+        """Record how to reach the turn's process. Both halves land together: the unit
+        is useless without the row and the pid alone cannot stop a cgroup."""
+        self.conn.execute("UPDATE wo_turns SET pid=?, unit=? WHERE id=?",
+                          (pid, unit, turn_id))
 
     def finish_turn(self, turn_id: int, state: str, result: str | None = None,
                     error: str | None = None, cost_usd: float | None = None,
