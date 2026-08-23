@@ -99,13 +99,16 @@ def test_the_work_order_record_points_at_what_was_asked(asked, project, capsys):
 
 
 def test_a_question_event_with_no_id_still_says_what_was_asked():
-    """The one case with nowhere to point: no id, so the text is all there is."""
-    from jarvis.timeline import build_timeline
+    """Nowhere to point, and the ask is still on the record — in the conversation,
+    which renders it from the event payload and never needed the id."""
+    from jarvis.timeline import build_conversation, build_timeline
 
     events = [{"ts": 1.0, "kind": "question_asked", "payload": {"question": "CSV?"}}]
     entry = build_timeline({}, events, [])[0]
     assert entry["ref"] is None
-    assert entry["detail"] == "CSV?"
+    assert entry["detail"] == ""
+    assert [(c["who"], c["content"]) for c in build_conversation(events, [])] == [
+        ("worker → Neo", "CSV?")]
 
 
 def test_neo_answers_and_delivers_to_worker(asked, project, fake_claude):
