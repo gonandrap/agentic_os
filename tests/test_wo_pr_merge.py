@@ -6,7 +6,8 @@ and (b) leave the work order id on the artifact they are looking at.
 
 `waiting_pr_merge` is deliberately NOT an attention item: it is a merge queue the user
 works through, not a decision blocking the fleet, and the "NEEDS YOU" strip stops being
-read the moment everything finished ends up in it.
+read the moment everything finished ends up in it — with one exception, the conflict
+nobody could heal, which the last section covers.
 """
 
 from __future__ import annotations
@@ -19,8 +20,15 @@ from jarvis import cli, github, hooks, ops
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import PR_POLL_EVERY_TICKS, Daemon
-from jarvis.invariants import PR_CLOSED_BLOCKER, check_project, true_blockers
+from jarvis.invariants import (
+    PR_CLOSED_BLOCKER,
+    PR_CONFLICT_BLOCKER,
+    PR_CONFLICT_MAX_ATTEMPTS,
+    check_project,
+    true_blockers,
+)
 from jarvis.project_store import OPEN_STATUSES, ProjectStore
+from jarvis.timeline import build_timeline
 
 PR = "https://github.com/acme/proj/pull/7"
 
@@ -422,6 +430,299 @@ def test_a_merge_notifies_nobody(started, project, fake_gh, parked):
     assert store.get_work_order(parked["id"])["status"] == "completed"
 
 
+# -- healing a conflicting pull request ---------------------------------------------
+#
+# docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md, whose
+# §1 is the complaint: a work order parked behind a stale branch needed the user to type
+# "go and resolve the conflicts" at it — a message with no decision in it.
+
+
+@pytest.fixture()
+def parked_worker(project, parked):
+    """`parked`, plus the worker session every real one has: `waiting_pr_merge` is
+    reached through `jarvis wo finish`, which only a dispatched worker can call.
+
+    Healing needs one — there is no point queueing a message for a conversation that
+    does not exist — so these tests must not inherit a fixture that lacks it."""
+    ProjectStore(project).update_work_order(parked["id"], session_id="sess-1")
+    return parked
+
+
+def conflicting(fake_gh, base: str = "main") -> None:
+    fake_gh.set_pr(PR, "OPEN", mergeable="CONFLICTING", base_ref=base)
+
+
+def delivered(store, wo_id: str) -> list[dict]:
+    """Pretend the daemon delivered whatever is queued, and hand it back."""
+    msgs = store.queued_messages(wo_id)
+    for m in msgs:
+        store.mark_message(m["id"], "delivered")
+    return msgs
+
+
+def test_a_conflicting_pr_asks_the_worker_to_resolve_it(started, project, fake_gh,
+                                                        parked_worker):
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    msgs = store.queued_messages(parked_worker["id"])
+    assert len(msgs) == 1
+    assert msgs[0]["source"] == "pr-conflict"
+    assert "origin/main" in msgs[0]["content"] and PR in msgs[0]["content"]
+    # the two things the loop depends on the worker NOT doing (spec §3)
+    assert "do NOT call `jarvis wo finish` again" in msgs[0]["content"]
+    assert "Do NOT rebase or force-push" in msgs[0]["content"]
+    assert store.pr_conflict_attempts(parked_worker["id"]) == 1
+
+
+def test_the_conflict_nudge_asks_the_user_for_nothing(started, project, fake_gh,
+                                                      parked_worker):
+    """The point of the feature: a conflict costs the user nothing until it cannot be
+    healed. The status does not move either — delivery is what resumes the worker, and
+    that is a whole tick away."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    row = store.get_work_order(parked_worker["id"])
+    assert row["status"] == "waiting_pr_merge"
+    assert not row["needs_attention"]
+    assert true_blockers(store, row) == []
+    assert ops.os_status()["attention"] == []
+
+
+def test_a_second_poll_does_not_nudge_twice(started, project, fake_gh, parked_worker):
+    """Between queueing and delivery the work order is still parked_worker, and a duplicate
+    nudge costs the worker a duplicated turn."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+
+    poll(started, store)
+    poll(started, store)
+
+    assert len(store.queued_messages(parked_worker["id"])) == 1
+    assert store.pr_conflict_attempts(parked_worker["id"]) == 1
+
+
+def test_a_work_order_with_no_session_is_left_alone(started, project, fake_gh, parked):
+    """`parked` without the session stamp: `deliver_messages` skips a work order with no
+    conversation, so a nudge queued here would never go out — and would then block every
+    later one, spending the whole budget without a single attempt."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    assert not store.queued_messages(parked["id"])
+    assert store.pr_conflict_attempts(parked["id"]) == 0
+    assert not store.get_work_order(parked["id"])["needs_attention"]
+
+
+def test_the_worker_is_woken_and_parks_itself_back(started, project, fake_gh,
+                                                   fake_claude, settle_turns):
+    """End to end through the real tick: the conflict resumes the finished session and
+    settlement returns the work order to the merge queue by itself — no second `jarvis
+    wo finish`, so no second validation round (spec §3)."""
+    wo = ops.create_work_order("proj_a", "add feature X")
+    started.tick()
+    store = ProjectStore(project)
+    assert settle_turns(store)
+    ops.finish(wo["id"], "opened a PR", pr_url=PR)
+    conflicting(fake_gh)
+
+    started.tick_count = 0               # a tick that polls: queues the nudge
+    started.tick()
+    assert store.queued_messages(wo["id"])
+
+    started.tick_count = 1               # a tick that delivers but does not poll
+    started.tick()
+    assert store.get_work_order(wo["id"])["status"] == "running"
+    assert settle_turns(store)
+
+    started.tick_count = 1               # and settlement puts it back where it was
+    started.tick()
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+
+
+def test_three_attempts_and_then_it_is_the_users_problem(started, project, fake_gh,
+                                                         parked_worker):
+    """A conflict that survives three merges is usually the stacked-PR trap of
+    kn-0a5c449c, which no amount of merging fixes."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+
+    for _ in range(PR_CONFLICT_MAX_ATTEMPTS):
+        poll(started, store)
+        assert delivered(store, parked_worker["id"])
+    assert not store.get_work_order(parked_worker["id"])["needs_attention"]  # still trying
+
+    poll(started, store)
+
+    row = store.get_work_order(parked_worker["id"])
+    assert row["status"] == "waiting_pr_merge"
+    assert row["needs_attention"]
+    assert row["attention_reason"] == PR_CONFLICT_BLOCKER
+    assert true_blockers(store, row) == [PR_CONFLICT_BLOCKER]
+    assert not store.queued_messages(parked_worker["id"])   # it stopped asking
+    assert store.pr_conflict_attempts(parked_worker["id"]) == PR_CONFLICT_MAX_ATTEMPTS
+
+
+def test_giving_up_is_recorded_once_however_long_it_stays_broken(started, project,
+                                                                 fake_gh, parked_worker):
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    for _ in range(PR_CONFLICT_MAX_ATTEMPTS):
+        poll(started, store)
+        delivered(store, parked_worker["id"])
+
+    for _ in range(3):
+        poll(started, store)
+
+    assert len([e for e in store.list_events(parked_worker["id"])
+                if e["kind"] == "pr_conflict_unresolved"]) == 1
+
+
+def test_the_give_up_reason_survives_the_reconciler(started, project, fake_gh, parked_worker):
+    """`true_blockers` is the only source of attention reasons, and a status missing
+    from BLOCKED_STATUSES has its blockers derived and then never surfaced (spec §5)."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    for _ in range(PR_CONFLICT_MAX_ATTEMPTS + 1):
+        poll(started, store)
+        delivered(store, parked_worker["id"])
+    store.clear_attention(parked_worker["id"])   # as a delivered nudge would have
+
+    violations = list(check_project(store))
+
+    assert [v.invariant for v in violations] == ["INV-ATTENTION-MISSING"]
+    row = store.get_work_order(parked_worker["id"])
+    assert row["needs_attention"]
+    assert row["attention_reason"] == PR_CONFLICT_BLOCKER
+
+
+def test_a_healthy_parked_work_order_is_still_never_flagged(started, project, fake_gh,
+                                                            parked_worker):
+    """`waiting_pr_merge` joined BLOCKED_STATUSES for the conflict case alone; the
+    ordinary merge queue must stay out of the "NEEDS YOU" strip."""
+    fake_gh.set_pr(PR, "OPEN")
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    assert [v.invariant for v in check_project(store)] == []
+    assert not store.get_work_order(parked_worker["id"])["needs_attention"]
+
+
+def test_resolving_the_conflict_clears_it_and_restores_the_budget(started, project,
+                                                                  fake_gh, parked_worker):
+    """The budget is per episode: a branch that conflicts again next week gets three
+    fresh attempts, not attempt four (spec §4)."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    for _ in range(PR_CONFLICT_MAX_ATTEMPTS + 1):
+        poll(started, store)
+        delivered(store, parked_worker["id"])
+    assert store.get_work_order(parked_worker["id"])["needs_attention"]
+
+    fake_gh.set_pr(PR, "OPEN")            # the worker got there in the end
+    poll(started, store)
+
+    row = store.get_work_order(parked_worker["id"])
+    assert not row["needs_attention"]
+    assert true_blockers(store, row) == []
+    assert store.pr_conflict_attempts(parked_worker["id"]) == 0
+    assert any(e["kind"] == "pr_conflict_cleared"
+               for e in store.list_events(parked_worker["id"]))
+
+    conflicting(fake_gh)                  # and it may conflict all over again
+    poll(started, store)
+    assert store.pr_conflict_attempts(parked_worker["id"]) == 1
+
+
+def test_clearing_a_conflict_leaves_an_unrelated_flag_alone(started, project, fake_gh,
+                                                            parked_worker):
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    poll(started, store)
+    delivered(store, parked_worker["id"])
+    store.flag_attention(parked_worker["id"], "something else entirely")
+
+    fake_gh.set_pr(PR, "OPEN")
+    poll(started, store)
+
+    row = store.get_work_order(parked_worker["id"])
+    assert row["needs_attention"]
+    assert row["attention_reason"] == "something else entirely"
+
+
+def test_a_pr_that_merged_after_conflicting_still_completes(started, project, fake_gh,
+                                                            parked_worker):
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    poll(started, store)
+    delivered(store, parked_worker["id"])
+
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-08-22T10:00:00Z")
+    poll(started, store)
+
+    row = store.get_work_order(parked_worker["id"])
+    assert row["status"] == "completed"
+    assert not row["needs_attention"]
+
+
+def test_unknown_mergeability_is_not_a_conflict(started, project, fake_gh, parked_worker):
+    """GitHub computes mergeability lazily and asking is what starts it, so the poll
+    right after a push routinely gets UNKNOWN. Acting on it would nudge a worker whose
+    push has just fixed everything."""
+    fake_gh.set_pr(PR, "OPEN", mergeable="UNKNOWN")
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    assert not store.queued_messages(parked_worker["id"])
+    assert store.pr_conflict_attempts(parked_worker["id"]) == 0
+
+
+def test_unknown_mergeability_does_not_clear_a_conflict_either(started, project,
+                                                              fake_gh, parked_worker):
+    """"Not known to conflict" is not "known to merge"."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    poll(started, store)
+    delivered(store, parked_worker["id"])
+
+    fake_gh.set_pr(PR, "OPEN", mergeable="UNKNOWN")
+    poll(started, store)
+
+    assert store.pr_conflict_attempts(parked_worker["id"]) == 1
+
+
+def test_the_timeline_shows_the_attempts_and_credits_nobody_with_them(
+        started, project, fake_gh, parked_worker):
+    """When the flag finally fires, the user has to see what was already tried without
+    asking — and must not read a message they never wrote as their own (spec §6)."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    for _ in range(PR_CONFLICT_MAX_ATTEMPTS + 1):
+        poll(started, store)
+        delivered(store, parked_worker["id"])
+
+    entries = build_timeline(store.get_work_order(parked_worker["id"]),
+                             store.list_events(parked_worker["id"]),
+                             store.list_messages(parked_worker["id"]))
+    labels = [e["label"] for e in entries]
+
+    assert labels.count("Merge conflict — asked the worker to resolve it") == 3
+    assert "Merge conflict the worker could not resolve — over to you" in labels
+    assert labels.count("Jarvis → worker") == 3
+    assert "You → worker" not in labels
+    assert [e["detail"] for e in entries if e["kind"] == "pr_conflict_nudged"] == [
+        "attempt 1 of 3", "attempt 2 of 3", "attempt 3 of 3"]
+
+
 # -- reading GitHub -----------------------------------------------------------------
 
 
@@ -433,6 +734,27 @@ def test_pr_view_parses_the_state(fake_gh):
     assert pr.merged and not pr.closed_unmerged
     assert pr.merged_at == "2026-08-02T10:00:00Z"
     assert github.pr_view(PR).state == "MERGED"
+
+
+def test_pr_view_reads_mergeability_and_the_base_branch(fake_gh):
+    fake_gh.set_pr(PR, "OPEN", mergeable="CONFLICTING", base_ref="develop")
+
+    pr = github.pr_view(PR)
+
+    assert pr.conflicting and not pr.mergeable_now
+    assert pr.base_ref == "develop"
+    assert github.pr_view(PR).state == "OPEN"
+
+
+def test_a_pr_with_no_mergeability_is_no_conflict(fake_gh):
+    """Merged and closed pull requests answer null, and so must read as "no conflict"
+    rather than crashing the poll that has always only asked about the state."""
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-08-22T10:00:00Z")
+
+    pr = github.pr_view(PR)
+
+    assert not pr.conflicting and not pr.mergeable_now
+    assert pr.mergeable is None
 
 
 def test_pr_view_raises_rather_than_guessing(fake_gh):

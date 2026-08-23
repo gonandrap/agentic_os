@@ -1582,13 +1582,17 @@ class Daemon:
         looks outside the machine, and it exists so the user does not have to type
         `jarvis wo done` after every merge they already performed.
 
-        Three answers, from `github.pr_view`:
+        Four answers, from `github.pr_view`:
 
         * **merged** — the work landed; the work order ends (`ops.complete_merged`).
         * **closed, unmerged** — someone refused the work; it goes to `needs_review`
           and asks for the user (`ops.record_pr_closed`).
-        * **open** — nothing to do, and nothing written. The overwhelmingly common case,
-          so it costs exactly one `gh` call and no database write.
+        * **open and conflicting** — the worker is asked to resolve it, so the user
+          never has to (`ops.nudge_pr_conflict`, and the whole of
+          docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md).
+        * **open and mergeable** — nothing to do, and nothing written unless a conflict
+          episode is being closed. The overwhelmingly common case, so it costs one `gh`
+          call, one indexed read and no write.
 
         Hidden work orders are polled too. Hiding drops a record from listings and the
         attention list; it does not mean the record may go on saying something untrue.
@@ -1631,9 +1635,36 @@ class Daemon:
                     log.info("[%s] %s closed unmerged — %s needs the user",
                              project.name, wo["pr_url"], wo["id"])
                     ops.record_pr_closed(store, wo)
+                elif pr.conflicting:
+                    self.heal_pr_conflict(project, store, wo, pr)
+                elif pr.mergeable_now and ops.clear_pr_conflict(store, wo):
+                    log.info("[%s] %s merges again — %s stopped conflicting",
+                             project.name, wo["pr_url"], wo["id"])
             except Exception:  # noqa: BLE001
                 log.exception("[%s] settling %s against its PR failed", project.name,
                               wo["id"])
+
+    def heal_pr_conflict(self, project: ProjectSpec, store: ProjectStore, wo: dict,
+                         pr: Any) -> None:
+        """A parked pull request that conflicts: ask its worker to resolve it.
+
+        The three guards are all this adds over `ops.nudge_pr_conflict`: no session to
+        resume, a nudge already queued, a turn already in flight. Spec §3 for why each
+        of them would otherwise cost a duplicated turn or silently spend the budget.
+        """
+        from . import ops
+
+        if not wo.get("session_id"):
+            return
+        if store.queued_messages(wo["id"]) or worker_session.busy(store, wo["id"]):
+            return
+        out = ops.nudge_pr_conflict(store, wo, base=pr.base_ref)
+        if out["gave_up"]:
+            log.info("[%s] %s still conflicts after %s attempts — %s needs the user",
+                     project.name, wo["pr_url"], out["attempts"], wo["id"])
+        else:
+            log.info("[%s] %s conflicts — asking %s to resolve (attempt %s)",
+                     project.name, wo["pr_url"], wo["id"], out["attempts"])
 
     def _warn_pr_poll_broken(self, project: ProjectSpec, store: ProjectStore,
                              error: Exception) -> None:

@@ -1365,6 +1365,74 @@ def record_pr_closed(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
             "pr_url": wo.get("pr_url")}
 
 
+#: The nudge the user used to type by hand, written once so it can be complete: what is
+#: wrong, what to do, what NOT to do, and how many attempts are left. Spec §3.
+PR_CONFLICT_NUDGE = """\
+Your pull request {url} has merge conflicts with `{base}` and cannot be merged as it \
+stands. GitHub reports it as CONFLICTING; nobody typed this message, Jarvis noticed \
+while polling for the merge.
+
+Resolve them: in your worktree, `git fetch origin`, merge `origin/{base}` into your \
+branch, fix every conflict, run this project's tests, and push. Do NOT rebase or \
+force-push — a forced branch update is refused by the permission classifier. If the \
+conflict is not resolvable from this branch (for instance the branch it was opened \
+against has itself been merged), say so plainly in your final message rather than \
+fighting it: that is a call for the user.
+
+When the push is done, simply END YOUR TURN. This work order already finished and \
+already has its summary — do NOT call `jarvis wo finish` again. Jarvis parks it back \
+behind the pull request by itself and re-checks the merge.
+
+This is attempt {attempt} of {max_attempts}. After {max_attempts} the work order stops \
+trying and asks the user."""
+
+
+def nudge_pr_conflict(store: ProjectStore, wo: dict[str, Any],
+                      base: str | None = None) -> dict[str, Any]:
+    """GitHub says this pull request conflicts: ask the worker to fix it, or give up.
+
+    Queues the message and records the attempt — delivery, the resume and the return to
+    `waiting_pr_merge` are all existing machinery, and nothing here runs git (spec §3).
+    Past PR_CONFLICT_MAX_ATTEMPTS it stops and flags the user instead, once (spec §4).
+    """
+    attempts = store.pr_conflict_attempts(wo["id"])
+    if attempts >= invariants.PR_CONFLICT_MAX_ATTEMPTS:
+        if not store.pr_conflict_gave_up(wo["id"]):
+            store.add_event(wo["id"], "pr_conflict_unresolved",
+                            {"pr_url": wo.get("pr_url"), "attempts": attempts})
+            store.flag_attention(wo["id"], invariants.PR_CONFLICT_BLOCKER)
+        return {"wo_id": wo["id"], "nudged": False, "attempts": attempts,
+                "gave_up": True}
+    attempt = attempts + 1
+    msg_id = store.queue_message(
+        wo["id"],
+        PR_CONFLICT_NUDGE.format(
+            url=wo.get("pr_url") or "your pull request", base=base or "its base branch",
+            attempt=attempt, max_attempts=invariants.PR_CONFLICT_MAX_ATTEMPTS),
+        # Not "jarvis" and not "user": this message had no author, a poll wrote it, and
+        # the timeline says so (spec §6).
+        source="pr-conflict",
+    )
+    store.add_event(wo["id"], "pr_conflict_nudged",
+                    {"pr_url": wo.get("pr_url"), "base": base, "attempt": attempt,
+                     "of": invariants.PR_CONFLICT_MAX_ATTEMPTS, "msg_id": msg_id})
+    return {"wo_id": wo["id"], "nudged": True, "attempts": attempt, "gave_up": False}
+
+
+def clear_pr_conflict(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """The pull request merges again: close the conflict episode. True if there was one.
+
+    Resets the attempt budget (spec §4) and takes down the give-up flag — but only that
+    one, never a flag raised for something else.
+    """
+    if not store.pr_conflict_attempts(wo["id"]):
+        return False
+    store.add_event(wo["id"], "pr_conflict_cleared", {"pr_url": wo.get("pr_url")})
+    if wo["attention_reason"] == invariants.PR_CONFLICT_BLOCKER:
+        store.clear_attention(wo["id"])
+    return True
+
+
 def _awaiting_merge(wo: dict[str, Any]) -> bool:
     """True when this work order's ending is still a pull request nobody has merged.
 

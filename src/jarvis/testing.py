@@ -574,7 +574,7 @@ if fail:
 if argv[:2] == ["issue", "create"]:
     print(os.environ["FAKE_GH_ISSUE_URL"])
 elif argv[:2] == ["pr", "view"]:
-    # `gh pr view <url> --json state,mergedAt`. The roster comes from the fixture; a URL
+    # `gh pr view <url> --json <fields>`. The roster comes from the fixture; a URL
     # nobody registered gets gh's own "no pull requests found" shape, because a test
     # about an unreadable PR should exercise the same path a real deleted one does.
     prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
@@ -618,11 +618,18 @@ def fake_gh(tmp_path, monkeypatch):
             """Make every subsequent `gh` call fail with `message` on stderr."""
             monkeypatch.setenv("FAKE_GH_FAIL", message)
 
-        def set_pr(self, pr_url: str, state: str,
-                   merged_at: str | None = None) -> None:
+        def set_pr(self, pr_url: str, state: str, merged_at: str | None = None,
+                   mergeable: str | None = None, base_ref: str = "main") -> None:
             """Register what `gh pr view <pr_url>` answers. Re-calling re-states it,
-            which is how a test walks a pull request from OPEN to MERGED."""
-            self.prs[pr_url] = {"state": state, "mergedAt": merged_at}
+            which is how a test walks a pull request from OPEN to MERGED — or from
+            MERGEABLE to CONFLICTING and back.
+
+            `mergeable` defaults to MERGEABLE for an open pull request and to null for
+            any other state, which is what GitHub itself answers."""
+            if mergeable is None:
+                mergeable = "MERGEABLE" if state == "OPEN" else None
+            self.prs[pr_url] = {"state": state, "mergedAt": merged_at,
+                                "mergeable": mergeable, "baseRefName": base_ref}
             monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
 
     return Handle()
