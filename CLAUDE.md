@@ -124,6 +124,16 @@ jarvis wo inject <session-id>              # hand the user's OWN Claude session 
                                            # the user started is theirs. Injecting only
                                            # creates the record — nothing is written into
                                            # the session until a `wo send`/`resume-auto`.
+jarvis validation show <wo-id|fo-id>       # HOW a unit was judged. `wo show` and `fo
+                                           # show` already carry each round — its number,
+                                           # its outcome and the reason the submitter was
+                                           # sent back. This is the deliberation behind
+                                           # them: every seat's verdict, model, latency
+                                           # and raw reply, plus the envelopes the
+                                           # feedback travelled in. On demand only, so
+                                           # nothing pushes it at the user; reach for it
+                                           # when they ask WHY a unit was rejected, not to
+                                           # report that it was. Takes either id.
 jarvis gate list [--pending]               # privileged-action approvals (merge a PR, ship
                                            # a release). Workers attempt these and get
                                            # blocked; Neo reviews and decides, so most

@@ -1043,6 +1043,81 @@ def assume(wo_id: str, content: str) -> dict[str, Any]:
     return {"project": name, "wo_id": wo_id, "recorded": content}
 
 
+def round_line(rnd: dict[str, Any]) -> str:
+    """One validation round on one line: number, fingerprint, outcome, reason.
+
+    A round is NOT deliberation. The number, the outcome and the reason are what the
+    submitter was told, so they belong on every surface a person reads by default; what
+    stays behind `jarvis validation show` is the seats — their verdicts and their raw
+    replies. One formatter, so the CLI's two `show` commands cannot word the same round
+    two different ways.
+    """
+    reason = (rnd.get("reason") or "").strip()
+    return (f"round {rnd['round']} · {rnd['fingerprint']} · {rnd['outcome']}"
+            + (f" — {reason}" if reason else ""))
+
+
+def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
+                      fo_id: str | None = None) -> list[dict[str, Any]]:
+    """One unit's rounds, oldest first, WITHOUT the seats' opinions.
+
+    The projection the default documents carry — `jarvis wo show`, `jarvis fo show` and
+    both dashboard pages. `summary` and `evidence` are dropped along with the opinions:
+    they are a copy of what the unit already says about itself, and a round listing is
+    read to answer "how many times, and what came back", not to re-read the submission.
+    """
+    return [{k: r[k] for k in ("id", "round", "ts", "fingerprint", "outcome", "reason",
+                               "pr_url")}
+            for r in store.validation_rounds(wo_id=wo_id, fo_id=fo_id)]
+
+
+def validation_detail(store: ProjectStore, *, wo_id: str | None = None,
+                      fo_id: str | None = None) -> dict[str, Any]:
+    """THE DELIBERATION on one unit, in full: every round with every seat.
+
+    The on-demand half of the separation every default surface keeps — each seat's
+    verdict, status, model, latency and raw reply, plus the envelopes the review
+    feedback travelled in. Nothing in it is pushed at anyone: `jarvis validation show`
+    asks for it explicitly, and the two dashboard pages fold it shut.
+
+    One function serves both units because a round is the same fact either way. It takes
+    an open store so the pages that already have one do not open a second, and so the
+    CLI and the dashboard cannot drift about what a deliberation contains.
+    """
+    rounds = [{**rnd, "opinions": store.validation_opinions(rnd["id"])}
+              for rnd in store.validation_rounds(wo_id=wo_id, fo_id=fo_id)]
+    envelopes = store.envelopes(subject_wo_id=wo_id, subject_fo_id=fo_id)
+    return {"rounds": rounds, "envelopes": envelopes,
+            # Pulled out rather than left for every reader to filter: an undeliverable
+            # envelope is a failure — feedback that reached nobody — and one that has to
+            # be noticed by scanning a `state` column is one nobody notices.
+            "undeliverable": [e for e in envelopes if e["state"] == "undeliverable"]}
+
+
+def validation_view(unit_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """`validation_detail` for a unit named on the command line, either kind.
+
+    Which unit is being asked about is read off the id — `fo-…` is a feature order,
+    anything else a work order — so the caller never has to say, and one command can
+    serve both.
+    """
+    if unit_id.startswith("fo-"):
+        name, path, row = find_feature_order(unit_id, project_name)
+        subject: dict[str, str | None] = {"fo_id": unit_id}
+        unit = "feature"
+    else:
+        name, path, row = find_work_order(unit_id, project_name)
+        subject = {"wo_id": unit_id}
+        unit = "work_order"
+    store = ProjectStore(path)
+    try:
+        detail = validation_detail(store, **subject)  # type: ignore[arg-type]
+    finally:
+        store.close()
+    return {"project": name, "unit": unit, "id": unit_id,
+            "title": row["title"], "status": row["status"], **detail}
+
+
 def validation_config() -> Any:
     """The OS's validation settings, or None when they cannot be read.
 
@@ -1709,11 +1784,24 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
                 planner = {k: p[k] for k in ("id", "title", "status", "result_summary")}
             except KeyError:
                 planner = None  # deleted out from under it; the link was released
+        # The other session that belongs to this feature without being a piece of its
+        # work. Shaped exactly like the planner and returned next to it, because the two
+        # answer the same question — who is holding this feature, and where do I go to
+        # read them. None for every feature planned with validation off, which is all of
+        # them until someone turns it on.
+        mgr = store.manager_work_order(fo_id)
+        manager = ({k: mgr[k] for k in ("id", "title", "status", "result_summary")}
+                   if mgr else None)
         return {
             "project": name, **fo,
             "plan": plan,
             "plan_text": "\n".join(plans.render_plan(plan)) if plan else "",
             "planner": planner,
+            "manager": manager,
+            # The feature's OWN rounds, never its children's: a child's review is on the
+            # child's page. Empty for every unit that has never been validated, and it
+            # is the emptiness the surfaces branch on — no rounds, no section.
+            "validation_rounds": validation_rounds(store, fo_id=fo_id),
             "children": children,
             "progress": feature_progress(store, fo),
             # Only meaningful next to `max_parallel`, but returned unconditionally so a
@@ -2797,6 +2885,24 @@ def _subproc_spend(groups: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return _call_spend(groups, "subproc")
 
 
+def _priced_group(usage_mod: Any, g: dict[str, Any]) -> Any:
+    """One `agent_call_totals` group at list prices, TTL SPLIT INCLUDED.
+
+    Passing `cache_1h`/`cache_5m` is the whole point of the function: `usage.priced`
+    falls back to the 1.25x floor without them, which under-priced every OS-side call
+    that bought the one-hour cache. Spec: 2026-08-22-the-five-minute-write-everywhere.md.
+
+    `"unknown"` rather than `""` for an uncaptured model: an empty model prices at ZERO
+    in `usage.price_for` (that branch is for `<synthetic>`, never billed), so a real call
+    would silently cost nothing. An unrecognised name falls through to the default rate.
+    """
+    return usage_mod.priced(
+        g.get("model") or "unknown", input=g.get("input") or 0,
+        cache_write=g.get("cache_write") or 0, cache_read=g.get("cache_read") or 0,
+        output=g.get("output") or 0, messages=g.get("calls") or 0,
+        cache_1h=g.get("cache_1h") or 0, cache_5m=g.get("cache_5m") or 0)
+
+
 def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]:
     """Sum and price one class of `agent_calls` groups under `<prefix>_…` keys.
 
@@ -2812,15 +2918,7 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
     calls = failed = 0
     exact = 0.0
     for g in groups:
-        # `"unknown"` rather than `""` for a call whose model was not captured: an empty
-        # model prices at ZERO in `usage.price_for` (that branch is for `<synthetic>`,
-        # a message the CLI generated itself and never billed), and a real call that
-        # silently costs nothing is the exact failure this whole feature is fixing. An
-        # unrecognised name falls through to the default rate instead.
-        u = usage_mod.priced(
-            g.get("model") or "unknown", input=g.get("input") or 0,
-            cache_write=g.get("cache_write") or 0, cache_read=g.get("cache_read") or 0,
-            output=g.get("output") or 0, messages=g.get("calls") or 0)
+        u = _priced_group(usage_mod, g)
         total = total + u
         calls += g.get("calls") or 0
         failed += g.get("failed") or 0
@@ -2841,6 +2939,10 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
         f"{prefix}_billed_input": total.billed_input,
         f"{prefix}_output": total.output,
         f"{prefix}_total_tokens": total.total_tokens,
+        # Carried up for the footer's write-TTL line; see `_write_ttl`.
+        f"{prefix}_cache_write": total.cache_write,
+        f"{prefix}_cache_1h": total.cache_1h,
+        f"{prefix}_cache_5m": total.cache_5m,
         # Dearest first: the whole point of the split is to say where the spend goes.
         f"{prefix}_by_kind": sorted(by_kind.values(), key=lambda k: -k["cost_usd"]),
     }
@@ -3070,8 +3172,30 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "subagent_cost_usd": round(sum(u["subagent_cost_usd"] for u in measured), 2),
             "output": sum(u["output"] for u in measured),
             "billed_input": sum(u["billed_input"] for u in measured),
+            **_write_ttl(measured, units),
         },
     }
+
+
+def _write_ttl(measured: list[dict[str, Any]], units: list[dict[str, Any]]
+               ) -> dict[str, int]:
+    """Cache-write tokens and their TTL split, over every class of spend on the report.
+
+    One figure for worker and OS spend together: the two were switched to the 5-minute
+    write ten days apart, so a total speaking for one of them would read as all-clear
+    while half the bill was still at 2x (spec:
+    2026-08-22-the-five-minute-write-everywhere.md).
+
+    `measured` for the transcript half (a unit whose transcript is gone has no split to
+    contribute), `units` for the recorded halves, which survive transcript pruning — the
+    same asymmetry `_rollup` applies to every other figure it sums.
+    """
+    out = {"cache_write": 0, "cache_1h": 0, "cache_5m": 0}
+    for key in out:
+        out[key] = (sum(u.get(key) or 0 for u in measured)
+                    + sum((u.get(f"os_{key}") or 0) + (u.get(f"subproc_{key}") or 0)
+                          for u in units))
+    return out
 
 
 def _cost_for_target(target: str, project: str | None,
@@ -3190,10 +3314,7 @@ def _subproc_detail(groups: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
 
     out = []
     for g in groups:
-        u = usage_mod.priced(
-            g.get("model") or "unknown", input=g.get("input") or 0,
-            cache_write=g.get("cache_write") or 0, cache_read=g.get("cache_read") or 0,
-            output=g.get("output") or 0, messages=g.get("calls") or 0)
+        u = _priced_group(usage_mod, g)
         out.append({
             "label": g.get("label") or "claude -p", "model": g.get("model") or "",
             "calls": g.get("calls") or 0, "failed": g.get("failed") or 0,

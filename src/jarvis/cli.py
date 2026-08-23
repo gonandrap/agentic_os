@@ -35,6 +35,25 @@ def _print(data: Any, as_json: bool) -> None:
         _pretty(data)
 
 
+def _readable_rounds(detail: dict[str, Any]) -> dict[str, Any]:
+    """A unit's document with its validation rounds collapsed to one line each.
+
+    HUMAN output only, and the same trick `_with_readable_digest` plays: `--json` gets
+    the rows as they are stored, because other tooling reads them, while a person gets
+    "round 1 · a1b2 · rejected — no test touches the new branch" instead of a nested
+    block per round. A unit that has never been validated loses the key altogether, so
+    its document reads exactly as it did before rounds existed — which is every unit in
+    a fleet that has not turned validation on.
+    """
+    from . import ops
+
+    row = dict(detail)
+    rounds = row.pop("validation_rounds", None) or []
+    if rounds:
+        row["validation_rounds"] = [ops.round_line(r) for r in rounds]
+    return row
+
+
 def _with_readable_digest(q: dict[str, Any]) -> dict[str, Any]:
     """A Neo question row with its dashboard digest decoded, for HUMAN output only.
 
@@ -531,6 +550,20 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--reason", required=True,
                    help="what supersedes it — this is kept beside the learning for ever")
 
+    # validation ----------------------------------------------------------------------
+    # The deliberation, on demand and nowhere else. `wo show` and `fo show` carry the
+    # ROUNDS — number, outcome, reason — because that is what the unit was told; what
+    # lives here is what the seats said, which nobody is made to read.
+    va = sub.add_parser(
+        "validation", help="how the validation panel judged a work or feature order"
+    ).add_subparsers(dest="validation_cmd", required=True)
+    v = va.add_parser("show", help="every round in full: each seat's verdict, model, "
+                                   "latency and raw reply")
+    # One command for both units: a round is the same fact either way, and the id says
+    # which one it is (`fo-…` is a feature order, anything else a work order).
+    v.add_argument("unit_id", metavar="WO_ID|FO_ID")
+    v.add_argument("--project")
+
     # notifications ----------------------------------------------------------------------------
     n = sub.add_parser("notify", help="emit a notification into the OS pipeline")
     n.add_argument("title")
@@ -765,6 +798,27 @@ def _print_turn_table(res: dict) -> None:
             line += (f" ({100 * rec['context_peak'] / rec['context_window']:.0f}% of "
                      f"the {_tok(rec['context_window'])} window)")
         print(f"\n{line}")
+
+
+def _print_write_ttl(totals: dict) -> None:
+    """What the fleet paid to WRITE to the prompt cache, and at which of the two rates.
+
+    Silent when the whole line was at 1.25x: a report that says "all good" every run is a
+    line readers stop seeing. The rate is derived from the split rather than restated from
+    a constant, so it says what was PAID (kn-2e0a6317). Spec:
+    2026-08-22-the-five-minute-write-everywhere.md.
+    """
+    from . import usage as usage_mod
+
+    write, hour = totals.get("cache_write") or 0, totals.get("cache_1h") or 0
+    if not write or not hour:
+        return
+    rate = usage_mod.write_rate(write, hour, totals.get("cache_5m") or 0)
+    print(f"  cache write   {_tok(write)} tokens at {rate:.2f}x base input — "
+          f"{_tok(hour)} of it bought the ONE-HOUR TTL (2x) rather than the "
+          f"five-minute one (1.25x)")
+    print("                every path Jarvis launches now forces the 5-minute write, "
+          "so a figure here is spend that predates that or a `claude` it did not start")
 
 
 def _print_os_calls(res: dict) -> None:
@@ -1080,6 +1134,7 @@ def cmd_cost(args: argparse.Namespace) -> int:
               f"{totals['resume_boundaries']} turn boundaries")
     if totals["subagent_cost_usd"]:
         print(f"  subagents     ~${totals['subagent_cost_usd']:.2f}")
+    _print_write_ttl(totals)
     unattributed = res.get("os_unattributed") or {}
     if unattributed.get("os_calls"):
         print(f"  OS overhead   ~${unattributed['os_cost_usd']:.2f} — "
@@ -1218,10 +1273,14 @@ def cmd_wo(args: argparse.Namespace) -> int:
                                        "decided_by", "decision_reason")}
                     for a in store.list_approvals(args.wo_id)
                 ],
+                # Additive, and always present under `--json` even when empty: a key
+                # that comes and goes is one every consumer has to guard. The seats'
+                # replies are NOT here — see `jarvis validation show`.
+                "validation_rounds": ops.validation_rounds(store, wo_id=args.wo_id),
             }
         finally:
             store.close()
-        _print(detail, args.json)
+        _print(_readable_rounds(detail) if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
         _print(ops.send_message(args.wo_id, args.message, source=args.source,
@@ -1314,6 +1373,15 @@ def cmd_fo(args: argparse.Namespace) -> int:
             if detail["planner"]:
                 p = detail["planner"]
                 print(f"planner: {p['id']} ({p['status']})")
+            # Next to the planner, because they are the same question: who holds this
+            # feature. Absent, and silent, for a feature planned with validation off.
+            if detail["manager"]:
+                m = detail["manager"]
+                print(f"manager: {m['id']} ({m['status']})")
+            if detail["validation_rounds"]:
+                print("\nvalidation:")
+                for rnd in detail["validation_rounds"]:
+                    print(f"  {ops.round_line(rnd)}")
             if detail["plan_text"]:
                 print(f"\nplan:\n{detail['plan_text']}")
             if detail["max_parallel"]:
@@ -1793,6 +1861,56 @@ def cmd_neo(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_validation(args: argparse.Namespace) -> int:
+    """`jarvis validation show <id>` — the panel's whole deliberation on one unit.
+
+    Modelled on `neo show --panel`, including what it does with nothing to show: a unit
+    that has never been validated gets a plain sentence saying so, not an empty
+    structure. A reader who runs this on a fleet with validation switched off — which is
+    every fleet until someone turns it on — is owed an answer, and "no rounds" printed
+    as `[]` reads like a bug in the command.
+    """
+    from . import ops
+
+    view = ops.validation_view(args.unit_id, args.project)
+    if args.json:
+        _print(view, True)
+        return 0
+
+    unit = "feature order" if view["unit"] == "feature" else "work order"
+    print(f"{view['id']} [{view['project']}] {view['title']} "
+          f"({unit}, {view['status']})")
+    if not view["rounds"]:
+        print(f"\nno validation has run on this {unit} — the panel judges a unit when "
+              f"it submits its evidence, and it ships disabled "
+              f"(`os.validation.enabled`)")
+    for rnd in view["rounds"]:
+        print(f"\n{ops.round_line(rnd)}")
+        if rnd["evidence"]:
+            print(f"  evidence: {rnd['evidence']}")
+        for o in rnd["opinions"]:
+            print(f"  {o['seat']:<10} {o['status']:<9} "
+                  f"verdict={o['verdict'] or '—':<7} "
+                  f"{o['latency_ms']}ms  {o['model'] or '—'}")
+            for line in (o["reply"] or "").splitlines():
+                print(f"      {line}")
+        if not rnd["opinions"]:
+            print("  no seat opined on this round")
+    # The bus, on the same page as the rounds it carried. Delivered envelopes are
+    # routine and live here rather than in any default listing; an UNDELIVERABLE one is
+    # a failure, so it is also flagged where nobody has to go looking — `jarvis doctor`
+    # and the unit's own page.
+    if view["envelopes"]:
+        print("\nenvelopes:")
+        for e in view["envelopes"]:
+            mark = "✗" if e["state"] == "undeliverable" else "·"
+            note = f" — {e['note']}" if e["note"] else ""
+            print(f"  {mark} {e['kind']} to role {e['to_role']} · {e['state']}"
+                  f"{' → ' + e['delivered_wo_id'] if e['delivered_wo_id'] else ''}"
+                  f"{note}")
+    return 0
+
+
 def cmd_notify(args: argparse.Namespace) -> int:
     """Write to the project outbox (daemon routes it), falling back to the central
     inbox when the project isn't identifiable."""
@@ -1920,6 +2038,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_learn(args)
         if args.cmd == "neo":
             return cmd_neo(args)
+        if args.cmd == "validation":
+            return cmd_validation(args)
         if args.cmd == "notify":
             return cmd_notify(args)
         if args.cmd == "inbox":
