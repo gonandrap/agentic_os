@@ -1043,7 +1043,80 @@ def assume(wo_id: str, content: str) -> dict[str, Any]:
     return {"project": name, "wo_id": wo_id, "recorded": content}
 
 
-def finish(wo_id: str, summary: str, pr_url: str | None = None) -> dict[str, Any]:
+def validation_config() -> Any:
+    """The OS's validation settings, or None when they cannot be read.
+
+    Best-effort on purpose, and it is `os_status`'s pattern rather than a new one: a
+    worker calling `jarvis wo finish` from a checkout whose catalog has moved, or with
+    no catalog registered at all, must still be able to finish. No catalog means no
+    validation, which is the shipped default anyway.
+    """
+    try:
+        return resolve_catalog().os.validation
+    except (OpsError, CatalogError, OSError):
+        return None
+
+
+def land_finished(store: ProjectStore, wo: dict[str, Any],
+                  pr_url: str | None = None) -> str:
+    """Where a work order that has genuinely finished lands, and the backlog item it
+    closes on the way. Shared by `finish` and by the round machine's PASS.
+
+    One function because there are now two routes to the same ending, and they must not
+    drift: the day validation is enabled, a work order that passes has to land exactly
+    where the same work order lands with the feature switched off — `waiting_pr_merge`
+    with a pull request, `completed` without one, and the backlog item closed in the
+    `completed` case only.
+    """
+    wo_id = wo["id"]
+    pr_url = pr_url or wo.get("pr_url") or None
+    status = "waiting_pr_merge" if pr_url else "completed"
+    store.set_status(wo_id, status)
+    store.clear_attention(wo_id)
+    if wo.get("backlog_id") and status == "completed":
+        central = CentralStore()
+        try:
+            central.mark_backlog(wo["backlog_id"], "done")
+        finally:
+            central.close()
+    return status
+
+
+def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str, Any],
+                          *, declared: str, cfg: Any) -> dict[str, Any]:
+    """Open a validation round over what this work order has produced.
+
+    Collects the evidence, fingerprints it, opens the round and parks the work order in
+    `validating`. It judges nothing: the daemon runs the validator off its tick thread
+    and settles what comes back.
+
+    **The round number is COUNTED, not derived from the row count** — a submission that
+    is retried while its round is still open, or one that follows a transport outage,
+    reuses the number it already has. The insert is idempotent per (work order, round),
+    so two callers racing here produce one round rather than two.
+    """
+    from . import evidence as evidence_mod
+
+    packet = evidence_mod.collect_work_order(
+        project_path, wo, declared=declared, diff_chars=cfg.diff_chars)
+    nxt = store.counted_validation_rounds(wo_id=wo["id"]) + 1
+    round_row = store.open_validation_round(
+        wo_id=wo["id"], fingerprint=evidence_mod.fingerprint(packet),
+        summary=str(wo.get("result_summary") or ""), evidence=declared,
+        pr_url=wo.get("pr_url"), round=nxt)
+    store.set_status(wo["id"], "validating")
+    # No attention flag: a unit under review is the system working. Only the give-up
+    # transition flags anyone.
+    store.clear_attention(wo["id"])
+    store.add_event(wo["id"], "validation_submitted",
+                    {"round": round_row["round"], "round_id": round_row["id"],
+                     "fingerprint": round_row["fingerprint"],
+                     "files": len(packet.files)})
+    return round_row
+
+
+def finish(wo_id: str, summary: str, pr_url: str | None = None,
+           evidence: str = "") -> dict[str, Any]:
     """The worker reporting its own result.
 
     `pr_url` is what separates "delivered" from "delivered and merged": a work order
@@ -1058,36 +1131,38 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None) -> dict[str, Any
     and a PR the user merges before deciding them accepts them by the back door. That
     makes `review_work_order` the only route back for such a work order, and it is that
     function's job to do the parking skipped here.
+
+    `evidence` is the worker's own account of how it tested the change, and it is
+    OPTIONAL: every worker in flight when this shipped predates the flag, so an empty
+    one is an ordinary submission and not a thin one.
+
+    **This is the one place `os.validation.enabled` is read**, and it gates OPENING a
+    round and nothing else. A flag turned off while rounds are open must still let the
+    daemon judge and settle them — otherwise the only control the user has over a
+    misbehaving panel would strand every unit already inside it.
     """
-    name, path, wo = find_work_order(wo_id)
+    name, path, _wo = find_work_order(wo_id)
+    cfg = validation_config()
     store = ProjectStore(path)
     try:
         fields: dict[str, Any] = {"result_summary": summary}
         if pr_url:
             fields["pr_url"] = pr_url
         store.update_work_order(wo_id, **fields)
+        fresh = store.get_work_order(wo_id)
         if store.pending_assumptions(wo_id):
             store.set_status(wo_id, "needs_review")
             store.flag_attention(wo_id, "assumptions pending review")
             status = "needs_review"
-        elif pr_url:
-            store.set_status(wo_id, "waiting_pr_merge")
-            store.clear_attention(wo_id)
-            status = "waiting_pr_merge"
+        elif cfg is not None and cfg.enabled:
+            submit_for_validation(store, path, fresh, declared=evidence, cfg=cfg)
+            status = "validating"
         else:
-            store.set_status(wo_id, "completed")
-            store.clear_attention(wo_id)
-            status = "completed"
+            status = land_finished(store, fresh, pr_url)
         store.add_event(wo_id, "finished", {"summary": summary,
                                             **({"pr_url": pr_url} if pr_url else {})})
     finally:
         store.close()
-    if wo.get("backlog_id") and status == "completed":
-        central = CentralStore()
-        try:
-            central.mark_backlog(wo["backlog_id"], "done")
-        finally:
-            central.close()
     return {"project": name, "wo_id": wo_id, "status": status,
             **({"pr_url": pr_url} if pr_url else {})}
 
@@ -2436,6 +2511,59 @@ def show_gate(approval_id: int, project_name: str | None = None) -> dict[str, An
         finally:
             neo.close()
     return {**approval, "project": name, "neo_question": question}
+
+
+# -- deferral ------------------------------------------------------------------------------------
+
+def defer(wo_id: str, title: str, why: str, description: str = "",
+          neo_question_id: int | None = None,
+          project_name: str | None = None) -> dict[str, Any]:
+    """(Workers) hand work found on the way to whoever owns deciding about it.
+
+    ONE post, and then it returns. Read the list of things this deliberately does NOT do,
+    because every one of them is a thing it would be natural to add and each would break
+    the same rule:
+
+    * it does not look at `parent_id` to see whether this work order has a feature;
+    * it does not look for a project manager;
+    * it does not call `CentralStore.add_backlog`;
+    * it does not name a work order as the recipient.
+
+    A sender that asked "does the recipient exist?" would be a sender coupled to its
+    recipient, and it would have to be edited again the day a second kind of recipient
+    appears. `bus.deliver` owns all of that: it reaches the manager if the feature has
+    one, and files the backlog item itself if not — which is the overwhelmingly common
+    case and is exactly today's behaviour.
+
+    The return value says the deferral was submitted and deliberately does not say what
+    happened to it. The worker must not depend on the outcome, so it is not told one.
+    """
+    from . import bus
+
+    if not why.strip():
+        raise OpsError(
+            "--why is the whole argument for deferring: it is what a reader sees months "
+            "later when deciding whether the item is still worth doing")
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        env_id = bus.post(
+            store, subject=bus.Subject(wo_id=wo_id), from_role="implementor",
+            to_role="manager",
+            payload=bus.DeferralRequest(title=title, why=why,
+                                        neo_question_id=neo_question_id,
+                                        description=description))
+        # On the work order's own record, because nobody reads worker transcripts and a
+        # deferral is a decision about scope: the timeline is where the user finds out
+        # this work order decided something was not its job.
+        store.add_event(wo_id, "deferral_submitted",
+                        {"title": title, "why": why, "envelope_id": env_id,
+                         "neo_question_id": neo_question_id})
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "envelope_id": env_id, "title": title,
+            "note": "deferral submitted — it is out of your hands now; carry on with "
+                    "your work order"}
 
 
 # -- backlog ------------------------------------------------------------------------------------

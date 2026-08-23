@@ -322,8 +322,13 @@ def contract_section(wo_id: str = WO_PLACEHOLDER,
         f"trail anyone gets. An assumption is a disclosure of something you were "
         f"SURE about. It is never a guess you are hoping nobody checks — if you "
         f"are guessing, ask instead.",
-        f"- File deferred work instead of leaving notes: `jarvis backlog add "
-        f"{project} \"...\"`",
+        f"- Found work that is real but is not THIS work order's job? Do not file "
+        f"it yourself and do not leave a note: `jarvis wo defer {wo_id} \"<title>\" "
+        f"--why \"<why it should not be done now>\"` (add `--neo-question <id>` if "
+        f"you agreed the deferral with Neo, `-d` to brief whoever picks it up). That "
+        f"is the whole action — the OS decides where it lands, records which work "
+        f"order suggested it, and tells you nothing back, because nothing you do "
+        f"next should depend on the answer.",
         f"- READ the OS knowledge base on demand: `jarvis learn show <id>` for an "
         f"entry your prompt's index lists, `jarvis learn search \"<term>\" "
         f"--project {project}` to sweep for one. Look up any area you are about to "

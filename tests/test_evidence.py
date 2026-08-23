@@ -357,11 +357,17 @@ def test_the_module_imports_nothing_that_could_have_seen_the_work():
         assert forbidden not in found
 
 
-def test_nothing_in_the_os_imports_the_new_leaf_yet():
-    """This work order ships a leaf. A caller appearing here means a later work order
-    wired it in and this assertion is the one to update, deliberately."""
+def test_only_the_round_machine_collects_evidence():
+    """The packet has exactly two callers, and they are the two halves of one round.
+
+    `ops` collects it when a submission opens a round; `daemon` collects it again on its
+    own thread when that round is judged. Anything else appearing here is a module that
+    has started forming its own opinion about what a work order changed — which is the
+    coupling this leaf exists to avoid — so the list is asserted whole rather than
+    "nothing imports it".
+    """
     src = Path(evidence.__file__).parent
     names = {".evidence", "jarvis.evidence"}
     importers = [p.name for p in sorted(src.glob("*.py"))
                  if p.name != "evidence.py" and _imports(p) & names]
-    assert importers == []
+    assert importers == ["daemon.py", "ops.py"]
