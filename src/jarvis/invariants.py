@@ -54,7 +54,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # start, and only the user can choose between cancelling it and cutting the edge.
 # This tuple must cover every status `true_blockers` can return a blocker for, or the
 # blocker is derived correctly and then never surfaced.
-BLOCKED_STATUSES = ("waiting_input", "needs_review", "failed", "pending")
+BLOCKED_STATUSES = ("waiting_input", "needs_review", "failed", "pending",
+                    # `waiting_pr_merge` is silent in the ordinary case and returns no
+                    # blockers below — it is here for the one state that does, the
+                    # conflict the worker could not resolve (spec §5).
+                    "waiting_pr_merge")
 # Statuses where nothing can possibly be pending: the work order is over.
 TERMINAL_STATUSES = ("completed", "cancelled")
 
@@ -64,6 +68,18 @@ TERMINAL_STATUSES = ("completed", "cancelled")
 #: derive, so a reason raised by `Daemon.poll_pull_requests` and not repeated here would
 #: silently become "finished without a completion signal" on the next reconcile tick.
 PR_CLOSED_BLOCKER = "pull request closed without merging — the work was not accepted"
+
+#: How many times the OS asks a worker to resolve the same merge conflict before it
+#: asks the user instead. See §4 of
+#: docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md.
+PR_CONFLICT_MAX_ATTEMPTS = 3
+
+#: What a work order says when its pull request conflicts and the worker could not fix
+#: it in PR_CONFLICT_MAX_ATTEMPTS attempts — the ONE thing that makes a
+#: `waiting_pr_merge` work order an attention item (spec §4). Re-derived below from the
+#: work order's own timeline, under the same obligation as PR_CLOSED_BLOCKER (spec §5).
+PR_CONFLICT_BLOCKER = ("merge conflicts the worker could not resolve — the pull request "
+                       "needs you")
 
 #: What a work order says when the validation panel gave up on it: it kept resubmitting
 #: and the panel kept rejecting, until the round budget ran out. Nothing automatic is
@@ -214,6 +230,12 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
             blockers.append(VALIDATION_STUCK_BLOCKER)
         else:
             blockers.append("finished without a completion signal — review the session")
+    # A pull request that cannot be merged and could not be healed — the whole reason
+    # `waiting_pr_merge` is in BLOCKED_STATUSES at all (spec §5). The query sits behind
+    # the status check so no other work order pays for it.
+    if wo["status"] == "waiting_pr_merge" and \
+            store.pr_conflict_attempts(wo["id"]) >= PR_CONFLICT_MAX_ATTEMPTS:
+        blockers.append(PR_CONFLICT_BLOCKER)
     # What the user has already looked at and dismissed stops being a blocker — but only
     # exactly that. Anything new still gets through (a pending assumption never can be
     # acknowledged away; `jarvis wo ack` refuses).

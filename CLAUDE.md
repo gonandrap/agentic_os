@@ -104,6 +104,13 @@ jarvis wo done <id>                        # the user closing it: the work is fi
                                            # once, in the inbox). A PR CLOSED unmerged
                                            # goes to `needs_review` and asks for you:
                                            # the work was delivered and refused.
+                                           # NEVER tell a parked order to go and resolve
+                                           # its merge conflicts — the same poll sees
+                                           # CONFLICTING and asks the worker itself, up
+                                           # to three times. It only reaches you if all
+                                           # three failed, and then the attention line
+                                           # says so and the timeline shows what was
+                                           # tried.
 jarvis wo hide <id> / unhide <id>          # declutter: keeps the record, drops it from
                                            # listings, the summary and the attention list
 jarvis wo delete <id> --yes                # irreversible: erases the WO and its whole
