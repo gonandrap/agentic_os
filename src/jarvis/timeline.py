@@ -217,6 +217,11 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any],
         return ("Validation could not be run — the reviewer was unreachable",
                 f"attempt {attempt}: {p.get('error') or ''}" if attempt
                 else (p.get("error") or ""))
+    if kind == "deferral_submitted":
+        # The worker deciding something is not its job is a scope decision, and the
+        # timeline is the only place the user ever sees it: the item itself lands on the
+        # backlog, where nothing points back at this work order's story.
+        return ("Deferred something out of scope", p.get("title") or "")
     if kind == "finished":
         return "Finished", p.get("summary") or ""
     if kind == "marked_done":
