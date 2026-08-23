@@ -522,8 +522,7 @@ def test_neo_tab_lists_questions_still_with_neo(client, daemon, project):
 
     r = client.get("/neo")
     assert r.status_code == 200
-    assert "1 queued" in r.text
-    assert "With Neo right now" in r.text
+    assert "With Neo right now" in r.text  # the block, not the count line it replaced
     assert "CSV or JSON?" in r.text          # the question itself, not just a count
     assert f"/wo/proj_a/{wo['id']}" in r.text  # traceable back to the parked worker
 

@@ -321,45 +321,4 @@
 </section>
 </div>
 
-<script>
-// Tabs. Nothing is hidden until `.js` is on the container — §6.
-(function () {
-  var root = document.getElementById('wo-tabs');
-  if (!root) return;
-  var tabs = root.querySelectorAll('.tabs button');
-  var panels = root.querySelectorAll('.tabpanel');
-
-  function show(id) {
-    var found = false;
-    panels.forEach(function (p) {
-      var on = p.id === id;
-      p.classList.toggle('on', on);
-      found = found || on;
-    });
-    if (!found) return false;
-    tabs.forEach(function (t) {
-      t.setAttribute('aria-selected', t.dataset.panel === id ? 'true' : 'false');
-    });
-    return true;
-  }
-
-  root.classList.add('js');
-  tabs.forEach(function (t) {
-    t.addEventListener('click', function () { show(t.dataset.panel); });
-  });
-
-  // Open whichever panel holds the hash target. On load AND on hashchange — §6.
-  function follow() {
-    var id = location.hash.slice(1);
-    if (!id) return;
-    var target = document.getElementById(id);
-    if (!target) return;
-    var panel = target.closest('.tabpanel');
-    if (panel && show(panel.id)) target.scrollIntoView();
-  }
-  follow();
-  window.addEventListener('hashchange', follow);
-})();
-</script>
-
 {% endblock %}

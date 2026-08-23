@@ -675,7 +675,6 @@ def create_app() -> FastAPI:
         from ..neo_store import NeoStore
         neo = NeoStore()
         try:
-            counts = neo.counts()
             # Oldest first: that is the order Neo drains them, and the oldest is the
             # one most likely to be stuck.
             in_flight = list(reversed(
@@ -702,7 +701,7 @@ def create_app() -> FastAPI:
             neo.close()
         for q in escalated + unreviewed:
             _decorate_question(q)
-        return render(request, "neo.html", active="neo", counts=counts,
+        return render(request, "neo.html", active="neo",
                       in_flight=in_flight, escalated=escalated,
                       unreviewed=unreviewed, history=history, learnings=learnings,
                       opinions=opinions, digest_credit=_digest_credit())
@@ -871,16 +870,16 @@ def create_app() -> FastAPI:
             ops.neo_review(question_id, approved=(decision == "approve"),
                            feedback=feedback)
         except ops.OpsError as e:
-            return RedirectResponse(f"/neo?error={e}", status_code=303)
-        return RedirectResponse("/neo", status_code=303)
+            return RedirectResponse(f"/neo?error={e}#tab-review", status_code=303)
+        return RedirectResponse("/neo#tab-review", status_code=303)
 
     @app.post("/neo/{question_id}/answer")
     def neo_answer(question_id: int, text: str = Form(...)):
         try:
             ops.neo_answer_escalated(question_id, text)
         except ops.OpsError as e:
-            return RedirectResponse(f"/neo?error={e}", status_code=303)
-        return RedirectResponse("/neo", status_code=303)
+            return RedirectResponse(f"/neo?error={e}#tab-escalated", status_code=303)
+        return RedirectResponse("/neo#tab-escalated", status_code=303)
 
     @app.post("/neo/learn")
     def neo_learn(content: str = Form(...), project: str = Form("")):
@@ -890,7 +889,7 @@ def create_app() -> FastAPI:
             neo.add_learning(content, project=project, source="manual")
         finally:
             neo.close()
-        return RedirectResponse("/neo", status_code=303)
+        return RedirectResponse("/neo#tab-learnings", status_code=303)
 
     @app.post("/gates/{approval_id}/decide")
     def decide_gate(approval_id: int, decision: str = Form(...),
