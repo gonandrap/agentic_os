@@ -1396,37 +1396,42 @@ class ProjectStore:
     # -- assumptions -----------------------------------------------------------
 
     def add_assumption(self, wo_id: str, content: str) -> int:
+        n = 1 + int(self.conn.execute(
+            "SELECT COUNT(*) FROM assumptions WHERE wo_id=?", (wo_id,)
+        ).fetchone()[0])
         cur = self.conn.execute(
             "INSERT INTO assumptions (wo_id, ts, content) VALUES (?,?,?)",
             (wo_id, db.now(), content),
         )
-        self.add_event(wo_id, "assumption", {"content": content})
+        self.add_event(wo_id, "assumption", {"content": content, "n": n})
         return int(cur.lastrowid)
 
     def pending_assumptions(self, wo_id: str | None = None) -> list[dict[str, Any]]:
         if wo_id:
-            rows = self.conn.execute(
-                "SELECT * FROM assumptions WHERE status='pending' AND wo_id=? ORDER BY ts", (wo_id,)
-            ).fetchall()
-        else:
-            # Fleet-wide view: assumptions of hidden work orders aren't asking for review.
-            rows = self.conn.execute(
-                """SELECT a.* FROM assumptions a JOIN work_orders w ON w.id = a.wo_id
-                   WHERE a.status='pending' AND w.hidden=0 ORDER BY a.ts"""
-            ).fetchall()
+            return [a for a in self.all_assumptions(wo_id) if a["status"] == "pending"]
+        # Fleet-wide view: assumptions of hidden work orders aren't asking for review.
+        # No `n` here — a number only means anything beside its own work order's list.
+        rows = self.conn.execute(
+            """SELECT a.* FROM assumptions a JOIN work_orders w ON w.id = a.wo_id
+               WHERE a.status='pending' AND w.hidden=0 ORDER BY a.ts"""
+        ).fetchall()
         return db.rows_to_dicts(rows)
 
     def all_assumptions(self, wo_id: str) -> list[dict[str, Any]]:
-        """Every assumption of a work order, reviewed or not.
+        """Every assumption of a work order, reviewed or not, each numbered from 1.
 
         `pending_assumptions` answers "what does the user still owe a decision on";
         this answers "what was ever recorded", which is what the persistence invariant
         has to compare the timeline against.
+
+        `n` is a position, never the row id, and is derived here rather than stored so
+        that rows written before it existed still have one. See §4 of
+        docs/superpowers/specs/2026-08-23-the-work-order-record.md.
         """
         rows = self.conn.execute(
-            "SELECT * FROM assumptions WHERE wo_id=? ORDER BY ts", (wo_id,)
+            "SELECT * FROM assumptions WHERE wo_id=? ORDER BY ts, id", (wo_id,)
         ).fetchall()
-        return db.rows_to_dicts(rows)
+        return [{**a, "n": i} for i, a in enumerate(db.rows_to_dicts(rows), start=1)]
 
     def review_assumption(self, assumption_id: int, status: str) -> None:
         assert status in ("accepted", "rejected"), status

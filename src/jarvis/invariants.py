@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from . import db, worker_session
-from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS
+from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS, DEFAULT_VALIDATION_TIMEOUT
 from .neo_store import USER_HELD_Q_STATUSES
 from .project_store import (
     ACTIVE_STATUSES,
@@ -307,6 +307,48 @@ def status_label(store: ProjectStore, wo: dict[str, Any]) -> str:
     return "pending"
 
 
+#: How long past its own deadline a paused turn may sit before the OS says so.
+#: `Daemon.retry_paused_turns` runs every `RETRY_EVERY_TICKS` ticks — about ten seconds
+#: — so this is two orders of magnitude of slack: long enough that a busy tick or a
+#: momentarily unreachable CLI never cries wolf, short enough that nobody loses an
+#: evening to it. See `check_paused_turns_resume`.
+PAUSE_OVERDUE_GRACE = 15 * 60
+
+
+def _clock(ts: float) -> str:
+    """A moment as the reader's own clock reads it, WITH THE DATE unless it is today.
+
+    A bare "%H:%M" is only unambiguous within the day it is written, and the pause note
+    is read exactly where that breaks. Through the twelve hours wo-b4f207ad was stuck the
+    dashboard promised "retrying by itself at 12:00" while meaning the NEXT day's noon,
+    which is why the user believed the retry was overdue rather than mis-scheduled (PR
+    129). The parse that caused that is fixed, but the ambiguity is not the parse: a
+    7-day window legitimately resets days out ("resets Aug 29, 9:50am") and would still
+    render as a bare "09:50" tomorrow.
+
+    Local wall-clock, not the timezone the CLI quoted: the reader is at this machine, and
+    a time they have to convert is a time they will misread.
+
+    "Today" is read through `time.time()` rather than by calling `time.localtime()` with
+    no argument. Same answer in production, and NOT the same thing: the no-argument form
+    reads the C clock directly, so it is a SECOND clock this function cannot be told
+    about — a caller that pins one of them moves half of the comparison and gets an
+    answer belonging to neither. That is the same two-clocks-for-one-question mistake as
+    the bug this whole change exists to fix, so there is one clock here.
+    """
+    when = time.localtime(ts)
+    if when[:3] == time.localtime(time.time())[:3]:
+        return time.strftime("%H:%M", when)
+    return time.strftime("%H:%M on %a %d %b", when)
+
+
+def _span(seconds: float) -> str:
+    """A duration in the coarsest unit that still says something — "8h", "12m"."""
+    if seconds >= 3600:
+        return f"{seconds / 3600:.0f}h"
+    return f"{max(seconds, 60) / 60:.0f}m"
+
+
 def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
     """Why this work order is not moving and when it will move again — or "" normally.
 
@@ -317,9 +359,9 @@ def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
     midnight is owed the reason nothing is happening, and the time it will happen again.
 
     Every surface renders this one string (the CLI through `status_label`, the dashboard
-    through `ops.os_status`) so they cannot disagree about the answer. Local wall-clock,
-    not the timezone the CLI quoted: the reader is at this machine, and a time they have
-    to convert is a time they will misread.
+    through `ops.os_status`) so they cannot disagree about the answer. `_clock` carries
+    the date whenever the retry is not today, which a usage window over 24h out and every
+    7-day reset genuinely is.
 
     The transient line names the attempt as well as the clock, because unlike a usage
     window — which reopens once, at a stated time — a backoff can be on its fourth of
@@ -330,7 +372,7 @@ def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
     pause = worker_session.turn_pause(store, wo["id"])
     if pause is None or pause.exhausted:
         return ""
-    when = time.strftime("%H:%M", time.localtime(pause.retry_at))
+    when = _clock(pause.retry_at)
     if pause.reason == worker_session.PAUSE_USAGE_LIMIT:
         return f"Claude usage limit reached, retrying by itself at {when}"
     what = f"Claude API error {pause.status}" if pause.status else "Claude API error"
@@ -818,6 +860,132 @@ def _envelope_violation(env: dict[str, Any], repair: str) -> Violation:
     )
 
 
+def check_paused_turns_resume(store: ProjectStore) -> Iterator[Violation]:
+    """INV-PAUSE-OVERDUE — a paused turn whose wait is over must actually be relaunched.
+
+    THE LIVENESS GUARANTEE `Daemon.retry_paused_turns` OWES, and the reason it is owed is
+    that the pass failing to fire is INVISIBLE. A work order paused for the usage limit
+    keeps its status and its slot on purpose (see `worker_session`), so from every
+    surface it looks like one that is being handled: `running`, no attention flag, and a
+    note promising it will retry by itself. `TurnPause.attempts` only rises when a retry
+    is ATTEMPTED, so a pass that never fires leaves it at 1 of 8 for ever — `exhausted`
+    is unreachable, and the path that hands an out-of-retries work order to the user can
+    never be taken. Nothing else in the OS is watching.
+
+    That is not hypothetical. wo-b4f207ad and four siblings sat silently stuck for twelve
+    hours because the reset moment was re-resolved against the asking clock and ran away
+    each time it arrived (PR 129); the parse is fixed, but a clock skew, a catalog
+    omission, or an exception inside the pass would all reproduce the same silent day.
+    This checks the OUTCOME instead of any one cause, so it survives the next one.
+
+    Predicate: an active, governed work order whose pause came due more than
+    `PAUSE_OVERDUE_GRACE` ago. The pass runs every `RETRY_EVERY_TICKS` ticks — about ten
+    seconds — so the grace is two orders of magnitude of slack, and anything reported
+    here is stuck rather than merely waiting its turn.
+
+    REPORT-ONLY, and deliberately not repairable. The repair is to relaunch the turn,
+    which is `retry_paused_turns`'s whole job; doing it here too would be a second
+    relaunch path to keep in step with the first, which is the exact duplication
+    `turn_pause` exists to prevent. An unrepaired violation raises a notification, and
+    being told once that the OS's self-healing is not healing is worth more than a quiet
+    second mechanism that hides it.
+
+    Self-clearing: a relaunch makes the new turn the latest, so `turn_pause` returns None
+    and there is nothing left to report. Exhausted pauses are skipped because the retry
+    pass skips them too — those already reach the user through the attention flag.
+    """
+    for wo in store.list_work_orders(statuses=ACTIVE_STATUSES):
+        if wo["origin"] in UNGOVERNED_ORIGINS:
+            continue  # the user's own session; Jarvis does not drive it
+        try:
+            pause = worker_session.turn_pause(store, wo["id"])
+        except Exception as e:  # noqa: BLE001 — one work order must not stall the check
+            yield Violation(invariant="INV-PAUSE-OVERDUE", wo_id=wo["id"],
+                            detail=f"could not diagnose the pause: {e!r}")
+            continue
+        if pause is None or pause.exhausted:
+            continue
+        overdue = time.time() - pause.retry_at
+        if overdue <= PAUSE_OVERDUE_GRACE:
+            continue
+        yield Violation(
+            invariant="INV-PAUSE-OVERDUE", wo_id=wo["id"],
+            detail=(f"paused for the {worker_session.PAUSE_NOUN.get(pause.reason, pause.reason)} since "
+                    f"{_clock(pause.turn.get('ended_at') or pause.turn['started_at'])}, "
+                    f"due to retry at {_clock(pause.retry_at)} and still not relaunched "
+                    f"{_span(overdue)} later — the OS is not healing this by itself"),
+            context={"reason": pause.reason, "retry_at": pause.retry_at,
+                     "overdue_seconds": round(overdue),
+                     "attempts": pause.attempts, "of": pause.max_attempts,
+                     "turn_seq": pause.turn["seq"]},
+        )
+
+
+def check_pause_deadline_stable(store: ProjectStore) -> Iterator[Violation]:
+    """INV-PAUSE-DRIFT — a pause's deadline must still be the one it was given.
+
+    THE COMPANION TO INV-PAUSE-OVERDUE, AND THE ONE THAT WOULD ACTUALLY HAVE CAUGHT
+    wo-b4f207ad. Overdue-ness cannot see a runaway deadline: while the reset moment was
+    being re-resolved against the asking clock it was ALWAYS in the future, so
+    `now > retry_at` was never true and an overdue check would have stayed silent for
+    the entire twelve hours. The two predicates cover the two ways self-healing fails —
+    the pass not running, and the pass being told the wrong moment — and neither sees
+    the other's.
+
+    Predicate: the reset `worker_session._diagnose` derives now must still match the one
+    `worker_session.settle_turn` recorded on the `turn_paused` event when the turn died.
+    That event is written at the one moment nobody has to reason about — the refusal is
+    in hand and the clock IS the turn's clock — so it is the closest thing to a
+    measurement the OS has. Under the bug the two diverge by exactly a day the instant
+    the stated reset passes, which is within a reconcile tick of when it matters.
+
+    This costs the derivation nothing extra: the pause is already computed for
+    INV-PAUSE-OVERDUE's sake on the same tick, and the event read is kind-filtered.
+
+    Matched by turn `seq`, not just by work order: a conversation refused twice has two
+    `turn_paused` events and comparing the newest against an older turn's deadline would
+    invent a violation. Skipped when the payload predates this field, or when the message
+    named no readable moment (`reset_at` is None) — there is nothing to disagree with.
+
+    Report-only. A disagreement means the derivation is wrong, and which of the two
+    numbers to believe is exactly the judgement an invariant must not make on its own.
+    """
+    for wo in store.list_work_orders(statuses=ACTIVE_STATUSES):
+        if wo["origin"] in UNGOVERNED_ORIGINS:
+            continue
+        try:
+            pause = worker_session.turn_pause(store, wo["id"])
+        except Exception:  # noqa: BLE001 — INV-PAUSE-OVERDUE reports the broken diagnosis
+            continue
+        if (pause is None or pause.reason != worker_session.PAUSE_USAGE_LIMIT
+                or pause.reset_at is None):
+            continue
+        events = store.events_of_kind(wo["id"], "turn_paused")
+        if not events:
+            continue
+        payload = events[-1].get("payload") or {}
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        recorded = payload.get("reset_at")
+        if recorded is None or payload.get("seq") != pause.turn["seq"]:
+            continue
+        # The reset is a clock time rounded to the minute, so a sub-minute difference is
+        # the rounding and not a drift. A real one is a whole day.
+        if abs(float(recorded) - pause.reset_at) <= 60:
+            continue
+        yield Violation(
+            invariant="INV-PAUSE-DRIFT", wo_id=wo["id"],
+            detail=(f"the retry deadline moved: recorded {_clock(float(recorded))} when "
+                    f"the turn was refused, re-derived as {_clock(pause.reset_at)} now — "
+                    f"the pause is not a pure function of the turn, so the retry pass is "
+                    f"chasing a moment that keeps moving"),
+            context={"recorded_reset_at": float(recorded),
+                     "derived_reset_at": pause.reset_at,
+                     "drift_seconds": round(pause.reset_at - float(recorded)),
+                     "turn_seq": pause.turn["seq"]},
+        )
+
+
 def check_no_lost_feedback(store: ProjectStore) -> Iterator[Violation]:
     """INV-ENVELOPE-LOST — a message that reached nobody must not pass for one that did.
 
@@ -865,6 +1033,82 @@ def check_no_lost_feedback(store: ProjectStore) -> Iterator[Violation]:
                      "to_role": env["to_role"], "state": env["state"],
                      "subject_fo_id": env["subject_fo_id"]},
         )
+
+
+def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
+    """INV-VALIDATION-STRANDED — a unit under review must not sit in `validating` for ever.
+
+    Nothing outside the daemon moves a `validating` unit: it raises no attention flag and
+    `settle_work_order` returns early for it. Both are right while a round is in flight,
+    and together they mean a daemon that dies mid-round leaves the unit invisibly stalled
+    with nothing left in the OS that will ever look at it again.
+
+    Predicate: `validating`, latest round still `pending`, opened longer than TWICE
+    `os.validation.timeout` ago — one timeout is what a round is allowed to take, so a
+    round at 1.2x its budget is late rather than abandoned.
+
+    Repaired by closing the round `failed`, not `escalated`: `counted_validation_rounds`
+    ignores `failed`, so the interruption costs the submitter no round, and
+    `Daemon.validation_tick` picks up `pending` AND `failed` — closing it is what hands
+    the unit back. Under `jarvis doctor` without `--repair`, `_ReadOnly` blocks the write.
+
+    Covers FEATURE orders too. Nothing sets one to `validating` yet (a sibling work order
+    adds that loop), and an invariant covering half the units would look like one
+    covering all of them.
+    """
+    per_round = _validation_timeout()
+    threshold = 2 * per_round
+    now = time.time()
+    cutoff = now - threshold
+    for kind, id_col, rows in (
+        ("work order", "wo_id", store.conn.execute(
+            "SELECT id FROM work_orders WHERE status='validating'").fetchall()),
+        ("feature order", "fo_id", store.conn.execute(
+            "SELECT id FROM feature_orders WHERE status='validating'").fetchall()),
+    ):
+        for row in rows:
+            unit_id = row["id"]
+            latest = store.latest_validation_round(**{id_col: unit_id})
+            if latest is None or latest["outcome"] != "pending":
+                continue
+            if float(latest["ts"] or 0) > cutoff:
+                continue  # late, not abandoned
+            age = int(now - float(latest["ts"] or 0))
+            store.close_validation_round(
+                int(latest["id"]), "failed",
+                f"the review was interrupted — round {latest['round']} was left open "
+                f"with nothing running it for {age}s")
+            yield Violation(
+                invariant="INV-VALIDATION-STRANDED",
+                wo_id=unit_id if id_col == "wo_id" else None,
+                detail=(
+                    f"{kind} {unit_id} has been `validating` on a `pending` round for "
+                    f"{age}s — over twice the {per_round}s a round is given. Nothing is "
+                    f"judging it; the daemon almost certainly restarted mid-round."
+                ),
+                repaired=True,
+                repair=(f"closed round {latest['round']} `failed` — the next tick "
+                        f"picks it up and runs it again"),
+                context={"round_id": latest["id"], "round": latest["round"],
+                         "age_seconds": age, "threshold_seconds": threshold,
+                         "unit": kind,
+                         "fo_id": None if id_col == "wo_id" else unit_id},
+            )
+
+
+def _validation_timeout() -> int:
+    """How long one validation round is allowed to take, per the LIVE catalog.
+
+    From the catalog rather than `DEFAULT_VALIDATION_TIMEOUT` because this number decides
+    a write: a project that raised the value would otherwise have its healthy long rounds
+    closed out from under it. (`status_label` makes the opposite call — it only prints a
+    number.) Falls back to the default when no catalog is readable; an invariant must
+    never be the thing that raises.
+    """
+    from .ops import validation_config
+
+    timeout = getattr(validation_config(), "timeout", None)
+    return int(timeout) if timeout else DEFAULT_VALIDATION_TIMEOUT
 
 
 def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
@@ -1161,6 +1405,12 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_attention_has_reason,
     check_manager_slots,           # a canary, not a state check: it repairs nothing and
                                    # is unaffected by the order it runs in
+    check_paused_turns_resume,     # ditto: a pure read of what the retry pass did or
+                                   # did not do, with nothing to repair
+    check_pause_deadline_stable,   # ...and its companion: the pass can also be failing
+                                   # because the moment it was given keeps moving
+    check_validation_progresses,   # after the flag checks: its repair touches no flag,
+                                   # and a `validating` row is invisible to all of them
     check_envelopes_move,          # last: it delivers, and delivery changes work orders
     check_no_lost_feedback,        # ...and after it, because that delivery is what
                                    # marks an envelope undeliverable in the first place
@@ -1201,7 +1451,10 @@ class _ReadOnly:
                 # The bus. `queue_message` is here because delivering an envelope IS a
                 # queued message, and a read-only doctor run must not send one.
                 "mark_envelope", "bump_envelope_attempt", "deliver_envelope",
-                "queue_message", "flag_feature_attention")
+                "queue_message", "flag_feature_attention",
+                # INV-VALIDATION-STRANDED's repair. Reporting a stranded round must not
+                # be the thing that ends it.
+                "close_validation_round")
 
     #: How a checker asks "am I allowed to change anything?". Needed by
     #: `check_envelopes_move`, whose repair also writes to the CENTRAL store — a proxy

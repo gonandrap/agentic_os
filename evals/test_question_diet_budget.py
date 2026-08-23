@@ -34,6 +34,16 @@ ASK = ("I want each working unit to not be claimed done until an external valida
 
 
 def production_shaped_plan() -> dict[str, Any]:
+    """The #65–#67 shape, briefs and all — reconstructed rather than submitted.
+
+    `plans.MAX_DESCRIPTION_CHARS` now refuses a brief this size outright, so this plan
+    could not be submitted today and `parse_plan` will not accept it. That is a SECOND
+    defence and not this one: the diet being measured here is `build_plan_question`
+    rendering a skeleton, which has to hold whatever the briefs weigh. So the plan is
+    normalised through the validator with briefs it accepts, and then fattened back to
+    the historical size — the shape the numbers in this module's docstring were actually
+    measured against.
+    """
     brief = ("The context the planner repeated into every child instead of the design "
              "document carrying it once. ")
     children = []
@@ -41,15 +51,18 @@ def production_shaped_plan() -> dict[str, Any]:
         children.append({
             "key": f"piece{i}",
             "title": f"Build piece {i} of the validation layer",
-            "description": (brief * (BRIEF_CHARS // len(brief) + 1))[:BRIEF_CHARS],
+            "description": brief,
             "needs": [f"piece{i - 1}"] if i else [],
             "acceptance": f"the piece {i} tests pass and the suite stays green",
         })
-    return plans.parse_plan({
+    plan = plans.parse_plan({
         "summary": "no work order reaches the merge queue until the panel says so",
         "design_doc": "docs/specs/validation-panel.md",
         "children": children,
     })
+    for child in plan["children"]:
+        child["description"] = (brief * (BRIEF_CHARS // len(brief) + 1))[:BRIEF_CHARS]
+    return plan
 
 
 @pytest.fixture(scope="module")

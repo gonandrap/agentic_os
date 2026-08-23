@@ -280,6 +280,31 @@ class CentralStore:
         row = self.conn.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
         return dict(row) if row else None
 
+    def project_name_for_path(self, path: str | Path) -> str:
+        """The catalog name of the project checked out at `path`.
+
+        A `ProjectStore` knows a path and nothing else, and several callers hold only a
+        store — the message bus resolving an envelope's project, the validation panel
+        scoping a seat's knowledge base. The registry maps name to path, so the path
+        resolves back: a LOOKUP rather than a guess. A project not in the registry falls
+        back to its directory name, which is what `jarvis adopt` would have named it.
+
+        ONE IMPLEMENTATION, because two would drift: a panel that scoped its knowledge to
+        a name the bus does not use would read a different project's standing
+        instructions, and nothing on either side would look wrong.
+        """
+        try:
+            here = Path(path).resolve()
+        except OSError:  # pragma: no cover - a path that cannot be resolved is still usable
+            here = Path(path)
+        for row in self.list_projects():
+            try:
+                if Path(row["path"]).resolve() == here:
+                    return str(row["name"])
+            except OSError:  # pragma: no cover
+                continue
+        return here.name
+
     # -- inbox ------------------------------------------------------------------
 
     def add_inbox(self, project: str, title: str, body: str = "", level: str = "info",

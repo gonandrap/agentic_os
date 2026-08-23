@@ -74,55 +74,38 @@ def test_ask_queues_and_parks_worker(asked, project):
         neo.close()
 
 
-def test_the_work_order_record_shows_what_was_asked(asked, project, capsys):
-    """The question text reaches the timeline, not just Neo's DB.
+def test_the_work_order_record_points_at_what_was_asked(asked, project, capsys):
+    """The record must lead a reader to the question — it no longer reproduces it.
 
-    Before this, `question_asked` stored only the Neo question id, so `jarvis wo show`
-    and the work order page displayed Neo's answer with no visible question — the
-    record read as an answer to nothing.
+    Before the question id was stored, `question_asked` said nothing at all and the
+    record read as an answer to nothing. It then carried the whole question inline,
+    which put the same paragraph on the page twice: once as the event, once as the
+    answer's message beneath it. What it carries now is a REFERENCE to the one record
+    that holds the question and its answer together — a link on the dashboard, and the
+    id the CLI's own question command takes.
     """
     import json as _json
 
     from jarvis import cli
 
-    _, wo, _ = asked
+    _, wo, result = asked
     capsys.readouterr()
     cli.main(["wo", "show", wo["id"], "--json"])
     timeline = _json.loads(capsys.readouterr().out)["timeline"]
     entry = next(e for e in timeline if e["kind"] == "question_asked")
-    assert entry["detail"] == "Should the export default to CSV or JSON?"
+    assert entry["detail"] == ""
+    assert entry["ref"] == {"kind": "neo_question", "id": result["question_id"],
+                            "label": f"question #{result['question_id']}"}
 
 
-def test_a_question_asked_before_the_fix_is_recovered_from_neos_db(asked, project):
-    """Events already on disk carry only the id — the text is still in Neo's DB, and
-    `ops.neo_question_texts` is what every timeline surface passes in to recover it."""
+def test_a_question_event_with_no_id_still_says_what_was_asked():
+    """The one case with nowhere to point: no id, so the text is all there is."""
     from jarvis.timeline import build_timeline
 
-    _, wo, result = asked
-    store = ProjectStore(project)
-    try:
-        # an event exactly as it was written before the text was stored in the payload
-        store.add_event(wo["id"], "question_asked",
-                        {"neo_question_id": result["question_id"]})
-        old = [e for e in store.list_events(wo["id"]) if e["kind"] == "question_asked"][-1]
-    finally:
-        store.close()
-    assert "question" not in json.loads(old["payload"])
-    entries = build_timeline({}, [old], [], questions=ops.neo_question_texts(wo["id"]))
-    assert entries[0]["detail"] == "Should the export default to CSV or JSON?"
-
-
-def test_question_text_lookup_survives_an_unreadable_neo_db(asked, monkeypatch):
-    """A timeline missing one detail beats `jarvis wo show` failing outright."""
-    import jarvis.neo_store as ns
-
-    _, wo, _ = asked
-
-    def boom(*a, **kw):
-        raise RuntimeError("neo.db is gone")
-
-    monkeypatch.setattr(ns, "NeoStore", boom)
-    assert ops.neo_question_texts(wo["id"]) == {}
+    events = [{"ts": 1.0, "kind": "question_asked", "payload": {"question": "CSV?"}}]
+    entry = build_timeline({}, events, [])[0]
+    assert entry["ref"] is None
+    assert entry["detail"] == "CSV?"
 
 
 def test_neo_answers_and_delivers_to_worker(asked, project, fake_claude):

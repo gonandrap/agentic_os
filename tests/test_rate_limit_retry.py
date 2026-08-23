@@ -253,6 +253,86 @@ def test_a_limit_with_no_readable_time_waits_the_fallback_delay(store):
         pause.turn["ended_at"] + worker_session.RATE_LIMIT_FALLBACK_DELAY, abs=1)
 
 
+def _age(store, wo_id, ended_at):
+    """Move a settled turn's `ended_at`, the only way a test can put the refusal in the
+    past without waiting. The pause is re-derived from the row every pass, so this is
+    the same code path a real wait takes."""
+    turn = store.latest_turn(wo_id)
+    store.conn.execute("UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
+                       (ended_at - 1, ended_at, turn["id"]))
+    store.conn.commit()
+    return ended_at
+
+
+def test_the_reset_is_resolved_against_the_turn_not_against_the_asking_clock(store):
+    """THE BUG THAT COST wo-b4f207ad TWELVE HOURS. "resets 12pm" is a statement made
+    when the turn died, so it must be read against THAT moment. Resolved against the
+    clock of whichever pass happens to be asking, `_reset_moment`'s "already gone, so
+    tomorrow" rule fires the instant the reset arrives and pushes the deadline a day
+    out — every pass, for ever. The deadline runs away exactly when it is reached, so
+    `due()` is never true and the work order waits until a human retries it by hand.
+    """
+    tz = ZoneInfo("America/Los_Angeles")
+    ended = datetime(2026, 8, 22, 8, 8, 34, tzinfo=tz).timestamp()
+    _refused(store, error="You've hit your session limit · resets 12pm "
+                          "(America/Los_Angeles)")
+    _age(store, "wo-test", ended)
+
+    pause = worker_session.turn_pause(store, "wo-test")
+    assert pause is not None
+    assert pause.reset_at == datetime(2026, 8, 22, 12, 0, tzinfo=tz).timestamp(), (
+        "noon on the day the turn died — not noon tomorrow, and not noon relative to "
+        "whenever this test runs")
+    assert pause.due(), "the window reopened hours ago; the retry pass must fire"
+
+
+def test_the_deadline_does_not_move_when_the_asking_clock_does(store, monkeypatch):
+    """THE PROPERTY THE FIX RESTS ON, exercised the only way it can be: by moving the
+    one variable the bug depended on. `turn_pause` is a pure function of the stored row,
+    so asking at 10am and asking again at 6am the next morning — with the stated reset
+    now hours behind us — must give the same deadline and a `due` that has flipped from
+    false to true.
+
+    Asking twice in quick succession does NOT test this, however plainly it reads: the
+    asking clock never varies, so both answers come out of the same wrong branch and
+    agree with each other. That is the same "proves the plumbing, not the property"
+    mistake this file's end-to-end test made, one layer up.
+    """
+    tz = ZoneInfo("America/Los_Angeles")
+    ended = datetime(2026, 8, 22, 9, 0, tzinfo=tz).timestamp()
+    reset = datetime(2026, 8, 22, 23, 50, tzinfo=tz).timestamp()  # LIVE_REFUSAL's
+    _refused(store, error=LIVE_REFUSAL)
+    _age(store, "wo-test", ended)
+
+    def _asked_at(moment):
+        """The pause as the daemon would read it on a pass at `moment`. `due` is captured
+        here rather than asserted later: it reads the clock too."""
+        monkeypatch.setattr(time, "time", lambda: moment)
+        pause = worker_session.turn_pause(store, "wo-test")
+        return pause.retry_at, pause.due()
+
+    early, early_due = _asked_at(ended + 3600)          # 10am, the window still shut
+    late, late_due = _asked_at(reset + 6 * 3600)        # 5:50am, long past the reset
+
+    assert early == late == reset, (
+        "the deadline moved when the clock did — it is being resolved against the pass "
+        "that asked instead of against the turn that died")
+    assert not early_due, "the window had not reopened yet"
+    assert late_due, "the window reopened six hours ago; the retry pass must fire"
+
+
+def test_the_relative_reset_counts_from_the_turn_not_from_now(store):
+    """"resets in 2h 15m" is the worse half of the same bug: read against the asking
+    clock it is permanently 2h15m in the future, so it can never come due at all."""
+    ended = time.time() - 6 * 3600
+    _refused(store, error="You've hit your session limit · resets in 2h 15m")
+    _age(store, "wo-test", ended)
+    pause = worker_session.turn_pause(store, "wo-test")
+    assert pause is not None
+    assert pause.reset_at == pytest.approx(ended + 2 * 3600 + 15 * 60, abs=1)
+    assert pause.due(), "2h15m after a turn that died six hours ago is long past"
+
+
 def test_the_streak_counts_off_the_end_and_resets_when_a_turn_gets_through(store):
     for _ in range(3):
         _refused(store)
@@ -293,6 +373,37 @@ def test_the_label_says_why_nothing_is_moving_and_when_it_will(store):
     assert invariants.status_label(store, wo).startswith("running — ")
 
 
+def test_a_retry_that_is_not_today_says_which_day(store, monkeypatch):
+    """A bare "%H:%M" is only unambiguous within the day it is written. For twelve hours
+    the dashboard promised wo-b4f207ad "retrying by itself at 12:00" while meaning the
+    NEXT day's noon — the sentence that made a mis-scheduled retry read as an overdue
+    one. A 7-day window legitimately resets days out, so the date has to be there."""
+    store.set_status("wo-test", "running")
+    ended = datetime(2026, 8, 22, 9, 0).timestamp()      # local, like the reader
+    reset = datetime(2026, 8, 29, 9, 50).timestamp()
+    _refused(store, error=time.strftime(
+        "You've hit your weekly limit · resets %b %-d, %-I:%M%P", time.localtime(reset)))
+    _age(store, "wo-test", ended)
+    monkeypatch.setattr(time, "time", lambda: ended + 3600)
+    note = invariants.pause_note(store, store.get_work_order("wo-test"))
+    assert note.endswith(time.strftime("at 09:50 on %a %d %b", time.localtime(reset))), (
+        f"no date in a retry a week out: {note!r}")
+
+
+def test_a_retry_later_today_stays_a_bare_clock_time(store, monkeypatch):
+    """The date is only worth the words when it is not today, which is the common case.
+    Both clocks are frozen: "today" is a comparison against the reader's own clock, so a
+    test that leaves either end free passes or fails by the hour it is run at."""
+    store.set_status("wo-test", "running")
+    ended = datetime(2026, 8, 22, 9, 0).timestamp()      # local, like the reader
+    _refused(store, error="You've hit your session limit · resets 11am")
+    _age(store, "wo-test", ended)
+    monkeypatch.setattr(time, "time", lambda: ended + 3600)   # 10am the same morning
+    note = invariants.pause_note(store, store.get_work_order("wo-test"))
+    assert note.endswith("at 11:00"), (
+        f"a retry later today does not need a date: {note!r}")
+
+
 def test_a_healthy_running_work_order_gets_the_bare_status(store):
     store.set_status("wo-test", "running")
     assert invariants.status_label(store, store.get_work_order("wo-test")) == "running"
@@ -303,6 +414,153 @@ def test_an_exhausted_pause_stops_claiming_it_will_retry(store):
     for _ in range(worker_session.MAX_RATE_LIMIT_RETRIES + 1):
         _refused(store)
     assert invariants.pause_note(store, store.get_work_order("wo-test")) == ""
+
+
+# -- the OS noticing when it is NOT healing itself -------------------------------------
+
+
+def test_an_overdue_pause_is_reported_rather_than_sitting_silently(store):
+    """INV-PAUSE-OVERDUE. The parse bug is fixed, but the thing that actually cost the
+    user twelve hours was that FIVE work orders sat stuck and nothing in the OS noticed:
+    a paused work order keeps its status and its slot, `attempts` only rises when a retry
+    is attempted, so a pass that never fires leaves it at 1 of 8 for ever and `exhausted`
+    is unreachable. Any future reason the pass fails to fire — clock skew, a catalog
+    omission, an exception inside it — reproduces the same silent day. This checks the
+    OUTCOME, so it does not care which cause it was.
+    """
+    store.set_status("wo-test", "running")
+    _refused(store, error=LIVE_REFUSAL)
+    _age(store, "wo-test", time.time() - 30 * 3600)   # reset was ~a day ago
+
+    violations = [v for v in invariants.check_paused_turns_resume(store)]
+    assert len(violations) == 1, "an overdue pause must be reported"
+    v = violations[0]
+    assert v.invariant == "INV-PAUSE-OVERDUE" and v.wo_id == "wo-test"
+    assert not v.repaired, (
+        "relaunching is `retry_paused_turns`'s job — a second relaunch path here would "
+        "be a second place to forget")
+    assert v.context["reason"] == worker_session.PAUSE_USAGE_LIMIT
+
+
+def test_a_pause_still_within_its_wait_is_not_reported(store):
+    """The predicate is "overdue", not "paused". A work order waiting correctly is the
+    normal case and must stay silent, or the signal is worthless."""
+    store.set_status("wo-test", "running")
+    _refused(store, error=LIVE_REFUSAL)
+    assert list(invariants.check_paused_turns_resume(store)) == []
+
+
+def test_a_pause_just_barely_overdue_is_given_its_grace(store):
+    """The retry pass runs about every ten seconds, so a deadline a minute past is a
+    tick in flight, not a stuck work order."""
+    store.set_status("wo-test", "running")
+    # The epoch form, so the deadline is stated outright and the arithmetic is exact
+    # rather than a function of what time of day the suite runs at.
+    due_five_minutes_ago = time.time() - 5 * 60
+    _refused(store, error=f"Claude AI usage limit reached|{int(due_five_minutes_ago)}")
+    _age(store, "wo-test", time.time() - 3600)
+    pause = worker_session.turn_pause(store, "wo-test")
+    assert pause.due() and pause.retry_at == pytest.approx(due_five_minutes_ago, abs=1)
+    assert list(invariants.check_paused_turns_resume(store)) == []
+
+
+def test_an_exhausted_pause_is_left_to_the_attention_flag(store):
+    """Out of retries is already the user's problem and already flagged; saying it twice
+    in two vocabularies is noise."""
+    store.set_status("wo-test", "running")
+    for _ in range(worker_session.MAX_RATE_LIMIT_RETRIES + 1):
+        _refused(store, error=LIVE_REFUSAL)
+    _age(store, "wo-test", time.time() - 30 * 3600)
+    assert worker_session.turn_pause(store, "wo-test").exhausted
+    assert list(invariants.check_paused_turns_resume(store)) == []
+
+
+def test_a_runaway_deadline_is_caught_even_though_it_is_never_overdue(store):
+    """INV-PAUSE-DRIFT, and the reason it exists rather than INV-PAUSE-OVERDUE alone.
+
+    THE ORIGINAL BUG WAS INVISIBLE TO OVERDUE-NESS. While the reset was re-resolved
+    against the asking clock it was always in the FUTURE — noon tomorrow, then noon the
+    day after — so `now > retry_at` was never true and an overdue check would have said
+    nothing for the whole twelve hours. What did change was the answer itself, and the
+    OS wrote down the right one at the moment the turn died.
+
+    Simulated by planting the reset the settler would have recorded at 08:08 and a turn
+    whose derivation now disagrees with it by a day, which is the shape the runaway made.
+    """
+    tz = ZoneInfo("America/Los_Angeles")
+    ended = datetime(2026, 8, 22, 8, 8, 34, tzinfo=tz).timestamp()
+    store.set_status("wo-test", "running")
+    _refused(store, error="You've hit your session limit · resets 12pm "
+                          "(America/Los_Angeles)")
+    _age(store, "wo-test", ended)
+    seq = store.latest_turn("wo-test")["seq"]
+    store.add_event("wo-test", "turn_paused", {
+        "seq": seq, "reason": worker_session.PAUSE_USAGE_LIMIT,
+        "reset_at": datetime(2026, 8, 23, 12, 0, tzinfo=tz).timestamp()})
+
+    pause = worker_session.turn_pause(store, "wo-test")
+    assert pause.reset_at == datetime(2026, 8, 22, 12, 0, tzinfo=tz).timestamp()
+    violations = list(invariants.check_pause_deadline_stable(store))
+    assert [v.invariant for v in violations] == ["INV-PAUSE-DRIFT"]
+    assert violations[0].context["drift_seconds"] == -86400
+    assert not violations[0].repaired
+
+
+def test_a_deadline_that_still_agrees_with_the_record_is_silent(store):
+    """The normal case, and the one the fix guarantees: the settler and the retry pass
+    read the same refusal against the same moment, so they cannot disagree."""
+    store.set_status("wo-test", "running")
+    _refused(store, error=LIVE_REFUSAL)
+    turn = store.latest_turn("wo-test")
+    store.add_event("wo-test", "turn_paused", {
+        "seq": turn["seq"], "reason": worker_session.PAUSE_USAGE_LIMIT,
+        "reset_at": worker_session.turn_pause(store, "wo-test").reset_at})
+    assert list(invariants.check_pause_deadline_stable(store)) == []
+
+
+def test_an_older_turns_deadline_is_not_compared_against_a_newer_pause(store):
+    """A conversation refused twice has two `turn_paused` events. Comparing the newest
+    pause against an older turn's recorded moment would invent a violation out of two
+    perfectly correct numbers."""
+    store.set_status("wo-test", "running")
+    _refused(store, error=LIVE_REFUSAL)
+    first = store.latest_turn("wo-test")
+    store.add_event("wo-test", "turn_paused", {
+        "seq": first["seq"], "reason": worker_session.PAUSE_USAGE_LIMIT,
+        "reset_at": time.time() - 5 * 86400})
+    _refused(store, error=LIVE_REFUSAL)          # a second refusal, no event planted
+    assert store.latest_turn("wo-test")["seq"] != first["seq"]
+    assert list(invariants.check_pause_deadline_stable(store)) == []
+
+
+def test_the_daemon_stops_reporting_once_the_retry_actually_fires(started, fake_claude,
+                                                                  project, settle_turns):
+    """Self-clearing, which is what makes it safe to run every reconcile tick: the
+    relaunch makes the new turn the latest, so there is no longer a pause to be overdue.
+    Runs the real daemon rather than the checker alone, because "the retry fired" is the
+    condition being cleared and only the daemon can produce it."""
+    daemon = started
+    fake_claude.turns_rate_limited(reset="12:01am (UTC)")
+    wo = ops.create_work_order("proj_a", "ship the thing")
+    store = ProjectStore(project)
+
+    _tick(daemon)
+    assert settle_turns(store), "the refused turn never settled"
+    _tick(daemon)
+
+    turn = store.latest_turn(wo["id"])
+    aged = time.time() - 3 * 86400
+    store.conn.execute("UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
+                       (aged - 1, aged, turn["id"]))
+    store.conn.commit()
+    assert [v.invariant for v in invariants.check_paused_turns_resume(store)] == [
+        "INV-PAUSE-OVERDUE"], "overdue and not yet relaunched — say so"
+
+    fake_claude.turns_recover()
+    _tick(daemon)                      # the retry pass relaunches it
+    assert list(invariants.check_paused_turns_resume(store)) == [], (
+        "the relaunch happened; there is nothing left to report")
+    store.close()
 
 
 # -- end to end ------------------------------------------------------------------------
@@ -378,6 +636,47 @@ def test_a_refused_work_order_resumes_itself(started, fake_claude, project,
     # without `jarvis wo finish` settles to; what matters here is that the usage limit
     # left no trace on where it ended up.
     assert store.get_work_order(wo["id"])["status"] == "needs_review"
+    store.close()
+
+
+def test_a_clock_time_reset_comes_due_without_the_error_being_rewritten(
+        started, fake_claude, project, settle_turns):
+    """THE REGRESSION THAT SHIPPED. The test above proves the plumbing, but it reopens
+    the window by rewriting the refusal to the epoch form — the one shape of the message
+    that states an absolute moment and so cannot drift. Every refusal the fleet has
+    actually taken states a CLOCK TIME, and for twelve hours that shape could not come
+    due at all: the reset was re-read against the asking clock, so it moved a day
+    further out every time the pass looked. Here the error is left exactly as the CLI
+    wrote it and only the turn ages, which is what really happens while a work order
+    waits.
+    """
+    daemon = started
+    fake_claude.turns_rate_limited(reset="12:01am (UTC)")
+    wo = ops.create_work_order("proj_a", "ship the thing")
+    store = ProjectStore(project)
+
+    _tick(daemon)                      # dispatches turn 1, which is refused
+    assert settle_turns(store), "the refused turn never settled"
+    _tick(daemon)                      # settles it
+    assert not worker_session.turn_pause(store, wo["id"]).due(), (
+        "a reset hours ahead must not fire yet")
+
+    # Three days pass. The refusal is untouched: "12:01am" now names a moment two days
+    # behind us, because it is read against the turn that died and not against today.
+    fake_claude.turns_recover()
+    turn = store.latest_turn(wo["id"])
+    aged = time.time() - 3 * 86400
+    store.conn.execute("UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
+                       (aged - 1, aged, turn["id"]))
+    store.conn.commit()
+
+    _tick(daemon)                      # the retry pass relaunches it
+    assert settle_turns(store), "the retried turn never ran — the deadline ran away"
+    _tick(daemon)
+
+    assert "turn_resumed" in [e["kind"] for e in store.list_events(wo["id"])]
+    assert store.latest_turn(wo["id"])["state"] == "done"
+    assert worker_session.turn_pause(store, wo["id"]) is None
     store.close()
 
 

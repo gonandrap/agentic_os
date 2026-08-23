@@ -84,6 +84,12 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
   parks in **waiting for PR merge** — it stays on the user's open list with the link
   until they merge it, instead of settling as completed work nobody is looking at.
 
+  Pass `--evidence "<what you ran and what it showed>"` too: the tests, evals and
+  manual checks you actually performed, and their results. Your summary says what you
+  built; the evidence says how you know it works, and it is read beside your diff.
+  Review feedback may come back asking for more of it — if it does, do the work it
+  asks for and run `jarvis wo finish` again with the fuller account.
+
 ## Navigating the code: Serena first, grep second
 
 If this project has Serena — its symbol tools appear in your tool list, or

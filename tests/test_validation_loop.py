@@ -891,13 +891,19 @@ def test_the_kill_switch_drains_open_rounds_instead_of_stranding_them(fleet):
         store.close()
 
 
-def test_with_no_validator_wired_an_open_round_settles_unjudged(fleet):
-    """The shipped default: this work order defines the seam and a later one fills it.
+def test_with_no_validator_wired_an_open_round_settles_unjudged(fleet, monkeypatch):
+    """A round with nothing to judge it settles its unit unjudged.
+
+    The panel now fills the seam, so this case has to be STAGED rather than found:
+    `_validator` is made to return None, which is exactly what it returns on every
+    catalog that has not enabled validation — and what it would return again if the panel
+    were ever unwired or removed.
 
     Closed `failed` and never `passed` — a round nobody judged must not read as a
     verdict on any surface — and the work order lands exactly where it lands with
     validation switched off, so an unwired seam costs nothing and hides nothing.
     """
+    monkeypatch.setattr(Daemon, "_validator", staticmethod(lambda cfg: None))
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
     finish(fleet, wo["id"], pr="https://github.com/x/y/pull/4")
@@ -936,6 +942,155 @@ def test_pending_assumptions_still_outrank_validation(fleet):
         assert store.validation_rounds(wo_id=wo["id"]) == []
         assert store.get_work_order(wo["id"])["attention_reason"] == \
             "assumptions pending review"
+        fleet.drain()
+        assert fleet.daemon.validator.calls == []
+    finally:
+        store.close()
+
+
+# -- the second route into done ------------------------------------------------------
+#
+# `ops.review_work_order` reaches `waiting_pr_merge`/`completed` without ever touching
+# `ops.finish`, so a work order that filed assumptions used to arrive at the merge queue
+# with nothing having judged it.
+
+
+def _parked_on_assumptions(fleet: Fleet, *, evidence: str = "ran `pytest -q`: 412 passed",
+                           pr: str = "https://github.com/x/y/pull/9") -> dict:
+    """A work order in the state `finish` leaves one that filed an assumption."""
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('reviewed')\n")
+    ops.assume(wo["id"], "assumed the exporter writes UTF-8")
+    assert ops.finish(wo["id"], "done", pr_url=pr,
+                      evidence=evidence)["status"] == "needs_review"
+    return wo
+
+
+def test_accepting_assumptions_validates_only_when_the_feature_is_on(fleet):
+    """THE PAIRING IS THE TEST. Validation ships disabled, so an accept that lands in
+    `waiting_pr_merge` proves nothing on its own — that is where it lands today and
+    where it landed before this file existed. The same review is run twice, once each
+    side of the flag, and the two endings have to differ."""
+    fleet.daemon.validator = Validator(passed())
+
+    # -- the flag OFF: exactly today's behaviour, and not one row in validation_rounds
+    fleet.reconfigure(enabled=False)
+    off = _parked_on_assumptions(fleet)
+    assert ops.review_work_order(off["id"], accept=True)["status"] == "waiting_pr_merge"
+
+    store = fleet.store()
+    try:
+        assert store.validation_rounds(wo_id=off["id"]) == []
+        assert store.get_work_order(off["id"])["status"] == "waiting_pr_merge"
+    finally:
+        store.close()
+
+    # -- the flag ON: the same accept parks it for review instead
+    fleet.reconfigure(enabled=True)
+    on = _parked_on_assumptions(fleet)
+    assert ops.review_work_order(on["id"], accept=True)["status"] == "validating"
+
+    store = fleet.store()
+    try:
+        rounds = store.validation_rounds(wo_id=on["id"])
+        assert len(rounds) == 1
+        assert rounds[0]["round"] == 1
+        assert rounds[0]["outcome"] == "pending"
+        assert rounds[0]["fingerprint"], "a round with no fingerprint proves nothing"
+        fresh = store.get_work_order(on["id"])
+        assert fresh["status"] == "validating"
+        assert fresh["needs_attention"] == 0  # under review is the OS working
+        assert [e["kind"] for e in store.list_events(on["id"])].count(
+            "validation_submitted") == 1
+    finally:
+        store.close()
+
+
+def test_a_work_order_already_judged_is_not_validated_a_second_time(fleet):
+    """PAIRED with a never-validated one in the same test. "No new round" is satisfied
+    perfectly by an implementation that opens no rounds at all on this route, so the
+    control has to open one.
+
+    The rule: a round already on record means the loop has run. An acceptance after
+    that is the USER overruling the machine, and the machine does not get a second
+    vote — re-submitting would hand the work order straight back to the reviewer that
+    had already given up on it.
+    """
+    fleet.reconfigure(max_rounds=1)  # one rejection is the whole budget
+    fleet.daemon.validator = Validator(rejected("no test covers the change"))
+
+    # -- judged already: the round ran, the reviewer gave up, and it is in front of the
+    # user for exactly that reason. They say ship it anyway.
+    judged = fleet.dispatch("judged")
+    fleet.change(judged["id"], "print('judged')\n")
+    finish(fleet, judged["id"], pr="https://github.com/x/y/pull/10")
+    fleet.drain()
+    store = fleet.store()
+    try:
+        assert store.get_work_order(judged["id"])["status"] == "needs_review"
+        assert store.get_work_order(judged["id"])["attention_reason"] == (
+            VALIDATION_STUCK_BLOCKER)
+        before = len(store.validation_rounds(wo_id=judged["id"]))
+        assert before == 1, "the control never got a round"
+    finally:
+        store.close()
+
+    assert ops.review_work_order(judged["id"], accept=True)["status"] == (
+        "waiting_pr_merge")
+
+    # -- never judged: the same accept opens round 1
+    virgin = _parked_on_assumptions(fleet, pr="https://github.com/x/y/pull/11")
+    assert ops.review_work_order(virgin["id"], accept=True)["status"] == "validating"
+
+    store = fleet.store()
+    try:
+        assert len(store.validation_rounds(wo_id=judged["id"])) == before
+        assert store.get_work_order(judged["id"])["status"] == "waiting_pr_merge"
+        assert store.get_work_order(judged["id"])["needs_attention"] == 0
+        assert len(store.validation_rounds(wo_id=virgin["id"])) == 1
+    finally:
+        store.close()
+
+
+def test_the_review_route_carries_the_evidence_the_worker_declared(fleet):
+    """`finish` drops a work order with pending assumptions into `needs_review` before
+    it ever reaches the validation branch, so without this the evidence its worker
+    passed would be lost and round 1 would open empty — on exactly the work orders that
+    filed assumptions. It is recovered from the `finished` event's payload.
+
+    Paired with a worker that declared nothing, which must still finish: `--evidence` is
+    optional, and an empty declaration is an ordinary submission rather than a thin one.
+    """
+    declared = "`uv run pytest -q` — 412 passed; exporter checked by hand on 3 files"
+    told = _parked_on_assumptions(fleet, evidence=declared)
+    silent = _parked_on_assumptions(fleet, evidence="",
+                                    pr="https://github.com/x/y/pull/12")
+
+    ops.review_work_order(told["id"], accept=True)
+    ops.review_work_order(silent["id"], accept=True)
+
+    store = fleet.store()
+    try:
+        assert store.latest_validation_round(wo_id=told["id"])["evidence"] == declared
+        assert store.latest_validation_round(wo_id=silent["id"])["evidence"] == ""
+        assert store.get_work_order(silent["id"])["status"] == "validating"
+    finally:
+        store.close()
+
+
+def test_rejecting_assumptions_opens_no_round(fleet):
+    """A rejection is not a route into done. The work order goes back to its worker with
+    the user's reasoning, and there is nothing finished for anyone to judge."""
+    fleet.daemon.validator = Validator(passed())
+    wo = _parked_on_assumptions(fleet)
+
+    out = ops.review_work_order(wo["id"], accept=False, feedback="use UTF-16 here")
+
+    assert out["status"] == "needs_review"
+    store = fleet.store()
+    try:
+        assert store.validation_rounds(wo_id=wo["id"]) == []
+        assert store.get_work_order(wo["id"])["status"] != "validating"
         fleet.drain()
         assert fleet.daemon.validator.calls == []
     finally:

@@ -1263,10 +1263,10 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 "status_label": invariants.status_label(store, wo),
                 "blocked_by": store.unfinished_dependencies(args.wo_id),
                 "timeline": build_timeline(wo, store.list_events(args.wo_id),
-                                           messages, include_debug=args.debug,
-                                           questions=ops.neo_question_texts(args.wo_id)),
+                                           messages, include_debug=args.debug),
                 "messages": messages,
-                "assumptions": store.pending_assumptions(args.wo_id),
+                # Every assumption, each with its `n` and `status` — §4.
+                "assumptions": store.all_assumptions(args.wo_id),
                 # What this work order was allowed (or refused) permission to ship.
                 "gates": [
                     {k: a[k] for k in ("id", "kind", "command", "status", "escalated",

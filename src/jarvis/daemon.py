@@ -946,18 +946,20 @@ class Daemon:
         validation is wired in.
 
         Returns None when the panel is disabled, exactly as `_panel_answer` does — and
-        None again for now regardless, because the panel itself is a later work order in
-        this feature. A round with no validator settles its unit where the OS settles it
-        with validation switched off, so the seam being unwired costs nothing and hides
-        nothing.
+        the feature ships disabled, so on every catalog that has not opted in this stays
+        None and not one seat is ever called. A round with no validator settles its unit
+        where the OS settles it with validation switched off.
 
-        **Replace this body with the import and the call and nothing else changes**: the
-        round machine takes a callable of `(store, round, packet) -> {"outcome",
-        "reason", "seats"}` and knows nothing else about who judges.
+        The import is local for the same reason every other adapter's is: `validation`
+        pulls in the seat machinery and the assets, and a daemon on a fleet that never
+        enables the panel should not pay to import them.
         """
         if not cfg.enabled:
             return None
-        return None
+        from . import validation
+
+        return lambda store, round_row, packet: validation.decide(
+            store, round_row, packet, cfg)
 
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                  msgs: list[dict[str, Any]]) -> None:
