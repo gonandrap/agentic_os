@@ -1,11 +1,18 @@
 """Staged releases — the daemon performs the restarts a self-ship must not.
 
-Why this exists: every worker `claude` process lives inside jarvis.service's cgroup
+Why this exists: a worker `claude` process used to live inside jarvis.service's cgroup
 (systemd's default KillMode=control-group), so a deploy script that restarts the daemon
-kills the shipping worker mid-final-turn. The turn lands `is_error` and the work order
+killed the shipping worker mid-final-turn. The turn lands `is_error` and the work order
 settles "failed — review and retry" even though the release fully applied — that is
 exactly how wo-2fa7c0e9 shipped v0.5.1 perfectly and reported failure. Post-mortem:
 docs/superpowers/specs/2026-08-10-why-a-self-ship-reports-failure.md.
+
+Turns now run in their own transient units (`systemd_units`, issue #133), so a restart
+no longer reaches them and this handshake is belt-and-braces rather than the only thing
+standing between a deploy and a failed fleet. KEPT ANYWAY, deliberately: it is what makes
+the release *verifiable* — the marker is how a rebooted daemon proves the version landed
+— and the running-turn guard still holds the restart for the shipping worker on a host
+where the transient-unit transport is unavailable and the direct fallback is in use.
 
 So the deploy script gained a `--stage` mode: it performs every release step EXCEPT the
 service restarts and the notify, then writes a JSON marker file at

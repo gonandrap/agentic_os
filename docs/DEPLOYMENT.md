@@ -70,12 +70,15 @@ intentionally lags behind the shipped one.
 
 ### Staged releases (`--stage`) — shipping from a work order
 
-A worker `claude` process lives inside `jarvis.service`'s cgroup, so a release run
-from a Jarvis-dispatched work order kills its own worker when the daemon restarts:
-the final turn dies mid-report, and the work order settles `failed` even though the
+A worker `claude` process used to live inside `jarvis.service`'s cgroup, so a release
+run from a Jarvis-dispatched work order killed its own worker when the daemon restarted:
+the final turn died mid-report, and the work order settled `failed` even though the
 release fully applied (that is exactly how v0.5.1 shipped — see
-`docs/superpowers/specs/2026-08-10-why-a-self-ship-reports-failure.md`). A self-ship
-therefore **stages** instead of restarting:
+`docs/superpowers/specs/2026-08-10-why-a-self-ship-reports-failure.md`). Turns now run in
+transient units of their own (see *Worker turns run outside the daemon's cgroup* below),
+so that no longer happens — but a self-ship still **stages** rather than restarting,
+because staging is also what makes the release verifiable and what protects a host that
+has fallen back to the direct transport:
 
 ```bash
 scripts/shipit.sh --stage 1.4.0 --wo wo-abc12345
@@ -170,12 +173,46 @@ If a tool lives somewhere the script does not look, add its directory to that fa
 list — and to `GH_SEARCH_DIRS` in `src/jarvis/bugreport.py`, its mirror, which is what
 lets an already-installed daemon find `gh` without being re-installed.
 
+### Worker turns run outside the daemon's cgroup
+
+`systemd --user` defaults to `KillMode=control-group`, so anything left in
+`jarvis.service`'s cgroup dies with the daemon on every restart — a deploy, a
+crash-restart, `jarvis stop`. Detaching a turn (`start_new_session=True`) does not help:
+that leaves the process *group*, not the cgroup. On the jarvis-0.6.2 release this killed
+a feature order's planner, which then sat dead for nine hours (issue #133).
+
+Each worker turn therefore gets a transient unit of its own:
+
+```
+jarvis-turn-<wo-id>-<seq>.service
+```
+
+started with `systemd-run --user --collect`, so it lives under `app.slice` beside
+`jarvis.service` rather than inside it. Restarting the daemon does not touch a running
+turn; the turn writes its result file, and the **new** daemon reaps it on its first tick.
+`--collect` means a finished unit unloads itself, so `systemctl --user list-units
+'jarvis-turn-*'` showing nothing is the normal state, not a fault.
+
+The transport is auto-detected per spawn — `systemd-run` on `PATH`, `XDG_RUNTIME_DIR`
+set, and the daemon itself in a `.service` cgroup. A dev checkout, `jarvis start
+--foreground` from a shell and any host without systemd keep the plain detached-`Popen`
+path, and a `systemd-run` that fails falls back to it rather than stalling dispatch.
+`JARVIS_TURN_TRANSPORT=systemd|direct|auto` overrides the detection.
+
+> A transient unit inherits the **systemd user manager's** environment, not the daemon's.
+> Everything a worker needs — `JARVIS_HOME`, `JARVIS_ENV`, the `Environment=PATH=` that
+> puts `gh` within reach (#90) — is forwarded explicitly with `--setenv`. If a worker
+> suddenly cannot see something the daemon can, that forwarding is the first place to
+> look.
+
 ### Restarting `jarvis.service` from a session Jarvis spawned
 
-A Claude session that the daemon started lives **inside `jarvis.service`'s cgroup**, so
-`systemctl --user restart jarvis.service` kills that session along with whatever script
-it was running. This is what left 0.5.0 half-applied: the deploy script restarted the
-daemon, died, and never reached `jarvis-ui.service`.
+A Claude session that the daemon started used to live **inside `jarvis.service`'s
+cgroup**, so `systemctl --user restart jarvis.service` killed that session along with
+whatever script it was running. This is what left 0.5.0 half-applied: the deploy script
+restarted the daemon, died, and never reached `jarvis-ui.service`. Worker turns now sit
+in their own units and are safe, but keep doing the below — it costs nothing, and it
+still covers a host on the direct fallback.
 
 `scripts/shipit.sh` and `scripts/install_prod_service.sh` both handle it the same way —
 the UI restarts inline, the daemon restarts **last**, detached into a transient unit:

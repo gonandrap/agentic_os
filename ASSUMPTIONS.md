@@ -442,7 +442,8 @@ for every call to be recorded here instead. These are those calls.
     a daemon thread pool.** Blocking in the pool is simpler and I did not take it:
     `shipit` restarts jarvisd on every release, and a turn can run for hours, so every
     deploy would lose the reply of every in-flight turn. Detaching also frees the 4-slot
-    delivery pool, which disappears.
+    delivery pool, which disappears. **Detaching turned out not to buy what this claimed**
+    — see #81, which is what actually delivers it.
 
 65. **A new `wo_turns` table, rather than reusing `job_id`/`reply_job_id`.** The
     conversation becomes explicit and queryable, which is what makes reply capture a
@@ -546,3 +547,18 @@ for every call to be recorded here instead. These are those calls.
     timeline, replies and any assumptions, and skips any row with assumptions still
     pending. It is idempotent, and the tracker deliberately ignores `adhoc` rows so the
     retirement cannot be undone on the next tick.
+
+81. **A worker turn runs in its own transient systemd unit (`systemd-run --user
+    --collect`), chosen by auto-detection at spawn time, with the plain `Popen` path kept
+    as both a fallback and the dev/foreground default** (issue #133). #64 assumed
+    `start_new_session=True` was enough to outlive a deploy. It is not: a new session
+    leaves the process GROUP, not the cgroup, and `systemd --user` defaults to
+    `KillMode=control-group`, so every `systemctl restart jarvis` SIGTERMed every turn in
+    flight — reproduced in production on the jarvis-0.6.2 release, where a feature order's
+    planner sat dead for nine hours. `KillMode=mixed` was rejected: systemd still SIGKILLs
+    the remaining cgroup once the main process is gone. Auto-detection (`systemd-run` on
+    PATH, `XDG_RUNTIME_DIR` set, and this process in a `.service` cgroup) was chosen over
+    an `Environment=` line in the service template because the template only takes effect
+    after someone re-runs `install_prod_service.sh` — the exact silent-no-op that cost a
+    release when `gh` fell off the daemon's PATH (#90). `JARVIS_TURN_TRANSPORT=systemd|
+    direct|auto` overrides it; the test-isolation gate pins `direct`.
