@@ -64,7 +64,9 @@ def _child(key: str, title: str, acceptance: str, needs: list[str] | None = None
 
 
 def _case(name: str, ask: str, plan_doc: dict[str, Any]) -> tuple[str, str]:
-    plan = plans.parse_plan(plan_doc)
+    # Every plan must stand on a design document (plans._spec_problems). Defaulted here
+    # so a case still says only what it is about; a case may override it.
+    plan = plans.parse_plan({"design_doc": "docs/specs/feature.md", **plan_doc})
     fo = {"id": f"fo-{name}", "title": ask.split(".")[0][:80], "description": ask}
     return name, plans.build_plan_question(fo, plan)
 

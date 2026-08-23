@@ -26,6 +26,7 @@ from jarvis import db, ops, plans
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
+from jarvis.testing import FIXTURE_DESIGN_DOC
 
 
 @pytest.fixture()
@@ -62,6 +63,11 @@ def a_plan(*children: dict, **extra) -> dict:
                                for m in ("FORCE_APPROVE", "FORCE_REJECT")
                                if m in c["description"]}))
     return {"summary": f"an exporter {markers}".strip(),
+            # Every plan must stand on a design document. The fixture project ships one
+            # (`jarvis.testing.FIXTURE_DESIGN_DOC`), so naming it here keeps the design
+            # rule out of tests that are about something else; the rule itself is tested
+            # in tests/test_plan_validator.py.
+            "design_doc": FIXTURE_DESIGN_DOC,
             "children": list(children), **extra}
 
 

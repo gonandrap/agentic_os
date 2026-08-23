@@ -26,6 +26,7 @@ from jarvis import ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
+from jarvis.testing import FIXTURE_DESIGN_DOC
 
 ASK = ("Add a CSV exporter to the reporting module, with a command that calls it and "
        "tests over both the happy path and an empty result set.")
@@ -64,6 +65,7 @@ def a_feature(daemon, store, *keys: str, max_parallel: int | None = None) -> dic
                                   max_parallel=max_parallel)
     daemon.tick()
     ops.submit_plan(fo["id"], {"summary": "an exporter FORCE_APPROVE",
+                               "design_doc": FIXTURE_DESIGN_DOC,
                                "children": [child(k) for k in keys]})
     daemon._neo_drain()
     return store.get_feature_order(fo["id"])
@@ -211,6 +213,7 @@ def test_a_child_blocked_on_a_dependency_says_that_instead(started, store):
                                   max_parallel=1)
     started.tick()
     ops.submit_plan(fo["id"], {"summary": "an exporter FORCE_APPROVE",
+                               "design_doc": FIXTURE_DESIGN_DOC,
                                "children": [child("schema"),
                                             child("api", needs=["schema"])]})
     started._neo_drain()

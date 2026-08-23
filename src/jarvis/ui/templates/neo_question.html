@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% from "_question.html" import question_body, deliberation %}
+{% block title %}question #{{ q.id }} — Jarvis{% endblock %}
+{% block content %}
+
+{# ONE question, with its answer — the page a work order's timeline points at.
+   The timeline used to print the question inline, directly above the answer arriving as
+   a message, so the reader read the exchange twice and still had to go elsewhere to see
+   whether Neo's answer had been reviewed. This is that elsewhere: the question, the
+   answer, who gave it, and what the panel did, in one place. #}
+
+<h2><a href="/neo">neo</a> / <span class="mono">question #{{ q.id }}</span></h2>
+
+<div class="panel" style="padding: 14px 16px;">
+  <div class="who">
+    {{ q.project }} ·
+    <a href="/wo/{{ q.project }}/{{ q.wo_id }}" class="mono">{{ q.wo_id }}</a> ·
+    asked {{ fmt_age(q.ts) }} ago
+    {% if q.kind and q.kind != 'question' %} · <span class="badge">{{ q.kind }}</span>{% endif %}
+    {% if q.status == 'failed' %} · <span class="tone-bad">✗ neo call failed</span>
+    {% elif q.status != 'answered' %} · <span class="st tone-warn"><span class="i">◌</span>{{ q.status }}</span>
+    {% endif %}
+  </div>
+  {{ question_body(q) }}
+</div>
+
+<h2>Answer</h2>
+<div class="panel" style="padding: 14px 16px;">
+  {% if q.answer %}
+  <div style="white-space: pre-wrap;">{{ q.answer }}</div>
+  <p class="kv" style="margin-bottom:0;">
+    — {{ q.answered_by or 'unknown' }}{% if q.answered_at %}, {{ fmt_age(q.answered_at) }} ago{% endif %}
+    {%- if q.answered_by == 'neo' %} ·
+    {% if q.review_status == 'approved' %}<span class="st tone-ok"><span class="i">✓</span>you approved this</span>
+    {% elif q.review_status == 'corrected' %}<span class="st tone-warn"><span class="i">✎</span>you corrected this</span>
+    {% else %}<span class="st tone-muted"><span class="i">◌</span>awaiting your review —
+      <a href="/neo">review it →</a></span>{% endif %}
+    {%- endif %}
+  </p>
+  {% if q.answer_reason %}<p class="sub">Reasoning: {{ q.answer_reason }}</p>{% endif %}
+  {% else %}
+  {# Not an error, and worth saying which kind of "not yet" this is: a worker is parked
+     on it either way, and only one of the two is waiting on the user. #}
+  <div class="empty">
+    {%- if q.status in ('escalated', 'failed') -%}
+      not answered yet — Neo escalated this to you. <a href="/neo">answer it →</a>
+    {%- else -%}
+      not answered yet — still with Neo.
+    {%- endif -%}
+  </div>
+  {% endif %}
+</div>
+
+{% if opinions %}
+<h2>How it was decided</h2>
+<div class="panel" style="padding: 14px 16px;">{{ deliberation(opinions) }}</div>
+{% endif %}
+
+{% endblock %}

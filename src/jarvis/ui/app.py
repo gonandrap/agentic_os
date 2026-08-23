@@ -559,8 +559,7 @@ def create_app() -> FastAPI:
         return render(request, "work_order.html", project=pname, wo=wo,
                       pause=pause, waiting=waiting,
                       timeline=build_timeline(wo, events, messages,
-                                              include_debug=show_debug,
-                                              questions=ops.neo_question_texts(wo_id)),
+                                              include_debug=show_debug),
                       debug=show_debug, debug_count=count_debug(events),
                       messages=messages, assumptions=assumptions,
                       approvals=approvals, bill=bill,
@@ -690,6 +689,30 @@ def create_app() -> FastAPI:
                       in_flight=in_flight, escalated=escalated,
                       unreviewed=unreviewed, history=history, learnings=learnings,
                       opinions=opinions, digest_credit=_digest_credit())
+
+    @app.get("/neo/question/{question_id}", response_class=HTMLResponse)
+    def neo_question_page(request: Request, question_id: int):
+        """One question and its answer — where a work order's timeline sends the reader.
+
+        The timeline entry for `question_asked` names the question and points here
+        instead of reprinting it, because the question is only half of what the reader
+        wants: the other half is the answer, and until this page existed the only way to
+        see the two together was to scroll `/neo` looking for the id. `active="neo"`
+        keeps the nav lit on the section this belongs to.
+        """
+        from ..neo_store import NeoStore
+        neo = NeoStore()
+        try:
+            q = neo.get(question_id)
+            opinions = neo.opinions(question_id) if q else []
+        finally:
+            neo.close()
+        if q is None:
+            return render(request, "error.html", active="neo",
+                          message=f"neo question {question_id} not found",
+                          status_code=404)
+        return render(request, "neo_question.html", active="neo",
+                      q=_decorate_question(q), opinions=opinions)
 
     @app.get("/gates", response_class=HTMLResponse)
     def gates_page(request: Request):

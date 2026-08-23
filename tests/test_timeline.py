@@ -12,7 +12,7 @@ from jarvis.timeline import build_timeline, event_level
 
 SIGNAL_KINDS = [
     "created", "dispatched", "status", "attention", "assumption",
-    "question_asked", "neo_answered", "escalation_answered", "reviewed",
+    "question_asked", "reviewed",
     "finished",
     # A turn that failed or was cancelled is the story, not the plumbing: it is why
     # the work order stopped.
@@ -27,6 +27,10 @@ DEBUG_KINDS = [
     "message_queued", "delivering", "message_delivered",
     "turn_started", "turn_ended", "session_released", "permission_mode_changed",
     "hook:SessionStart", "hook:Stop", "hook:SessionEnd", "hook:Notification",
+    # An answer is the message it was queued as, not the bookkeeping beside it. Both
+    # writers do the two in the same breath, so as signal these cost the reader a line
+    # that says an answer arrived, directly above the answer.
+    "neo_answered", "escalation_answered",
 ]
 
 
@@ -65,12 +69,14 @@ def test_debug_events_included_when_asked():
     assert [e["level"] for e in entries] == ["signal", "debug"]
 
 
-def test_created_entry_says_what_the_work_order_is_about():
+def test_created_entry_does_not_restate_the_work_order():
+    """Every surface that renders this timeline puts the title and description at the
+    top of the same page, so an opening entry repeating them is the reader's first
+    scroll spent on text they have just read."""
     wo = {"title": "Fix the citation exporter", "description": "BibTeX output drops DOIs"}
     entry = build_timeline(wo, [ev("created", 1.0, origin="jarvis")], [])[0]
     assert entry["label"] == "Work order created"
-    assert "Fix the citation exporter" in entry["detail"]
-    assert "BibTeX output drops DOIs" in entry["detail"]
+    assert entry["detail"] == ""
 
 
 def test_signal_entries_read_as_prose_not_json():
@@ -82,9 +88,9 @@ def test_signal_entries_read_as_prose_not_json():
     ]
     entries = build_timeline({}, events, [])
     labels = [e["label"] for e in entries]
-    assert labels == ["Running", "Needs you", "Assumption recorded", "Finished"]
+    assert labels == ["Running", "Needs you", "Assumption #1 recorded", "Finished"]
     assert [e["detail"] for e in entries] == [
-        "", "Claude needs your permission", "assuming UTF-8 input", "exporter fixed",
+        "", "Claude needs your permission", "", "exporter fixed",
     ]
 
 
@@ -124,48 +130,111 @@ def test_message_plumbing_events_never_duplicate_the_message_itself():
 # renders an empty detail forever, and asserting only on event_level (as the tests
 # above do) cannot see it — that is exactly how the empty "Worker asked a question"
 # entry shipped. These tests assert the DETAIL, so a key that goes unwritten fails here.
+#
+# The same trap has a second face, which the rest of this section is about: a detail
+# that DOES render, and renders text the reader is already looking at somewhere else on
+# the same page. That costs attention rather than losing it, so no assertion catches it
+# by accident — each of these names the surface the text is duplicated from.
 
-def test_question_asked_shows_what_was_asked():
+def test_question_asked_points_at_the_question_instead_of_reprinting_it():
+    """A question has an answer, and only its own record holds the two together. So the
+    entry carries a reference and the reader follows it — rather than reading the
+    question here and its answer again two lines down, as a message."""
     events = [ev("question_asked", 1.0, neo_question_id=7,
                  question="CSV or JSON for the export default?")]
     entry = build_timeline({}, events, [])[0]
     assert entry["label"] == "Worker asked a question"
-    assert entry["detail"] == "CSV or JSON for the export default?"
+    assert entry["detail"] == ""
+    assert entry["ref"] == {"kind": "neo_question", "id": 7, "label": "question #7"}
 
 
-def test_an_older_question_is_filled_in_from_neos_db():
-    """Events written before the text was stored carry only the id."""
-    events = [ev("question_asked", 1.0, neo_question_id=7)]
-    entries = build_timeline({}, events, [], questions={7: "the original question"})
-    assert entries[0]["detail"] == "the original question"
+def test_a_question_event_with_no_id_falls_back_to_its_text():
+    """Nothing to point at, so the text is all there is — an entry saying neither what
+    was asked nor where to read it says nothing at all."""
+    events = [ev("question_asked", 1.0, question="what was asked")]
+    entry = build_timeline({}, events, [])[0]
+    assert entry["ref"] is None
+    assert entry["detail"] == "what was asked"
 
 
-def test_a_question_with_nothing_to_fill_it_in_from_still_renders():
-    """No payload text, no lookup (Neo's DB unreadable, or the question purged)."""
-    events = [ev("question_asked", 1.0, neo_question_id=7)]
+def test_most_entries_point_at_nothing():
+    """`ref` is present on every entry and set on almost none: a template that reads it
+    must not have to ask whether the key is there."""
+    entries = build_timeline({}, [ev("created", 1.0), ev("finished", 2.0, summary="s")],
+                             [{"ts": 3.0, "direction": "agent_to_user", "content": "x"}])
+    assert [e["ref"] for e in entries] == [None, None, None]
+
+
+def test_assumptions_are_numbered_rather_than_repeated():
+    """The page that shows this timeline lists the assumptions themselves, numbered the
+    same way — so the text here was the same paragraph twice, feet apart."""
+    events = [ev("assumption", 1.0, content="assuming UTF-8 input", n=1),
+              ev("assumption", 2.0, content="assuming ISO dates", n=2)]
     entries = build_timeline({}, events, [])
-    assert entries[0]["label"] == "Worker asked a question"
-    assert entries[0]["detail"] == ""
+    assert [e["label"] for e in entries] == ["Assumption #1 recorded",
+                                             "Assumption #2 recorded"]
+    assert [e["detail"] for e in entries] == ["", ""]
 
 
-def test_the_payload_wins_over_the_lookup():
-    events = [ev("question_asked", 1.0, neo_question_id=7, question="what was asked")]
-    entries = build_timeline({}, events, [], questions={7: "stale"})
-    assert entries[0]["detail"] == "what was asked"
+def test_assumptions_written_before_they_were_numbered_are_numbered_here():
+    """Rows already on disk carry no `n`. Numbering them by position gives the same
+    answer as the writer's counter — both count in `ts` order, which is the order the
+    assumptions table is read back in — so the two surfaces cannot disagree."""
+    events = [ev("assumption", 1.0, content="first"),
+              ev("assumption", 2.0, content="second"),
+              ev("assumption", 3.0, content="third", n=3)]
+    entries = build_timeline({}, events, [])
+    assert [e["label"] for e in entries] == [
+        "Assumption #1 recorded", "Assumption #2 recorded", "Assumption #3 recorded"]
+
+
+def test_neos_answer_is_one_line_and_says_neo_said_it():
+    """It used to be two, and the survivor was misattributed. `neo_answered` and the
+    message carrying the answer are the same moment, written in the same breath — so the
+    event is plumbing, and the message is labelled from its own `source`."""
+    events = [ev("question_asked", 1.0, neo_question_id=7),
+              ev("neo_answered", 3.0, neo_question_id=7)]
+    messages = [{"ts": 4.0, "direction": "user_to_agent", "source": "neo",
+                 "content": "[Neo] go with CSV"}]
+    entries = build_timeline({}, events, messages)
+    assert [(e["kind"], e["label"]) for e in entries] == [
+        ("question_asked", "Worker asked a question"),
+        ("message", "Neo → worker"),
+    ]
+
+
+def test_the_user_answering_still_reads_as_the_user():
+    """Only Neo's own messages are relabelled; everything else inbound is the user."""
+    events = [ev("escalation_answered", 3.0, neo_question_id=8)]
+    messages = [{"ts": 4.0, "direction": "user_to_agent", "source": "ui",
+                 "content": "[Answer from the user] and gzip it"}]
+    entries = build_timeline({}, events, messages)
+    assert [e["label"] for e in entries] == ["You → worker"]
+
+
+def test_the_bookkeeping_is_still_on_the_record_for_anyone_who_asks():
+    """Debug, not deleted. The moment Neo answered is an audit fact; it is just not one
+    worth a line of the story directly above the answer itself."""
+    events = [ev("neo_answered", 3.0, neo_question_id=7),
+              ev("escalation_answered", 5.0, neo_question_id=8)]
+    entries = build_timeline({}, events, [], include_debug=True)
+    assert [(e["kind"], e["label"], e["detail"]) for e in entries] == [
+        ("neo_answered", "Neo answered the worker", ""),
+        ("escalation_answered", "You answered the worker", ""),
+    ]
 
 
 def test_answers_are_not_repeated_on_top_of_their_message():
     """Both answer paths queue the answer as a message in the same breath, so the
     text is already the next line — an event detail here would print it twice."""
-    events = [ev("question_asked", 1.0, question="CSV or JSON?"),
+    events = [ev("question_asked", 1.0, neo_question_id=7),
               ev("neo_answered", 3.0, neo_question_id=7),
               ev("escalation_answered", 5.0, neo_question_id=8)]
-    messages = [{"ts": 2.0, "direction": "user_to_agent", "content": "[Neo] go with CSV"},
-                {"ts": 4.0, "direction": "user_to_agent", "content": "[user] and gzip it"}]
+    messages = [{"ts": 2.0, "direction": "user_to_agent", "source": "neo",
+                 "content": "[Neo] go with CSV"},
+                {"ts": 4.0, "direction": "user_to_agent", "source": "ui",
+                 "content": "[user] and gzip it"}]
     entries = build_timeline({}, events, messages)
-    by_kind = {e["kind"]: e for e in entries}
-    assert by_kind["neo_answered"]["detail"] == ""
-    assert by_kind["escalation_answered"]["detail"] == ""
     # ...and the answers themselves are still on the record, once each.
     assert [e["detail"] for e in entries if e["kind"] == "message"] == [
         "[Neo] go with CSV", "[user] and gzip it"]

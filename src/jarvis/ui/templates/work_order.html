@@ -148,8 +148,15 @@
 {% if assumptions %}
 <h2{% if pending == 'assumptions' %} id="pending"{% endif %}>Assumptions pending your review</h2>
 <div class="panel">
+  {# NUMBERED, and the number is the one the timeline uses ("Assumption #2 recorded").
+     The timeline stopped repeating the text — this is the only place it is written —
+     so the number is what ties the two together, and `n` comes from the store rather
+     than from `loop.index` because this list is only the PENDING ones: numbering by
+     position here would call the second assumption "#1" the moment the first is
+     reviewed, and disagree with what the timeline already said. #}
   {% for a in assumptions %}
-  <div class="row"><div class="grow">{{ a.content }}</div>
+  <div class="row"><span class="mono sub" style="min-width: 2.5em;">#{{ a.n }}</span>
+    <div class="grow">{{ a.content }}</div>
     <span class="sub mono">{{ fmt_age(a.ts) }} ago</span></div>
   {% endfor %}
   <div class="row">
@@ -201,11 +208,38 @@
 </div>
 {% endif %}
 
+{# THE THREE READINGS OF ONE WORK ORDER, as tabs rather than as a stack.
+   Conversation, spend and timeline are alternatives — a reader wants one of them at a
+   time — and stacked they cost a long scroll to reach the last. Everything ABOVE this
+   point stays outside the tabs on purpose: the header, the assumptions awaiting a
+   decision and the gates awaiting one are things the page is ASKING of the reader, and
+   an ask hidden behind a tab is an ask that does not happen. #}
+<div class="tabbed" id="wo-tabs">
+  <div class="tabs" role="tablist">
+    <button role="tab" data-panel="tab-conversation" aria-selected="true"
+            aria-controls="tab-conversation">Conversation
+      {%- if messages %}<span class="n">{{ messages|length }}</span>{% endif %}</button>
+    {% if bill and bill.turns %}
+    <button role="tab" data-panel="tab-spend" aria-selected="false"
+            aria-controls="tab-spend">Spend
+      <span class="n">~${{ '%.2f'|format(bill.total.cost.list_usd) }}</span></button>
+    {% endif %}
+    <button role="tab" data-panel="tab-timeline" aria-selected="false"
+            aria-controls="tab-timeline">Timeline
+      {%- if timeline %}<span class="n">{{ timeline|length }}</span>{% endif %}</button>
+  </div>
+
+<section class="tabpanel on" id="tab-conversation" role="tabpanel">
 <h2>Conversation</h2>
 <div class="panel">
   {% for msg in messages %}
+  {# Who spoke, from the message's own `source` — the same rule the timeline uses
+     (`timeline._message_label`). "you → worker" on every inbound message was false for
+     the commonest one there is: Neo's answer to a worker's question. #}
+  {% set who = ('neo → worker' if msg.source == 'neo' else 'you → worker')
+                if msg.direction == 'user_to_agent' else 'worker → you' %}
   <div class="msg {{ 'user' if msg.direction == 'user_to_agent' }}">
-    <div class="who">{{ 'you → worker' if msg.direction == 'user_to_agent' else 'worker → you' }}
+    <div class="who">{{ who }}
       · via {{ msg.source }} · {{ msg.status }} · {{ fmt_age(msg.ts) }} ago
       {#- What answering this message cost. It is the TURN's line, not a second
           accounting of the message: a message is an ask, and the turn it set going is
@@ -231,11 +265,13 @@
     </form>
   </div>
 </div>
+</section>
 
 {% if bill and bill.turns %}
 {# The same bill as `/cost/<project>/<id>`, turn by turn, on the page the reader is
-   already on. Expandable rather than printed: the numbers are here for the turn that
+   already on. Behind a tab rather than printed: the numbers are here for the turn that
    looks wrong, and a page that opens with a token table buries the conversation. #}
+<section class="tabpanel" id="tab-spend" role="tabpanel">
 <h2>Spend, turn by turn</h2>
 {{ bill_ui.view(bill.turns, bill.total, 'total for ' ~ wo.id) }}
 <p class="sub" style="margin-top: 8px;">
@@ -243,14 +279,22 @@
   turns, what Jarvis spent answering it, and what the worker's tool calls spawned
   beneath it. <a href="/cost/{{ project }}/{{ wo.id }}">The full bill →</a>
 </p>
+</section>
 {% endif %}
 
+<section class="tabpanel" id="tab-timeline" role="tabpanel">
 <h2>Timeline</h2>
 <div class="panel">
   <ul class="timeline">
     {% for e in timeline %}
     <li{% if e.level == 'debug' %} class="dbg"{% endif %}>
-      {{ fmt_age(e.ts) }} ago — <strong>{{ e.label }}</strong>{% if e.detail %}
+      {{ fmt_age(e.ts) }} ago — <strong>{{ e.label }}</strong>
+      {#- Where the entry points at a record of its own instead of reproducing it
+          (timeline._ref): a link, so the reader can go and read the whole of it —
+          a question together with its answer — rather than half of it here. -#}
+      {%- if e.ref and e.ref.kind == 'neo_question' %}
+      <a href="/neo/question/{{ e.ref.id }}">{{ e.ref.label }} →</a>{% endif %}
+      {%- if e.detail %}
       <span class="detail" style="white-space: pre-wrap;">{{ e.detail }}</span>{% endif %}
     </li>
     {% else %}
@@ -264,5 +308,52 @@
       ({{ debug_count }})</a>
   {% endif %}
 </div>
+</section>
+</div>
+
+<script>
+// Tabs, added to a page that works without them. Nothing is hidden until `.js` is on
+// the container, so a browser that never runs this still gets all three sections.
+(function () {
+  var root = document.getElementById('wo-tabs');
+  if (!root) return;
+  var tabs = root.querySelectorAll('.tabs button');
+  var panels = root.querySelectorAll('.tabpanel');
+
+  function show(id) {
+    var found = false;
+    panels.forEach(function (p) {
+      var on = p.id === id;
+      p.classList.toggle('on', on);
+      found = found || on;
+    });
+    if (!found) return false;
+    tabs.forEach(function (t) {
+      t.setAttribute('aria-selected', t.dataset.panel === id ? 'true' : 'false');
+    });
+    return true;
+  }
+
+  root.classList.add('js');
+  tabs.forEach(function (t) {
+    t.addEventListener('click', function () { show(t.dataset.panel); });
+  });
+
+  // Deep links must keep working. `#pending` — what every notification links to — and
+  // `#gate-<id>` land on elements that may now be inside a closed tab, so open whichever
+  // panel contains the target and then scroll to it. Without this the page would open on
+  // the conversation tab and the thing the user was sent here for would be invisible.
+  function follow() {
+    var id = location.hash.slice(1);
+    if (!id) return;
+    var target = document.getElementById(id);
+    if (!target) return;
+    var panel = target.closest('.tabpanel');
+    if (panel && show(panel.id)) target.scrollIntoView();
+  }
+  follow();
+  window.addEventListener('hashchange', follow);
+})();
+</script>
 
 {% endblock %}

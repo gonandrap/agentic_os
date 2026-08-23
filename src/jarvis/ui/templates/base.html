@@ -164,6 +164,31 @@
   .disclosure > summary::before { content: "▸ "; color: var(--ink-3); }
   .disclosure[open] > summary::before { content: "▾ "; }
   .disclosure > summary:hover { color: var(--ink); border-color: var(--ink-3); }
+  /* TABS — for a page whose sections are alternatives, not a sequence.
+     The work order page had three full-height blocks stacked (conversation, spend,
+     timeline) and reading the last meant scrolling past the other two every time.
+
+     Progressive enhancement, deliberately: without JavaScript every panel is visible
+     and the page is exactly the stack it used to be. The script adds `.js` to the
+     container, and only then does anything hide — so a broken or blocked script costs
+     the reader nothing but the tab strip. */
+  .tabs { display: flex; gap: 4px; margin: 30px 0 0; border-bottom: 1px solid var(--line);
+          flex-wrap: wrap; }
+  .tabs button {
+    background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0;
+    padding: 8px 14px; color: var(--ink-3); font: 600 12px var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+  }
+  .tabs button:hover { color: var(--ink-2); }
+  .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--amber); }
+  .tabs .n { font-weight: 400; letter-spacing: 0; color: var(--ink-3); margin-left: 6px;
+             text-transform: none; }
+  .tabbed.js > .tabpanel { display: none; }
+  .tabbed.js > .tabpanel.on { display: block; }
+  /* The panels carry their own heading when they are stacked (no JS); with tabs the
+     strip IS the heading, so it would be said twice. */
+  .tabbed.js > .tabpanel > h2:first-child { display: none; }
+
   @media (prefers-reduced-motion: no-preference) {
     .pulse { animation: pulse 2.4s ease-in-out infinite; }
     @keyframes pulse { 50% { opacity: 0.45; } }

@@ -377,7 +377,7 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
     `Bash` either — withholding `Write` while granting a shell is not a prohibition,
     because a heredoc writes a file just as well (ruled 2026-08-03).
     """
-    from .plans import CHILD_CAP, MIN_DESCRIPTION_CHARS
+    from .plans import CHILD_CAP, MAX_DESCRIPTION_CHARS, MIN_DESCRIPTION_CHARS
 
     fo_id = wo.get("parent_id") or "?"
     parts = [
@@ -433,6 +433,8 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         '  "summary": "one line: what this feature is, once it is all done",',
         '  "design_doc": "docs/specs/<feature>.md — the design document your briefs '
         'reference, relative to the repo root",',
+        '  "design_doc_by": "<child key> — INSTEAD of design_doc, when there is no spec '
+        'yet: the child that writes one",',
         '  "justification": "only if you exceed the child cap — why it cannot be fewer",',
         '  "children": [',
         "    {",
@@ -460,6 +462,14 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "the architecture, the data model, the interfaces, the traps — goes THERE, "
         "once. Do not repeat it into every child: that duplication is what took "
         "plan-review questions to 84KB.",
+        "",
+        "**Every plan stands on a design document, and the validator checks it.** If "
+        "writing one yourself is genuinely not the right move — the feature is a set of "
+        "small independent fixes, or the spec is itself the thing that has to be worked "
+        "out against the code — then make writing it THE FIRST CHILD: name that child's "
+        "key in `design_doc_by` instead of naming a `design_doc`, and give every other "
+        "child a `needs` path back to it. A spec its siblings do not wait for is a spec "
+        "they cannot cite. Name one or the other; naming both is refused.",
         "",
         "Each child is dispatched into a NEW session with a worker that sees its own "
         "description plus the design document, and nothing else — not this plan, not "
@@ -489,6 +499,13 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"cannot)",
         f"- a description under {MIN_DESCRIPTION_CHARS} characters, or one that only "
         f"repeats the title, or one that points at something the child worker cannot see",
+        f"- a description over {MAX_DESCRIPTION_CHARS} characters. This is the hard "
+        f"edge of \"a brief, not an encyclopedia\", and it is not negotiable by writing "
+        f"more carefully: if the piece needs more than that to explain, the explanation "
+        f"belongs in the design document and the brief cites its section number",
+        f"- a plan naming neither `design_doc` nor `design_doc_by`, a `design_doc_by` "
+        f"that is not a child of the plan, or a `design_doc_by` child that some sibling "
+        f"does not depend on",
         "",
         "If it refuses, it names every problem at once. Fix them all and resubmit.",
         "",

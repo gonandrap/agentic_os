@@ -1351,24 +1351,43 @@ class ProjectStore:
 
     # -- assumptions -----------------------------------------------------------
 
+    #: Every assumption, carrying `n`: its position among its OWN work order's
+    #: assumptions, numbered from 1 in the order they were recorded. `n` is what the
+    #: timeline says instead of repeating the assumption's text ("Assumption #2
+    #: recorded"), so it has to mean the same thing on both surfaces — and a row id
+    #: would not, being global to the project and liable to start a work order's list
+    #: at 47. Computed rather than stored so it is right for rows written before it
+    #: existed; `add_assumption` writes the same number into the event payload, by the
+    #: same rule, so the two cannot drift.
+    _NUMBERED = ("SELECT a.*, ROW_NUMBER() OVER (PARTITION BY a.wo_id "
+                 "ORDER BY a.ts, a.id) AS n FROM assumptions a")
+
     def add_assumption(self, wo_id: str, content: str) -> int:
+        n = 1 + int(self.conn.execute(
+            "SELECT COUNT(*) FROM assumptions WHERE wo_id=?", (wo_id,)
+        ).fetchone()[0])
         cur = self.conn.execute(
             "INSERT INTO assumptions (wo_id, ts, content) VALUES (?,?,?)",
             (wo_id, db.now(), content),
         )
-        self.add_event(wo_id, "assumption", {"content": content})
+        # `content` stays in the payload — the event record has always been
+        # self-contained, and an assumption that survives only in another table is one a
+        # deleted row erases. `n` is what the timeline renders instead of it.
+        self.add_event(wo_id, "assumption", {"content": content, "n": n})
         return int(cur.lastrowid)
 
     def pending_assumptions(self, wo_id: str | None = None) -> list[dict[str, Any]]:
         if wo_id:
             rows = self.conn.execute(
-                "SELECT * FROM assumptions WHERE status='pending' AND wo_id=? ORDER BY ts", (wo_id,)
+                f"SELECT * FROM ({self._NUMBERED}) WHERE status='pending' AND wo_id=? "
+                f"ORDER BY ts", (wo_id,)
             ).fetchall()
         else:
             # Fleet-wide view: assumptions of hidden work orders aren't asking for review.
             rows = self.conn.execute(
-                """SELECT a.* FROM assumptions a JOIN work_orders w ON w.id = a.wo_id
-                   WHERE a.status='pending' AND w.hidden=0 ORDER BY a.ts"""
+                f"""SELECT a.* FROM ({self._NUMBERED}) a
+                    JOIN work_orders w ON w.id = a.wo_id
+                    WHERE a.status='pending' AND w.hidden=0 ORDER BY a.ts"""
             ).fetchall()
         return db.rows_to_dicts(rows)
 
@@ -1380,7 +1399,7 @@ class ProjectStore:
         has to compare the timeline against.
         """
         rows = self.conn.execute(
-            "SELECT * FROM assumptions WHERE wo_id=? ORDER BY ts", (wo_id,)
+            f"SELECT * FROM ({self._NUMBERED}) WHERE wo_id=? ORDER BY ts", (wo_id,)
         ).fetchall()
         return db.rows_to_dicts(rows)
 
