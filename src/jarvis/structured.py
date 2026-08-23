@@ -19,6 +19,12 @@ step is the one worth sharing, because the two sensible answers to it are opposi
 policy of its own: `parse_json_object` returns `None` rather than raising or inventing an
 empty dict, and `validate` belongs to the caller.
 
+ONE REPAIR IS ATTEMPTED, AND ONLY ONE. A reply that is complete except for the closing
+brackets is closed and re-parsed (`close_unterminated`); anything cut off mid-value is
+not, because the two failures look nothing alike from the caller's side. The first costs
+a byte and, for Neo, an unnecessary interruption of the user. The second would cost a
+worker a truncated answer it could not tell from a whole one.
+
 THE RETRY APPENDS TO THE USER PROMPT ONLY. `system_prompt` is passed through byte-identical
 on every attempt, because that is what keeps consecutive calls inside the Anthropic
 prompt cache — a retry that rewrote the system prompt would cost a full cache miss, and
@@ -45,7 +51,9 @@ DEFAULT_CALL = partial(claude_cli.run_headless_result, attribute=False)
 #: it spans from the first `{` to the LAST `}`, so a nested object survives and a
 #: trailing ``` fence does not. The cost is that two separate objects in one reply match
 #: as one unparseable span — a reply that said two things is not a reply that said one,
-#: so refusing it is the right answer rather than silently taking the first.
+#: so refusing it is the right answer rather than silently taking the first. That case
+#: survives the `close_unterminated` repair untouched, because two whole objects are
+#: already bracket-balanced and the repair only ever APPENDS closers.
 #: `tests/test_structured.py` pins this input by input.
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
@@ -61,19 +69,98 @@ class InvalidOutput(ValueError):
     """
 
 
+def _load_object(text: str) -> dict[str, Any] | None:
+    """`json.loads(text)` when it yields an object, `None` on anything else."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def close_unterminated(text: str) -> str | None:
+    """`text` plus the `}`/`]` its still-open containers need, or `None`.
+
+    CLOSERS ONLY, and that restraint is the whole safety argument. An unterminated
+    string is not closed, a dangling comma is not trimmed, a missing value is not
+    invented — those are the shapes a reply cut off MID-VALUE takes, and a repair that
+    guessed at them would hand a caller half an answer wearing a whole answer's shape.
+    What this repairs is the one failure it costs nothing to be sure about: a model that
+    finished its last value and then forgot the brackets around it. Everything else still
+    fails to parse, and for Neo still fails toward the user (see `neo.parse_verdict`).
+
+    `None` means "not repairable this way": already balanced (so the caller's parse
+    failed for some other reason, and appending nothing cannot change that), ended inside
+    a string, ended on a bare number, or closed a bracket it never opened. Note the scan
+    is STRING-AWARE — a naive count calls `{"a": "}"}` unbalanced.
+
+    THE NUMBER IS THE SUBTLE ONE. `{"n": 12` closes to `{"n": 12}` and parses, so nothing
+    downstream would ever know the reply might have been cut out of the middle of 123456;
+    a digit is the only JSON token whose prefix is itself a valid token. Strings are
+    refused because they need a quote invented, and `true`/`false`/`null` are
+    self-delimiting, so numbers are the one case where closers alone silently change a
+    value rather than failing. Refused for that reason, at the cost of an escalation in
+    the case where the model merely forgot the brace after a number.
+    """
+    stack: list[str] = []
+    in_string = escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not stack or stack[-1] != ch:
+                return None  # crossed brackets: not a truncation, so do not guess
+            stack.pop()
+    if in_string or not stack or text.rstrip()[-1:].isdigit():
+        return None
+    return text + "".join(reversed(stack))
+
+
 def parse_json_object(raw: str) -> dict[str, Any] | None:
     """Pull one JSON object out of `raw`, or return `None`.
 
     No policy: `None` means "there was nothing to parse", not "an empty answer". A caller
     that wants an exception or a fallback builds it on top — see `coerce`.
+
+    When nothing decodes, ONE repair is attempted: `close_unterminated` appends the
+    closing brackets an otherwise-complete object is missing. That is not politeness to a
+    sloppy model, it is a measured cost — Neo answered question 145 with 3161 characters
+    of perfect JSON and no final `}` (`stop_reason: end_turn`, so not even a truncation),
+    the greedy span stopped at the nested `dispatch` block's brace, and one absent byte
+    escalated a settled answer to the user. Three spans are tried, longest shot last: the
+    greedy match, which drops trailing prose; everything from the first `{`, which is all
+    there is when the closing brace never arrived at all and `_JSON_RE` therefore never
+    matched; and that same tail with a trailing ``` fence off it. Trimming the fence is
+    not a rewrite of the model's JSON — it is the same thing the greedy expression
+    already does to its right edge, done for a reply whose last brace is missing and
+    whose fence therefore has nothing to hide behind.
     """
-    m = _JSON_RE.search(raw or "")
-    if m is None:
+    raw = raw or ""
+    start = raw.find("{")
+    if start < 0:
         return None
-    try:
-        return json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return None
+    m = _JSON_RE.search(raw)
+    if m is not None:
+        data = _load_object(m.group(0))
+        if data is not None:
+            return data
+    tail = raw[start:]
+    for span in dict.fromkeys([m.group(0) if m else "", tail, tail.rstrip("` \t\r\n")]):
+        repaired = close_unterminated(span) if span else None
+        if repaired is not None:
+            data = _load_object(repaired)
+            if data is not None:
+                return data
+    return None
 
 
 def coerce(raw: str, validate: Callable[[dict[str, Any]], Any],

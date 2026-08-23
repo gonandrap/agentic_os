@@ -2624,6 +2624,59 @@ def show_gate(approval_id: int, project_name: str | None = None) -> dict[str, An
     return {**approval, "project": name, "neo_question": question}
 
 
+# -- deferral ------------------------------------------------------------------------------------
+
+def defer(wo_id: str, title: str, why: str, description: str = "",
+          neo_question_id: int | None = None,
+          project_name: str | None = None) -> dict[str, Any]:
+    """(Workers) hand work found on the way to whoever owns deciding about it.
+
+    ONE post, and then it returns. Read the list of things this deliberately does NOT do,
+    because every one of them is a thing it would be natural to add and each would break
+    the same rule:
+
+    * it does not look at `parent_id` to see whether this work order has a feature;
+    * it does not look for a project manager;
+    * it does not call `CentralStore.add_backlog`;
+    * it does not name a work order as the recipient.
+
+    A sender that asked "does the recipient exist?" would be a sender coupled to its
+    recipient, and it would have to be edited again the day a second kind of recipient
+    appears. `bus.deliver` owns all of that: it reaches the manager if the feature has
+    one, and files the backlog item itself if not — which is the overwhelmingly common
+    case and is exactly today's behaviour.
+
+    The return value says the deferral was submitted and deliberately does not say what
+    happened to it. The worker must not depend on the outcome, so it is not told one.
+    """
+    from . import bus
+
+    if not why.strip():
+        raise OpsError(
+            "--why is the whole argument for deferring: it is what a reader sees months "
+            "later when deciding whether the item is still worth doing")
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        env_id = bus.post(
+            store, subject=bus.Subject(wo_id=wo_id), from_role="implementor",
+            to_role="manager",
+            payload=bus.DeferralRequest(title=title, why=why,
+                                        neo_question_id=neo_question_id,
+                                        description=description))
+        # On the work order's own record, because nobody reads worker transcripts and a
+        # deferral is a decision about scope: the timeline is where the user finds out
+        # this work order decided something was not its job.
+        store.add_event(wo_id, "deferral_submitted",
+                        {"title": title, "why": why, "envelope_id": env_id,
+                         "neo_question_id": neo_question_id})
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "envelope_id": env_id, "title": title,
+            "note": "deferral submitted — it is out of your hands now; carry on with "
+                    "your work order"}
+
+
 # -- backlog ------------------------------------------------------------------------------------
 
 def promote_backlog(item_id: str, force: bool = False,
