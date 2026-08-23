@@ -9,7 +9,7 @@ Grouped commands:
   jarvis gate rules|rule-retract|explain  what counts as privileged, and what the OS
                                           has LEARNED does not
   jarvis neo list|show|review|answer|learnings|learn|export
-  jarvis backlog add|list|promote|done
+  jarvis backlog add|list|show|promote|done
   jarvis learn add|list|search|show|topics|pin|unpin
   jarvis notify / jarvis inbox
   jarvis bug report                       file a Jarvis OS bug (GitHub issue + ping)
@@ -223,6 +223,19 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("question")
     q.add_argument("--project")
 
+    d = wo.add_parser("defer", help="(workers) hand off work that is not this work "
+                                    "order's job — the OS decides where it lands")
+    d.add_argument("wo_id")
+    d.add_argument("title")
+    d.add_argument("--why", required=True,
+                   help="why it should not be done now — this is what a reader sees "
+                        "months later when deciding whether it is still worth doing")
+    d.add_argument("--description", "-d", default="",
+                   help="the brief for whoever eventually picks it up")
+    d.add_argument("--neo-question", dest="neo_question", type=int, metavar="ID",
+                   help="the Neo question this deferral was agreed in")
+    d.add_argument("--project")
+
     f = wo.add_parser("finish", help="(workers) mark a work order finished")
     f.add_argument("wo_id")
     f.add_argument("--summary", required=True)
@@ -407,9 +420,21 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("title")
     b.add_argument("--description", "-d", default="")
     b.add_argument("--depends-on", default="", help="comma-separated backlog ids")
+    # Where the item came from, when something deferred it rather than somebody typing
+    # it. Flags rather than prose in the description, so the relationship survives being
+    # read back by a query instead of by a person.
+    b.add_argument("--origin-wo", dest="origin_wo", metavar="WO-ID",
+                   help="the work order that suggested this")
+    b.add_argument("--origin-fo", dest="origin_fo", metavar="FO-ID",
+                   help="the feature order whose plan it came out of")
+    b.add_argument("--origin-note", dest="origin_note", default="",
+                   help="why it was deferred, and the Neo question id if there was one")
     b = bl.add_parser("list")
     b.add_argument("project", nargs="?")
     b.add_argument("--all", action="store_true", help="include non-open items")
+    b = bl.add_parser("show", help="one backlog item in full, including where it "
+                                   "came from")
+    b.add_argument("item_id")
     b = bl.add_parser("promote", help="turn a backlog item into a work order (or, with "
                                       "--as feature, into a feature order the project "
                                       "plans for itself)")
@@ -1231,6 +1256,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
     elif args.wo_cmd == "ask":
         _print(ops.ask_question(args.wo_id, args.question,
                                 project_name=args.project), args.json)
+    elif args.wo_cmd == "defer":
+        _print(ops.defer(args.wo_id, args.title, args.why,
+                         description=args.description,
+                         neo_question_id=args.neo_question,
+                         project_name=args.project), args.json)
     elif args.wo_cmd == "finish":
         _print(ops.finish(args.wo_id, args.summary, pr_url=args.pr or None,
                           evidence=args.evidence), args.json)
@@ -1484,6 +1514,23 @@ def cmd_gate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _backlog_origin(item: dict) -> str:
+    """One line saying where a deferred item came from, or "" for one somebody typed.
+
+    Empty for every item filed before deferral routing and for every one a human adds
+    without the flags, so those keep rendering exactly as they always have — the origin
+    is an addition to the listing, never a change to it.
+    """
+    bits = []
+    if item.get("origin_wo_id"):
+        bits.append(f"deferred by {item['origin_wo_id']}")
+    if item.get("origin_fo_id"):
+        bits.append(f"from {item['origin_fo_id']}")
+    if item.get("origin_note"):
+        bits.append(f"— {item['origin_note']}")
+    return " ".join(bits)
+
+
 def cmd_backlog(args: argparse.Namespace) -> int:
     from . import ops
     from .central_store import CentralStore
@@ -1492,7 +1539,10 @@ def cmd_backlog(args: argparse.Namespace) -> int:
         if args.bl_cmd == "add":
             deps = [d.strip() for d in args.depends_on.split(",") if d.strip()]
             item = central.add_backlog(args.project, args.title,
-                                       description=args.description, depends_on=deps)
+                                       description=args.description, depends_on=deps,
+                                       origin_wo_id=args.origin_wo,
+                                       origin_fo_id=args.origin_fo,
+                                       origin_note=args.origin_note)
             _print(item, args.json)
         elif args.bl_cmd == "list":
             items = central.list_backlog(project=args.project,
@@ -1504,8 +1554,30 @@ def cmd_backlog(args: argparse.Namespace) -> int:
                     deps = f" (deps: {', '.join(it['depends_on'])})" if it["depends_on"] else ""
                     print(f"• {it['id']} [{it['project']}] {it['title']} "
                           f"({it['status']}){deps}")
+                    origin = _backlog_origin(it)
+                    if origin:
+                        print(f"    ↳ {origin}")
                 if not items:
                     print("backlog empty")
+        elif args.bl_cmd == "show":
+            item = central.get_backlog(args.item_id)
+            if not item:
+                print(f"backlog item {args.item_id!r} not found")
+                return 1
+            if args.json:
+                _print(item, True)
+            else:
+                print(f"{item['id']} [{item['project']}] {item['title']} "
+                      f"({item['status']})")
+                if item["description"]:
+                    print(f"\n{item['description']}")
+                if item["depends_on"]:
+                    print(f"\ndepends on: {', '.join(item['depends_on'])}")
+                if item.get("promoted_wo_id"):
+                    print(f"promoted to: {item['promoted_wo_id']}")
+                origin = _backlog_origin(item)
+                if origin:
+                    print(f"\norigin: {origin}")
         elif args.bl_cmd == "promote":
             _print(ops.promote_backlog(args.item_id, force=args.force,
                                        as_feature=args.as_kind == "feature",
