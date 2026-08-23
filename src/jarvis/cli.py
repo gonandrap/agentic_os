@@ -1761,9 +1761,14 @@ def cmd_neo(args: argparse.Namespace) -> int:
         finally:
             neo.close()
         if not args.all:
+            # `answered_by == "neo"` matches NeoStore.counts, which is what the
+            # `jarvis status` line above this list already counts: only Neo's own
+            # judgement is up for review, and an answer the user or the OS wrote is not
+            # a decision anyone owes. Without it the two surfaces disagree.
             qs = [q for q in qs
                   if q["status"] in ("queued", "answering", "escalated", "failed")
-                  or (q["status"] == "answered" and q["review_status"] == "unreviewed")]
+                  or (q["status"] == "answered" and q["review_status"] == "unreviewed"
+                      and q["answered_by"] == "neo")]
         if args.json:
             _print(qs, True)
         else:
