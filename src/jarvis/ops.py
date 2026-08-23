@@ -3437,3 +3437,140 @@ def _subproc_detail(groups: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
             "billed_input": u.billed_input, "output": u.output,
         })
     return sorted(out, key=lambda g: -g["list_cost_usd"])
+
+
+# -- what the knowledge base costs, and who actually reads it -----------------------------
+
+#: How much of a work order's own title has to survive into a search for the "it could
+#: have looked" signal to mean anything. Below this the query is words like "fix the",
+#: which match half the base and would manufacture a miss for every silent order.
+MISSED_MIN_WORDS = 3
+
+
+def _index_cost(central: CentralStore, name: str, path: Path) -> dict[str, Any]:
+    """What the knowledge base costs a dispatch prompt, measured rather than estimated.
+
+    The same prompt is built twice, with the index and without it, and the difference IS
+    the cost — no model of what the block "should" be, so it cannot drift away from what
+    `build_worker_prompt` actually emits.
+    """
+    from .catalog import WorkerDefaults
+    from .dispatch import build_worker_prompt
+
+    spec = ProjectSpec(name=name, path=path, worker=WorkerDefaults())
+    wo = {"id": "wo-00000000", "title": "measure the index", "description": ""}
+    brief = central.knowledge_brief(name)
+    whole = len(build_worker_prompt(wo, spec, brief))
+    bare = len(build_worker_prompt(wo, spec, None))
+    return {
+        "project": name,
+        "indexed": len(brief.digest), "pinned": len(brief.pinned),
+        "overflow": brief.overflow_count, "entries": brief.total,
+        "index_chars": whole - bare, "prompt_chars": whole,
+        "share_of_prompt": round((whole - bare) / whole, 4) if whole else 0.0,
+        "body_chars": central.knowledge_body_chars(name),
+    }
+
+
+def knowledge_usage_report(project: str | None = None, days: int | None = None,
+                           limit: int = 20) -> dict[str, Any]:
+    """What memory costs and whether anyone uses it.
+
+    Three questions, answered from three different places because no one of them can
+    answer another:
+
+    * COST — `_index_cost` builds a real dispatch prompt with and without the index. The
+      body text of the base is reported beside it as what the index AVOIDS: the entries
+      never reach a prompt, so the base's size is not the prompt's size (kn-1485b845).
+    * USE — the `knowledge_reads` log, written by the CLI verbs a worker runs. Before it
+      existed this half of the report did not exist at all.
+    * NON-USE — the work orders that completed having never read anything, and of those,
+      the ones whose own title matches an entry that already existed when they started.
+      A title match is EVIDENCE, NOT A VERDICT, and it is labelled that way wherever it
+      is rendered: the same `LIKE`-based search a worker would have run is what scores
+      it, so it inherits that search's blindness to synonyms (bl-dde1f708).
+    """
+    from .central_store import headline
+
+    since = db.now() - days * 86400 if days else None
+    paths = registered_project_paths()
+    if project and project not in paths:
+        raise OpsError(f"project {project!r} not registered (known: {sorted(paths)})")
+    scope = {project: paths[project]} if project else paths
+
+    central = CentralStore()
+    try:
+        summary = central.knowledge_read_summary(project, since)
+        hit_counts = central.knowledge_hit_counts(since)
+        by_order = central.knowledge_reads_by_order(since)
+        entries = [e for e in central.search_knowledge("", limit=10_000, project=project)
+                   if not e.get("retired_at")]
+        top: list[dict[str, Any]] = [
+            {"id": e["id"], "topic": e["topic"], "reads": hit_counts.get(e["id"], 0),
+             "chars": len(e["content"]), "headline": headline(e["content"])}
+            for e in entries]
+        top.sort(key=lambda e: (-int(e["reads"]), -int(e["chars"])))
+        cost = [_index_cost(central, name, path) for name, path in sorted(scope.items())]
+
+        silent: list[dict[str, Any]] = []
+        missed: list[dict[str, Any]] = []
+        # Nothing before the log's first row was OBSERVED, so nothing before it can be
+        # reported as an order that ignored the knowledge base.
+        observed_from = central.knowledge_log_starts()
+        floor = 0.0 if observed_from is None else (
+            observed_from if since is None else max(since, observed_from))
+        for name, path in sorted(scope.items()):
+            store = ProjectStore(path)
+            try:
+                for wo in store.list_work_orders(statuses=("completed",), limit=500,
+                                                 include_hidden=True):
+                    if observed_from is None or (wo["created_at"] or 0) < floor:
+                        continue
+                    if by_order.get(wo["id"]):
+                        continue
+                    row = {"wo_id": wo["id"], "project": name, "title": wo["title"]}
+                    silent.append(row)
+                    if len(wo["title"].split()) < MISSED_MIN_WORDS:
+                        continue
+                    # Only entries that already existed when the order was created: an
+                    # entry it wrote ITSELF is not something it failed to read.
+                    could = [e for e in central.search_knowledge(
+                        wo["title"], limit=3, project=name)
+                        if not e.get("retired_at") and e["ts"] <= (wo["created_at"] or 0)]
+                    if could:
+                        missed.append({**row, "entries": [
+                            {"id": e["id"], "headline": headline(e["content"])}
+                            for e in could]})
+            finally:
+                store.close()
+    finally:
+        central.close()
+
+    sizes = sorted(len(e["content"]) for e in entries)
+    return {
+        "project": project or "", "days": days,
+        "entries": len(entries),
+        "size": {
+            "total_chars": sum(sizes),
+            "median_chars": sizes[len(sizes) // 2] if sizes else 0,
+            "max_chars": sizes[-1] if sizes else 0,
+            # An entry whose first line overflows the headline reaches the index as a
+            # sentence cut mid-word, and the index is the only thing that decides
+            # whether it is ever read.
+            "truncated_headlines": sum(
+                1 for e in entries
+                if len(e["content"].split("\n", 1)[0]) > len(headline(e["content"]))),
+        },
+        "prompt_cost": cost,
+        "reads": summary,
+        "read_chars_per_order": (round(summary["chars"] / summary["orders"])
+                                 if summary["orders"] else 0),
+        # When the read log begins. Every "never read" and "never looked" figure below is
+        # a statement about work AFTER this instant and about nothing before it.
+        "observed_from": observed_from,
+        "top_entries": top[:limit],
+        "never_read": [e for e in top if e["reads"] == 0][:limit],
+        "never_read_count": sum(1 for e in top if e["reads"] == 0),
+        "silent_orders": silent[:limit], "silent_order_count": len(silent),
+        "could_have_read": missed[:limit], "could_have_read_count": len(missed),
+    }
