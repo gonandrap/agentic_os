@@ -783,6 +783,16 @@ class CentralStore:
 
         One query for the whole fleet: the alternative is a query per work order, and
         the cost report walks every work order there is.
+
+        THE TTL SPLIT COMES OUT OF `usage_json`, not out of a column, and summing it here
+        is what stops the report under-pricing its own overhead. A cache write is 1.25x
+        base input at the 5-minute TTL and 2x at the one-hour one; with no split the
+        pricing falls back to the 5-minute FLOOR, which was wrong for every OS-side call
+        made before `run_headless_result` forced the 5m cache (wo-b4f207ad) — Neo and the
+        digest bought the hour and were billed here as if they had not. `json_extract`
+        returns NULL both for a row whose envelope predates the field and for one with no
+        envelope at all, and COALESCE folds both into the same honest zero: no split
+        known, floor rate, exactly as before.
         """
         clause = "WHERE project=?" if project else ""
         params = (project,) if project else ()
@@ -790,7 +800,11 @@ class CentralStore:
             f"""SELECT wo_id, kind, label, model, COUNT(*) AS calls,
                        SUM(cost_usd) AS cost_usd, SUM(input) AS input,
                        SUM(cache_write) AS cache_write, SUM(cache_read) AS cache_read,
-                       SUM(output) AS output, SUM(1 - ok) AS failed
+                       SUM(output) AS output, SUM(1 - ok) AS failed,
+                       SUM(COALESCE(json_extract(usage_json, '$.cache_1h'), 0))
+                           AS cache_1h,
+                       SUM(COALESCE(json_extract(usage_json, '$.cache_5m'), 0))
+                           AS cache_5m
                 FROM agent_calls {clause}
                 GROUP BY wo_id, kind, label, model""", params).fetchall())
 

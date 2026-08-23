@@ -111,6 +111,24 @@ and the default allowlists `repl_main_thread*`, `sdk`, `auto_mode`, `memdir_rele
 `querySource` — a headless worker turn matches, which is why every write above is a 1h one.
 (Usage overage already forces 5m; that is the 3.1M of 5m writes in the corpus.)
 
+> **Follow-up, wo-b4f207ad (2026-08-22): "every worker" was not "everything Jarvis runs".**
+> The settings file reaches worker turns and nothing else, so Neo, the panel's seats and the
+> dashboard digest — all of which go through `claude_cli.run_headless_result`, which passed
+> no settings file and no env — kept buying the hour for another ten days. Measured on
+> wo-b9563d2b: the worker's own turns wrote 362,028 tokens **all at 5m**, and Jarvis's own
+> calls on the same work order wrote 28,804 **all at 1h**. The flag now lives in
+> `claude_cli.PROMPT_CACHE_5M_ENV` and is applied by `_run` and `spawn_turn`, the only two
+> functions in the module that start a process, with an AST test that fails if a third
+> appears (`tests/test_prompt_cache_ttl.py`). Re-read out of 2.1.240, where the decision
+> function is now `EEe`: the 5m check is FIRST and short-circuits, so it beats
+> `ENABLE_PROMPT_CACHING_1H` in an inherited environment and beats the `querySource`
+> allowlist — which is fetched from `tengu_prompt_cache_1h_config` and can therefore change
+> without a CLI release. Forcing it is what makes the rate a Jarvis decision rather than a
+> default. Second half of the same work order: `ops._call_spend` priced the OS half's cache
+> writes at the 1.25x floor because `agent_call_totals` never selected the split, so
+> `jarvis cost <project>` disagreed with `jarvis cost <wo>` about the same tokens; the query
+> now sums it out of `usage_json` and the report footer states the rate the fleet paid.
+
 **Verified live, not inferred.** A settings-file `env` block is not obviously the same thing
 as the CLI's own `process.env` at request-build time — Jarvis's existing env vars are all
 read by *child* processes (hooks, Bash tool calls), so none of them proves this path. Two

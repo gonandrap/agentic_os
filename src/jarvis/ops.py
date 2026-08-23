@@ -2767,6 +2767,30 @@ def _subproc_spend(groups: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return _call_spend(groups, "subproc")
 
 
+def _priced_group(usage_mod: Any, g: dict[str, Any]) -> Any:
+    """One `agent_call_totals` group at list prices, TTL SPLIT INCLUDED.
+
+    The split is the whole reason this is a function rather than four lines inlined
+    twice. A cache write is 1.25x base input at the 5-minute TTL and 2x at the one-hour
+    one, and `usage.priced` falls back to the 5-minute FLOOR when it is not told which —
+    so omitting it here silently under-priced every OS-side call that bought the hour,
+    which was all of them until `run_headless_result` forced the 5m cache (wo-b4f207ad).
+    `bill.py` read the split all along, so the two surfaces disagreed about the same
+    tokens: `jarvis cost <wo>` said 2x and `jarvis cost <project>` charged 1.25x.
+
+    `"unknown"` rather than `""` for a call whose model was not captured: an empty model
+    prices at ZERO in `usage.price_for` (that branch is for `<synthetic>`, a message the
+    CLI generated itself and never billed), and a real call that silently costs nothing
+    is the exact failure this whole feature is fixing. An unrecognised name falls through
+    to the default rate instead.
+    """
+    return usage_mod.priced(
+        g.get("model") or "unknown", input=g.get("input") or 0,
+        cache_write=g.get("cache_write") or 0, cache_read=g.get("cache_read") or 0,
+        output=g.get("output") or 0, messages=g.get("calls") or 0,
+        cache_1h=g.get("cache_1h") or 0, cache_5m=g.get("cache_5m") or 0)
+
+
 def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]:
     """Sum and price one class of `agent_calls` groups under `<prefix>_…` keys.
 
@@ -2782,15 +2806,7 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
     calls = failed = 0
     exact = 0.0
     for g in groups:
-        # `"unknown"` rather than `""` for a call whose model was not captured: an empty
-        # model prices at ZERO in `usage.price_for` (that branch is for `<synthetic>`,
-        # a message the CLI generated itself and never billed), and a real call that
-        # silently costs nothing is the exact failure this whole feature is fixing. An
-        # unrecognised name falls through to the default rate instead.
-        u = usage_mod.priced(
-            g.get("model") or "unknown", input=g.get("input") or 0,
-            cache_write=g.get("cache_write") or 0, cache_read=g.get("cache_read") or 0,
-            output=g.get("output") or 0, messages=g.get("calls") or 0)
+        u = _priced_group(usage_mod, g)
         total = total + u
         calls += g.get("calls") or 0
         failed += g.get("failed") or 0
@@ -2811,6 +2827,11 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
         f"{prefix}_billed_input": total.billed_input,
         f"{prefix}_output": total.output,
         f"{prefix}_total_tokens": total.total_tokens,
+        # Carried up so the fleet footer can answer "is anything still buying the
+        # one-hour write?" in one command, instead of one `jarvis cost <wo>` at a time.
+        f"{prefix}_cache_write": total.cache_write,
+        f"{prefix}_cache_1h": total.cache_1h,
+        f"{prefix}_cache_5m": total.cache_5m,
         # Dearest first: the whole point of the split is to say where the spend goes.
         f"{prefix}_by_kind": sorted(by_kind.values(), key=lambda k: -k["cost_usd"]),
     }
@@ -3040,8 +3061,33 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "subagent_cost_usd": round(sum(u["subagent_cost_usd"] for u in measured), 2),
             "output": sum(u["output"] for u in measured),
             "billed_input": sum(u["billed_input"] for u in measured),
+            # THE RATE THE FLEET ACTUALLY PAID TO WRITE TO THE CACHE. Cache write is the
+            # largest avoidable line in a Jarvis bill and it has two prices — 1.25x base
+            # input at the 5-minute TTL, 2x at the one-hour one — so a total that hides
+            # the split hides a 60% swing on its biggest line. Summed over the worker
+            # transcripts AND both classes of recorded call, because the whole point is
+            # that the answer was different for each of them: workers were switched to
+            # the 5-minute write in wo-5668a3f7 and the OS's own calls only in
+            # wo-b4f207ad, and nothing on this report said so.
+            **_write_ttl(measured, units),
         },
     }
+
+
+def _write_ttl(measured: list[dict[str, Any]], units: list[dict[str, Any]]
+               ) -> dict[str, int]:
+    """Cache-write tokens and their TTL split, over every class of spend on the report.
+
+    `measured` for the transcript half (a unit whose transcript is gone has no split to
+    contribute), `units` for the recorded halves, which survive transcript pruning — the
+    same asymmetry `_rollup` applies to every other figure it sums.
+    """
+    out = {"cache_write": 0, "cache_1h": 0, "cache_5m": 0}
+    for key in out:
+        out[key] = (sum(u.get(key) or 0 for u in measured)
+                    + sum((u.get(f"os_{key}") or 0) + (u.get(f"subproc_{key}") or 0)
+                          for u in units))
+    return out
 
 
 def _cost_for_target(target: str, project: str | None,
@@ -3160,10 +3206,7 @@ def _subproc_detail(groups: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
 
     out = []
     for g in groups:
-        u = usage_mod.priced(
-            g.get("model") or "unknown", input=g.get("input") or 0,
-            cache_write=g.get("cache_write") or 0, cache_read=g.get("cache_read") or 0,
-            output=g.get("output") or 0, messages=g.get("calls") or 0)
+        u = _priced_group(usage_mod, g)
         out.append({
             "label": g.get("label") or "claude -p", "model": g.get("model") or "",
             "calls": g.get("calls") or 0, "failed": g.get("failed") or 0,

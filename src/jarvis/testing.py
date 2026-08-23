@@ -183,8 +183,15 @@ argv = sys.argv[1:]
 # detached processes and a worker prompt is far past the 4KB atomic-append ceiling, so
 # a single calls.jsonl loses and interleaves records under any real fan-out.
 os.makedirs(calls_dir, exist_ok=True)
+# The prompt-cache TTL is decided by the environment the CLI is launched with and by
+# nothing in argv, so the recorded call has to carry it or the rate Jarvis pays is
+# untestable. Only these two keys: the whole environment would put every secret the
+# daemon holds into a test fixture on disk.
 with open(os.path.join(calls_dir, f"{time.time_ns()}-{os.getpid()}.json"), "w") as f:
-    json.dump({"argv": argv, "cwd": os.getcwd()}, f)
+    json.dump({"argv": argv, "cwd": os.getcwd(),
+               "cache_env": {k: os.environ[k] for k in
+                             ("FORCE_PROMPT_CACHING_5M", "ENABLE_PROMPT_CACHING_1H")
+                             if k in os.environ}}, f)
 
 def opt(name, default=None):
     return argv[argv.index(name) + 1] if name in argv else default

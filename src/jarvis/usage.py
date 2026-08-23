@@ -67,6 +67,14 @@ pricing them all at 1.25x understated the largest avoidable line in the bill by 
 transcript and per turn in a result envelope, and where it is present it is used. Where
 it is absent — an old row, a caller that has counts and nothing else — the 5-minute rate
 is the floor and the estimate stays where it always was, rather than guessing upward.
+
+THE FLOOR IS ONLY HONEST IF THE CALLER ACTUALLY HAS NO SPLIT TO GIVE. `priced()` takes
+`cache_1h`/`cache_5m` for exactly this reason and a caller that omits them is claiming
+ignorance on the report's behalf: `ops._call_spend` did that for a year and charged every
+one of Jarvis's own Neo/panel/digest calls at 1.25x while `bill.py`, reading the same
+`agent_calls.usage_json`, said 2x (wo-b4f207ad). Since wo-b4f207ad every path Jarvis
+launches forces the 5-minute write, so the split matters most for reading HISTORY — which
+is what a bill is for.
 """
 
 from __future__ import annotations

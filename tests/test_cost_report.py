@@ -426,3 +426,67 @@ def test_the_rewrite_tax_survives_into_the_rollup(store, transcripts):
     assert report["totals"]["rewrite_excess"] == 2_000_000
     assert report["totals"]["resume_boundaries"] == 0  # reads never dropped: all zero
     assert report["totals"]["rewrite_cost_usd"] == pytest.approx(11.5)
+
+
+# -- the rate the cache write was actually paid at -------------------------------------
+
+
+def _os_call(wo_id: str, **split) -> None:
+    """One recorded OS-side call (Neo answering), with a chosen TTL split."""
+    from jarvis import agent_usage
+
+    agent_usage.record("neo_answer", project="proj_a", wo_id=wo_id, label="question",
+                       model="claude-opus-5",
+                       usage={"total_cost_usd": 0.02, "input": 10,
+                              "cache_write": 100_000, "cache_read": 0, "output": 0,
+                              **split})
+
+
+def test_the_os_half_is_priced_at_the_ttl_it_actually_bought(store):
+    """Jarvis's own calls used to be priced at the 5-minute FLOOR whatever they bought.
+
+    `usage.priced` charges 1.25x with no split and 2x with a wholly-1h one, and
+    `agent_call_totals` had no split to give it — so `jarvis cost <project>` billed a
+    one-hour write as if it were a five-minute one while `jarvis cost <wo>`, which reads
+    the same envelope through `bill.py`, said 2x. 100k Opus write tokens at $5/M input:
+    $0.625 at the floor, $1.00 at the rate actually paid.
+    """
+    wo = store.create_work_order("an order Neo answered", "")
+    _os_call(wo["id"], cache_1h=100_000, cache_5m=0)
+
+    res = ops.cost_report("proj_a")
+    unit = next(u for u in res["units"] if u["id"] == wo["id"])
+    assert unit["os_cost_usd"] == pytest.approx(1.00, abs=0.01)
+
+
+def test_a_call_with_no_split_recorded_still_prices_at_the_floor(store):
+    """The rows written before the split was captured must not move.
+
+    An ABSENT split is not evidence of a one-hour write, and guessing upward would
+    rewrite the history of every OS call the fleet has ever made.
+    """
+    wo = store.create_work_order("an order from before the split existed", "")
+    _os_call(wo["id"])
+
+    res = ops.cost_report("proj_a")
+    unit = next(u for u in res["units"] if u["id"] == wo["id"])
+    assert unit["os_cost_usd"] == pytest.approx(0.625, abs=0.01)
+
+
+def test_the_rollup_reports_the_write_split_across_both_halves(store, transcripts):
+    """The footer's one job: "is anything still buying the one-hour write?".
+
+    Worker and OS spend are summed into ONE line deliberately. The two were switched to
+    the 5-minute write ten days apart, so a total that spoke for only one of them would
+    have read as all-clear while half the bill was still at 2x.
+    """
+    wo = store.create_work_order("a worker that also asked Neo", "")
+    give_session(store, wo["id"], "sess-both")
+    transcripts("sess-both", [assistant_row("m1", write=40_000)])
+    _os_call(wo["id"], cache_1h=100_000, cache_5m=0)
+
+    totals = ops.cost_report("proj_a")["totals"]
+    assert totals["cache_write"] == 140_000
+    assert totals["cache_1h"] == 100_000
+    assert usage.write_rate(totals["cache_write"], totals["cache_1h"],
+                            totals["cache_5m"]) == pytest.approx(2.0)
