@@ -261,16 +261,27 @@ def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+#: Prefix of the `reason` a synthetic escalation carries. A constant rather than a
+#: literal in two files because `answer_question` recognises this path by it, and a
+#: prefix that drifted would silently stop the diagnostic log below from ever firing.
+UNPARSEABLE_PREFIX = "unparseable Neo output: "
+
+
 def _unparseable_verdict(raw: str) -> dict[str, Any]:
     """The fail-safe: output Neo cannot be held to becomes an escalation to the user.
 
     Deliberately NOT a retry. An answer nobody can read must never reach a worker as an
     answer, and asking again would spend a call to find that out — so this path fails
     toward the user's attention, which is the failure the OS can recover from.
+
+    The 120-character clip is for the SURFACES — this reason is what the escalation, the
+    daemon log line and the Telegram push all print, and none of them wants three
+    kilobytes. The full text is logged separately by `answer_question`; see the note
+    there for why that mattered.
     """
     return {"escalate": True, "answer": "", "approve": False, "verdict": "denied",
             "dispatch": None,
-            "reason": f"unparseable Neo output: {(raw or '')[:120]}"}
+            "reason": f"{UNPARSEABLE_PREFIX}{(raw or '')[:120]}"}
 
 
 def parse_verdict(raw: str) -> dict[str, Any]:
@@ -318,7 +329,19 @@ def answer_question(store: NeoStore, q: dict[str, Any], model: str,
     record("neo_answer", usage=result, project=q.get("project") or "",
            wo_id=q.get("wo_id") or "", label=q.get("kind") or "question",
            model=result.model or model, question_id=q.get("id"))
-    return parse_verdict(result.text)
+    verdict = parse_verdict(result.text)
+    if verdict["reason"].startswith(UNPARSEABLE_PREFIX):
+        # THE FULL REPLY, ONCE, HERE. Every other surface clips it to 120 characters,
+        # which is right for a notification and useless for a diagnosis: question 145's
+        # root cause (a single missing `}` at character 3161) was only reachable by
+        # digging Neo's raw text out of a `~/.claude` session transcript by hand, and a
+        # transcript is not something the OS owns or can promise will still be there.
+        # An unparseable reply is rare and already costs the user an interruption; it
+        # can afford the log lines.
+        log.warning("neo question %s: reply could not be parsed (%d chars) — full raw "
+                    "reply follows:\n%s", q.get("id"), len(result.text or ""),
+                    result.text or "")
+    return verdict
 
 
 def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,

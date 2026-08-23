@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_validation.html" as validation_ui %}
 {% block title %}{{ fo.id }} — Jarvis{% endblock %}
 {% block content %}
 {# The one page where the whole feature is visible at once: the ask the user wrote, the
@@ -40,6 +41,17 @@
   {% if fo.planner.result_summary %}— {{ fo.planner.result_summary }}{% endif %}
 </p>
 {% endif %}
+{% if fo.manager %}
+{# The feature's other session. Beside the planner because they answer the same
+   question — who is holding this feature — and NOT in the children list below, where it
+   would be counted as a piece of the work: it writes no product code, it acts on what
+   the bus brings it. Absent for every feature planned with validation switched off. #}
+<p class="sub">manager:
+  <a class="mono" href="/wo/{{ project }}/{{ fo.manager.id }}">{{ fo.manager.id }}</a>
+  ({{ fo.manager.status }})
+  {% if fo.manager.result_summary %}— {{ fo.manager.result_summary }}{% endif %}
+</p>
+{% endif %}
 
 {% if fo.plan %}
 <h3>The plan{% if fo.plan.summary %} — {{ fo.plan.summary }}{% endif %}</h3>
@@ -79,6 +91,8 @@
   </form>
 </div>
 {% endif %}
+
+{{ validation_ui.section(validation, 'h3') }}
 
 <h3>Children</h3>
 <div class="panel">

@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% import "_bill.html" as bill_ui %}
+{% import "_validation.html" as validation_ui %}
 {% block title %}{{ wo.id }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -47,6 +48,13 @@
         Delete</button>
     </form>
   </div>
+  {% if status_label != wo.status %}
+    {# Everything invariants.status_label says that the badge above does not: which
+       validation round is in flight, what a `pending` row is blocked by, why a running
+       worker is not running. Derived by the OS, never assembled here — a header that
+       words a status for itself is how this page and the listings disagreed once. #}
+    <p class="sub">{{ status_label }}</p>
+  {% endif %}
   {% if wo.hidden %}
     <p class="sub">🙈 Hidden — it stays on the record but is out of listings, the
       summary and the attention list, and won't be dispatched.</p>
@@ -200,6 +208,8 @@
   {% endfor %}
 </div>
 {% endif %}
+
+{{ validation_ui.section(validation) }}
 
 <h2>Conversation</h2>
 <div class="panel">

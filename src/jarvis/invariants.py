@@ -39,6 +39,8 @@ from .neo_store import USER_HELD_Q_STATUSES
 from .project_store import (
     ACTIVE_STATUSES,
     DEPENDENCY_DEAD_STATUSES,
+    FO_OPEN_STATUSES,
+    OPEN_STATUSES,
     UNGOVERNED_ORIGINS,
 )
 
@@ -962,6 +964,55 @@ def check_pause_deadline_stable(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+def check_no_lost_feedback(store: ProjectStore) -> Iterator[Violation]:
+    """INV-ENVELOPE-LOST — a message that reached nobody must not pass for one that did.
+
+    `check_envelopes_move` above is about liveness: an envelope still `queued` is one
+    the bus has not given up on. This one is about the ending it gives up INTO.
+    `undeliverable` means the router found no work order filling the role — review
+    feedback for a work order that was cancelled, or a feature whose manager is gone —
+    and from the outside that is indistinguishable from delivered: the row is there, the
+    payload is there, and the unit is simply waiting for a reply that will never come.
+
+    Reported, never repaired. There is nothing to derive here — the recipient does not
+    exist — so the only honest action is to tell someone, which is exactly the shape of
+    the OS-level checks.
+
+    **Scoped to units that are still open.** An undeliverable envelope is permanent, and
+    a check that reported every one of them for ever would mean a project's `jarvis
+    doctor` never printed a clean bill again — and a signal that can only ever say
+    "something is wrong" is one an operator learns to skip. Once the subject is settled
+    or cancelled the lost message can no longer cost anything, and it stays on the
+    unit's own page and in `jarvis validation show` for the permanent record.
+    """
+    for env in store.envelopes():
+        if env["state"] != "undeliverable":
+            continue
+        subject, still_open = env["subject_wo_id"] or env["subject_fo_id"], False
+        try:
+            if env["subject_wo_id"]:
+                still_open = (store.get_work_order(env["subject_wo_id"])["status"]
+                              in OPEN_STATUSES)
+            elif env["subject_fo_id"]:
+                still_open = (store.get_feature_order(env["subject_fo_id"])["status"]
+                              in FO_OPEN_STATUSES)
+        except KeyError:
+            # Deleted out from under the envelope. Nothing is waiting on it any more,
+            # which is the same conclusion as a settled subject.
+            still_open = False
+        if not still_open:
+            continue
+        yield Violation(
+            invariant="INV-ENVELOPE-LOST",
+            wo_id=env["subject_wo_id"],
+            detail=(f"envelope {env['id']} ({env['kind']} to role {env['to_role']}) "
+                    f"about {subject} reached nobody: {env['note'] or 'undeliverable'}"),
+            context={"envelope_id": env["id"], "kind": env["kind"],
+                     "to_role": env["to_role"], "state": env["state"],
+                     "subject_fo_id": env["subject_fo_id"]},
+        )
+
+
 def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
     """INV-MANAGER-SLOTS — a project manager order must not spend a concurrency slot.
 
@@ -1261,6 +1312,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_pause_deadline_stable,   # ...and its companion: the pass can also be failing
                                    # because the moment it was given keeps moving
     check_envelopes_move,          # last: it delivers, and delivery changes work orders
+    check_no_lost_feedback,        # ...and after it, because that delivery is what
+                                   # marks an envelope undeliverable in the first place
 )
 
 
