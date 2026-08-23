@@ -2,8 +2,9 @@
 
 A work order that ends behind a pull request parks in `waiting_pr_merge` and stays on
 the user's open list until the PR is dealt with. This module is how the daemon finds
-out that it was: one `gh pr view <url> --json state,mergedAt` per parked work order,
-turned into a three-way answer (open / merged / closed-unmerged).
+out that it was: one `gh pr view <url>` per parked work order, turned into a three-way
+answer (open / merged / closed-unmerged) plus whether the branch can still be merged at
+all (docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md §2).
 
 Deliberately thin, and deliberately read-only. Jarvis never writes to GitHub from the
 daemon — merging is a privileged action a human or a gate approval authorises, never
@@ -48,9 +49,14 @@ class GhUnavailable(GitHubError):
     """
 
 
+#: The fields of one `gh pr view --json …`. Two questions in one round trip: did this
+#: land, and can it still land? See the spec's §2 for the second half.
+PR_FIELDS = "state,mergedAt,mergeable,baseRefName"
+
+
 @dataclass(frozen=True)
 class PullRequest:
-    """What `gh pr view --json state,mergedAt` says, and nothing more.
+    """What `gh pr view --json <PR_FIELDS>` says, and nothing more.
 
     `state` is GitHub's own enum: OPEN, MERGED or CLOSED. The distinction that matters
     to the OS is MERGED (the work landed) versus CLOSED (the pull request was shut
@@ -60,6 +66,10 @@ class PullRequest:
 
     state: str
     merged_at: str | None = None
+    #: GitHub's three-way mergeability: CONFLICTING, MERGEABLE or UNKNOWN — and None
+    #: when the field was not asked for or not answered.
+    mergeable: str | None = None
+    base_ref: str | None = None
 
     @property
     def merged(self) -> bool:
@@ -68,6 +78,16 @@ class PullRequest:
     @property
     def closed_unmerged(self) -> bool:
         return self.state == "CLOSED"
+
+    @property
+    def conflicting(self) -> bool:
+        """The branch cannot be merged into its base. UNKNOWN is not this — spec §2."""
+        return self.mergeable == "CONFLICTING"
+
+    @property
+    def mergeable_now(self) -> bool:
+        """GitHub positively says it merges — as opposed to "not known to conflict"."""
+        return self.mergeable == "MERGEABLE"
 
 
 def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
@@ -78,7 +98,7 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
     GitHub Enterprise remote. A missing directory is ignored rather than raising —
     losing the poll over a moved checkout would be worse than polling from anywhere.
     """
-    cmd = [gh_bin(), "pr", "view", url, "--json", "state,mergedAt"]
+    cmd = [gh_bin(), "pr", "view", url, "--json", PR_FIELDS]
     where = str(cwd) if cwd and Path(cwd).is_dir() else None
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=GH_TIMEOUT,
@@ -100,4 +120,12 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
     state = str(payload.get("state") or "").upper()
     if not state:
         raise GitHubError(f"`gh pr view {url}` reported no state ({payload!r})")
-    return PullRequest(state=state, merged_at=payload.get("mergedAt") or None)
+    # Only `state` is required above: `mergeable` arrives as null on a merged or closed
+    # pull request and on one GitHub has not computed yet, and None reads everywhere as
+    # "no conflict known" — the safe direction (spec §2).
+    return PullRequest(
+        state=state,
+        merged_at=payload.get("mergedAt") or None,
+        mergeable=str(payload["mergeable"]).upper() if payload.get("mergeable") else None,
+        base_ref=payload.get("baseRefName") or None,
+    )

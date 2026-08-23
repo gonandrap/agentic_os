@@ -1098,6 +1098,32 @@ class ProjectStore:
             (wo_id, kind)).fetchall()
         return db.rows_to_dicts(rows)
 
+    def _this_conflict(self, wo_id: str, kind: str) -> int:
+        """Events of `kind` since the last `pr_conflict_cleared` — this EPISODE's.
+
+        Conflict state is derived from the timeline rather than kept in columns; the
+        clear is the budget reset. See §4 of
+        docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md.
+        """
+        rows = self.events_of_kind(wo_id, kind)
+        if not rows:
+            return 0
+        cleared = self.events_of_kind(wo_id, "pr_conflict_cleared")
+        since = cleared[-1]["ts"] if cleared else 0.0
+        return sum(1 for r in rows if r["ts"] > since)
+
+    def pr_conflict_attempts(self, wo_id: str) -> int:
+        """How many times the OS has asked this worker to resolve the SAME conflict."""
+        return self._this_conflict(wo_id, "pr_conflict_nudged")
+
+    def pr_conflict_gave_up(self, wo_id: str) -> bool:
+        """Has the OS already stopped trying on this conflict and said so?
+
+        Not "are the attempts spent": this is what keeps the give-up event to one per
+        episode on a work order that may be flagged for something else entirely.
+        """
+        return bool(self._this_conflict(wo_id, "pr_conflict_unresolved"))
+
     def list_events(self, wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM wo_events WHERE wo_id=? ORDER BY ts LIMIT ?", (wo_id, limit)

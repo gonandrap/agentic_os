@@ -223,6 +223,18 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return ("Validation could not be run — the reviewer was unreachable",
                 f"attempt {attempt}: {p.get('error') or ''}" if attempt
                 else (p.get("error") or ""))
+    # The conflict-healing loop, on the timeline so that a give-up arrives with the
+    # record of what was already tried (spec §6 of
+    # docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md).
+    if kind == "pr_conflict_nudged":
+        of = p.get("of")
+        return ("Merge conflict — asked the worker to resolve it",
+                f"attempt {p.get('attempt')} of {of}" if of else "")
+    if kind == "pr_conflict_cleared":
+        return "Merge conflict resolved", ""
+    if kind == "pr_conflict_unresolved":
+        return ("Merge conflict the worker could not resolve — over to you",
+                f"{p.get('attempts')} attempts")
     if kind == "deferral_submitted":
         # The worker deciding something is not its job is a scope decision, and the
         # timeline is the only place the user ever sees it: the item itself lands on the
@@ -245,11 +257,22 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     return kind, json.dumps(p, sort_keys=True) if p else ""
 
 
+#: Message sources nobody decided: no user typed them, and no delegate chose to send
+#: them on the user's behalf either. So far exactly one — the automatic merge-conflict
+#: nudge a poll writes on seeing GitHub report CONFLICTING (§6 of
+#: docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md).
+UNAUTHORED_SOURCES = frozenset({"pr-conflict"})
+
+
 def _message_label(m: dict[str, Any]) -> str:
     """Who is speaking, from the message's own `source` — §5."""
     if m.get("direction") != "user_to_agent":
         return "Worker → you"
-    return "Neo → worker" if m.get("source") == "neo" else "You → worker"
+    if m.get("source") == "neo":
+        return "Neo → worker"
+    if m.get("source") in UNAUTHORED_SOURCES:
+        return "Jarvis → worker"
+    return "You → worker"
 
 
 def build_timeline(wo: dict[str, Any], events: list[dict[str, Any]],
