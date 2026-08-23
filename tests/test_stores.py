@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 import pytest
@@ -60,6 +61,29 @@ def test_assumptions_flow(project):
     assert len(store.pending_assumptions(wo["id"])) == 1
     store.review_assumption(aid, "accepted")
     assert store.pending_assumptions(wo["id"]) == []
+
+
+def test_assumptions_are_numbered_from_one_per_work_order(project):
+    """`n` is what the timeline says instead of repeating the text, so it has to be a
+    POSITION within this work order — a row id would start the second work order's list
+    at 3 — and it has to survive a review, which is what turns the list into a subset."""
+    store = ProjectStore(project)
+    a, b = store.create_work_order("a"), store.create_work_order("b")
+    first = store.add_assumption(a["id"], "assumed sqlite")
+    store.add_assumption(a["id"], "assumed UTF-8")
+    store.add_assumption(b["id"], "assumed the other thing")
+
+    assert [x["n"] for x in store.all_assumptions(a["id"])] == [1, 2]
+    assert [x["n"] for x in store.all_assumptions(b["id"])] == [1]
+    # The event says the same number, so the timeline and the listing agree.
+    events = [e for e in store.list_events(a["id"]) if e["kind"] == "assumption"]
+    assert [json.loads(e["payload"])["n"] for e in events] == [1, 2]
+
+    # Reviewing #1 leaves #2 called #2. Renumbering the remainder would rewrite what the
+    # timeline already said about an assumption nobody touched.
+    store.review_assumption(first, "accepted")
+    assert [x["n"] for x in store.pending_assumptions(a["id"])] == [2]
+    store.close()
 
 
 def test_notifications_outbox(project):

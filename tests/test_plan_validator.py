@@ -2,7 +2,7 @@
 
 Neo, not the user, is the routine reviewer of plans, and the design calls the two
 backstops that reversal rests on (this and the child cap) load-bearing rather than
-nice-to-have. So these tests are written against the four rejections by NAME, not
+nice-to-have. So these tests are written against the rejections by NAME, not
 against whatever the implementation happens to catch: a future simplification that drops
 one of them should fail here loudly.
 
@@ -16,6 +16,7 @@ import pytest
 
 from jarvis.plans import (
     CHILD_CAP,
+    MAX_DESCRIPTION_CHARS,
     MIN_DESCRIPTION_CHARS,
     PlanError,
     creation_order,
@@ -41,7 +42,10 @@ def child(key: str, needs: list[str] | None = None, description: str | None = No
 
 
 def plan(*children: dict, **extra) -> dict:
-    return {"children": list(children), **extra}
+    """A plan that passes every check. `design_doc` is defaulted rather than written
+    into each call so a test can knock out exactly the rule it is about — pass
+    `design_doc=""` to make it a plan that names no design document."""
+    return {"design_doc": "docs/specs/budgets.md", "children": list(children), **extra}
 
 
 # -- the shape ------------------------------------------------------------------------
@@ -193,6 +197,84 @@ def test_a_description_too_short_to_brief_anyone_is_refused():
 def test_a_missing_description_says_why_it_matters():
     with pytest.raises(PlanError, match="ONLY thing the child worker will see"):
         parse_plan(plan(child("a", description="")))
+
+
+# -- rejection 5: descriptions that do not stop ----------------------------------------
+# The mirror of rejection 4, and the one the prose could not enforce: `_planner_prompt`
+# has said "a brief, not an encyclopedia" for as long as the design-document field has
+# existed, and planners still shipped six-kilobyte briefs restating their spec.
+
+
+def test_a_description_over_the_ceiling_is_refused():
+    fat = "Rebuild the exporter. " + ("Context restated from the design document. "
+                                      * 40)
+    assert len(fat) > MAX_DESCRIPTION_CHARS
+    with pytest.raises(PlanError, match="over the"):
+        parse_plan(plan(child("schema", description=fat)))
+
+
+def test_the_ceiling_names_the_way_out():
+    """A rejection that does not say what to do instead just gets reworded prose back."""
+    fat = "x" * (MAX_DESCRIPTION_CHARS + 1)
+    with pytest.raises(PlanError) as e:
+        parse_plan(plan(child("schema", description=fat)))
+    assert "design document" in str(e.value)
+    assert "sections" in str(e.value)
+
+
+def test_a_description_right_at_the_ceiling_is_fine():
+    """The boundary is inclusive: a brief may BE the maximum, not merely approach it."""
+    ok = "Ship the schema piece. " + "x" * (MAX_DESCRIPTION_CHARS - 23)
+    assert len(ok) == MAX_DESCRIPTION_CHARS
+    out = parse_plan(plan(child("schema", description=ok)))
+    assert out["children"][0]["description"] == ok
+
+
+# -- rejection 6: a plan standing on no design document --------------------------------
+# The ceiling above is only affordable because a brief may CITE a document instead of
+# carrying it. So the document has to exist — or be the first thing the plan builds.
+
+
+def test_a_plan_with_no_design_document_at_all_is_refused():
+    with pytest.raises(PlanError, match="design_doc"):
+        parse_plan(plan(child("schema"), design_doc=""))
+
+
+def test_a_plan_whose_first_child_writes_the_spec_is_accepted():
+    out = parse_plan(plan(child("spec"), child("schema", needs=["spec"]),
+                          child("api", needs=["schema"]),
+                          design_doc="", design_doc_by="spec"))
+    assert out["design_doc"] == ""
+    assert out["design_doc_by"] == "spec"
+
+
+def test_the_spec_writing_child_must_be_a_child_of_this_plan():
+    with pytest.raises(PlanError, match="not a child of this plan"):
+        parse_plan(plan(child("schema"), design_doc="", design_doc_by="ghost"))
+
+
+def test_a_sibling_that_does_not_wait_for_the_spec_is_refused():
+    """A spec written in parallel with the work it governs is a spec nobody can cite."""
+    with pytest.raises(PlanError, match="do not depend on it"):
+        parse_plan(plan(child("spec"), child("schema"), child("api"),
+                        design_doc="", design_doc_by="spec"))
+
+
+def test_waiting_for_the_spec_through_another_child_counts():
+    """The edge may be transitive — `api` needs `schema` needs `spec` is waiting."""
+    out = parse_plan(plan(child("spec"), child("schema", needs=["spec"]),
+                          child("api", needs=["schema"]),
+                          design_doc="", design_doc_by="spec"))
+    assert [c["key"] for c in creation_order(out["children"])] == \
+        ["spec", "schema", "api"]
+
+
+def test_naming_both_a_document_and_the_child_that_writes_it_is_refused():
+    """`ops.submit_plan` demands a named `design_doc` already exist on disk, so a plan
+    claiming both describes two different worlds."""
+    with pytest.raises(PlanError, match="not both"):
+        parse_plan(plan(child("spec"), child("schema", needs=["spec"]),
+                        design_doc="docs/specs/budgets.md", design_doc_by="spec"))
 
 
 # -- creation order --------------------------------------------------------------------

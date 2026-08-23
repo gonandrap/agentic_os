@@ -1,0 +1,75 @@
+{#
+  ONE NEO QUESTION, AS THE USER READS IT.
+
+  Shared by `/neo`, which lists questions in bulk, and `/neo/question/<id>`, which is
+  where a work order's timeline sends a reader who wants the one it names. Two surfaces
+  rendering a question separately is how they come to show different things — and the
+  single-question page exists precisely so the timeline does not have to render it at
+  all, so it has to be the same question the review page shows.
+#}
+
+{#
+  A worker can paste a 7,000-character brief into `jarvis wo ask`, and until this macro
+  existed the page rendered every one of those characters inline. So: the digest when
+  there is one (see src/jarvis/digest.py), the question in full when there isn't, and in
+  BOTH cases the exact prompt Neo received behind a disclosure. The disclosure is
+  unconditional on purpose — it is the answer to "what did the digest leave out?", and a
+  control that only appears sometimes is not one the reader learns to trust.
+#}
+{% macro question_body(q) %}
+  {% if q.digest_view %}
+  <div class="digest">
+    <p class="headline"><strong>Q:</strong> {{ q.digest_view.headline }}</p>
+    {% if q.digest_view.bullets %}
+    <ul>{% for b in q.digest_view.bullets %}<li>{{ b }}</li>{% endfor %}</ul>
+    {% endif %}
+    {% if q.digest_view.options %}
+    <p class="label">Options</p>
+    <ol>{% for o in q.digest_view.options %}<li>{{ o }}</li>{% endfor %}</ol>
+    {% endif %}
+    {% if q.digest_view.recommendation %}
+    <div class="rec"><span class="label">Recommended</span>{{ q.digest_view.recommendation }}</div>
+    {% endif %}
+  </div>
+  {% else %}
+  <div style="margin:6px 0"><strong>Q:</strong> {{ q.question }}</div>
+  {% endif %}
+  <details class="disclosure">
+    <summary>Full question context sent to Neo{% if q.digest_view %} — it read all of it{% endif %}</summary>
+    <pre class="request-text">{{ q.full_context }}</pre>
+  </details>
+{% endmacro %}
+
+{# How the panel reached one answer. COLLAPSED, and absent entirely for a question no
+   panel deliberated on: deliberation is stored and inspectable on demand, never pushed.
+   A section of the page that showed it open would spend exactly the attention the panel
+   exists to protect — the thing to review is still the chair's answer, not the seats'.
+   `rows` is passed in rather than looked up, so the macro renders nothing by
+   construction when there is nothing to render. #}
+{% macro deliberation(rows) %}
+{% if rows %}
+<details style="margin-top:6px">
+  <summary class="sub">Panel deliberation — {{ rows|length }} seat{{ '' if rows|length == 1 else 's' }}</summary>
+  <table>
+    <tr><th>seat</th><th>status</th><th>verdict</th><th>route</th><th>latency</th><th>model</th></tr>
+    {% for o in rows %}
+    <tr>
+      <td class="mono">{{ o.seat }}</td>
+      <td class="mono">
+        {% if o.status == 'ok' %}<span class="st tone-ok"><span class="i">✓</span>ok</span>
+        {% elif o.status == 'abstained' %}<span class="st tone-muted"><span class="i">◌</span>abstained</span>
+        {% else %}<span class="st tone-bad"><span class="i">✗</span>{{ o.status }}</span>{% endif %}
+      </td>
+      <td class="mono">{{ o.verdict or '—' }}</td>
+      <td class="mono">{{ o.route or '—' }}</td>
+      <td class="mono">{{ o.latency_ms }}ms</td>
+      <td class="mono">{{ o.model or '—' }}</td>
+    </tr>
+    {% if o.reply %}
+    <tr><td colspan="6"><pre class="request-text">{{ o.reply }}</pre></td></tr>
+    {% endif %}
+    {% endfor %}
+  </table>
+</details>
+{% endif %}
+{% endmacro %}

@@ -837,12 +837,33 @@ def settle_turns():
     return _settle_turns
 
 
+#: Where every fixture project keeps a design document, and what a test plan names in its
+#: `design_doc`. Every plan must stand on one, so without a real file here each test that
+#: submits a plan would have to write one first. See §7 of
+#: docs/superpowers/specs/2026-08-23-the-work-order-record.md.
+FIXTURE_DESIGN_DOC = "docs/specs/exporter.md"
+
+FIXTURE_DESIGN_DOC_BODY = """# Exporter design
+
+## 1. Shape
+
+The exporter is one module with one entry point.
+
+## 2. Data model
+
+Rows are dicts; the header is the union of keys, first-seen order.
+"""
+
+
 def make_git_project(root: Path, name: str, readme: str | None = "# proj\n") -> Path:
     path = root / name
     path.mkdir(parents=True)
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
     if readme is not None:
         (path / "README.md").write_text(readme)
+    doc = path / FIXTURE_DESIGN_DOC
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    doc.write_text(FIXTURE_DESIGN_DOC_BODY)
     return path
 
 
