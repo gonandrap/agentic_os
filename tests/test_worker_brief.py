@@ -34,7 +34,8 @@ SPEC = ProjectSpec(name="p1", path=Path("/tmp/p1"))
 GATED = ProjectSpec(name="p1", path=Path("/tmp/p1"),
                     gates=GateConfig(enabled=("release", "pr_merge")))
 
-SECTION_NAMES = ["contract", "gates", "record", "navigation", "knowledge"]
+SECTION_NAMES = ["contract", "gates", "record", "navigation", "concision",
+                 "knowledge"]
 
 
 def _prompt(spec: ProjectSpec = SPEC, knowledge=None) -> str:

@@ -34,7 +34,14 @@ PROJECT_PLACEHOLDER = "<project>"
 #: Budget for the rendered core contract block (between "# Operating contract" and
 #: "# Full briefings"), excluding the work order's own description and the knowledge
 #: index. Enforced by tests/test_worker_brief.py.
-CORE_BUDGET_CHARS = 2500
+#:
+#: Raised from 2500 in wo-322cd6f8: the original figure was set against a 2080-char
+#: core, and PR 124's `--evidence` bullet spent all of that headroom. A bullet earns
+#: its place here only if a worker that lacks it does damage BEFORE it would think to
+#: fetch the section — which is why concision is here rather than fetch-only
+#: (docs/superpowers/specs/2026-08-22-agent-concision.md SS6). Raise it again only on
+#: that test, not to make room.
+CORE_BUDGET_CHARS = 2750
 
 
 # -- the git briefing, replacing Claude Code's own ---------------------------------------
@@ -136,6 +143,8 @@ SECTION_HOOKS: dict[str, str] = {
               "in full",
     "navigation": "Serena first, grep second — how to find code before you go "
                   "exploring",
+    "concision": "what a comment, a PR body and a message to the record are each "
+                 "allowed to contain",
     "knowledge": "the OS knowledge base: reading it on demand, writing back what "
                  "you learn",
 }
@@ -164,6 +173,8 @@ def render_section(name: str, *, wo_id: str | None = None,
         return record_section(wo)
     if name == "navigation":
         return navigation_section()
+    if name == "concision":
+        return concision_section()
     if name == "knowledge":
         return knowledge_section(proj)
     raise UnknownSection(name)
@@ -228,6 +239,10 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             f"--why \"<why this is ready>\" --evidence \"<PR, tests, checks>\"` "
             f"(full protocol: `jarvis brief gates --wo {wo_id}`).",
         ] if gate_names else []),
+        f"- **Point, do not explain; say each thing ONCE.** A code comment is one "
+        f"line citing the spec that explains it (`docs/superpowers/specs/`), not "
+        f"the explanation. A PR body hints; the diff explains. Never restate what "
+        f"is already on this record. Rules: `jarvis brief concision`.",
         f"- When done, ALWAYS run `jarvis wo finish {wo_id} --summary \"...\"` "
         f"(add `--pr <url>` if you opened a pull request) and then write your "
         f"complete answer as the last thing you say. The work order record IS this "
@@ -449,6 +464,48 @@ def navigation_section() -> str:
         "If the project has no Serena, `Glob` and `Grep` are the fallback and "
         "there is nothing to apologise for — just expect to work harder for a less "
         "complete picture.",
+    ]
+    return "\n".join(lines)
+
+
+def concision_section() -> str:
+    """The three surfaces this OS is verbose on, and what each is allowed to hold.
+
+    Design and the probe behind the output-style half:
+    docs/superpowers/specs/2026-08-22-agent-concision.md — this section is SS6.
+    """
+    lines = [
+        "# Point, do not explain",
+        "Three surfaces, one rule each. All three are things you WRITE, which is "
+        "why no output style covers them — the OS sets `outputStyle: Concise` for "
+        "what you SAY, and this section is the rest.",
+        "",
+        "## Code comments point at documentation; they are not documentation",
+        "One line, naming the reason or citing a spec section: `# -- SS3`. If the "
+        "explanation runs past a couple of lines it belongs in "
+        "`docs/superpowers/specs/YYYY-MM-DD-<name>.md` with numbered sections, and "
+        "the comment cites it by number. Write that spec as part of the work when "
+        "there is none. This is kn-f861a2f6, from a review that took 206 lines of "
+        "comment out of `src/` and put 70 back: the reasoning was wanted, the "
+        "place was wrong.",
+        "",
+        "## A PR body hints to the reviewer; it does not explain the feature",
+        "What to look at first, what is risky, what was decided and where the "
+        "reasoning lives. The reviewer has the diff and does not need it "
+        "narrated. If the PR needs a rationale longer than a few lines, that "
+        "rationale is a spec and the PR links to it.",
+        "",
+        "## Say each thing once, across the whole record",
+        "The description, your questions, your messages and your finish summary "
+        "are read TOGETHER. A paragraph repeated across them is read three times "
+        "and learned once. Refer to what is already on the record — 'as in the "
+        "description', 'question 12 settled this' — instead of restating it. "
+        "Questions especially: state the decision, the options and your "
+        "recommendation, and do not paste context the reader already has.",
+        "",
+        "None of this trades against correctness. Failing test output, error "
+        "messages, security caveats and the things you did NOT do keep their full "
+        "content — the rule deletes restatement, never evidence.",
     ]
     return "\n".join(lines)
 
