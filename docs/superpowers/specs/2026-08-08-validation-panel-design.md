@@ -299,12 +299,30 @@ stateDiagram-v2
 
     validating --> completed: passed
     validating --> executing: rejected — the manager files\nremediation work orders
-    validating --> needs_review_by_user: gave up (+ attention on the feature)
+    validating --> validating: gave up — stays put, + attention on the feature
 ```
 
 The two diagrams are deliberately the same shape. One round machine drives both; the only
 differences are what the evidence packet contains and which role the rejection is addressed
 to.
+
+> **CORRECTION, 2026-08-23 (built on wo-9c26001c, child 9).** The give-up transition above
+> read `validating --> needs_review_by_user`, and **there is no such feature-order status**.
+> `FO_STATUSES` was laid down whole by child 2 and deliberately does not mirror
+> `WO_STATUSES` — a feature order runs no session, so most of a work order's states are
+> meaningless for it, and `needs_review` is one of them.
+>
+> **A feature the panel gave up on stays `validating` and raises its flag.** The status is
+> not what the user reads; the flag is. `flagged_feature_orders` is not filtered by status,
+> `jarvis status` surfaces the feature with `VALIDATION_STUCK_BLOCKER` verbatim, and the
+> round machine will not look at it again because its latest round is `escalated` rather
+> than `pending`. Adding an eighth status would have meant a new `FO_ICON` entry, a new
+> `FO_STATUS_META` entry and a new open/terminal classification, for a state whose whole
+> content is already carried by a boolean the user is shown.
+>
+> This does NOT weaken the load-bearing property below. "`validating` raises no attention"
+> is a statement about a round in flight, and it is tested as such — paired, in one test,
+> against an escalated feature in the same status that does.
 
 ### Three properties that are load-bearing
 
