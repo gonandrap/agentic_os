@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from . import db, worker_session
-from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS
+from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS, DEFAULT_VALIDATION_TIMEOUT
 from .neo_store import USER_HELD_Q_STATUSES
 from .project_store import (
     ACTIVE_STATUSES,
@@ -1013,6 +1013,82 @@ def check_no_lost_feedback(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
+    """INV-VALIDATION-STRANDED — a unit under review must not sit in `validating` for ever.
+
+    Nothing outside the daemon moves a `validating` unit: it raises no attention flag and
+    `settle_work_order` returns early for it. Both are right while a round is in flight,
+    and together they mean a daemon that dies mid-round leaves the unit invisibly stalled
+    with nothing left in the OS that will ever look at it again.
+
+    Predicate: `validating`, latest round still `pending`, opened longer than TWICE
+    `os.validation.timeout` ago — one timeout is what a round is allowed to take, so a
+    round at 1.2x its budget is late rather than abandoned.
+
+    Repaired by closing the round `failed`, not `escalated`: `counted_validation_rounds`
+    ignores `failed`, so the interruption costs the submitter no round, and
+    `Daemon.validation_tick` picks up `pending` AND `failed` — closing it is what hands
+    the unit back. Under `jarvis doctor` without `--repair`, `_ReadOnly` blocks the write.
+
+    Covers FEATURE orders too. Nothing sets one to `validating` yet (a sibling work order
+    adds that loop), and an invariant covering half the units would look like one
+    covering all of them.
+    """
+    per_round = _validation_timeout()
+    threshold = 2 * per_round
+    now = time.time()
+    cutoff = now - threshold
+    for kind, id_col, rows in (
+        ("work order", "wo_id", store.conn.execute(
+            "SELECT id FROM work_orders WHERE status='validating'").fetchall()),
+        ("feature order", "fo_id", store.conn.execute(
+            "SELECT id FROM feature_orders WHERE status='validating'").fetchall()),
+    ):
+        for row in rows:
+            unit_id = row["id"]
+            latest = store.latest_validation_round(**{id_col: unit_id})
+            if latest is None or latest["outcome"] != "pending":
+                continue
+            if float(latest["ts"] or 0) > cutoff:
+                continue  # late, not abandoned
+            age = int(now - float(latest["ts"] or 0))
+            store.close_validation_round(
+                int(latest["id"]), "failed",
+                f"the review was interrupted — round {latest['round']} was left open "
+                f"with nothing running it for {age}s")
+            yield Violation(
+                invariant="INV-VALIDATION-STRANDED",
+                wo_id=unit_id if id_col == "wo_id" else None,
+                detail=(
+                    f"{kind} {unit_id} has been `validating` on a `pending` round for "
+                    f"{age}s — over twice the {per_round}s a round is given. Nothing is "
+                    f"judging it; the daemon almost certainly restarted mid-round."
+                ),
+                repaired=True,
+                repair=(f"closed round {latest['round']} `failed` — the next tick "
+                        f"picks it up and runs it again"),
+                context={"round_id": latest["id"], "round": latest["round"],
+                         "age_seconds": age, "threshold_seconds": threshold,
+                         "unit": kind,
+                         "fo_id": None if id_col == "wo_id" else unit_id},
+            )
+
+
+def _validation_timeout() -> int:
+    """How long one validation round is allowed to take, per the LIVE catalog.
+
+    From the catalog rather than `DEFAULT_VALIDATION_TIMEOUT` because this number decides
+    a write: a project that raised the value would otherwise have its healthy long rounds
+    closed out from under it. (`status_label` makes the opposite call — it only prints a
+    number.) Falls back to the default when no catalog is readable; an invariant must
+    never be the thing that raises.
+    """
+    from .ops import validation_config
+
+    timeout = getattr(validation_config(), "timeout", None)
+    return int(timeout) if timeout else DEFAULT_VALIDATION_TIMEOUT
+
+
 def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
     """INV-MANAGER-SLOTS — a project manager order must not spend a concurrency slot.
 
@@ -1311,6 +1387,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # did not do, with nothing to repair
     check_pause_deadline_stable,   # ...and its companion: the pass can also be failing
                                    # because the moment it was given keeps moving
+    check_validation_progresses,   # after the flag checks: its repair touches no flag,
+                                   # and a `validating` row is invisible to all of them
     check_envelopes_move,          # last: it delivers, and delivery changes work orders
     check_no_lost_feedback,        # ...and after it, because that delivery is what
                                    # marks an envelope undeliverable in the first place
@@ -1351,7 +1429,10 @@ class _ReadOnly:
                 # The bus. `queue_message` is here because delivering an envelope IS a
                 # queued message, and a read-only doctor run must not send one.
                 "mark_envelope", "bump_envelope_attempt", "deliver_envelope",
-                "queue_message", "flag_feature_attention")
+                "queue_message", "flag_feature_attention",
+                # INV-VALIDATION-STRANDED's repair. Reporting a stranded round must not
+                # be the thing that ends it.
+                "close_validation_round")
 
     #: How a checker asks "am I allowed to change anything?". Needed by
     #: `check_envelopes_move`, whose repair also writes to the CENTRAL store — a proxy
