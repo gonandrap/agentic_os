@@ -125,6 +125,35 @@ def test_a_timeline_question_opens_the_question_and_its_answer(page, server, dae
     assert "CSV, and gzip it" in body
 
 
+def test_a_timeline_message_opens_the_conversation_at_that_turn(page, server, daemon,
+                                                                project):
+    """The timeline says a message happened and points at the words. The words are on
+    another tab, so following that pointer has to OPEN that tab — the same `hashchange`
+    path `#pending` uses, and the only surface that can prove it."""
+    wo = ops.create_work_order("proj_a", "answered task")
+    daemon.tick()
+    qid = ops.ask_question(wo["id"], "CSV or JSON for the export default?")["question_id"]
+    ops.neo_answer_escalated(qid, "CSV, and gzip it — every export, no exceptions")
+
+    page.goto(f"{server}/wo/proj_a/{wo['id']}")
+    # The ask and the answer are one exchange, on the tab that opens by default.
+    said = page.locator("#tab-conversation").inner_text()
+    assert "worker → Neo" in said
+    assert "CSV or JSON for the export default?" in said
+    assert "CSV, and gzip it — every export, no exceptions" in said
+
+    page.click(".tabs button:has-text('Timeline')")
+    story = page.locator("#tab-timeline").inner_text()
+    assert "You messaged the worker" in story
+    assert "CSV, and gzip it — every export, no exceptions" not in story
+
+    page.click("#tab-timeline a:has-text('in the conversation')")
+    # `hashchange` fires after the click's own task, so wait rather than sample.
+    page.wait_for_selector("#tab-conversation", state="visible")
+    assert not page.locator("#tab-timeline").is_visible()
+    assert page.locator("#msg-1").is_visible()
+
+
 def test_send_feedback_from_wo_page(page, server, daemon, project):
     wo = ops.create_work_order("proj_a", "chatty task")
     daemon.tick()

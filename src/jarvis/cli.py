@@ -220,8 +220,9 @@ def build_parser() -> argparse.ArgumentParser:
     l.add_argument("--include-hidden", action="store_true",
                    help="include work orders you've hidden")
 
-    s = wo.add_parser("show", help="show one work order with its timeline, messages "
-                                   "and assumptions")
+    s = wo.add_parser("show", help="show one work order: what was said (the "
+                                   "conversation), what happened (the timeline), and "
+                                   "its assumptions")
     s.add_argument("wo_id")
     s.add_argument("--project")
     s.add_argument("--debug", action="store_true",
@@ -1197,7 +1198,7 @@ def cmd_adopt(args: argparse.Namespace) -> int:
 def cmd_wo(args: argparse.Namespace) -> int:
     from . import invariants, ops
     from .project_store import OPEN_STATUSES, ProjectStore
-    from .timeline import build_timeline
+    from .timeline import build_conversation, build_timeline
 
     if args.wo_cmd == "create":
         deps = [d.strip() for d in args.depends_on.split(",") if d.strip()]
@@ -1268,14 +1269,17 @@ def cmd_wo(args: argparse.Namespace) -> int:
         name, path, wo = ops.find_work_order(args.wo_id, args.project)
         store = ProjectStore(path)
         try:
+            events = store.list_events(args.wo_id)
             messages = store.list_messages(args.wo_id)
             detail = {
                 "project": name, **wo,
                 "status_label": invariants.status_label(store, wo),
                 "blocked_by": store.unfinished_dependencies(args.wo_id),
-                "timeline": build_timeline(wo, store.list_events(args.wo_id),
-                                           messages, include_debug=args.debug),
-                "messages": messages,
+                "timeline": build_timeline(wo, events, messages,
+                                           include_debug=args.debug),
+                # What was said, in order, whoever spoke — the worker's questions to
+                # Neo included, which `messages` alone never held.
+                "conversation": build_conversation(events, messages),
                 # Every assumption, each with its `n` and `status` — §4.
                 "assumptions": store.all_assumptions(args.wo_id),
                 # What this work order was allowed (or refused) permission to ship.
