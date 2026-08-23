@@ -257,6 +257,28 @@ def test_cli_wo_show_hides_debug_entries_by_default(jarvis_home, fake_claude,
     assert "turn_ended" in [e["kind"] for e in debug["timeline"]]
 
 
+def test_a_failed_round_never_reads_as_a_rejection():
+    """The kind a reader is most likely to misread. `validation_failed` means NOTHING
+    JUDGED THE WORK — a transport outage, or no validator configured at all — and a
+    reader who takes it for a rejection goes looking for something to fix that nobody
+    asked for. Both causes are asserted, because they are two different sentences, and
+    both are asserted to differ from what a real rejection renders as."""
+    entries = build_timeline({}, [
+        ev("validation_failed", 1.0, round=1, cause="transport", attempt=2,
+           error="connection reset"),
+        ev("validation_failed", 2.0, round=1, cause="no_validator",
+           reason="no validator was configured"),
+        ev("validation_rejected", 3.0, reason="no test touches the new branch"),
+    ], [])
+
+    labels = [e["label"] for e in entries]
+    assert len(set(labels)) == 3, labels
+    assert all(label and label != entries[i]["kind"]
+               for i, label in enumerate(labels)), labels
+    assert "reject" not in (labels[0] + labels[1]).lower()
+    assert "attempt 2" in entries[0]["detail"]
+
+
 def test_the_four_validation_events_read_as_four_different_things():
     """The LABELS, not the level.
 

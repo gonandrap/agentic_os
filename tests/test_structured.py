@@ -93,6 +93,121 @@ def test_nothing_to_parse_and_an_empty_object_are_different_answers():
     assert structured.parse_json_object("{}") == {}
 
 
+# --- close_unterminated: the one repair, and everything it refuses to repair -------
+#
+# The boundary these tests exist to hold is a single sentence: CLOSERS ONLY. A reply
+# whose last value finished is repaired; a reply cut off mid-value is not, because a
+# caller cannot tell a half answer from a whole one once it parses. Pinned input by
+# input for the same reason the greedy regex is — a prose description tolerates a
+# one-input drift and a case list does not.
+
+def test_the_regression_a_nested_object_missing_only_the_outer_brace():
+    # Neo's reply to question 145, in miniature: perfect JSON, one absent final `}`.
+    # The greedy span stopped at the NESTED object's brace, `json.loads` said
+    # "Expecting ',' delimiter", and a settled answer escalated to the user.
+    raw = '{"escalate": false, "answer": "(b) is right", "dispatch": {"title": "t"}'
+    assert structured.parse_json_object(raw) == {
+        "escalate": False, "answer": "(b) is right", "dispatch": {"title": "t"}}
+
+
+def test_an_object_with_no_closing_brace_at_all_is_repaired():
+    # `_JSON_RE` never even matches here — there is no `}` for it to end on — so the
+    # repair has to work from the first `{` to the end of the text.
+    assert structured.parse_json_object('{"ok": "yes"') == {"ok": "yes"}
+
+
+def test_an_unclosed_array_is_closed_too_and_in_the_right_order():
+    raw = '{"ok": 1, "seats": [{"a": 1}, {"b": "two"}'
+    assert structured.parse_json_object(raw) == {
+        "ok": 1, "seats": [{"a": 1}, {"b": "two"}]}
+
+
+def test_a_fenced_reply_that_lost_its_closing_brace_is_repaired():
+    # The fence is trimmed off the right edge before the closers go on — the same thing
+    # the greedy expression does when there IS a last brace to end on.
+    assert structured.parse_json_object('```json\n{"ok": "yes"\n```') == {"ok": "yes"}
+
+
+def test_prose_after_an_unclosed_object_still_parses():
+    # Two spans are tried: the greedy match (which drops the trailing prose) before
+    # everything-from-the-first-brace. Only the first of them can win here.
+    assert structured.parse_json_object('{"ok": {"n": 1}. Hope that helps.') == {
+        "ok": {"n": 1}}
+
+
+@pytest.mark.parametrize("raw", [
+    '{"answer": "cut off mid-sen',          # mid-string: closing it would invent an end
+    '{"answer": "done",',                   # dangling comma: a field is missing
+    '{"answer": "done", "reason":',         # a key with no value
+    '{"answer": "a", "n": tru',             # mid-literal
+])
+def test_a_reply_cut_off_mid_value_is_still_refused(raw):
+    # THE LINE THAT MATTERS. Appending `}` to any of these either fails to parse or
+    # would hand a caller a truncated value wearing a whole value's shape. For Neo they
+    # keep failing toward the user, which is the failure the OS can recover from.
+    assert structured.parse_json_object(raw) is None
+
+
+@pytest.mark.parametrize("raw", [
+    '{"n": 12',                             # for all we know the reply was cut out of 123456
+    '{"a": "x", "ns": [1, 2',
+    '{"n": 1.5',
+])
+def test_a_reply_ending_on_a_bare_number_is_refused_even_though_closers_would_parse(raw):
+    # The one case where appending nothing but `}` silently CHANGES a value instead of
+    # failing: a digit is the only JSON token whose prefix is itself a valid token. This
+    # costs an escalation when the model merely forgot the brace after a number, which
+    # is the direction this whole module is supposed to fail in.
+    assert structured.close_unterminated(raw) is None
+    assert structured.parse_json_object(raw) is None
+
+
+def test_a_literal_is_self_delimiting_so_it_does_not_need_the_number_rule():
+    # `true` cannot be the prefix of any other JSON token, so closing after it invents
+    # nothing. Stated as a test so the number rule is not later generalised to literals.
+    assert structured.parse_json_object('{"escalate": true') == {"escalate": True}
+    assert structured.parse_json_object('{"dispatch": null') == {"dispatch": None}
+
+
+def test_the_repair_never_fires_on_two_objects_because_they_are_already_balanced():
+    # kn-755ff9f5's load-bearing case, restated against the repair: a reply that said
+    # two things stays refused. Nothing to append, so nothing changes.
+    assert structured.close_unterminated('{"a": 1} and then {"b": 2}') is None
+    assert structured.parse_json_object('{"a": 1} and then {"b": 2}') is None
+
+
+def test_brackets_inside_strings_do_not_count():
+    # A naive counter reads three openers and one closer here and "repairs" a valid
+    # object into a broken one.
+    assert structured.parse_json_object('{"a": "{ [ not a bracket"}') == {
+        "a": "{ [ not a bracket"}
+    assert structured.close_unterminated('{"a": "}"}') is None
+
+
+def test_an_escaped_quote_does_not_end_the_string():
+    assert structured.parse_json_object(r'{"a": "he said \"go\""') == {"a": 'he said "go"'}
+
+
+def test_a_bracket_closed_that_was_never_opened_is_not_a_truncation():
+    assert structured.close_unterminated('{"a": [1}') is None
+    assert structured.parse_json_object('{"a": [1}') is None
+
+
+def test_close_unterminated_returns_none_when_there_is_nothing_to_close():
+    # None means "this repair does not apply", not "the text is bad" — `{"a": 1}` is
+    # perfectly good JSON that simply needs no closers.
+    assert structured.close_unterminated('{"a": 1}') is None
+
+
+def test_close_unterminated_appends_only_and_never_rewrites():
+    # The safety property in one assertion: whatever comes back starts with exactly what
+    # went in. No comma trimmed, no quote inserted, no value invented.
+    raw = '{"a": [1, 2], "b": {"c": "x"'
+    repaired = structured.close_unterminated(raw)
+    assert repaired is not None and repaired.startswith(raw)
+    assert set(repaired[len(raw):]) <= {"}", "]"}
+
+
 # --- coerce: the attempts=1 policy, on a reply already in hand ---------------------
 
 def test_coerce_returns_the_validated_value():

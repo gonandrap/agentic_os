@@ -632,10 +632,19 @@ def _manager_prompt(wo: dict[str, Any], project: ProjectSpec,
         "instead.",
         "",
         "## A deferral request",
-        "A work order may report something worth doing that is not its job. File it: "
-        f"`jarvis backlog add {project.name} \"...\"`, recording in the text which work "
-        f"order suggested it and that it came from {fo_id}. Filing it is the whole "
-        f"action — you are not being asked to schedule it.",
+        "A work order may report something worth doing that is not its job. File it on "
+        "the backlog, recording where it came from — which work order suggested it, and "
+        f"that it came out of {fo_id}:",
+        "",
+        f"    jarvis backlog add {project.name} \"<title>\" -d \"<the brief>\" \\",
+        f"        --origin-wo <the work order that suggested it> --origin-fo {fo_id} \\",
+        "        --origin-note \"<why it was deferred>\"",
+        "",
+        "The message you receive spells that command out with its values already filled "
+        "in; run it as it stands. Use the flags rather than writing the relationship "
+        "into the description: they are columns, so a reader months from now can ask the "
+        "backlog where an item came from instead of hoping somebody wrote it down. "
+        "Filing it is the whole action — you are not being asked to schedule it.",
         "",
         "**You do not know who sends you these messages. Do not try to find out.** "
         "Whoever it was addressed a role, not you, and never learns who read it.",

@@ -866,3 +866,80 @@ def test_parse_verdict_tolerates_fences():
                  "exempt_pattern": ""}
     v = neo_mod.parse_verdict("total nonsense")
     assert v["escalate"] is True
+
+
+def test_parse_verdict_recovers_a_reply_missing_only_its_final_brace():
+    """Question 145, reduced: Neo answered clearly, left off one `}`, and the user was
+    interrupted for a decision Neo had already made.
+
+    The greedy span stopped at the nested `dispatch` object's brace rather than the
+    outer one, so `json.loads` failed and the fail-safe escalated a settled answer. What
+    makes this worth a regression test rather than a one-line fix is the direction of
+    the damage: the fail-safe is CORRECT to escalate what it cannot read, so nothing
+    downstream was ever going to catch this — the only place it can be fixed is at the
+    point where the bytes are read.
+    """
+    v = neo_mod.parse_verdict(
+        '{"escalate": false, "answer": "(b) is right", "reason": "agrees with (b)", '
+        '"dispatch": {"title": "t", "description": "d"}')
+    assert v["escalate"] is False, "a recoverable reply must not reach the user"
+    assert v["answer"] == "(b) is right"
+    assert v["dispatch"] == {"title": "t", "description": "d"}
+
+
+def test_parse_verdict_still_escalates_a_reply_cut_off_mid_answer():
+    """The other half of the same boundary, and the more important one.
+
+    A reply whose `answer` string was cut short cannot be repaired without inventing the
+    end of it, so it keeps failing toward the user. A worker being handed half a ruling
+    it cannot tell from a whole one is the failure this fail-safe exists to prevent.
+    """
+    v = neo_mod.parse_verdict('{"escalate": false, "answer": "(b) is right because it ke')
+    assert v["escalate"] is True
+    assert v["answer"] == ""
+    assert v["reason"].startswith(neo_mod.UNPARSEABLE_PREFIX)
+
+
+def test_answer_question_logs_the_full_raw_reply_when_it_cannot_be_parsed(
+        jarvis_home, monkeypatch, caplog):
+    """Every SURFACE clips the raw reply to 120 characters — the escalation reason, the
+    daemon log line, the Telegram push — which is right for a notification and useless
+    for a diagnosis. Question 145's root cause sat at character 3161 and was only
+    reachable by hand-digging a `~/.claude` session transcript, which is not a file the
+    OS owns or can promise still exists. One log line, once, on a path that is rare and
+    already costs the user an interruption.
+    """
+    from jarvis import claude_cli
+
+    raw = '{"escalate": false, "answer": "' + "x" * 500 + '", "reason": "cut off here'
+    monkeypatch.setattr(claude_cli, "run_headless_result",
+                        lambda *a, **kw: claude_cli.HeadlessResult(text=raw, model="m"))
+    store = NeoStore()
+    q = {"id": 145, "project": "proj_a", "wo_id": "wo-1", "question": "which?",
+         "kind": "question"}
+    with caplog.at_level("WARNING", logger="neo"):
+        verdict = neo_mod.answer_question(store, q, "m", record=lambda *a, **kw: None)
+
+    assert verdict["escalate"] is True
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert raw in logged, "the WHOLE reply must be in the log, not the 120-char clip"
+    assert "145" in logged, "and it must say which question it came from"
+
+
+def test_answer_question_does_not_log_a_reply_it_could_parse(
+        jarvis_home, monkeypatch, caplog):
+    """The corollary: a working answer is not three kilobytes of log noise per question.
+    Paired with the test above so the trigger cannot silently widen to every reply."""
+    from jarvis import claude_cli
+
+    raw = '{"escalate": false, "answer": "go", "reason": "r"}'
+    monkeypatch.setattr(claude_cli, "run_headless_result",
+                        lambda *a, **kw: claude_cli.HeadlessResult(text=raw, model="m"))
+    store = NeoStore()
+    q = {"id": 146, "project": "proj_a", "wo_id": "wo-1", "question": "which?",
+         "kind": "question"}
+    with caplog.at_level("WARNING", logger="neo"):
+        verdict = neo_mod.answer_question(store, q, "m", record=lambda *a, **kw: None)
+
+    assert verdict["answer"] == "go"
+    assert not [r for r in caplog.records if "raw reply" in r.getMessage()]

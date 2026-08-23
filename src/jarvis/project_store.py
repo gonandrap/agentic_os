@@ -7,6 +7,7 @@ orders that own work orders in sets.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,10 @@ VALIDATOR_SEATS = ("tester", "security", "architect", "maintainer", "chair")
 # How a round ended. `pending` is a round still open; `failed` is the panel itself
 # breaking (no seat answered), which is not the same as the work being `rejected`.
 VALIDATION_OUTCOMES = ("pending", "passed", "rejected", "escalated", "failed")
+# The outcomes that mean a round was JUDGED, and so that the submitter spent one of its
+# `max_rounds`. `pending` and `failed` are deliberately absent: see
+# `counted_validation_rounds`, which is the only thing that may count a round.
+COUNTED_VALIDATION_OUTCOMES = ("passed", "rejected", "escalated")
 # What one seat proposed. "" is a seat that offered none — it ran, but said nothing the
 # arbiter can count.
 VALIDATION_VERDICTS = ("pass", "reject", "")
@@ -1080,6 +1085,19 @@ class ProjectStore:
             (wo_id, db.now(), kind, db.to_json(payload or {})),
         )
 
+    def events_of_kind(self, wo_id: str, kind: str) -> list[dict[str, Any]]:
+        """Every event of ONE kind on this work order, oldest first and UNCAPPED.
+
+        `list_events` takes the oldest `limit` rows, which is right for a timeline and
+        wrong for counting: a chatty work order would push the rows a counter cares
+        about off the end and quietly report zero. The kind filter is what makes an
+        uncapped read safe here.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM wo_events WHERE wo_id=? AND kind=? ORDER BY ts",
+            (wo_id, kind)).fetchall()
+        return db.rows_to_dicts(rows)
+
     def list_events(self, wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM wo_events WHERE wo_id=? ORDER BY ts LIMIT ?", (wo_id, limit)
@@ -1412,25 +1430,62 @@ class ProjectStore:
     def open_validation_round(self, *, wo_id: str | None = None,
                               fo_id: str | None = None, fingerprint: str,
                               summary: str = "", evidence: str = "",
-                              pr_url: str | None = None) -> dict[str, Any]:
-        """Start a round on one subject. The round number is derived, never passed in.
+                              pr_url: str | None = None,
+                              round: int | None = None) -> dict[str, Any]:
+        """Start a round on one subject, or return the one that already holds its number.
 
-        1-based and per subject, counted from what is already stored, so two rounds can
-        never disagree about which came first. The partial unique index is the backstop
-        if two ever race for the same number.
+        1-based and per subject. Left to itself the number is derived from what is
+        already stored, so two rounds can never disagree about which came first; a caller
+        that COUNTS rounds by outcome — the round machine does, because a `failed`
+        transport round must not consume one — passes the number it counted instead.
+
+        **Idempotent per (subject, round).** A `finish` retried while its round is still
+        open, or an envelope redelivered, must not consume a second round. The
+        enforcement is the partial unique index and the `IntegrityError` it raises, not a
+        SELECT before the INSERT: that check-then-insert is a race with no lock, and the
+        losing side would silently open the round the index exists to forbid.
         """
         col, subject_id = self._subject(wo_id, fo_id)
-        row = self.conn.execute(
-            f"SELECT MAX(round) AS n FROM validation_rounds WHERE {col}=?", (subject_id,)
-        ).fetchone()
-        nxt = int(row["n"] or 0) + 1
-        cur = self.conn.execute(
-            f"""INSERT INTO validation_rounds ({col}, round, ts, fingerprint, summary,
-                                               evidence, pr_url)
-                VALUES (?,?,?,?,?,?,?)""",
-            (subject_id, nxt, db.now(), fingerprint, summary, evidence, pr_url),
-        )
+        if round is None:
+            row = self.conn.execute(
+                f"SELECT MAX(round) AS n FROM validation_rounds WHERE {col}=?",
+                (subject_id,)).fetchone()
+            round = int(row["n"] or 0) + 1
+        try:
+            cur = self.conn.execute(
+                f"""INSERT INTO validation_rounds ({col}, round, ts, fingerprint,
+                                                   summary, evidence, pr_url)
+                    VALUES (?,?,?,?,?,?,?)""",
+                (subject_id, round, db.now(), fingerprint, summary, evidence, pr_url),
+            )
+        except sqlite3.IntegrityError:
+            existing = self.conn.execute(
+                f"SELECT * FROM validation_rounds WHERE {col}=? AND round=?",
+                (subject_id, round)).fetchone()
+            if existing is None:  # pragma: no cover - some other constraint
+                raise
+            return dict(existing)
         return self.get_validation_round(int(cur.lastrowid))  # type: ignore[arg-type]
+
+    def counted_validation_rounds(self, *, wo_id: str | None = None,
+                                  fo_id: str | None = None) -> int:
+        """How many rounds this subject has actually SPENT.
+
+        Rounds are counted, never inferred from the row count: only a round that reached
+        a verdict — `COUNTED_VALIDATION_OUTCOMES` — is one the submitter used up. A
+        `failed` round is a transport outage rather than a judgement and must stay
+        invisible here, or three bad nights on the network would give up on a unit
+        nothing ever judged; a `pending` round is the one in flight, and counting it
+        would make a retried submission consume a second.
+        """
+        col, subject_id = self._subject(wo_id, fo_id)
+        marks = ",".join("?" * len(COUNTED_VALIDATION_OUTCOMES))
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS n FROM validation_rounds "
+            f"WHERE {col}=? AND outcome IN ({marks})",
+            (subject_id, *COUNTED_VALIDATION_OUTCOMES),
+        ).fetchone()
+        return int(row["n"] or 0)
 
     def get_validation_round(self, round_id: int) -> dict[str, Any] | None:
         row = self.conn.execute(
