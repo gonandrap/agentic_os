@@ -373,18 +373,21 @@ def test_the_label_says_why_nothing_is_moving_and_when_it_will(store):
     assert invariants.status_label(store, wo).startswith("running — ")
 
 
-def test_a_retry_that_is_not_today_says_which_day(store):
+def test_a_retry_that_is_not_today_says_which_day(store, monkeypatch):
     """A bare "%H:%M" is only unambiguous within the day it is written. For twelve hours
     the dashboard promised wo-b4f207ad "retrying by itself at 12:00" while meaning the
     NEXT day's noon — the sentence that made a mis-scheduled retry read as an overdue
     one. A 7-day window legitimately resets days out, so the date has to be there."""
     store.set_status("wo-test", "running")
-    _refused(store, error="You've hit your weekly limit · resets Aug 29, 9:50am "
-                          "(America/Los_Angeles)")
-    tz = ZoneInfo("America/Los_Angeles")
-    _age(store, "wo-test", datetime(2026, 8, 22, 9, 0, tzinfo=tz).timestamp())
+    ended = datetime(2026, 8, 22, 9, 0).timestamp()      # local, like the reader
+    reset = datetime(2026, 8, 29, 9, 50).timestamp()
+    _refused(store, error=time.strftime(
+        "You've hit your weekly limit · resets %b %-d, %-I:%M%P", time.localtime(reset)))
+    _age(store, "wo-test", ended)
+    monkeypatch.setattr(time, "time", lambda: ended + 3600)
     note = invariants.pause_note(store, store.get_work_order("wo-test"))
-    assert "Sat 29 Aug" in note, f"no date in a retry six days out: {note!r}"
+    assert note.endswith(time.strftime("at 09:50 on %a %d %b", time.localtime(reset))), (
+        f"no date in a retry a week out: {note!r}")
 
 
 def test_a_retry_later_today_stays_a_bare_clock_time(store, monkeypatch):

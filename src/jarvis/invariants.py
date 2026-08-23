@@ -304,9 +304,16 @@ def _clock(ts: float) -> str:
 
     Local wall-clock, not the timezone the CLI quoted: the reader is at this machine, and
     a time they have to convert is a time they will misread.
+
+    "Today" is read through `time.time()` rather than by calling `time.localtime()` with
+    no argument. Same answer in production, and NOT the same thing: the no-argument form
+    reads the C clock directly, so it is a SECOND clock this function cannot be told
+    about — a caller that pins one of them moves half of the comparison and gets an
+    answer belonging to neither. That is the same two-clocks-for-one-question mistake as
+    the bug this whole change exists to fix, so there is one clock here.
     """
     when = time.localtime(ts)
-    if when[:3] == time.localtime()[:3]:
+    if when[:3] == time.localtime(time.time())[:3]:
         return time.strftime("%H:%M", when)
     return time.strftime("%H:%M on %a %d %b", when)
 
