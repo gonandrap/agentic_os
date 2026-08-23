@@ -1550,28 +1550,27 @@ class Daemon:
             #
             # The question half was missing, and the `else` below caught those instead:
             # a `jarvis wo ask` whose answer had not landed by the time the turn settled
-            # was filed as `needs_review — worker idle without jarvis wo finish` and put
-            # in front of the user, for a worker doing exactly what the contract asks of
-            # it (GitHub issue 100). Only the tightness of the Neo drain loop kept that
-            # rare; a slow or disabled Neo makes it every `wo ask`.
+            # was filed as `needs_review` + IDLE_NO_FINISH_BLOCKER and put in front of
+            # the user, for a worker doing exactly what the contract asks of it (GitHub
+            # issue 100). Only the tightness of the Neo drain loop kept that rare; a
+            # slow or disabled Neo makes it every `wo ask`.
             if fresh["status"] != "waiting_input":
                 store.set_status(wo["id"], "waiting_input")
         elif wo.get("kind") == "manager":
             # A project manager order is idle BY DESIGN: it acts on a message and ends
             # its turn, and between messages there is nothing for it to do. The default
-            # below would file that as `needs_review — worker idle without jarvis wo
-            # finish` on the manager's very first turn and again after every message it
-            # handled, so every feature order in the fleet would carry a permanent false
-            # flag. It never finishes itself either: `settle_features` completes it when
-            # its feature settles.
+            # below would file that as `needs_review` + IDLE_NO_FINISH_BLOCKER on the
+            # manager's very first turn and again after every message it handled, so
+            # every feature order in the fleet would carry a permanent false flag. It
+            # never finishes itself either: `settle_features` completes it when its
+            # feature settles.
             if fresh["status"] != "waiting_input":
                 store.set_status(wo["id"], "waiting_input")
         else:
+            from .invariants import IDLE_NO_FINISH_BLOCKER
+
             store.set_status(wo["id"], "needs_review")
-            store.flag_attention(
-                wo["id"],
-                "worker idle without `jarvis wo finish` — review the session",
-            )
+            store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
 
     # -- 6. pull requests parked on a human ------------------------------------------
 

@@ -10,7 +10,7 @@ within a minute, that an idle worker in `waiting_input` meant "the user is being
   * the `Notification` branch of `hooks.handle_hook` — Claude Code's routine idle prompt,
     ~1 min after the turn ends, stamped "Claude is waiting for your input" over it;
   * `Daemon.settle_work_order` — a turn that ended with no queued message and no
-    `jarvis wo finish` was filed as `needs_review — worker idle without …`.
+    `jarvis wo finish` was filed as `needs_review` + IDLE_NO_FINISH_BLOCKER.
 
 Three of five sampled `jarvis_os` work orders had it, and the remedy the attention line
 offered (`jarvis wo resume-auto`) could not help: `auto` is the fleet-wide default, so
@@ -32,6 +32,7 @@ from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.hooks import handle_hook
 from jarvis.invariants import (
+    IDLE_NO_FINISH_BLOCKER,
     awaiting_neo,
     check_project,
     neo_question_blocker,
@@ -286,8 +287,8 @@ def test_a_real_permission_prompt_still_reaches_the_user(project):
 
 def test_settling_parks_a_worker_that_asked_neo(started, project, settle_turns):
     """A worker that ends its turn on `jarvis wo ask` has done exactly what the contract
-    asks of it. Before this, the `else` branch caught it — `needs_review`, "worker idle
-    without `jarvis wo finish`" — whenever Neo had not answered within the tick.
+    asks of it. Before this, the `else` branch caught it — `needs_review` plus
+    IDLE_NO_FINISH_BLOCKER — whenever Neo had not answered within the tick.
 
     `Daemon.settle_turns` directly rather than `tick`: a full tick also kicks the Neo
     drain onto its thread pool, which would answer the question out from under the
@@ -313,7 +314,13 @@ def test_settling_parks_a_worker_that_asked_neo(started, project, settle_turns):
 
 def test_settling_still_files_a_genuinely_idle_worker(started, project, settle_turns):
     """The control: the same settlement pass, the same ended turn, no question. This
-    must still reach the user, or the fix has bought silence rather than accuracy."""
+    must still reach the user, or the fix has bought silence rather than accuracy.
+
+    The flag and its re-derivation are pinned to the same constant here (kn-78346a2d).
+    They were two different sentences for one state, so the dashboard banner and the
+    attention list disagreed about what had gone wrong — and neither said the part the
+    user cannot see, that whatever the worker left running died with its turn.
+    """
     daemon = started
     spec = daemon.catalog.project("proj_a")
     wo = ops.create_work_order("proj_a", "build the exporter")
@@ -326,6 +333,8 @@ def test_settling_still_files_a_genuinely_idle_worker(started, project, settle_t
     fresh = store.get_work_order(wo["id"])
     assert fresh["status"] == "needs_review"
     assert fresh["needs_attention"]
+    assert fresh["attention_reason"] == IDLE_NO_FINISH_BLOCKER
+    assert true_blockers(store, fresh) == [IDLE_NO_FINISH_BLOCKER]
 
 
 # -- 5. the drain: what the answer does to the wait ------------------------------------

@@ -76,6 +76,18 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
   project are not Jarvis OS bugs — those go to the backlog.
 - **Notify on things needing human attention**:
   `jarvis notify --project {project_name} --level warning|critical "<title>" "<body>"`
+- **A turn is one-shot: never end one expecting to be re-invoked.** Your session is a
+  single `claude -p` process, so ending a turn exits it and everything you started
+  inside it goes too — a backgrounded command is killed or orphaned, and either way
+  nobody reads its output, because no event wakes a worker when a job it launched
+  finishes.
+
+  Exactly three things start your next turn: an answer to `jarvis wo ask`, a verdict on
+  a gate you requested, or a message the user sends you. So work that outlasts one
+  command runs in the *foreground* and you wait for it, or you split it into pieces that
+  each fit inside a turn. If it fits in neither, say so and ask. A turn that ends on
+  "I'll pick this up when the background run finishes" is the work order abandoned
+  mid-task, and the user is flagged for it.
 - **Summarize your result** when done:
   `jarvis wo finish "$JARVIS_WO_ID" --summary "<what was delivered, where>"`
   then write your full answer as the last thing you say.

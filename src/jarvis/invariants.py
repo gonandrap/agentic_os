@@ -66,7 +66,7 @@ TERMINAL_STATUSES = ("completed", "cancelled")
 #: being merged. Lives here rather than at the call site because `true_blockers` is the
 #: only source of attention reasons — INV-ATTENTION-REASON rewrites any flag it cannot
 #: derive, so a reason raised by `Daemon.poll_pull_requests` and not repeated here would
-#: silently become "finished without a completion signal" on the next reconcile tick.
+#: silently become the generic IDLE_NO_FINISH_BLOCKER below on the next reconcile tick.
 PR_CLOSED_BLOCKER = "pull request closed without merging — the work was not accepted"
 
 #: How many times the OS asks a worker to resolve the same merge conflict before it
@@ -93,6 +93,19 @@ PR_CONFLICT_BLOCKER = ("merge conflicts the worker could not resolve — the pul
 #: and has no branch below.
 VALIDATION_STUCK_BLOCKER = ("the review could not be satisfied — the work needs your "
                             "judgement")
+
+#: What a work order says when its worker went quiet without `jarvis wo finish`. Says
+#: what HAPPENED, not merely that the turn ended: the worker stopped mid-task, and — the
+#: half a user cannot see and reliably guesses wrong — nothing it may have left running
+#: survived, because a turn is one `claude -p` process and no event wakes a worker when a
+#: background job finishes. wo-2df8828c signed off on "I'll be re-invoked when it
+#: finishes" and read as merely mislabelled; the eval had in fact died with the turn.
+#:
+#: `Daemon.settle_work_order` flags it and `true_blockers` re-derives it, from here, for
+#: the reason PR_CLOSED_BLOCKER gives above. They said two different sentences for one
+#: state until this constant existed.
+IDLE_NO_FINISH_BLOCKER = ("the worker stopped mid-task without `jarvis wo finish` — "
+                          "nothing it started is still running; review the session")
 
 
 @dataclass
@@ -229,7 +242,7 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
             # session whose story is already written down in the rounds.
             blockers.append(VALIDATION_STUCK_BLOCKER)
         else:
-            blockers.append("finished without a completion signal — review the session")
+            blockers.append(IDLE_NO_FINISH_BLOCKER)
     # A pull request that cannot be merged and could not be healed — the whole reason
     # `waiting_pr_merge` is in BLOCKED_STATUSES at all (spec §5). The query sits behind
     # the status check so no other work order pays for it.
@@ -553,7 +566,7 @@ def check_adhoc_not_governed(store: ProjectStore) -> Iterator[Violation]:
     A session the user started and handed over with `jarvis wo inject` is a *mirror*,
     not a dispatch: it never received the worker contract and has no way to call
     `jarvis wo finish`. Judging it against that contract parked it in `needs_review`
-    ("worker idle without `jarvis wo finish`") the moment it ended a turn, and in
+    (IDLE_NO_FINISH_BLOCKER) the moment it ended a turn, and in
     `failed` ("worker session disappeared") the moment the user cleaned it up — one live
     fleet accumulated fifteen of these, one of which was the session the user was
     talking to. (Back then Jarvis adopted these sessions on its own; it no longer does,

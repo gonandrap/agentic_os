@@ -18,6 +18,7 @@ from jarvis.catalog import DEFAULT_VALIDATION_TIMEOUT
 from jarvis.hooks import handle_hook
 from jarvis.invariants import (
     BLOCKED_STATUSES,
+    IDLE_NO_FINISH_BLOCKER,
     PR_CLOSED_BLOCKER,
     VALIDATION_STUCK_BLOCKER,
     check_project,
@@ -504,7 +505,7 @@ def test_a_validating_work_order_is_silent_until_the_panel_gives_up(project):
     # likewise not the user's problem yet
     store.set_status(wo["id"], "needs_review")
     assert true_blockers(store, store.get_work_order(wo["id"])) == [
-        "finished without a completion signal — review the session"]
+        IDLE_NO_FINISH_BLOCKER]
 
     # the panel gives up: now it is
     store.close_validation_round(rnd["id"], "escalated", reason="three rounds, no deal")

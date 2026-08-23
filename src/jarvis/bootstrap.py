@@ -43,7 +43,11 @@ from .paths import project_state_dir
 # only the diff. Prose is the whole mechanism — the flag has been accepted since the
 # round machine landed — so it has to reach every managed repo to be worth anything,
 # which is what this bump is for.
-TEMPLATE_VERSION = 9
+# v10 = a turn is one-shot. Nothing in the contract said so, so a worker backgrounded a
+# 15-minute eval, signed off on the promise of a wake-up that does not exist, and the run
+# died with its process (wo-2df8828c). Prose is again the whole mechanism, and it only
+# helps the workers whose repo has it.
+TEMPLATE_VERSION = 10
 ASSETS = Path(__file__).parent / "assets"
 
 
