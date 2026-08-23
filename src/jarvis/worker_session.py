@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import claude_cli
+from . import claude_cli, systemd_units
 from .catalog import ProjectSpec
 from .project_store import ProjectStore
 
@@ -224,13 +224,17 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
     store.conn.execute("UPDATE wo_turns SET outfile=?, errfile=? WHERE id=?",
                        (str(outfile), str(errfile), turn["id"]))
     try:
-        pid = claude_cli.spawn_turn(
+        spawned = claude_cli.spawn_turn(
             prompt=prompt,
             cwd=cwd,
             session_id=wo["session_id"],
             outfile=outfile,
             errfile=errfile,
             resume=resume,
+            # Named from the row that already exists, which is what makes the name unique
+            # per (work order, sequence) — `systemd-run` refuses a unit name already in
+            # use, and a resumed or retried turn always has a fresh seq.
+            unit=systemd_units.unit_name(wo_id, turn["seq"]),
             name=worker_name(wo),
             worktree=worktree,
             **briefing_for(project, wo),
@@ -239,13 +243,13 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
         store.finish_turn(turn["id"], "failed", error=str(e))
         store.add_event(wo_id, "turn_failed", {"seq": turn["seq"], "error": str(e)})
         raise
-    store.set_turn_pid(turn["id"], pid)
+    store.set_turn_pid(turn["id"], spawned.pid, unit=spawned.unit)
     store.add_event(wo_id, "turn_started", {
-        "seq": turn["seq"], "kind": kind, "pid": pid,
+        "seq": turn["seq"], "kind": kind, "pid": spawned.pid, "unit": spawned.unit,
         "session_id": wo["session_id"], "resumed": resume,
     })
-    log.info("[%s] %s turn %s for %s (pid %s)", project.name, kind, turn["seq"],
-             wo_id, pid)
+    log.info("[%s] %s turn %s for %s (pid %s%s)", project.name, kind, turn["seq"],
+             wo_id, spawned.pid, f", unit {spawned.unit}" if spawned.unit else "")
     return store.get_turn(turn["id"])  # type: ignore[return-value]
 
 
@@ -291,8 +295,24 @@ def poll(store: ProjectStore) -> list[dict[str, Any]]:
             continue
         if turn["pid"] is None and time.time() - turn["started_at"] < 30:
             continue  # spawned this instant; the pid write has not landed yet
+        if _unit_still_running(turn):
+            continue
         settled.append(_reap(store, turn))
     return settled
+
+
+def _unit_still_running(turn: dict[str, Any]) -> bool:
+    """Liveness of last resort, for a turn whose transient unit started but whose main
+    pid could not be read back.
+
+    The pid stays the primary answer — it is cheaper, it is what every other caller uses,
+    and for a unit-hosted turn it is the `claude` process itself, so `process_alive`'s
+    "no longer our child" case already covers a daemon restart. This only stops a turn
+    that is demonstrably running from being reaped as dead over a missing number, so it
+    is asked only once the pid has said nothing useful.
+    """
+    unit = turn.get("unit")
+    return bool(unit) and turn["pid"] is None and systemd_units.unit_active(unit)
 
 
 def _reap(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any]:
@@ -667,9 +687,15 @@ def cancel(store: ProjectStore, wo_id: str) -> dict[str, Any]:
     turn = busy(store, wo_id)
     if turn is None:
         return {"stopped": False, "reason": "no turn in flight"}
-    killed = claude_cli.kill_process_group(turn["pid"])
+    # The unit first, and then the process group anyway. Stopping the unit is the
+    # thorough half — systemd takes down the whole cgroup, MCP servers included — but it
+    # is `--no-block`, and a turn that fell back to the direct transport has no unit at
+    # all, so the signal still goes out either way.
+    unit = turn.get("unit")
+    stopped_unit = systemd_units.stop_unit(unit) if unit else False
+    killed = claude_cli.kill_process_group(turn["pid"]) or stopped_unit
     store.finish_turn(turn["id"], "failed",
                       error="cancelled" if killed else "cancelled (process already gone)")
     store.add_event(wo_id, "turn_cancelled", {"seq": turn["seq"], "pid": turn["pid"],
-                                              "killed": killed})
-    return {"stopped": killed, "pid": turn["pid"], "seq": turn["seq"]}
+                                              "unit": unit, "killed": killed})
+    return {"stopped": killed, "pid": turn["pid"], "unit": unit, "seq": turn["seq"]}

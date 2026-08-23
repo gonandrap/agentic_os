@@ -7,6 +7,7 @@ All interaction with Claude Code goes through here so tests can substitute a fak
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -20,6 +21,10 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from . import systemd_units
+
+
+log = logging.getLogger("jarvisd.claude")
 
 #: `claude` location override, mirroring bugreport's GH_BIN_ENV. Tests point it at a
 #: fake; the test-isolation gate points it at a stub that refuses to run.
@@ -457,30 +462,79 @@ def turn_args(
     return args
 
 
-def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
-               errfile: Path, resume: bool = False, **kwargs: Any) -> int:
-    """Start one worker turn as a detached process; returns its pid.
+@dataclass
+class SpawnedTurn:
+    """What a launched turn is tracked by: always a pid, and a unit when it got one."""
 
-    Detached (`start_new_session=True`) on purpose: a turn can run for hours and
-    `shipit` restarts jarvisd on every release, so a turn parented to the daemon would
-    lose its reply on each deploy. Its own process group is also what makes `cancel()`
-    able to take the whole tree down.
+    pid: int | None
+    #: The transient systemd unit the turn runs in, or None on the direct path. Recorded
+    #: on the turn row rather than re-derived, so `cancel` stops the unit that exists.
+    unit: str | None = None
+
+
+def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
+               errfile: Path, resume: bool = False, unit: str | None = None,
+               **kwargs: Any) -> SpawnedTurn:
+    """Start one worker turn; returns the pid to track it by and the unit it runs in.
+
+    TWO TRANSPORTS, chosen per spawn by `systemd_units.use_transient_units()`:
+
+    * **Transient unit** (the fleet, where the daemon is a `.service`). The turn runs in
+      its own cgroup, so `systemctl restart jarvis` — a deploy, a crash-restart, `jarvis
+      stop` — no longer SIGTERMs it along with the daemon (issue #133). The pid recorded
+      is the UNIT's main process, i.e. the `claude` itself and not the `systemd-run` that
+      enqueued it, so everything downstream (`process_alive`, `kill_process_group`, the
+      reap) keeps working on a real pid exactly as before.
+    * **Direct `Popen`** (a dev checkout, `jarvis start --foreground`, any host without
+      systemd, and every test). Detached with `start_new_session=True`: a turn can run for
+      hours, and its own process group is what lets `cancel()` take the whole tree down.
+
+    Falling back is deliberate and silent-but-logged: if `systemd-run` is missing or
+    refuses, the turn still starts on the direct path. A transport problem must never be
+    the reason the fleet stops dispatching.
 
     stdin is /dev/null because `claude -p` otherwise spends three seconds waiting for
     input that is never coming, on every turn.
 
     The cache flag rides in the environment as well as in the settings file, so the
     property holds for a turn launched without one. `os.environ` is overlaid FIRST here
-    (it is ambient, not intent) — the opposite order from `_run`.
+    (it is ambient, not intent) — the opposite order from `_run`. Both transports build
+    that same environment, which is the whole reason they share this one function.
     """
     outfile.parent.mkdir(parents=True, exist_ok=True)
     args = turn_args(prompt, session_id, resume, **kwargs)
+    env = {**os.environ, **cache_env()}
+    if unit and systemd_units.use_transient_units():
+        prefix = systemd_units.run_prefix(
+            unit, cwd=cwd, outfile=outfile, errfile=errfile, env=env,
+            description=f"jarvis worker turn ({session_id})",
+        )
+        try:
+            # No redirection here: the unit's own StandardOutput= writes the result file,
+            # and `systemd-run`'s chatter is captured so it can never land in it.
+            done = subprocess.run([*prefix, claude_bin(), *args], capture_output=True,
+                                  text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as e:
+            log.warning("systemd-run unavailable for %s (%s) — spawning directly",
+                        unit, e)
+        else:
+            if done.returncode == 0:
+                pid = systemd_units.main_pid(unit)
+                if pid:
+                    return SpawnedTurn(pid=pid, unit=unit)
+                # The unit started but never told us its pid. It IS running, so it must
+                # not be started a second time: record it with a placeholder pid and let
+                # `worker_session.poll` fall back to asking the unit whether it is alive.
+                log.warning("unit %s started but reported no MainPID", unit)
+                return SpawnedTurn(pid=None, unit=unit)
+            log.warning("systemd-run failed for %s (%s): %s — spawning directly",
+                        unit, done.returncode, (done.stderr or "").strip()[:300])
     try:
         with outfile.open("w") as out, errfile.open("w") as err:
             proc = subprocess.Popen(
                 [claude_bin(), *args],
                 cwd=cwd,
-                env={**os.environ, **cache_env()},
+                env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=out,
                 stderr=err,
@@ -488,7 +542,7 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
             )
     except (FileNotFoundError, OSError) as e:
         raise ClaudeCliError(f"could not start `{claude_bin()}`: {e}") from e
-    return proc.pid
+    return SpawnedTurn(pid=proc.pid)
 
 
 def read_turn_result(outfile: Path, errfile: Path | None = None) -> TurnResult | None:

@@ -334,6 +334,12 @@ CREATE TABLE IF NOT EXISTS wo_turns (
     prompt TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'running',  -- running | done | failed
     pid INTEGER,
+    -- The transient systemd unit the turn runs in, when it got one (systemd_units).
+    -- NULL is the direct-Popen transport: a dev checkout, `start --foreground`, a host
+    -- without systemd, or a spawn that fell back. Recorded rather than re-derived from
+    -- the (wo, seq) naming convention, because `cancel` has to stop the unit that
+    -- actually exists.
+    unit TEXT,
     started_at REAL NOT NULL,
     ended_at REAL,
     exit_code INTEGER,
@@ -477,6 +483,9 @@ ADDED_COLUMNS = {
         # these columns existed, and never "nothing went wrong".
         "terminal_reason": "TEXT",
         "api_error_status": "INTEGER",
+        # See the CREATE TABLE comment. NULL on every row written before turns moved into
+        # their own units, which reads correctly as "the direct transport".
+        "unit": "TEXT",
     },
     "approvals": {
         # Which SEAT attempted the command, when a subagent did. NULL means the session's
@@ -1098,6 +1107,32 @@ class ProjectStore:
             (wo_id, kind)).fetchall()
         return db.rows_to_dicts(rows)
 
+    def _this_conflict(self, wo_id: str, kind: str) -> int:
+        """Events of `kind` since the last `pr_conflict_cleared` — this EPISODE's.
+
+        Conflict state is derived from the timeline rather than kept in columns; the
+        clear is the budget reset. See §4 of
+        docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md.
+        """
+        rows = self.events_of_kind(wo_id, kind)
+        if not rows:
+            return 0
+        cleared = self.events_of_kind(wo_id, "pr_conflict_cleared")
+        since = cleared[-1]["ts"] if cleared else 0.0
+        return sum(1 for r in rows if r["ts"] > since)
+
+    def pr_conflict_attempts(self, wo_id: str) -> int:
+        """How many times the OS has asked this worker to resolve the SAME conflict."""
+        return self._this_conflict(wo_id, "pr_conflict_nudged")
+
+    def pr_conflict_gave_up(self, wo_id: str) -> bool:
+        """Has the OS already stopped trying on this conflict and said so?
+
+        Not "are the attempts spent": this is what keeps the give-up event to one per
+        episode on a work order that may be flagged for something else entirely.
+        """
+        return bool(self._this_conflict(wo_id, "pr_conflict_unresolved"))
+
     def list_events(self, wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM wo_events WHERE wo_id=? ORDER BY ts LIMIT ?", (wo_id, limit)
@@ -1291,8 +1326,12 @@ class ProjectStore:
         row = self.conn.execute("SELECT * FROM wo_turns WHERE id=?", (turn_id,)).fetchone()
         return dict(row) if row else None
 
-    def set_turn_pid(self, turn_id: int, pid: int) -> None:
-        self.conn.execute("UPDATE wo_turns SET pid=? WHERE id=?", (pid, turn_id))
+    def set_turn_pid(self, turn_id: int, pid: int | None,
+                     unit: str | None = None) -> None:
+        """Record how to reach the turn's process. Both halves land together: the unit
+        is useless without the row and the pid alone cannot stop a cgroup."""
+        self.conn.execute("UPDATE wo_turns SET pid=?, unit=? WHERE id=?",
+                          (pid, unit, turn_id))
 
     def finish_turn(self, turn_id: int, state: str, result: str | None = None,
                     error: str | None = None, cost_usd: float | None = None,
