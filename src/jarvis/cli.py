@@ -4,7 +4,7 @@ Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
   jarvis cost [project|wo-id|fo-id]       what the work has cost in tokens
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
-  jarvis fo create|list|show|plan|approve|cancel        feature orders (planned sets)
+  jarvis fo create|list|show|plan|submit|approve|cancel feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
   jarvis gate rules|rule-retract|explain  what counts as privileged, and what the OS
                                           has LEARNED does not
@@ -358,6 +358,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the plan, as JSON. A file rather than an argument on purpose: "
                         "a plan is a long string full of repo paths, which is exactly "
                         "what trips the privileged-action classifier")
+    f.add_argument("--project")
+
+    f = fo.add_parser("submit", help="(project managers) submit the feature for review "
+                                     "again, once the remediation work orders have landed")
+    f.add_argument("fo_id")
+    f.add_argument("--summary", required=True,
+                   help="what changed since the last round, in your own words")
+    f.add_argument("--evidence", default="",
+                   help="how the feature as a whole was verified — the reviewer reads "
+                        "this against the integrated diff, so a claim the diff does not "
+                        "support is worse than no claim")
     f.add_argument("--project")
 
     f = fo.add_parser("approve", help="release a submitted plan (or send it back), when "
@@ -1333,7 +1344,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
 
 
 FO_ICON = {"pending": "⏳", "planning": "🧭", "plan_review": "👀", "executing": "🟢",
-           "completed": "✅", "failed": "❌", "cancelled": "🚫"}
+           "validating": "🔎", "completed": "✅", "failed": "❌", "cancelled": "🚫"}
 
 
 def cmd_fo(args: argparse.Namespace) -> int:
@@ -1408,6 +1419,10 @@ def cmd_fo(args: argparse.Namespace) -> int:
         except _json.JSONDecodeError as e:
             raise ops.OpsError(f"{path} is not valid JSON: {e}") from e
         _print(ops.submit_plan(args.fo_id, doc, project_name=args.project), args.json)
+
+    elif args.fo_cmd == "submit":
+        _print(ops.submit_feature(args.fo_id, args.summary, evidence=args.evidence,
+                                  project_name=args.project), args.json)
 
     elif args.fo_cmd == "approve":
         _print(ops.review_plan(args.fo_id, accept=not args.reject,
