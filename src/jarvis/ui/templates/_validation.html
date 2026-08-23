@@ -1,0 +1,78 @@
+{# THE VALIDATION SECTION, for a work order or a feature order.
+
+   One implementation for both, because a round is the same fact either way and two
+   renderers would be two chances to word the same verdict differently — the mistake
+   `_bill.html` exists to avoid for spend.
+
+   The split this file exists to keep: a ROUND (its number, its outcome, the reason the
+   submitter was sent back) is not deliberation and is shown outright. The SEATS are
+   deliberation — inspectable on demand, never pushed — so they render collapsed, in a
+   plain <details>, exactly as `/neo` shows a panel. This dashboard has no JavaScript
+   and a validation section must not be what introduces it.
+
+   `rows` is passed in rather than looked up, so a unit that has never been validated
+   renders NOTHING here by construction — no heading, no empty box. That is every unit
+   in a fleet that has not turned validation on, which is all of them today. #}
+
+{% macro section(validation, heading='h2') %}
+{% if validation and (validation.rounds or validation.undeliverable) %}
+<{{ heading }} id="validation">Validation</{{ heading }}>
+<div class="panel">
+  {% for r in validation.rounds %}
+  <div class="row">
+    <div class="grow">
+      <strong>Round {{ r.round }}</strong>
+      <span class="mono sub">{{ r.fingerprint }}</span>
+      {% if r.outcome == 'passed' %}<span class="st tone-ok"><span class="i">✓</span>passed</span>
+      {% elif r.outcome == 'rejected' %}<span class="st tone-warn"><span class="i">◭</span>rejected</span>
+      {% elif r.outcome == 'escalated' %}<span class="st tone-warn"><span class="i">🙋</span>escalated</span>
+      {% elif r.outcome == 'failed' %}<span class="st tone-bad"><span class="i">✗</span>failed</span>
+      {% else %}<span class="st tone-active"><span class="i">◑</span>{{ r.outcome }}</span>{% endif %}
+      <span class="sub">{{ fmt_age(r.ts) }} ago</span>
+      {% if r.reason %}<div class="sub" style="white-space: pre-wrap;">{{ r.reason }}</div>{% endif %}
+      {{ deliberation(r.opinions) }}
+    </div>
+  </div>
+  {% endfor %}
+  {# An envelope that reached NOBODY is a failure, not routine: the unit is waiting on
+     a reply that will never arrive. Delivered ones are not here — they are the ordinary
+     case, and they live behind `jarvis validation show`. #}
+  {% for e in validation.undeliverable %}
+  <div class="row">
+    <div class="grow tone-bad">✗ {{ e.kind }} to role {{ e.to_role }} reached nobody
+      <div class="sub">{{ e.note or 'undeliverable' }}</div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+{% endmacro %}
+
+{# How the panel judged one round. Collapsed, and absent entirely for a round no seat
+   opined on — a round that failed on transport, or one still in flight. #}
+{% macro deliberation(rows) %}
+{% if rows %}
+<details style="margin-top:6px">
+  <summary class="sub">Panel deliberation — {{ rows|length }} seat{{ '' if rows|length == 1 else 's' }}</summary>
+  <table>
+    <tr><th>seat</th><th>status</th><th>verdict</th><th>latency</th><th>model</th></tr>
+    {% for o in rows %}
+    <tr>
+      <td class="mono">{{ o.seat }}</td>
+      <td class="mono">
+        {% if o.status == 'ok' %}<span class="st tone-ok"><span class="i">✓</span>ok</span>
+        {% elif o.status == 'abstained' %}<span class="st tone-muted"><span class="i">◌</span>abstained</span>
+        {% else %}<span class="st tone-bad"><span class="i">✗</span>{{ o.status }}</span>{% endif %}
+      </td>
+      <td class="mono">{{ o.verdict or '—' }}</td>
+      <td class="mono">{{ o.latency_ms }}ms</td>
+      <td class="mono">{{ o.model or '—' }}</td>
+    </tr>
+    {% if o.reply %}
+    <tr><td colspan="5"><pre class="request-text">{{ o.reply }}</pre></td></tr>
+    {% endif %}
+    {% endfor %}
+  </table>
+</details>
+{% endif %}
+{% endmacro %}
