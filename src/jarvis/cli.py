@@ -800,6 +800,27 @@ def _print_turn_table(res: dict) -> None:
         print(f"\n{line}")
 
 
+def _print_write_ttl(totals: dict) -> None:
+    """What the fleet paid to WRITE to the prompt cache, and at which of the two rates.
+
+    Silent when the whole line was at 1.25x: a report that says "all good" every run is a
+    line readers stop seeing. The rate is derived from the split rather than restated from
+    a constant, so it says what was PAID (kn-2e0a6317). Spec:
+    2026-08-22-the-five-minute-write-everywhere.md.
+    """
+    from . import usage as usage_mod
+
+    write, hour = totals.get("cache_write") or 0, totals.get("cache_1h") or 0
+    if not write or not hour:
+        return
+    rate = usage_mod.write_rate(write, hour, totals.get("cache_5m") or 0)
+    print(f"  cache write   {_tok(write)} tokens at {rate:.2f}x base input — "
+          f"{_tok(hour)} of it bought the ONE-HOUR TTL (2x) rather than the "
+          f"five-minute one (1.25x)")
+    print("                every path Jarvis launches now forces the 5-minute write, "
+          "so a figure here is spend that predates that or a `claude` it did not start")
+
+
 def _print_os_calls(res: dict) -> None:
     """What Jarvis itself spent on this work order, call by call.
 
@@ -1113,6 +1134,7 @@ def cmd_cost(args: argparse.Namespace) -> int:
               f"{totals['resume_boundaries']} turn boundaries")
     if totals["subagent_cost_usd"]:
         print(f"  subagents     ~${totals['subagent_cost_usd']:.2f}")
+    _print_write_ttl(totals)
     unattributed = res.get("os_unattributed") or {}
     if unattributed.get("os_calls"):
         print(f"  OS overhead   ~${unattributed['os_cost_usd']:.2f} — "
@@ -1241,10 +1263,10 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 "status_label": invariants.status_label(store, wo),
                 "blocked_by": store.unfinished_dependencies(args.wo_id),
                 "timeline": build_timeline(wo, store.list_events(args.wo_id),
-                                           messages, include_debug=args.debug,
-                                           questions=ops.neo_question_texts(args.wo_id)),
+                                           messages, include_debug=args.debug),
                 "messages": messages,
-                "assumptions": store.pending_assumptions(args.wo_id),
+                # Every assumption, each with its `n` and `status` — §4.
+                "assumptions": store.all_assumptions(args.wo_id),
                 # What this work order was allowed (or refused) permission to ship.
                 "gates": [
                     {k: a[k] for k in ("id", "kind", "command", "status", "escalated",

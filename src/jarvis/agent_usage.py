@@ -79,6 +79,7 @@ SUBPROCESS_KINDS = frozenset({WORKER_SUBPROCESS})
 KIND_LABELS = {
     "neo_answer": "Neo answering",
     "panel_seat": "panel seat",
+    "validation_seat": "validation seat",
     "digest": "dashboard digest",
     WORKER_SUBPROCESS: "worker subprocess",
 }

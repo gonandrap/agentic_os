@@ -67,6 +67,11 @@ pricing them all at 1.25x understated the largest avoidable line in the bill by 
 transcript and per turn in a result envelope, and where it is present it is used. Where
 it is absent — an old row, a caller that has counts and nothing else — the 5-minute rate
 is the floor and the estimate stays where it always was, rather than guessing upward.
+
+THE FLOOR IS ONLY HONEST IF THE CALLER ACTUALLY HAS NO SPLIT TO GIVE. A caller that omits
+`priced()`'s `cache_1h`/`cache_5m` is claiming ignorance on the report's behalf, and two
+surfaces reading the same rows then disagree about the same tokens — see
+`docs/superpowers/specs/2026-08-22-the-five-minute-write-everywhere.md`.
 """
 
 from __future__ import annotations

@@ -280,6 +280,31 @@ class CentralStore:
         row = self.conn.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
         return dict(row) if row else None
 
+    def project_name_for_path(self, path: str | Path) -> str:
+        """The catalog name of the project checked out at `path`.
+
+        A `ProjectStore` knows a path and nothing else, and several callers hold only a
+        store — the message bus resolving an envelope's project, the validation panel
+        scoping a seat's knowledge base. The registry maps name to path, so the path
+        resolves back: a LOOKUP rather than a guess. A project not in the registry falls
+        back to its directory name, which is what `jarvis adopt` would have named it.
+
+        ONE IMPLEMENTATION, because two would drift: a panel that scoped its knowledge to
+        a name the bus does not use would read a different project's standing
+        instructions, and nothing on either side would look wrong.
+        """
+        try:
+            here = Path(path).resolve()
+        except OSError:  # pragma: no cover - a path that cannot be resolved is still usable
+            here = Path(path)
+        for row in self.list_projects():
+            try:
+                if Path(row["path"]).resolve() == here:
+                    return str(row["name"])
+            except OSError:  # pragma: no cover
+                continue
+        return here.name
+
     # -- inbox ------------------------------------------------------------------
 
     def add_inbox(self, project: str, title: str, body: str = "", level: str = "info",
@@ -808,6 +833,12 @@ class CentralStore:
 
         One query for the whole fleet: the alternative is a query per work order, and
         the cost report walks every work order there is.
+
+        THE TTL SPLIT COMES OUT OF `usage_json`, not out of a column, and summing it here
+        is what stops the report under-pricing its own overhead at the 1.25x floor (spec:
+        2026-08-22-the-five-minute-write-everywhere.md). `json_extract` returns NULL both
+        for a row with no envelope and for one whose envelope predates the field, and
+        COALESCE folds both into the same honest zero: no split known, floor rate.
         """
         clause = "WHERE project=?" if project else ""
         params = (project,) if project else ()
@@ -815,7 +846,11 @@ class CentralStore:
             f"""SELECT wo_id, kind, label, model, COUNT(*) AS calls,
                        SUM(cost_usd) AS cost_usd, SUM(input) AS input,
                        SUM(cache_write) AS cache_write, SUM(cache_read) AS cache_read,
-                       SUM(output) AS output, SUM(1 - ok) AS failed
+                       SUM(output) AS output, SUM(1 - ok) AS failed,
+                       SUM(COALESCE(json_extract(usage_json, '$.cache_1h'), 0))
+                           AS cache_1h,
+                       SUM(COALESCE(json_extract(usage_json, '$.cache_5m'), 0))
+                           AS cache_5m
                 FROM agent_calls {clause}
                 GROUP BY wo_id, kind, label, model""", params).fetchall())
 

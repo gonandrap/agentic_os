@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 import jarvis.catalog
+import jarvis.validation
 from jarvis.catalog import (
     DEFAULT_AUTOCOMPACT_WINDOW,
     CatalogError,
@@ -261,16 +262,18 @@ def test_a_validator_roster_naming_an_unknown_seat_is_rejected_and_the_five_are_
         validation_of({"seat_models": {"scurity": "haiku"}})
 
 
-def test_a_roster_naming_a_seat_whose_markdown_has_not_shipped_still_parses():
+def test_a_roster_naming_a_seat_whose_markdown_has_not_shipped_still_parses(monkeypatch,
+                                                                            tmp_path):
     """`VALIDATOR_SEATS` is the VOCABULARY, not the set of seats shipped in this build.
 
-    No validator seat has a definition on disk yet — this work order lands before any of
-    them — so the five defaults are, right now, exactly the case of config written ahead
-    of the code. If parsing consulted the asset directory, the fleet would refuse to
-    start on its own default.
+    All five now ship, so the staging case this test was written for — config written
+    ahead of the code — has to be STAGED rather than found: the seat directory is swapped
+    for an empty one, and parsing must still accept the five defaults. If it consulted
+    the asset directory, a catalog written for the next release would stop the fleet
+    booting on this one.
     """
-    seats = Path(jarvis.catalog.__file__).parent / "assets" / "validator-seats"
-    assert not list(seats.glob("*.md")) if seats.exists() else True
+    monkeypatch.setattr(jarvis.validation, "SEAT_ASSETS", tmp_path / "no-seats")
+    assert jarvis.validation.shipped_seats() == ()
 
     assert validation_of({"enabled": True}).roster == VALIDATOR_SEATS
 

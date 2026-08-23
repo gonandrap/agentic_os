@@ -11,7 +11,10 @@ blocked on a question that did not exist.
 
 from __future__ import annotations
 
+import time
+
 from jarvis import cli, ops
+from jarvis.catalog import DEFAULT_VALIDATION_TIMEOUT
 from jarvis.hooks import handle_hook
 from jarvis.invariants import (
     BLOCKED_STATUSES,
@@ -535,3 +538,170 @@ def test_the_validating_label_says_which_round_the_work_is_on(project):
     label = status_label(store, store.get_work_order(wo["id"]))
 
     assert label == "validating — review round 2 of 3"
+
+
+# -- INV-VALIDATION-STRANDED ---------------------------------------------------------
+#
+# Nothing outside the daemon moves a `validating` unit, so a daemon that dies mid-round
+# leaves a work order nobody will ever look at again.
+
+
+def _stranded(store: ProjectStore, *, age: float, outcome: str = "pending",
+              feature: bool = False) -> tuple[str, dict]:
+    """A unit parked in `validating` on a round opened `age` seconds ago.
+
+    The timestamp is FABRICATED. The threshold is twice `os.validation.timeout`, which
+    is 600s at the shipped default, and a test that waited for it would be a ten-minute
+    test.
+    """
+    if feature:
+        unit = store.create_feature_order("ship the feature", description="all of it")
+        store.set_feature_status(unit["id"], "validating")
+        rnd = store.open_validation_round(fo_id=unit["id"], fingerprint="fp")
+    else:
+        unit = store.create_work_order("ship the thing")
+        store.update_work_order(unit["id"], result_summary="done")
+        store.set_status(unit["id"], "validating")
+        rnd = store.open_validation_round(wo_id=unit["id"], fingerprint="fp")
+    if outcome != "pending":
+        store.close_validation_round(rnd["id"], outcome)
+    store.conn.execute("UPDATE validation_rounds SET ts=? WHERE id=?",
+                       (time.time() - age, rnd["id"]))
+    return unit["id"], rnd
+
+
+def _stranded_violations(store: ProjectStore, repair: bool = True) -> list:
+    return [v for v in check_project(store, repair=repair)
+            if v.invariant == "INV-VALIDATION-STRANDED"]
+
+
+def _round(store: ProjectStore, rnd: dict) -> dict:
+    """Re-read a round, insisting it is still there — the repair closes rounds, it never
+    deletes them, and a `None` here would otherwise read as a passing assertion."""
+    fresh = store.get_validation_round(rnd["id"])
+    assert fresh is not None, f"round {rnd['id']} vanished"
+    return fresh
+
+
+def test_a_round_left_pending_past_twice_its_timeout_is_stranded(project):
+    """The pairing IS the test. A round only a single timeout old is LATE, not
+    abandoned — one timeout is what a round is allowed to take — and firing on it would
+    close a review that was about to come back. Assert only the stale half and an
+    implementation with no threshold at all passes."""
+    store = ProjectStore(project)
+    late, late_round = _stranded(store, age=DEFAULT_VALIDATION_TIMEOUT)
+    abandoned, abandoned_round = _stranded(
+        store, age=2 * DEFAULT_VALIDATION_TIMEOUT + 60)
+
+    found = _stranded_violations(store)
+
+    assert [v.wo_id for v in found] == [abandoned]
+    assert late not in [v.wo_id for v in found]
+    assert _round(store, late_round)["outcome"] == "pending"
+    assert _round(store, abandoned_round)["outcome"] == "failed"
+
+
+def test_the_repair_hands_the_round_back_to_the_daemon_as_failed(project):
+    """`failed`, never `escalated`: `counted_validation_rounds` ignores a failed round,
+    so an interrupted one costs the submitter nothing, and `Daemon.validation_tick`
+    picks up `pending` AND `failed` rounds — so closing it is what puts the work order
+    back in front of the machinery that dropped it."""
+    store = ProjectStore(project)
+    wo_id, rnd = _stranded(store, age=5000)
+
+    found = _stranded_violations(store)
+
+    assert len(found) == 1 and found[0].repaired
+    closed = _round(store, rnd)
+    assert closed["outcome"] == "failed"
+    assert "interrupted" in closed["reason"]
+    # the round is not spent: nobody judged it
+    assert store.counted_validation_rounds(wo_id=wo_id) == 0
+    # ...and the work order is left in `validating`, where the next tick finds it
+    assert store.get_work_order(wo_id)["status"] == "validating"
+    # reported once by construction: the round is no longer pending
+    assert _stranded_violations(store) == []
+
+
+def test_doctor_without_repair_does_not_close_the_stranded_round(project, catalog_file,
+                                                                capsys):
+    """Reporting mode is READ-ONLY, and this invariant is the one with the most to lose
+    from it: describing a stranded round must never be the thing that ends it."""
+    store = ProjectStore(project)
+    wo_id, rnd = _stranded(store, age=5000)
+    store.close()
+
+    rc = cli.main(["doctor", "--catalog", str(catalog_file)])
+
+    assert rc == 1
+    assert "INV-VALIDATION-STRANDED" in capsys.readouterr().out
+    after = ProjectStore(project)
+    try:
+        assert _round(after, rnd)["outcome"] == "pending"
+        assert after.get_work_order(wo_id)["status"] == "validating"
+    finally:
+        after.close()
+
+
+def test_a_judged_round_is_never_stranded_however_old(project):
+    """A round that reached a verdict is finished business. The unit sitting in
+    `validating` after one is a different bug and not this one's to repair."""
+    store = ProjectStore(project)
+    _stranded(store, age=5000, outcome="rejected")
+
+    assert _stranded_violations(store) == []
+
+
+def test_a_feature_order_in_validating_is_covered_too(project):
+    """Nothing sets a feature order to `validating` yet — the loop that will is a
+    sibling work order. An invariant that silently covered only half the units would be
+    worse than one that covered none: the half it missed would LOOK checked.
+
+    Paired with a healthy feature order, because "no violation for the fresh one" is
+    the only thing that separates a real predicate from one that never fires."""
+    store = ProjectStore(project)
+    stale_id, stale_round = _stranded(store, age=5000, feature=True)
+    fresh_id, fresh_round = _stranded(store, age=10, feature=True)
+
+    found = _stranded_violations(store)
+
+    assert len(found) == 1
+    assert found[0].context["fo_id"] == stale_id
+    assert found[0].context["unit"] == "feature order"
+    assert found[0].wo_id is None  # a feature order is not a work order
+    assert _round(store, stale_round)["outcome"] == "failed"
+    assert _round(store, fresh_round)["outcome"] == "pending"
+    assert store.get_feature_order(fresh_id)["status"] == "validating"
+
+
+def test_the_threshold_follows_the_configured_timeout(project, monkeypatch):
+    """The number decides a WRITE, so it is read from the LIVE catalog rather than the
+    shipped default: a project that raised `os.validation.timeout` must not have its
+    perfectly healthy long rounds closed out from under it by a checker still using
+    300s. Paired with the same round at the default, which must be repaired — otherwise
+    "no violation" is indistinguishable from a predicate that never fires."""
+    from types import SimpleNamespace
+
+    store = ProjectStore(project)
+    _, rnd = _stranded(store, age=2 * DEFAULT_VALIDATION_TIMEOUT + 60)
+
+    # `_validation_timeout` imports it inside the call, so patching the module
+    # attribute is what reaches it.
+    monkeypatch.setattr(ops, "validation_config",
+                        lambda: SimpleNamespace(timeout=3600))
+    assert _stranded_violations(store) == []
+    assert _round(store, rnd)["outcome"] == "pending"
+
+    monkeypatch.undo()
+    assert len(_stranded_violations(store)) == 1
+    assert _round(store, rnd)["outcome"] == "failed"
+
+
+def test_an_unreadable_catalog_falls_back_to_the_shipped_timeout(monkeypatch):
+    """A worker's checkout whose catalog has moved answers None, and an invariant must
+    never be the thing that raises. The default is what it falls back to."""
+    from jarvis.invariants import _validation_timeout
+
+    monkeypatch.setattr(ops, "validation_config", lambda: None)
+
+    assert _validation_timeout() == DEFAULT_VALIDATION_TIMEOUT

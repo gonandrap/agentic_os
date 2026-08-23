@@ -348,6 +348,26 @@ One dataclass, two collectors, distinguished by a `unit` field.
 > to build a seat prompt would then silently ship the untruncated diff and defeat
 > `diff_chars` entirely. A digest cannot leak that way.
 
+> **CORRECTION, 2026-08-22 (settled on wo-0a2a69e4, Neo question 143).** `declared` is *the
+> worker's `--evidence`* on **both** routes into done, and on the review route it had
+> nowhere to come from. `ops.finish` routes a work order with pending assumptions to
+> `needs_review` **before** the validation branch and stores the `--evidence` text nowhere,
+> so `ops.review_work_order` would have opened round 1 with `declared=""` on precisely the
+> work orders that filed assumptions — the empty-evidence failure the worker-contract prose
+> exists to end, reintroduced by the route that bypasses it.
+>
+> **`finish` now carries the text in the payload of the `finished` event it already
+> writes**, and `ops.declared_evidence(store, wo_id)` reads it back through
+> `events_of_kind`. No column, no migration, no second store of record. The last `finished`
+> event wins: a worker that finished, was sent back and finished again has superseded its
+> earlier account.
+>
+> **The general shape, for the children still to land:** when a feature adds a *second*
+> entry point to an existing sequence, check what the *first* entry point's arguments were
+> and where they went. A parameter with no equivalent on the new route is silent data loss,
+> and no test of the control flow will catch it. `feature-validation` (child 9) inherits
+> this question for the manager's `--evidence`.
+
 **The feature's `base_sha` is recorded when the feature enters `executing`** — the default
 branch's head at the moment its first child could start. Everything between that and the
 default branch now IS the feature, by construction, and it needs no per-child bookkeeping.
@@ -540,7 +560,7 @@ only returns a value. The daemon is the only place any two of them are known tog
 | `Daemon.settle_work_order` | a `kind='manager'` idle branch | its default flags an idle session `needs_review`; a manager is idle by design |
 | `Daemon.settle_features` | route to `validating`; settle the manager | it looks only at `executing` features — that is what makes "flag once" true **by construction**, and routing must not break it |
 | `ops.finish` | opens a round, sets `validating` | closes the backlog item only on `completed`; a new intermediate status silently stops backlog items closing |
-| `ops.review_work_order` | the **second** route into done | a work order that filed assumptions goes finish → `needs_review` → review, bypassing `finish` entirely and reaching the merge queue unvalidated |
+| `ops.review_work_order` | the **second** route into done | a work order that filed assumptions goes finish → `needs_review` → review, bypassing `finish` entirely and reaching the merge queue unvalidated. **And it has no `--evidence` of its own** — see the correction below |
 | `Daemon.settle_work_order` | early return on `validating` | it re-derives status from the latest turn on **every** tick, so without the return it sets `waiting_pr_merge` on the next one |
 | `create_plan_children` | create the manager too | all-or-nothing: a feature with children and no manager has nowhere to route |
 | `invariants.status_label` | a `validating` branch | it early-returns for every status that is not `pending`; a later branch is dead code |
@@ -548,6 +568,8 @@ only returns a value. The daemon is the only place any two of them are known tog
 | `timeline.event_level` | new kinds | it returns `"signal"` for unknown kinds, so the obvious test is vacuous |
 | `ui.STATUS_META` | a `validating` entry | templates index it by status; a missing key 500s the project page |
 | `bootstrap.TEMPLATE_VERSION` | bumped | without it the new contract prose never reaches an already-bootstrapped project |
+| `worker_brief.core_contract` | the `--evidence` bullet | `CORE_BUDGET_CHARS` is a **hard 2500** with an A/B eval behind it, and `test_every_core_command_string_parses` argparse-parses every backticked `jarvis …` string in the core — so the reasoning belongs in the fetched `record` section, and prose must not backtick an incomplete command |
+| `invariants._ReadOnly._BLOCKED` | add `close_validation_round` | `INV-VALIDATION-STRANDED` repairs by closing a round, so without this `jarvis doctor` **without** `--repair` ends the very round it was only describing |
 | `assets/validator-seats/` | **not** `assets/agents/` | `bootstrap._rebuild` copytrees `agents/` into every planner's `.claude/agents/`, so a seat dropped there becomes a bogus subagent |
 | `panel.definition`'s `lru_cache` | key on the roster | `chair.md` will exist in two seat directories; a name-only key means the first one loaded poisons the other |
 
@@ -601,7 +623,7 @@ rows in any new table, and no manager order created.
 
 | key | default | notes |
 |---|---|---|
-| `enabled` | **`false`** | enabling it is a separate decision, after measurement |
+| `enabled` | **`false`** | enabling it is a separate decision, after measurement. Read at the **submission sites only** — `ops.finish` *and* `ops.review_work_order` — and never in `Daemon.validation_tick`, so turning it off mid-flight does not strand units already inside the loop |
 | `roster` | tester, security, architect, maintainer, chair | a name outside the vocabulary is a `CatalogError` |
 | `seat_models` / `chair_model` | `{}` / `""` | the chair writes what a human reads |
 | `timeout` | `300` | per seat, seconds |
@@ -627,7 +649,7 @@ here makes measuring first more important, not less.
 | **panel unreachable** (`ClaudeCliError`) | round `failed`, retry next tick, **consume no round** | a transport outage is not a verdict |
 | …3 outages in a row | escalate | not retrying for ever |
 | **a seat abstains** | contributes no signal; the panel proceeds | silence is neither veto nor consent |
-| **daemon restarts mid-validation** | `INV-VALIDATION-STRANDED` finds a `pending` round older than `2 × timeout`; `--repair` closes it `failed` | otherwise the unit sits in `validating` for ever with no flag |
+| **daemon restarts mid-validation** | `INV-VALIDATION-STRANDED` finds a `pending` round older than `2 × timeout` (the **live catalog's**, not the default — the number decides a write); `--repair` closes it `failed`, and `validation_tick` picks up `failed` as well as `pending`, so that hands the unit straight back. Covers feature orders too | otherwise the unit sits in `validating` for ever with no flag |
 | **an envelope reaches nobody** | `undeliverable`, and the round escalates | feedback that reached nobody must never look like feedback that was acted on |
 | **the manager is cancelled, feature live** | `undeliverable` + attention on the feature | the loop cannot run and the user must know |
 | **feature rejected → remediation → rejected → …** | bounded by `max_rounds`, same counter | the loop that could run for ever is the one worth bounding twice |
@@ -677,7 +699,7 @@ Eleven work orders. Arrows are dependency edges.
 | 2 | `schema` | both `validating` statuses, `kind='manager'`, the polymorphic round tables, config, labels |
 | 3 | `evidence` | the packet and the fingerprint (`unit="work_order"`) |
 | 4 | `loop` | the work-order round machine; the validator is an **injected callable defaulting to `None`** |
-| 5 | `entrypoints` | the `review_work_order` route, the worker contract, `INV-VALIDATION-STRANDED` |
+| 5 | `entrypoints` | the `review_work_order` route **and the evidence carried across it**, the worker contract (`--evidence` prose + `TEMPLATE_VERSION`), `INV-VALIDATION-STRANDED` over both unit kinds |
 | 6 | `panel` | `seats.py` extracted, `validation.py`, the five seats, the daemon wiring |
 | 7 | `manager` | the project manager order: creation, contract, idle settlement, **the `count_active` exemption** |
 | 8 | `deferral` | `jarvis wo defer`, the envelope kind, the backlog relationship columns, the no-manager fallback |
@@ -702,7 +724,17 @@ without the others. Everything that can safely land after that seam is in `entry
    to the *structure* — nothing forces a pass, two seats hold vetoes — and leaves the
    judgement quality to measurement.
 2. **How often does a submitter actually pass `--evidence`?** The flag is optional, because
-   requiring it would break every worker in flight.
+   requiring it would break every worker in flight. It is now *taught* — in
+   `OPERATION.md.tmpl` and in the dispatched worker prompt, framed as review feedback and
+   naming no panel, seat or validator — but teaching it is not the same as measuring
+   uptake, and nothing counts empty declarations yet.
+
+   **A release-ordering constraint falls out of this, and it bites once.** `--evidence`
+   landed on `main` with the round machine (child 4) while the prose telling workers to use
+   it landed with child 5; production runs a *released tag*, so between the two releases a
+   worker taught the flag by a fresh `OPERATION.md` would have called a CLI that rejects it.
+   Ship the prose no earlier than the flag — after `jarvis-0.7.x` carries both, this is
+   moot.
 3. **Is the integrated feature diff a reviewable object?** A feature of six children may be
    a very large diff. Truncation makes it safe but perhaps not useful, and the feature-level
    panel may need a different roster or a summarising pass. The eval is where that shows up.

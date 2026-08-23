@@ -358,16 +358,19 @@ def test_the_module_imports_nothing_that_could_have_seen_the_work():
 
 
 def test_only_the_round_machine_collects_evidence():
-    """The packet has exactly two callers, and they are the two halves of one round.
+    """The packet has exactly three readers: the two halves of one round, and the panel
+    the round hands it to.
 
     `ops` collects it when a submission opens a round; `daemon` collects it again on its
-    own thread when that round is judged. Anything else appearing here is a module that
-    has started forming its own opinion about what a work order changed — which is the
-    coupling this leaf exists to avoid — so the list is asserted whole rather than
+    own thread when that round is judged; `validation` names the type it renders into
+    seat prompts, and NAMES ONLY THAT — its import is under `TYPE_CHECKING`, so the panel
+    still cannot collect a packet of its own. Anything else appearing here is a module
+    that has started forming its own opinion about what a work order changed — which is
+    the coupling this leaf exists to avoid — so the list is asserted whole rather than
     "nothing imports it".
     """
     src = Path(evidence.__file__).parent
     names = {".evidence", "jarvis.evidence"}
     importers = [p.name for p in sorted(src.glob("*.py"))
                  if p.name != "evidence.py" and _imports(p) & names]
-    assert importers == ["daemon.py", "ops.py"]
+    assert importers == ["daemon.py", "ops.py", "validation.py"]

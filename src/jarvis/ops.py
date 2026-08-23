@@ -1190,6 +1190,24 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     return round_row
 
 
+def declared_evidence(store: ProjectStore, wo_id: str) -> str:
+    """What the worker last said it did to test this, recovered from its own `finish`.
+
+    A work order with pending assumptions never reaches `finish`'s validation branch, so
+    without this the `--evidence` its worker declared would be dropped and
+    `review_work_order` would open round 1 empty. The `finished` event is written on
+    every route through `finish`, so its payload carries the text without a new column.
+
+    The LAST one wins: a worker that finished, was sent back and finished again has
+    superseded its earlier account.
+    """
+    for event in reversed(store.events_of_kind(wo_id, "finished")):
+        text = db.from_json(event["payload"], {}).get("evidence")
+        if text:
+            return str(text)
+    return ""
+
+
 def finish(wo_id: str, summary: str, pr_url: str | None = None,
            evidence: str = "") -> dict[str, Any]:
     """The worker reporting its own result.
@@ -1211,10 +1229,12 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
     OPTIONAL: every worker in flight when this shipped predates the flag, so an empty
     one is an ordinary submission and not a thin one.
 
-    **This is the one place `os.validation.enabled` is read**, and it gates OPENING a
-    round and nothing else. A flag turned off while rounds are open must still let the
-    daemon judge and settle them — otherwise the only control the user has over a
-    misbehaving panel would strand every unit already inside it.
+    **`os.validation.enabled` is read at the SUBMISSION SITES ONLY** — here and in
+    `review_work_order`, the other route into done — and it gates OPENING a round and
+    nothing else. A flag turned off while rounds are open must still let the daemon
+    judge and settle them, or the only control the user has over a misbehaving panel
+    would strand every unit already inside it. That is why `daemon.validation_tick`
+    does not check it, and why adding a check there for symmetry is a bug.
     """
     name, path, _wo = find_work_order(wo_id)
     cfg = validation_config()
@@ -1234,8 +1254,12 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             status = "validating"
         else:
             status = land_finished(store, fresh, pr_url)
-        store.add_event(wo_id, "finished", {"summary": summary,
-                                            **({"pr_url": pr_url} if pr_url else {})})
+        # The evidence rides in the payload so the OTHER route into done can find it —
+        # `review_work_order` has no `--evidence` of its own. See `declared_evidence`.
+        store.add_event(wo_id, "finished",
+                        {"summary": summary,
+                         **({"pr_url": pr_url} if pr_url else {}),
+                         **({"evidence": evidence} if evidence else {})})
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "status": status,
@@ -1584,6 +1608,17 @@ def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, 
     return out
 
 
+def _validates_on_review(store: ProjectStore, wo_id: str, cfg: Any) -> bool:
+    """Should accepting this work order's assumptions open a validation round?
+
+    Switched on, and never judged. Anything with a round on record has been through the
+    loop already, so an acceptance is the user's decision on top of the machine's rather
+    than an input to it.
+    """
+    return (cfg is not None and cfg.enabled
+            and store.latest_validation_round(wo_id=wo_id) is None)
+
+
 def review_work_order(wo_id: str, accept: bool = True,
                       feedback: str = "") -> dict[str, Any]:
     """Accept (or reject) all pending assumptions and settle the work order.
@@ -1602,8 +1637,15 @@ def review_work_order(wo_id: str, accept: bool = True,
     user's open list, and out of `Daemon.poll_pull_requests`, which only ever looks at
     `waiting_pr_merge` — so the merge that should have ended the work order unattended
     ends nothing.
+
+    **This is the SECOND route into done, and it must validate too.** Pending assumptions
+    outrank validation, so a work order that filed them goes finish → `needs_review` →
+    here and never passes through `finish`'s validation branch — reaching the merge queue
+    unjudged. An accepted work order that has never been validated therefore opens round
+    1 here, through the same helper `finish` uses (`_validates_on_review`).
     """
     name, path, wo = find_work_order(wo_id)
+    cfg = validation_config()
     store = ProjectStore(path)
     try:
         pending = store.pending_assumptions(wo_id)
@@ -1611,7 +1653,11 @@ def review_work_order(wo_id: str, accept: bool = True,
             store.review_assumption(a["id"], "accepted" if accept else "rejected")
         status = wo["status"]
         if wo["status"] == "needs_review":
-            if accept:
+            if accept and _validates_on_review(store, wo_id, cfg):
+                submit_for_validation(store, path, store.get_work_order(wo_id),
+                                      declared=declared_evidence(store, wo_id), cfg=cfg)
+                status = "validating"
+            elif accept:
                 status = "waiting_pr_merge" if _awaiting_merge(wo) else "completed"
                 store.set_status(wo_id, status)
                 store.clear_attention(wo_id)
@@ -2125,29 +2171,6 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
             f"pasting context (the cap is {QUESTION_MAX_CHARS})"
         )
     return out
-
-
-def neo_question_texts(wo_id: str) -> dict[int, str]:
-    """{question_id: question} for back-filling a timeline. Never raises.
-
-    `question_asked` events written before the text was stored in their payload carry
-    only the id, and the text is in Neo's DB. Every surface that renders a timeline
-    passes this in so those older entries still read as questions. Failure to open
-    Neo's DB must not take `jarvis wo show` (or the work order page) down with it —
-    a timeline missing one detail beats no timeline at all.
-    """
-    from .neo_store import NeoStore
-
-    try:
-        neo = NeoStore()
-    except Exception:  # noqa: BLE001 — best-effort enrichment, see docstring
-        return {}
-    try:
-        return neo.question_texts(wo_id)
-    except Exception:  # noqa: BLE001
-        return {}
-    finally:
-        neo.close()
 
 
 def neo_status() -> dict[str, Any]:
@@ -2908,6 +2931,24 @@ def _subproc_spend(groups: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return _call_spend(groups, "subproc")
 
 
+def _priced_group(usage_mod: Any, g: dict[str, Any]) -> Any:
+    """One `agent_call_totals` group at list prices, TTL SPLIT INCLUDED.
+
+    Passing `cache_1h`/`cache_5m` is the whole point of the function: `usage.priced`
+    falls back to the 1.25x floor without them, which under-priced every OS-side call
+    that bought the one-hour cache. Spec: 2026-08-22-the-five-minute-write-everywhere.md.
+
+    `"unknown"` rather than `""` for an uncaptured model: an empty model prices at ZERO
+    in `usage.price_for` (that branch is for `<synthetic>`, never billed), so a real call
+    would silently cost nothing. An unrecognised name falls through to the default rate.
+    """
+    return usage_mod.priced(
+        g.get("model") or "unknown", input=g.get("input") or 0,
+        cache_write=g.get("cache_write") or 0, cache_read=g.get("cache_read") or 0,
+        output=g.get("output") or 0, messages=g.get("calls") or 0,
+        cache_1h=g.get("cache_1h") or 0, cache_5m=g.get("cache_5m") or 0)
+
+
 def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]:
     """Sum and price one class of `agent_calls` groups under `<prefix>_…` keys.
 
@@ -2923,15 +2964,7 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
     calls = failed = 0
     exact = 0.0
     for g in groups:
-        # `"unknown"` rather than `""` for a call whose model was not captured: an empty
-        # model prices at ZERO in `usage.price_for` (that branch is for `<synthetic>`,
-        # a message the CLI generated itself and never billed), and a real call that
-        # silently costs nothing is the exact failure this whole feature is fixing. An
-        # unrecognised name falls through to the default rate instead.
-        u = usage_mod.priced(
-            g.get("model") or "unknown", input=g.get("input") or 0,
-            cache_write=g.get("cache_write") or 0, cache_read=g.get("cache_read") or 0,
-            output=g.get("output") or 0, messages=g.get("calls") or 0)
+        u = _priced_group(usage_mod, g)
         total = total + u
         calls += g.get("calls") or 0
         failed += g.get("failed") or 0
@@ -2952,6 +2985,10 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
         f"{prefix}_billed_input": total.billed_input,
         f"{prefix}_output": total.output,
         f"{prefix}_total_tokens": total.total_tokens,
+        # Carried up for the footer's write-TTL line; see `_write_ttl`.
+        f"{prefix}_cache_write": total.cache_write,
+        f"{prefix}_cache_1h": total.cache_1h,
+        f"{prefix}_cache_5m": total.cache_5m,
         # Dearest first: the whole point of the split is to say where the spend goes.
         f"{prefix}_by_kind": sorted(by_kind.values(), key=lambda k: -k["cost_usd"]),
     }
@@ -3181,8 +3218,30 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "subagent_cost_usd": round(sum(u["subagent_cost_usd"] for u in measured), 2),
             "output": sum(u["output"] for u in measured),
             "billed_input": sum(u["billed_input"] for u in measured),
+            **_write_ttl(measured, units),
         },
     }
+
+
+def _write_ttl(measured: list[dict[str, Any]], units: list[dict[str, Any]]
+               ) -> dict[str, int]:
+    """Cache-write tokens and their TTL split, over every class of spend on the report.
+
+    One figure for worker and OS spend together: the two were switched to the 5-minute
+    write ten days apart, so a total speaking for one of them would read as all-clear
+    while half the bill was still at 2x (spec:
+    2026-08-22-the-five-minute-write-everywhere.md).
+
+    `measured` for the transcript half (a unit whose transcript is gone has no split to
+    contribute), `units` for the recorded halves, which survive transcript pruning — the
+    same asymmetry `_rollup` applies to every other figure it sums.
+    """
+    out = {"cache_write": 0, "cache_1h": 0, "cache_5m": 0}
+    for key in out:
+        out[key] = (sum(u.get(key) or 0 for u in measured)
+                    + sum((u.get(f"os_{key}") or 0) + (u.get(f"subproc_{key}") or 0)
+                          for u in units))
+    return out
 
 
 def _cost_for_target(target: str, project: str | None,
@@ -3301,10 +3360,7 @@ def _subproc_detail(groups: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
 
     out = []
     for g in groups:
-        u = usage_mod.priced(
-            g.get("model") or "unknown", input=g.get("input") or 0,
-            cache_write=g.get("cache_write") or 0, cache_read=g.get("cache_read") or 0,
-            output=g.get("output") or 0, messages=g.get("calls") or 0)
+        u = _priced_group(usage_mod, g)
         out.append({
             "label": g.get("label") or "claude -p", "model": g.get("model") or "",
             "calls": g.get("calls") or 0, "failed": g.get("failed") or 0,
