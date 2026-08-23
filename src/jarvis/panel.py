@@ -48,15 +48,13 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import claude_cli, structured
+from . import claude_cli, seats, structured
 from .bootstrap import ASSETS
 from .neo_store import SEATS, NeoStore
+from .seats import Opinion, SeatError, parse_definition
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .catalog import NeoConfig
@@ -81,57 +79,37 @@ SEAT_HEADER = "# Neo panel seat: {seat}"
 ROUTES = ("fast", "panel", "single")
 
 
-class SeatError(RuntimeError):
-    """A seat could not be run at all — no definition ships for it in this build."""
-
-
-# -- seat definitions -------------------------------------------------------------------
+#: Neo's roster, as `seats.py` sees it: where the mandates live, what names are legal and
+#: the header that identifies a call as one of THESE seats. Built per call rather than held
+#: as a module constant, because `SEAT_ASSETS` is a module global a test swaps to unship a
+#: seat — a constant captured at import time would ignore that, and the "no markdown ships
+#: for this seat" path would stop being reachable.
+def neo_roster() -> seats.Roster:
+    return seats.Roster(assets=SEAT_ASSETS, vocabulary=SEATS, header=SEAT_HEADER)
 
 
 def seat_path(seat: str) -> Path:
-    return SEAT_ASSETS / f"{seat}.md"
+    return neo_roster().path(seat)
 
 
 def shipped_seats() -> tuple[str, ...]:
     """The seats whose definition ships in this build, in `SEATS` order."""
-    return tuple(s for s in SEATS if seat_path(s).is_file())
+    return seats.shipped(neo_roster())
 
 
-def parse_definition(text: str) -> tuple[dict[str, str], str]:
-    """Split a seat definition into (frontmatter, mandate).
-
-    Same authoring format as `assets/agents/*.md` — a `---` fenced block of `key: value`
-    lines, then the mandate as the body — parsed by a two-line splitter rather than by a
-    YAML library. The core of `jarvis` is stdlib-only and this is not the feature that
-    gets to add a dependency.
-
-    A `tools:` key is meaningful there and meaningless here: a seat is a headless
-    `claude -p` call, not a subagent, so it has no tool set to allow-list.
-    """
-    if not text.startswith("---\n"):
-        raise SeatError("a seat definition must open with `---` frontmatter")
-    parts = text.split("---\n", 2)
-    if len(parts) < 3:
-        raise SeatError("a seat definition's frontmatter is never closed")
-    meta: dict[str, str] = {}
-    for line in parts[1].splitlines():
-        if ":" in line:
-            key, value = line.split(":", 1)
-            meta[key.strip()] = value.strip()
-    return meta, parts[2].strip()
-
-
-@lru_cache(maxsize=None)
 def definition(seat: str) -> tuple[dict[str, str], str]:
-    """The shipped (frontmatter, mandate) for one seat. Cached: it is a file on disk that
-    only changes when the build does."""
-    path = seat_path(seat)
-    if not path.is_file():
-        raise SeatError(f"no definition ships for the {seat!r} seat ({path})")
-    meta, body = parse_definition(path.read_text())
-    if meta.get("name") != seat:
-        raise SeatError(f"{path} declares name={meta.get('name')!r}, not {seat!r}")
-    return meta, body
+    """The shipped (frontmatter, mandate) for one Neo seat.
+
+    A thin binding of `seats.definition` to this roster. The cache lives there and is keyed
+    on the ROSTER as well as the seat: `chair.md` ships in `neo-seats/` and in
+    `validator-seats/`, and a name-only key would let whichever was read first answer for
+    both. `cache_clear` is re-exported because clearing it is how a test swaps the seat
+    directory under `SEAT_ASSETS`.
+    """
+    return seats.definition(neo_roster(), seat)
+
+
+definition.cache_clear = seats.definition.cache_clear  # type: ignore[attr-defined]
 
 
 def seat_model(seat: str, cfg: NeoConfig) -> str:
@@ -179,80 +157,16 @@ def build_seat_system_prompt(store: NeoStore, project: str, seat: str,
 # -- one seat's contribution ------------------------------------------------------------
 
 
-@dataclass
-class Opinion:
-    """One seat's contribution to one decision, as stored in `panel_opinions`."""
-
-    seat: str
-    raw: str = ""
-    verdict: str = ""
-    route: str = ""
-    status: str = "ok"          # ok | abstained | failed
-    model: str = ""
-    latency_ms: int = 0
-    #: Did a model actually reply? False when the call never happened at all — it errored,
-    #: timed out, or no definition for the seat ships in this build. NOT the same as
-    #: `status == "ok"`: a seat that replied with something unusable still replied, and
-    #: unusable output is a thing the panel can route on (toward `panel`) while silence is
-    #: not. Derived, in-memory, and deliberately not a column: the store records what the
-    #: seat said, and this is about whether it said anything.
-    replied: bool = True
-    #: What this seat's call cost (`claude_cli.derive_turn_usage` envelope), carried here
-    #: rather than written where it is produced: `_run_seat` runs on a pool thread and
-    #: touches no database. `_record` persists it on the calling thread with the rest.
-    usage: dict[str, Any] | None = None
-
-    @property
-    def data(self) -> dict[str, Any] | None:
-        """The seat's reply as an object, or None if it did not emit one."""
-        if self.status != "ok":
-            return None
-        return structured.parse_json_object(self.raw)
-
-    def summary(self) -> dict[str, Any]:
-        """What travels back to the caller in the verdict's additive `panel` key.
-
-        The seat's RAW reply is deliberately not in here. Panel deliberation is stored and
-        inspectable on demand; it is never pushed to a worker or into the inbox, and the
-        surest way to keep it that way is for it never to leave this module.
-        """
-        return {"seat": self.seat, "status": self.status, "verdict": self.verdict,
-                "route": self.route, "model": self.model, "latency_ms": self.latency_ms}
-
-
-def _run_seat(seat: str, prompt: str, system: str, model: str, timeout: int,
-              cwd: Path) -> Opinion:
-    """Call one seat. Never raises: a seat that fails abstains and the panel proceeds.
-
-    Runs on a pool thread, so it touches NO database — sqlite connections belong to the
-    thread that opened them. Opinions are recorded by the caller.
-    """
-    started = time.monotonic()
-
-    def elapsed() -> int:
-        return int((time.monotonic() - started) * 1000)
-
-    try:
-        # `attribute=False`: the caller records this seat itself, by name. See `neo`.
-        result = claude_cli.run_headless_result(prompt, system_prompt=system, model=model,
-                                                timeout=timeout, cwd=cwd,
-                                                attribute=False)
-    except claude_cli.ClaudeCliError as e:
-        log.warning("panel seat %s abstained: %s", seat, e)
-        return Opinion(seat=seat, raw=str(e), status="abstained", model=model,
-                       latency_ms=elapsed(), replied=False)
-    raw, usage = result.text, result.usage
-    data = structured.parse_json_object(raw)
-    if not isinstance(data, dict):
-        return Opinion(seat=seat, raw=raw, status="failed", model=model,
-                       latency_ms=elapsed(), usage=usage)
-    return Opinion(seat=seat, raw=raw, model=model, latency_ms=elapsed(), usage=usage,
-                   verdict=str(data.get("verdict") or "").strip(),
-                   route=str(data.get("route") or "").strip().lower())
+#: One seat's contribution, and the runner that produces it, both live in `seats.py` —
+#: this panel and the validation panel are two rosters of the same machine. `replied` is
+#: carried across with them: `decide`'s fallback to the single agent turns on the
+#: difference between a premise seat that SAID nothing and one that said something
+#: unusable, and that distinction is the first thing a copy would lose.
+_run_seat = seats._run_seat
 
 
 def _round(store: NeoStore, q: dict[str, Any], cfg: NeoConfig,
-           seats: list[str], record: Any = None) -> list[Opinion]:
+           names: list[str], record: Any = None) -> list[Opinion]:
     """Run every seat blind, concurrently, and record what each said.
 
     Concurrent INSIDE the daemon's single Neo thread: the queue still drains FIFO, one
@@ -270,7 +184,7 @@ def _round(store: NeoStore, q: dict[str, Any], cfg: NeoConfig,
     prompt = _question_prompt(q)
     systems: dict[str, str] = {}
     missing: list[Opinion] = []
-    for seat in seats:
+    for seat in names:
         try:
             systems[seat] = build_seat_system_prompt(store, q["project"], seat,
                                                      cfg.learnings_limit)
@@ -283,16 +197,10 @@ def _round(store: NeoStore, q: dict[str, Any], cfg: NeoConfig,
             missing.append(Opinion(seat=seat, raw=str(e), status="failed",
                                    replied=False))
 
-    opinions: list[Opinion] = []
-    if systems:
-        with ThreadPoolExecutor(max_workers=len(systems),
-                                thread_name_prefix="neo-seat") as pool:
-            futures = {
-                seat: pool.submit(_run_seat, seat, prompt, system,
-                                  seat_model(seat, cfg), cfg.panel.timeout, home)
-                for seat, system in systems.items()
-            }
-            opinions = [futures[seat].result() for seat in seats if seat in futures]
+    opinions = seats.run_blind(
+        {seat: (system, prompt) for seat, system in systems.items()},
+        models={seat: seat_model(seat, cfg) for seat in systems},
+        timeout=cfg.panel.timeout, cwd=home)
     opinions += missing
     for op in opinions:
         _record(store, q, op, record)

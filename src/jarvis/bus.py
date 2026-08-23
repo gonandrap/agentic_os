@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict, dataclass, fields
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import db
@@ -414,15 +413,9 @@ def project_name(store: ProjectStore, central: CentralStore) -> str:
     has only a store, and it is a lookup rather than a guess — the registry maps name to
     path, so the path resolves back. A project not in the registry falls back to its
     directory name, which is what `jarvis adopt` would have named it.
+
+    The lookup itself lives on `CentralStore`: the validation panel needs the same answer
+    from the same starting point, and it may not import this module (a panel returns a
+    value; posting is the round machine's job). One implementation, two callers.
     """
-    try:
-        here = Path(store.project_path).resolve()
-    except OSError:  # pragma: no cover - a path that cannot be resolved is still usable
-        here = Path(store.project_path)
-    for row in central.list_projects():
-        try:
-            if Path(row["path"]).resolve() == here:
-                return str(row["name"])
-        except OSError:  # pragma: no cover
-            continue
-    return here.name
+    return central.project_name_for_path(store.project_path)
