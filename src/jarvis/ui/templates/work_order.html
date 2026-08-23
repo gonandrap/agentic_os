@@ -8,7 +8,7 @@
 {% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
 {# #pending is the deep-link target used by notifications: it lands on whatever
    is actually waiting on the user, falling back to the reply box. #}
-{% set pending = 'assumptions' if assumptions else ('attention' if wo.needs_attention else 'reply') %}
+{% set pending = 'assumptions' if unreviewed else ('attention' if wo.needs_attention else 'reply') %}
 
 <h2><a href="/project/{{ project }}">{{ project }}</a> / <span class="mono">{{ wo.id }}</span></h2>
 <div class="panel" style="padding: 14px 16px;">
@@ -21,7 +21,7 @@
     {% if wo.status not in ('completed', 'failed', 'cancelled') %}
     {# Not offered while assumptions are pending: closing over them would accept them
        silently. The panel that decides them is further down this same page. #}
-    {% if not assumptions %}
+    {% if not unreviewed %}
     <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/done">
       <button class="accept" title="The work is finished — close this work order.
                                     Any worker still running is stopped.">
@@ -103,7 +103,7 @@
   {% if wo.needs_attention %}
     <p class="st tone-warn"{% if pending == 'attention' %} id="pending"{% endif %}>
       <span class="i">◭</span>{{ wo.attention_reason }}
-      {% if not assumptions %}
+      {% if not unreviewed %}
       <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/ack">
         <button title="Seen it — stop asking for me. The record stays; a new blocker
                        will still surface.">Got it</button>
@@ -153,13 +153,25 @@
   {% endif %}
 </div>
 
+{# EVERY assumption, not just those still owed a decision: the timeline names them by
+   number and says nothing else, so the number has to stay resolvable — §4 of
+   docs/superpowers/specs/2026-08-23-the-work-order-record.md. #}
 {% if assumptions %}
-<h2{% if pending == 'assumptions' %} id="pending"{% endif %}>Assumptions pending your review</h2>
+{% set a_title = 'Assumptions pending your review' if unreviewed
+                 else 'Assumptions the worker recorded' %}
+<h2{% if pending == 'assumptions' %} id="pending"{% endif %}>{{ a_title }}</h2>
 <div class="panel">
+  {# `a.n` from the store, never `loop.index`: this list can be filtered. #}
   {% for a in assumptions %}
-  <div class="row"><div class="grow">{{ a.content }}</div>
+  <div class="row"><span class="mono sub" style="min-width: 2.5em;">#{{ a.n }}</span>
+    <div class="grow">{{ a.content }}</div>
+    {% if a.status != 'pending' %}
+    <span class="st tone-{{ 'ok' if a.status == 'accepted' else 'bad' }}">
+      <span class="i">{{ '✓' if a.status == 'accepted' else '✗' }}</span>{{ a.status }}</span>
+    {% endif %}
     <span class="sub mono">{{ fmt_age(a.ts) }} ago</span></div>
   {% endfor %}
+  {% if unreviewed %}
   <div class="row">
     <form method="post" action="/wo/{{ project }}/{{ wo.id }}/review"
           style="flex:1; display:flex; gap:8px; align-items:center">
@@ -171,6 +183,7 @@
   </div>
   <div class="row"><span class="sub">Rejecting without a reason keeps the work order
     flagged — send guidance below.</span></div>
+  {% endif %}
 </div>
 {% endif %}
 
@@ -209,13 +222,38 @@
 </div>
 {% endif %}
 
+{# Outside the tabs with the gates and the assumptions: a round that was rejected or
+   escalated is the page asking something of the reader — §6. #}
 {{ validation_ui.section(validation) }}
+
+{# The three readings of one work order. Everything above stays outside the tabs — an
+   ask hidden behind a tab is an ask that does not happen. §6 of
+   docs/superpowers/specs/2026-08-23-the-work-order-record.md. #}
+<div class="tabbed" id="wo-tabs">
+  <div class="tabs" role="tablist">
+    <button role="tab" data-panel="tab-conversation" aria-selected="true"
+            aria-controls="tab-conversation">Conversation
+      {%- if messages %}<span class="n">{{ messages|length }}</span>{% endif %}</button>
+    {% if bill and bill.turns %}
+    <button role="tab" data-panel="tab-spend" aria-selected="false"
+            aria-controls="tab-spend">Spend
+      <span class="n">~${{ '%.2f'|format(bill.total.cost.list_usd) }}</span></button>
+    {% endif %}
+    <button role="tab" data-panel="tab-timeline" aria-selected="false"
+            aria-controls="tab-timeline">Timeline
+      {%- if timeline %}<span class="n">{{ timeline|length }}</span>{% endif %}</button>
+  </div>
+
+<section class="tabpanel on" id="tab-conversation" role="tabpanel">
 
 <h2>Conversation</h2>
 <div class="panel">
   {% for msg in messages %}
+  {# Who spoke, from the message's own `source` — same rule as `timeline._message_label`. #}
+  {% set who = ('neo → worker' if msg.source == 'neo' else 'you → worker')
+                if msg.direction == 'user_to_agent' else 'worker → you' %}
   <div class="msg {{ 'user' if msg.direction == 'user_to_agent' }}">
-    <div class="who">{{ 'you → worker' if msg.direction == 'user_to_agent' else 'worker → you' }}
+    <div class="who">{{ who }}
       · via {{ msg.source }} · {{ msg.status }} · {{ fmt_age(msg.ts) }} ago
       {#- What answering this message cost. It is the TURN's line, not a second
           accounting of the message: a message is an ask, and the turn it set going is
@@ -241,11 +279,11 @@
     </form>
   </div>
 </div>
+</section>
 
 {% if bill and bill.turns %}
-{# The same bill as `/cost/<project>/<id>`, turn by turn, on the page the reader is
-   already on. Expandable rather than printed: the numbers are here for the turn that
-   looks wrong, and a page that opens with a token table buries the conversation. #}
+{# The same bill as `/cost/<project>/<id>`, on the page the reader is already on. #}
+<section class="tabpanel" id="tab-spend" role="tabpanel">
 <h2>Spend, turn by turn</h2>
 {{ bill_ui.view(bill.turns, bill.total, 'total for ' ~ wo.id) }}
 <p class="sub" style="margin-top: 8px;">
@@ -253,14 +291,20 @@
   turns, what Jarvis spent answering it, and what the worker's tool calls spawned
   beneath it. <a href="/cost/{{ project }}/{{ wo.id }}">The full bill →</a>
 </p>
+</section>
 {% endif %}
 
+<section class="tabpanel" id="tab-timeline" role="tabpanel">
 <h2>Timeline</h2>
 <div class="panel">
   <ul class="timeline">
     {% for e in timeline %}
     <li{% if e.level == 'debug' %} class="dbg"{% endif %}>
-      {{ fmt_age(e.ts) }} ago — <strong>{{ e.label }}</strong>{% if e.detail %}
+      {{ fmt_age(e.ts) }} ago — <strong>{{ e.label }}</strong>
+      {#- What the entry points at instead of reproducing (`timeline._ref`). -#}
+      {%- if e.ref and e.ref.kind == 'neo_question' %}
+      <a href="/neo/question/{{ e.ref.id }}">{{ e.ref.label }} →</a>{% endif %}
+      {%- if e.detail %}
       <span class="detail" style="white-space: pre-wrap;">{{ e.detail }}</span>{% endif %}
     </li>
     {% else %}
@@ -274,5 +318,48 @@
       ({{ debug_count }})</a>
   {% endif %}
 </div>
+</section>
+</div>
+
+<script>
+// Tabs. Nothing is hidden until `.js` is on the container — §6.
+(function () {
+  var root = document.getElementById('wo-tabs');
+  if (!root) return;
+  var tabs = root.querySelectorAll('.tabs button');
+  var panels = root.querySelectorAll('.tabpanel');
+
+  function show(id) {
+    var found = false;
+    panels.forEach(function (p) {
+      var on = p.id === id;
+      p.classList.toggle('on', on);
+      found = found || on;
+    });
+    if (!found) return false;
+    tabs.forEach(function (t) {
+      t.setAttribute('aria-selected', t.dataset.panel === id ? 'true' : 'false');
+    });
+    return true;
+  }
+
+  root.classList.add('js');
+  tabs.forEach(function (t) {
+    t.addEventListener('click', function () { show(t.dataset.panel); });
+  });
+
+  // Open whichever panel holds the hash target. On load AND on hashchange — §6.
+  function follow() {
+    var id = location.hash.slice(1);
+    if (!id) return;
+    var target = document.getElementById(id);
+    if (!target) return;
+    var panel = target.closest('.tabpanel');
+    if (panel && show(panel.id)) target.scrollIntoView();
+  }
+  follow();
+  window.addEventListener('hashchange', follow);
+})();
+</script>
 
 {% endblock %}

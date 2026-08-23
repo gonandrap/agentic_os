@@ -235,6 +235,12 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         f"user and Neo decide from that record, and neither will ever open this "
         f"session — a detail that lives only in the summary is a detail that "
         f"ceases to exist.",
+        f"- Add `--evidence \"<what you ran and what it showed>\"` to that same "
+        f"finish: the tests, evals and checks you actually ran, and what they "
+        f"reported. The summary says what you built; the evidence says how you "
+        f"know it works, and it is read beside your diff. Review feedback may come "
+        f"back asking for more — do what it asks, then finish again with the "
+        f"fuller account.",
     ]
     return lines
 
@@ -384,6 +390,22 @@ def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
         f"link until they merge it, instead of settling as completed work nobody "
         f"is looking at. The daemon closes it itself once the PR merges; a PR "
         f"closed unmerged sends the work order back for review.",
+        "",
+        "# Evidence",
+        f"Pass `--evidence \"<what you ran and what it showed>\"` to `jarvis wo "
+        f"finish` as well: the tests, evals and manual checks you actually "
+        f"performed, and what they reported. It is a different question from "
+        f"`--summary`. The summary says what you built and where; the evidence "
+        f"says how you know it works, and it is read beside your diff by someone "
+        f"who was not in this session and takes nothing on trust. \"Ran the "
+        f"suite\" is not evidence; \"`uv run pytest -q` — 412 passed, 0 failed, "
+        f"including the 6 new cases in tests/test_thing.py\" is.",
+        "",
+        "Review feedback may come back asking for more: a case you did not cover, "
+        "a claim the diff does not support, a check you described but did not "
+        "run. That is an ordinary part of finishing. Do the work it asks for, "
+        "then run `jarvis wo finish` again with the fuller account — a second "
+        "`finish` that only rewords the first one has added nothing.",
         "",
         "Do not stop without finishing: a session that ends with neither "
         f"`jarvis wo finish` nor an open question is invisible work.",

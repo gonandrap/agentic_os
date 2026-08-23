@@ -25,6 +25,25 @@ from zoneinfo import ZoneInfo
 #: fake; the test-isolation gate points it at a stub that refuses to run.
 CLAUDE_BIN_ENV = "JARVIS_CLAUDE_BIN"
 
+#: Buy the 5-minute prompt cache (write 1.25x) rather than the one-hour one (2x), on
+#: EVERY `claude` process Jarvis starts — `_run` and `spawn_turn` are the only two that
+#: do, and both apply it. The value matters as much as the key: the CLI accepts exactly
+#: "1"/"true"/"yes"/"on". Why it is forced rather than left to the CLI's default, and
+#: what would reverse the decision:
+#: docs/superpowers/specs/2026-08-22-the-five-minute-write-everywhere.md
+PROMPT_CACHE_5M_ENV = {"FORCE_PROMPT_CACHING_5M": "1"}
+
+
+def cache_env(explicit: dict[str, str] | None = None) -> dict[str, str]:
+    """The 5-minute cache flag, overlaid by whatever a caller asked for EXPLICITLY.
+
+    Three levels of precedence: the ambient environment loses, this default sits above
+    it, an explicit `env_extra` above that. Callers therefore merge the result in
+    opposite directions depending on which they hold — see the spec's "where the flag
+    lives" section.
+    """
+    return {**PROMPT_CACHE_5M_ENV, **(explicit or {})}
+
 
 class ClaudeCliError(RuntimeError):
     pass
@@ -46,8 +65,8 @@ def version() -> str:
 def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
          env_extra: dict[str, str] | None = None) -> str:
     env = os.environ.copy()
-    if env_extra:
-        env.update(env_extra)
+    # `env_extra` is caller intent and must win over the cache default; ambient env loses.
+    env.update(cache_env(env_extra))
     try:
         proc = subprocess.run(
             [claude_bin(), *args],
@@ -449,6 +468,10 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
 
     stdin is /dev/null because `claude -p` otherwise spends three seconds waiting for
     input that is never coming, on every turn.
+
+    The cache flag rides in the environment as well as in the settings file, so the
+    property holds for a turn launched without one. `os.environ` is overlaid FIRST here
+    (it is ambient, not intent) — the opposite order from `_run`.
     """
     outfile.parent.mkdir(parents=True, exist_ok=True)
     args = turn_args(prompt, session_id, resume, **kwargs)
@@ -457,6 +480,7 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
             proc = subprocess.Popen(
                 [claude_bin(), *args],
                 cwd=cwd,
+                env={**os.environ, **cache_env()},
                 stdin=subprocess.DEVNULL,
                 stdout=out,
                 stderr=err,

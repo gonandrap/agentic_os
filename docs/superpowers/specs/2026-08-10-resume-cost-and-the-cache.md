@@ -111,6 +111,12 @@ and the default allowlists `repl_main_thread*`, `sdk`, `auto_mode`, `memdir_rele
 `querySource` — a headless worker turn matches, which is why every write above is a 1h one.
 (Usage overage already forces 5m; that is the 3.1M of 5m writes in the corpus.)
 
+> **Completed 2026-08-22 (wo-b4f207ad).** "Every worker" was not "everything Jarvis runs":
+> the settings file reaches worker turns only, so Neo, the panel's seats and the dashboard
+> digest kept buying the hour for another ten days. The flag is now a property of the
+> transport, and the cost report was under-pricing those same tokens at the 1.25x floor.
+> See `docs/superpowers/specs/2026-08-22-the-five-minute-write-everywhere.md`.
+
 **Verified live, not inferred.** A settings-file `env` block is not obviously the same thing
 as the CLI's own `process.env` at request-build time — Jarvis's existing env vars are all
 read by *child* processes (hooks, Bash tool calls), so none of them proves this path. Two

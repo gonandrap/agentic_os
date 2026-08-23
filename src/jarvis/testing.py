@@ -183,8 +183,14 @@ argv = sys.argv[1:]
 # detached processes and a worker prompt is far past the 4KB atomic-append ceiling, so
 # a single calls.jsonl loses and interleaves records under any real fan-out.
 os.makedirs(calls_dir, exist_ok=True)
+# The prompt-cache TTL is decided by the launch ENVIRONMENT and by nothing in argv, so a
+# call record of argv alone cannot test the rate Jarvis pays. Only these two keys: the
+# whole environment would spill every secret the daemon holds into a fixture on disk.
 with open(os.path.join(calls_dir, f"{time.time_ns()}-{os.getpid()}.json"), "w") as f:
-    json.dump({"argv": argv, "cwd": os.getcwd()}, f)
+    json.dump({"argv": argv, "cwd": os.getcwd(),
+               "cache_env": {k: os.environ[k] for k in
+                             ("FORCE_PROMPT_CACHING_5M", "ENABLE_PROMPT_CACHING_1H")
+                             if k in os.environ}}, f)
 
 def opt(name, default=None):
     return argv[argv.index(name) + 1] if name in argv else default
@@ -881,12 +887,33 @@ def settle_turns():
     return _settle_turns
 
 
+#: Where every fixture project keeps a design document, and what a test plan names in its
+#: `design_doc`. Every plan must stand on one, so without a real file here each test that
+#: submits a plan would have to write one first. See §7 of
+#: docs/superpowers/specs/2026-08-23-the-work-order-record.md.
+FIXTURE_DESIGN_DOC = "docs/specs/exporter.md"
+
+FIXTURE_DESIGN_DOC_BODY = """# Exporter design
+
+## 1. Shape
+
+The exporter is one module with one entry point.
+
+## 2. Data model
+
+Rows are dicts; the header is the union of keys, first-seen order.
+"""
+
+
 def make_git_project(root: Path, name: str, readme: str | None = "# proj\n") -> Path:
     path = root / name
     path.mkdir(parents=True)
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
     if readme is not None:
         (path / "README.md").write_text(readme)
+    doc = path / FIXTURE_DESIGN_DOC
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    doc.write_text(FIXTURE_DESIGN_DOC_BODY)
     return path
 
 

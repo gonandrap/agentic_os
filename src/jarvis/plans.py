@@ -12,7 +12,7 @@ attention, they are pure Python over the submitted document, and — like
 `invariants.py` — they involve no LLM on purpose: the checker has to be more
 trustworthy than the thing it checks.
 
-The four rejections, and what each is guarding:
+The rejections, and what each is guarding:
 
 * **Cycles.** A plan is a graph and a graph can close on itself. Phase 1's dependency
   edges are acyclic *by construction* — `ProjectStore.create_work_order` may only point
@@ -30,6 +30,10 @@ The four rejections, and what each is guarding:
   so "as discussed in the plan" hands a worker a sentence pointing at a document it
   cannot open. This project has already recorded the general form of that lesson: the
   work order record must stand alone, because nobody reads worker transcripts.
+* **Children whose description does not stop**, and **a plan with no design document
+  and no plan to write one.** The mirror of the rejection above and its consequence: a
+  brief must stand alone as INSTRUCTIONS, which is not a licence to restate the design.
+  See §2 of docs/superpowers/specs/2026-08-23-the-work-order-record.md.
 """
 
 from __future__ import annotations
@@ -47,6 +51,12 @@ CHILD_CAP = 8
 #: generous — this is a floor against obvious under-specification, not a quality bar;
 #: judging whether a real paragraph is *good* enough is Neo's job, not a character count.
 MIN_DESCRIPTION_CHARS = 80
+
+#: Longest a child brief may be. The floor's argument does NOT run in reverse: a
+#: description that must stand alone is not one that should carry the whole design, which
+#: is materialised beside every child anyway. See §2 of
+#: docs/superpowers/specs/2026-08-23-the-work-order-record.md.
+MAX_DESCRIPTION_CHARS = 1500
 
 #: Plan-local child keys. The planner names its children so it can wire `needs` between
 #: them before any work-order id exists; these keys never leave the plan.
@@ -165,6 +175,7 @@ def parse_plan(raw: Any) -> dict[str, Any]:
         problems.append(f"dependency cycle: {' -> '.join(cycle)}")
 
     design_doc = str(raw.get("design_doc") or "").strip()
+    design_doc_by = str(raw.get("design_doc_by") or "").strip()
     if design_doc:
         parts_of = design_doc.replace("\\", "/").split("/")
         if design_doc.startswith(("/", "\\")) or ".." in parts_of:
@@ -172,6 +183,7 @@ def parse_plan(raw: Any) -> dict[str, Any]:
                 f"`design_doc` must be a path relative to the repository root, with no "
                 f"`..` segments, got {design_doc!r}"
             )
+    problems += _spec_problems(design_doc, design_doc_by, children, known)
 
     justification = str(raw.get("justification") or "").strip()
     if len(children) > CHILD_CAP and not justification:
@@ -191,8 +203,71 @@ def parse_plan(raw: Any) -> dict[str, Any]:
         # every child, which is what lets a child brief REFERENCE its sections instead
         # of duplicating them — the duplication that took plan-review questions to 84KB.
         "design_doc": design_doc,
+        # The child that WRITES the design document, when there is not one yet. Mutually
+        # exclusive with `design_doc` and validated the same way: see `_spec_problems`.
+        "design_doc_by": design_doc_by,
         "children": children,
     }
+
+
+def _spec_problems(design_doc: str, design_doc_by: str,
+                   children: list[dict[str, Any]], known: set[str]) -> list[str]:
+    """Every plan must stand on a design document — or produce one first.
+
+    The two forms, why naming both is refused, and why every sibling must wait for a
+    `design_doc_by` child: §2, §2.1 and §2.2 of
+    docs/superpowers/specs/2026-08-23-the-work-order-record.md.
+    """
+    if design_doc and design_doc_by:
+        return [
+            f"the plan names both `design_doc` ({design_doc!r}) and `design_doc_by` "
+            f"({design_doc_by!r}) — name the document you wrote, or name the child that "
+            f"writes it, not both"
+        ]
+    if not design_doc and not design_doc_by:
+        return [
+            "the plan names no `design_doc`. Every child brief is meant to CITE the "
+            "feature's design document rather than restate it, so the plan must either "
+            "name a document you wrote (`design_doc`) or, when there is no spec yet, "
+            "name in `design_doc_by` the child of this plan that writes one — writing "
+            "the spec becomes the first piece of the work"
+        ]
+    if not design_doc_by:
+        return []
+    if design_doc_by not in known:
+        return [
+            f"`design_doc_by` names {design_doc_by!r}, which is not a child of this plan "
+            f"(known: {', '.join(sorted(known)) or 'none'})"
+        ]
+    stragglers = sorted(c["key"] for c in children
+                        if c["key"] != design_doc_by
+                        and design_doc_by not in _transitive_needs(children, c["key"]))
+    if stragglers:
+        return [
+            f"child {design_doc_by!r} writes the design document, but "
+            f"{', '.join(repr(k) for k in stragglers)} "
+            f"{'does' if len(stragglers) == 1 else 'do'} not depend on it — a spec its "
+            f"siblings do not wait for is not a spec they can cite. Add it to their "
+            f"`needs`, directly or through another child."
+        ]
+    return []
+
+
+def _transitive_needs(children: list[dict[str, Any]], key: str) -> set[str]:
+    """Every child key `key` depends on, directly or through other children.
+
+    Tolerates a cycle rather than recursing for ever; cycles have their own check — §2.2.
+    """
+    edges = {c["key"]: [d for d in c["needs"] if d != c["key"]] for c in children}
+    reached: set[str] = set()
+    stack = list(edges.get(key, ()))
+    while stack:
+        dep = stack.pop()
+        if dep in reached or dep not in edges:
+            continue
+        reached.add(dep)
+        stack.extend(edges[dep])
+    return reached
 
 
 def _description_problems(key: str, title: str, description: str) -> list[str]:
@@ -214,6 +289,14 @@ def _description_problems(key: str, title: str, description: str) -> list[str]:
         problems.append(
             f"child {key!r}: `description` is {len(description)} characters, under the "
             f"{MIN_DESCRIPTION_CHARS} needed to brief a worker that sees nothing else"
+        )
+    elif len(description) > MAX_DESCRIPTION_CHARS:
+        problems.append(
+            f"child {key!r}: `description` is {len(description)} characters, over the "
+            f"{MAX_DESCRIPTION_CHARS} a brief may be. The design document is "
+            f"materialised beside every child worker — cite its sections by number "
+            f"instead of restating them, and keep here only what this piece must do, "
+            f"what it must not touch, and what done means."
         )
     low = description.lower()
     for pattern, why in DANGLING_PHRASES:
@@ -400,6 +483,10 @@ def render_plan_skeleton(plan: dict[str, Any]) -> list[str]:
     if plan.get("design_doc"):
         lines.append(f"Design document: {plan['design_doc']}")
         lines.append("")
+    elif plan.get("design_doc_by"):
+        lines.append(f"Design document: to be written by child "
+                     f"[{plan['design_doc_by']}]")
+        lines.append("")
     for child in plan.get("children") or []:
         needs = f" (needs {', '.join(child['needs'])})" if child.get("needs") else ""
         lines.append(f"- [{child['key']}] {child['title']}{needs}")
@@ -424,6 +511,10 @@ def render_plan(plan: dict[str, Any]) -> list[str]:
         lines.append("")
     if plan.get("design_doc"):
         lines.append(f"Design document: {plan['design_doc']}")
+        lines.append("")
+    elif plan.get("design_doc_by"):
+        lines.append(f"Design document: to be written by child "
+                     f"[{plan['design_doc_by']}]")
         lines.append("")
     for child in plan.get("children") or []:
         needs = f" (needs {', '.join(child['needs'])})" if child.get("needs") else ""
