@@ -1016,36 +1016,23 @@ def check_no_lost_feedback(store: ProjectStore) -> Iterator[Violation]:
 def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
     """INV-VALIDATION-STRANDED — a unit under review must not sit in `validating` for ever.
 
-    `validating` is the one status in `ACTIVE_STATUSES` that nothing outside the daemon
-    can move. It raises no attention flag — a unit under review is the OS working, not a
-    decision anyone owes — and `Daemon.settle_work_order` returns early for it, so the
-    reconciler will not re-derive it either. Each of those is correct while a round is
-    genuinely in flight, and together they mean that a daemon which dies mid-round leaves
-    the unit invisibly stalled: `pending` round, no flag, no reconciliation, for ever.
-    That is precisely the failure this module exists to catch, and it is the worst shape
-    of it, because nothing else in the OS will ever look at the row again.
+    Nothing outside the daemon moves a `validating` unit: it raises no attention flag and
+    `settle_work_order` returns early for it. Both are right while a round is in flight,
+    and together they mean a daemon that dies mid-round leaves the unit invisibly stalled
+    with nothing left in the OS that will ever look at it again.
 
-    Predicate: the unit's status is `validating`, its LATEST round is still `pending`,
-    and that round was opened longer than twice `os.validation.timeout` ago. Twice rather
-    than once, because one timeout is what a single round is allowed to take — a round at
-    1.2x its budget is late, not abandoned, and closing it would cut off a review that
-    was about to return.
+    Predicate: `validating`, latest round still `pending`, opened longer than TWICE
+    `os.validation.timeout` ago — one timeout is what a round is allowed to take, so a
+    round at 1.2x its budget is late rather than abandoned.
 
-    Repairable, and unambiguously so: the round is closed `failed`, which is the outcome
-    the daemon already uses for "nobody judged this". `failed` and not `escalated` —
-    `counted_validation_rounds` ignores it, so the interrupted round costs the submitter
-    nothing, and `Daemon.validation_tick` picks up `pending` AND `failed` rounds, so
-    closing it hands the unit straight back to the machinery that dropped it. Nothing
-    here judges the work; it only ends a round nobody is running.
+    Repaired by closing the round `failed`, not `escalated`: `counted_validation_rounds`
+    ignores `failed`, so the interruption costs the submitter no round, and
+    `Daemon.validation_tick` picks up `pending` AND `failed` — closing it is what hands
+    the unit back. Under `jarvis doctor` without `--repair`, `_ReadOnly` blocks the write.
 
-    Reported once by construction under repair: the round leaves `pending`, so the next
-    tick finds nothing. Under `jarvis doctor` without `--repair` the repair is described
-    and not applied — `close_validation_round` is blocked by `_ReadOnly`.
-
-    Covers FEATURE orders as well as work orders. Nothing sets a feature order to
-    `validating` yet; the loop that will is a sibling of the work order that added this,
-    and an invariant that silently covered half the units would be worse than none — the
-    half it missed would look checked.
+    Covers FEATURE orders too. Nothing sets one to `validating` yet (a sibling work order
+    adds that loop), and an invariant covering half the units would look like one
+    covering all of them.
     """
     per_round = _validation_timeout()
     threshold = 2 * per_round
@@ -1074,10 +1061,8 @@ def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
                 wo_id=unit_id if id_col == "wo_id" else None,
                 detail=(
                     f"{kind} {unit_id} has been `validating` on a `pending` round for "
-                    f"{age}s — more than twice the {per_round}s a round is given. "
-                    f"Nothing is judging it and nothing else will ever look at it: "
-                    f"`validating` raises no attention flag and the reconciler steps "
-                    f"over it. The daemon almost certainly restarted mid-round."
+                    f"{age}s — over twice the {per_round}s a round is given. Nothing is "
+                    f"judging it; the daemon almost certainly restarted mid-round."
                 ),
                 repaired=True,
                 repair=(f"closed round {latest['round']} `failed` — the next tick "
@@ -1090,16 +1075,13 @@ def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
 
 
 def _validation_timeout() -> int:
-    """How long one validation round is allowed to take, per the live catalog.
+    """How long one validation round is allowed to take, per the LIVE catalog.
 
-    Read from the catalog rather than taken from `DEFAULT_VALIDATION_TIMEOUT` because
-    this number decides a WRITE: a project that raised `os.validation.timeout` would
-    otherwise have its perfectly healthy long rounds closed out from under it by a
-    checker still using the shipped default. `status_label` makes the opposite call for
-    the opposite reason — it only prints a number.
-
-    Falls back to the default whenever no catalog can be read, which is
-    `validation_config`'s own contract: an invariant must never be the thing that raises.
+    From the catalog rather than `DEFAULT_VALIDATION_TIMEOUT` because this number decides
+    a write: a project that raised the value would otherwise have its healthy long rounds
+    closed out from under it. (`status_label` makes the opposite call — it only prints a
+    number.) Falls back to the default when no catalog is readable; an invariant must
+    never be the thing that raises.
     """
     from .ops import validation_config
 

@@ -542,10 +542,8 @@ def test_the_validating_label_says_which_round_the_work_is_on(project):
 
 # -- INV-VALIDATION-STRANDED ---------------------------------------------------------
 #
-# `validating` is the one active status nothing outside the daemon moves: it raises no
-# attention flag and `settle_work_order` returns early for it. A daemon that dies
-# mid-round therefore leaves a work order nobody will ever look at again, which is the
-# exact shape of invisible stall this module exists to catch.
+# Nothing outside the daemon moves a `validating` unit, so a daemon that dies mid-round
+# leaves a work order nobody will ever look at again.
 
 
 def _stranded(store: ProjectStore, *, age: float, outcome: str = "pending",

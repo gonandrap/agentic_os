@@ -1193,16 +1193,13 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
 def declared_evidence(store: ProjectStore, wo_id: str) -> str:
     """What the worker last said it did to test this, recovered from its own `finish`.
 
-    A work order with pending assumptions never reaches `finish`'s validation branch —
-    the decision outranks it — so the `--evidence` its worker declared would otherwise
-    be dropped on the floor and `review_work_order` would open round 1 with nothing,
-    on exactly the work orders that filed assumptions. The `finished` event is already
-    written on every route through `finish`, so carrying the text in its payload needs
-    no column and no second store of record.
+    A work order with pending assumptions never reaches `finish`'s validation branch, so
+    without this the `--evidence` its worker declared would be dropped and
+    `review_work_order` would open round 1 empty. The `finished` event is written on
+    every route through `finish`, so its payload carries the text without a new column.
 
     The LAST one wins: a worker that finished, was sent back and finished again has
-    superseded its earlier account. Empty when the worker declared nothing, which is an
-    ordinary submission rather than a thin one.
+    superseded its earlier account.
     """
     for event in reversed(store.events_of_kind(wo_id, "finished")):
         text = db.from_json(event["payload"], {}).get("evidence")
@@ -1257,9 +1254,8 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             status = "validating"
         else:
             status = land_finished(store, fresh, pr_url)
-        # The evidence rides in the payload so that the OTHER route into done can find
-        # it: a work order parked in `needs_review` over its assumptions never reached
-        # the branch above, and `review_work_order` has no `--evidence` of its own.
+        # The evidence rides in the payload so the OTHER route into done can find it —
+        # `review_work_order` has no `--evidence` of its own. See `declared_evidence`.
         store.add_event(wo_id, "finished",
                         {"summary": summary,
                          **({"pr_url": pr_url} if pr_url else {}),
@@ -1615,11 +1611,9 @@ def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, 
 def _validates_on_review(store: ProjectStore, wo_id: str, cfg: Any) -> bool:
     """Should accepting this work order's assumptions open a validation round?
 
-    Two conditions and no more. The feature is switched on — the same `cfg.enabled` read
-    `finish` makes, and the ONLY other place it is read — and this work order has never
-    been judged. Anything with a round already on record has been through the loop, so
-    an acceptance here is the user's decision on top of the machine's and not an input
-    to it.
+    Switched on, and never judged. Anything with a round on record has been through the
+    loop already, so an acceptance is the user's decision on top of the machine's rather
+    than an input to it.
     """
     return (cfg is not None and cfg.enabled
             and store.latest_validation_round(wo_id=wo_id) is None)
@@ -1644,19 +1638,11 @@ def review_work_order(wo_id: str, accept: bool = True,
     `waiting_pr_merge` — so the merge that should have ended the work order unattended
     ends nothing.
 
-    **This is the SECOND route into done, and it must validate too.** Pending
-    assumptions outrank validation — correctly, since a reviewer cannot settle a
-    decision the user has not made — so a work order that filed them goes
-    finish → `needs_review` → here and never passes through `finish`'s validation
-    branch at all. Left alone it would reach the merge queue unjudged, which is exactly
-    what the validation layer exists to prevent. So an accepted work order that has
-    never been validated opens round 1 here, through the same helper `finish` uses.
-
-    One that HAS already been validated and comes back through review is NOT
-    re-validated: that is the user overruling the machine, and the machine does not get
-    a second vote. `latest_validation_round` is the whole test — an escalated round put
-    it in front of the user in the first place, and re-submitting would hand it straight
-    back to the reviewer that had already given up on it.
+    **This is the SECOND route into done, and it must validate too.** Pending assumptions
+    outrank validation, so a work order that filed them goes finish → `needs_review` →
+    here and never passes through `finish`'s validation branch — reaching the merge queue
+    unjudged. An accepted work order that has never been validated therefore opens round
+    1 here, through the same helper `finish` uses (`_validates_on_review`).
     """
     name, path, wo = find_work_order(wo_id)
     cfg = validation_config()

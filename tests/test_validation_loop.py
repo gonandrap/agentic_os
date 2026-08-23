@@ -945,10 +945,8 @@ def test_pending_assumptions_still_outrank_validation(fleet):
 # -- the second route into done ------------------------------------------------------
 #
 # `ops.review_work_order` reaches `waiting_pr_merge`/`completed` without ever touching
-# `ops.finish`. Pending assumptions outrank validation — a reviewer cannot settle a
-# decision the user has not made — so a work order that files them goes
-# finish -> needs_review -> review, and until this it arrived at the merge queue with
-# nothing having judged it, which is the exact failure the layer exists to prevent.
+# `ops.finish`, so a work order that filed assumptions used to arrive at the merge queue
+# with nothing having judged it.
 
 
 def _parked_on_assumptions(fleet: Fleet, *, evidence: str = "ran `pytest -q`: 412 passed",
