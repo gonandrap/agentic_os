@@ -1459,3 +1459,137 @@ def test_a_validating_feature_order_renders_everywhere_it_appears(client, projec
         res = client.get(url)
         assert res.status_code == 200, (url, res.status_code)
     assert "under review" in client.get(f"/fo/proj_a/{fo['id']}").text
+
+
+# -- the validation section ------------------------------------------------------------
+#
+# The rounds are shown outright; the seats are folded shut. `id="validation"` is the
+# section marker every test here keys on rather than the word "Validation", which the
+# timeline already prints ("Validation rejected — sent back") on a page that may have no
+# section at all.
+
+
+def _validated(store, *, wo_id=None, fo_id=None):
+    """A rejection and a pass, with the seats that produced them."""
+    subject = {"wo_id": wo_id} if wo_id else {"fo_id": fo_id}
+    first = store.open_validation_round(**subject, fingerprint="aaaa1111")
+    store.close_validation_round(first["id"], "rejected", "no test touches the branch")
+    store.record_validation_opinion(first["id"], "tester", verdict="reject",
+                                    reply="no file under tests/ is in the diff",
+                                    model="sonnet", latency_ms=1200)
+    store.record_validation_opinion(first["id"], "security", verdict="pass",
+                                    reply="nothing exposed", model="sonnet",
+                                    latency_ms=900)
+    second = store.open_validation_round(**subject, fingerprint="bbbb2222")
+    store.close_validation_round(second["id"], "passed", "the new case covers it")
+
+
+def test_the_work_order_page_shows_its_rounds_and_folds_the_seats_away(client, project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship the exporter")
+    _validated(store, wo_id=wo["id"])
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert 'id="validation"' in page
+    assert "aaaa1111" in page and "bbbb2222" in page
+    assert "rejected" in page and "passed" in page
+    assert "no test touches the branch" in page
+    assert "tester" in page and "security" in page
+    # Folded, not hidden: the seats are one click away and cost nobody a page of
+    # reading they did not ask for. Zero JavaScript, as everywhere else here.
+    assert "Panel deliberation" in page
+    assert "<details" in page
+    assert "no file under tests/ is in the diff" in page
+
+
+def test_the_feature_page_shows_its_rounds_and_folds_the_seats_away(client, project):
+    store = ProjectStore(project)
+    fo = store.create_feature_order("CSV export", description="the whole ask")
+    _validated(store, fo_id=fo["id"])
+
+    page = client.get(f"/fo/proj_a/{fo['id']}").text
+
+    assert 'id="validation"' in page
+    assert "aaaa1111" in page and "bbbb2222" in page
+    assert "rejected" in page and "passed" in page
+    assert "the new case covers it" in page
+    assert "tester" in page and "security" in page
+    assert "Panel deliberation" in page
+
+
+def test_a_unit_that_was_never_validated_gets_no_validation_section(client, project):
+    """No empty box. Validation ships disabled, so this is every unit in the fleet —
+    a section that renders as a heading over nothing would be on almost every page in
+    the dashboard, saying nothing, for ever."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship the exporter")
+    fo = store.create_feature_order("CSV export", description="the whole ask")
+
+    assert 'id="validation"' not in client.get(f"/wo/proj_a/{wo['id']}").text
+    assert 'id="validation"' not in client.get(f"/fo/proj_a/{fo['id']}").text
+
+
+def test_the_work_order_page_reads_its_label_off_the_os_not_the_template(client,
+                                                                        project):
+    """`invariants.status_label` is where every surface gets its wording, and this page
+    is the one that has drifted from the listings before by deriving its own. The round
+    number is the proof: STATUS_META can produce "under review", and nothing a template
+    can reach knows that this is round 2 of 3."""
+    from jarvis import invariants
+
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship the exporter")
+    store.set_status(wo["id"], "validating")
+    store.open_validation_round(wo_id=wo["id"], fingerprint="aaaa1111", round=1)
+    store.open_validation_round(wo_id=wo["id"], fingerprint="bbbb2222", round=2)
+    expected = invariants.status_label(store, store.get_work_order(wo["id"]))
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert expected in page
+    assert "review round 2 of 3" in expected      # the label really did say something
+
+
+def test_an_undeliverable_envelope_is_visible_on_the_page_and_a_delivered_one_is_not(
+        client, project):
+    """Feedback that reached nobody must never read like feedback that was acted on.
+    Delivered envelopes are routine and belong behind `jarvis validation show`."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship the exporter")
+    lost = store.post_envelope(from_role="reviewer", to_role="implementor",
+                               kind="review_feedback", subject_wo_id=wo["id"])
+    fine = store.post_envelope(from_role="reviewer", to_role="implementor",
+                               kind="review_feedback", subject_wo_id=wo["id"])
+    store.mark_envelope(lost, "undeliverable", note="nobody fills role implementor")
+    store.mark_envelope(fine, "delivered", delivered_wo_id=wo["id"])
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert 'id="validation"' in page          # a section with no rounds, but a failure
+    assert "reached nobody" in page
+    assert "nobody fills role implementor" in page
+    # ONE envelope on the page, out of two on the record. Counted rather than asserted
+    # absent by word: "delivered" is ordinary English and appears in the reply box's
+    # own copy, so a bare `not in` would fail against a page that is perfectly correct.
+    assert page.count("review_feedback") == 1
+
+
+def test_the_feature_page_names_its_manager_order(client, project):
+    """Paired with a feature that has none — which is every feature planned with
+    validation switched off, and the case that must keep rendering."""
+    store = ProjectStore(project)
+    with_mgr = store.create_feature_order("CSV export", description="the whole ask")
+    mgr = store.create_work_order("own the follow-through", kind="manager",
+                                  parent_id=with_mgr["id"])
+    without = store.create_feature_order("PDF export", description="the other ask")
+
+    page = client.get(f"/fo/proj_a/{with_mgr['id']}").text
+    assert "manager:" in page
+    assert mgr["id"] in page
+    # ...and it is not counted as a piece of the work.
+    assert "no children" in page
+
+    plain = client.get(f"/fo/proj_a/{without['id']}")
+    assert plain.status_code == 200
+    assert "manager:" not in plain.text
