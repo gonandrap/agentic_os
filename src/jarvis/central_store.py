@@ -98,7 +98,12 @@ CREATE TABLE IF NOT EXISTS backlog (
     status TEXT NOT NULL DEFAULT 'open',    -- open | promoted | done | dropped
     depends_on TEXT NOT NULL DEFAULT '[]',  -- JSON list of backlog ids
     promoted_wo_id TEXT,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    -- Where this item came from. NULL/'' on anything a human typed; filled in when a
+    -- work order deferred it, whoever ends up filing the row (see ADDED_COLUMNS).
+    origin_wo_id TEXT,                      -- the work order that suggested it
+    origin_fo_id TEXT,                      -- the feature order whose plan it came from
+    origin_note TEXT NOT NULL DEFAULT ''    -- the why, and the Neo question id if given
 );
 CREATE TABLE IF NOT EXISTS knowledge (
     id TEXT PRIMARY KEY,
@@ -207,6 +212,14 @@ ADDED_COLUMNS = {
         # Retraction. NULL on every pre-existing row, which reads as "standing".
         "retired_at": "REAL",
         "retired_reason": "TEXT",
+    },
+    "backlog": {
+        # Where a deferred item came from. The backlog predates deferral routing, so
+        # every pre-existing row reads as "somebody typed this" — NULL origins and an
+        # empty note — which is exactly what it was.
+        "origin_wo_id": "TEXT",
+        "origin_fo_id": "TEXT",
+        "origin_note": "TEXT NOT NULL DEFAULT ''",
     },
     "agent_calls": {
         # Which session the call ran in, so its per-API-call detail can be read back
@@ -356,15 +369,27 @@ class CentralStore:
     # -- backlog ------------------------------------------------------------------
 
     def add_backlog(self, project: str, title: str, description: str = "",
-                    depends_on: list[str] | None = None, item_id: str | None = None) -> dict[str, Any]:
+                    depends_on: list[str] | None = None, item_id: str | None = None,
+                    origin_wo_id: str | None = None, origin_fo_id: str | None = None,
+                    origin_note: str = "") -> dict[str, Any]:
+        """File a backlog item. The three `origin_*` arguments are the relationship.
+
+        They default to "nobody deferred this", so every caller that predates deferral
+        routing is unaffected — and every caller that DOES have the relationship must
+        pass it, whichever side of `bus.deliver` it is on. A row whose origin depends on
+        which path filed it is a backlog nobody can query.
+        """
         item_id = item_id or db.new_id("bl")
         deps = depends_on or []
         for dep in deps:
             if not self.get_backlog(dep):
                 raise KeyError(f"backlog dependency {dep!r} does not exist")
         self.conn.execute(
-            "INSERT INTO backlog (id, project, title, description, depends_on, created_at) VALUES (?,?,?,?,?,?)",
-            (item_id, project, title, description, db.to_json(deps), db.now()),
+            "INSERT INTO backlog (id, project, title, description, depends_on, "
+            "created_at, origin_wo_id, origin_fo_id, origin_note) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (item_id, project, title, description, db.to_json(deps), db.now(),
+             origin_wo_id, origin_fo_id, origin_note),
         )
         return self.get_backlog(item_id)  # type: ignore[return-value]
 

@@ -167,7 +167,10 @@ def test_contract_section_contains_everything_the_old_contract_had():
         "a call you made with NO doubt",
         "Record EVERY such call, including the small and obvious ones",
         "only audit trail",
-        "jarvis backlog add p1",
+        # Deferred work reached the backlog by the worker filing it itself until
+        # `jarvis wo defer` routed it instead. The DUTY is the load-bearing part and
+        # it survived the split; the command under it changed.
+        "jarvis wo defer wo-brief01",
         "LOOK IT UP FIRST",
         "jarvis learn search",
         "jarvis learn add",

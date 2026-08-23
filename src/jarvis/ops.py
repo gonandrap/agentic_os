@@ -1043,6 +1043,81 @@ def assume(wo_id: str, content: str) -> dict[str, Any]:
     return {"project": name, "wo_id": wo_id, "recorded": content}
 
 
+def round_line(rnd: dict[str, Any]) -> str:
+    """One validation round on one line: number, fingerprint, outcome, reason.
+
+    A round is NOT deliberation. The number, the outcome and the reason are what the
+    submitter was told, so they belong on every surface a person reads by default; what
+    stays behind `jarvis validation show` is the seats — their verdicts and their raw
+    replies. One formatter, so the CLI's two `show` commands cannot word the same round
+    two different ways.
+    """
+    reason = (rnd.get("reason") or "").strip()
+    return (f"round {rnd['round']} · {rnd['fingerprint']} · {rnd['outcome']}"
+            + (f" — {reason}" if reason else ""))
+
+
+def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
+                      fo_id: str | None = None) -> list[dict[str, Any]]:
+    """One unit's rounds, oldest first, WITHOUT the seats' opinions.
+
+    The projection the default documents carry — `jarvis wo show`, `jarvis fo show` and
+    both dashboard pages. `summary` and `evidence` are dropped along with the opinions:
+    they are a copy of what the unit already says about itself, and a round listing is
+    read to answer "how many times, and what came back", not to re-read the submission.
+    """
+    return [{k: r[k] for k in ("id", "round", "ts", "fingerprint", "outcome", "reason",
+                               "pr_url")}
+            for r in store.validation_rounds(wo_id=wo_id, fo_id=fo_id)]
+
+
+def validation_detail(store: ProjectStore, *, wo_id: str | None = None,
+                      fo_id: str | None = None) -> dict[str, Any]:
+    """THE DELIBERATION on one unit, in full: every round with every seat.
+
+    The on-demand half of the separation every default surface keeps — each seat's
+    verdict, status, model, latency and raw reply, plus the envelopes the review
+    feedback travelled in. Nothing in it is pushed at anyone: `jarvis validation show`
+    asks for it explicitly, and the two dashboard pages fold it shut.
+
+    One function serves both units because a round is the same fact either way. It takes
+    an open store so the pages that already have one do not open a second, and so the
+    CLI and the dashboard cannot drift about what a deliberation contains.
+    """
+    rounds = [{**rnd, "opinions": store.validation_opinions(rnd["id"])}
+              for rnd in store.validation_rounds(wo_id=wo_id, fo_id=fo_id)]
+    envelopes = store.envelopes(subject_wo_id=wo_id, subject_fo_id=fo_id)
+    return {"rounds": rounds, "envelopes": envelopes,
+            # Pulled out rather than left for every reader to filter: an undeliverable
+            # envelope is a failure — feedback that reached nobody — and one that has to
+            # be noticed by scanning a `state` column is one nobody notices.
+            "undeliverable": [e for e in envelopes if e["state"] == "undeliverable"]}
+
+
+def validation_view(unit_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """`validation_detail` for a unit named on the command line, either kind.
+
+    Which unit is being asked about is read off the id — `fo-…` is a feature order,
+    anything else a work order — so the caller never has to say, and one command can
+    serve both.
+    """
+    if unit_id.startswith("fo-"):
+        name, path, row = find_feature_order(unit_id, project_name)
+        subject: dict[str, str | None] = {"fo_id": unit_id}
+        unit = "feature"
+    else:
+        name, path, row = find_work_order(unit_id, project_name)
+        subject = {"wo_id": unit_id}
+        unit = "work_order"
+    store = ProjectStore(path)
+    try:
+        detail = validation_detail(store, **subject)  # type: ignore[arg-type]
+    finally:
+        store.close()
+    return {"project": name, "unit": unit, "id": unit_id,
+            "title": row["title"], "status": row["status"], **detail}
+
+
 def validation_config() -> Any:
     """The OS's validation settings, or None when they cannot be read.
 
@@ -1709,11 +1784,24 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
                 planner = {k: p[k] for k in ("id", "title", "status", "result_summary")}
             except KeyError:
                 planner = None  # deleted out from under it; the link was released
+        # The other session that belongs to this feature without being a piece of its
+        # work. Shaped exactly like the planner and returned next to it, because the two
+        # answer the same question — who is holding this feature, and where do I go to
+        # read them. None for every feature planned with validation off, which is all of
+        # them until someone turns it on.
+        mgr = store.manager_work_order(fo_id)
+        manager = ({k: mgr[k] for k in ("id", "title", "status", "result_summary")}
+                   if mgr else None)
         return {
             "project": name, **fo,
             "plan": plan,
             "plan_text": "\n".join(plans.render_plan(plan)) if plan else "",
             "planner": planner,
+            "manager": manager,
+            # The feature's OWN rounds, never its children's: a child's review is on the
+            # child's page. Empty for every unit that has never been validated, and it
+            # is the emptiness the surfaces branch on — no rounds, no section.
+            "validation_rounds": validation_rounds(store, fo_id=fo_id),
             "children": children,
             "progress": feature_progress(store, fo),
             # Only meaningful next to `max_parallel`, but returned unconditionally so a
@@ -2534,6 +2622,59 @@ def show_gate(approval_id: int, project_name: str | None = None) -> dict[str, An
         finally:
             neo.close()
     return {**approval, "project": name, "neo_question": question}
+
+
+# -- deferral ------------------------------------------------------------------------------------
+
+def defer(wo_id: str, title: str, why: str, description: str = "",
+          neo_question_id: int | None = None,
+          project_name: str | None = None) -> dict[str, Any]:
+    """(Workers) hand work found on the way to whoever owns deciding about it.
+
+    ONE post, and then it returns. Read the list of things this deliberately does NOT do,
+    because every one of them is a thing it would be natural to add and each would break
+    the same rule:
+
+    * it does not look at `parent_id` to see whether this work order has a feature;
+    * it does not look for a project manager;
+    * it does not call `CentralStore.add_backlog`;
+    * it does not name a work order as the recipient.
+
+    A sender that asked "does the recipient exist?" would be a sender coupled to its
+    recipient, and it would have to be edited again the day a second kind of recipient
+    appears. `bus.deliver` owns all of that: it reaches the manager if the feature has
+    one, and files the backlog item itself if not — which is the overwhelmingly common
+    case and is exactly today's behaviour.
+
+    The return value says the deferral was submitted and deliberately does not say what
+    happened to it. The worker must not depend on the outcome, so it is not told one.
+    """
+    from . import bus
+
+    if not why.strip():
+        raise OpsError(
+            "--why is the whole argument for deferring: it is what a reader sees months "
+            "later when deciding whether the item is still worth doing")
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        env_id = bus.post(
+            store, subject=bus.Subject(wo_id=wo_id), from_role="implementor",
+            to_role="manager",
+            payload=bus.DeferralRequest(title=title, why=why,
+                                        neo_question_id=neo_question_id,
+                                        description=description))
+        # On the work order's own record, because nobody reads worker transcripts and a
+        # deferral is a decision about scope: the timeline is where the user finds out
+        # this work order decided something was not its job.
+        store.add_event(wo_id, "deferral_submitted",
+                        {"title": title, "why": why, "envelope_id": env_id,
+                         "neo_question_id": neo_question_id})
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "envelope_id": env_id, "title": title,
+            "note": "deferral submitted — it is out of your hands now; carry on with "
+                    "your work order"}
 
 
 # -- backlog ------------------------------------------------------------------------------------

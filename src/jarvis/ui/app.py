@@ -498,8 +498,16 @@ def create_app() -> FastAPI:
             detail = ops.show_feature_order(fo_id, name)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
+        # The deliberation, for the fold. `show_feature_order` deliberately does NOT
+        # carry it — that document is what `jarvis fo show` prints, and the seats'
+        # replies must not ride into it.
+        store = ProjectStore(ops.registered_project_paths()[detail["project"]])
+        try:
+            validation = ops.validation_detail(store, fo_id=fo_id)
+        finally:
+            store.close()
         return render(request, "feature_order.html", fo=detail, project=detail["project"],
-                      error=error)
+                      validation=validation, error=error)
 
     @app.get("/project/{name}/sessions", response_class=HTMLResponse)
     def project_sessions(request: Request, name: str):
@@ -552,12 +560,19 @@ def create_app() -> FastAPI:
             # And why a `waiting_input` one is not in fact waiting on the reader. Both
             # notes are display; `true_blockers` decides what actually costs attention.
             waiting = ops.waiting_on(store, wo)
+            # How this status should READ — derived once, in the one function every
+            # other surface derives it from. The header used to build its own wording
+            # out of STATUS_META alone, which is how a listing and a header came to
+            # disagree about the same work order once before (PR 65).
+            label = invariants.status_label(store, wo)
+            validation = ops.validation_detail(store, wo_id=wo_id)
         finally:
             store.close()
         show_debug = debug not in ("", "0", "false")
         bill = wo_bill(wo_id, pname)
         return render(request, "work_order.html", project=pname, wo=wo,
-                      pause=pause, waiting=waiting,
+                      pause=pause, waiting=waiting, status_label=label,
+                      validation=validation,
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug,
                                               questions=ops.neo_question_texts(wo_id)),

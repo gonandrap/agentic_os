@@ -9,7 +9,7 @@ Grouped commands:
   jarvis gate rules|rule-retract|explain  what counts as privileged, and what the OS
                                           has LEARNED does not
   jarvis neo list|show|review|answer|learnings|learn|export
-  jarvis backlog add|list|promote|done
+  jarvis backlog add|list|show|promote|done
   jarvis learn add|list|search|show|topics|pin|unpin
   jarvis notify / jarvis inbox
   jarvis bug report                       file a Jarvis OS bug (GitHub issue + ping)
@@ -33,6 +33,25 @@ def _print(data: Any, as_json: bool) -> None:
         print(json.dumps(data, indent=2, default=str))
     else:
         _pretty(data)
+
+
+def _readable_rounds(detail: dict[str, Any]) -> dict[str, Any]:
+    """A unit's document with its validation rounds collapsed to one line each.
+
+    HUMAN output only, and the same trick `_with_readable_digest` plays: `--json` gets
+    the rows as they are stored, because other tooling reads them, while a person gets
+    "round 1 · a1b2 · rejected — no test touches the new branch" instead of a nested
+    block per round. A unit that has never been validated loses the key altogether, so
+    its document reads exactly as it did before rounds existed — which is every unit in
+    a fleet that has not turned validation on.
+    """
+    from . import ops
+
+    row = dict(detail)
+    rounds = row.pop("validation_rounds", None) or []
+    if rounds:
+        row["validation_rounds"] = [ops.round_line(r) for r in rounds]
+    return row
 
 
 def _with_readable_digest(q: dict[str, Any]) -> dict[str, Any]:
@@ -223,6 +242,19 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("question")
     q.add_argument("--project")
 
+    d = wo.add_parser("defer", help="(workers) hand off work that is not this work "
+                                    "order's job — the OS decides where it lands")
+    d.add_argument("wo_id")
+    d.add_argument("title")
+    d.add_argument("--why", required=True,
+                   help="why it should not be done now — this is what a reader sees "
+                        "months later when deciding whether it is still worth doing")
+    d.add_argument("--description", "-d", default="",
+                   help="the brief for whoever eventually picks it up")
+    d.add_argument("--neo-question", dest="neo_question", type=int, metavar="ID",
+                   help="the Neo question this deferral was agreed in")
+    d.add_argument("--project")
+
     f = wo.add_parser("finish", help="(workers) mark a work order finished")
     f.add_argument("wo_id")
     f.add_argument("--summary", required=True)
@@ -407,9 +439,21 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("title")
     b.add_argument("--description", "-d", default="")
     b.add_argument("--depends-on", default="", help="comma-separated backlog ids")
+    # Where the item came from, when something deferred it rather than somebody typing
+    # it. Flags rather than prose in the description, so the relationship survives being
+    # read back by a query instead of by a person.
+    b.add_argument("--origin-wo", dest="origin_wo", metavar="WO-ID",
+                   help="the work order that suggested this")
+    b.add_argument("--origin-fo", dest="origin_fo", metavar="FO-ID",
+                   help="the feature order whose plan it came out of")
+    b.add_argument("--origin-note", dest="origin_note", default="",
+                   help="why it was deferred, and the Neo question id if there was one")
     b = bl.add_parser("list")
     b.add_argument("project", nargs="?")
     b.add_argument("--all", action="store_true", help="include non-open items")
+    b = bl.add_parser("show", help="one backlog item in full, including where it "
+                                   "came from")
+    b.add_argument("item_id")
     b = bl.add_parser("promote", help="turn a backlog item into a work order (or, with "
                                       "--as feature, into a feature order the project "
                                       "plans for itself)")
@@ -505,6 +549,20 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("learning_id", type=int)
     n.add_argument("--reason", required=True,
                    help="what supersedes it — this is kept beside the learning for ever")
+
+    # validation ----------------------------------------------------------------------
+    # The deliberation, on demand and nowhere else. `wo show` and `fo show` carry the
+    # ROUNDS — number, outcome, reason — because that is what the unit was told; what
+    # lives here is what the seats said, which nobody is made to read.
+    va = sub.add_parser(
+        "validation", help="how the validation panel judged a work or feature order"
+    ).add_subparsers(dest="validation_cmd", required=True)
+    v = va.add_parser("show", help="every round in full: each seat's verdict, model, "
+                                   "latency and raw reply")
+    # One command for both units: a round is the same fact either way, and the id says
+    # which one it is (`fo-…` is a feature order, anything else a work order).
+    v.add_argument("unit_id", metavar="WO_ID|FO_ID")
+    v.add_argument("--project")
 
     # notifications ----------------------------------------------------------------------------
     n = sub.add_parser("notify", help="emit a notification into the OS pipeline")
@@ -1193,10 +1251,14 @@ def cmd_wo(args: argparse.Namespace) -> int:
                                        "decided_by", "decision_reason")}
                     for a in store.list_approvals(args.wo_id)
                 ],
+                # Additive, and always present under `--json` even when empty: a key
+                # that comes and goes is one every consumer has to guard. The seats'
+                # replies are NOT here — see `jarvis validation show`.
+                "validation_rounds": ops.validation_rounds(store, wo_id=args.wo_id),
             }
         finally:
             store.close()
-        _print(detail, args.json)
+        _print(_readable_rounds(detail) if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
         _print(ops.send_message(args.wo_id, args.message, source=args.source,
@@ -1206,6 +1268,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
     elif args.wo_cmd == "ask":
         _print(ops.ask_question(args.wo_id, args.question,
                                 project_name=args.project), args.json)
+    elif args.wo_cmd == "defer":
+        _print(ops.defer(args.wo_id, args.title, args.why,
+                         description=args.description,
+                         neo_question_id=args.neo_question,
+                         project_name=args.project), args.json)
     elif args.wo_cmd == "finish":
         _print(ops.finish(args.wo_id, args.summary, pr_url=args.pr or None,
                           evidence=args.evidence), args.json)
@@ -1284,6 +1351,15 @@ def cmd_fo(args: argparse.Namespace) -> int:
             if detail["planner"]:
                 p = detail["planner"]
                 print(f"planner: {p['id']} ({p['status']})")
+            # Next to the planner, because they are the same question: who holds this
+            # feature. Absent, and silent, for a feature planned with validation off.
+            if detail["manager"]:
+                m = detail["manager"]
+                print(f"manager: {m['id']} ({m['status']})")
+            if detail["validation_rounds"]:
+                print("\nvalidation:")
+                for rnd in detail["validation_rounds"]:
+                    print(f"  {ops.round_line(rnd)}")
             if detail["plan_text"]:
                 print(f"\nplan:\n{detail['plan_text']}")
             if detail["max_parallel"]:
@@ -1459,6 +1535,23 @@ def cmd_gate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _backlog_origin(item: dict) -> str:
+    """One line saying where a deferred item came from, or "" for one somebody typed.
+
+    Empty for every item filed before deferral routing and for every one a human adds
+    without the flags, so those keep rendering exactly as they always have — the origin
+    is an addition to the listing, never a change to it.
+    """
+    bits = []
+    if item.get("origin_wo_id"):
+        bits.append(f"deferred by {item['origin_wo_id']}")
+    if item.get("origin_fo_id"):
+        bits.append(f"from {item['origin_fo_id']}")
+    if item.get("origin_note"):
+        bits.append(f"— {item['origin_note']}")
+    return " ".join(bits)
+
+
 def cmd_backlog(args: argparse.Namespace) -> int:
     from . import ops
     from .central_store import CentralStore
@@ -1467,7 +1560,10 @@ def cmd_backlog(args: argparse.Namespace) -> int:
         if args.bl_cmd == "add":
             deps = [d.strip() for d in args.depends_on.split(",") if d.strip()]
             item = central.add_backlog(args.project, args.title,
-                                       description=args.description, depends_on=deps)
+                                       description=args.description, depends_on=deps,
+                                       origin_wo_id=args.origin_wo,
+                                       origin_fo_id=args.origin_fo,
+                                       origin_note=args.origin_note)
             _print(item, args.json)
         elif args.bl_cmd == "list":
             items = central.list_backlog(project=args.project,
@@ -1479,8 +1575,30 @@ def cmd_backlog(args: argparse.Namespace) -> int:
                     deps = f" (deps: {', '.join(it['depends_on'])})" if it["depends_on"] else ""
                     print(f"• {it['id']} [{it['project']}] {it['title']} "
                           f"({it['status']}){deps}")
+                    origin = _backlog_origin(it)
+                    if origin:
+                        print(f"    ↳ {origin}")
                 if not items:
                     print("backlog empty")
+        elif args.bl_cmd == "show":
+            item = central.get_backlog(args.item_id)
+            if not item:
+                print(f"backlog item {args.item_id!r} not found")
+                return 1
+            if args.json:
+                _print(item, True)
+            else:
+                print(f"{item['id']} [{item['project']}] {item['title']} "
+                      f"({item['status']})")
+                if item["description"]:
+                    print(f"\n{item['description']}")
+                if item["depends_on"]:
+                    print(f"\ndepends on: {', '.join(item['depends_on'])}")
+                if item.get("promoted_wo_id"):
+                    print(f"promoted to: {item['promoted_wo_id']}")
+                origin = _backlog_origin(item)
+                if origin:
+                    print(f"\norigin: {origin}")
         elif args.bl_cmd == "promote":
             _print(ops.promote_backlog(args.item_id, force=args.force,
                                        as_feature=args.as_kind == "feature",
@@ -1721,6 +1839,56 @@ def cmd_neo(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_validation(args: argparse.Namespace) -> int:
+    """`jarvis validation show <id>` — the panel's whole deliberation on one unit.
+
+    Modelled on `neo show --panel`, including what it does with nothing to show: a unit
+    that has never been validated gets a plain sentence saying so, not an empty
+    structure. A reader who runs this on a fleet with validation switched off — which is
+    every fleet until someone turns it on — is owed an answer, and "no rounds" printed
+    as `[]` reads like a bug in the command.
+    """
+    from . import ops
+
+    view = ops.validation_view(args.unit_id, args.project)
+    if args.json:
+        _print(view, True)
+        return 0
+
+    unit = "feature order" if view["unit"] == "feature" else "work order"
+    print(f"{view['id']} [{view['project']}] {view['title']} "
+          f"({unit}, {view['status']})")
+    if not view["rounds"]:
+        print(f"\nno validation has run on this {unit} — the panel judges a unit when "
+              f"it submits its evidence, and it ships disabled "
+              f"(`os.validation.enabled`)")
+    for rnd in view["rounds"]:
+        print(f"\n{ops.round_line(rnd)}")
+        if rnd["evidence"]:
+            print(f"  evidence: {rnd['evidence']}")
+        for o in rnd["opinions"]:
+            print(f"  {o['seat']:<10} {o['status']:<9} "
+                  f"verdict={o['verdict'] or '—':<7} "
+                  f"{o['latency_ms']}ms  {o['model'] or '—'}")
+            for line in (o["reply"] or "").splitlines():
+                print(f"      {line}")
+        if not rnd["opinions"]:
+            print("  no seat opined on this round")
+    # The bus, on the same page as the rounds it carried. Delivered envelopes are
+    # routine and live here rather than in any default listing; an UNDELIVERABLE one is
+    # a failure, so it is also flagged where nobody has to go looking — `jarvis doctor`
+    # and the unit's own page.
+    if view["envelopes"]:
+        print("\nenvelopes:")
+        for e in view["envelopes"]:
+            mark = "✗" if e["state"] == "undeliverable" else "·"
+            note = f" — {e['note']}" if e["note"] else ""
+            print(f"  {mark} {e['kind']} to role {e['to_role']} · {e['state']}"
+                  f"{' → ' + e['delivered_wo_id'] if e['delivered_wo_id'] else ''}"
+                  f"{note}")
+    return 0
+
+
 def cmd_notify(args: argparse.Namespace) -> int:
     """Write to the project outbox (daemon routes it), falling back to the central
     inbox when the project isn't identifiable."""
@@ -1848,6 +2016,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_learn(args)
         if args.cmd == "neo":
             return cmd_neo(args)
+        if args.cmd == "validation":
+            return cmd_validation(args)
         if args.cmd == "notify":
             return cmd_notify(args)
         if args.cmd == "inbox":

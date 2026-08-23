@@ -92,11 +92,18 @@ class ReviewFeedback:
 
 @dataclass(frozen=True, slots=True)
 class DeferralRequest:
-    """Work found on the way that is not this work order's job."""
+    """Work found on the way that is not this work order's job.
+
+    `why` and `description` are different things and both are carried: `why` is the
+    argument for deferring — it becomes the backlog row's `origin_note` — while
+    `description` is the brief for whoever eventually picks the item up. A deferral
+    usually has the first and often lacks the second, so only `description` is optional.
+    """
 
     title: str
     why: str
     neo_question_id: int | None = None
+    description: str = ""
 
 
 #: kind -> the dataclass that IS that kind. Every entry in `ENVELOPE_KINDS` must appear
@@ -224,11 +231,43 @@ def resolve(store: ProjectStore, envelope: dict[str, Any]) -> str | None:
 # -- delivery ------------------------------------------------------------------------
 
 
-def render(payload: ReviewFeedback | DeferralRequest) -> str:
+def origin_note(payload: DeferralRequest) -> str:
+    """The `origin_note` a deferral becomes, wherever it is filed from.
+
+    ONE function, called by the router's own filing path and quoted verbatim into the
+    command the manager is handed, because a note whose wording depends on which side
+    filed it is a relationship you cannot query for.
+    """
+    note = payload.why
+    if payload.neo_question_id is not None:
+        note = f"{note} (Neo question {payload.neo_question_id})"
+    return note
+
+
+def _q(value: str) -> str:
+    """Double-quote a value for the shell command a recipient is shown.
+
+    Not `shlex.quote`: that switches to single quotes on anything interesting, and the
+    text here is prose read by an agent that has to be able to see its own title in it.
+    """
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def render(payload: ReviewFeedback | DeferralRequest, *, project: str = "",
+           origin_wo_id: str | None = None, origin_fo_id: str | None = None) -> str:
     """The text the recipient's session actually receives.
 
-    Says what happened and nothing about who said it: the recipient is not told which
-    entity posted the envelope, because knowing would couple it back.
+    Says what happened and nothing about WHO said it: the recipient is never told which
+    entity posted the envelope, because knowing would couple it back. The envelope's
+    SUBJECT is a different thing and it does travel — a manager asked to record which
+    work order suggested a deferral has to be told which work order that is. It learns
+    what the message is about, never who chose to send it.
+
+    The keyword arguments are the router's context, filled in by `deliver`; they only
+    reach a `DeferralRequest`, where they become the exact `jarvis backlog add`
+    invocation the recipient is asked to run. Naming the command rather than describing
+    it is the whole point: prose that says "record where it came from" loses the
+    relationship the first time a manager paraphrases it.
     """
     if isinstance(payload, ReviewFeedback):
         lines = [f"Review feedback (round {payload.round}): {payload.outcome}.", "",
@@ -239,8 +278,22 @@ def render(payload: ReviewFeedback | DeferralRequest) -> str:
         lines += ["", "Act on this and continue your work order."]
         return "\n".join(lines)
     lines = [f"Deferral request: {payload.title}", "", payload.why]
+    if payload.description:
+        lines += ["", payload.description]
     if payload.neo_question_id is not None:
         lines += ["", f"(raised against Neo question {payload.neo_question_id})"]
+    cmd = [f"    jarvis backlog add {project or '<project>'} {_q(payload.title)} \\"]
+    if payload.description:
+        cmd.append(f"        -d {_q(payload.description)} \\")
+    if origin_wo_id:
+        cmd.append(f"        --origin-wo {origin_wo_id} \\")
+    if origin_fo_id:
+        cmd.append(f"        --origin-fo {origin_fo_id} \\")
+    cmd.append(f"        --origin-note {_q(origin_note(payload))}")
+    lines += ["", "File this on the backlog with where it came from recorded — the "
+                  "flags ARE the record, so run it as it stands:", "", *cmd, "",
+              "Filing it is the whole action: you are not being asked to schedule it, "
+              "and you do not report back."]
     return "\n".join(lines)
 
 
@@ -269,7 +322,9 @@ def deliver(store: ProjectStore, central: CentralStore, envelope: dict[str, Any]
         return _unfilled(store, central, envelope, payload, project=project)
 
     try:
-        store.deliver_envelope(env_id, target, render(payload),
+        store.deliver_envelope(env_id, target,
+                               render(payload, **_context(store, central, envelope,
+                                                          payload, project=project)),
                                source=MESSAGE_SOURCE)
     except Exception as e:  # noqa: BLE001 — one bad envelope must not stop the tick
         # The transaction rolled back, so the envelope is exactly as it was: still
@@ -278,6 +333,22 @@ def deliver(store: ProjectStore, central: CentralStore, envelope: dict[str, Any]
         log.warning("envelope %s could not be delivered to %s: %s", env_id, target, e)
         return "queued"
     return "delivered"
+
+
+def _context(store: ProjectStore, central: CentralStore, envelope: dict[str, Any],
+             payload: ReviewFeedback | DeferralRequest, *,
+             project: str) -> dict[str, Any]:
+    """What `render` needs beyond the payload, for the kinds that need anything.
+
+    Only a deferral does, and resolving it costs a walk to the feature order and
+    possibly a central lookup — so this stays keyed on the payload type rather than
+    being computed for every envelope the tick delivers.
+    """
+    if not isinstance(payload, DeferralRequest):
+        return {}
+    return {"project": project or project_name(store, central),
+            "origin_wo_id": envelope["subject_wo_id"],
+            "origin_fo_id": _feature_of(store, envelope)}
 
 
 def _unfilled(store: ProjectStore, central: CentralStore, envelope: dict[str, Any],
@@ -316,7 +387,14 @@ def _unfilled(store: ProjectStore, central: CentralStore, envelope: dict[str, An
 
     if envelope["kind"] == "deferral_request" and isinstance(payload, DeferralRequest):
         name = project or project_name(store, central)
-        item = central.add_backlog(name, payload.title, payload.why)
+        # The SAME three columns the manager's `jarvis backlog add` invocation fills in.
+        # A relationship that is only recorded on one of the two filing paths is worse
+        # than one recorded on neither: nothing notices until somebody queries it.
+        item = central.add_backlog(
+            name, payload.title, payload.description or payload.why,
+            origin_wo_id=envelope["subject_wo_id"],
+            origin_fo_id=_feature_of(store, envelope),
+            origin_note=origin_note(payload))
         store.mark_envelope(
             env_id, "handled_by_router",
             note=f"no {to_role} to reach; filed backlog item {item['id']}")
