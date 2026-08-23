@@ -25,42 +25,22 @@ from zoneinfo import ZoneInfo
 #: fake; the test-isolation gate points it at a stub that refuses to run.
 CLAUDE_BIN_ENV = "JARVIS_CLAUDE_BIN"
 
-#: THE 5-MINUTE PROMPT CACHE, FORCED ON EVERY `claude` PROCESS JARVIS STARTS.
-#:
-#: A prompt-cache WRITE costs 1.25x base input at the 5-minute TTL and 2x at the
-#: one-hour one; a READ is 0.1x under either (kn-f94abf34). Claude Code picks the TTL in
-#: a single function — `EEe` in 2.1.240, `L0e` when kn-f94abf34 first read it — and the
-#: order inside it is what makes this variable the whole lever:
-#:
-#:     if (Vn(process.env.FORCE_PROMPT_CACHING_5M)) return false;   // <- checked FIRST
-#:     if (Vn(process.env.ENABLE_PROMPT_CACHING_1H) || …) return true;
-#:     if (!ds() || qB().isUsingOverage) return false;
-#:     … querySource against a REMOTELY CONFIGURABLE allowlist, default
-#:       ["repl_main_thread*", "sdk", "auto_mode", "memdir_relevance"]
-#:
-#: It short-circuits, so it beats `ENABLE_PROMPT_CACHING_1H` in an inherited environment
-#: and beats the allowlist — which every `claude -p` matches through "sdk", and which
-#: Anthropic can change under us without a release. Forcing it is therefore not a
-#: micro-optimisation of a default, it is the only way the rate paid is a Jarvis decision.
-#: `Vn` accepts exactly "1"/"true"/"yes"/"on" (kn-522c6103), hence the value.
-#:
-#: WHY IT LIVES HERE RATHER THAN ONLY IN THE WORKER SETTINGS FILE. It shipped in
-#: `dispatch._write_worker_settings` first (wo-5668a3f7), which covers worker turns and
-#: nothing else — and workers are not the only thing Jarvis runs. Measured on wo-b9563d2b
-#: after that fix: the worker's own turns wrote 362,028 tokens, all at 5m, while Neo and
-#: the dashboard digest wrote 28,804, ALL AT 1H, because `run_headless_result` never
-#: passed the flag. Every launch path now goes through `_run` or `spawn_turn`, and both
-#: apply this, so a new OS-side agent cannot reintroduce the 2x write by forgetting it.
+#: Buy the 5-minute prompt cache (write 1.25x) rather than the one-hour one (2x), on
+#: EVERY `claude` process Jarvis starts — `_run` and `spawn_turn` are the only two that
+#: do, and both apply it. The value matters as much as the key: the CLI accepts exactly
+#: "1"/"true"/"yes"/"on". Why it is forced rather than left to the CLI's default, and
+#: what would reverse the decision:
+#: docs/superpowers/specs/2026-08-22-the-five-minute-write-everywhere.md
 PROMPT_CACHE_5M_ENV = {"FORCE_PROMPT_CACHING_5M": "1"}
 
 
 def cache_env(explicit: dict[str, str] | None = None) -> dict[str, str]:
     """The 5-minute cache flag, overlaid by whatever a caller asked for EXPLICITLY.
 
-    The precedence has three levels and the middle one is the point: the AMBIENT
-    environment loses (a stray `ENABLE_PROMPT_CACHING_1H` in the daemon's env must not
-    quietly re-buy the hour), this default sits above it, and a caller's own `env_extra`
-    sits above that — so an A/B measurement of this very decision stays possible.
+    Three levels of precedence: the ambient environment loses, this default sits above
+    it, an explicit `env_extra` above that. Callers therefore merge the result in
+    opposite directions depending on which they hold — see the spec's "where the flag
+    lives" section.
     """
     return {**PROMPT_CACHE_5M_ENV, **(explicit or {})}
 
@@ -85,9 +65,7 @@ def version() -> str:
 def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
          env_extra: dict[str, str] | None = None) -> str:
     env = os.environ.copy()
-    # Every synchronous `claude` Jarvis runs — `run_headless_result` above all, which is
-    # the transport for Neo, the panel's seats and the digest — buys the 5-minute cache
-    # write. See PROMPT_CACHE_5M_ENV; `env_extra` still wins, by design.
+    # `env_extra` is caller intent and must win over the cache default; ambient env loses.
     env.update(cache_env(env_extra))
     try:
         proc = subprocess.run(
@@ -491,10 +469,9 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
     stdin is /dev/null because `claude -p` otherwise spends three seconds waiting for
     input that is never coming, on every turn.
 
-    The environment carries the 5-minute cache flag as well as the settings file, which
-    is belt AND braces on purpose: `--settings` is what makes it reach a worker (the
-    file survives the spawn and the CLI reloads it), and the env is what makes the
-    property hold for a turn launched with no settings file at all.
+    The cache flag rides in the environment as well as in the settings file, so the
+    property holds for a turn launched without one. `os.environ` is overlaid FIRST here
+    (it is ambient, not intent) — the opposite order from `_run`.
     """
     outfile.parent.mkdir(parents=True, exist_ok=True)
     args = turn_args(prompt, session_id, resume, **kwargs)

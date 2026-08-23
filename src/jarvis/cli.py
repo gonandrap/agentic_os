@@ -745,13 +745,10 @@ def _print_turn_table(res: dict) -> None:
 def _print_write_ttl(totals: dict) -> None:
     """What the fleet paid to WRITE to the prompt cache, and at which of the two rates.
 
-    Silent when nothing was written and silent when the whole line was at 1.25x — a
-    report that says "all good" on every run is a line readers stop seeing, and 1.25x
-    everywhere is the intended state, not news. It speaks up for the one-hour share,
-    which is the only part anyone can act on.
-
-    The rate is derived from the split rather than restated from a constant, so it says
-    what was PAID and not what the code intends to pay (kn-2e0a6317).
+    Silent when the whole line was at 1.25x: a report that says "all good" every run is a
+    line readers stop seeing. The rate is derived from the split rather than restated from
+    a constant, so it says what was PAID (kn-2e0a6317). Spec:
+    2026-08-22-the-five-minute-write-everywhere.md.
     """
     from . import usage as usage_mod
 

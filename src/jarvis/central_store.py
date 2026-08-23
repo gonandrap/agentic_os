@@ -785,14 +785,10 @@ class CentralStore:
         the cost report walks every work order there is.
 
         THE TTL SPLIT COMES OUT OF `usage_json`, not out of a column, and summing it here
-        is what stops the report under-pricing its own overhead. A cache write is 1.25x
-        base input at the 5-minute TTL and 2x at the one-hour one; with no split the
-        pricing falls back to the 5-minute FLOOR, which was wrong for every OS-side call
-        made before `run_headless_result` forced the 5m cache (wo-b4f207ad) — Neo and the
-        digest bought the hour and were billed here as if they had not. `json_extract`
-        returns NULL both for a row whose envelope predates the field and for one with no
-        envelope at all, and COALESCE folds both into the same honest zero: no split
-        known, floor rate, exactly as before.
+        is what stops the report under-pricing its own overhead at the 1.25x floor (spec:
+        2026-08-22-the-five-minute-write-everywhere.md). `json_extract` returns NULL both
+        for a row with no envelope and for one whose envelope predates the field, and
+        COALESCE folds both into the same honest zero: no split known, floor rate.
         """
         clause = "WHERE project=?" if project else ""
         params = (project,) if project else ()

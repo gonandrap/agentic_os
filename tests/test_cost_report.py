@@ -445,11 +445,8 @@ def _os_call(wo_id: str, **split) -> None:
 def test_the_os_half_is_priced_at_the_ttl_it_actually_bought(store):
     """Jarvis's own calls used to be priced at the 5-minute FLOOR whatever they bought.
 
-    `usage.priced` charges 1.25x with no split and 2x with a wholly-1h one, and
-    `agent_call_totals` had no split to give it — so `jarvis cost <project>` billed a
-    one-hour write as if it were a five-minute one while `jarvis cost <wo>`, which reads
-    the same envelope through `bill.py`, said 2x. 100k Opus write tokens at $5/M input:
-    $0.625 at the floor, $1.00 at the rate actually paid.
+    100k Opus write tokens at $5/M input: $0.625 at the floor, $1.00 at the rate paid.
+    Spec: 2026-08-22-the-five-minute-write-everywhere.md.
     """
     wo = store.create_work_order("an order Neo answered", "")
     _os_call(wo["id"], cache_1h=100_000, cache_5m=0)
@@ -460,11 +457,7 @@ def test_the_os_half_is_priced_at_the_ttl_it_actually_bought(store):
 
 
 def test_a_call_with_no_split_recorded_still_prices_at_the_floor(store):
-    """The rows written before the split was captured must not move.
-
-    An ABSENT split is not evidence of a one-hour write, and guessing upward would
-    rewrite the history of every OS call the fleet has ever made.
-    """
+    """An ABSENT split is not evidence of a one-hour write: pre-split rows must not move."""
     wo = store.create_work_order("an order from before the split existed", "")
     _os_call(wo["id"])
 
@@ -476,9 +469,7 @@ def test_a_call_with_no_split_recorded_still_prices_at_the_floor(store):
 def test_the_rollup_reports_the_write_split_across_both_halves(store, transcripts):
     """The footer's one job: "is anything still buying the one-hour write?".
 
-    Worker and OS spend are summed into ONE line deliberately. The two were switched to
-    the 5-minute write ten days apart, so a total that spoke for only one of them would
-    have read as all-clear while half the bill was still at 2x.
+    Worker and OS spend sum into ONE line deliberately — see `ops._write_ttl`.
     """
     wo = store.create_work_order("a worker that also asked Neo", "")
     give_session(store, wo["id"], "sess-both")

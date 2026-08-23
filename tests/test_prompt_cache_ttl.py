@@ -1,19 +1,13 @@
 """What TTL Jarvis buys when it writes to the prompt cache, on every launch path.
 
-A prompt-cache WRITE costs 1.25x base input at the 5-minute TTL and 2x at the one-hour
-one; a READ is 0.1x under either. Claude Code picks the one-hour TTL by default for the
-`querySource` every `claude -p` presents, so the expensive write is what Jarvis gets
-unless it says otherwise — on every path, every time.
+A cache WRITE is 1.25x base input at the 5-minute TTL and 2x at the one-hour one, and the
+CLI picks the hour by default for the `querySource` every `claude -p` presents.
 
-WHY THIS FILE EXISTS RATHER THAN ONE ASSERTION NEXT TO EACH CALL SITE. The flag first
-shipped in `dispatch._write_worker_settings` (wo-5668a3f7) and was tested there
-(`test_workers_buy_the_five_minute_cache_not_the_one_hour_one`, tests/test_worker_
-session.py), which proved the property for worker turns and for nothing else. It stayed
-false for Neo, the panel's seats and the dashboard digest for another ten days,
-invisibly: measured on wo-b9563d2b, the worker's own turns wrote 362,028 tokens all at
-5m while Jarvis's own calls on the same order wrote 28,804, ALL AT 1H. A per-call-site
-test cannot fail for a call site nobody thought of, so the guard here is over the SEAM —
-every subprocess in `claude_cli` must go through one of the two functions that force it.
+The guard here is over the SEAM rather than over each call site, because a per-call-site
+test cannot fail for a call site nobody thought of — which is exactly how Neo, the panel
+and the digest kept buying the hour for ten days after workers stopped. Background and
+the reversal criteria:
+`docs/superpowers/specs/2026-08-22-the-five-minute-write-everywhere.md`.
 """
 
 from __future__ import annotations
@@ -41,12 +35,10 @@ def _cache_env(call: dict) -> dict:
 def _no_inherited_flag(monkeypatch):
     """Clear the flag out of the ambient environment before every test here.
 
-    NOT tidiness — without this the whole file is vacuous, and it passes while proving
-    nothing. These tests are usually run BY a Jarvis worker, and a worker's own session
-    carries `FORCE_PROMPT_CACHING_5M=1` from its settings file. pytest inherits it, the
-    fake `claude` inherits it from pytest, and every assertion below holds with the
-    implementation deleted. Verified by mutation: reverting `_run` and `spawn_turn` left
-    all seven green until this fixture existed (kn-95a32178).
+    NOT tidiness — without this the whole file is vacuous. These tests are usually run BY
+    a Jarvis worker, whose own session carries `FORCE_PROMPT_CACHING_5M=1`; pytest
+    inherits it and hands it to the fake `claude`, so every assertion below passes with
+    the implementation deleted (verified by mutation; kn-95a32178).
     """
     monkeypatch.delenv(FLAG, raising=False)
     monkeypatch.delenv("ENABLE_PROMPT_CACHING_1H", raising=False)
@@ -80,11 +72,7 @@ def test_only_the_two_launchers_start_a_claude_process() -> None:
 
 
 def test_the_flag_value_is_one_the_cli_actually_parses() -> None:
-    """Claude Code's boolean reader accepts exactly 1/true/yes/on (kn-522c6103).
-
-    "TRUE" works and "y" does not, and the failure mode of getting it wrong is silence:
-    nothing errors, the flag is simply ignored and the hour is bought again.
-    """
+    """The CLI accepts exactly 1/true/yes/on (kn-522c6103), and "y" is silently ignored."""
     assert claude_cli.PROMPT_CACHE_5M_ENV == {FLAG: "1"}
 
 
@@ -94,9 +82,8 @@ def test_the_flag_value_is_one_the_cli_actually_parses() -> None:
 def test_ambient_environment_cannot_re_buy_the_hour(monkeypatch) -> None:
     """A stray variable in the daemon's own environment must not decide the rate.
 
-    Both directions matter. `ENABLE_PROMPT_CACHING_1H` loses because Claude Code checks
-    the 5m flag first and short-circuits (`EEe`, 2.1.240); a `FORCE_PROMPT_CACHING_5M=0`
-    inherited from a shell would win, so it is overwritten rather than merged.
+    Both directions: the 1h flag loses to the CLI's own short-circuit, and an inherited
+    `FORCE_PROMPT_CACHING_5M=0` would win unless it is overwritten rather than merged.
     """
     monkeypatch.setenv(FLAG, "0")
     monkeypatch.setenv("ENABLE_PROMPT_CACHING_1H", "1")
@@ -112,11 +99,8 @@ def test_an_explicit_caller_can_still_buy_another_ttl() -> None:
 
 
 def test_jarvis_own_headless_calls_buy_the_five_minute_write(fake_claude, tmp_path) -> None:
-    """The regression this file was written for.
-
-    `run_headless_result` is the transport for Neo answering a worker's question, for
-    each of the panel's seats and for the dashboard digest — every token Jarvis spends
-    on itself. It passed no settings file and no env, so all of it wrote at 2x.
+    """The regression this file was written for: `run_headless_result` is the transport
+    for Neo, the panel's seats and the digest, and it passed no settings file and no env.
     """
     claude_cli.run_headless("hi", cwd=tmp_path)
     assert _cache_env(fake_claude.calls[-1]) == {FLAG: "1"}
@@ -129,13 +113,8 @@ def test_env_extra_does_not_drop_the_flag(fake_claude, tmp_path) -> None:
 
 
 def test_a_worker_turn_carries_the_flag_in_its_environment_too(fake_claude, tmp_path) -> None:
-    """Belt and braces beside `--settings`.
-
-    A worker turn gets the flag twice over: in the settings file (what reaches a session
-    the CLI reloads settings for) and in the spawn environment. This asserts the second,
-    with NO settings file passed, so the property does not depend on the file existing —
-    which is exactly the state a turn launched outside `worker_session.briefing_for`
-    would be in.
+    """Belt and braces beside `--settings`: asserted with NO settings file passed, so the
+    property does not depend on one being written.
     """
     claude_cli.spawn_turn("hi", cwd=tmp_path, session_id="s-1",
                           outfile=tmp_path / "o.json", errfile=tmp_path / "o.err")

@@ -2770,19 +2770,13 @@ def _subproc_spend(groups: Sequence[dict[str, Any]]) -> dict[str, Any]:
 def _priced_group(usage_mod: Any, g: dict[str, Any]) -> Any:
     """One `agent_call_totals` group at list prices, TTL SPLIT INCLUDED.
 
-    The split is the whole reason this is a function rather than four lines inlined
-    twice. A cache write is 1.25x base input at the 5-minute TTL and 2x at the one-hour
-    one, and `usage.priced` falls back to the 5-minute FLOOR when it is not told which —
-    so omitting it here silently under-priced every OS-side call that bought the hour,
-    which was all of them until `run_headless_result` forced the 5m cache (wo-b4f207ad).
-    `bill.py` read the split all along, so the two surfaces disagreed about the same
-    tokens: `jarvis cost <wo>` said 2x and `jarvis cost <project>` charged 1.25x.
+    Passing `cache_1h`/`cache_5m` is the whole point of the function: `usage.priced`
+    falls back to the 1.25x floor without them, which under-priced every OS-side call
+    that bought the one-hour cache. Spec: 2026-08-22-the-five-minute-write-everywhere.md.
 
-    `"unknown"` rather than `""` for a call whose model was not captured: an empty model
-    prices at ZERO in `usage.price_for` (that branch is for `<synthetic>`, a message the
-    CLI generated itself and never billed), and a real call that silently costs nothing
-    is the exact failure this whole feature is fixing. An unrecognised name falls through
-    to the default rate instead.
+    `"unknown"` rather than `""` for an uncaptured model: an empty model prices at ZERO
+    in `usage.price_for` (that branch is for `<synthetic>`, never billed), so a real call
+    would silently cost nothing. An unrecognised name falls through to the default rate.
     """
     return usage_mod.priced(
         g.get("model") or "unknown", input=g.get("input") or 0,
@@ -2827,8 +2821,7 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
         f"{prefix}_billed_input": total.billed_input,
         f"{prefix}_output": total.output,
         f"{prefix}_total_tokens": total.total_tokens,
-        # Carried up so the fleet footer can answer "is anything still buying the
-        # one-hour write?" in one command, instead of one `jarvis cost <wo>` at a time.
+        # Carried up for the footer's write-TTL line; see `_write_ttl`.
         f"{prefix}_cache_write": total.cache_write,
         f"{prefix}_cache_1h": total.cache_1h,
         f"{prefix}_cache_5m": total.cache_5m,
@@ -3061,14 +3054,6 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "subagent_cost_usd": round(sum(u["subagent_cost_usd"] for u in measured), 2),
             "output": sum(u["output"] for u in measured),
             "billed_input": sum(u["billed_input"] for u in measured),
-            # THE RATE THE FLEET ACTUALLY PAID TO WRITE TO THE CACHE. Cache write is the
-            # largest avoidable line in a Jarvis bill and it has two prices — 1.25x base
-            # input at the 5-minute TTL, 2x at the one-hour one — so a total that hides
-            # the split hides a 60% swing on its biggest line. Summed over the worker
-            # transcripts AND both classes of recorded call, because the whole point is
-            # that the answer was different for each of them: workers were switched to
-            # the 5-minute write in wo-5668a3f7 and the OS's own calls only in
-            # wo-b4f207ad, and nothing on this report said so.
             **_write_ttl(measured, units),
         },
     }
@@ -3077,6 +3062,11 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
 def _write_ttl(measured: list[dict[str, Any]], units: list[dict[str, Any]]
                ) -> dict[str, int]:
     """Cache-write tokens and their TTL split, over every class of spend on the report.
+
+    One figure for worker and OS spend together: the two were switched to the 5-minute
+    write ten days apart, so a total speaking for one of them would read as all-clear
+    while half the bill was still at 2x (spec:
+    2026-08-22-the-five-minute-write-everywhere.md).
 
     `measured` for the transcript half (a unit whose transcript is gone has no split to
     contribute), `units` for the recorded halves, which survive transcript pruning — the
