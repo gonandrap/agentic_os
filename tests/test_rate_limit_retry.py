@@ -253,6 +253,68 @@ def test_a_limit_with_no_readable_time_waits_the_fallback_delay(store):
         pause.turn["ended_at"] + worker_session.RATE_LIMIT_FALLBACK_DELAY, abs=1)
 
 
+def _age(store, wo_id, ended_at):
+    """Move a settled turn's `ended_at`, the only way a test can put the refusal in the
+    past without waiting. The pause is re-derived from the row every pass, so this is
+    the same code path a real wait takes."""
+    turn = store.latest_turn(wo_id)
+    store.conn.execute("UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
+                       (ended_at - 1, ended_at, turn["id"]))
+    store.conn.commit()
+    return ended_at
+
+
+def test_the_reset_is_resolved_against_the_turn_not_against_the_asking_clock(store):
+    """THE BUG THAT COST wo-b4f207ad TWELVE HOURS. "resets 12pm" is a statement made
+    when the turn died, so it must be read against THAT moment. Resolved against the
+    clock of whichever pass happens to be asking, `_reset_moment`'s "already gone, so
+    tomorrow" rule fires the instant the reset arrives and pushes the deadline a day
+    out — every pass, for ever. The deadline runs away exactly when it is reached, so
+    `due()` is never true and the work order waits until a human retries it by hand.
+    """
+    tz = ZoneInfo("America/Los_Angeles")
+    ended = datetime(2026, 8, 22, 8, 8, 34, tzinfo=tz).timestamp()
+    _refused(store, error="You've hit your session limit · resets 12pm "
+                          "(America/Los_Angeles)")
+    _age(store, "wo-test", ended)
+
+    pause = worker_session.turn_pause(store, "wo-test")
+    assert pause is not None
+    assert pause.reset_at == datetime(2026, 8, 22, 12, 0, tzinfo=tz).timestamp(), (
+        "noon on the day the turn died — not noon tomorrow, and not noon relative to "
+        "whenever this test runs")
+    assert pause.due(), "the window reopened hours ago; the retry pass must fire"
+
+
+def test_the_deadline_does_not_move_when_the_pause_is_asked_about_twice(store):
+    """The property the fix rests on: `turn_pause` is a pure function of the stored row,
+    so the answer cannot depend on when it is called. Anything that re-reads the clock
+    here is a deadline that outruns the pass chasing it."""
+    tz = ZoneInfo("America/Los_Angeles")
+    _refused(store, error=LIVE_REFUSAL)
+    for ended in (datetime(2026, 8, 22, 23, 55, tzinfo=tz).timestamp(),
+                  datetime(2026, 8, 22, 9, 0, tzinfo=tz).timestamp()):
+        _age(store, "wo-test", ended)
+        first = worker_session.turn_pause(store, "wo-test").retry_at
+        assert worker_session.turn_pause(store, "wo-test").retry_at == first
+        # 11:50pm read from that moment: the same day when it is still ahead, the next
+        # when it has gone. Either way it is anchored, and it is within a day of the
+        # turn rather than within a day of now.
+        assert ended < first <= ended + 86400
+
+
+def test_the_relative_reset_counts_from_the_turn_not_from_now(store):
+    """"resets in 2h 15m" is the worse half of the same bug: read against the asking
+    clock it is permanently 2h15m in the future, so it can never come due at all."""
+    ended = time.time() - 6 * 3600
+    _refused(store, error="You've hit your session limit · resets in 2h 15m")
+    _age(store, "wo-test", ended)
+    pause = worker_session.turn_pause(store, "wo-test")
+    assert pause is not None
+    assert pause.reset_at == pytest.approx(ended + 2 * 3600 + 15 * 60, abs=1)
+    assert pause.due(), "2h15m after a turn that died six hours ago is long past"
+
+
 def test_the_streak_counts_off_the_end_and_resets_when_a_turn_gets_through(store):
     for _ in range(3):
         _refused(store)
@@ -378,6 +440,47 @@ def test_a_refused_work_order_resumes_itself(started, fake_claude, project,
     # without `jarvis wo finish` settles to; what matters here is that the usage limit
     # left no trace on where it ended up.
     assert store.get_work_order(wo["id"])["status"] == "needs_review"
+    store.close()
+
+
+def test_a_clock_time_reset_comes_due_without_the_error_being_rewritten(
+        started, fake_claude, project, settle_turns):
+    """THE REGRESSION THAT SHIPPED. The test above proves the plumbing, but it reopens
+    the window by rewriting the refusal to the epoch form — the one shape of the message
+    that states an absolute moment and so cannot drift. Every refusal the fleet has
+    actually taken states a CLOCK TIME, and for twelve hours that shape could not come
+    due at all: the reset was re-read against the asking clock, so it moved a day
+    further out every time the pass looked. Here the error is left exactly as the CLI
+    wrote it and only the turn ages, which is what really happens while a work order
+    waits.
+    """
+    daemon = started
+    fake_claude.turns_rate_limited(reset="12:01am (UTC)")
+    wo = ops.create_work_order("proj_a", "ship the thing")
+    store = ProjectStore(project)
+
+    _tick(daemon)                      # dispatches turn 1, which is refused
+    assert settle_turns(store), "the refused turn never settled"
+    _tick(daemon)                      # settles it
+    assert not worker_session.turn_pause(store, wo["id"]).due(), (
+        "a reset hours ahead must not fire yet")
+
+    # Three days pass. The refusal is untouched: "12:01am" now names a moment two days
+    # behind us, because it is read against the turn that died and not against today.
+    fake_claude.turns_recover()
+    turn = store.latest_turn(wo["id"])
+    aged = time.time() - 3 * 86400
+    store.conn.execute("UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
+                       (aged - 1, aged, turn["id"]))
+    store.conn.commit()
+
+    _tick(daemon)                      # the retry pass relaunches it
+    assert settle_turns(store), "the retried turn never ran — the deadline ran away"
+    _tick(daemon)
+
+    assert "turn_resumed" in [e["kind"] for e in store.list_events(wo["id"])]
+    assert store.latest_turn(wo["id"])["state"] == "done"
+    assert worker_session.turn_pause(store, wo["id"]) is None
     store.close()
 
 

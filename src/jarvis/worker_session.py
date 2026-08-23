@@ -509,9 +509,20 @@ def _diagnose(turn: dict[str, Any]) -> claude_cli.UsageLimit | claude_cli.Transi
     One place, so the pause and the streak that counts it can never disagree about what
     a given turn was. The usage limit goes first because its message is also an API
     error and would otherwise be read as one.
+
+    A PURE FUNCTION OF THE ROW, AND `now` IS WHAT MAKES IT ONE. The refusal states a
+    wall-clock time ("resets 12pm") or a countdown ("resets in 2h 15m"), and both are
+    statements made at the moment the turn ENDED. Resolving them against the clock of
+    whichever pass happens to be asking is what cost wo-b4f207ad twelve hours: at 12:00
+    exactly, `claude_cli._reset_moment`'s "that time has gone, so it means tomorrow"
+    rule starts firing, so every subsequent pass pushed the deadline another day out
+    and `TurnPause.due` was never true — the deadline outran the pass chasing it, for
+    ever. The countdown form was worse still: `now + 2h15m` on every pass is a moment
+    that can never arrive. Anchored here instead, the answer is fixed the moment the
+    turn is settled and no later reader can move it.
     """
     error = turn.get("error")
-    limit = claude_cli.usage_limit(error)
+    limit = claude_cli.usage_limit(error, now=turn.get("ended_at") or turn["started_at"])
     if limit is not None:
         return limit
     return claude_cli.transient_failure(
