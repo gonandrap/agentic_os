@@ -573,9 +573,20 @@ def retry(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
     the transcript speak for what was already said.
 
     The test is `duration_api_ms`, which the CLI reports on the failed envelope too: a
-    refusal that never reached the API records 0 there (verified across every usage-limit
-    refusal the fleet has recorded), and a turn that got any distance records the time it
-    spent. It is read from the stored usage envelope, so it outlives the result file.
+    turn refused before it reached the API records 0 there, and a turn that got any
+    distance records the time it spent. It is read from the stored usage envelope, so it
+    outlives the result file.
+
+    THE PAUSE REASON IS NOT A PROXY FOR THAT, and an earlier version of this comment
+    claimed it was — that a usage-limit refusal always records 0, "verified across every
+    usage-limit refusal the fleet has recorded". That is false, and the fleet has since
+    disproved it comprehensively: on 2026-08-22 five work orders were refused for the
+    session limit MID-TURN, after real work, recording 223,944ms / 433,119ms /
+    545,416ms / 1,003,519ms / 1,150,038ms of API time and $1.69–$15.80 of spend apiece.
+    The window can close under a conversation that is already running, not only in front
+    of one about to start. Reading the measurement rather than trusting the reason is
+    what makes this correct anyway — do not "simplify" it back to a check on
+    `pause.reason`, which would re-send a prompt those five workers had already acted on.
 
     Two flags have to be re-decided rather than copied off the original turn, because a
     failure can land on either side of both. Each is settled by asking the filesystem
