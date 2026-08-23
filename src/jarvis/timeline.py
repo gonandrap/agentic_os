@@ -7,6 +7,9 @@ hooks, turn boundaries, session binding) exists to debug the circuitry.
 
 `build_timeline` merges events with the actual conversation and renders each entry as
 prose. Debug entries are held back unless explicitly requested.
+
+An entry says WHAT HAPPENED and points at records rather than reproducing them:
+docs/superpowers/specs/2026-08-23-the-work-order-record.md §1, §3.
 """
 
 from __future__ import annotations
@@ -27,6 +30,9 @@ DEBUG_KINDS = frozenset({
     "hook_ignored",             # a hook from a session that is not this work order's
     "permission_mode_changed",  # worker permission plumbing
     "notification_ignored",     # idle prompt on an already-settled work order
+    # Same moment as the message carrying the answer, so the message is the entry — §5.
+    "neo_answered",
+    "escalation_answered",
 })
 
 STATUS_LABEL = {
@@ -72,28 +78,27 @@ def _payload(event: dict[str, Any]) -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
-def _question(p: dict[str, Any], questions: dict[int, str]) -> str:
-    """What the worker asked, from the payload or — for older events — from Neo's DB."""
-    stored = p.get("question")
-    if stored:
-        return str(stored)
+def _neo_question_id(p: dict[str, Any]) -> int | None:
     qid = p.get("neo_question_id")
     try:
-        return questions.get(int(qid), "") if qid is not None else ""
+        return int(qid) if qid is not None else None
     except (TypeError, ValueError):
-        return ""
+        return None
 
 
-def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any],
-              questions: dict[int, str]) -> tuple[str, str]:
-    """(label, detail) in plain language for one event.
+def _ref(kind: str, p: dict[str, Any]) -> dict[str, Any] | None:
+    """The record this entry points at, or None. Surface-neutral by design — §3."""
+    if kind == "question_asked":
+        qid = _neo_question_id(p)
+        if qid is not None:
+            return {"kind": "neo_question", "id": qid, "label": f"question #{qid}"}
+    return None
 
-    `questions` back-fills question text for events that predate it being stored in
-    the payload; see `build_timeline`.
-    """
+
+def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
+    """(label, detail) in plain language for one event, from its payload alone."""
     if kind == "created":
-        about = [wo.get("title") or "", wo.get("description") or ""]
-        return "Work order created", "\n".join(x for x in about if x)
+        return "Work order created", ""  # the title and description are already above
     if kind == "status":
         status = p.get("status", "")
         return STATUS_LABEL.get(status, status or "Status changed"), ""
@@ -135,13 +140,14 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any],
     if kind == "attention":
         return "Needs you", p.get("reason") or ""
     if kind == "assumption":
-        return "Assumption recorded", p.get("content") or ""
+        n = p.get("n")  # the number, not the text — §4
+        return (f"Assumption #{n} recorded" if n else "Assumption recorded"), ""
     if kind == "question_asked":
-        return "Worker asked a question", _question(p, questions)
-    # The two "answered" kinds carry NO detail on purpose. Both writers queue the
-    # answer as a message in the same breath, and messages render verbatim, so the
-    # text is already the very next line of the timeline. Attaching it here too would
-    # print every Neo answer twice.
+        # `_ref` is the way to it; the text is the fallback when there is no id — §3.
+        if _neo_question_id(p) is not None:
+            return "Worker asked a question", ""
+        return "Worker asked a question", str(p.get("question") or "")
+    # Debug (see DEBUG_KINDS); they still render, with no detail, when asked for.
     if kind == "neo_answered":
         return "Neo answered the worker", ""
     if kind == "neo_dispatched":
@@ -239,36 +245,41 @@ def _describe(kind: str, p: dict[str, Any], wo: dict[str, Any],
     return kind, json.dumps(p, sort_keys=True) if p else ""
 
 
+def _message_label(m: dict[str, Any]) -> str:
+    """Who is speaking, from the message's own `source` — §5."""
+    if m.get("direction") != "user_to_agent":
+        return "Worker → you"
+    return "Neo → worker" if m.get("source") == "neo" else "You → worker"
+
+
 def build_timeline(wo: dict[str, Any], events: list[dict[str, Any]],
                    messages: list[dict[str, Any]],
-                   *, include_debug: bool = False,
-                   questions: dict[int, str] | None = None) -> list[dict[str, Any]]:
+                   *, include_debug: bool = False) -> list[dict[str, Any]]:
     """Merge events and conversation into time-ordered, human-readable entries.
 
-    Each entry: {ts, level, kind, label, detail}. Debug entries are omitted unless
-    `include_debug`.
-
-    `questions` is {neo_question_id: question}, used only to fill in `question_asked`
-    events written before the text was stored in the payload. Callers get it from
-    `ops.neo_question_texts`; omitting it costs nothing but those older details. This
-    function stays pure — it never opens a store itself.
+    Each entry: {ts, level, kind, label, detail, ref}. Debug entries are omitted unless
+    `include_debug`. Stays pure — it never opens a store.
     """
-    questions = questions or {}
     entries: list[dict[str, Any]] = []
+    seen_assumptions = 0
     for e in events:
         kind = e.get("kind", "")
+        payload = _payload(e)
+        if kind == "assumption":
+            # Rows written before `add_assumption` stored `n` are numbered here, by the
+            # same rule and therefore to the same numbers — §4.
+            seen_assumptions += 1
+            payload = {**payload, "n": payload.get("n") or seen_assumptions}
         level = event_level(kind)
         if level == "debug" and not include_debug:
             continue
-        label, detail = _describe(kind, _payload(e), wo, questions)
+        label, detail = _describe(kind, payload)
         entries.append({"ts": e.get("ts") or 0.0, "level": level, "kind": kind,
-                        "label": label, "detail": detail})
+                        "label": label, "detail": detail, "ref": _ref(kind, payload)})
     for m in messages:
-        to_worker = m.get("direction") == "user_to_agent"
         entries.append({
             "ts": m.get("ts") or 0.0, "level": "signal", "kind": "message",
-            "label": "You → worker" if to_worker else "Worker → you",
-            "detail": m.get("content") or "",
+            "label": _message_label(m), "detail": m.get("content") or "", "ref": None,
         })
     entries.sort(key=lambda e: e["ts"])
     return entries

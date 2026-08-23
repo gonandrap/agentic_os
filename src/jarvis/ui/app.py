@@ -549,7 +549,9 @@ def create_app() -> FastAPI:
         try:
             events = store.list_events(wo_id)
             messages = store.list_messages(wo_id)
-            assumptions = store.pending_assumptions(wo_id)
+            # Both lists: `assumptions` is the record, `unreviewed` is the ask — §4.
+            assumptions = store.all_assumptions(wo_id)
+            unreviewed = store.pending_assumptions(wo_id)
             # A worker held at a gate looks identical to an idle one from here, so
             # the reason it stopped belongs on the page it stopped on.
             store.expire_approvals()
@@ -574,10 +576,9 @@ def create_app() -> FastAPI:
                       pause=pause, waiting=waiting, status_label=label,
                       validation=validation,
                       timeline=build_timeline(wo, events, messages,
-                                              include_debug=show_debug,
-                                              questions=ops.neo_question_texts(wo_id)),
+                                              include_debug=show_debug),
                       debug=show_debug, debug_count=count_debug(events),
-                      messages=messages, assumptions=assumptions,
+                      messages=messages, assumptions=assumptions, unreviewed=unreviewed,
                       approvals=approvals, bill=bill,
                       turn_lines=turn_lines_by_message(bill))
 
@@ -705,6 +706,27 @@ def create_app() -> FastAPI:
                       in_flight=in_flight, escalated=escalated,
                       unreviewed=unreviewed, history=history, learnings=learnings,
                       opinions=opinions, digest_credit=_digest_credit())
+
+    @app.get("/neo/question/{question_id}", response_class=HTMLResponse)
+    def neo_question_page(request: Request, question_id: int):
+        """One question and its answer — where a work order's timeline sends the reader.
+
+        The `question_asked` entry points here rather than reprinting the question: §3 of
+        docs/superpowers/specs/2026-08-23-the-work-order-record.md.
+        """
+        from ..neo_store import NeoStore
+        neo = NeoStore()
+        try:
+            q = neo.get(question_id)
+            opinions = neo.opinions(question_id) if q else []
+        finally:
+            neo.close()
+        if q is None:
+            return render(request, "error.html", active="neo",
+                          message=f"neo question {question_id} not found",
+                          status_code=404)
+        return render(request, "neo_question.html", active="neo",
+                      q=_decorate_question(q), opinions=opinions)
 
     @app.get("/gates", response_class=HTMLResponse)
     def gates_page(request: Request):

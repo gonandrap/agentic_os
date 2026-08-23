@@ -33,6 +33,7 @@ from jarvis import bootstrap, bus, dispatch, invariants, ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
+from jarvis.testing import FIXTURE_DESIGN_DOC
 
 ASK = ("Add a CSV exporter to the reporting module, with a command that calls it and "
        "tests over both the happy path and an empty result set.")
@@ -52,7 +53,8 @@ def a_child(key: str) -> dict:
 
 
 def a_plan(*keys: str) -> dict:
-    return {"summary": "an exporter", "children": [a_child(k) for k in keys]}
+    return {"summary": "an exporter", "design_doc": FIXTURE_DESIGN_DOC,
+            "children": [a_child(k) for k in keys]}
 
 
 @pytest.fixture()

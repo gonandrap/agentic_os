@@ -164,6 +164,25 @@
   .disclosure > summary::before { content: "▸ "; color: var(--ink-3); }
   .disclosure[open] > summary::before { content: "▾ "; }
   .disclosure > summary:hover { color: var(--ink); border-color: var(--ink-3); }
+  /* TABS — for a page whose sections are alternatives, not a sequence. Progressive
+     enhancement: nothing hides until the script adds `.js`. See §6 of
+     docs/superpowers/specs/2026-08-23-the-work-order-record.md. */
+  .tabs { display: flex; gap: 4px; margin: 30px 0 0; border-bottom: 1px solid var(--line);
+          flex-wrap: wrap; }
+  .tabs button {
+    background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0;
+    padding: 8px 14px; color: var(--ink-3); font: 600 12px var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+  }
+  .tabs button:hover { color: var(--ink-2); }
+  .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--amber); }
+  .tabs .n { font-weight: 400; letter-spacing: 0; color: var(--ink-3); margin-left: 6px;
+             text-transform: none; }
+  .tabbed.js > .tabpanel { display: none; }
+  .tabbed.js > .tabpanel.on { display: block; }
+  /* Stacked, each panel carries its own heading; with tabs the strip is the heading. */
+  .tabbed.js > .tabpanel > h2:first-child { display: none; }
+
   @media (prefers-reduced-motion: no-preference) {
     .pulse { animation: pulse 2.4s ease-in-out infinite; }
     @keyframes pulse { 50% { opacity: 0.45; } }

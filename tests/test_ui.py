@@ -215,6 +215,148 @@ def test_wo_page_anchors_pending_at_what_needs_the_user(client, daemon):
     assert '<h2 id="pending">Assumptions pending your review</h2>' in review
 
 
+# -- the work order page reads as three alternatives, not one long scroll ---------------
+
+
+def test_the_three_readings_are_tabs_and_the_asks_are_not(client, daemon, project):
+    """Conversation, spend and timeline are alternatives — one tab strip, one panel
+    open. What the page ASKS of the reader stays outside: an ask behind a tab is an ask
+    that does not happen."""
+    wo = ops.create_work_order("proj_a", "risky change")
+    daemon.tick()
+    ops.assume(wo["id"], "assumed the API is v2")
+    ops.finish(wo["id"], "done-ish")
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    head, tabs = page.split('<div class="tabbed"', 1)
+    assert 'id="tab-conversation"' in tabs and 'id="tab-timeline"' in tabs
+    # Exactly one panel starts open, and it is the conversation.
+    assert tabs.count('class="tabpanel on"') == 1
+    assert 'class="tabpanel on" id="tab-conversation"' in tabs
+    # The pending-assumptions panel is above the strip, where it cannot be hidden.
+    assert "Assumptions pending your review" in head
+
+
+def test_the_page_still_reads_without_the_tab_script(client, daemon):
+    """Nothing is hidden until the script marks the container `.js`, so a browser that
+    never runs it gets the stack the page used to be rather than one third of it."""
+    wo = ops.create_work_order("proj_a", "risky change")
+    daemon.tick()
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert "<h2>Conversation</h2>" in page
+    assert "<h2>Timeline</h2>" in page
+    assert "root.classList.add('js')" in page
+
+
+def test_a_neo_answer_is_one_line_on_the_page_and_credited_to_neo(client, daemon,
+                                                                  project):
+    """It used to be two — the "Neo answered the worker" event and the message under
+    it — and the message called Neo "you"."""
+    from jarvis.project_store import ProjectStore as _PS
+
+    wo = ops.create_work_order("proj_a", "risky change")
+    daemon.tick()
+    store = _PS(project)
+    try:
+        store.queue_message(wo["id"], "[Neo] go with CSV", source="neo")
+        store.add_event(wo["id"], "neo_answered", {"neo_question_id": 1})
+    finally:
+        store.close()
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert "neo → worker" in page  # the conversation credits it correctly too
+    # In the timeline the answer is ONE entry. It used to be the bookkeeping event and
+    # then the answer, and only the second was worth reading.
+    story = page.split('id="tab-timeline"', 1)[1]
+    assert "Neo answered the worker" not in story
+    assert story.count("[Neo] go with CSV") == 1
+    assert "Neo → worker" in story
+
+
+def test_a_question_on_the_timeline_is_a_link_to_the_question(client, daemon, project):
+    wo = ops.create_work_order("proj_a", "risky change")
+    daemon.tick()
+    result = ops.ask_question(wo["id"], "Should the export default to CSV or JSON?")
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert f'/neo/question/{result["question_id"]}' in page
+    # ...and the question itself is NOT reprinted beside the link.
+    assert "Should the export default to CSV or JSON?" not in page
+
+
+def test_the_question_page_holds_the_question_and_its_answer(client, daemon, project):
+    wo = ops.create_work_order("proj_a", "risky change")
+    daemon.tick()
+    qid = ops.ask_question(wo["id"], "CSV or JSON for the export default?")["question_id"]
+    ops.neo_answer_escalated(qid, "CSV, and gzip it")
+
+    page = client.get(f"/neo/question/{qid}").text
+    assert "CSV or JSON for the export default?" in page
+    assert "CSV, and gzip it" in page
+    assert f"/wo/proj_a/{wo['id']}" in page  # back to the work order that asked
+
+
+def test_a_question_that_does_not_exist_says_so(client):
+    r = client.get("/neo/question/9999")
+    assert r.status_code == 404
+    assert "not found" in r.text
+
+
+def test_assumptions_are_numbered_to_match_the_timeline(client, daemon, project):
+    """The timeline says "Assumption #2 recorded" and never the text, so the number is
+    the only thing tying an entry to the paragraph it is about."""
+    wo = ops.create_work_order("proj_a", "risky change")
+    daemon.tick()
+    ops.assume(wo["id"], "assumed the API is v2")
+    ops.assume(wo["id"], "assumed UTF-8 throughout")
+    ops.finish(wo["id"], "done-ish")
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert "#1" in page and "#2" in page
+    assert "Assumption #1 recorded" in page and "Assumption #2 recorded" in page
+    # The text is written once, in the panel that asks for a decision on it.
+    assert page.count("assumed the API is v2") == 1
+
+
+def test_a_reviewed_assumption_is_still_readable_by_its_number(client, daemon, project):
+    """The timeline names an assumption and says nothing else about it, so the number
+    has to stay resolvable after the decision — a panel that emptied on review would
+    leave "Assumption #1 recorded" pointing at nothing."""
+    wo = ops.create_work_order("proj_a", "risky change")
+    daemon.tick()
+    ops.assume(wo["id"], "assumed the API is v2")
+    ops.finish(wo["id"], "done-ish")
+    client.post(f"/wo/proj_a/{wo['id']}/review", data={"decision": "accept"})
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert "Assumption #1 recorded" in page
+    assert "assumed the API is v2" in page
+    assert "accepted" in page
+    # ...and the decision is no longer being asked for.
+    assert "Accept all" not in page
+    assert "Assumptions the worker recorded" in page
+
+
+def test_wo_show_carries_every_assumption_with_its_number(jarvis_home, fake_claude,
+                                                          catalog_file, capsys):
+    """`jarvis wo show` speaks the same record as the page, for the same reason."""
+    import json as _json
+
+    from jarvis import cli
+
+    ops.start_os(str(catalog_file), foreground=True)
+    wo = ops.create_work_order("proj_a", "risky change")
+    ops.assume(wo["id"], "assumed the API is v2")
+    ops.assume(wo["id"], "assumed UTF-8 throughout")
+    ops.review_work_order(wo["id"], accept=True)
+
+    capsys.readouterr()
+    cli.main(["wo", "show", wo["id"], "--json"])
+    detail = _json.loads(capsys.readouterr().out)
+    assert [(a["n"], a["status"]) for a in detail["assumptions"]] == [
+        (1, "accepted"), (2, "accepted")]
+
+
 def test_attention_strip_shows_review_items(client, daemon, project):
     wo = ops.create_work_order("proj_a", "risky change")
     daemon.tick()

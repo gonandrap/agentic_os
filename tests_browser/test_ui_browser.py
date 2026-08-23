@@ -65,6 +65,66 @@ def test_attention_strip_and_review_flow(page, server, daemon, project):
     assert page.locator(".attention .quiet").is_visible()
 
 
+def test_work_order_tabs_show_one_reading_at_a_time(page, server, daemon, project):
+    """The tab strip is JavaScript, so only a real browser proves it: three panels, one
+    open, and switching swaps which."""
+    wo = ops.create_work_order("proj_a", "tabbed task")
+    daemon.tick()
+    page.goto(f"{server}/wo/proj_a/{wo['id']}")
+
+    conversation = page.locator("#tab-conversation")
+    timeline = page.locator("#tab-timeline")
+    assert conversation.is_visible()
+    assert not timeline.is_visible()
+
+    page.click(".tabs button:has-text('Timeline')")
+    assert timeline.is_visible()
+    assert not conversation.is_visible()
+    assert "Work order created" in timeline.inner_text()
+
+
+def test_a_deep_link_opens_the_tab_its_target_is_inside(page, server, daemon, project):
+    """Every notification links to `#pending`, and with no work owed it resolves to the
+    reply box — which now lives inside a tab. A deep link that landed on a closed panel
+    would show the user nothing at all."""
+    wo = ops.create_work_order("proj_a", "deep linked task")
+    daemon.tick()
+    page.goto(f"{server}/wo/proj_a/{wo['id']}#pending")
+
+    assert page.locator("#tab-conversation").is_visible()
+    assert page.locator("#pending").is_visible()
+
+    # ...and the hash arriving LATER works too, which is the case a load-time-only
+    # handler would miss: the reader is on another tab when the link is followed.
+    page.click(".tabs button:has-text('Timeline')")
+    assert not page.locator("#tab-conversation").is_visible()
+    page.evaluate("location.hash = ''")
+    page.evaluate("location.hash = 'pending'")
+    assert page.locator("#tab-conversation").is_visible()
+    assert page.locator("#pending").is_visible()
+
+
+def test_a_timeline_question_opens_the_question_and_its_answer(page, server, daemon,
+                                                               project):
+    """The timeline names the question and points at it. Following that link must land
+    on the one record holding the question and the answer together."""
+    wo = ops.create_work_order("proj_a", "asking task")
+    daemon.tick()
+    qid = ops.ask_question(wo["id"], "CSV or JSON for the export default?")["question_id"]
+    ops.neo_answer_escalated(qid, "CSV, and gzip it")
+
+    page.goto(f"{server}/wo/proj_a/{wo['id']}")
+    page.click(".tabs button:has-text('Timeline')")
+    story = page.locator("#tab-timeline").inner_text()
+    assert "Worker asked a question" in story
+    assert "CSV or JSON for the export default?" not in story  # pointed at, not printed
+
+    page.click(f"#tab-timeline a:has-text('question #{qid}')")
+    body = page.locator("body").inner_text()
+    assert "CSV or JSON for the export default?" in body
+    assert "CSV, and gzip it" in body
+
+
 def test_send_feedback_from_wo_page(page, server, daemon, project):
     wo = ops.create_work_order("proj_a", "chatty task")
     daemon.tick()
