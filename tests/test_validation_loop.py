@@ -891,13 +891,19 @@ def test_the_kill_switch_drains_open_rounds_instead_of_stranding_them(fleet):
         store.close()
 
 
-def test_with_no_validator_wired_an_open_round_settles_unjudged(fleet):
-    """The shipped default: this work order defines the seam and a later one fills it.
+def test_with_no_validator_wired_an_open_round_settles_unjudged(fleet, monkeypatch):
+    """A round with nothing to judge it settles its unit unjudged.
+
+    The panel now fills the seam, so this case has to be STAGED rather than found:
+    `_validator` is made to return None, which is exactly what it returns on every
+    catalog that has not enabled validation — and what it would return again if the panel
+    were ever unwired or removed.
 
     Closed `failed` and never `passed` — a round nobody judged must not read as a
     verdict on any surface — and the work order lands exactly where it lands with
     validation switched off, so an unwired seam costs nothing and hides nothing.
     """
+    monkeypatch.setattr(Daemon, "_validator", staticmethod(lambda cfg: None))
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
     finish(fleet, wo["id"], pr="https://github.com/x/y/pull/4")

@@ -391,6 +391,50 @@ elif "-p" in argv and "--resume" not in argv:
     # verdict driven by the prompt so tests control escalation.
     prompt = argv[argv.index("-p") + 1]
     system = opt("--append-system-prompt", "")
+    # A VALIDATION SEAT, AND THIS BRANCH IS FIRST OF ALL. `chair` IS A LEGAL SEAT NAME IN
+    # BOTH ROSTERS: a validator chair answered by the Neo seat branch below comes back a
+    # perfectly well-formed Neo verdict carrying no pass and no reject at all, and a
+    # lenient `validation.decide` would read that as a pass — a green suite that exercised
+    # nothing. The two headers are different literals precisely so this branch can tell
+    # them apart, and the per-seat failure variable is separate for the same reason.
+    vseat = next((s for s in ("tester", "security", "architect", "maintainer", "chair")
+                  if ("# Jarvis validation seat: " + s) in system), None)
+    if vseat:
+        if vseat in [s for s in
+                     os.environ.get("FAKE_VALIDATION_SEAT_FAIL", "").split(",") if s]:
+            sys.stderr.write(f"validation seat {vseat} failed (test-forced)\n")
+            sys.exit(1)
+        if f"FORCE_VALIDATION_GARBAGE_{vseat.upper()}" in prompt:
+            emit_headless(f"on reflection the {vseat} question is a hard one")
+            sys.exit(0)
+        if vseat == "chair":
+            # The chair's schema is `outcome`/`reason` and NOTHING else — no `escalate`,
+            # no `answer`. That difference from the Neo chair's reply is what a test
+            # asserts to prove this branch, and not the one below, answered the call.
+            reply = {"outcome": "passed", "reason": ""}
+            if "FORCE_VALIDATION_REJECT" in prompt:
+                reply = {"outcome": "rejected",
+                         "reason": "your change is not covered by the evidence you "
+                                   "declared."}
+            elif "FORCE_VALIDATION_NO_OUTCOME" in prompt:
+                reply = {"reason": "a reply with no outcome at all"}
+        else:
+            reply = {"verdict": "pass", "blocking": False,
+                     "reason": f"the {vseat} question is answered by this change",
+                     "asks": []}
+            if f"FORCE_BLOCK_{vseat.upper()}" in prompt:
+                # `blocking` true from EVERY seat, veto-holder or not. Arbitration, not
+                # the seat, decides what that forces — which is exactly the row the
+                # architect and maintainer tests need staged.
+                reply = {"verdict": "reject", "blocking": True,
+                         "reason": f"test-forced {vseat} objection",
+                         "asks": [f"answer the {vseat} objection"]}
+            elif f"FORCE_REJECT_{vseat.upper()}" in prompt:
+                reply = {"verdict": "reject", "blocking": False,
+                         "reason": f"test-forced {vseat} concern that blocks nothing",
+                         "asks": []}
+        emit_headless(json.dumps(reply))
+        sys.exit(0)
     # A DASHBOARD DIGEST, AND IT COMES FIRST FOR THE SAME REASON THE SEAT BRANCH DOES:
     # the call is identified by its system prompt, never by the user prompt — which is
     # the worker's question verbatim, so a digest of a gate question would otherwise
@@ -733,14 +777,20 @@ def fake_claude(tmp_path, monkeypatch):
                 for path in sorted(tdir.iterdir())
             }
 
-        def fail_seat(self, *seats: str) -> None:
+        def fail_seat(self, *seats: str, roster: str = "neo") -> None:
             """Make the named panel seats' calls fail, and only those.
 
             Per-seat rather than the shared `FORCE_FAIL`, which keys on the user prompt —
             identical across every seat on one question — and so could only fail the whole
             panel at once. Degradation is per seat: one seat abstains and the rest proceed.
+
+            `roster` picks WHICH panel, and it is not decoration: `chair` is a legal seat
+            name in Neo's roster and in the validator's, so one shared variable could not
+            take a validation chair down without taking Neo's down with it — and a test
+            that failed both would prove nothing about either.
             """
-            monkeypatch.setenv("FAKE_SEAT_FAIL", ",".join(seats))
+            env = "FAKE_SEAT_FAIL" if roster == "neo" else "FAKE_VALIDATION_SEAT_FAIL"
+            monkeypatch.setenv(env, ",".join(seats))
 
         def turns_fail(self, mode: str = "fail") -> None:
             """Make subsequent turns fail. `fail` = non-zero exit, `silent` = exits
