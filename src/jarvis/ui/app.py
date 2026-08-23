@@ -541,7 +541,13 @@ def create_app() -> FastAPI:
         try:
             events = store.list_events(wo_id)
             messages = store.list_messages(wo_id)
-            assumptions = store.pending_assumptions(wo_id)
+            # BOTH lists. `pending` is what the page still owes a decision on and
+            # decides whether the review form renders; `assumptions` is every one ever
+            # recorded, because the timeline names them by number and says nothing else
+            # about them — so a page that listed only the pending ones would leave
+            # "Assumption #2 recorded" pointing at nothing the moment #2 was reviewed.
+            assumptions = store.all_assumptions(wo_id)
+            unreviewed = store.pending_assumptions(wo_id)
             # A worker held at a gate looks identical to an idle one from here, so
             # the reason it stopped belongs on the page it stopped on.
             store.expire_approvals()
@@ -561,7 +567,7 @@ def create_app() -> FastAPI:
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug),
                       debug=show_debug, debug_count=count_debug(events),
-                      messages=messages, assumptions=assumptions,
+                      messages=messages, assumptions=assumptions, unreviewed=unreviewed,
                       approvals=approvals, bill=bill,
                       turn_lines=turn_lines_by_message(bill))
 

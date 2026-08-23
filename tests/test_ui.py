@@ -318,6 +318,45 @@ def test_assumptions_are_numbered_to_match_the_timeline(client, daemon, project)
     assert page.count("assumed the API is v2") == 1
 
 
+def test_a_reviewed_assumption_is_still_readable_by_its_number(client, daemon, project):
+    """The timeline names an assumption and says nothing else about it, so the number
+    has to stay resolvable after the decision — a panel that emptied on review would
+    leave "Assumption #1 recorded" pointing at nothing."""
+    wo = ops.create_work_order("proj_a", "risky change")
+    daemon.tick()
+    ops.assume(wo["id"], "assumed the API is v2")
+    ops.finish(wo["id"], "done-ish")
+    client.post(f"/wo/proj_a/{wo['id']}/review", data={"decision": "accept"})
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert "Assumption #1 recorded" in page
+    assert "assumed the API is v2" in page
+    assert "accepted" in page
+    # ...and the decision is no longer being asked for.
+    assert "Accept all" not in page
+    assert "Assumptions the worker recorded" in page
+
+
+def test_wo_show_carries_every_assumption_with_its_number(jarvis_home, fake_claude,
+                                                          catalog_file, capsys):
+    """`jarvis wo show` speaks the same record as the page, for the same reason."""
+    import json as _json
+
+    from jarvis import cli
+
+    ops.start_os(str(catalog_file), foreground=True)
+    wo = ops.create_work_order("proj_a", "risky change")
+    ops.assume(wo["id"], "assumed the API is v2")
+    ops.assume(wo["id"], "assumed UTF-8 throughout")
+    ops.review_work_order(wo["id"], accept=True)
+
+    capsys.readouterr()
+    cli.main(["wo", "show", wo["id"], "--json"])
+    detail = _json.loads(capsys.readouterr().out)
+    assert [(a["n"], a["status"]) for a in detail["assumptions"]] == [
+        (1, "accepted"), (2, "accepted")]
+
+
 def test_attention_strip_shows_review_items(client, daemon, project):
     wo = ops.create_work_order("proj_a", "risky change")
     daemon.tick()

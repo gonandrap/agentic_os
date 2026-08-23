@@ -1182,7 +1182,12 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 "timeline": build_timeline(wo, store.list_events(args.wo_id),
                                            messages, include_debug=args.debug),
                 "messages": messages,
-                "assumptions": store.pending_assumptions(args.wo_id),
+                # EVERY assumption, each carrying its number. The timeline names them
+                # by number ("Assumption #2 recorded") and says nothing else about them,
+                # so a record listing only the undecided ones would leave the entry
+                # pointing at nothing as soon as it was decided. `status` is on each row,
+                # which is what still answers "what do I owe a decision on".
+                "assumptions": store.all_assumptions(args.wo_id),
                 # What this work order was allowed (or refused) permission to ship.
                 "gates": [
                     {k: a[k] for k in ("id", "kind", "command", "status", "escalated",

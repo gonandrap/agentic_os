@@ -7,7 +7,7 @@
 {% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
 {# #pending is the deep-link target used by notifications: it lands on whatever
    is actually waiting on the user, falling back to the reply box. #}
-{% set pending = 'assumptions' if assumptions else ('attention' if wo.needs_attention else 'reply') %}
+{% set pending = 'assumptions' if unreviewed else ('attention' if wo.needs_attention else 'reply') %}
 
 <h2><a href="/project/{{ project }}">{{ project }}</a> / <span class="mono">{{ wo.id }}</span></h2>
 <div class="panel" style="padding: 14px 16px;">
@@ -20,7 +20,7 @@
     {% if wo.status not in ('completed', 'failed', 'cancelled') %}
     {# Not offered while assumptions are pending: closing over them would accept them
        silently. The panel that decides them is further down this same page. #}
-    {% if not assumptions %}
+    {% if not unreviewed %}
     <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/done">
       <button class="accept" title="The work is finished — close this work order.
                                     Any worker still running is stopped.">
@@ -95,7 +95,7 @@
   {% if wo.needs_attention %}
     <p class="st tone-warn"{% if pending == 'attention' %} id="pending"{% endif %}>
       <span class="i">◭</span>{{ wo.attention_reason }}
-      {% if not assumptions %}
+      {% if not unreviewed %}
       <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/ack">
         <button title="Seen it — stop asking for me. The record stays; a new blocker
                        will still surface.">Got it</button>
@@ -145,20 +145,32 @@
   {% endif %}
 </div>
 
+{# EVERY assumption, not just the ones still owed a decision — and outside the tabs,
+   because while any is unreviewed this panel is the page's ask.
+
+   It lists the reviewed ones too because the timeline now names an assumption by number
+   and says nothing else about it. Listing only the pending ones would leave
+   "Assumption #2 recorded" pointing at nothing the moment #2 was decided, which is
+   worse than the duplication removing the text was meant to fix. #}
 {% if assumptions %}
-<h2{% if pending == 'assumptions' %} id="pending"{% endif %}>Assumptions pending your review</h2>
+{% set a_title = 'Assumptions pending your review' if unreviewed
+                 else 'Assumptions the worker recorded' %}
+<h2{% if pending == 'assumptions' %} id="pending"{% endif %}>{{ a_title }}</h2>
 <div class="panel">
-  {# NUMBERED, and the number is the one the timeline uses ("Assumption #2 recorded").
-     The timeline stopped repeating the text — this is the only place it is written —
-     so the number is what ties the two together, and `n` comes from the store rather
-     than from `loop.index` because this list is only the PENDING ones: numbering by
-     position here would call the second assumption "#1" the moment the first is
-     reviewed, and disagree with what the timeline already said. #}
+  {# The number is the one the timeline uses ("Assumption #2 recorded"), and it comes
+     from the store rather than from `loop.index`: this list can be filtered or a row
+     deleted, and a position recomputed here would disagree with what the timeline has
+     already said about an assumption nobody touched. #}
   {% for a in assumptions %}
   <div class="row"><span class="mono sub" style="min-width: 2.5em;">#{{ a.n }}</span>
     <div class="grow">{{ a.content }}</div>
+    {% if a.status != 'pending' %}
+    <span class="st tone-{{ 'ok' if a.status == 'accepted' else 'bad' }}">
+      <span class="i">{{ '✓' if a.status == 'accepted' else '✗' }}</span>{{ a.status }}</span>
+    {% endif %}
     <span class="sub mono">{{ fmt_age(a.ts) }} ago</span></div>
   {% endfor %}
+  {% if unreviewed %}
   <div class="row">
     <form method="post" action="/wo/{{ project }}/{{ wo.id }}/review"
           style="flex:1; display:flex; gap:8px; align-items:center">
@@ -170,6 +182,7 @@
   </div>
   <div class="row"><span class="sub">Rejecting without a reason keeps the work order
     flagged — send guidance below.</span></div>
+  {% endif %}
 </div>
 {% endif %}
 
