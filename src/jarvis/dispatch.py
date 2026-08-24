@@ -628,10 +628,22 @@ def _manager_prompt(wo: dict[str, Any], project: ProjectSpec,
         "`--parent` is what makes it part of the feature: the feature waits for it and "
         "shows it in its tree. Without the flag you would be filing unrelated work that "
         "the feature settles without. The worker who picks it up sees only that "
-        "description and has never read this conversation — brief it as a stranger. Then "
-        "resubmit the feature's evidence once they have landed. Judge the feedback rather "
-        "than obeying it: if an ask is wrong, say so in your answer and say what you did "
-        "instead.",
+        "description and has never read this conversation — brief it as a stranger. "
+        "Judge the feedback rather than obeying it: if an ask is wrong, say so in your "
+        "answer and say what you did instead.",
+        "",
+        "**Once they have landed, submit the feature for review again.** Nothing else "
+        "will: a feature order runs no session, so this is the only way it goes back to "
+        "the reviewer, and a feature nobody resubmits waits for ever.",
+        "",
+        f"    jarvis fo submit {fo_id} --summary \"<what changed since last time>\" \\",
+        "        --evidence \"<how the feature as a whole was verified>\"",
+        "",
+        "Wait until every work order under the feature is COMPLETED — a review reads the "
+        "code that has actually merged, so submitting while a child is still in flight "
+        "spends one of a small number of rounds on a diff that is missing the fix. The "
+        "reviewer compares your `--evidence` against that diff, so claim only what it "
+        "supports.",
         "",
         "## A deferral request",
         "A work order may report something worth doing that is not its job. File it on "

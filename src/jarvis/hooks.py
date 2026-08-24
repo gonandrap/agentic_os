@@ -214,7 +214,11 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
     try:
         grant = store.usable_grant(wo_id, action.kind, action.command)
         if grant is not None:
-            gates.open_gate(store, grant)
+            neo = NeoStore()
+            try:
+                gates.open_gate(store, grant, neo=neo)
+            finally:
+                neo.close()
             # Two things open a gate and only one of them is permission. Saying which is
             # which here matters because this string is the audit record of why the
             # command ran: "approved" against a command that was never privileged is the

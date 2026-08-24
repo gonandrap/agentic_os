@@ -53,6 +53,7 @@ from .dispatch import dispatch_work_order
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     ACTIVE_STATUSES,
+    FO_TERMINAL_STATUSES,
     OPEN_STATUSES,
     PRE_APPROVED_KEY,
     UNGOVERNED_ORIGINS,
@@ -122,6 +123,21 @@ REVIEW_FEEDBACK = """REVIEW FEEDBACK (round {n} of {max})
 
 Address this and then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."`
 again. Re-submitting without changed code or new evidence will end the review."""
+
+#: THE SAME REJECTION, ADDRESSED TO A DIFFERENT JOB. A manager does not fix code — it
+#: files work orders that do — so the closing instruction cannot be the implementor's, and
+#: a manager that read "address this" would go and edit the repository itself.
+#:
+#: The feature order id IS in the text, unlike the work-order wording where it is
+#: incidental: `jarvis fo submit` takes it as an argument, and the manager owns one
+#: feature but may be holding several messages about it.
+FEATURE_REVIEW_FEEDBACK = """REVIEW FEEDBACK ON THE FEATURE (round {n} of {max})
+{reason}
+
+Decide what actually has to change, file a work order under {fo_id} for each thing that
+does (`jarvis wo create <project> "..." --parent {fo_id}`), and once they have landed run
+`jarvis fo submit {fo_id} --summary "..." --evidence "..."`. Re-submitting without changed
+code or new evidence will end the review."""
 
 #: How many transport outages in a row one round survives before the OS gives up on it.
 #: An outage is not a verdict, so it consumes no round — but retrying for ever would
@@ -284,6 +300,11 @@ class Daemon:
                 # an earlier tick is already on its way to the worker, so the work order
                 # it rejected has left `validating` and is not looked at again here.
                 self.validation_tick(project, store)
+                # Beside its twin and for the same reason: an envelope a feature round
+                # posted on an earlier tick has already gone out to the manager above,
+                # so the feature it rejected has left `validating` and is not looked at
+                # again here. Both machines share one thread and one in-flight set.
+                self.feature_validation_tick(project, store)
                 # Before dispatch, not after: a planner filed this tick is an ordinary
                 # pending work order, so it is claimed by the same pass rather than
                 # waiting a whole poll interval to start.
@@ -467,7 +488,10 @@ class Daemon:
           count — the same strict rule Phase 1 shipped for dependency edges, and for the
           same reason: a feature is done when its code is on the default branch, not when
           it is sitting on branches. The merge poller closes each child a couple of
-          minutes after the user merges, so this costs nobody a step.
+          minutes after the user merges, so this costs nobody a step. With validation
+          enabled that ending becomes `validating` instead, and `completed` is reached
+          from the panel's pass — see `_route_to_validation`. Feature validation happens
+          HERE, after the merges, precisely so the diff it judges is real merged code.
         * **`failed` when ANY child is `failed` or `cancelled`.** Deliberately without
           the design's "and the remainder cannot proceed" qualifier: a feature with a
           dead child needs a human whichever siblings could still run, so the
@@ -499,12 +523,67 @@ class Daemon:
                 self._close_feature_manager(store, fo["id"])
                 log.info("[%s] feature %s failed: %s", project.name, fo["id"], reason)
             elif all(c["status"] == "completed" for c in children):
-                store.set_feature_status(fo["id"], "completed")
-                store.clear_feature_attention(fo["id"])
-                self._close_feature_manager(store, fo["id"])
-                self._close_feature_backlog(fo)
+                if self._route_to_validation(project, store, fo):
+                    continue
+                self._complete_feature(store, fo)
                 log.info("[%s] feature %s completed (%d work orders)", project.name,
                          fo["id"], len(children))
+
+    def _route_to_validation(self, project: ProjectSpec, store: ProjectStore,
+                             fo: dict) -> bool:
+        """Should this finished feature go to the panel instead of to `completed`?
+
+        True means it has been dealt with and `settle_features` must leave it alone —
+        EITHER because round 1 was just opened over the integrated diff, OR because a
+        round has already been judged and the feature is waiting on its manager to
+        resubmit. Those are one answer because they are the same fact: from the moment a
+        feature has a round, "every child is completed" stops being what settles it.
+
+        THE SECOND CASE IS WHAT MAKES THE LOOP TERMINATE. A rejection sends the feature
+        back to `executing` so the manager's remediation children can be dispatched, and
+        its children are all `completed` again the instant they land — so a version of
+        this that only asked "are the children done?" would re-open a round on the very
+        next tick with the identical fingerprint, escalate on the repeat, and cut the
+        manager out of its own loop. Resubmission is the manager's act (`jarvis fo
+        submit`), never the reconciler's.
+
+        Both switches are read here rather than in the round machine, for the reason the
+        whole design turns on: `enabled` gates OPENING a round and never settling one, so
+        a user who turns the panel off at three in the morning drains what is open and
+        strands nothing (see `validation_tick`). `feature_units` is the same switch one
+        level down — off, work orders still validate and features settle exactly as they
+        do today.
+        """
+        from . import ops
+
+        cfg = self.catalog.os.validation
+        if not (cfg.enabled and cfg.feature_units):
+            return False
+        if store.validation_rounds(fo_id=fo["id"]):
+            return True  # judged once already; the manager owns the next submission
+        try:
+            round_row = ops.submit_feature_for_validation(
+                store, project.path, fo, declared="", summary="", cfg=cfg)
+        except Exception:  # noqa: BLE001 — one feature must not cost the tick the rest
+            log.exception("[%s] could not open a validation round for %s",
+                          project.name, fo["id"])
+            return False
+        log.info("[%s] feature %s -> validating (round %d)", project.name, fo["id"],
+                 round_row["round"])
+        return True
+
+    def _complete_feature(self, store: ProjectStore, fo: dict) -> None:
+        """The one place a feature order ends successfully.
+
+        Two callers now — `settle_features` with validation off, and the round machine on
+        a pass — and they must land a feature in exactly the same state or the day
+        validation is enabled becomes the day backlog items stop closing. Same argument
+        as `ops.land_finished` makes for a work order, one level up.
+        """
+        store.set_feature_status(fo["id"], "completed")
+        store.clear_feature_attention(fo["id"])
+        self._close_feature_manager(store, fo["id"])
+        self._close_feature_backlog(fo)
 
     def _close_feature_manager(self, store: ProjectStore, fo_id: str) -> None:
         """End the project manager order when its feature ends, whichever way it ended.
@@ -812,7 +891,7 @@ class Daemon:
             # A REPEAT of the IMMEDIATELY PRECEDING round only. Compared against every
             # earlier round it would punish a submitter that was told to go back to a
             # shape it had already tried, which is a legitimate answer to feedback.
-            previous = self._preceding_round(store, wo_id, n)
+            previous = self._preceding_round(store, n, wo_id=wo_id)
             if previous and previous["fingerprint"] == round_row["fingerprint"]:
                 self._escalate(
                     store, wo, round_id, n,
@@ -865,10 +944,15 @@ class Daemon:
             store.close()
 
     @staticmethod
-    def _preceding_round(store: ProjectStore, wo_id: str,
-                         n: int) -> dict[str, Any] | None:
-        """The round before this one, by number. None for the first."""
-        for row in store.validation_rounds(wo_id=wo_id):
+    def _preceding_round(store: ProjectStore, n: int, *, wo_id: str | None = None,
+                         fo_id: str | None = None) -> dict[str, Any] | None:
+        """The round before this one, by number. None for the first.
+
+        Keyed the way every round query is — exactly one of `wo_id`/`fo_id` — because
+        both loops need it and a shared helper that silently accepted either column would
+        be the bad SELECT `ProjectStore._subject` exists to make impossible.
+        """
+        for row in store.validation_rounds(wo_id=wo_id, fo_id=fo_id):
             if int(row["round"]) == n - 1:
                 return row
         return None
@@ -960,6 +1044,266 @@ class Daemon:
 
         return lambda store, round_row, packet: validation.decide(
             store, round_row, packet, cfg)
+
+    # -- 3c. the same machine, one level up: feature orders ---------------------------
+
+    def feature_validation_tick(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Judge every FEATURE order parked in `validating`, off this thread.
+
+        The twin of `validation_tick`, and it does not read the kill switch either, for
+        the same reason: `enabled` and `feature_units` gate opening a round and never
+        settling one, so turning either off drains what is open instead of stranding it —
+        and stranding a feature strands its manager too, waiting for a message that would
+        never come.
+
+        `self.validating` is SHARED with the work-order machine and holds ids of both
+        kinds. That is safe rather than lucky: `db.new_id` prefixes every id with its
+        kind, so a `wo-` key and an `fo-` key cannot collide, and one set means one pool
+        and one re-entrancy rule to reason about instead of two.
+        """
+        for fo in store.list_feature_orders(statuses=("validating",)):
+            fo_id = fo["id"]
+            if fo_id in self.validating:
+                continue  # its round is in flight; a second tick must not start another
+            round_row = store.latest_validation_round(fo_id=fo_id)
+            if round_row is None:
+                # In `validating` with no round at all: nothing this machine can judge.
+                # INV-VALIDATION-STRANDED covers feature orders and is what finds these.
+                log.warning("[%s] feature %s is validating with no round on record",
+                            project.name, fo_id)
+                continue
+            if round_row["outcome"] not in ("pending", "failed"):
+                continue  # already judged — settlement is what moves it, not a re-run
+            self.validating.add(fo_id)
+            future = self.validate_pool.submit(
+                self._validate_feature, project, fo_id, int(round_row["id"]))
+            future.add_done_callback(
+                lambda f, k=fo_id: self.validating.discard(k))
+
+    def _validate_feature(self, project: ProjectSpec, fo_id: str,
+                          round_id: int) -> None:
+        """One feature round, start to finish (runs on the single validate thread).
+
+        Deliberately the same shape, the same order and the same refusals as
+        `_validate_work_order`, including its OWN store — a sqlite connection belongs to
+        the thread that made it. What differs is only what the two ends of the round are:
+        the packet is the integrated diff rather than one worktree's, and the rejection is
+        addressed to the role `manager` rather than `implementor`.
+
+        The one refusal that has no work-order equivalent is the NULL `base_sha`: a
+        feature order that predates the column has no honest base to diff from, and
+        guessing one produces a confidently wrong diff. It escalates without calling the
+        panel, exactly as an empty diff does and for the same reason — a reviewer handed
+        the wrong evidence will answer about the wrong evidence.
+        """
+        from . import ops
+
+        cfg = self.catalog.os.validation
+        store = ProjectStore(project.path)  # thread-local connection — see the docstring
+        try:
+            fo = store.get_feature_order(fo_id)
+            round_row = store.get_validation_round(round_id)
+            if round_row is None:  # pragma: no cover - deleted mid-flight
+                return
+            n, max_rounds = int(round_row["round"]), int(cfg.max_rounds)
+            packet = ops.collect_feature_evidence(
+                store, project.path, fo, declared=str(round_row["evidence"] or ""),
+                summary=str(round_row["summary"] or ""), cfg=cfg)
+
+            validator = (self.validator if self.validator is not None
+                         else self._validator(cfg))
+            if validator is None:
+                # Nothing to judge with — the panel is not wired in, or the user turned
+                # it off while this round was open. The feature settles exactly where it
+                # settles with validation off, which also closes its manager.
+                store.close_validation_round(round_id, "failed", NO_VALIDATOR_REASON)
+                ops.feature_event(store, fo_id, "validation_failed",
+                                  {"round": n, "cause": "no_validator",
+                                   "reason": NO_VALIDATOR_REASON, "feature_order": fo_id})
+                self._complete_feature(store, fo)
+                log.info("[%s] feature %s: round %d settled unjudged (no validator)",
+                         project.name, fo_id, n)
+                return
+
+            # NO MANAGER, NO LOOP. The manager order is the only addressee a feature-level
+            # rejection has, and it is also the only timeline a feature's events can be
+            # written to (`ops.feature_event`), so a feature without one can neither act
+            # on a verdict nor keep a retry budget. Escalating here rather than after the
+            # panel is Neo's ruling on question 153, and it is the same fail-safe as the
+            # two refusals below: never spend five headless calls to produce feedback
+            # nobody can read. Reachable in normal operation — a plan released while
+            # `enabled` was false has no manager, and the user can cancel one.
+            if store.manager_work_order(fo_id) is None:
+                self._escalate_feature(
+                    store, fo, round_id, n,
+                    "this feature order has no project manager work order, so a review "
+                    "that asked for changes would have nobody to act on it. Nobody has "
+                    "judged the work.")
+                return
+            if not packet.base:
+                self._escalate_feature(
+                    store, fo, round_id, n,
+                    "this feature order has no recorded base commit, so there is no "
+                    "honest way to say what it changed. It was released before the OS "
+                    "started recording one. Nobody has judged the work.")
+                return
+            if not packet.files:
+                self._escalate_feature(
+                    store, fo, round_id, n,
+                    "nothing has changed on the default branch since this feature "
+                    "started, so there is nothing to review. Nobody has judged the work.")
+                return
+
+            previous = self._preceding_round(store, n, fo_id=fo_id)
+            if previous and previous["fingerprint"] == round_row["fingerprint"]:
+                self._escalate_feature(
+                    store, fo, round_id, n,
+                    f"this submission is identical to round {previous['round']} — the "
+                    f"same integrated diff and the same declared evidence — so the "
+                    f"review has nothing new to judge.")
+                return
+
+            try:
+                verdict = validator(store, dict(round_row), packet)
+            except claude_cli.ClaudeCliError as e:
+                self._feature_outage(store, fo, round_id, n, e)
+                return
+
+            for seat in verdict.get("seats") or ():
+                store.record_validation_opinion(
+                    round_id, str(seat.get("seat") or ""),
+                    reply=str(seat.get("reply") or ""),
+                    verdict=str(seat.get("verdict") or ""),
+                    status=str(seat.get("status") or "ok"),
+                    model=str(seat.get("model") or ""),
+                    latency_ms=int(seat.get("latency_ms") or 0))
+            outcome = str(verdict.get("outcome") or "")
+            reason = str(verdict.get("reason") or "")
+
+            if outcome == "passed":
+                store.close_validation_round(round_id, "passed", reason)
+                ops.feature_event(store, fo_id, "validation_passed",
+                                  {"round": n, "round_id": round_id,
+                                   "feature_order": fo_id})
+                self._complete_feature(store, fo)
+                log.info("[%s] feature %s passed review in round %d",
+                         project.name, fo_id, n)
+            elif outcome == "rejected" and n < max_rounds:
+                self._reject_feature(store, fo, round_id, n, max_rounds, reason)
+                log.info("[%s] feature %s rejected in round %d of %d",
+                         project.name, fo_id, n, max_rounds)
+            elif outcome == "rejected":
+                # The last round it had, and it was refused. Telling the manager to
+                # remediate now would ask for a resubmission there is no round to judge.
+                self._escalate_feature(store, fo, round_id, n, reason or (
+                    f"the review was not satisfied after {max_rounds} rounds."))
+            else:
+                self._escalate_feature(store, fo, round_id, n, reason or (
+                    "the review could not reach a verdict."))
+        except Exception:  # noqa: BLE001 — a round must never kill the daemon
+            log.exception("[%s] validating feature %s failed", project.name, fo_id)
+        finally:
+            store.close()
+
+    @staticmethod
+    def _reject_feature(store: ProjectStore, fo: dict, round_id: int, n: int,
+                        max_rounds: int, reason: str) -> None:
+        """Close the round, tell the role `manager`, and put the feature back to work.
+
+        `executing`, not `validating`: the manager's answer to feedback is remediation
+        WORK ORDERS, and a feature that stayed in `validating` would hold children that
+        `dispatch_pending` never claimed. The round counter does NOT reset on the way
+        back — `counted_validation_rounds` counts judged rounds per subject and knows
+        nothing about status — which is the only thing standing between a manager that
+        keeps filing children and a loop that never ends.
+
+        The envelope names a ROLE and forgets, exactly as the work-order machine does.
+        Whether a manager exists, and what happens when one does not, is the router's
+        business: `bus._unfilled` marks the envelope undeliverable AND flags the feature,
+        so a feature whose manager is gone reaches the user without this knowing that
+        managers can be gone.
+        """
+        from . import ops
+
+        fo_id = fo["id"]
+        store.close_validation_round(round_id, "rejected", reason)
+        ops.feature_event(store, fo_id, "validation_rejected",
+                          {"round": n, "round_id": round_id, "of": max_rounds,
+                           "feature_order": fo_id})
+        bus.post(store, subject=bus.Subject(fo_id=fo_id),
+                 from_role="reviewer", to_role="manager",
+                 payload=bus.ReviewFeedback(
+                     round=n, outcome="rejected",
+                     reason=FEATURE_REVIEW_FEEDBACK.format(n=n, max=max_rounds,
+                                                           reason=reason, fo_id=fo_id)))
+        store.set_feature_status(fo_id, "executing")
+        store.clear_feature_attention(fo_id)
+
+    @staticmethod
+    def _escalate_feature(store: ProjectStore, fo: dict, round_id: int, n: int,
+                          reason: str) -> None:
+        """Give up on this feature and ask the user.
+
+        THE FLAG GOES ON THE FEATURE ORDER, not on its manager: the manager is a session
+        the OS opened to run this loop, and pointing the user at it would send them to
+        read a conversation whose whole story is already written down in the rounds.
+
+        The feature stays `validating`. There is no feature-order equivalent of a work
+        order's `needs_review` — `FO_STATUSES` has none, deliberately — and the flag is
+        what the user reads, not the status: `flagged_feature_orders` is not filtered by
+        status, `jarvis status` surfaces it, and the round machine will not pick the
+        feature up again because its latest round is `escalated` rather than `pending`.
+
+        `VALIDATION_STUCK_BLOCKER` VERBATIM, for symmetry with the work-order machine.
+        `true_blockers` never sees a feature order — it answers "what does this WORK
+        ORDER need from me" — so nothing rewrites this reason, but two units giving up
+        for the same cause must say the same words to the user.
+        """
+        from . import ops
+        from .invariants import VALIDATION_STUCK_BLOCKER
+
+        fo_id = fo["id"]
+        store.close_validation_round(round_id, "escalated", reason)
+        ops.feature_event(store, fo_id, "validation_escalated",
+                          {"round": n, "round_id": round_id, "reason": reason,
+                           "feature_order": fo_id})
+        store.flag_feature_attention(fo_id, VALIDATION_STUCK_BLOCKER)
+
+    def _feature_outage(self, store: ProjectStore, fo: dict, round_id: int, n: int,
+                        error: Exception) -> None:
+        """The validator could not be reached. A transport failure, NOT a verdict.
+
+        The round is closed `failed`, which `counted_validation_rounds` ignores, so the
+        outage costs the feature no round: the next tick picks the same round up and tries
+        again, three times, counted from the events so a daemon restart does not hand it a
+        fresh budget.
+
+        The events it is counted from live on the MANAGER's timeline
+        (`ops.feature_event`), because `wo_events.wo_id` is a foreign key into
+        `work_orders` and a feature order cannot be its own carrier. `_validate_feature`
+        refuses to call the panel at all without a manager, so by the time an outage can
+        happen the carrier exists — and `not recorded` is the backstop for that being
+        wrong, because the failure it would otherwise produce is a round retrying for ever
+        against a budget that always reads one.
+        """
+        from . import ops
+
+        fo_id = fo["id"]
+        outages = 1 + sum(
+            1 for e in ops.feature_events_of_kind(store, fo_id, "validation_failed")
+            if db.from_json(e["payload"], {}).get("round") == n
+            and db.from_json(e["payload"], {}).get("cause") == "transport")
+        store.close_validation_round(
+            round_id, "failed", f"the validator could not be reached: {error}")
+        recorded = ops.feature_event(
+            store, fo_id, "validation_failed",
+            {"round": n, "cause": "transport", "attempt": outages,
+             "error": str(error)[:500], "feature_order": fo_id})
+        if outages >= VALIDATION_OUTAGE_LIMIT or not recorded:
+            self._escalate_feature(
+                store, fo, round_id, n,
+                f"the review could not be run: the validator was unreachable "
+                f"{outages} times in a row. Nobody has judged the work.")
 
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                  msgs: list[dict[str, Any]]) -> None:
@@ -1562,9 +1906,23 @@ class Daemon:
             # below would file that as `needs_review — worker idle without jarvis wo
             # finish` on the manager's very first turn and again after every message it
             # handled, so every feature order in the fleet would carry a permanent false
-            # flag. It never finishes itself either: `settle_features` completes it when
-            # its feature settles.
-            if fresh["status"] != "waiting_input":
+            # flag. It never finishes itself either: `_close_feature_manager` completes
+            # it when its feature settles.
+            #
+            # UNLESS ITS FEATURE IS ALREADY OVER, and that ordering is one the feature
+            # round machine makes reachable. A manager is created `pending` and claimed
+            # by `dispatch_pending`; a feature settling on the VALIDATE thread can close
+            # a manager the tick thread is claiming in the same moment, and the claim
+            # lands last. Parking that manager in `waiting_input` would leave exactly the
+            # row `_close_feature_manager` exists to prevent — an open work order against
+            # a closed feature, with nothing left that would ever look at it again.
+            # Re-derived from the feature rather than guarded with a lock: noticing is
+            # what a reconciler is for.
+            parent = wo.get("parent_id")
+            feature = store.get_feature_order(parent) if parent else None
+            if feature and feature["status"] in FO_TERMINAL_STATUSES:
+                self._close_feature_manager(store, str(parent))
+            elif fresh["status"] != "waiting_input":
                 store.set_status(wo["id"], "waiting_input")
         else:
             store.set_status(wo["id"], "needs_review")
