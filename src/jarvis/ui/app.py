@@ -23,7 +23,7 @@ from ..project_store import (
     WO_STATUSES,
     ProjectStore,
 )
-from ..timeline import build_timeline, count_debug
+from ..timeline import build_conversation, build_timeline, count_debug
 
 TEMPLATES = Path(__file__).parent / "templates"
 
@@ -578,7 +578,10 @@ def create_app() -> FastAPI:
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug),
                       debug=show_debug, debug_count=count_debug(events),
-                      messages=messages, assumptions=assumptions, unreviewed=unreviewed,
+                      # What was said, and what happened — two readings of one record,
+                      # neither derivable from the other. See `timeline`'s docstring.
+                      conversation=build_conversation(events, messages),
+                      assumptions=assumptions, unreviewed=unreviewed,
                       approvals=approvals, bill=bill,
                       turn_lines=turn_lines_by_message(bill))
 

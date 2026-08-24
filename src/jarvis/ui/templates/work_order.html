@@ -233,7 +233,7 @@
   <div class="tabs" role="tablist">
     <button role="tab" data-panel="tab-conversation" aria-selected="true"
             aria-controls="tab-conversation">Conversation
-      {%- if messages %}<span class="n">{{ messages|length }}</span>{% endif %}</button>
+      {%- if conversation %}<span class="n">{{ conversation|length }}</span>{% endif %}</button>
     {% if bill and bill.turns %}
     <button role="tab" data-panel="tab-spend" aria-selected="false"
             aria-controls="tab-spend">Spend
@@ -248,20 +248,27 @@
 
 <h2>Conversation</h2>
 <div class="panel">
-  {% for msg in messages %}
-  {# Who spoke, from the message's own `source` — same rule as `timeline._message_label`. #}
-  {% set who = ('neo → worker' if msg.source == 'neo' else 'you → worker')
-                if msg.direction == 'user_to_agent' else 'worker → you' %}
-  <div class="msg {{ 'user' if msg.direction == 'user_to_agent' }}">
-    <div class="who">{{ who }}
-      · via {{ msg.source }} · {{ msg.status }} · {{ fmt_age(msg.ts) }} ago
+  {# Every turn, whoever took it — `timeline.build_conversation`, which is also where
+     the speaker label is decided. The worker's question to Neo is one of these: it is
+     a `wo_events` row rather than a message, and rendering `messages` alone opened this
+     panel on Neo's answer to a question that appeared nowhere on the page. #}
+  {% for turn in conversation %}
+  {# `id` is the anchor the timeline's `{"kind": "message", …}` ref resolves to, so it
+     is what makes "in the conversation" a link and not a promise. #}
+  <div class="msg {{ 'user' if turn.inbound }}"{% if turn.anchor %} id="{{ turn.anchor }}"{% endif %}>
+    <div class="who">{{ turn.who }}
+      {%- if turn.source %} · via {{ turn.source }}{% endif %}
+      {%- if turn.status %} · {{ turn.status }}{% endif %} · {{ fmt_age(turn.ts) }} ago
+      {#- Straight to the deliberation that produced the answer below. -#}
+      {%- if turn.ref and turn.ref.kind == 'neo_question' %}
+      · <a href="/neo/question/{{ turn.ref.id }}">{{ turn.ref.label }} →</a>{% endif %}
       {#- What answering this message cost. It is the TURN's line, not a second
           accounting of the message: a message is an ask, and the turn it set going is
           what was paid for. Shown here because this is where the reader already is. -#}
-      {%- set line = turn_lines.get(msg.id) %}
+      {%- set line = turn_lines.get(turn.msg_id) %}
       {%- if line %} · <span class="mono">{{ bill_ui.money(line.cost.list_usd) }}
         · {{ fmt_tok(line.tokens.total) }} tokens</span>{% endif %}</div>
-    <div style="white-space: pre-wrap;">{{ msg.content }}</div>
+    <div style="white-space: pre-wrap;">{{ turn.content }}</div>
     {% if line %}
     <details style="margin-top: 6px;">
       <summary class="sub">what {{ line.label }} cost — the same line as on the bill</summary>
@@ -270,7 +277,7 @@
     {% endif %}
   </div>
   {% else %}
-  <div class="empty">no messages yet</div>
+  <div class="empty">nothing said yet</div>
   {% endfor %}
   <div class="msg"{% if pending == 'reply' %} id="pending"{% endif %}>
     <form method="post" action="/wo/{{ project }}/{{ wo.id }}/send">
@@ -301,9 +308,14 @@
     {% for e in timeline %}
     <li{% if e.level == 'debug' %} class="dbg"{% endif %}>
       {{ fmt_age(e.ts) }} ago — <strong>{{ e.label }}</strong>
-      {#- What the entry points at instead of reproducing (`timeline._ref`). -#}
+      {#- What the entry points at instead of reproducing it. The refs are
+          surface-neutral (`timeline._ref`, `timeline._message_ref`); this is the
+          dashboard resolving them. `#msg-…` is a conversation turn, and the tab script
+          below opens whichever panel the anchor is in. -#}
       {%- if e.ref and e.ref.kind == 'neo_question' %}
-      <a href="/neo/question/{{ e.ref.id }}">{{ e.ref.label }} →</a>{% endif %}
+      <a href="/neo/question/{{ e.ref.id }}">{{ e.ref.label }} →</a>
+      {%- elif e.ref and e.ref.kind == 'message' %}
+      <a href="#msg-{{ e.ref.id }}">{{ e.ref.label }} →</a>{% endif %}
       {%- if e.detail %}
       <span class="detail" style="white-space: pre-wrap;">{{ e.detail }}</span>{% endif %}
     </li>
