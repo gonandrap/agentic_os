@@ -867,23 +867,31 @@ def create_app() -> FastAPI:
             return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
         return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
 
+    def _neo_back(next: str) -> str:
+        """Where a Neo decision returns the reader — `/neo` or the page they decided
+        from. Same-site paths only, as in `decide_gate`: a form field is
+        attacker-settable and an open redirect is not worth the convenience."""
+        return next if next.startswith("/") and not next.startswith("//") else "/neo"
+
     @app.post("/neo/{question_id}/review")
     def neo_review(question_id: int, decision: str = Form(...),
-                   feedback: str = Form("")):
+                   feedback: str = Form(""), next: str = Form("")):
+        back = _neo_back(next)
         try:
             ops.neo_review(question_id, approved=(decision == "approve"),
                            feedback=feedback)
         except ops.OpsError as e:
-            return RedirectResponse(f"/neo?error={e}", status_code=303)
-        return RedirectResponse("/neo", status_code=303)
+            return RedirectResponse(f"{back}?error={e}", status_code=303)
+        return RedirectResponse(back, status_code=303)
 
     @app.post("/neo/{question_id}/answer")
-    def neo_answer(question_id: int, text: str = Form(...)):
+    def neo_answer(question_id: int, text: str = Form(...), next: str = Form("")):
+        back = _neo_back(next)
         try:
             ops.neo_answer_escalated(question_id, text)
         except ops.OpsError as e:
-            return RedirectResponse(f"/neo?error={e}", status_code=303)
-        return RedirectResponse("/neo", status_code=303)
+            return RedirectResponse(f"{back}?error={e}", status_code=303)
+        return RedirectResponse(back, status_code=303)
 
     @app.post("/neo/learn")
     def neo_learn(content: str = Form(...), project: str = Form("")):

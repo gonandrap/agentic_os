@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_question.html" import question_body, deliberation %}
+{% from "_question.html" import question_body, deliberation, answer_form, review_form %}
 {% block title %}question #{{ q.id }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -7,7 +7,7 @@
    The timeline used to print the question inline, directly above the answer arriving as
    a message, so the reader read the exchange twice and still had to go elsewhere to see
    whether Neo's answer had been reviewed. This is that elsewhere: the question, the
-   answer, who gave it, and what the panel did, in one place. #}
+   answer, who gave it, what the panel did — and the decision itself, in one place. #}
 
 <h2><a href="/neo">neo</a> / <span class="mono">question #{{ q.id }}</span></h2>
 
@@ -33,21 +33,27 @@
     {%- if q.answered_by == 'neo' %} ·
     {% if q.review_status == 'approved' %}<span class="st tone-ok"><span class="i">✓</span>you approved this</span>
     {% elif q.review_status == 'corrected' %}<span class="st tone-warn"><span class="i">✎</span>you corrected this</span>
-    {% else %}<span class="st tone-muted"><span class="i">◌</span>awaiting your review —
-      <a href="/neo">review it →</a></span>{% endif %}
+    {% else %}<span class="st tone-muted"><span class="i">◌</span>awaiting your review</span>{% endif %}
     {%- endif %}
   </p>
   {% if q.answer_reason %}<p class="sub">Reasoning: {{ q.answer_reason }}</p>{% endif %}
+  {% if q.answered_by == 'neo' and q.review_status == 'unreviewed' %}
+  {{ review_form(q, '/neo/question/' ~ q.id) }}
+  {% endif %}
   {% else %}
   {# Not an error, and worth saying which kind of "not yet" this is: a worker is parked
      on it either way, and only one of the two is waiting on the user. #}
   <div class="empty">
     {%- if q.status in ('escalated', 'failed') -%}
-      not answered yet — Neo escalated this to you. <a href="/neo">answer it →</a>
+      not answered yet — Neo escalated this to you.
     {%- else -%}
       not answered yet — still with Neo.
     {%- endif -%}
   </div>
+  {% if q.status in ('escalated', 'failed') %}
+  <div class="sub">Why escalated: {{ q.answer_reason or '—' }}</div>
+  {{ answer_form(q, '/neo/question/' ~ q.id) }}
+  {% endif %}
   {% endif %}
 </div>
 

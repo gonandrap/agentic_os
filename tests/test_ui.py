@@ -308,6 +308,81 @@ def test_a_question_that_does_not_exist_says_so(client):
     assert "not found" in r.text
 
 
+def test_the_question_page_reviews_the_answer_and_stays_put(client, daemon, project):
+    """The timeline sends the reader here; the decision has to be here too.
+
+    `/neo` is a list with no anchor, so the link this page used to carry landed them on
+    somebody else's question — reported by the user against wo-01d30340.
+    """
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "CSV or JSON?")
+    daemon._neo_drain()
+
+    page = client.get("/neo/question/1").text
+    assert 'action="/neo/1/review"' in page
+    assert 'href="/neo"' in page  # the breadcrumb stays; the "go elsewhere" link doesn't
+    assert "review it →" not in page
+
+    r = client.post("/neo/1/review", data={"decision": "correct",
+                                           "feedback": "CSV. Always CSV.",
+                                           "next": "/neo/question/1"})
+    assert r.status_code == 303
+    assert r.headers["location"] == "/neo/question/1"
+    from jarvis.neo_store import NeoStore
+    neo = NeoStore()
+    try:
+        assert neo.get(1)["review_status"] == "corrected"
+    finally:
+        neo.close()
+    assert "you corrected this" in client.get("/neo/question/1").text
+
+
+def test_the_question_page_answers_an_escalation_and_stays_put(client, daemon, project):
+    wo = ops.create_work_order("proj_a", "prod thing")
+    daemon.tick()
+    ops.ask_question(wo["id"], "FORCE_ESCALATE: touch prod?")
+    daemon._neo_drain()
+
+    page = client.get("/neo/question/1").text
+    assert 'action="/neo/1/answer"' in page
+    assert "answer it →" not in page
+
+    r = client.post("/neo/1/answer", data={"text": "No. Wait for the window.",
+                                           "next": "/neo/question/1"})
+    assert r.status_code == 303
+    assert r.headers["location"] == "/neo/question/1"
+    store = ProjectStore(project)
+    try:
+        contents = [m["content"] for m in store.queued_messages(wo["id"])]
+        assert any("Wait for the window" in c for c in contents)
+    finally:
+        store.close()
+
+
+def test_a_neo_decision_will_not_redirect_off_site(client, daemon, project):
+    """`next` is attacker-settable, exactly as on the gates form."""
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "CSV or JSON?")
+    daemon._neo_drain()
+
+    r = client.post("/neo/1/review", data={"decision": "approve",
+                                           "next": "//evil.example/steal"})
+    assert r.headers["location"] == "/neo"
+
+
+def test_the_question_page_sends_a_gate_request_to_the_gates_tab(gated):
+    """An approval question carries a gate the textarea cannot open — the branch
+    `neo.html` has always had, now that this page renders the controls too."""
+    gated.request()
+    gated.daemon._neo_drain()  # the fake model escalates by default
+
+    page = gated.client.get("/neo/question/1").text
+    assert 'action="/neo/1/answer"' not in page
+    assert "decide it on the gates tab" in page
+
+
 def test_assumptions_are_numbered_to_match_the_timeline(client, daemon, project):
     """The timeline says "Assumption #2 recorded" and never the text, so the number is
     the only thing tying an entry to the paragraph it is about."""
