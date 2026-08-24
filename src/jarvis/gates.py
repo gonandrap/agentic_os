@@ -61,6 +61,7 @@ from .gate_rules import (  # re-exported: this is still the module callers impor
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .central_store import CentralStore
+    from .neo_store import NeoStore
     from .project_store import ProjectStore
 
 __all__ = [
@@ -517,7 +518,8 @@ def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any]
 # -- opening the gate ------------------------------------------------------------------
 
 
-def open_gate(store: ProjectStore, grant: dict[str, Any]) -> dict[str, Any]:
+def open_gate(store: ProjectStore, grant: dict[str, Any],
+              neo: NeoStore | None = None) -> dict[str, Any]:
     """Spend one use of a grant, and close the requests it has just made moot.
 
     The second half is what stops a work order finishing while a gate for the very action
@@ -550,6 +552,17 @@ def open_gate(store: ProjectStore, grant: dict[str, Any]) -> dict[str, Any]:
             f"{approval['id']}, which this command only wraps — nothing is left to "
             f"authorise or refuse, and no authorisation is implied by closing it"
         ))
+        # The approval closes; its Neo question does not, and if Neo had escalated that
+        # question it went on asking the user to rule on an action that had already run
+        # (production question 118, still in the attention list a week later). Only
+        # `decide_gate` ever closed one of these, and this path is not it.
+        if neo is not None and pending["neo_question_id"]:
+            neo.supersede(
+                pending["neo_question_id"],
+                f"SUPERSEDED by approval {approval['id']}",
+                f"the {approval['kind']} action ran under approved request "
+                f"{approval['id']}; nothing here authorises anything",
+            )
     return approval
 
 

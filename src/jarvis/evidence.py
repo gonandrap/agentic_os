@@ -2,9 +2,13 @@
 
 A work order settles on its own word today. The validation panel replaces that with a
 reviewer that never met the worker, and this module is the only thing standing between
-the two: it assembles, from a work order's git worktree, the packet the seats read, and
-it fingerprints that packet so a resubmission that produced nothing new can be told apart
-from one that did.
+the two: it assembles the packet the seats read, and it fingerprints that packet so a
+resubmission that produced nothing new can be told apart from one that did.
+
+Two collectors, one packet. `collect_work_order` reads a work order's own worktree;
+`collect_feature` reads the project root, because the question a feature-level panel
+exists to answer — do these children add up, and do they collide — is only answerable
+where the children's work has actually met.
 
 ## Why this module imports almost nothing
 
@@ -42,6 +46,9 @@ two commands, never one:
 
 Both halves, concatenated. A worker that forgot to commit has still produced the change,
 and dropping the second half is invisible in every test that only commits.
+
+The SAME ladder resolves a feature's head (`default_branch_head`), one step further to a
+sha. A feature has no second half: see `collect_feature`.
 """
 
 from __future__ import annotations
@@ -64,9 +71,9 @@ DEFAULT_DIFF_CHARS = 60000
 class EvidencePacket:
     """One submission, as the panel sees it.
 
-    `unit` and `children` are the seam for the feature-order collector that a later work
-    order adds to this module: a feature's packet is the same shape with `unit="feature"`
-    and one entry per merged child. For a work order `children` is always `()`.
+    `unit` and `children` are what tell the two collectors apart: a feature's packet is
+    the same shape with `unit="feature"` and one entry per merged child. For a work order
+    `children` is always `()`.
     """
 
     unit: str                       # "work_order" | "feature"
@@ -173,6 +180,98 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
         dropped_files=dropped,
         diff_sha=hashlib.sha256(diff.encode("utf-8")).hexdigest(),
     )
+
+
+def collect_feature(project_path: Path, fo: dict[str, Any], children: list[dict[str, Any]],
+                    *, declared: str, summary: str = "",
+                    diff_chars: int = DEFAULT_DIFF_CHARS) -> EvidencePacket:
+    """Assemble the packet for one feature order, from the PROJECT ROOT.
+
+    Every child passed its own review on its own diff, so the marginal defect a
+    feature-level panel can find is an INTEGRATION defect: two children each correct
+    alone and wrong together. That is only visible in one place — the default branch,
+    where the children's work has actually met — so this collector reads the project
+    checkout and never a worktree.
+
+    **The range is `base_sha...<default branch head>` and there is no working-tree half.**
+    A work order's packet adds `git diff HEAD` because a worker that forgot to commit has
+    still produced the change; the project root has no such excuse. Whatever is
+    uncommitted there belongs to the user's own session, and shipping it to a panel as
+    the feature's evidence would be the same silent lie `collect_work_order` refuses to
+    tell when a worktree is missing.
+
+    **A NULL `base_sha` yields an EMPTY packet, and no git command is run.** Feature
+    orders that predate the column have none, and the alternatives are all guesses: the
+    project's first commit, the oldest child's branch point, `HEAD~n`. A guessed base
+    produces a diff that is confidently wrong — the wrong files, plausibly sized, with
+    nothing on its face to say so — which is strictly worse for a reviewer than no diff
+    at all. The round machine escalates on `files == ()` and a human looks.
+
+    `children` are the feature's child work-order rows. Each contributes its title, its
+    `result_summary` and, under the key `declared`, what its own last validation round
+    was told — assembled by the caller, because this module may not read a store.
+
+    **`summary` is a parameter here and a column there**, and that asymmetry is the point:
+    a work order's `--summary` is written to `work_orders.result_summary` before its
+    packet is collected, so `collect_work_order` reads the row. A feature order has no
+    such column — the manager's `--summary` lives on the round it opened — so a collector
+    that only read `fo` would drop it, and the seats would judge a submission whose author
+    said nothing about it. That is the silent-data-loss shape the design doc's 2026-08-22
+    correction names, arriving exactly where it said it would.
+    """
+    base = str(fo.get("base_sha") or "")
+    head = default_branch_head(project_path) if base else ""
+    stat = diff = ""
+    files: tuple[str, ...] = ()
+    if base and head:
+        rng = f"{base}...{head}"
+        stat = _git(project_path, *_diff_args(rng, "--stat"))
+        diff = _git(project_path, *_diff_args(rng))
+        files = _dedupe(_git(project_path, *_diff_args(rng, "--name-only")).split("\n"))
+
+    kept, truncated, dropped = _truncate(diff, diff_chars, files)
+    return EvidencePacket(
+        unit="feature",
+        subject_id=str(fo.get("id") or ""),
+        title=str(fo.get("title") or ""),
+        description=str(fo.get("description") or ""),
+        summary=summary,
+        declared=declared,
+        # A feature order never has a pull request of its own: its children each opened
+        # one and the user merged them, which is precisely what made this diff exist.
+        pr_url="",
+        base=base,
+        head=head,
+        stat=stat,
+        files=files,
+        diff=kept,
+        diff_truncated=truncated,
+        dropped_files=dropped,
+        diff_sha=hashlib.sha256(diff.encode("utf-8")).hexdigest(),
+        children=tuple(
+            {"id": str(c.get("id") or ""), "title": str(c.get("title") or ""),
+             "summary": str(c.get("result_summary") or ""),
+             "declared": str(c.get("declared") or "")}
+            for c in children),
+    )
+
+
+def default_branch_head(repo: Path) -> str:
+    """The sha the default branch points at right now, or "" if there is no answer.
+
+    The SAME pinned ladder `collect_work_order` resolves a merge base with
+    (`_resolve_base`), resolved one step further to a sha. Two uses, one ladder: a
+    feature whose `base_sha` was recorded against `origin/main` and whose head was later
+    read off `main` would diff two different branches and blame the difference on the
+    feature.
+
+    "" when the ladder finds nothing, and the caller must treat that as "no diff" rather
+    than falling back to `HEAD`. On a checkout with no default branch, `HEAD` is whatever
+    the user last checked out — which is exactly the confidently-wrong base this module
+    refuses to invent.
+    """
+    ref = _resolve_base(repo)
+    return _git(repo, "rev-parse", ref).strip() if ref else ""
 
 
 # --------------------------------------------------------------------------- internals

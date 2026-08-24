@@ -178,6 +178,8 @@
   .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--amber); }
   .tabs .n { font-weight: 400; letter-spacing: 0; color: var(--ink-3); margin-left: 6px;
              text-transform: none; }
+  /* A count is how an ask stays visible from inside a closed panel. */
+  .tabs .n.hot { color: var(--amber); font-weight: 600; }
   .tabbed.js > .tabpanel { display: none; }
   .tabbed.js > .tabpanel.on { display: block; }
   /* Stacked, each panel carries its own heading; with tabs the strip is the heading. */
@@ -213,5 +215,48 @@
   {% endif %}
   {% block content %}{% endblock %}
 </div>
+<script>
+// Tabs, for every `.tabbed` container on the page. Nothing is hidden until `.js` is on
+// the container — §6 of docs/superpowers/specs/2026-08-23-the-work-order-record.md.
+(function () {
+  var roots = document.querySelectorAll('.tabbed');
+  if (!roots.length) return;
+
+  function show(root, id) {
+    var found = false;
+    root.querySelectorAll(':scope > .tabpanel').forEach(function (p) {
+      var on = p.id === id;
+      p.classList.toggle('on', on);
+      found = found || on;
+    });
+    if (!found) return false;
+    root.querySelectorAll(':scope > .tabs button').forEach(function (t) {
+      t.setAttribute('aria-selected', t.dataset.panel === id ? 'true' : 'false');
+    });
+    return true;
+  }
+
+  roots.forEach(function (root) {
+    root.classList.add('js');
+    root.querySelectorAll(':scope > .tabs button').forEach(function (t) {
+      t.addEventListener('click', function () { show(root, t.dataset.panel); });
+    });
+  });
+
+  // Open whichever panel holds the hash target. On load AND on hashchange — §6.
+  function follow() {
+    var id = location.hash.slice(1);
+    if (!id) return;
+    var target = document.getElementById(id);
+    if (!target) return;
+    var panel = target.closest('.tabpanel');
+    if (!panel) return;
+    var root = panel.closest('.tabbed');
+    if (root && show(root, panel.id)) target.scrollIntoView();
+  }
+  follow();
+  window.addEventListener('hashchange', follow);
+})();
+</script>
 </body>
 </html>

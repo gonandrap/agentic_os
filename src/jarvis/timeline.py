@@ -1,15 +1,24 @@
-"""Work order timeline: the story, not the plumbing.
+"""A work order's record, in two readings.
 
-`wo_events` records everything that happens to a work order, which mixes two very
-different audiences. The user wants the story — what was asked, what the worker
-decided, what came back. The rest (message delivery bookkeeping, Claude Code session
-hooks, turn boundaries, session binding) exists to debug the circuitry.
+`build_conversation` is **what was said** — the exchange, in order, whoever spoke.
+`build_timeline` is **what happened** — the sequence of events, each one pointing at
+the record that holds the detail rather than reproducing it
+(docs/superpowers/specs/2026-08-23-the-work-order-record.md §1, §3).
 
-`build_timeline` merges events with the actual conversation and renders each entry as
-prose. Debug entries are held back unless explicitly requested.
+The two are not the same list rendered twice. Neither is complete without the other,
+and each has exactly one thing the other must not carry:
 
-An entry says WHAT HAPPENED and points at records rather than reproducing them:
-docs/superpowers/specs/2026-08-23-the-work-order-record.md §1, §3.
+- The worker's question to Neo is a `wo_events` row, never a message. Read the
+  messages alone and Neo's answer arrives with nothing above it to answer, which is
+  what the conversation showed until `build_conversation` existed.
+- A message body belongs to the conversation. Merged into the timeline as well — as
+  every message was — the timeline becomes a second, worse copy of it.
+
+See docs/superpowers/specs/2026-08-24-the-conversation-owns-what-was-said.md.
+
+`wo_events` also mixes two audiences. The user wants the story; the rest (message
+delivery bookkeeping, Claude Code session hooks, turn boundaries, session binding)
+exists to debug the circuitry, and is held back unless explicitly requested.
 """
 
 from __future__ import annotations
@@ -87,7 +96,13 @@ def _neo_question_id(p: dict[str, Any]) -> int | None:
 
 
 def _ref(kind: str, p: dict[str, Any]) -> dict[str, Any] | None:
-    """The record this entry points at, or None. Surface-neutral by design — §3."""
+    """The record this entry points at, or None. Surface-neutral by design — §3.
+
+    Never a URL and never an anchor: the dashboard resolves a `neo_question` to
+    `/neo/question/<id>` and a `message` to the conversation turn `build_conversation`
+    gave the same id, while `jarvis wo show` prints the label and the CLI's own
+    commands reach the same two records.
+    """
     if kind == "question_asked":
         qid = _neo_question_id(p)
         if qid is not None:
@@ -143,10 +158,10 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         n = p.get("n")  # the number, not the text — §4
         return (f"Assumption #{n} recorded" if n else "Assumption recorded"), ""
     if kind == "question_asked":
-        # `_ref` is the way to it; the text is the fallback when there is no id — §3.
-        if _neo_question_id(p) is not None:
-            return "Worker asked a question", ""
-        return "Worker asked a question", str(p.get("question") or "")
+        # Never the text, with or without an id: the conversation renders the ask from
+        # this same payload, so a fallback here would print it twice on one page. `_ref`
+        # is the way to the question's own record, where the ANSWER is beside it.
+        return "Worker asked a question", ""
     # Debug (see DEBUG_KINDS); they still render, with no detail, when asked for.
     if kind == "neo_answered":
         return "Neo answered the worker", ""
@@ -265,23 +280,106 @@ UNAUTHORED_SOURCES = frozenset({"pr-conflict"})
 
 
 def _message_label(m: dict[str, Any]) -> str:
-    """Who is speaking, from the message's own `source` — §5."""
+    """Who is speaking, from the message's own `source` — §5.
+
+    The conversation's label: two parties and an arrow, because the reader is looking
+    at the words. The timeline wants a sentence instead; see `_message_event_label`.
+    """
     if m.get("direction") != "user_to_agent":
-        return "Worker → you"
+        return "worker → you"
     if m.get("source") == "neo":
-        return "Neo → worker"
+        return "neo → worker"
     if m.get("source") in UNAUTHORED_SOURCES:
-        return "Jarvis → worker"
-    return "You → worker"
+        return "jarvis → worker"
+    return "you → worker"
+
+
+def _message_event_label(m: dict[str, Any]) -> str:
+    """What happened, for the timeline — the same `source` rule, worded as an event.
+
+    A timeline entry is a sentence about a moment, not a speaker tag: the body it used
+    to carry is a click away in the conversation, and "Neo → worker" over an empty
+    detail says less than "Neo answered the worker" does.
+    """
+    if m.get("direction") != "user_to_agent":
+        return "Worker replied"
+    if m.get("source") == "neo":
+        # `source="neo"` is written in exactly one place (`daemon._neo_drain`), and only
+        # for the message carrying an answer — so this cannot mislabel anything else.
+        return "Neo answered the worker"
+    if m.get("source") in UNAUTHORED_SOURCES:
+        return "Jarvis messaged the worker"
+    return "You messaged the worker"
+
+
+def _message_ref(m: dict[str, Any]) -> dict[str, Any] | None:
+    """The conversation turn this entry points at, or None if it has no id.
+
+    Corollary 1 of §1 in reverse: an id that cannot be resolved is not a pointer, so a
+    message the store never gave an id keeps its text on the timeline instead.
+    """
+    mid = m.get("id")
+    if mid is None:
+        return None
+    return {"kind": "message", "id": mid, "label": "in the conversation"}
+
+
+def build_conversation(events: list[dict[str, Any]],
+                       messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Everything that was SAID about this work order, in the order it was said.
+
+    Messages are only half of it. The worker's question to Neo is a `question_asked`
+    event — `ops.neo_ask` writes the text into its payload precisely so that a record
+    built from the project store alone can show what was asked — and without it the
+    conversation opens on Neo's answer to a question that appears nowhere.
+
+    Each turn: {ts, kind, who, content, anchor, ref, msg_id, source, status, inbound}.
+    `anchor` is the id every surface gives the turn, so that a timeline entry's
+    `{"kind": "message", "id": …}` ref resolves to the words. Stays pure — it never
+    opens a store, and in particular never opens Neo's.
+    """
+    turns: list[dict[str, Any]] = []
+    for e in events:
+        if e.get("kind") != "question_asked":
+            continue
+        p = _payload(e)
+        text = str(p.get("question") or "")
+        if not text:
+            # Nothing was said that we can show. An empty bubble is worse than no
+            # bubble; the timeline still records that a question was asked.
+            continue
+        qid = _neo_question_id(p)
+        turns.append({
+            "ts": e.get("ts") or 0.0, "kind": "question", "who": "worker → Neo",
+            "content": text, "anchor": f"q-{qid}" if qid is not None else "",
+            "ref": _ref("question_asked", p), "msg_id": None,
+            "source": "neo", "status": "", "inbound": False,
+        })
+    for m in messages:
+        mid = m.get("id")
+        turns.append({
+            "ts": m.get("ts") or 0.0, "kind": "message", "who": _message_label(m),
+            "content": m.get("content") or "",
+            "anchor": f"msg-{mid}" if mid is not None else "",
+            "ref": None, "msg_id": mid, "source": m.get("source") or "",
+            "status": m.get("status") or "",
+            "inbound": m.get("direction") == "user_to_agent",
+        })
+    turns.sort(key=lambda t: t["ts"])
+    return turns
 
 
 def build_timeline(wo: dict[str, Any], events: list[dict[str, Any]],
                    messages: list[dict[str, Any]],
                    *, include_debug: bool = False) -> list[dict[str, Any]]:
-    """Merge events and conversation into time-ordered, human-readable entries.
+    """Merge events and messages into time-ordered entries saying WHAT HAPPENED.
 
     Each entry: {ts, level, kind, label, detail, ref}. Debug entries are omitted unless
     `include_debug`. Stays pure — it never opens a store.
+
+    Messages are here as moments, not as text: they are what makes the timeline a
+    sequence rather than a list of lifecycle changes, and their words are the
+    conversation's, one `ref` away.
     """
     entries: list[dict[str, Any]] = []
     seen_assumptions = 0
@@ -300,9 +398,11 @@ def build_timeline(wo: dict[str, Any], events: list[dict[str, Any]],
         entries.append({"ts": e.get("ts") or 0.0, "level": level, "kind": kind,
                         "label": label, "detail": detail, "ref": _ref(kind, payload)})
     for m in messages:
+        ref = _message_ref(m)
         entries.append({
             "ts": m.get("ts") or 0.0, "level": "signal", "kind": "message",
-            "label": _message_label(m), "detail": m.get("content") or "", "ref": None,
+            "label": _message_event_label(m),
+            "detail": "" if ref else (m.get("content") or ""), "ref": ref,
         })
     entries.sort(key=lambda e: e["ts"])
     return entries

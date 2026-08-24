@@ -264,13 +264,15 @@ def test_a_neo_answer_is_one_line_on_the_page_and_credited_to_neo(client, daemon
         store.close()
 
     page = client.get(f"/wo/proj_a/{wo['id']}").text
-    assert "neo → worker" in page  # the conversation credits it correctly too
-    # In the timeline the answer is ONE entry. It used to be the bookkeeping event and
-    # then the answer, and only the second was worth reading.
-    story = page.split('id="tab-timeline"', 1)[1]
-    assert "Neo answered the worker" not in story
-    assert story.count("[Neo] go with CSV") == 1
-    assert "Neo → worker" in story
+    said, story = page.split('id="tab-timeline"', 1)
+    # The conversation credits it correctly, and is the only place the words appear.
+    assert "neo → worker" in said
+    assert said.count("[Neo] go with CSV") == 1
+    # In the timeline the answer is ONE entry, saying what happened and pointing at the
+    # words rather than repeating them a tab away.
+    assert story.count("Neo answered the worker") == 1
+    assert "[Neo] go with CSV" not in story
+    assert "in the conversation" in story
 
 
 def test_a_question_on_the_timeline_is_a_link_to_the_question(client, daemon, project):
@@ -279,9 +281,13 @@ def test_a_question_on_the_timeline_is_a_link_to_the_question(client, daemon, pr
     result = ops.ask_question(wo["id"], "Should the export default to CSV or JSON?")
 
     page = client.get(f"/wo/proj_a/{wo['id']}").text
-    assert f'/neo/question/{result["question_id"]}' in page
-    # ...and the question itself is NOT reprinted beside the link.
-    assert "Should the export default to CSV or JSON?" not in page
+    said, story = page.split('id="tab-timeline"', 1)
+    assert f'/neo/question/{result["question_id"]}' in story
+    # ...and the question itself is NOT reprinted beside the link. It is a turn in the
+    # conversation, which is where the answer to it will land.
+    assert "Should the export default to CSV or JSON?" not in story
+    assert "Should the export default to CSV or JSON?" in said
+    assert "worker → Neo" in said
 
 
 def test_the_question_page_holds_the_question_and_its_answer(client, daemon, project):
@@ -522,8 +528,7 @@ def test_neo_tab_lists_questions_still_with_neo(client, daemon, project):
 
     r = client.get("/neo")
     assert r.status_code == 200
-    assert "1 queued" in r.text
-    assert "With Neo right now" in r.text
+    assert "With Neo right now" in r.text  # the block, not the count line it replaced
     assert "CSV or JSON?" in r.text          # the question itself, not just a count
     assert f"/wo/proj_a/{wo['id']}" in r.text  # traceable back to the parked worker
 

@@ -34,7 +34,7 @@
     {% if q.review_status == 'approved' %}<span class="st tone-ok"><span class="i">✓</span>you approved this</span>
     {% elif q.review_status == 'corrected' %}<span class="st tone-warn"><span class="i">✎</span>you corrected this</span>
     {% else %}<span class="st tone-muted"><span class="i">◌</span>awaiting your review —
-      <a href="/neo">review it →</a></span>{% endif %}
+      <a href="/neo#tab-review">review it →</a></span>{% endif %}
     {%- endif %}
   </p>
   {% if q.answer_reason %}<p class="sub">Reasoning: {{ q.answer_reason }}</p>{% endif %}
@@ -43,7 +43,7 @@
      on it either way, and only one of the two is waiting on the user. #}
   <div class="empty">
     {%- if q.status in ('escalated', 'failed') -%}
-      not answered yet — Neo escalated this to you. <a href="/neo">answer it →</a>
+      not answered yet — Neo escalated this to you. <a href="/neo#tab-escalated">answer it →</a>
     {%- else -%}
       not answered yet — still with Neo.
     {%- endif -%}

@@ -717,8 +717,8 @@ def test_the_timeline_shows_the_attempts_and_credits_nobody_with_them(
 
     assert labels.count("Merge conflict — asked the worker to resolve it") == 3
     assert "Merge conflict the worker could not resolve — over to you" in labels
-    assert labels.count("Jarvis → worker") == 3
-    assert "You → worker" not in labels
+    assert labels.count("Jarvis messaged the worker") == 3
+    assert "You messaged the worker" not in labels
     assert [e["detail"] for e in entries if e["kind"] == "pr_conflict_nudged"] == [
         "attempt 1 of 3", "attempt 2 of 3", "attempt 3 of 3"]
 

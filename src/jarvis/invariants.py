@@ -859,6 +859,103 @@ def check_envelopes_move(store: ProjectStore) -> Iterator[Violation]:
         central.close()
 
 
+def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
+    """INV-NEO-ESCALATION-STALE — a question held by the user must still be answerable.
+
+    `ops._neo_attention` lists every `escalated` or `failed` question of every kind, so
+    one whose decision was taken elsewhere goes on asking the user for a ruling nobody
+    can give. Three were doing that in production, the oldest for a fortnight, and none
+    was of kind `question`: an `approval` question is closed only through
+    `approvals.neo_question_id` and a `plan` question only through
+    `feature_orders.plan_question_id`, and both subjects can move that pointer or retire
+    without closing what it pointed at.
+
+    The point fixes (`ops.submit_plan`, `ops.cancel_feature_order`, `gates.open_gate`)
+    close them as the pointer moves, which is the only moment that can name what replaced
+    it. This derives the same fact from the subject's current state instead, so a fourth
+    site that forgets costs one tick rather than for ever — and it is what clears the
+    rows already stranded.
+
+    LIVE means the subject still has this decision open: a `pending` approval, or a
+    feature order in `plan_review` still pointing at this very question. Everything else
+    is moot, which is the same "only the LATEST round counts" reading
+    `_validation_escalated` uses. A question whose subject this project does not know is
+    left alone — that is how another project's rows are skipped, since the checks run per
+    project while Neo's database is OS-wide.
+
+    Repairs on the daemon tick rather than behind `--repair` as INV-MANAGER-MISSING does:
+    closing a question the OS can prove is moot creates nothing, authorises nothing and
+    overwrites no verdict (`NeoStore.supersede` is guarded on the open statuses).
+    """
+    from .neo_store import USER_HELD_Q_STATUSES, NeoStore
+
+    readonly = getattr(store, "readonly", False)
+    neo = NeoStore()
+    try:
+        held = [q for q in neo.list_questions(statuses=USER_HELD_Q_STATUSES)
+                if q["kind"] in ("approval", "plan")]
+        for q in held:
+            moot = (_stale_approval_question(store, q) if q["kind"] == "approval"
+                    else _stale_plan_question(store, q))
+            if moot is None:
+                continue
+            answer, why = moot
+            # Neo's store is OS-wide, so the `_ReadOnly` proxy over the project store
+            # cannot intercept this write — the checker has to skip it itself.
+            if not readonly:
+                neo.supersede(q["id"], answer, why)
+            yield Violation(
+                invariant="INV-NEO-ESCALATION-STALE",
+                # A plan question names the FEATURE order when its planner is gone
+                # (`ops.submit_plan`), and the daemon writes this id onto the work
+                # order's timeline — an FK the events table enforces. Report it
+                # unattached rather than crash the reporting loop.
+                wo_id=q["wo_id"] if _is_work_order(store, q["wo_id"]) else None,
+                detail=(f"Neo question {q['id']} ({q['kind']}) was still {q['status']} "
+                        f"to the user, but {why}"),
+                repaired=True,
+                repair=("would close it as " if readonly else "closed as ") + answer,
+                context={"question_id": q["id"], "kind": q["kind"], "was": q["status"]},
+            )
+    finally:
+        neo.close()
+
+
+def _is_work_order(store: ProjectStore, wo_id: str) -> bool:
+    try:
+        store.get_work_order(wo_id)
+    except KeyError:
+        return False
+    return True
+
+
+def _stale_approval_question(store: ProjectStore,
+                             q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) if this approval question is moot, else None."""
+    approval = store.approval_for_question(q["id"])
+    if approval is None or approval["status"] == "pending":
+        return None
+    by = f" by {approval['decided_by']}" if approval["decided_by"] else ""
+    return (f"SUPERSEDED — approval {approval['id']} is {approval['status']}",
+            f"approval {approval['id']} was already {approval['status']}{by}")
+
+
+def _stale_plan_question(store: ProjectStore,
+                         q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) if this plan question is moot, else None."""
+    fo = store.feature_order_for_planner(q["wo_id"])
+    if fo is None:
+        return None
+    if fo["plan_question_id"] != q["id"]:
+        return (f"SUPERSEDED by question {fo['plan_question_id']}",
+                f"{fo['id']} has since been replanned and its review is now question "
+                f"{fo['plan_question_id']}")
+    if fo["status"] == "plan_review":
+        return None
+    return (f"SUPERSEDED — {fo['id']} is {fo['status']}",
+            f"{fo['id']} left plan review and is now {fo['status']}")
+
+
 def _envelope_violation(env: dict[str, Any], repair: str) -> Violation:
     return Violation(
         invariant="INV-ENVELOPE-STUCK",
@@ -1424,6 +1521,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # because the moment it was given keeps moving
     check_validation_progresses,   # after the flag checks: its repair touches no flag,
                                    # and a `validating` row is invisible to all of them
+    check_neo_escalations_are_live,  # order-free: it writes to Neo's store only, and
+                                   # touches no flag any other check reads
     check_envelopes_move,          # last: it delivers, and delivery changes work orders
     check_no_lost_feedback,        # ...and after it, because that delivery is what
                                    # marks an envelope undeliverable in the first place

@@ -259,6 +259,32 @@ class NeoStore:
             (answer, answered_by, reason, db.now(), question_id),
         )
 
+    def supersede(self, question_id: int, answer: str, reason: str) -> bool:
+        """Close an open question whose decision was taken somewhere else. Returns
+        whether it closed.
+
+        A question row is only ever closed through the pointer its subject holds
+        (`approvals.neo_question_id`, `feature_orders.plan_question_id`), and a subject
+        that moves that pointer or retires leaves what it pointed at open for ever —
+        three of these were sitting in production attention, the oldest for a fortnight.
+        Whoever moves the pointer calls this; `invariants.check_neo_escalations_are_live`
+        is the backstop that derives the same fact when nobody did.
+
+        `answered_by='os'` rather than a new `superseded` status: nothing about the
+        lifecycle is new here — the question was decided, just not on this row — and a
+        status addition would cost the surface churn kn-a42253df describes for nothing.
+        It is also what keeps these out of the review queue, since every review surface
+        (`counts`, `questions_needing_digest`) already reads `answered_by='neo'`.
+
+        Guarded on OPEN_Q_STATUSES so a real verdict is never overwritten: the invariant
+        and the point fix can both fire on the same row, and the second must be a no-op.
+        """
+        q = self.get(question_id)
+        if q is None or q["status"] not in OPEN_Q_STATUSES:
+            return False
+        self.record_answer(question_id, answer, answered_by="os", reason=reason)
+        return True
+
     def mark(self, question_id: int, status: str, reason: str = "") -> None:
         assert status in Q_STATUSES, status
         self.conn.execute(
