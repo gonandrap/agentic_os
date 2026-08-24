@@ -4,7 +4,7 @@ Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
   jarvis cost [project|wo-id|fo-id]       what the work has cost in tokens
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
-  jarvis fo create|list|show|plan|approve|cancel        feature orders (planned sets)
+  jarvis fo create|list|show|plan|submit|approve|cancel feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
   jarvis gate rules|rule-retract|explain  what counts as privileged, and what the OS
                                           has LEARNED does not
@@ -220,8 +220,9 @@ def build_parser() -> argparse.ArgumentParser:
     l.add_argument("--include-hidden", action="store_true",
                    help="include work orders you've hidden")
 
-    s = wo.add_parser("show", help="show one work order with its timeline, messages "
-                                   "and assumptions")
+    s = wo.add_parser("show", help="show one work order: what was said (the "
+                                   "conversation), what happened (the timeline), and "
+                                   "its assumptions")
     s.add_argument("wo_id")
     s.add_argument("--project")
     s.add_argument("--debug", action="store_true",
@@ -357,6 +358,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the plan, as JSON. A file rather than an argument on purpose: "
                         "a plan is a long string full of repo paths, which is exactly "
                         "what trips the privileged-action classifier")
+    f.add_argument("--project")
+
+    f = fo.add_parser("submit", help="(project managers) submit the feature for review "
+                                     "again, once the remediation work orders have landed")
+    f.add_argument("fo_id")
+    f.add_argument("--summary", required=True,
+                   help="what changed since the last round, in your own words")
+    f.add_argument("--evidence", default="",
+                   help="how the feature as a whole was verified — the reviewer reads "
+                        "this against the integrated diff, so a claim the diff does not "
+                        "support is worse than no claim")
     f.add_argument("--project")
 
     f = fo.add_parser("approve", help="release a submitted plan (or send it back), when "
@@ -1186,7 +1198,7 @@ def cmd_adopt(args: argparse.Namespace) -> int:
 def cmd_wo(args: argparse.Namespace) -> int:
     from . import invariants, ops
     from .project_store import OPEN_STATUSES, ProjectStore
-    from .timeline import build_timeline
+    from .timeline import build_conversation, build_timeline
 
     if args.wo_cmd == "create":
         deps = [d.strip() for d in args.depends_on.split(",") if d.strip()]
@@ -1257,14 +1269,17 @@ def cmd_wo(args: argparse.Namespace) -> int:
         name, path, wo = ops.find_work_order(args.wo_id, args.project)
         store = ProjectStore(path)
         try:
+            events = store.list_events(args.wo_id)
             messages = store.list_messages(args.wo_id)
             detail = {
                 "project": name, **wo,
                 "status_label": invariants.status_label(store, wo),
                 "blocked_by": store.unfinished_dependencies(args.wo_id),
-                "timeline": build_timeline(wo, store.list_events(args.wo_id),
-                                           messages, include_debug=args.debug),
-                "messages": messages,
+                "timeline": build_timeline(wo, events, messages,
+                                           include_debug=args.debug),
+                # What was said, in order, whoever spoke — the worker's questions to
+                # Neo included, which `messages` alone never held.
+                "conversation": build_conversation(events, messages),
                 # Every assumption, each with its `n` and `status` — §4.
                 "assumptions": store.all_assumptions(args.wo_id),
                 # What this work order was allowed (or refused) permission to ship.
@@ -1329,7 +1344,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
 
 
 FO_ICON = {"pending": "⏳", "planning": "🧭", "plan_review": "👀", "executing": "🟢",
-           "completed": "✅", "failed": "❌", "cancelled": "🚫"}
+           "validating": "🔎", "completed": "✅", "failed": "❌", "cancelled": "🚫"}
 
 
 def cmd_fo(args: argparse.Namespace) -> int:
@@ -1404,6 +1419,10 @@ def cmd_fo(args: argparse.Namespace) -> int:
         except _json.JSONDecodeError as e:
             raise ops.OpsError(f"{path} is not valid JSON: {e}") from e
         _print(ops.submit_plan(args.fo_id, doc, project_name=args.project), args.json)
+
+    elif args.fo_cmd == "submit":
+        _print(ops.submit_feature(args.fo_id, args.summary, evidence=args.evidence,
+                                  project_name=args.project), args.json)
 
     elif args.fo_cmd == "approve":
         _print(ops.review_plan(args.fo_id, accept=not args.reject,

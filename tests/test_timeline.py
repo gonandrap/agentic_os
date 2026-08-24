@@ -8,7 +8,7 @@ the story by default; the plumbing is debug and only surfaces on request.
 
 from __future__ import annotations
 
-from jarvis.timeline import build_timeline, event_level
+from jarvis.timeline import build_conversation, build_timeline, event_level
 
 SIGNAL_KINDS = [
     "created", "dispatched", "status", "attention", "assumption",
@@ -95,17 +95,18 @@ def test_signal_entries_read_as_prose_not_json():
 
 
 def test_messages_appear_as_prompt_and_reply():
+    """Both directions are moments on the timeline; the words are the conversation's."""
     messages = [
-        {"ts": 2.0, "direction": "user_to_agent", "content": "also cover EndNote",
+        {"id": 1, "ts": 2.0, "direction": "user_to_agent", "content": "also cover EndNote",
          "source": "ui"},
-        {"ts": 3.0, "direction": "agent_to_user", "content": "done, EndNote covered",
+        {"id": 2, "ts": 3.0, "direction": "agent_to_user", "content": "done, EndNote covered",
          "source": "worker"},
     ]
     entries = build_timeline({}, [ev("created", 1.0)], messages)
     assert [e["label"] for e in entries] == [
-        "Work order created", "You → worker", "Worker → you"]
-    assert entries[1]["detail"] == "also cover EndNote"
-    assert entries[2]["detail"] == "done, EndNote covered"
+        "Work order created", "You messaged the worker", "Worker replied"]
+    assert [c["content"] for c in build_conversation([], messages)] == [
+        "also cover EndNote", "done, EndNote covered"]
 
 
 def test_entries_are_ordered_by_time():
@@ -145,13 +146,13 @@ def test_question_asked_points_at_the_question_instead_of_reprinting_it():
     assert entry["ref"] == {"kind": "neo_question", "id": 7, "label": "question #7"}
 
 
-def test_a_question_event_with_no_id_falls_back_to_its_text():
-    """Nothing to point at, so the text is all there is — an entry saying neither what
-    was asked nor where to read it says nothing at all."""
+def test_a_question_event_with_no_id_has_nothing_to_point_at():
+    """It still does not reprint the text: the conversation renders the ask from this
+    same payload, so a fallback here would print it twice on one page."""
     events = [ev("question_asked", 1.0, question="what was asked")]
     entry = build_timeline({}, events, [])[0]
     assert entry["ref"] is None
-    assert entry["detail"] == "what was asked"
+    assert entry["detail"] == ""
 
 
 def test_most_entries_point_at_nothing():
@@ -187,12 +188,12 @@ def test_neos_answer_is_one_line_and_says_neo_said_it():
     """It used to be two lines, and the survivor was misattributed to the user."""
     events = [ev("question_asked", 1.0, neo_question_id=7),
               ev("neo_answered", 3.0, neo_question_id=7)]
-    messages = [{"ts": 4.0, "direction": "user_to_agent", "source": "neo",
+    messages = [{"id": 1, "ts": 4.0, "direction": "user_to_agent", "source": "neo",
                  "content": "[Neo] go with CSV"}]
     entries = build_timeline({}, events, messages)
     assert [(e["kind"], e["label"]) for e in entries] == [
         ("question_asked", "Worker asked a question"),
-        ("message", "Neo → worker"),
+        ("message", "Neo answered the worker"),
     ]
 
 
@@ -202,7 +203,7 @@ def test_the_user_answering_still_reads_as_the_user():
     messages = [{"ts": 4.0, "direction": "user_to_agent", "source": "ui",
                  "content": "[Answer from the user] and gzip it"}]
     entries = build_timeline({}, events, messages)
-    assert [e["label"] for e in entries] == ["You → worker"]
+    assert [e["label"] for e in entries] == ["You messaged the worker"]
 
 
 def test_the_bookkeeping_is_still_on_the_record_for_anyone_who_asks():
@@ -222,13 +223,14 @@ def test_answers_are_not_repeated_on_top_of_their_message():
     events = [ev("question_asked", 1.0, neo_question_id=7),
               ev("neo_answered", 3.0, neo_question_id=7),
               ev("escalation_answered", 5.0, neo_question_id=8)]
-    messages = [{"ts": 2.0, "direction": "user_to_agent", "source": "neo",
+    messages = [{"id": 1, "ts": 2.0, "direction": "user_to_agent", "source": "neo",
                  "content": "[Neo] go with CSV"},
-                {"ts": 4.0, "direction": "user_to_agent", "source": "ui",
+                {"id": 2, "ts": 4.0, "direction": "user_to_agent", "source": "ui",
                  "content": "[user] and gzip it"}]
     entries = build_timeline({}, events, messages)
-    # ...and the answers themselves are still on the record, once each.
-    assert [e["detail"] for e in entries if e["kind"] == "message"] == [
+    assert [e["detail"] for e in entries if e["kind"] == "message"] == ["", ""]
+    # ...and the answers themselves are still on the record, once each — over there.
+    assert [c["content"] for c in build_conversation(events, messages)] == [
         "[Neo] go with CSV", "[user] and gzip it"]
 
 
@@ -311,3 +313,109 @@ def test_the_four_validation_events_read_as_four_different_things():
 def test_the_validating_status_change_has_a_human_label():
     entry = build_timeline({}, [ev("status", 1.0, status="validating")], [])[0]
     assert entry["label"] == "Under review by the validation panel"
+
+
+# --- The conversation owns what was SAID; the timeline points at it ---------------
+#
+# §3's rule was applied to the event half of `build_timeline` and to nothing else, which
+# left the record with a hole and a duplicate:
+#
+#   * the worker's question to Neo is an EVENT, never a message, so the conversation
+#     showed Neo's answer with nothing above it to answer;
+#   * every message was merged into the timeline with its whole body, so the timeline
+#     was a second, worse copy of the conversation.
+#
+# Both are the same missing half — a home for what was said. See
+# docs/superpowers/specs/2026-08-24-the-conversation-owns-what-was-said.md.
+
+def test_the_conversation_carries_the_question_the_worker_asked():
+    """The ask and its answer are one exchange; the ask was only ever an event."""
+    events = [ev("question_asked", 1.0, neo_question_id=7,
+                 question="CSV or JSON for the export default?")]
+    messages = [{"id": 3, "ts": 2.0, "direction": "user_to_agent", "source": "neo",
+                 "content": "[Neo] go with CSV", "status": "delivered"}]
+    convo = build_conversation(events, messages)
+    assert [(c["kind"], c["who"], c["content"]) for c in convo] == [
+        ("question", "worker → Neo", "CSV or JSON for the export default?"),
+        ("message", "neo → worker", "[Neo] go with CSV"),
+    ]
+    assert convo[0]["ref"] == {"kind": "neo_question", "id": 7, "label": "question #7"}
+
+
+def test_the_conversation_is_ordered_by_when_it_was_said():
+    """Questions and messages interleave — they are turns in one exchange."""
+    events = [ev("question_asked", 3.0, neo_question_id=7, question="second"),
+              ev("dispatched", 2.0, worktree="wt")]
+    messages = [{"id": 1, "ts": 1.0, "direction": "user_to_agent", "source": "ui",
+                 "content": "first"},
+                {"id": 2, "ts": 4.0, "direction": "agent_to_user", "content": "third"}]
+    assert [c["content"] for c in build_conversation(events, messages)] == [
+        "first", "second", "third"]
+
+
+def test_the_conversation_holds_nothing_that_was_not_said():
+    """Lifecycle events are the timeline's business, not the conversation's."""
+    events = [ev("created", 1.0), ev("status", 2.0, status="running"),
+              ev("finished", 3.0, summary="done")]
+    assert build_conversation(events, []) == []
+
+
+def test_a_question_with_no_recorded_text_is_not_a_silent_turn():
+    """`question` has been written since the event existed, but a row that lacks it
+    must not render an empty speech bubble — corollary 1 of §1."""
+    convo = build_conversation([ev("question_asked", 1.0, neo_question_id=7)], [])
+    assert convo == []
+
+
+def test_every_conversation_turn_can_be_pointed_at():
+    """The timeline's whole saving depends on the anchor resolving."""
+    events = [ev("question_asked", 1.0, neo_question_id=7, question="q?")]
+    messages = [{"id": 42, "ts": 2.0, "direction": "agent_to_user", "content": "a"}]
+    assert [c["anchor"] for c in build_conversation(events, messages)] == [
+        "q-7", "msg-42"]
+
+
+def test_the_timeline_points_at_a_message_instead_of_reprinting_it():
+    """The conversation tab is showing the reader this exact text a click away."""
+    messages = [{"id": 528, "ts": 4.0, "direction": "user_to_agent", "source": "neo",
+                 "content": "[Neo, answering for the user] A now, B filed, C rejected."}]
+    entry = build_timeline({}, [], messages)[0]
+    assert entry["label"] == "Neo answered the worker"
+    assert entry["detail"] == ""
+    assert entry["ref"] == {"kind": "message", "id": 528, "label": "in the conversation"}
+
+
+def test_the_timeline_says_who_spoke_without_saying_what():
+    """One label per speaker, and none of them carries the body."""
+    messages = [
+        {"id": 1, "ts": 1.0, "direction": "user_to_agent", "source": "ui", "content": "a"},
+        {"id": 2, "ts": 2.0, "direction": "user_to_agent", "source": "neo", "content": "b"},
+        {"id": 3, "ts": 3.0, "direction": "user_to_agent", "source": "pr-conflict",
+         "content": "c"},
+        {"id": 4, "ts": 4.0, "direction": "agent_to_user", "content": "d"},
+    ]
+    entries = build_timeline({}, [], messages)
+    assert [(e["label"], e["detail"]) for e in entries] == [
+        ("You messaged the worker", ""),
+        ("Neo answered the worker", ""),
+        ("Jarvis messaged the worker", ""),
+        ("Worker replied", ""),
+    ]
+
+
+def test_a_message_with_no_id_still_says_what_it_said():
+    """Nothing to point at, so the text is all there is — the same fallback the
+    question entry has, and for the same reason."""
+    entry = build_timeline({}, [], [{"ts": 1.0, "direction": "agent_to_user",
+                                     "content": "no id here"}])[0]
+    assert entry["ref"] is None
+    assert entry["detail"] == "no id here"
+
+
+def test_the_timeline_never_reprints_the_question_either():
+    """It has a home now: the conversation. The id-less case is not a licence to
+    print it twice, because the conversation renders it from the payload, not the id."""
+    events = [ev("question_asked", 1.0, question="what was asked")]
+    entry = build_timeline({}, events, [])[0]
+    assert entry["detail"] == ""
+    assert build_conversation(events, [])[0]["content"] == "what was asked"
