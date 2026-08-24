@@ -649,18 +649,28 @@ def create_app() -> FastAPI:
 
     @app.get("/knowledge", response_class=HTMLResponse)
     def knowledge(request: Request):
-        from ..central_store import PINNED_TAG, has_tag
+        """The base, and what it costs against what it is used for.
+
+        Entries render as their INDEX LINE with the body behind a disclosure — the same
+        160 characters a worker decides from. A page that dumps every entry in full is
+        reading matter nobody has; the headline is the artefact that actually does the
+        work, and seeing it truncated mid-sentence is the point.
+        """
+        from ..central_store import PINNED_TAG, has_tag, headline
         central = CentralStore()
         try:
             rows = central.search_knowledge("", limit=200)
             topics = central.knowledge_topics()
+            hits = central.knowledge_hit_counts()
         finally:
             central.close()
         rows = sorted(rows, key=lambda r: (not has_tag(r["tags"], PINNED_TAG), -r["ts"]))
         for r in rows:
             r["pinned"] = has_tag(r["tags"], PINNED_TAG)
+            r["headline"] = headline(r["content"])
+            r["reads"] = hits.get(r["id"], 0)
         return render(request, "knowledge.html", active="knowledge", rows=rows,
-                      topics=topics)
+                      topics=topics, usage=ops.knowledge_usage_report(limit=8))
 
     @app.post("/knowledge/pin")
     def knowledge_pin(kn_id: str = Form(...), pinned: str = Form("")):
