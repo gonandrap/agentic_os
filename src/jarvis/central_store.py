@@ -6,6 +6,7 @@ notification inbox, the backlog (with dependencies), and the knowledge base.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -38,6 +39,17 @@ def split_tags(tags: str) -> list[str]:
 
 def has_tag(tags: str, tag: str) -> bool:
     return tag in split_tags(tags)
+
+
+def fts_query(term: str) -> str:
+    """A user's words as an FTS5 OR-query. '' when nothing in them is searchable.
+
+    Each word becomes a quoted phrase, so `-`, `:` and `"` reach the tokenizer as text
+    instead of as FTS5 syntax — see
+    docs/superpowers/specs/2026-08-24-ranked-knowledge-search.md §5.
+    """
+    words = [w for w in (term or "").split() if any(c.isalnum() for c in w)]
+    return " OR ".join('"' + w.replace('"', '""') + '"' for w in words)
 
 
 def headline(content: str, limit: int = HEADLINE_CHARS) -> str:
@@ -238,6 +250,38 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_reads_wo ON knowledge_reads(wo_id, ts);
 CREATE INDEX IF NOT EXISTS idx_knowledge_read_hits ON knowledge_read_hits(kn_id);
 """
 
+# The ranked half of `search_knowledge` — see
+# docs/superpowers/specs/2026-08-24-ranked-knowledge-search.md §4. Separate from SCHEMA
+# because FTS5 is a compile-time option and a store that will not open is worse than a
+# search that is merely as good as yesterday's (§8).
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+    content, topic, tags,
+    content='knowledge', content_rowid='rowid', tokenize="porter unicode61"
+);
+CREATE TRIGGER IF NOT EXISTS knowledge_fts_ai AFTER INSERT ON knowledge BEGIN
+    INSERT INTO knowledge_fts (rowid, content, topic, tags)
+    VALUES (new.rowid, new.content, new.topic, new.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS knowledge_fts_ad AFTER DELETE ON knowledge BEGIN
+    INSERT INTO knowledge_fts (knowledge_fts, rowid, content, topic, tags)
+    VALUES ('delete', old.rowid, old.content, old.topic, old.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS knowledge_fts_au AFTER UPDATE ON knowledge BEGIN
+    INSERT INTO knowledge_fts (knowledge_fts, rowid, content, topic, tags)
+    VALUES ('delete', old.rowid, old.content, old.topic, old.tags);
+    INSERT INTO knowledge_fts (rowid, content, topic, tags)
+    VALUES (new.rowid, new.content, new.topic, new.tags);
+END;
+"""
+
+# One-time backfill marker, NOT a row count — a count on an external-content table
+# re-scans `knowledge` and would hide a broken trigger by rebuilding on every open (§4).
+FTS_BUILT_KEY = "knowledge_fts_built"
+
+# content, topic, tags. A query word in the TOPIC outranks one buried in a long body (§6).
+FTS_WEIGHTS = (1.0, 4.0, 2.0)
+
 # Columns added after the first release, exactly as in `neo_store` and `project_store`.
 # `CREATE TABLE IF NOT EXISTS` is a NO-OP on a table that already exists, so a column
 # added to SCHEMA alone reaches new installs only and every live `os.db` fails on read.
@@ -274,6 +318,7 @@ class CentralStore:
         self.conn = db.connect(self.db_path)
         self.conn.executescript(SCHEMA)
         self._migrate()
+        self.fts = self._ensure_fts()
         self._seed_gate_rules()
 
     def _migrate(self) -> None:
@@ -285,6 +330,21 @@ class CentralStore:
             for name, decl in columns.items():
                 if name not in have:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+    def _ensure_fts(self) -> bool:
+        """Create the search index and backfill it once. False = this SQLite has no FTS5.
+
+        docs/superpowers/specs/2026-08-24-ranked-knowledge-search.md §4, §8.
+        """
+        try:
+            self.conn.executescript(FTS_SCHEMA)
+            if not self.get_state(FTS_BUILT_KEY):
+                self.conn.execute(
+                    "INSERT INTO knowledge_fts (knowledge_fts) VALUES ('rebuild')")
+                self.set_state(FTS_BUILT_KEY, str(db.now()))
+        except sqlite3.Error:
+            return False
+        return True
 
     def close(self) -> None:
         self.conn.close()
@@ -581,21 +641,63 @@ class CentralStore:
         project + global; omit it to search the whole fleet (cross-project learnings
         are often the point).
 
-        **Words are ORed and the result is ranked by how many of them a row matched**,
-        rather than the whole term being one `LIKE '%…%'`. A single word behaves exactly
-        as it always did; the difference is a query like "cents rounding format", which
-        under phrase matching required that literal string and so returned nothing at
-        all. That is how real agents search — the retrieval eval
-        (evals/llm/test_knowledge_retrieval_judgment.py) scored 2/7 on phrase matching
-        purely because natural multi-word queries retrieved nothing — and an index whose
-        lookup verb only answers single keywords is not a lookup verb.
+        **TWO TIERS, and the second is a floor** — see
+        docs/superpowers/specs/2026-08-24-ranked-knowledge-search.md §3. First the FTS5
+        hits ordered by BM25, which is what buys stemming ("rounding" now finds
+        "rounded") and rarity-weighted ranking; then the substring hits FTS5 did not
+        return, ordered as they always were — how many of the query's words the row
+        matched, then recency. Deduplicated by id, then truncated to `limit`. Nothing
+        yesterday's search returned is dropped: §2 measures why pure FTS5 would drop
+        some ("deploy" stops finding "deployment", because porter stems the two into
+        different buckets). Tier 1 decides what comes FIRST, not what comes back.
 
-        Still substring matching per word, so it has no stemming and no synonyms:
-        "rounding" does not find "rounded" on its own, it survives only by riding along
-        with the other words in the query. FTS5 is the real fix and is on the backlog.
+        Synonyms remain unsolved and are out of reach for any lexical index: this still
+        will not find an entry that only ever says "shipit" (§7, on the backlog).
+        """
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for tier in (self._search_fts(term, limit, project, topic),
+                     self._search_like(term, limit, project, topic)):
+            for row in tier:
+                if row["id"] not in seen:
+                    seen.add(row["id"])
+                    rows.append(row)
+        return rows[:limit]
+
+    def _search_fts(self, term: str, limit: int, project: str | None,
+                    topic: str | None) -> list[dict[str, Any]]:
+        """Tier 1: stemmed, BM25-ranked. Empty on a store without FTS5 (§8)."""
+        match = fts_query(term)
+        if not self.fts or not match:
+            return []
+        params: list[Any] = [*FTS_WEIGHTS, match]
+        q = ["SELECT k.*, bm25(knowledge_fts, ?, ?, ?) AS _rank FROM knowledge k",
+             "JOIN knowledge_fts f ON f.rowid = k.rowid",
+             "WHERE knowledge_fts MATCH ?"]
+        if project is not None:
+            q.append("AND (k.project=? OR k.project='')")
+            params.append(project)
+        if topic is not None:
+            q.append("AND k.topic=?")
+            params.append(topic)
+        q.append("ORDER BY _rank LIMIT ?")  # bm25 is negative: best match is lowest
+        params.append(limit)
+        try:
+            rows = db.rows_to_dicts(self.conn.execute(" ".join(q), params).fetchall())
+        except sqlite3.Error:  # a read verb never raises on what a user typed (§5)
+            return []
+        for row in rows:  # ranking orders the list; it is not a field of an entry
+            row.pop("_rank", None)
+        return rows
+
+    def _search_like(self, term: str, limit: int, project: str | None,
+                     topic: str | None) -> list[dict[str, Any]]:
+        """Tier 2: substring, one point per query word the row matched anywhere.
+
+        Catches what stemming splits apart, and keeps the empty term meaning
+        "everything" — the read `jarvis learn list` and the dashboard rely on.
         """
         words = [w for w in (term or "").split() if w] or [""]
-        # score = how many of the query's words this row matched anywhere
         score = " + ".join(
             "(CASE WHEN content LIKE ? OR topic LIKE ? OR tags LIKE ? THEN 1 ELSE 0 END)"
             for _ in words)
@@ -612,7 +714,7 @@ class CentralStore:
         q.append("ORDER BY _score DESC, ts DESC LIMIT ?")
         params.append(limit)
         rows = db.rows_to_dicts(self.conn.execute(" ".join(q), params).fetchall())
-        for row in rows:  # ranking is how the list is ordered, not a field of an entry
+        for row in rows:
             row.pop("_score", None)
         return rows
 

@@ -42,9 +42,10 @@ Retrieval is graded against a REAL store, not by string matching. When the reply
 searches instead of showing, the term it chose is run through
 `CentralStore.search_knowledge` and the target entry has to actually come back — so a
 plausible-looking `jarvis learn search "deployment"` that retrieves nothing is scored
-as the miss it is. That is also the early-warning system for substring search: the day
-this battery starts failing on synonyms is the day the search backend needs to stop
-being `LIKE`.
+as the miss it is. That is also the early-warning system for the search backend, which is
+now FTS5/BM25 over a substring floor (docs/superpowers/specs/2026-08-24-ranked-knowledge-
+search.md). Stemming is in; SYNONYMS are not, and no lexical index can reach them — the
+day this battery starts failing on one is the day that becomes the next work order.
 
 Opt-in (spends tokens, needs a logged-in Claude Code):
     JARVIS_EVALS_LLM=1 pytest evals/llm/test_knowledge_retrieval_judgment.py -q
