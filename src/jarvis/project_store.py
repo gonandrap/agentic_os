@@ -995,6 +995,21 @@ class ProjectStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def feature_order_for_planner(self, wo_id: str) -> dict[str, Any] | None:
+        """The feature order a plan question hangs off, found the way the question
+        names it rather than the way the feature order points back.
+
+        `feature_order_for_question` follows `plan_question_id`, so it goes blind the
+        moment a resubmission moves that pointer — which is exactly the case
+        `invariants.check_neo_escalations_are_live` has to judge. A plan question's
+        `wo_id` is `plan_wo_id`, or the feature order itself when the planner is gone
+        (`ops.submit_plan`), so both are matched here.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM feature_orders WHERE id=? OR plan_wo_id=?", (wo_id, wo_id)
+        ).fetchone()
+        return dict(row) if row else None
+
     def create_plan_children(self, fo_id: str,
                              ordered: list[dict[str, Any]],
                              manager: bool = False) -> list[dict[str, Any]]:

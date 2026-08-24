@@ -2120,6 +2120,19 @@ def submit_plan(fo_id: str, doc: Any,
     neo = NeoStore()
     try:
         q = neo.ask(name, planner_id, question, kind="plan")
+        # A resubmission moves `plan_question_id` off the previous review, and
+        # `review_plan` only ever closes the one it currently points at — so an
+        # escalated plan question survived every revision that followed it (production
+        # questions 67 and 130, the second still asking for the user three days after
+        # its successor was approved). Close it here, naming what replaced it, because
+        # this is the only moment that knows both ids.
+        if fo.get("plan_question_id"):
+            neo.supersede(
+                fo["plan_question_id"],
+                f"SUPERSEDED by question {q['id']}",
+                f"the plan was revised and resubmitted; question {q['id']} reviews the "
+                f"version that replaced the one this asks about",
+            )
     finally:
         neo.close()
 
@@ -2278,6 +2291,18 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
         store.clear_feature_attention(fo_id)
     finally:
         store.close()
+    # A feature cancelled while its plan was still under review leaves that review with
+    # nothing to decide — the plan it reviews will never be released either way.
+    if fo.get("plan_question_id"):
+        from .neo_store import NeoStore
+
+        neo = NeoStore()
+        try:
+            neo.supersede(fo["plan_question_id"], "SUPERSEDED — feature order cancelled",
+                          f"{fo_id} was cancelled, so its plan will not be released "
+                          f"whatever this review concluded")
+        finally:
+            neo.close()
     for wo_id in stop_ids:
         cancel(wo_id)
     return {"project": name, "fo_id": fo_id, "title": fo["title"],

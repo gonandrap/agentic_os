@@ -167,8 +167,16 @@ Conversation, spend and timeline are *alternatives*: a reader wants one at a tim
 tabs.
 
 **Progressive enhancement, not a tab widget.** Nothing is hidden by CSS alone —
-`.tabbed.js > .tabpanel { display: none }`, and the inline script adds `.js`. A browser that
-blocks or fails the script gets the stack the page used to be, not one third of it.
+`.tabbed.js > .tabpanel { display: none }`, and the script adds `.js`. A browser that
+blocks or fails the script gets the stack the page used to be, not one third of it. The
+script lives in `base.html` and drives every `.tabbed` container on the page; the Neo page
+is the second caller.
+
+**An ask may be a tab only if its count is in the strip.** The rule below is about the ask
+reaching the reader, not about where it sits. Neo's page is nothing *but* asks, so hiding
+them all above the strip is the scroll this section exists to kill: there the two ask tabs
+carry a live count in amber, which puts the ask above the fold — strictly better than the
+block two screens down it replaced. A silent tab does not qualify.
 
 **What the page ASKS for stays outside the tabs.** The header, the pending-assumptions panel
 and the pending-gates panel sit above the strip. An ask hidden behind a tab is an ask that

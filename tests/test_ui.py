@@ -369,7 +369,20 @@ def test_a_neo_decision_will_not_redirect_off_site(client, daemon, project):
 
     r = client.post("/neo/1/review", data={"decision": "approve",
                                            "next": "//evil.example/steal"})
-    assert r.headers["location"] == "/neo"
+    assert r.headers["location"] == "/neo#tab-review"
+
+
+def test_a_refused_neo_decision_flashes_on_the_tab_it_came_from(client, daemon, project):
+    """`?error=` has to precede `#tab-review` — after it the browser reads the flash as
+    part of the fragment and `base.html` renders nothing."""
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "CSV or JSON?")
+    daemon._neo_drain()
+
+    r = client.post("/neo/1/review", data={"decision": "correct", "feedback": ""})
+    assert r.headers["location"].startswith("/neo?error=")
+    assert r.headers["location"].endswith("#tab-review")
 
 
 def test_the_question_page_sends_a_gate_request_to_the_gates_tab(gated):
@@ -603,8 +616,7 @@ def test_neo_tab_lists_questions_still_with_neo(client, daemon, project):
 
     r = client.get("/neo")
     assert r.status_code == 200
-    assert "1 queued" in r.text
-    assert "With Neo right now" in r.text
+    assert "With Neo right now" in r.text  # the block, not the count line it replaced
     assert "CSV or JSON?" in r.text          # the question itself, not just a count
     assert f"/wo/proj_a/{wo['id']}" in r.text  # traceable back to the parked worker
 
