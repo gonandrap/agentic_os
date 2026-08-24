@@ -142,7 +142,7 @@ CREATE TABLE IF NOT EXISTS os_state (
 -- was READ: whether workers consult the base, which entries earn their place, which are
 -- dead weight, and which questions it is asked and cannot answer. The only evidence was
 -- an opt-in paid eval somebody had to remember to run. See
--- docs/superpowers/specs/2026-08-23-memory-observability.md.
+-- docs/superpowers/specs/2026-08-23-what-memory-costs-and-who-reads-it.md.
 --
 -- Recorded at the read for the same reason `agent_calls` is recorded at the call: a
 -- `jarvis learn show` leaves no trace anywhere else, so nothing can recover it later.

@@ -6,6 +6,19 @@ Follow-on to `docs/superpowers/specs/2026-07-27-knowledge-on-demand-design.md`, 
 the knowledge base out of the worker prompt and left a bounded index plus four retrieval
 verbs behind it. Written for `wo-34ff39a6`.
 
+**Supersedes**, in the two specs that describe the search backend as it was:
+
+* `2026-07-27-knowledge-on-demand-design.md` §"Its first run scored 2/7", bullet 1 —
+  "still no stemming … FTS5 remains the real fix and stays on the backlog". Stemming is
+  in; that bullet now points here.
+* `2026-08-23-what-memory-costs-and-who-reads-it.md` §2 — "**No embeddings, no chunking,
+  no FTS5, no reranker**", and §1's "a longer entry is a bigger target for accidental
+  matches", which BM25 inverts: length now costs an entry rank rather than buying it.
+
+Both were edited in place rather than left standing beside this file, because a spec that
+states the current design in the present tense is read as current. What each one used to
+say is preserved above and in git.
+
 ---
 
 ## 1. Problem
