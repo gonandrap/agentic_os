@@ -46,7 +46,7 @@ PROJECT_PLACEHOLDER = "<project>"
 #: exactly: a worker that does not know a turn ends its process backgrounds a long job
 #: and signs off expecting a wake-up, and the damage — the work lost, the money spent —
 #: is done before any section could be fetched.
-CORE_BUDGET_CHARS = 3075
+CORE_BUDGET_CHARS = 3220
 
 
 # -- the git briefing, replacing Claude Code's own ---------------------------------------
@@ -245,10 +245,12 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             f"(full protocol: `jarvis brief gates --wo {wo_id}`).",
         ] if gate_names else []),
         f"- **A turn is one-shot and NOTHING wakes you when a background job "
-        f"ends.** Your session is a single `claude -p`: ending the turn exits it "
-        f"and takes whatever you left running with it. Only a Neo answer, a gate "
-        f"verdict or a user message starts the next one. Run long work in the "
-        f"FOREGROUND and wait — never sign off saying you will be re-invoked.",
+        f"ends.** You are one `claude -p`, NOT an interactive session: the "
+        f"background-task notification you remember DOES NOT EXIST here, and "
+        f"ending the turn kills whatever you left running. Only a Neo answer, a "
+        f"gate verdict or a user message starts the next turn. Already backgrounded "
+        f"something? It is already lost — re-run it in the FOREGROUND and wait. "
+        f"Never end a turn saying you will be re-invoked when the run finishes.",
         f"- **Point, do not explain; say each thing ONCE.** A code comment is one "
         f"line citing the spec that explains it (`docs/superpowers/specs/`), not "
         f"the explanation. A PR body hints; the diff explains. Never restate what "

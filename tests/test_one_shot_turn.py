@@ -16,6 +16,8 @@ Two halves ship together here, and either alone leaves the fleet wrong:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from jarvis.bootstrap import TEMPLATE_VERSION, bootstrap_project
@@ -135,3 +137,68 @@ def test_a_worker_that_was_told_to_wait_is_not_accused_of_stopping(project, stat
 
     assert IDLE_NO_FINISH_BLOCKER not in true_blockers(store, store.get_work_order(
         wo["id"]))
+
+
+# -- 3. the paid A/B stays honest -----------------------------------------------------
+
+EVAL_PATH = Path(__file__).resolve().parents[1] / "evals" / "llm" / "test_one_shot_turn_ab.py"
+
+
+def test_the_ab_eval_exists_and_is_opt_in():
+    text = EVAL_PATH.read_text()
+    assert "JARVIS_EVALS_LLM" in text
+    assert "JARVIS_EVALS_LLM=1 pytest" in text, "the skip gate never says how to turn it on"
+
+
+def test_the_ab_markers_still_match_the_shipped_prose(project):
+    """The A/B's arms differ by a substring cut. Reword the rule without updating the
+    marker and `_strip_rule` silently removes NOTHING — arm WITHOUT becomes arm WITH,
+    the eval passes at 100%, and it has measured an A/A."""
+    import importlib.util
+
+    spec_ = importlib.util.spec_from_file_location("_one_shot_ab", EVAL_PATH)
+    mod = importlib.util.module_from_spec(spec_)
+    spec_.loader.exec_module(mod)
+
+    from jarvis import worker_brief
+
+    prompt = _worker_prompt(project)
+    record = worker_brief.render_section("record", wo_id="wo-abc123", project="p1")
+
+    assert any(ln.startswith(mod.CORE_BULLET_MARKER) for ln in prompt.split("\n")), (
+        "the eval's core marker no longer matches a line of the shipped prompt")
+    assert mod.RECORD_BLOCK_MARKER in record
+
+    assert mod.CORE_BULLET_MARKER not in mod._strip_rule(prompt)
+    assert mod.RECORD_BLOCK_MARKER not in mod._strip_rule(record)
+
+
+def test_the_ab_cut_removes_the_rule_and_nothing_else(project):
+    """The arms must be byte-identical everywhere but the rule, or the A/B measures
+    whatever else drifted."""
+    import importlib.util
+
+    spec_ = importlib.util.spec_from_file_location("_one_shot_ab", EVAL_PATH)
+    mod = importlib.util.module_from_spec(spec_)
+    spec_.loader.exec_module(mod)
+
+    prompt = _worker_prompt(project)
+    kept = mod._strip_rule(prompt).split("\n")
+    dropped = [ln for ln in prompt.split("\n") if ln not in kept]
+
+    assert dropped, "the cut removed nothing"
+    assert all(ln.startswith(mod.CORE_BULLET_MARKER) for ln in dropped), (
+        f"the cut removed lines that are not the rule: {dropped}")
+
+
+def test_the_ab_asserts_no_cost_or_latency_number():
+    """Same ban the other paid evals carry: a test that failed on tokens or seconds
+    would spend real money to be flaky."""
+    import ast
+
+    tree = ast.parse(EVAL_PATH.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assert):
+            src = ast.dump(node).lower()
+            for word in ("seconds", "latency", "cost_usd", "elapsed"):
+                assert word not in src, f"the eval asserts on {word}"
