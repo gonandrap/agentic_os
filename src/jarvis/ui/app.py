@@ -876,23 +876,38 @@ def create_app() -> FastAPI:
             return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
         return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
 
+    def _neo_back(next: str, fallback: str, error: str = "") -> str:
+        """Where a Neo decision returns the reader — the page they decided from, or the
+        `/neo` tab the decision belongs to. Same-site paths only, as in `decide_gate`: a
+        form field is attacker-settable and an open redirect is not worth the
+        convenience. The error flash rides in the query, which has to precede the tab
+        fragment or the browser reads it as part of the fragment.
+        """
+        back = next if next.startswith("/") and not next.startswith("//") else fallback
+        if not error:
+            return back
+        path, hash_, frag = back.partition("#")
+        return f"{path}{'&' if '?' in path else '?'}error={error}{hash_}{frag}"
+
     @app.post("/neo/{question_id}/review")
     def neo_review(question_id: int, decision: str = Form(...),
-                   feedback: str = Form("")):
+                   feedback: str = Form(""), next: str = Form("")):
         try:
             ops.neo_review(question_id, approved=(decision == "approve"),
                            feedback=feedback)
         except ops.OpsError as e:
-            return RedirectResponse(f"/neo?error={e}#tab-review", status_code=303)
-        return RedirectResponse("/neo#tab-review", status_code=303)
+            return RedirectResponse(_neo_back(next, "/neo#tab-review", str(e)),
+                                    status_code=303)
+        return RedirectResponse(_neo_back(next, "/neo#tab-review"), status_code=303)
 
     @app.post("/neo/{question_id}/answer")
-    def neo_answer(question_id: int, text: str = Form(...)):
+    def neo_answer(question_id: int, text: str = Form(...), next: str = Form("")):
         try:
             ops.neo_answer_escalated(question_id, text)
         except ops.OpsError as e:
-            return RedirectResponse(f"/neo?error={e}#tab-escalated", status_code=303)
-        return RedirectResponse("/neo#tab-escalated", status_code=303)
+            return RedirectResponse(_neo_back(next, "/neo#tab-escalated", str(e)),
+                                    status_code=303)
+        return RedirectResponse(_neo_back(next, "/neo#tab-escalated"), status_code=303)
 
     @app.post("/neo/learn")
     def neo_learn(content: str = Form(...), project: str = Form("")):
