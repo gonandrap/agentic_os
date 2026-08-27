@@ -120,6 +120,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "dispatched":
         return "Worker dispatched", p.get("worktree") or ""
     if kind == "turn_failed":
+        # Auth is a turn_failed and not one of the pauses below, because the OS does NOT
+        # put it right — but it is still not the WORK failing, so it says what it was.
+        if p.get("reason") == "auth":
+            return "Blocked — Claude Code could not authenticate", (
+                p.get("error") or "")[:200]
         return "Worker turn failed", (p.get("error") or "")[:200]
     # The self-healing trio. Deliberately NOT filed under "Worker turn failed": nothing
     # about the WORK went wrong — the transport did, either by refusing the turn (the

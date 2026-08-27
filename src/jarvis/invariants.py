@@ -94,6 +94,16 @@ PR_CONFLICT_BLOCKER = ("merge conflicts the worker could not resolve — the pul
 VALIDATION_STUCK_BLOCKER = ("the review could not be satisfied — the work needs your "
                             "judgement")
 
+#: What a work order says when its turn died because Claude Code could not authenticate
+#: (`worker_session.PAUSE_AUTH`). Nothing here is wrong with the work, nothing is wrong
+#: with the API, and no amount of waiting helps — the account cannot answer until a human
+#: signs in. Under the same obligation as PR_CLOSED_BLOCKER above: `Daemon.settle_work_order`
+#: raises it and this module must be able to re-derive it, or INV-ATTENTION-REASON
+#: relabels it "worker failed — review and retry" on the next tick, which is the exact
+#: sentence that sent the user hunting for a bug in the work on 2026-08-27.
+AUTH_BLOCKER = ("Claude Code could not authenticate — sign in again, then "
+                "`jarvis wo send <id> \"retry\"` to resume")
+
 #: What a work order says when its worker went quiet without `jarvis wo finish`. Says
 #: what HAPPENED, not merely that the turn ended: the worker stopped mid-task, and — the
 #: half a user cannot see and reliably guesses wrong — nothing it may have left running
@@ -184,7 +194,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     # See Daemon.retire_ungoverned.
     governed = wo.get("origin") not in UNGOVERNED_ORIGINS
     if governed and wo["status"] == "failed":
-        blockers.append("worker failed — review and retry")
+        pause = worker_session.turn_pause(store, wo["id"])
+        blockers.append(
+            AUTH_BLOCKER if pause and pause.reason == worker_session.PAUSE_AUTH
+            else "worker failed — review and retry")
     # Blocked on a prompt is real whoever started the session: nobody else can unstick it.
     # A worker waiting on the DELEGATE is the exception, and there are two ways to be
     # waiting on it — a gate still with Neo, and a question still with Neo. Routing both

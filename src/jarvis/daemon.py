@@ -1847,22 +1847,34 @@ class Daemon:
             if pause and not pause.exhausted:
                 return
             if wo["status"] != "failed":
+                from .invariants import AUTH_BLOCKER
+
+                auth = pause is not None and pause.reason == worker_session.PAUSE_AUTH
                 store.set_status(wo["id"], "failed")
-                store.flag_attention(wo["id"], "worker turn failed — review and retry")
-                if pause:
-                    # Retried until the OS ran out of patience. Say so plainly: the
-                    # message the user needs is "this is not going to fix itself", and
-                    # a bare "worker turn failed" would send them looking for a bug in
-                    # the work instead of at the account's limits or Anthropic's status
-                    # page.
+                # THE TITLE HAS TO NAME THE FAILURE, not the fact that there was one:
+                # this is the line the user reads in Telegram, and "worker turn failed"
+                # sends them looking for a bug in the work instead of at their own login
+                # or Anthropic's status page. The body carries the CLI's own words.
+                store.flag_attention(wo["id"], (
+                    AUTH_BLOCKER if auth
+                    else "worker turn failed — review and retry"))
+                if pause and not auth:
+                    # Retried until the OS ran out of patience. An auth pause never was
+                    # retried (`max_attempts` is 0), so it gets no "still failing after
+                    # N retries" line — the `turn_failed` event already names it.
                     store.add_event(wo["id"], "turn_retries_exhausted",
                                     {"attempts": pause.attempts,
                                      "reason": pause.reason,
                                      "error": pause.message})
+                if auth:
+                    title = f"{wo['id']} blocked — Claude Code authentication failed"
+                elif pause:
+                    title = (f"{wo['id']} still failing after {pause.attempts} "
+                             f"{worker_session.PAUSE_NOUN[pause.reason]} retries")
+                else:
+                    title = f"{wo['id']} worker turn failed"
                 store.add_notification(
-                    title=(f"{wo['id']} still failing after {pause.attempts} "
-                           f"{worker_session.PAUSE_NOUN[pause.reason]} retries" if pause
-                           else f"{wo['id']} worker turn failed"),
+                    title=title,
                     body=(turn.get("error") or "no error recorded")[:500],
                     level="warning", wo_id=wo["id"], source="reconciler",
                 )
