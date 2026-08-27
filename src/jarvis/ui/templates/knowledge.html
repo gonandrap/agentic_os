@@ -11,6 +11,71 @@
   rails only.
 </p>
 
+<div class="panel" style="padding: 10px 16px; margin-bottom: 10px;">
+  <b>what it costs a prompt</b>
+  <table>
+    <tr><th>project</th><th>index</th><th>share of a dispatch prompt</th>
+        <th>indexed</th><th>overflow</th><th>never sent</th></tr>
+    {% for c in usage.prompt_cost %}
+    <tr>
+      <td class="mono">{{ c.project }}</td>
+      <td class="mono">{{ c.index_chars }} chars</td>
+      <td class="mono">{{ '%.0f' % (c.share_of_prompt * 100) }}%</td>
+      <td class="mono">{{ c.indexed }}{% if c.pinned %} + {{ c.pinned }} pinned{% endif %}</td>
+      <td class="mono">{{ c.overflow }}</td>
+      <td class="mono sub">{{ c.body_chars // 1000 }}k chars</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="sub">
+    <strong>Overflow</strong> is the entries that did not fit the index and reach a worker
+    only as a topic name and a count. {{ usage.size.truncated_headlines }} of
+    {{ usage.entries }} entries reach the index as a first line cut mid-sentence — the
+    index line is the only thing that decides whether an entry is ever opened, so a
+    shorter opening sentence buys both precision and more entries indexed.
+  </p>
+</div>
+
+<div class="panel" style="padding: 10px 16px; margin-bottom: 10px;">
+  <b>who reads it</b>
+  <span class="sub">
+    {{ usage.reads.reads }} reads ({{ usage.reads.by_workers }} by workers across
+    {{ usage.reads.orders }} orders) ·
+    {{ usage.reads.chars // 1000 }}k chars fetched ·
+    {{ usage.reads.misses }} came back empty ·
+    {{ usage.never_read_count }} entries never opened ·
+    {% if usage.observed_from %}{{ usage.silent_order_count }} orders completed without
+    one read{% else %}no reads recorded yet — the log starts at the first
+    <code>jarvis learn</code> a worker runs, and work before it was never observed{% endif %}
+  </span>
+  {% if usage.could_have_read %}
+  <details class="disclosure" style="margin-top:6px">
+    <summary class="sub">{{ usage.could_have_read_count }} of those orders had an entry
+      matching their own title, recorded before they started — a hint, not a verdict</summary>
+    <table>
+      {% for m in usage.could_have_read %}
+      <tr>
+        <td class="mono"><a href="/wo/{{ m.wo_id }}">{{ m.wo_id }}</a></td>
+        <td>{{ m.title }}</td>
+        <td class="mono sub">{% for e in m.entries %}{{ e.id }} {% endfor %}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </details>
+  {% endif %}
+  {% if usage.reads.unanswered %}
+  <details class="disclosure" style="margin-top:6px">
+    <summary class="sub">asked and unanswered — what agents looked for and did not find</summary>
+    <table>
+      {% for u in usage.reads.unanswered %}
+      <tr><td class="mono sub">{{ u.wo_id or 'you' }}</td>
+          <td class="mono">{{ u.verb }}</td><td>{{ u.term }}</td></tr>
+      {% endfor %}
+    </table>
+  </details>
+  {% endif %}
+</div>
+
 {% if topics %}
 <div class="panel">
   <b>topics</b>
@@ -20,12 +85,19 @@
 
 <div class="panel">
   <table>
-    <tr><th>scope</th><th>topic</th><th>learning</th><th>age</th><th></th></tr>
+    <tr><th>scope</th><th>topic</th><th>index line</th><th>reads</th><th>age</th><th></th></tr>
     {% for k in rows %}
     <tr>
       <td class="mono">{{ k.project or 'global' }}</td>
       <td class="mono">{{ k.topic or '–' }}</td>
-      <td>{% if k.pinned %}📌 {% endif %}{{ k.content }}<div class="sub mono">{{ k.id }}</div></td>
+      <td>
+        <details class="disclosure">
+          <summary>{% if k.pinned %}📌 {% endif %}{{ k.headline }}</summary>
+          <div style="white-space: pre-wrap">{{ k.content }}</div>
+        </details>
+        <div class="sub mono">{{ k.id }} · {{ k.content|length }} chars</div>
+      </td>
+      <td class="mono {{ 'sub' if not k.reads }}">{{ k.reads or '–' }}</td>
       <td class="mono sub">{{ fmt_age(k.ts) }}</td>
       <td>
         <form method="post" action="/knowledge/pin">
@@ -36,7 +108,7 @@
       </td>
     </tr>
     {% else %}
-    <tr><td colspan="5" class="empty">nothing learned yet — workers report with <code>jarvis learn add</code></td></tr>
+    <tr><td colspan="6" class="empty">nothing learned yet — workers report with <code>jarvis learn add</code></td></tr>
     {% endfor %}
   </table>
 </div>

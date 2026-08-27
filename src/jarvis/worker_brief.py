@@ -522,6 +522,14 @@ def concision_section() -> str:
         "narrated. If the PR needs a rationale longer than a few lines, that "
         "rationale is a spec and the PR links to it.",
         "",
+        "This cuts NARRATION OF THE DIFF, and nothing else. It is not licence to "
+        "ship a thin body: the summary, the implementation notes, the Neo "
+        "questions, the learnings and the test evidence all stay, because none of "
+        "them is anywhere else. Fill the repository's PR template — your "
+        "`open-a-pull-request` skill has it, and a `gh pr create` missing a "
+        "section is denied "
+        "(docs/superpowers/specs/2026-08-24-a-pull-request-a-reviewer-can-read.md).",
+        "",
         "## Say each thing once, across the whole record",
         "The description, your questions, your messages and your finish summary "
         "are read TOGETHER. A paragraph repeated across them is read three times "

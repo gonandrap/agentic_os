@@ -649,18 +649,28 @@ def create_app() -> FastAPI:
 
     @app.get("/knowledge", response_class=HTMLResponse)
     def knowledge(request: Request):
-        from ..central_store import PINNED_TAG, has_tag
+        """The base, and what it costs against what it is used for.
+
+        Entries render as their INDEX LINE with the body behind a disclosure — the same
+        160 characters a worker decides from. A page that dumps every entry in full is
+        reading matter nobody has; the headline is the artefact that actually does the
+        work, and seeing it truncated mid-sentence is the point.
+        """
+        from ..central_store import PINNED_TAG, has_tag, headline
         central = CentralStore()
         try:
             rows = central.search_knowledge("", limit=200)
             topics = central.knowledge_topics()
+            hits = central.knowledge_hit_counts()
         finally:
             central.close()
         rows = sorted(rows, key=lambda r: (not has_tag(r["tags"], PINNED_TAG), -r["ts"]))
         for r in rows:
             r["pinned"] = has_tag(r["tags"], PINNED_TAG)
+            r["headline"] = headline(r["content"])
+            r["reads"] = hits.get(r["id"], 0)
         return render(request, "knowledge.html", active="knowledge", rows=rows,
-                      topics=topics)
+                      topics=topics, usage=ops.knowledge_usage_report(limit=8))
 
     @app.post("/knowledge/pin")
     def knowledge_pin(kn_id: str = Form(...), pinned: str = Form("")):
@@ -866,23 +876,38 @@ def create_app() -> FastAPI:
             return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
         return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
 
+    def _neo_back(next: str, fallback: str, error: str = "") -> str:
+        """Where a Neo decision returns the reader — the page they decided from, or the
+        `/neo` tab the decision belongs to. Same-site paths only, as in `decide_gate`: a
+        form field is attacker-settable and an open redirect is not worth the
+        convenience. The error flash rides in the query, which has to precede the tab
+        fragment or the browser reads it as part of the fragment.
+        """
+        back = next if next.startswith("/") and not next.startswith("//") else fallback
+        if not error:
+            return back
+        path, hash_, frag = back.partition("#")
+        return f"{path}{'&' if '?' in path else '?'}error={error}{hash_}{frag}"
+
     @app.post("/neo/{question_id}/review")
     def neo_review(question_id: int, decision: str = Form(...),
-                   feedback: str = Form("")):
+                   feedback: str = Form(""), next: str = Form("")):
         try:
             ops.neo_review(question_id, approved=(decision == "approve"),
                            feedback=feedback)
         except ops.OpsError as e:
-            return RedirectResponse(f"/neo?error={e}#tab-review", status_code=303)
-        return RedirectResponse("/neo#tab-review", status_code=303)
+            return RedirectResponse(_neo_back(next, "/neo#tab-review", str(e)),
+                                    status_code=303)
+        return RedirectResponse(_neo_back(next, "/neo#tab-review"), status_code=303)
 
     @app.post("/neo/{question_id}/answer")
-    def neo_answer(question_id: int, text: str = Form(...)):
+    def neo_answer(question_id: int, text: str = Form(...), next: str = Form("")):
         try:
             ops.neo_answer_escalated(question_id, text)
         except ops.OpsError as e:
-            return RedirectResponse(f"/neo?error={e}#tab-escalated", status_code=303)
-        return RedirectResponse("/neo#tab-escalated", status_code=303)
+            return RedirectResponse(_neo_back(next, "/neo#tab-escalated", str(e)),
+                                    status_code=303)
+        return RedirectResponse(_neo_back(next, "/neo#tab-escalated"), status_code=303)
 
     @app.post("/neo/learn")
     def neo_learn(content: str = Form(...), project: str = Form("")):
