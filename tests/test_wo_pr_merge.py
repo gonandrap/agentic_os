@@ -296,7 +296,7 @@ def test_the_closed_pr_reason_survives_the_reconciler(started, project, fake_gh,
     """INV-ATTENTION-REASON rewrites any reason `true_blockers` cannot derive.
 
     Without the PR_CLOSED_BLOCKER branch this work order would keep its status but be
-    relabelled "finished without a completion signal — review the session", sending the
+    relabelled with the generic IDLE_NO_FINISH_BLOCKER, sending the
     user to read a worker session that did nothing wrong.
     """
     fake_gh.set_pr(PR, "CLOSED")
