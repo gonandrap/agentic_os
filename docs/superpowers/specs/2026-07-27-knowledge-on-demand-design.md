@@ -172,11 +172,12 @@ eval.** Worth recording, because neither was visible to any structural test:
 1. **The retrieval verb did not answer the way agents ask.** Two misses were the subject
    searching correctly — `learn search "cents rounding format"` — against a store doing
    `LIKE '%cents rounding format%'`, which requires that literal phrase and returned
-   nothing. Agents search in phrases. `search_knowledge` now ORs the words and ranks rows
-   by how many matched; a single word behaves exactly as before. Still no stemming
-   ("rounding" does not find "rounded" alone, it rides along with the rest of the query),
-   so FTS5 remains the real fix and stays on the backlog — but an index whose lookup verb
-   only answers single keywords was not a lookup verb.
+   nothing. Agents search in phrases. `search_knowledge` ORs the words and ranks rows by
+   how many matched; a single word behaves exactly as before. An index whose lookup verb
+   only answers single keywords was not a lookup verb. That word-OR pass is now the
+   FLOOR under an FTS5/BM25 tier, which closed the stemming gap this bullet used to end
+   on — "rounding" retrieves "rounded" on its own —
+   see `2026-08-24-ranked-knowledge-search.md`.
 2. **Reading lost to asking.** Three misses went to `jarvis wo ask` on questions the
    index plainly covered — the READ bullet was quietly losing to the (deliberately very
    loud) "Neo is your first responder, any doubt goes to it" rule. Spending the user's
