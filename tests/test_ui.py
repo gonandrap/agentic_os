@@ -506,6 +506,21 @@ def test_knowledge_page(client):
     assert "prefer uv" in r.text and "global" in r.text
 
 
+def test_knowledge_page_reports_what_the_base_costs_and_who_reads_it(client):
+    """The page used to answer "what do we know" and nothing about what that is worth:
+    no cost, no reads, no unopened entries. Both halves render together or the page is
+    back to being a wall of text."""
+    central = CentralStore()
+    row = central.add_knowledge("A LESSON WITH A FIRST LINE LONG ENOUGH TO BE CUT. "
+                                + "padding " * 60, project="proj_a", topic="tooling")
+    central.record_knowledge_read("show", [row], project="proj_a", wo_id="wo-x")
+
+    page = client.get("/knowledge").text
+    assert "what it costs a prompt" in page and "who reads it" in page
+    assert "…" in page                       # the index line, truncated as a worker sees it
+    assert "1 reads" in page or ">1<" in page  # the read just recorded is counted
+
+
 def test_api_status(client):
     r = client.get("/api/status")
     assert r.status_code == 200
