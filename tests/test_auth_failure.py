@@ -23,6 +23,7 @@ Two things are under test, and they fail separately:
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -165,16 +166,27 @@ def test_an_auth_failure_is_a_pause_with_the_real_string_on_it(store):
     assert "OAuth session expired" in pause.message
 
 
-def test_it_is_exhausted_on_arrival(store):
-    """Neo's ruling on question 167: no deadline exists, so there is nothing to wait
-    for and nothing to retry. Every reader of the pause — the retry pass, message
-    delivery, the status note — already steps aside for an exhausted one."""
+def test_it_never_exhausts_however_long_the_sign_in_takes(store):
+    """`failed` is a DEPENDENCY_DEAD_STATUS: exhausting an auth pause strands the order's
+    dependents and fails its parent feature order — what happened to fo-e353491c — for
+    something a `/login` fixes. So the one thing this pause can never become is spent
+    (Neo, question 169, reversing 167)."""
     _auth_turn(store)
     pause = worker_session.turn_pause(store, "wo-test")
-    assert pause is not None and pause.max_attempts == 0 and pause.exhausted
+    assert pause is not None
+    assert not pause.exhausted
+    assert not replace(pause, attempts=99).exhausted
+
+
+def test_with_no_sign_in_it_is_parked_rather_than_waiting(store):
+    """`resumable` is the distinction `due()` cannot draw: not yet, versus not ever."""
+    _auth_turn(store)
+    pause = worker_session.turn_pause(store, "wo-test")
+    assert pause is not None
+    assert pause.retry_at == worker_session.NEVER and not pause.resumable
     store.set_status("wo-test", "running")
-    assert invariants.pause_note(store, store.get_work_order("wo-test")) == "", \
-        "there is no moment to promise, so promise none"
+    assert "sign in" in invariants.pause_note(store, store.get_work_order("wo-test")), \
+        "no clock to promise, but the action that ends it is worth naming"
 
 
 def test_the_streak_counts_auth_turns_apart_from_the_others(store):
@@ -191,10 +203,10 @@ def test_the_streak_counts_auth_turns_apart_from_the_others(store):
 
 
 def test_the_timeline_names_auth_rather_than_a_generic_failure():
-    label, detail = timeline._describe("turn_failed", {"reason": "auth",
+    label, detail = timeline._describe("turn_paused", {"reason": "auth",
                                                        "error": LIVE_OAUTH})
-    assert "authenticate" in label.lower()
-    assert "OAuth session expired" in detail
+    assert "sign-in" in label.lower()
+    assert "OAuth session expired" in detail and "sign in again" in detail
 
 
 # -- end to end -------------------------------------------------------------------------
@@ -231,12 +243,14 @@ def test_the_user_is_told_what_actually_happened(started, fake_claude, project,
         f"the generic string survived: {turn['error']!r}"
 
     row = store.get_work_order(wo["id"])
-    assert row["status"] == "failed" and row["needs_attention"]
+    assert row["status"] == "waiting_input", \
+        "`failed` is a DEPENDENCY_DEAD_STATUS — it would fail the parent feature order"
+    assert row["needs_attention"]
     assert "authenticate" in row["attention_reason"].lower()
 
-    failed = [e for e in store.list_events(wo["id"]) if e["kind"] == "turn_failed"]
-    assert failed, "a failure the user cannot see in `wo show` is the same bug twice"
-    assert json.loads(failed[-1]["payload"])["reason"] == worker_session.PAUSE_AUTH
+    paused = [e for e in store.list_events(wo["id"]) if e["kind"] == "turn_paused"]
+    assert paused, "a failure the user cannot see in `wo show` is the same bug twice"
+    assert json.loads(paused[-1]["payload"])["reason"] == worker_session.PAUSE_AUTH
     assert [e for e in store.list_events(wo["id"])
             if e["kind"] == "turn_retries_exhausted"] == [], \
         "nothing was retried, so do not tell the user it was"
@@ -244,16 +258,18 @@ def test_the_user_is_told_what_actually_happened(started, fake_claude, project,
     note = dict(store.conn.execute(
         "SELECT * FROM notifications ORDER BY id DESC LIMIT 1").fetchone())
     assert LIVE_OAUTH in note["body"]
-    assert "authentication" in note["title"].lower()
+    assert "authenticate" in note["title"].lower()
     # What Telegram would actually send, since the body is the half that was empty.
     assert LIVE_OAUTH in notify.render_telegram(note | {"project": "proj_a"},
                                                 daemon.catalog)
     store.close()
 
 
-def test_it_is_never_retried(started, fake_claude, project, settle_turns):
-    """The account cannot answer, so a backoff is five more of the same refusal. The
-    conversation stops at the turn that failed."""
+def test_it_is_not_retried_while_the_sign_in_has_not_changed(started, fake_claude,
+                                                             project, settle_turns):
+    """The account cannot answer, so a backoff is five more of the same refusal. Nothing
+    moves until the credentials do — which is also what stops the OS spawning a process
+    per tick against a login nobody has fixed yet."""
     daemon = started
     fake_claude.turns_auth_failed()
     wo = ops.create_work_order("proj_a", "ship the thing")
