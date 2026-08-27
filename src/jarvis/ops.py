@@ -3655,8 +3655,8 @@ def knowledge_usage_report(project: str | None = None, days: int | None = None,
     * NON-USE — the work orders that completed having never read anything, and of those,
       the ones whose own title matches an entry that already existed when they started.
       A title match is EVIDENCE, NOT A VERDICT, and it is labelled that way wherever it
-      is rendered: the same `LIKE`-based search a worker would have run is what scores
-      it, so it inherits that search's blindness to synonyms (bl-dde1f708).
+      is rendered: the same search a worker would have run is what scores it, so it
+      inherits that search's blind spots — synonyms, since FTS5 landed (bl-8169af54).
     """
     from .central_store import headline
 

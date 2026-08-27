@@ -48,9 +48,10 @@ lot of text" — not *shorten the entries*, but **make the first line a real hea
 
 Second-order costs, for completeness. A fetch is charged at what it returns: median entry
 1,474 chars (~370 tokens), largest 6,605 (~1,650). A worker reading five entries spends
-~2k tokens — deliberate, aimed, and cheap. And `search_knowledge` is `LIKE` over
-`content`, so a longer entry is a bigger target for accidental matches; the ranking
-change of PR 27 mitigates it, `bl-dde1f708` (FTS5) is the real fix.
+~2k tokens — deliberate, aimed, and cheap. A longer entry used to be a bigger target for
+accidental matches, because `search_knowledge` was `LIKE` over `content` and every match
+counted the same; BM25 now discounts hits in a long document, so length costs an entry
+rank rather than buying it (`2026-08-24-ranked-knowledge-search.md`).
 
 ## 2. The memory stack, as it actually exists
 
@@ -65,11 +66,13 @@ Six layers, none of them a vector database:
 | Serena code map | `.serena/memories`, committed | symbol-level navigation; ships with the release tag |
 | The work-order record | per-project `wo_events` | episodic memory of one order; re-asserted into the session after a compaction (`hooks.compaction_brief`) |
 
-Retrieval is substring matching, word-ORed and ranked by how many query words a row
-matched. **No embeddings, no chunking, no FTS5, no reranker.** That is a deliberate
-floor, not an oversight — the measured access pattern (`kn-844df5e3`) is that workers
-mostly do not search at all: they read an id straight off an index headline. Which is
-exactly why headline quality, not search quality, is the lever.
+Retrieval is FTS5/BM25 over a substring floor — stemmed and ranked first, then the
+word-ORed `LIKE` hits FTS5 missed (`2026-08-24-ranked-knowledge-search.md`, which
+supersedes this paragraph's original claim that there was no FTS5 and did not need to
+be). **Still no embeddings, no chunking, no reranker, and no synonyms** (`bl-8169af54`).
+That remains a deliberate floor — the measured access pattern (`kn-844df5e3`) is that
+workers mostly do not search at all: they read an id straight off an index headline,
+which is why headline quality is still the bigger lever of the two.
 
 ## 3. Observability: there was none, and now there is
 
@@ -104,8 +107,9 @@ panel on `/knowledge`, answering the three questions in order:
 * *When could it have been used and was not?* — work orders that completed with zero
   reads, and of those, the ones whose own title matches an entry that already existed
   when they started. **A title match is a hint, not a verdict**, and it is labelled that
-  way on every surface: it is scored with the same `LIKE` search a worker would have run,
-  so it is blind to synonyms in both directions. Also recorded: reads that came back
+  way on every surface: it is scored with the same search a worker would have run, so it
+  inherits that search's blind spots — no longer inflections, since FTS5 landed, but
+  still synonyms, in both directions. Also recorded: reads that came back
   EMPTY, which is the opposite signal — an agent asked and the base had nothing.
 
 **The honesty boundary.** Every "never looked" figure is scoped to work that started
