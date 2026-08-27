@@ -124,13 +124,14 @@ def sink_log(item: dict[str, Any], catalog: Catalog) -> str:
     return "ok"
 
 
-def sink_telegram(item: dict[str, Any], catalog: Catalog) -> str:
-    if external_sinks_disabled():
-        return f"skipped: {DISABLE_EXTERNAL_SINKS_ENV} set"
-    token = os.environ.get(catalog.os.telegram_token_env, "")
-    chat_id = os.environ.get(catalog.os.telegram_chat_id_env, "")
-    if not token or not chat_id:
-        return f"skipped: {catalog.os.telegram_token_env}/{catalog.os.telegram_chat_id_env} not set"
+def render_telegram(item: dict[str, Any], catalog: Catalog) -> str:
+    """The message body exactly as Telegram will receive it.
+
+    Split out from the send so a test can assert on what the user READS — the half that
+    was empty on the 2026-08-27 auth incident. Nothing here truncates: the body arrives
+    already clipped by whoever raised the notification (the reconciler cuts at 500), and
+    a second, invisible limit here is how a diagnosis loses its last sentence.
+    """
     emoji = LEVEL_EMOJI.get(item["level"], "")
     esc = html.escape
     # HTML (not Markdown): work order ids become tappable links into the local UI,
@@ -146,6 +147,17 @@ def sink_telegram(item: dict[str, Any], catalog: Catalog) -> str:
             # No link rather than a link that 404s: the user cannot tell a stale link
             # from a broken dashboard, and guessing wrong costs them a debugging session.
             text += f"\n{esc(item['wo_id'])} — <i>{esc(problem)}</i>"
+    return text
+
+
+def sink_telegram(item: dict[str, Any], catalog: Catalog) -> str:
+    if external_sinks_disabled():
+        return f"skipped: {DISABLE_EXTERNAL_SINKS_ENV} set"
+    token = os.environ.get(catalog.os.telegram_token_env, "")
+    chat_id = os.environ.get(catalog.os.telegram_chat_id_env, "")
+    if not token or not chat_id:
+        return f"skipped: {catalog.os.telegram_token_env}/{catalog.os.telegram_chat_id_env} not set"
+    text = render_telegram(item, catalog)
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/sendMessage",
         data=json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "HTML",

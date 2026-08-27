@@ -518,6 +518,61 @@ def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
     return [by_id[mid] for mid in order]
 
 
+#: Claude Code's model id for a message it wrote itself rather than getting from the
+#: API — an auth refusal, a usage-limit notice, a cancellation. `price_for` already
+#: knows it costs nothing; `said_in_session` is the caller that reads what it SAYS.
+SYNTHETIC_MODEL = "<synthetic>"
+
+
+def said_in_session(session_id: str, *, since: float = 0.0, until: float | None = None,
+                    index: dict[str, list[Path]] | None = None,
+                    root: Path | None = None) -> list[tuple[str, str]]:
+    """(model, text) for every assistant message in a session, in the order written.
+
+    NOT accounting — the one reader in this module that wants the prose rather than the
+    tokens, and it exists because the transcript is sometimes the ONLY record of why a
+    turn died (`worker_session._transcript_error`). It shares this module's index
+    because that index is the only reliable way to find a worker's transcript: the
+    directory is the slugified cwd the session was created in, which for a worker is a
+    worktree that may no longer exist.
+
+    `since`/`until` bound it to ONE TURN, and they are not optional in practice. A
+    session outlives the turn that failed in it: wo-c2793bf0's transcript holds the auth
+    refusal that killed turn 1 and, eight minutes later, an unrelated "No response
+    requested." from turn 2 — so the last synthetic message in the FILE is the wrong
+    answer to "why did this turn die".
+    """
+    if index is None:
+        index = index_sessions(root)
+    said: list[tuple[str, str]] = []
+    for path in sorted(index.get(session_id) or []):
+        try:
+            handle = Path(path).open(errors="replace")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                if '"assistant"' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if row.get("type") != "assistant":
+                    continue
+                ts = _parse_stamp(row.get("timestamp"))
+                if ts < since or (until is not None and ts > until):
+                    continue
+                message = row.get("message") or {}
+                text = " ".join(
+                    block.get("text", "") for block in message.get("content") or []
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ).strip()
+                if text:
+                    said.append((message.get("model") or "", text))
+    return said
+
+
 def calls_of(path: Path | str) -> list[Call]:
     """Every API call in one transcript, in the order they were made.
 

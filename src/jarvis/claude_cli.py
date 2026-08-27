@@ -925,6 +925,56 @@ def transient_failure(text: str | None, *, terminal_reason: str | None = None,
     return None
 
 
+# -- the account cannot answer ---------------------------------------------------------
+#
+# A THIRD WAY A TURN DIES WITHOUT THE WORK BEING WRONG, and the one that does NOT come
+# back on its own: Claude Code could not authenticate. The OAuth session expired, the
+# login lapsed, the key is wrong. No deadline exists, because what clears it is a human
+# running `/login` — see `worker_session.PAUSE_AUTH` for what the OS does about that.
+#
+# WHERE IT SHOWS UP IS THE POINT. On the 2026-08-27 incident (wo-c2793bf0, wo-5def741d,
+# wo-2df8828c) `claude -p` exited writing NEITHER the result JSON nor a byte of stderr —
+# it wrote the reason into its own session transcript as a `<synthetic>` assistant
+# message and quit. So this runs mostly against text `worker_session._transcript_error`
+# recovered from there, and only sometimes against a result envelope.
+#
+# MATCHED AT THE START OF A LINE, unlike the two above. There is no `API Error: ` prefix
+# to key on and no reset clause to demand, so the anchor is all that separates the CLI's
+# own standalone one-line refusal from a worker discussing one — and in this repo, whose
+# workers write about this very failure, that is not a theoretical collision.
+_AUTH_RE = re.compile(
+    r"^\s*(?:"
+    r"Failed to authenticate"
+    r"|OAuth (?:token|session) expired"
+    r"|Login expired"
+    r"|Please run /login"
+    r"|Invalid API key"
+    r"|API Error: 401"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+@dataclass(frozen=True)
+class AuthFailure:
+    """A turn refused because Claude Code could not authenticate."""
+
+    message: str
+
+
+def auth_failure(text: str | None) -> AuthFailure | None:
+    """Read a failed turn as an authentication failure, or None if it is not one.
+
+    None for every ordinary failure, so callers use it as the predicate itself. Asked
+    BEFORE the other two everywhere (`worker_session._diagnose`): an auth refusal is the
+    one thing here that retrying cannot fix, and reading one as transient would spend
+    five backoff attempts against an account that cannot answer any of them.
+    """
+    if not text or not _AUTH_RE.search(text):
+        return None
+    return AuthFailure(message=_summarise(text))
+
+
 def process_alive(pid: int | None) -> bool:
     """Is this turn's process still running?
 
