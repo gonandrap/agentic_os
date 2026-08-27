@@ -6,7 +6,7 @@ the same two bugs:
 1. The reconciler adopts every background session it finds in a project directory "for
    visibility" (a session the user started themselves in `claude agents`). It then held
    that session to the Jarvis worker contract: end a turn without calling
-   `jarvis wo finish` and you are flagged "worker idle without `jarvis wo finish`";
+   `jarvis wo finish` and you are flagged as having stopped mid-task;
    vanish from `claude agents` and you are marked `failed` — "worker session
    disappeared". An adopted session was never dispatched by Jarvis, has no
    `JARVIS_WO_ID`, and never received the contract, so it *cannot* satisfy it. Every
@@ -27,7 +27,8 @@ import pytest
 
 from jarvis import db, ops
 from jarvis.hooks import handle_hook
-from jarvis.invariants import check_project, true_blockers
+from jarvis.invariants import (IDLE_NO_FINISH_BLOCKER, check_project,
+                               true_blockers)
 from jarvis.project_store import ProjectStore
 
 from test_pipeline import _add_session, _inject, started  # noqa: F401
@@ -61,9 +62,9 @@ def test_injected_session_going_idle_is_not_held_to_the_contract(
 ):
     """The user's own session ends a turn. That is not an anomaly — it is a turn ending.
 
-    This is the exact shape of six live attention items ("worker idle without
-    `jarvis wo finish` — review the session"), one of which was the very session the
-    user was talking to at the time.
+    This is the exact shape of six live attention items carrying
+    IDLE_NO_FINISH_BLOCKER, one of which was the very session the user was talking to
+    at the time.
     """
     daemon = started
     _inject(fake_claude, project, "working", sid="adhoc-1", name="my manual hack")
@@ -194,7 +195,7 @@ def test_the_wreckage_already_on_disk_is_repaired(project):
     store.flag_attention(gone["id"], "worker session disappeared")
     idle = store.create_work_order("adversarial design review jarvis", origin="injected")
     store.set_status(idle["id"], "needs_review")
-    store.flag_attention(idle["id"], "worker idle without `jarvis wo finish`")
+    store.flag_attention(idle["id"], IDLE_NO_FINISH_BLOCKER)
 
     violations = check_project(store, repair=True)
 
@@ -341,7 +342,7 @@ def test_ack_survives_the_reconcilers_next_pass(project):
     store = ProjectStore(project)
     wo = store.create_work_order("task")
     store.set_status(wo["id"], "needs_review")
-    store.flag_attention(wo["id"], "finished without a completion signal — review the session")
+    store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
 
     fresh = store.get_work_order(wo["id"])
     store.ack_attention(wo["id"], true_blockers(store, fresh))
@@ -357,7 +358,7 @@ def test_ack_does_not_deafen_the_work_order_to_something_new(project):
     store = ProjectStore(project)
     wo = store.create_work_order("task")
     store.set_status(wo["id"], "needs_review")
-    store.flag_attention(wo["id"], "finished without a completion signal — review the session")
+    store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
     store.ack_attention(wo["id"], true_blockers(store, store.get_work_order(wo["id"])))
 
     store.add_assumption(wo["id"], "swapped the auth library")
@@ -388,7 +389,7 @@ def test_ack_all_clears_the_whole_attention_list(started, project):
     for i in range(3):
         wo = store.create_work_order(f"task {i}")
         store.set_status(wo["id"], "needs_review")
-        store.flag_attention(wo["id"], "finished without a completion signal — review the session")
+        store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
         ids.append(wo["id"])
     keep = store.create_work_order("needs a decision")
     store.add_assumption(keep["id"], "picked postgres")
@@ -408,7 +409,7 @@ def test_ack_is_recorded_on_the_timeline(started, project):
     store = ProjectStore(project)
     wo = store.create_work_order("task")
     store.set_status(wo["id"], "needs_review")
-    store.flag_attention(wo["id"], "finished without a completion signal — review the session")
+    store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
 
     ops.ack_attention(wo["id"])
 
@@ -420,7 +421,7 @@ def test_status_stops_listing_acknowledged_work(started, project):
     store = ProjectStore(project)
     wo = store.create_work_order("task")
     store.set_status(wo["id"], "needs_review")
-    store.flag_attention(wo["id"], "finished without a completion signal — review the session")
+    store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
     assert any(a["wo_id"] == wo["id"] for a in ops.os_status()["attention"])
 
     ops.ack_attention(wo["id"])

@@ -1,17 +1,14 @@
 {% extends "base.html" %}
 {% block title %}Neo — Jarvis{% endblock %}
 
-{% from "_question.html" import question_body, deliberation %}
+{% from "_question.html" import question_body, deliberation, answer_form, review_form %}
 
 {% block content %}
 
+{# Counts live in the tab strip below, not here. #}
 <p class="kv" style="margin-top:18px">
-  Neo answers worker questions on your behalf. Review every answer below — approvals
+  Neo answers worker questions on your behalf. Review every answer it gives — approvals
   confirm its instincts, corrections become learnings it applies next time.
-  <span class="counts">({{ counts.get('queued', 0) }} queued ·
-  {{ counts.get('escalated', 0) }} escalated ·
-  {{ counts.get('unreviewed', 0) }} awaiting review ·
-  {{ learnings|length }} learnings)</span>
 </p>
 
 {% set digested = (escalated + unreviewed) | selectattr('digest_view') | list %}
@@ -52,13 +49,41 @@
       doubt, and Neo answers as you within a minute. If work orders keep arriving as
       long assumption lists to review instead, the workers are guessing — that is
       worth a look, not a shrug.
-      <br>Seed Neo below so its first answer already sounds like you.
+      <br>Seed Neo from the Learnings tab so its first answer already sounds like you.
     </div>
   </div></div>
 </div>
 {% endif %}
 
-{% if escalated %}
+{# The four readings of Neo's queue. Anything still in flight stays above the strip;
+   the two ASKS are tabs, and their counts ride in the strip in amber, so an ask is
+   announced above the fold instead of two screens down. §6 of
+   docs/superpowers/specs/2026-08-23-the-work-order-record.md. #}
+{% set open_tab = 'tab-escalated' if escalated
+     else ('tab-review' if unreviewed
+     else ('tab-history' if history else 'tab-learnings')) %}
+<div class="tabbed" id="neo-tabs">
+  <div class="tabs" role="tablist">
+    <button role="tab" data-panel="tab-escalated"
+            aria-selected="{{ 'true' if open_tab == 'tab-escalated' else 'false' }}"
+            aria-controls="tab-escalated">Escalated
+      <span class="n {{ 'hot' if escalated }}">{{ escalated|length }}</span></button>
+    <button role="tab" data-panel="tab-review"
+            aria-selected="{{ 'true' if open_tab == 'tab-review' else 'false' }}"
+            aria-controls="tab-review">Awaiting review
+      <span class="n {{ 'hot' if unreviewed }}">{{ unreviewed|length }}</span></button>
+    <button role="tab" data-panel="tab-history"
+            aria-selected="{{ 'true' if open_tab == 'tab-history' else 'false' }}"
+            aria-controls="tab-history">History
+      <span class="n">{{ history|length }}</span></button>
+    <button role="tab" data-panel="tab-learnings"
+            aria-selected="{{ 'true' if open_tab == 'tab-learnings' else 'false' }}"
+            aria-controls="tab-learnings">Learnings
+      <span class="n">{{ learnings|length }}</span></button>
+  </div>
+
+<section class="tabpanel {{ 'on' if open_tab == 'tab-escalated' }}" id="tab-escalated"
+         role="tabpanel">
 <h2>Escalated — Neo wants you to decide</h2>
 <div class="panel">
   {% for q in escalated %}
@@ -71,23 +96,16 @@
     {{ question_body(q) }}
     <div class="sub">Why escalated: {{ q.answer_reason or '—' }}</div>
     {{ deliberation(opinions.get(q.id)) }}
-    {% if q.kind == 'approval' %}
-    {# Answering here would send the worker a message and leave the gate shut: only
-       `decide_gate` records the verdict the hook checks. Send them where it counts. #}
-    <div class="sub" style="margin-top:8px">This is a privileged-action request —
-      typing a reply here would not open the gate.
-      <a href="/gates">decide it on the gates tab →</a></div>
-    {% else %}
-    <form method="post" action="/neo/{{ q.id }}/answer" style="margin-top:8px">
-      <textarea name="text" placeholder="Your answer — it goes straight to the worker" required></textarea>
-      <button class="primary" style="margin-top:6px">Send answer to worker</button>
-    </form>
-    {% endif %}
+    {{ answer_form(q, '/neo#tab-escalated') }}
   </div>
+  {% else %}
+  <div class="empty">nothing escalated — Neo is deciding these itself</div>
   {% endfor %}
 </div>
-{% endif %}
+</section>
 
+<section class="tabpanel {{ 'on' if open_tab == 'tab-review' }}" id="tab-review"
+         role="tabpanel">
 <h2>Awaiting your review</h2>
 <div class="panel">
   {% for q in unreviewed %}
@@ -99,23 +117,16 @@
     <div style="margin:6px 0"><strong>Neo:</strong> {{ q.answer }}</div>
     {% if q.answer_reason %}<div class="sub">Reasoning: {{ q.answer_reason }}</div>{% endif %}
     {{ deliberation(opinions.get(q.id)) }}
-    <div style="display:flex; gap:10px; margin-top:8px; align-items:flex-start">
-      <form method="post" action="/neo/{{ q.id }}/review" class="inline">
-        <input type="hidden" name="decision" value="approve">
-        <button class="accept">✓ That's what I'd say</button>
-      </form>
-      <form method="post" action="/neo/{{ q.id }}/review" style="flex:1; display:flex; gap:8px">
-        <input type="hidden" name="decision" value="correct">
-        <input type="text" name="feedback" placeholder="Correct Neo — what should it have said? (teaches it)">
-        <button class="danger">Correct</button>
-      </form>
-    </div>
+    {{ review_form(q, '/neo#tab-review') }}
   </div>
   {% else %}
   <div class="empty">nothing awaiting review</div>
   {% endfor %}
 </div>
+</section>
 
+<section class="tabpanel {{ 'on' if open_tab == 'tab-history' }}" id="tab-history"
+         role="tabpanel">
 <h2>History</h2>
 <div class="panel">
   <table>
@@ -142,7 +153,10 @@
     {% endfor %}
   </table>
 </div>
+</section>
 
+<section class="tabpanel {{ 'on' if open_tab == 'tab-learnings' }}" id="tab-learnings"
+         role="tabpanel">
 <h2>Learnings — how Neo becomes you</h2>
 <div class="panel">
   {% for l in learnings %}
@@ -155,7 +169,7 @@
     <span class="sub mono">{{ l.project or 'global' }}</span>
   </div>
   {% else %}
-  <div class="empty">no learnings yet — correct an answer above to teach Neo</div>
+  <div class="empty">no learnings yet — correct an answer on the review tab to teach Neo</div>
   {% endfor %}
 </div>
 <form method="post" action="/neo/learn" style="margin-top:10px; display:flex; gap:8px">
@@ -163,5 +177,7 @@
   <input type="text" name="project" placeholder="project (blank = global)" style="max-width:220px">
   <button class="primary">Teach</button>
 </form>
+</section>
+</div>
 
 {% endblock %}

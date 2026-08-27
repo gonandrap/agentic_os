@@ -338,6 +338,33 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
         sys.stderr.write("turn failed (test-forced)\n"); sys.exit(1)
     if os.environ.get("FAKE_CLAUDE_TURN") == "silent":
         sys.exit(0)  # process ends writing nothing — a crashed turn
+    # THE AUTH REFUSAL, AND THE WHOLE POINT IS WHERE IT WRITES. `claude -p` exits with
+    # NO result JSON and NO stderr — indistinguishable from `silent` out here — and puts
+    # the reason in its own session transcript as a `<synthetic>` assistant message. A
+    # fake that wrote to stdout or stderr would test a path the real incident never took
+    # (wo-c2793bf0, 2026-08-27; kn-8d466c3d).
+    if os.environ.get("FAKE_CLAUDE_TURN") == "auth":
+        root = os.environ.get("JARVIS_TRANSCRIPT_ROOT")
+        if root:
+            said = os.environ.get(
+                "FAKE_CLAUDE_AUTH_MESSAGE",
+                "Failed to authenticate: OAuth session expired and could not be refreshed")
+            d = os.path.join(root, "-fake")
+            os.makedirs(d, exist_ok=True)
+            # Sub-second, because the window it has to land inside is one turn of a test
+            # that takes milliseconds: a stamp floored to the second lands BEFORE
+            # `started_at` and `usage.said_in_session` drops it.
+            now = time.time()
+            stamp = (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+                     + f".{int(now % 1 * 1000):03d}Z")
+            with open(os.path.join(d, sid + ".jsonl"), "a") as f:
+                f.write(json.dumps({
+                    "type": "assistant", "timestamp": stamp,
+                    "message": {"id": f"synth-{seq}", "model": "<synthetic>",
+                                "content": [{"type": "text", "text": said}],
+                                "usage": {"input_tokens": 0, "output_tokens": 0}},
+                }) + "\n")
+        sys.exit(0)
     if os.environ.get("FAKE_CLAUDE_TURN") == "error":
         print(json.dumps({"type": "result", "subtype": "error_during_execution",
                           "is_error": True, "result": "model call failed",
@@ -1003,9 +1030,27 @@ def fake_claude(tmp_path, monkeypatch):
             monkeypatch.setenv("FAKE_CLAUDE_API_ERROR_STATUS", str(status))
             monkeypatch.setenv("FAKE_CLAUDE_TURN", "api_error")
 
+        def turns_auth_failed(
+                self, said: str = ("Failed to authenticate: OAuth session expired "
+                                   "and could not be refreshed"),
+                root: Path | None = None) -> Path:
+            """Refuse every subsequent turn the way an expired login does — SILENTLY.
+
+            No result JSON, no stderr: the reason goes into the session transcript as a
+            `<synthetic>` message and nowhere else, which is the whole reason the OS
+            could not see it. Points `JARVIS_TRANSCRIPT_ROOT` at `root` (a temp dir by
+            default) and returns it, so a test can also read what was written.
+            """
+            root = root or (tmp_path / "auth-transcripts")
+            root.mkdir(parents=True, exist_ok=True)
+            monkeypatch.setenv("JARVIS_TRANSCRIPT_ROOT", str(root))
+            monkeypatch.setenv("FAKE_CLAUDE_AUTH_MESSAGE", said)
+            monkeypatch.setenv("FAKE_CLAUDE_TURN", "auth")
+            return root
+
         def turns_recover(self) -> None:
-            """Undo `turns_fail`/`turns_rate_limited`/`turns_api_error`: turns succeed
-            again."""
+            """Undo `turns_fail`/`turns_rate_limited`/`turns_api_error`/
+            `turns_auth_failed`: turns succeed again."""
             monkeypatch.delenv("FAKE_CLAUDE_TURN", raising=False)
 
         def hold_turns(self) -> Path:

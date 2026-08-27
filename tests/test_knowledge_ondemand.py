@@ -327,6 +327,141 @@ def test_multi_word_search_ors_and_ranks(jarvis_home):
     assert "_score" not in ranked[0]
 
 
+def test_search_stems_so_a_different_inflection_still_retrieves(jarvis_home):
+    """The gap FTS5 was added to close: "rounding" finding an entry that says "rounded".
+
+    Under substring matching alone this query retrieved the entry only by riding along
+    with its other words (kn-b02bd307). On its own it returned nothing.
+    """
+    central = CentralStore()
+    central.add_knowledge("Figures are rounded at the presentation layer.",
+                          project="p1", topic="billing")
+    central.add_knowledge("Scheduled jobs register an idempotency key.",
+                          project="p1", topic="jobs")
+
+    assert [r["topic"] for r in central.search_knowledge("rounding", project="p1")] \
+        == ["billing"]
+    assert [r["topic"] for r in central.search_knowledge("scheduling", project="p1")] \
+        == ["jobs"]
+
+
+def test_search_ranks_by_bm25_not_by_how_many_words_appeared(jarvis_home):
+    """Ranking is the other half, and it needs a case word-counting CANNOT get right.
+
+    Both entries contain both query words, so the substring tier scores them equal and
+    falls back to recency — which puts the padded one first. BM25 sees that the other
+    says the same thing in a tenth of the space, and the assertion below is the
+    difference: with the FTS tier off, this exact query returns them the other way up.
+    """
+    central = CentralStore()
+    central.add_knowledge("Scheduled reports are chunked by day.",
+                          project="p1", topic="reports")
+    central.add_knowledge(
+        "Nightly export. " + "unrelated padding sentence. " * 200
+        + " It is scheduled by the daemon and lands beside the report.",
+        project="p1", topic="exports")  # more recent, so recency alone puts it first
+
+    assert central.search_knowledge(
+        "scheduled report", project="p1")[0]["topic"] == "reports"
+
+    central.fts = False  # the tier under test, removed
+    assert central.search_knowledge(
+        "scheduled report", project="p1")[0]["topic"] == "exports"
+
+
+def test_fts_never_retrieves_less_than_substring_matching_did(jarvis_home):
+    """The floor (spec §2, §3). Porter stems "deploy" and "deployment" apart, so pure
+    FTS5 would answer this query with nothing — and a worker reads nothing as "the OS
+    has never heard of this"."""
+    central = CentralStore()
+    central.add_knowledge("Deployment runs from a release tag, never from main.",
+                          project="p1", topic="releases")
+    central.add_knowledge("Kubernetes manifests live beside the chart.",
+                          project="p1", topic="infra")
+
+    assert [r["topic"] for r in central.search_knowledge("deploy", project="p1")] \
+        == ["releases"]
+    assert [r["topic"] for r in central.search_knowledge("kube", project="p1")] \
+        == ["infra"]
+
+
+def test_search_does_not_raise_on_what_a_user_actually_types(jarvis_home):
+    """`-`, `:`, `*`, `"` and bare `(` are FTS5 SYNTAX. This is a read verb reached from
+    the CLI, the dashboard and every worker: it returns rows or none, never a traceback.
+    """
+    central = CentralStore()
+    central.add_knowledge("PRs #1-#2 are unmerged.", project="p1", topic="process")
+
+    for hostile in ('PRs #1-', '-deploy', 'NEAR("a"', 'topic:billing', 'quote " mark',
+                    'star*', '^caret', '---', '(', '*', ':', '"'):
+        central.search_knowledge(hostile, project="p1")  # must not raise
+
+    assert len(central.search_knowledge("PRs #1-", project="p1")) == 1
+
+
+def test_the_index_tracks_every_writer_not_just_add_knowledge(jarvis_home):
+    """Triggers, not a call in `add_knowledge` — `retract_knowledge`,
+    `record_memory_file` and `set_knowledge_tags` write to the table directly (spec §4).
+    """
+    central = CentralStore()
+    row = central.add_knowledge("Figures are rounded at the presentation layer.",
+                                project="p1", topic="billing")
+
+    central.retract_knowledge(row["id"], "superseded")
+    hits = central.search_knowledge("rounding", project="p1")
+    assert [h["id"] for h in hits] == [row["id"]], "retraction lost the row from the index"
+    assert hits[0]["retired_reason"] == "superseded"
+
+    central.record_memory_file("Exports are chunked by day.", project="p1", topic="mem")
+    assert central.search_knowledge("chunking", project="p1")
+
+    tagged = central.add_knowledge("Nightly export.", project="p1", topic="exports")
+    central.set_knowledge_tags(tagged["id"], "nightly")
+    assert [h["id"] for h in central.search_knowledge("nightly", project="p1")] \
+        == [tagged["id"]]
+
+    central.conn.execute("DELETE FROM knowledge WHERE id=?", (tagged["id"],))
+    assert central.search_knowledge("nightly", project="p1") == []
+
+
+def test_an_existing_os_db_is_backfilled_once(jarvis_home):
+    """`executescript(SCHEMA)` is a no-op on a database that already has its tables, so
+    a live `os.db` gets the index by rebuild — the same problem ADDED_COLUMNS solves for
+    columns (spec §4)."""
+    central = CentralStore()
+    central.add_knowledge("Figures are rounded at the presentation layer.",
+                          project="p1", topic="billing")
+    # a store from before the index existed
+    central.conn.executescript(
+        "DROP TRIGGER knowledge_fts_ai; DROP TRIGGER knowledge_fts_au;"
+        " DROP TRIGGER knowledge_fts_ad; DROP TABLE knowledge_fts;")
+    central.conn.execute("DELETE FROM os_state WHERE key='knowledge_fts_built'")
+    central.close()
+
+    reopened = CentralStore()
+    assert reopened.fts
+    assert [r["topic"] for r in reopened.search_knowledge("rounding", project="p1")] \
+        == ["billing"], "pre-existing entries were not indexed"
+
+    # and the backfill is once, not on every open: a third open must not rebuild
+    stamp = reopened.get_state("knowledge_fts_built")
+    reopened.close()
+    assert CentralStore().get_state("knowledge_fts_built") == stamp
+
+
+def test_search_still_works_when_sqlite_has_no_fts5(jarvis_home, monkeypatch):
+    """A search as good as yesterday's is not an outage; a store that will not open is
+    (spec §8)."""
+    central = CentralStore()
+    central.add_knowledge("Figures are rounded at the presentation layer.",
+                          project="p1", topic="billing")
+    central.fts = False
+
+    assert central.search_knowledge("rounded", project="p1")     # substring tier alone
+    assert central.search_knowledge("rounding", project="p1") == []  # no stemming left
+    assert len(central.search_knowledge("", project="p1")) == 1
+
+
 def test_search_filters_by_topic(jarvis_home):
     central = CentralStore()
     central.add_knowledge("deploy note", project="p1", topic="deploy")

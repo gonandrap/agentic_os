@@ -51,13 +51,20 @@ def wo_title_prefix(wo_id: str) -> str:
     return f"[{wo_id}] "
 
 
-def gh_pr_create_title(command: str) -> str | None:
-    """The `--title` of a `gh pr create` in this command, or None.
+#: `gh pr create` flags this module reads, mapped to the key it files them under.
+_PR_CREATE_FLAGS = {"--title": "title", "-t": "title",
+                    "--body": "body", "-b": "body",
+                    "--body-file": "body_file", "-F": "body_file"}
 
-    None means "not something this hook has an opinion about": not a `gh pr create`, no
-    explicit title (`--fill`, an editor prompt), or a command shlex cannot parse.
-    Deliberately narrow — a hook that fires on commands it does not really understand
-    costs more than the leak it prevents, and the contract text covers the rest.
+
+def gh_pr_create_args(command: str) -> dict[str, str] | None:
+    """The flags of a `gh pr create` in this command, or None.
+
+    None means "not something these hooks have an opinion about": not a `gh pr create`,
+    or a command shlex cannot parse. An empty dict is a create carrying none of the
+    flags above — `--fill`, or an editor prompt. Deliberately narrow — a hook that fires
+    on commands it does not really understand costs more than the leak it prevents, and
+    the contract text covers the rest.
     """
     try:
         words = shlex.split(command)
@@ -73,14 +80,46 @@ def gh_pr_create_title(command: str) -> str | None:
         if (word != "gh" and not word.endswith("/gh")) \
                 or words[i + 1:i + 3] != ["pr", "create"]:
             continue
+        found: dict[str, str] = {}
         for j, arg in enumerate(words[i + 3:], start=i + 3):
             if arg in ("&&", "||", ";", "|"):
                 break
-            if arg.startswith("--title="):
-                return arg.split("=", 1)[1]
-            if arg in ("--title", "-t"):
-                return words[j + 1] if j + 1 < len(words) else None
+            flag, sep, inline = arg.partition("=")
+            key = _PR_CREATE_FLAGS.get(flag)
+            if key is None:
+                continue
+            if sep:
+                found[key] = inline
+            elif j + 1 < len(words):
+                found[key] = words[j + 1]
+        return found
     return None
+
+
+def gh_pr_create_title(command: str) -> str | None:
+    """The `--title` of a `gh pr create` in this command, or None."""
+    return (gh_pr_create_args(command) or {}).get("title")
+
+
+def gh_pr_create_body(command: str, cwd: str = "") -> str | None:
+    """The body text a `gh pr create` would submit, or None when it cannot be read.
+
+    `--body-file -` reads stdin, which a PreToolUse hook cannot see, and a path that
+    does not resolve is the same situation. Both are None: a body the hook cannot read
+    is one it must not judge.
+    """
+    args = gh_pr_create_args(command)
+    if args is None:
+        return None
+    if "body" in args:
+        return args["body"]
+    path = args.get("body_file")
+    if not path or path == "-":
+        return None
+    try:
+        return (Path(cwd) / path if cwd else Path(path)).read_text()
+    except OSError:
+        return None
 
 
 def pr_title_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
@@ -108,6 +147,122 @@ def pr_title_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str,
         f"PR titles in a Jarvis-managed project must start with the work order id, so "
         f"the pull request is traceable back to it. Re-run with:\n"
         f'    --title "{prefix}{title}"'
+    )
+
+
+# -- the PR body: what a reviewer needs, and what GitHub must not mislink --------------
+# Design: docs/superpowers/specs/2026-08-24-a-pull-request-a-reviewer-can-read.md
+
+#: The `##` headings a PR body must carry. Single-sourced here; the shipped templates
+#: (`.github/pull_request_template.md` and the skill's bundled copy) are asserted
+#: against this tuple by tests/test_pr_body.py, so the three cannot drift.
+PR_BODY_SECTIONS = ("Summary", "Implementation notes", "Questions asked to Neo",
+                    "Learnings", "Test evidence")
+
+# GitHub renders neither of these, so neither can mislink or count as content.
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+_CODE_SPAN = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
+
+_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+_TABLE_SEP = re.compile(r"^\s*\|[\s|:-]+\|\s*$")
+
+#: A `#123` GitHub will autolink. The lookbehind drops the cases it would NOT: a
+#: `owner/repo#12` cross-reference, a URL fragment, a `##` heading.
+_BARE_REF = re.compile(r"(?<![\w/#-])#\d+\b")
+#: ...and these words immediately before one mean the author really did mean issue N.
+_REF_IS_DELIBERATE = re.compile(
+    r"\b(?:issues?|prs?|pull requests?|close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*$",
+    re.IGNORECASE)
+
+
+def _blank_out(pattern: re.Pattern[str], text: str) -> str:
+    """Erase every match, preserving length and line breaks so offsets stay usable."""
+    return pattern.sub(lambda m: re.sub(r"\S", " ", m.group(0)), text)
+
+
+def mislinking_ref(body: str) -> str | None:
+    """The first `#N` in `body` that GitHub would turn into a link to someone else's
+    issue or pull request, or None.
+
+    Work orders number their own items, so a description's "as in #2" becomes a link to
+    a stranger's PR the moment it is copied into a body — observed on PR 143.
+    """
+    scannable = _blank_out(_CODE_SPAN, _blank_out(_HTML_COMMENT, body))
+    for m in _BARE_REF.finditer(scannable):
+        if not _REF_IS_DELIBERATE.search(scannable[:m.start()].rstrip()):
+            return m.group(0)
+    return None
+
+
+def _section_is_empty(text: str) -> bool:
+    """Whether a section holds anything the template did not already put there."""
+    lines = _HTML_COMMENT.sub("", text).splitlines()
+    seps = {i for i, ln in enumerate(lines) if _TABLE_SEP.match(ln)}
+    scaffolding = seps | {i - 1 for i in seps}  # a separator's header row
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if i in scaffolding or not line or line in ("-", "*") or set(line) <= set("-="):
+            continue
+        if line.startswith("|"):
+            # The first column is the row's template-supplied label; the row says
+            # something only once a later column is filled in.
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if not any(cells[1:]):
+                continue
+        return False
+    return True
+
+
+def pr_body_problems(body: str) -> list[str]:
+    """Every reason this body is not ready, as phrases naming the fix."""
+    heads = [(m.group(1).strip().lower(), m.start(), m.end())
+             for m in _HEADING.finditer(body)]
+    # A section runs to the START of the next heading of any level, so the heading line
+    # itself is never mistaken for the previous section's content.
+    starts = [h[1] for h in heads] + [len(body)]
+    spans = {name: body[end:starts[i + 1]] for i, (name, _, end) in enumerate(heads)}
+    problems = []
+    for name in PR_BODY_SECTIONS:
+        if name.lower() not in spans:
+            problems.append(f"no `## {name}` section")
+        elif _section_is_empty(spans[name.lower()]):
+            problems.append(f"`## {name}` is still the empty template")
+    ref = mislinking_ref(body)
+    if ref is not None:
+        problems.append(
+            f"`{ref}` — GitHub links that to issue/PR {ref[1:]}. Say `item {ref[1:]} "
+            f"of the work order`, or `issue {ref}` if you really do mean that issue, "
+            f"or put it in backticks if it is a literal")
+    return problems
+
+
+def pr_body_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
+    """Hold `gh pr create` to a body a reviewer can actually review.
+
+    Same reasoning as `pr_title_decision`, one field over: the body is the only place a
+    reviewer learns what the diff cannot tell them, and the contract's "a PR body hints,
+    it does not explain" was read as licence to ship a thin one (PR 143 — no test
+    evidence, no questions, no learnings). Prose alone does not fix that: kn-fe226ab1
+    measured a contract bullet changing worker behaviour 0/5.
+
+    Denies rather than rewrites, and never guesses — a body it cannot read (`--fill`,
+    an editor, stdin) is not its business.
+    """
+    if not env.get("JARVIS_WO_ID"):
+        return None
+    command = (payload.get("tool_input") or {}).get("command", "")
+    body = gh_pr_create_body(command, payload.get("cwd") or "")
+    if body is None:
+        return None
+    problems = pr_body_problems(body)
+    if not problems:
+        return None
+    return _deny(
+        "This PR body is not ready:\n"
+        + "".join(f"  - {p}\n" for p in problems)
+        + "The template and the rules for filling it are in your "
+          "`open-a-pull-request` skill; this repository's copy, if it has one, is "
+          "`.github/pull_request_template.md`."
     )
 
 
@@ -214,7 +369,11 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
     try:
         grant = store.usable_grant(wo_id, action.kind, action.command)
         if grant is not None:
-            gates.open_gate(store, grant)
+            neo = NeoStore()
+            try:
+                gates.open_gate(store, grant, neo=neo)
+            finally:
+                neo.close()
             # Two things open a gate and only one of them is permission. Saying which is
             # which here matters because this string is the audit record of why the
             # command ran: "approved" against a command that was never privileged is the
@@ -286,8 +445,9 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
       (JARVIS_WO_ID set), never for interactive sessions in managed projects.
 
     Gated privileged actions are resolved FIRST, so no auto-approval below can hand out
-    a merge or a release by accident. The PR-title rule is checked next, for the same
-    reason in reverse: it must not be reachable around by an auto-approval below it.
+    a merge or a release by accident. The PR title and body rules are checked next, for
+    the same reason in reverse: they must not be reachable around by an auto-approval
+    below them.
     """
     tool = payload.get("tool_name")
     tool_input = payload.get("tool_input") or {}
@@ -299,6 +459,9 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         mistitled = pr_title_decision(payload, env)
         if mistitled is not None:
             return mistitled
+        unreviewable = pr_body_decision(payload, env)
+        if unreviewable is not None:
+            return unreviewable
         if is_jarvis_command_chain(tool_input.get("command", "")):
             return _allow("jarvis contract command")
         return None

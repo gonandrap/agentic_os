@@ -191,6 +191,15 @@ jarvis learn show <kn-id> / list [--topic t] / topics / pin <id> / unpin <id>
                                            # workers fetch full text on demand.
                                            # `pin` = ride along verbatim in every
                                            # prompt — safety rails only.
+jarvis learn stats [--project p] [--days n]     # what memory COSTS and whether anyone
+                                           # reads it: the index's share of a dispatch
+                                           # prompt, entries nobody has ever opened,
+                                           # searches that came back empty, and orders
+                                           # that completed without one read. Reach for
+                                           # it when the base feels bloated — the
+                                           # entries themselves never reach a prompt,
+                                           # so the number that matters is retrieval,
+                                           # not size.
 jarvis learn retract <id> --reason "…"     # same for the knowledge base: retire a
                                            # superseded entry so it stops reaching
                                            # workers — it leaves the index too, not

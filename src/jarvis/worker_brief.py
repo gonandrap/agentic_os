@@ -41,7 +41,12 @@ PROJECT_PLACEHOLDER = "<project>"
 #: fetch the section — which is why concision is here rather than fetch-only
 #: (docs/superpowers/specs/2026-08-22-agent-concision.md SS6). Raise it again only on
 #: that test, not to make room.
-CORE_BUDGET_CHARS = 2750
+#:
+#: Raised again in wo-b1088ed9 for the one-shot-turn bullet, which passes that test
+#: exactly: a worker that does not know a turn ends its process backgrounds a long job
+#: and signs off expecting a wake-up, and the damage — the work lost, the money spent —
+#: is done before any section could be fetched.
+CORE_BUDGET_CHARS = 3220
 
 
 # -- the git briefing, replacing Claude Code's own ---------------------------------------
@@ -239,6 +244,13 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             f"--why \"<why this is ready>\" --evidence \"<PR, tests, checks>\"` "
             f"(full protocol: `jarvis brief gates --wo {wo_id}`).",
         ] if gate_names else []),
+        f"- **A turn is one-shot and NOTHING wakes you when a background job "
+        f"ends.** You are one `claude -p`, NOT an interactive session: the "
+        f"background-task notification you remember DOES NOT EXIST here, and "
+        f"ending the turn kills whatever you left running. Only a Neo answer, a "
+        f"gate verdict or a user message starts the next turn. Already backgrounded "
+        f"something? It is already lost — re-run it in the FOREGROUND and wait. "
+        f"Never end a turn saying you will be re-invoked when the run finishes.",
         f"- **Point, do not explain; say each thing ONCE.** A code comment is one "
         f"line citing the spec that explains it (`docs/superpowers/specs/`), not "
         f"the explanation. A PR body hints; the diff explains. Never restate what "
@@ -424,6 +436,21 @@ def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
         "",
         "Do not stop without finishing: a session that ends with neither "
         f"`jarvis wo finish` nor an open question is invisible work.",
+        "",
+        "# A turn is one-shot",
+        "Your session is a single `claude -p --resume` process, and ending a turn "
+        "exits it. Everything you started inside it goes too: a backgrounded "
+        "command is killed or orphaned, and either way nobody reads its output, "
+        "because no event re-invokes a worker when a job it launched finishes. "
+        "Exactly three things start your next turn — an answer to `jarvis wo ask`, "
+        "a verdict on a gate you requested, a message the user sends you.",
+        "",
+        "So work that outlasts one command runs in the FOREGROUND and you wait for "
+        "it, or you split it into pieces that each fit inside a turn. If it fits "
+        "in neither, say so and ask — a turn that ends on a question is a turn the "
+        "OS understands. A turn that ends on \"I'll pick this up when the "
+        "background run finishes\" is the work order abandoned mid-task, and the "
+        "user is flagged for it.",
     ]
     return "\n".join(lines)
 
@@ -494,6 +521,14 @@ def concision_section() -> str:
         "reasoning lives. The reviewer has the diff and does not need it "
         "narrated. If the PR needs a rationale longer than a few lines, that "
         "rationale is a spec and the PR links to it.",
+        "",
+        "This cuts NARRATION OF THE DIFF, and nothing else. It is not licence to "
+        "ship a thin body: the summary, the implementation notes, the Neo "
+        "questions, the learnings and the test evidence all stay, because none of "
+        "them is anywhere else. Fill the repository's PR template — your "
+        "`open-a-pull-request` skill has it, and a `gh pr create` missing a "
+        "section is denied "
+        "(docs/superpowers/specs/2026-08-24-a-pull-request-a-reviewer-can-read.md).",
         "",
         "## Say each thing once, across the whole record",
         "The description, your questions, your messages and your finish summary "

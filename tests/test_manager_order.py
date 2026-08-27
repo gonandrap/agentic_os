@@ -66,12 +66,14 @@ def boot(tmp_path, jarvis_home, fake_claude, project):
     `ops.validation_enabled` reads it on demand, so a test can release one plan with the
     flag off and the next with it on and compare the two.
     """
-    def _boot(validation: bool = True, max_concurrent: int = 4) -> Daemon:
+    def _boot(validation: bool = True, max_concurrent: int = 4,
+              feature_units: bool = True) -> Daemon:
         data = {
             "os": {
                 "defaults": {"model": "sonnet", "max_concurrent": max_concurrent},
                 "notifications": {"sinks": ["log"]},
-                "validation": {"enabled": validation},
+                "validation": {"enabled": validation,
+                               "feature_units": feature_units},
             },
             "projects": [
                 {"name": "proj_a", "path": str(project), "description": "test project"},
@@ -242,8 +244,15 @@ def test_inv_manager_slots_fires_when_the_exemption_is_removed(boot, store, monk
 def test_a_feature_completes_while_its_manager_is_open(boot, store):
     """`feature_children` filters to `kind='worker'`, so the manager cannot deadlock the
     completion — and because it cannot, nothing else would ever close it, which is why
-    `settle_features` does it here."""
-    daemon = boot(validation=True)
+    `settle_features` does it here.
+
+    `feature_units=False` is what this test has always been asking for and could not say
+    until the switch existed: a manager, and a feature that settles on its children. With
+    feature validation on, the last child landing sends the feature to the panel instead,
+    and the manager is closed by the pass — the same `_complete_feature`, one caller
+    further along. `tests/test_feature_validation.py` covers that route.
+    """
+    daemon = boot(validation=True, feature_units=False)
     spec = daemon.catalog.project("proj_a")
     fo_id = release(daemon, "CSV export", "one", "two")
     manager = store.manager_work_order(fo_id)
@@ -466,8 +475,13 @@ def test_a_work_order_can_be_filed_under_an_open_feature(boot, store):
 
 def test_a_settled_feature_refuses_new_children(boot, store):
     """Attaching a child to a completed feature would silently reopen a unit the user
-    has already been told about, and leave `settle_features` deciding what that means."""
-    daemon = boot(validation=True)
+    has already been told about, and leave `settle_features` deciding what that means.
+
+    `feature_units=False` for the same reason as the completion test above: what is being
+    pinned is the refusal on a SETTLED feature, and the shortest honest way to a settled
+    one is the route that does not go through the panel.
+    """
+    daemon = boot(validation=True, feature_units=False)
     spec = daemon.catalog.project("proj_a")
     fo_id = release(daemon, "CSV export", "one")
     for c in store.feature_children(fo_id):

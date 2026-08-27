@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import claude_cli, systemd_units
+from . import claude_cli, systemd_units, usage
 from .catalog import ProjectSpec
 from .project_store import ProjectStore
 
@@ -320,8 +320,13 @@ def _reap(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any]:
     result = claude_cli.read_turn_result(Path(turn["outfile"]),
                                          Path(turn["errfile"]) if turn["errfile"] else None)
     if result is None:
-        error = _stderr_tail(turn) or "the turn's process ended without writing a result"
-        store.add_event(wo_id, "turn_failed", {"seq": turn["seq"], "error": error[:500]})
+        error = (_stderr_tail(turn) or _transcript_error(store, wo_id, turn)
+                 or NO_RESULT)
+        payload: dict[str, Any] = {"seq": turn["seq"], "error": error[:500]}
+        auth = claude_cli.auth_failure(error)
+        if auth:
+            payload |= {"reason": PAUSE_AUTH}
+        store.add_event(wo_id, "turn_failed", payload)
         return store.finish_turn(turn["id"], "failed", error=error)
     # Recorded on BOTH outcomes: a failed turn's tokens were spent just the same — the
     # turn that motivated this hit a 429 having already paid $0.07 for the attempt.
@@ -338,15 +343,21 @@ def _reap(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any]:
         # is the same evidence `_diagnose` will re-read later (the row carries both
         # fields for exactly that reason) — but this is the one moment the stderr tail is
         # also in hand.
-        limit = claude_cli.usage_limit(result.error)
-        transient = None if limit else claude_cli.transient_failure(
+        auth = claude_cli.auth_failure(result.error)
+        limit = None if auth else claude_cli.usage_limit(result.error)
+        transient = None if auth or limit else claude_cli.transient_failure(
             result.error, terminal_reason=result.terminal_reason,
             api_error_status=result.api_error_status)
-        payload: dict[str, Any] = {"seq": turn["seq"], "error": result.error[:500]}
-        if limit:
+        payload = {"seq": turn["seq"], "error": result.error[:500]}
+        if auth:
+            payload |= {"reason": PAUSE_AUTH}
+        elif limit:
             payload |= {"reason": PAUSE_USAGE_LIMIT, "reset_at": limit.reset_at}
         elif transient:
             payload |= {"reason": PAUSE_TRANSIENT, "status": transient.status}
+        # `turn_failed` for auth, not `turn_paused`: the OS is not going to put this one
+        # right, and a "paused, resuming shortly" line about an account that cannot
+        # answer would be a promise the timeline cannot keep.
         store.add_event(wo_id, "turn_paused" if limit or transient else "turn_failed",
                         payload)
         return store.finish_turn(turn["id"], "failed", error=result.error,
@@ -383,6 +394,42 @@ def _last_assistant_message(store: ProjectStore, wo_id: str,
         if message:
             return str(message)
     return ""
+
+
+#: What the OS used to say about EVERY turn that died this way, and all it could say.
+#: Kept as the last resort only.
+NO_RESULT = "the turn's process ended without writing a result"
+
+
+def _transcript_error(store: ProjectStore, wo_id: str,
+                      turn: dict[str, Any]) -> str:
+    """Why a turn died, recovered from the session transcript — the third place to look.
+
+    `claude -p` can exit writing neither the result JSON nor a byte of stderr, and then
+    the transcript is the only record of the reason. It writes one there as an assistant
+    message from `<synthetic>`, its own voice: "Failed to authenticate: OAuth session
+    expired and could not be refreshed" is what all three of the 2026-08-27 work orders
+    were really saying while the OS reported `NO_RESULT` (kn-8d466c3d).
+
+    TWO VOICES, AND ONLY ONE OF THEM IS AN ERROR. A `<synthetic>` message is the CLI
+    speaking and is returned verbatim, so `_diagnose` can classify it. Anything else is
+    the WORKER speaking — its last words before something killed the process — which is
+    worth showing and must not be read as a diagnosis, so it goes back wrapped in
+    `NO_RESULT` rather than standing in for it.
+    """
+    session_id = store.get_work_order(wo_id).get("session_id")
+    if not session_id:
+        return ""
+    try:
+        said = usage.said_in_session(
+            session_id, since=turn["started_at"],
+            until=turn.get("ended_at") or time.time())
+    except OSError:
+        return ""
+    for model, text in reversed(said):
+        if model == usage.SYNTHETIC_MODEL:
+            return text
+    return f"{NO_RESULT}; its last words were: {said[-1][1][:400]}" if said else ""
 
 
 def _stderr_tail(turn: dict[str, Any]) -> str:
@@ -435,6 +482,14 @@ def is_stalled(turn: dict[str, Any] | None) -> bool:
 PAUSE_USAGE_LIMIT = "usage_limit"
 #: The API broke. Nothing names a moment, so `TRANSIENT_BACKOFF` picks one.
 PAUSE_TRANSIENT = "transient"
+#: THE ODD ONE OUT, AND THE COMMENT ABOVE IS WHY IT IS STILL HERE. Claude Code could not
+#: authenticate, so nothing about this comes back by itself — it clears when a human runs
+#: `/login`. It is a `reason` on the same `TurnPause` anyway because all four call sites
+#: ask "is this coming back by itself, and when?", and the honest answer for auth is "no"
+#: — which they already have a word for. `max_attempts` is 0, so the very first auth turn
+#: is `exhausted` and every one of them steps aside for the user (Neo, question 167).
+#: Resuming one automatically when the account is well again is a separate order.
+PAUSE_AUTH = "auth"
 
 #: What to call each reason in a sentence written for the user. Here rather than at each
 #: surface so the notification, the status note and the timeline cannot end up calling
@@ -442,6 +497,7 @@ PAUSE_TRANSIENT = "transient"
 PAUSE_NOUN = {
     PAUSE_USAGE_LIMIT: "usage-limit",
     PAUSE_TRANSIENT: "Claude API",
+    PAUSE_AUTH: "Claude Code authentication",
 }
 
 
@@ -449,8 +505,8 @@ PAUSE_NOUN = {
 class TurnPause:
     """A work order that stopped for the transport, and is coming back on its own."""
 
-    #: `PAUSE_USAGE_LIMIT` or `PAUSE_TRANSIENT` — why it stopped, and which schedule
-    #: decided `retry_at`.
+    #: `PAUSE_USAGE_LIMIT`, `PAUSE_TRANSIENT` or `PAUSE_AUTH` — why it stopped, and
+    #: which schedule decided `retry_at` (none, for auth: it is exhausted on arrival).
     reason: str
     #: The turn that died. Its `prompt` is what a retry re-sends, when it re-sends one.
     turn: dict[str, Any]
@@ -468,6 +524,8 @@ class TurnPause:
 
     @property
     def max_attempts(self) -> int:
+        if self.reason == PAUSE_AUTH:
+            return 0  # nothing to wait for; see PAUSE_AUTH
         return (MAX_RATE_LIMIT_RETRIES if self.reason == PAUSE_USAGE_LIMIT
                 else len(TRANSIENT_BACKOFF))
 
@@ -498,6 +556,14 @@ def turn_pause(store: ProjectStore, wo_id: str) -> TurnPause | None:
     reason, ended = _diagnose(turn), turn.get("ended_at") or turn["started_at"]
     if reason is None:
         return None
+    if isinstance(reason, claude_cli.AuthFailure):
+        # `retry_at` is the moment it died only because the field is not nullable — it
+        # is never compared to a clock, because `exhausted` is already true.
+        return TurnPause(
+            reason=PAUSE_AUTH, turn=turn, retry_at=ended,
+            attempts=pause_streak(store, wo_id, PAUSE_AUTH),
+            message=reason.message,
+        )
     if isinstance(reason, claude_cli.UsageLimit):
         when = (ended + RATE_LIMIT_FALLBACK_DELAY if reason.reset_at is None
                 else reason.reset_at)
@@ -523,12 +589,15 @@ def turn_pause(store: ProjectStore, wo_id: str) -> TurnPause | None:
     )
 
 
-def _diagnose(turn: dict[str, Any]) -> claude_cli.UsageLimit | claude_cli.TransientFailure | None:
-    """Why this failed turn is worth retrying, or None if it is not.
+def _diagnose(
+    turn: dict[str, Any],
+) -> claude_cli.AuthFailure | claude_cli.UsageLimit | claude_cli.TransientFailure | None:
+    """What this failed turn actually was, or None if it was an ordinary failure.
 
     One place, so the pause and the streak that counts it can never disagree about what
-    a given turn was. The usage limit goes first because its message is also an API
-    error and would otherwise be read as one.
+    a given turn was. The usage limit goes before the transient because its message is
+    also an API error and would otherwise be read as one; auth goes before BOTH, because
+    it is the one diagnosis here that no amount of retrying can improve.
 
     A PURE FUNCTION OF THE ROW, AND `now` IS WHAT MAKES IT ONE. The refusal states a
     wall-clock time ("resets 12pm") or a countdown ("resets in 2h 15m"), and both are
@@ -542,6 +611,9 @@ def _diagnose(turn: dict[str, Any]) -> claude_cli.UsageLimit | claude_cli.Transi
     turn is settled and no later reader can move it.
     """
     error = turn.get("error")
+    auth = claude_cli.auth_failure(error)
+    if auth is not None:
+        return auth
     limit = claude_cli.usage_limit(error, now=turn.get("ended_at") or turn["started_at"])
     if limit is not None:
         return limit
@@ -563,7 +635,9 @@ def pause_streak(store: ProjectStore, wo_id: str, reason: str) -> int:
     included: a conversation that hit the usage limit and then hit a 500 is on its first
     500, and charging it the limit's attempts would cut its backoff short.
     """
-    want = claude_cli.UsageLimit if reason == PAUSE_USAGE_LIMIT else claude_cli.TransientFailure
+    want = {PAUSE_USAGE_LIMIT: claude_cli.UsageLimit,
+            PAUSE_TRANSIENT: claude_cli.TransientFailure,
+            PAUSE_AUTH: claude_cli.AuthFailure}[reason]
     n = 0
     for turn in store.recent_turns(wo_id, limit=MAX_RATE_LIMIT_RETRIES + 2):
         if turn["state"] != "failed" or not isinstance(_diagnose(turn), want):

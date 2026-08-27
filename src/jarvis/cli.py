@@ -4,13 +4,13 @@ Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
   jarvis cost [project|wo-id|fo-id]       what the work has cost in tokens
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
-  jarvis fo create|list|show|plan|approve|cancel        feature orders (planned sets)
+  jarvis fo create|list|show|plan|submit|approve|cancel feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
   jarvis gate rules|rule-retract|explain  what counts as privileged, and what the OS
                                           has LEARNED does not
   jarvis neo list|show|review|answer|learnings|learn|export
   jarvis backlog add|list|show|promote|done
-  jarvis learn add|list|search|show|topics|pin|unpin
+  jarvis learn add|list|search|show|topics|stats|pin|unpin
   jarvis notify / jarvis inbox
   jarvis bug report                       file a Jarvis OS bug (GitHub issue + ping)
   jarvis ui                               web dashboard
@@ -220,8 +220,9 @@ def build_parser() -> argparse.ArgumentParser:
     l.add_argument("--include-hidden", action="store_true",
                    help="include work orders you've hidden")
 
-    s = wo.add_parser("show", help="show one work order with its timeline, messages "
-                                   "and assumptions")
+    s = wo.add_parser("show", help="show one work order: what was said (the "
+                                   "conversation), what happened (the timeline), and "
+                                   "its assumptions")
     s.add_argument("wo_id")
     s.add_argument("--project")
     s.add_argument("--debug", action="store_true",
@@ -359,6 +360,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "what trips the privileged-action classifier")
     f.add_argument("--project")
 
+    f = fo.add_parser("submit", help="(project managers) submit the feature for review "
+                                     "again, once the remediation work orders have landed")
+    f.add_argument("fo_id")
+    f.add_argument("--summary", required=True,
+                   help="what changed since the last round, in your own words")
+    f.add_argument("--evidence", default="",
+                   help="how the feature as a whole was verified — the reviewer reads "
+                        "this against the integrated diff, so a claim the diff does not "
+                        "support is worse than no claim")
+    f.add_argument("--project")
+
     f = fo.add_parser("approve", help="release a submitted plan (or send it back), when "
                                       "Neo escalated the decision to you")
     f.add_argument("fo_id")
@@ -492,6 +504,10 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("ids", nargs="+")
     k = kn.add_parser("topics", help="topics and how many entries each holds")
     k.add_argument("--project")
+    k = kn.add_parser("stats", help="what memory costs and whether anyone reads it")
+    k.add_argument("--project")
+    k.add_argument("--days", type=int, help="only reads and orders this recent")
+    k.add_argument("--limit", type=int, default=10, help="rows per list")
     k = kn.add_parser("pin", help="always inject this entry in full")
     k.add_argument("kn_id")
     k = kn.add_parser("unpin", help="demote to an index headline")
@@ -1186,7 +1202,7 @@ def cmd_adopt(args: argparse.Namespace) -> int:
 def cmd_wo(args: argparse.Namespace) -> int:
     from . import invariants, ops
     from .project_store import OPEN_STATUSES, ProjectStore
-    from .timeline import build_timeline
+    from .timeline import build_conversation, build_timeline
 
     if args.wo_cmd == "create":
         deps = [d.strip() for d in args.depends_on.split(",") if d.strip()]
@@ -1257,14 +1273,17 @@ def cmd_wo(args: argparse.Namespace) -> int:
         name, path, wo = ops.find_work_order(args.wo_id, args.project)
         store = ProjectStore(path)
         try:
+            events = store.list_events(args.wo_id)
             messages = store.list_messages(args.wo_id)
             detail = {
                 "project": name, **wo,
                 "status_label": invariants.status_label(store, wo),
                 "blocked_by": store.unfinished_dependencies(args.wo_id),
-                "timeline": build_timeline(wo, store.list_events(args.wo_id),
-                                           messages, include_debug=args.debug),
-                "messages": messages,
+                "timeline": build_timeline(wo, events, messages,
+                                           include_debug=args.debug),
+                # What was said, in order, whoever spoke — the worker's questions to
+                # Neo included, which `messages` alone never held.
+                "conversation": build_conversation(events, messages),
                 # Every assumption, each with its `n` and `status` — §4.
                 "assumptions": store.all_assumptions(args.wo_id),
                 # What this work order was allowed (or refused) permission to ship.
@@ -1329,7 +1348,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
 
 
 FO_ICON = {"pending": "⏳", "planning": "🧭", "plan_review": "👀", "executing": "🟢",
-           "completed": "✅", "failed": "❌", "cancelled": "🚫"}
+           "validating": "🔎", "completed": "✅", "failed": "❌", "cancelled": "🚫"}
 
 
 def cmd_fo(args: argparse.Namespace) -> int:
@@ -1404,6 +1423,10 @@ def cmd_fo(args: argparse.Namespace) -> int:
         except _json.JSONDecodeError as e:
             raise ops.OpsError(f"{path} is not valid JSON: {e}") from e
         _print(ops.submit_plan(args.fo_id, doc, project_name=args.project), args.json)
+
+    elif args.fo_cmd == "submit":
+        _print(ops.submit_feature(args.fo_id, args.summary, evidence=args.evidence,
+                                  project_name=args.project), args.json)
 
     elif args.fo_cmd == "approve":
         _print(ops.review_plan(args.fo_id, accept=not args.reject,
@@ -1633,9 +1656,86 @@ def cmd_backlog(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_knowledge_usage(res: dict[str, Any], as_json: bool) -> None:
+    """`jarvis learn stats` for a person: cost, use, and non-use, in that order.
+
+    Non-use is last and longest because it is the only half that asks for a decision —
+    an entry nothing has ever read is a candidate for retraction, and an order that
+    finished without reading is a candidate for a better index line.
+    """
+    if as_json:
+        _print(res, True)
+        return
+    size, reads = res["size"], res["reads"]
+    scope = res["project"] or "fleet"
+    window = f", last {res['days']}d" if res["days"] else ""
+    print(f"{scope}{window} — {res['entries']} entries, "
+          f"{size['total_chars'] // 1000}k chars of body text "
+          f"(median {size['median_chars']}, largest {size['max_chars']})\n")
+
+    print("WHAT IT COSTS A PROMPT — the index ships, the entries do not")
+    for c in res["prompt_cost"]:
+        print(f"  {c['project']:<16} {c['index_chars']:>6} chars "
+              f"({c['share_of_prompt'] * 100:.0f}% of a dispatch prompt) · "
+              f"{c['indexed']} indexed, {c['pinned']} pinned, {c['overflow']} overflow · "
+              f"{c['body_chars'] // 1000}k chars never sent")
+    print(f"  {size['truncated_headlines']}/{res['entries']} entries reach the index as a "
+          f"TRUNCATED first line")
+
+    def plural(n: int, word: str) -> str:
+        return f"{n} {word}{'' if n == 1 else 's'}"
+
+    print(f"\nWHO READS IT — {plural(reads['reads'], 'read')}, {reads['by_workers']} by "
+          f"workers across {plural(reads['orders'], 'order')}")
+    if reads["by_verb"]:
+        print("  " + " · ".join(f"{v}: {n}" for v, n in reads["by_verb"].items()))
+    print(f"  {reads['chars'] // 1000}k chars fetched in total, "
+          f"~{res['read_chars_per_order']} per order that read at all")
+    if reads["misses"]:
+        print(f"  {plural(reads['misses'], 'read')} came back EMPTY — the base was asked "
+              f"and had nothing")
+    for u in reads["unanswered"][:5]:
+        print(f"    {u['wo_id'] or 'you':<14} {u['verb']} {u['term']!r}")
+
+    print(f"\nWHAT IS NEVER READ — {res['never_read_count']}/{res['entries']} entries")
+    for e in res["never_read"][:5]:
+        print(f"  {e['id']}  {e['chars']:>5} chars  {e['headline'][:70]}")
+    if res["top_entries"] and res["top_entries"][0]["reads"]:
+        print("  most read:")
+        for e in res["top_entries"][:5]:
+            if e["reads"]:
+                print(f"  {e['id']}  {e['reads']:>3} × {e['headline'][:70]}")
+
+    if res["observed_from"] is None:
+        print("\nORDERS THAT NEVER LOOKED — nothing recorded yet: the read log starts at "
+              "the first `jarvis learn` a worker runs, and orders that finished before "
+              "it were never observed")
+        return
+    since = _age(res["observed_from"])
+    print(f"\nORDERS THAT NEVER LOOKED — {res['silent_order_count']} completed without "
+          f"one read, of those started in the {since} since the log began")
+    # A title match is a hint, not a verdict: it is the same LIKE search a worker would
+    # have run, so it is blind to synonyms in both directions.
+    print(f"  {res['could_have_read_count']} of them had an entry matching their own "
+          f"title, recorded before they started:")
+    for m in res["could_have_read"][:5]:
+        print(f"  {m['wo_id']}  {m['title'][:52]}")
+        for e in m["entries"][:2]:
+            print(f"      → {e['id']}  {e['headline'][:62]}")
+
+
 def cmd_learn(args: argparse.Namespace) -> int:
+    import os
+
+    from . import ops
     from .central_store import PINNED_TAG, CentralStore, has_tag, headline, split_tags
     from .ops import OpsError
+
+    # Who is reading, for the read log. The env pair is what `dispatch._worker_env` sets,
+    # so an empty wo_id means a person at a terminal rather than a worker.
+    reader_wo = os.environ.get("JARVIS_WO_ID", "")
+    reader_project = (os.environ.get("JARVIS_PROJECT", "")
+                      or getattr(args, "project", "") or "")
 
     def digested(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Index form: enough to decide whether to fetch the entry, not the entry.
@@ -1668,23 +1768,38 @@ def cmd_learn(args: argparse.Namespace) -> int:
             # headline cannot pass for standing advice.
             rows = central.search_knowledge("", limit=args.limit, project=args.project,
                                             topic=args.topic)
+            central.record_knowledge_read(
+                "list", rows, term=args.topic or "", project=reader_project,
+                wo_id=reader_wo,
+                chars=sum(len(r["content"] if args.full else headline(r["content"]))
+                          for r in rows))
             _print(rows if args.full else digested(rows), args.json)
         elif args.kn_cmd == "search":
             rows = central.search_knowledge(args.term, limit=args.limit,
                                             project=args.project, topic=args.topic)
+            central.record_knowledge_read("search", rows, term=args.term,
+                                          project=reader_project, wo_id=reader_wo)
             if not rows and not args.json:
                 print(f"no knowledge matching {args.term!r} — "
                       f"try `jarvis learn topics` for what is recorded")
             _print(rows, args.json)
         elif args.kn_cmd == "show":
             rows = [r for r in (central.get_knowledge(i) for i in args.ids) if r]
+            central.record_knowledge_read("show", rows, term=" ".join(args.ids),
+                                          project=reader_project, wo_id=reader_wo)
             missing = set(args.ids) - {r["id"] for r in rows}
             if missing:
                 raise OpsError(f"unknown knowledge id(s): {', '.join(sorted(missing))}")
             _print(rows, args.json)
         elif args.kn_cmd == "topics":
-            _print([{"topic": t or "(no topic)", "entries": n}
-                    for t, n in central.knowledge_topics(args.project)], args.json)
+            topics = central.knowledge_topics(args.project)
+            central.record_knowledge_read("topics", [{"topic": t} for t, _ in topics],
+                                          project=reader_project, wo_id=reader_wo)
+            _print([{"topic": t or "(no topic)", "entries": n} for t, n in topics],
+                   args.json)
+        elif args.kn_cmd == "stats":
+            _print_knowledge_usage(ops.knowledge_usage_report(
+                project=args.project, days=args.days), args.json)
         elif args.kn_cmd in ("pin", "unpin"):
             row = central.pin_knowledge(args.kn_id, pinned=args.kn_cmd == "pin")
             if row is None:
@@ -1761,9 +1876,14 @@ def cmd_neo(args: argparse.Namespace) -> int:
         finally:
             neo.close()
         if not args.all:
+            # `answered_by == "neo"` matches NeoStore.counts, which is what the
+            # `jarvis status` line above this list already counts: only Neo's own
+            # judgement is up for review, and an answer the user or the OS wrote is not
+            # a decision anyone owes. Without it the two surfaces disagree.
             qs = [q for q in qs
                   if q["status"] in ("queued", "answering", "escalated", "failed")
-                  or (q["status"] == "answered" and q["review_status"] == "unreviewed")]
+                  or (q["status"] == "answered" and q["review_status"] == "unreviewed"
+                      and q["answered_by"] == "neo")]
         if args.json:
             _print(qs, True)
         else:

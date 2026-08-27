@@ -104,6 +104,75 @@ def test_a_deep_link_opens_the_tab_its_target_is_inside(page, server, daemon, pr
     assert page.locator("#pending").is_visible()
 
 
+def _neo_queue(daemon, escalate: bool = True, review: bool = True):
+    """Whatever mix of the two asks a test needs, through the real drain."""
+    wo = ops.create_work_order("proj_a", "neo tabbed task")
+    daemon.tick()
+    if review:
+        ops.ask_question(wo["id"], "CSV or JSON for the export default?")
+    if escalate:
+        ops.ask_question(wo["id"], "FORCE_ESCALATE: may I rotate the production key?")
+    daemon._neo_drain()
+    return wo
+
+
+def test_neo_tabs_show_one_block_at_a_time(page, server, daemon, project):
+    """The three blocks the reader came for used to be one long scroll."""
+    _neo_queue(daemon)
+    page.goto(f"{server}/neo")
+
+    assert page.locator("#tab-escalated").is_visible()
+    for other in ("#tab-review", "#tab-history", "#tab-learnings"):
+        assert not page.locator(other).is_visible()
+
+    page.click(".tabs button:has-text('Awaiting review')")
+    assert page.locator("#tab-review").is_visible()
+    assert not page.locator("#tab-escalated").is_visible()
+    assert "CSV or JSON" in page.locator("#tab-review").inner_text()
+
+    page.click(".tabs button:has-text('Learnings')")
+    assert page.locator("#tab-learnings").is_visible()
+    assert page.locator("form[action='/neo/learn']").is_visible()
+
+
+def test_neo_opens_on_the_ask_that_is_owed(page, server, daemon, project):
+    """Nothing escalated, an answer awaiting review: the review tab is the one open.
+    Landing on Escalated-and-empty would hide the only thing the page owes."""
+    _neo_queue(daemon, escalate=False)
+    page.goto(f"{server}/neo")
+
+    assert page.locator("#tab-review").is_visible()
+    assert not page.locator("#tab-escalated").is_visible()
+
+
+def test_an_ask_is_counted_in_the_strip_while_its_panel_is_shut(page, server, daemon,
+                                                                project):
+    """The whole licence for putting an ask in a tab: the count stays above the fold,
+    in amber, from whichever tab the reader is on. A silent tab would just be the
+    scroll again, one fold higher."""
+    _neo_queue(daemon)
+    page.goto(f"{server}/neo")
+    page.click(".tabs button:has-text('History')")
+
+    assert not page.locator("#tab-escalated").is_visible()
+    hot = page.locator(".tabs button:has-text('Escalated') .n.hot")
+    assert hot.is_visible()
+    assert hot.inner_text().strip() == "1"
+
+
+def test_answering_an_escalation_lands_back_on_its_tab(page, server, daemon, project):
+    """Acting on a tab and being returned to the top of a different one is how a
+    reader loses their place — and with four tabs there are three wrong ones."""
+    _neo_queue(daemon, review=False)
+    page.goto(f"{server}/neo")
+    page.fill("#tab-escalated textarea[name='text']", "No — wait for the window")
+    page.click("#tab-escalated button:has-text('Send answer to worker')")
+
+    assert page.url.endswith("/neo#tab-escalated")
+    assert page.locator("#tab-escalated").is_visible()
+    assert not page.locator("#tab-history").is_visible()
+
+
 def test_a_timeline_question_opens_the_question_and_its_answer(page, server, daemon,
                                                                project):
     """The timeline names the question and points at it. Following that link must land
@@ -123,6 +192,35 @@ def test_a_timeline_question_opens_the_question_and_its_answer(page, server, dae
     body = page.locator("body").inner_text()
     assert "CSV or JSON for the export default?" in body
     assert "CSV, and gzip it" in body
+
+
+def test_a_timeline_message_opens_the_conversation_at_that_turn(page, server, daemon,
+                                                                project):
+    """The timeline says a message happened and points at the words. The words are on
+    another tab, so following that pointer has to OPEN that tab — the same `hashchange`
+    path `#pending` uses, and the only surface that can prove it."""
+    wo = ops.create_work_order("proj_a", "answered task")
+    daemon.tick()
+    qid = ops.ask_question(wo["id"], "CSV or JSON for the export default?")["question_id"]
+    ops.neo_answer_escalated(qid, "CSV, and gzip it — every export, no exceptions")
+
+    page.goto(f"{server}/wo/proj_a/{wo['id']}")
+    # The ask and the answer are one exchange, on the tab that opens by default.
+    said = page.locator("#tab-conversation").inner_text()
+    assert "worker → Neo" in said
+    assert "CSV or JSON for the export default?" in said
+    assert "CSV, and gzip it — every export, no exceptions" in said
+
+    page.click(".tabs button:has-text('Timeline')")
+    story = page.locator("#tab-timeline").inner_text()
+    assert "You messaged the worker" in story
+    assert "CSV, and gzip it — every export, no exceptions" not in story
+
+    page.click("#tab-timeline a:has-text('in the conversation')")
+    # `hashchange` fires after the click's own task, so wait rather than sample.
+    page.wait_for_selector("#tab-conversation", state="visible")
+    assert not page.locator("#tab-timeline").is_visible()
+    assert page.locator("#msg-1").is_visible()
 
 
 def test_send_feedback_from_wo_page(page, server, daemon, project):
@@ -151,9 +249,12 @@ def test_neo_full_review_cycle(page, server, daemon, project):
     assert "CSV or JSON for the export?" in body
     assert "neo-decision" in body
 
-    # approve from the browser
+    # approve from the browser: the queue the reader is working drains, and the
+    # verdict is on the history tab
     page.click("button:has-text(\"That's what I'd say\")")
-    assert page.locator("text=approved").first.is_visible()
+    assert "nothing awaiting review" in page.locator("#tab-review").inner_text()
+    page.click(".tabs button:has-text('History')")
+    assert "approved" in page.locator("#tab-history").inner_text()
 
     # second question — correct it, teaching Neo
     ops.ask_question(wo["id"], "And the delimiter?")
@@ -161,7 +262,8 @@ def test_neo_full_review_cycle(page, server, daemon, project):
     page.goto(f"{server}/neo")
     page.fill("input[name='feedback']", "Semicolons. Excel-friendly.")
     page.click("button:has-text('Correct')")
-    assert "Semicolons. Excel-friendly." in page.locator("body").inner_text()
+    page.click(".tabs button:has-text('Learnings')")
+    assert "Semicolons. Excel-friendly." in page.locator("#tab-learnings").inner_text()
 
 
 def test_neo_escalation_answered_in_browser(page, server, daemon, project):

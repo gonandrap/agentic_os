@@ -1190,6 +1190,142 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     return round_row
 
 
+def collect_feature_evidence(store: ProjectStore, project_path: Path,
+                             fo: dict[str, Any], *, declared: str, summary: str,
+                             cfg: Any) -> Any:
+    """The feature's packet, with each child's own account attached.
+
+    Here rather than in `evidence` because assembling `children` is a store read per
+    child, and that module may not touch a store — its whole value is that nothing it
+    reports could have been influenced by the work it is reporting on.
+
+    A child contributes what its OWN last validation round was told, not what it wrote
+    into its pull request: that text was already judged once, so a feature seat comparing
+    the integrated diff against it is re-checking the same claim at the only level where
+    two children can contradict each other. A child that never validated contributes an
+    empty string, which says so honestly.
+    """
+    from . import evidence as evidence_mod
+
+    children = []
+    for child in store.feature_children(fo["id"]):
+        last = store.latest_validation_round(wo_id=child["id"])
+        children.append({**child, "declared": str((last or {}).get("evidence") or "")})
+    return evidence_mod.collect_feature(project_path, fo, children, declared=declared,
+                                        summary=summary, diff_chars=cfg.diff_chars)
+
+
+def submit_feature_for_validation(store: ProjectStore, project_path: Path,
+                                  fo: dict[str, Any], *, declared: str, summary: str,
+                                  cfg: Any) -> dict[str, Any]:
+    """Open a validation round over the feature as a whole, and park it in `validating`.
+
+    The mirror of `submit_for_validation`, and deliberately the same shape: collect,
+    fingerprint, open the round by COUNTED number, park the unit, record the event. It
+    judges nothing — the daemon runs the validator off its tick thread and settles what
+    comes back.
+
+    Two callers, one on each side of the loop: `Daemon.settle_features` opens round 1 when
+    the last child lands, and `jarvis fo submit` opens every round after that. Neither
+    reads the kill switch here; both read it before calling, which is the rule the whole
+    design turns on (see `finish`).
+    """
+    from . import evidence as evidence_mod
+
+    packet = collect_feature_evidence(store, project_path, fo, declared=declared,
+                                      summary=summary, cfg=cfg)
+    fo_id = fo["id"]
+    nxt = store.counted_validation_rounds(fo_id=fo_id) + 1
+    round_row = store.open_validation_round(
+        fo_id=fo_id, fingerprint=evidence_mod.fingerprint(packet), summary=summary,
+        evidence=declared, round=nxt)
+    store.set_feature_status(fo_id, "validating")
+    # No attention flag: a unit under review is the system working. Only the give-up
+    # transition flags anyone — and for a feature order that flag goes on the feature.
+    store.clear_feature_attention(fo_id)
+    feature_event(store, fo_id, "validation_submitted",
+                  {"round": round_row["round"], "round_id": round_row["id"],
+                   "fingerprint": round_row["fingerprint"],
+                   "files": len(packet.files), "feature_order": fo_id})
+    return round_row
+
+
+def feature_event(store: ProjectStore, fo_id: str, kind: str,
+                  payload: dict[str, Any]) -> bool:
+    """Write one feature-order event onto the timeline that carries it. True if it landed.
+
+    A feature order has no timeline of its own — `wo_events.wo_id` is a real foreign key
+    into `work_orders` — so every step of its life is recorded on whichever work order
+    carried that step. For the validation loop that carrier is the PROJECT MANAGER order:
+    it is the feature's only long-lived session, it is the addressee of everything this
+    loop sends, and `jarvis wo show <manager>` is therefore where the round history reads
+    back in order.
+
+    False when the feature has no manager. That is not hypothetical — a plan released
+    while `os.validation.enabled` was false has none, and the user can cancel one — and
+    the caller must not treat a lost event as a written one: the round machine counts
+    transport outages from these rows.
+    """
+    manager = store.manager_work_order(fo_id)
+    if not manager:
+        return False
+    store.add_event(manager["id"], kind, payload)
+    return True
+
+
+def feature_events_of_kind(store: ProjectStore, fo_id: str,
+                           kind: str) -> list[dict[str, Any]]:
+    """Read back what `feature_event` wrote. Empty when the feature has no manager.
+
+    Paired with the writer so that the carrier is decided in exactly one place: a counter
+    reading the manager's timeline directly would keep working right up until the day the
+    carrier changed, and then quietly count zero.
+    """
+    manager = store.manager_work_order(fo_id)
+    return store.events_of_kind(manager["id"], kind) if manager else []
+
+
+def submit_feature(fo_id: str, summary: str, evidence: str = "",
+                   project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis fo submit` — the project manager saying the feature is ready again.
+
+    A feature order runs no session, so it cannot finish itself the way a work order does.
+    This is the manager's equivalent of `jarvis wo finish`: it opens the NEXT round over
+    the integrated diff and hands the feature back to the panel.
+
+    Only from `executing`, and the refusal is deliberately plain rather than an invitation
+    to retry. A manager submitting a feature that is already `validating` is asking for a
+    second opinion on a round in flight; one submitting a `completed` feature has misread
+    its inbox. Both are told what the feature is doing instead.
+
+    **The kill switch is read HERE**, at the submission site, exactly as `finish` reads
+    it. With validation off — or with `feature_units` off — no round opens and the feature
+    stays where it is; `Daemon.settle_features` then completes it as soon as its children
+    are all done, which is the behaviour with the feature switched off entirely. That is
+    what stops a manager waiting for a verdict nobody will ever produce.
+    """
+    name, path, fo = find_feature_order(fo_id, project_name)
+    if fo["status"] != "executing":
+        raise OpsError(
+            f"{fo_id} is {fo['status']}, not executing — there is nothing to submit. A "
+            f"feature order can only be submitted for review while its work orders are "
+            f"the thing in flight.")
+    cfg = validation_config()
+    if cfg is None or not cfg.enabled or not cfg.feature_units:
+        return {"project": name, "fo_id": fo_id, "status": fo["status"], "opened": False,
+                "note": "validation of feature orders is switched off, so no review "
+                        "round was opened; this feature settles when its work orders do"}
+    store = ProjectStore(path)
+    try:
+        round_row = submit_feature_for_validation(
+            store, path, store.get_feature_order(fo_id), declared=evidence,
+            summary=summary, cfg=cfg)
+    finally:
+        store.close()
+    return {"project": name, "fo_id": fo_id, "status": "validating", "opened": True,
+            "round": round_row["round"], "fingerprint": round_row["fingerprint"]}
+
+
 def declared_evidence(store: ProjectStore, wo_id: str) -> str:
     """What the worker last said it did to test this, recovered from its own `finish`.
 
@@ -1984,6 +2120,19 @@ def submit_plan(fo_id: str, doc: Any,
     neo = NeoStore()
     try:
         q = neo.ask(name, planner_id, question, kind="plan")
+        # A resubmission moves `plan_question_id` off the previous review, and
+        # `review_plan` only ever closes the one it currently points at — so an
+        # escalated plan question survived every revision that followed it (production
+        # questions 67 and 130, the second still asking for the user three days after
+        # its successor was approved). Close it here, naming what replaced it, because
+        # this is the only moment that knows both ids.
+        if fo.get("plan_question_id"):
+            neo.supersede(
+                fo["plan_question_id"],
+                f"SUPERSEDED by question {q['id']}",
+                f"the plan was revised and resubmitted; question {q['id']} reviews the "
+                f"version that replaced the one this asks about",
+            )
     finally:
         neo.close()
 
@@ -2031,7 +2180,7 @@ def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
     delivers the reason to the planner as a message, which re-opens its existing session
     rather than starting a cold one.
     """
-    from . import plans
+    from . import evidence, plans
     from .neo_store import NeoStore
 
     name, path, fo = find_feature_order(fo_id, project_name)
@@ -2054,7 +2203,14 @@ def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
                 fo_id, plans.creation_order(plan["children"]),
                 manager=validation_enabled())
             manager = store.manager_work_order(fo_id)
-            store.set_feature_status(fo_id, "executing")
+            # THE FEATURE'S BASE, recorded at the only moment it is knowable: the default
+            # branch's head just before its first child could start. Everything between
+            # this sha and the default branch later IS the feature, by construction, with
+            # no per-child bookkeeping to keep in step. Recorded whether or not validation
+            # is enabled, because the flag can be turned on while a feature is running and
+            # a base nobody wrote down cannot be recovered afterwards.
+            store.set_feature_status(fo_id, "executing",
+                                     base_sha=evidence.default_branch_head(path) or None)
             store.clear_feature_attention(fo_id)
         else:
             children = []
@@ -2135,6 +2291,18 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
         store.clear_feature_attention(fo_id)
     finally:
         store.close()
+    # A feature cancelled while its plan was still under review leaves that review with
+    # nothing to decide — the plan it reviews will never be released either way.
+    if fo.get("plan_question_id"):
+        from .neo_store import NeoStore
+
+        neo = NeoStore()
+        try:
+            neo.supersede(fo["plan_question_id"], "SUPERSEDED — feature order cancelled",
+                          f"{fo_id} was cancelled, so its plan will not be released "
+                          f"whatever this review concluded")
+        finally:
+            neo.close()
     for wo_id in stop_ids:
         cancel(wo_id)
     return {"project": name, "fo_id": fo_id, "title": fo["title"],
@@ -3437,3 +3605,140 @@ def _subproc_detail(groups: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
             "billed_input": u.billed_input, "output": u.output,
         })
     return sorted(out, key=lambda g: -g["list_cost_usd"])
+
+
+# -- what the knowledge base costs, and who actually reads it -----------------------------
+
+#: How much of a work order's own title has to survive into a search for the "it could
+#: have looked" signal to mean anything. Below this the query is words like "fix the",
+#: which match half the base and would manufacture a miss for every silent order.
+MISSED_MIN_WORDS = 3
+
+
+def _index_cost(central: CentralStore, name: str, path: Path) -> dict[str, Any]:
+    """What the knowledge base costs a dispatch prompt, measured rather than estimated.
+
+    The same prompt is built twice, with the index and without it, and the difference IS
+    the cost — no model of what the block "should" be, so it cannot drift away from what
+    `build_worker_prompt` actually emits.
+    """
+    from .catalog import WorkerDefaults
+    from .dispatch import build_worker_prompt
+
+    spec = ProjectSpec(name=name, path=path, worker=WorkerDefaults())
+    wo = {"id": "wo-00000000", "title": "measure the index", "description": ""}
+    brief = central.knowledge_brief(name)
+    whole = len(build_worker_prompt(wo, spec, brief))
+    bare = len(build_worker_prompt(wo, spec, None))
+    return {
+        "project": name,
+        "indexed": len(brief.digest), "pinned": len(brief.pinned),
+        "overflow": brief.overflow_count, "entries": brief.total,
+        "index_chars": whole - bare, "prompt_chars": whole,
+        "share_of_prompt": round((whole - bare) / whole, 4) if whole else 0.0,
+        "body_chars": central.knowledge_body_chars(name),
+    }
+
+
+def knowledge_usage_report(project: str | None = None, days: int | None = None,
+                           limit: int = 20) -> dict[str, Any]:
+    """What memory costs and whether anyone uses it.
+
+    Three questions, answered from three different places because no one of them can
+    answer another:
+
+    * COST — `_index_cost` builds a real dispatch prompt with and without the index. The
+      body text of the base is reported beside it as what the index AVOIDS: the entries
+      never reach a prompt, so the base's size is not the prompt's size (kn-1485b845).
+    * USE — the `knowledge_reads` log, written by the CLI verbs a worker runs. Before it
+      existed this half of the report did not exist at all.
+    * NON-USE — the work orders that completed having never read anything, and of those,
+      the ones whose own title matches an entry that already existed when they started.
+      A title match is EVIDENCE, NOT A VERDICT, and it is labelled that way wherever it
+      is rendered: the same search a worker would have run is what scores it, so it
+      inherits that search's blind spots — synonyms, since FTS5 landed (bl-8169af54).
+    """
+    from .central_store import headline
+
+    since = db.now() - days * 86400 if days else None
+    paths = registered_project_paths()
+    if project and project not in paths:
+        raise OpsError(f"project {project!r} not registered (known: {sorted(paths)})")
+    scope = {project: paths[project]} if project else paths
+
+    central = CentralStore()
+    try:
+        summary = central.knowledge_read_summary(project, since)
+        hit_counts = central.knowledge_hit_counts(since)
+        by_order = central.knowledge_reads_by_order(since)
+        entries = [e for e in central.search_knowledge("", limit=10_000, project=project)
+                   if not e.get("retired_at")]
+        top: list[dict[str, Any]] = [
+            {"id": e["id"], "topic": e["topic"], "reads": hit_counts.get(e["id"], 0),
+             "chars": len(e["content"]), "headline": headline(e["content"])}
+            for e in entries]
+        top.sort(key=lambda e: (-int(e["reads"]), -int(e["chars"])))
+        cost = [_index_cost(central, name, path) for name, path in sorted(scope.items())]
+
+        silent: list[dict[str, Any]] = []
+        missed: list[dict[str, Any]] = []
+        # Nothing before the log's first row was OBSERVED, so nothing before it can be
+        # reported as an order that ignored the knowledge base.
+        observed_from = central.knowledge_log_starts()
+        floor = 0.0 if observed_from is None else (
+            observed_from if since is None else max(since, observed_from))
+        for name, path in sorted(scope.items()):
+            store = ProjectStore(path)
+            try:
+                for wo in store.list_work_orders(statuses=("completed",), limit=500,
+                                                 include_hidden=True):
+                    if observed_from is None or (wo["created_at"] or 0) < floor:
+                        continue
+                    if by_order.get(wo["id"]):
+                        continue
+                    row = {"wo_id": wo["id"], "project": name, "title": wo["title"]}
+                    silent.append(row)
+                    if len(wo["title"].split()) < MISSED_MIN_WORDS:
+                        continue
+                    # Only entries that already existed when the order was created: an
+                    # entry it wrote ITSELF is not something it failed to read.
+                    could = [e for e in central.search_knowledge(
+                        wo["title"], limit=3, project=name)
+                        if not e.get("retired_at") and e["ts"] <= (wo["created_at"] or 0)]
+                    if could:
+                        missed.append({**row, "entries": [
+                            {"id": e["id"], "headline": headline(e["content"])}
+                            for e in could]})
+            finally:
+                store.close()
+    finally:
+        central.close()
+
+    sizes = sorted(len(e["content"]) for e in entries)
+    return {
+        "project": project or "", "days": days,
+        "entries": len(entries),
+        "size": {
+            "total_chars": sum(sizes),
+            "median_chars": sizes[len(sizes) // 2] if sizes else 0,
+            "max_chars": sizes[-1] if sizes else 0,
+            # An entry whose first line overflows the headline reaches the index as a
+            # sentence cut mid-word, and the index is the only thing that decides
+            # whether it is ever read.
+            "truncated_headlines": sum(
+                1 for e in entries
+                if len(e["content"].split("\n", 1)[0]) > len(headline(e["content"]))),
+        },
+        "prompt_cost": cost,
+        "reads": summary,
+        "read_chars_per_order": (round(summary["chars"] / summary["orders"])
+                                 if summary["orders"] else 0),
+        # When the read log begins. Every "never read" and "never looked" figure below is
+        # a statement about work AFTER this instant and about nothing before it.
+        "observed_from": observed_from,
+        "top_entries": top[:limit],
+        "never_read": [e for e in top if e["reads"] == 0][:limit],
+        "never_read_count": sum(1 for e in top if e["reads"] == 0),
+        "silent_orders": silent[:limit], "silent_order_count": len(silent),
+        "could_have_read": missed[:limit], "could_have_read_count": len(missed),
+    }

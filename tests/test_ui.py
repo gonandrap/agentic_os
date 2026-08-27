@@ -13,7 +13,7 @@ from jarvis import gates, ops  # noqa: E402
 from jarvis.catalog import load_catalog  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
 from jarvis.daemon import Daemon  # noqa: E402
-from jarvis.invariants import check_project  # noqa: E402
+from jarvis.invariants import IDLE_NO_FINISH_BLOCKER, check_project  # noqa: E402
 from jarvis.project_store import ProjectStore  # noqa: E402
 from jarvis.ui.app import create_app  # noqa: E402
 
@@ -264,13 +264,15 @@ def test_a_neo_answer_is_one_line_on_the_page_and_credited_to_neo(client, daemon
         store.close()
 
     page = client.get(f"/wo/proj_a/{wo['id']}").text
-    assert "neo → worker" in page  # the conversation credits it correctly too
-    # In the timeline the answer is ONE entry. It used to be the bookkeeping event and
-    # then the answer, and only the second was worth reading.
-    story = page.split('id="tab-timeline"', 1)[1]
-    assert "Neo answered the worker" not in story
-    assert story.count("[Neo] go with CSV") == 1
-    assert "Neo → worker" in story
+    said, story = page.split('id="tab-timeline"', 1)
+    # The conversation credits it correctly, and is the only place the words appear.
+    assert "neo → worker" in said
+    assert said.count("[Neo] go with CSV") == 1
+    # In the timeline the answer is ONE entry, saying what happened and pointing at the
+    # words rather than repeating them a tab away.
+    assert story.count("Neo answered the worker") == 1
+    assert "[Neo] go with CSV" not in story
+    assert "in the conversation" in story
 
 
 def test_a_question_on_the_timeline_is_a_link_to_the_question(client, daemon, project):
@@ -279,9 +281,13 @@ def test_a_question_on_the_timeline_is_a_link_to_the_question(client, daemon, pr
     result = ops.ask_question(wo["id"], "Should the export default to CSV or JSON?")
 
     page = client.get(f"/wo/proj_a/{wo['id']}").text
-    assert f'/neo/question/{result["question_id"]}' in page
-    # ...and the question itself is NOT reprinted beside the link.
-    assert "Should the export default to CSV or JSON?" not in page
+    said, story = page.split('id="tab-timeline"', 1)
+    assert f'/neo/question/{result["question_id"]}' in story
+    # ...and the question itself is NOT reprinted beside the link. It is a turn in the
+    # conversation, which is where the answer to it will land.
+    assert "Should the export default to CSV or JSON?" not in story
+    assert "Should the export default to CSV or JSON?" in said
+    assert "worker → Neo" in said
 
 
 def test_the_question_page_holds_the_question_and_its_answer(client, daemon, project):
@@ -300,6 +306,94 @@ def test_a_question_that_does_not_exist_says_so(client):
     r = client.get("/neo/question/9999")
     assert r.status_code == 404
     assert "not found" in r.text
+
+
+def test_the_question_page_reviews_the_answer_and_stays_put(client, daemon, project):
+    """The timeline sends the reader here; the decision has to be here too.
+
+    `/neo` is a list with no anchor, so the link this page used to carry landed them on
+    somebody else's question — reported by the user against wo-01d30340.
+    """
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "CSV or JSON?")
+    daemon._neo_drain()
+
+    page = client.get("/neo/question/1").text
+    assert 'action="/neo/1/review"' in page
+    assert 'href="/neo"' in page  # the breadcrumb stays; the "go elsewhere" link doesn't
+    assert "review it →" not in page
+
+    r = client.post("/neo/1/review", data={"decision": "correct",
+                                           "feedback": "CSV. Always CSV.",
+                                           "next": "/neo/question/1"})
+    assert r.status_code == 303
+    assert r.headers["location"] == "/neo/question/1"
+    from jarvis.neo_store import NeoStore
+    neo = NeoStore()
+    try:
+        assert neo.get(1)["review_status"] == "corrected"
+    finally:
+        neo.close()
+    assert "you corrected this" in client.get("/neo/question/1").text
+
+
+def test_the_question_page_answers_an_escalation_and_stays_put(client, daemon, project):
+    wo = ops.create_work_order("proj_a", "prod thing")
+    daemon.tick()
+    ops.ask_question(wo["id"], "FORCE_ESCALATE: touch prod?")
+    daemon._neo_drain()
+
+    page = client.get("/neo/question/1").text
+    assert 'action="/neo/1/answer"' in page
+    assert "answer it →" not in page
+
+    r = client.post("/neo/1/answer", data={"text": "No. Wait for the window.",
+                                           "next": "/neo/question/1"})
+    assert r.status_code == 303
+    assert r.headers["location"] == "/neo/question/1"
+    store = ProjectStore(project)
+    try:
+        contents = [m["content"] for m in store.queued_messages(wo["id"])]
+        assert any("Wait for the window" in c for c in contents)
+    finally:
+        store.close()
+
+
+def test_a_neo_decision_will_not_redirect_off_site(client, daemon, project):
+    """`next` is attacker-settable, exactly as on the gates form."""
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "CSV or JSON?")
+    daemon._neo_drain()
+
+    r = client.post("/neo/1/review", data={"decision": "approve",
+                                           "next": "//evil.example/steal"})
+    assert r.headers["location"] == "/neo#tab-review"
+
+
+def test_a_refused_neo_decision_flashes_on_the_tab_it_came_from(client, daemon, project):
+    """`?error=` has to precede `#tab-review` — after it the browser reads the flash as
+    part of the fragment and `base.html` renders nothing."""
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "CSV or JSON?")
+    daemon._neo_drain()
+
+    r = client.post("/neo/1/review", data={"decision": "correct", "feedback": ""})
+    assert r.headers["location"].startswith("/neo?error=")
+    assert r.headers["location"].endswith("#tab-review")
+
+
+def test_the_question_page_sends_a_gate_request_to_the_gates_tab(gated):
+    """An approval question carries a gate the textarea cannot open — the branch
+    `neo.html` has always had, now that this page renders the controls too."""
+    gated.request()
+    gated.daemon._neo_drain()  # the fake model escalates by default
+
+    page = gated.client.get("/neo/question/1").text
+    assert 'action="/neo/1/answer"' not in page
+    assert "decide it on the gates tab" in page
 
 
 def test_assumptions_are_numbered_to_match_the_timeline(client, daemon, project):
@@ -500,6 +594,21 @@ def test_knowledge_page(client):
     assert "prefer uv" in r.text and "global" in r.text
 
 
+def test_knowledge_page_reports_what_the_base_costs_and_who_reads_it(client):
+    """The page used to answer "what do we know" and nothing about what that is worth:
+    no cost, no reads, no unopened entries. Both halves render together or the page is
+    back to being a wall of text."""
+    central = CentralStore()
+    row = central.add_knowledge("A LESSON WITH A FIRST LINE LONG ENOUGH TO BE CUT. "
+                                + "padding " * 60, project="proj_a", topic="tooling")
+    central.record_knowledge_read("show", [row], project="proj_a", wo_id="wo-x")
+
+    page = client.get("/knowledge").text
+    assert "what it costs a prompt" in page and "who reads it" in page
+    assert "…" in page                       # the index line, truncated as a worker sees it
+    assert "1 reads" in page or ">1<" in page  # the read just recorded is counted
+
+
 def test_api_status(client):
     r = client.get("/api/status")
     assert r.status_code == 200
@@ -522,8 +631,7 @@ def test_neo_tab_lists_questions_still_with_neo(client, daemon, project):
 
     r = client.get("/neo")
     assert r.status_code == 200
-    assert "1 queued" in r.text
-    assert "With Neo right now" in r.text
+    assert "With Neo right now" in r.text  # the block, not the count line it replaced
     assert "CSV or JSON?" in r.text          # the question itself, not just a count
     assert f"/wo/proj_a/{wo['id']}" in r.text  # traceable back to the parked worker
 
@@ -1212,7 +1320,7 @@ def test_got_it_button_puts_the_flag_down(client, project):
     wo = ops.create_work_order("proj_a", "noisy task")
     store = ProjectStore(project)
     store.set_status(wo["id"], "needs_review")
-    store.flag_attention(wo["id"], "finished without a completion signal — review the session")
+    store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
     assert "NEEDS YOU" in client.get("/").text
 
     detail = client.get(f"/wo/proj_a/{wo['id']}")

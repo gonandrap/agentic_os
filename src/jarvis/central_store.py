@@ -6,9 +6,10 @@ notification inbox, the backlog (with dependencies), and the knowledge base.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from . import db
 from .paths import central_db_path, ensure_home
@@ -26,6 +27,11 @@ PINNED_TAG = "pinned"
 # learning (most are one sentence), short enough that 40 of them cost ~1.5k tokens.
 HEADLINE_CHARS = 160
 
+# Read verbs that AIM at an entry, as against the two that sweep the index. Only these
+# record per-entry hits: `list` returns everything, so counting it would mark the whole
+# base as consulted and destroy the one number that says which entries earn their place.
+AIMED_VERBS = ("show", "search")
+
 
 def split_tags(tags: str) -> list[str]:
     return [t for t in (s.strip() for s in (tags or "").split(",")) if t]
@@ -33,6 +39,17 @@ def split_tags(tags: str) -> list[str]:
 
 def has_tag(tags: str, tag: str) -> bool:
     return tag in split_tags(tags)
+
+
+def fts_query(term: str) -> str:
+    """A user's words as an FTS5 OR-query. '' when nothing in them is searchable.
+
+    Each word becomes a quoted phrase, so `-`, `:` and `"` reach the tokenizer as text
+    instead of as FTS5 syntax — see
+    docs/superpowers/specs/2026-08-24-ranked-knowledge-search.md §5.
+    """
+    words = [w for w in (term or "").split() if any(c.isalnum() for c in w)]
+    return " OR ".join('"' + w.replace('"', '""') + '"' for w in words)
 
 
 def headline(content: str, limit: int = HEADLINE_CHARS) -> str:
@@ -119,6 +136,36 @@ CREATE TABLE IF NOT EXISTS os_state (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+-- One retrieval FROM the knowledge base, recorded where it happens.
+--
+-- Until this table existed the OS could say what it KNEW and nothing at all about what
+-- was READ: whether workers consult the base, which entries earn their place, which are
+-- dead weight, and which questions it is asked and cannot answer. The only evidence was
+-- an opt-in paid eval somebody had to remember to run. See
+-- docs/superpowers/specs/2026-08-23-what-memory-costs-and-who-reads-it.md.
+--
+-- Recorded at the read for the same reason `agent_calls` is recorded at the call: a
+-- `jarvis learn show` leaves no trace anywhere else, so nothing can recover it later.
+--
+-- `chars` is what the read COST — content characters handed back — which is the only
+-- honest measure of the knowledge base's share of a worker's context. The index in the
+-- prompt is a fixed budget; this is the variable part.
+CREATE TABLE IF NOT EXISTS knowledge_reads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    project TEXT NOT NULL DEFAULT '',
+    wo_id TEXT NOT NULL DEFAULT '',         -- '' = no work order: a person at a terminal
+    verb TEXT NOT NULL,                     -- show | search | list | topics
+    term TEXT NOT NULL DEFAULT '',          -- the query, or the ids asked for
+    hits INTEGER NOT NULL DEFAULT 0,        -- rows returned
+    chars INTEGER NOT NULL DEFAULT 0        -- content characters returned
+);
+-- Which entries a read actually returned, so "how often was THIS consulted" and "what
+-- has never been read" are one GROUP BY rather than a scan of `term` strings.
+CREATE TABLE IF NOT EXISTS knowledge_read_hits (
+    read_id INTEGER NOT NULL REFERENCES knowledge_reads(id) ON DELETE CASCADE,
+    kn_id TEXT NOT NULL
+);
 -- One Claude call the OS made on its OWN behalf, and the work order it was made for.
 --
 -- A work order's spend is not just its worker's turns: every question it asked Neo, every
@@ -199,7 +246,41 @@ CREATE INDEX IF NOT EXISTS idx_gate_rules_role ON gate_rules(role, kind);
 CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
 CREATE INDEX IF NOT EXISTS idx_backlog_project ON backlog(project, status);
 CREATE INDEX IF NOT EXISTS idx_agent_calls_wo ON agent_calls(wo_id, ts);
+CREATE INDEX IF NOT EXISTS idx_knowledge_reads_wo ON knowledge_reads(wo_id, ts);
+CREATE INDEX IF NOT EXISTS idx_knowledge_read_hits ON knowledge_read_hits(kn_id);
 """
+
+# The ranked half of `search_knowledge` — see
+# docs/superpowers/specs/2026-08-24-ranked-knowledge-search.md §4. Separate from SCHEMA
+# because FTS5 is a compile-time option and a store that will not open is worse than a
+# search that is merely as good as yesterday's (§8).
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+    content, topic, tags,
+    content='knowledge', content_rowid='rowid', tokenize="porter unicode61"
+);
+CREATE TRIGGER IF NOT EXISTS knowledge_fts_ai AFTER INSERT ON knowledge BEGIN
+    INSERT INTO knowledge_fts (rowid, content, topic, tags)
+    VALUES (new.rowid, new.content, new.topic, new.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS knowledge_fts_ad AFTER DELETE ON knowledge BEGIN
+    INSERT INTO knowledge_fts (knowledge_fts, rowid, content, topic, tags)
+    VALUES ('delete', old.rowid, old.content, old.topic, old.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS knowledge_fts_au AFTER UPDATE ON knowledge BEGIN
+    INSERT INTO knowledge_fts (knowledge_fts, rowid, content, topic, tags)
+    VALUES ('delete', old.rowid, old.content, old.topic, old.tags);
+    INSERT INTO knowledge_fts (rowid, content, topic, tags)
+    VALUES (new.rowid, new.content, new.topic, new.tags);
+END;
+"""
+
+# One-time backfill marker, NOT a row count — a count on an external-content table
+# re-scans `knowledge` and would hide a broken trigger by rebuilding on every open (§4).
+FTS_BUILT_KEY = "knowledge_fts_built"
+
+# content, topic, tags. A query word in the TOPIC outranks one buried in a long body (§6).
+FTS_WEIGHTS = (1.0, 4.0, 2.0)
 
 # Columns added after the first release, exactly as in `neo_store` and `project_store`.
 # `CREATE TABLE IF NOT EXISTS` is a NO-OP on a table that already exists, so a column
@@ -237,6 +318,7 @@ class CentralStore:
         self.conn = db.connect(self.db_path)
         self.conn.executescript(SCHEMA)
         self._migrate()
+        self.fts = self._ensure_fts()
         self._seed_gate_rules()
 
     def _migrate(self) -> None:
@@ -248,6 +330,21 @@ class CentralStore:
             for name, decl in columns.items():
                 if name not in have:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+    def _ensure_fts(self) -> bool:
+        """Create the search index and backfill it once. False = this SQLite has no FTS5.
+
+        docs/superpowers/specs/2026-08-24-ranked-knowledge-search.md §4, §8.
+        """
+        try:
+            self.conn.executescript(FTS_SCHEMA)
+            if not self.get_state(FTS_BUILT_KEY):
+                self.conn.execute(
+                    "INSERT INTO knowledge_fts (knowledge_fts) VALUES ('rebuild')")
+                self.set_state(FTS_BUILT_KEY, str(db.now()))
+        except sqlite3.Error:
+            return False
+        return True
 
     def close(self) -> None:
         self.conn.close()
@@ -329,12 +426,15 @@ class CentralStore:
         inbox = self.conn.execute("DELETE FROM inbox WHERE wo_id=?", (wo_id,)).rowcount
         calls = self.conn.execute("DELETE FROM agent_calls WHERE wo_id=?",
                                   (wo_id,)).rowcount
+        reads = self.conn.execute("DELETE FROM knowledge_reads WHERE wo_id=?",
+                                  (wo_id,)).rowcount
         backlog = self.conn.execute(
             """UPDATE backlog SET status='open', promoted_wo_id=NULL
                WHERE promoted_wo_id=? AND status='promoted'""",
             (wo_id,),
         ).rowcount
-        return {"inbox": inbox, "agent_calls": calls, "backlog_reopened": backlog}
+        return {"inbox": inbox, "agent_calls": calls, "knowledge_reads": reads,
+                "backlog_reopened": backlog}
 
     def unacked_inbox(self, level: str | None = None) -> list[dict[str, Any]]:
         if level:
@@ -541,21 +641,63 @@ class CentralStore:
         project + global; omit it to search the whole fleet (cross-project learnings
         are often the point).
 
-        **Words are ORed and the result is ranked by how many of them a row matched**,
-        rather than the whole term being one `LIKE '%…%'`. A single word behaves exactly
-        as it always did; the difference is a query like "cents rounding format", which
-        under phrase matching required that literal string and so returned nothing at
-        all. That is how real agents search — the retrieval eval
-        (evals/llm/test_knowledge_retrieval_judgment.py) scored 2/7 on phrase matching
-        purely because natural multi-word queries retrieved nothing — and an index whose
-        lookup verb only answers single keywords is not a lookup verb.
+        **TWO TIERS, and the second is a floor** — see
+        docs/superpowers/specs/2026-08-24-ranked-knowledge-search.md §3. First the FTS5
+        hits ordered by BM25, which is what buys stemming ("rounding" now finds
+        "rounded") and rarity-weighted ranking; then the substring hits FTS5 did not
+        return, ordered as they always were — how many of the query's words the row
+        matched, then recency. Deduplicated by id, then truncated to `limit`. Nothing
+        yesterday's search returned is dropped: §2 measures why pure FTS5 would drop
+        some ("deploy" stops finding "deployment", because porter stems the two into
+        different buckets). Tier 1 decides what comes FIRST, not what comes back.
 
-        Still substring matching per word, so it has no stemming and no synonyms:
-        "rounding" does not find "rounded" on its own, it survives only by riding along
-        with the other words in the query. FTS5 is the real fix and is on the backlog.
+        Synonyms remain unsolved and are out of reach for any lexical index: this still
+        will not find an entry that only ever says "shipit" (§7, on the backlog).
+        """
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for tier in (self._search_fts(term, limit, project, topic),
+                     self._search_like(term, limit, project, topic)):
+            for row in tier:
+                if row["id"] not in seen:
+                    seen.add(row["id"])
+                    rows.append(row)
+        return rows[:limit]
+
+    def _search_fts(self, term: str, limit: int, project: str | None,
+                    topic: str | None) -> list[dict[str, Any]]:
+        """Tier 1: stemmed, BM25-ranked. Empty on a store without FTS5 (§8)."""
+        match = fts_query(term)
+        if not self.fts or not match:
+            return []
+        params: list[Any] = [*FTS_WEIGHTS, match]
+        q = ["SELECT k.*, bm25(knowledge_fts, ?, ?, ?) AS _rank FROM knowledge k",
+             "JOIN knowledge_fts f ON f.rowid = k.rowid",
+             "WHERE knowledge_fts MATCH ?"]
+        if project is not None:
+            q.append("AND (k.project=? OR k.project='')")
+            params.append(project)
+        if topic is not None:
+            q.append("AND k.topic=?")
+            params.append(topic)
+        q.append("ORDER BY _rank LIMIT ?")  # bm25 is negative: best match is lowest
+        params.append(limit)
+        try:
+            rows = db.rows_to_dicts(self.conn.execute(" ".join(q), params).fetchall())
+        except sqlite3.Error:  # a read verb never raises on what a user typed (§5)
+            return []
+        for row in rows:  # ranking orders the list; it is not a field of an entry
+            row.pop("_rank", None)
+        return rows
+
+    def _search_like(self, term: str, limit: int, project: str | None,
+                     topic: str | None) -> list[dict[str, Any]]:
+        """Tier 2: substring, one point per query word the row matched anywhere.
+
+        Catches what stemming splits apart, and keeps the empty term meaning
+        "everything" — the read `jarvis learn list` and the dashboard rely on.
         """
         words = [w for w in (term or "").split() if w] or [""]
-        # score = how many of the query's words this row matched anywhere
         score = " + ".join(
             "(CASE WHEN content LIKE ? OR topic LIKE ? OR tags LIKE ? THEN 1 ELSE 0 END)"
             for _ in words)
@@ -572,7 +714,7 @@ class CentralStore:
         q.append("ORDER BY _score DESC, ts DESC LIMIT ?")
         params.append(limit)
         rows = db.rows_to_dicts(self.conn.execute(" ".join(q), params).fetchall())
-        for row in rows:  # ranking is how the list is ordered, not a field of an entry
+        for row in rows:
             row.pop("_score", None)
         return rows
 
@@ -682,6 +824,140 @@ class CentralStore:
             key=lambda kv: (-kv[1], kv[0]),
         )
         return brief
+
+    # -- who reads the knowledge base --------------------------------------------------
+
+    def record_knowledge_read(self, verb: str, rows: Sequence[dict[str, Any]] = (), *,
+                              term: str = "", project: str = "", wo_id: str = "",
+                              chars: int | None = None) -> int | None:
+        """Write down one retrieval. NEVER RAISES — see `agent_usage`'s closing note.
+
+        An observer that can fail the thing it observes is worse than no observer: a
+        worker must not lose a `jarvis learn show` because the OS could not write down
+        that it happened. A missing row is visible in the count; a crashed read is not.
+
+        `chars` is what the reader was actually handed, and the caller overrides it when
+        that is not the entries' full text: `jarvis learn list` returns headlines unless
+        asked for `--full`, and charging it for bodies it never printed would inflate the
+        one figure that answers "how much context does memory cost".
+        """
+        try:
+            cur = self.conn.execute(
+                "INSERT INTO knowledge_reads (ts, project, wo_id, verb, term, hits, chars)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (db.now(), project, wo_id, verb, term, len(rows),
+                 sum(len(r.get("content") or "") for r in rows)
+                 if chars is None else chars),
+            )
+            read_id = int(cur.lastrowid)
+            if verb in AIMED_VERBS:
+                self.conn.executemany(
+                    "INSERT INTO knowledge_read_hits (read_id, kn_id) VALUES (?,?)",
+                    [(read_id, r["id"]) for r in rows if r.get("id")],
+                )
+            return read_id
+        except Exception:  # noqa: BLE001 — accounting never breaks the read it counts
+            return None
+
+    def knowledge_reads(self, project: str | None = None, since: float | None = None,
+                        limit: int = 2000) -> list[dict[str, Any]]:
+        """The raw log, newest first. `project` scopes to reads made FROM that project,
+        which is not the same as reads that returned that project's entries: a global
+        entry is read from everywhere."""
+        conds, params = [], []
+        if project:
+            conds.append("project=?")
+            params.append(project)
+        if since is not None:
+            conds.append("ts>=?")
+            params.append(since)
+        where = f" WHERE {' AND '.join(conds)}" if conds else ""
+        params.append(limit)
+        return db.rows_to_dicts(self.conn.execute(
+            f"SELECT * FROM knowledge_reads{where} ORDER BY ts DESC LIMIT ?",
+            params).fetchall())
+
+    def knowledge_hit_counts(self, since: float | None = None) -> dict[str, int]:
+        """How many aimed reads each entry has answered, by id. Entries never read are
+        ABSENT rather than zero — the caller knows the base and can subtract, and a row
+        per never-read entry would make the common case the expensive one."""
+        q = ("SELECT h.kn_id AS kn_id, COUNT(*) AS n FROM knowledge_read_hits h"
+             " JOIN knowledge_reads r ON r.id = h.read_id")
+        params: list[Any] = []
+        if since is not None:
+            q += " WHERE r.ts>=?"
+            params.append(since)
+        q += " GROUP BY h.kn_id"
+        return {r["kn_id"]: int(r["n"]) for r in self.conn.execute(q, params).fetchall()}
+
+    def knowledge_read_summary(self, project: str | None = None,
+                               since: float | None = None) -> dict[str, Any]:
+        """Totals over the read log: by verb, by who asked, and what came back.
+
+        `misses` counts reads that returned NOTHING. Those are the most informative rows
+        in the table and the easiest to lose in an average: an agent asked the base a
+        question and the base had no answer, which is a gap in what is recorded, not in
+        who reads it.
+        """
+        conds, params = [], []
+        if project:
+            conds.append("project=?")
+            params.append(project)
+        if since is not None:
+            conds.append("ts>=?")
+            params.append(since)
+        where = f" WHERE {' AND '.join(conds)}" if conds else ""
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS reads, COALESCE(SUM(chars),0) AS chars,"
+            f" COALESCE(SUM(hits),0) AS hits,"
+            f" COUNT(DISTINCT CASE WHEN wo_id != '' THEN wo_id END) AS orders,"
+            f" SUM(CASE WHEN hits=0 THEN 1 ELSE 0 END) AS misses,"
+            f" SUM(CASE WHEN wo_id != '' THEN 1 ELSE 0 END) AS by_workers"
+            f" FROM knowledge_reads{where}", params).fetchone()
+        out: dict[str, Any] = {k: int(row[k] or 0) for k in
+                               ("reads", "chars", "hits", "orders", "misses", "by_workers")}
+        out["by_verb"] = {r["verb"]: int(r["n"]) for r in self.conn.execute(
+            f"SELECT verb, COUNT(*) AS n FROM knowledge_reads{where}"
+            f" GROUP BY verb ORDER BY n DESC", params).fetchall()}
+        blank = " AND ".join([*conds, "hits=0", "term != ''"])
+        out["unanswered"] = [
+            {"verb": r["verb"], "term": r["term"], "wo_id": r["wo_id"], "ts": r["ts"]}
+            for r in self.conn.execute(
+                f"SELECT verb, term, wo_id, ts FROM knowledge_reads WHERE {blank}"
+                f" ORDER BY ts DESC LIMIT 20", params).fetchall()]
+        return out
+
+    def knowledge_log_starts(self) -> float | None:
+        """When the read log begins, or None if nothing has been recorded yet.
+
+        The boundary every "nobody read this" claim rests on. Work predating it was not
+        observed, and counting an unobserved order as one that ignored the knowledge base
+        would turn the absence of a measurement into an accusation — the exact failure
+        `cost_report` avoids by reporting `found: false` rather than zero.
+        """
+        row = self.conn.execute("SELECT MIN(ts) AS t FROM knowledge_reads").fetchone()
+        return row["t"] if row and row["t"] is not None else None
+
+    def knowledge_reads_by_order(self, since: float | None = None) -> dict[str, int]:
+        """How many reads each work order made. The denominator for "did this order
+        consult the base at all" lives in the project stores, not here."""
+        q = "SELECT wo_id, COUNT(*) AS n FROM knowledge_reads WHERE wo_id != ''"
+        params: list[Any] = []
+        if since is not None:
+            q += " AND ts>=?"
+            params.append(since)
+        q += " GROUP BY wo_id"
+        return {r["wo_id"]: int(r["n"]) for r in self.conn.execute(q, params).fetchall()}
+
+    def knowledge_body_chars(self, project: str | None = None) -> int:
+        """Total content characters standing in the base — what the entries WOULD cost
+        if they were pasted into a prompt, which is exactly what the index avoids."""
+        q = "SELECT COALESCE(SUM(LENGTH(content)),0) AS n FROM knowledge WHERE retired_at IS NULL"
+        params: list[Any] = []
+        if project:
+            q += " AND (project=? OR project='')"
+            params.append(project)
+        return int(self.conn.execute(q, params).fetchone()["n"])
 
     # -- the OS's own Claude spend -----------------------------------------------------
 

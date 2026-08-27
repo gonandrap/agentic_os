@@ -296,7 +296,7 @@ def test_the_closed_pr_reason_survives_the_reconciler(started, project, fake_gh,
     """INV-ATTENTION-REASON rewrites any reason `true_blockers` cannot derive.
 
     Without the PR_CLOSED_BLOCKER branch this work order would keep its status but be
-    relabelled "finished without a completion signal — review the session", sending the
+    relabelled with the generic IDLE_NO_FINISH_BLOCKER, sending the
     user to read a worker session that did nothing wrong.
     """
     fake_gh.set_pr(PR, "CLOSED")
@@ -717,8 +717,8 @@ def test_the_timeline_shows_the_attempts_and_credits_nobody_with_them(
 
     assert labels.count("Merge conflict — asked the worker to resolve it") == 3
     assert "Merge conflict the worker could not resolve — over to you" in labels
-    assert labels.count("Jarvis → worker") == 3
-    assert "You → worker" not in labels
+    assert labels.count("Jarvis messaged the worker") == 3
+    assert "You messaged the worker" not in labels
     assert [e["detail"] for e in entries if e["kind"] == "pr_conflict_nudged"] == [
         "attempt 1 of 3", "attempt 2 of 3", "attempt 3 of 3"]
 
