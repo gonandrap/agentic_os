@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Neo — Jarvis{% endblock %}
 
-{% from "_question.html" import question_body, deliberation %}
+{% from "_question.html" import question_body, deliberation, answer_form, review_form %}
 
 {% block content %}
 
@@ -96,18 +96,7 @@
     {{ question_body(q) }}
     <div class="sub">Why escalated: {{ q.answer_reason or '—' }}</div>
     {{ deliberation(opinions.get(q.id)) }}
-    {% if q.kind == 'approval' %}
-    {# Answering here would send the worker a message and leave the gate shut: only
-       `decide_gate` records the verdict the hook checks. Send them where it counts. #}
-    <div class="sub" style="margin-top:8px">This is a privileged-action request —
-      typing a reply here would not open the gate.
-      <a href="/gates">decide it on the gates tab →</a></div>
-    {% else %}
-    <form method="post" action="/neo/{{ q.id }}/answer" style="margin-top:8px">
-      <textarea name="text" placeholder="Your answer — it goes straight to the worker" required></textarea>
-      <button class="primary" style="margin-top:6px">Send answer to worker</button>
-    </form>
-    {% endif %}
+    {{ answer_form(q, '/neo#tab-escalated') }}
   </div>
   {% else %}
   <div class="empty">nothing escalated — Neo is deciding these itself</div>
@@ -128,17 +117,7 @@
     <div style="margin:6px 0"><strong>Neo:</strong> {{ q.answer }}</div>
     {% if q.answer_reason %}<div class="sub">Reasoning: {{ q.answer_reason }}</div>{% endif %}
     {{ deliberation(opinions.get(q.id)) }}
-    <div style="display:flex; gap:10px; margin-top:8px; align-items:flex-start">
-      <form method="post" action="/neo/{{ q.id }}/review" class="inline">
-        <input type="hidden" name="decision" value="approve">
-        <button class="accept">✓ That's what I'd say</button>
-      </form>
-      <form method="post" action="/neo/{{ q.id }}/review" style="flex:1; display:flex; gap:8px">
-        <input type="hidden" name="decision" value="correct">
-        <input type="text" name="feedback" placeholder="Correct Neo — what should it have said? (teaches it)">
-        <button class="danger">Correct</button>
-      </form>
-    </div>
+    {{ review_form(q, '/neo#tab-review') }}
   </div>
   {% else %}
   <div class="empty">nothing awaiting review</div>
