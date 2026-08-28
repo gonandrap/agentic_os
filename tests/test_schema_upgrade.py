@@ -178,6 +178,39 @@ def test_the_central_database_from_the_live_release_upgrades_in_full(
     }
 
 
+def test_the_config_version_ledger_and_its_index_arrive_on_a_central_upgrade(tmp_path):
+    """`schema_of` returns `{table: {columns}}`, so an index is invisible to every
+    column comparison in this file — including the one directly above, which would pass
+    with `idx_os_config_versions_ts` missing.
+
+    The table itself arrives free on `CREATE TABLE IF NOT EXISTS`; the index does so only
+    because it is in `SCHEMA` beside it. Same trap as the validation tables' partial
+    unique indexes, one database over.
+    """
+    path = tmp_path / "legacy-os.db"
+    old = sqlite3.connect(path)
+    old.executescript(SHIPPED_CENTRAL_SCHEMA.read_text())
+    old.commit()
+    old.close()
+
+    store = CentralStore(path)         # the upgrade
+    try:
+        assert "os_config_versions" in schema_of(store.conn)
+        indexes = {r[0] for r in store.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+        assert "idx_os_config_versions_ts" in indexes
+        # and the ledger works on the UPGRADED database, not merely exists on it
+        row = store.add_config_version({"os": {"ui": {"port": 9000}}},
+                                       {"os.ui.port": 9000}, actor="user",
+                                       reason="moved the dashboard")
+        assert store.head_config_version()["id"] == row["id"]
+        assert store.add_config_version({"os": {"ui": {"port": 9000}}}, {},
+                                        actor="file")["id"] == row["id"]
+        assert len(store.config_versions()) == 1
+    finally:
+        store.close()
+
+
 def test_the_usage_json_column_reaches_a_database_that_already_has_wo_turns(tmp_path):
     """`wo_turns` already ships in the live release, so `usage_json` cannot arrive
     with the `CREATE TABLE` — it must be in `ADDED_COLUMNS`.
