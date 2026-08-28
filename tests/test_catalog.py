@@ -304,3 +304,83 @@ def test_a_validation_budget_below_one_is_rejected(key):
     panel handed nothing, which the design says must never be asked to judge."""
     with pytest.raises(CatalogError, match=f"os.validation.{key}"):
         validation_of({key: 0})
+
+
+# -- a project's own validation settings ----------------------------------------------
+
+
+def projects_validation(os_raw=None, *project_raws):
+    """Parse a fleet and hand back each project's resolved `validation`."""
+    cat = parse_catalog({
+        "os": {"validation": os_raw} if os_raw is not None else {},
+        "projects": [dict({"name": chr(ord("a") + i), "path": "/tmp/p"}, **raw)
+                     for i, raw in enumerate(project_raws)],
+    })
+    return [p.validation for p in cat.projects]
+
+
+def test_a_project_that_says_nothing_gets_the_os_answer_and_ships_disabled():
+    """The whole point of the default, restated one level down: adding the key must not
+    turn anything on, and a silent project must be indistinguishable from today."""
+    [quiet] = projects_validation(None, {})
+    assert quiet == parse_catalog({"projects": []}).os.validation
+    assert quiet.enabled is False
+
+    [inherits] = projects_validation({"enabled": True, "max_rounds": 7}, {})
+    assert inherits.enabled is True
+    assert inherits.max_rounds == 7
+
+
+def test_one_project_can_turn_validation_on_while_the_fleet_stays_off():
+    """The acceptance criterion of the design doc's §1.2, as one assertion."""
+    on, off = projects_validation(None, {"validation": {"enabled": True}}, {})
+    assert on.enabled is True
+    assert off.enabled is False
+
+
+def test_a_project_override_inherits_every_key_it_does_not_name():
+    """`os.validation` is the BASE, not a fallback consulted later: a project naming one
+    key must carry the OS's answer for the other seven, so no caller has two objects to
+    reconcile."""
+    os_raw = {"enabled": True, "roster": ["tester", "chair"], "chair_model": "opus",
+              "timeout": 90, "max_rounds": 1, "diff_chars": 200, "feature_units": False}
+    [v] = projects_validation(os_raw, {"validation": {"max_rounds": 5}})
+    assert v.max_rounds == 5
+    assert v.enabled is True
+    assert v.roster == ("tester", "chair")
+    assert v.chair_model == "opus"
+    assert v.timeout == 90
+    assert v.diff_chars == 200
+    assert v.feature_units is False
+
+
+def test_a_project_seat_models_replaces_the_os_map_rather_than_merging_into_it():
+    """Inheritance is FIELD-level, and `seat_models` is one field (Neo, q174). A project
+    that names it owns the whole map; the seats it drops fall back to the project model
+    the way an empty map always has."""
+    [v] = projects_validation({"seat_models": {"architect": "opus"}},
+                              {"validation": {"seat_models": {"chair": "sonnet"}}})
+    assert v.seat_models == {"chair": "sonnet"}
+
+
+def test_a_project_override_does_not_reach_back_up_to_the_os_block():
+    cat = parse_catalog({
+        "os": {"validation": {"enabled": False, "max_rounds": 3}},
+        "projects": [{"name": "a", "path": "/tmp/a",
+                      "validation": {"enabled": True, "max_rounds": 9}}],
+    })
+    assert cat.os.validation.enabled is False
+    assert cat.os.validation.max_rounds == 3
+    assert cat.projects[0].validation.enabled is True
+    assert cat.projects[0].validation.max_rounds == 9
+
+
+def test_a_project_validation_block_is_validated_and_the_error_names_the_project():
+    """Same checks as the OS block — the vocabulary and the budgets — but a message that
+    points at the object the user actually typed, not at `os.validation`."""
+    with pytest.raises(CatalogError, match=r"projects\[0\] \(a\)\.validation\.roster"):
+        projects_validation(None, {"validation": {"roster": ["tetser"]}})
+    with pytest.raises(CatalogError, match=r"projects\[0\] \(a\)\.validation\.max_rounds"):
+        projects_validation(None, {"validation": {"max_rounds": 0}})
+    with pytest.raises(CatalogError, match=r'"projects\[0\] \(a\)\.validation"'):
+        projects_validation(None, {"validation": "yes please"})
