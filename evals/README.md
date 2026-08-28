@@ -51,6 +51,44 @@ this eval is still wired — that its skip gate reads exactly `JARVIS_EVALS_LLM`
 batteries are non-empty module-level literals with no production path in them, and that
 `panel.decide` is what it calls.
 
+### The validation eval, and the baseline file beside it
+
+`evals/llm/test_validation_judgment.py` is the same shape for the validation panel, and
+it is the measurement enabling `os.validation.enabled` is gated on. What it grades is
+**the seats' judgement, not the code**: `tests/test_validation*.py` already prove the veto
+table routes correctly against a fake model, and no free test can say whether the seat
+mandates in `src/jarvis/assets/validator-seats/` cause a real model to refuse bad work and
+pass good work. Ten invented submissions — a diff plus the testing evidence a worker
+declared — go through the real `validation.decide`, in three batteries: four that must not
+pass, three that must not be bounced, and two feature orders, one of which carries a defect
+that exists only BETWEEN two children. Cost is printed per unit kind and asserted on by
+nothing.
+
+**`evals/llm/validation_baseline.json` is not a baseline anything is compared against
+automatically.** It is the transcript of the run the pass marks were set from: every seat's
+verdict, blocking flag and reply on every case, with the model, the date and the size of
+each battery. It exists so the measurement does not have to be bought twice — a threshold
+that has to move can be moved against this file, and an eval that starts failing can be
+diagnosed from it (did the veto seats stop blocking, or did the chair start passing?
+different investigations, and otherwise a paid run to tell them apart).
+
+**Regenerate it whenever you change a seat's mandate** — that is the main reason to touch
+any of this. The run rewrites the file, and `git diff` on it then shows exactly what your
+prose edit did to every seat on every case. Commit it with the prose change:
+
+```bash
+JARVIS_EVALS_LLM=1 pytest evals/llm/test_validation_judgment.py -q
+```
+
+Otherwise it is inert. `tests/test_validation_eval_harness.py` runs for free on every
+`pytest tests/` and holds the file and the eval to each other: `n` per battery must match
+the batteries, and no threshold may sit above what the recorded run actually scored. So
+**adding a case turns the free suite red until the file is regenerated** — deliberate, not
+a bug: a case no run has ever seen has no measurement behind it. If you cannot spend the
+tokens, edit the file by hand and say so in the PR; it is a record, not a lock.
+
+What it is not: a statistical claim. Ten invented cases, one model, one day.
+
 `test_knowledge_retrieval.py` is the odd one out: its subject is **tooled and does real
 work** in a throwaway sandbox with a real `jarvis` on its PATH, because asking a
 tool-less model "what command would you run?" primes the very answer being graded. It

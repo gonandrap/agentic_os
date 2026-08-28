@@ -47,6 +47,36 @@ the date. It is CHECKED IN, so a later worker can recalibrate a threshold — or
 seat moved — by reading the file rather than by spending the money again.
 `tests/test_validation_eval_harness.py` holds the file and this module's thresholds to
 each other.
+
+## WHEN TO RUN THIS, AND WHAT TO DO WITH WHAT IT WRITES
+
+Read this before deciding you have to do anything here. Most of the time you do not.
+
+* **You changed a seat's mandate** in `src/jarvis/assets/validator-seats/`. RUN IT, and
+  commit the rewritten baseline with the prose change. `git diff` on the baseline is then
+  the answer to "what did my wording actually do?", seat by seat and case by case — which
+  is how the two chair fixes in this file's own history were confirmed. Prose is the one
+  thing here no free test can measure.
+* **You are deciding whether to enable `os.validation.enabled`.** Read the baseline and the
+  printed cost line. That decision is the reason this file exists.
+* **The eval started failing.** Read the baseline BEFORE touching a threshold. It says
+  whether the veto seats stopped blocking or the chair started passing — different
+  investigations, and without the file the only way to tell them apart is another paid run.
+  Note also that three of the four runs that calibrated this file were red for a defect in
+  the FIXTURE rather than in the panel: the seats are very good at catching a brief or a
+  declared-evidence claim the diff does not support, so read the rejection reason before
+  concluding the panel regressed.
+* **You added a case.** The free suite goes red until the baseline is regenerated, because
+  `n` no longer matches. That is deliberate: a case no run has ever seen has no measurement
+  behind it. Regenerate, or hand-edit the file and say so in the pull request — it is a
+  record, not a lock.
+* **Anything else** — you are editing the round machine, the store, a surface. Do nothing.
+  The free companion covers the wiring and this file stays skipped.
+
+WHAT THIS IS NOT: a statistical claim. Ten invented submissions, one model, one day. It is
+enough to say the seats are not obviously miscalibrated and what a round costs; it is not
+enough to say they are right in general. The production-corpus replay that would say more
+is on the backlog and blocked on a publication decision only the user can take.
 """
 
 from __future__ import annotations
