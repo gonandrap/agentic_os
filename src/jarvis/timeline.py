@@ -120,11 +120,6 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "dispatched":
         return "Worker dispatched", p.get("worktree") or ""
     if kind == "turn_failed":
-        # Auth is a turn_failed and not one of the pauses below, because the OS does NOT
-        # put it right — but it is still not the WORK failing, so it says what it was.
-        if p.get("reason") == "auth":
-            return "Blocked — Claude Code could not authenticate", (
-                p.get("error") or "")[:200]
         return "Worker turn failed", (p.get("error") or "")[:200]
     # The self-healing trio. Deliberately NOT filed under "Worker turn failed": nothing
     # about the WORK went wrong — the transport did, either by refusing the turn (the
@@ -136,6 +131,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     # retries existed, and those were all usage-limit ones, so its absence reads as that
     # — which is why the legacy kinds below need no payload migration.
     if kind in ("turn_paused", "rate_limited"):
+        if p.get("reason") == "auth":
+            # The only one of the three that names what the READER has to do: the other
+            # two resume on a clock, this one resumes on them.
+            return ("Paused — Claude Code sign-in expired",
+                    f"{p.get('error') or ''} · resuming when you sign in again")
         if p.get("reason") == "transient":
             status = f" {p['status']}" if p.get("status") else ""
             return (f"Paused — Claude API error{status}",
@@ -145,6 +145,8 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 f"{p.get('error') or ''}"
                 + (f" · resuming after {when}" if when else ""))
     if kind in ("turn_resumed", "rate_limit_retry"):
+        if p.get("reason") == "auth":
+            return "Resumed — you signed back in", ""
         what = ("the Claude API error" if p.get("reason") == "transient"
                 else "the usage limit")
         attempt = p.get("attempt")

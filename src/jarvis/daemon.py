@@ -687,19 +687,23 @@ class Daemon:
 
         The OS's only loop that repairs a work order without being asked, and it is
         deterministic end to end: `worker_session.turn_pause` says when the turn may go
-        again — the reset the refusal named, or the next step of `TRANSIENT_BACKOFF` —
-        and this compares it to the clock. No LLM is consulted and none could help: the
-        decision is a comparison.
+        again — the reset the refusal named, the next step of `TRANSIENT_BACKOFF`, or the
+        moment the user's Claude Code sign-in last changed — and this compares it to the
+        clock. No LLM is consulted and none could help: the decision is a comparison.
 
-        Both reasons run through here, because to this pass they differ only in the
+        All three reasons run through here, because to this pass they differ only in the
         moment they name. That is the whole reason `turn_pause` returns one type: a
-        second loop beside this one would be a second place to forget.
+        second loop beside this one would be a second place to forget. It is also what
+        makes an auth recovery FLEET-WIDE for free — signing in is an account-level fact,
+        and `tick` decides `retry_paused` once, outside the project loop, so every
+        project's parked orders are swept on the same tick.
 
         Every work order this touches is in an ACTIVE status, because the settler
-        deliberately did not fail it (see `settle_work_order`). What the relaunch SENDS
-        is `worker_session.retry`'s business, and it is not the same for both: a refused
-        turn was never sent, so the prompt goes again verbatim; a turn that died in
-        flight already reached the model, so the worker is nudged to continue instead.
+        deliberately did not fail it (see `settle_work_order` and `_park_on_signin`).
+        What the relaunch SENDS is `worker_session.retry`'s business, and it is not the
+        same for all: a refused turn was never sent, so the prompt goes again verbatim; a
+        turn that died in flight already reached the model, so the worker is nudged to
+        continue instead.
         """
         for wo in store.list_work_orders(statuses=ACTIVE_STATUSES):
             if wo["origin"] in UNGOVERNED_ORIGINS:
@@ -709,7 +713,7 @@ class Daemon:
             except Exception:  # noqa: BLE001 — one work order must not stall the rest
                 log.exception("[%s] could not diagnose %s", project.name, wo["id"])
                 continue
-            if pause is None or pause.exhausted or not pause.due():
+            if pause is None or not pause.resumable or not pause.due():
                 continue
             try:
                 turn = worker_session.retry(store, project, wo, pause)
@@ -724,12 +728,19 @@ class Daemon:
                 continue
             log.info("[%s] %s resumed after %s (attempt %s/%s, turn %s)",
                      project.name, wo["id"], pause.reason, pause.attempts,
-                     pause.max_attempts, turn["seq"])
+                     pause.max_attempts or "∞", turn["seq"])
             store.add_event(wo["id"], "turn_resumed", {
                 "seq": turn["seq"], "retried_seq": pause.turn["seq"],
                 "attempt": pause.attempts, "of": pause.max_attempts,
                 "reason": pause.reason,
             })
+            # Only an auth pause is ever parked out of `running` (`_park_on_signin`), so
+            # this is where that gets put back — the same two lines `_deliver` uses, for
+            # the same reason: the turn is out, and a record still saying "waiting on
+            # you" about a worker that is working would be a lie.
+            if wo["status"] != "running":
+                store.set_status(wo["id"], "running")
+                store.clear_attention(wo["id"])
 
     # -- 3. message delivery ----------------------------------------------------------
 
@@ -764,14 +775,18 @@ class Daemon:
             if worker_session.busy(store, wo["id"]):
                 continue  # mid-turn: one turn at a time, and resume would refuse anyway
             pause = worker_session.turn_pause(store, wo["id"])
-            if pause is not None and not pause.exhausted:
+            if pause is not None and pause.resumable:
                 # Parked on the usage limit or on a broken API. The lost turn has to go
                 # out first — it is holding a message already marked `delivered`, so
                 # sending this one now would silently jump the queue. Held, not dropped:
                 # the same queue delivers it as the next turn once the retry gets
-                # through. Once the retries are EXHAUSTED this stops applying, which is
-                # what keeps the manual escape hatch (`jarvis wo send … "retry"`)
-                # working.
+                # through.
+                #
+                # `resumable`, not `exhausted`: the two answer differently only for an
+                # auth pause whose sign-in has not changed, and that one never exhausts
+                # by design — holding on it would hold `jarvis wo send … "retry"` for
+                # ever, which is the manual escape hatch for a sign-in the OS cannot see
+                # (Neo, question 169).
                 continue
             pending.setdefault(wo["id"], []).append(dict(msg))
         for wo_id, msgs in pending.items():
@@ -1843,38 +1858,33 @@ class Daemon:
             # feature order, and flag the user for something that fixes itself — and the
             # flag would come straight back every reconcile tick, because `true_blockers`
             # derives it from the status.
+            #
+            # Auth first, and it is the one that does not just fall through: it never
+            # exhausts, and unlike the other two the user has something to do about it.
             pause = worker_session.turn_pause(store, wo["id"])
+            if pause and pause.reason == worker_session.PAUSE_AUTH:
+                self._park_on_signin(store, wo, pause, turn)
+                return
             if pause and not pause.exhausted:
                 return
             if wo["status"] != "failed":
-                from .invariants import AUTH_BLOCKER
-
-                auth = pause is not None and pause.reason == worker_session.PAUSE_AUTH
                 store.set_status(wo["id"], "failed")
-                # THE TITLE HAS TO NAME THE FAILURE, not the fact that there was one:
-                # this is the line the user reads in Telegram, and "worker turn failed"
-                # sends them looking for a bug in the work instead of at their own login
-                # or Anthropic's status page. The body carries the CLI's own words.
-                store.flag_attention(wo["id"], (
-                    AUTH_BLOCKER if auth
-                    else "worker turn failed — review and retry"))
-                if pause and not auth:
-                    # Retried until the OS ran out of patience. An auth pause never was
-                    # retried (`max_attempts` is 0), so it gets no "still failing after
-                    # N retries" line — the `turn_failed` event already names it.
+                store.flag_attention(wo["id"],
+                                     "worker turn failed — review and retry")
+                if pause:
+                    # Retried until the OS ran out of patience. Say so plainly: the
+                    # message the user needs is "this is not going to fix itself", and
+                    # a bare "worker turn failed" would send them looking for a bug in
+                    # the work instead of at the account's limits or Anthropic's status
+                    # page.
                     store.add_event(wo["id"], "turn_retries_exhausted",
                                     {"attempts": pause.attempts,
                                      "reason": pause.reason,
                                      "error": pause.message})
-                if auth:
-                    title = f"{wo['id']} blocked — Claude Code authentication failed"
-                elif pause:
-                    title = (f"{wo['id']} still failing after {pause.attempts} "
-                             f"{worker_session.PAUSE_NOUN[pause.reason]} retries")
-                else:
-                    title = f"{wo['id']} worker turn failed"
                 store.add_notification(
-                    title=title,
+                    title=(f"{wo['id']} still failing after {pause.attempts} "
+                           f"{worker_session.PAUSE_NOUN[pause.reason]} retries" if pause
+                           else f"{wo['id']} worker turn failed"),
                     body=(turn.get("error") or "no error recorded")[:500],
                     level="warning", wo_id=wo["id"], source="reconciler",
                 )
@@ -1941,6 +1951,42 @@ class Daemon:
 
             store.set_status(wo["id"], "needs_review")
             store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
+
+    def _park_on_signin(self, store: ProjectStore, wo: dict[str, Any],
+                        pause: worker_session.TurnPause,
+                        turn: dict[str, Any]) -> None:
+        """Hold a work order whose turn died on authentication, until the user signs in.
+
+        NOT `failed`, and that is the whole of `TurnPause.exhausted`: `failed` is a
+        DEPENDENCY_DEAD_STATUS, so it strands dependents and fails the parent feature
+        order for something a `/login` fixes — which is what happened to fo-e353491c on
+        2026-08-27.
+
+        `waiting_input` is what this state actually is, and it is the status that makes
+        every existing surface work with no new exception. Still ACTIVE, so
+        `retry_paused_turns` keeps sweeping it and no dependency edge treats it as dead;
+        and in `invariants.BLOCKED_STATUSES`, so `true_blockers` can re-derive
+        AUTH_BLOCKER — the obligation a flag raised only here would not meet.
+
+        SAID ONCE, and the status is the guard. Every subsequent tick sees the same pause
+        on an already-parked order, and a Telegram message per tick about one sign-in is
+        how an attention strip earns being ignored. Each `turn_paused` event still lands
+        on the timeline, so a resume that fails on auth again is on the record.
+        """
+        from .invariants import AUTH_BLOCKER
+
+        if wo["status"] == "waiting_input":
+            return
+        store.set_status(wo["id"], "waiting_input")
+        store.flag_attention(wo["id"], AUTH_BLOCKER)
+        store.add_notification(
+            # The title names the failure rather than the fact that there was one: this
+            # is the line the user reads in Telegram, and "worker turn failed" sends them
+            # looking for a bug in the work instead of at their own login.
+            title=f"{wo['id']} parked — Claude Code could not authenticate",
+            body=(turn.get("error") or pause.message)[:500],
+            level="warning", wo_id=wo["id"], source="reconciler",
+        )
 
     # -- 6. pull requests parked on a human ------------------------------------------
 
