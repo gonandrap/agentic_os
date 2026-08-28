@@ -1126,6 +1126,23 @@ class CentralStore:
             (limit,)).fetchall()
         return [self._config_version_row(r) for r in rows]  # type: ignore[misc]
 
+    def config_versions_since(self, version_id: str) -> int | None:
+        """How many versions were written after this one. None if the id is unknown.
+
+        Ordered by `(ts, rowid)`, the same total order `config_versions` uses, so a
+        stamp on the head reads 0 rather than one-or-zero depending on the clock.
+        """
+        row = self.conn.execute(
+            "SELECT ts, rowid FROM os_config_versions WHERE id=?",
+            (version_id,)).fetchone()
+        if row is None:
+            return None
+        after = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM os_config_versions "
+            "WHERE ts > ? OR (ts = ? AND rowid > ?)",
+            (row["ts"], row["ts"], row["rowid"])).fetchone()
+        return int(after["n"])
+
     def head_config_version(self) -> dict[str, Any] | None:
         """What the fleet is configured to run. None on a fleet that never wrote one —
         which reads as "before the console existed", never as version 1."""

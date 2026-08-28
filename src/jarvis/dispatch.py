@@ -788,6 +788,9 @@ def dispatch_work_order(
         "model": wo.get("model") or project.worker.model,
         "effort": wo.get("effort") or project.worker.effort,
         "permission_mode": wo.get("permission_mode") or project.worker.permission_mode,
+        # Which configuration this ran under. NULL until the ledger holds a version —
+        # "before the console existed", never version 1 (config-console design §5).
+        "config_version": (central.head_config_version() or {}).get("id"),
     }
     store.update_work_order(wo["id"], **resolved)
     wo = store.get_work_order(wo["id"])

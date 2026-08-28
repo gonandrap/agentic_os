@@ -867,13 +867,13 @@ class Daemon:
         from . import evidence as evidence_mod
         from . import ops
 
-        cfg = project.validation
         store = ProjectStore(project.path)  # thread-local connection — see the docstring
         try:
             wo = store.get_work_order(wo_id)
             round_row = store.get_validation_round(round_id)
             if round_row is None:  # pragma: no cover - deleted mid-flight
                 return
+            cfg = self._round_config(project, round_row)
             n, max_rounds = int(round_row["round"]), int(cfg.max_rounds)
             packet = evidence_mod.collect_work_order(
                 project.path, wo, declared=str(round_row["evidence"] or ""),
@@ -1039,6 +1039,43 @@ class Daemon:
                 f"the review could not be run: the validator was unreachable "
                 f"{outages} times in a row. Nobody has judged the work.")
 
+    def _round_config(self, project: ProjectSpec, round_row: dict[str, Any]) -> Any:
+        """The validation settings THE ROUND WAS OPENED UNDER, not the live ones.
+
+        What keeps the drain property true once the daemon reloads its catalog: a user
+        who disables the panel at 3am must not turn every open round into a `failed`
+        one that reads as "nobody judged the work" (config-console design §4.1).
+
+        The fallbacks both land on `project.validation` — the live catalog's answer for
+        THIS project, which is what both call sites read before the stamp existed — and
+        both mean the same thing: nothing was recorded, so there is nothing to prefer
+        over what is running now. A NULL stamp is a round opened before the console
+        existed; an unknown id is a ledger that has lost the row.
+
+        BOTH loops read it (Neo, question 176): a feature round is judged under a stamp
+        for the same reason a work order's is, and the two settle paths are held
+        deliberately identical.
+
+        Opens its own `CentralStore` because this runs on the validate thread, the same
+        reason `_validate_work_order` opens its own `ProjectStore`.
+        """
+        from . import config_version as cv
+
+        vid = round_row.get("config_version")
+        if not vid:
+            return project.validation
+        central = CentralStore()  # thread-local connection — see the docstring
+        try:
+            row = central.get_config_version(str(vid))
+        finally:
+            central.close()
+        if row is None:
+            log.warning("[%s] round %s stamped %s, which is not in the ledger — "
+                        "judging under the live catalog",
+                        project.name, round_row["id"], vid)
+            return project.validation
+        return cv.validation_config_from_resolved(row["resolved"], project.name)
+
     @staticmethod
     def _validator(cfg: Any) -> Any:
         """How a round is judged: the validation panel, or nothing. THE ONLY PLACE
@@ -1113,13 +1150,13 @@ class Daemon:
         """
         from . import ops
 
-        cfg = project.validation
         store = ProjectStore(project.path)  # thread-local connection — see the docstring
         try:
             fo = store.get_feature_order(fo_id)
             round_row = store.get_validation_round(round_id)
             if round_row is None:  # pragma: no cover - deleted mid-flight
                 return
+            cfg = self._round_config(project, round_row)
             n, max_rounds = int(round_row["round"]), int(cfg.max_rounds)
             packet = ops.collect_feature_evidence(
                 store, project.path, fo, declared=str(round_row["evidence"] or ""),

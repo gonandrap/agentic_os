@@ -328,3 +328,41 @@ def test_the_validation_tables_and_their_partial_indexes_arrive_on_an_upgrade(tm
                 " VALUES (?,1,1.0,'dup')", (wo["id"],))
     finally:
         store.close()
+
+
+def test_config_version_reaches_a_database_that_already_has_rounds_and_work_orders(
+        tmp_path):
+    """`validation_rounds` already ships, so the round's stamp cannot arrive with the
+    `CREATE TABLE` — same construction, and same reason, as `usage_json` above: the
+    frozen project asset predates the table entirely and would create it fresh.
+
+    The work-order half is the LOUD failure. `dispatch.dispatch_work_order` splats its
+    resolved dict into `update_work_order`, which builds its SQL from the keys with no
+    whitelist, so a stamp added without the `ADDED_COLUMNS` entry raises `no such
+    column` on every dispatch — on live databases only.
+    """
+    proj = tmp_path / "legacy"
+    (proj / ".jarvis").mkdir(parents=True)
+    ProjectStore(proj).close()                      # today's schema...
+    conn = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
+    conn.execute("ALTER TABLE validation_rounds DROP COLUMN config_version")  # ...aged
+    conn.execute("ALTER TABLE work_orders DROP COLUMN config_version")
+    conn.commit()
+    conn.close()
+
+    store = ProjectStore(proj)                      # the upgrade
+    try:
+        after = schema_of(store.conn)
+        assert "config_version" in after["validation_rounds"]
+        assert "config_version" in after["work_orders"]
+        # and both round-trip on the upgraded database
+        wo = store.create_work_order(title="after the upgrade", description="")
+        assert store.get_work_order(wo["id"])["config_version"] is None
+        store.update_work_order(wo["id"], model="sonnet",         # the dispatch splat
+                                config_version="cfg-a1b2c3d4e5f6")
+        assert store.get_work_order(wo["id"])["config_version"] == "cfg-a1b2c3d4e5f6"
+        rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="a",
+                                          config_version="cfg-a1b2c3d4e5f6")
+        assert rnd["config_version"] == "cfg-a1b2c3d4e5f6"
+    finally:
+        store.close()
