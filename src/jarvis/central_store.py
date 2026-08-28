@@ -242,6 +242,40 @@ CREATE TABLE IF NOT EXISTS gate_rules (
     retired_at REAL,                        -- NULL = in force; set = retracted
     retired_reason TEXT NOT NULL DEFAULT ''
 );
+-- The append-only history of what the fleet was configured to run, and the only place
+-- that record exists: `projects.catalog_json` holds the CURRENT project dict and is
+-- overwritten on every `jarvis start`, and the catalog file is untracked, so git is not
+-- the history either. See
+-- docs/superpowers/specs/2026-08-27-the-config-console.md §2, §9.
+--
+-- Fleet-wide rather than per project, because project settings resolve AGAINST the `os`
+-- block at parse time, several settings have no project to belong to, and traceability
+-- wants one id to stamp on a work order. "Per project" is served as a view, not as
+-- separate counters.
+--
+-- TWO JSON documents with two different jobs, and the second is what makes the ledger
+-- survive a release. `document_json` is the catalog file's own raw JSON, canonicalised —
+-- what the file is rewritten FROM and what the content-addressed id hashes.
+-- `resolved_json` is that document parsed and flattened to `path -> value` with every
+-- default MATERIALISED at write time, which is what "which config judged this work
+-- order" reads: a snapshot storing only the user's sparse keys would silently change
+-- meaning on the day a shipped default moved (§2).
+--
+-- Rows are never rewritten and never migrated. A historical version is evidence of what
+-- ran, not configuration anyone needs to run, so it is rendered and diffed — never fed
+-- back to `parse_catalog` (§6).
+CREATE TABLE IF NOT EXISTS os_config_versions (
+    id             TEXT PRIMARY KEY,        -- cfg-<sha256(document_json)[:16]>
+    ts             REAL NOT NULL,
+    actor          TEXT NOT NULL,           -- user | file | release | <wo-id>
+    reason         TEXT NOT NULL DEFAULT '',
+    schema_version TEXT NOT NULL,           -- bugreport.jarvis_version() at write time
+    document_json  TEXT NOT NULL,           -- canonical catalog document; APPLIED  (§2)
+    resolved_json  TEXT NOT NULL,           -- path -> value, defaults frozen; EVIDENCE (§2)
+    changes_json   TEXT NOT NULL DEFAULT '[]',  -- the edits the actor asked for
+    source_path    TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_os_config_versions_ts ON os_config_versions(ts);
 CREATE INDEX IF NOT EXISTS idx_gate_rules_role ON gate_rules(role, kind);
 CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
 CREATE INDEX IF NOT EXISTS idx_backlog_project ON backlog(project, status);
@@ -1039,6 +1073,78 @@ class CentralStore:
             (db.now(), reason, rule_id),
         )
         return self.get_gate_rule(rule_id)  # type: ignore[return-value]
+
+    # --- the config version ledger -------------------------------------------------
+    # docs/superpowers/specs/2026-08-27-the-config-console.md §2, §9.
+
+    def add_config_version(
+            self, document: Any, resolved: dict[str, Any], *, actor: str,
+            reason: str = "", changes: list[dict[str, Any]] | None = None,
+            source_path: str = "",
+            schema_version: str | None = None) -> dict[str, Any]:
+        """Record a configuration snapshot. Returns the EXISTING row when its id is
+        already present, writing nothing.
+
+        That is not an optimisation for duplicate calls — it is the meaning of a
+        content-addressed id. An edit that changes nothing is not a change, and
+        `jarvis config restore` landing back on the id it restored is the same fact seen
+        from the other end. The caller learns which happened from the returned row's
+        `ts`/`actor`, not from a flag.
+
+        The id is computed here rather than passed in so no call site can write a row
+        whose id does not address its own document.
+        """
+        from . import bugreport, config_version
+
+        vid = config_version.version_id(document)
+        existing = self.get_config_version(vid)
+        if existing is not None:
+            return existing
+        self.conn.execute(
+            """INSERT INTO os_config_versions
+               (id, ts, actor, reason, schema_version, document_json, resolved_json,
+                changes_json, source_path)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (vid, db.now(), actor, reason,
+             schema_version if schema_version is not None
+             else bugreport.jarvis_version(),
+             config_version.canonicalise(document),
+             db.to_json(resolved), db.to_json(changes or []), source_path),
+        )
+        return self.get_config_version(vid)  # type: ignore[return-value]
+
+    def get_config_version(self, version_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM os_config_versions WHERE id=?", (version_id,)).fetchone()
+        return self._config_version_row(row)
+
+    def config_versions(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Newest first. `rowid` breaks a tie on `ts` so the order is total: two writes
+        inside the same clock tick must still have a head."""
+        rows = self.conn.execute(
+            "SELECT * FROM os_config_versions ORDER BY ts DESC, rowid DESC LIMIT ?",
+            (limit,)).fetchall()
+        return [self._config_version_row(r) for r in rows]  # type: ignore[misc]
+
+    def head_config_version(self) -> dict[str, Any] | None:
+        """What the fleet is configured to run. None on a fleet that never wrote one —
+        which reads as "before the console existed", never as version 1."""
+        versions = self.config_versions(limit=1)
+        return versions[0] if versions else None
+
+    @staticmethod
+    def _config_version_row(row: Any) -> dict[str, Any] | None:
+        """The raw columns plus the three decoded documents, under names without the
+        `_json` suffix. Both are kept: the ledger is append-only and its rendering
+        surfaces want the stored bytes, while every caller that USES a version wants the
+        objects."""
+        if row is None:
+            return None
+        d = dict(row)
+        d["document"] = db.from_json(d["document_json"], {})
+        d["resolved"] = db.from_json(d["resolved_json"], {})
+        d["changes"] = db.from_json(d["changes_json"], [])
+        return d
 
     def record_gate_rule_hit(self, rule_id: str) -> None:
         """Count an exemption actually clearing a command.
