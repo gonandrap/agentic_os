@@ -5,6 +5,7 @@ Every mutation of the OS goes through here, so all surfaces behave identically.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import signal
@@ -17,13 +18,15 @@ from typing import Any
 
 from .bootstrap import BootstrapReport, bootstrap_project, settings_drift
 from .catalog import (
+    SAFETY_KEYS,
     Catalog,
     CatalogError,
     ProjectSpec,
     load_catalog,
+    parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import db, invariants
+from . import config_version, db, invariants
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import CentralStore
 from .daemon import daemon_running
@@ -2936,6 +2939,503 @@ def show_gate(approval_id: int, project_name: str | None = None) -> dict[str, An
         finally:
             neo.close()
     return {**approval, "project": name, "neo_question": question}
+
+
+# -- the config console ---------------------------------------------------------------
+# docs/superpowers/specs/2026-08-27-the-config-console.md §3, §7, §8. The version ledger
+# in `os.db` is the record; the catalog file is a materialised view of it. Every write
+# below goes through `_commit_document`, which is this feature's whole write path.
+
+# Which reads of a setting a change actually reaches (§4.2), by resolved path. First
+# glob wins, so the two blocks that stay hot whatever their fields are called come before
+# the name-based `next-dispatch` rules — `os.neo.model` is hot, `os.defaults.model` is not.
+APPLY_RULES: tuple[tuple[str, str], ...] = (
+    ("os.validation.*", "hot"),
+    ("os.neo.*", "hot"),
+    ("os.ui.*", "restart"),
+    ("projects.*.path", "restart"),
+    ("projects.*.settings_overrides", "restart"),
+    ("projects.*.settings_overrides.*", "restart"),
+    ("*.model", "next-dispatch"),
+    ("*.effort", "next-dispatch"),
+    ("*.permission_mode", "next-dispatch"),
+    ("*.autocompact_window", "next-dispatch"),
+    ("*.append_system_prompt", "next-dispatch"),
+)
+
+APPLY_NOTES = {
+    "hot": "in force on the daemon's next tick",
+    "next-dispatch": "applies to work orders dispatched from now on — a worker already "
+                     "running keeps what it was dispatched with",
+    "restart": "NOT in force until `jarvis start` restarts the OS",
+}
+
+# `settings_overrides` is `restart` for a reason the class name does not carry: nothing
+# re-runs `bootstrap_project`, so the project's own settings file is untouched.
+SETTINGS_OVERRIDES_NOTE = (
+    "nothing re-runs bootstrap_project, so the project's .claude settings on disk are "
+    "unchanged until `jarvis start` writes them"
+)
+
+
+def apply_class(path: str) -> str:
+    """`hot`, `next-dispatch` or `restart` for one resolved path (§4.2)."""
+    for glob, cls in APPLY_RULES:
+        if fnmatch.fnmatch(path, glob):
+            return cls
+    return "hot"
+
+
+def apply_note(path: str) -> str:
+    cls = apply_class(path)
+    if cls == "restart" and ".settings_overrides" in f".{path}.":
+        return SETTINGS_OVERRIDES_NOTE
+    return APPLY_NOTES[cls]
+
+
+def safety_key(path: str) -> bool:
+    """Does this path change what a worker is ALLOWED to do, rather than what it costs?
+
+    Buys exactly two things (§7): a louder line on the way past, and a mandatory
+    `--reason` on the version row.
+    """
+    return any(fnmatch.fnmatch(path, glob) for glob in SAFETY_KEYS)
+
+
+def _refuse_worker_write(verb: str) -> None:
+    """A worker may not change the fleet's own configuration (§7).
+
+    THIS is the layer that stops one. `ProjectSpec.gates` is empty by default, so on an
+    ungated project the `config_write` gate protects nobody, and
+    `hooks.preflight_decision` allows any `jarvis` command chain outright.
+    """
+    wo_id = os.environ.get("JARVIS_WO_ID")
+    if not wo_id:
+        return
+    raise OpsError(
+        f"{wo_id} is a worker session — a worker may not `jarvis config {verb}`. "
+        "The fleet's configuration is the user's. Ask on the work order record "
+        "(`jarvis wo ask`), or file it: `jarvis backlog add jarvis_os \"…\"`."
+    )
+
+
+def _catalog_file(catalog_path: str | None = None) -> Path:
+    """The file `jarvis config` rewrites: the one registered at `jarvis start`."""
+    if catalog_path:
+        return Path(catalog_path).expanduser().resolve()
+    central = CentralStore()
+    try:
+        stored = central.get_state("catalog_path")
+    finally:
+        central.close()
+    if not stored:
+        raise OpsError(
+            "no catalog is registered — run `jarvis start --catalog <file>` first, "
+            "or pass --catalog <file>")
+    return Path(stored)
+
+
+def _read_document(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as e:
+        raise OpsError(f"cannot read the catalog at {path}: {e}") from e
+    except ValueError as e:
+        raise OpsError(f"the catalog at {path} is not valid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise OpsError(f"the catalog at {path} must be a JSON object")
+    return data
+
+
+def _write_document(path: Path, document: dict[str, Any]) -> None:
+    """Rewrite the catalog from the canonical document, atomically.
+
+    The temp file is a SIBLING of the catalog: `os.replace` is atomic within one
+    filesystem and raises across two, so a temp file under /tmp turns the rename into a
+    failure on any machine whose $JARVIS_HOME is a separate mount.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(config_version.canonicalise(document) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        raise OpsError(f"cannot write the catalog at {path}: {e}") from e
+
+
+def _resolved_of(document: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
+    """Parse-and-flatten a document, raising `OpsError` rather than `CatalogError`."""
+    try:
+        cat = parse_catalog(json.loads(json.dumps(document)), source_path=path)
+    except CatalogError as e:
+        raise OpsError(str(e)) from None
+    return config_version.resolve(cat)
+
+
+def _commit_document(document: dict[str, Any], *, path: Path, actor: str,
+                     reason: str, changes: list[dict[str, Any]]) -> dict[str, Any]:
+    """Validate, rewrite the file, write the version row — in that order (§3).
+
+    The order is the decision, not the steps: a row written first leaves a head version
+    nobody is running, which nothing detects, while a file written first leaves a running
+    config with no record, which the drift check catches and `config adopt` repairs.
+    """
+    resolved = _resolved_of(document, path)
+    _write_document(path, document)
+    central = CentralStore()
+    try:
+        return central.add_config_version(
+            document, resolved, actor=actor, reason=reason, changes=changes,
+            source_path=str(path))
+    finally:
+        central.close()
+
+
+def parse_config_value(text: str) -> Any:
+    """The CLI hands values in as text. JSON first, bare string otherwise: `true`, `3`,
+    `null` and `["a"]` mean what they look like, and `opus` is the string it looks like.
+    """
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def _project_names(document: dict[str, Any]) -> list[str]:
+    return [p["name"] for p in document.get("projects", [])
+            if isinstance(p, dict) and isinstance(p.get("name"), str)]
+
+
+def _key_path(path: str, project: str | None, document: dict[str, Any]) -> str:
+    """The key-space path a user's `<path>` and optional `<project>` name together.
+
+    The positional SCOPES the path (Neo, question 175): `set proj_a validation.enabled`
+    means `projects.proj_a.validation.enabled`. An already-absolute path is accepted
+    beside a project positional when the two agree and refused when they do not, so no
+    spelling ever silently edits a project other than the one named.
+    """
+    key = path.strip().strip(".")
+    if not key:
+        raise OpsError("give a setting path, e.g. `os.validation.enabled`")
+    known = _project_names(document)
+
+    if project is None:
+        head = key.split(".")[0]
+        if head not in ("os", "projects"):
+            raise OpsError(
+                f"{key!r} is not a setting path — give `os.…` or `projects.<name>.…`, "
+                f"or name the project: `jarvis config set <project> {key} …`")
+        if head == "projects":
+            parts = key.split(".")
+            if len(parts) < 3:
+                raise OpsError(f"{key!r} names a whole project, not a setting in it")
+            if parts[1] not in known:
+                raise OpsError(f"unknown project {parts[1]!r} (known: {known})")
+        return key
+
+    if project not in known:
+        raise OpsError(f"unknown project {project!r} (known: {known})")
+    prefix = f"projects.{project}."
+    if key.startswith(prefix):
+        return key
+    if key.split(".")[0] in ("os", "projects"):
+        raise OpsError(
+            f"{key!r} is not a path under project {project!r} — drop the project to "
+            f"set it, or give a path relative to the project (`validation.enabled`)")
+    return prefix + key
+
+
+def _document_slot(document: dict[str, Any], key: str, *,
+                   create: bool) -> tuple[dict[str, Any] | None, str]:
+    """The container object and final key a key-space path names in the raw document.
+
+    The key space is flat (`projects.<name>.…`) and the document is not — `projects` is
+    a LIST, addressed by each entry's `name`. A `None` container means the path is not
+    written in the file at all, which is a plain fact about a setting on its default and
+    not an error: the caller has better words for it than this walk does.
+    """
+    parts = key.split(".")
+    if parts[0] == "os":
+        node = document.setdefault("os", {}) if create else document.get("os")
+        rest, seen = parts[1:], "os"
+    else:
+        node = next((p for p in document.get("projects", [])
+                     if isinstance(p, dict) and p.get("name") == parts[1]), None)
+        rest, seen = parts[2:], f"projects.{parts[1]}"
+    if not rest:
+        raise OpsError(f"{key!r} names a whole section, not a setting")
+
+    for seg in rest[:-1]:
+        if node is None:
+            return None, rest[-1]
+        if not isinstance(node, dict):
+            raise OpsError(f"{seen} is not an object in the catalog file")
+        seen = f"{seen}.{seg}"
+        if seg not in node and create:
+            node[seg] = {}
+        node = node.get(seg)
+    if node is not None and not isinstance(node, dict):
+        raise OpsError(f"{seen} is not an object in the catalog file")
+    return node, rest[-1]
+
+
+def _one_change(key: str, before: dict[str, Any], after: dict[str, Any],
+                doc_before: Any, doc_after: Any, existed: bool) -> list[dict[str, Any]]:
+    """The single triple a `set`/`unset` asked for, read off the RESOLVED maps.
+
+    Resolved rather than raw so the history shows the default the user was actually on
+    rather than a blank. A path the resolver does not know — a forward-compatible key
+    `parse_catalog` ignores — has no resolved value at all, so it falls back to the
+    document's own before/after, which is the only honest answer for it.
+    """
+    for change in config_version.diff(before, after):
+        if change["path"] == key:
+            return [change]
+    if key in before or key in after:
+        return [{"path": key, "kind": "changed",
+                 "old": before.get(key), "new": after.get(key)}]
+    return [{"path": key, "kind": "changed" if existed else "added",
+             "old": doc_before, "new": doc_after}]
+
+
+def _require_reason(changes: list[dict[str, Any]], reason: str) -> None:
+    unsafe = [c["path"] for c in changes if safety_key(c["path"])]
+    if not unsafe or reason.strip():
+        return
+    more = f" (and {len(unsafe) - 3} more)" if len(unsafe) > 3 else ""
+    raise OpsError(
+        f"{', '.join(unsafe[:3])}{more} — a safety setting changes what a worker is "
+        f"ALLOWED to do, so `--reason` is required and goes on the version row")
+
+
+def _find_version(version_id: str) -> dict[str, Any]:
+    """A version by id, or by any unambiguous prefix of one — the ids are 16 hex
+    characters and nobody retypes one in full."""
+    central = CentralStore()
+    try:
+        row = central.get_config_version(version_id)
+        if row is not None:
+            return row
+        hits = [v for v in central.config_versions(limit=1000)
+                if v["id"].startswith(version_id)]
+    finally:
+        central.close()
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise OpsError(f"no config version {version_id!r} — `jarvis config history`")
+    raise OpsError(f"{version_id!r} matches {len(hits)} versions: "
+                   f"{[h['id'] for h in hits]}")
+
+
+def _touches(paths: Sequence[str], project: str | None) -> bool:
+    """Does a version's change list reach `project`'s effective configuration?
+
+    An `os.` change does — project settings resolve against `os.defaults` at parse time
+    — so the filter only drops versions that exclusively touch OTHER projects. A version
+    with no recorded changes is kept: nothing rules it out.
+    """
+    if not project or not paths:
+        return True
+    return any(not p.startswith("projects.") or p.startswith(f"projects.{project}.")
+               for p in paths)
+
+
+def _in_scope(resolved: dict[str, Any], project: str | None) -> dict[str, Any]:
+    """A project's own settings plus the fleet settings it runs under."""
+    if not project:
+        return resolved
+    prefix = f"projects.{project}."
+    return {k: v for k, v in resolved.items()
+            if k.startswith(prefix) or k.startswith("os.")}
+
+
+def set_config(path: str, value: Any, project: str | None = None, *, reason: str = "",
+               catalog_path: str | None = None, actor: str = "user") -> dict[str, Any]:
+    """Write one setting: validate, rewrite the catalog, record the version (§3)."""
+    _refuse_worker_write("set")
+    file = _catalog_file(catalog_path)
+    document = _read_document(file)
+    key = _key_path(path, project, document)
+
+    try:
+        before = _resolved_of(document, file)
+    except OpsError:
+        before = {}  # an already-invalid catalog is exactly what a `set` may be fixing
+    was = config_version.version_id(document)
+    container, leaf = _document_slot(document, key, create=True)
+    assert container is not None  # `create=True` builds the whole chain
+    existed, doc_before = leaf in container, container.get(leaf)
+    container[leaf] = value
+
+    after = _resolved_of(document, file)
+    changes = _one_change(key, before, after, doc_before, value, existed)
+    _require_reason(changes, reason)
+    row = _commit_document(document, path=file, actor=actor, reason=reason,
+                           changes=changes)
+    return {"version": row, "changed": row["id"] != was,
+            "path": key, "value": value, "change": changes[0],
+            "apply": apply_class(key), "note": apply_note(key),
+            "safety": safety_key(key), "catalog": str(file)}
+
+
+def unset_config(path: str, project: str | None = None, *, reason: str = "",
+                 catalog_path: str | None = None,
+                 actor: str = "user") -> dict[str, Any]:
+    """Remove one setting from the document, so it falls back to its default."""
+    _refuse_worker_write("unset")
+    file = _catalog_file(catalog_path)
+    document = _read_document(file)
+    key = _key_path(path, project, document)
+
+    before = _resolved_of(document, file)
+    container, leaf = _document_slot(document, key, create=False)
+    if container is None or leaf not in container:
+        raise OpsError(
+            f"{key} is not set in the catalog file — it is already running on its "
+            f"default ({before.get(key)!r})")
+    doc_before = container.pop(leaf)
+
+    after = _resolved_of(document, file)
+    changes = _one_change(key, before, after, doc_before, after.get(key), True)
+    _require_reason(changes, reason)
+    row = _commit_document(document, path=file, actor=actor, reason=reason,
+                           changes=changes)
+    return {"version": row, "changed": True, "path": key, "value": after.get(key),
+            "change": changes[0], "apply": apply_class(key), "note": apply_note(key),
+            "safety": safety_key(key), "catalog": str(file)}
+
+
+def config_get(path: str, project: str | None = None,
+               catalog_path: str | None = None) -> dict[str, Any]:
+    """One setting as the fleet would read it, and whether the file says so."""
+    file = _catalog_file(catalog_path)
+    document = _read_document(file)
+    key = _key_path(path, project, document)
+    resolved = _resolved_of(document, file)
+    if key not in resolved:
+        raise OpsError(
+            f"{key} is not a known setting — `jarvis config show` lists every path")
+    container, leaf = _document_slot(document, key, create=False)
+    written = container is not None and leaf in container
+    return {"path": key, "value": resolved[key], "written": written,
+            "apply": apply_class(key), "note": apply_note(key),
+            "safety": safety_key(key), "catalog": str(file)}
+
+
+def config_show(project: str | None = None, version: str | None = None,
+                catalog_path: str | None = None) -> dict[str, Any]:
+    """The effective configuration, and where it came from.
+
+    Without `--version` the answer is read from the FILE, because the file is what the
+    fleet runs; the head version and the drift flag are the provenance beside it.
+    """
+    if version:
+        row = _find_version(version)
+        return {"source": "version", "version": row, "project": project,
+                "resolved": _in_scope(row["resolved"], project), "drift": False}
+
+    file = _catalog_file(catalog_path)
+    document = _read_document(file)
+    resolved = _resolved_of(document, file)
+    central = CentralStore()
+    try:
+        head = central.head_config_version()
+    finally:
+        central.close()
+    live_id = config_version.version_id(document)
+    return {"source": "file", "catalog": str(file), "project": project,
+            "resolved": _in_scope(resolved, project), "version": head,
+            "file_version": live_id,
+            "drift": head is None or head["id"] != live_id}
+
+
+def config_history(project: str | None = None,
+                   limit: int = 20) -> list[dict[str, Any]]:
+    """The ledger, newest first, each row flagged `head` if it is the applied one."""
+    central = CentralStore()
+    try:
+        head = central.head_config_version()
+        rows = central.config_versions(limit=max(limit * 4, limit))
+    finally:
+        central.close()
+    out = []
+    for row in rows:
+        if not _touches([c["path"] for c in row["changes"]], project):
+            continue
+        row["head"] = bool(head and head["id"] == row["id"])
+        out.append(row)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def config_diff(a: str, b: str) -> dict[str, Any]:
+    """Every path where two stored versions disagree, over the RESOLVED maps — each
+    document's defaults were frozen at write time, so this survives a release that moved
+    one (§2)."""
+    left, right = _find_version(a), _find_version(b)
+    return {"a": {k: left[k] for k in ("id", "ts", "actor", "reason")},
+            "b": {k: right[k] for k in ("id", "ts", "actor", "reason")},
+            "changes": config_version.diff(left["resolved"], right["resolved"])}
+
+
+def restore_config(version_id: str, *, reason: str = "",
+                   catalog_path: str | None = None,
+                   actor: str = "user") -> dict[str, Any]:
+    """Put an old document back. Writes FORWARD: the restored id becomes the head.
+
+    Content addressing means no row is written — the id already exists — so what moves is
+    the head pointer, and the history shows the restored version as head beside its
+    original write.
+    """
+    _refuse_worker_write("restore")
+    row = _find_version(version_id)
+    file = _catalog_file(catalog_path)
+    try:
+        before = _resolved_of(_read_document(file), file)
+    except OpsError:
+        before = {}
+    changes = config_version.diff(before, row["resolved"])
+    _require_reason(changes, reason)
+    applied = _commit_document(row["document"], path=file, actor=actor, reason=reason,
+                               changes=changes)
+    return {"version": applied, "restored": row["id"], "changes": changes,
+            "catalog": str(file),
+            "classes": sorted({apply_class(c["path"]) for c in changes})}
+
+
+def adopt_config(*, reason: str = "", catalog_path: str | None = None,
+                 actor: str = "file") -> dict[str, Any]:
+    """Record a hand-edited catalog as a version, so the record catches up with the file.
+
+    Content-addressed, the way `_seed_gate_rules` is: a file that already hashes to the
+    head version writes nothing and says so (§3).
+
+    The one write path that does NOT demand a `--reason` for a safety key, because it is
+    the one that changes nothing: the edit already happened on disk and the fleet is
+    already running it. Refusing here would leave the record behind the file, which is
+    the drift this command exists to close.
+    """
+    _refuse_worker_write("adopt")
+    file = _catalog_file(catalog_path)
+    document = _read_document(file)
+    resolved = _resolved_of(document, file)
+    central = CentralStore()
+    try:
+        head = central.head_config_version()
+    finally:
+        central.close()
+    if head is not None and head["id"] == config_version.version_id(document):
+        return {"adopted": False, "version": head, "changes": [],
+                "catalog": str(file),
+                "note": "the file is already the head version — nothing to adopt"}
+    changes = config_version.diff(head["resolved"] if head else {}, resolved)
+    row = _commit_document(document, path=file, actor=actor, reason=reason,
+                           changes=changes)
+    return {"adopted": True, "version": row, "changes": changes, "catalog": str(file),
+            "note": "recorded the file as a version"
+                    + ("" if head else " — the ledger's first")}
 
 
 # -- deferral ------------------------------------------------------------------------------------
