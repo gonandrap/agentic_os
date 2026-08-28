@@ -326,7 +326,7 @@ def _reap(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any]:
         auth = claude_cli.auth_failure(error)
         if auth:
             payload |= {"reason": PAUSE_AUTH}
-        store.add_event(wo_id, "turn_failed", payload)
+        store.add_event(wo_id, "turn_paused" if auth else "turn_failed", payload)
         return store.finish_turn(turn["id"], "failed", error=error)
     # Recorded on BOTH outcomes: a failed turn's tokens were spent just the same — the
     # turn that motivated this hit a 429 having already paid $0.07 for the attempt.
@@ -355,11 +355,9 @@ def _reap(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any]:
             payload |= {"reason": PAUSE_USAGE_LIMIT, "reset_at": limit.reset_at}
         elif transient:
             payload |= {"reason": PAUSE_TRANSIENT, "status": transient.status}
-        # `turn_failed` for auth, not `turn_paused`: the OS is not going to put this one
-        # right, and a "paused, resuming shortly" line about an account that cannot
-        # answer would be a promise the timeline cannot keep.
-        store.add_event(wo_id, "turn_paused" if limit or transient else "turn_failed",
-                        payload)
+        store.add_event(
+            wo_id, "turn_paused" if auth or limit or transient else "turn_failed",
+            payload)
         return store.finish_turn(turn["id"], "failed", error=result.error,
                                  result=result.result or None,
                                  cost_usd=result.cost_usd, num_turns=result.num_turns,
@@ -448,8 +446,8 @@ def is_stalled(turn: dict[str, Any] | None) -> bool:
 
 # -- parked, and coming back by itself ------------------------------------------------
 #
-# TWO WAYS A TURN DIES WITHOUT THE WORK BEING WRONG, and neither is the work order's
-# fault, so neither should cost the user an evening.
+# THREE WAYS A TURN DIES WITHOUT THE WORK BEING WRONG, and none is the work order's
+# fault, so none should cost the user an evening.
 #
 #   `usage_limit`  the account's window is spent. The turn did not happen at all:
 #                  nothing was sent, nothing was billed, and the CLI says WHEN the
@@ -457,19 +455,26 @@ def is_stalled(turn: dict[str, Any] | None) -> bool:
 #   `transient`    the transport broke — a 500, a 529, a dropped connection. The turn
 #                  DID happen, possibly at length, and nothing says when the API will
 #                  be well again, so the wait is a backoff (`TRANSIENT_BACKOFF`).
+#   `auth`         Claude Code could not sign in. Nothing about the wait is a duration:
+#                  it ends when a human runs `/login`, so the moment it may go again is
+#                  read off the credentials file rather than computed (`PAUSE_AUTH`).
 #
-# Treating either as a failure settles the work order into `failed`, which is a
+# Treating any of them as a failure settles the work order into `failed`, which is a
 # DEPENDENCY_DEAD_STATUS, fails the parent feature order and puts a permanent attention
-# flag on something that will be fine again in a minute. So the OS does not fail it at
-# all: the work order stays in the active status it already had and
-# `Daemon.retry_paused_turns` relaunches the turn when the wait is up.
+# flag on something that will be fine again in a minute — or the minute after the user
+# signs in. So the OS does not fail it at all: the work order stays in an ACTIVE status
+# and `Daemon.retry_paused_turns` relaunches the turn when the wait is up. (Auth is the
+# one that changes status while it waits, to `waiting_input`, because it is the one the
+# user has to do something about — `Daemon._park_on_signin`.)
 #
-# WHY ONE ABSTRACTION AND NOT TWO. The pause is read in four places — the settler,
-# message delivery, the retry pass and `invariants.status_label` — and every one of them
-# asks the same question ("is this work order coming back by itself, and when?"). A
-# second parallel predicate would mean four more call sites that could be updated one at
-# a time and drift, which is the exact failure the original design called out. So there
-# is ONE predicate, `turn_pause`, and the reason it returns is a field.
+# WHY ONE ABSTRACTION AND NOT THREE. The pause is read in five places — the settler,
+# message delivery, the retry pass, `invariants.status_label` and INV-PAUSE-OVERDUE —
+# and every one of them asks the same question ("is this work order coming back by
+# itself, and when?"). A second parallel predicate would mean five more call sites that
+# could be updated one at a time and drift, which is the exact failure the original
+# design called out. So there is ONE predicate, `turn_pause`, the reason it returns is a
+# field, and even auth — whose answer is "yes, but on an action rather than a clock" —
+# is expressed as a `retry_at` rather than as machinery of its own.
 #
 # There is still NO column and NO status for the pause itself. It is re-derived from the
 # latest turn every time it is asked for, which is the rule project_store.py states for
@@ -483,13 +488,22 @@ PAUSE_USAGE_LIMIT = "usage_limit"
 #: The API broke. Nothing names a moment, so `TRANSIENT_BACKOFF` picks one.
 PAUSE_TRANSIENT = "transient"
 #: THE ODD ONE OUT, AND THE COMMENT ABOVE IS WHY IT IS STILL HERE. Claude Code could not
-#: authenticate, so nothing about this comes back by itself — it clears when a human runs
-#: `/login`. It is a `reason` on the same `TurnPause` anyway because all four call sites
-#: ask "is this coming back by itself, and when?", and the honest answer for auth is "no"
-#: — which they already have a word for. `max_attempts` is 0, so the very first auth turn
-#: is `exhausted` and every one of them steps aside for the user (Neo, question 167).
-#: Resuming one automatically when the account is well again is a separate order.
+#: authenticate. It clears when a human runs `/login`, which may be in thirty seconds or
+#: next week, so unlike the two above there is no deadline to wait on — and a backoff
+#: would be a guess that either hammers an account that cannot answer or leaves the user
+#: waiting an hour after signing back in.
+#:
+#: SO THE EVIDENCE IS THE CLOCK. `_auth_retry_at` reads `claude_cli.signin_changed_at`
+#: and hands back the moment the stored sign-in last changed, if that is after the turn
+#: died — and `NEVER` if it is not. `due()` stays the same clock comparison it is for
+#: the other two, every reader keeps working unchanged, and a relaunch can happen at most
+#: once per rewrite of the credentials file (Neo, question 169; this reverses question
+#: 167's `max_attempts = 0`, which settled these into `failed`).
 PAUSE_AUTH = "auth"
+
+#: A `retry_at` that will not arrive. Not a far-future deadline: `resumable` tests for
+#: this exact value, so nothing goes looking at a clock that was never a promise.
+NEVER = float("inf")
 
 #: What to call each reason in a sentence written for the user. Here rather than at each
 #: surface so the notification, the status note and the timeline cannot end up calling
@@ -503,10 +517,10 @@ PAUSE_NOUN = {
 
 @dataclass(frozen=True)
 class TurnPause:
-    """A work order that stopped for the transport, and is coming back on its own."""
+    """A work order that stopped for something other than the work, and is coming back."""
 
     #: `PAUSE_USAGE_LIMIT`, `PAUSE_TRANSIENT` or `PAUSE_AUTH` — why it stopped, and
-    #: which schedule decided `retry_at` (none, for auth: it is exhausted on arrival).
+    #: which schedule decided `retry_at`.
     reason: str
     #: The turn that died. Its `prompt` is what a retry re-sends, when it re-sends one.
     turn: dict[str, Any]
@@ -525,14 +539,34 @@ class TurnPause:
     @property
     def max_attempts(self) -> int:
         if self.reason == PAUSE_AUTH:
-            return 0  # nothing to wait for; see PAUSE_AUTH
+            return 0  # uncapped; what bounds an auth retry is `retry_at`, see `exhausted`
         return (MAX_RATE_LIMIT_RETRIES if self.reason == PAUSE_USAGE_LIMIT
                 else len(TRANSIENT_BACKOFF))
 
     @property
     def exhausted(self) -> bool:
-        """Retried enough. The work order fails for real and asks for the user."""
-        return self.attempts > self.max_attempts
+        """Retried enough. The work order fails for real and asks for the user.
+
+        NEVER TRUE FOR AUTH, whatever the streak says, and that is the point of the
+        whole reason: `failed` is a DEPENDENCY_DEAD_STATUS, so exhausting one would
+        strand its dependents and fail its parent feature order — which is what happened
+        to fo-e353491c on 2026-08-27 — for something a `/login` fixes. What limits an
+        auth relaunch is `retry_at` moving, which happens once per sign-in, not a count.
+        """
+        return self.reason != PAUSE_AUTH and self.attempts > self.max_attempts
+
+    @property
+    def resumable(self) -> bool:
+        """Will the OS relaunch this turn by itself — ever?
+
+        `due()` answers "not yet"; only this answers "not ever", which is a state solely
+        `PAUSE_AUTH` can be in. The two readers that must tell them apart are
+        `Daemon.deliver_messages`, which holds a queued message behind a lost turn that
+        is going out first and would otherwise hold the manual escape hatch for ever, and
+        `invariants.check_paused_turns_resume`, which reports a relaunch that did not
+        happen.
+        """
+        return not self.exhausted and self.retry_at != NEVER
 
     def due(self, now: float | None = None) -> bool:
         return (time.time() if now is None else now) >= self.retry_at
@@ -557,10 +591,8 @@ def turn_pause(store: ProjectStore, wo_id: str) -> TurnPause | None:
     if reason is None:
         return None
     if isinstance(reason, claude_cli.AuthFailure):
-        # `retry_at` is the moment it died only because the field is not nullable — it
-        # is never compared to a clock, because `exhausted` is already true.
         return TurnPause(
-            reason=PAUSE_AUTH, turn=turn, retry_at=ended,
+            reason=PAUSE_AUTH, turn=turn, retry_at=_auth_retry_at(ended),
             attempts=pause_streak(store, wo_id, PAUSE_AUTH),
             message=reason.message,
         )
@@ -587,6 +619,21 @@ def turn_pause(store: ProjectStore, wo_id: str) -> TurnPause | None:
         message=reason.message,
         status=reason.status,
     )
+
+
+def _auth_retry_at(ended: float) -> float:
+    """When an auth-paused turn may go again: the moment the sign-in last changed.
+
+    NOT anchored to the turn the way the other two reasons are (`_diagnose` explains why
+    they must be). Their deadline is a statement the CLI made when the turn died and can
+    only be read once; this is a live fact about the account that the user changes later,
+    on purpose, and re-reading it is the entire mechanism.
+
+    `NEVER` unless the change came AFTER the failure. A sign-in older than the turn is
+    the one that failed.
+    """
+    changed = claude_cli.signin_changed_at()
+    return changed if changed is not None and changed > ended else NEVER
 
 
 def _diagnose(

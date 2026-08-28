@@ -95,14 +95,17 @@ VALIDATION_STUCK_BLOCKER = ("the review could not be satisfied — the work need
                             "judgement")
 
 #: What a work order says when its turn died because Claude Code could not authenticate
-#: (`worker_session.PAUSE_AUTH`). Nothing here is wrong with the work, nothing is wrong
-#: with the API, and no amount of waiting helps — the account cannot answer until a human
-#: signs in. Under the same obligation as PR_CLOSED_BLOCKER above: `Daemon.settle_work_order`
-#: raises it and this module must be able to re-derive it, or INV-ATTENTION-REASON
-#: relabels it "worker failed — review and retry" on the next tick, which is the exact
-#: sentence that sent the user hunting for a bug in the work on 2026-08-27.
-AUTH_BLOCKER = ("Claude Code could not authenticate — sign in again, then "
-                "`jarvis wo send <id> \"retry\"` to resume")
+#: (`worker_session.PAUSE_AUTH`). Nothing here is wrong with the work and nothing is wrong
+#: with the API: the account cannot answer until a human signs in, and then it can. So
+#: this asks for the ONE action that helps and promises the rest — `Daemon._park_on_signin`
+#: holds the order in `waiting_input` and `retry_paused_turns` relaunches it fleet-wide
+#: within a tick of the sign-in.
+#:
+#: Under the same obligation as PR_CLOSED_BLOCKER above: `_park_on_signin` raises it and
+#: this module must be able to re-derive it, or INV-ATTENTION-REASON relabels it on the
+#: next tick with a sentence that sends the user hunting for a bug in the work.
+AUTH_BLOCKER = ("Claude Code could not authenticate — sign in again and it resumes "
+                "by itself")
 
 #: What a work order says when its worker went quiet without `jarvis wo finish`. Says
 #: what HAPPENED, not merely that the turn ended: the worker stopped mid-task, and — the
@@ -194,10 +197,18 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     # See Daemon.retire_ungoverned.
     governed = wo.get("origin") not in UNGOVERNED_ORIGINS
     if governed and wo["status"] == "failed":
+        blockers.append("worker failed — review and retry")
+    # Parked on the user's Claude Code sign-in (`Daemon._park_on_signin`). Before the
+    # `waiting_input` branch below, whose generic "waiting on your input" would send the
+    # user looking for a session to type into — the thing to do is `/login`, and once
+    # they have, nothing else is asked of them. The query sits behind the status check so
+    # no other work order pays for it.
+    auth_parked = False
+    if governed and wo["status"] == "waiting_input":
         pause = worker_session.turn_pause(store, wo["id"])
-        blockers.append(
-            AUTH_BLOCKER if pause and pause.reason == worker_session.PAUSE_AUTH
-            else "worker failed — review and retry")
+        auth_parked = pause is not None and pause.reason == worker_session.PAUSE_AUTH
+        if auth_parked:
+            blockers.append(AUTH_BLOCKER)
     # Blocked on a prompt is real whoever started the session: nobody else can unstick it.
     # A worker waiting on the DELEGATE is the exception, and there are two ways to be
     # waiting on it — a gate still with Neo, and a question still with Neo. Routing both
@@ -218,7 +229,7 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     # on the tick after `Daemon.settle_work_order` parked it. Narrow on purpose: a manager
     # in any OTHER status is judged exactly like any other work order, so a failed one
     # still reaches the user.
-    if wo["status"] == "waiting_input" and wo.get("kind") != "manager":
+    if wo["status"] == "waiting_input" and wo.get("kind") != "manager" and not auth_parked:
         question = awaiting_neo(wo["id"])
         if question is not None and question["status"] in USER_HELD_Q_STATUSES:
             # Neo handed the decision back. That IS the user's, and it gets a reason
@@ -398,6 +409,10 @@ def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
     pause = worker_session.turn_pause(store, wo["id"])
     if pause is None or pause.exhausted:
         return ""
+    if pause.reason == worker_session.PAUSE_AUTH:
+        # The one pause with no moment to name — it resumes on an ACTION. `_clock` would
+        # be asked to render `NEVER`, and any time it could print would be a guess.
+        return "Claude Code sign-in expired, resuming once you sign in again"
     when = _clock(pause.retry_at)
     if pause.reason == worker_session.PAUSE_USAGE_LIMIT:
         return f"Claude usage limit reached, retrying by itself at {when}"
@@ -1006,6 +1021,12 @@ def check_paused_turns_resume(store: ProjectStore) -> Iterator[Violation]:
     seconds — so the grace is two orders of magnitude of slack, and anything reported
     here is stuck rather than merely waiting its turn.
 
+    `resumable`, not `exhausted`, because an auth pause is neither due nor exhausted
+    while the sign-in has not changed: its `retry_at` is `NEVER`, and there is nothing
+    overdue about a wait for an action the user has not taken yet. It becomes ordinary
+    the moment they sign in — `retry_at` lands in the recent past, and this holds the
+    relaunch to the same grace as the other two.
+
     REPORT-ONLY, and deliberately not repairable. The repair is to relaunch the turn,
     which is `retry_paused_turns`'s whole job; doing it here too would be a second
     relaunch path to keep in step with the first, which is the exact duplication
@@ -1026,7 +1047,7 @@ def check_paused_turns_resume(store: ProjectStore) -> Iterator[Violation]:
             yield Violation(invariant="INV-PAUSE-OVERDUE", wo_id=wo["id"],
                             detail=f"could not diagnose the pause: {e!r}")
             continue
-        if pause is None or pause.exhausted:
+        if pause is None or not pause.resumable:
             continue
         overdue = time.time() - pause.retry_at
         if overdue <= PAUSE_OVERDUE_GRACE:
