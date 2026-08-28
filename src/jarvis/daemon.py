@@ -556,7 +556,7 @@ class Daemon:
         """
         from . import ops
 
-        cfg = self.catalog.os.validation
+        cfg = project.validation
         if not (cfg.enabled and cfg.feature_units):
             return False
         if store.validation_rounds(fo_id=fo["id"]):
@@ -867,7 +867,7 @@ class Daemon:
         from . import evidence as evidence_mod
         from . import ops
 
-        cfg = self.catalog.os.validation
+        cfg = project.validation
         store = ProjectStore(project.path)  # thread-local connection — see the docstring
         try:
             wo = store.get_work_order(wo_id)
@@ -1113,7 +1113,7 @@ class Daemon:
         """
         from . import ops
 
-        cfg = self.catalog.os.validation
+        cfg = project.validation
         store = ProjectStore(project.path)  # thread-local connection — see the docstring
         try:
             fo = store.get_feature_order(fo_id)

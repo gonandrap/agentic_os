@@ -2003,7 +2003,7 @@ def cmd_validation(args: argparse.Namespace) -> int:
     if not view["rounds"]:
         print(f"\nno validation has run on this {unit} — the panel judges a unit when "
               f"it submits its evidence, and it ships disabled "
-              f"(`os.validation.enabled`)")
+              f"(`os.validation.enabled`, or this project's `validation.enabled`)")
     for rnd in view["rounds"]:
         print(f"\n{ops.round_line(rnd)}")
         if rnd["evidence"]:

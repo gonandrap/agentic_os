@@ -135,62 +135,6 @@ class WorkerDefaults:
     autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
 
 
-@dataclass
-class ProjectSpec:
-    name: str
-    path: Path
-    description: str = ""
-    model: str | None = None
-    worker: WorkerDefaults = field(default_factory=WorkerDefaults)
-    settings_overrides: dict[str, Any] = field(default_factory=dict)
-    max_concurrent: int = DEFAULT_MAX_CONCURRENT
-    # Privileged actions this project's workers may attempt under review rather than
-    # not at all (see gates.py). Off by default: enabling a gate widens what a worker
-    # can do, so it is always a deliberate per-project choice.
-    gates: GateConfig = field(default_factory=GateConfig)
-    raw: dict[str, Any] = field(default_factory=dict)
-
-
-# The seats the panel runs by default. Deliberately NOT `neo_store.SEATS`: `record`,
-# `blast` and `taste` have no definition shipped yet, and a default roster naming safety
-# seats that cannot run would be worse than a short one that says what it is.
-DEFAULT_ROSTER = ("premise", "chair")
-
-# Which question kinds the panel may answer by default. `plan` is excluded on purpose: a
-# feature order's plan review has its own reviewed persona (`plans.PLAN_REVIEWER_PERSONA`)
-# that the seats' mandates say nothing about, so including it would silently swap a
-# reviewed persona for one written for a different job on the day someone enables this.
-DEFAULT_PANEL_KINDS = ("question", "approval")
-
-# Per-seat call timeout. Well below Neo's own 300s: the seats run concurrently but inside
-# the daemon's single Neo thread, so the whole FIFO drain — and every worker parked behind
-# it — waits on the slowest seat.
-DEFAULT_PANEL_TIMEOUT = 120
-
-
-@dataclass
-class PanelConfig:
-    """Neo answering as a panel of profiled seats instead of as one agent.
-
-    SHIPS DISABLED, and that is a requirement rather than caution: at this default the
-    OS's behaviour must be byte-identical to the single-agent path — same number of
-    Claude calls, same system prompt, same message to the worker. Enabling it is a
-    catalog edit, gated on a measurement that does not exist yet.
-
-    `seat_models` and `chair_model` are both empty by default, meaning "use
-    `NeoConfig.model`"; a nested dataclass cannot see its parent's field at construction,
-    so the fallback is resolved where it is used (`panel.seat_model`).
-    """
-
-    enabled: bool = False
-    roster: tuple[str, ...] = DEFAULT_ROSTER
-    seat_models: dict[str, str] = field(default_factory=dict)
-    chair_model: str = ""
-    timeout: int = DEFAULT_PANEL_TIMEOUT
-    kinds: tuple[str, ...] = DEFAULT_PANEL_KINDS
-    fast_path: bool = True
-
-
 # The validation panel's default roster: every seat in the vocabulary. Unlike Neo's
 # DEFAULT_ROSTER, which is short because most of its seats have no definition shipped
 # yet, this one names all five — the panel's whole point is the four independent lenses
@@ -236,6 +180,67 @@ class ValidationConfig:
     # a separate question from whether its children each validated: the feature is the
     # only level at which "does this add up to what was asked" can be judged.
     feature_units: bool = True
+
+
+@dataclass
+class ProjectSpec:
+    name: str
+    path: Path
+    description: str = ""
+    model: str | None = None
+    worker: WorkerDefaults = field(default_factory=WorkerDefaults)
+    settings_overrides: dict[str, Any] = field(default_factory=dict)
+    max_concurrent: int = DEFAULT_MAX_CONCURRENT
+    # Privileged actions this project's workers may attempt under review rather than
+    # not at all (see gates.py). Off by default: enabling a gate widens what a worker
+    # can do, so it is always a deliberate per-project choice.
+    gates: GateConfig = field(default_factory=GateConfig)
+    # Already RESOLVED against `os.validation`: `_parse_validation` is handed the OS
+    # config as its base, so every field here is the answer for this project and no
+    # caller has to consult two objects. See
+    # docs/superpowers/specs/2026-08-27-the-config-console.md §1.2.
+    validation: ValidationConfig = field(default_factory=ValidationConfig)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+# The seats the panel runs by default. Deliberately NOT `neo_store.SEATS`: `record`,
+# `blast` and `taste` have no definition shipped yet, and a default roster naming safety
+# seats that cannot run would be worse than a short one that says what it is.
+DEFAULT_ROSTER = ("premise", "chair")
+
+# Which question kinds the panel may answer by default. `plan` is excluded on purpose: a
+# feature order's plan review has its own reviewed persona (`plans.PLAN_REVIEWER_PERSONA`)
+# that the seats' mandates say nothing about, so including it would silently swap a
+# reviewed persona for one written for a different job on the day someone enables this.
+DEFAULT_PANEL_KINDS = ("question", "approval")
+
+# Per-seat call timeout. Well below Neo's own 300s: the seats run concurrently but inside
+# the daemon's single Neo thread, so the whole FIFO drain — and every worker parked behind
+# it — waits on the slowest seat.
+DEFAULT_PANEL_TIMEOUT = 120
+
+
+@dataclass
+class PanelConfig:
+    """Neo answering as a panel of profiled seats instead of as one agent.
+
+    SHIPS DISABLED, and that is a requirement rather than caution: at this default the
+    OS's behaviour must be byte-identical to the single-agent path — same number of
+    Claude calls, same system prompt, same message to the worker. Enabling it is a
+    catalog edit, gated on a measurement that does not exist yet.
+
+    `seat_models` and `chair_model` are both empty by default, meaning "use
+    `NeoConfig.model`"; a nested dataclass cannot see its parent's field at construction,
+    so the fallback is resolved where it is used (`panel.seat_model`).
+    """
+
+    enabled: bool = False
+    roster: tuple[str, ...] = DEFAULT_ROSTER
+    seat_models: dict[str, str] = field(default_factory=dict)
+    chair_model: str = ""
+    timeout: int = DEFAULT_PANEL_TIMEOUT
+    kinds: tuple[str, ...] = DEFAULT_PANEL_KINDS
+    fast_path: bool = True
 
 
 @dataclass
@@ -363,8 +368,14 @@ def _parse_panel(raw: Any) -> PanelConfig:
     )
 
 
-def _parse_validation(raw: Any) -> ValidationConfig:
-    """`os.validation`, validated against the seat vocabulary it names.
+def _parse_validation(raw: Any, base: ValidationConfig | None = None,
+                      where: str = "os.validation") -> ValidationConfig:
+    """`os.validation` — or a project's override of it — against the seat vocabulary.
+
+    `base` is what an omitted key falls through to, and it is the whole mechanism behind
+    per-project validation: `os.validation` parses against the shipped defaults, then
+    each project parses against the OS answer, so a project naming one key inherits the
+    other seven (design doc §1.2). `where` only labels the error messages.
 
     Modelled on `_parse_panel`, and it makes the same distinction for the same reason:
     `project_store.VALIDATOR_SEATS` is the VOCABULARY, not the set of seats whose
@@ -375,38 +386,39 @@ def _parse_validation(raw: Any) -> ValidationConfig:
     the vocabulary at all is a different thing: a typo that would silently remove a
     reviewer, so it is a CatalogError naming it.
     """
+    base = base or ValidationConfig()
     if not isinstance(raw, dict):
-        raise _err('"os.validation" must be an object')
-    roster = tuple(raw.get("roster", DEFAULT_VALIDATION_ROSTER))
+        raise _err(f'"{where}" must be an object')
+    roster = tuple(raw.get("roster", base.roster))
     unknown = [s for s in roster if s not in VALIDATOR_SEATS]
     if unknown:
-        raise _err(f"os.validation.roster names unknown seat(s) {unknown} "
+        raise _err(f"{where}.roster names unknown seat(s) {unknown} "
                    f"(known: {list(VALIDATOR_SEATS)})")
-    seat_models = raw.get("seat_models", {}) or {}
+    seat_models = raw.get("seat_models", base.seat_models) or {}
     if not isinstance(seat_models, dict):
-        raise _err('"os.validation.seat_models" must be an object')
+        raise _err(f'"{where}.seat_models" must be an object')
     unknown = [s for s in seat_models if s not in VALIDATOR_SEATS]
     if unknown:
-        raise _err(f"os.validation.seat_models names unknown seat(s) {unknown} "
+        raise _err(f"{where}.seat_models names unknown seat(s) {unknown} "
                    f"(known: {list(VALIDATOR_SEATS)})")
-    timeout = int(raw.get("timeout", DEFAULT_VALIDATION_TIMEOUT))
+    timeout = int(raw.get("timeout", base.timeout))
     if timeout < 1:
-        raise _err("os.validation.timeout must be >= 1")
-    max_rounds = int(raw.get("max_rounds", DEFAULT_VALIDATION_MAX_ROUNDS))
+        raise _err(f"{where}.timeout must be >= 1")
+    max_rounds = int(raw.get("max_rounds", base.max_rounds))
     if max_rounds < 1:
-        raise _err("os.validation.max_rounds must be >= 1")
-    diff_chars = int(raw.get("diff_chars", DEFAULT_VALIDATION_DIFF_CHARS))
+        raise _err(f"{where}.max_rounds must be >= 1")
+    diff_chars = int(raw.get("diff_chars", base.diff_chars))
     if diff_chars < 1:
-        raise _err("os.validation.diff_chars must be >= 1")
+        raise _err(f"{where}.diff_chars must be >= 1")
     return ValidationConfig(
-        enabled=bool(raw.get("enabled", False)),
+        enabled=bool(raw.get("enabled", base.enabled)),
         roster=roster,
         seat_models={k: str(v) for k, v in seat_models.items()},
-        chair_model=str(raw.get("chair_model", "") or ""),
+        chair_model=str(raw.get("chair_model", base.chair_model) or ""),
         timeout=timeout,
         max_rounds=max_rounds,
         diff_chars=diff_chars,
-        feature_units=bool(raw.get("feature_units", True)),
+        feature_units=bool(raw.get("feature_units", base.feature_units)),
     )
 
 
@@ -499,6 +511,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             gate_cfg = GateConfig.parse(p.get("gates"))
         except ValueError as e:
             raise _err(f"project {name}: {e}") from e
+        validation_cfg = _parse_validation(
+            p.get("validation", {}), base=os_cfg.validation,
+            where=f"projects[{i}] ({name}).validation")
         projects.append(
             ProjectSpec(
                 name=name,
@@ -509,6 +524,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 settings_overrides=p.get("settings_overrides", {}),
                 max_concurrent=max_conc,
                 gates=gate_cfg,
+                validation=validation_cfg,
                 raw=p,
             )
         )

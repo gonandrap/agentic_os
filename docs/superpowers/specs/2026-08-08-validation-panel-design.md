@@ -649,6 +649,11 @@ rows in any new table, and no manager order created.
 | `diff_chars` | `60000` | truncation limit |
 | `feature_units` | `true` | whether feature orders validate too, independently of work orders |
 
+`projects[].validation` takes the same eight keys and overrides `os.validation` key by
+key, so one project can validate while the fleet does not — see
+`docs/superpowers/specs/2026-08-27-the-config-console.md` §1.2. `ProjectSpec.validation`
+is the resolved answer, and every read above is project-aware.
+
 **Why disabled by default, when the ask is phrased as a mandatory gate.** A round is
 roughly five headless `claude` calls over a diff of up to 60 000 characters, up to three
 rounds, on *every* unit in the fleet — the highest-volume path there is — and it throttles

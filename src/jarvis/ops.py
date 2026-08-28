@@ -67,8 +67,8 @@ def project_spec(catalog: Catalog, name: str) -> ProjectSpec:
         raise OpsError(str(e)) from e
 
 
-def validation_enabled() -> bool:
-    """Is `os.validation.enabled` on? False whenever the catalog cannot be read.
+def validation_enabled(project: str | None = None) -> bool:
+    """Is validation on — for `project`, or fleet-wide? False if the catalog can't be read.
 
     The validation layer ships DISABLED, and at that default the OS must behave exactly
     as it does today. A catalog that has moved, been deleted or was never registered is
@@ -77,10 +77,8 @@ def validation_enabled() -> bool:
     released. The catalog file is read on demand rather than cached because the daemon may
     be days old and the answer is only ever consulted at the moments a unit changes shape.
     """
-    try:
-        return bool(resolve_catalog().os.validation.enabled)
-    except (OpsError, CatalogError, OSError, ValueError):
-        return False
+    cfg = validation_config(project)
+    return bool(cfg is not None and cfg.enabled)
 
 
 # -- OS lifecycle -------------------------------------------------------------------
@@ -1129,8 +1127,13 @@ def validation_view(unit_id: str, project_name: str | None = None) -> dict[str, 
             "title": row["title"], "status": row["status"], **detail}
 
 
-def validation_config() -> Any:
-    """The OS's validation settings, or None when they cannot be read.
+def validation_config(project: str | None = None) -> Any:
+    """The validation settings in force for `project` — or the OS's — or None.
+
+    `None` for the project means the OS-level answer, which is what a caller holding no
+    project has always got. A named project gets its own resolved `ProjectSpec.validation`
+    (design doc §1.2); an unknown name is a `CatalogError` and therefore answered None,
+    not raised, for the same reason the rest of this is best-effort.
 
     Best-effort on purpose, and it is `os_status`'s pattern rather than a new one: a
     worker calling `jarvis wo finish` from a checkout whose catalog has moved, or with
@@ -1138,8 +1141,11 @@ def validation_config() -> Any:
     validation, which is the shipped default anyway.
     """
     try:
-        return resolve_catalog().os.validation
-    except (OpsError, CatalogError, OSError):
+        catalog = resolve_catalog()
+        if project is None:
+            return catalog.os.validation
+        return catalog.project(project).validation
+    except (OpsError, CatalogError, OSError, ValueError):
         return None
 
 
@@ -1321,7 +1327,7 @@ def submit_feature(fo_id: str, summary: str, evidence: str = "",
             f"{fo_id} is {fo['status']}, not executing — there is nothing to submit. A "
             f"feature order can only be submitted for review while its work orders are "
             f"the thing in flight.")
-    cfg = validation_config()
+    cfg = validation_config(name)
     if cfg is None or not cfg.enabled or not cfg.feature_units:
         return {"project": name, "fo_id": fo_id, "status": fo["status"], "opened": False,
                 "note": "validation of feature orders is switched off, so no review "
@@ -1384,7 +1390,7 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
     does not check it, and why adding a check there for symmetry is a bug.
     """
     name, path, _wo = find_work_order(wo_id)
-    cfg = validation_config()
+    cfg = validation_config(name)
     store = ProjectStore(path)
     try:
         fields: dict[str, Any] = {"result_summary": summary}
@@ -1860,7 +1866,7 @@ def review_work_order(wo_id: str, accept: bool = True,
     1 here, through the same helper `finish` uses (`_validates_on_review`).
     """
     name, path, wo = find_work_order(wo_id)
-    cfg = validation_config()
+    cfg = validation_config(name)
     store = ProjectStore(path)
     try:
         pending = store.pending_assumptions(wo_id)
@@ -2212,7 +2218,7 @@ def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
         if accept:
             children = store.create_plan_children(
                 fo_id, plans.creation_order(plan["children"]),
-                manager=validation_enabled())
+                manager=validation_enabled(name))
             manager = store.manager_work_order(fo_id)
             # THE FEATURE'S BASE, recorded at the only moment it is knowable: the default
             # branch's head just before its first child could start. Everything between

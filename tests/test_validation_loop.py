@@ -107,13 +107,14 @@ class Fleet:
         self.daemon = Daemon(load_catalog(catalog_path))
 
     # -- configuration ---------------------------------------------------------
-    def reconfigure(self, **validation) -> None:
+    def reconfigure(self, project_validation: dict | None = None, **validation) -> None:
         """Rewrite the catalog on disk AND reload the daemon's copy.
 
         Both halves matter: `ops.finish` reads the catalog from disk (it runs in the
         worker's process, not the daemon's), and the daemon reads its own loaded copy.
         """
-        write_catalog(self.tmp_path, self.project, **validation)
+        write_catalog(self.tmp_path, self.project,
+                      project_validation=project_validation, **validation)
         self.daemon.catalog = load_catalog(self.catalog_path)
 
     @property
@@ -181,15 +182,18 @@ def _settle(store: ProjectStore, wo_id: str, timeout: float = 15.0) -> bool:
     return False
 
 
-def write_catalog(tmp_path: Path, project: Path, **validation) -> Path:
+def write_catalog(tmp_path: Path, project: Path,
+                  project_validation: dict | None = None, **validation) -> Path:
+    proj: dict = {"name": "proj_a", "path": str(project), "description": "test project"}
+    if project_validation is not None:
+        proj["validation"] = project_validation
     data = {
         "os": {
             "defaults": {"model": "sonnet"},
             "notifications": {"sinks": ["log"]},
             "validation": {"enabled": True, **validation},
         },
-        "projects": [{"name": "proj_a", "path": str(project),
-                      "description": "test project"}],
+        "projects": [proj],
     }
     path = tmp_path / "catalog.json"
     path.write_text(json.dumps(data))
@@ -711,6 +715,40 @@ def test_two_failed_rounds_then_a_rejection_land_on_round_one(fleet):
     try:
         rounds = store.validation_rounds(wo_id=wo["id"])
         assert [(r["round"], r["outcome"]) for r in rounds] == [(1, "rejected")]
+    finally:
+        store.close()
+
+
+def test_a_project_switch_decides_whether_finish_opens_a_round_at_all(fleet):
+    """Both directions, because either alone passes for the wrong reason: a submission
+    site that ignored the project would keep answering the OS block, and one that ignored
+    the OS block would still look right in the first half."""
+    fleet.reconfigure(enabled=False, project_validation={"enabled": True})
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    assert finish(fleet, wo["id"])["status"] == "validating"
+
+    fleet.reconfigure(enabled=True, project_validation={"enabled": False})
+    other = fleet.dispatch("second")
+    fleet.change(other["id"], "print('two')\n")
+    assert finish(fleet, other["id"])["status"] == "completed"
+
+
+def test_the_daemon_prices_a_round_from_the_projects_settings_not_the_os_block(fleet):
+    """The three `self.catalog.os.validation` reads were on threads already holding a
+    `ProjectSpec`; this pins that they now use it. The OS budget of 9 would take three
+    more rounds before escalating."""
+    fleet.reconfigure(max_rounds=9, project_validation={"max_rounds": 1})
+    fleet.daemon.validator = Validator(rejected("still no test"))
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.drain()
+
+    store = fleet.store()
+    try:
+        assert [(r["round"], r["outcome"])
+                for r in store.validation_rounds(wo_id=wo["id"])] == [(1, "escalated")]
     finally:
         store.close()
 
