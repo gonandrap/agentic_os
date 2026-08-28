@@ -875,6 +875,7 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
     function answers "does this need the USER", and this one answers "what is this
     waiting for", which for most of these is Neo, the daemon, or nothing at all.
     """
+    from . import worker_session
     from .invariants import awaiting_neo, neo_question_blocker
     from .neo_store import USER_HELD_Q_STATUSES
 
@@ -906,6 +907,16 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
         return {"what": "queued_message", "stalled": False,
                 "detail": f"{len(queued)} message(s) queued — jarvisd delivers them "
                           f"when the worker is idle"}
+    # Parked on the user's Claude Code sign-in (`Daemon._park_on_signin`). It reaches
+    # this function as a `waiting_input` order with no session running and nothing
+    # queued, which is EXACTLY the shape the fall-through calls a permission prompt — so
+    # without this the one command that exists to say what a work order is waiting on
+    # would name the wrong thing, and name it confidently.
+    pause = worker_session.turn_pause(store, wo_id)
+    if pause is not None and pause.reason == worker_session.PAUSE_AUTH:
+        return {"what": "signin", "stalled": False,
+                "detail": "Claude Code could not authenticate — run `/login`, and the "
+                          "OS resumes this and every other parked order by itself"}
     # A live turn means "working" for every status EXCEPT `waiting_input`, where it means
     # the opposite: a permission prompt blocks INSIDE the turn, so the process is alive
     # and going nowhere. That is the one case this command was written for, and reading

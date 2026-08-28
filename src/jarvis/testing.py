@@ -23,7 +23,7 @@ import pytest
 
 from . import agent_usage, systemd_units
 from .bugreport import GH_BIN_ENV
-from .claude_cli import CLAUDE_BIN_ENV
+from .claude_cli import CLAUDE_BIN_ENV, CREDENTIALS_ENV
 from .notify import DISABLE_EXTERNAL_SINKS_ENV
 
 #: Sandbox root the gate installed, or None if `gate_test_environment` never ran.
@@ -118,6 +118,13 @@ def gate_environment(root: Path) -> dict[str, str]:
         # systemd path is exercised by pointing `JARVIS_SYSTEMD_RUN_BIN` at a fake, which
         # is the same shape as the `claude` and `gh` stubs above.
         systemd_units.TRANSPORT_ENV: systemd_units.DIRECT,
+        # The developer's own Claude Code sign-in, which `worker_session._auth_retry_at`
+        # reads to decide whether an auth-paused turn may go again. Left ambient, a suite
+        # run on a machine whose credentials were refreshed a second ago would resume
+        # every fixture's auth pause — passing or failing on the state of the human's
+        # login. Pointed at a path inside the sandbox that no test writes unless it means
+        # to, so the default answer is "cannot tell, do not resume".
+        CREDENTIALS_ENV: str(root / "claude-credentials.json"),
     }
     if not os.environ.get(LLM_EVALS_ENV):
         env[CLAUDE_BIN_ENV] = str(_blocked_bin(root, "claude", BLOCKED_CLAUDE))
@@ -1150,6 +1157,31 @@ def claude_json(tmp_path, monkeypatch):
         path.write_text(json.dumps(data))
 
     return trust
+
+
+@pytest.fixture()
+def signin(tmp_path, monkeypatch):
+    """Control what `claude_cli.signin_changed_at` sees — an auth pause's whole clock.
+
+    Calling the returned function is the user running `/login`: it writes a valid
+    credentials file, stamped now unless `at` back-dates it. Not autouse, because the
+    gate already points the path at a file that does not exist, and "cannot tell, do not
+    resume" is what every other test wants from this.
+    """
+    path = tmp_path / "credentials.json"
+    monkeypatch.setenv(CREDENTIALS_ENV, str(path))
+
+    def sign_in(at: float | None = None, *, refresh_expires_in: float = 30 * 86400):
+        path.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "at", "refreshToken": "rt",
+            "expiresAt": int((time.time() + 3600) * 1000),
+            "refreshTokenExpiresAt": int((time.time() + refresh_expires_in) * 1000),
+        }}))
+        if at is not None:
+            os.utime(path, (at, at))
+        return path
+
+    return sign_in
 
 
 @pytest.fixture()

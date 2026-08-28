@@ -11,6 +11,19 @@ from .gates import GateConfig
 from .neo_store import Q_KINDS, SEATS
 from .project_store import VALIDATOR_SEATS
 
+# Dotted-path globs (fnmatch) over a resolved config map naming the settings that are
+# SAFETY rather than money: they change what a worker is allowed to do. Earns its place
+# by buying exactly two things and no more — a louder confirmation, and a mandatory
+# `--reason` on the version row. See
+# docs/superpowers/specs/2026-08-27-the-config-console.md §7, and §11.5 for what the
+# list is not yet sure of.
+SAFETY_KEYS = (
+    "*.permission_mode",
+    "*.gates.*",
+    "os.validation.*",
+    "os.neo.enabled",
+)
+
 # Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
 VALID_PERMISSION_MODES = {
     "acceptEdits",

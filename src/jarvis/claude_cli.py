@@ -975,6 +975,50 @@ def auth_failure(text: str | None) -> AuthFailure | None:
     return AuthFailure(message=_summarise(text))
 
 
+#: Where Claude Code keeps the OAuth session it signs in with and refreshes. Overridable
+#: like every other path this module reads, so a test can never reach the developer's own
+#: sign-in — `testing.gate_environment` points it at the sandbox.
+CREDENTIALS_ENV = "JARVIS_CLAUDE_CREDENTIALS"
+
+
+def credentials_path() -> Path:
+    override = os.environ.get(CREDENTIALS_ENV)
+    if override:
+        return Path(override).expanduser()
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser() / ".credentials.json"
+
+
+def signin_changed_at() -> float | None:
+    """When Claude Code's stored sign-in last changed, or None if nothing can be said.
+
+    THE CLOCK AN AUTH PAUSE WAITS ON (`worker_session.PAUSE_AUTH`), and it is a file's
+    mtime rather than a deadline because an auth failure has none: it clears when a human
+    runs `/login`. That rewrites this file, and so does every token refresh that
+    SUCCEEDS, while a session that cannot be refreshed rewrites nothing. So "changed
+    since the turn died" is the whole of the evidence, it costs one `stat`, and it can
+    become true only once per rewrite — which is what stops `Daemon.retry_paused_turns`
+    hammering an account that cannot answer.
+
+    None means DO NOT RESUME, by either route. The file is unreadable, so the sign-in
+    lives somewhere this cannot see (a macOS keychain, `ANTHROPIC_API_KEY`). Or the
+    refresh token has expired, which `/login` REPLACES rather than touches — so an mtime
+    moved by anything else is not evidence of a sign-in. `jarvis wo send <id> "retry"` is
+    the way back from both (Neo, question 169).
+    """
+    path = credentials_path()
+    try:
+        changed = path.stat().st_mtime
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    oauth = raw.get("claudeAiOauth") if isinstance(raw, dict) else None
+    expires = oauth.get("refreshTokenExpiresAt") if isinstance(oauth, dict) else None
+    if isinstance(expires, (int, float)) and not isinstance(expires, bool) and \
+            expires / 1000 <= time.time():
+        return None
+    return changed
+
+
 def process_alive(pid: int | None) -> bool:
     """Is this turn's process still running?
 

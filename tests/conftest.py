@@ -10,4 +10,5 @@ from jarvis.testing import (  # noqa: F401
     make_git_project,
     project,
     settle_turns,
+    signin,
 )
