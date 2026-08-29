@@ -140,6 +140,12 @@ KINDS: tuple[GateKind, ...] = (
         summary="push directly to a protected branch, bypassing review",
         conflict_markers=("git push",),
     ),
+    GateKind(
+        name="config_write",
+        summary="change the fleet's own configuration (this can turn gates, validation "
+                "and worker permission modes off)",
+        conflict_markers=("jarvis config",),
+    ),
 )
 
 KIND_NAMES = tuple(k.name for k in KINDS)
@@ -584,6 +590,7 @@ SEED_MATCHES: tuple[tuple[str, str], ...] = (
     ("service_restart", r"\bsystemctl\b[^\n]*\b(restart|stop|start|disable|enable)\b"),
     ("push_protected", r"\bgit\s+push\b[^\n]*\b(origin\s+)?(main|master)\b"),
     ("push_protected", r"\bgit\s+push\b[^\n]*\bHEAD:(refs/heads/)?(main|master)\b"),
+    ("config_write", r"\bjarvis\s+config\s+(set|unset|restore|adopt)\b"),
 )
 
 # Commands that must gate, forever, whatever anyone learns. Every proposed exemption is
@@ -611,6 +618,13 @@ SEED_CANARIES: tuple[tuple[str, str], ...] = (
     ("service_restart", "systemctl --user stop jarvisd"),
     ("push_protected", "git push origin main"),
     ("push_protected", "git push -f origin HEAD:refs/heads/master"),
+    # The recursion this cuts: the console can turn gates off, so the command that turns
+    # them off must never become exemptible. See the spec's §7.
+    ("config_write", "jarvis config set proj_a worker.permission_mode bypassPermissions "
+                     "--reason \"faster\""),
+    ("config_write", "jarvis config unset os.validation.enabled --reason \"noisy\""),
+    ("config_write", "jarvis config restore cfg-0123456789abcdef --reason \"revert\""),
+    ("config_write", "jarvis config adopt --reason \"hand edit\""),
 )
 
 
@@ -632,7 +646,8 @@ def seed_rows() -> list[dict[str, Any]]:
     return rows
 
 
-SEED_VERSION = "1"
+# 2: the `config_write` kind, its recogniser and its canaries (the config console).
+SEED_VERSION = "2"
 
 
 # -- the live rule base ---------------------------------------------------------------

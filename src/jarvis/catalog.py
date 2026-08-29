@@ -20,7 +20,10 @@ from .project_store import VALIDATOR_SEATS
 SAFETY_KEYS = (
     "*.permission_mode",
     "*.gates.*",
-    "os.validation.*",
+    # `*.` rather than `os.`: a project's own validation block is the same switch with a
+    # smaller blast radius, and the per-project form is the sentence the design's
+    # acceptance walk is written in (§10.3).
+    "*.validation.*",
     "os.neo.enabled",
 )
 
