@@ -160,6 +160,17 @@ FEATURE_CHILD_FAILED = "{id} failed — this feature cannot finish without it"
 FEATURE_CHILD_CANCELLED = ("{id} was cancelled — this feature will not deliver what the "
                            "plan promised")
 
+
+def dead_feature_children(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The children that fail their feature: ended badly, and not answered for.
+
+    ONE function because `Daemon.settle_features` and `check_feature_failures_are_real`
+    must agree exactly. A settler that fails a feature on a child the invariant then
+    un-fails it on is an infinite loop, and the user watches it flap on every tick.
+    """
+    return [c for c in children
+            if c["status"] in ("failed", "cancelled") and not c.get("superseded")]
+
 #: What a work order says when something it depends on can never complete. A dependency
 #: that is `cancelled` or `failed` will not come back, so the dependent would sit in
 #: `pending` for ever with nothing on its face to say why — the stranded row the
@@ -1241,6 +1252,50 @@ def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
             )
 
 
+def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
+    """INV-FEATURE-FALSE-FAILURE — a failed feature whose children all recovered goes back.
+
+    `Daemon.settle_features` only ever looks at `executing` features. That is what makes
+    "flag once, at feature level" true by construction — and it is also what makes
+    `failed` TERMINAL. A child that recovers after the feature settled (a retry, a
+    `jarvis wo done` on a wrongly-flagged failure, a late merge) leaves the feature failed
+    for ever, carrying a stale reason that names a work order which is now `completed`.
+    That is how fo-e353491c sat with 12/12 children done and nothing in the OS that would
+    ever look again.
+
+    Predicate: `failed`, has children, and `dead_feature_children` finds none — the exact
+    function the settler fails on, so the two cannot disagree.
+
+    Repair: back to `executing`, flag cleared. It DECIDES NOTHING. `settle_features` gets
+    the feature on the next tick and completes it, or opens a validation round, exactly as
+    it would have the first time.
+
+    Repaired on the daemon tick rather than behind `--repair`, unlike INV-MANAGER-MISSING:
+    the state admits one reading, and the failure mode is silence — a settled feature
+    raises nothing, ever again, so nobody comes looking.
+    """
+    for row in store.conn.execute(
+            "SELECT id, attention_reason FROM feature_orders WHERE status='failed'"
+    ).fetchall():
+        fo_id = row["id"]
+        children = store.feature_children(fo_id)
+        if not children or dead_feature_children(children):
+            continue
+        store.set_feature_status(fo_id, "executing")
+        store.clear_feature_attention(fo_id)
+        yield Violation(
+            invariant="INV-FEATURE-FALSE-FAILURE",
+            detail=(f"feature order {fo_id} is `failed` — \"{row['attention_reason']}\" "
+                    f"— but not one of its {len(children)} children is failed or "
+                    f"cancelled any more. The child recovered after the feature settled, "
+                    f"and nothing re-derives a settled feature."),
+            repaired=True,
+            repair="back to `executing` — the next tick settles it on the real state",
+            context={"fo_id": fo_id, "children": len(children),
+                     "stale_reason": row["attention_reason"]},
+        )
+
+
 def _validation_timeout() -> int:
     """How long one validation round is allowed to take, per the LIVE catalog.
 
@@ -1609,6 +1664,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # because the moment it was given keeps moving
     check_validation_progresses,   # after the flag checks: its repair touches no flag,
                                    # and a `validating` row is invisible to all of them
+    check_feature_failures_are_real,  # order-free: it reads and writes feature orders
+                                   # only, which no work-order check looks at
     check_neo_escalations_are_live,  # order-free: it writes to Neo's store only, and
                                    # touches no flag any other check reads
     check_envelopes_move,          # last: it delivers, and delivery changes work orders
@@ -1654,7 +1711,10 @@ class _ReadOnly:
                 "queue_message", "flag_feature_attention",
                 # INV-VALIDATION-STRANDED's repair. Reporting a stranded round must not
                 # be the thing that ends it.
-                "close_validation_round")
+                "close_validation_round",
+                # INV-FEATURE-FALSE-FAILURE's. Ditto: reporting that a feature is wrongly
+                # failed must not be the thing that un-fails it.
+                "set_feature_status", "clear_feature_attention")
 
     #: How a checker asks "am I allowed to change anything?". Needed by
     #: `check_envelopes_move`, whose repair also writes to the CENTRAL store — a proxy
