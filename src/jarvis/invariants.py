@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from . import db, worker_session
@@ -1517,9 +1518,62 @@ def check_ui_healthy() -> Iterator[Violation]:
     )
 
 
+def check_config_drift() -> Iterator[Violation]:
+    """INV-CONFIG-DRIFT — the catalog on disk must be the version the ledger calls head.
+
+    The ledger is only evidence if it describes the file the fleet is actually running,
+    and `jarvis config` is not the only way that file changes: a hand edit, an `scp`, a
+    restore of a backup copy all move it behind the record's back. Content addressing
+    makes the check one hash (spec §3, §6).
+
+    A `jarvis doctor` check ONLY — an `OS_INVARIANTS` member, and `check_os()`'s single
+    caller is `ops.run_doctor`. Deliberately not on the daemon's reconcile tick: a hand
+    edit is legitimate, `Daemon.reload_catalog` has already applied it, and a fleet that
+    filed an inbox item every time someone opened their editor would teach the user to
+    ignore the one that matters.
+
+    Not repairable, and the two repairs are opposites: `adopt` keeps the file and moves
+    the record, `restore` keeps the record and moves the file. Nothing in the state says
+    which of them the user meant.
+    """
+    from . import config_version
+    from .central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        head = central.head_config_version()
+        stored = central.get_state("catalog_path")
+    finally:
+        central.close()
+    if head is None or not stored:
+        return  # no ledger, or no catalog registered: nothing to be behind
+    path = Path(stored)
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return  # unreadable or not JSON is a louder problem, and not this one's
+    # The DOCUMENTS, not the ids: a release-rebase row is addressed by document AND
+    # build (§6.1), so an id comparison would report permanent drift after an upgrade
+    # that moved a default — on a file nobody has touched.
+    if config_version.canonicalise(document) == config_version.canonicalise(
+            head["document"]):
+        return
+    on_disk = config_version.version_id(document)
+    yield Violation(
+        invariant="INV-CONFIG-DRIFT",
+        detail=(f"{path} hashes to {on_disk}, but the ledger's head version is "
+                f"{head['id']} — the fleet is running a configuration no row records. "
+                f"Keep the file with `jarvis config adopt --reason \"...\"`, or put the "
+                f"recorded version back with `jarvis config restore {head['id']} "
+                f"--reason \"...\"`."),
+        context={"catalog": str(path), "on_disk": on_disk, "head": head["id"]},
+    )
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
     check_gate_canaries,
+    check_config_drift,
 )
 
 

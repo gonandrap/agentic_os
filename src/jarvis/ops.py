@@ -3426,7 +3426,10 @@ def adopt_config(*, reason: str = "", catalog_path: str | None = None,
         head = central.head_config_version()
     finally:
         central.close()
-    if head is not None and head["id"] == config_version.version_id(document):
+    # DOCUMENTS, not ids: a release-rebase row is addressed by document AND build
+    # (§6.1), so an id comparison would re-adopt the same file after every upgrade.
+    if head is not None and config_version.canonicalise(
+            head["document"]) == config_version.canonicalise(document):
         return {"adopted": False, "version": head, "changes": [],
                 "catalog": str(file),
                 "note": "the file is already the head version — nothing to adopt"}
