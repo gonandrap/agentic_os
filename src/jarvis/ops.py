@@ -1060,9 +1060,14 @@ def round_line(rnd: dict[str, Any]) -> str:
     stays behind `jarvis validation show` is the seats — their verdicts and their raw
     replies. One formatter, so the CLI's two `show` commands cannot word the same round
     two different ways.
+
+    The config version is the round's OTHER input — what judged it, beside the
+    `fingerprint` of what was judged — and `not recorded` is the only honest reading of a
+    NULL stamp (config-console design §5).
     """
     reason = (rnd.get("reason") or "").strip()
     return (f"round {rnd['round']} · {rnd['fingerprint']} · {rnd['outcome']}"
+            f" · config {rnd.get('config_version') or 'not recorded'}"
             + (f" — {reason}" if reason else ""))
 
 
@@ -1076,7 +1081,7 @@ def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
     read to answer "how many times, and what came back", not to re-read the submission.
     """
     return [{k: r[k] for k in ("id", "round", "ts", "fingerprint", "outcome", "reason",
-                               "pr_url")}
+                               "pr_url", "config_version")}
             for r in store.validation_rounds(wo_id=wo_id, fo_id=fo_id)]
 
 
@@ -1125,6 +1130,38 @@ def validation_view(unit_id: str, project_name: str | None = None) -> dict[str, 
         store.close()
     return {"project": name, "unit": unit, "id": unit_id,
             "title": row["title"], "status": row["status"], **detail}
+
+
+def current_config_version() -> str | None:
+    """The id of the configuration in force, or None when the ledger holds nothing.
+
+    None is the honest answer on a fleet that has never written a version, and it is
+    what every stamp written by this OS falls back to (config-console design §5).
+    """
+    central = CentralStore()
+    try:
+        return (central.head_config_version() or {}).get("id")
+    finally:
+        central.close()
+
+
+def config_version_line(version_id: str | None) -> str:
+    """One configuration stamp, as a person reads it: the id and how far behind it is.
+
+    `not recorded` for NULL — the unit ran before the console existed, which is not
+    version 1 and must never render as one. The count is what makes the id actionable:
+    an id alone says nothing about whether the fleet has moved since.
+    """
+    if not version_id:
+        return "not recorded"
+    central = CentralStore()
+    try:
+        since = central.config_versions_since(version_id)
+    finally:
+        central.close()
+    if since is None:
+        return f"{version_id} (no longer in the ledger)"
+    return f"{version_id} ({since} versions since)" if since else version_id
 
 
 def validation_config(project: str | None = None) -> Any:
@@ -1195,7 +1232,8 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     round_row = store.open_validation_round(
         wo_id=wo["id"], fingerprint=evidence_mod.fingerprint(packet),
         summary=str(wo.get("result_summary") or ""), evidence=declared,
-        pr_url=wo.get("pr_url"), round=nxt)
+        pr_url=wo.get("pr_url"), round=nxt,
+        config_version=current_config_version())
     store.set_status(wo["id"], "validating")
     # No attention flag: a unit under review is the system working. Only the give-up
     # transition flags anyone.
@@ -1255,7 +1293,7 @@ def submit_feature_for_validation(store: ProjectStore, project_path: Path,
     nxt = store.counted_validation_rounds(fo_id=fo_id) + 1
     round_row = store.open_validation_round(
         fo_id=fo_id, fingerprint=evidence_mod.fingerprint(packet), summary=summary,
-        evidence=declared, round=nxt)
+        evidence=declared, round=nxt, config_version=current_config_version())
     store.set_feature_status(fo_id, "validating")
     # No attention flag: a unit under review is the system working. Only the give-up
     # transition flags anyone — and for a feature order that flag goes on the feature.

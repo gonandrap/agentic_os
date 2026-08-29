@@ -323,6 +323,71 @@ def test_with_validation_on_the_same_feature_waits_for_a_pass(fleet):
         store.close()
 
 
+def _config_version(fleet, **validation) -> str:
+    """One row in the config ledger: this fleet's catalog with `os.validation` changed,
+    stored the way the console will store it. The catalog ON DISK is left alone, which is
+    what makes "judged under the stamp" distinguishable from "judged under the live
+    catalog"."""
+    from jarvis import catalog as catalog_mod, config_version as cv
+    from jarvis.central_store import CentralStore
+
+    document = json.loads(fleet.catalog_path.read_text())
+    document["os"]["validation"] = {**document["os"].get("validation", {}), **validation}
+    central = CentralStore()
+    try:
+        return central.add_config_version(
+            document, cv.resolve(catalog_mod.parse_catalog(document)),
+            actor="user")["id"]
+    finally:
+        central.close()
+
+
+def test_a_feature_round_is_stamped_with_the_configuration_it_was_opened_under(fleet):
+    """No column on `feature_orders`: a feature's rounds live in the same polymorphic
+    table as a work order's, so the round stamp already covers both (config-console
+    design §5)."""
+    version = _config_version(fleet)
+    fleet.daemon.validator = Validator(passed())
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+
+        fleet.daemon.settle_features(fleet.spec, store)
+
+        assert [r["config_version"] for r in store.validation_rounds(fo_id=fo_id)] == [
+            version]
+    finally:
+        store.close()
+
+
+def test_a_feature_round_is_judged_under_its_stamp_and_not_the_live_catalog(fleet):
+    """The pair, and the reason the stamp is written at all (Neo, question 176): the
+    settle side must follow the version the round was OPENED under, or a catalog edit
+    mid-flight decides a round nobody judged under those terms.
+
+    Stamped `max_rounds=1`, live catalog 3: one rejection is the last round, so the
+    feature gives up instead of going back to its manager. Reading the live catalog
+    produces an ordinary rejection here, which is what makes the two distinguishable.
+    """
+    _config_version(fleet, max_rounds=1)
+    fleet.daemon.validator = Validator(rejected())
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+
+        fleet.drain()
+
+        assert store.latest_validation_round(fo_id=fo_id)["outcome"] == "escalated"
+        assert store.get_feature_order(fo_id)["needs_attention"] == 1
+        assert envelopes(store) == [], "a last round must not ask for another attempt"
+    finally:
+        store.close()
+
+
 def test_feature_units_off_validates_work_orders_and_not_features(fleet):
     """THE PAIRING IS THE TEST. With `feature_units` false and `enabled` true the switch
     is indistinguishable from validation being off unless a WORK order is seen to

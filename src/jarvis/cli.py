@@ -54,6 +54,21 @@ def _readable_rounds(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _readable_config(detail: dict[str, Any]) -> dict[str, Any]:
+    """`config_version: cfg-a1b2…` replaced by `config: cfg-a1b2… (3 versions since)`.
+
+    HUMAN output only, the same trick as `_readable_rounds`: `--json` keeps the raw
+    column because other tooling reads it, while a person gets the id together with how
+    far the fleet has moved since — and `not recorded` where there is no stamp.
+    """
+    from . import ops
+
+    line = ops.config_version_line(detail.get("config_version"))
+    return {("config" if k == "config_version" else k):
+            (line if k == "config_version" else v)
+            for k, v in detail.items()}
+
+
 def _with_readable_digest(q: dict[str, Any]) -> dict[str, Any]:
     """A Neo question row with its dashboard digest decoded, for HUMAN output only.
 
@@ -1299,7 +1314,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
             }
         finally:
             store.close()
-        _print(_readable_rounds(detail) if not args.json else detail, args.json)
+        _print(_readable_config(_readable_rounds(detail)) if not args.json else detail,
+               args.json)
 
     elif args.wo_cmd == "send":
         _print(ops.send_message(args.wo_id, args.message, source=args.source,

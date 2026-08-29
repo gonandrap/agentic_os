@@ -261,6 +261,9 @@ CREATE TABLE IF NOT EXISTS validation_rounds (
     -- pending | passed | rejected | escalated | failed
     outcome TEXT NOT NULL DEFAULT 'pending',
     reason TEXT NOT NULL DEFAULT '',    -- what was sent back
+    -- Which configuration judged it (`os_config_versions.id`). Also in ADDED_COLUMNS —
+    -- this table already ships, so a live database gets it only there.
+    config_version TEXT,
     CHECK ((wo_id IS NULL) <> (fo_id IS NULL))
 );
 -- PARTIAL unique indexes, NOT `UNIQUE (wo_id, fo_id, round)`. SQLite treats NULLs as
@@ -453,6 +456,12 @@ ADDED_COLUMNS = {
         # column existed — and those are costed live, with the shortfall named.
         "bill_json": "TEXT",
         "bill_sealed_at": "REAL",
+        # The configuration in force when this work order was DISPATCHED — the id of a
+        # row in `os_config_versions`. Frozen there beside model/effort/permission_mode
+        # and for the same reason (dispatch.py), and NULL carries the same honesty as
+        # `pr_state`: "ran before the console existed", never version 1. See
+        # docs/superpowers/specs/2026-08-27-the-config-console.md §5.
+        "config_version": "TEXT",
     },
     "feature_orders": {
         # Same, one level up: a feature's bill is its children's, and children can be
@@ -486,6 +495,17 @@ ADDED_COLUMNS = {
         # See the CREATE TABLE comment. NULL on every row written before turns moved into
         # their own units, which reads correctly as "the direct transport".
         "unit": "TEXT",
+    },
+    "validation_rounds": {
+        # WHICH CONFIGURATION JUDGED THIS ROUND — a different question from the work
+        # order's stamp, because one unit can be judged three times under three
+        # configurations. The same idea as this row's `fingerprint`, about the other
+        # input. Load-bearing rather than decorative: `Daemon._validate_work_order`
+        # resolves its `ValidationConfig` from this id, so settling follows the version
+        # the round was OPENED under and not a catalog that has since moved (§4.1). NULL
+        # falls back to the live catalog. `validation_rounds` already ships, so the
+        # column reaches a live database only through here.
+        "config_version": "TEXT",
     },
     "approvals": {
         # Which SEAT attempted the command, when a subagent did. NULL means the session's
@@ -1485,7 +1505,8 @@ class ProjectStore:
                               fo_id: str | None = None, fingerprint: str,
                               summary: str = "", evidence: str = "",
                               pr_url: str | None = None,
-                              round: int | None = None) -> dict[str, Any]:
+                              round: int | None = None,
+                              config_version: str | None = None) -> dict[str, Any]:
         """Start a round on one subject, or return the one that already holds its number.
 
         1-based and per subject. Left to itself the number is derived from what is
@@ -1498,6 +1519,9 @@ class ProjectStore:
         enforcement is the partial unique index and the `IntegrityError` it raises, not a
         SELECT before the INSERT: that check-then-insert is a race with no lock, and the
         losing side would silently open the round the index exists to forbid.
+
+        `config_version` stamps the round with the configuration it is being judged
+        under; None means the ledger holds nothing yet, and reads as "not recorded".
         """
         col, subject_id = self._subject(wo_id, fo_id)
         if round is None:
@@ -1508,9 +1532,11 @@ class ProjectStore:
         try:
             cur = self.conn.execute(
                 f"""INSERT INTO validation_rounds ({col}, round, ts, fingerprint,
-                                                   summary, evidence, pr_url)
-                    VALUES (?,?,?,?,?,?,?)""",
-                (subject_id, round, db.now(), fingerprint, summary, evidence, pr_url),
+                                                   summary, evidence, pr_url,
+                                                   config_version)
+                    VALUES (?,?,?,?,?,?,?,?)""",
+                (subject_id, round, db.now(), fingerprint, summary, evidence, pr_url,
+                 config_version),
             )
         except sqlite3.IntegrityError:
             existing = self.conn.execute(
