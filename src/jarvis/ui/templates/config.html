@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+{% block title %}Config — Jarvis{% endblock %}
+{% block content %}
+
+{% macro change_line(c) %}
+{% if c.kind == 'added' %}<span class="tone-ok">+</span> {{ c.path }} = {{ c.new|tojson }}
+{% elif c.kind == 'removed' %}<span class="tone-bad">−</span> {{ c.path }} (was {{ c.old|tojson }})
+{% else %}<span class="tone-warn">~</span> {{ c.path }}: {{ c.old|tojson }} → {{ c.new|tojson }}
+{% endif %}
+{% endmacro %}
+
+<h2>Configuration</h2>
+<p class="kv">
+  What the fleet is running, read from <span class="mono">{{ show.catalog }}</span>.
+  This page is <strong>read-only plus boolean toggles</strong> — every other value is
+  changed with <code>jarvis config set</code>, where it is already text.
+</p>
+<div class="panel" style="padding: 10px 16px">
+  {% if show.drift %}
+  <div class="tone-warn">⚠ the file is
+    <span class="mono">{{ show.file_version }}</span>, which is NOT the recorded head —
+    <code>jarvis config adopt</code> records it, or <code>jarvis config restore &lt;id&gt;</code>
+    puts the record's version back</div>
+  {% elif show.version %}
+  <div class="sub">version <span class="mono">{{ show.version.id }}</span> ·
+    {{ show.version.actor }} · {{ fmt_age(show.version.ts) }} ago
+    {% if show.version.reason %} · {{ show.version.reason }}{% endif %}</div>
+  {% else %}
+  <div class="sub">no version recorded yet — <code>jarvis config adopt</code> records
+    the file as the ledger's first</div>
+  {% endif %}
+</div>
+
+{% for g in groups %}
+<h2>{{ 'os — the fleet' if g.name == 'os' else 'project · ' + g.title }}</h2>
+<div class="panel">
+  <table>
+    <tr><th>setting</th><th>value</th><th>where it came from</th><th></th></tr>
+    {% for k in g.settings %}
+    <tr>
+      <td class="mono">{{ k.label }}</td>
+      <td class="mono">{{ k.value|tojson }}</td>
+      <td class="sub">
+        {%- if k.version %}set by <a href="#{{ k.version }}" class="mono">{{ k.version }}</a>
+        {%- elif k.written %}set in the catalog file, by no recorded version
+        {%- else %}a default of this build{% endif %}</td>
+      <td>
+        {% if k.bool %}
+        <form method="post" action="/config/set" class="inline"
+              style="display:flex; gap:6px; align-items:center">
+          <input type="hidden" name="path" value="{{ k.path }}">
+          <input type="hidden" name="value" value="{{ 'false' if k.value else 'true' }}">
+          <input type="text" name="reason"
+                 placeholder="reason — required for a safety setting" style="width:20em">
+          <button>{{ 'turn off' if k.value else 'turn on' }}</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endfor %}
+
+<h2>History</h2>
+<div class="panel">
+  {% for row in history %}
+  <div class="msg" id="{{ row.id }}">
+    <div class="who">{{ '● head · ' if row.head }}<span class="mono sid">{{ row.id }}</span> ·
+      {{ row.actor }} · {{ fmt_age(row.ts) }} ago
+      {% if row.reason %} · {{ row.reason }}{% endif %}</div>
+    <div class="mono" style="margin:4px 0">
+      {% for c in row.changes[:6] %}<div>{{ change_line(c) }}</div>{% endfor %}
+      {% if row.changes|length > 6 %}
+      <div class="sub">… and {{ row.changes|length - 6 }} more</div>{% endif %}
+      {% if not row.changes %}<div class="sub">no recorded changes</div>{% endif %}
+    </div>
+    <details class="disclosure">
+      <summary>the whole document, as it was written</summary>
+      <pre class="request-text">{{ row.document|tojson(indent=2) }}</pre>
+    </details>
+  </div>
+  {% else %}
+  <div class="empty">no configuration versions recorded yet —
+    <code>jarvis config adopt</code> records the file as the first</div>
+  {% endfor %}
+</div>
+
+<h2>Diff</h2>
+<div class="panel" style="padding: 10px 16px">
+  <form method="get" action="/config" style="display:flex; gap:8px; align-items:center">
+    <select name="a">
+      {% for row in history %}
+      <option value="{{ row.id }}" {{ 'selected' if row.id == a }}>{{ row.id }} · {{ row.actor }} · {{ fmt_age(row.ts) }} ago</option>
+      {% endfor %}
+    </select>
+    <span class="sub">→</span>
+    <select name="b">
+      {% for row in history %}
+      <option value="{{ row.id }}" {{ 'selected' if row.id == b }}>{{ row.id }} · {{ row.actor }} · {{ fmt_age(row.ts) }} ago</option>
+      {% endfor %}
+    </select>
+    <button class="primary">Compare</button>
+  </form>
+  {% if diff_error %}
+  <div class="sub tone-bad" style="margin-top:8px">{{ diff_error }}</div>
+  {% elif diff %}
+  <div class="sub" style="margin-top:8px">
+    <span class="mono">{{ diff.a.id }}</span> ({{ diff.a.actor }}) →
+    <span class="mono">{{ diff.b.id }}</span> ({{ diff.b.actor }}) ·
+    {{ diff.changes|length }} setting{{ '' if diff.changes|length == 1 else 's' }} differ{{ 's' if diff.changes|length == 1 }}
+  </div>
+  <details class="disclosure" {{ 'open' if diff.changes }}>
+    <summary>what differs</summary>
+    <div class="mono" style="margin-top:8px">
+      {% for c in diff.changes %}<div>{{ change_line(c) }}</div>
+      {% else %}<div class="sub">the two versions are identical</div>{% endfor %}
+    </div>
+  </details>
+  {% else %}
+  <div class="sub" style="margin-top:8px">pick two versions to compare</div>
+  {% endif %}
+</div>
+
+{% endblock %}

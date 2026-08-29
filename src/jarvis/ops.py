@@ -3323,6 +3323,26 @@ def config_get(path: str, project: str | None = None,
             "safety": safety_key(key), "catalog": str(file)}
 
 
+def _written_paths(document: dict[str, Any], resolved: dict[str, Any]) -> list[str]:
+    """Which of the resolved paths the DOCUMENT itself says, as against a default of
+    this build — `jarvis config get`'s "set in the catalog" answer, for every key at
+    once (§8).
+
+    The ledger cannot answer this: `adopt` diffs against nothing and so records every
+    resolved path as a change, which would make every shipped default on a freshly
+    adopted catalog read as one somebody chose.
+    """
+    written = []
+    for key in resolved:
+        try:
+            container, leaf = _document_slot(document, key, create=False)
+        except OpsError:
+            continue  # a path this document cannot hold is not one it sets
+        if container is not None and leaf in container:
+            written.append(key)
+    return sorted(written)
+
+
 def config_show(project: str | None = None, version: str | None = None,
                 catalog_path: str | None = None) -> dict[str, Any]:
     """The effective configuration, and where it came from.
@@ -3332,8 +3352,10 @@ def config_show(project: str | None = None, version: str | None = None,
     """
     if version:
         row = _find_version(version)
+        resolved = _in_scope(row["resolved"], project)
         return {"source": "version", "version": row, "project": project,
-                "resolved": _in_scope(row["resolved"], project), "drift": False}
+                "resolved": resolved, "drift": False,
+                "written": _written_paths(row["document"], resolved)}
 
     file = _catalog_file(catalog_path)
     document = _read_document(file)
@@ -3344,9 +3366,11 @@ def config_show(project: str | None = None, version: str | None = None,
     finally:
         central.close()
     live_id = config_version.version_id(document)
+    in_scope = _in_scope(resolved, project)
     return {"source": "file", "catalog": str(file), "project": project,
-            "resolved": _in_scope(resolved, project), "version": head,
+            "resolved": in_scope, "version": head,
             "file_version": live_id,
+            "written": _written_paths(document, in_scope),
             "drift": head is None or head["id"] != live_id}
 
 
