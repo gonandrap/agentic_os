@@ -71,14 +71,24 @@ def canonicalise(document: Any) -> str:
     return json.dumps(document, sort_keys=True, indent=2, ensure_ascii=False)
 
 
-def version_id(document: Any) -> str:
+def version_id(document: Any, build: str | None = None) -> str:
     """`cfg-` + the first 16 hex of sha256 over the canonical form.
 
     Content-addressed, the same move as `evidence.fingerprint`, and its two consequences
     are features rather than side effects (§2): an edit that changes nothing writes no
     row, and re-applying an old configuration lands back on its old id.
+
+    `build` SALTS the hash, and is for `actor="release"` rows ONLY (§6.1, Neo question
+    181). A release rebase records the same document resolved under a new build: same
+    document, so the same id, so no row — the salt is what gives that fact a row of its
+    own. Every other writer must leave it None, or an edit would land on a different id
+    on every upgrade and the two consequences above would both stop holding.
+    `CentralStore.add_config_version` is the only caller that passes it, off `actor`.
     """
-    digest = hashlib.sha256(canonicalise(document).encode("utf-8")).hexdigest()
+    canonical = canonicalise(document)
+    if build:
+        canonical = f"{canonical}\n@build {build}"
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return f"cfg-{digest[:16]}"
 
 

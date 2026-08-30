@@ -1097,10 +1097,18 @@ class CentralStore:
 
         The id is computed here rather than passed in so no call site can write a row
         whose id does not address its own document.
+
+        `actor="release"` is the one exception, and the reason it is decided here rather
+        than by the caller: a release rebase records the SAME document resolved under a
+        new build (§6.1), which is the same id and so no row at all. Those rows — and
+        only those — are addressed by document AND build.
         """
         from . import bugreport, config_version
 
-        vid = config_version.version_id(document)
+        build = (schema_version if schema_version is not None
+                 else bugreport.jarvis_version())
+        vid = config_version.version_id(document,
+                                        build=build if actor == "release" else None)
         existing = self.get_config_version(vid)
         if existing is not None:
             self.set_state(CONFIG_HEAD_KEY, vid)
@@ -1110,9 +1118,7 @@ class CentralStore:
                (id, ts, actor, reason, schema_version, document_json, resolved_json,
                 changes_json, source_path)
                VALUES (?,?,?,?,?,?,?,?,?)""",
-            (vid, db.now(), actor, reason,
-             schema_version if schema_version is not None
-             else bugreport.jarvis_version(),
+            (vid, db.now(), actor, reason, build,
              config_version.canonicalise(document),
              db.to_json(resolved), db.to_json(changes or []), source_path),
         )

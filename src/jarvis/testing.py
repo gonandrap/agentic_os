@@ -1233,8 +1233,15 @@ def signin(tmp_path, monkeypatch):
             "expiresAt": int((time.time() + 3600) * 1000),
             "refreshTokenExpiresAt": int((time.time() + refresh_expires_in) * 1000),
         }}))
-        if at is not None:
-            os.utime(path, (at, at))
+        # ALWAYS stamped explicitly, including the `at=None` case, and from `time.time()`
+        # — the same clock `wo_turns.ended_at` is written from. A file's mtime otherwise
+        # comes from the kernel's COARSE clock, which lags `time.time()` by up to a timer
+        # tick, so a sign-in written microseconds after a turn failed can land BEFORE it
+        # and be read as the sign-in that failed (`worker_session._auth_retry_at` wants
+        # strictly greater). That is a real inversion, not a rounding artefact, and CI
+        # hit it on 3.13 while 3.11 and 3.12 passed on the same commit.
+        stamp = time.time() if at is None else at
+        os.utime(path, (stamp, stamp))
         return path
 
     return sign_in

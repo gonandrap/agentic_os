@@ -2082,7 +2082,7 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
         plan = db.from_json(fo.get("plan"), None)
         children = [
             {**{k: c[k] for k in ("id", "title", "status", "needs_attention",
-                                  "attention_reason", "pr_url")},
+                                  "attention_reason", "pr_url", "superseded")},
              "depends_on": store.dependencies(c),
              "status_label": invariants.status_label(store, c)}
             for c in store.feature_children(fo_id)
@@ -2413,6 +2413,72 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
         cancel(wo_id)
     return {"project": name, "fo_id": fo_id, "title": fo["title"],
             "status": "cancelled", "cancelled_work_orders": stop_ids}
+
+
+#: The most of a `--fix` that becomes the corrective child's title. The rest is the
+#: description, which is all the worker actually reads.
+FIX_TITLE_CHARS = 120
+
+
+def resume_feature_order(fo_id: str, fix: str = "",
+                         project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis fo resume` — put a failed feature order back to work.
+
+    The user's own route past a dead child, so that reviving a feature never needs
+    somebody with database access. Design: docs/superpowers/specs/2026-08-29-feature-order-resume.md.
+
+    Three things, in this order, and the order is what makes a crash safe:
+
+    1. **Supersede every child that is currently dead.** They stop settling the feature
+       either way (`Daemon.settle_features`) and the record of the decision — which
+       children, when, and the user's words — goes in `feature_orders.metadata`.
+    2. **Back to `executing`, flag cleared.**
+    3. **File `fix` as a new child**, if one was given.
+
+    A crash between 2 and 3 leaves a feature that simply settles on what its children
+    already say, which is the same answer INV-FEATURE-FALSE-FAILURE would reach. The
+    opposite order would file a child under a feature the user had not yet reopened.
+
+    `--fix` is OPTIONAL EVEN WHEN A CHILD IS DEAD. Forcing one would be the OS insisting
+    that a cancelled child must always be replaced, and sometimes the honest answer is
+    that the feature no longer needs it.
+
+    `failed` only. `cancelled` was the user's own decision and reversing it is a
+    different act with different consequences for the children they stopped; `completed`
+    has nothing to resume.
+    """
+    from .invariants import dead_feature_children
+
+    name, path, fo = find_feature_order(fo_id, project_name)
+    if fo["status"] != "failed":
+        raise OpsError(
+            f"{fo_id} is {fo['status']}, not failed — `fo resume` revives a feature a "
+            f"child killed. Nothing to resume."
+        )
+    store = ProjectStore(path)
+    try:
+        children = store.feature_children(fo_id)
+        dead = dead_feature_children(children)
+        if dead:
+            store.supersede_children(fo_id, [c["id"] for c in dead], note=fix)
+        store.set_feature_status(fo_id, "executing")
+        store.clear_feature_attention(fo_id)
+        child = None
+        if fix.strip():
+            title = " ".join(fix.split())[:FIX_TITLE_CHARS]
+            # `store.create_work_order`, not `ops.create_work_order`: the latter refuses a
+            # parent that is not open, and this call IS the reopening — the guard would be
+            # reading the status one statement before it stopped being true.
+            child = store.create_work_order(
+                title=title, description=fix, origin="jarvis", kind="worker",
+                parent_id=fo_id,
+            )
+        return {"project": name, "fo_id": fo_id, "title": fo["title"],
+                "status": "executing",
+                "superseded": [c["id"] for c in dead],
+                "fix_wo_id": child["id"] if child else None}
+    finally:
+        store.close()
 
 
 # -- Neo (OS answerer agent) ---------------------------------------------------------------------
@@ -3474,7 +3540,10 @@ def adopt_config(*, reason: str = "", catalog_path: str | None = None,
         head = central.head_config_version()
     finally:
         central.close()
-    if head is not None and head["id"] == config_version.version_id(document):
+    # DOCUMENTS, not ids: a release-rebase row is addressed by document AND build
+    # (§6.1), so an id comparison would re-adopt the same file after every upgrade.
+    if head is not None and config_version.canonicalise(
+            head["document"]) == config_version.canonicalise(document):
         return {"adopted": False, "version": head, "changes": [],
                 "catalog": str(file),
                 "note": "the file is already the head version — nothing to adopt"}
