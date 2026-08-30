@@ -272,8 +272,9 @@ def test_a_childs_page_names_its_section_and_does_not_reprint_it(started, store,
     fo = release(started, store, "schema")
     wo = store.feature_children(fo["id"])[0]
     spec = specs.spec_of(store, wo)
+    wo_id = wo["id"]
 
-    body = _client().get(f"/wo/proj_a/{wo["id"]}").text
+    body = _client().get(f"/wo/proj_a/{wo_id}").text
 
     assert f"Spec section {wo['spec_section']}" in body
     assert FIXTURE_DESIGN_DOC in body
@@ -284,9 +285,10 @@ def test_a_childs_page_names_its_section_and_does_not_reprint_it(started, store,
 
 def test_a_work_order_with_no_feature_shows_no_spec_line(started):
     """The control. Most work orders have no feature and must read exactly as before."""
-    wo = ops.create_work_order("proj_a", "unrelated", description="something else")
+    wo_id = ops.create_work_order("proj_a", "unrelated",
+                                  description="something else")["id"]
 
-    body = _client().get(f"/wo/proj_a/{wo["id"]}").text
+    body = _client().get(f"/wo/proj_a/{wo_id}").text
 
     assert "Spec section" not in body
 
@@ -294,9 +296,9 @@ def test_a_work_order_with_no_feature_shows_no_spec_line(started):
 def test_the_features_page_names_the_spec_and_each_childs_section(started, store):
     """A reader who does not know the spec exists reads twelve thin briefs and concludes
     the feature was under-specified. So the plan is labelled as an index into it."""
-    fo = release(started, store, "schema", "api")
+    fo_id = release(started, store, "schema", "api")["id"]
 
-    body = _client().get(f"/fo/proj_a/{fo["id"]}").text
+    body = _client().get(f"/fo/proj_a/{fo_id}").text
 
     assert FIXTURE_DESIGN_DOC in body
     for key in ("schema", "api"):
