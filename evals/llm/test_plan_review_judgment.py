@@ -42,6 +42,7 @@ import pytest
 from jarvis import neo as neo_mod
 from jarvis import plans
 from jarvis.neo_store import NeoStore
+from jarvis.testing import fixture_spec_section
 
 pytestmark = [
     pytest.mark.skipif(not os.environ.get("JARVIS_EVALS_LLM"),
@@ -58,9 +59,12 @@ FAT_MARKER = "FAT-BRIEF-CONTEXT"
 
 def _child(key: str, title: str, acceptance: str, needs: list[str] | None = None,
            brief: str = "") -> dict[str, Any]:
-    filler = f"{FAT_MARKER}: {brief or title}. " + "Context repeated at length. " * 40
+    # As fat as a brief may now be. The point of the marker is that NO brief text reaches
+    # the question, so what matters is that it is there at all, not how much of it.
+    filler = f"{FAT_MARKER}: {brief or title}. " + "Context repeated at length. " * 15
     return {"key": key, "title": title, "description": filler,
-            "needs": needs or [], "acceptance": acceptance}
+            "needs": needs or [], "acceptance": acceptance,
+            "spec_section": fixture_spec_section(key)}
 
 
 def _case(name: str, ask: str, plan_doc: dict[str, Any]) -> tuple[str, str]:

@@ -1120,16 +1120,65 @@ def settle_turns():
 #: docs/superpowers/specs/2026-08-23-the-work-order-record.md.
 FIXTURE_DESIGN_DOC = "docs/specs/exporter.md"
 
-FIXTURE_DESIGN_DOC_BODY = """# Exporter design
+#: How many numbered sections the fixture document carries. A plan is refused unless every
+#: child names a section that resolves AND no two children name the same one, so a fixture
+#: with two sections would cap every fixture plan at two children. Generous rather than
+#: exact: the cost is a few lines of markdown, and running out is a confusing failure in
+#: a test that is about something else entirely.
+#: (Counted across the whole session, not per plan — `fixture_spec_section` remembers a
+#: key for ever, so this is the number of DISTINCT child keys the suite uses in total.)
+FIXTURE_SPEC_SECTIONS = 200
 
-## 1. Shape
+_FIXTURE_SECTION_BY_KEY: dict[str, str] = {}
 
-The exporter is one module with one entry point.
 
-## 2. Data model
+def fixture_spec_section(key: str) -> str:
+    """A distinct, resolvable `spec_section` for a fixture child, from its plan key.
 
-Rows are dicts; the header is the union of keys, first-seen order.
-"""
+    Assigned lazily and remembered, so the same key is always the same section and two
+    different keys are never the same one — which is exactly the uniqueness rule
+    `plans.spec_problems` enforces, expressed as the fixture's own invariant.
+    """
+    if key not in _FIXTURE_SECTION_BY_KEY:
+        assert len(_FIXTURE_SECTION_BY_KEY) < FIXTURE_SPEC_SECTIONS, (
+            f"the fixture design document has only {FIXTURE_SPEC_SECTIONS} sections; "
+            f"raise it if the suite really needs more distinct child keys"
+        )
+        _FIXTURE_SECTION_BY_KEY[key] = str(len(_FIXTURE_SECTION_BY_KEY) + 1)
+    return _FIXTURE_SECTION_BY_KEY[key]
+
+
+#: Numbered sections plus the `Agent profile` appendix `plans.spec_problems` demands. The
+#: appendix has to clear `specs.MIN_PROFILE_CHARS`, which is why it is prose rather than a
+#: placeholder line.
+FIXTURE_DESIGN_DOC_BODY = "\n".join([
+    "# Exporter design",
+    "",
+    "## 1. Shape",
+    "",
+    "The exporter is one module with one entry point.",
+    "",
+    "## 2. Data model",
+    "",
+    "Rows are dicts; the header is the union of keys, first-seen order.",
+    "",
+    "## 3. Failure handling",
+    "",
+    "An empty result set writes the header and nothing else. Errors raise, never print.",
+    *[line
+      for n in range(4, FIXTURE_SPEC_SECTIONS + 1)
+      for line in ("", f"## {n}. Piece {n}", "",
+                   f"The {n}th separable piece of the exporter.")],
+    "",
+    "## Appendix: Agent profile",
+    "",
+    "You are a Python engineer working on the exporter. You keep the module's single",
+    "entry point single, you write a test beside every behaviour you add, and you never",
+    "widen the public surface without saying so in the work order record. Prefer the",
+    "standard library over a dependency, and where two readings of a requirement differ,",
+    "ask rather than pick.",
+    "",
+])
 
 
 def make_git_project(root: Path, name: str, readme: str | None = "# proj\n") -> Path:

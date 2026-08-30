@@ -47,6 +47,13 @@ Two corollaries, and the second is the one that gets forgotten:
 
 ## 2. Briefs cite the design document; they do not carry it
 
+> **CORRECTION, 2026-08-29 (wo-4580e7c1).** §2's argument stands and its numbers do not.
+> `MAX_DESCRIPTION_CHARS` is **600**, not 1500; a brief now carries only what its section
+> of the spec does not say. §2.1's two-field table is gone — **`design_doc` is required
+> and `design_doc_by` was removed** (Neo, question 179), so §2.2 and `_transitive_needs`
+> describe machinery that no longer exists. Read
+> `2026-08-29-spec-driven-feature-orders.md` instead. §2.3's scope ruling is unchanged.
+
 `dispatch._planner_prompt` has told planners *"a description is a BRIEF, not an
 encyclopedia"* for as long as the `design_doc` field has existed, and the OS materialises
 that document into every child's worktree. Planners still shipped six-kilobyte briefs

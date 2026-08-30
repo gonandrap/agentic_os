@@ -399,6 +399,10 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("fo_id")
     f.add_argument("--project")
 
+    f = fo.add_parser("agent", help="rebuild this feature's agent type from its spec")
+    f.add_argument("fo_id")
+    f.add_argument("--project")
+
     # gates (privileged-action approvals) ------------------------------------------------
     ga = sub.add_parser(
         "gate",
@@ -1451,6 +1455,9 @@ def cmd_fo(args: argparse.Namespace) -> int:
 
     elif args.fo_cmd == "cancel":
         _print(ops.cancel_feature_order(args.fo_id, args.project), args.json)
+
+    elif args.fo_cmd == "agent":
+        _print(ops.rebuild_feature_agent(args.fo_id, args.project), args.json)
     return 0
 
 

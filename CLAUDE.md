@@ -80,6 +80,14 @@ jarvis fo approve <id> [--reject] [--feedback "why"]   # only when Neo escalated
                                            # in its existing session, so the feedback
                                            # must say what to CHANGE.
 jarvis fo cancel <id>                      # stops the planner and every child running
+jarvis fo agent <id>                       # rebuild this feature's AGENT TYPE from its
+                                           # spec. Every feature order builds one from
+                                           # its spec's "Agent profile" appendix, every
+                                           # child work order runs as it, and it is
+                                           # deleted when the feature settles. The spec
+                                           # outlives it, so this hands the persona back
+                                           # — to a repaired live feature, or to a
+                                           # session the user opens by hand afterwards.
 jarvis backlog promote <id> --as feature   # intake -> feature order, not a work order
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
 jarvis wo review <id> [--reject] [--feedback "why"]   # feedback teaches Neo; on
