@@ -185,6 +185,77 @@ class ValidationConfig:
     feature_units: bool = True
 
 
+# -- `jarvis inspect`: what counts as worth reporting, and what as worth interrupting for
+#
+# EVERY NUMBER HERE WAS MEASURED, over the 438 worker turns and 118 dispatched work orders
+# on this machine at the time it shipped, and none of them is a round number chosen
+# because it looked reasonable. The measured firing rate is stated beside each one,
+# because that rate is what a person is really choosing when they change it. Method and
+# figures: docs/superpowers/specs/2026-08-30-the-anatomy-of-a-turn.md §6.
+#
+# The `report_` pair only decide what `jarvis inspect` PRINTS. The `alarm_` trio decide
+# when the OS interrupts the user about a turn that is still running, which is a much
+# higher bar — hence 300s against 30s for the same blocking join, and 300k against 20k for
+# the same cache write. They are prefixed rather than nested so that a reader of
+# `jarvis config show` cannot mistake one for the other; confusing the two would either
+# flood the attention list or empty the report.
+
+#: A cache write below this is the conversation's own growth rather than a re-send of it,
+#: and labelling it by the gap alone would call the cache working a defect. The method's
+#: own figure (`docs/anatomy-of-an-expensive-turn.md` §1 step 5: "flag every write over
+#: ~20k"), kept because it is what the worked example was derived with.
+DEFAULT_INSPECT_REPORT_WRITE_FLOOR = 20_000
+
+#: A blocking join shorter than this is not worth a line of its own. Well under the
+#: alarm's threshold on purpose: the report is read deliberately and can afford detail
+#: the attention list cannot.
+DEFAULT_INSPECT_REPORT_JOIN_FLOOR = 30
+
+#: How much of a turn's triggering prompt is quoted. A terminal line, and the quote is
+#: there to identify the prompt rather than to reproduce it.
+DEFAULT_INSPECT_QUOTE_CHARS = 140
+
+#: A turn still running after this long is burning money now. p95 of a turn's ACTIVE time
+#: is 59 minutes, so this fires on 16% of work orders — and it sits well below
+#: `worker_session.TURN_STALL_SECONDS` (6h), which reports a different fact: hung, not
+#: expensive.
+DEFAULT_INSPECT_ALARM_TURN_MINUTES = 60
+
+#: A blocking join still open after this long. THE ONLY THRESHOLD HERE THAT IS PRINCIPLED
+#: RATHER THAN EMPIRICAL: it is the 5-minute cache TTL itself, past which the prefix is
+#: certainly cold and the wait will be paid for a second time as a re-write. Fires on 2%.
+DEFAULT_INSPECT_ALARM_JOIN_SECONDS = 300
+
+#: One call re-sending this much of the conversation. p95 of the largest re-write per work
+#: order (the median is 130,519), so it fires on 5% — about $1.88 at Opus list prices in a
+#: single event.
+DEFAULT_INSPECT_ALARM_WRITE_TOKENS = 300_000
+
+
+@dataclass
+class InspectConfig:
+    """What `jarvis inspect` reports, and when the OS raises a turn that is still running.
+
+    Per project as well as fleet-wide, with field-level inheritance (`_parse_inspect`):
+    a project that names one key keeps the OS answer for the rest. That matters because
+    the alarm thresholds are a statement about what is NORMAL, and normal differs by
+    project — an hour-long turn is routine where the work is a design document and a
+    symptom where it is a one-file fix.
+
+    `enabled` turns only the ALARM off, never the report: `jarvis inspect` reads files
+    that are already on disk and costs nothing until someone runs it, whereas the alarm
+    reads a transcript per running work order per reconcile tick.
+    """
+
+    enabled: bool = True
+    report_write_floor: int = DEFAULT_INSPECT_REPORT_WRITE_FLOOR
+    report_join_floor: int = DEFAULT_INSPECT_REPORT_JOIN_FLOOR
+    quote_chars: int = DEFAULT_INSPECT_QUOTE_CHARS
+    alarm_turn_minutes: int = DEFAULT_INSPECT_ALARM_TURN_MINUTES
+    alarm_join_seconds: int = DEFAULT_INSPECT_ALARM_JOIN_SECONDS
+    alarm_write_tokens: int = DEFAULT_INSPECT_ALARM_WRITE_TOKENS
+
+
 @dataclass
 class ProjectSpec:
     name: str
@@ -203,6 +274,7 @@ class ProjectSpec:
     # caller has to consult two objects. See
     # docs/superpowers/specs/2026-08-27-the-config-console.md §1.2.
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+    inspect: InspectConfig = field(default_factory=InspectConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -263,37 +335,6 @@ class NeoConfig:
     # falls back to rendering every question in full, which is what it did before.
     digest_model: str = "haiku"
     panel: PanelConfig = field(default_factory=PanelConfig)
-
-
-#: Defaults for the cost alarm, every one of them measured rather than guessed — over
-#: the 438 worker turns and 118 dispatched work orders on this machine at the time it
-#: shipped. See `inspection.Alarm` and
-#: docs/superpowers/specs/2026-08-30-the-anatomy-of-a-turn.md §5.
-#:
-#: Measured against a turn's ACTIVE time — its own process — not its span, which for a
-#: turn with a successor runs on to the next prompt and includes `idle`.
-#:
-#: A NOISY COST ALARM IS WORSE THAN NONE, so each threshold is set where it fires on a
-#: small minority and the measured rate is stated beside it.
-DEFAULT_INSPECT_TURN_MINUTES = 60    # p95 of a turn's ACTIVE time is 59m; fires on 16%
-DEFAULT_INSPECT_JOIN_SECONDS = 300   # the 5-minute cache TTL itself; fires on 2%
-DEFAULT_INSPECT_WRITE_TOKENS = 300_000  # p95 of the largest re-write per order; fires on 5%
-
-
-@dataclass
-class InspectConfig:
-    """When a turn that is still running is worth interrupting the user for.
-
-    Three independent conditions, because they are three different things going wrong
-    and only one of them has a fix the user can apply while it burns. `enabled` turns
-    the whole check off: it reads a transcript per running work order per reconcile
-    tick, which is cheap but not free.
-    """
-
-    enabled: bool = True
-    turn_minutes: int = DEFAULT_INSPECT_TURN_MINUTES
-    join_seconds: int = DEFAULT_INSPECT_JOIN_SECONDS
-    write_tokens: int = DEFAULT_INSPECT_WRITE_TOKENS
 
 
 @dataclass
@@ -457,24 +498,39 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     )
 
 
-def _parse_inspect(raw: Any) -> InspectConfig:
-    """`os.inspect`, with every threshold rejected rather than clamped if it is absurd.
+def _parse_inspect(raw: Any, base: InspectConfig | None = None,
+                   where: str = "os.inspect") -> InspectConfig:
+    """`os.inspect`, or a project's override of it, with absurd values refused.
 
-    A threshold of zero would flag every work order the fleet runs, which is the exact
-    failure the defaults were measured to avoid — and it would arrive by a typo in a
-    `jarvis config set`, so it is caught at parse time where the message can say so.
+    `base` is what an omitted key falls through to — the same field-level inheritance
+    `_parse_validation` uses (kn-6ca2bcd9): `os.inspect` parses against the shipped
+    defaults and each project parses against the OS answer, so a project naming one key
+    inherits the other five and no caller ever has to consult two objects.
+
+    Every threshold is REFUSED rather than clamped below 1. Zero would report every write
+    a session makes and flag every work order the fleet runs — the exact failure the
+    defaults were measured to avoid — and it arrives by a typo in a `jarvis config set`,
+    so it is caught where the message can name the key.
     """
+    base = base or InspectConfig()
     if not isinstance(raw, dict):
-        raise _err('"os.inspect" must be an object')
+        raise _err(f'"{where}" must be an object')
     cfg = InspectConfig(
-        enabled=bool(raw.get("enabled", True)),
-        turn_minutes=int(raw.get("turn_minutes", DEFAULT_INSPECT_TURN_MINUTES)),
-        join_seconds=int(raw.get("join_seconds", DEFAULT_INSPECT_JOIN_SECONDS)),
-        write_tokens=int(raw.get("write_tokens", DEFAULT_INSPECT_WRITE_TOKENS)),
+        enabled=bool(raw.get("enabled", base.enabled)),
+        report_write_floor=int(raw.get("report_write_floor",
+                                       base.report_write_floor)),
+        report_join_floor=int(raw.get("report_join_floor", base.report_join_floor)),
+        quote_chars=int(raw.get("quote_chars", base.quote_chars)),
+        alarm_turn_minutes=int(raw.get("alarm_turn_minutes",
+                                       base.alarm_turn_minutes)),
+        alarm_join_seconds=int(raw.get("alarm_join_seconds",
+                                       base.alarm_join_seconds)),
+        alarm_write_tokens=int(raw.get("alarm_write_tokens",
+                                       base.alarm_write_tokens)),
     )
-    for name in ("turn_minutes", "join_seconds", "write_tokens"):
-        if getattr(cfg, name) < 1:
-            raise _err(f"os.inspect.{name} must be >= 1")
+    for name, value in vars(cfg).items():
+        if name != "enabled" and value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
     return cfg
 
 
@@ -571,6 +627,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         validation_cfg = _parse_validation(
             p.get("validation", {}), base=os_cfg.validation,
             where=f"projects[{i}] ({name}).validation")
+        inspect_cfg = _parse_inspect(
+            p.get("inspect", {}), base=os_cfg.inspect,
+            where=f"projects[{i}] ({name}).inspect")
         projects.append(
             ProjectSpec(
                 name=name,
@@ -582,6 +641,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 max_concurrent=max_conc,
                 gates=gate_cfg,
                 validation=validation_cfg,
+                inspect=inspect_cfg,
                 raw=p,
             )
         )

@@ -4234,9 +4234,27 @@ def _cost_for_target(target: str, project: str | None,
             "floor": True, "floor_reason": COST_FLOOR_NOTE}
 
 
+def inspect_config(project: str | None = None) -> Any:
+    """The `jarvis inspect` settings in force for `project` — or the OS's — or defaults.
+
+    `ops.validation_config`'s shape and its reasoning: best-effort, because a report over
+    files on disk must not fail because a catalog has moved. Unlike validation it falls
+    back to `InspectConfig()` rather than to None — every default here is a threshold
+    with a measured justification, and having none would mean having no report.
+    """
+    from .catalog import InspectConfig
+
+    try:
+        catalog = resolve_catalog()
+        return (catalog.os.inspect if project is None
+                else catalog.project(project).inspect)
+    except (OpsError, CatalogError, OSError, ValueError):
+        return InspectConfig()
+
+
 def inspect_report(target: str, project: str | None = None, *,
                    write_floor: int | None = None,
-                   join_floor: float | None = None) -> dict[str, Any]:
+                   join_floor: int | None = None) -> dict[str, Any]:
     """Where a work order's or a feature order's TIME went — `jarvis cost`'s other half.
 
     Resolves the target exactly the way `_cost_for_target` does, feature order first and
@@ -4248,18 +4266,36 @@ def inspect_report(target: str, project: str | None = None, *,
     gap `jarvis cost` reports, because an unmeasurable clock and an idle one are
     different answers.
     """
+    from dataclasses import replace
+
     from . import inspection
     from . import usage as usage_mod
 
-    floor = inspection.DEFAULT_WRITE_FLOOR if write_floor is None else write_floor
-    joins = inspection.DEFAULT_JOIN_FLOOR if join_floor is None else join_floor
     index = usage_mod.index_sessions()
+    # The catalog decides the floors and the flags override them for one invocation:
+    # a project's setting is what the report means by "large" day to day, and `--writes
+    # -over` is someone asking a different question of the same session once.
+    configs: dict[str, Any] = {}
+
+    def settings(project_name: str) -> Any:
+        if project_name not in configs:
+            cfg = inspect_config(project_name)
+            overrides = {}
+            if write_floor is not None:
+                overrides["report_write_floor"] = write_floor
+            if join_floor is not None:
+                overrides["report_join_floor"] = join_floor
+            configs[project_name] = replace(cfg, **overrides) if overrides else cfg
+        return configs[project_name]
 
     def unit(project_name: str, wo: dict[str, Any]) -> dict[str, Any]:
         session = wo.get("session_id") or ""
-        anatomy = (inspection.read_session(session, write_floor=floor, index=index)
-                   if session else inspection.Anatomy(session_id=""))
-        payload = anatomy.as_dict(joins)
+        cfg = settings(project_name)
+        anatomy = (inspection.read_session(session, cfg, index=index) if session
+                   else inspection.Anatomy(session_id="",
+                                           write_floor=cfg.report_write_floor,
+                                           join_floor=cfg.report_join_floor))
+        payload = anatomy.as_dict()
         payload.update(wo_id=wo["id"], project=project_name, title=wo["title"],
                        status=wo["status"], kind=wo.get("kind") or "worker")
         return payload
@@ -4268,8 +4304,10 @@ def inspect_report(target: str, project: str | None = None, *,
         name, path, fo = find_feature_order(target, project)
     except OpsError:
         name, _wo_path, wo = find_work_order(target, project)
+        cfg = settings(name)
         return {"scope": wo["id"], "title": wo["title"],
-                "write_floor": floor, "join_floor": joins, "units": [unit(name, wo)]}
+                "write_floor": cfg.report_write_floor,
+                "join_floor": cfg.report_join_floor, "units": [unit(name, wo)]}
 
     store = ProjectStore(path)
     try:
@@ -4283,8 +4321,10 @@ def inspect_report(target: str, project: str | None = None, *,
         units.extend(unit(name, child) for child in store.feature_children(fo["id"]))
     finally:
         store.close()
+    cfg = settings(name)
     return {"scope": fo["id"], "title": fo["title"], "status": fo["status"],
-            "write_floor": floor, "join_floor": joins, "units": units}
+            "write_floor": cfg.report_write_floor,
+            "join_floor": cfg.report_join_floor, "units": units}
 
 
 def _os_calls_detail(wo_id: str, limit: int = 200) -> list[dict[str, Any]]:

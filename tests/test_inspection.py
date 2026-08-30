@@ -336,8 +336,9 @@ def test_a_small_write_seconds_after_the_last_call_is_the_cache_working():
     delta it just added — a short gap, so the gap test alone calls it a prefix-miss. The
     floor is what makes the label mean something."""
     calls = [call(0, 50_000), call(1, 900), call(2, 1_200)]
+    floor = InspectConfig().report_write_floor
 
-    causes = [w.cause for w in inspection.classify_writes(calls)]
+    causes = [w.cause for w in inspection.classify_writes(calls, floor)]
 
     assert causes == [inspection.COLD_START]
 
@@ -347,9 +348,10 @@ def test_a_one_hour_write_is_not_called_a_defect_for_surviving_ten_minutes():
     old transcript against 300 seconds would report an honest expiry as a defect."""
     hour = [call(0, 50_000, cache_1h=50_000), call(600, 200_000)]
     five = [call(0, 50_000), call(600, 200_000)]
+    floor = InspectConfig().report_write_floor
 
-    assert inspection.classify_writes(hour)[1].cause == inspection.PREFIX_MISS
-    assert inspection.classify_writes(five)[1].cause == inspection.TTL_EXPIRY
+    assert inspection.classify_writes(hour, floor)[1].cause == inspection.PREFIX_MISS
+    assert inspection.classify_writes(five, floor)[1].cause == inspection.TTL_EXPIRY
 
 
 # -- the live alarm --------------------------------------------------------------------
@@ -371,9 +373,9 @@ def burning(*, wall: float = 0.0, write: int = 0, join: float = 0.0) -> tuple:
 def test_each_threshold_raises_its_own_alarm():
     cfg = InspectConfig()
 
-    long_turn, now = burning(wall=cfg.turn_minutes * 60 + 1)
-    big_write, _ = burning(wall=60, write=cfg.write_tokens + 1)
-    blocked, when = burning(join=cfg.join_seconds + 1)
+    long_turn, now = burning(wall=cfg.alarm_turn_minutes * 60 + 1)
+    big_write, _ = burning(wall=60, write=cfg.alarm_write_tokens + 1)
+    blocked, when = burning(join=cfg.alarm_join_seconds + 1)
 
     assert [a.kind for a in inspection.alarms(long_turn, cfg, now=now)] == \
         [inspection.TURN_ALARM]
@@ -387,7 +389,7 @@ def test_the_alarm_measures_the_running_turn_against_the_wall_clock():
     """A turn that is GENERATING has written no row for minutes. Judged against its own
     last line it reports how long ago it spoke, not how long it has been running."""
     anatomy, _ = burning(wall=60)
-    cfg = InspectConfig(turn_minutes=10)
+    cfg = InspectConfig(alarm_turn_minutes=10)
 
     assert inspection.alarms(anatomy, cfg) == []
     assert inspection.alarms(anatomy, cfg, now=11 * 60)[0].kind == inspection.TURN_ALARM
@@ -422,6 +424,7 @@ def test_a_join_still_open_past_the_cache_ttl_is_raised_from_the_live_file(
     quiet = inspection.live_alarms(session, InspectConfig(), now=200)
     loud = inspection.live_alarms(session, InspectConfig(), wo_id="wo-1", now=400)
 
+
     assert quiet == []
     assert [a.kind for a in loud] == [inspection.JOIN_ALARM]
     assert "jarvis inspect wo-1" in loud[0].reason
@@ -450,8 +453,36 @@ def test_the_defaults_are_the_measured_ones():
     interrupted. See `catalog.InspectConfig`."""
     cfg = InspectConfig()
 
-    assert (cfg.turn_minutes, cfg.join_seconds, cfg.write_tokens) == (60, 300, 300_000)
-    assert cfg.join_seconds == inspection.TTL_5M
+    assert (cfg.alarm_turn_minutes, cfg.alarm_join_seconds,
+            cfg.alarm_write_tokens) == (60, 300, 300_000)
+    assert cfg.alarm_join_seconds == inspection.TTL_5M
+    # The report is deliberately far more talkative than the alarm: the same blocking
+    # join is worth a line at 30s and worth interrupting someone at 300s.
+    assert (cfg.report_write_floor, cfg.report_join_floor) == (20_000, 30)
+    assert cfg.report_join_floor < cfg.alarm_join_seconds
+    assert cfg.report_write_floor < cfg.alarm_write_tokens
+
+
+def test_nothing_in_the_module_hard_codes_a_threshold():
+    """THE MAGIC-NUMBER GUARD, and it is the reason this test is worth its noise: the
+    thresholds are policy and they belong in the catalog, so a later change that reaches
+    for a literal instead of a setting fails here rather than in review.
+
+    `TTL_5M`/`TTL_1H` are exempt and are the only exemption: they are the two durations
+    Anthropic's cache actually offers, not a number anyone gets to choose.
+    """
+    import ast
+    import inspect as stdlib_inspect
+
+    tree = ast.parse(stdlib_inspect.getsource(inspection))
+    allowed = {0, 1, 2, 4, 60, 300.0, 3600.0}  # indices, seconds-per-minute, the TTLs
+    literals = {node.value for node in ast.walk(tree)
+                if isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
+                and not isinstance(node.value, bool)}
+
+    assert not (literals - allowed), (
+        f"undeclared numeric literal(s) {sorted(literals - allowed)} in inspection.py — "
+        "a threshold belongs in catalog.InspectConfig, not in the code that reads it")
 
 
 # -- configuration ---------------------------------------------------------------------
@@ -462,18 +493,49 @@ def test_the_thresholds_are_settable_through_the_config_console():
     `jarvis config set` reaches it with no edit to the console."""
     from jarvis import config_version
 
-    cat = catalog.parse_catalog({"os": {"inspect": {"turn_minutes": 20}},
+    cat = catalog.parse_catalog({"os": {"inspect": {"alarm_turn_minutes": 20}},
                                  "projects": []})
     resolved = config_version.resolve(cat)
 
-    assert cat.os.inspect.turn_minutes == 20
-    assert resolved["os.inspect.turn_minutes"] == 20
-    assert resolved["os.inspect.write_tokens"] == 300_000  # a default, materialised
+    assert cat.os.inspect.alarm_turn_minutes == 20
+    assert resolved["os.inspect.alarm_turn_minutes"] == 20
+    # A default, materialised — which is what makes `jarvis config get` able to answer
+    # for a key nobody has ever set.
+    assert resolved["os.inspect.alarm_write_tokens"] == 300_000
 
 
-def test_a_threshold_of_zero_is_refused_rather_than_flagging_everything():
-    with pytest.raises(catalog.CatalogError):
-        catalog.parse_catalog({"os": {"inspect": {"write_tokens": 0}}, "projects": []})
+def test_a_project_overrides_one_threshold_and_inherits_the_rest(tmp_path):
+    """Field-level inheritance, the shape `_parse_validation` established (kn-6ca2bcd9).
+
+    It matters here because a threshold is a claim about what is NORMAL, and normal
+    differs by project: an hour-long turn is routine where the work is a design document
+    and a symptom where it is a one-file fix.
+    """
+    from jarvis import config_version
+
+    cat = catalog.parse_catalog({
+        "os": {"inspect": {"alarm_turn_minutes": 90, "report_write_floor": 50_000}},
+        "projects": [{"name": "quick", "path": str(tmp_path),
+                      "inspect": {"alarm_turn_minutes": 15}}],
+    })
+    project = cat.project("quick")
+
+    assert project.inspect.alarm_turn_minutes == 15        # its own
+    assert project.inspect.report_write_floor == 50_000    # inherited from os
+    assert project.inspect.alarm_write_tokens == 300_000   # inherited from the default
+    assert cat.os.inspect.alarm_turn_minutes == 90         # the OS block is untouched
+    assert config_version.resolve(cat)[
+        "projects.quick.inspect.alarm_turn_minutes"] == 15
+
+
+@pytest.mark.parametrize("key", ["alarm_write_tokens", "report_write_floor",
+                                 "quote_chars", "alarm_turn_minutes"])
+def test_a_threshold_of_zero_is_refused_rather_than_flagging_everything(key):
+    """Zero would report every write a session makes and flag every work order the fleet
+    runs — and it arrives by a typo in a `jarvis config set`, so it is caught where the
+    message can name the key."""
+    with pytest.raises(catalog.CatalogError, match=key):
+        catalog.parse_catalog({"os": {"inspect": {key: 0}}, "projects": []})
 
 
 # -- the command, and the daemon -------------------------------------------------------

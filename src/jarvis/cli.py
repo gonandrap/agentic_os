@@ -161,8 +161,8 @@ class _VersionAction(argparse.Action):
 
 def build_parser() -> argparse.ArgumentParser:
     # A leaf module with no store or CLI dependency, so importing it here costs nothing
-    # and lets `--help` state the defaults it actually uses rather than repeating them.
-    from . import inspection
+    # and lets `--help` state the shipped defaults rather than repeating their values.
+    from . import catalog
 
     p = argparse.ArgumentParser(prog="jarvis", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -208,11 +208,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("target", help="a work-order id or a feature-order id")
     sp.add_argument("--project")
     sp.add_argument("--writes-over", type=int, metavar="TOKENS",
-                    help="classify cache writes at or above this size "
-                         f"(default: {inspection.DEFAULT_WRITE_FLOOR:,})")
-    sp.add_argument("--joins-over", type=float, metavar="SECONDS",
-                    help="list blocking joins at or above this long "
-                         f"(default: {inspection.DEFAULT_JOIN_FLOOR:g})")
+                    help="classify cache writes at or above this size, for this run "
+                         "only (default: the project's os.inspect.report_write_floor, "
+                         f"{catalog.DEFAULT_INSPECT_REPORT_WRITE_FLOOR:,})")
+    sp.add_argument("--joins-over", type=int, metavar="SECONDS",
+                    help="list blocking joins at or above this long, for this run only "
+                         "(default: the project's os.inspect.report_join_floor, "
+                         f"{catalog.DEFAULT_INSPECT_REPORT_JOIN_FLOOR})")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
@@ -1186,9 +1188,19 @@ def _print_bill(bill: dict) -> None:
     print("List prices, as a common unit for comparing token kinds — not a bill.")
 
 
+#: Above this many seconds a duration reads better in minutes. Presentation only — it
+#: changes no measurement and nothing branches on it, which is why it is a constant here
+#: rather than a setting in `catalog.InspectConfig` beside the thresholds that do.
+MINUTES_OVER_SECONDS = 90
+
+#: Width of the rule under a unit's heading, so a long work-order title does not draw a
+#: line past the edge of a standard terminal.
+RULE_WIDTH = 78
+
+
 def _mins(seconds: float) -> str:
     """Durations at the magnitude a reader can hold in their head, like `_tok`."""
-    if seconds >= 90:
+    if seconds >= MINUTES_OVER_SECONDS:
         return f"{seconds / 60:.1f}m"
     return f"{seconds:.1f}s"
 
@@ -1216,7 +1228,7 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
     waiting for, what the tokens were re-sent for, and what the tool time was doing.
     """
     head = f"{unit['wo_id']} — {unit['title']}"
-    print(f"\n{head}\n{'-' * min(len(head), 78)}")
+    print(f"{head}\n{'-' * min(len(head), RULE_WIDTH)}")
     if not unit["found"]:
         # The same answer `jarvis cost` gives, and for the same reason: Claude Code
         # prunes transcripts on its own schedule, and an unmeasurable clock is not a
@@ -1278,8 +1290,10 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     # A feature order is many units and needs a line saying which feature they are; a
     # work order IS the unit, and repeating its title above itself is noise.
     if len(res["units"]) != 1 or res["units"][0]["wo_id"] != res["scope"]:
-        print(f"{res['scope']} — {res['title']}")
-    for unit in res["units"]:
+        print(f"{res['scope']} — {res['title']}\n")
+    for index, unit in enumerate(res["units"]):
+        if index:
+            print()
         _print_anatomy(unit, res["write_floor"])
     return 0
 

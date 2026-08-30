@@ -150,19 +150,148 @@ A NOISY COST ALARM GETS IGNORED, and then it is worse than nothing. So each thre
 set from the fleet's own history — 438 worker turns across 118 dispatched work orders —
 at a point where it fires on a small minority:
 
-| threshold | default | why |
+| setting | default | why |
 |---|---|---|
-| `turn_minutes` | 60 | p95 of a turn's ACTIVE time is 59 minutes; fires on 16% of orders, and sits well below the 6-hour `is_stalled` flag, which is a different fact (hung, not expensive) |
-| `join_seconds` | 300 | the 5-minute cache TTL itself: past it the prefix is cold, so the wait converts into a re-write. Fires on 2% |
-| `write_tokens` | 300,000 | p95 of the largest re-write per order (median 130,519). ~$1.88 at Opus list in one event. Fires on 5% |
+| `alarm_turn_minutes` | 60 | p95 of a turn's ACTIVE time is 59 minutes; fires on 16% of orders, and sits well below the 6-hour `is_stalled` flag, which is a different fact (hung, not expensive) |
+| `alarm_join_seconds` | 300 | the 5-minute cache TTL itself: past it the prefix is cold, so the wait converts into a re-write. Fires on 2% |
+| `alarm_write_tokens` | 300,000 | p95 of the largest re-write per order (median 130,519). ~$1.88 at Opus list in one event. Fires on 5% |
 
-`join_seconds` is the only one that is principled rather than empirical, and it is the
+`alarm_join_seconds` is the only one that is principled rather than empirical, and it is the
 one that would have caught the 450-second block in §3.1.
 
-Settable as `os.inspect.*` through the config console — `config_version.resolve` walks
-the dataclasses reflectively, so `jarvis config set os.inspect.turn_minutes 20` reaches it
-with no edit to the console. A threshold below 1 is refused at parse time rather than
-clamped: it would flag every work order in the fleet, and it arrives by a typo.
+### 6.1 The sequence, end to end
+
+`jarvis inspect` is a read a person asks for. The alarm is the only part of this work
+that changes the daemon's execution flow, so here is exactly what runs, when, and what it
+touches.
+
+**Where it is called from.** `Daemon.tick()` runs every poll interval. Every
+`RECONCILE_EVERY_TICKS` (6) ticks it additionally runs the reconcile block, and
+`check_burning_turns` is the second-to-last step of it — after `seal_bills`, before
+`check_invariants`. It runs on the reconcile cadence and not every tick because it reads
+a file per running work order; it runs before the invariants because it is a fact about
+work still RUNNING, not about state that has settled.
+
+```
+Daemon.tick()                                    every poll interval
+└── if tick_count % RECONCILE_EVERY_TICKS == 1:  every 6th tick
+    ├── track_injected_sessions()
+    ├── seal_bills()
+    ├── check_burning_turns(project, store)      ◄── THE ALARM
+    └── check_invariants()
+```
+
+```
+check_burning_turns(project, store)
+│
+├─ project.inspect.enabled is False? ──────────────────────────► return, nothing read
+│
+├─ usage.index_sessions()            one directory walk, shared by every work order below
+│
+└─ for each work order with status == "running":
+   │
+   ├─ no session_id, or origin is ungoverned? ─────────────────► skip
+   │     (an injected session is the user's own; they are watching it)
+   ├─ store.latest_turn() is None or not "running"? ───────────► skip
+   │
+   ├─ inspection.live_alarms(session_id, project.inspect, now=time.time())
+   │  │
+   │  ├─ read_session()   ONE transcript read. No model call, nothing written.
+   │  │                   Read at alarm_write_tokens, not report_write_floor: the small
+   │  │                   writes would be classified and then thrown away.
+   │  └─ alarms()         judges THE LAST TURN ONLY, against three thresholds:
+   │        • wall = max(turn.wall, now - turn.started)  ≥ alarm_turn_minutes × 60
+   │             └─► "long-turn"    a turn still being billed
+   │        • an UNFINISHED join open ≥ alarm_join_seconds
+   │             └─► "long-join"    past the cache TTL, so the wait is paid for twice
+   │        • a write in this turn ≥ alarm_write_tokens and not cold-start
+   │             └─► "big-rewrite"  the conversation is being paid for again
+   │
+   ├─ store.events_of_kind(wo_id, "cost_alarm")
+   │     └─ drop any alarm whose (kind, turn seq) is already on the timeline
+   │
+   ├─ for each REMAINING alarm: store.add_event("cost_alarm", {kind, seq, reason})
+   │                            log.info(...)
+   │
+   └─ if any remained AND the work order is not already flagged:
+         store.flag_attention(wo_id, first_alarm.reason)
+```
+
+**What the user sees.** Exactly what every other blocker looks like — no new channel:
+
+```
+$ jarvis status
+  attention
+    wo-1a2b3c4d  jarvis_os  this turn has been running 74 minutes and is still
+                            being billed — `jarvis inspect wo-1a2b3c4d`
+```
+
+and on the work order's timeline, one row per alarm:
+
+```
+$ jarvis wo show wo-1a2b3c4d
+  ...
+  Costing money while it runs   this turn has been running 74 minutes …
+  Needs you                     this turn has been running 74 minutes …
+```
+
+**What it does NOT do.** It never cancels a turn, never sends the worker a message, never
+calls a model and never writes anything but the timeline event and the attention flag.
+The turn keeps running; the decision to let it or stop it is the user's, and
+`jarvis wo cancel` is the same command it always was. `worker_session.is_stalled` (6h) is
+untouched and still reports the different fact — hung rather than expensive.
+
+**Why the timeline event and not the attention flag is the memory.** The flag alone
+cannot be the record: `jarvis wo ack` puts it down, and on the next reconcile tick the
+same condition is still true, so the same sentence would come straight back. Matching on
+`(kind, turn seq)` in the timeline is what makes it ONE alarm per turn per kind, and it
+is why acknowledging one actually ends it. A new turn is a new seq and can raise its own.
+
+**Cost of running it.** One `index_sessions()` directory walk plus one transcript read per
+RUNNING work order, every 6th tick. Nothing when the fleet is idle, because a project with
+no running work order reads no files at all.
+
+
+### 6.2 Every threshold is a setting, fleet-wide and per project
+
+NOTHING IN `inspection.py` HARD-CODES A THRESHOLD. `catalog.InspectConfig` holds all six,
+and `tests/test_inspection.py::test_nothing_in_the_module_hard_codes_a_threshold` walks
+the module's AST and fails on any numeric literal outside a short allow-list of loop
+indices and the two cache TTLs — so a later change that reaches for a literal is caught
+here rather than in review.
+
+| setting | default | what it decides |
+|---|---|---|
+| `report_write_floor` | 20,000 | which cache writes `jarvis inspect` classifies. The method's own figure (§1 step 5) |
+| `report_join_floor` | 30 | which blocking joins get a line |
+| `quote_chars` | 140 | how much of a triggering prompt is quoted |
+| `alarm_turn_minutes` | 60 | when a running turn interrupts the user |
+| `alarm_join_seconds` | 300 | when an open join does |
+| `alarm_write_tokens` | 300,000 | when a single re-write does |
+
+The `report_` pair and the `alarm_` trio are prefixed rather than nested so that a reader
+of `jarvis config show` cannot mistake one for the other: they are thresholds on the same
+quantities at very different bars (30s against 300s for a join; 20k against 300k for a
+write), and swapping them would either flood the attention list or empty the report.
+
+Reachable as `os.inspect.*` and as `projects[].inspect.*`, with FIELD-LEVEL INHERITANCE
+(`catalog._parse_inspect`, modelled on `_parse_validation` — kn-6ca2bcd9): a project
+naming one key keeps the OS answer for the other five, and `ProjectSpec.inspect` is fully
+resolved so no caller consults two objects. `config_version.resolve` walks the dataclasses
+reflectively, so `jarvis config set proj_a inspect.alarm_turn_minutes 20` works with no
+edit to the config console.
+
+Per project rather than only fleet-wide because a threshold is a claim about what is
+NORMAL, and normal differs by project: an hour-long turn is routine where the work is a
+design document and a symptom where it is a one-file fix.
+
+A value below 1 is refused at parse time rather than clamped — zero would report every
+write a session makes and flag every work order the fleet runs, and it arrives by a typo.
+
+`TTL_5M` and `TTL_1H` stay constants and are the only numbers here that are not settings:
+they are the two durations Anthropic's cache actually offers (kn-f94abf34), not a policy
+Jarvis holds an opinion about. A catalog that could declare the cache lives for an hour
+when it does not would make every `ttl-expiry` label downstream wrong.
 
 **One alarm per turn per kind**, recorded as a `cost_alarm` timeline event and checked
 against that record rather than against the attention flag. The flag is not enough: the

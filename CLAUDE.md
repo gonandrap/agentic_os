@@ -268,8 +268,11 @@ jarvis inspect <wo-id|fo-id>               # where the TIME went, which `cost` c
                                            # a turn past an hour, a join past the cache
                                            # TTL, or a 300k re-write becomes an
                                            # attention item on the next reconcile tick.
-                                           # Thresholds: `jarvis config set
-                                           # os.inspect.turn_minutes …`.
+                                           # Every threshold is a setting, fleet-wide or
+                                           # per project: `jarvis config set <project>
+                                           # inspect.alarm_turn_minutes 90`. A project
+                                           # naming one keeps the fleet answer for the
+                                           # rest.
 jarvis adopt <path>                        # migrate a project into the OS
 jarvis ui                                  # dashboard at http://127.0.0.1:8787
 ```

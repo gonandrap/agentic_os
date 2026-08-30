@@ -1991,7 +1991,11 @@ class Daemon:
         from . import inspection
         from . import usage as usage_mod
 
-        cfg = self.catalog.os.inspect
+        # The PROJECT's thresholds, already resolved against the OS block by
+        # `catalog._parse_inspect`. What counts as a long turn is a statement about what
+        # is normal, and normal differs by project — an hour is routine where the work is
+        # a design document and a symptom where it is a one-file fix.
+        cfg = project.inspect
         if not cfg.enabled:
             return
         now = time.time()

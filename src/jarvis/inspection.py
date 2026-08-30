@@ -51,8 +51,9 @@ THE THRESHOLD IS LOAD-BEARING, not cosmetic. Inside one turn every call after th
 writes the delta it just added to the conversation while reading the rest — a few
 thousand tokens, seconds after the previous call, which by the gap test alone would read
 as a `prefix-miss`. It is not one; it is the cache working. Only a write large enough to
-be a re-send of the conversation is classified at all, which is why `write_floor` has a
-conservative default and why every report states it.
+be a re-send of the conversation is classified at all, which is why the floor is a
+setting rather than a literal (`catalog.InspectConfig`, per project) and why every report
+states the value it was taken at.
 
 ## No paid call, and nothing persisted
 
@@ -65,13 +66,19 @@ is reported as absent rather than guessed at.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from . import usage as usage_mod
+from .catalog import (DEFAULT_INSPECT_REPORT_JOIN_FLOOR,
+                      DEFAULT_INSPECT_REPORT_WRITE_FLOOR, InspectConfig)
 
-#: Cache TTLs in seconds. The 5-minute one is what every Jarvis call buys since
+#: Cache TTLs in seconds. NOT CONFIGURABLE, and deliberately not: these are the two
+#: durations Anthropic's prompt cache actually offers (kn-f94abf34), not a policy Jarvis
+#: gets to hold an opinion about. Making them settable would let a catalog declare that
+#: the cache lives for an hour when it does not, and every `ttl-expiry` label downstream
+#: would then be wrong. The 5-minute one is what every Jarvis call buys since
 #: `claude_cli.PROMPT_CACHE_5M_ENV` shipped (kn-5dd784f5); the hour is what older
 #: transcripts were charged for, and a write's own `cache_1h` split is what says which
 #: of the two a LATER call had to beat.
@@ -83,13 +90,6 @@ TTL_1H = 3600.0
 #: today — `Agent` itself returns immediately when the subagent is backgrounded, and the
 #: wait it defers is exactly what `TaskOutput` later collects.
 JOIN_TOOLS = ("TaskOutput",)
-
-#: What a re-write has to weigh before it is classified. Below this a write is the
-#: conversation's own growth, not a re-send of it; see the module docstring.
-DEFAULT_WRITE_FLOOR = 20_000
-
-#: What a blocking join has to last before it is worth a line of its own.
-DEFAULT_JOIN_FLOOR = 30.0
 
 COLD_START, TTL_EXPIRY, PREFIX_MISS = "cold-start", "ttl-expiry", "prefix-miss"
 
@@ -116,7 +116,7 @@ TRIGGERS: tuple[tuple[str, str], ...] = (
 MESSAGE_TRIGGER = "a message"
 
 
-def _first_line(text: str, limit: int = 140) -> str:
+def _first_line(text: str, limit: int) -> str:
     line = " ".join(text.split())
     return line[:limit] + "…" if len(line) > limit else line
 
@@ -315,7 +315,11 @@ class Anatomy:
     found: bool = False
     turns: list[Turn] = field(default_factory=list)
     writes: list[Write] = field(default_factory=list)
-    write_floor: int = DEFAULT_WRITE_FLOOR
+    #: The thresholds this reading was taken at, carried so every rendering of it can
+    #: state them. A report that shows "3 large writes" without saying what large meant
+    #: is not reproducible, and these are per-project settings (`catalog.InspectConfig`).
+    write_floor: int = DEFAULT_INSPECT_REPORT_WRITE_FLOOR
+    join_floor: int = DEFAULT_INSPECT_REPORT_JOIN_FLOOR
     #: Task id -> what it was, from the subagent `.meta.json` Claude Code writes beside
     #: the transcript. This is what turns "blocked 450s on a7b62083" into a sentence.
     subagents: dict[str, str] = field(default_factory=dict)
@@ -328,8 +332,10 @@ class Anatomy:
     def wall(self) -> float:
         return sum(t.wall for t in self.turns)
 
-    def joins(self, over: float = DEFAULT_JOIN_FLOOR) -> list[ToolSpan]:
-        return sorted((s for s in self.spans if s.is_join and s.seconds >= over),
+    def joins(self, over: float | None = None) -> list[ToolSpan]:
+        """Blocking joins at or over `over` seconds — the report's floor by default."""
+        floor = self.join_floor if over is None else over
+        return sorted((s for s in self.spans if s.is_join and s.seconds >= floor),
                       key=lambda s: s.seconds, reverse=True)
 
     def tool_profile(self) -> list[dict[str, Any]]:
@@ -385,14 +391,14 @@ class Anatomy:
         peak = max((t.context_peak for t in self.turns), default=0)
         return max(0, written - peak)
 
-    def as_dict(self, join_floor: float = DEFAULT_JOIN_FLOOR) -> dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         part = self.partition()
         wall = part["wall"] or 1.0
         return {
             "session_id": self.session_id,
             "found": self.found,
             "write_floor": self.write_floor,
-            "join_floor": join_floor,
+            "join_floor": self.join_floor,
             "partition": {k: round(v, 2) for k, v in part.items()},
             "share": {k: round(part[k] / wall, 4) for k in PARTS},
             "context_peak": max((t.context_peak for t in self.turns), default=0),
@@ -400,7 +406,7 @@ class Anatomy:
             "cache_ttl": self.cache_ttl(),
             "turns": [t.as_dict() for t in self.turns],
             "writes": [w.as_dict() for w in self.writes],
-            "joins": [s.as_dict() for s in self.joins(join_floor)],
+            "joins": [s.as_dict() for s in self.joins()],
             "tools": self.tool_profile(),
         }
 
@@ -408,7 +414,7 @@ class Anatomy:
 # -- reading a transcript --------------------------------------------------------------
 
 
-def _detail_of(payload: Any) -> str:
+def _detail_of(payload: Any, limit: int) -> str:
     """A one-line answer to "doing what" for a tool call.
 
     `description` first wherever it exists, because it is the agent's own words for what
@@ -419,7 +425,7 @@ def _detail_of(payload: Any) -> str:
     for key in ("description", "command", "task_id", "file_path", "pattern", "skill"):
         value = payload.get(key)
         if isinstance(value, str) and value:
-            return _first_line(value)
+            return _first_line(value, limit)
     return ""
 
 
@@ -437,7 +443,7 @@ def _prompt_text(row: dict[str, Any]) -> str:
     return " ".join(b.get("text", "") for b in usage_mod.blocks_of(row, "text"))
 
 
-def _prompt_of(row: dict[str, Any], ts: float) -> Prompt | None:
+def _prompt_of(row: dict[str, Any], ts: float, limit: int) -> Prompt | None:
     """The prompt this row is, or None if it is not one.
 
     THREE KINDS OF `user` ROW share the type and only one of them starts a turn. A tool
@@ -454,7 +460,7 @@ def _prompt_of(row: dict[str, Any], ts: float) -> Prompt | None:
     text = _prompt_text(row)
     if not text.strip():
         return None
-    return Prompt(ts=ts, kind=_trigger_kind(text), quote=_first_line(text),
+    return Prompt(ts=ts, kind=_trigger_kind(text), quote=_first_line(text, limit),
                   source=source)
 
 
@@ -480,7 +486,9 @@ def _subagent_labels(path: Path) -> dict[str, str]:
     return labels
 
 
-def read_transcript(path: Path | str) -> tuple[list[Turn], dict[str, str]]:
+def read_transcript(path: Path | str,
+                    cfg: InspectConfig | None = None,
+                    ) -> tuple[list[Turn], dict[str, str]]:
     """One transcript file, cut into turns with their tool spans attached.
 
     A single ordered walk, because the three things it collects are interleaved and
@@ -488,6 +496,7 @@ def read_transcript(path: Path | str) -> tuple[list[Turn], dict[str, str]]:
     at an injected prompt, but only at one with an assistant message since the last turn
     started — otherwise the two prompts Jarvis coalesces into one turn would read as two.
     """
+    cfg = cfg or InspectConfig()
     turns: list[Turn] = []
     pending: dict[str, ToolSpan] = {}
     open_turn: Turn | None = None
@@ -498,13 +507,13 @@ def read_transcript(path: Path | str) -> tuple[list[Turn], dict[str, str]]:
         # A TURN ENDS WHEN THE MODEL STOPS, NOT WHEN THE NEXT TURN STARTS. A worker turn
         # is one `claude -p` process and the next one can be days later, so closing a
         # turn at its successor's start charges it the whole idle gap: measured over the
-        # fleet's 370 worker turns that read the longest one as ELEVEN DAYS of wall
+        # fleet's 441 worker turns that read the longest one as ELEVEN DAYS of wall
         # clock, and every percentile above the median was the gap rather than the work.
         # Only conversation rows count — the UI-state rows Claude Code appends
         # (`custom-title`, `worktree-state`) are written outside the turn.
         if ts and open_turn is not None and row.get("type") in ("assistant", "user"):
             open_turn.ended = max(open_turn.ended, ts)
-        prompt = _prompt_of(row, ts)
+        prompt = _prompt_of(row, ts, cfg.quote_chars)
         if prompt is not None:
             # A new turn only if the model has spoken since the last one started:
             # `Daemon.deliver_messages` coalesces everything queued for a work order
@@ -523,7 +532,9 @@ def read_transcript(path: Path | str) -> tuple[list[Turn], dict[str, str]]:
             if not tool_id:
                 continue
             span = ToolSpan(name=str(block.get("name") or ""), tool_id=tool_id,
-                            started=ts, detail=_detail_of(block.get("input")))
+                            started=ts,
+                            detail=_detail_of(block.get("input"),
+                                              cfg.quote_chars))
             pending[tool_id] = span
             # Charged to the turn that ASKED for it. A span whose result lands after the
             # next turn starts still belongs to the turn that spent the seconds.
@@ -537,8 +548,7 @@ def read_transcript(path: Path | str) -> tuple[list[Turn], dict[str, str]]:
     return turns, _subagent_labels(Path(path))
 
 
-def classify_writes(calls: Sequence[usage_mod.Call],
-                    floor: int = DEFAULT_WRITE_FLOOR) -> list[Write]:
+def classify_writes(calls: Sequence[usage_mod.Call], floor: int) -> list[Write]:
     """Every cache write at or over `floor`, labelled with what caused it.
 
     The gap is measured to the PREVIOUS API call in the session whatever its size, and
@@ -565,7 +575,7 @@ def classify_writes(calls: Sequence[usage_mod.Call],
     return writes
 
 
-def read_session(session_id: str, *, write_floor: int = DEFAULT_WRITE_FLOOR,
+def read_session(session_id: str, cfg: InspectConfig | None = None, *,
                  root: Path | None = None,
                  index: dict[str, list[Path]] | None = None) -> Anatomy:
     """Take one session apart, across every segment file it left behind.
@@ -574,7 +584,9 @@ def read_session(session_id: str, *, write_floor: int = DEFAULT_WRITE_FLOOR,
     renumbered — a session resumed under a second cwd has a file under each slug
     (`usage.index_sessions`), and numbering per file would produce two turn 1s.
     """
-    anatomy = Anatomy(session_id=session_id, write_floor=write_floor)
+    cfg = cfg or InspectConfig()
+    anatomy = Anatomy(session_id=session_id, write_floor=cfg.report_write_floor,
+                      join_floor=cfg.report_join_floor)
     if index is None:
         index = usage_mod.index_sessions(root)
     paths = index.get(session_id)
@@ -583,7 +595,7 @@ def read_session(session_id: str, *, write_floor: int = DEFAULT_WRITE_FLOOR,
     anatomy.found = True
     turns: list[Turn] = []
     for path in sorted(paths):
-        found, labels = read_transcript(path)
+        found, labels = read_transcript(path, cfg)
         turns.extend(found)
         anatomy.subagents.update(labels)
     turns.sort(key=lambda t: t.started)
@@ -592,7 +604,7 @@ def read_session(session_id: str, *, write_floor: int = DEFAULT_WRITE_FLOOR,
     anatomy.turns = turns
 
     calls = usage_mod.session_calls(session_id, index=index)
-    anatomy.writes = classify_writes(calls, write_floor)
+    anatomy.writes = classify_writes(calls, cfg.report_write_floor)
     _attach_calls(turns, calls)
     _close_turns(turns)
     _name_joins(turns, anatomy.subagents)
@@ -678,7 +690,7 @@ class Alarm:
         return {"kind": self.kind, "reason": self.reason}
 
 
-def alarms(anatomy: Anatomy, cfg: Any, wo_id: str = "",
+def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
            now: float | None = None) -> list[Alarm]:
     """What is wrong with the turn that is running, most actionable first.
 
@@ -691,20 +703,20 @@ def alarms(anatomy: Anatomy, cfg: Any, wo_id: str = "",
     the wall and not against its own last line — measuring it against the transcript
     would report an hour-long turn as however long ago it last spoke.
     """
-    if not anatomy.found or not anatomy.turns or not getattr(cfg, "enabled", True):
+    if not anatomy.found or not anatomy.turns or not cfg.enabled:
         return []
     turn = anatomy.turns[-1]
     wall = max(turn.wall, (now - turn.started) if now else 0.0)
     raised: list[Alarm] = []
     hint = f" — `jarvis inspect {wo_id}`" if wo_id else ""
 
-    if wall >= cfg.turn_minutes * 60:
+    if wall >= cfg.alarm_turn_minutes * 60:
         raised.append(Alarm(TURN_ALARM, (
             f"this turn has been running {int(wall // 60)} minutes and is still being "
             f"billed{hint}")))
     for span in turn.spans:
         if span.is_join and not span.finished and now and \
-                now - span.started >= cfg.join_seconds:
+                now - span.started >= cfg.alarm_join_seconds:
             waited = int((now - span.started) // 60)
             raised.append(Alarm(JOIN_ALARM, (
                 f"blocked {waited}m waiting on {span.detail or span.tool_id} with no "
@@ -712,7 +724,7 @@ def alarms(anatomy: Anatomy, cfg: Any, wo_id: str = "",
                 f"wait will be paid for twice{hint}")))
             break
     for write in anatomy.writes:
-        if write.ts >= turn.started and write.written >= cfg.write_tokens \
+        if write.ts >= turn.started and write.written >= cfg.alarm_write_tokens \
                 and write.cause != COLD_START:
             raised.append(Alarm(WRITE_ALARM, (
                 f"re-sent {write.written:,} cached tokens in one call ({write.cause}) "
@@ -721,17 +733,15 @@ def alarms(anatomy: Anatomy, cfg: Any, wo_id: str = "",
     return raised
 
 
-def live_alarms(session_id: str, cfg: Any, *, wo_id: str = "",
-                now: float | None = None, write_floor: int | None = None,
-                root: Path | None = None,
+def live_alarms(session_id: str, cfg: InspectConfig, *, wo_id: str = "",
+                now: float | None = None, root: Path | None = None,
                 index: dict[str, list[Path]] | None = None) -> list[Alarm]:
     """`alarms` for a session id — one transcript read, no paid call, nothing written.
 
-    The write floor follows the ALARM's threshold rather than the report's: the only
+    The session is read at the ALARM's write threshold rather than the report's: the only
     writes this needs to see are the ones big enough to raise one, and classifying the
     small ones would be work whose answer is thrown away.
     """
-    floor = write_floor if write_floor is not None else int(
-        getattr(cfg, "write_tokens", DEFAULT_WRITE_FLOOR))
-    anatomy = read_session(session_id, write_floor=floor, root=root, index=index)
+    reading = replace(cfg, report_write_floor=cfg.alarm_write_tokens)
+    anatomy = read_session(session_id, reading, root=root, index=index)
     return alarms(anatomy, cfg, wo_id=wo_id, now=now)
