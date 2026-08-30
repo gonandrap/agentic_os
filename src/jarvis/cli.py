@@ -1193,11 +1193,19 @@ def _mins(seconds: float) -> str:
     return f"{seconds:.1f}s"
 
 
-def _print_partition(part: dict[str, float], share: dict[str, float]) -> None:
-    print(f"  wall clock {_mins(part['wall'])} — "
-          f"generating {share['generating'] * 100:.0f}%, "
-          f"blocked {share['blocked'] * 100:.0f}%, "
-          f"running tools {share['tools'] * 100:.0f}%")
+#: What each bucket of the partition is called on the page. `idle` says what it is
+#: rather than naming itself: "idle" alone reads as a judgement about the worker, and
+#: what happened is that no process existed to be busy.
+PART_LABELS = {"generating": "generating", "blocked": "blocked on a subagent",
+               "tools": "running tools", "idle": "between turns, nothing running"}
+
+
+def _print_partition(unit: dict[str, Any]) -> None:
+    part, share = unit["partition"], unit["share"]
+    print(f"  wall clock {_mins(part['wall'])}, peak context {_tok(unit['context_peak'])}")
+    for name in PART_LABELS:
+        print(f"    {share[name] * 100:>4.0f}%  {_mins(part[name]):>8}  "
+              f"{PART_LABELS[name]}")
 
 
 def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
@@ -1216,13 +1224,24 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
         print("  no transcript — nothing to measure")
         return
 
-    _print_partition(unit["partition"], unit["share"])
+    _print_partition(unit)
+    ttl = unit["cache_ttl"]
+    # §1 step 1 of the method: the re-write tax and the TTL split are read BEFORE the
+    # clock is partitioned, because they say whether the waiting below was paid for
+    # twice. `1h: 0` is the finding of §3.2 and no surface stated it until now.
+    print(f"  re-written {_tok(unit['rewrite_excess'])} tokens · cache writes bought at "
+          f"5m {_tok(ttl['cache_5m'])}, 1h {_tok(ttl['cache_1h'])}"
+          + (f", unknown {_tok(ttl['unknown'])}" if ttl["unknown"] else ""))
+
+    print()
     for turn in unit["turns"]:
         reasons = ", ".join(t["kind"] for t in turn["triggers"]) or "no prompt recorded"
         s = turn["share"]
         print(f"  turn {turn['seq']:>2}  {_mins(turn['wall']):>7}  "
               f"gen {s['generating'] * 100:>3.0f}%  blocked {s['blocked'] * 100:>3.0f}%  "
-              f"tools {s['tools'] * 100:>3.0f}%  {turn['api_calls']:>3} calls  {reasons}")
+              f"tools {s['tools'] * 100:>3.0f}%  idle {s['idle'] * 100:>3.0f}%  "
+              f"{turn['api_calls']:>3} calls  peak {_tok(turn['context_peak']):>5}  "
+              f"{reasons}")
         for trigger in turn["triggers"]:
             print(f"           ↳ {trigger['quote']}")
 

@@ -9,18 +9,30 @@ that cost money on every work order in the fleet.
 
 Design and worked example: `docs/superpowers/specs/2026-08-30-the-anatomy-of-a-turn.md`.
 
-## The partition, and why it is only three parts
+## The partition
+
+The method is `docs/anatomy-of-an-expensive-turn.md` §1 step 4, with one bucket added:
 
     executing tools   `tool_use` timestamp to the matching `tool_result` timestamp
     blocked           the subset of those where the tool is a BLOCKING JOIN
+    idle              after the turn's last API call, before the next turn's prompt
     generating        the wall clock left over
 
 Blocked is carved out of tool time rather than added beside it because the two are
 opposite facts about the same seconds: 45 seconds of `Bash` is work being done, and 450
 seconds of `TaskOutput` is the lead agent asleep with no API call in flight — and long
 enough to lose its prompt cache, which is why the same 450 seconds shows up again below
-as a `ttl-expiry` write. Everything not inside a tool span is charged to the model,
-including the gaps between spans; there is nothing else it can be.
+as a `ttl-expiry` write.
+
+IDLE IS THE ONE ADDITION TO THE METHOD, and it is here because the method's subject
+session could not see it. A turn runs from its prompt to the NEXT turn's prompt, which is
+what makes the turns sum to the session with nothing dropped — but a worker turn is one
+`claude -p` process, and between it exiting and Jarvis sending the next prompt there is a
+stretch where nothing is generating because nothing is running. On the subject session
+that stretch is 5s and 41s and charging it to the model is invisible. Across the fleet's
+441 worker turns it reaches ELEVEN DAYS, on a turn with a successor — a work order parked
+in `waiting_input` until a `wo send` arrived. Reported separately, `generating + idle` is
+the method's original figure, and neither number is a lie on either session.
 
 ## Three cache writes that look identical and are not
 
@@ -80,6 +92,10 @@ DEFAULT_WRITE_FLOOR = 20_000
 DEFAULT_JOIN_FLOOR = 30.0
 
 COLD_START, TTL_EXPIRY, PREFIX_MISS = "cold-start", "ttl-expiry", "prefix-miss"
+
+#: The buckets a wall clock divides into, in the order they are rendered. Walked rather
+#: than spelled out at each site, so a bucket cannot exist in one renderer and not another.
+PARTS = ("generating", "blocked", "tools", "idle")
 
 WRITE_CAUSE_NOTES = {
     COLD_START: "the first call of the session — unavoidable",
@@ -197,6 +213,10 @@ class Turn:
     seq: int
     started: float
     ended: float
+    #: The last thing the token accounting can see inside this turn — its last API call
+    #: or finished tool span. `ended` runs on to the NEXT turn's prompt; what lies
+    #: between the two is `idle`, and on a parked work order it is most of the turn.
+    active_ended: float = 0.0
     triggers: list[Prompt] = field(default_factory=list)
     spans: list[ToolSpan] = field(default_factory=list)
     calls: list[usage_mod.Call] = field(default_factory=list)
@@ -214,6 +234,17 @@ class Turn:
         return sum(s.seconds for s in self.spans if not s.is_join)
 
     @property
+    def idle(self) -> float:
+        """After the worker's last API call, before the next turn's prompt.
+
+        Nothing is running here — the `claude -p` process has exited and Jarvis has not
+        sent the next prompt yet. See the module docstring for why it is not `generating`.
+        """
+        if not self.active_ended:
+            return 0.0
+        return max(0.0, self.ended - self.active_ended)
+
+    @property
     def generating(self) -> float:
         """The wall clock nothing else accounts for.
 
@@ -221,7 +252,17 @@ class Turn:
         file Jarvis does not write, and a clock skew or an overlapping pair of spans
         must not produce a partition that reads as nonsense.
         """
-        return max(0.0, self.wall - self.blocked - self.tools)
+        return max(0.0, self.wall - self.blocked - self.tools - self.idle)
+
+    @property
+    def context_peak(self) -> int:
+        """The largest context any one call of this turn carried — §1 step 1.
+
+        Per TURN, which is the grain the method asks for and the grain `Usage` cannot
+        give: `usage.priced` deliberately leaves `context_peak` at zero because it is a
+        property of a conversation rather than of counts.
+        """
+        return max((c.context for c in self.calls), default=0)
 
     @property
     def unfinished(self) -> int:
@@ -240,17 +281,20 @@ class Turn:
     def share(self) -> dict[str, float]:
         """The partition as fractions of the wall clock, or all zero for an empty turn."""
         if self.wall <= 0:
-            return {"generating": 0.0, "blocked": 0.0, "tools": 0.0}
+            return {k: 0.0 for k in PARTS}
         return {"generating": self.generating / self.wall,
                 "blocked": self.blocked / self.wall,
-                "tools": self.tools / self.wall}
+                "tools": self.tools / self.wall,
+                "idle": self.idle / self.wall}
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "seq": self.seq, "started": self.started, "ended": self.ended,
             "wall": round(self.wall, 2), "generating": round(self.generating, 2),
             "blocked": round(self.blocked, 2), "tools": round(self.tools, 2),
+            "idle": round(self.idle, 2),
             "share": {k: round(v, 4) for k, v in self.share().items()},
+            "context_peak": self.context_peak,
             "api_calls": len(self.calls), "tool_calls": len(self.spans),
             "unfinished_tool_calls": self.unfinished,
             "triggers": [p.as_dict() for p in self.triggers],
@@ -310,9 +354,36 @@ class Anatomy:
     def partition(self) -> dict[str, float]:
         """The whole session's clock, summed over its turns."""
         return {"wall": self.wall,
-                "generating": sum(t.generating for t in self.turns),
-                "blocked": sum(t.blocked for t in self.turns),
-                "tools": sum(t.tools for t in self.turns)}
+                **{k: sum(getattr(t, k) for t in self.turns) for k in PARTS}}
+
+    def cache_ttl(self) -> dict[str, int]:
+        """Which TTL this session's cache writes were bought at — §1 step 5, §3.2.
+
+        The finding it exists to make visible is a ZERO: across 1.8M cache-write tokens
+        in the subject session the one-hour TTL was requested for none of them, and no
+        surface said so. `unknown` is writes whose record carries no split at all, kept
+        apart from a measured zero rather than folded into it.
+        """
+        split = {"cache_1h": 0, "cache_5m": 0, "unknown": 0}
+        for turn in self.turns:
+            for call in turn.calls:
+                split["cache_1h"] += call.cache_1h
+                split["cache_5m"] += call.cache_5m
+                split["unknown"] += max(0, call.cache_write - call.cache_1h
+                                        - call.cache_5m)
+        return split
+
+    def rewrite_excess(self) -> int:
+        """Tokens this session paid to send twice — `usage`'s definition, not a second one.
+
+        In a perfectly cached session every token is written to the cache exactly once,
+        so the total written can never exceed the largest context reached. `usage` owns
+        this arithmetic and the comment that justifies it; this reads the same two
+        numbers off the calls already in hand rather than re-opening the file.
+        """
+        written = sum(c.cache_write for t in self.turns for c in t.calls)
+        peak = max((t.context_peak for t in self.turns), default=0)
+        return max(0, written - peak)
 
     def as_dict(self, join_floor: float = DEFAULT_JOIN_FLOOR) -> dict[str, Any]:
         part = self.partition()
@@ -323,8 +394,10 @@ class Anatomy:
             "write_floor": self.write_floor,
             "join_floor": join_floor,
             "partition": {k: round(v, 2) for k, v in part.items()},
-            "share": {k: round(part[k] / wall, 4)
-                      for k in ("generating", "blocked", "tools")},
+            "share": {k: round(part[k] / wall, 4) for k in PARTS},
+            "context_peak": max((t.context_peak for t in self.turns), default=0),
+            "rewrite_excess": self.rewrite_excess(),
+            "cache_ttl": self.cache_ttl(),
             "turns": [t.as_dict() for t in self.turns],
             "writes": [w.as_dict() for w in self.writes],
             "joins": [s.as_dict() for s in self.joins(join_floor)],
@@ -527,24 +600,33 @@ def read_session(session_id: str, *, write_floor: int = DEFAULT_WRITE_FLOOR,
 
 
 def _close_turns(turns: Sequence[Turn]) -> None:
-    """End each turn at the last thing the token accounting can see inside it.
+    """Give every turn its two ends: when it stopped working, and when it stopped.
 
-    THE ROW CLOCK IS NOT ENOUGH ON ITS OWN. A transcript file can be appended to long
-    after its last API call — an old-transport session resumed by hand under the same id
-    writes conversation rows with no prompt row before them, and one such file charged a
-    21-minute turn with TWELVE DAYS of wall clock. Rows `usage` cannot count must not
-    move a clock `usage` is the denominator of either: bounding the turn by its own
-    calls and tool spans is what keeps `jarvis inspect` and `jarvis cost` cutting the
-    session at identical points, which is the whole value of laying one beside the other.
+    `active_ended` is the last thing the token accounting can SEE inside the turn — its
+    own API calls and finished tool spans. THE ROW CLOCK IS NOT ENOUGH FOR THIS. A
+    transcript can be appended to long after its last call (an old-transport session
+    resumed by hand under the same id writes conversation rows with no prompt row before
+    them), and one such file charged a 21-minute turn with TWELVE DAYS. Rows `usage`
+    cannot count must not move a clock `usage` is the denominator of.
 
-    A turn with neither — a prompt whose turn never produced anything — keeps the row
-    clock, because there is nothing better and zero would be a claim rather than a gap.
+    `ended` runs on to the NEXT turn's prompt, which is the method's own rule
+    (`docs/anatomy-of-an-expensive-turn.md` §2) and is what makes the turns sum to the
+    session with nothing between them dropped. The gap between the two is `idle`.
+
+    A turn with no calls and no finished spans keeps `active_ended` at zero, which reads
+    as "no idle known" rather than as an idle turn — there is nothing to measure from,
+    and zero would be a claim rather than a gap.
     """
-    for turn in turns:
+    for index, turn in enumerate(turns):
         seen = [call.ts for call in turn.calls]
         seen += [span.ended for span in turn.spans if span.finished]
         if seen:
-            turn.ended = max(turn.started, max(seen))
+            turn.active_ended = max(turn.started, max(seen))
+        following = turns[index + 1] if index + 1 < len(turns) else None
+        # The LAST turn has no successor to run on to, so it ends where it stopped
+        # working — and that is exactly where the twelve-day transcript above lives.
+        turn.ended = following.started if following else (turn.active_ended
+                                                          or turn.ended)
 
 
 def _attach_calls(turns: Sequence[Turn], calls: Iterable[usage_mod.Call]) -> None:

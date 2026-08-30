@@ -270,9 +270,12 @@ class NeoConfig:
 #: shipped. See `inspection.Alarm` and
 #: docs/superpowers/specs/2026-08-30-the-anatomy-of-a-turn.md §5.
 #:
+#: Measured against a turn's ACTIVE time — its own process — not its span, which for a
+#: turn with a successor runs on to the next prompt and includes `idle`.
+#:
 #: A NOISY COST ALARM IS WORSE THAN NONE, so each threshold is set where it fires on a
 #: small minority and the measured rate is stated beside it.
-DEFAULT_INSPECT_TURN_MINUTES = 60    # p95 of a single turn is 54m; fires on 15% of orders
+DEFAULT_INSPECT_TURN_MINUTES = 60    # p95 of a turn's ACTIVE time is 59m; fires on 16%
 DEFAULT_INSPECT_JOIN_SECONDS = 300   # the 5-minute cache TTL itself; fires on 2%
 DEFAULT_INSPECT_WRITE_TOKENS = 300_000  # p95 of the largest re-write per order; fires on 5%
 

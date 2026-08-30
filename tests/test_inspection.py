@@ -40,20 +40,43 @@ def real_session(monkeypatch):
 # -- the three findings the command exists to produce ----------------------------------
 
 
-def test_the_wall_clock_splits_into_generating_blocked_and_tools(real_session):
-    """66% generating, 31% blocked on a subagent join, 3% executing tools.
+def test_the_wall_clock_splits_the_way_the_method_says(real_session):
+    """`docs/anatomy-of-an-expensive-turn.md`'s summary table, to the second: 1886s of
+    wall clock, 576s blocked on a subagent join, 58s executing tools.
 
     The question that started this: a DESIGN-ONLY agent with three 14-minute turns. A
     third of it was the lead agent asleep with no API call in flight, which is invisible
     to every token-based surface Jarvis had.
     """
     part = real_session.partition()
-    share = {k: part[k] / part["wall"] for k in ("generating", "blocked", "tools")}
 
-    assert round(share["generating"], 2) == 0.66
-    assert round(share["blocked"], 2) == 0.31
-    assert round(share["tools"], 2) == 0.03
-    assert sum(share.values()) == pytest.approx(1.0)
+    assert round(part["wall"]) == 1886
+    assert round(part["blocked"]) == 576
+    assert round(part["tools"]) == 58
+    assert sum(part[k] for k in inspection.PARTS) == pytest.approx(part["wall"])
+
+
+def test_the_method_s_66_percent_is_generating_plus_idle(real_session):
+    """THE ONE PLACE THIS DEPARTS FROM THE METHOD, and it is a decomposition rather than
+    a disagreement. The method charges everything outside a tool span to the model, which
+    on this session folds in 46 seconds during which no `claude -p` process existed —
+    invisible here, and ELEVEN DAYS on a fleet turn whose work order was parked in
+    `waiting_input`. Split out, the method's figure is still recoverable exactly."""
+    part = real_session.partition()
+
+    assert round(part["generating"] + part["idle"]) == 1252  # the method's number
+    assert round(part["idle"]) == 46
+    assert round((part["generating"] + part["idle"]) / part["wall"], 2) == 0.66
+
+
+def test_each_turn_matches_the_method_s_per_turn_table(real_session):
+    """§2: 865s / 136s blocked / 26s tools, then 885s / 440s / 23s, then 136s / 0 / 9s."""
+    rows = [(round(t.wall), round(t.blocked), round(t.tools))
+            for t in real_session.turns]
+
+    assert rows == [(865, 136, 26), (885, 440, 23), (136, 0, 9)]
+    # "Half of turn 2 was the lead agent doing nothing, holding a 193k context."
+    assert round(real_session.turns[1].share()["blocked"], 2) == 0.50
 
 
 def test_the_three_big_writes_are_told_apart_by_cause(real_session):
@@ -87,14 +110,44 @@ def test_every_blocking_join_is_named_by_what_it_waited_on(real_session):
 
 
 def test_the_tool_profile_prices_reading_the_whole_codebase(real_session):
-    """55 Bash calls at 0.8s each. Individually invisible, collectively 45 seconds."""
+    """§3.6: 55 Bash calls at 0.8s each. Individually invisible, collectively 45 seconds
+    — which is why optimising how an agent searches a codebase would save nothing."""
     rows = {r["name"]: r for r in real_session.tool_profile()}
 
     assert rows["Bash"]["calls"] == 55
     assert round(rows["Bash"]["seconds"], 1) == 45.6
     assert round(rows["Bash"]["mean"], 1) == 0.8
-    # The joins dominate the clock while being 2 calls of 81.
+    # The summary table's "58s across 79 calls": the profile counts all 81 tool calls,
+    # and the 2 joins are the ones charged to `blocked` rather than to tool execution.
+    assert sum(r["calls"] for r in real_session.tool_profile()) == 81
+    assert rows["TaskOutput"]["calls"] == 2
     assert rows["TaskOutput"]["seconds"] > rows["Bash"]["seconds"] * 10
+
+
+def test_the_one_hour_cache_was_never_once_requested(real_session):
+    """§3.2, and the finding is a ZERO — a number no surface stated before this one.
+
+    THE METHOD'S ABSOLUTE TOTAL IS WRONG AND ITS CONCLUSION IS NOT. §3.2 reports
+    1,797,566 cache-write tokens; that is the sum over transcript ROWS, and a single
+    assistant message is written once per content block, so it counts the same API
+    response up to three times (the trap `usage._assistant_messages` exists for). Deduped
+    by message id the lead agent wrote 569,173. The ratio the finding rests on — 1h
+    against 5m — is unaffected, because the duplicates inflate both sides equally.
+    """
+    split = real_session.cache_ttl()
+
+    assert split["cache_1h"] == 0
+    assert split["cache_5m"] == 569_173
+    assert split["unknown"] == 0
+
+
+def test_the_peak_context_is_reported_per_turn(real_session):
+    """§1 step 1 asks for it per turn, and per turn is the only grain that answers "how
+    large did the conversation get before that re-write"."""
+    peaks = [t.context_peak for t in real_session.turns]
+
+    assert peaks == sorted(peaks) and peaks[-1] == 233_585
+    assert real_session.rewrite_excess() > 0
 
 
 def test_each_turn_says_why_it_happened(real_session):
@@ -128,6 +181,7 @@ def test_a_session_with_no_transcript_is_absent_not_empty(monkeypatch, tmp_path)
 
     assert anatomy.found is False and anatomy.turns == []
     assert anatomy.partition()["wall"] == 0.0
+    assert anatomy.cache_ttl() == {"cache_1h": 0, "cache_5m": 0, "unknown": 0}
 
 
 def stamp(at: float) -> str:
@@ -246,6 +300,7 @@ def test_a_turn_ends_at_its_last_api_call_not_at_a_row_written_days_later(
     (turn,) = inspection.read_session(session).turns
 
     assert turn.wall == pytest.approx(60, abs=1)
+    assert turn.idle == 0.0  # nothing to be idle BETWEEN: there is no next turn
 
 
 def test_an_unfinished_tool_call_is_counted_but_not_timed(write_transcript):

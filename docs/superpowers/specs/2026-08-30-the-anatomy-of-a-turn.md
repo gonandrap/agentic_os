@@ -2,6 +2,9 @@
 
 **Status:** shipped (wo-797367ee)
 **Subject:** `jarvis inspect`, and the live alarm for a turn that is still burning
+**Implements:** `docs/anatomy-of-an-expensive-turn.md` — the METHOD this automates, with
+the worked example it was derived from. That document is the specification; this one
+records what building it changed, and §7 lists every departure from it.
 **Companions:** `docs/superpowers/specs/2026-08-16-the-bill.md` (where the MONEY went),
 kn-335170a1 (the cold-resume boundary), kn-f94abf34 (the cache-write TTL)
 
@@ -17,21 +20,25 @@ reads it.
 
 ## 2. The partition
 
-Three parts, per turn and per session:
+The method's §1 step 4, with one bucket added:
 
 | part | how it is measured |
 |---|---|
 | executing tools | `tool_use` timestamp to the matching `tool_result` timestamp |
 | blocked | the subset of those spans whose tool is a BLOCKING JOIN (`TaskOutput`) |
+| idle | after the turn's last API call, before the next turn's prompt |
 | generating | the wall clock left over |
 
 Blocked is carved OUT of tool time rather than counted beside it, because they are
 opposite facts about the same seconds: 45 seconds of `Bash` is work being done, and 450
-seconds of `TaskOutput` is the lead agent asleep with no API call in flight. Everything
-outside a tool span is charged to the model; there is nothing else it can be.
+seconds of `TaskOutput` is the lead agent asleep with no API call in flight. What is left
+after the three measured buckets is charged to the model, including the gaps between
+spans; inside a running process there is nothing else it can be.
 
 `Agent` is not a join. It returns as soon as the subagent is backgrounded; the wait it
 defers is exactly what a later `TaskOutput` collects.
+
+`idle` is the one addition, and §7.1 is why it exists.
 
 ### 2.1 Where a turn begins and ends
 
@@ -51,13 +58,17 @@ two days into a single "turn". A `user` row is a prompt unless it is a tool resu
 `isMeta` — the latter is Claude Code talking to itself, and counting one would cut a turn
 in half at the moment a skill loaded.
 
-**It ends at its last API call or tool span, not at the next turn's start and not at the
-file's last row.** Closing a turn at its successor's start charges it the whole idle gap
-between two `claude -p` processes; over the fleet's 438 worker turns that read the longest
-as ELEVEN DAYS. Closing it at the last row is nearly right and fails on an old-transport
-transcript appended to under the same session id twelve days later. Bounding it by what
-`usage` can count is what keeps `jarvis inspect` and `jarvis cost` cutting the session at
-identical points, which is the whole value of laying one beside the other.
+**It has two ends, not one.** `ended` runs on to the next turn's prompt, which is the
+method's own rule (§2) and is what makes the turns sum to the session with nothing
+dropped. `active_ended` is the last thing the token accounting can COUNT inside it — its
+own API calls and finished tool spans. The gap between them is `idle`.
+
+Neither end can be taken from the row clock. A transcript can be appended to long after
+its last call — an old-transport session resumed by hand under the same id writes
+conversation rows with no prompt row before them — and one such file charged a 21-minute
+turn with TWELVE DAYS. That case has no successor to run on to, so the LAST turn of a
+session ends at `active_ended`; bounding it by what `usage` can count is also what keeps
+`jarvis inspect` and `jarvis cost` cutting the session at identical points.
 
 ## 3. Three cache writes that look identical
 
@@ -83,8 +94,9 @@ classified at all, and every report states the floor it used.
 ### 3.1 The worked example, which is also the regression fixture
 
 `wo-5a6b2d6d`, the planner of `fo-306b8f48`: a design-only agent, $19.28 / 19.0M tokens,
-three ~14-minute turns. 66% generating, 31% blocked on a subagent join, 3% executing
-tools. 55 `Bash` calls averaging 0.8s — reading the whole codebase cost 45.6 seconds
+three ~14-minute turns. 1886s of wall clock: 64% generating, 31% blocked on a subagent
+join, 3% executing tools, 2% idle between turns — and 64% + 2% is the method's 66%
+(§7.1). 55 `Bash` calls averaging 0.8s — reading the whole codebase cost 45.6 seconds
 against 9.6 minutes of waiting for two subagents.
 
     t = 0.00m    45,169 written,      0 read                    cold-start
@@ -99,7 +111,24 @@ The session is committed as `tests/data/transcripts/`, reduced to its skeleton b
 every payload is dropped. 1.5 MB of source code and other people's words became 166 KB of
 arithmetic that reproduces all three findings exactly.
 
-## 4. Repairs this instrument found and did NOT make
+## 4. Two corrections to the method, found by implementing it
+
+Both are recorded here because the method document is committed beside this one and a
+reader will check the command's output against it.
+
+**4.1 — §3.2's absolute total counts every API response up to three times.** It reports
+1,797,566 cache-write tokens for the subject session. That is the sum over transcript
+ROWS, and Claude Code writes a single assistant message once per content block as its
+text grows; deduped by message id the lead agent wrote **569,173** (127 rows, 68
+messages). This is the trap `usage._assistant_messages` was written for and which the
+work order's constraints require reusing rather than re-deriving. **The finding is
+unaffected**: 1h = 0 either way, because the duplicates inflate both sides of the ratio
+equally, and a zero stays a zero.
+
+**4.2 — §2's per-turn wall clock silently includes time when nothing was running.** See
+§7.1.
+
+## 5. Repairs this instrument found and did NOT make
 
 Both belong to `wo-237d6dc4`, which is queued with the measurements. Building the
 instrument added one thing to them:
@@ -111,7 +140,7 @@ order on this machine, the largest re-write per order has a MEDIAN of 130,519 to
 starts. Whatever fixes the prefix-miss is worth roughly what fixes the TTL expiry, and
 neither is a rounding error.
 
-## 5. The live half, and why its defaults are what they are
+## 6. The live half, and why its defaults are what they are
 
 Every cost surface Jarvis had answered after the fact. The alarm runs the same arithmetic
 against a turn that has not finished, on the reconcile cadence, and reaches the user
@@ -123,7 +152,7 @@ at a point where it fires on a small minority:
 
 | threshold | default | why |
 |---|---|---|
-| `turn_minutes` | 60 | p95 of a single turn is 54 minutes; fires on 15% of orders, and sits well below the 6-hour `is_stalled` flag, which is a different fact (hung, not expensive) |
+| `turn_minutes` | 60 | p95 of a turn's ACTIVE time is 59 minutes; fires on 16% of orders, and sits well below the 6-hour `is_stalled` flag, which is a different fact (hung, not expensive) |
 | `join_seconds` | 300 | the 5-minute cache TTL itself: past it the prefix is cold, so the wait converts into a re-write. Fires on 2% |
 | `write_tokens` | 300,000 | p95 of the largest re-write per order (median 130,519). ~$1.88 at Opus list in one event. Fires on 5% |
 
@@ -141,9 +170,42 @@ user putting it down with `jarvis wo ack` would bring the same sentence straight
 the next tick, which is exactly how a cost alarm becomes noise.
 
 **Only the last turn is judged.** An alarm about spend the user can no longer prevent is
-the noise; everything earlier belongs on `jarvis inspect`.
+the noise; everything earlier belongs on `jarvis inspect`. It is measured against the
+turn's ACTIVE time — a running turn has no successor, so it has no `idle` yet.
 
-## 6. What it costs to run
+## 7. Every departure from the method
+
+### 7.1 `idle` is split out of `generating`
+
+The method charges everything outside a tool span to the model. On its subject session
+that is right to within 46 seconds: the gap between a turn's last API call and the next
+turn's prompt is 5s and 41s, which is Jarvis's own delivery latency and invisible at this
+scale. Across the fleet's 441 worker turns the same gap reaches **eleven days**, on a turn
+that HAS a successor — a work order parked in `waiting_input` until a `wo send` arrived.
+Charging that to "model generating" would make the headline of every parked work order a
+lie.
+
+So it is reported as its own bucket, and `generating + idle` recovers the method's figure
+exactly: 1205s + 46s = **1252s = 66%**, which is what §-summary asserts. Nothing is lost
+and the parked case reads correctly.
+
+### 7.2 A `user` prompt is a turn boundary too
+
+The method reads turn boundaries from `promptSource == "sdk"` (§1 step 3). That is right
+for where a turn's REASON is quoted from and wrong for where one starts: a session the
+user injected (`jarvis wo inject`) or a worker they resumed by hand has turns Jarvis never
+sent, and reading only the injected ones fused one real session's last two days into a
+single turn. A `user` row starts a turn unless it is a tool result or `isMeta` — the
+latter is Claude Code talking to itself, and counting one would cut a turn in half at the
+moment a skill loaded.
+
+### 7.3 A third write label: `cold-start`
+
+§4 requirement 3 names two labels, `TTL-expiry` and `prefix-miss`. The first write of a
+session is neither — §3.5 discusses it separately and it is not a defect — so it gets its
+own label rather than being mislabelled a prefix-miss for having no predecessor.
+
+## 8. What it costs to run
 
 Nothing paid. One transcript read per running work order per reconcile tick, over files
 Claude Code already wrote. Read-only, nothing persisted except the timeline event, and a
