@@ -1216,6 +1216,13 @@ def signin(tmp_path, monkeypatch):
     credentials file, stamped now unless `at` back-dates it. Not autouse, because the
     gate already points the path at a file that does not exist, and "cannot tell, do not
     resume" is what every other test wants from this.
+
+    THE STAMP MUST NOT BE MOVED FORWARD to make "signed in after the failure" reliable,
+    however tempting that is when a test races. The mtime becomes the pause's `retry_at`
+    verbatim (`worker_session._auth_retry_at`) and `TurnPause.due()` is `now >=
+    retry_at` — so a sign-in stamped in the future is a pause that is not due yet, which
+    is the opposite of what such a test is asserting. Back-date the FAILURE instead; see
+    `test_auth_resume._auth_turn`.
     """
     path = tmp_path / "credentials.json"
     monkeypatch.setenv(CREDENTIALS_ENV, str(path))
