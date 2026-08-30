@@ -462,6 +462,64 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("command")
     g.add_argument("--project")
 
+    # config (the versioned configuration console) ---------------------------------------
+    # docs/superpowers/specs/2026-08-27-the-config-console.md §8. Every subcommand takes
+    # the project as an optional FIRST POSITIONAL, and it scopes the path rather than
+    # merely filtering: `set proj_a validation.enabled` is `projects.proj_a.…`.
+    cf = sub.add_parser(
+        "config",
+        help="the fleet's configuration: read it, change it, and see who changed it "
+             "when and why. Every write records a version and rewrites the catalog",
+    ).add_subparsers(dest="cfg_cmd", required=True)
+
+    c = cf.add_parser("show", help="the effective configuration, and which version it is")
+    c.add_argument("project", nargs="?", help="only this project's settings, plus the "
+                                              "fleet settings it runs under")
+    c.add_argument("--version", help="a stored version instead of the live file")
+    c.add_argument("--catalog", help="a catalog file other than the registered one")
+
+    c = cf.add_parser("get", help="one setting, as the fleet reads it")
+    c.add_argument("project", nargs="?")
+    c.add_argument("path", help="e.g. os.validation.enabled, or validation.enabled "
+                                "when a project is named")
+    c.add_argument("--catalog")
+
+    c = cf.add_parser("set", help="change one setting")
+    c.add_argument("project", nargs="?")
+    c.add_argument("path")
+    c.add_argument("value", help="JSON if it parses as JSON (true, 3, null, [\"a\"]), "
+                                 "otherwise the literal string")
+    c.add_argument("--reason", default="",
+                   help="REQUIRED for a safety setting (permission_mode, gates, "
+                        "validation, neo.enabled) — it goes on the version row")
+    c.add_argument("--catalog")
+
+    c = cf.add_parser("unset", help="drop one setting, so it falls back to its default")
+    c.add_argument("project", nargs="?")
+    c.add_argument("path")
+    c.add_argument("--reason", default="")
+    c.add_argument("--catalog")
+
+    c = cf.add_parser("history", help="who changed what, when and why")
+    c.add_argument("project", nargs="?")
+    c.add_argument("--limit", type=int, default=20)
+
+    c = cf.add_parser("diff", help="every setting two versions disagree on")
+    c.add_argument("a", help="a version id, or any unambiguous prefix of one")
+    c.add_argument("b")
+
+    c = cf.add_parser("restore", help="put an old version back — writes forward")
+    c.add_argument("version_id")
+    c.add_argument("--reason", default="")
+    c.add_argument("--catalog")
+
+    c = cf.add_parser(
+        "adopt",
+        help="record a hand-edited catalog as a version, so the record catches up "
+             "with the file")
+    c.add_argument("--reason", default="")
+    c.add_argument("--catalog")
+
     # backlog ---------------------------------------------------------------------------
     bl = sub.add_parser("backlog", help="unified deferred-work backlog").add_subparsers(
         dest="bl_cmd", required=True)
@@ -1603,6 +1661,128 @@ def cmd_gate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cfg_value(value: Any) -> str:
+    """A setting as JSON, so `"true"` never reads as `true`."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _cfg_change(change: dict) -> str:
+    sign = {"added": "+", "removed": "-", "changed": "~"}[change["kind"]]
+    if change["kind"] == "added":
+        return f"{sign} {change['path']} = {_cfg_value(change['new'])}"
+    if change["kind"] == "removed":
+        return f"{sign} {change['path']} (was {_cfg_value(change['old'])})"
+    return (f"{sign} {change['path']}: {_cfg_value(change['old'])} → "
+            f"{_cfg_value(change['new'])}")
+
+
+def _print_config_write(data: dict) -> None:
+    change = data["change"]
+    print(f"✓ {_cfg_change(change)}")
+    if data["safety"]:
+        print("  ⚠ SAFETY SETTING — this changes what a worker is allowed to do")
+    print(f"  {data['apply']} — {data['note']}")
+    print(f"  {data['version']['id']}"
+          + ("" if data.get("changed", True) else "  (the document was already this — "
+                                                  "no new version)"))
+
+
+def _print_config_versions(rows: list[dict]) -> None:
+    for row in rows:
+        head = "●" if row.get("head") else " "
+        reason = f" · {row['reason']}" if row["reason"] else ""
+        print(f"{head} {row['id']}  {row['actor']} · {_age(row['ts'])} ago{reason}")
+        for change in row["changes"][:4]:
+            print(f"      {_cfg_change(change)}")
+        if len(row["changes"]) > 4:
+            print(f"      … and {len(row['changes']) - 4} more")
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    from . import ops
+
+    if args.cfg_cmd == "show":
+        data = ops.config_show(project=args.project, version=args.version,
+                               catalog_path=args.catalog)
+        if args.json:
+            _print(data, True)
+            return 0
+        version = data["version"]
+        if data["source"] == "version":
+            print(f"{version['id']}  {version['actor']} · {_age(version['ts'])} ago"
+                  + (f" · {version['reason']}" if version["reason"] else ""))
+        else:
+            print(f"catalog: {data['catalog']}")
+            if data["drift"]:
+                print(f"⚠ the file is {data['file_version']}, which is NOT the recorded "
+                      f"head — `jarvis config adopt` to record it, or "
+                      f"`jarvis config restore <id>` to put the record's version back")
+            else:
+                print(f"version: {version['id']}  {version['actor']} · "
+                      f"{_age(version['ts'])} ago")
+        for path, value in sorted(data["resolved"].items()):
+            print(f"  {path} = {_cfg_value(value)}")
+    elif args.cfg_cmd == "get":
+        data = ops.config_get(args.path, project=args.project,
+                              catalog_path=args.catalog)
+        if args.json:
+            _print(data, True)
+        else:
+            source = "set in the catalog" if data["written"] else "the shipped default"
+            print(f"{data['path']} = {_cfg_value(data['value'])}   ({source})")
+            print(f"  {data['apply']} — {data['note']}")
+    elif args.cfg_cmd == "set":
+        data = ops.set_config(args.path, ops.parse_config_value(args.value),
+                              project=args.project, reason=args.reason,
+                              catalog_path=args.catalog)
+        _print(data, True) if args.json else _print_config_write(data)
+    elif args.cfg_cmd == "unset":
+        data = ops.unset_config(args.path, project=args.project, reason=args.reason,
+                                catalog_path=args.catalog)
+        _print(data, True) if args.json else _print_config_write(data)
+    elif args.cfg_cmd == "history":
+        rows = ops.config_history(project=args.project, limit=args.limit)
+        if args.json:
+            _print(rows, True)
+        elif not rows:
+            print("no configuration versions recorded yet — "
+                  "`jarvis config adopt` records the file as the first")
+        else:
+            _print_config_versions(rows)
+    elif args.cfg_cmd == "diff":
+        data = ops.config_diff(args.a, args.b)
+        if args.json:
+            _print(data, True)
+            return 0
+        print(f"{data['a']['id']} ({data['a']['actor']}) → "
+              f"{data['b']['id']} ({data['b']['actor']})")
+        for change in data["changes"]:
+            print(f"  {_cfg_change(change)}")
+        if not data["changes"]:
+            print("  (identical)")
+    elif args.cfg_cmd == "restore":
+        data = ops.restore_config(args.version_id, reason=args.reason,
+                                  catalog_path=args.catalog)
+        if args.json:
+            _print(data, True)
+            return 0
+        print(f"✓ restored {data['restored']} — now the head")
+        for change in data["changes"]:
+            print(f"  {_cfg_change(change)}")
+        if "restart" in data["classes"]:
+            print("  ⚠ some of these need `jarvis start` to take effect")
+    elif args.cfg_cmd == "adopt":
+        data = ops.adopt_config(reason=args.reason, catalog_path=args.catalog)
+        if args.json:
+            _print(data, True)
+            return 0
+        print(("✓ " if data["adopted"] else "· ") + data["note"])
+        print(f"  {data['version']['id']}")
+        for change in data["changes"][:20]:
+            print(f"  {_cfg_change(change)}")
+    return 0
+
+
 def _backlog_origin(item: dict) -> str:
     """One line saying where a deferred item came from, or "" for one somebody typed.
 
@@ -2173,6 +2353,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_fo(args)
         if args.cmd == "gate":
             return cmd_gate(args)
+        if args.cmd == "config":
+            return cmd_config(args)
         if args.cmd == "backlog":
             return cmd_backlog(args)
         if args.cmd == "brief":
