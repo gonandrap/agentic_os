@@ -251,6 +251,25 @@ jarvis cost [project|wo-id|fo-id]          # what the work cost in tokens. TWO H
                                            # cache-WRITE rate, ~12% of fleet spend.
                                            # Dollars are list prices, a common unit for
                                            # comparing token kinds — not a bill.
+jarvis inspect <wo-id|fo-id>               # where the TIME went, which `cost` cannot
+                                           # say. Splits each turn's wall clock into
+                                           # generating / blocked on a subagent /
+                                           # running tools, names every blocking join,
+                                           # profiles the tools, quotes the prompt that
+                                           # started each turn — and LABELS every big
+                                           # cache write by cause: `cold-start`,
+                                           # `ttl-expiry` (the cache had expired) or
+                                           # `prefix-miss` (it had NOT, and the
+                                           # conversation was re-sent anyway — a
+                                           # defect). Those two look identical on a
+                                           # bill, cost the same, and have completely
+                                           # different fixes. Read-only, no model call.
+                                           # The OS also raises this WHILE it happens:
+                                           # a turn past an hour, a join past the cache
+                                           # TTL, or a 300k re-write becomes an
+                                           # attention item on the next reconcile tick.
+                                           # Thresholds: `jarvis config set
+                                           # os.inspect.turn_minutes …`.
 jarvis adopt <path>                        # migrate a project into the OS
 jarvis ui                                  # dashboard at http://127.0.0.1:8787
 ```

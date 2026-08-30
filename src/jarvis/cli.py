@@ -3,6 +3,8 @@
 Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
   jarvis cost [project|wo-id|fo-id]       what the work has cost in tokens
+  jarvis inspect <wo-id|fo-id>            where its TIME went, and which cache writes
+                                          were a defect rather than the cache expiring
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
   jarvis fo create|list|show|plan|submit|approve|cancel feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
@@ -158,6 +160,10 @@ class _VersionAction(argparse.Action):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # A leaf module with no store or CLI dependency, so importing it here costs nothing
+    # and lets `--help` state the defaults it actually uses rather than repeating them.
+    from . import inspection
+
     p = argparse.ArgumentParser(prog="jarvis", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--json", action="store_true", help="machine-readable output")
@@ -192,6 +198,21 @@ def build_parser() -> argparse.ArgumentParser:
                          "(default: the whole fleet)")
     sp.add_argument("--limit", type=int, default=50,
                     help="work orders per project to measure (default: 50)")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser(
+        "inspect",
+        help="where an order's TIME went: generating, blocked or running tools — and "
+             "which cache writes were a defect rather than the cache expiring",
+    )
+    sp.add_argument("target", help="a work-order id or a feature-order id")
+    sp.add_argument("--project")
+    sp.add_argument("--writes-over", type=int, metavar="TOKENS",
+                    help="classify cache writes at or above this size "
+                         f"(default: {inspection.DEFAULT_WRITE_FLOOR:,})")
+    sp.add_argument("--joins-over", type=float, metavar="SECONDS",
+                    help="list blocking joins at or above this long "
+                         f"(default: {inspection.DEFAULT_JOIN_FLOOR:g})")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
@@ -1163,6 +1184,85 @@ def _print_bill(bill: dict) -> None:
         print(f"\n⚠ {note}")
     print(f"\nEvery figure above is {bill['floor_reason']}.")
     print("List prices, as a common unit for comparing token kinds — not a bill.")
+
+
+def _mins(seconds: float) -> str:
+    """Durations at the magnitude a reader can hold in their head, like `_tok`."""
+    if seconds >= 90:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds:.1f}s"
+
+
+def _print_partition(part: dict[str, float], share: dict[str, float]) -> None:
+    print(f"  wall clock {_mins(part['wall'])} — "
+          f"generating {share['generating'] * 100:.0f}%, "
+          f"blocked {share['blocked'] * 100:.0f}%, "
+          f"running tools {share['tools'] * 100:.0f}%")
+
+
+def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
+    """One session taken apart, in the order the questions get asked.
+
+    The partition first because it is the headline, then the turns it is made of, then
+    the three lists that explain the two expensive slices — what the blocked time was
+    waiting for, what the tokens were re-sent for, and what the tool time was doing.
+    """
+    head = f"{unit['wo_id']} — {unit['title']}"
+    print(f"\n{head}\n{'-' * min(len(head), 78)}")
+    if not unit["found"]:
+        # The same answer `jarvis cost` gives, and for the same reason: Claude Code
+        # prunes transcripts on its own schedule, and an unmeasurable clock is not a
+        # zero one.
+        print("  no transcript — nothing to measure")
+        return
+
+    _print_partition(unit["partition"], unit["share"])
+    for turn in unit["turns"]:
+        reasons = ", ".join(t["kind"] for t in turn["triggers"]) or "no prompt recorded"
+        s = turn["share"]
+        print(f"  turn {turn['seq']:>2}  {_mins(turn['wall']):>7}  "
+              f"gen {s['generating'] * 100:>3.0f}%  blocked {s['blocked'] * 100:>3.0f}%  "
+              f"tools {s['tools'] * 100:>3.0f}%  {turn['api_calls']:>3} calls  {reasons}")
+        for trigger in turn["triggers"]:
+            print(f"           ↳ {trigger['quote']}")
+
+    if unit["joins"]:
+        print("\n  blocked on:")
+        for span in unit["joins"]:
+            print(f"    {_mins(span['seconds']):>8}  {span['detail'] or span['tool_id']}")
+
+    print(f"\n  cache writes over {write_floor:,} tokens:")
+    if not unit["writes"]:
+        print("    none — nothing was re-sent at that size")
+    for write in unit["writes"]:
+        gap = "—" if write["cause"] == "cold-start" else _mins(write["gap"])
+        print(f"    {_tok(write['written']):>7} written, {_tok(write['read']):>7} read, "
+              f"{gap:>7} since the last call   {write['cause']}")
+        print(f"            {write['note']}")
+
+    if unit["tools"]:
+        print("\n  tools:")
+        for row in unit["tools"]:
+            plural = "call " if row["calls"] == 1 else "calls"
+            print(f"    {row['name']:<14}{row['calls']:>4} {plural}  "
+                  f"{_mins(row['seconds']):>8} total  {_mins(row['mean']):>7} mean")
+
+
+def cmd_inspect(args: argparse.Namespace) -> int:
+    from . import ops
+
+    res = ops.inspect_report(args.target, args.project,
+                             write_floor=args.writes_over, join_floor=args.joins_over)
+    if args.json:
+        _print(res, True)
+        return 0
+    # A feature order is many units and needs a line saying which feature they are; a
+    # work order IS the unit, and repeating its title above itself is noise.
+    if len(res["units"]) != 1 or res["units"][0]["wo_id"] != res["scope"]:
+        print(f"{res['scope']} — {res['title']}")
+    for unit in res["units"]:
+        _print_anatomy(unit, res["write_floor"])
+    return 0
 
 
 def cmd_cost(args: argparse.Namespace) -> int:
@@ -2368,6 +2468,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_doctor(args)
         if args.cmd == "cost":
             return cmd_cost(args)
+        if args.cmd == "inspect":
+            return cmd_inspect(args)
         if args.cmd == "adopt":
             return cmd_adopt(args)
         if args.cmd == "wo":

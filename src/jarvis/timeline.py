@@ -161,6 +161,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return "Worker turn cancelled", ""
     if kind == "attention":
         return "Needs you", p.get("reason") or ""
+    if kind == "cost_alarm":
+        # Its own line rather than folded into "Needs you": only the FIRST alarm of a
+        # turn raises the flag, so the rest exist only here, and this is the row that
+        # says a turn was already known to be expensive while it was still running.
+        return "Costing money while it runs", p.get("reason") or ""
     if kind == "assumption":
         n = p.get("n")  # the number, not the text — §4
         return (f"Assumption #{n} recorded" if n else "Assumption recorded"), ""

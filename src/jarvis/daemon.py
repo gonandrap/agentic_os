@@ -462,6 +462,9 @@ class Daemon:
                     # this tick — the evidence a bill is built from starts expiring the
                     # moment the work stops.
                     self.seal_bills(project, store)
+                    # Before the invariants, because it is a fact about work that is
+                    # still RUNNING rather than about state that has settled.
+                    self.check_burning_turns(project, store)
                     # Last: check the state everything above just produced.
                     self.check_invariants(project, store)
                 self.central.touch_project(project.name)
@@ -1966,6 +1969,59 @@ class Daemon:
                 )
 
     # -- 2 & 6. turns, settlement, and injected sessions ---------------------------------------------------
+
+    def check_burning_turns(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Raise a turn that is costing money WHILE it is still costing it.
+
+        The user asked for a self-inspecting mechanism, and the reason is that every
+        cost surface Jarvis had answered after the fact: `jarvis cost` and `jarvis
+        inspect` both read a bill. This is the same arithmetic run against a turn that
+        has not finished, and it reaches the user the way everything else does — the
+        attention list — rather than inventing a channel.
+
+        ONE ALARM PER TURN PER KIND, recorded as a `cost_alarm` event and checked against
+        that record rather than against the attention flag. The flag is not enough: the
+        user putting it down with `jarvis wo ack` would bring the same sentence straight
+        back on the next tick, which is precisely how a cost alarm becomes noise and then
+        gets ignored. Thresholds and the off switch: `catalog.InspectConfig`.
+
+        Read-only and free of the model: one transcript read per running work order, on
+        the reconcile cadence rather than every tick.
+        """
+        from . import inspection
+        from . import usage as usage_mod
+
+        cfg = self.catalog.os.inspect
+        if not cfg.enabled:
+            return
+        now = time.time()
+        index = usage_mod.index_sessions()
+        for wo in store.list_work_orders(statuses=("running",)):
+            session_id = wo.get("session_id")
+            if not session_id or wo["origin"] in UNGOVERNED_ORIGINS:
+                continue
+            turn = store.latest_turn(wo["id"])
+            if turn is None or turn["state"] != "running":
+                continue
+            try:
+                raised = inspection.live_alarms(session_id, cfg, wo_id=wo["id"],
+                                                now=now, index=index)
+            except OSError:
+                continue  # a transcript Jarvis cannot read is not a work order in trouble
+            seen = [db.from_json(e["payload"], {}) or {}
+                    for e in store.events_of_kind(wo["id"], "cost_alarm")]
+            already = {p.get("kind") for p in seen if p.get("seq") == turn["seq"]}
+            fresh = [a for a in raised if a.kind not in already]
+            for alarm in fresh:
+                store.add_event(wo["id"], "cost_alarm",
+                                {"kind": alarm.kind, "seq": turn["seq"],
+                                 "reason": alarm.reason})
+                log.info("[%s] %s: %s", project.name, wo["id"], alarm.reason)
+            # Every alarm goes on the timeline; only the first reaches the attention
+            # line, because `alarms` returns them most-actionable first and a flag can
+            # carry one sentence.
+            if fresh and not wo["needs_attention"]:
+                store.flag_attention(wo["id"], fresh[0].reason)
 
     def settle_turns(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Reap finished turns, then move each work order to where its turn says it is.

@@ -265,6 +265,34 @@ class NeoConfig:
     panel: PanelConfig = field(default_factory=PanelConfig)
 
 
+#: Defaults for the cost alarm, every one of them measured rather than guessed — over
+#: the 438 worker turns and 118 dispatched work orders on this machine at the time it
+#: shipped. See `inspection.Alarm` and
+#: docs/superpowers/specs/2026-08-30-the-anatomy-of-a-turn.md §5.
+#:
+#: A NOISY COST ALARM IS WORSE THAN NONE, so each threshold is set where it fires on a
+#: small minority and the measured rate is stated beside it.
+DEFAULT_INSPECT_TURN_MINUTES = 60    # p95 of a single turn is 54m; fires on 15% of orders
+DEFAULT_INSPECT_JOIN_SECONDS = 300   # the 5-minute cache TTL itself; fires on 2%
+DEFAULT_INSPECT_WRITE_TOKENS = 300_000  # p95 of the largest re-write per order; fires on 5%
+
+
+@dataclass
+class InspectConfig:
+    """When a turn that is still running is worth interrupting the user for.
+
+    Three independent conditions, because they are three different things going wrong
+    and only one of them has a fix the user can apply while it burns. `enabled` turns
+    the whole check off: it reads a transcript per running work order per reconcile
+    tick, which is cheap but not free.
+    """
+
+    enabled: bool = True
+    turn_minutes: int = DEFAULT_INSPECT_TURN_MINUTES
+    join_seconds: int = DEFAULT_INSPECT_JOIN_SECONDS
+    write_tokens: int = DEFAULT_INSPECT_WRITE_TOKENS
+
+
 @dataclass
 class OsConfig:
     default_model: str = DEFAULT_MODEL
@@ -286,6 +314,7 @@ class OsConfig:
     knowledge_digest_chars: int = 4000   # hard char budget for those lines
     neo: NeoConfig = field(default_factory=NeoConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+    inspect: InspectConfig = field(default_factory=InspectConfig)
 
 
 @dataclass
@@ -425,6 +454,27 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     )
 
 
+def _parse_inspect(raw: Any) -> InspectConfig:
+    """`os.inspect`, with every threshold rejected rather than clamped if it is absurd.
+
+    A threshold of zero would flag every work order the fleet runs, which is the exact
+    failure the defaults were measured to avoid — and it would arrive by a typo in a
+    `jarvis config set`, so it is caught at parse time where the message can say so.
+    """
+    if not isinstance(raw, dict):
+        raise _err('"os.inspect" must be an object')
+    cfg = InspectConfig(
+        enabled=bool(raw.get("enabled", True)),
+        turn_minutes=int(raw.get("turn_minutes", DEFAULT_INSPECT_TURN_MINUTES)),
+        join_seconds=int(raw.get("join_seconds", DEFAULT_INSPECT_JOIN_SECONDS)),
+        write_tokens=int(raw.get("write_tokens", DEFAULT_INSPECT_WRITE_TOKENS)),
+    )
+    for name in ("turn_minutes", "join_seconds", "write_tokens"):
+        if getattr(cfg, name) < 1:
+            raise _err(f"os.inspect.{name} must be >= 1")
+    return cfg
+
+
 def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     if not isinstance(data, dict):
         raise _err("top level must be an object")
@@ -465,6 +515,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 4000)),
         neo=neo_cfg,
         validation=_parse_validation(os_raw.get("validation", {})),
+        inspect=_parse_inspect(os_raw.get("inspect", {})),
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")

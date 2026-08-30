@@ -81,7 +81,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 TRANSCRIPT_ROOT_ENV = "JARVIS_TRANSCRIPT_ROOT"
 
@@ -428,29 +428,61 @@ def _subagent_detail(path: Path, sub_usage: Usage) -> Subagent:
     )
 
 
+def rows(path: Path | str, needle: str = "") -> Iterator[dict[str, Any]]:
+    """Every JSON row of one transcript, in file order — the one line-reader.
+
+    A transcript is JSONL of mixed row types, and every reader in the OS wants a
+    different projection of it: token counts, prose, tool spans. They share this so a
+    change in how Claude Code writes a file lands in one place; a missing or corrupt
+    file yields nothing, which is what makes "no transcript" the same answer everywhere.
+
+    `needle` is a substring pre-filter applied to the RAW LINE before parsing. Most rows
+    in a transcript are of no interest to any one caller, and `json.loads` on a megabyte
+    of them is the whole cost of a read: `_assistant_messages` skips ~75% of the rows in
+    a real file this way. A caller that wants everything passes nothing.
+    """
+    try:
+        handle = Path(path).open(errors="replace")
+    except OSError:
+        return
+    with handle:
+        for line in handle:
+            if needle and needle not in line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                yield row
+
+
+def blocks_of(row: dict[str, Any], kind: str = "") -> list[dict[str, Any]]:
+    """The content blocks of a transcript row's message, optionally of one type.
+
+    A row's `message.content` is a list of blocks on an API message and a bare string on
+    some user rows; both shapes are real and neither is an error, so a caller asking for
+    blocks of a string message gets none rather than a crash.
+    """
+    content = (row.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return []
+    return [b for b in content if isinstance(b, dict)
+            and (not kind or b.get("type") == kind)]
+
+
 def _time_span(path: Path) -> tuple[float, float]:
     """When a transcript's rows start and end, as unix timestamps (0 if unreadable)."""
     first = last = 0.0
-    try:
-        handle = path.open(errors="replace")
-    except OSError:
-        return (0.0, 0.0)
-    with handle:
-        for line in handle:
-            if '"timestamp"' not in line:
-                continue
-            try:
-                stamp = json.loads(line).get("timestamp")
-            except ValueError:
-                continue
-            when = _parse_stamp(stamp)
-            if when:
-                first = first or when
-                last = when
+    for row in rows(path, '"timestamp"'):
+        when = parse_stamp(row.get("timestamp"))
+        if when:
+            first = first or when
+            last = when
     return (first, last)
 
 
-def _parse_stamp(stamp: Any) -> float:
+def parse_stamp(stamp: Any) -> float:
     if not isinstance(stamp, str):
         return 0.0
     try:
@@ -474,47 +506,36 @@ def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
     """
     by_id: dict[str, dict[str, Any]] = {}
     order: list[str] = []
-    try:
-        handle = Path(path).open(errors="replace")
-    except OSError:
-        return []
-    with handle:
-        for line in handle:
-            # Cheap pre-filter: a row with no `usage` key cannot carry token counts,
-            # and most rows in a transcript are tool results or UI state.
-            if '"usage"' not in line:
-                continue
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            if row.get("type") != "assistant":
-                continue
-            message = row.get("message") or {}
-            usage, mid = message.get("usage"), message.get("id")
-            if not isinstance(usage, dict) or not mid:
-                continue
-            entry = by_id.get(mid)
-            if entry is None:
-                # `ts` rides along so a message can be placed in the TURN it ran in.
-                # First occurrence, not max: a message is rewritten as its text grows,
-                # and when the call LANDED is when its first row was written.
-                entry = by_id[mid] = {"model": message.get("model") or "",
-                                      "ts": _parse_stamp(row.get("timestamp"))}
-                order.append(mid)
-            for key, value in usage.items():
+    # The pre-filter: a row with no `usage` key cannot carry token counts, and most
+    # rows in a transcript are tool results or UI state.
+    for row in rows(path, '"usage"'):
+        if row.get("type") != "assistant":
+            continue
+        message = row.get("message") or {}
+        usage, mid = message.get("usage"), message.get("id")
+        if not isinstance(usage, dict) or not mid:
+            continue
+        entry = by_id.get(mid)
+        if entry is None:
+            # `ts` rides along so a message can be placed in the TURN it ran in.
+            # First occurrence, not max: a message is rewritten as its text grows,
+            # and when the call LANDED is when its first row was written.
+            entry = by_id[mid] = {"model": message.get("model") or "",
+                                  "ts": parse_stamp(row.get("timestamp"))}
+            order.append(mid)
+        for key, value in usage.items():
+            if isinstance(value, int):
+                entry[key] = max(entry.get(key, 0), value)
+        # The TTL of the cache write, one level down. Flattened in rather than
+        # skipped with the rest of the nested values: it is not a detail but a
+        # PRICE — the same token costs 1.25x or 2x depending on which of these two
+        # it landed in (kn-f94abf34), and it is exact per message here.
+        creation = usage.get("cache_creation")
+        if isinstance(creation, dict):
+            for key in ("ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"):
+                value = creation.get(key)
                 if isinstance(value, int):
                     entry[key] = max(entry.get(key, 0), value)
-            # The TTL of the cache write, one level down. Flattened in rather than
-            # skipped with the rest of the nested values: it is not a detail but a
-            # PRICE — the same token costs 1.25x or 2x depending on which of these two
-            # it landed in (kn-f94abf34), and it is exact per message here.
-            creation = usage.get("cache_creation")
-            if isinstance(creation, dict):
-                for key in ("ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"):
-                    value = creation.get(key)
-                    if isinstance(value, int):
-                        entry[key] = max(entry.get(key, 0), value)
     return [by_id[mid] for mid in order]
 
 
@@ -546,30 +567,16 @@ def said_in_session(session_id: str, *, since: float = 0.0, until: float | None 
         index = index_sessions(root)
     said: list[tuple[str, str]] = []
     for path in sorted(index.get(session_id) or []):
-        try:
-            handle = Path(path).open(errors="replace")
-        except OSError:
-            continue
-        with handle:
-            for line in handle:
-                if '"assistant"' not in line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if row.get("type") != "assistant":
-                    continue
-                ts = _parse_stamp(row.get("timestamp"))
-                if ts < since or (until is not None and ts > until):
-                    continue
-                message = row.get("message") or {}
-                text = " ".join(
-                    block.get("text", "") for block in message.get("content") or []
-                    if isinstance(block, dict) and block.get("type") == "text"
-                ).strip()
-                if text:
-                    said.append((message.get("model") or "", text))
+        for row in rows(path, '"assistant"'):
+            if row.get("type") != "assistant":
+                continue
+            ts = parse_stamp(row.get("timestamp"))
+            if ts < since or (until is not None and ts > until):
+                continue
+            text = " ".join(b.get("text", "")
+                            for b in blocks_of(row, "text")).strip()
+            if text:
+                said.append(((row.get("message") or {}).get("model") or "", text))
     return said
 
 
