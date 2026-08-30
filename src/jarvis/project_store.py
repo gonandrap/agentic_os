@@ -972,6 +972,14 @@ class ProjectStore:
         ).fetchall()
         return db.rows_to_dicts(rows)
 
+    def feature_status_counts(self) -> dict[str, int]:
+        """How many feature orders sit in each status. Counted in SQL, like
+        `status_counts` and for the same reason: `list_feature_orders` is capped."""
+        rows = self.conn.execute(
+            "SELECT status, COUNT(*) AS n FROM feature_orders GROUP BY status"
+        ).fetchall()
+        return {row["status"]: int(row["n"]) for row in rows}
+
     def flagged_feature_orders(self) -> list[dict[str, Any]]:
         """Every feature order asking for the user, whatever its status.
 
