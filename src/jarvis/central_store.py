@@ -313,6 +313,10 @@ END;
 # re-scans `knowledge` and would hide a broken trigger by rebuilding on every open (§4).
 FTS_BUILT_KEY = "knowledge_fts_built"
 
+# Which config version the catalog file currently holds — the APPLIED one, which is not
+# always the newest row. See `head_config_version`.
+CONFIG_HEAD_KEY = "config_head"
+
 # content, topic, tags. A query word in the TOPIC outranks one buried in a long body (§6).
 FTS_WEIGHTS = (1.0, 4.0, 2.0)
 
@@ -1099,6 +1103,7 @@ class CentralStore:
         vid = config_version.version_id(document)
         existing = self.get_config_version(vid)
         if existing is not None:
+            self.set_state(CONFIG_HEAD_KEY, vid)
             return existing
         self.conn.execute(
             """INSERT INTO os_config_versions
@@ -1111,6 +1116,7 @@ class CentralStore:
              config_version.canonicalise(document),
              db.to_json(resolved), db.to_json(changes or []), source_path),
         )
+        self.set_state(CONFIG_HEAD_KEY, vid)
         return self.get_config_version(vid)  # type: ignore[return-value]
 
     def get_config_version(self, version_id: str) -> dict[str, Any] | None:
@@ -1145,7 +1151,20 @@ class CentralStore:
 
     def head_config_version(self) -> dict[str, Any] | None:
         """What the fleet is configured to run. None on a fleet that never wrote one —
-        which reads as "before the console existed", never as version 1."""
+        which reads as "before the console existed", never as version 1.
+
+        The APPLIED version, not the newest one, and the two differ exactly when
+        `jarvis config restore` lands back on an older id: ids are content-addressed, so
+        a restore writes no row, and a head read off `ts` would then name a document
+        nobody is running — permanent drift out of the one command the design offers as
+        a REMEDY for drift (spec §3). The pointer falls back to the newest row so a
+        ledger written before it existed still has a head.
+        """
+        pinned = self.get_state(CONFIG_HEAD_KEY)
+        if pinned:
+            row = self.get_config_version(pinned)
+            if row is not None:
+                return row
         versions = self.config_versions(limit=1)
         return versions[0] if versions else None
 
