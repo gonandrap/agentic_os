@@ -1086,6 +1086,9 @@ def _worker_extras(session: Any) -> dict[str, Any]:
             "tokens": total.rewrite_excess,
             "list_usd": total.rewrite_cost_usd,
             "boundaries": total.resume_boundaries,
+            "ttl_share": total.rewrite_ttl_share,
+            "ttl_tokens": total.rewrite_ttl_excess,
+            "ttl_boundaries": total.boundaries_ttl,
         },
         "context_peak": total.context_peak,
     }

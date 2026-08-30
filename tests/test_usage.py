@@ -23,7 +23,8 @@ from jarvis import usage
 
 
 def row(mid: str, *, write: int = 0, read: int = 0, out: int = 0, plain: int = 0,
-        model: str = "claude-opus-5", ttl_1h: int = 0, ttl_5m: int = 0) -> dict:
+        model: str = "claude-opus-5", ttl_1h: int = 0, ttl_5m: int = 0,
+        at: str = "2026-08-09T00:00:00.000Z") -> dict:
     """One assistant row, in the shape Claude Code writes.
 
     `cache_creation` — the TTL the write bought — is nested one level down and is only
@@ -41,7 +42,7 @@ def row(mid: str, *, write: int = 0, read: int = 0, out: int = 0, plain: int = 0
                                        "ephemeral_5m_input_tokens": ttl_5m}
     return {
         "type": "assistant",
-        "timestamp": "2026-08-09T00:00:00.000Z",
+        "timestamp": at,
         "message": {"id": mid, "model": model, "usage": usage_obj},
     }
 
@@ -172,6 +173,98 @@ def test_a_boundary_is_the_cache_going_backwards_not_a_big_write(transcripts):
 def test_a_single_turn_session_has_no_boundaries(transcripts):
     transcripts("s1", [row("m1", write=100), row("m2", write=50, read=100)])
     assert usage.read_session("s1").total.resume_boundaries == 0
+
+
+# -- which of the two causes made a boundary cold -------------------------------------
+
+def test_a_boundary_inside_the_ttl_is_the_prefix_moving_however_little_it_read(
+        transcripts):
+    """The misreading this split exists to prevent, and its opposite in the same test.
+
+    wo-5a6b2d6d's 157k re-write was read as a 14-minute turn outliving a 5-minute cache.
+    The gap between the call that wrote the cache and the one that missed it was TWELVE
+    SECONDS: the entry was alive and the prefix had moved. A classifier that looked only
+    at how little was read would get that backwards, so the pair below differs in the
+    GAP alone — same tokens, same drop, opposite cause.
+    """
+    transcripts("s1", [
+        row("m1", write=9_000, read=0, at="2026-08-09T00:00:00.000Z"),
+        row("m2", write=100, read=9_000, at="2026-08-09T00:00:02.000Z"),
+        row("m3", write=9_000, read=10, at="2026-08-09T00:00:14.000Z"),   # 12s later
+    ])
+    near = usage.read_session("s1").total
+    assert near.boundaries_ttl == 0
+    assert near.rewrite_prefix_write == 9_000
+    assert near.rewrite_ttl_share == 0.0
+
+    transcripts("s2", [
+        row("m1", write=9_000, read=0, at="2026-08-09T00:00:00.000Z"),
+        row("m2", write=100, read=9_000, at="2026-08-09T00:00:02.000Z"),
+        row("m3", write=9_000, read=10, at="2026-08-09T00:11:00.000Z"),   # 11min later
+    ])
+    far = usage.read_session("s2").total
+    assert far.boundaries_ttl == 1
+    assert far.rewrite_ttl_write == 9_000
+    assert far.rewrite_ttl_share == 1.0
+
+
+def test_a_long_gap_that_still_read_the_static_prefix_is_not_an_expiry(transcripts):
+    """An expired entry leaves NOTHING; a moved prefix still serves the system prompt.
+
+    Both calls below sit far outside the TTL and differ only in what survived, which is
+    the whole discriminator: 20k read back means the entry was there and stopped
+    matching, and no longer TTL would have changed that.
+    """
+    transcripts("s1", [
+        row("m1", write=60_000, read=0, at="2026-08-09T00:00:00.000Z"),
+        row("m2", write=100, read=60_000, at="2026-08-09T00:00:02.000Z"),
+        row("m3", write=40_000, read=20_000, at="2026-08-09T00:30:00.000Z"),
+    ])
+    total = usage.read_session("s1").total
+    assert total.resume_boundaries == 1
+    assert total.boundaries_ttl == 0
+    assert total.rewrite_prefix_write == 40_000
+
+
+def test_the_cause_split_is_a_partition_of_the_tax_not_a_second_count(transcripts):
+    """`rewrite_excess` keeps its own threshold-free definition; the causes divide it.
+
+    The two halves must add back to the tax exactly (kn-7a2180ba), even though the raw
+    boundary writes they are derived from do not equal it.
+    """
+    transcripts("s1", [
+        row("m1", write=50_000, read=0, at="2026-08-09T00:00:00.000Z"),
+        row("m2", write=100, read=50_000, at="2026-08-09T00:00:02.000Z"),
+        row("m3", write=50_000, read=20_000, at="2026-08-09T00:00:07.000Z"),  # prefix
+        row("m4", write=100, read=70_000, at="2026-08-09T00:00:09.000Z"),
+        row("m5", write=50_000, read=100, at="2026-08-09T00:20:00.000Z"),     # TTL
+    ])
+    total = usage.read_session("s1").total
+    assert total.rewrite_ttl_share == 0.5
+    assert total.rewrite_ttl_excess + (total.rewrite_excess - total.rewrite_ttl_excess) \
+        == total.rewrite_excess
+    assert 0 < total.rewrite_ttl_excess < total.rewrite_excess
+
+
+def test_an_unclassified_tax_reports_no_share_rather_than_a_zero_one(transcripts):
+    """A session with no boundary has NOT been measured at 0% — the two must not read
+    alike, or a report prints "0% was the TTL" as though it were a finding."""
+    transcripts("s1", [row("m1", write=500), row("m2", write=400, read=500)])
+    total = usage.read_session("s1").total
+    assert total.rewrite_ttl_share is None
+    assert total.rewrite_ttl_excess == 0
+
+
+def test_merging_keeps_the_share_token_weighted_not_averaged():
+    """Two sessions of very different size must not each get half a vote."""
+    small = usage.Usage(rewrite_ttl_write=10, rewrite_prefix_write=0, boundaries_ttl=1,
+                        resume_boundaries=1)
+    large = usage.Usage(rewrite_ttl_write=0, rewrite_prefix_write=990,
+                        boundaries_ttl=0, resume_boundaries=3)
+    merged = small + large
+    assert merged.boundaries_ttl == 1
+    assert merged.resume_boundaries == 4
+    assert merged.rewrite_ttl_share == 0.01
 
 
 # -- subagents ------------------------------------------------------------------------
