@@ -63,6 +63,11 @@ starts:
 
 **81.8% of the re-write tax is invisible to any TTL change.**
 
+(This table counts a boundary as `write > 40k` with `read < 40k`. The shipped classifier
+instead counts the cache going *backwards*, which needs no threshold and catches small
+boundaries too, so the cohort tables below report more boundaries and slightly different
+totals. The causes are assigned identically and the verdict is the same either way.)
+
 ### The break-even, and why it is not close
 
 Switching to the 1-hour TTL pays 0.75x more on *every* cache-write token and buys back
@@ -78,24 +83,36 @@ Measured `W_ttl / W_total` = **13.8%** (15.4M of 112.0M). Net **−54.7M**
 base-input-token equivalents ≈ **$273 worse** at Opus list. It is not marginal; it
 loses by roughly 4x.
 
+### Watch the denominator — it is the second trap in this question
+
+The trigger's denominator is **every written token**, because the 1-hour premium is paid
+on the whole cache-write line. It is *not* the re-write tax. The TTL's share **of the
+tax** is a much bigger number about a much smaller base, and reading one against the
+other says "nearly worth switching" when the truth is "off by a factor of two". This
+report made that mistake in draft; the script below prints both, labelled, so the next
+reader cannot.
+
 ### What would change my mind — and it is moving
 
-Split by era, around the `includeGitInstructions` fix (PR #96, 2026-08-15):
+Split by era, around the `includeGitInstructions` fix (PR #96, 2026-08-15). All figures
+from `scripts/cache_ttl_cohort.py`, i.e. from the shipped classifier:
 
-| cohort | sessions | TTL share of tax | verdict |
-|---|---:|---:|---|
-| pre git-fix | 736 | 4.3% | loss by 31.4M |
-| post git-fix | 862 | 30.3% | loss by 23.2M |
-| last 7 days | 469 | **39.2%** | loss by 8.0M |
+| cohort | sessions | TTL share **of all writes** | (of the tax) | verdict |
+|---|---:|---:|---:|---|
+| pre git-fix | 749 | 0.3% | 0.9% | keep |
+| post git-fix | 1,152 | 15.4% | 30.7% | keep |
+| trailing 30 days | 1,339 | 10.6% | 23.0% | keep |
+| trailing 7 days | 440 | **20.4%** | 40.6% | keep |
 
-The fix worked: removing the prefix churn leaves TTL expiry as a larger *share* of a
-smaller problem. The last-7-day cohort sits at 39.2% against a 39.5% break-even — **the
-answer is one good week from flipping.**
+The fix worked: removing the prefix churn leaves TTL expiry a larger share of a smaller
+problem, and the decisive ratio has gone 0.3% → 20.4%. **It is still roughly half the
+39.5% it needs, so the recommendation is not marginal — but it is no longer stable
+either, and it was 0.3% six weeks ago.**
 
-So: keep the constant, and re-measure when the fleet's shape changes. The trigger is a
-single number, and `jarvis cost` now prints it beside the tax rather than leaving it to
-be re-derived — which is the whole reason this work order's premise was available to
-misread. **Re-open this when the TTL share of the re-write tax exceeds 39.5% over a
+So: keep the constant, and re-measure on a cohort window rather than over all history,
+which averages the trend away. `jarvis cost` prints the split for one order or the whole
+fleet; `scripts/cache_ttl_cohort.py --days 30` prints it for a window and states the
+verdict. **Re-open this when the TTL share of ALL CACHE WRITES exceeds 39.5% over a
 trailing month.**
 
 ### On a per-project setting
