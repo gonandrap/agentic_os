@@ -18,6 +18,8 @@ from ..paths import PRODUCTION, deployment_env
 from ..project_store import (
     ACTIVE_STATUSES,
     FO_OPEN_STATUSES,
+    FO_STATUSES,
+    FO_TERMINAL_STATUSES,
     OPEN_STATUSES,
     TERMINAL_STATUSES,
     WO_STATUSES,
@@ -427,7 +429,8 @@ def create_app() -> FastAPI:
                       revealed=revealed)
 
     @app.get("/project/{name}", response_class=HTMLResponse)
-    def project(request: Request, name: str, hidden: str = "", show: str = ""):
+    def project(request: Request, name: str, hidden: str = "", show: str = "",
+                fo: str = ""):
         """A project's work orders — the ones that want the user, by default.
 
         Work orders owing the user a decision, running ones, and PRs waiting to be
@@ -435,6 +438,10 @@ def create_app() -> FastAPI:
         the settled orders that are the bulk of any project with history — collapses
         into per-status counts the user can expand. `show` is "" (featured only), any
         status name (plus that group), or "all".
+
+        `fo` is the same reveal for the feature orders, on its own param rather than
+        sharing `show`: the two lifecycles spell three settled statuses the same way
+        (see FO_STATUS_META), so one param would expand both lists on every click.
         """
         paths = ops.registered_project_paths()
         if name not in paths:
@@ -445,6 +452,11 @@ def create_app() -> FastAPI:
             statuses = None
         else:
             statuses = OPEN_STATUSES + ((revealed,) if revealed else ())
+        fo_revealed = fo if fo in FO_STATUSES else ("all" if fo == "all" else "")
+        if fo_revealed == "all":
+            fo_statuses = None
+        else:
+            fo_statuses = FO_OPEN_STATUSES + ((fo_revealed,) if fo_revealed else ())
         store = ProjectStore(paths[name])
         try:
             # Open feature orders get their own short list above the work orders, and
@@ -452,8 +464,9 @@ def create_app() -> FastAPI:
             # already in the listing below as ordinary work orders, and printing the
             # tree twice on one page is how a page stops being read. The tree lives on
             # the feature's own page.
-            features = [{**fo, "progress": ops.feature_progress(store, fo)}
-                        for fo in store.list_feature_orders(statuses=FO_OPEN_STATUSES)]
+            features = [{**row, "progress": ops.feature_progress(store, row)}
+                        for row in store.list_feature_orders(statuses=fo_statuses)]
+            fo_counts = store.feature_status_counts()
             wos = store.list_work_orders(statuses=statuses, include_hidden=show_hidden)
             # Inside the store's lifetime: the label reads the dependencies' own rows.
             blocked = {wo["id"]: ops.blocked_by(store, wo) for wo in wos}
@@ -478,12 +491,15 @@ def create_app() -> FastAPI:
         # reason the settled line is. Terminal statuses have their own line below.
         other_open = [s for s in OPEN_STATUSES if s not in FEATURED_STATUSES]
         open_counts = [(s, counts[s]) for s in other_open if counts.get(s)]
+        fo_settled = [(s, fo_counts[s]) for s in FO_TERMINAL_STATUSES
+                      if fo_counts.get(s)]
         return render(request, "project.html", project_name=name, path=paths[name],
                       featured=featured, rest=rest, open_counts=open_counts,
                       backlog=backlog, show_hidden=show_hidden, blocked=blocked,
                       pauses=pauses,
                       hidden_count=hidden_count, settled=settled, revealed=revealed,
-                      features=features)
+                      features=features, fo_settled=fo_settled,
+                      fo_revealed=fo_revealed)
 
     @app.get("/fo/{name}/{fo_id}", response_class=HTMLResponse)
     def feature_order(request: Request, name: str, fo_id: str, error: str = ""):

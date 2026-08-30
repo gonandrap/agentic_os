@@ -1494,6 +1494,70 @@ def test_the_project_page_lists_feature_orders_without_repeating_the_tree(featur
     assert page.count(f"/fo/proj_a/{fo['id']}") == 1
 
 
+def _settle_feature(project, title, status):
+    """A feature order in a terminal status, with no ceremony about how it got there."""
+    fo = ops.create_feature_order("proj_a", title, description="the whole ask, at "
+                                  "length, with enough detail to plan it properly")
+    store = ProjectStore(project)
+    try:
+        store.update_feature_order(fo["id"], status=status)
+    finally:
+        store.close()
+    return fo
+
+
+def test_settled_feature_orders_collapse_into_a_count(client, project):
+    """The complaint: a completed feature order left the project page and there was no
+    way back to it — the CLI has `fo list --all`, the dashboard had nothing."""
+    done = _settle_feature(project, "CSV export", "completed")
+    killed = _settle_feature(project, "PDF export", "cancelled")
+    still_going = ops.create_feature_order("proj_a", "XLS export",
+                                           description="the whole ask, at length, "
+                                                       "with enough detail to plan it")
+
+    page = client.get("/project/proj_a").text
+    assert "XLS export" in page
+    assert "CSV export" not in page and "PDF export" not in page
+    # The gap was discoverability, not just filtering: the count says they exist.
+    assert "1 completed" in page and "1 cancelled" in page
+    assert "fo=completed" in page
+    assert "fo=failed" not in page  # zero of them: no count, no link
+
+    just_completed = client.get("/project/proj_a?fo=completed").text
+    assert "CSV export" in just_completed
+    assert "PDF export" not in just_completed  # just that group
+    assert "XLS export" in just_completed  # the open ones never leave
+
+    everything = client.get("/project/proj_a?fo=all").text
+    for fo in (done, killed, still_going):
+        assert f"/fo/proj_a/{fo['id']}" in everything
+
+
+def test_a_settled_feature_is_still_told_apart_from_an_open_one(client, project):
+    """Revealed, it is a row like any other — wearing its own status, not an open one's.
+
+    Also the case where a project has ONLY settled features: the block still exists.
+    """
+    _settle_feature(project, "CSV export", "failed")
+
+    page = client.get("/project/proj_a?fo=all").text
+    assert "Feature orders" in page
+    assert "tone-bad" in page and "✗" in page
+
+
+def test_the_work_order_reveal_and_the_feature_reveal_do_not_undo_each_other(client,
+                                                                            project):
+    """Two independent reveals on one page: every link must carry the other."""
+    _settle_feature(project, "CSV export", "completed")
+    finished = ops.create_work_order("proj_a", "old and finished")
+    ops.mark_done(finished["id"])
+
+    both = client.get("/project/proj_a?fo=all&show=all").text
+    assert "CSV export" in both and "old and finished" in both
+    assert "?fo=all&amp;show=completed" in both  # the work-order reveal keeps `fo`
+    assert "?show=all&amp;fo=completed" in both  # and the feature reveal keeps `show`
+
+
 def test_the_dashboard_takes_a_feature_order(client):
     res = client.post("/fo/create", data={"project": "proj_a", "title": "CSV export",
                                           "description": "the whole ask, at length, "
