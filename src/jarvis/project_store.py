@@ -8,6 +8,7 @@ orders that own work orders in sets.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -145,6 +146,16 @@ FO_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 # worker must not spend a round trip asking whether it may do the thing it was sent to
 # do. Value: {"by": "neo", "scope": "<what is pre-approved, in words>", ...}.
 PRE_APPROVED_KEY = "pre_approved"
+
+# Feature-order metadata key: children whose failure the user has already answered for
+# with `jarvis fo resume`. Value: [{"wo_id": str, "ts": float, "note": str}] — the flat
+# list of ids AND the record of why, in one key, because the two must never disagree.
+#
+# In `feature_orders.metadata` rather than on a work order or a feature event. The event
+# path was the obvious home and cannot carry it: `ops.feature_event` returns False when a
+# feature has no project manager order, which is every feature planned while
+# `os.validation.enabled` was false. See docs/superpowers/specs/2026-08-29-feature-order-resume.md.
+SUPERSEDED_CHILDREN_KEY = "superseded_children"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS work_orders (
@@ -995,13 +1006,54 @@ class ProjectStore:
         belongs to the feature order as much as any child does, but it is the session
         that produced the plan rather than a piece of the work. `plan_wo_id` is how you
         reach it.
+
+        Every child carries `superseded`: True when the user answered for its failure
+        with `jarvis fo resume`. ANNOTATED, NEVER FILTERED OUT — billing, cancellation
+        and the child tree all still want the row, and a superseded child that vanished
+        from the tree would look like one that never existed. Only the settle rule reads
+        the flag (`Daemon.settle_features`).
         """
         rows = self.conn.execute(
             "SELECT * FROM work_orders WHERE parent_id=? AND kind='worker' "
             "ORDER BY created_at",
             (fo_id,),
         ).fetchall()
-        return db.rows_to_dicts(rows)
+        answered = {s["wo_id"] for s in self.superseded_children(fo_id)}
+        return [{**c, "superseded": c["id"] in answered}
+                for c in db.rows_to_dicts(rows)]
+
+    def superseded_children(self, fo_id: str) -> list[dict[str, Any]]:
+        """Which of this feature's children the user has answered for, and why.
+
+        Read straight off `feature_orders.metadata` rather than through
+        `get_feature_order`, so a call for a feature that no longer exists is an empty
+        list rather than a KeyError: `feature_children` is on every settle tick and every
+        listing, and it has always been tolerant of an unknown id.
+        """
+        row = self.conn.execute(
+            "SELECT metadata FROM feature_orders WHERE id=?", (fo_id,)
+        ).fetchone()
+        meta = db.from_json(row["metadata"], {}) if row else {}
+        return list((meta or {}).get(SUPERSEDED_CHILDREN_KEY) or [])
+
+    def supersede_children(self, fo_id: str, wo_ids: Iterable[str],
+                           note: str = "") -> list[dict[str, Any]]:
+        """Record that the user has answered for these children's failure.
+
+        Idempotent on `wo_id`: resuming a feature twice must not double the record, and
+        the FIRST note is the one kept — it is the one that was true when the decision
+        was taken.
+        """
+        current = self.superseded_children(fo_id)
+        known = {s["wo_id"] for s in current}
+        for wo_id in wo_ids:
+            if wo_id not in known:
+                current.append({"wo_id": wo_id, "ts": db.now(), "note": note})
+                known.add(wo_id)
+        meta = db.from_json(self.get_feature_order(fo_id).get("metadata"), {}) or {}
+        meta[SUPERSEDED_CHILDREN_KEY] = current
+        self.update_feature_order(fo_id, metadata=db.to_json(meta))
+        return current
 
     def feature_order_for_question(self, question_id: int) -> dict[str, Any] | None:
         """The feature order whose plan this Neo question is reviewing, if any.

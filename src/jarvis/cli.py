@@ -399,6 +399,16 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("fo_id")
     f.add_argument("--project")
 
+    f = fo.add_parser("resume", help="put a FAILED feature order back to work — the way "
+                                     "past a dead child, without touching the database")
+    f.add_argument("fo_id")
+    f.add_argument("--fix", default="",
+                   help="what still needs doing, in your own words. Filed as a new child "
+                        "work order under the feature, and the only thing that worker "
+                        "sees. Omit it when the failure was spurious and the work is "
+                        "already done")
+    f.add_argument("--project")
+
     # gates (privileged-action approvals) ------------------------------------------------
     ga = sub.add_parser(
         "gate",
@@ -1485,8 +1495,11 @@ def cmd_fo(args: argparse.Namespace) -> int:
                 for c in detail["children"]:
                     icon = STATUS_ICON.get(c["status"], "•")
                     att = " ⚠" if c["needs_attention"] else ""
+                    # Superseded rather than hidden: the row is still the feature's
+                    # history, and the label is what says it no longer settles it.
+                    sup = " — superseded" if c.get("superseded") else ""
                     print(f"  {icon} {c['id']} {c['title']} "
-                          f"({c['status_label']}){att}")
+                          f"({c['status_label']}{sup}){att}")
 
     elif args.fo_cmd == "plan":
         path = Path(args.from_file)
@@ -1509,6 +1522,15 @@ def cmd_fo(args: argparse.Namespace) -> int:
 
     elif args.fo_cmd == "cancel":
         _print(ops.cancel_feature_order(args.fo_id, args.project), args.json)
+
+    elif args.fo_cmd == "resume":
+        out = ops.resume_feature_order(args.fo_id, fix=args.fix,
+                                       project_name=args.project)
+        _print({**out, "note": (
+            f"filed {out['fix_wo_id']} — jarvisd dispatches it shortly"
+            if out["fix_wo_id"] else
+            "no work filed; the feature settles on what its children already say"
+        )}, args.json)
     return 0
 
 

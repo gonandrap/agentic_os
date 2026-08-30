@@ -876,6 +876,14 @@ def create_app() -> FastAPI:
             return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
         return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
 
+    @app.post("/fo/{name}/{fo_id}/resume")
+    def resume_fo(name: str, fo_id: str, fix: str = Form("")):
+        try:
+            ops.resume_feature_order(fo_id, fix=fix, project_name=name)
+        except ops.OpsError as e:
+            return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
+        return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
+
     def _neo_back(next: str, fallback: str, error: str = "") -> str:
         """Where a Neo decision returns the reader — the page they decided from, or the
         `/neo` tab the decision belongs to. Same-site paths only, as in `decide_gate`: a

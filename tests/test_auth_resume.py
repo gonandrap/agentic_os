@@ -60,6 +60,19 @@ def test_an_expired_refresh_token_is_not_evidence_of_anything(signin):
     assert claude_cli.signin_changed_at() is None
 
 
+def test_a_bare_sign_in_is_later_than_the_turn_it_rescues(signin):
+    """The fixture's contract, asserted rather than assumed. A file's mtime comes from
+    the kernel's coarse clock and can land BEHIND a `time.time()` sampled just before it,
+    which made the sign-in read as the one that failed — `test_a_sign_in_after_the_failure
+    _makes_the_pause_due` went red on CI for 3.13 while 3.11 and 3.12 passed on the same
+    commit. Looped, because a race that fires once in a thousand proves nothing in one."""
+    for _ in range(200):
+        ended = time.time()
+        signin()
+        changed = claude_cli.signin_changed_at()
+        assert changed is not None and changed > ended
+
+
 def test_a_credentials_file_it_cannot_parse_is_read_as_no_answer(signin):
     signin().write_text("{not json")
     assert claude_cli.signin_changed_at() is None

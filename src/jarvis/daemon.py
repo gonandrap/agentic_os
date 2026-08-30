@@ -634,6 +634,12 @@ class Daemon:
           child counts too — it did not settle successfully, so `completed` would be a
           lie — but the reason says cancellation rather than failure, because the two ask
           the user for different things.
+        * **A SUPERSEDED child counts for neither rule.** `failed` is a settled status
+          that nothing here re-derives — only `executing` features are looked at — so a
+          feature stayed failed even after the child that killed it recovered. The two
+          ways back are `INV-FEATURE-FALSE-FAILURE`, which reopens a feature with no dead
+          children left, and `ops.resume_feature_order`, which is the user answering for
+          one that is still dead. See docs/superpowers/specs/2026-08-29-feature-order-resume.md.
 
         No notification is raised here, on purpose. A failed child has already pinged the
         user through `settle_work_order`, and `notify.route_new_inbox` applies no level
@@ -641,13 +647,24 @@ class Daemon:
         event arriving on the phone twice. The feature-level flag is what the user finds
         when they follow the first one.
         """
-        from .invariants import FEATURE_CHILD_CANCELLED, FEATURE_CHILD_FAILED
+        from .invariants import (
+            FEATURE_CHILD_CANCELLED,
+            FEATURE_CHILD_FAILED,
+            dead_feature_children,
+        )
 
         for fo in store.list_feature_orders(statuses=("executing",)):
             children = store.feature_children(fo["id"])
             if not children:
                 continue  # released with nothing in it; nothing to settle against
-            dead = [c for c in children if c["status"] in ("failed", "cancelled")]
+            # A superseded child settles its feature NEITHER WAY. `jarvis fo resume` is
+            # the user saying "I have answered for this one" — so it stops failing the
+            # feature, and it equally stops counting towards completion, or the feature
+            # would sit in `executing` for ever waiting on a child that will never move.
+            # A feature whose every child is superseded therefore completes, which is
+            # right: nothing is outstanding.
+            live = [c for c in children if not c["superseded"]]
+            dead = dead_feature_children(children)
             if dead:
                 first = dead[0]
                 template = (FEATURE_CHILD_FAILED if first["status"] == "failed"
@@ -657,7 +674,7 @@ class Daemon:
                 store.flag_feature_attention(fo["id"], reason)
                 self._close_feature_manager(store, fo["id"])
                 log.info("[%s] feature %s failed: %s", project.name, fo["id"], reason)
-            elif all(c["status"] == "completed" for c in children):
+            elif all(c["status"] == "completed" for c in live):
                 if self._route_to_validation(project, store, fo):
                     continue
                 self._complete_feature(store, fo)
