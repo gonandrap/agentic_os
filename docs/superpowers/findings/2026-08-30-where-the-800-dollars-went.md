@@ -49,6 +49,13 @@ Two causes make a boundary cold, and they leave different fingerprints:
 `read=15,862` above is the prefix signature exactly — the same number family as the
 15,461 / 15,995 measured in the clean room.
 
+The ceiling separating the two is **`os.cold_prefix_floor`**, default 5,000. It is
+configuration rather than a constant because it is a property of *this fleet's prompts*:
+the static head is a project's `CLAUDE.md` plus the worker briefing, so a fleet of terse
+projects sits lower and a verbose one higher. Set it just under the smallest static head
+across your projects. It affects reporting only — never what a worker does — so it can
+be changed while the fleet is running, and a daemon picks it up on restart.
+
 ### Fleet-wide, classified
 
 All transcripts, cold boundaries (`write > 40k` and `read < 40k`), excluding session

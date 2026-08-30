@@ -8,6 +8,8 @@
       "$comment_autocompact": "how large a worker's conversation may grow before Claude Code compacts it (claude --autocompact). Every API call re-reads the whole conversation, so this multiplies into the bill on every call; 100000-1000000, or null for the model's own window",
       "autocompact_window": 400000
     },
+    "$comment_cold_prefix_floor": "cost reporting only, never worker behaviour: the cache read below which a cold turn boundary kept NOTHING and so was the cache entry EXPIRING, rather than the prompt prefix moving (which no cache TTL can help). Set it just under the smallest static system-prompt head across your projects — roughly a CLAUDE.md plus the worker briefing. See docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md",
+    "cold_prefix_floor": 5000,
     "notifications": {
       "sinks": ["log", "telegram"],
       "telegram": {

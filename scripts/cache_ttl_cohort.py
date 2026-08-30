@@ -4,13 +4,14 @@
 `jarvis cost` prints this split for one order or for the fleet's whole history. This
 prints it for a COHORT WINDOW, which is the form the decision actually needs: the answer
 moves as the OS changes, and a figure averaged over all history hides the trend that
-will eventually reverse it. Measured 2026-08-30: 4.3% of the re-write tax was TTL expiry
-before the `includeGitInstructions` fix, 30.3% after it, and 39.2% over the trailing
-week — against a 39.5% break-even. See
-`docs/superpowers/specs/2026-08-30-where-the-800-dollars-went.md`.
+will eventually reverse it. Measured 2026-08-30, as a share of ALL cache writes: 0.3%
+was TTL expiry before the `includeGitInstructions` fix, 15.4% after it, and 20.4% over
+the trailing week — against a 39.5% break-even. See
+`docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md`.
 
-Classification is `usage.session_usage`'s own, not a second implementation, so this
-script and `jarvis cost` cannot drift apart.
+Classification is `usage.read_session`'s own, not a second implementation, so this
+script and `jarvis cost` cannot drift apart — including the `os.cold_prefix_floor`
+threshold, which both resolve from the catalog.
 
     uv run python scripts/cache_ttl_cohort.py --days 30
     uv run python scripts/cache_ttl_cohort.py --since 2026-08-15 --until 2026-08-23

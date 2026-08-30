@@ -908,8 +908,8 @@ def _rewrite_cause(share: float | None, ttl_boundaries: int, boundaries: int) ->
 
     Shared by both cost renderers because the number is only actionable with its cause
     attached: the prefix half is bought back by keeping the prefix still, the TTL half by
-    a longer TTL, and reporting one total invites spending on the wrong one. Spec:
-    2026-08-30-where-the-800-dollars-went.md.
+    a longer TTL, and reporting one total invites spending on the wrong one. Findings:
+    docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
     """
     if share is None:
         return ""

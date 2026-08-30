@@ -96,6 +96,16 @@ DEFAULT_AUTOCOMPACT_WINDOW = 400_000
 AUTOCOMPACT_MIN = 100_000    # `claude --autocompact` rejects anything under this
 AUTOCOMPACT_MAX = 1_000_000  # ... or over this
 
+# A cold cache boundary that kept NOTHING was the entry expiring; one that still served
+# the static head of the system prompt was the prefix moving, and no TTL would have
+# helped it. This is the ceiling separating them, and it is configurable because it is a
+# property of THIS FLEET'S PROMPTS — the static head is a project's CLAUDE.md plus the
+# worker briefing, so a fleet of terse projects sits lower and a verbose one higher.
+# Reasoning and the measured populations:
+# docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
+DEFAULT_COLD_PREFIX_FLOOR = 5_000
+COLD_PREFIX_FLOOR_MAX = 100_000  # above this it would swallow real boundaries
+
 
 _MISSING = object()
 
@@ -272,6 +282,8 @@ class OsConfig:
     default_permission_mode: str = DEFAULT_PERMISSION_MODE
     default_max_concurrent: int = DEFAULT_MAX_CONCURRENT
     default_autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
+    #: Read by the cost surfaces, not by a worker launch — see DEFAULT_COLD_PREFIX_FLOOR.
+    cold_prefix_floor: int = DEFAULT_COLD_PREFIX_FLOOR
     notification_sinks: list[str] = field(default_factory=lambda: ["log"])
     telegram_token_env: str = "JARVIS_TELEGRAM_TOKEN"
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
@@ -303,6 +315,22 @@ class Catalog:
 
 def _err(msg: str) -> CatalogError:
     return CatalogError(f"catalog error: {msg}")
+
+
+def _cold_prefix_floor_or_err(os_raw: dict[str, Any]) -> int:
+    """`os.cold_prefix_floor`, validated at boot rather than at report time.
+
+    Rejected here for the same reason the autocompact window is: a bad value would
+    otherwise surface far from its cause — as a cost report quietly reclassifying every
+    boundary, which reads as a finding rather than as a config error.
+    """
+    value = os_raw.get("cold_prefix_floor", DEFAULT_COLD_PREFIX_FLOOR)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _err("os.cold_prefix_floor must be an integer")
+    if not 0 <= value <= COLD_PREFIX_FLOOR_MAX:
+        raise _err(f"os.cold_prefix_floor {value} out of range "
+                   f"0-{COLD_PREFIX_FLOOR_MAX}")
+    return value
 
 
 def _autocompact_or_err(raw: dict[str, Any], key: str, where: str,
@@ -460,6 +488,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         telegram_chat_id_env=telegram.get("chat_id_env", "JARVIS_TELEGRAM_CHAT_ID"),
         ui_port=ui.get("port", 8787),
         ui_base_url=str(ui.get("base_url", "") or "").rstrip("/"),
+        cold_prefix_floor=_cold_prefix_floor_or_err(os_raw),
         knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
         knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 40)),
         knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 4000)),

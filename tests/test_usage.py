@@ -255,6 +255,46 @@ def test_an_unclassified_tax_reports_no_share_rather_than_a_zero_one(transcripts
     assert total.rewrite_ttl_excess == 0
 
 
+def test_the_floor_comes_from_the_catalog_and_reclassifies_the_same_boundary(
+        transcripts):
+    """`os.cold_prefix_floor` is the knob, and this is the boundary it moves.
+
+    One transcript, read twice under different floors. At 5,000 a boundary reading 16k
+    kept its prefix, so no TTL would have helped it; raise the floor above 16k and the
+    same boundary is read as an expiry. Nothing else about the session changes, which is
+    what makes this the setting's actual effect rather than a coincidence.
+    """
+    transcripts("s1", [
+        row("m1", write=60_000, read=0, at="2026-08-09T00:00:00.000Z"),
+        row("m2", write=100, read=60_000, at="2026-08-09T00:00:02.000Z"),
+        row("m3", write=60_000, read=16_000, at="2026-08-09T00:30:00.000Z"),
+    ])
+    assert usage.read_session("s1", cold_prefix_floor=5_000).total.boundaries_ttl == 0
+    assert usage.read_session("s1", cold_prefix_floor=20_000).total.boundaries_ttl == 1
+
+
+def test_a_missing_catalog_falls_back_rather_than_failing_the_report(monkeypatch):
+    """`jarvis cost` has to work on a machine where no catalog was ever registered."""
+    def explode():
+        raise RuntimeError("no catalog registered")
+    monkeypatch.setattr("jarvis.ops.resolve_catalog", explode)
+    usage._reset_cold_prefix_floor()
+    try:
+        assert usage.resolved_cold_prefix_floor() == usage.COLD_PREFIX_FLOOR
+    finally:
+        usage._reset_cold_prefix_floor()
+
+
+def test_the_two_defaults_cannot_drift_apart():
+    """The value's home is the catalog; `usage` repeats it only as a no-catalog floor.
+
+    Two literals for one number is a bug waiting to happen, so it is asserted rather
+    than trusted.
+    """
+    from jarvis import catalog
+    assert usage.COLD_PREFIX_FLOOR == catalog.DEFAULT_COLD_PREFIX_FLOOR
+
+
 def test_merging_keeps_the_share_token_weighted_not_averaged():
     """Two sessions of very different size must not each get half a vote."""
     small = usage.Usage(rewrite_ttl_write=10, rewrite_prefix_write=0, boundaries_ttl=1,

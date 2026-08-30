@@ -6,7 +6,7 @@ average hides that. So the tests that matter are the two ways a reader gets the 
 wrong: the window not actually selecting a cohort, and the trigger being read against
 the wrong denominator.
 
-Spec: docs/superpowers/specs/2026-08-30-where-the-800-dollars-went.md.
+Findings: docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
 """
 
 from __future__ import annotations
