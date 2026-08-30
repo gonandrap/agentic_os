@@ -76,11 +76,17 @@ def store(tmp_path):
     s.close()
 
 
-def _auth_turn(store):
+def _auth_turn(store, ended_at: float | None = None):
     turn = store.create_turn("wo-test", kind="message", prompt="do the thing")
-    return store.finish_turn(
+    row = store.finish_turn(
         turn["id"], "failed",
         error="Failed to authenticate: OAuth session expired and could not be refreshed")
+    if ended_at is None:
+        return row
+    store.conn.execute("UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
+                       (ended_at - 1, ended_at, turn["id"]))
+    store.conn.commit()
+    return dict(row, started_at=ended_at - 1, ended_at=ended_at)
 
 
 def test_the_sign_in_that_failed_is_not_the_one_that_fixes_it(store, signin):
@@ -94,7 +100,11 @@ def test_the_sign_in_that_failed_is_not_the_one_that_fixes_it(store, signin):
 
 
 def test_a_sign_in_after_the_failure_makes_the_pause_due(store, signin):
-    _auth_turn(store)
+    # The failure is aged rather than stamped `now`: the two sides of `_auth_retry_at`
+    # are different clocks — a file's mtime against `db.now()` — and a sign-in written
+    # microseconds after the turn is not reliably NEWER than it. Unaged, this passes
+    # locally and fails on CI (3.11 and 3.13 of run 33295018938).
+    _auth_turn(store, ended_at=time.time() - 5)
     signin()
     pause = worker_session.turn_pause(store, "wo-test")
     assert pause is not None
