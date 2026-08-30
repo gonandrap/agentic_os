@@ -55,6 +55,14 @@
 
 {% if fo.plan %}
 <h3>The plan{% if fo.plan.summary %} — {{ fo.plan.summary }}{% endif %}</h3>
+{# THE SPEC IS THE FEATURE, and the plan below is an index into it: one section per
+   child, and each child's brief is only the boundary around its section. Named at the
+   top because a reader who does not know the spec exists will read twelve thin briefs
+   and conclude the feature was under-specified. #}
+{% if fo.plan.design_doc %}
+<p class="sub">📄 Spec: <span class="mono">{{ fo.plan.design_doc }}</span> — each child
+  below implements one section of it.</p>
+{% endif %}
 {# Rendered from the stored document rather than from the children, so it keeps saying
    what was APPROVED even after the children have moved on from it. #}
 <div class="panel">
@@ -63,6 +71,7 @@
     <div class="grow">
       <span class="mono">{{ c.key }}</span> <strong>{{ c.title }}</strong>
       {% if c.needs %}<span class="sub">needs {{ c.needs | join(', ') }}</span>{% endif %}
+      {% if c.spec_section %}<span class="sub">§ {{ c.spec_section }}</span>{% endif %}
       <div class="sub">{{ c.description }}</div>
       {% if c.acceptance %}<div class="sub">done when: {{ c.acceptance }}</div>{% endif %}
     </div>
@@ -94,6 +103,25 @@
 
 {{ validation_ui.section(validation, 'h3') }}
 
+{% if fo.status == 'failed' %}
+{# The user's own way past a dead child. Without it, reviving a feature needed somebody
+   with database access — `settle_features` never looks at a settled feature again.
+   See docs/superpowers/specs/2026-08-29-feature-order-resume.md. #}
+<h3>Resume this feature</h3>
+<div class="panel">
+  <form method="post" action="/fo/{{ project }}/{{ fo.id }}/resume">
+    <p class="sub">Every child that is still failed or cancelled is marked superseded —
+      it stops holding the feature back, and stays on the list saying so. Describe what
+      still needs doing and it is filed as a new child work order, which is all that
+      worker will see. Leave it empty when the failure was spurious and the work is
+      already done.</p>
+    <textarea name="fix" rows="3"
+              placeholder="what still needs doing (optional)"></textarea>
+    <button>Resume it</button>
+  </form>
+</div>
+{% endif %}
+
 <h3>Children</h3>
 <div class="panel">
   {% for c in fo.children %}
@@ -102,6 +130,12 @@
       <span class="st tone-{{ cm.tone }}"><span class="i">{{ cm.icon }}</span>{{ cm.word }}</span>
       <div class="grow">
         <a href="/wo/{{ project }}/{{ c.id }}" class="mono">{{ c.id }}</a> {{ c.title }}
+        {% if c.superseded %}
+          {# Superseded, not hidden: the row IS the feature's history, and dropping it
+             would make a child the user answered for look like one that never ran. #}
+          <div class="sub">⊘ superseded — you answered for this one; it no longer
+            settles the feature either way</div>
+        {% endif %}
         {% if c.depends_on %}
           <div class="sub">⊘ after
             {% for d in c.depends_on %}<a class="mono"

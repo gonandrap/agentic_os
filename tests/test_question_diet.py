@@ -31,6 +31,7 @@ from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
 from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
+from jarvis.testing import FIXTURE_DESIGN_DOC_BODY, fixture_spec_section
 
 
 @pytest.fixture()
@@ -51,18 +52,20 @@ def fat_child(key: str, needs: list[str] | None = None) -> dict:
     `plans.MAX_DESCRIPTION_CHARS`, and still an order of magnitude more text than the
     one skeleton line Neo is meant to receive for it.
 
-    It used to be several KB. The ceiling landed afterwards (wo-ed9af5b7), so a brief
-    that size is refused at submission now and could not reach these tests at all — but
-    the diet these tests are about is the ratio between a brief and its skeleton line,
-    not the absolute size, and 1.4KB against one line still demonstrates it."""
+    It used to be several KB. The ceiling landed afterwards (wo-ed9af5b7) and dropped
+    again to 600 when the spec became the artifact (wo-4580e7c1), so a brief that size is
+    refused at submission now and could not reach these tests at all — but the diet these
+    tests are about is the ratio between a brief and its skeleton line, not the absolute
+    size, and even 600 characters against one line still demonstrates it."""
     body = (f"BRIEF-BODY-{key}: build the {key} piece of the exporter. "
-            + "Context the planner repeated into every child. " * 28)
+            + "Context the planner repeated into every child. " * 11)
     assert len(body) <= plans.MAX_DESCRIPTION_CHARS, len(body)
     return {
         "key": key,
         "title": f"Build {key}",
         "description": body,
         "needs": needs or [],
+        "spec_section": fixture_spec_section(key),
         "acceptance": f"tests for {key} pass",
     }
 
@@ -71,20 +74,11 @@ ASK = ("Add a CSV exporter to the reporting module, with a command that calls it
        "tests over both the happy path and an empty result set.")
 
 
-DESIGN_DOC = """# Exporter design
-
-## 1. Shape
-
-The exporter is one module with one entry point.
-
-## 2. Data model
-
-Rows are dicts; the header is the union of keys, first-seen order.
-
-## 3. Failure handling
-
-An empty result set writes the header and nothing else. Errors raise, never print.
-"""
+#: The shared fixture document rather than a local copy of it. A plan is now refused
+#: unless every child's `spec_section` resolves in the spec it names, so a private
+#: document with three sections would cap this file's plans at three children and drift
+#: from what `fixture_spec_section` hands out.
+DESIGN_DOC = FIXTURE_DESIGN_DOC_BODY
 
 
 # -- P1: the plan-review question is a skeleton -----------------------------------------
@@ -112,8 +106,18 @@ def test_plan_question_is_a_skeleton_and_fo_show_keeps_the_full_briefs():
     assert "BRIEF-BODY-api" not in question
     # Whoever reads it is told where the full briefs live.
     assert "jarvis fo show fo-x" in question
-    # The diet is the point: production plans hit 84KB; the skeleton stays small.
-    assert len(question) < len(full) / 4
+    # The diet is the point: production plans hit 84KB. Asserted as INDEPENDENCE rather
+    # than as a ratio — the same plan with briefs three times the size produces the
+    # byte-identical question — because a ratio is a statement about today's
+    # MAX_DESCRIPTION_CHARS and silently weakens every time that number moves.
+    thin = plans.parse_plan({
+        "summary": "an exporter",
+        "design_doc": "docs/specs/exporter.md",
+        "children": [{**fat_child("schema"), "description": "a" * 200},
+                     {**fat_child("api", needs=["schema"]), "description": "b" * 200}],
+    })
+    assert plans.build_plan_question(fo, thin) == question
+    assert len("\n".join(plans.render_plan(thin))) < len(full)
 
 
 def test_plan_question_names_the_design_doc_when_the_plan_has_one():
@@ -145,11 +149,6 @@ def test_parse_plan_normalises_design_doc_and_refuses_an_absolute_path():
         "children": [fat_child("a")],
     })
     assert plan["design_doc"] == "docs/specs/exporter.md"
-    # Absent stays empty, not missing — nothing downstream re-derives.
-    # A plan may stand on a document it has yet to write instead of one it names.
-    by_child = plans.parse_plan({"design_doc_by": "a", "children": [fat_child("a")]})
-    assert by_child["design_doc"] == ""
-    assert by_child["design_doc_by"] == "a"
     with pytest.raises(plans.PlanError, match="design_doc"):
         plans.parse_plan({"design_doc": "/etc/passwd",
                           "children": [fat_child("a")]})
@@ -200,30 +199,34 @@ def test_children_of_a_design_doc_plan_get_the_doc_materialised(planning, store,
 
     snapshot = project / ".jarvis" / "features" / fo["id"] / "exporter.md"
     assert snapshot.read_text() == DESIGN_DOC
+    # ...and, separately, only this child's SECTION — the file the prompt names first.
+    section = next((project / ".jarvis" / "features" / fo["id"] / "sections")
+                   .glob("*.md"))
+    which = fat_child("schema")["spec_section"]
+    assert section.read_text() == sections.extract_section(DESIGN_DOC, which) + "\n"
+    assert section.read_text() != DESIGN_DOC, "the section is a CUT, not the whole spec"
     # Two dispatch turns by now: the planner's, then the child's.
     calls = fake_claude.wait_calls(lambda c: "--session-id" in c["argv"], count=2)
     child_prompt = next(c["argv"][-1] for c in calls
                         if "BRIEF-BODY-schema" in c["argv"][-1])
-    assert "# Design document" in child_prompt
+    assert "# Your section of the feature spec" in child_prompt
+    assert str(section) in child_prompt
     assert str(snapshot) in child_prompt
+    # The SECTION's text is not pasted into the prompt: naming the file is the whole
+    # saving, and a prompt carrying the section would only move the duplication.
+    assert section.read_text().strip() not in child_prompt
 
 
-def test_children_of_a_plain_plan_carry_no_design_doc_section(planning, store, project,
+def test_a_work_order_with_no_feature_carries_no_spec_section(started, store, project,
                                                               fake_claude):
-    """A plan whose spec is still to be written names no document, so nothing is
-    snapshotted and no child is handed a section that does not exist yet."""
-    daemon, fo = planning
-    ops.submit_plan(fo["id"], {
-        "summary": "an exporter FORCE_APPROVE",
-        "design_doc_by": "schema",
-        "children": [fat_child("schema")],
-    })
-    daemon._neo_drain()
-    daemon.tick()
-    calls = fake_claude.wait_calls(lambda c: "--session-id" in c["argv"], count=2)
-    child_prompt = next(c["argv"][-1] for c in calls
-                        if "BRIEF-BODY-schema" in c["argv"][-1])
-    assert "# Design document" not in child_prompt
+    """The null case, and the control for the test above: an ordinary work order has no
+    parent, so nothing is snapshotted and its prompt has no spec heading at all."""
+    ops.create_work_order("proj_a", "unrelated", description="something else entirely")
+
+    started.tick()
+
+    call = fake_claude.wait_calls(lambda c: "--session-id" in c["argv"], count=1)[0]
+    assert "# Your section of the feature spec" not in call["argv"][-1]
     assert not (project / ".jarvis" / "features").exists()
 
 

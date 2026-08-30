@@ -30,10 +30,16 @@ The rejections, and what each is guarding:
   so "as discussed in the plan" hands a worker a sentence pointing at a document it
   cannot open. This project has already recorded the general form of that lesson: the
   work order record must stand alone, because nobody reads worker transcripts.
-* **Children whose description does not stop**, and **a plan with no design document
-  and no plan to write one.** The mirror of the rejection above and its consequence: a
-  brief must stand alone as INSTRUCTIONS, which is not a licence to restate the design.
-  See §2 of docs/superpowers/specs/2026-08-23-the-work-order-record.md.
+* **Children whose description does not stop**, and **a plan with no design document.**
+  The mirror of the rejection above and its consequence: a brief must stand alone as
+  INSTRUCTIONS, which is not a licence to restate the spec.
+* **A child that does not name its section of the spec**, two children naming the same
+  one, or a section that does not resolve. The spec's boundaries are what the split is
+  made of, so a plan that does not line up with them has not been cut.
+
+The last of those needs the spec's TEXT, which this module never reads from disk —
+`spec_problems` is the pure other half and `ops.submit_plan` is where the two meet. See
+docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md.
 """
 
 from __future__ import annotations
@@ -53,10 +59,12 @@ CHILD_CAP = 8
 MIN_DESCRIPTION_CHARS = 80
 
 #: Longest a child brief may be. The floor's argument does NOT run in reverse: a
-#: description that must stand alone is not one that should carry the whole design, which
-#: is materialised beside every child anyway. See §2 of
-#: docs/superpowers/specs/2026-08-23-the-work-order-record.md.
-MAX_DESCRIPTION_CHARS = 1500
+#: description that must stand alone is not one that should carry the design, and the
+#: child's own SECTION of the spec is now materialised beside it. 1500 was PR 125's
+#: number and it left room for a paraphrase; 600 leaves room for what the section does not
+#: say — the scope boundary and what done means. §1.3 of
+#: docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md.
+MAX_DESCRIPTION_CHARS = 600
 
 #: Plan-local child keys. The planner names its children so it can wire `needs` between
 #: them before any work-order id exists; these keys never leave the plan.
@@ -142,6 +150,13 @@ def parse_plan(raw: Any) -> dict[str, Any]:
         if not title:
             problems.append(f"{where} ({key}): `title` is required")
         problems += _description_problems(key, title, description)
+        spec_section = str(entry.get("spec_section") or "").strip()
+        if not spec_section:
+            problems.append(
+                f"{where} ({key}): `spec_section` is required — name the section of the "
+                f"design document this piece implements, by number or by heading. It is "
+                f"what the worker is handed and what the panel judges the change against"
+            )
         needs_raw = entry.get("needs") or []
         if not isinstance(needs_raw, list):
             problems.append(f"{where} ({key}): `needs` must be a list of child keys")
@@ -154,6 +169,10 @@ def parse_plan(raw: Any) -> dict[str, Any]:
         children.append({
             "key": key, "title": title[:200], "description": description,
             "needs": needs,
+            # Which section of the spec this child implements. Resolved against the
+            # document's text in `spec_problems`, not here: this function never touches
+            # disk. §1.2 of the design document.
+            "spec_section": spec_section,
             # Free-form and never validated: the test-lead seat that fills it lands in
             # Phase 3, and a field the OS refuses to carry until then is a field Phase 3
             # has to migrate. It rides along instead.
@@ -175,15 +194,20 @@ def parse_plan(raw: Any) -> dict[str, Any]:
         problems.append(f"dependency cycle: {' -> '.join(cycle)}")
 
     design_doc = str(raw.get("design_doc") or "").strip()
-    design_doc_by = str(raw.get("design_doc_by") or "").strip()
-    if design_doc:
+    if not design_doc:
+        problems.append(
+            "the plan names no `design_doc`. The spec is the feature's one artifact: "
+            "every child brief points at a section of it, every child worker is handed "
+            "that section, and the feature's agent type is built from its `Agent "
+            "profile` appendix. Write the document, then name it here."
+        )
+    else:
         parts_of = design_doc.replace("\\", "/").split("/")
         if design_doc.startswith(("/", "\\")) or ".." in parts_of:
             problems.append(
                 f"`design_doc` must be a path relative to the repository root, with no "
                 f"`..` segments, got {design_doc!r}"
             )
-    problems += _spec_problems(design_doc, design_doc_by, children, known)
 
     justification = str(raw.get("justification") or "").strip()
     if len(children) > CHILD_CAP and not justification:
@@ -198,76 +222,64 @@ def parse_plan(raw: Any) -> dict[str, Any]:
     return {
         "summary": str(raw.get("summary") or "").strip(),
         "justification": justification,
-        # The feature's design document, relative to the repository root. Optional but
-        # first-class: `fo plan` snapshots its content and dispatch materialises it for
-        # every child, which is what lets a child brief REFERENCE its sections instead
-        # of duplicating them — the duplication that took plan-review questions to 84KB.
+        # The feature's spec, relative to the repository root. REQUIRED: `fo plan`
+        # snapshots its content, dispatch materialises each child's own section beside
+        # it, and the feature's agent type is built from its `Agent profile` appendix.
+        # §1.1 of docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md.
         "design_doc": design_doc,
-        # The child that WRITES the design document, when there is not one yet. Mutually
-        # exclusive with `design_doc` and validated the same way: see `_spec_problems`.
-        "design_doc_by": design_doc_by,
         "children": children,
     }
 
 
-def _spec_problems(design_doc: str, design_doc_by: str,
-                   children: list[dict[str, Any]], known: set[str]) -> list[str]:
-    """Every plan must stand on a design document — or produce one first.
+def spec_problems(plan: dict[str, Any], doc_text: str) -> list[str]:
+    """Whether the plan and the spec it names describe the same feature.
 
-    The two forms, why naming both is refused, and why every sibling must wait for a
-    `design_doc_by` child: §2, §2.1 and §2.2 of
-    docs/superpowers/specs/2026-08-23-the-work-order-record.md.
+    The half of the validation that needs the document's TEXT, kept pure and separate so
+    `parse_plan` never touches disk; `ops.submit_plan` reads the file and calls both.
+    Three rejections, all §2 of the design document:
+
+    * a `spec_section` that resolves to no heading — the child would be handed nothing,
+      and the panel would judge its diff against nothing;
+    * two children naming the same section — a boundary two work orders share is a
+      boundary the planner did not cut, which is the whole premise of splitting on the
+      spec rather than on the planner's intuition;
+    * no usable `Agent profile` appendix, which is `specs.profile_problems`.
+
+    Nothing here judges whether a section is any GOOD. That is the plan reviewer's job;
+    this only ensures there is something for it to review.
     """
-    if design_doc and design_doc_by:
-        return [
-            f"the plan names both `design_doc` ({design_doc!r}) and `design_doc_by` "
-            f"({design_doc_by!r}) — name the document you wrote, or name the child that "
-            f"writes it, not both"
-        ]
-    if not design_doc and not design_doc_by:
-        return [
-            "the plan names no `design_doc`. Every child brief is meant to CITE the "
-            "feature's design document rather than restate it, so the plan must either "
-            "name a document you wrote (`design_doc`) or, when there is no spec yet, "
-            "name in `design_doc_by` the child of this plan that writes one — writing "
-            "the spec becomes the first piece of the work"
-        ]
-    if not design_doc_by:
-        return []
-    if design_doc_by not in known:
-        return [
-            f"`design_doc_by` names {design_doc_by!r}, which is not a child of this plan "
-            f"(known: {', '.join(sorted(known)) or 'none'})"
-        ]
-    stragglers = sorted(c["key"] for c in children
-                        if c["key"] != design_doc_by
-                        and design_doc_by not in _transitive_needs(children, c["key"]))
-    if stragglers:
-        return [
-            f"child {design_doc_by!r} writes the design document, but "
-            f"{', '.join(repr(k) for k in stragglers)} "
-            f"{'does' if len(stragglers) == 1 else 'do'} not depend on it — a spec its "
-            f"siblings do not wait for is not a spec they can cite. Add it to their "
-            f"`needs`, directly or through another child."
-        ]
-    return []
+    from . import sections, specs
 
-
-def _transitive_needs(children: list[dict[str, Any]], key: str) -> set[str]:
-    """Every child key `key` depends on, directly or through other children.
-
-    Tolerates a cycle rather than recursing for ever; cycles have their own check — §2.2.
-    """
-    edges = {c["key"]: [d for d in c["needs"] if d != c["key"]] for c in children}
-    reached: set[str] = set()
-    stack = list(edges.get(key, ()))
-    while stack:
-        dep = stack.pop()
-        if dep in reached or dep not in edges:
+    problems: list[str] = []
+    seen: dict[str, str] = {}
+    profile_heading = specs.AGENT_PROFILE.lower()
+    for child in plan.get("children") or []:
+        which = str(child.get("spec_section") or "").strip()
+        if not which:
+            continue  # already reported by parse_plan
+        key = child["key"]
+        if sections.extract_section(doc_text, which) is None:
+            problems.append(
+                f"child {key!r}: `spec_section` {which!r} matches no heading in "
+                f"{plan.get('design_doc')!r}. Name a section by its number or by its "
+                f"heading text."
+            )
             continue
-        reached.add(dep)
-        stack.extend(edges[dep])
-    return reached
+        if profile_heading in which.lower():
+            problems.append(
+                f"child {key!r}: `spec_section` names the {specs.AGENT_PROFILE!r} "
+                f"appendix, which is the team's posture and not a piece of the work"
+            )
+        norm = which.lower()
+        if norm in seen:
+            problems.append(
+                f"children {seen[norm]!r} and {key!r} both claim section {which!r}. One "
+                f"section, one work order — if they are really two pieces, the spec owes "
+                f"them two sections."
+            )
+        else:
+            seen[norm] = key
+    return problems + specs.profile_problems(doc_text)
 
 
 def _description_problems(key: str, title: str, description: str) -> list[str]:
@@ -293,10 +305,10 @@ def _description_problems(key: str, title: str, description: str) -> list[str]:
     elif len(description) > MAX_DESCRIPTION_CHARS:
         problems.append(
             f"child {key!r}: `description` is {len(description)} characters, over the "
-            f"{MAX_DESCRIPTION_CHARS} a brief may be. The design document is "
-            f"materialised beside every child worker — cite its sections by number "
-            f"instead of restating them, and keep here only what this piece must do, "
-            f"what it must not touch, and what done means."
+            f"{MAX_DESCRIPTION_CHARS} a brief may be. This child's own section of the "
+            f"spec is materialised beside its worker — keep here only what that section "
+            f"does NOT say: the scope boundary, what this piece must not touch, and what "
+            f"done means."
         )
     low = description.lower()
     for pattern, why in DANGLING_PHRASES:
@@ -411,8 +423,12 @@ APPROVE when all of these hold:
 - **The edges are the real ones.** A child depends on another only where it genuinely
   needs its code, since an edge costs a merge cycle of waiting. Equally, work that truly
   needs a schema change must not be running in parallel with it.
+- **The split follows the spec's boundaries.** Every child names the section of the
+  design document it implements, and no two name the same one. Judge whether those
+  sections are the feature's real functional seams or a decomposition the planner
+  reached for first and then carved the spec to fit.
 - **Each child is nameable from its line.** You see one line per child — title,
-  edges, acceptance — and NOT the full briefs: those were validated mechanically
+  edges, section, acceptance — and NOT the full briefs: those were validated mechanically
   (they stand alone, or this never reached you) and are withheld on purpose, because
   yours is a review of the decomposition, not of prose. If a title plus its
   acceptance line does not tell you what that child ships, reject and say which
@@ -475,7 +491,12 @@ def build_plan_question(fo: dict[str, Any], plan: dict[str, Any]) -> str:
 
 
 def render_plan_skeleton(plan: dict[str, Any]) -> list[str]:
-    """One line per child: key, title, edges, acceptance. Never the description."""
+    """One line per child: key, title, edges, section, acceptance. Never the description.
+
+    The section IS part of the skeleton, unlike the brief: the reviewer's judgement is
+    whether the decomposition follows the spec's boundaries, and it cannot make that
+    judgement without seeing which boundary each child claims.
+    """
     lines = []
     if plan.get("summary"):
         lines.append(plan["summary"])
@@ -483,13 +504,11 @@ def render_plan_skeleton(plan: dict[str, Any]) -> list[str]:
     if plan.get("design_doc"):
         lines.append(f"Design document: {plan['design_doc']}")
         lines.append("")
-    elif plan.get("design_doc_by"):
-        lines.append(f"Design document: to be written by child "
-                     f"[{plan['design_doc_by']}]")
-        lines.append("")
     for child in plan.get("children") or []:
         needs = f" (needs {', '.join(child['needs'])})" if child.get("needs") else ""
         lines.append(f"- [{child['key']}] {child['title']}{needs}")
+        if child.get("spec_section"):
+            lines.append(f"    spec section: {child['spec_section']}")
         if child.get("acceptance"):
             lines.append(f"    done when: {child['acceptance']}")
     if plan.get("justification"):
@@ -512,13 +531,11 @@ def render_plan(plan: dict[str, Any]) -> list[str]:
     if plan.get("design_doc"):
         lines.append(f"Design document: {plan['design_doc']}")
         lines.append("")
-    elif plan.get("design_doc_by"):
-        lines.append(f"Design document: to be written by child "
-                     f"[{plan['design_doc_by']}]")
-        lines.append("")
     for child in plan.get("children") or []:
         needs = f" (needs {', '.join(child['needs'])})" if child.get("needs") else ""
         lines.append(f"- [{child['key']}] {child['title']}{needs}")
+        if child.get("spec_section"):
+            lines.append(f"    spec section: {child['spec_section']}")
         lines.append(f"    {child['description']}")
         if child.get("acceptance"):
             lines.append(f"    done when: {child['acceptance']}")

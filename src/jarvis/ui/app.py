@@ -11,7 +11,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import bill, invariants, ops, uilog
+from .. import bill, invariants, ops, specs, uilog
 from ..central_store import CentralStore
 from ..daemon import daemon_running
 from ..paths import PRODUCTION, deployment_env
@@ -603,13 +603,19 @@ def create_app() -> FastAPI:
             # disagree about the same work order once before (PR 65).
             label = invariants.status_label(store, wo)
             validation = ops.validation_detail(store, wo_id=wo_id)
+            # WHERE THE REST OF THIS ORDER IS. The brief is deliberately only the margin
+            # around a section of the feature's spec now, so a page that showed the brief
+            # alone would be a page missing most of the work. `section_text` is NOT passed
+            # to the template: pasting it here would re-create the duplication the whole
+            # change removed — the pointer is the point.
+            spec = specs.spec_of(store, wo)
         finally:
             store.close()
         show_debug = debug not in ("", "0", "false")
         bill = wo_bill(wo_id, pname)
         return render(request, "work_order.html", project=pname, wo=wo,
                       pause=pause, waiting=waiting, status_label=label,
-                      validation=validation,
+                      validation=validation, spec=spec,
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug),
                       debug=show_debug, debug_count=count_debug(events),
@@ -931,6 +937,14 @@ def create_app() -> FastAPI:
     def cancel_fo(name: str, fo_id: str):
         try:
             ops.cancel_feature_order(fo_id, project_name=name)
+        except ops.OpsError as e:
+            return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
+        return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
+
+    @app.post("/fo/{name}/{fo_id}/resume")
+    def resume_fo(name: str, fo_id: str, fix: str = Form("")):
+        try:
+            ops.resume_feature_order(fo_id, fix=fix, project_name=name)
         except ops.OpsError as e:
             return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
         return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)

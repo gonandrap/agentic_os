@@ -74,6 +74,16 @@
       to.</p>
   {% endif %}
   {% if wo.description %}<p class="kv" style="white-space: pre-wrap;">{{ wo.description }}</p>{% endif %}
+  {# The brief above is only the MARGIN around this order's section of its feature's
+     spec — the scope boundary and what done means. The section itself is the work, and
+     it is NAMED here rather than inlined: repeating it under every order is exactly the
+     duplication the spec-driven change removed. See
+     docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md §4. #}
+  {% if spec and spec.section %}
+  <p class="kv">📄 <strong>Spec section {{ spec.section }}</strong>
+    of <span class="mono">{{ spec.repo_path }}</span> — that section is what this order
+    builds; the brief above is the boundary around it.</p>
+  {% endif %}
   <p class="kv mono">
     created {{ fmt_age(wo.created_at) }} ago · updated {{ fmt_age(wo.updated_at) }} ago
     {% if wo.model %} · model {{ wo.model }}{% endif %}

@@ -54,6 +54,7 @@ def production_shaped_plan() -> dict[str, Any]:
             "description": brief,
             "needs": [f"piece{i - 1}"] if i else [],
             "acceptance": f"the piece {i} tests pass and the suite stays green",
+            "spec_section": str(i + 1),
         })
     plan = plans.parse_plan({
         "summary": "no work order reaches the merge queue until the panel says so",

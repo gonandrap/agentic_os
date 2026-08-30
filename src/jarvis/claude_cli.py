@@ -171,6 +171,7 @@ def _briefing_args(
     settings_file: Path | None = None,
     add_dirs: list[Path] | None = None,
     autocompact_window: int | None = None,
+    agent: str | None = None,
 ) -> list[str]:
     """The flags that constitute a worker's briefing, in one place.
 
@@ -207,6 +208,13 @@ def _briefing_args(
         # the same range up front so a bad catalog fails at boot rather than on the
         # first dispatch.
         args += ["--autocompact", str(autocompact_window)]
+    if agent:
+        # The LEAD session's persona, not a subagent type. Verified live with a control
+        # on 2026-08-29: the definition is resolved out of `<add-dir>/.claude/agents/`,
+        # and without the matching `--add-dir` the CLI exits with "not found" rather than
+        # falling back — so this flag and that directory travel together or not at all.
+        # §3 of docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md.
+        args += ["--agent", agent]
     for d in add_dirs or []:
         args += ["--add-dir", str(d)]
     return args
@@ -225,6 +233,7 @@ def spawn_background(
     resume_session_id: str | None = None,
     add_dirs: list[Path] | None = None,
     autocompact_window: int | None = None,
+    agent: str | None = None,
 ) -> str | None:
     """Spawn a native Claude Code background session; returns the job id if the
     CLI reported one.
@@ -254,7 +263,7 @@ def spawn_background(
     if worktree:
         args += ["--worktree", worktree]
     args += _briefing_args(model, effort, permission_mode, append_system_prompt,
-                           settings_file, add_dirs, autocompact_window)
+                           settings_file, add_dirs, autocompact_window, agent)
     # `--` fences the prompt off from option parsing. Without it a variadic option
     # (`--add-dir <directories...>` is one) keeps consuming positionals and swallows
     # the prompt as a directory: the session boots with nothing to do and parks at
@@ -438,6 +447,7 @@ def turn_args(
     settings_file: Path | None = None,
     add_dirs: list[Path] | None = None,
     autocompact_window: int | None = None,
+    agent: str | None = None,
 ) -> list[str]:
     """argv for one worker turn. Split out from `spawn_turn` so tests can assert on it.
 
@@ -454,7 +464,7 @@ def turn_args(
     if worktree:
         args += ["--worktree", worktree]
     args += _briefing_args(model, effort, permission_mode, append_system_prompt,
-                           settings_file, add_dirs, autocompact_window)
+                           settings_file, add_dirs, autocompact_window, agent)
     # Same fence, same reason as `spawn_background`: `--add-dir` and `--tools` are both
     # variadic and will eat the prompt as an option value if it arrives bare. Nothing
     # may be appended after this.

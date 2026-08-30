@@ -118,7 +118,38 @@ def _append_system_prompt(*parts: str | None) -> str:
     return "\n\n".join(p.strip() for p in parts if p and p.strip())
 
 
-def briefing_for(project: ProjectSpec, wo: dict[str, Any]) -> dict[str, Any]:
+def feature_agent(store: ProjectStore | None, project: ProjectSpec,
+                  wo: dict[str, Any]) -> tuple[str | None, Path | None]:
+    """This child's per-feature agent type: its name and the directory that supplies it.
+
+    Rebuilt from the stored plan on EVERY turn rather than only at plan release, for the
+    reason `bootstrap._rebuild` rebuilds the skills tree on every dispatch: the
+    destination is generated, so a definition deleted or mangled between turns heals
+    itself, and a feature released before this existed acquires one on its next dispatch.
+
+    `(None, None)` for anything without one, and every failure lands there too — no
+    parent, no plan, no `Agent profile` appendix, an unwritable `.jarvis/`. A missing
+    persona must never be the reason a work order does not run (§3 of
+    docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md). The two travel
+    together or not at all: `--agent` without its `--add-dir` is an immediate CLI error.
+    """
+    from . import specs
+
+    if store is None or not wo.get("parent_id") or wo.get("kind") != "worker":
+        return None, None
+    plan = specs.plan_of(store, wo["parent_id"])
+    content = str(plan.get("design_doc_content") or "")
+    if not content:
+        return None, None
+    name = specs.install_agent(project.path, wo["parent_id"],
+                               str(plan.get("summary") or wo.get("title") or ""), content)
+    if not name:
+        return None, None
+    return name, specs.agent_root(project.path, wo["parent_id"])
+
+
+def briefing_for(project: ProjectSpec, wo: dict[str, Any],
+                 store: ProjectStore | None = None) -> dict[str, Any]:
     """The flags every turn of this work order is launched with.
 
     A resumed session re-derives its model, effort, permission mode, system prompt and
@@ -145,7 +176,13 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any]) -> dict[str, Any]:
     reaches the architect and test-lead seat definitions, and an ordinary worker does not
     (design decision 4). Because a resumed turn re-derives its flags from argv, this is
     also what keeps the seats available on the planner's second and later turns — dropping
-    the kind here would make them vanish after turn 1.
+    the kind here would make them vanish after turn 1. A child of a feature order adds a
+    third: the directory holding its feature's own agent type, which is what makes
+    `agent` resolvable — see `feature_agent`.
+
+    `store` is optional only so the tests and callers that ask for a briefing outside a
+    dispatch keep working; without it a child of a feature order simply runs as an
+    ordinary worker.
 
     `autocompact_window` is the one flag read from the CATALOG on every turn rather than
     from the work-order row. Model, effort and permission mode are resolved onto the row
@@ -159,8 +196,10 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any]) -> dict[str, Any]:
     from .worker_brief import git_briefing
 
     model = wo.get("model") or project.worker.model
+    agent, agent_dir = feature_agent(store, project, wo)
     return {
         "model": model,
+        "agent": agent,
         "effort": wo.get("effort") or project.worker.effort,
         "permission_mode": (wo.get("permission_mode")
                             or project.worker.permission_mode),
@@ -168,7 +207,8 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any]) -> dict[str, Any]:
             git_briefing(model),
             wo.get("append_system_prompt") or project.worker.append_system_prompt),
         "settings_file": _write_worker_settings(project, wo),
-        "add_dirs": install_agent_assets(project.path, wo.get("kind") or "worker"),
+        "add_dirs": (install_agent_assets(project.path, wo.get("kind") or "worker")
+                     + ([agent_dir] if agent_dir else [])),
         "autocompact_window": project.worker.autocompact_window,
     }
 
@@ -237,7 +277,7 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
             unit=systemd_units.unit_name(wo_id, turn["seq"]),
             name=worker_name(wo),
             worktree=worktree,
-            **briefing_for(project, wo),
+            **briefing_for(project, wo, store),
         )
     except claude_cli.ClaudeCliError as e:
         store.finish_turn(turn["id"], "failed", error=str(e))
