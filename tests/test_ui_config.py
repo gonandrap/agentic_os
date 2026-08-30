@@ -34,9 +34,11 @@ def client(jarvis_home, fake_claude, catalog_file):
 
 
 def row(page: str, label: str) -> str:
-    """The one setting row whose left column is `label`."""
+    """The one setting row whose left column is `label` — read off the cell's text, since
+    a safety setting carries a marker after its name."""
     for tr in page.split("<tr>"):
-        if f">{label}</td>" in tr:
+        cell = tr.partition('<td class="mono">')[2].partition("<")[0].strip()
+        if cell == label:
             return tr
     raise AssertionError(f"no row for {label!r} on the page")
 
@@ -61,8 +63,17 @@ def test_the_page_is_in_the_nav_and_groups_the_key_space(client):
 
 def test_only_booleans_get_a_toggle(client):
     page = client.get("/config").text
-    assert "<button>turn off</button>" in row(page, "neo.panel.fast_path")
+    assert ">turn off</button>" in row(page, "neo.panel.fast_path")
     assert "<button" not in row(page, "defaults.model")
+
+
+def test_a_safety_setting_is_marked_and_asks_for_its_reason(client):
+    """`*.validation.*` changes what a worker is ALLOWED to do, and `ops` will refuse the
+    toggle without a reason — so the row says so before the click, not after."""
+    safety = row(client.get("/config").text, "validation.enabled")
+    assert "⚠" in safety and 'placeholder="reason — required"' in safety
+    plain = row(client.get("/config").text, "neo.panel.fast_path")
+    assert "⚠" not in plain and 'placeholder="reason — optional"' in plain
 
 
 def test_provenance_names_the_version_that_set_a_key(client):

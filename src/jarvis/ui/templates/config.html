@@ -35,12 +35,15 @@
 <h2>{{ 'os — the fleet' if g.name == 'os' else 'project · ' + g.title }}</h2>
 <div class="panel">
   <table>
-    <tr><th>setting</th><th>value</th><th>where it came from</th><th></th></tr>
+    <tr><th style="width:32%">setting</th><th style="width:16%">value</th>
+        <th style="width:24%">where it came from</th><th style="width:28%"></th></tr>
     {% for k in g.settings %}
     <tr>
-      <td class="mono">{{ k.label }}</td>
+      <td class="mono">{{ k.label }}{% if k.safety %}
+        <span class="tone-warn" title="a safety setting — it changes what a worker is
+              allowed to do, so a reason is required">⚠</span>{% endif %}</td>
       <td class="mono">{{ k.value|tojson }}</td>
-      <td class="sub">
+      <td class="sub" style="white-space:nowrap">
         {%- if k.version %}set by <a href="#{{ k.version }}" class="mono">{{ k.version }}</a>
         {%- elif k.written %}set in the catalog file, by no recorded version
         {%- else %}a default of this build{% endif %}</td>
@@ -50,9 +53,9 @@
               style="display:flex; gap:6px; align-items:center">
           <input type="hidden" name="path" value="{{ k.path }}">
           <input type="hidden" name="value" value="{{ 'false' if k.value else 'true' }}">
-          <input type="text" name="reason"
-                 placeholder="reason — required for a safety setting" style="width:20em">
-          <button>{{ 'turn off' if k.value else 'turn on' }}</button>
+          <input type="text" name="reason" style="min-width:0"
+                 placeholder="{{ 'reason — required' if k.safety else 'reason — optional' }}">
+          <button style="white-space:nowrap">{{ 'turn off' if k.value else 'turn on' }}</button>
         </form>
         {% endif %}
       </td>

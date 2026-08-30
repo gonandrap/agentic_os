@@ -350,6 +350,7 @@ def group_config(show: dict, setters: dict[str, str]) -> list[dict]:
         groups.setdefault(prefix, []).append(
             {"path": path, "label": path[len(prefix) + 1:], "value": resolved[path],
              "bool": isinstance(resolved[path], bool), "written": path in written,
+             "safety": ops.safety_key(path),
              "version": setters.get(path) if path in written else None})
     return [{"name": p, "title": p if p == "os" else p.split(".", 1)[1],
              "settings": rows} for p, rows in groups.items()]
