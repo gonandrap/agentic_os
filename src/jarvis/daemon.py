@@ -1,6 +1,8 @@
 """jarvisd — the deterministic OS daemon.
 
 One process, one poll loop over every project in the catalog. Per tick, in this order:
+  0. reload the catalog if its file changed, so a `jarvis config set` reaches a running
+     fleet — once, at the top, so the whole tick runs under one configuration
   1. route project notification outboxes to the central inbox, then to sinks
   2. reap finished worker turns and settle their work orders against what came back
   3. route queued envelopes to whoever fills the role they name (src/jarvis/bus.py),
@@ -37,6 +39,7 @@ turns it launches (see worker_session.py, which owns how a turn is actually run)
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import signal
@@ -197,6 +200,13 @@ class Daemon:
         # The systemd seam for staged releases (src/jarvis/release.py). None means the
         # real thing; tests inject a fake so no test can ever touch real systemctl.
         self.release_runner: Any = None
+        # What the catalog file looked like when this catalog was loaded, SEEDED HERE so
+        # the first tick over an untouched file reloads nothing and cannot undo an
+        # in-memory edit. See `reload_catalog`.
+        self._catalog_stamp = self._catalog_file_stamp()
+        # Reload refused (unreadable, unparseable, or the project roster moved): say so
+        # once per daemon run, not once per tick. Same rule as `pr_poll_warned`.
+        self.catalog_reload_warned = False
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -205,6 +215,125 @@ class Daemon:
             self.stores[project.name] = ProjectStore(project.path)
         return self.stores[project.name]
 
+    # -- configuration reload ---------------------------------------------------
+
+    def _catalog_file_stamp(self) -> tuple[int, str] | None:
+        """`(mtime_ns, sha256)` of the catalog file, or None when there is nothing on
+        disk to watch."""
+        path = self.catalog.source_path
+        if path is None:
+            return None
+        try:
+            return (path.stat().st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest())
+        except OSError:
+            return None
+
+    def reload_catalog(self) -> bool:
+        """Pick up a config change without a restart, once per tick. Spec §4.
+
+        `self.catalog` is REPLACED here and nowhere else, which is what makes it stable
+        for the whole tick and safe to keep as a plain attribute: a pool thread holding
+        a `ValidationConfig` for the length of a round cannot have it swapped mid-round
+        (§4.1). Never turn it into a re-reading property.
+
+        The mtime is what an unchanged file costs every tick; the hash is what stops a
+        file that was touched but not changed from replacing the object anyway.
+
+        Settings only. Everything else — a bad file, a moved project roster — keeps the
+        last good catalog and says so once.
+        """
+        path = self.catalog.source_path
+        if path is None:
+            return False
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError as e:
+            self._refuse_reload(f"cannot read the catalog at {path}: {e}")
+            return False
+        if self._catalog_stamp is not None and mtime == self._catalog_stamp[0]:
+            return False
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as e:
+            self._refuse_reload(f"cannot read the catalog at {path}: {e}")
+            return False
+        seen, self._catalog_stamp = self._catalog_stamp, (mtime, digest)
+        if seen is not None and digest == seen[1]:
+            return False
+        try:
+            fresh = load_catalog(path)
+        except Exception as e:  # noqa: BLE001 — one bad file must not stop the fleet
+            self._refuse_reload(
+                f"{e}\n\nThe fleet is still running the configuration it started with. "
+                f"Fix {path} and it will be picked up on the next tick.")
+            return False
+        if {p.name for p in fresh.projects} != {p.name for p in self.catalog.projects}:
+            self._refuse_reload(
+                f"{path} added or removed a project, and that is not a setting: a new "
+                f"project has never been through `bootstrap_project`, and a removed one "
+                f"leaves an open store behind. Run `jarvis start` to apply it. Setting "
+                f"changes in the same file are not applied either until you do.")
+            return False
+        self.catalog = fresh
+        self.catalog_reload_warned = False
+        log.info("catalog reloaded from %s", path)
+        return True
+
+    def rebase_config_for_release(self) -> dict[str, Any] | None:
+        """Re-resolve the head version under the running build, once, at daemon start.
+
+        `resolved_json` is materialised at write time (§2), so a release that moves a
+        shipped default leaves the head row describing a configuration nobody is running
+        any more. This is what makes the ledger "every change to what the fleet actually
+        runs" rather than "changes the user made" (§6.1): without it an upgrade is a
+        behaviour change with no row.
+
+        The document is unchanged — only its resolution moved — so the row is addressed
+        by document AND build; `CentralStore.add_config_version` does that off
+        `actor="release"` (Neo, question 181).
+
+        Returns the row it wrote, or None when nothing moved.
+        """
+        from . import bugreport, config_version
+        from .catalog import CatalogError, parse_catalog
+
+        head = self.central.head_config_version()
+        if head is None:
+            return None
+        build = bugreport.jarvis_version()
+        try:
+            resolved = config_version.resolve(parse_catalog(head["document"]))
+        except CatalogError as e:
+            # A historical document this build can no longer parse. Nothing to compare
+            # it against, and refusing to boot over it would be worse than a stale row.
+            log.warning("config rebase skipped: head %s does not parse under %s (%s)",
+                        head["id"], build, e)
+            return None
+        moved = config_version.diff(head["resolved"], resolved)
+        if not moved:
+            return None
+        shown = "; ".join(f"{c['path']} {c['old']!r} → {c['new']!r}" for c in moved[:5])
+        more = f" (and {len(moved) - 5} more)" if len(moved) > 5 else ""
+        row = self.central.add_config_version(
+            head["document"], resolved, actor="release",
+            reason=f"upgrade {head['schema_version']} → {build}: {shown}{more}",
+            changes=moved, source_path=head["source_path"], schema_version=build)
+        log.info("config rebased for %s: %d default(s) moved (%s)",
+                 build, len(moved), row["id"])
+        return row
+
+    def _refuse_reload(self, detail: str) -> None:
+        """Once per daemon run, not once per tick — the `pr_poll_warned` rule: a file
+        that stays broken is broken on every tick, and an inbox item every five seconds
+        is how an inbox stops being read."""
+        log.warning("catalog reload refused: %s", detail)
+        if self.catalog_reload_warned:
+            return
+        self.catalog_reload_warned = True
+        self.central.add_inbox(
+            project="os", level="warning",
+            title="a catalog change was NOT applied", body=detail)
+
     def run_forever(self) -> None:
         ensure_home()
         self._write_pidfile()
@@ -212,6 +341,10 @@ class Daemon:
         signal.signal(signal.SIGINT, self._on_signal)
         log.info("jarvisd started (pid=%s, projects=%s)",
                  os.getpid(), [p.name for p in self.catalog.projects])
+        # Before the first tick, and before anything reads a version: this boot may be
+        # the first under a new build, and the head row may no longer describe what it
+        # resolves to here (§6.1).
+        self.rebase_config_for_release()
         # Before the first tick: if the boot we are living through IS a staged
         # release's restart, prove the release applied and settle its work order —
         # otherwise the reconciler reaps the dead shipping turn first and files the
@@ -249,6 +382,8 @@ class Daemon:
     # -- main tick -------------------------------------------------------------
 
     def tick(self) -> None:
+        # First, so everything below runs under one configuration — and the same one.
+        self.reload_catalog()
         self.tick_count += 1
         reconcile = self.tick_count % RECONCILE_EVERY_TICKS == 1
         poll_prs = self.tick_count % PR_POLL_EVERY_TICKS == 1
