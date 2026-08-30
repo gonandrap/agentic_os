@@ -208,12 +208,27 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
     `files`, `stat` and `dropped_files` are here even when the diff is complete, because
     they are what lets a seat say "you claim tests, and no file under `tests/` appears in
     this change" — an answer the diff alone cannot support once it has been truncated.
+
+    When the unit carries a spec section, that section is the standard the change is held
+    to and the brief is demoted to the scope boundary around it — the heading says so,
+    because a seat handed two descriptions of the same work will otherwise pick whichever
+    the diff agrees with. No section, and the prompt is exactly what it was before: §5 of
+    docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md.
     """
     unit = "feature order" if packet.unit == "feature" else "work order"
     parts = [
         f"# The submission — {unit} {packet.subject_id}",
         f"## Title\n{packet.title}",
         f"## The brief it was given\n{packet.description or '(none recorded)'}",
+    ]
+    if packet.spec_section:
+        parts.append(
+            f"## THE SPEC THIS WAS BUILT TO — {packet.spec_ref}\n"
+            f"This section is the source of truth for what the change was supposed to "
+            f"be; the brief above is only the scope boundary around it. Judge whether "
+            f"the diff implements THIS, and say which part of it is unimplemented, "
+            f"contradicted or exceeded.\n\n{packet.spec_section}")
+    parts += [
         f"## What the submitter says it did\n{packet.summary or '(nothing stated)'}",
         "## The testing evidence the submitter DECLARED\n"
         f"{packet.declared or '(none declared — the submitter claimed no evidence)'}",

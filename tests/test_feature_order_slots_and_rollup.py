@@ -26,7 +26,7 @@ from jarvis import ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
-from jarvis.testing import FIXTURE_DESIGN_DOC
+from jarvis.testing import FIXTURE_DESIGN_DOC, fixture_spec_section
 
 ASK = ("Add a CSV exporter to the reporting module, with a command that calls it and "
        "tests over both the happy path and an empty result set.")
@@ -55,6 +55,7 @@ def child(key: str, needs: list[str] | None = None) -> dict:
             f"suite. Do not change the public interface of the caller. FORCE_APPROVE"
         ),
         "needs": needs or [],
+        "spec_section": fixture_spec_section(key),
     }
 
 

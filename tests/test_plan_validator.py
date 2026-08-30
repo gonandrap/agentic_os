@@ -23,11 +23,13 @@ from jarvis.plans import (
     find_cycles,
     parse_plan,
     render_plan,
+    spec_problems,
 )
+from jarvis.testing import fixture_spec_section
 
 
 def child(key: str, needs: list[str] | None = None, description: str | None = None,
-          title: str | None = None) -> dict:
+          title: str | None = None, section: str | None = None) -> dict:
     """A child that passes every check, so a test can break exactly one thing."""
     return {
         "key": key,
@@ -38,6 +40,7 @@ def child(key: str, needs: list[str] | None = None, description: str | None = No
             f"documented where the neighbouring functions are documented."
         ),
         "needs": needs or [],
+        "spec_section": section if section is not None else fixture_spec_section(key),
     }
 
 
@@ -218,8 +221,8 @@ def test_the_ceiling_names_the_way_out():
     fat = "x" * (MAX_DESCRIPTION_CHARS + 1)
     with pytest.raises(PlanError) as e:
         parse_plan(plan(child("schema", description=fat)))
-    assert "design document" in str(e.value)
-    assert "sections" in str(e.value)
+    assert "section of the spec" in str(e.value)
+    assert "materialised beside its worker" in str(e.value)
 
 
 def test_a_description_right_at_the_ceiling_is_fine():
@@ -240,41 +243,72 @@ def test_a_plan_with_no_design_document_at_all_is_refused():
         parse_plan(plan(child("schema"), design_doc=""))
 
 
-def test_a_plan_whose_first_child_writes_the_spec_is_accepted():
-    out = parse_plan(plan(child("spec"), child("schema", needs=["spec"]),
-                          child("api", needs=["schema"]),
-                          design_doc="", design_doc_by="spec"))
-    assert out["design_doc"] == ""
-    assert out["design_doc_by"] == "spec"
+def test_there_is_no_escape_hatch_for_a_spec_that_does_not_exist_yet():
+    """`design_doc_by` — naming the CHILD that would write the spec — was removed with
+    this rejection's tightening (Neo, question 179). A plan whose spec does not exist
+    cannot be checked at submission, which is the whole point of the checks around it;
+    a stray `design_doc_by` is now just an ignored key, never a second way to pass."""
+    with pytest.raises(PlanError, match="design_doc"):
+        parse_plan(plan(child("schema"), design_doc="", design_doc_by="schema"))
 
 
-def test_the_spec_writing_child_must_be_a_child_of_this_plan():
-    with pytest.raises(PlanError, match="not a child of this plan"):
-        parse_plan(plan(child("schema"), design_doc="", design_doc_by="ghost"))
+# -- rejection 7: children that do not line up with the spec's sections ----------------
+# Pure over the plan + the spec's TEXT, so it lives in `spec_problems` and is called by
+# `ops.submit_plan`, which is the one place holding both.
 
 
-def test_a_sibling_that_does_not_wait_for_the_spec_is_refused():
-    """A spec written in parallel with the work it governs is a spec nobody can cite."""
-    with pytest.raises(PlanError, match="do not depend on it"):
-        parse_plan(plan(child("spec"), child("schema"), child("api"),
-                        design_doc="", design_doc_by="spec"))
+DOC = ("# Budgets\n\n## 1. Schema\n\nThe table.\n\n## 2. API\n\nThe endpoint.\n\n"
+       "## Appendix: Agent profile\n\n"
+       "You are a Python engineer on the budgets feature. You change the schema before "
+       "the code that reads it, you cover every branch with a test in the existing "
+       "suite, and you never widen a public interface without saying so.\n")
 
 
-def test_waiting_for_the_spec_through_another_child_counts():
-    """The edge may be transitive — `api` needs `schema` needs `spec` is waiting."""
-    out = parse_plan(plan(child("spec"), child("schema", needs=["spec"]),
-                          child("api", needs=["schema"]),
-                          design_doc="", design_doc_by="spec"))
-    assert [c["key"] for c in creation_order(out["children"])] == \
-        ["spec", "schema", "api"]
+def test_a_plan_whose_children_match_the_specs_sections_passes():
+    assert spec_problems(parse_plan(plan(child("schema", section="1"),
+                                         child("api", section="2"))), DOC) == []
 
 
-def test_naming_both_a_document_and_the_child_that_writes_it_is_refused():
-    """`ops.submit_plan` demands a named `design_doc` already exist on disk, so a plan
-    claiming both describes two different worlds."""
-    with pytest.raises(PlanError, match="not both"):
-        parse_plan(plan(child("spec"), child("schema", needs=["spec"]),
-                        design_doc="docs/specs/budgets.md", design_doc_by="spec"))
+def test_a_section_that_matches_no_heading_is_refused():
+    problems = spec_problems(parse_plan(plan(child("schema", section="9"))), DOC)
+    assert any("matches no heading" in p for p in problems)
+
+
+def test_two_children_may_not_claim_the_same_section():
+    """The mechanical form of "the spec's boundaries are the split": a boundary two work
+    orders share is a boundary the planner did not cut."""
+    problems = spec_problems(
+        parse_plan(plan(child("schema", section="1"), child("api", section="1"))), DOC)
+    assert any("both claim section" in p for p in problems)
+
+
+def test_a_child_may_not_claim_the_agent_profile_appendix():
+    problems = spec_problems(
+        parse_plan(plan(child("schema", section="Agent profile"))), DOC)
+    assert any("appendix" in p for p in problems)
+
+
+def test_a_spec_with_no_agent_profile_is_refused():
+    """Every feature builds its agent type from that appendix, so a spec without one is
+    a feature whose children have no persona to run as."""
+    bare = "# Budgets\n\n## 1. Schema\n\nThe table.\n"
+    problems = spec_problems(parse_plan(plan(child("schema", section="1"))), bare)
+    assert any("Agent profile" in p for p in problems)
+
+
+def test_a_stub_agent_profile_is_refused():
+    """A heading with one line under it is a placeholder, not a system prompt."""
+    stub = "# Budgets\n\n## 1. Schema\n\nThe table.\n\n## Agent profile\n\nBe good.\n"
+    problems = spec_problems(parse_plan(plan(child("schema", section="1"))), stub)
+    assert any("under the" in p for p in problems)
+
+
+def test_a_child_with_no_section_at_all_is_refused_by_parse_plan():
+    """Reported by `parse_plan`, not `spec_problems`: it needs no document to see it,
+    and a planner should learn it in the same revision as everything else structural."""
+    naked = {**child("schema"), "spec_section": ""}
+    with pytest.raises(PlanError, match="spec_section"):
+        parse_plan(plan(naked))
 
 
 # -- creation order --------------------------------------------------------------------

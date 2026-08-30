@@ -28,7 +28,7 @@ from jarvis.daemon import Daemon
 from jarvis.invariants import check_project
 from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
-from jarvis.testing import FIXTURE_DESIGN_DOC
+from jarvis.testing import FIXTURE_DESIGN_DOC, fixture_spec_section
 
 
 @pytest.fixture()
@@ -67,6 +67,7 @@ def child(key: str, extra: str = "") -> dict:
             f"suite. Do not change the public interface of the caller. {extra}"
         ),
         "needs": [],
+        "spec_section": fixture_spec_section(key),
     }
 
 

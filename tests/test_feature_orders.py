@@ -26,7 +26,7 @@ from jarvis import db, ops, plans
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
-from jarvis.testing import FIXTURE_DESIGN_DOC
+from jarvis.testing import FIXTURE_DESIGN_DOC, fixture_spec_section
 
 
 @pytest.fixture()
@@ -52,6 +52,7 @@ def child(key: str, needs: list[str] | None = None, extra: str = "") -> dict:
             f"suite. Do not change the public interface of the caller. {extra}"
         ),
         "needs": needs or [],
+        "spec_section": fixture_spec_section(key),
     }
 
 
@@ -142,7 +143,7 @@ def test_the_planner_carries_the_ask_verbatim_and_a_planner_briefing(planning, s
     assert f"jarvis fo plan {fo['id']} --from-file" in prompt
     assert "Do not build the feature" in prompt
     # The rule the whole plan lives or dies on has to be in there.
-    assert "sees its own description plus the design document, and nothing else" in prompt
+    assert "sees its own description plus its section, and nothing else" in prompt
     # And it must NOT be told to finish the ordinary way, because `fo plan` is its finish.
     assert "Do not run `jarvis wo finish`" in prompt
 

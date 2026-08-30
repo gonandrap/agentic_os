@@ -89,24 +89,39 @@ def store(tmp_path):
     s.close()
 
 
-def _auth_turn(store):
+def _auth_turn(store, ago: float = 3600.0):
+    """A turn that died on auth `ago` seconds back. Never "just now", and that matters.
+
+    `_auth_retry_at` resumes on a sign-in STRICTLY NEWER than the failure. A turn stamped
+    from `db.now()` and a credentials file stamped by the filesystem a moment later are
+    two different clocks at two different granularities, so "the sign-in came after"
+    was a coin flip — it came up tails on CI's 3.12 runner while 3.11 and 3.13 passed on
+    the same commit. Back-dating the FAILURE is the fix and forward-dating the sign-in is
+    not: the mtime becomes `retry_at` verbatim, so a future one is a pause that is not
+    due (see `jarvis.testing.signin`).
+    """
     turn = store.create_turn("wo-test", kind="message", prompt="do the thing")
-    return store.finish_turn(
+    row = store.finish_turn(
         turn["id"], "failed",
         error="Failed to authenticate: OAuth session expired and could not be refreshed")
+    store.conn.execute("UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
+                       (row["started_at"] - ago, row["ended_at"] - ago, turn["id"]))
+    return store.get_turn(turn["id"])
 
 
 def test_the_sign_in_that_failed_is_not_the_one_that_fixes_it(store, signin):
     """A sign-in OLDER than the turn is the one the turn died on. Without this the very
     first tick after the failure would relaunch, and go on relaunching."""
-    _auth_turn(store)
-    signin(at=time.time() - 3600)
+    turn = _auth_turn(store)
+    signin(at=turn["ended_at"] - 60)
     pause = worker_session.turn_pause(store, "wo-test")
     assert pause is not None
     assert pause.retry_at == worker_session.NEVER and not pause.resumable
 
 
 def test_a_sign_in_after_the_failure_makes_the_pause_due(store, signin):
+    """The test that caught the clock race. `_auth_turn` back-dates the failure by an
+    hour, so an un-stamped `/login` is unambiguously newer than it."""
     _auth_turn(store)
     signin()
     pause = worker_session.turn_pause(store, "wo-test")
@@ -127,6 +142,17 @@ def _tick(daemon):
     """One tick with every cadence-gated pass firing — `tick` increments first."""
     daemon.tick_count = 0
     daemon.tick()
+
+
+def _sign_in_after(signin, store, wo_id):
+    """`/login`, stamped a hair AFTER the turn that failed and still in the past.
+
+    The end-to-end tests cannot back-date their failure the way `_auth_turn` does — the
+    daemon writes it — so they anchor the sign-in to it instead. Both directions of the
+    comparison matter and pull opposite ways: strictly newer than the failure, or the
+    pause never becomes resumable; not in the future, or `due()` is false.
+    """
+    return signin(at=store.latest_turn(wo_id)["ended_at"] + 0.001)
 
 
 def _park(daemon, store, fake_claude, settle_turns, title="ship the thing"):
@@ -155,7 +181,7 @@ def test_it_waits_for_the_sign_in_and_then_comes_back(started, fake_claude, proj
         "relaunched with no sign-in — that is a process spawn per tick against a dead account"
 
     fake_claude.turns_recover()
-    signin()
+    _sign_in_after(signin, store, wo["id"])
     _tick(daemon)
 
     assert store.latest_turn(wo["id"])["seq"] == 2, "the sign-in did not release it"
@@ -179,7 +205,7 @@ def test_the_prompt_goes_again_verbatim(started, fake_claude, project, settle_tu
     first = store.latest_turn(wo["id"])["prompt"]
 
     fake_claude.turns_recover()
-    signin()
+    _sign_in_after(signin, store, wo["id"])
     _tick(daemon)
 
     assert store.latest_turn(wo["id"])["prompt"] == first
@@ -244,7 +270,9 @@ def test_one_sign_in_releases_every_project(jarvis_home, fake_claude, two_projec
     assert b.get_work_order(wos["proj_b"]["id"])["status"] == "waiting_input"
 
     fake_claude.turns_recover()
-    signin()
+    # After the LATER of the two failures: one sign-in has to release both.
+    signin(at=max(a.latest_turn(wos["proj_a"]["id"])["ended_at"],
+                  b.latest_turn(wos["proj_b"]["id"])["ended_at"]) + 0.001)
     _tick(daemon)
 
     assert a.latest_turn(wos["proj_a"]["id"])["seq"] == 2

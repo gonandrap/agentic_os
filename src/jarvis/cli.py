@@ -399,6 +399,10 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("fo_id")
     f.add_argument("--project")
 
+    f = fo.add_parser("agent", help="rebuild this feature's agent type from its spec")
+    f.add_argument("fo_id")
+    f.add_argument("--project")
+
     f = fo.add_parser("resume", help="put a FAILED feature order back to work — the way "
                                      "past a dead child, without touching the database")
     f.add_argument("fo_id")
@@ -1523,6 +1527,9 @@ def cmd_fo(args: argparse.Namespace) -> int:
     elif args.fo_cmd == "cancel":
         _print(ops.cancel_feature_order(args.fo_id, args.project), args.json)
 
+    elif args.fo_cmd == "agent":
+        _print(ops.rebuild_feature_agent(args.fo_id, args.project), args.json)
+
     elif args.fo_cmd == "resume":
         out = ops.resume_feature_order(args.fo_id, fix=args.fix,
                                        project_name=args.project)
@@ -1531,6 +1538,7 @@ def cmd_fo(args: argparse.Namespace) -> int:
             if out["fix_wo_id"] else
             "no work filed; the feature settles on what its children already say"
         )}, args.json)
+
     return 0
 
 

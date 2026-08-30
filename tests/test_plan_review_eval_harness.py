@@ -64,10 +64,14 @@ def test_the_battery_is_skeleton_shaped(eval_module):
             f"{name}: a child brief leaked into the question")
         assert len(question) < 10_000, (
             f"{name}: {len(question)} chars — the diet this eval guards is gone")
-    # Control in the same test: the briefs the questions withhold really are fat.
+    # Control in the same test: the briefs the questions withhold really are fat. Stated
+    # against the shipped ceiling rather than a literal, because that ceiling has moved
+    # twice (1500, then 600) and a hard number turns this control into a chore.
+    from jarvis.plans import MAX_DESCRIPTION_CHARS
+
     fat = eval_module._child("k", "t", "a")
     assert eval_module.FAT_MARKER in fat["description"]
-    assert len(fat["description"]) > 1_000
+    assert len(fat["description"]) > MAX_DESCRIPTION_CHARS * 0.7
 
 
 def test_a_canned_model_drives_the_real_plumbing(eval_module, tmp_path, monkeypatch):

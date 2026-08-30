@@ -9,6 +9,31 @@ sits on: `mem:work-order-lifecycle`.
 backlog (`bl-e3a88979`) with the verified stacking invocation attached; read it before
 designing anything there.
 
+## SPEC-DRIVEN (wo-4580e7c1) — read this before anything below
+
+`docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md`. **The spec is the
+feature's one artifact and everything else points at it.** Four changes that falsify parts
+of the rest of this memory:
+
+1. **`design_doc` is REQUIRED and `design_doc_by` is gone** (Neo, question 179). A plan
+   whose spec does not exist cannot be checked at submission, and every check below needs
+   the spec's text. `plans.spec_problems(plan, doc_text)` is the pure other half of
+   `parse_plan`; `ops.submit_plan` reads the file and calls both.
+2. **Each child names a `spec_section`** — required, unique across children, must resolve,
+   may not be the `Agent profile` appendix. Stored on `work_orders.spec_section` because
+   three readers need it: the worker's prompt, the section file materialised beside it,
+   and the validation panel's packet. `MAX_DESCRIPTION_CHARS` is **600**: a brief is the
+   MARGIN around a section, not a paraphrase of it.
+3. **Every feature builds its own agent type** from the spec's `Agent profile` appendix
+   (`specs.py`). Written at plan release, rebuilt at every dispatch, deleted by
+   `set_feature_status` when the feature settles, rebuildable with `jarvis fo agent`.
+   Children run as it: `--agent <fo-id>` plus the `--add-dir` that supplies it. Verified
+   live with a control — `--agent` without that directory is a hard CLI error, so the two
+   travel together or not at all. The definition declares NO `tools:` key on purpose
+   (kn-44fb3e42: `tools:` is enforced, and a child needs everything).
+4. **The panel judges against the section.** `EvidencePacket.spec_ref` / `.spec_section`,
+   rendered by `validation.build_packet_prompt` above the brief.
+
 ## The loop
 
 ```

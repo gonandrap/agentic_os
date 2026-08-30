@@ -96,6 +96,14 @@ class EvidencePacket:
     #: one — defeating `diff_chars` silently. The digest is all `fingerprint` needs.
     diff_sha: str
     children: tuple[dict, ...] = ()
+    #: The section of the feature's spec this unit was told to implement — `spec_ref` is
+    #: "<path> § <section>" for citing, `spec_section` its text. Both "" for a standalone
+    #: work order and for anything planned before specs existed, which is the null case
+    #: the panel already handles: no section, no section heading in the prompt.
+    #: DELIBERATELY NOT in `fingerprint`: the spec does not change between rounds, so
+    #: hashing it would only make an unchanged submission look new after a spec edit.
+    spec_ref: str = ""
+    spec_section: str = ""
 
 
 def fingerprint(packet: EvidencePacket) -> str:
@@ -129,7 +137,8 @@ def fingerprint(packet: EvidencePacket) -> str:
 
 
 def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
-                       diff_chars: int = DEFAULT_DIFF_CHARS) -> EvidencePacket:
+                       diff_chars: int = DEFAULT_DIFF_CHARS,
+                       spec: dict[str, str] | None = None) -> EvidencePacket:
     """Assemble the packet for one work order from its worktree.
 
     Never raises for a repository that is missing, empty, broken or gone: a collector
@@ -144,6 +153,10 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
     `wo` is a `work_orders` row. Note what is NOT read from it: `branch`. That column is
     declared and written by nothing in the codebase, so it is always NULL; the base comes
     from git, via the pinned ladder.
+
+    `spec` is `specs.spec_of`'s result, passed in rather than looked up because this
+    module reads a repository and never a database — the same separation that keeps
+    `_ProjectRef` a two-line stand-in instead of a `ProjectSpec` import.
     """
     # type: ignore — `_ProjectRef` carries the one attribute that helper reads; see it.
     worktree = worker_session.worktree_path(_ProjectRef(project_path), wo)  # type: ignore[arg-type]
@@ -179,7 +192,16 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
         diff_truncated=truncated,
         dropped_files=dropped,
         diff_sha=hashlib.sha256(diff.encode("utf-8")).hexdigest(),
+        spec_ref=_spec_ref(spec),
+        spec_section=(spec or {}).get("section_text", ""),
     )
+
+
+def _spec_ref(spec: dict[str, str] | None) -> str:
+    """`<path> § <section>`, or "" when there is no resolved section to cite."""
+    if not spec or not spec.get("section_text"):
+        return ""
+    return f"{spec.get('repo_path', '')} § {spec.get('section', '')}".strip()
 
 
 def collect_feature(project_path: Path, fo: dict[str, Any], children: list[dict[str, Any]],

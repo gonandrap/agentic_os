@@ -458,6 +458,14 @@ ADDED_COLUMNS = {
         "parent_id": "TEXT REFERENCES feature_orders(id)",
         # `worker` or `planner` — see WO_KINDS.
         "kind": "TEXT NOT NULL DEFAULT 'worker'",
+        # Which section of the parent feature's spec this child implements, as the plan
+        # named it (a heading number or its text). NULL for every standalone work order
+        # and for the planner and manager, which own the whole feature rather than a
+        # piece of it. Three readers, which is why it is a column and not re-derived from
+        # the plan at each of them: the worker's prompt, the section file materialised
+        # beside it, and the validation panel's evidence packet. See §1.2 of
+        # docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md.
+        "spec_section": "TEXT",
         # THE SEALED BILL (`bill.build`), written once the order reaches a terminal
         # status and never recomputed. The sources a bill is built from all expire:
         # Claude Code prunes session transcripts and result JSONs on its own schedule,
@@ -588,6 +596,7 @@ class ProjectStore:
         depends_on: list[str] | None = None,
         parent_id: str | None = None,
         kind: str = "worker",
+        spec_section: str | None = None,
     ) -> dict[str, Any]:
         """Create a work order. `status` and `session_id` are set in the same INSERT
         rather than afterwards, because the row is visible to the daemon the instant it
@@ -617,13 +626,13 @@ class ProjectStore:
             """INSERT INTO work_orders (id, title, description, status, origin,
                    created_at, updated_at, model, effort, permission_mode,
                    append_system_prompt, backlog_id, metadata, session_id, depends_on,
-                   parent_id, kind)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   parent_id, kind, spec_section)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 wo_id, title, description, status, origin, ts, ts, model, effort,
                 permission_mode, append_system_prompt, backlog_id,
                 db.to_json(metadata or {}), session_id, db.to_json(deps),
-                parent_id, kind,
+                parent_id, kind, spec_section or None,
             ),
         )
         self.add_event(wo_id, "created", {"origin": origin, "depends_on": deps,
@@ -986,8 +995,24 @@ class ProjectStore:
         )
 
     def set_feature_status(self, fo_id: str, status: str, **extra: Any) -> None:
+        """Move a feature order, and retire its agent type when it settles.
+
+        The deletion lives HERE, not at the four callers that settle a feature (the
+        daemon's completed and failed branches, the merge poller, `fo cancel`), because
+        it is the one line every one of them passes through. A generated agent left
+        behind after its feature is over is a persona a later, unrelated work order in
+        the same project could be given.
+
+        `remove_agent` never raises and the spec snapshot stays in the stored plan, so
+        `jarvis fo agent <fo-id>` rebuilds it — §3 of
+        docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md.
+        """
+        from . import specs
+
         assert status in FO_STATUSES, status
         self.update_feature_order(fo_id, status=status, **extra)
+        if status in FO_TERMINAL_STATUSES:
+            specs.remove_agent(self.project_path, fo_id)
 
     def flag_feature_attention(self, fo_id: str, reason: str) -> None:
         self.update_feature_order(fo_id, needs_attention=1, attention_reason=reason)
@@ -1123,6 +1148,7 @@ class ProjectStore:
                     origin="jarvis",
                     depends_on=[by_key[k] for k in child["needs"] if k in by_key],
                     parent_id=fo_id,
+                    spec_section=child.get("spec_section"),
                 )
                 by_key[child["key"]] = wo["id"]
                 created.append(wo["id"])

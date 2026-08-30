@@ -203,28 +203,26 @@ def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str
 
 def materialize_design_doc(store: ProjectStore, project: ProjectSpec,
                            wo: dict[str, Any]) -> dict[str, str] | None:
-    """Put the parent feature's design document where this child worker can read it.
+    """Put this child's SECTION of the feature spec, and the spec, where it can read them.
 
-    A child's worktree branches from the default branch, but the design document lives
-    on the PLANNER's unmerged branch — so the snapshot taken at `fo plan` time is
-    written under the project's shared `.jarvis/` tree, which workers already read
-    (agent skills live there). Returns `{repo_path, path}` for the prompt, or None when
-    the work order has no parent or its plan names no document. Idempotent: later
-    dispatches of siblings rewrite the same bytes.
+    A child's worktree branches from the default branch, but the spec lives on the
+    PLANNER's unmerged branch — so the snapshot taken at `fo plan` time is written under
+    the project's shared `.jarvis/` tree, which workers already read (agent skills live
+    there). Returns what the prompt renders (`repo_path`, `path`, and `section` /
+    `section_path` when the child's section resolved), or None when the work order has no
+    parent or its plan names no document. Idempotent: later dispatches of siblings rewrite
+    the same bytes.
+
+    §4 of docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md is why the
+    section is written as its own file rather than only named: pointing a worker at a
+    whole spec is what made every child read all of it.
     """
-    from . import db
+    from . import specs
 
-    if not wo.get("parent_id") or wo.get("kind") == "planner":
+    spec = specs.spec_of(store, wo)
+    if spec is None:
         return None
-    fo = store.get_feature_order(wo["parent_id"])
-    plan = db.from_json((fo or {}).get("plan"), {}) or {}
-    if not (fo and plan.get("design_doc") and plan.get("design_doc_content")):
-        return None
-    target = (project.path / ".jarvis" / "features" / fo["id"]
-              / Path(plan["design_doc"]).name)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(plan["design_doc_content"])
-    return {"repo_path": plan["design_doc"], "path": str(target)}
+    return specs.materialize(project.path, wo["parent_id"], wo["id"], spec)
 
 
 def feature_context(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
@@ -279,12 +277,16 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         wo.get("description") or "(no further description — the title is the task)",
         *([
             "",
-            "# Design document",
-            f"Your brief references sections of this feature's design document "
-            f"(`{design_doc['repo_path']}`). A snapshot is materialised at "
-            f"{design_doc['path']} — read the sections your brief names rather than "
-            f"the whole document, and treat it as read-only: the authoritative copy "
-            f"is on the planner's branch.",
+            "# Your section of the feature spec",
+            *([f"This work order implements section \"{design_doc['section']}\" of "
+               f"`{design_doc['repo_path']}`, and that section — not the brief above — "
+               f"is the source of truth for WHAT to build. It is materialised at "
+               f"{design_doc['section_path']}: read it first.",
+               ] if design_doc.get("section_path") else []),
+            *([f"The whole spec is at {design_doc['path']} if the section is not enough. "
+               f"Both are read-only snapshots; the authoritative copy is on the "
+               f"planner's branch.",
+               ] if design_doc.get("path") else []),
         ] if design_doc else []),
         "",
         *worker_brief.core_contract(wo["id"], wo["title"], project.name,
@@ -433,16 +435,16 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "```json",
         "{",
         '  "summary": "one line: what this feature is, once it is all done",',
-        '  "design_doc": "docs/specs/<feature>.md — the design document your briefs '
-        'reference, relative to the repo root",',
-        '  "design_doc_by": "<child key> — INSTEAD of design_doc, when there is no spec '
-        'yet: the child that writes one",',
+        '  "design_doc": "docs/specs/<feature>.md — the spec you wrote, relative to the '
+        'repo root. REQUIRED, and it must already exist",',
         '  "justification": "only if you exceed the child cap — why it cannot be fewer",',
         '  "children": [',
         "    {",
         '      "key": "schema",',
         '      "title": "short imperative title, as a work order would have",',
-        '      "description": "the WHOLE brief for this piece — see below",',
+        '      "spec_section": "3 — the section of the spec this child implements, by '
+        'number or by heading text",',
+        '      "description": "what the section does NOT say — see below",',
         '      "needs": ["other-key", "..."],',
         '      "acceptance": "how the worker knows it is done (optional)"',
         "    }",
@@ -456,32 +458,38 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"edges, and a child does not start until everything it needs has completed and "
         f"merged.",
         "",
-        "## The design document carries the shared context; each brief stands alone on "
-        "top of it",
-        "Write the feature's design document FIRST — a markdown file in your worktree "
-        "(convention: `docs/`), with numbered sections — and name it in the plan's "
-        "`design_doc` field. Everything you know because you read the whole feature — "
-        "the architecture, the data model, the interfaces, the traps — goes THERE, "
-        "once. Do not repeat it into every child: that duplication is what took "
-        "plan-review questions to 84KB.",
+        "## THE SPEC IS THE DELIVERABLE. The plan is an index into it.",
+        "Write the feature's spec FIRST — a markdown file in your worktree (convention: "
+        "`docs/`), with numbered sections — and name it in `design_doc`. It must exist "
+        "before you submit; a plan that names no spec, or names one that is not on disk, "
+        "is refused. Everything you know because you read the whole feature — the "
+        "architecture, the data model, the interfaces, the traps — goes THERE, once, and "
+        "is never repeated into a brief.",
         "",
-        "**Every plan stands on a design document, and the validator checks it.** If "
-        "writing one yourself is genuinely not the right move — the feature is a set of "
-        "small independent fixes, or the spec is itself what has to be worked out "
-        "against the code — then make writing it THE FIRST CHILD: name that child's key "
-        "in `design_doc_by` instead of naming a `design_doc`, and give every other child "
-        "a `needs` path back to it. Name one or the other; naming both is refused.",
+        "**Cut the spec's sections along the feature's FUNCTIONAL boundaries, because "
+        "the sections are the split.** One section, one work order: every child names "
+        "its section in `spec_section`, no two children may name the same one, and a "
+        "child is handed that section and only that section. If a section cannot be one "
+        "worker's job, it is not a section — and if two children want the same one, the "
+        "seam is in the wrong place. Decide the boundaries while WRITING the spec; do "
+        "not write prose first and carve it afterwards.",
+        "",
+        "**The spec ends with an `Agent profile` appendix, and it is not decoration.** "
+        "The OS builds a Claude Code agent type from that section and every child work "
+        "order of this feature runs AS it — so write it as a system prompt in the second "
+        "person: the role, what it must know about this codebase, the conventions it "
+        "must follow, the traps it must avoid, what it must never do. It is deleted when "
+        "the feature order settles and can be rebuilt from the spec, so the spec is the "
+        "only place it may live.",
         "",
         "Each child is dispatched into a NEW session with a worker that sees its own "
-        "description plus the design document, and nothing else — not this plan, not "
-        "this conversation, not what its siblings are doing. The OS snapshots the "
-        "document when you submit and materialises it where every child worker can "
-        "read it. So a description is a BRIEF, not an encyclopedia: the goal, the "
-        "scope boundary (what this piece must not touch), what done means, and "
-        "explicit references to the design document's sections by number for "
-        "everything deeper (`the state machine is design doc section 3`). It must "
-        "still stand alone as INSTRUCTIONS — a stranger must know what to do from the "
-        "description; the document is where they read how it fits.",
+        "description plus its section, and nothing else — not this plan, not this "
+        "conversation, not what its siblings are doing. So a description is not a brief "
+        "any more, it is the MARGIN around one: what the section does not say. The scope "
+        "boundary (what this piece must not touch), what done means, and which sibling "
+        "owns the thing it must not touch. Everything about WHAT to build is in the "
+        "section, and repeating it here is the duplication this whole shape exists to "
+        "remove.",
         "",
         "So: no \"as discussed in the plan\", no \"same as the previous work order\", no "
         "\"as described above\". Those are rejected mechanically, before anything is "
@@ -501,12 +509,14 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"- a description under {MIN_DESCRIPTION_CHARS} characters, or one that only "
         f"repeats the title, or one that points at something the child worker cannot see",
         f"- a description over {MAX_DESCRIPTION_CHARS} characters. This is the hard "
-        f"edge of \"a brief, not an encyclopedia\", and it is not negotiable by writing "
+        f"edge of \"the margin, not the brief\", and it is not negotiable by writing "
         f"more carefully: if the piece needs more than that to explain, the explanation "
-        f"belongs in the design document and the brief cites its section number",
-        f"- a plan naming neither `design_doc` nor `design_doc_by`, a `design_doc_by` "
-        f"that is not a child of the plan, or a `design_doc_by` child that some sibling "
-        f"does not depend on",
+        f"belongs in its section of the spec",
+        "- a plan naming no `design_doc`, or one naming a file that is not on disk",
+        "- a child with no `spec_section`, a `spec_section` matching no heading in the "
+        "spec, two children claiming the same section, or a child claiming the `Agent "
+        "profile` appendix",
+        "- a spec with no `Agent profile` section, or one too short to brief an agent",
         "",
         "If it refuses, it names every problem at once. Fix them all and resubmit.",
         "",

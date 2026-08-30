@@ -1017,7 +1017,7 @@ class Daemon:
         find rather than a work order in `validating` with no trace of why.
         """
         from . import evidence as evidence_mod
-        from . import ops
+        from . import ops, specs
 
         store = ProjectStore(project.path)  # thread-local connection — see the docstring
         try:
@@ -1029,7 +1029,7 @@ class Daemon:
             n, max_rounds = int(round_row["round"]), int(cfg.max_rounds)
             packet = evidence_mod.collect_work_order(
                 project.path, wo, declared=str(round_row["evidence"] or ""),
-                diff_chars=cfg.diff_chars)
+                diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo))
 
             validator = (self.validator if self.validator is not None
                          else self._validator(cfg))
