@@ -101,6 +101,17 @@ AUTOCOMPACT_MAX = 1_000_000  # ... or over this
 # helped it. This is the ceiling separating them, and it is configurable because it is a
 # property of THIS FLEET'S PROMPTS — the static head is a project's CLAUDE.md plus the
 # worker briefing, so a fleet of terse projects sits lower and a verbose one higher.
+#
+# IT SITS AT `os.` AND NOT AT `os.defaults.`, WHICH IS THE DELIBERATE PART. Everything
+# under `os.defaults` is a value a project may override, and per-project is the shape
+# this setting most looks like it wants — the static head is literally per project. It
+# is not offered, because the two surfaces that consume the threshold (the fleet cost
+# view and scripts/cache_ttl_cohort.py) walk TRANSCRIPTS rather than work orders and
+# cannot cheaply tell which project a session belonged to. A per-project override would
+# therefore be honoured for a single order's bill and silently ignored by every
+# aggregate — a knob that looks like a feature and behaves like a bug. Offer it only
+# together with session-to-project attribution in those two readers (Neo, question 191).
+#
 # Reasoning and the measured populations:
 # docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
 DEFAULT_COLD_PREFIX_FLOOR = 5_000

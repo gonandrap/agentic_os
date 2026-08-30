@@ -56,6 +56,15 @@ projects sits lower and a verbose one higher. Set it just under the smallest sta
 across your projects. It affects reporting only — never what a worker does — so it can
 be changed while the fleet is running, and a daemon picks it up on restart.
 
+It is **not** under `os.defaults`, and that is deliberate. `os.defaults` is the namespace
+a project may override, and per-project is the shape this setting most looks like it
+wants — the static head is literally per project. But the two surfaces that consume the
+threshold, the fleet cost view and `scripts/cache_ttl_cohort.py`, walk *transcripts*
+rather than work orders and cannot cheaply tell which project a session belonged to. A
+per-project override would be honoured for one order's bill and silently ignored by every
+aggregate: a knob that looks like a feature and behaves like a bug. Offer it only
+together with session-to-project attribution in those two readers.
+
 ### Fleet-wide, classified
 
 All transcripts, cold boundaries (`write > 40k` and `read < 40k`), excluding session
