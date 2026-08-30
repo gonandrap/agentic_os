@@ -125,7 +125,28 @@ brief is only the scope boundary around it.
 A packet with no spec — a standalone work order, a feature released before this change —
 renders exactly as it did before. The panel's existing behaviour is the null case.
 
-## 6. What this does NOT change
+## 6. What the user reads
+
+The reduction the user asked for is a **content** change, and every surface renders that
+content verbatim — `jarvis fo show` through `plans.render_plan`, the dashboard through
+`wo.description` and `c.description`. So the 600-character ceiling reaches all of them
+with no template touched. Measured on `fo-e353491c`, the feature that prompted this:
+12 children, **128,744 characters of brief**, mean 10.7KB, largest 16.6KB. None of the
+twelve would validate now; the same plan is capped at 7,200 — **a 94% cut**, and it is
+what the user was being asked to read.
+
+Two things the templates *did* owe, and neither is the brief:
+
+* **Say where the rest is.** A brief that is only a boundary reads as an under-specified
+  order unless the page names the section it is the boundary around. The work-order page
+  carries `Spec section N of <path>`, the feature page names the spec once and marks each
+  child with `§ N`.
+* **Do not print the section.** Inlining it under every order would rebuild the exact
+  duplication this change removes, one page at a time — so `specs.spec_of`'s
+  `section_text` is deliberately not passed to the template. `test_feature_agent` asserts
+  its absence, because a page that quietly grew it back would still return 200.
+
+## 7. What this does NOT change
 
 The planner's team (`jarvis-architect`, `jarvis-test-lead`), the child cap, the cycle and
 dangling-reference checks, the dependency graph, the round machine, the message bus, and

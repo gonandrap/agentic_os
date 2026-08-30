@@ -55,6 +55,14 @@
 
 {% if fo.plan %}
 <h3>The plan{% if fo.plan.summary %} — {{ fo.plan.summary }}{% endif %}</h3>
+{# THE SPEC IS THE FEATURE, and the plan below is an index into it: one section per
+   child, and each child's brief is only the boundary around its section. Named at the
+   top because a reader who does not know the spec exists will read twelve thin briefs
+   and conclude the feature was under-specified. #}
+{% if fo.plan.design_doc %}
+<p class="sub">📄 Spec: <span class="mono">{{ fo.plan.design_doc }}</span> — each child
+  below implements one section of it.</p>
+{% endif %}
 {# Rendered from the stored document rather than from the children, so it keeps saying
    what was APPROVED even after the children have moved on from it. #}
 <div class="panel">
@@ -63,6 +71,7 @@
     <div class="grow">
       <span class="mono">{{ c.key }}</span> <strong>{{ c.title }}</strong>
       {% if c.needs %}<span class="sub">needs {{ c.needs | join(', ') }}</span>{% endif %}
+      {% if c.spec_section %}<span class="sub">§ {{ c.spec_section }}</span>{% endif %}
       <div class="sub">{{ c.description }}</div>
       {% if c.acceptance %}<div class="sub">done when: {{ c.acceptance }}</div>{% endif %}
     </div>

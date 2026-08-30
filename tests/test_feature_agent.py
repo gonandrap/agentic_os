@@ -247,3 +247,57 @@ def test_the_profile_is_the_appendix_and_not_the_rest_of_the_spec():
 
     assert PROFILE_MARKER in profile
     assert "The exporter is one module with one entry point." not in profile
+
+
+# -- what the reader sees ----------------------------------------------------------------
+
+
+def _client():
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    return TestClient(create_app(), follow_redirects=False)
+
+
+def test_a_childs_page_names_its_section_and_does_not_reprint_it(started, store,
+                                                                 project, catalog_file):
+    """THE ASK, at the surface the user actually reads: the order page says WHERE the
+    rest of the work is written instead of restating it.
+
+    Asserted on the rendered text and paired with a negative — kn-9c5bcac7: a template
+    that dropped the block would still return 200, so "the page rendered" proves nothing.
+    """
+    fo = release(started, store, "schema")
+    wo = store.feature_children(fo["id"])[0]
+    spec = specs.spec_of(store, wo)
+
+    body = _client().get(f"/wo/proj_a/{wo["id"]}").text
+
+    assert f"Spec section {wo['spec_section']}" in body
+    assert FIXTURE_DESIGN_DOC in body
+    # ...and the section's own prose is NOT on the page. Inlining it here would rebuild
+    # the duplication the whole change removed, one page at a time.
+    assert spec["section_text"] not in body
+
+
+def test_a_work_order_with_no_feature_shows_no_spec_line(started):
+    """The control. Most work orders have no feature and must read exactly as before."""
+    wo = ops.create_work_order("proj_a", "unrelated", description="something else")
+
+    body = _client().get(f"/wo/proj_a/{wo["id"]}").text
+
+    assert "Spec section" not in body
+
+
+def test_the_features_page_names_the_spec_and_each_childs_section(started, store):
+    """A reader who does not know the spec exists reads twelve thin briefs and concludes
+    the feature was under-specified. So the plan is labelled as an index into it."""
+    fo = release(started, store, "schema", "api")
+
+    body = _client().get(f"/fo/proj_a/{fo["id"]}").text
+
+    assert FIXTURE_DESIGN_DOC in body
+    for key in ("schema", "api"):
+        assert f"§ {fixture_spec_section(key)}" in body
