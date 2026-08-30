@@ -323,6 +323,41 @@ def turn_lines_by_message(bill: dict | None) -> dict[int, dict]:
     return out
 
 
+def config_setters(history: list[dict]) -> dict[str, str]:
+    """path → the id of the most recent version that changed it.
+
+    Only half of a key's provenance: a version's change list says what was WRITTEN at
+    the time, and `ops.config_show`'s `written` says what the document still sets. A key
+    the file no longer sets is on a default however many versions once named it.
+    """
+    setters: dict[str, str] = {}
+    for row in reversed(history):  # oldest first, so the last writer wins
+        for change in row["changes"]:
+            setters[change["path"]] = row["id"]
+    return setters
+
+
+def group_config(show: dict, setters: dict[str, str]) -> list[dict]:
+    """The flat key space, split into the blocks the catalog is written in (spec §8).
+
+    `os.…` is one group and each `projects.<name>.…` is its own; the label a row shows
+    is the path with that prefix taken off, so the column reads as settings rather than
+    as forty repetitions of the same first two segments.
+    """
+    resolved, written = show["resolved"], set(show["written"])
+    groups: dict[str, list[dict]] = {}
+    for path in sorted(resolved):
+        parts = path.split(".")
+        prefix = "os" if parts[0] == "os" else ".".join(parts[:2])
+        groups.setdefault(prefix, []).append(
+            {"path": path, "label": path[len(prefix) + 1:], "value": resolved[path],
+             "bool": isinstance(resolved[path], bool), "written": path in written,
+             "safety": ops.safety_key(path),
+             "version": setters.get(path) if path in written else None})
+    return [{"name": p, "title": p if p == "os" else p.split(".", 1)[1],
+             "settings": rows} for p, rows in groups.items()]
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None)
 
@@ -786,6 +821,30 @@ def create_app() -> FastAPI:
                       decided=decided, dismissed=dismissed,
                       false_positive_rate=_false_positive_rate(rows))
 
+    @app.get("/config", response_class=HTMLResponse)
+    def config_page(request: Request, a: str = "", b: str = ""):
+        """What the fleet is configured to run, who changed it, and what changed.
+
+        A form over `jarvis config` and nothing more — see
+        docs/superpowers/specs/2026-08-27-the-config-console.md §8 for the scope cut.
+        """
+        show = ops.config_show()
+        history = ops.config_history(limit=50)
+        # Default the diff to the change that landed: the head against the version
+        # before it, so the page answers "what changed last" unasked.
+        ids = [row["id"] for row in history]
+        if not a and not b and len(ids) >= 2:
+            a, b = ids[1], ids[0]
+        diff = diff_error = None
+        if a and b:
+            try:
+                diff = ops.config_diff(a, b)
+            except ops.OpsError as e:
+                diff_error = str(e)
+        return render(request, "config.html", active="config", show=show,
+                      groups=group_config(show, config_setters(history)),
+                      history=history, diff=diff, diff_error=diff_error, a=a, b=b)
+
     @app.get("/api/status")
     def api_status():
         return JSONResponse(ops.os_status())
@@ -976,6 +1035,26 @@ def create_app() -> FastAPI:
             sep = "&" if "?" in back else "?"
             return RedirectResponse(f"{back}{sep}error={e}", status_code=303)
         return RedirectResponse(back, status_code=303)
+
+    @app.post("/config/set")
+    def config_set(path: str = Form(...), value: str = Form(""),
+                   reason: str = Form("")):
+        """The page's only write, and it is `jarvis config set` under another name.
+
+        v1 toggles booleans and nothing else (spec §8): a POST for any other key is
+        refused here and sent to the CLI, where the value is already text.
+        """
+        try:
+            if value not in ("true", "false") \
+                    or not isinstance(ops.config_get(path)["value"], bool):
+                return RedirectResponse(
+                    f"/config?error={path} is not a boolean — this page toggles "
+                    f"true/false only. Use `jarvis config set {path} <value> "
+                    f'--reason "…"`.', status_code=303)
+            ops.set_config(path, value == "true", reason=reason)
+        except ops.OpsError as e:
+            return RedirectResponse(f"/config?error={e}", status_code=303)
+        return RedirectResponse("/config", status_code=303)
 
     @app.post("/inbox/ack")
     def ack(inbox_id: str = Form("")):
