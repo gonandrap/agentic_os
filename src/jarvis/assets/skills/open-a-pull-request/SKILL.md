@@ -1,6 +1,6 @@
 ---
 name: open-a-pull-request
-description: Use when opening a pull request for a work order — before running `gh pr create`. Fills the repository's PR template with the summary, implementation notes, Neo questions, learnings and test evidence a reviewer needs, and keeps GitHub from turning a work-order item number into a link to someone else's PR.
+description: Use when opening a pull request for a work order — before running `gh pr create`. Fills the repository's PR template with the summary, implementation notes, Neo questions, alarms raised, learnings and test evidence a reviewer needs, and keeps GitHub from turning a work-order item number into a link to someone else's PR.
 ---
 
 # Opening a pull request
@@ -9,7 +9,7 @@ The pull request is the only artifact of your work order that a reviewer reads b
 the diff, and the only one that outlives the OS's records. It is also the one your
 operating contract tells you to keep terse — and terse is not the same as thin. The
 brief's "a PR body hints, it does not explain" deletes **narration of the diff**. It
-does not delete the five things below, which the diff cannot tell anyone.
+does not delete the six things below, which the diff cannot tell anyone.
 
 A `gh pr create` whose body is missing a section, or which contains a bare `#N`, is
 **denied by a hook** with the fix named. Filling the template correctly the first time
@@ -26,7 +26,7 @@ cat .github/pull_request_template.md 2>/dev/null \
 ```
 
 If the repository has none, use this skill's bundled copy —
-`pull_request_template.md`, beside this file. Its five `##` headings are what the hook
+`pull_request_template.md`, beside this file. Its six `##` headings are what the hook
 requires, so do not rename or drop any of them.
 
 ## 2. Fill every section
@@ -52,6 +52,21 @@ http://localhost:8787/neo/question/<id>
 
 Use the host and port from your own catalog if the OS is not on the default port.
 If you asked none, write `None.` — an empty section reads as a section you forgot.
+
+**Alarms raised** — one bullet per cost alarm the OS raised against this work
+order while it was running, each with its `al-` id and the link to its page:
+
+```bash
+jarvis alarms --wo $JARVIS_WO_ID
+```
+
+```
+http://localhost:8787/alarms/<project>/<al-id>
+```
+
+Same host and port rule as above. Write `None.` if none was raised — an empty section
+reads as a section you forgot, and "nothing burned here" is a fact the reviewer wants
+stated rather than inferred.
 
 **Learnings** — one bullet per knowledge-base entry this work wrote, with its `kn-` id
 and its headline. Write these with `jarvis learn add` *before* you open the PR, so the
