@@ -115,7 +115,11 @@ AUTOCOMPACT_MAX = 1_000_000  # ... or over this
 # Reasoning and the measured populations:
 # docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
 DEFAULT_COLD_PREFIX_FLOOR = 5_000
-COLD_PREFIX_FLOOR_MAX = 100_000  # above this it would swallow real boundaries
+#: Guard rail on the above, and configurable for the same reason it is: a fleet whose
+#: static heads are unusually large needs room to raise the floor. Only the SCHEMA
+#: defaults are literals here; both values are `os.` keys the config console can change
+#: without a release.
+DEFAULT_COLD_PREFIX_FLOOR_MAX = 100_000
 
 
 _MISSING = object()
@@ -295,6 +299,7 @@ class OsConfig:
     default_autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
     #: Read by the cost surfaces, not by a worker launch — see DEFAULT_COLD_PREFIX_FLOOR.
     cold_prefix_floor: int = DEFAULT_COLD_PREFIX_FLOOR
+    cold_prefix_floor_max: int = DEFAULT_COLD_PREFIX_FLOOR_MAX
     notification_sinks: list[str] = field(default_factory=lambda: ["log"])
     telegram_token_env: str = "JARVIS_TELEGRAM_TOKEN"
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
@@ -328,20 +333,30 @@ def _err(msg: str) -> CatalogError:
     return CatalogError(f"catalog error: {msg}")
 
 
-def _cold_prefix_floor_or_err(os_raw: dict[str, Any]) -> int:
-    """`os.cold_prefix_floor`, validated at boot rather than at report time.
+def _positive_int_or_err(os_raw: dict[str, Any], key: str, default: int) -> int:
+    value = os_raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _err(f"os.{key} must be an integer")
+    return value
+
+
+def _cold_prefix_floor_or_err(os_raw: dict[str, Any]) -> tuple[int, int]:
+    """`os.cold_prefix_floor` and its guard rail, validated at boot not at report time.
 
     Rejected here for the same reason the autocompact window is: a bad value would
     otherwise surface far from its cause — as a cost report quietly reclassifying every
     boundary, which reads as a finding rather than as a config error.
     """
-    value = os_raw.get("cold_prefix_floor", DEFAULT_COLD_PREFIX_FLOOR)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise _err("os.cold_prefix_floor must be an integer")
-    if not 0 <= value <= COLD_PREFIX_FLOOR_MAX:
-        raise _err(f"os.cold_prefix_floor {value} out of range "
-                   f"0-{COLD_PREFIX_FLOOR_MAX}")
-    return value
+    ceiling = _positive_int_or_err(os_raw, "cold_prefix_floor_max",
+                                   DEFAULT_COLD_PREFIX_FLOOR_MAX)
+    if ceiling <= 0:
+        raise _err(f"os.cold_prefix_floor_max {ceiling} must be positive")
+    floor = _positive_int_or_err(os_raw, "cold_prefix_floor",
+                                 DEFAULT_COLD_PREFIX_FLOOR)
+    if not 0 <= floor <= ceiling:
+        raise _err(f"os.cold_prefix_floor {floor} out of range 0-{ceiling} "
+                   f"(os.cold_prefix_floor_max)")
+    return floor, ceiling
 
 
 def _autocompact_or_err(raw: dict[str, Any], key: str, where: str,
@@ -486,6 +501,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         panel=_parse_panel(neo_raw.get("panel", {})),
     )
 
+    cold_floor, cold_floor_max = _cold_prefix_floor_or_err(os_raw)
     os_cfg = OsConfig(
         default_model=defaults.get("model", DEFAULT_MODEL),
         default_effort=defaults.get("effort"),
@@ -499,7 +515,8 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         telegram_chat_id_env=telegram.get("chat_id_env", "JARVIS_TELEGRAM_CHAT_ID"),
         ui_port=ui.get("port", 8787),
         ui_base_url=str(ui.get("base_url", "") or "").rstrip("/"),
-        cold_prefix_floor=_cold_prefix_floor_or_err(os_raw),
+        cold_prefix_floor=cold_floor,
+        cold_prefix_floor_max=cold_floor_max,
         knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
         knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 40)),
         knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 4000)),

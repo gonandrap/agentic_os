@@ -916,6 +916,17 @@ def _accuracy(payload: dict[str, Any], turn_rows: Sequence[dict[str, Any]],
     return {"sealed_at": None, "live": True, "complete": not gaps, "gaps": gaps}
 
 
+def _cold_prefix_floor() -> int:
+    """`os.cold_prefix_floor`, or the catalog's own error if none is registered.
+
+    Deliberately no fallback: classifying a cold boundary against a threshold nobody
+    configured would print a finding the configuration never produced.
+    """
+    from .ops import resolve_catalog
+
+    return resolve_catalog().os.cold_prefix_floor
+
+
 def for_work_order(project: str, path: Path, wo: dict[str, Any],
                    index: dict[str, list[Path]] | None = None) -> dict[str, Any]:
     """One work order's bill: its turns, Jarvis's calls on it, its own subprocesses."""
@@ -933,7 +944,8 @@ def for_work_order(project: str, path: Path, wo: dict[str, Any],
         calls = central.agent_calls(wo_id=wo["id"], limit=CALL_LIMIT)
     finally:
         central.close()
-    session = usage_mod.read_session(wo.get("session_id") or "", index=index)
+    session = usage_mod.read_session(wo.get("session_id") or "", _cold_prefix_floor(),
+                                     index=index)
     # Per-API-call detail, sealed onto the turn rows. Done BEFORE the items are built so
     # that `api_calls` and `context_peak` are settled once, on the rows every surface
     # reads, rather than corrected differently in each renderer.

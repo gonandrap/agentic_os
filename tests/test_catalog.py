@@ -6,9 +6,9 @@ import pytest
 import jarvis.catalog
 import jarvis.validation
 from jarvis.catalog import (
-    COLD_PREFIX_FLOOR_MAX,
     DEFAULT_AUTOCOMPACT_WINDOW,
     DEFAULT_COLD_PREFIX_FLOOR,
+    DEFAULT_COLD_PREFIX_FLOOR_MAX,
     CatalogError,
     load_catalog,
     parse_catalog,
@@ -409,6 +409,21 @@ def test_the_cold_prefix_floor_is_validated_at_boot_not_at_report_time():
     reclassifying every boundary — which reads as a finding, not as a config error."""
     assert (parse_catalog({"projects": []}).os.cold_prefix_floor
             == DEFAULT_COLD_PREFIX_FLOOR)
-    for bad in ("5000", True, -1, COLD_PREFIX_FLOOR_MAX + 1):
+    for bad in ("5000", True, -1, DEFAULT_COLD_PREFIX_FLOOR_MAX + 1):
         with pytest.raises(CatalogError, match="cold_prefix_floor"):
             parse_catalog({"os": {"cold_prefix_floor": bad}, "projects": []})
+
+
+def test_the_guard_rail_on_the_floor_is_itself_configurable():
+    """`cold_prefix_floor_max` is config, not a constant: a fleet whose static heads are
+    unusually large has to be able to raise the floor past the shipped ceiling."""
+    over = {"cold_prefix_floor": DEFAULT_COLD_PREFIX_FLOOR_MAX + 50_000}
+    with pytest.raises(CatalogError, match="cold_prefix_floor"):
+        parse_catalog({"os": over, "projects": []})
+    raised = parse_catalog({
+        "os": {**over, "cold_prefix_floor_max": DEFAULT_COLD_PREFIX_FLOOR_MAX + 60_000},
+        "projects": [],
+    })
+    assert raised.os.cold_prefix_floor == DEFAULT_COLD_PREFIX_FLOOR_MAX + 50_000
+    with pytest.raises(CatalogError, match="cold_prefix_floor_max"):
+        parse_catalog({"os": {"cold_prefix_floor_max": 0}, "projects": []})

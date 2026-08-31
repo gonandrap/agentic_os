@@ -21,6 +21,11 @@ import pytest
 
 from jarvis import usage
 
+#: `read_session` takes the cold-prefix floor as a REQUIRED argument — there is no
+#: module default to fall back on — so every call here passes one. The value only
+#: matters to the tests that are about the classification; elsewhere it is inert.
+FLOOR = 5_000
+
 
 def row(mid: str, *, write: int = 0, read: int = 0, out: int = 0, plain: int = 0,
         model: str = "claude-opus-5", ttl_1h: int = 0, ttl_5m: int = 0,
@@ -90,7 +95,7 @@ def test_streamed_duplicates_count_once_but_distinct_messages_both_count(transcr
         row("msg_a", write=500, read=0, out=140),
         row("msg_b", write=200, read=500, out=60),
     ])
-    total = usage.read_session("s1").total
+    total = usage.read_session("s1", FLOOR).total
 
     assert total.messages == 2                 # not 4
     assert total.cache_write == 700            # 500 + 200, not 1500 + 200
@@ -104,7 +109,7 @@ def test_output_takes_the_max_not_the_last_row(transcripts):
         row("msg_a", out=900),
         row("msg_a", out=12),
     ])
-    assert usage.read_session("s1").total.output == 900
+    assert usage.read_session("s1", FLOOR).total.output == 900
 
 
 # -- the re-write tax -----------------------------------------------------------------
@@ -122,7 +127,7 @@ def test_rewrite_excess_counts_only_what_was_written_twice(transcripts):
         row("m2", write=500, read=1000),
         row("m3", write=300, read=1500),
     ])
-    clean = usage.read_session("clean").total
+    clean = usage.read_session("clean", FLOOR).total
     assert clean.context_peak == 1800          # 300 + 1500
     assert clean.cache_write == 1800
     assert clean.rewrite_excess == 0
@@ -133,7 +138,7 @@ def test_rewrite_excess_counts_only_what_was_written_twice(transcripts):
         row("m2", write=500, read=1000),
         row("m3", write=1500, read=0),
     ])
-    cold = usage.read_session("cold").total
+    cold = usage.read_session("cold", FLOOR).total
     assert cold.context_peak == 1500
     assert cold.cache_write == 3000
     assert cold.rewrite_excess == 1500
@@ -145,7 +150,7 @@ def test_rewrite_cost_is_the_difference_between_writing_and_reading(transcripts)
         row("m1", write=1_000_000, read=0),
         row("m2", write=1_000_000, read=0),
     ])
-    total = usage.read_session("s1").total
+    total = usage.read_session("s1", FLOOR).total
     assert total.rewrite_excess == 1_000_000
     # 1M tokens at Opus $5/MTok: written at 1.25x = $6.25, read at 0.1x = $0.50.
     assert total.rewrite_cost_usd == pytest.approx(5.75)
@@ -167,12 +172,12 @@ def test_a_boundary_is_the_cache_going_backwards_not_a_big_write(transcripts):
         row("m4", write=100, read=1100),   # rose again
         row("m5", write=900, read=300),    # dropped — a second boundary
     ])
-    assert usage.read_session("s1").total.resume_boundaries == 2
+    assert usage.read_session("s1", FLOOR).total.resume_boundaries == 2
 
 
 def test_a_single_turn_session_has_no_boundaries(transcripts):
     transcripts("s1", [row("m1", write=100), row("m2", write=50, read=100)])
-    assert usage.read_session("s1").total.resume_boundaries == 0
+    assert usage.read_session("s1", FLOOR).total.resume_boundaries == 0
 
 
 # -- which of the two causes made a boundary cold -------------------------------------
@@ -192,7 +197,7 @@ def test_a_boundary_inside_the_ttl_is_the_prefix_moving_however_little_it_read(
         row("m2", write=100, read=9_000, at="2026-08-09T00:00:02.000Z"),
         row("m3", write=9_000, read=10, at="2026-08-09T00:00:14.000Z"),   # 12s later
     ])
-    near = usage.read_session("s1").total
+    near = usage.read_session("s1", FLOOR).total
     assert near.boundaries_ttl == 0
     assert near.rewrite_prefix_write == 9_000
     assert near.rewrite_ttl_share == 0.0
@@ -202,7 +207,7 @@ def test_a_boundary_inside_the_ttl_is_the_prefix_moving_however_little_it_read(
         row("m2", write=100, read=9_000, at="2026-08-09T00:00:02.000Z"),
         row("m3", write=9_000, read=10, at="2026-08-09T00:11:00.000Z"),   # 11min later
     ])
-    far = usage.read_session("s2").total
+    far = usage.read_session("s2", FLOOR).total
     assert far.boundaries_ttl == 1
     assert far.rewrite_ttl_write == 9_000
     assert far.rewrite_ttl_share == 1.0
@@ -220,7 +225,7 @@ def test_a_long_gap_that_still_read_the_static_prefix_is_not_an_expiry(transcrip
         row("m2", write=100, read=60_000, at="2026-08-09T00:00:02.000Z"),
         row("m3", write=40_000, read=20_000, at="2026-08-09T00:30:00.000Z"),
     ])
-    total = usage.read_session("s1").total
+    total = usage.read_session("s1", FLOOR).total
     assert total.resume_boundaries == 1
     assert total.boundaries_ttl == 0
     assert total.rewrite_prefix_write == 40_000
@@ -239,7 +244,7 @@ def test_the_cause_split_is_a_partition_of_the_tax_not_a_second_count(transcript
         row("m4", write=100, read=70_000, at="2026-08-09T00:00:09.000Z"),
         row("m5", write=50_000, read=100, at="2026-08-09T00:20:00.000Z"),     # TTL
     ])
-    total = usage.read_session("s1").total
+    total = usage.read_session("s1", FLOOR).total
     assert total.rewrite_ttl_share == 0.5
     assert total.rewrite_ttl_excess + (total.rewrite_excess - total.rewrite_ttl_excess) \
         == total.rewrite_excess
@@ -250,7 +255,7 @@ def test_an_unclassified_tax_reports_no_share_rather_than_a_zero_one(transcripts
     """A session with no boundary has NOT been measured at 0% — the two must not read
     alike, or a report prints "0% was the TTL" as though it were a finding."""
     transcripts("s1", [row("m1", write=500), row("m2", write=400, read=500)])
-    total = usage.read_session("s1").total
+    total = usage.read_session("s1", FLOOR).total
     assert total.rewrite_ttl_share is None
     assert total.rewrite_ttl_excess == 0
 
@@ -273,26 +278,18 @@ def test_the_floor_comes_from_the_catalog_and_reclassifies_the_same_boundary(
     assert usage.read_session("s1", cold_prefix_floor=20_000).total.boundaries_ttl == 1
 
 
-def test_a_missing_catalog_falls_back_rather_than_failing_the_report(monkeypatch):
-    """`jarvis cost` has to work on a machine where no catalog was ever registered."""
-    def explode():
-        raise RuntimeError("no catalog registered")
-    monkeypatch.setattr("jarvis.ops.resolve_catalog", explode)
-    usage._reset_cold_prefix_floor()
-    try:
-        assert usage.resolved_cold_prefix_floor() == usage.COLD_PREFIX_FLOOR
-    finally:
-        usage._reset_cold_prefix_floor()
+def test_the_floor_has_no_default_anywhere_in_this_module():
+    """There must be nothing to fall back TO.
 
-
-def test_the_two_defaults_cannot_drift_apart():
-    """The value's home is the catalog; `usage` repeats it only as a no-catalog floor.
-
-    Two literals for one number is a bug waiting to happen, so it is asserted rather
-    than trusted.
+    A default here would let a caller that could not reach a catalog still produce a
+    classification, and a cost report that classified against a guessed threshold prints
+    a finding the configuration never produced. Asserted on the module surface rather
+    than on one call, because the way this regresses is somebody re-adding the constant.
     """
-    from jarvis import catalog
-    assert usage.COLD_PREFIX_FLOOR == catalog.DEFAULT_COLD_PREFIX_FLOOR
+    assert not hasattr(usage, "COLD_PREFIX_FLOOR")
+    assert not hasattr(usage, "resolved_cold_prefix_floor")
+    with pytest.raises(TypeError):
+        usage.read_session("s1")            # type: ignore[call-arg]
 
 
 def test_merging_keeps_the_share_token_weighted_not_averaged():
@@ -321,7 +318,7 @@ def test_subagents_are_counted_separately_and_included_in_the_total(transcripts)
         "agent-aaa": [row("s1m1", write=300, out=5)],
         "agent-bbb": [row("s2m1", write=200, out=7)],
     })
-    session = usage.read_session("s1")
+    session = usage.read_session("s1", FLOOR)
 
     assert session.subagent_count == 2
     assert session.main.cache_write == 1000
@@ -333,7 +330,7 @@ def test_subagents_are_counted_separately_and_included_in_the_total(transcripts)
 def test_an_empty_subagent_transcript_is_not_counted_as_an_agent(transcripts):
     """Claude Code leaves behind stub files for agents that produced nothing."""
     transcripts("s1", [row("m1", write=100)], subagents={"agent-empty": []})
-    assert usage.read_session("s1").subagent_count == 0
+    assert usage.read_session("s1", FLOOR).subagent_count == 0
 
 
 # -- sessions split across project directories ----------------------------------------
@@ -353,7 +350,7 @@ def test_a_session_split_across_project_dirs_sums_every_segment(transcripts):
                 slug="-repo-worktree")
     transcripts("solo", [row("m3", out=5)], slug="-repo")
 
-    split = usage.read_session("split").total
+    split = usage.read_session("split", FLOOR).total
     assert split.messages == 2
     assert split.cache_write == 150
     assert split.cache_read == 400
@@ -363,7 +360,7 @@ def test_a_session_split_across_project_dirs_sums_every_segment(transcripts):
     # visible across separately-read files.
     assert split.resume_boundaries == 1
 
-    assert usage.read_session("solo").total.output == 5
+    assert usage.read_session("solo", FLOOR).total.output == 5
 
 
 def test_subagents_are_found_beside_every_segment(transcripts):
@@ -373,7 +370,7 @@ def test_subagents_are_found_beside_every_segment(transcripts):
     transcripts("split", [row("m2", write=50)], slug="-repo-worktree",
                 subagents={"agent-bbb": [row("sb1", out=7)]})
 
-    session = usage.read_session("split")
+    session = usage.read_session("split", FLOOR)
     assert session.subagent_count == 2
     assert session.subagents.output == 12
 
@@ -385,11 +382,11 @@ def test_a_missing_transcript_is_not_found_rather_than_free(transcripts):
     """Unmeasurable and zero are different answers and must not render the same."""
     transcripts("present", [row("m1", write=100, out=10)])
 
-    missing = usage.read_session("nope")
+    missing = usage.read_session("nope", FLOOR)
     assert missing.found is False
     assert missing.total.list_cost_usd == 0.0
 
-    present = usage.read_session("present")
+    present = usage.read_session("present", FLOOR)
     assert present.found is True
     assert present.total.list_cost_usd > 0
 
@@ -397,7 +394,7 @@ def test_a_missing_transcript_is_not_found_rather_than_free(transcripts):
 def test_a_work_order_with_no_session_id_reports_not_found(transcripts):
     """A work order that never got a session must not match a transcript by accident."""
     transcripts("", [row("m1", write=100)], slug="-oddly-named")
-    assert usage.read_session("").found is False
+    assert usage.read_session("", FLOOR).found is False
 
 
 # -- pricing --------------------------------------------------------------------------
@@ -421,7 +418,7 @@ def test_cost_is_priced_per_message_model_not_per_session(transcripts):
         row("m1", plain=1_000_000, out=1_000_000, model="claude-opus-5"),
         row("m2", plain=1_000_000, out=1_000_000, model="claude-haiku-4-5"),
     ])
-    total = usage.read_session("s1").total
+    total = usage.read_session("s1", FLOOR).total
     assert total.cost_by_model["claude-opus-5"] == pytest.approx(30.0)   # 5 + 25
     assert total.cost_by_model["claude-haiku-4-5"] == pytest.approx(6.0)  # 1 + 5
     assert total.list_cost_usd == pytest.approx(36.0)
@@ -429,9 +426,9 @@ def test_cost_is_priced_per_message_model_not_per_session(transcripts):
 
 def test_cache_reads_are_a_tenth_and_writes_are_a_quarter_more(transcripts):
     transcripts("s1", [row("m1", read=1_000_000)])
-    assert usage.read_session("s1").total.list_cost_usd == pytest.approx(0.5)
+    assert usage.read_session("s1", FLOOR).total.list_cost_usd == pytest.approx(0.5)
     transcripts("s2", [row("m1", write=1_000_000)])
-    assert usage.read_session("s2").total.list_cost_usd == pytest.approx(6.25)
+    assert usage.read_session("s2", FLOOR).total.list_cost_usd == pytest.approx(6.25)
 
 
 def test_a_one_hour_cache_write_costs_twice_input_not_a_quarter_more(transcripts):
@@ -444,13 +441,13 @@ def test_a_one_hour_cache_write_costs_twice_input_not_a_quarter_more(transcripts
     there.
     """
     transcripts("s1", [row("m1", write=1_000_000, ttl_1h=1_000_000)])
-    assert usage.read_session("s1").total.list_cost_usd == pytest.approx(10.0)
+    assert usage.read_session("s1", FLOOR).total.list_cost_usd == pytest.approx(10.0)
     transcripts("s2", [row("m1", write=1_000_000, ttl_5m=1_000_000)])
-    assert usage.read_session("s2").total.list_cost_usd == pytest.approx(6.25)
+    assert usage.read_session("s2", FLOOR).total.list_cost_usd == pytest.approx(6.25)
     # Half and half prices in between, and a message with no split at all stays on the
     # 5-minute rate — the floor, and what this module has always charged.
     transcripts("s3", [row("m1", write=1_000_000, ttl_1h=500_000, ttl_5m=500_000)])
-    assert usage.read_session("s3").total.list_cost_usd == pytest.approx(8.125)
+    assert usage.read_session("s3", FLOOR).total.list_cost_usd == pytest.approx(8.125)
 
 
 def test_the_split_is_a_ratio_when_it_covers_only_part_of_the_write(transcripts):
@@ -467,13 +464,13 @@ def test_the_bill_says_what_each_class_of_token_cost(transcripts):
     they are priced 20x apart, so which one dominates IS the finding."""
     transcripts("s1", [row("m1", plain=1_000, write=100_000, read=2_000_000,
                            out=10_000)])
-    classes = usage.read_session("s1").total.cost_by_class
+    classes = usage.read_session("s1", FLOOR).total.cost_by_class
     assert classes["input"] == pytest.approx(0.005)
     assert classes["cache_write"] == pytest.approx(0.625)
     assert classes["cache_read"] == pytest.approx(1.0)
     assert classes["output"] == pytest.approx(0.25)
     assert sum(classes.values()) == pytest.approx(
-        usage.read_session("s1").total.list_cost_usd)
+        usage.read_session("s1", FLOOR).total.list_cost_usd)
 
 
 # -- merging --------------------------------------------------------------------------
@@ -514,4 +511,4 @@ def test_rows_without_usage_are_ignored(transcripts):
         {"type": "custom-title", "customTitle": 'the "usage" of the thing'},
         row("m1", write=100, out=10),
     ])
-    assert usage.read_session("s1").total.messages == 1
+    assert usage.read_session("s1", FLOOR).total.messages == 1

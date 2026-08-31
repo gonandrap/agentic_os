@@ -3922,7 +3922,10 @@ def _unit_row(name: str, wo: dict[str, Any], index: dict[str, list[Path]],
     """
     from . import usage as usage_mod
 
-    session = usage_mod.read_session(wo.get("session_id") or "", index=index)
+    from .bill import _cold_prefix_floor
+
+    session = usage_mod.read_session(wo.get("session_id") or "", _cold_prefix_floor(),
+                                     index=index)
     total = session.total
     provenance, recorded, settled, rec_totals = _turn_summary(list(turn_rows))
     os_groups_only, subproc_groups = _partition_calls(list(os_groups))

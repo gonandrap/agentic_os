@@ -109,45 +109,11 @@ CACHE_READ_RATE = 0.10  # x input price, under either TTL
 #: The TTL Jarvis buys (`claude_cli.PROMPT_CACHE_5M_ENV`). A boundary closer together
 #: than this cannot be an expiry, whatever else it looks like.
 WRITE_TTL_SECONDS = 300.0
-#: Fallback for `os.cold_prefix_floor` when no catalog is reachable — see
-#: `resolved_cold_prefix_floor`. Mirrors `catalog.DEFAULT_COLD_PREFIX_FLOOR`, the
-#: value's real home; duplicated as a literal only so this module keeps working with no
-#: catalog and no store, which is the state `jarvis cost` runs in on a fresh machine.
-COLD_PREFIX_FLOOR = 5_000
-
-#: Resolved once per process. Cached because the fleet cost view reads hundreds of
-#: sessions and would otherwise re-read and re-parse the catalog for each one.
-_floor_cache: int | None = None
-
-
-def resolved_cold_prefix_floor() -> int:
-    """`os.cold_prefix_floor`, or `COLD_PREFIX_FLOOR` when no catalog is registered.
-
-    Resolved HERE rather than threaded through the eight call sites that build a bill,
-    for the reason kn-5dd784f5 records about the cache TTL: a value every surface must
-    agree on belongs at the one seam they all pass through, because a per-call-site
-    parameter cannot be passed by a call site nobody thought of.
-
-    Staleness is deliberate and harmless: this only decides how a cost report CLASSIFIES
-    history that already happened, never what a worker does, so a daemon that has been
-    running since before a config change reports under the old value until it restarts.
-    """
-    global _floor_cache
-    if _floor_cache is None:
-        try:
-            from .ops import resolve_catalog
-            _floor_cache = resolve_catalog().os.cold_prefix_floor
-        except Exception:
-            # No catalog registered, no store, or an unparseable file. The report is
-            # still worth printing, and the default is the value it was calibrated on.
-            _floor_cache = COLD_PREFIX_FLOOR
-    return _floor_cache
-
-
-def _reset_cold_prefix_floor() -> None:
-    """Drop the cache. For tests, and for a process that reloads its catalog."""
-    global _floor_cache
-    _floor_cache = None
+#: There is no module-level default for the cold-prefix floor on purpose. It is
+#: `os.cold_prefix_floor`, every reader passes it in, and a caller with no catalog gets
+#: the catalog's own error rather than a number this module invented — a report that
+#: silently classified boundaries against a guessed threshold would print a finding the
+#: configuration never produced.
 
 #: The four things a bill can be charged for, in the order they are rendered. Named here
 #: because every surface that breaks a line item down by class walks this list, and a
@@ -697,15 +663,11 @@ def session_calls(session_id: str, root: Path | None = None,
     return calls
 
 
-def _usage_of(path: Path, cold_prefix_floor: int | None = None) -> Usage:
+def _usage_of(path: Path, cold_prefix_floor: int) -> Usage:
     messages = _assistant_messages(path)
     if not messages:
         return Usage()
     usage = Usage(messages=len(messages))
-    # An explicit value where a caller has one (the tests, and any A/B of the threshold);
-    # otherwise the catalog's, resolved once per process.
-    floor = (cold_prefix_floor if cold_prefix_floor is not None
-             else resolved_cold_prefix_floor())
     previous_read: int | None = None
     previous_ts: float | None = None
     for message in messages:
@@ -735,16 +697,10 @@ def _usage_of(path: Path, cold_prefix_floor: int | None = None) -> Usage:
         # on exactly (turns - 1) for every work order measured.
         if previous_read is not None and read < previous_read:
             usage.resume_boundaries += 1
-            # WHICH of the two causes in the module docstring. The discriminator is what
-            # SURVIVED, not how long the gap was: an expired entry leaves nothing, while
-            # a moved prefix still serves the static head of the system prompt, so the
-            # read lands on a small non-zero plateau (~15-22k, one value per project's
-            # CLAUDE.md length). A gap inside the TTL cannot be an expiry whatever it
-            # read. Thresholds and the fleet measurement they came from:
-            # `docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md`.
+            # Expired, or the prefix moved: findings/2026-08-30-where-the-800-dollars-went.md
             gap = (ts - previous_ts) if (ts and previous_ts) else None
             expired = (gap is not None and gap >= WRITE_TTL_SECONDS
-                       and read <= floor)
+                       and read <= cold_prefix_floor)
             if expired:
                 usage.rewrite_ttl_write += write
                 usage.boundaries_ttl += 1
@@ -820,13 +776,13 @@ def index_sessions(root: Path | None = None) -> dict[str, list[Path]]:
     return index
 
 
-def read_session(session_id: str, root: Path | None = None,
-                 index: dict[str, list[Path]] | None = None,
-                 cold_prefix_floor: int | None = None) -> SessionUsage:
+def read_session(session_id: str, cold_prefix_floor: int,
+                 root: Path | None = None,
+                 index: dict[str, list[Path]] | None = None) -> SessionUsage:
     """Spend for one session id, subagents included but reported separately.
 
-    `cold_prefix_floor` is `os.cold_prefix_floor` where the caller could resolve a
-    catalog; None takes the module default (see `_usage_of`).
+    `cold_prefix_floor` is `os.cold_prefix_floor` and is REQUIRED: a caller that cannot
+    reach a catalog must fail rather than classify against a guessed threshold.
     """
     result = SessionUsage(session_id=session_id)
     if index is None:

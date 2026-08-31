@@ -23,11 +23,27 @@ SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "cache_ttl_cohort.
 
 
 @pytest.fixture()
-def cohort(tmp_path, monkeypatch):
-    """A transcript tree, plus the script loaded as a module against it."""
+def cohort(tmp_path, monkeypatch, jarvis_home):
+    """A transcript tree and a registered catalog, plus the script as a module.
+
+    The catalog is required, not scenery: the script resolves `os.cold_prefix_floor` and
+    raises without one — see `test_no_catalog_is_an_error_not_a_default`.
+    """
+    from jarvis.central_store import CentralStore
+
     root = tmp_path / "projects"
     (root / "-proj").mkdir(parents=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text(json.dumps({"os": {"cold_prefix_floor": 5_000},
+                                   "projects": []}))
+    central = CentralStore()
+    try:
+        central.set_state("catalog_path", str(catalog))
+        central.conn.commit()
+    finally:
+        central.close()
 
     spec = importlib.util.spec_from_file_location("cache_ttl_cohort", SCRIPT)
     assert spec and spec.loader
@@ -122,3 +138,27 @@ def test_the_trigger_is_derived_from_the_rate_table_not_typed_in(cohort):
     """If a price moves, the threshold must move with it."""
     module, _ = cohort
     assert module.TRIGGER == pytest.approx(0.75 / 1.90)
+
+
+def test_no_catalog_is_an_error_not_a_default(cohort, capsys):
+    """With the catalog unregistered the script must stop, not classify against 5,000.
+
+    The whole point of the report is to say which half of the re-write tax a longer TTL
+    would buy back; producing that split from a threshold nobody configured is worse than
+    producing nothing, because it looks like a measurement.
+    """
+    from jarvis.central_store import CentralStore
+    from jarvis.ops import OpsError
+
+    module, session = cohort
+    session("s", _expired("s", "2026-08-29"))
+
+    central = CentralStore()
+    try:
+        central.set_state("catalog_path", "")
+        central.conn.commit()
+    finally:
+        central.close()
+
+    with pytest.raises(OpsError, match="no catalog registered"):
+        module.main(["--since", "2026-08-01", "--until", "2026-09-01"])

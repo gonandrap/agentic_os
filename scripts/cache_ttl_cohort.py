@@ -54,6 +54,11 @@ def main(argv: list[str] | None = None) -> int:
     since = args.since if args.since is not None else now - args.days * 86400
     until = args.until if args.until is not None else now
 
+    # Resolved once, and loudly: with no catalog registered this raises rather than
+    # classifying every boundary against a threshold nobody configured.
+    from jarvis.ops import resolve_catalog
+    floor = resolve_catalog().os.cold_prefix_floor
+
     total = usage.Usage()
     sessions = 0
     for session_id, paths in usage.index_sessions().items():
@@ -64,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         if not started or not (since <= started < until):
             continue
         sessions += 1
-        total = total + usage.read_session(session_id).total
+        total = total + usage.read_session(session_id, floor).total
 
     span = f"{datetime.fromtimestamp(since, timezone.utc):%Y-%m-%d} to " \
            f"{datetime.fromtimestamp(until, timezone.utc):%Y-%m-%d}"

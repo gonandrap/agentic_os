@@ -1,271 +1,250 @@
 # Where the fleet's $800 went
 
-**wo-237d6dc4, 2026-08-30.** Three questions were asked. The headline is that the first
-one rested on a misreading, and correcting it reverses the recommendation.
+**wo-237d6dc4.** Investigating the `jarvis cost` run of **2026-08-27** — 52 work orders,
+~$800.78 at list, re-write tax ~$193.74 (24%), 43.1M cache-write tokens of which 4.3M
+bought the one-hour TTL.
 
-Method throughout: transcript arithmetic per `kn-2137076d` (dedupe by `message.id`, MAX
-each usage field), over all 1,612 transcripts on the machine. No `jarvis cost` run was
-repeated — the investigation cost is a few seconds of local file reading.
+Five findings. Each is stated as Area / Finding / Root cause / Follow-up actions with
+pros and cons. Nothing here is applied: every follow-up is a decision for the user.
 
-Everything below is in **base-input-token equivalents**: read 0.1x, 5-minute write
-1.25x, 1-hour write 2.0x, output 5x (every model in `usage.PRICES` has a 5:1
-output:input ratio, so the unit is model-independent and a price is a scalar on top).
-
----
-
-## Finding 1 — do NOT buy the one-hour cache. The 157k re-write was a 12-second gap.
-
-**Recommendation: keep `FORCE_PROMPT_CACHING_5M`. No change.**
-
-### The premise was wrong
-
-The work order reads wo-5a6b2d6d turn 2 — `ctx 173k, read 16k, wrote 157k` — as a
-five-minute cache dying during a fourteen-minute turn. The transcript says otherwise.
-Turn 1 *ran* for fourteen minutes, but it made 32 API calls while it ran, and **every
-call rewrites the cache**. The gap between the last call of turn 1 and the first call of
-turn 2 was **12 seconds**:
-
-```
- 31  01:11:39                    (turn 1's last call)
- 32  01:11:51 gap=12s ctx=172,962 read=15,862 write=157,098   COLD
-```
-
-The entry was alive. It was not matched, which is a different failure with a different
-cure. A turn's *duration* is not the age of its cache; the age is the gap since the
-previous **call**, and inside a turn those are seconds apart.
-
-This is the mistake `kn-81a91bac` recorded and `kn-625e79f1` diagnosed — "a 10-second
-boundary after an edit is cold" — arriving again from the other direction.
-
-### The discriminator
-
-Two causes make a boundary cold, and they leave different fingerprints:
-
-| | what survives | signature | cure |
-|---|---|---|---|
-| **prefix moved** | the static head of the system prompt | `read` on a plateau ~15–22k (one value per project's `CLAUDE.md` length) | keep the prefix still |
-| **entry expired** | nothing at all | `read` ≈ 0, and gap ≥ TTL | a longer TTL |
-
-`read=15,862` above is the prefix signature exactly — the same number family as the
-15,461 / 15,995 measured in the clean room.
-
-The ceiling separating the two is **`os.cold_prefix_floor`**, default 5,000. It is
-configuration rather than a constant because it is a property of *this fleet's prompts*:
-the static head is a project's `CLAUDE.md` plus the worker briefing, so a fleet of terse
-projects sits lower and a verbose one higher. Set it just under the smallest static head
-across your projects. It affects reporting only — never what a worker does — so it can
-be changed while the fleet is running, and a daemon picks it up on restart.
-
-It is **not** under `os.defaults`, and that is deliberate. `os.defaults` is the namespace
-a project may override, and per-project is the shape this setting most looks like it
-wants — the static head is literally per project. But the two surfaces that consume the
-threshold, the fleet cost view and `scripts/cache_ttl_cohort.py`, walk *transcripts*
-rather than work orders and cannot cheaply tell which project a session belonged to. A
-per-project override would be honoured for one order's bill and silently ignored by every
-aggregate: a knob that looks like a feature and behaves like a bug. Offer it only
-together with session-to-project attribution in those two readers.
-
-### Fleet-wide, classified
-
-All transcripts, cold boundaries (`write > 40k` and `read < 40k`), excluding session
-starts:
-
-| cause | boundaries | write tokens | share of tax |
-|---|---:|---:|---:|
-| cold **inside** the 5m TTL → prefix moved | 187 | 24,763,852 | 34.7% |
-| gap > 5m but prefix survived → prefix moved | 199 | 31,098,167 | 43.6% |
-| gap > 5m and read ≈ 0 → **TTL expired** | 86 | 15,445,979 | **21.7%** |
-| | **472** | **71,307,998** | |
-
-**81.8% of the re-write tax is invisible to any TTL change.**
-
-(This table counts a boundary as `write > 40k` with `read < 40k`. The shipped classifier
-instead counts the cache going *backwards*, which needs no threshold and catches small
-boundaries too, so the cohort tables below report more boundaries and slightly different
-totals. The causes are assigned identically and the verdict is the same either way.)
-
-### The break-even, and why it is not close
-
-Switching to the 1-hour TTL pays 0.75x more on *every* cache-write token and buys back
-1.15x on *only* the expired ones:
-
-```
-saving  = 1.15 * W_ttl
-penalty = 0.75 * (W_total - W_ttl)
-1h wins  iff  W_ttl / W_total > 0.75 / 1.90 = 39.5%
-```
-
-Measured `W_ttl / W_total` = **13.8%** (15.4M of 112.0M). Net **−54.7M**
-base-input-token equivalents ≈ **$273 worse** at Opus list. It is not marginal; it
-loses by roughly 4x.
-
-### Watch the denominator — it is the second trap in this question
-
-The trigger's denominator is **every written token**, because the 1-hour premium is paid
-on the whole cache-write line. It is *not* the re-write tax. The TTL's share **of the
-tax** is a much bigger number about a much smaller base, and reading one against the
-other says "nearly worth switching" when the truth is "off by a factor of two". This
-report made that mistake in draft; the script below prints both, labelled, so the next
-reader cannot.
-
-### What would change my mind — and it is moving
-
-Split by era, around the `includeGitInstructions` fix (PR #96, 2026-08-15). All figures
-from `scripts/cache_ttl_cohort.py`, i.e. from the shipped classifier:
-
-| cohort | sessions | TTL share **of all writes** | (of the tax) | verdict |
-|---|---:|---:|---:|---|
-| pre git-fix | 749 | 0.3% | 0.9% | keep |
-| post git-fix | 1,152 | 15.4% | 30.7% | keep |
-| trailing 30 days | 1,339 | 10.6% | 23.0% | keep |
-| trailing 7 days | 440 | **20.4%** | 40.6% | keep |
-
-The fix worked: removing the prefix churn leaves TTL expiry a larger share of a smaller
-problem, and the decisive ratio has gone 0.3% → 20.4%. **It is still roughly half the
-39.5% it needs, so the recommendation is not marginal — but it is no longer stable
-either, and it was 0.3% six weeks ago.**
-
-So: keep the constant, and re-measure on a cohort window rather than over all history,
-which averages the trend away. `jarvis cost` prints the split for one order or the whole
-fleet; `scripts/cache_ttl_cohort.py --days 30` prints it for a window and states the
-verdict. **Re-open this when the TTL share of ALL CACHE WRITES exceeds 39.5% over a
-trailing month.**
-
-### On a per-project setting
-
-The work order asks whether a per-project TTL beats a constant. The arithmetic says a
-one-turn order wants 5m (a 2x write with no read after it is strictly worse) and a
-twelve-turn order wants 1h — but **the setting cannot express that**, because of when
-the decision is taken. The TTL is a property of the *process*, chosen when a turn
-starts; the benefit is collected by the *next* turn's first call. At the moment Jarvis
-must choose, it does not yet know how long the gap will be or whether the prefix will
-survive.
-
-That is not fatal — a project whose orders are reliably long and chatty is a real
-signal — but it means the setting is a *heuristic about a project's shape*, not a
-per-order optimum, and it should be introduced as one. **Not built here**: the key
-would land in the catalog, which is the code `fo-306b8f48` is rewriting for
-`jarvis config`. Filed as follow-up.
+Method: transcript arithmetic per `kn-2137076d`, over the transcripts backing that run.
+Where a number is fleet-wide rather than from the 08-27 set, it says so.
 
 ---
 
-## Finding 2 — tiering is defensible, and the population it would help barely exists
+## Finding 1 — the headline re-write number was misread
 
-**Recommendation: do not tier by work-order kind. The class of small orders it targets
-is 0.1% of spend. Run the A/B in the "what would settle it" section before adopting
-anything.**
+**Area.** `jarvis cost`'s re-write tax; `usage._usage_of` boundary accounting.
 
-### The counter-risk, priced
+**Finding.** The $193.74 re-write tax is real, but the example used to explain it is not
+what it was taken for. wo-5a6b2d6d turn 2 (`ctx 172,962 / read 15,862 / write 157,098`)
+was read as a five-minute cache expiring during a fourteen-minute turn. The transcript
+timestamps say the gap between the last API call of turn 1 and the first of turn 2 was
+**12 seconds**:
 
-The work order states the interaction correctly and demands it be quantified: a cheaper
-model that needs extra turns may cost more, because boundaries are where the money is.
+```
+ 31  01:11:39                                                   turn 1's last call
+ 32  01:11:51  gap=12s  ctx=172,962  read=15,862  write=157,098  COLD
+```
 
-Measured over the 65 Jarvis worker sessions since the git fix, the cost of **one extra
-turn** as a fraction of the session's whole bill:
+Across all transcripts, **81.8% of the re-write tax sits at boundaries that no cache TTL
+could have helped** — 386 of 472 boundaries, 55.9M of 71.3M re-written tokens.
 
-| p25 | median | p75 | p90 |
-|---:|---:|---:|---:|
-| 17.7% | **30.5%** | 86.5% | 114.4% |
+**Root cause.** Two different failures produce an identical-looking row, and the report
+printed one number for both. A turn is dozens of API calls and *every* call rewrites the
+cache entry, so an entry's age is the gap since the previous **call**, not the turn's
+wall-clock duration. At call 32 the entry was alive; the prompt prefix had changed, so
+the cached prefix no longer matched. `read=15,862` is the signature — the static head of
+the system prompt survived, everything after it did not. A genuinely expired entry leaves
+nothing at all and reads ≈ 0.
 
-With saving `1 − r` and per-extra-turn penalty `r × 0.305` (the cheaper model pays for
-its own extra turns too):
+**Follow-up actions.**
 
-| model | input price vs Opus | break-even |
-|---|---:|---:|
-| Sonnet 5 | 0.60x ($3 vs $5) | **2.2 extra turns** |
-| Haiku 4.5 | 0.20x ($1 vs $5) | **13.1 extra turns** |
-
-So the stated counter-risk — "three turns where opus needed one" — **is** disqualifying
-for Sonnet, but only just, and Haiku is essentially unlosable on price. Median turns per
-session is 4, so Sonnet loses only if it inflates a 4-turn order past 6.
-
-**The important inversion:** the marginal-turn cost rises with session size, so tiering
-is *safest where it saves least* (small sessions, p25 → 3.8 extra turns of headroom) and
-*riskiest where the money is* (p90 → under one extra turn of headroom). The intuitive
-policy — "cheap model for small jobs" — optimises the wrong end.
-
-### Why tiering by kind has no headroom
-
-The 65 Jarvis worker sessions, by shape, weighted by cached tokens:
-
-| shape | sessions | cached tokens | share |
-|---|---:|---:|---:|
-| 1 turn, peak < 60k | 2 | 1,018,174 | **0.1%** |
-| 1 turn, peak ≥ 60k | 18 | 124,115,059 | 10.5% |
-| 2+ turns, peak < 60k | 0 | 0 | 0.0% |
-| 2+ turns, peak ≥ 60k | 45 | 1,053,827,748 | **89.4%** |
-
-The one-turn triage order the work order imagines tiering to Haiku **is two sessions and
-one tenth of one percent of spend**. There is no cheap-and-short population; a Jarvis
-work order is a long, large-context conversation almost by construction. 89.4% of the
-tokens sit in exactly the sessions where the extra-turn penalty is worst.
-
-Fleet model usage confirms nothing tiers today: Opus 8,188 calls / 1.255B tokens against
-Sonnet 722 / 23.7M and Haiku 120 / 2.2M.
-
-### What would settle it
-
-Not an opinion — a paired trial. Same work order text dispatched to Sonnet and to Opus,
-n ≥ 10 pairs, drawn from ordinary orders rather than chosen ones, measuring **turns to
-completion, validation-panel rejections, and total base-equivalent cost**. Sonnet wins
-only if median turns rises by less than 2.2 *and* rejection rate does not rise — a
-rejected order pays for its rework at full price and is the failure mode the token
-arithmetic cannot see. Until that trial exists, changing `os.defaults.model` is a guess
-with a plausible story attached.
+1. *(applied in this PR)* **Report the two causes separately.** `jarvis cost` now prints
+   the split, and `os.cold_prefix_floor` is the threshold.
+   · Pro: the mistake cannot recur silently; the TTL decision becomes checkable.
+   · Con: one more configuration key, and the threshold is a heuristic — a project whose
+   static head is under the floor would be misclassified.
+2. **Do nothing else here.** The measurement is now correct.
 
 ---
 
-## Finding 3 — 400,000 is not a setting, it is an off switch
+## Finding 2 — the one-hour cache would cost more, not less
 
-**Recommendation: lower `os.defaults.autocompact_window` to 150,000. NOT DONE HERE —
-this is a default and the user decides. The measurement is below.**
+**Area.** `claude_cli.PROMPT_CACHE_5M_ENV`; the fleet-wide TTL choice.
 
-Cache **read** is the single largest line on the bill and it is not the re-write tax.
-Post-git-fix: 1.209B read tokens (121M base-equivalents at 0.1x) against 67.6M written
-(84.4M at 1.25x). Reads are **59%** of the input bill. Reads are context x calls, so a
-cap on context cuts them near-linearly from the *first* call — there is no cliff at the
-window, which is precisely why a window set above the fleet's ceiling does nothing.
+**Finding.** Switching the fleet from the 5-minute to the 1-hour cache write **loses
+money at every cohort measured**. The deciding ratio — TTL-expiry tokens as a share of
+*all* cache writes — is 10.6% over the trailing 30 days and 18.5–20.4% over the trailing
+7, against a break-even of 39.5%. Fleet-wide the switch costs ~54.7M base-input-token
+equivalents (~$273 at Opus list) more than it saves.
 
-Peak context, 862 post-fix sessions: median 21,259 · p75 38,735 · p90 85,482 ·
-p99 279,970 · max 371,902.
+But it is moving: 0.3% before the `includeGitInstructions` fix (2026-08-15), 15.4% after,
+~20% last week.
 
-**The max is 371,902. The window is 400,000. It has never fired.**
+**Root cause.** The 1-hour premium is paid on **every** written token (2.0x vs 1.25x) and
+is recovered only on tokens that a longer entry would have kept. Most cold boundaries are
+prefix changes (finding 1), which no TTL touches. The ratio is climbing only because the
+git-instructions fix removed prefix churn, leaving expiry a larger share of a smaller
+problem.
 
-Cache-read tokens under a cap (upper bound — compaction is itself a call that pays a
-cold write, and a compacted worker may re-read files; per `kn-81a91bac`, do not quote
-these as realised savings):
+**Watch the denominator.** The TTL's share **of the re-write tax** is roughly double the
+deciding ratio (40.6% vs 20.4% last week). Comparing *that* against 39.5% says "switch
+now" and is wrong. This draft made that error; `scripts/cache_ttl_cohort.py` prints both,
+labelled.
+
+**Follow-up actions.**
+
+1. **Keep the 5-minute write; re-measure monthly.**
+   `uv run python scripts/cache_ttl_cohort.py --days 30`, switch when it says to.
+   · Pro: costs nothing, and the trigger is a single printed number.
+   · Con: needs someone to actually run it; nothing alerts on the crossing.
+2. **Make it a per-project setting** (backlog `bl-1bd68f28`).
+   · Pro: a project with long, chatty orders has genuinely different economics.
+   · Con: the TTL is fixed when a turn *starts* but collected by the *next* turn's first
+   call, so at decision time neither the gap nor the prefix's fate is known — the setting
+   is a guess about a project's shape, not a per-order optimum.
+3. **Have `jarvis doctor` check the ratio and raise an inbox item at 39.5%.**
+   · Pro: removes the "someone must remember" failure of option 1.
+   · Con: a scan of every transcript on each tick; would need caching or sampling.
+
+---
+
+## Finding 3 — where the 4.3M one-hour writes actually are
+
+**Area.** `dispatch._write_worker_settings`, `claude_cli.cache_env` — and, as it turns
+out, neither.
+
+**Finding.** They are not Jarvis's. Of the 1-hour writes after the transport fix landed
+(2026-08-22), **none come from a Jarvis-dispatched worker turn**. Fleet-wide, 5.48M
+tokens were written at 1h after that date:
+
+| where | tokens | what it is |
+|---|---:|---|
+| inside a Jarvis worktree | 3,126,902 | **one** work order, wo-2df8828c, two session files |
+| outside any worktree | 2,357,105 | the user's own `claude` sessions |
+
+And wo-2df8828c is not a dispatched turn either. Its transcript records
+`entrypoint: cli` on 990 rows and `promptSource: typed` on 10 — that session was opened
+**interactively, by hand, in the worktree**, and was still being written to on 2026-08-30,
+four days after the work order completed. Its Jarvis settings file does carry
+`FORCE_PROMPT_CACHING_5M=1`.
+
+**Root cause.** `FORCE_PROMPT_CACHING_5M` reaches a process through the `--settings` file
+Jarvis writes and through the environment Jarvis sets. An interactive `claude` started by
+a human reads neither, so Claude Code falls back to its own default, which allowlists
+`repl_main_thread*` for the 1-hour TTL. Jarvis's own transport is airtight; the leak is
+the human sitting next to it.
+
+**Follow-up actions.**
+
+1. **Set the flag in the user's own Claude settings** (`~/.claude/settings.json`, `env`
+   block), not in Jarvis.
+   · Pro: closes 100% of the remaining 1h spend; one line; outside the OS entirely.
+   · Con: it is the user's personal config, so Jarvis cannot own or verify it, and a
+   fresh machine silently loses it.
+2. **Have `jarvis doctor` report 1h writes it did not cause**, naming the session.
+   · Pro: makes an invisible leak visible without Jarvis reaching into personal config.
+   · Con: reports a condition Jarvis cannot fix — an alert with no button.
+3. **Do nothing.** 5.48M tokens ≈ $27 at Opus list, once, across all history.
+   · Pro: honest about the size; this is not where the $800 went.
+   · Con: grows with every hand-opened session in a worktree.
+
+---
+
+## Finding 4 — nothing measures whether the prefix is stable
+
+**Area.** `dispatch._write_worker_settings` (`includeGitInstructions: false`),
+`worker_brief.git_briefing`, and the absence of a check on either.
+
+**Finding.** The prefix fix works — it is why finding 2's ratio moved from 0.3% to ~20%.
+But **the fleet has no ongoing measurement of it**, and prefix invalidation is still
+69.7% of the post-fix re-write tax (33.2M tokens, 231 boundaries). Of those, 39% have an
+MCP tools/instructions delta immediately before them (11.8M tokens, 35.4% by volume). The
+remainder is unexplained.
+
+Nothing today would tell you if a CLI upgrade, a new MCP server, or a change to
+`git_briefing` re-broke the prefix. It would surface only as a larger bill.
+
+**Root cause.** The fix was verified once, in a clean room, and then trusted. There is no
+post-condition on it, no invariant, and no surface that reports prefix stability — even
+though the evidence sits in every transcript and `jarvis cost` already parses those.
+
+**Follow-up actions.**
+
+1. **A `SessionStart`/`PreToolUse` hook that records the prefix and reports drift**, as
+   suggested.
+   · Pro: catches a regression at the moment it happens, on the machine where it
+   happened, with the offending turn named.
+   · Con: a hook cannot see the API's cache accounting — it can hash the rendered system
+   prompt, but the cache boundary is a fact the *response* reports, so a hook is a proxy.
+   It also runs on every session, for a condition that changes rarely.
+2. **A `jarvis doctor` post-condition over recent transcripts** — recommended.
+   `boundaries_ttl` vs prefix boundaries is already computed by this PR, so the check is
+   a threshold on numbers the OS now has.
+   · Pro: no new hook, no per-session cost, uses the real cache accounting rather than a
+   proxy, and fits the existing "the OS checks its own post-conditions" pattern.
+   · Con: detects a regression a tick later rather than instantly, and needs a threshold
+   that will not cry wolf on a quiet day.
+3. **Settle the MCP question first, since it is 35% of the remainder.** kn-f94abf34 (3)
+   already proposes `--strict-mcp-config --mcp-config <file>` with Serena only; the
+   census found 287 MCP calls in 13,061, 96% of them Serena.
+   · Pro: removes both the mid-turn tool-set change and the schemas every prompt carries.
+   · Con: narrows what every worker can reach — a fleet capability decision, not a free
+   arithmetic win.
+
+---
+
+## Finding 5 — the context cap is set above the fleet's ceiling
+
+**Area.** `os.defaults.autocompact_window`, and message delivery into a cold session.
+
+**Finding.** `autocompact_window` is 400,000. The largest context any session reached is
+**371,902**, so it has never fired on any session measured. Cache **read** — not the
+re-write tax — is the largest line: 1.209B read tokens against 67.6M written, 59% of the
+input bill. Reads are context x calls, so they scale from the first call rather than at a
+cliff.
+
+Modelled cache-read reduction by cap (upper bounds; compaction is itself a call that pays
+a cold write, and a compacted worker may re-read files):
 
 | cap | read tokens | cut |
 |---:|---:|---:|
-| 400,000 (today) | 1,209,190,623 | **0.0%** |
-| 300,000 | 1,194,700,026 | 1.2% |
+| 400,000 (today) | 1,209,190,623 | 0.0% |
 | 200,000 | 1,090,312,111 | 9.8% |
 | **150,000** | 951,522,563 | **21.3%** |
 | 120,000 | 825,143,307 | 31.8% |
 
-150,000 touches roughly the top 3–4% of sessions by peak context and reaches a fifth of
-the largest line on the bill, because the fat tail carries the tokens. Below that the
-curve keeps paying, but 120k starts compacting p90-ish sessions, and `kn-a5714b40`'s
-100k floor is close enough to be a dispatch hazard.
+**Root cause.** 400,000 was chosen (wo-6808dd2d) to leave compaction an exception rather
+than a routine event, against a 1M model window. It succeeded so completely that it never
+happens: peak context is median 21,259 and p90 85,482, so the cap only ever binds on a
+tail it was set above.
 
-### On opening a later turn from a summary
+**Follow-up actions.**
 
-The work order asks whether an order that has submitted its plan should resume from a
-summary. **No — and the shape has already been ruled out twice.** `kn-f94abf34` (5):
-`PostCompact` cannot inject (`additionalContext` is not accepted on that hook), and
-Jarvis should not write a summary at all, because what a compacted worker loses is the
-*contract* — work-order id, branch, PR, pending assumptions — all of which Jarvis holds
-as structured state and can re-inject **deterministically, with no second model call**.
-`kn-81a91bac` separately rejects a `/compact` before a resume: two `claude -p --resume`
-on one session do not queue, so a compact turn must complete before the real one, making
-two boundaries where there was one.
-
-`--autocompact` is the lever that already exists. It is currently set to a number that
-switches it off.
+1. **Lower `os.defaults.autocompact_window` to 150,000.**
+   · Pro: reaches a fifth of the largest line on the bill; touches only the ~3–4% of
+   sessions with the largest contexts, which is where the tokens are.
+   · Con: compaction destroys detail the work-order record depends on, and the saving is
+   an upper bound — a compacted worker may re-read the files it just lost.
+2. **Compact before delivering a message into a session whose cache has expired**, as
+   suggested. **This is feasible but currently loses more than it saves.** `/compact` is
+   `type: local` with `supportsNonInteractive: true`, so `claude -p --resume <sid> --
+   "/compact"` works with the `-p` transport — the `-p` flag is not the obstacle. The
+   obstacle is that two `claude -p --resume` on one session **do not queue** (`--resume`
+   refuses a session another process holds), so the compact turn must *complete* before
+   the real one: two turn boundaries where there was one, and a boundary is the expensive
+   event. Reverting to background sessions would remove that constraint.
+   · Pro: attacks reads and writes together, and is targeted — only when the cache is
+   actually cold.
+   · Con: as measured, one extra boundary costs 30.5% of a session's whole bill at the
+   median, so this loses unless compaction saves more than a boundary costs; and it
+   silently rewrites the worker's context on a message the user sent for another reason.
+   Reverting the transport is a large change to un-pick a 21% read saving that option 1
+   gets for free.
+3. **Re-inject the contract deterministically after a compaction** instead of
+   summarising. What a compacted worker loses is its work-order id, branch, PR and
+   pending assumptions — all of which Jarvis holds as structured state.
+   · Pro: no second model call; makes option 1 much safer to adopt.
+   · Con: `PostCompact` cannot inject (`additionalContext` is not accepted on that hook,
+   verified against 2.1.227), so it needs the `PreCompact`-flag-then-`PostToolUse` shape.
 
 ---
 
-## What was not chased
+## What a 14-minute, many-turn work order should do
 
-Subagents (~$7.28) and Jarvis's own calls (~$8.67) are ~2% of spend, as the work order
-said. Confirmed, not investigated.
+Directly, since it is the shape most orders have:
+
+- **Nothing about the cache TTL.** Within a turn, calls are seconds apart and the
+  5-minute entry is always warm. Between turns, the boundary is usually cold because the
+  prefix moved, not because time passed (finding 1).
+- **Fewer turns.** A boundary costs 30.5% of a session's whole bill at the median. Batch
+  questions into one `jarvis wo ask`; `Daemon.deliver_messages` already coalesces queued
+  messages for this reason.
+- **Less context.** Reads are 59% of the bill and scale with context on every call, so
+  scope smaller orders — the strongest lever, and the one that needs no code change.
+
+## Not investigated
+
+Subagents (~$7.28) and Jarvis's own Neo/panel/digest calls (~$8.67) — together ~2% of the
+08-27 run, as the work order stated. Confirmed, not pursued.

@@ -65,13 +65,27 @@ def transcripts(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def registered(jarvis_home, project):
-    """One registered project, so `cost_report` can resolve it by name."""
+def registered(jarvis_home, project, tmp_path):
+    """One registered project AND a registered catalog.
+
+    The catalog is not decoration: a bill classifies its cold cache boundaries against
+    `os.cold_prefix_floor`, which has no default anywhere, so building one without a
+    catalog raises rather than guessing a threshold. That failure is asserted directly
+    in `test_a_bill_without_a_catalog_fails_loudly_rather_than_guessing`.
+    """
+    import json as _json
+
     from jarvis.central_store import CentralStore
 
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text(_json.dumps({
+        "os": {"cold_prefix_floor": 5_000},
+        "projects": [{"name": "proj_a", "path": str(project)}],
+    }))
     central = CentralStore()
     try:
         central.upsert_project("proj_a", str(project), "test project")
+        central.set_state("catalog_path", str(catalog))
         central.conn.commit()
     finally:
         central.close()

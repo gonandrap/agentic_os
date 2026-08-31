@@ -722,3 +722,65 @@ def test_an_old_seal_stands_once_the_evidence_is_gone(store, wo, transcripts,
     assert b["total"]["tokens"]["total"] == before, "the seal stood"
     assert "payload_v" not in b, "and it was NOT re-derived from nothing"
     assert not b["accuracy"].get("resealed_at")
+
+
+def test_a_bill_without_a_catalog_fails_loudly_rather_than_guessing(store, wo,
+                                                                    transcripts):
+    """No catalog, no classification — and the error says which key is missing.
+
+    A bill splits its re-write tax by cause against `os.cold_prefix_floor`, and there is
+    deliberately no default anywhere to fall back on: a report that classified every
+    boundary against a threshold nobody configured would print a finding the
+    configuration never produced. Paired with the same call succeeding once the catalog
+    is back, so this cannot pass against a bill that is simply broken.
+    """
+    from jarvis.central_store import CentralStore
+
+    give_session(store, wo["id"], "sess-nocat")
+    transcripts("sess-nocat", [assistant_row("m1", write=9_000, read=0, out=100)])
+    add_turn(store, wo["id"], None)
+
+    central = CentralStore()
+    try:
+        kept = central.get_state("catalog_path")
+        central.set_state("catalog_path", "")
+        central.conn.commit()
+    finally:
+        central.close()
+
+    with pytest.raises(ops.OpsError, match="no catalog registered"):
+        ops.bill(wo["id"])
+
+    central = CentralStore()
+    try:
+        central.set_state("catalog_path", kept)
+        central.conn.commit()
+    finally:
+        central.close()
+    assert ops.bill(wo["id"])["total"]["tokens"]["total"] == 9_100
+
+
+def test_a_catalog_that_cannot_be_parsed_fails_the_bill_too(store, wo, transcripts,
+                                                            tmp_path):
+    """The other way a catalog goes missing: it is there and it is wrong.
+
+    Same rule — the bill must not fall through to a guessed threshold — but a different
+    exception path, which is why it is asserted separately rather than assumed.
+    """
+    from jarvis.central_store import CentralStore
+
+    give_session(store, wo["id"], "sess-badcat")
+    transcripts("sess-badcat", [assistant_row("m1", write=9_000, read=0, out=100)])
+    add_turn(store, wo["id"], None)
+
+    broken = tmp_path / "broken.json"
+    broken.write_text('{"os": {"cold_prefix_floor": "not a number"}, "projects": []}')
+    central = CentralStore()
+    try:
+        central.set_state("catalog_path", str(broken))
+        central.conn.commit()
+    finally:
+        central.close()
+
+    with pytest.raises(Exception, match="cold_prefix_floor"):
+        ops.bill(wo["id"])
