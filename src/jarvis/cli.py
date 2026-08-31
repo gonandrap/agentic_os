@@ -57,6 +57,24 @@ def _readable_rounds(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _readable_alarms(detail: dict[str, Any]) -> dict[str, Any]:
+    """The `wo_alarms` rows collapsed to `ops.alarm_standing_line`, for HUMAN output.
+
+    Same trick as `_readable_rounds`, including the disappearing key: an order with no
+    alarm reads exactly as it did before the supervisor existed, which is most of them.
+    `--json` never comes through here — it gets the rows in full, because this is one
+    order's own record and the fleet-wide dict's join columns are already on the work
+    order the caller is reading (§4).
+    """
+    from . import ops
+
+    row = dict(detail)
+    line = ops.alarm_standing_line(row.pop("alarms", None) or [])
+    if line:
+        row["alarms"] = line
+    return row
+
+
 def _readable_config(detail: dict[str, Any]) -> dict[str, Any]:
     """`config_version: cfg-a1b2…` replaced by `config: cfg-a1b2… (3 versions since)`.
 
@@ -1559,11 +1577,15 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # that comes and goes is one every consumer has to guard. The seats'
                 # replies are NOT here — see `jarvis validation show`.
                 "validation_rounds": ops.validation_rounds(store, wo_id=args.wo_id),
+                # The rows themselves, on the same always-present rule: this order's own
+                # alarms, not `ops.list_cost_alarms`' fleet-wide dict, whose join columns
+                # (title, status, hidden) are already above — §4.
+                "alarms": store.alarms_of(args.wo_id),
             }
         finally:
             store.close()
-        _print(_readable_config(_readable_rounds(detail)) if not args.json else detail,
-               args.json)
+        _print(_readable_config(_readable_alarms(_readable_rounds(detail)))
+               if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
         _print(ops.send_message(args.wo_id, args.message, source=args.source,
