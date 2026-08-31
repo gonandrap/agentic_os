@@ -482,6 +482,41 @@ elif "-p" in argv and "--resume" not in argv:
                          "asks": []}
         emit_headless(json.dumps(reply))
         sys.exit(0)
+    # A SUPERVISOR REVIEW, AND IT IS IDENTIFIED BY THE SYSTEM PROMPT FOR THE REASON THE
+    # SEAT BRANCHES ARE: the user prompt is the EVIDENCE PACKET, which quotes the work
+    # order's brief and the worker's last turns verbatim, so any FORCE_ token a test put
+    # in a work order description would reach the branches below and be answered as a Neo
+    # verdict. The forcing tokens here are therefore read from the packet but only after
+    # this branch has claimed the call.
+    if "You are the SUPERVISOR inside the Jarvis agentic OS." in system:
+        if "FORCE_SUPERVISOR_FAIL" in prompt:
+            sys.stderr.write("supervisor call failed (test-forced)\n"); sys.exit(1)
+        if "FORCE_SUPERVISOR_GARBAGE" in prompt:
+            emit_headless("hard to say really, that turn looks fine to me?")
+            sys.exit(0)
+        if "FORCE_SUPERVISOR_NO_DECISION" in prompt:
+            # Well-formed JSON with no `decision`: the third failure shape, and the one
+            # `_validate` must RAISE on rather than default. A fake that omitted this
+            # could not tell a validator that raises from one that quietly acks.
+            emit_headless(json.dumps({"reason": "a reply that decides nothing",
+                                      "note": "", "question": ""}))
+            sys.exit(0)
+        if "FORCE_SUPERVISOR_ESCALATE" in prompt:
+            reply = {"decision": "escalate", "reason": "test-forced escalation",
+                     "note": "", "question": "is this turn making progress?"}
+        else:
+            # Acking is the DEFAULT here, unlike the gate and plan branches which escalate
+            # by default. Those default to the safe answer because the test fleet must not
+            # ship code unreviewed; here the interesting path — the one that puts a flag
+            # down and writes an inbox row — is the ack, and a test that wants the quiet
+            # answer asks for it.
+            reply = {"decision": "ack",
+                     "reason": "test verdict: the turn is long because the work is long",
+                     "note": "Still going: it is writing a design document, which is why "
+                             "the turn is long.",
+                     "question": ""}
+        emit_headless(json.dumps(reply))
+        sys.exit(0)
     # A DASHBOARD DIGEST, AND IT COMES FIRST FOR THE SAME REASON THE SEAT BRANCH DOES:
     # the call is identified by its system prompt, never by the user prompt — which is
     # the worker's question verbatim, so a digest of a gate question would otherwise
