@@ -2017,9 +2017,14 @@ class Daemon:
             already = {p.get("kind") for p in seen if p.get("seq") == turn["seq"]}
             fresh = [a for a in raised if a.kind not in already]
             for alarm in fresh:
+                # THE ROW IS THE IDENTITY; THE EVENT IS STILL THE DEDUPE MEMORY, and
+                # `alarm_id` is purely additive to a payload whose other three keys are
+                # what `already` above matches on. Move the dedupe onto `wo_alarms` and
+                # this re-raises every tick for the life of the turn.
+                row = store.add_alarm(wo["id"], alarm.kind, turn["seq"], alarm.reason)
                 store.add_event(wo["id"], "cost_alarm",
                                 {"kind": alarm.kind, "seq": turn["seq"],
-                                 "reason": alarm.reason})
+                                 "reason": alarm.reason, "alarm_id": row["id"]})
                 log.info("[%s] %s: %s", project.name, wo["id"], alarm.reason)
             # Every alarm goes on the timeline; only the first reaches the attention
             # line, because `alarms` returns them most-actionable first and a flag can
