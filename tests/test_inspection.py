@@ -607,6 +607,15 @@ def test_a_burning_turn_reaches_the_user_the_way_everything_else_does(
         assert "still being billed" in flagged["attention_reason"]
         assert len(events) == 1
 
+        # The row and the event are one raise: the row is the identity, the event is
+        # the dedupe memory, and the event's payload points at the row.
+        alarms = store.alarms_of(wo["id"])
+        assert len(alarms) == 1
+        assert alarms[0]["id"].startswith("al-")
+        assert alarms[0]["status"] == "raised"
+        assert alarms[0]["seq"] == 1
+        assert json.loads(events[0]["payload"])["alarm_id"] == alarms[0]["id"]
+
         # AND NEVER AGAIN FOR THIS TURN. The user putting the flag down must not bring
         # the same sentence back on the next tick — that is how a cost alarm becomes
         # noise, and then it is worse than nothing.
@@ -615,6 +624,9 @@ def test_a_burning_turn_reaches_the_user_the_way_everything_else_does(
 
         assert store.get_work_order(wo["id"])["needs_attention"] == 0
         assert len(store.events_of_kind(wo["id"], "cost_alarm")) == 1
+        # The half a single-tick test cannot see, and the one that costs a model call
+        # per tick per alarm once the supervisor reads this table.
+        assert len(store.alarms_of(wo["id"])) == 1
     finally:
         store.close()
 
@@ -734,3 +746,62 @@ def test_the_cli_answers_the_same_question_as_the_page(
     assert wo_id in out
     assert "1 asking for you" in out
     assert "jarvis wo ack" in out
+
+
+def test_every_alarm_has_an_id_and_one_work_order_s_can_be_read_alone(
+        started, monkeypatch, tmp_path, capsys):
+    """PR 159 shipped an alarm with no identity, so "link to THIS alarm" was not
+    expressible. `--wo` is the read a worker makes when it writes its pull request."""
+    from jarvis import cli
+
+    wo_id = _burning(started, monkeypatch, tmp_path, title="the burning one")
+    other = _burning(started, monkeypatch, tmp_path, title="the other one")
+
+    rows = ops.list_cost_alarms(wo_id=wo_id)
+
+    assert [r["wo_id"] for r in rows] == [wo_id], "the other order's alarm is not here"
+    assert rows[0]["id"].startswith("al-")
+    # Frozen for sections 2, 3 and 5, which are written against these keys.
+    assert rows[0]["alarm_status"] == "raised"
+    assert (rows[0]["verdict"], rows[0]["note"], rows[0]["neo_question_id"]) == (
+        None, None, None)
+    assert rows[0]["review_status"] == "unreviewed"
+
+    assert cli.main(["alarms", "--wo", wo_id]) == 0
+    out = capsys.readouterr().out
+    assert rows[0]["id"] in out
+    assert other not in out
+
+    # And the listing that was already there renders as it did before: the alarm id is
+    # section 4's to put on the surfaces, not this one's.
+    assert cli.main(["alarms"]) == 0
+    every = capsys.readouterr().out
+    assert wo_id in every and other in every
+    assert "al-" not in every
+
+
+def test_the_alarm_status_is_not_the_thing_the_page_calls_live(
+        started, monkeypatch, tmp_path):
+    """`live` is a property of the ORDER's attention flag. Deriving it from the row's
+    own status instead would make an answered alarm disappear from the ask before the
+    user had put the flag down — and leave it there after they had."""
+    from jarvis.project_store import ProjectStore
+
+    wo_id = _burning(started, monkeypatch, tmp_path)
+    path = ops.find_work_order(wo_id)[1]
+    store = ProjectStore(path)
+    try:
+        alarm = store.alarms_of(wo_id)[0]
+        store.update_alarm(alarm["id"], status="acked", verdict="ack",
+                           note="a design document; the hour is normal here")
+    finally:
+        store.close()
+
+    rows = ops.list_cost_alarms()
+
+    assert rows[0]["alarm_status"] == "acked"
+    assert rows[0]["verdict"] == "ack"
+    assert rows[0]["live"] is True, "the order is still flagged, so it is still an ask"
+
+    ops.ack_attention(wo_id, project_name="proj_a")
+    assert ops.list_cost_alarms()[0]["live"] is False

@@ -78,6 +78,7 @@ def test_delete_work_order_cascades(project):
     store.add_notification("done", wo_id=wo["id"])
     store.add_approval(wo["id"], "release", "./scripts/ship.sh")
     store.create_turn(wo["id"], kind="dispatch", prompt="go")
+    store.add_alarm(wo["id"], "long-turn", 1, "two hours and still being billed")
     store.queue_message(other["id"], "untouched")
     store.add_event(other["id"], "turn_ended")
 
@@ -94,6 +95,11 @@ def test_delete_work_order_cascades(project):
     assert store.pending_assumptions(wo["id"]) == []
     assert store.list_approvals(wo["id"]) == []
     assert store.unrouted_notifications() == []
+    # `wo_alarms` goes by ON DELETE CASCADE, so it is deliberately NOT a seventh key in
+    # `counts` — which means the `==` above would stay green with the cascade broken.
+    # This is the assertion that actually watches it.
+    assert store.alarms_of(wo["id"]) == []
+    assert store.conn.execute("SELECT COUNT(*) c FROM wo_alarms").fetchone()["c"] == 0
     # the neighbour is untouched
     assert store.get_work_order(other["id"])["title"] == "survivor"
     assert len(store.list_messages(other["id"])) == 1
