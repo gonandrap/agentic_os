@@ -937,6 +937,23 @@ def _print_turn_table(res: dict) -> None:
         print(f"\n{line}")
 
 
+def _rewrite_cause(share: float | None, ttl_boundaries: int, boundaries: int) -> str:
+    """The half-sentence saying WHICH of the two cold-boundary causes this tax was.
+
+    Shared by both cost renderers because the number is only actionable with its cause
+    attached: the prefix half is bought back by keeping the prefix still, the TTL half by
+    a longer TTL, and reporting one total invites spending on the wrong one. Findings:
+    docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
+    """
+    if share is None:
+        return ""
+    prefix = boundaries - ttl_boundaries
+    return (f" {share:.0%} of it was the cache entry EXPIRING ({ttl_boundaries} "
+            f"boundar{'ies' if ttl_boundaries != 1 else 'y'}, the part a longer TTL "
+            f"would buy back); the other {1 - share:.0%} was the prompt PREFIX moving "
+            f"({prefix} boundar{'ies' if prefix != 1 else 'y'}), which no TTL can help.")
+
+
 def _print_write_ttl(totals: dict) -> None:
     """What the fleet paid to WRITE to the prompt cache, and at which of the two rates.
 
@@ -1187,7 +1204,10 @@ def _print_bill(bill: dict) -> None:
               f"boundar{'ies' if rewrite['boundaries'] != 1 else 'y'}. "
               f"Not an extra charge: it is the "
               f"part of the cache-write line above that paid to send context a warm "
-              f"cache would have served at a tenth of the price.")
+              f"cache would have served at a tenth of the price."
+              + _rewrite_cause(rewrite.get("ttl_share"),
+                               rewrite.get("ttl_boundaries") or 0,
+                               rewrite["boundaries"]))
     subagents = bill.get("subagents") or {}
     if subagents.get("count"):
         print(f"{subagents['count']} subagent(s), ~${subagents['list_usd']:.2f}, "
@@ -1411,6 +1431,11 @@ def cmd_cost(args: argparse.Namespace) -> int:
         print(f"  re-write tax  ~${totals['rewrite_cost_usd']:.2f} — "
               f"{_tok(totals['rewrite_excess'])} tokens re-sent across "
               f"{totals['resume_boundaries']} turn boundaries")
+        cause = _rewrite_cause(totals.get("rewrite_ttl_share"),
+                               totals.get("boundaries_ttl") or 0,
+                               totals["resume_boundaries"])
+        if cause:
+            print(f"               {cause.strip()}")
     if totals["subagent_cost_usd"]:
         print(f"  subagents     ~${totals['subagent_cost_usd']:.2f}")
     _print_write_ttl(totals)
