@@ -157,6 +157,35 @@ PRE_APPROVED_KEY = "pre_approved"
 # `os.validation.enabled` was false. See docs/superpowers/specs/2026-08-29-feature-order-resume.md.
 SUPERSEDED_CHILDREN_KEY = "superseded_children"
 
+# -- the cost alarm's vocabulary ---------------------------------------------------
+#
+# In the STORE because four surfaces have to agree on it and none of them may depend on
+# another: the daemon raises, the supervisor judges, Neo answers and the timeline
+# renders. §1 of docs/superpowers/specs/2026-08-31-the-supervisor.md freezes all four.
+
+ALARM_STATUSES = (
+    "raised",     # on the supervisor's queue, awaiting a look
+    "reviewing",  # claimed by a supervisor tick
+    "acked",      # judged and answered with a note to the user
+    "escalated",  # judged and handed to Neo
+    "skipped",    # never offered to the supervisor — backfilled history, or declined
+    "failed",     # the review could not be completed; the alarm stays unresolved
+)
+# The supervisor reads and reports; it never acts on a work order.
+ALARM_VERDICTS = ("ack", "escalate")
+ALARM_REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
+
+# The four `wo_events` kinds that carry an alarm's life, and their payloads:
+#
+#   cost_alarm       {kind, seq, reason, alarm_id}   the raise (daemon)
+#   alarm_reviewed   {alarm_id, verdict, reason, note}
+#   alarm_escalated  {alarm_id, neo_question_id}
+#   alarm_advice     {alarm_id, neo_question_id, answer}
+#
+# `cost_alarm`'s first three keys are UNCHANGED and load-bearing: they are the dedupe
+# memory that makes it one alarm per turn per kind (see `Daemon.check_burning_turns`).
+ALARM_EVENT_KINDS = ("cost_alarm", "alarm_reviewed", "alarm_escalated", "alarm_advice")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS work_orders (
     id TEXT PRIMARY KEY,
@@ -223,6 +252,38 @@ CREATE TABLE IF NOT EXISTS wo_events (
     ts REAL NOT NULL,
     kind TEXT NOT NULL,
     payload TEXT
+);
+-- One cost alarm, with an identity. The `cost_alarm` event is still written and is
+-- still the raise's dedupe memory; this is the object a supervisor claims, a verdict
+-- attaches to and a URL can point at, none of which an event row can carry.
+--
+-- IN THIS DATABASE AND NOT `neo.db`, where Neo's questions live: an alarm is unreadable
+-- without its work order's title, status, hidden and attention flags, and those are
+-- `work_orders` columns here. `questions.wo_id` is a loose string with no foreign key,
+-- so the fleet-wide read would keep its per-project fan-out AND gain a second database
+-- — and the cascade below would become hand-maintained cleanup, which `neo_store` is
+-- the standing evidence this OS gets wrong.
+--
+-- Everything past `reason` is written by later sections of
+-- docs/superpowers/specs/2026-08-31-the-supervisor.md and is NULL/default until then.
+CREATE TABLE IF NOT EXISTS wo_alarms (
+    id TEXT PRIMARY KEY,                    -- 'al-' + db.new_id, like wo-/fo-
+    wo_id TEXT NOT NULL REFERENCES work_orders(id) ON DELETE CASCADE,
+    ts REAL NOT NULL,
+    kind TEXT NOT NULL,                     -- inspection's alarm kinds
+    seq INTEGER NOT NULL,                   -- the turn it judged
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'raised',  -- ALARM_STATUSES
+    claimed_at REAL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    verdict TEXT,                           -- ALARM_VERDICTS
+    verdict_reason TEXT,
+    note TEXT,                              -- what the user is told, in words
+    decided_at REAL,
+    neo_question_id INTEGER,
+    review_status TEXT NOT NULL DEFAULT 'unreviewed',  -- ALARM_REVIEW_STATUSES
+    review_feedback TEXT,
+    reviewed_at REAL
 );
 CREATE TABLE IF NOT EXISTS wo_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -401,6 +462,12 @@ CREATE INDEX IF NOT EXISTS idx_turns_wo ON wo_turns(wo_id, seq);
 CREATE INDEX IF NOT EXISTS idx_turns_state ON wo_turns(state);
 CREATE INDEX IF NOT EXISTS idx_wo_status ON work_orders(status);
 CREATE INDEX IF NOT EXISTS idx_events_wo ON wo_events(wo_id);
+-- Both readers of this index run per project: `events_across` on every alarm surface,
+-- and the alarm backfill's guard on EVERY ProjectStore open, which is every CLI
+-- invocation. Neither had one before and both were full scans of the busiest table.
+CREATE INDEX IF NOT EXISTS idx_events_kind ON wo_events(kind);
+CREATE INDEX IF NOT EXISTS idx_alarms_wo ON wo_alarms(wo_id, ts);
+CREATE INDEX IF NOT EXISTS idx_alarms_status ON wo_alarms(status);
 CREATE INDEX IF NOT EXISTS idx_msgs_status ON wo_messages(status);
 CREATE INDEX IF NOT EXISTS idx_notif_status ON notifications(status);
 CREATE INDEX IF NOT EXISTS idx_approvals_wo ON approvals(wo_id, status);
@@ -573,6 +640,47 @@ class ProjectStore:
             for name, decl in columns.items():
                 if name not in have:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        self._backfill_alarms()
+
+    def _backfill_alarms(self) -> None:
+        """Give every alarm raised before `wo_alarms` existed a row of its own.
+
+        A backfill rather than a permanent union read ("rows, plus events with no row")
+        in `alarms_across`: that union would be in the one function every alarm surface
+        is built on, for ever, to serve the two events the production fleet holds today.
+
+        'ONCE' IS NOT FREE HERE. This runs inside `__init__` — every CLI invocation and
+        every reconcile of every project, not once per release — so the guard is the
+        `(wo_id, kind, seq)` set rebuilt from the table on each pass, not a flag. The
+        count comparison above it is only a fast path off the hot road; correctness is
+        the set. See §1 of docs/superpowers/specs/2026-08-31-the-supervisor.md.
+
+        `skipped`, never `raised`: `raised` is the supervisor's work queue, and history
+        landing in it would spend one model call per legacy alarm, fleet-wide, on turns
+        that finished weeks ago.
+        """
+        legacy = self.conn.execute(
+            "SELECT COUNT(*) c FROM wo_events WHERE kind='cost_alarm'").fetchone()["c"]
+        have = self.conn.execute("SELECT COUNT(*) c FROM wo_alarms").fetchone()["c"]
+        if legacy <= have:
+            return
+        known = {(r["wo_id"], r["kind"], r["seq"]) for r in
+                 self.conn.execute("SELECT wo_id, kind, seq FROM wo_alarms")}
+        rows = self.conn.execute(
+            "SELECT * FROM wo_events WHERE kind='cost_alarm' ORDER BY ts").fetchall()
+        for event in rows:
+            payload = db.from_json(event["payload"], {}) or {}
+            key = (event["wo_id"], str(payload.get("kind") or "unknown"),
+                   int(payload.get("seq") or 0))
+            if key in known:
+                continue
+            known.add(key)
+            self.conn.execute(
+                """INSERT INTO wo_alarms (id, wo_id, ts, kind, seq, reason, status)
+                   VALUES (?,?,?,?,?,?,'skipped')""",
+                (db.new_id("al"), key[0], event["ts"], key[1], key[2],
+                 str(payload.get("reason") or "")),
+            )
 
     def close(self) -> None:
         self.conn.close()
@@ -1248,6 +1356,94 @@ class ProjectStore:
             " FROM wo_events e JOIN work_orders w ON w.id = e.wo_id"
             " WHERE e.kind=? ORDER BY e.ts DESC LIMIT ?", (kind, limit)).fetchall()
         return db.rows_to_dicts(rows)
+
+    # -- cost alarms ---------------------------------------------------------
+
+    def add_alarm(self, wo_id: str, kind: str, seq: int, reason: str) -> dict[str, Any]:
+        """Record one raised alarm and return it. The caller still writes the event.
+
+        Both, not one: the row is the identity everything downstream hangs off, and the
+        `cost_alarm` event remains the raise's dedupe memory and the work order's
+        timeline entry. See ALARM_EVENT_KINDS for the payloads of all four kinds.
+        """
+        alarm_id = db.new_id("al")
+        self.conn.execute(
+            """INSERT INTO wo_alarms (id, wo_id, ts, kind, seq, reason)
+               VALUES (?,?,?,?,?,?)""",
+            (alarm_id, wo_id, db.now(), kind, int(seq), reason),
+        )
+        return self.get_alarm(alarm_id)
+
+    def get_alarm(self, alarm_id: str) -> dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT * FROM wo_alarms WHERE id=?", (alarm_id,)).fetchone()
+        if row is None:
+            raise KeyError(alarm_id)
+        return dict(row)
+
+    def alarms_of(self, wo_id: str) -> list[dict[str, Any]]:
+        """Every alarm on one work order, oldest first."""
+        return db.rows_to_dicts(self.conn.execute(
+            "SELECT * FROM wo_alarms WHERE wo_id=? ORDER BY ts", (wo_id,)).fetchall())
+
+    def alarms_across(self, limit: int = 200, statuses: tuple[str, ...] | None = None,
+                      wo_id: str | None = None) -> list[dict[str, Any]]:
+        """Every alarm in the project, NEWEST first, with its work order.
+
+        The work-order columns are the same ones `events_across` brings along and for
+        the same reason — an alarm is about a title and a status, not about an id — and
+        `ops.list_cost_alarms` builds its dict straight from them, so the two reads must
+        not diverge. Hidden orders are included and marked: this is the record of what
+        the fleet spent, not a listing competing for attention.
+
+        `statuses` is what makes this the supervisor's work queue as well as the review
+        surface's read.
+
+        `status` IS THE WORK ORDER'S and `alarm_status` is the row's own, matching what
+        `ops.list_cost_alarms` has published since PR 159. The two tables both have a
+        `status`, and `SELECT a.*, w.*` would have silently handed one of them to every
+        caller depending on column order, so both are spelled out.
+        """
+        where = ["1=1"]
+        args: list[Any] = []
+        if statuses:
+            where.append(f"a.status IN ({','.join('?' for _ in statuses)})")
+            args.extend(statuses)
+        if wo_id:
+            # Filtered here rather than by the caller after the fact: `limit` is applied
+            # by SQLite, so a post-filter over a busy project's newest 200 could return
+            # nothing for an order that has alarms.
+            where.append("a.wo_id=?")
+            args.append(wo_id)
+        rows = self.conn.execute(
+            "SELECT a.id AS id, a.wo_id AS wo_id, a.ts AS ts, a.kind AS kind,"
+            " a.seq AS seq, a.reason AS reason, a.status AS alarm_status,"
+            " a.claimed_at AS claimed_at, a.attempts AS attempts,"
+            " a.verdict AS verdict, a.verdict_reason AS verdict_reason,"
+            " a.note AS note, a.decided_at AS decided_at,"
+            " a.neo_question_id AS neo_question_id,"
+            " a.review_status AS review_status, a.review_feedback AS review_feedback,"
+            " a.reviewed_at AS reviewed_at,"
+            " w.title AS title, w.status AS status, w.hidden AS hidden,"
+            " w.needs_attention AS needs_attention,"
+            " w.attention_reason AS attention_reason"
+            " FROM wo_alarms a JOIN work_orders w ON w.id = a.wo_id"
+            f" WHERE {' AND '.join(where)} ORDER BY a.ts DESC LIMIT ?",
+            (*args, limit)).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def update_alarm(self, alarm_id: str, **fields: Any) -> None:
+        for column, vocabulary in (("status", ALARM_STATUSES),
+                                   ("verdict", ALARM_VERDICTS),
+                                   ("review_status", ALARM_REVIEW_STATUSES)):
+            value = fields.get(column)
+            if value is not None:
+                assert value in vocabulary, (column, value)
+        if not fields:
+            return
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self.conn.execute(
+            f"UPDATE wo_alarms SET {cols} WHERE id=?", (*fields.values(), alarm_id))
 
     def _this_conflict(self, wo_id: str, kind: str) -> int:
         """Events of `kind` since the last `pr_conflict_cleared` — this EPISODE's.

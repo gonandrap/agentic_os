@@ -366,3 +366,42 @@ def test_config_version_reaches_a_database_that_already_has_rounds_and_work_orde
         assert rnd["config_version"] == "cfg-a1b2c3d4e5f6"
     finally:
         store.close()
+
+
+def test_legacy_cost_alarms_are_backfilled_exactly_once_however_often_the_store_opens(
+        tmp_path):
+    """`_migrate` runs in `ProjectStore.__init__` — every CLI invocation and every
+    reconcile of every project, not once per release. A test that opens the store once
+    and counts rows cannot tell a guarded backfill from an unguarded one."""
+    proj = tmp_path / "legacy"
+    (proj / ".jarvis").mkdir(parents=True)
+    old = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
+    old.executescript(SHIPPED_SCHEMA.read_text())
+    old.execute("INSERT INTO work_orders (id, title, description, status, origin,"
+                " created_at, updated_at) VALUES ('wo-legacy','the long one','',"
+                "'running','jarvis',1.0,1.0)")
+    for ts, payload in ((2.0, '{"kind":"long-turn","seq":3,"reason":"being billed"}'),
+                        (3.0, '{"kind":"big-rewrite","seq":3,"reason":"re-sent it"}')):
+        old.execute("INSERT INTO wo_events (wo_id, ts, kind, payload)"
+                    " VALUES ('wo-legacy',?,'cost_alarm',?)", (ts, payload))
+    old.commit()
+    old.close()
+
+    counts, rows = [], []
+    for _ in range(3):
+        store = ProjectStore(proj)          # the upgrade, three times over
+        try:
+            rows = store.alarms_of("wo-legacy")
+            counts.append(len(rows))
+        finally:
+            store.close()
+
+    assert counts == [2, 2, 2], "the backfill ran again on a later open"
+    assert [r["kind"] for r in rows] == ["long-turn", "big-rewrite"]
+    assert [r["seq"] for r in rows] == [3, 3]
+    assert rows[0]["reason"] == "being billed"
+    assert rows[0]["ts"] == 2.0, "dated when it was raised, not when it was backfilled"
+    assert rows[0]["id"].startswith("al-")
+    # SKIPPED, not RAISED: `raised` is the supervisor's work queue, and history landing
+    # in it would spend one model call per legacy alarm on turns that ended weeks ago.
+    assert {r["status"] for r in rows} == {"skipped"}
