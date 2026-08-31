@@ -286,6 +286,25 @@ def test_show_scopes_to_one_project_plus_the_fleet_settings_it_runs_under(catalo
     assert not [k for k in resolved if k.startswith("projects.proj_b.")]
 
 
+def test_show_says_which_paths_the_document_sets_and_which_are_defaults(catalog):
+    """`config_get`'s "set in the catalog" answer, for every key at once — the half of
+    provenance the /config page cannot get from the ledger (§8, Neo q180)."""
+    written = ops.config_show()["written"]
+
+    assert "os.defaults.model" in written
+    assert "os.ui.port" not in written  # a default of this build, not a choice
+
+
+def test_show_of_a_version_reads_its_own_document_not_the_file(catalog):
+    """A stored version's provenance is the document that was stored with it: the file
+    has moved on, and reading it here would date-stamp an old version with new facts."""
+    row = ops.set_config("os.ui.port", 9999)["version"]
+    ops.unset_config("os.ui.port")
+
+    assert "os.ui.port" not in ops.config_show()["written"]
+    assert "os.ui.port" in ops.config_show(version=row["id"])["written"]
+
+
 def test_show_flags_a_file_the_ledger_has_never_seen(catalog):
     """The drift the invariant will report, visible in the command that reads config."""
     before = ops.config_show()

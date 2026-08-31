@@ -19,9 +19,9 @@ def test_dashboard_quiet_state(page, server):
 
 def test_nav_walk_all_tabs(page, server):
     page.goto(server)
-    for label, path in [("neo", "/neo"), ("gates", "/gates"), ("inbox", "/inbox"),
-                        ("backlog", "/backlog"), ("knowledge", "/knowledge"),
-                        ("dashboard", "/")]:
+    for label, path in [("neo", "/neo"), ("gates", "/gates"), ("alarms", "/alarms"),
+                        ("inbox", "/inbox"), ("backlog", "/backlog"),
+                        ("knowledge", "/knowledge"), ("dashboard", "/")]:
         page.click(f"nav >> text={label}")
         assert page.url.rstrip("/").endswith(path.rstrip("/")) or path == "/"
         assert page.locator("nav a.here").inner_text().startswith(label)
@@ -454,3 +454,84 @@ def test_a_long_neo_question_is_collapsed_and_the_full_text_opens_from_the_page(
     assert verbatim.is_visible()
     assert LONG_QUESTION.strip() in verbatim.inner_text()
     assert wo["id"] in verbatim.inner_text()            # the prompt Neo got, not a copy
+
+
+def _shot(page, name):
+    """Save a screenshot only when someone asked for one.
+
+    A normal run writes nothing into the tree; `JARVIS_UI_SHOTS=<dir> pytest
+    tests_browser` collects them for a review. The alternative — always writing — puts
+    binaries in the working tree of everyone who runs the suite.
+    """
+    import os
+    import pathlib
+
+    where = os.environ.get("JARVIS_UI_SHOTS")
+    if not where:
+        return
+    out = pathlib.Path(where)
+    out.mkdir(parents=True, exist_ok=True)
+    page.screenshot(path=str(out / f"{name}.png"), full_page=True)
+
+
+def test_a_burning_turn_is_reviewed_and_acked_in_the_browser(
+        page, server, daemon, project, monkeypatch, tmp_path):
+    """The review surface end to end: the daemon raises it, the page shows it, one
+    button answers it, and the record survives the answer.
+
+    The alarm is produced by running the real `check_burning_turns` against a real
+    transcript rather than by writing the event by hand — the page's job is to render
+    what the daemon actually produces, and a hand-written row would not test that.
+    """
+    import json
+    import time as _time
+
+    from jarvis import ops, usage
+    from jarvis.project_store import ProjectStore
+
+    root = tmp_path / "transcripts"
+    (root / "-proj").mkdir(parents=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+
+    wo = ops.create_work_order("proj_a", "plan the observability console")
+    store = ProjectStore(project)
+    try:
+        # The turn genuinely started two hours ago, rather than the daemon being told a
+        # lie about the time when it judges: the alarm event then carries a REAL
+        # timestamp, which is what the page ages against.
+        at = _time.time() - 2 * 3600
+        with monkeypatch.context() as clock:
+            clock.setattr("jarvis.db.now", lambda: at)
+            turn = store.create_turn(wo["id"], "dispatch", "go")
+        assert turn["started_at"] == at
+        def stamp(t):
+            return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(t))
+        (root / "-proj" / f"{wo['id']}.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in [
+                {"type": "user", "timestamp": stamp(at), "promptSource": "sdk",
+                 "message": {"content": "You are the worker agent for " + wo["id"]}},
+                {"type": "assistant", "timestamp": stamp(at + 5),
+                 "message": {"id": "m1", "model": "claude-opus-5",
+                             "usage": {"input_tokens": 0,
+                                       "cache_creation_input_tokens": 0,
+                                       "cache_read_input_tokens": 0,
+                                       "output_tokens": 1},
+                             "content": [{"type": "text", "text": "ok"}]}},
+            ]))
+        store.update_work_order(wo["id"], status="running", session_id=wo["id"])
+        daemon.check_burning_turns(daemon.catalog.projects[0], store)
+    finally:
+        store.close()
+
+    page.goto(f"{server}/alarms")
+    body = page.locator("body").inner_text()
+    assert "plan the observability console" in body
+    assert "still being billed" in body
+    assert page.locator("nav a:has-text('alarms') .nav-badge").is_visible()
+    _shot(page, "alarms-asking-for-you")
+
+    page.click("form[action$='/ack'] button")
+    after = page.locator("body").inner_text()
+    assert "nothing is burning" in after, "the ask is answered"
+    assert wo["id"] in after, "and the alarm is still on the record"
+    _shot(page, "alarms-after-ack")

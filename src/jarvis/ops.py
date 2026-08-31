@@ -3437,6 +3437,26 @@ def config_get(path: str, project: str | None = None,
             "safety": safety_key(key), "catalog": str(file)}
 
 
+def _written_paths(document: dict[str, Any], resolved: dict[str, Any]) -> list[str]:
+    """Which of the resolved paths the DOCUMENT itself says, as against a default of
+    this build — `jarvis config get`'s "set in the catalog" answer, for every key at
+    once (§8).
+
+    The ledger cannot answer this: `adopt` diffs against nothing and so records every
+    resolved path as a change, which would make every shipped default on a freshly
+    adopted catalog read as one somebody chose.
+    """
+    written = []
+    for key in resolved:
+        try:
+            container, leaf = _document_slot(document, key, create=False)
+        except OpsError:
+            continue  # a path this document cannot hold is not one it sets
+        if container is not None and leaf in container:
+            written.append(key)
+    return sorted(written)
+
+
 def config_show(project: str | None = None, version: str | None = None,
                 catalog_path: str | None = None) -> dict[str, Any]:
     """The effective configuration, and where it came from.
@@ -3446,8 +3466,10 @@ def config_show(project: str | None = None, version: str | None = None,
     """
     if version:
         row = _find_version(version)
+        resolved = _in_scope(row["resolved"], project)
         return {"source": "version", "version": row, "project": project,
-                "resolved": _in_scope(row["resolved"], project), "drift": False}
+                "resolved": resolved, "drift": False,
+                "written": _written_paths(row["document"], resolved)}
 
     file = _catalog_file(catalog_path)
     document = _read_document(file)
@@ -3458,9 +3480,11 @@ def config_show(project: str | None = None, version: str | None = None,
     finally:
         central.close()
     live_id = config_version.version_id(document)
+    in_scope = _in_scope(resolved, project)
     return {"source": "file", "catalog": str(file), "project": project,
-            "resolved": _in_scope(resolved, project), "version": head,
+            "resolved": in_scope, "version": head,
             "file_version": live_id,
+            "written": _written_paths(document, in_scope),
             "drift": head is None or head["id"] != live_id}
 
 
@@ -4211,6 +4235,146 @@ def _cost_for_target(target: str, project: str | None,
     return {"scope": fo["id"], "title": fo["title"], "status": fo["status"],
             "units": units, **_rollup(units),
             "floor": True, "floor_reason": COST_FLOOR_NOTE}
+
+
+def inspect_config(project: str | None = None) -> Any:
+    """The `jarvis inspect` settings in force for `project` — or the OS's — or defaults.
+
+    `ops.validation_config`'s shape and its reasoning: best-effort, because a report over
+    files on disk must not fail because a catalog has moved. Unlike validation it falls
+    back to `InspectConfig()` rather than to None — every default here is a threshold
+    with a measured justification, and having none would mean having no report.
+    """
+    from .catalog import InspectConfig
+
+    try:
+        catalog = resolve_catalog()
+        return (catalog.os.inspect if project is None
+                else catalog.project(project).inspect)
+    except (OpsError, CatalogError, OSError, ValueError):
+        return InspectConfig()
+
+
+def inspect_report(target: str, project: str | None = None, *,
+                   write_floor: int | None = None,
+                   join_floor: int | None = None) -> dict[str, Any]:
+    """Where a work order's or a feature order's TIME went — `jarvis cost`'s other half.
+
+    Resolves the target exactly the way `_cost_for_target` does, feature order first and
+    for the same reason, so the two commands agree about what an id means and a reader
+    can put one report beside the other.
+
+    Read-only and no paid call: everything comes from transcripts already on disk. A
+    unit whose transcript has expired is reported with `found: false`, the same honest
+    gap `jarvis cost` reports, because an unmeasurable clock and an idle one are
+    different answers.
+    """
+    from dataclasses import replace
+
+    from . import inspection
+    from . import usage as usage_mod
+
+    index = usage_mod.index_sessions()
+    # The catalog decides the floors and the flags override them for one invocation:
+    # a project's setting is what the report means by "large" day to day, and `--writes
+    # -over` is someone asking a different question of the same session once.
+    configs: dict[str, Any] = {}
+
+    def settings(project_name: str) -> Any:
+        if project_name not in configs:
+            cfg = inspect_config(project_name)
+            overrides = {}
+            if write_floor is not None:
+                overrides["report_write_floor"] = write_floor
+            if join_floor is not None:
+                overrides["report_join_floor"] = join_floor
+            configs[project_name] = replace(cfg, **overrides) if overrides else cfg
+        return configs[project_name]
+
+    def unit(project_name: str, wo: dict[str, Any]) -> dict[str, Any]:
+        session = wo.get("session_id") or ""
+        cfg = settings(project_name)
+        anatomy = (inspection.read_session(session, cfg, index=index) if session
+                   else inspection.Anatomy(session_id="",
+                                           write_floor=cfg.report_write_floor,
+                                           join_floor=cfg.report_join_floor))
+        payload = anatomy.as_dict()
+        payload.update(wo_id=wo["id"], project=project_name, title=wo["title"],
+                       status=wo["status"], kind=wo.get("kind") or "worker")
+        return payload
+
+    try:
+        name, path, fo = find_feature_order(target, project)
+    except OpsError:
+        name, _wo_path, wo = find_work_order(target, project)
+        cfg = settings(name)
+        return {"scope": wo["id"], "title": wo["title"],
+                "write_floor": cfg.report_write_floor,
+                "join_floor": cfg.report_join_floor, "units": [unit(name, wo)]}
+
+    store = ProjectStore(path)
+    try:
+        units = []
+        planner_id = fo.get("plan_wo_id")
+        if planner_id:
+            try:
+                units.append(unit(name, store.get_work_order(planner_id)))
+            except KeyError:
+                pass
+        units.extend(unit(name, child) for child in store.feature_children(fo["id"]))
+    finally:
+        store.close()
+    cfg = settings(name)
+    return {"scope": fo["id"], "title": fo["title"], "status": fo["status"],
+            "write_floor": cfg.report_write_floor,
+            "join_floor": cfg.report_join_floor, "units": units}
+
+
+def list_cost_alarms(project_name: str | None = None, limit: int = 200
+                     ) -> list[dict[str, Any]]:
+    """Every turn the OS raised WHILE it was burning, newest first, across the fleet.
+
+    The alarm's memory is the `cost_alarm` timeline event, not the attention flag —
+    `jarvis wo ack` puts the flag down and the event stays (§6.1 of
+    docs/superpowers/specs/2026-08-30-the-anatomy-of-a-turn.md). So this reads the
+    events: acking is meant to clear the ASK, and it must not erase the record of what
+    the fleet spent.
+
+    `live` is the one derived field: whether this alarm's work order is still asking for
+    the user. It is a property of the ORDER, not of the event, which is why several
+    alarms on one order share it — one ack answers all of them, and the page has to be
+    able to say so rather than offering four buttons that do the same thing.
+    """
+    paths = registered_project_paths()
+    if project_name:
+        if project_name not in paths:
+            raise OpsError(f"project {project_name!r} not registered")
+        paths = {project_name: paths[project_name]}
+    out: list[dict[str, Any]] = []
+    for name, path in paths.items():
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            rows = store.events_across("cost_alarm", limit=limit)
+        finally:
+            store.close()
+        for row in rows:
+            payload = db.from_json(row["payload"], {}) or {}
+            out.append({
+                "project": name,
+                "wo_id": row["wo_id"],
+                "title": row["title"],
+                "status": row["status"],
+                "hidden": bool(row["hidden"]),
+                "ts": row["ts"],
+                "kind": payload.get("kind") or "unknown",
+                "seq": payload.get("seq"),
+                "reason": payload.get("reason") or "",
+                "live": bool(row["needs_attention"]),
+            })
+    out.sort(key=lambda r: r["ts"], reverse=True)
+    return out[:limit]
 
 
 def _os_calls_detail(wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
