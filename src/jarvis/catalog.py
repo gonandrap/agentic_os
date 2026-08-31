@@ -202,8 +202,8 @@ class ValidationConfig:
 
 #: A cache write below this is the conversation's own growth rather than a re-send of it,
 #: and labelling it by the gap alone would call the cache working a defect. The method's
-#: own figure (`docs/anatomy-of-an-expensive-turn.md` §1 step 5: "flag every write over
-#: ~20k"), kept because it is what the worked example was derived with.
+#: own figure (`docs/findings/anatomy-of-an-expensive-turn.md` §1 step 5: "flag every
+#: write over ~20k"), kept because it is what the worked example was derived with.
 DEFAULT_INSPECT_REPORT_WRITE_FLOOR = 20_000
 
 #: A blocking join shorter than this is not worth a line of its own. Well under the

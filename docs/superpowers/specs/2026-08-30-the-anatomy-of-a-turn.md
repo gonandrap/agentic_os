@@ -2,7 +2,7 @@
 
 **Status:** shipped (wo-797367ee)
 **Subject:** `jarvis inspect`, and the live alarm for a turn that is still burning
-**Implements:** `docs/anatomy-of-an-expensive-turn.md` — the METHOD this automates, with
+**Implements:** `docs/findings/anatomy-of-an-expensive-turn.md` — the METHOD this automates, with
 the worked example it was derived from. That document is the specification; this one
 records what building it changed, and §7 lists every departure from it.
 **Companions:** `docs/superpowers/specs/2026-08-16-the-bill.md` (where the MONEY went),
@@ -252,7 +252,38 @@ RUNNING work order, every 6th tick. Nothing when the fleet is idle, because a pr
 no running work order reads no files at all.
 
 
-### 6.2 Every threshold is a setting, fleet-wide and per project
+### 6.2 Reviewing them: `jarvis alarms` and `/alarms`
+
+Raising an alarm and REVIEWING alarms are opposite reads, and the timeline could only do
+the first. `jarvis wo show` puts one alarm on one work order's timeline; the question "what
+has the fleet been burning, and what still wants me?" would have meant opening every work
+order there is. `ProjectStore.events_across` is the read that answers it — every event of
+one kind in a project, newest first, with its work order joined on, because an alarm is
+about a title and a status and is unreadable as a bare id.
+
+Both surfaces render the same `ops.list_cost_alarms`, split the same way:
+
+- **Asking for you** — grouped BY WORK ORDER, not by alarm. The attention flag carries one
+  sentence, so three alarms on one order were only ever one ask; three buttons that all do
+  the same thing would be a lie about how many decisions the user has.
+- **On the record** — every alarm ever raised, acknowledged or not. This half is meant to
+  be long and is meant to sit there unacted on: it is the memory that keeps the alarm
+  quiet (§6.1), so a page that hid it would hide the reason acking works.
+
+Acking from the list returns the user to the list (`back=alarms`), because they are
+working through a queue rather than visiting an order. The value is checked against a
+known path rather than used as a redirect target.
+
+![the queue](../../screenshots/alarms-asking-for-you.png)
+
+![the record, after one ack](../../screenshots/alarms-after-ack.png)
+
+`jarvis alarms [project]` is the same read in the terminal. Not a convenience: the CLI is
+the OS (prime directive 1), and a dashboard page that is the only way to see something the
+OS knows would be the first exception to that.
+
+
+### 6.3 Every threshold is a setting, fleet-wide and per project
 
 NOTHING IN `inspection.py` HARD-CODES A THRESHOLD. `catalog.InspectConfig` holds all six,
 and `tests/test_inspection.py::test_nothing_in_the_module_hard_codes_a_threshold` walks

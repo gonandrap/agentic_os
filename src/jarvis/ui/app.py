@@ -14,6 +14,7 @@ from fastapi.templating import Jinja2Templates
 from .. import bill, invariants, ops, specs, uilog
 from ..central_store import CentralStore
 from ..daemon import daemon_running
+from ..inspection import ALARM_KINDS
 from ..paths import PRODUCTION, deployment_env
 from ..project_store import (
     ACTIVE_STATUSES,
@@ -226,6 +227,18 @@ def gate_badge() -> int | None:
         return None
 
 
+def alarm_badge() -> int | None:
+    """How many work orders are asking for the user BECAUSE of a cost alarm.
+
+    Counted over orders, not over events: several alarms on one turn are one ask and
+    one ack. Never raises — a badge must not be the reason a page 500s.
+    """
+    try:
+        return len({a["wo_id"] for a in ops.list_cost_alarms() if a["live"]}) or None
+    except Exception:  # noqa: BLE001 — see docstring
+        return None
+
+
 def _decorate_question(q: dict) -> dict:
     """Add the two display-only fields the `/neo` question blocks render.
 
@@ -399,6 +412,7 @@ def create_app() -> FastAPI:
         ctx["neo_badge"] = (c.get("escalated", 0) + c.get("failed", 0)
                             + c.get("unreviewed", 0)) or None
         ctx["gate_badge"] = gate_badge()
+        ctx["alarm_badge"] = alarm_badge()
         return templates.TemplateResponse(request, template, ctx,
                                           status_code=status_code)
 
@@ -845,6 +859,29 @@ def create_app() -> FastAPI:
                       groups=group_config(show, config_setters(history)),
                       history=history, diff=diff, diff_error=diff_error, a=a, b=b)
 
+    @app.get("/alarms", response_class=HTMLResponse)
+    def alarms_page(request: Request):
+        """Turns the OS raised WHILE they were still costing money.
+
+        Split by whether the work order is still ASKING, because the two halves are
+        different things and mixing them is how a cost alarm becomes wallpaper: the top
+        is a queue the user is meant to empty, the bottom is the record of what the
+        fleet has spent and is meant to be long.
+
+        Acking is per WORK ORDER, not per alarm, and the page groups the live half that
+        way — one order with three alarms is one decision. That is not a shortcut: the
+        attention flag carries one sentence, so there was never more than one ask.
+        """
+        rows = ops.list_cost_alarms()
+        live: dict[str, dict] = {}
+        for a in (r for r in rows if r["live"]):
+            group = live.setdefault(a["wo_id"], {**a, "alarms": []})
+            group["alarms"].append(a)
+        return render(request, "alarms.html", active="alarms",
+                      live=list(live.values()),
+                      history=[r for r in rows if not r["live"]],
+                      kinds=ALARM_KINDS)
+
     @app.get("/api/status")
     def api_status():
         return JSONResponse(ops.os_status())
@@ -898,14 +935,20 @@ def create_app() -> FastAPI:
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/ack")
-    def ack_wo(name: str, wo_id: str):
+    def ack_wo(name: str, wo_id: str, back: str = Form("")):
+        # `back` is where the user pressed the button. Acking from a LIST is a different
+        # act from acking on the order's own page — the user is working through a queue
+        # and wants the next row, not a detail page they then have to leave. Restricted
+        # to a known path so a form cannot be used to bounce anyone off the dashboard.
+        home = f"/wo/{name}/{wo_id}"
+        landing = "/alarms" if back == "alarms" else home
         try:
             ops.ack_attention(wo_id, project_name=name)
         except ops.OpsError as e:
             # The one case that refuses: pending assumptions want a decision, not a
             # dismissal. Say so instead of silently doing nothing.
-            return RedirectResponse(f"/wo/{name}/{wo_id}?error={e}", status_code=303)
-        return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
+            return RedirectResponse(f"{landing}?error={e}", status_code=303)
+        return RedirectResponse(landing, status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/hide")
     def hide_wo(name: str, wo_id: str):

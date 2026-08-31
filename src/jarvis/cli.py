@@ -5,6 +5,7 @@ Grouped commands:
   jarvis cost [project|wo-id|fo-id]       what the work has cost in tokens
   jarvis inspect <wo-id|fo-id>            where its TIME went, and which cache writes
                                           were a defect rather than the cache expiring
+  jarvis alarms [project]                 turns raised WHILE they were still burning
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
   jarvis fo create|list|show|plan|submit|approve|cancel feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
@@ -215,6 +216,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="list blocking joins at or above this long, for this run only "
                          "(default: the project's os.inspect.report_join_floor, "
                          f"{catalog.DEFAULT_INSPECT_REPORT_JOIN_FLOOR})")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser(
+        "alarms",
+        help="turns the OS raised WHILE they were still costing money, newest first",
+    )
+    sp.add_argument("project", nargs="?", help="one project (default: the whole fleet)")
+    sp.add_argument("--limit", type=int, default=50,
+                    help="alarms to show (default: 50)")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
@@ -1295,6 +1305,33 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         if index:
             print()
         _print_anatomy(unit, res["write_floor"])
+    return 0
+
+
+def cmd_alarms(args: argparse.Namespace) -> int:
+    """The dashboard's `/alarms` page in the terminal — the CLI is the OS.
+
+    Live ones first, because they are the only rows that are an ask; the rest are the
+    record and are meant to be long. `jarvis wo ack` is what answers one.
+    """
+    from . import ops
+
+    rows = ops.list_cost_alarms(args.project, limit=args.limit)
+    if args.json:
+        _print(rows, True)
+        return 0
+    if not rows:
+        print("no cost alarm has ever been raised")
+        return 0
+    live = [r for r in rows if r["live"]]
+    print(f"{len(live)} asking for you · {len(rows) - len(live)} on the record\n")
+    for row in rows:
+        mark = "!" if row["live"] else " "
+        print(f"{mark} {row['wo_id']}  {row['project']}  {row['kind']}  "
+              f"turn {row['seq']}  {_age(row['ts'])} ago")
+        print(f"    {row['reason']}")
+    if live:
+        print("\nack one with: jarvis wo ack <wo-id>")
     return 0
 
 
@@ -2503,6 +2540,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_cost(args)
         if args.cmd == "inspect":
             return cmd_inspect(args)
+        if args.cmd == "alarms":
+            return cmd_alarms(args)
         if args.cmd == "adopt":
             return cmd_adopt(args)
         if args.cmd == "wo":

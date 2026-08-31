@@ -41,8 +41,8 @@ def real_session(monkeypatch):
 
 
 def test_the_wall_clock_splits_the_way_the_method_says(real_session):
-    """`docs/anatomy-of-an-expensive-turn.md`'s summary table, to the second: 1886s of
-    wall clock, 576s blocked on a subagent join, 58s executing tools.
+    """`docs/findings/anatomy-of-an-expensive-turn.md`'s summary table, to the second:
+    1886s of wall clock, 576s blocked on a subagent join, 58s executing tools.
 
     The question that started this: a DESIGN-ONLY agent with three 14-minute turns. A
     third of it was the lead agent asleep with no API call in flight, which is invisible
@@ -617,3 +617,120 @@ def test_a_burning_turn_reaches_the_user_the_way_everything_else_does(
         assert len(store.events_of_kind(wo["id"], "cost_alarm")) == 1
     finally:
         store.close()
+
+
+# -- the review surface: reading the alarms back, and answering one --------------------
+
+
+def _burning(daemon, monkeypatch, tmp_path, title="the long one"):
+    """One work order with a live `long-turn` alarm against it. Returns its id."""
+    from jarvis.project_store import ProjectStore
+
+    root = tmp_path / "projects"
+    (root / "-proj").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    wo = ops.create_work_order("proj_a", title)
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        turn = store.create_turn(wo["id"], "dispatch", "go")
+        at = turn["started_at"]
+        (root / "-proj" / f"{wo['id']}.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in [
+                prompt_row(at, "You are the worker agent for wo-1"),
+                assistant_row(at + 5, "m1"),
+            ]))
+        store.update_work_order(wo["id"], status="running", session_id=wo["id"])
+        monkeypatch.setattr("jarvis.daemon.time.time", lambda: at + 2 * 3600)
+        daemon.check_burning_turns(daemon.catalog.projects[0], store)
+    finally:
+        store.close()
+    return wo["id"]
+
+
+def test_an_alarm_can_be_read_back_off_the_fleet(started, monkeypatch, tmp_path):
+    """`jarvis wo show` puts one alarm on one timeline. Reviewing them is the opposite
+    question — which orders across the fleet have any — and `events_of_kind` cannot
+    answer it without reading every work order there is."""
+    wo_id = _burning(started, monkeypatch, tmp_path)
+
+    rows = ops.list_cost_alarms()
+
+    assert [r["wo_id"] for r in rows] == [wo_id]
+    assert rows[0]["kind"] == inspection.TURN_ALARM
+    assert rows[0]["project"] == "proj_a"
+    assert rows[0]["seq"] == 1
+    assert "still being billed" in rows[0]["reason"]
+    # `live` is the ONE derived field: it is a property of the order, not of the event.
+    assert rows[0]["live"] is True
+
+
+def test_acking_answers_the_ask_and_keeps_the_record(started, monkeypatch, tmp_path):
+    """The whole point of the alarm being a timeline event rather than a flag: the user
+    can put the ask down without erasing what the fleet spent."""
+    wo_id = _burning(started, monkeypatch, tmp_path)
+    ops.ack_attention(wo_id, project_name="proj_a")
+
+    rows = ops.list_cost_alarms()
+
+    assert len(rows) == 1, "the alarm survives the ack"
+    assert rows[0]["live"] is False, "but it has stopped asking"
+
+
+def test_the_alarms_page_lists_the_live_one_and_offers_the_ack(
+        started, monkeypatch, tmp_path):
+    """The dashboard half of the same read. Asserted on the page a user actually gets,
+    not on the context dict, because the ack button is the thing under test."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    wo_id = _burning(started, monkeypatch, tmp_path, title="a very slow design")
+    client = TestClient(create_app(), follow_redirects=False)
+
+    page = client.get("/alarms").text
+    assert "a very slow design" in page
+    assert "still being billed" in page
+    assert f'action="/wo/proj_a/{wo_id}/ack"' in page
+    assert 'name="back" value="alarms"' in page
+    # The nav badge counts ORDERS, not events: several alarms on one turn are one ask.
+    assert 'alarms<span class="nav-badge">1</span>' in page.replace(" <span", "<span")
+
+    ack = client.post(f"/wo/proj_a/{wo_id}/ack", data={"back": "alarms"})
+    assert ack.status_code == 303
+    assert ack.headers["location"] == "/alarms", "back to the queue, not to the order"
+
+    after = client.get("/alarms").text
+    assert "nothing is burning" in after, "the ask is gone"
+    assert wo_id in after, "and the record is not"
+
+
+def test_acking_from_the_order_s_own_page_still_lands_there(
+        started, monkeypatch, tmp_path):
+    """`back` must not change the behaviour of the button that was already there."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    wo_id = _burning(started, monkeypatch, tmp_path)
+    client = TestClient(create_app(), follow_redirects=False)
+
+    ack = client.post(f"/wo/proj_a/{wo_id}/ack")
+
+    assert ack.headers["location"] == f"/wo/proj_a/{wo_id}"
+
+
+def test_the_cli_answers_the_same_question_as_the_page(
+        started, monkeypatch, tmp_path, capsys):
+    """The CLI is the OS: no dashboard surface may be the only way to read something."""
+    from jarvis import cli
+
+    wo_id = _burning(started, monkeypatch, tmp_path)
+
+    assert cli.main(["alarms"]) == 0
+
+    out = capsys.readouterr().out
+    assert wo_id in out
+    assert "1 asking for you" in out
+    assert "jarvis wo ack" in out

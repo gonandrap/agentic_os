@@ -11,7 +11,8 @@ Design and worked example: `docs/superpowers/specs/2026-08-30-the-anatomy-of-a-t
 
 ## The partition
 
-The method is `docs/anatomy-of-an-expensive-turn.md` §1 step 4, with one bucket added:
+The method is `docs/findings/anatomy-of-an-expensive-turn.md` §1 step 4, with one
+bucket added:
 
     executing tools   `tool_use` timestamp to the matching `tool_result` timestamp
     blocked           the subset of those where the tool is a BLOCKING JOIN
@@ -622,8 +623,8 @@ def _close_turns(turns: Sequence[Turn]) -> None:
     cannot count must not move a clock `usage` is the denominator of.
 
     `ended` runs on to the NEXT turn's prompt, which is the method's own rule
-    (`docs/anatomy-of-an-expensive-turn.md` §2) and is what makes the turns sum to the
-    session with nothing between them dropped. The gap between the two is `idle`.
+    (`docs/findings/anatomy-of-an-expensive-turn.md` §2) and is what makes the turns
+    sum to the session with nothing between them dropped. The gap between the two is `idle`.
 
     A turn with no calls and no finished spans keeps `active_ended` at zero, which reads
     as "no idle known" rather than as an idle turn — there is nothing to measure from,
@@ -672,6 +673,15 @@ def _name_joins(turns: Sequence[Turn], labels: dict[str, str]) -> None:
 
 
 TURN_ALARM, JOIN_ALARM, WRITE_ALARM = "long-turn", "long-join", "big-rewrite"
+
+#: What each kind IS, for a surface listing alarms rather than raising one. An `Alarm`'s
+#: own `reason` is about one turn and carries its numbers; this is the standing meaning,
+#: and it lives beside the constants so a dashboard and the CLI cannot drift on it.
+ALARM_KINDS = {
+    TURN_ALARM: "a turn still generating, still being billed",
+    JOIN_ALARM: "a join open past the cache TTL — the wait is paid for twice",
+    WRITE_ALARM: "the conversation sent again, at the cache-write rate",
+}
 
 
 @dataclass

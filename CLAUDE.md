@@ -273,6 +273,13 @@ jarvis inspect <wo-id|fo-id>               # where the TIME went, which `cost` c
                                            # inspect.alarm_turn_minutes 90`. A project
                                            # naming one keeps the fleet answer for the
                                            # rest.
+jarvis alarms [project]                    # the other end of that: every turn the OS has
+                                           # raised WHILE it burned, newest first, live
+                                           # ones marked `!`. `jarvis wo ack` answers
+                                           # one — the flag goes down, the alarm stays on
+                                           # the record, and it never re-fires for that
+                                           # turn. Same page on the dashboard at
+                                           # /alarms, where the ack is a button.
 jarvis adopt <path>                        # migrate a project into the OS
 jarvis ui                                  # dashboard at http://127.0.0.1:8787
 ```
