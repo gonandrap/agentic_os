@@ -225,6 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("project", nargs="?", help="one project (default: the whole fleet)")
     sp.add_argument("--limit", type=int, default=50,
                     help="alarms to show (default: 50)")
+    sp.add_argument("--wo", help="one work order's alarms, with their ids")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
@@ -1316,18 +1317,23 @@ def cmd_alarms(args: argparse.Namespace) -> int:
     """
     from . import ops
 
-    rows = ops.list_cost_alarms(args.project, limit=args.limit)
+    rows = ops.list_cost_alarms(args.project, limit=args.limit, wo_id=args.wo)
     if args.json:
         _print(rows, True)
         return 0
     if not rows:
-        print("no cost alarm has ever been raised")
+        print(f"no cost alarm has ever been raised against {args.wo}" if args.wo
+              else "no cost alarm has ever been raised")
         return 0
     live = [r for r in rows if r["live"]]
     print(f"{len(live)} asking for you · {len(rows) - len(live)} on the record\n")
     for row in rows:
         mark = "!" if row["live"] else " "
-        print(f"{mark} {row['wo_id']}  {row['project']}  {row['kind']}  "
+        # The id only on the read that asked for one order: §1 of
+        # docs/superpowers/specs/2026-08-31-the-supervisor.md wants every surface that
+        # reads alarms today to render exactly as it does today.
+        who = f"{row['id']}  " if args.wo else f"{row['wo_id']}  {row['project']}  "
+        print(f"{mark} {who}{row['kind']}  "
               f"turn {row['seq']}  {_age(row['ts'])} ago")
         print(f"    {row['reason']}")
     if live:
