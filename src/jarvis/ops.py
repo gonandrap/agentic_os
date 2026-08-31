@@ -3481,11 +3481,18 @@ def config_show(project: str | None = None, version: str | None = None,
         central.close()
     live_id = config_version.version_id(document)
     in_scope = _in_scope(resolved, project)
+    # DOCUMENTS, not ids — the third reader of this comparison, and it was the odd one
+    # out: a release-rebase row is addressed by document AND build (§6.1), so an id
+    # comparison reports drift for ever after an upgrade that moved a default, on a
+    # file nobody has touched. `invariants.check_config_drift` and `adopt_config` both
+    # say so in as many words; this one quietly disagreed with them.
+    drift = head is None or config_version.canonicalise(
+        head["document"]) != config_version.canonicalise(document)
     return {"source": "file", "catalog": str(file), "project": project,
             "resolved": in_scope, "version": head,
             "file_version": live_id,
             "written": _written_paths(document, in_scope),
-            "drift": head is None or head["id"] != live_id}
+            "drift": drift}
 
 
 def config_history(project: str | None = None,
