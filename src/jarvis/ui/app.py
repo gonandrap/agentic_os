@@ -14,10 +14,13 @@ from fastapi.templating import Jinja2Templates
 from .. import bill, invariants, ops, specs, uilog
 from ..central_store import CentralStore
 from ..daemon import daemon_running
+from ..inspection import ALARM_KINDS
 from ..paths import PRODUCTION, deployment_env
 from ..project_store import (
     ACTIVE_STATUSES,
     FO_OPEN_STATUSES,
+    FO_STATUSES,
+    FO_TERMINAL_STATUSES,
     OPEN_STATUSES,
     TERMINAL_STATUSES,
     WO_STATUSES,
@@ -224,6 +227,18 @@ def gate_badge() -> int | None:
         return None
 
 
+def alarm_badge() -> int | None:
+    """How many work orders are asking for the user BECAUSE of a cost alarm.
+
+    Counted over orders, not over events: several alarms on one turn are one ask and
+    one ack. Never raises — a badge must not be the reason a page 500s.
+    """
+    try:
+        return len({a["wo_id"] for a in ops.list_cost_alarms() if a["live"]}) or None
+    except Exception:  # noqa: BLE001 — see docstring
+        return None
+
+
 def _decorate_question(q: dict) -> dict:
     """Add the two display-only fields the `/neo` question blocks render.
 
@@ -321,6 +336,41 @@ def turn_lines_by_message(bill: dict | None) -> dict[int, dict]:
     return out
 
 
+def config_setters(history: list[dict]) -> dict[str, str]:
+    """path → the id of the most recent version that changed it.
+
+    Only half of a key's provenance: a version's change list says what was WRITTEN at
+    the time, and `ops.config_show`'s `written` says what the document still sets. A key
+    the file no longer sets is on a default however many versions once named it.
+    """
+    setters: dict[str, str] = {}
+    for row in reversed(history):  # oldest first, so the last writer wins
+        for change in row["changes"]:
+            setters[change["path"]] = row["id"]
+    return setters
+
+
+def group_config(show: dict, setters: dict[str, str]) -> list[dict]:
+    """The flat key space, split into the blocks the catalog is written in (spec §8).
+
+    `os.…` is one group and each `projects.<name>.…` is its own; the label a row shows
+    is the path with that prefix taken off, so the column reads as settings rather than
+    as forty repetitions of the same first two segments.
+    """
+    resolved, written = show["resolved"], set(show["written"])
+    groups: dict[str, list[dict]] = {}
+    for path in sorted(resolved):
+        parts = path.split(".")
+        prefix = "os" if parts[0] == "os" else ".".join(parts[:2])
+        groups.setdefault(prefix, []).append(
+            {"path": path, "label": path[len(prefix) + 1:], "value": resolved[path],
+             "bool": isinstance(resolved[path], bool), "written": path in written,
+             "safety": ops.safety_key(path),
+             "version": setters.get(path) if path in written else None})
+    return [{"name": p, "title": p if p == "os" else p.split(".", 1)[1],
+             "settings": rows} for p, rows in groups.items()]
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None)
 
@@ -362,6 +412,7 @@ def create_app() -> FastAPI:
         ctx["neo_badge"] = (c.get("escalated", 0) + c.get("failed", 0)
                             + c.get("unreviewed", 0)) or None
         ctx["gate_badge"] = gate_badge()
+        ctx["alarm_badge"] = alarm_badge()
         return templates.TemplateResponse(request, template, ctx,
                                           status_code=status_code)
 
@@ -427,7 +478,8 @@ def create_app() -> FastAPI:
                       revealed=revealed)
 
     @app.get("/project/{name}", response_class=HTMLResponse)
-    def project(request: Request, name: str, hidden: str = "", show: str = ""):
+    def project(request: Request, name: str, hidden: str = "", show: str = "",
+                fo: str = ""):
         """A project's work orders — the ones that want the user, by default.
 
         Work orders owing the user a decision, running ones, and PRs waiting to be
@@ -435,6 +487,10 @@ def create_app() -> FastAPI:
         the settled orders that are the bulk of any project with history — collapses
         into per-status counts the user can expand. `show` is "" (featured only), any
         status name (plus that group), or "all".
+
+        `fo` is the same reveal for the feature orders, on its own param rather than
+        sharing `show`: the two lifecycles spell three settled statuses the same way
+        (see FO_STATUS_META), so one param would expand both lists on every click.
         """
         paths = ops.registered_project_paths()
         if name not in paths:
@@ -445,6 +501,11 @@ def create_app() -> FastAPI:
             statuses = None
         else:
             statuses = OPEN_STATUSES + ((revealed,) if revealed else ())
+        fo_revealed = fo if fo in FO_STATUSES else ("all" if fo == "all" else "")
+        if fo_revealed == "all":
+            fo_statuses = None
+        else:
+            fo_statuses = FO_OPEN_STATUSES + ((fo_revealed,) if fo_revealed else ())
         store = ProjectStore(paths[name])
         try:
             # Open feature orders get their own short list above the work orders, and
@@ -452,8 +513,9 @@ def create_app() -> FastAPI:
             # already in the listing below as ordinary work orders, and printing the
             # tree twice on one page is how a page stops being read. The tree lives on
             # the feature's own page.
-            features = [{**fo, "progress": ops.feature_progress(store, fo)}
-                        for fo in store.list_feature_orders(statuses=FO_OPEN_STATUSES)]
+            features = [{**row, "progress": ops.feature_progress(store, row)}
+                        for row in store.list_feature_orders(statuses=fo_statuses)]
+            fo_counts = store.feature_status_counts()
             wos = store.list_work_orders(statuses=statuses, include_hidden=show_hidden)
             # Inside the store's lifetime: the label reads the dependencies' own rows.
             blocked = {wo["id"]: ops.blocked_by(store, wo) for wo in wos}
@@ -478,12 +540,15 @@ def create_app() -> FastAPI:
         # reason the settled line is. Terminal statuses have their own line below.
         other_open = [s for s in OPEN_STATUSES if s not in FEATURED_STATUSES]
         open_counts = [(s, counts[s]) for s in other_open if counts.get(s)]
+        fo_settled = [(s, fo_counts[s]) for s in FO_TERMINAL_STATUSES
+                      if fo_counts.get(s)]
         return render(request, "project.html", project_name=name, path=paths[name],
                       featured=featured, rest=rest, open_counts=open_counts,
                       backlog=backlog, show_hidden=show_hidden, blocked=blocked,
                       pauses=pauses,
                       hidden_count=hidden_count, settled=settled, revealed=revealed,
-                      features=features)
+                      features=features, fo_settled=fo_settled,
+                      fo_revealed=fo_revealed)
 
     @app.get("/fo/{name}/{fo_id}", response_class=HTMLResponse)
     def feature_order(request: Request, name: str, fo_id: str, error: str = ""):
@@ -770,6 +835,53 @@ def create_app() -> FastAPI:
                       decided=decided, dismissed=dismissed,
                       false_positive_rate=_false_positive_rate(rows))
 
+    @app.get("/config", response_class=HTMLResponse)
+    def config_page(request: Request, a: str = "", b: str = ""):
+        """What the fleet is configured to run, who changed it, and what changed.
+
+        A form over `jarvis config` and nothing more — see
+        docs/superpowers/specs/2026-08-27-the-config-console.md §8 for the scope cut.
+        """
+        show = ops.config_show()
+        history = ops.config_history(limit=50)
+        # Default the diff to the change that landed: the head against the version
+        # before it, so the page answers "what changed last" unasked.
+        ids = [row["id"] for row in history]
+        if not a and not b and len(ids) >= 2:
+            a, b = ids[1], ids[0]
+        diff = diff_error = None
+        if a and b:
+            try:
+                diff = ops.config_diff(a, b)
+            except ops.OpsError as e:
+                diff_error = str(e)
+        return render(request, "config.html", active="config", show=show,
+                      groups=group_config(show, config_setters(history)),
+                      history=history, diff=diff, diff_error=diff_error, a=a, b=b)
+
+    @app.get("/alarms", response_class=HTMLResponse)
+    def alarms_page(request: Request):
+        """Turns the OS raised WHILE they were still costing money.
+
+        Split by whether the work order is still ASKING, because the two halves are
+        different things and mixing them is how a cost alarm becomes wallpaper: the top
+        is a queue the user is meant to empty, the bottom is the record of what the
+        fleet has spent and is meant to be long.
+
+        Acking is per WORK ORDER, not per alarm, and the page groups the live half that
+        way — one order with three alarms is one decision. That is not a shortcut: the
+        attention flag carries one sentence, so there was never more than one ask.
+        """
+        rows = ops.list_cost_alarms()
+        live: dict[str, dict] = {}
+        for a in (r for r in rows if r["live"]):
+            group = live.setdefault(a["wo_id"], {**a, "alarms": []})
+            group["alarms"].append(a)
+        return render(request, "alarms.html", active="alarms",
+                      live=list(live.values()),
+                      history=[r for r in rows if not r["live"]],
+                      kinds=ALARM_KINDS)
+
     @app.get("/api/status")
     def api_status():
         return JSONResponse(ops.os_status())
@@ -823,14 +935,20 @@ def create_app() -> FastAPI:
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/ack")
-    def ack_wo(name: str, wo_id: str):
+    def ack_wo(name: str, wo_id: str, back: str = Form("")):
+        # `back` is where the user pressed the button. Acking from a LIST is a different
+        # act from acking on the order's own page — the user is working through a queue
+        # and wants the next row, not a detail page they then have to leave. Restricted
+        # to a known path so a form cannot be used to bounce anyone off the dashboard.
+        home = f"/wo/{name}/{wo_id}"
+        landing = "/alarms" if back == "alarms" else home
         try:
             ops.ack_attention(wo_id, project_name=name)
         except ops.OpsError as e:
             # The one case that refuses: pending assumptions want a decision, not a
             # dismissal. Say so instead of silently doing nothing.
-            return RedirectResponse(f"/wo/{name}/{wo_id}?error={e}", status_code=303)
-        return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
+            return RedirectResponse(f"{landing}?error={e}", status_code=303)
+        return RedirectResponse(landing, status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/hide")
     def hide_wo(name: str, wo_id: str):
@@ -960,6 +1078,26 @@ def create_app() -> FastAPI:
             sep = "&" if "?" in back else "?"
             return RedirectResponse(f"{back}{sep}error={e}", status_code=303)
         return RedirectResponse(back, status_code=303)
+
+    @app.post("/config/set")
+    def config_set(path: str = Form(...), value: str = Form(""),
+                   reason: str = Form("")):
+        """The page's only write, and it is `jarvis config set` under another name.
+
+        v1 toggles booleans and nothing else (spec §8): a POST for any other key is
+        refused here and sent to the CLI, where the value is already text.
+        """
+        try:
+            if value not in ("true", "false") \
+                    or not isinstance(ops.config_get(path)["value"], bool):
+                return RedirectResponse(
+                    f"/config?error={path} is not a boolean — this page toggles "
+                    f"true/false only. Use `jarvis config set {path} <value> "
+                    f'--reason "…"`.', status_code=303)
+            ops.set_config(path, value == "true", reason=reason)
+        except ops.OpsError as e:
+            return RedirectResponse(f"/config?error={e}", status_code=303)
+        return RedirectResponse("/config", status_code=303)
 
     @app.post("/inbox/ack")
     def ack(inbox_id: str = Form("")):

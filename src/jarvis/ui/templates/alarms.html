@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}Alarms — Jarvis{% endblock %}
+{% block content %}
+
+{# Two halves, deliberately not one table. The top is a queue the user empties; the
+   bottom is the record of what the fleet spent and is MEANT to grow without ever being
+   acted on. Merged, the second would bury the first and the page would stop being read
+   — which is exactly how a cost alarm becomes wallpaper. §6.1 of
+   docs/superpowers/specs/2026-08-30-the-anatomy-of-a-turn.md. #}
+
+<p class="kv" style="margin-top:18px">
+  Turns the OS raised <em>while they were still costing money</em>, rather than on the
+  bill afterwards. Every 6th reconcile tick each running work order's transcript is read
+  — no model call — and a turn past its threshold, a subagent join open past the cache
+  TTL, or the conversation being sent again lands here and on the attention list.
+  <span class="counts">({{ live|length }} asking for you ·
+  {{ history|length }} on the record)</span>
+</p>
+
+<h2>Asking for you</h2>
+<div class="panel">
+  {% for g in live %}
+  <div class="msg" id="alarm-{{ g.wo_id }}">
+    <div class="who tone-warn">{{ g.project }} ·
+      <a href="/wo/{{ g.project }}/{{ g.wo_id }}" class="mono">{{ g.wo_id }}</a> ·
+      {{ g.status }} · {{ fmt_age(g.alarms[0].ts) }} ago</div>
+    <div style="margin:6px 0">{{ g.title }}</div>
+    <ul class="timeline" style="border-top:1px solid var(--line); margin-top:8px">
+      {% for a in g.alarms %}
+      <li><span class="tone-warn">{{ a.kind }}</span> · turn {{ a.seq }} ·
+        {{ fmt_ts(a.ts) }}
+        <span class="detail">{{ a.reason }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {# One button for the whole order, not one per alarm: the attention flag carries a
+       single sentence, so there was only ever one ask to answer. `back` returns the user
+       to this queue instead of the order's page — they are working through a list. #}
+    <form method="post" action="/wo/{{ g.project }}/{{ g.wo_id }}/ack" class="inline"
+          style="margin-top:10px">
+      <input type="hidden" name="back" value="alarms">
+      <button>✓ Acknowledge{% if g.alarms|length > 1 %} all {{ g.alarms|length }}{% endif %}</button>
+    </form>
+    <span class="sub" style="margin-left:10px">puts the flag down; the alarms stay on the
+      record below. The turn keeps running — stop it with
+      <span class="mono">jarvis wo cancel {{ g.wo_id }}</span>.</span>
+  </div>
+  {% else %}
+  <div class="empty">nothing is burning — no running turn is over its thresholds</div>
+  {% endfor %}
+</div>
+
+<h2>On the record</h2>
+<div class="panel">
+  <p class="kv">
+    Every alarm ever raised, acknowledged or not. This is the memory that keeps the alarm
+    quiet: one per turn per kind, matched against these rows rather than against the
+    attention flag, so acknowledging one does not bring the same sentence back on the next
+    tick.
+  </p>
+  <table>
+    <tr><th>when</th><th>project / wo</th><th>kind</th><th>turn</th><th>what it said</th></tr>
+    {% for a in history %}
+    <tr>
+      <td class="mono">{{ fmt_ts(a.ts) }}<div class="sub">{{ fmt_age(a.ts) }} ago</div></td>
+      <td class="mono" style="white-space:nowrap">{{ a.project }}<br>
+        <a href="/wo/{{ a.project }}/{{ a.wo_id }}">{{ a.wo_id }}</a></td>
+      <td class="mono">{{ a.kind }}
+        <div class="sub">{{ kinds.get(a.kind, '') }}</div></td>
+      <td class="mono">{{ a.seq if a.seq is not none else '—' }}</td>
+      <td>{{ a.reason }}
+        <div class="sub">{{ a.title }}{% if a.hidden %} · hidden{% endif %}</div></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="empty">no cost alarm has ever been raised</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+{% endblock %}

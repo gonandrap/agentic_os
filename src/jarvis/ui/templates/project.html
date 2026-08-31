@@ -7,18 +7,25 @@
    review, waiting on them), a running worker, a pull request waiting to be merged.
    Only work the OS has not started yet — pending, dispatching — collapses to a count,
    along with the settled orders that are the bulk of any project with history. Every
-   link carries the hidden flag through, so expanding a group does not silently undo
-   "show hidden too". #}
-{% set collapsed = '/project/' + project_name + ('?hidden=1' if show_hidden else '') %}
-{% set keep = '&hidden=1' if show_hidden else '' %}
-{% macro count_line(groups) %}
+   link carries the OTHER two flags through, so expanding one group does not silently
+   undo "show hidden too" or a revealed group of feature orders. #}
+{% set p_show = 'show=' + revealed if revealed else '' %}
+{% set p_fo = 'fo=' + fo_revealed if fo_revealed else '' %}
+{% macro purl(a='', b='', hidden=show_hidden) -%}
+  {%- set parts = [('hidden=1' if hidden else ''), a, b]|select|list -%}
+  /project/{{ project_name }}{{ '?' ~ parts|join('&') if parts }}
+{%- endmacro %}
+{# One macro for both lines: the work orders' and the feature orders' reveals are the
+   same control on different rows, and a copy is how two of them drift apart. #}
+{% macro count_line(groups, meta=status_meta, active=revealed, param='show',
+                    carry=p_fo, noun='work') %}
   {% for status, n in groups %}
-    {%- set word = status_meta.get(status, {}).get('word', status) -%}
-    {%- if revealed == status -%}
-      <strong>{{ n }} {{ word }}</strong> (<a href="{{ collapsed }}">collapse</a>)
+    {%- set word = meta.get(status, {}).get('word', status) -%}
+    {%- if active == status -%}
+      <strong>{{ n }} {{ word }}</strong> (<a href="{{ purl(carry) }}">collapse</a>)
     {%- else -%}
-      <a href="/project/{{ project_name }}?show={{ status }}{{ keep }}"
-         title="Show the {{ n }} {{ word }} work order(s) as well">{{ n }} {{ word }}</a>
+      <a href="{{ purl(carry, param + '=' + status) }}"
+         title="Show the {{ n }} {{ word }} {{ noun }} order(s) as well">{{ n }} {{ word }}</a>
     {%- endif -%}
     {{ ' · ' if not loop.last }}
   {% endfor %}
@@ -28,27 +35,39 @@
   {{ count_line(open_counts + settled) }}
   ·
   {% if revealed == 'all' %}
-    <a href="{{ collapsed }}">collapse them again</a>
+    <a href="{{ purl(p_fo) }}">collapse them again</a>
   {% else %}
-    <a href="/project/{{ project_name }}?show=all{{ keep }}">show all</a>
+    <a href="{{ purl(p_fo, 'show=all') }}">show all</a>
   {% endif %}
 </p>
 {% endif %}
 <p class="sub">
   {% if show_hidden %}
     Showing hidden work orders too ·
-    <a href="/project/{{ project_name }}{{ '?show=' + revealed if revealed }}">hide them again</a>
+    <a href="{{ purl(p_show, p_fo, hidden=false) }}">hide them again</a>
   {% elif hidden_count %}
     {{ hidden_count }} hidden ·
-    <a href="/project/{{ project_name }}?hidden=1{{ '&show=' + revealed if revealed }}">show</a>
+    <a href="{{ purl(p_show, p_fo, hidden=true) }}">show</a>
   {% endif %}
 </p>
 {# Feature orders sit ABOVE the work orders and do not expand into their children here:
    the children are already in the listing below as ordinary work orders, and printing
    the same tree twice on one page is how a page stops being read. The tree is on the
-   feature's own page. #}
-{% if features %}
+   feature's own page. Settled ones collapse to a count of their own, on the `fo` param
+   rather than `show` — see the project route for why the two cannot share one. #}
+{% if features or fo_settled %}
 <h3>Feature orders</h3>
+{% if fo_settled %}
+<p class="sub">
+  {{ count_line(fo_settled, fo_status_meta, fo_revealed, 'fo', p_show, 'feature') }}
+  ·
+  {% if fo_revealed == 'all' %}
+    <a href="{{ purl(p_show) }}">collapse them again</a>
+  {% else %}
+    <a href="{{ purl(p_show, 'fo=all') }}">show all</a>
+  {% endif %}
+</p>
+{% endif %}
 <div class="panel">
   {% for fo in features %}
     {% set fm = fo_status_meta.get(fo.status, {'word': fo.status, 'icon': '•', 'tone': 'muted'}) %}
