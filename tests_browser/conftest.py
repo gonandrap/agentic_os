@@ -26,6 +26,17 @@ pytest.importorskip("uvicorn")
 from playwright.sync_api import sync_playwright  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def not_a_worker(monkeypatch):
+    """The suite is routinely run BY a worker, and `ops.set_config` refuses one.
+
+    Autouse here rather than named per test: the UI server runs in a thread of THIS
+    process, so a leftover `JARVIS_WO_ID` locks out the page's own write path too, not
+    just the fixture's setup. Same trap as tests/test_config_console.py (kn-650b6f24).
+    """
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
+
+
 @pytest.fixture(scope="session")
 def browser():
     with sync_playwright() as pw:
