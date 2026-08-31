@@ -374,8 +374,14 @@ def test_an_upgrade_that_moves_nothing_writes_nothing(daemon, catalog_file):
 
 
 def test_a_rebased_head_is_neither_drift_nor_something_to_adopt(daemon, catalog_file):
-    """The trap in option (a): both readers compare DOCUMENTS. An id comparison would
-    report permanent drift, and re-adopt, on a file nobody has touched."""
+    """The trap in option (a): every reader compares DOCUMENTS. An id comparison would
+    report permanent drift, and re-adopt, on a file nobody has touched.
+
+    There are THREE of them, not the two this test was written with: `config_show` is
+    what the `/config` page and `jarvis config show` read `drift` off, and it was still
+    comparing ids — so an upgrade that moved a default opened the console on a warning
+    about a hand edit nobody had made.
+    """
     central = CentralStore()
     central.set_state("catalog_path", str(catalog_file))
     central.close()
@@ -384,6 +390,7 @@ def test_a_rebased_head_is_neither_drift_nor_something_to_adopt(daemon, catalog_
 
     assert drift() == []
     assert ops.adopt_config()["adopted"] is False
+    assert ops.config_show()["drift"] is False
 
 
 def test_a_head_this_build_cannot_parse_is_skipped(daemon, catalog_file):

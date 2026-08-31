@@ -225,6 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("project", nargs="?", help="one project (default: the whole fleet)")
     sp.add_argument("--limit", type=int, default=50,
                     help="alarms to show (default: 50)")
+    sp.add_argument("--wo", help="one work order's alarms, with their ids")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
@@ -936,6 +937,23 @@ def _print_turn_table(res: dict) -> None:
         print(f"\n{line}")
 
 
+def _rewrite_cause(share: float | None, ttl_boundaries: int, boundaries: int) -> str:
+    """The half-sentence saying WHICH of the two cold-boundary causes this tax was.
+
+    Shared by both cost renderers because the number is only actionable with its cause
+    attached: the prefix half is bought back by keeping the prefix still, the TTL half by
+    a longer TTL, and reporting one total invites spending on the wrong one. Findings:
+    docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
+    """
+    if share is None:
+        return ""
+    prefix = boundaries - ttl_boundaries
+    return (f" {share:.0%} of it was the cache entry EXPIRING ({ttl_boundaries} "
+            f"boundar{'ies' if ttl_boundaries != 1 else 'y'}, the part a longer TTL "
+            f"would buy back); the other {1 - share:.0%} was the prompt PREFIX moving "
+            f"({prefix} boundar{'ies' if prefix != 1 else 'y'}), which no TTL can help.")
+
+
 def _print_write_ttl(totals: dict) -> None:
     """What the fleet paid to WRITE to the prompt cache, and at which of the two rates.
 
@@ -1186,7 +1204,10 @@ def _print_bill(bill: dict) -> None:
               f"boundar{'ies' if rewrite['boundaries'] != 1 else 'y'}. "
               f"Not an extra charge: it is the "
               f"part of the cache-write line above that paid to send context a warm "
-              f"cache would have served at a tenth of the price.")
+              f"cache would have served at a tenth of the price."
+              + _rewrite_cause(rewrite.get("ttl_share"),
+                               rewrite.get("ttl_boundaries") or 0,
+                               rewrite["boundaries"]))
     subagents = bill.get("subagents") or {}
     if subagents.get("count"):
         print(f"{subagents['count']} subagent(s), ~${subagents['list_usd']:.2f}, "
@@ -1316,18 +1337,23 @@ def cmd_alarms(args: argparse.Namespace) -> int:
     """
     from . import ops
 
-    rows = ops.list_cost_alarms(args.project, limit=args.limit)
+    rows = ops.list_cost_alarms(args.project, limit=args.limit, wo_id=args.wo)
     if args.json:
         _print(rows, True)
         return 0
     if not rows:
-        print("no cost alarm has ever been raised")
+        print(f"no cost alarm has ever been raised against {args.wo}" if args.wo
+              else "no cost alarm has ever been raised")
         return 0
     live = [r for r in rows if r["live"]]
     print(f"{len(live)} asking for you · {len(rows) - len(live)} on the record\n")
     for row in rows:
         mark = "!" if row["live"] else " "
-        print(f"{mark} {row['wo_id']}  {row['project']}  {row['kind']}  "
+        # The id only on the read that asked for one order: §1 of
+        # docs/superpowers/specs/2026-08-31-the-supervisor.md wants every surface that
+        # reads alarms today to render exactly as it does today.
+        who = f"{row['id']}  " if args.wo else f"{row['wo_id']}  {row['project']}  "
+        print(f"{mark} {who}{row['kind']}  "
               f"turn {row['seq']}  {_age(row['ts'])} ago")
         print(f"    {row['reason']}")
     if live:
@@ -1405,6 +1431,11 @@ def cmd_cost(args: argparse.Namespace) -> int:
         print(f"  re-write tax  ~${totals['rewrite_cost_usd']:.2f} — "
               f"{_tok(totals['rewrite_excess'])} tokens re-sent across "
               f"{totals['resume_boundaries']} turn boundaries")
+        cause = _rewrite_cause(totals.get("rewrite_ttl_share"),
+                               totals.get("boundaries_ttl") or 0,
+                               totals["resume_boundaries"])
+        if cause:
+            print(f"               {cause.strip()}")
     if totals["subagent_cost_usd"]:
         print(f"  subagents     ~${totals['subagent_cost_usd']:.2f}")
     _print_write_ttl(totals)

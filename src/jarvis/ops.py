@@ -3481,11 +3481,18 @@ def config_show(project: str | None = None, version: str | None = None,
         central.close()
     live_id = config_version.version_id(document)
     in_scope = _in_scope(resolved, project)
+    # DOCUMENTS, not ids — the third reader of this comparison, and it was the odd one
+    # out: a release-rebase row is addressed by document AND build (§6.1), so an id
+    # comparison reports drift for ever after an upgrade that moved a default, on a
+    # file nobody has touched. `invariants.check_config_drift` and `adopt_config` both
+    # say so in as many words; this one quietly disagreed with them.
+    drift = head is None or config_version.canonicalise(
+        head["document"]) != config_version.canonicalise(document)
     return {"source": "file", "catalog": str(file), "project": project,
             "resolved": in_scope, "version": head,
             "file_version": live_id,
             "written": _written_paths(document, in_scope),
-            "drift": head is None or head["id"] != live_id}
+            "drift": drift}
 
 
 def config_history(project: str | None = None,
@@ -3946,7 +3953,10 @@ def _unit_row(name: str, wo: dict[str, Any], index: dict[str, list[Path]],
     """
     from . import usage as usage_mod
 
-    session = usage_mod.read_session(wo.get("session_id") or "", index=index)
+    from .bill import _cold_prefix_floor
+
+    session = usage_mod.read_session(wo.get("session_id") or "", _cold_prefix_floor(),
+                                     index=index)
     total = session.total
     provenance, recorded, settled, rec_totals = _turn_summary(list(turn_rows))
     os_groups_only, subproc_groups = _partition_calls(list(os_groups))
@@ -4327,20 +4337,20 @@ def inspect_report(target: str, project: str | None = None, *,
             "join_floor": cfg.report_join_floor, "units": units}
 
 
-def list_cost_alarms(project_name: str | None = None, limit: int = 200
-                     ) -> list[dict[str, Any]]:
+def list_cost_alarms(project_name: str | None = None, limit: int = 200,
+                     wo_id: str | None = None) -> list[dict[str, Any]]:
     """Every turn the OS raised WHILE it was burning, newest first, across the fleet.
 
-    The alarm's memory is the `cost_alarm` timeline event, not the attention flag —
-    `jarvis wo ack` puts the flag down and the event stays (§6.1 of
-    docs/superpowers/specs/2026-08-30-the-anatomy-of-a-turn.md). So this reads the
-    events: acking is meant to clear the ASK, and it must not erase the record of what
-    the fleet spent.
+    Read off `wo_alarms` rows since §1 of
+    docs/superpowers/specs/2026-08-31-the-supervisor.md; the `cost_alarm` event it used
+    to read is still written, and is still the raise's dedupe memory. The row is what
+    carries an identity, so an alarm can be linked to, claimed and answered.
 
-    `live` is the one derived field: whether this alarm's work order is still asking for
-    the user. It is a property of the ORDER, not of the event, which is why several
-    alarms on one order share it — one ack answers all of them, and the page has to be
-    able to say so rather than offering four buttons that do the same thing.
+    Acking clears the ASK and must not erase the record of what the fleet spent, so
+    `live` stays the one derived field: whether this alarm's WORK ORDER is still asking
+    for the user, never `alarm_status`. That is why several alarms on one order share it
+    — one ack answers all of them, and the page has to be able to say so rather than
+    offering four buttons that do the same thing.
     """
     paths = registered_project_paths()
     if project_name:
@@ -4353,11 +4363,10 @@ def list_cost_alarms(project_name: str | None = None, limit: int = 200
             continue
         store = ProjectStore(path)
         try:
-            rows = store.events_across("cost_alarm", limit=limit)
+            rows = store.alarms_across(limit=limit, wo_id=wo_id)
         finally:
             store.close()
         for row in rows:
-            payload = db.from_json(row["payload"], {}) or {}
             out.append({
                 "project": name,
                 "wo_id": row["wo_id"],
@@ -4365,10 +4374,16 @@ def list_cost_alarms(project_name: str | None = None, limit: int = 200
                 "status": row["status"],
                 "hidden": bool(row["hidden"]),
                 "ts": row["ts"],
-                "kind": payload.get("kind") or "unknown",
-                "seq": payload.get("seq"),
-                "reason": payload.get("reason") or "",
+                "kind": row["kind"],
+                "seq": row["seq"],
+                "reason": row["reason"],
                 "live": bool(row["needs_attention"]),
+                "id": row["id"],
+                "alarm_status": row["alarm_status"],
+                "verdict": row["verdict"],
+                "note": row["note"],
+                "review_status": row["review_status"],
+                "neo_question_id": row["neo_question_id"],
             })
     out.sort(key=lambda r: r["ts"], reverse=True)
     return out[:limit]
