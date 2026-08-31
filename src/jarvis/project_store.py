@@ -1228,6 +1228,27 @@ class ProjectStore:
             (wo_id, kind)).fetchall()
         return db.rows_to_dicts(rows)
 
+    def events_across(self, kind: str, limit: int = 200) -> list[dict[str, Any]]:
+        """Every event of ONE kind in the project, NEWEST first, with its work order.
+
+        `events_of_kind` answers "what happened to this order". A fleet-wide review
+        surface asks the opposite question, and without this it would have to read
+        every work order to find the handful that carry the event at all.
+
+        The work-order columns come along because the row is unreadable without them:
+        an alarm is about a title and a status, not about an id. Hidden orders are
+        included and marked — hiding takes an order out of the listings that compete
+        for attention, and this page is the record of what it cost, not a listing.
+        """
+        rows = self.conn.execute(
+            "SELECT e.ts AS ts, e.kind AS kind, e.payload AS payload,"
+            " w.id AS wo_id, w.title AS title, w.status AS status,"
+            " w.hidden AS hidden, w.needs_attention AS needs_attention,"
+            " w.attention_reason AS attention_reason"
+            " FROM wo_events e JOIN work_orders w ON w.id = e.wo_id"
+            " WHERE e.kind=? ORDER BY e.ts DESC LIMIT ?", (kind, limit)).fetchall()
+        return db.rows_to_dicts(rows)
+
     def _this_conflict(self, wo_id: str, kind: str) -> int:
         """Events of `kind` since the last `pr_conflict_cleared` — this EPISODE's.
 

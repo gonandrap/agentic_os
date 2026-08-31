@@ -3,6 +3,9 @@
 Grouped commands:
   jarvis start|stop|status|adopt          OS lifecycle
   jarvis cost [project|wo-id|fo-id]       what the work has cost in tokens
+  jarvis inspect <wo-id|fo-id>            where its TIME went, and which cache writes
+                                          were a defect rather than the cache expiring
+  jarvis alarms [project]                 turns raised WHILE they were still burning
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
   jarvis fo create|list|show|plan|submit|approve|cancel feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
@@ -158,6 +161,10 @@ class _VersionAction(argparse.Action):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # A leaf module with no store or CLI dependency, so importing it here costs nothing
+    # and lets `--help` state the shipped defaults rather than repeating their values.
+    from . import catalog
+
     p = argparse.ArgumentParser(prog="jarvis", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--json", action="store_true", help="machine-readable output")
@@ -192,6 +199,32 @@ def build_parser() -> argparse.ArgumentParser:
                          "(default: the whole fleet)")
     sp.add_argument("--limit", type=int, default=50,
                     help="work orders per project to measure (default: 50)")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser(
+        "inspect",
+        help="where an order's TIME went: generating, blocked or running tools — and "
+             "which cache writes were a defect rather than the cache expiring",
+    )
+    sp.add_argument("target", help="a work-order id or a feature-order id")
+    sp.add_argument("--project")
+    sp.add_argument("--writes-over", type=int, metavar="TOKENS",
+                    help="classify cache writes at or above this size, for this run "
+                         "only (default: the project's os.inspect.report_write_floor, "
+                         f"{catalog.DEFAULT_INSPECT_REPORT_WRITE_FLOOR:,})")
+    sp.add_argument("--joins-over", type=int, metavar="SECONDS",
+                    help="list blocking joins at or above this long, for this run only "
+                         "(default: the project's os.inspect.report_join_floor, "
+                         f"{catalog.DEFAULT_INSPECT_REPORT_JOIN_FLOOR})")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser(
+        "alarms",
+        help="turns the OS raised WHILE they were still costing money, newest first",
+    )
+    sp.add_argument("project", nargs="?", help="one project (default: the whole fleet)")
+    sp.add_argument("--limit", type=int, default=50,
+                    help="alarms to show (default: 50)")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
@@ -1163,6 +1196,143 @@ def _print_bill(bill: dict) -> None:
         print(f"\n⚠ {note}")
     print(f"\nEvery figure above is {bill['floor_reason']}.")
     print("List prices, as a common unit for comparing token kinds — not a bill.")
+
+
+#: Above this many seconds a duration reads better in minutes. Presentation only — it
+#: changes no measurement and nothing branches on it, which is why it is a constant here
+#: rather than a setting in `catalog.InspectConfig` beside the thresholds that do.
+MINUTES_OVER_SECONDS = 90
+
+#: Width of the rule under a unit's heading, so a long work-order title does not draw a
+#: line past the edge of a standard terminal.
+RULE_WIDTH = 78
+
+
+def _mins(seconds: float) -> str:
+    """Durations at the magnitude a reader can hold in their head, like `_tok`."""
+    if seconds >= MINUTES_OVER_SECONDS:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds:.1f}s"
+
+
+#: What each bucket of the partition is called on the page. `idle` says what it is
+#: rather than naming itself: "idle" alone reads as a judgement about the worker, and
+#: what happened is that no process existed to be busy.
+PART_LABELS = {"generating": "generating", "blocked": "blocked on a subagent",
+               "tools": "running tools", "idle": "between turns, nothing running"}
+
+
+def _print_partition(unit: dict[str, Any]) -> None:
+    part, share = unit["partition"], unit["share"]
+    print(f"  wall clock {_mins(part['wall'])}, peak context {_tok(unit['context_peak'])}")
+    for name in PART_LABELS:
+        print(f"    {share[name] * 100:>4.0f}%  {_mins(part[name]):>8}  "
+              f"{PART_LABELS[name]}")
+
+
+def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
+    """One session taken apart, in the order the questions get asked.
+
+    The partition first because it is the headline, then the turns it is made of, then
+    the three lists that explain the two expensive slices — what the blocked time was
+    waiting for, what the tokens were re-sent for, and what the tool time was doing.
+    """
+    head = f"{unit['wo_id']} — {unit['title']}"
+    print(f"{head}\n{'-' * min(len(head), RULE_WIDTH)}")
+    if not unit["found"]:
+        # The same answer `jarvis cost` gives, and for the same reason: Claude Code
+        # prunes transcripts on its own schedule, and an unmeasurable clock is not a
+        # zero one.
+        print("  no transcript — nothing to measure")
+        return
+
+    _print_partition(unit)
+    ttl = unit["cache_ttl"]
+    # §1 step 1 of the method: the re-write tax and the TTL split are read BEFORE the
+    # clock is partitioned, because they say whether the waiting below was paid for
+    # twice. `1h: 0` is the finding of §3.2 and no surface stated it until now.
+    print(f"  re-written {_tok(unit['rewrite_excess'])} tokens · cache writes bought at "
+          f"5m {_tok(ttl['cache_5m'])}, 1h {_tok(ttl['cache_1h'])}"
+          + (f", unknown {_tok(ttl['unknown'])}" if ttl["unknown"] else ""))
+
+    print()
+    for turn in unit["turns"]:
+        reasons = ", ".join(t["kind"] for t in turn["triggers"]) or "no prompt recorded"
+        s = turn["share"]
+        print(f"  turn {turn['seq']:>2}  {_mins(turn['wall']):>7}  "
+              f"gen {s['generating'] * 100:>3.0f}%  blocked {s['blocked'] * 100:>3.0f}%  "
+              f"tools {s['tools'] * 100:>3.0f}%  idle {s['idle'] * 100:>3.0f}%  "
+              f"{turn['api_calls']:>3} calls  peak {_tok(turn['context_peak']):>5}  "
+              f"{reasons}")
+        for trigger in turn["triggers"]:
+            print(f"           ↳ {trigger['quote']}")
+
+    if unit["joins"]:
+        print("\n  blocked on:")
+        for span in unit["joins"]:
+            print(f"    {_mins(span['seconds']):>8}  {span['detail'] or span['tool_id']}")
+
+    print(f"\n  cache writes over {write_floor:,} tokens:")
+    if not unit["writes"]:
+        print("    none — nothing was re-sent at that size")
+    for write in unit["writes"]:
+        gap = "—" if write["cause"] == "cold-start" else _mins(write["gap"])
+        print(f"    {_tok(write['written']):>7} written, {_tok(write['read']):>7} read, "
+              f"{gap:>7} since the last call   {write['cause']}")
+        print(f"            {write['note']}")
+
+    if unit["tools"]:
+        print("\n  tools:")
+        for row in unit["tools"]:
+            plural = "call " if row["calls"] == 1 else "calls"
+            print(f"    {row['name']:<14}{row['calls']:>4} {plural}  "
+                  f"{_mins(row['seconds']):>8} total  {_mins(row['mean']):>7} mean")
+
+
+def cmd_inspect(args: argparse.Namespace) -> int:
+    from . import ops
+
+    res = ops.inspect_report(args.target, args.project,
+                             write_floor=args.writes_over, join_floor=args.joins_over)
+    if args.json:
+        _print(res, True)
+        return 0
+    # A feature order is many units and needs a line saying which feature they are; a
+    # work order IS the unit, and repeating its title above itself is noise.
+    if len(res["units"]) != 1 or res["units"][0]["wo_id"] != res["scope"]:
+        print(f"{res['scope']} — {res['title']}\n")
+    for index, unit in enumerate(res["units"]):
+        if index:
+            print()
+        _print_anatomy(unit, res["write_floor"])
+    return 0
+
+
+def cmd_alarms(args: argparse.Namespace) -> int:
+    """The dashboard's `/alarms` page in the terminal — the CLI is the OS.
+
+    Live ones first, because they are the only rows that are an ask; the rest are the
+    record and are meant to be long. `jarvis wo ack` is what answers one.
+    """
+    from . import ops
+
+    rows = ops.list_cost_alarms(args.project, limit=args.limit)
+    if args.json:
+        _print(rows, True)
+        return 0
+    if not rows:
+        print("no cost alarm has ever been raised")
+        return 0
+    live = [r for r in rows if r["live"]]
+    print(f"{len(live)} asking for you · {len(rows) - len(live)} on the record\n")
+    for row in rows:
+        mark = "!" if row["live"] else " "
+        print(f"{mark} {row['wo_id']}  {row['project']}  {row['kind']}  "
+              f"turn {row['seq']}  {_age(row['ts'])} ago")
+        print(f"    {row['reason']}")
+    if live:
+        print("\nack one with: jarvis wo ack <wo-id>")
+    return 0
 
 
 def cmd_cost(args: argparse.Namespace) -> int:
@@ -2368,6 +2538,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_doctor(args)
         if args.cmd == "cost":
             return cmd_cost(args)
+        if args.cmd == "inspect":
+            return cmd_inspect(args)
+        if args.cmd == "alarms":
+            return cmd_alarms(args)
         if args.cmd == "adopt":
             return cmd_adopt(args)
         if args.cmd == "wo":
