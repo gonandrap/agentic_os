@@ -871,6 +871,11 @@ def create_app() -> FastAPI:
         Acking is per WORK ORDER, not per alarm, and the page groups the live half that
         way — one order with three alarms is one decision. That is not a shortcut: the
         attention flag carries one sentence, so there was never more than one ask.
+
+        The middle half comes from its own read rather than being filtered out of
+        `rows`: the supervisor's reasoning and Neo's advice are not in the frozen
+        `list_cost_alarms` dict, and widening that dict is what four sibling surfaces
+        bind against. See `ops.alarm_review_queue`.
         """
         rows = ops.list_cost_alarms()
         live: dict[str, dict] = {}
@@ -879,8 +884,24 @@ def create_app() -> FastAPI:
             group["alarms"].append(a)
         return render(request, "alarms.html", active="alarms",
                       live=list(live.values()),
+                      review_queue=ops.alarm_review_queue(),
                       history=[r for r in rows if not r["live"]],
                       kinds=ALARM_KINDS)
+
+    @app.get("/alarms/{project}/{alarm_id}", response_class=HTMLResponse)
+    def alarm_page(request: Request, project: str, alarm_id: str):
+        """One alarm — where the work order's timeline and a Neo escalation both link.
+
+        `/alarms` is a list with no anchor, so pointing a "review it →" at it opens on
+        whichever row sorts first; that shipped once on `/neo` and came back as two bug
+        reports. §5 of docs/superpowers/specs/2026-08-31-the-supervisor.md.
+        """
+        try:
+            alarm = ops.alarm_detail(alarm_id, project_name=project)
+        except ops.OpsError as e:
+            return render(request, "error.html", active="alarms",
+                          message=str(e), status_code=404)
+        return render(request, "alarm.html", active="alarms", a=alarm)
 
     @app.get("/api/status")
     def api_status():
@@ -1008,12 +1029,15 @@ def create_app() -> FastAPI:
             return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
         return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
 
-    def _neo_back(next: str, fallback: str, error: str = "") -> str:
-        """Where a Neo decision returns the reader — the page they decided from, or the
-        `/neo` tab the decision belongs to. Same-site paths only, as in `decide_gate`: a
-        form field is attacker-settable and an open redirect is not worth the
-        convenience. The error flash rides in the query, which has to precede the tab
-        fragment or the browser reads it as part of the fragment.
+    def _same_site_back(next: str, fallback: str, error: str = "") -> str:
+        """Where a decision returns the reader — the page they decided from, or the
+        surface's own fallback. Same-site paths only, as in `decide_gate`: a form field
+        is attacker-settable and an open redirect is not worth the convenience. The
+        error flash rides in the query, which has to precede the tab fragment or the
+        browser reads it as part of the fragment.
+
+        Was `_neo_back`; the alarm review needs exactly this and a second copy of a
+        redirect guard is how one of the two comes to be the lax one.
         """
         back = next if next.startswith("/") and not next.startswith("//") else fallback
         if not error:
@@ -1028,18 +1052,32 @@ def create_app() -> FastAPI:
             ops.neo_review(question_id, approved=(decision == "approve"),
                            feedback=feedback)
         except ops.OpsError as e:
-            return RedirectResponse(_neo_back(next, "/neo#tab-review", str(e)),
+            return RedirectResponse(_same_site_back(next, "/neo#tab-review", str(e)),
                                     status_code=303)
-        return RedirectResponse(_neo_back(next, "/neo#tab-review"), status_code=303)
+        return RedirectResponse(_same_site_back(next, "/neo#tab-review"), status_code=303)
 
     @app.post("/neo/{question_id}/answer")
     def neo_answer(question_id: int, text: str = Form(...), next: str = Form("")):
         try:
             ops.neo_answer_escalated(question_id, text)
         except ops.OpsError as e:
-            return RedirectResponse(_neo_back(next, "/neo#tab-escalated", str(e)),
+            return RedirectResponse(_same_site_back(next, "/neo#tab-escalated", str(e)),
                                     status_code=303)
-        return RedirectResponse(_neo_back(next, "/neo#tab-escalated"), status_code=303)
+        return RedirectResponse(_same_site_back(next, "/neo#tab-escalated"), status_code=303)
+
+    @app.post("/alarms/{project}/{alarm_id}/review")
+    def alarm_review(project: str, alarm_id: str, decision: str = Form(...),
+                     feedback: str = Form(""), next: str = Form("")):
+        """The user's verdict on the supervisor's. Same shape as `neo_review` above,
+        and the same guard on `next`."""
+        fallback = f"/alarms/{project}/{alarm_id}"
+        try:
+            ops.review_alarm(alarm_id, approved=(decision == "approve"),
+                             feedback=feedback, project_name=project)
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, fallback, str(e)),
+                                    status_code=303)
+        return RedirectResponse(_same_site_back(next, fallback), status_code=303)
 
     @app.post("/neo/learn")
     def neo_learn(content: str = Form(...), project: str = Form("")):

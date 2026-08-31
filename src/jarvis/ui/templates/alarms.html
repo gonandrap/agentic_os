@@ -1,12 +1,15 @@
 {% extends "base.html" %}
+{% from "_alarm.html" import verdict_body, review_form %}
 {% block title %}Alarms — Jarvis{% endblock %}
 {% block content %}
 
-{# Two halves, deliberately not one table. The top is a queue the user empties; the
-   bottom is the record of what the fleet spent and is MEANT to grow without ever being
-   acted on. Merged, the second would bury the first and the page would stop being read
-   — which is exactly how a cost alarm becomes wallpaper. §6.1 of
-   docs/superpowers/specs/2026-08-30-the-anatomy-of-a-turn.md. #}
+{# Three halves, deliberately not one table. The top is a queue the user empties, the
+   middle is what the supervisor already answered on their behalf, and the bottom is the
+   record of what the fleet spent and is MEANT to grow without ever being acted on.
+   Merged, the last would bury the first two and the page would stop being read — which
+   is exactly how a cost alarm becomes wallpaper. §6.1 of
+   docs/superpowers/specs/2026-08-30-the-anatomy-of-a-turn.md, §5 of
+   docs/superpowers/specs/2026-08-31-the-supervisor.md. #}
 
 <p class="kv" style="margin-top:18px">
   Turns the OS raised <em>while they were still costing money</em>, rather than on the
@@ -14,6 +17,7 @@
   — no model call — and a turn past its threshold, a subagent join open past the cache
   TTL, or the conversation being sent again lands here and on the attention list.
   <span class="counts">({{ live|length }} asking for you ·
+  {{ review_queue|length }} awaiting your feedback ·
   {{ history|length }} on the record)</span>
 </p>
 
@@ -28,7 +32,8 @@
     <ul class="timeline" style="border-top:1px solid var(--line); margin-top:8px">
       {% for a in g.alarms %}
       <li><span class="tone-warn">{{ a.kind }}</span> · turn {{ a.seq }} ·
-        {{ fmt_ts(a.ts) }}
+        {{ fmt_ts(a.ts) }} ·
+        <a href="/alarms/{{ a.project }}/{{ a.id }}" class="mono">{{ a.id }}</a>
         <span class="detail">{{ a.reason }}</span>
       </li>
       {% endfor %}
@@ -50,6 +55,30 @@
   {% endfor %}
 </div>
 
+{# Absent entirely when it is empty, rather than an empty panel: with the supervisor off
+   — which is how it ships — this half never has a row, and a permanent empty box on the
+   page teaches the reader to skip the region where the asks appear. #}
+{% if review_queue %}
+<h2>Addressed by the supervisor, awaiting your feedback</h2>
+<div class="panel">
+  <p class="kv">
+    The supervisor read these turns and answered them for you. Nothing here is blocking
+    — it is asking whether it called them right, and a correction is what changes the
+    next one.
+  </p>
+  {% for a in review_queue %}
+  <div class="msg" id="alarm-{{ a.id }}">
+    {{ verdict_body(a) }}
+    <div class="sub" style="margin-top:6px">
+      <a href="/alarms/{{ a.project }}/{{ a.id }}" class="mono">{{ a.id }} →</a></div>
+    {# `back` is this queue, not the alarm's own page: the reader is working through a
+       list, the same reasoning as the ack button above. #}
+    {{ review_form(a, '/alarms') }}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
 <h2>On the record</h2>
 <div class="panel">
   <p class="kv">
@@ -59,7 +88,8 @@
     tick.
   </p>
   <table>
-    <tr><th>when</th><th>project / wo</th><th>kind</th><th>turn</th><th>what it said</th></tr>
+    <tr><th>when</th><th>project / wo</th><th>kind</th><th>turn</th><th>what it said</th>
+      <th>supervisor</th><th>you</th></tr>
     {% for a in history %}
     <tr>
       <td class="mono">{{ fmt_ts(a.ts) }}<div class="sub">{{ fmt_age(a.ts) }} ago</div></td>
@@ -68,11 +98,13 @@
       <td class="mono">{{ a.kind }}
         <div class="sub">{{ kinds.get(a.kind, '') }}</div></td>
       <td class="mono">{{ a.seq if a.seq is not none else '—' }}</td>
-      <td>{{ a.reason }}
+      <td><a href="/alarms/{{ a.project }}/{{ a.id }}">{{ a.reason }}</a>
         <div class="sub">{{ a.title }}{% if a.hidden %} · hidden{% endif %}</div></td>
+      <td class="mono">{{ a.verdict or a.alarm_status }}</td>
+      <td class="mono">{{ '—' if a.review_status == 'unreviewed' else a.review_status }}</td>
     </tr>
     {% else %}
-    <tr><td colspan="5" class="empty">no cost alarm has ever been raised</td></tr>
+    <tr><td colspan="7" class="empty">no cost alarm has ever been raised</td></tr>
     {% endfor %}
   </table>
 </div>

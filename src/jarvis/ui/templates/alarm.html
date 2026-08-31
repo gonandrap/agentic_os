@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% from "_alarm.html" import verdict_body, review_form, review_standing %}
+{% block title %}{{ a.id }} — Jarvis{% endblock %}
+{% block content %}
+
+{# ONE alarm, in full — the anchor `/alarms` cannot be. A list has no per-row identity,
+   so a "review it →" link into one opens on whichever row happens to be first; `/neo`
+   was exactly this and the user reported it as two bugs. The work order's timeline and
+   a Neo escalation's inbox line both point here. §5 of
+   docs/superpowers/specs/2026-08-31-the-supervisor.md. #}
+
+<h2><a href="/alarms">alarms</a> / <span class="mono">{{ a.id }}</span></h2>
+
+<div class="panel" style="padding: 14px 16px;">
+  {{ verdict_body(a) }}
+</div>
+
+<h2>Your review</h2>
+<div class="panel" style="padding: 14px 16px;">
+  {% if a.review_status != 'unreviewed' %}
+  {{ review_standing(a) }}
+  {% elif a.verdict %}
+  <p class="kv" style="margin-bottom:0">Was that the right call? Approving teaches the
+    supervisor nothing new; correcting it is how the next one goes differently.</p>
+  {{ review_form(a, '/alarms/' ~ a.project ~ '/' ~ a.id) }}
+  {% else %}
+  <div class="empty">nothing to review yet — the supervisor has not decided this alarm
+    ({{ a.alarm_status }})</div>
+  {% endif %}
+</div>
+
+{% endblock %}
