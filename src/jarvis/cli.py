@@ -715,8 +715,9 @@ def build_parser() -> argparse.ArgumentParser:
     n = ne.add_parser("learnings", help="what Neo has learned from your reviews")
     n.add_argument("--project", default="")
     n.add_argument("--seat", metavar="NAME", default="",
-                   help="also show learnings scoped to this panel seat (global rows "
-                        "alone are shown without it)")
+                   help="also show learnings scoped to this seat — a panel seat, or "
+                        "`supervisor` for what your alarm reviews have taught the "
+                        "supervisor (global rows alone are shown without it)")
     n.add_argument("--json", action="store_true", help="machine-readable output")
     n = ne.add_parser("export", help="Neo's whole ledger as one document: every "
                                      "question, learning and panel opinion")

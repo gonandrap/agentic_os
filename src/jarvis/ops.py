@@ -2639,16 +2639,23 @@ def neo_export() -> dict[str, list[dict[str, Any]]]:
 
 
 def validate_seat(seat: str) -> None:
-    """Refuse a seat name the panel does not have, BEFORE anything is written.
+    """Refuse a seat name no learning may carry, BEFORE anything is written.
 
     An unknown seat is a typo, and a typo that is accepted writes a learning into a
     prefix no seat will ever read — invisible, and indistinguishable from the lesson
     having been lost.
-    """
-    from .neo_store import SEATS
 
-    if seat and seat not in SEATS:
-        raise OpsError(f"unknown panel seat {seat!r} — the seats are: {', '.join(SEATS)}")
+    `LEARNING_SCOPES`, not `SEATS`: the supervisor scopes its learnings by the same
+    column without being a panel seat, and `SEATS` is what a catalog roster is parsed
+    against. `neo_review` still refuses `--seat supervisor` — the supervisor never opines
+    on a Neo question, so its existing "did this seat see the question" check catches it,
+    and with a message that says which seats did.
+    """
+    from .neo_store import LEARNING_SCOPES
+
+    if seat and seat not in LEARNING_SCOPES:
+        raise OpsError(f"unknown seat {seat!r} — the seats are: "
+                       f"{', '.join(LEARNING_SCOPES)}")
 
 
 def neo_review(question_id: int, approved: bool, feedback: str = "",
@@ -4561,7 +4568,8 @@ def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
     on, and an alarm review corrects the supervisor about a turn the worker was never
     told anything about.
     """
-    from .neo_store import NeoStore
+    from . import supervisor
+    from .neo_store import SUPERVISOR_SEAT, NeoStore
 
     # Every refusal ahead of the first write, as in `neo_review`: a rejected review
     # leaves the row untouched rather than half-applied.
@@ -4581,20 +4589,33 @@ def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
     finally:
         store.close()
 
-    # THE CLOSE SITE NOBODY ELSE OWNS. An escalated alarm holds an open Neo question;
-    # the user deciding the alarm here IS its answer, and leaving it open would go on
-    # asking them for a ruling they have just given. `supersede` is guarded on the
-    # question still being open, so a real verdict is never overwritten.
     closed = False
-    if row["neo_question_id"]:
+    if not approved or row["neo_question_id"]:
         neo = NeoStore()
         try:
-            closed = neo.supersede(
-                row["neo_question_id"],
-                f"The user {review} the supervisor's verdict on alarm {alarm_id}."
-                + (f" Their correction: {feedback.strip()}" if feedback.strip() else ""),
-                reason=f"decided by the user on {alarm_id} itself",
-            )
+            # THE CORRECTION IS THE MEMORY, AND IT LIVES IN neo.db RATHER THAN ON THE
+            # ROW: the alarm is this project's record of one turn and settles with it;
+            # what the supervisor learned outlives it and reaches the next review
+            # through `supervisor.build_system_prompt` (§6). `seat` scopes it there and
+            # keeps it out of Neo's own prompt, which has to stay byte-stable.
+            if not approved:
+                neo.add_learning(
+                    supervisor.learning_from_review(row, feedback.strip()),
+                    project=name, source="review", seat=SUPERVISOR_SEAT)
+
+            # THE CLOSE SITE NOBODY ELSE OWNS. An escalated alarm holds an open Neo
+            # question; the user deciding the alarm here IS its answer, and leaving it
+            # open would go on asking them for a ruling they have just given.
+            # `supersede` is guarded on the question still being open, so a real verdict
+            # is never overwritten.
+            if row["neo_question_id"]:
+                closed = neo.supersede(
+                    row["neo_question_id"],
+                    f"The user {review} the supervisor's verdict on alarm {alarm_id}."
+                    + (f" Their correction: {feedback.strip()}"
+                       if feedback.strip() else ""),
+                    reason=f"decided by the user on {alarm_id} itself",
+                )
         finally:
             neo.close()
     return {"alarm_id": alarm_id, "project": name, "wo_id": row["wo_id"],
