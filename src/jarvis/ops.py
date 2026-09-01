@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -1072,6 +1073,39 @@ def round_line(rnd: dict[str, Any]) -> str:
     return (f"round {rnd['round']} · {rnd['fingerprint']} · {rnd['outcome']}"
             f" · config {rnd.get('config_version') or 'not recorded'}"
             + (f" — {reason}" if reason else ""))
+
+
+#: How each `wo_alarms.status` reads to a person, frozen with the statuses themselves in
+#: §4 of docs/superpowers/specs/2026-08-31-the-supervisor.md. `raised` is the COMMON case,
+#: not the interesting one: the supervisor ships off.
+ALARM_STANDING = {
+    "raised": "raised",
+    "reviewing": "with the supervisor",
+    "acked": "acked by the supervisor",
+    "escalated": "escalated to Neo",
+    "skipped": "not reviewed",
+    "failed": "supervisor failed",
+}
+
+
+def alarm_standing_line(alarms: list[dict[str, Any]]) -> str:
+    """One work order's alarms on one line: how many, how they stand, and their ids.
+
+    `round_line`'s job for the other thing that judges a work order — one formatter, so
+    the surfaces cannot word the same standing two different ways. Pure: it reads the
+    `wo_alarms` rows the caller already has and opens nothing.
+
+    The ids are the point of the line. An alarm is an object with a page of its own now
+    (`/alarms/<project>/<al-id>`, `jarvis alarms show`), so a count with no ids tells a
+    reader something is there and gives them no way to reach it.
+    """
+    if not alarms:
+        return ""
+    counts = Counter(a["status"] for a in alarms)
+    order = [*ALARM_STANDING, *sorted(k for k in counts if k not in ALARM_STANDING)]
+    standing = ", ".join(f"{counts[s]} {ALARM_STANDING.get(s, s)}"
+                         for s in order if counts.get(s))
+    return f"{len(alarms)} ({standing}) — " + ", ".join(a["id"] for a in alarms)
 
 
 def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
@@ -3481,11 +3515,18 @@ def config_show(project: str | None = None, version: str | None = None,
         central.close()
     live_id = config_version.version_id(document)
     in_scope = _in_scope(resolved, project)
+    # DOCUMENTS, not ids — the third reader of this comparison, and it was the odd one
+    # out: a release-rebase row is addressed by document AND build (§6.1), so an id
+    # comparison reports drift for ever after an upgrade that moved a default, on a
+    # file nobody has touched. `invariants.check_config_drift` and `adopt_config` both
+    # say so in as many words; this one quietly disagreed with them.
+    drift = head is None or config_version.canonicalise(
+        head["document"]) != config_version.canonicalise(document)
     return {"source": "file", "catalog": str(file), "project": project,
             "resolved": in_scope, "version": head,
             "file_version": live_id,
             "written": _written_paths(document, in_scope),
-            "drift": head is None or head["id"] != live_id}
+            "drift": drift}
 
 
 def config_history(project: str | None = None,
@@ -3946,7 +3987,10 @@ def _unit_row(name: str, wo: dict[str, Any], index: dict[str, list[Path]],
     """
     from . import usage as usage_mod
 
-    session = usage_mod.read_session(wo.get("session_id") or "", index=index)
+    from .bill import _cold_prefix_floor
+
+    session = usage_mod.read_session(wo.get("session_id") or "", _cold_prefix_floor(),
+                                     index=index)
     total = session.total
     provenance, recorded, settled, rec_totals = _turn_summary(list(turn_rows))
     os_groups_only, subproc_groups = _partition_calls(list(os_groups))
@@ -4327,6 +4371,35 @@ def inspect_report(target: str, project: str | None = None, *,
             "join_floor": cfg.report_join_floor, "units": units}
 
 
+def _alarm_dict(name: str, row: dict[str, Any]) -> dict[str, Any]:
+    """The sixteen keys `list_cost_alarms` publishes, from one `alarms_across` row.
+
+    Frozen by §1 of docs/superpowers/specs/2026-08-31-the-supervisor.md and bound by
+    four surfaces written against it at once, so it lives in one function rather than
+    inline: the review reads below build on top of this dict and must not be able to
+    drift from it. Anything a review surface needs beyond these keys is ADDED by
+    `_reviewable`, never smuggled in here.
+    """
+    return {
+        "project": name,
+        "wo_id": row["wo_id"],
+        "title": row["title"],
+        "status": row["status"],
+        "hidden": bool(row["hidden"]),
+        "ts": row["ts"],
+        "kind": row["kind"],
+        "seq": row["seq"],
+        "reason": row["reason"],
+        "live": bool(row["needs_attention"]),
+        "id": row["id"],
+        "alarm_status": row["alarm_status"],
+        "verdict": row["verdict"],
+        "note": row["note"],
+        "review_status": row["review_status"],
+        "neo_question_id": row["neo_question_id"],
+    }
+
+
 def list_cost_alarms(project_name: str | None = None, limit: int = 200,
                      wo_id: str | None = None) -> list[dict[str, Any]]:
     """Every turn the OS raised WHILE it was burning, newest first, across the fleet.
@@ -4356,27 +4429,176 @@ def list_cost_alarms(project_name: str | None = None, limit: int = 200,
             rows = store.alarms_across(limit=limit, wo_id=wo_id)
         finally:
             store.close()
-        for row in rows:
-            out.append({
-                "project": name,
-                "wo_id": row["wo_id"],
-                "title": row["title"],
-                "status": row["status"],
-                "hidden": bool(row["hidden"]),
-                "ts": row["ts"],
-                "kind": row["kind"],
-                "seq": row["seq"],
-                "reason": row["reason"],
-                "live": bool(row["needs_attention"]),
-                "id": row["id"],
-                "alarm_status": row["alarm_status"],
-                "verdict": row["verdict"],
-                "note": row["note"],
-                "review_status": row["review_status"],
-                "neo_question_id": row["neo_question_id"],
-            })
+        out.extend(_alarm_dict(name, row) for row in rows)
     out.sort(key=lambda r: r["ts"], reverse=True)
     return out[:limit]
+
+
+# -- the review loop: what the supervisor decided, and what the user makes of it -------
+#
+# `list_cost_alarms`' dict is frozen and four surfaces bind it, so the two review reads
+# ADD to it rather than widen it (Neo question 197). Both go through `_reviewable`, which
+# is the only place the supervisor's reasoning and Neo's advice are assembled — the list
+# and the per-alarm page are the same two surfaces `_question.html` exists to keep
+# identical for a Neo question.
+
+
+def _reviewable(name: str, row: dict[str, Any],
+                answers: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    """One alarm as a review surface reads it: the frozen dict plus the reasoning.
+
+    `verdict_reason` is the supervisor's argument and `note` is what it wrote to the
+    user; they are different sentences and the page shows both. `neo_advice` is the
+    ANSWER text, which lives in neo.db and no per-project read can reach — passed in
+    already fetched so this stays a pure projection and the caller opens Neo once for
+    the whole queue rather than once per escalated row.
+    """
+    view = _alarm_dict(name, row)
+    question = answers.get(row["neo_question_id"]) if row["neo_question_id"] else None
+    view.update({
+        "verdict_reason": row["verdict_reason"],
+        "decided_at": row["decided_at"],
+        "attempts": row["attempts"],
+        "review_feedback": row["review_feedback"],
+        "reviewed_at": row["reviewed_at"],
+        "neo_advice": (question or {}).get("answer"),
+        "neo_question_status": (question or {}).get("status"),
+    })
+    return view
+
+
+def _neo_answers(question_ids: Sequence[int]) -> dict[int, dict[str, Any]]:
+    """Neo's questions by id, in one store open. Empty when nothing escalated."""
+    from .neo_store import NeoStore
+
+    ids = {q for q in question_ids if q}
+    if not ids:
+        return {}
+    neo = NeoStore()
+    try:
+        found = {qid: neo.get(qid) for qid in ids}
+    finally:
+        neo.close()
+    return {qid: q for qid, q in found.items() if q is not None}
+
+
+def alarm_review_queue(project_name: str | None = None, limit: int = 200
+                       ) -> list[dict[str, Any]]:
+    """Alarms the supervisor answered and the user has not yet looked at, newest first.
+
+    `acked` + `unreviewed`, per §5 of the supervisor spec. Deliberately NOT the whole
+    unreviewed set: an `escalated` alarm is still with Neo and is asked about by the
+    attention flag, so listing it here would ask the user for the same decision twice
+    in two different words.
+    """
+    paths = registered_project_paths()
+    if project_name:
+        if project_name not in paths:
+            raise OpsError(f"project {project_name!r} not registered")
+        paths = {project_name: paths[project_name]}
+    rows: list[tuple[str, dict[str, Any]]] = []
+    for name, path in paths.items():
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            found = store.alarms_across(limit=limit, statuses=("acked",))
+        finally:
+            store.close()
+        rows.extend((name, r) for r in found if r["review_status"] == "unreviewed")
+    answers = _neo_answers([r["neo_question_id"] for _, r in rows])
+    out = [_reviewable(name, row, answers) for name, row in rows]
+    out.sort(key=lambda r: r["decided_at"] or r["ts"], reverse=True)
+    return out[:limit]
+
+
+def _find_alarm(alarm_id: str, project_name: str | None = None
+                ) -> tuple[str, Path, dict[str, Any]]:
+    """Locate one alarm across the fleet, shaped as `alarms_across` returns it.
+
+    Joined rather than the bare `wo_alarms` row: an alarm is unreadable without its work
+    order's title and status, and going back through `alarms_across` is what keeps this
+    read and the fleet-wide one from diverging.
+    """
+    paths = registered_project_paths()
+    if project_name and project_name not in paths:
+        raise OpsError(f"project {project_name!r} not registered "
+                       f"(known: {sorted(paths)})")
+    candidates = {project_name: paths[project_name]} if project_name else paths
+    for name, path in candidates.items():
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            try:
+                bare = store.get_alarm(alarm_id)
+            except KeyError:
+                continue
+            joined = [r for r in store.alarms_across(wo_id=bare["wo_id"], limit=1000)
+                      if r["id"] == alarm_id]
+        finally:
+            store.close()
+        if joined:
+            return name, path, joined[0]
+    raise OpsError(f"alarm {alarm_id!r} not found in any registered project")
+
+
+def alarm_detail(alarm_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """One alarm in full — what fired, what the supervisor made of it, what Neo said.
+
+    The anchor `/alarms` cannot be: a list has no per-row identity, and both the work
+    order's timeline and a Neo escalation's inbox line link straight at one alarm.
+    """
+    name, _, row = _find_alarm(alarm_id, project_name)
+    return _reviewable(name, row, _neo_answers([row["neo_question_id"]]))
+
+
+def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
+                 project_name: str | None = None) -> dict[str, Any]:
+    """The user's verdict on the supervisor's verdict. Modelled on `neo_review`.
+
+    It does NOT message the worker: a corrected Neo answer was advice the worker acted
+    on, and an alarm review corrects the supervisor about a turn the worker was never
+    told anything about.
+    """
+    from .neo_store import NeoStore
+
+    # Every refusal ahead of the first write, as in `neo_review`: a rejected review
+    # leaves the row untouched rather than half-applied.
+    if not approved and not feedback.strip():
+        raise OpsError("a correction needs feedback — what should the supervisor "
+                       "have decided?")
+    name, path, row = _find_alarm(alarm_id, project_name)
+    if row["alarm_status"] not in ("acked", "escalated"):
+        raise OpsError(f"alarm {alarm_id} is {row['alarm_status']}, and only an alarm "
+                       f"the supervisor has decided ('acked' or 'escalated') can be "
+                       f"reviewed")
+    review = "approved" if approved else "corrected"
+    store = ProjectStore(path)
+    try:
+        store.update_alarm(alarm_id, review_status=review,
+                           review_feedback=feedback.strip(), reviewed_at=db.now())
+    finally:
+        store.close()
+
+    # THE CLOSE SITE NOBODY ELSE OWNS. An escalated alarm holds an open Neo question;
+    # the user deciding the alarm here IS its answer, and leaving it open would go on
+    # asking them for a ruling they have just given. `supersede` is guarded on the
+    # question still being open, so a real verdict is never overwritten.
+    closed = False
+    if row["neo_question_id"]:
+        neo = NeoStore()
+        try:
+            closed = neo.supersede(
+                row["neo_question_id"],
+                f"The user {review} the supervisor's verdict on alarm {alarm_id}."
+                + (f" Their correction: {feedback.strip()}" if feedback.strip() else ""),
+                reason=f"decided by the user on {alarm_id} itself",
+            )
+        finally:
+            neo.close()
+    return {"alarm_id": alarm_id, "project": name, "wo_id": row["wo_id"],
+            "review": review, "neo_question_closed": closed}
 
 
 def _os_calls_detail(wo_id: str, limit: int = 200) -> list[dict[str, Any]]:

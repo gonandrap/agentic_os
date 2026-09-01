@@ -419,3 +419,188 @@ def test_the_timeline_never_reprints_the_question_either():
     entry = build_timeline({}, events, [])[0]
     assert entry["detail"] == ""
     assert build_conversation(events, [])[0]["content"] == "what was asked"
+
+
+# -- the cost alarm on the order's own record ---------------------------------------
+# §4 of docs/superpowers/specs/2026-08-31-the-supervisor.md. The events are constructed
+# here rather than produced by running a supervisor: the four kinds are frozen in §1 and
+# the judge emitting three of them is a separate piece.
+
+
+def test_the_four_alarm_events_read_as_four_different_things():
+    """The LABELS, in the shape the validation kinds forced.
+
+    `event_level` returns "signal" for any kind it has never heard of, so asserting
+    these four are signal passes just as well when `_describe` renders each as its own
+    name beside a JSON blob. What has to be true is that a reader can tell the raise
+    from the verdict from the hand-off from the advice.
+    """
+    events = [
+        # Spelled out: `ev`'s first parameter is the event kind and this payload has a
+        # `kind` of its own — inspection's, the threshold that fired.
+        {"ts": 1.0, "kind": "cost_alarm",
+         "payload": {"kind": "turn_minutes", "seq": 3, "alarm_id": "al-1a2b",
+                     "reason": "turn has been running 94 minutes"}},
+        ev("alarm_reviewed", 2.0, alarm_id="al-1a2b", verdict="ack",
+           reason="a long test run, not a stuck turn", note="left it running"),
+        ev("alarm_escalated", 3.0, alarm_id="al-3c4d", neo_question_id=12),
+        ev("alarm_advice", 4.0, alarm_id="al-3c4d", neo_question_id=12,
+           answer="the re-write is a prefix miss; let it finish"),
+    ]
+
+    entries = build_timeline({}, events, [])
+
+    labels = [e["label"] for e in entries]
+    assert len(set(labels)) == 4, labels
+    assert all(label and label != entries[i]["kind"]
+               for i, label in enumerate(labels)), labels
+    # The verdict's reason is the record's, and nothing else on either surface has it.
+    assert entries[1]["detail"] == "a long test run, not a stuck turn"
+    assert entries[2]["detail"] == "question #12"
+    assert event_level("message_delivered") == "debug"
+
+
+def test_the_renderer_knows_exactly_the_kinds_the_store_freezes():
+    """`timeline` is a leaf and must not import a store, so the four kinds are spelled
+    out in both places. This is the only thing stopping the copies drifting — a fifth
+    kind added to the store and not here gets no ref and no label, and `event_level`
+    calls it signal, so it renders as a bare name beside a JSON blob and looks fine."""
+    from jarvis.project_store import ALARM_EVENT_KINDS
+    from jarvis.timeline import ALARM_KINDS
+
+    assert ALARM_KINDS == frozenset(ALARM_EVENT_KINDS)
+
+
+def test_a_verdict_reads_as_what_it_decided():
+    """`alarm_reviewed` carries both verdicts, and "cleared" on an escalation would be
+    the one falsehood this line is able to tell."""
+    acked, escalated = (build_timeline({}, [ev("alarm_reviewed", 1.0, alarm_id="al-1",
+                                               verdict=v, reason=v)], [])[0]
+                        for v in ("ack", "escalate"))
+    assert acked["label"] != escalated["label"]
+    assert "cleared" in acked["label"] and "cleared" not in escalated["label"]
+
+
+def test_every_alarm_event_points_at_the_alarm():
+    """One `al-` id reaches every surface that knows about that alarm, so all four kinds
+    spend their one pointer on it — the two carrying a Neo question id included, whose
+    deliberation the alarm's own page quotes anyway."""
+    for kind in ("cost_alarm", "alarm_reviewed", "alarm_escalated", "alarm_advice"):
+        entry = build_timeline({}, [ev(kind, 1.0, alarm_id="al-1a2b",
+                                       neo_question_id=12)], [])[0]
+        assert entry["ref"] == {"kind": "alarm", "id": "al-1a2b",
+                                "label": "alarm al-1a2b"}, kind
+
+
+def test_an_alarm_raised_before_the_table_existed_has_nothing_to_point_at():
+    """`cost_alarm` events predating §1 carry no `alarm_id`, and the backfill gives
+    those rows ids the EVENT never learns. A ref that cannot resolve is not a pointer."""
+    entry = build_timeline({}, [{"ts": 1.0, "kind": "cost_alarm",
+                                 "payload": {"kind": "turn_minutes", "seq": 1,
+                                             "reason": "94 minutes"}}], [])[0]
+    assert entry["ref"] is None
+    assert entry["detail"] == "94 minutes"
+
+
+def test_the_conversation_carries_the_note_and_the_advice_and_no_verdict():
+    """What was SAID about the alarm: a note addressed to the user, and the advice
+    behind it. The raise, the verdict and the hand-off are events — they happened,
+    nobody said them — and tuple equality is what catches one leaking in here."""
+    events = [
+        ev("cost_alarm", 1.0, alarm_id="al-1a2b", reason="94 minutes"),
+        ev("alarm_escalated", 2.0, alarm_id="al-1a2b", neo_question_id=12),
+        ev("alarm_advice", 3.0, alarm_id="al-1a2b", neo_question_id=12,
+           answer="a prefix miss on a long test run — let it finish"),
+        ev("alarm_reviewed", 4.0, alarm_id="al-1a2b", verdict="ack",
+           reason="explicable", note="it is re-running the suite; nothing is stuck"),
+    ]
+    convo = build_conversation(events, [])
+    assert [(c["kind"], c["who"], c["content"]) for c in convo] == [
+        ("advice", "neo → supervisor",
+         "a prefix miss on a long test run — let it finish"),
+        ("note", "supervisor → you",
+         "it is re-running the suite; nothing is stuck"),
+    ]
+    assert convo[1]["ref"] == {"kind": "alarm", "id": "al-1a2b",
+                               "label": "alarm al-1a2b"}
+
+
+def test_the_timeline_never_reprints_the_note_or_the_advice():
+    """Both have a home in the conversation, rendered from these same payloads, so a
+    fallback detail here would print each twice on one page."""
+    events = [ev("alarm_reviewed", 1.0, alarm_id="al-1", verdict="ack", reason="fine",
+                 note="it is re-running the suite"),
+              ev("alarm_advice", 2.0, alarm_id="al-1", answer="let it finish")]
+    assert [e["detail"] for e in build_timeline({}, events, [])] == ["fine", ""]
+    assert [c["content"] for c in build_conversation(events, [])] == [
+        "it is re-running the suite", "let it finish"]
+
+
+def test_an_escalation_is_not_an_empty_speech_bubble():
+    """`note` is empty by contract when the supervisor escalates (§2), so the verdict
+    that reached no words must not open a bubble saying nothing."""
+    assert build_conversation([ev("alarm_reviewed", 1.0, alarm_id="al-1",
+                                  verdict="escalate", reason="cannot tell",
+                                  note="")], []) == []
+
+
+def test_every_alarm_status_has_a_reading_a_person_can_use():
+    """All six, because the supervisor ships OFF and `raised` is therefore the common
+    case — an example built from `acked` alone would grade the interesting one only.
+    The ids are asserted too: they are what makes the line reachable rather than a
+    count of things the reader cannot open."""
+    from jarvis.ops import ALARM_STANDING, alarm_standing_line
+    from jarvis.project_store import ALARM_STATUSES
+
+    assert set(ALARM_STANDING) == set(ALARM_STATUSES)
+    alarms = [{"id": f"al-{i}", "status": s} for i, s in enumerate(ALARM_STATUSES)]
+    assert alarm_standing_line(alarms) == (
+        "6 (1 raised, 1 with the supervisor, 1 acked by the supervisor, "
+        "1 escalated to Neo, 1 not reviewed, 1 supervisor failed) — "
+        "al-0, al-1, al-2, al-3, al-4, al-5")
+    assert alarm_standing_line([{"id": "al-1a2b", "status": "acked"},
+                                {"id": "al-3c4d", "status": "escalated"}]) == (
+        "2 (1 acked by the supervisor, 1 escalated to Neo) — al-1a2b, al-3c4d")
+    # The supervisor off, which is every fleet today.
+    assert alarm_standing_line([{"id": "al-1a2b", "status": "raised"}]) == (
+        "1 (1 raised) — al-1a2b")
+
+
+def test_cli_wo_show_says_where_the_alarms_stand(jarvis_home, fake_claude,
+                                                 catalog_file, capsys):
+    """The header line, and the rows behind it. An order with no alarm keeps the
+    document it had before the supervisor existed — which is most of them."""
+    import json as _json
+
+    from jarvis import cli, ops
+    from jarvis.project_store import ProjectStore
+
+    ops.start_os(str(catalog_file), foreground=True)
+    wo = ops.create_work_order("proj_a", "export citations")
+    _, path, _ = ops.find_work_order(wo["id"], "proj_a")
+
+    cli.main(["wo", "show", wo["id"]])
+    assert "alarms:" not in capsys.readouterr().out
+    cli.main(["wo", "show", wo["id"], "--json"])
+    assert _json.loads(capsys.readouterr().out)["alarms"] == []
+
+    store = ProjectStore(path)
+    acked = store.add_alarm(wo["id"], "turn_minutes", 3, "running 94 minutes")
+    store.update_alarm(acked["id"], status="acked", verdict="ack",
+                       note="it is re-running the suite")
+    escalated = store.add_alarm(wo["id"], "cache_write", 3, "300k re-write")
+    store.update_alarm(escalated["id"], status="escalated")
+    store.close()
+
+    cli.main(["wo", "show", wo["id"]])
+    assert (f"alarms: 2 (1 acked by the supervisor, 1 escalated to Neo) — "
+            f"{acked['id']}, {escalated['id']}") in capsys.readouterr().out
+
+    cli.main(["wo", "show", wo["id"], "--json"])
+    rows = _json.loads(capsys.readouterr().out)["alarms"]
+    # The `wo_alarms` rows in full, not `ops.list_cost_alarms`' fleet-wide dict: this is
+    # one order's own record and that dict's join columns are already on the document.
+    assert [r["id"] for r in rows] == [acked["id"], escalated["id"]]
+    assert rows[0]["note"] == "it is re-running the suite"
+    assert rows[0]["seq"] == 3 and rows[0]["kind"] == "turn_minutes"
+    assert "title" not in rows[0] and "alarm_status" not in rows[0]

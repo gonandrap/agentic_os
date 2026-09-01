@@ -1,0 +1,81 @@
+{#
+  ONE COST ALARM'S SUPERVISOR VERDICT, AS THE USER READS IT.
+
+  Shared by `/alarms`, which lists the ones awaiting feedback, and
+  `/alarms/{project}/{alarm_id}`, which is where a work order's timeline and a Neo
+  escalation's inbox line send a reader who wants the one they were told about. Beside
+  `_question.html` and for its reason: two surfaces rendering the same thing separately
+  is how they come to show different things.
+#}
+
+{# What the supervisor decided and why. TWO SENTENCES, NOT ONE: `verdict_reason` is its
+   argument for the verdict and `note` is what it wrote to the user, and collapsing them
+   would lose whichever the reader happened to need. §5 of
+   docs/superpowers/specs/2026-08-31-the-supervisor.md. #}
+{% macro verdict_body(a) %}
+  <div class="who">
+    {{ a.project }} ·
+    <a href="/wo/{{ a.project }}/{{ a.wo_id }}" class="mono">{{ a.wo_id }}</a> ·
+    <span class="tone-warn">{{ a.kind }}</span> · turn {{ a.seq }} ·
+    {{ fmt_age(a.ts) }} ago
+  </div>
+  <div style="margin:6px 0">{{ a.title }}</div>
+  <div class="sub">What fired: {{ a.reason }}</div>
+  {% if a.verdict %}
+  <p class="kv" style="margin-top:10px">
+    {% if a.verdict == 'ack' %}<span class="st tone-ok"><span class="i">✓</span>acked</span>
+    {% else %}<span class="st tone-warn"><span class="i">↑</span>escalated</span>{% endif %}
+    by the supervisor{% if a.decided_at %}, {{ fmt_age(a.decided_at) }} ago{% endif %}
+  </p>
+  {% if a.verdict_reason %}<div class="sub">Why: {{ a.verdict_reason }}</div>{% endif %}
+  {% if a.note %}<div style="margin:6px 0; white-space:pre-wrap">{{ a.note }}</div>{% endif %}
+  {% else %}
+  <p class="kv" style="margin-top:10px">
+    <span class="st tone-muted"><span class="i">◌</span>{{ a.alarm_status }}</span>
+    — the supervisor has not decided this one
+  </p>
+  {% endif %}
+  {% if a.neo_question_id %}
+  <div class="sub" style="margin-top:6px">Neo advised:
+    {{ a.neo_advice or 'not answered yet' }}
+    <a href="/neo/question/{{ a.neo_question_id }}">question #{{ a.neo_question_id }} →</a>
+  </div>
+  {% endif %}
+{% endmacro %}
+
+{# THE DECISION ITSELF, WHEREVER THE ALARM IS READ.
+
+   `back` is where the POST returns the reader; the handler honours same-site paths only,
+   as `_same_site_back` does, because a form field is attacker-settable. #}
+{% macro review_form(a, back) %}
+<div style="display:flex; gap:10px; margin-top:8px; align-items:flex-start"
+     id="review-{{ a.id }}">
+  <form method="post" action="/alarms/{{ a.project }}/{{ a.id }}/review" class="inline">
+    <input type="hidden" name="decision" value="approve">
+    <input type="hidden" name="next" value="{{ back }}">
+    <button class="accept">✓ That's the right call</button>
+  </form>
+  <form method="post" action="/alarms/{{ a.project }}/{{ a.id }}/review"
+        style="flex:1; display:flex; gap:8px">
+    <input type="hidden" name="decision" value="correct">
+    <input type="hidden" name="next" value="{{ back }}">
+    <input type="text" name="feedback"
+           placeholder="Correct it — what should the supervisor have decided?">
+    <button class="danger">Correct</button>
+  </form>
+</div>
+{% endmacro %}
+
+{# What the user already made of it, once they have. Not a control: a reviewed alarm is
+   the record of a decision taken, and re-offering the buttons would invite the same
+   verdict to be written twice with no way to tell the readings apart. #}
+{% macro review_standing(a) %}
+  {% if a.review_status == 'approved' %}
+  <p class="kv"><span class="st tone-ok"><span class="i">✓</span>you approved this</span>
+    {% if a.reviewed_at %}· {{ fmt_age(a.reviewed_at) }} ago{% endif %}</p>
+  {% elif a.review_status == 'corrected' %}
+  <p class="kv"><span class="st tone-warn"><span class="i">✎</span>you corrected this</span>
+    {% if a.reviewed_at %}· {{ fmt_age(a.reviewed_at) }} ago{% endif %}</p>
+  <div class="sub">{{ a.review_feedback }}</div>
+  {% endif %}
+{% endmacro %}
