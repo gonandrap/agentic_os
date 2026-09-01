@@ -7,6 +7,8 @@ import jarvis.catalog
 import jarvis.validation
 from jarvis.catalog import (
     DEFAULT_AUTOCOMPACT_WINDOW,
+    DEFAULT_COLD_PREFIX_FLOOR,
+    DEFAULT_COLD_PREFIX_FLOOR_MAX,
     CatalogError,
     load_catalog,
     parse_catalog,
@@ -384,3 +386,44 @@ def test_a_project_validation_block_is_validated_and_the_error_names_the_project
         projects_validation(None, {"validation": {"max_rounds": 0}})
     with pytest.raises(CatalogError, match=r'"projects\[0\] \(a\)\.validation"'):
         projects_validation(None, {"validation": "yes please"})
+
+
+def test_the_cold_prefix_floor_is_fleet_wide_and_not_a_project_override():
+    """Deliberately NOT under `os.defaults`, which is the namespace projects override.
+
+    The two surfaces that consume this threshold walk transcripts rather than work
+    orders, so a per-project value would be honoured for one order's bill and ignored by
+    every aggregate. This pins the placement: a project naming the key must not change
+    anything, or the knob would look overridable while behaving fleet-wide (Neo, q191).
+    """
+    c = parse_catalog({
+        "os": {"cold_prefix_floor": 9_000},
+        "projects": [{"name": "a", "path": ".", "cold_prefix_floor": 123}],
+    })
+    assert c.os.cold_prefix_floor == 9_000
+    assert not hasattr(c.projects[0].worker, "cold_prefix_floor")
+
+
+def test_the_cold_prefix_floor_is_validated_at_boot_not_at_report_time():
+    """A bad value must fail where it was typed, not surface as a cost report quietly
+    reclassifying every boundary — which reads as a finding, not as a config error."""
+    assert (parse_catalog({"projects": []}).os.cold_prefix_floor
+            == DEFAULT_COLD_PREFIX_FLOOR)
+    for bad in ("5000", True, -1, DEFAULT_COLD_PREFIX_FLOOR_MAX + 1):
+        with pytest.raises(CatalogError, match="cold_prefix_floor"):
+            parse_catalog({"os": {"cold_prefix_floor": bad}, "projects": []})
+
+
+def test_the_guard_rail_on_the_floor_is_itself_configurable():
+    """`cold_prefix_floor_max` is config, not a constant: a fleet whose static heads are
+    unusually large has to be able to raise the floor past the shipped ceiling."""
+    over = {"cold_prefix_floor": DEFAULT_COLD_PREFIX_FLOOR_MAX + 50_000}
+    with pytest.raises(CatalogError, match="cold_prefix_floor"):
+        parse_catalog({"os": over, "projects": []})
+    raised = parse_catalog({
+        "os": {**over, "cold_prefix_floor_max": DEFAULT_COLD_PREFIX_FLOOR_MAX + 60_000},
+        "projects": [],
+    })
+    assert raised.os.cold_prefix_floor == DEFAULT_COLD_PREFIX_FLOOR_MAX + 50_000
+    with pytest.raises(CatalogError, match="cold_prefix_floor_max"):
+        parse_catalog({"os": {"cold_prefix_floor_max": 0}, "projects": []})
