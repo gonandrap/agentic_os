@@ -331,3 +331,34 @@ def test_the_cli_refuses_a_correction_with_no_feedback(started, capsys):
 
     assert cli.main(["alarms", "review", alarm_id, "--reject"]) == 1
     assert "what should the supervisor" in capsys.readouterr().err
+
+
+# -- the link section 4 emits, followed --------------------------------------------
+
+
+def test_the_link_the_work_order_timeline_renders_actually_resolves(started):
+    """§4 renders `href="/alarms/<project>/<al-id>"` and says outright that proving it
+    RESOLVES is this section's job. So: scrape the href off the work-order page and
+    follow it, rather than re-asserting a URL both halves compose from the same parts.
+    That is the assertion that would catch the two halves not meeting."""
+    import re
+
+    wo_id, alarm_id = _alarm(decided=True, status="acked")
+    store = ProjectStore(ops.find_work_order(wo_id)[1])
+    try:
+        store.add_event(wo_id, "cost_alarm",
+                        {"kind": "long-turn", "seq": 1, "reason": FIRED,
+                         "alarm_id": alarm_id})
+    finally:
+        store.close()
+    client = _client()
+
+    page = client.get(f"/wo/proj_a/{wo_id}").text
+    hrefs = re.findall(r'href="(/alarms/[^"]+)"', page)
+    assert hrefs, "the timeline rendered no link to the alarm"
+
+    followed = client.get(hrefs[0])
+
+    assert alarm_id in hrefs[0]
+    assert followed.status_code == 200
+    assert FIRED in followed.text
