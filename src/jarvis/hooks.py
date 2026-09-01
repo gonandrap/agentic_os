@@ -157,7 +157,7 @@ def pr_title_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str,
 #: (`.github/pull_request_template.md` and the skill's bundled copy) are asserted
 #: against this tuple by tests/test_pr_body.py, so the three cannot drift.
 PR_BODY_SECTIONS = ("Summary", "Implementation notes", "Questions asked to Neo",
-                    "Learnings", "Test evidence")
+                    "Alarms raised", "Learnings", "Test evidence")
 
 # GitHub renders neither of these, so neither can mislink or count as content.
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
