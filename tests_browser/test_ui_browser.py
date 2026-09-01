@@ -594,3 +594,153 @@ def test_the_three_halves_of_the_alarms_page_and_the_alarm_it_links_to(
     page.click("form button.accept")
     assert "you approved this" in page.locator("body").inner_text()
     _shot(page, "alarm-after-review")
+
+
+# -- /config -----------------------------------------------------------------------
+# WHY THIS BLOCK EXISTS. Ten defects were reported against the config console at once,
+# and tests/test_ui_config.py -- which asserts on the HTML string -- could not have
+# caught the two worst of them: a reason box rendered 22px wide, and table rules drawn
+# past the panel they belong to. Both are questions about LAYOUT, and layout only exists
+# in a browser. Every assertion below measures something rendered.
+
+def _config_fixture(page, server, width=900):
+    """A narrow window over a project with a long value in it -- the shape the reported
+    overflow needed. `set_viewport_size` before `goto`, so nothing is measured mid-reflow.
+    """
+    ops.set_config(
+        "projects.proj_a.worker.append_system_prompt",
+        "You are working on the Jarvis OS source itself, and production runs a separate "
+        "released copy, so editing this checkout does not touch the running fleet.")
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(f"{server}/config?scope=projects.proj_a")
+
+
+def test_config_is_in_the_nav_walk(page, server):
+    page.goto(server)
+    page.click("nav >> text=config")
+    assert page.url.endswith("/config")
+    assert page.locator("nav a.here").inner_text().startswith("config")
+
+
+def test_no_config_table_draws_its_rules_past_its_panel(page, server, project):
+    """Reported item 7. `table { width: 100% }` is advisory under the default auto
+    layout: a long value or a nowrap button sizes the table from its content, and the
+    full-bleed row borders then run out past the rounded panel."""
+    _config_fixture(page, server)
+    over = page.evaluate("""() => [...document.querySelectorAll('.panel')]
+        .map(p => ({t: p.querySelector('table'), p}))
+        .filter(x => x.t)
+        .map(x => Math.round(x.t.getBoundingClientRect().right
+                             - x.p.getBoundingClientRect().right))
+        .filter(d => d > 0)""")
+    assert over == [], f"tables overflow their panel by {over}px"
+
+
+def test_the_reason_box_is_wide_enough_to_type_a_reason_in(page, server, project):
+    """Reported item 3: in the per-project view it was one character wide. A flex item's
+    `min-width` defaults to `auto` and collapses to its content once the row is tight."""
+    _config_fixture(page, server)
+    widths = page.evaluate(
+        """() => [...document.querySelectorAll('.cfg-edit .reason')]
+               .map(el => Math.round(el.getBoundingClientRect().width))""")
+    assert widths, "no reason boxes on the page"
+    assert min(widths) >= 60, f"narrowest reason box is {min(widths)}px"
+
+
+def test_the_config_console_fits_a_narrow_window(page, server, project):
+    """The other half of item 7 -- content wider than the window is content the reader
+    has to drag sideways to read.
+
+    Scoped to the console's own boxes, not the document: `base.html`'s top nav overflows
+    below ~800px on EVERY page, which is a real defect and a different one.
+    """
+    _config_fixture(page, server, width=760)
+    over = page.evaluate("""() => {
+        const w = window.innerWidth, bad = [];
+        document.querySelectorAll('.cfg-bar, .cfg-legend, .cfg-layout, .cfg-layout *')
+            .forEach(el => {
+                const r = el.getBoundingClientRect();
+                if (r.right > w + 1) bad.push(el.className.toString() || el.tagName);
+            });
+        return bad;
+    }""")
+    assert over == [], f"config content past the window edge: {over}"
+
+
+def test_a_non_boolean_value_is_edited_in_the_browser(page, server, project):
+    """Reported item 1: only booleans could be changed, and the reader was sent to the
+    terminal for everything else."""
+    page.goto(f"{server}/config?scope=os&node=defaults")
+    row = page.locator("tr:has-text('defaults.autocompact_window')")
+    row.locator("input[name='value']").fill("222000")
+    row.locator("button").click()
+    page.wait_for_url("**node=defaults*")
+
+    assert ops.config_show()["resolved"]["os.defaults.autocompact_window"] == 222000
+    # ...and the reader is still looking at the node they made the change from.
+    assert page.locator(
+        "tr:has-text('defaults.autocompact_window') input[name='value']"
+    ).input_value() == "222000"
+
+
+def test_a_refused_value_says_why_on_the_page(page, server, project):
+    """Through a control that CAN produce the mistake: `type=number` will not accept
+    letters at all, which is half the point of rendering a widget per type. A JSON box
+    takes anything, so that is where a type refusal is still reachable by clicking.
+    """
+    page.goto(f"{server}/config?scope=os&node=notifications")
+    row = page.locator("tr:has-text('notifications.sinks')")
+    row.locator("textarea[name='value']").fill("log, telegram")
+    row.locator("button").click()
+    assert "takes a JSON list" in page.locator(".error-flash").inner_text()
+    assert ops.config_show()["resolved"]["os.notifications.sinks"] == ["log"]
+
+
+def test_a_project_is_picked_not_scrolled_to(page, server, project):
+    """Reported item 4. The picker submits on change, so the reader does not have to
+    find a button after choosing."""
+    page.goto(f"{server}/config")
+    assert "worker.model" not in page.locator(".cfg-panel").inner_text()
+    page.select_option("select[name='scope']", "projects.proj_a")
+    page.wait_for_url("**scope=projects.proj_a*")
+    assert "worker.model" in page.locator(".cfg-panel").inner_text()
+
+
+def test_the_tree_narrows_the_pane_to_one_node(page, server, project):
+    """Reported item 6."""
+    page.goto(f"{server}/config")
+    page.click(".cfg-tree a:has-text('validation')")
+    shown = page.locator(".cfg-panel").inner_text()
+    assert "validation.enabled" in shown
+    assert "defaults.model" not in shown
+    assert "validation" in page.locator(".cfg-tree a.on").inner_text()
+
+
+def test_search_finds_a_setting_from_any_node(page, server, project):
+    """Reported item 5, and the rule that makes it useful: a search overrides the
+    selected node, because not knowing the node is why anyone searches."""
+    page.goto(f"{server}/config?scope=os&node=neo")
+    page.fill("input[name='q']", "autocompact")
+    page.click("form.cfg-bar button")
+    shown = page.locator(".cfg-panel").inner_text()
+    assert "defaults.autocompact_window" in shown
+    assert "neo.model" not in shown
+    _shot(page, "config-search")
+
+
+def test_the_safety_marker_has_a_legend_beside_it(page, server, project):
+    """Reported item 9: the marker's only explanation was a `title` tooltip."""
+    page.goto(f"{server}/config")
+    legend = page.locator(".cfg-legend")
+    assert legend.is_visible()
+    assert "safety setting" in legend.inner_text()
+    _shot(page, "config-fleet")
+
+
+def test_a_fresh_fleet_is_not_warned_about_an_edit_nobody_made(page, server, project):
+    """Reported item 10. `drift` is true with an EMPTY ledger too, so the page opened on
+    a warning about a hand edit on every install that had never run `config adopt`."""
+    page.goto(f"{server}/config")
+    body = page.locator("body").inner_text()
+    assert "no version recorded yet" in body
+    assert "edited outside Jarvis" not in body

@@ -3,9 +3,11 @@ the same ops functions as the CLI. Binds to localhost by default (no auth in MVP
 
 from __future__ import annotations
 
+import json
 import time
 from collections import Counter
 from pathlib import Path
+from urllib.parse import quote, urlencode
 
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -350,25 +352,163 @@ def config_setters(history: list[dict]) -> dict[str, str]:
     return setters
 
 
-def group_config(show: dict, setters: dict[str, str]) -> list[dict]:
-    """The flat key space, split into the blocks the catalog is written in (spec §8).
+def config_scope_of(path: str) -> str:
+    """The catalog block a resolved path lives in: `os`, or one `projects.<name>`."""
+    parts = path.split(".")
+    return "os" if parts[0] == "os" else ".".join(parts[:2])
 
-    `os.…` is one group and each `projects.<name>.…` is its own; the label a row shows
-    is the path with that prefix taken off, so the column reads as settings rather than
-    as forty repetitions of the same first two segments.
+
+def config_scopes(resolved: dict) -> list[dict]:
+    """Every block the page can be pointed at, for the picker at the top.
+
+    One scope is on screen at a time: the fleet's settings and forty projects' used
+    to be one column the reader scrolled through to reach the project they came for.
+    """
+    names = sorted({p.split(".")[1] for p in resolved if p.startswith("projects.")})
+    return ([{"key": "os", "title": "os — the fleet"}]
+            + [{"key": f"projects.{n}", "title": n} for n in names])
+
+
+def config_tree(labels: list[str], node: str = "") -> list[dict]:
+    """One scope's dotted labels as the nested nodes a tree renders.
+
+    Only an interior segment becomes a node: `neo.panel.fast_path` gives `neo` and
+    `neo.panel`, and the leaf is a setting the node's page shows. `open` is what keeps
+    the selected node's ancestors unfolded — the tree is plain HTML, so a node's state
+    has to be decided here rather than by a click nobody is listening for.
+    """
+    def build(prefix: str, entries: list[str]) -> list[dict]:
+        groups: dict[str, list[str]] = {}
+        for label in entries:
+            head, _, rest = label.partition(".")
+            if rest:
+                groups.setdefault(head, []).append(rest)
+        out = []
+        for head in sorted(groups):
+            path = f"{prefix}{head}"
+            out.append({"path": path, "name": head,
+                        "count": sum(1 for x in labels if x.startswith(f"{path}.")),
+                        "children": build(f"{path}.", groups[head]),
+                        "here": node == path,
+                        "open": node == path or node.startswith(f"{path}.")})
+        return out
+    return build("", labels)
+
+
+CONFIG_TYPE_NAMES = [
+    (bool, "true or false"), (int, "a whole number"), (float, "a number"),
+    (str, "text"), (list, "a JSON list"), (dict, "a JSON object"),
+]
+
+
+def config_type_name(value: object) -> str:
+    for kind, name in CONFIG_TYPE_NAMES:
+        if isinstance(value, kind):
+            return name
+    return "a value"
+
+
+def config_widget(value: object) -> str:
+    """Which input a setting is edited with — the whole of the page's type awareness."""
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, (list, dict)):
+        return "json"
+    return "text"
+
+
+def config_input_text(value: object) -> str:
+    """The submitted-text form of a value, so an edit starts from what is already set."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return json.dumps(value)
+
+
+def config_value_of(current: object, text: str) -> object:
+    """What the page will write for `text`, given the value already there.
+
+    A text setting takes its text VERBATIM — `os.defaults.model` is the string `123` if
+    that is what the user typed — and everything else goes through the CLI's own parser,
+    so `true`, `3` and `["a"]` mean on this page what they mean in the terminal.
+    """
+    if isinstance(current, str):
+        return text
+    if current is None and not text.strip():
+        return None
+    return ops.parse_config_value(text)
+
+
+def config_type_ok(current: object, new: object) -> bool:
+    """May `new` be written where `current` is? Neo, q193.
+
+    The page is where this lives because the page is what has an untyped text box:
+    `parse_catalog` takes `true` for `os.defaults.model` without a word, and answers a
+    bad whole number with a bare `ValueError` rather than the `CatalogError` `ops`
+    converts. Widening `ops.set_config`'s own contract is a different change.
+
+    An unset optional takes anything; nothing else takes `null`, because a key present
+    and null is not the same as absent and `jarvis config unset` is what clears one.
+    """
+    if current is None:
+        return True
+    if new is None:
+        return False
+    if isinstance(current, bool):
+        return isinstance(new, bool)
+    if isinstance(current, int):
+        return isinstance(new, int) and not isinstance(new, bool)
+    if isinstance(current, float):
+        return isinstance(new, (int, float)) and not isinstance(new, bool)
+    return isinstance(new, type(current))
+
+
+def _config_nodes(label: str) -> list[str]:
+    """Every interior node a dotted label passes through: `a.b.c` → `a`, `a.b`."""
+    parts = label.split(".")
+    return [".".join(parts[:i]) for i in range(1, len(parts))]
+
+
+def _config_url(scope: str, node: str = "", q: str = "") -> str:
+    """The page as it is being read right now, so a save comes back to it rather than
+    dropping the reader at the top of the fleet's settings."""
+    query = {k: v for k, v in (("scope", scope), ("node", node), ("q", q)) if v}
+    return "/config" + (f"?{urlencode(query)}" if query else "")
+
+
+def config_rows(show: dict, setters: dict[str, str], scope: str,
+                node: str = "", query: str = "") -> list[dict]:
+    """The settings one scope shows, narrowed by the tree node or by the search box.
+
+    A SEARCH OVERRIDES THE NODE rather than narrowing it: someone typing `autocompact`
+    is searching precisely because they do not know which node it is under, and a search
+    inside the selected node answers nothing unless they had already guessed right.
     """
     resolved, written = show["resolved"], set(show["written"])
-    groups: dict[str, list[dict]] = {}
+    needle = query.strip().lower()
+    rows = []
     for path in sorted(resolved):
-        parts = path.split(".")
-        prefix = "os" if parts[0] == "os" else ".".join(parts[:2])
-        groups.setdefault(prefix, []).append(
-            {"path": path, "label": path[len(prefix) + 1:], "value": resolved[path],
-             "bool": isinstance(resolved[path], bool), "written": path in written,
-             "safety": ops.safety_key(path),
-             "version": setters.get(path) if path in written else None})
-    return [{"name": p, "title": p if p == "os" else p.split(".", 1)[1],
-             "settings": rows} for p, rows in groups.items()]
+        if config_scope_of(path) != scope:
+            continue
+        label = path[len(scope) + 1:]
+        if needle:
+            if needle not in label.lower():
+                continue
+        elif node and not label.startswith(f"{node}."):
+            continue
+        value = resolved[path]
+        rows.append({"path": path, "label": label, "value": value,
+                     # Which node the match came out of, so a search result set can be
+                     # grouped by it (Neo, q194) — the tree is not narrowed by a search,
+                     # so the row has to say where it lives.
+                     "node": label.rpartition(".")[0],
+                     "widget": config_widget(value), "text": config_input_text(value),
+                     "written": path in written, "safety": ops.safety_key(path),
+                     "version": setters.get(path) if path in written else None})
+    return rows
 
 
 def create_app() -> FastAPI:
@@ -836,14 +976,29 @@ def create_app() -> FastAPI:
                       false_positive_rate=_false_positive_rate(rows))
 
     @app.get("/config", response_class=HTMLResponse)
-    def config_page(request: Request, a: str = "", b: str = ""):
+    def config_page(request: Request, a: str = "", b: str = "", scope: str = "",
+                    node: str = "", q: str = ""):
         """What the fleet is configured to run, who changed it, and what changed.
 
-        A form over `jarvis config` and nothing more — see
-        docs/superpowers/specs/2026-08-27-the-config-console.md §8 for the scope cut.
+        A form over `jarvis config` — see
+        docs/superpowers/specs/2026-08-27-the-config-console.md §8 for the ledger and
+        the provenance column; `jarvis wo show wo-516126ce` for the editor, the
+        scope picker and the tree that replaced the one long column.
+
+        Scope, node and search are URL state, not script: text a browser test cannot
+        see is text nothing proves, and this page's whole shape is chosen around that
+        (the same reason §8 forbids tabs here).
         """
         show = ops.config_show()
         history = ops.config_history(limit=50)
+        scopes = config_scopes(show["resolved"])
+        keys = [s["key"] for s in scopes]
+        if scope not in keys:
+            scope = keys[0]
+        labels = sorted(p[len(scope) + 1:] for p in show["resolved"]
+                        if config_scope_of(p) == scope)
+        if node not in {n for label in labels for n in _config_nodes(label)}:
+            node = ""
         # Default the diff to the change that landed: the head against the version
         # before it, so the page answers "what changed last" unasked.
         ids = [row["id"] for row in history]
@@ -856,7 +1011,14 @@ def create_app() -> FastAPI:
             except ops.OpsError as e:
                 diff_error = str(e)
         return render(request, "config.html", active="config", show=show,
-                      groups=group_config(show, config_setters(history)),
+                      scopes=scopes, scope=scope, node=node, q=q,
+                      scope_title=next(s["title"] for s in scopes if s["key"] == scope),
+                      # The tree root wants the SHORT name: "os — the fleet" wrapped
+                      # to four lines in a 236px column and squashed the tree.
+                      scope_short="os" if scope == "os" else scope.split(".", 1)[1],
+                      tree=config_tree(labels, node),
+                      rows=config_rows(show, config_setters(history), scope, node, q),
+                      total=len(labels), here=_config_url(scope, node, q),
                       history=history, diff=diff, diff_error=diff_error, a=a, b=b)
 
     @app.get("/alarms", response_class=HTMLResponse)
@@ -1119,23 +1281,31 @@ def create_app() -> FastAPI:
 
     @app.post("/config/set")
     def config_set(path: str = Form(...), value: str = Form(""),
-                   reason: str = Form("")):
+                   reason: str = Form(""), back: str = Form("/config")):
         """The page's only write, and it is `jarvis config set` under another name.
 
-        v1 toggles booleans and nothing else (spec §8): a POST for any other key is
-        refused here and sent to the CLI, where the value is already text.
+        Every setting is editable now, so the type check that boolean-only used
+        to give for free is explicit and lives here — Neo, q193.
         """
+        back = back if back.startswith("/config") else "/config"
         try:
-            if value not in ("true", "false") \
-                    or not isinstance(ops.config_get(path)["value"], bool):
-                return RedirectResponse(
-                    f"/config?error={path} is not a boolean — this page toggles "
-                    f"true/false only. Use `jarvis config set {path} <value> "
-                    f'--reason "…"`.', status_code=303)
-            ops.set_config(path, value == "true", reason=reason)
-        except ops.OpsError as e:
-            return RedirectResponse(f"/config?error={e}", status_code=303)
-        return RedirectResponse("/config", status_code=303)
+            current = ops.config_get(path)["value"]
+            new = config_value_of(current, value)
+            if not config_type_ok(current, new):
+                raise ops.OpsError(
+                    f"{path} takes {config_type_name(current)} — {value!r} is not. "
+                    f"`jarvis config set {path} <value>` says the same thing.")
+            ops.set_config(path, new, reason=reason)
+        # ValueError/TypeError: `parse_catalog` coerces with bare `int()`/`str()` and
+        # raises neither `CatalogError` nor anything `ops` converts (kn-650b6f24).
+        except (ops.OpsError, ValueError, TypeError) as e:
+            sep = "&" if "?" in back else "?"
+            # `quote`, not the default `quote_plus`: the flash is read by a human
+            # off the address bar as often as by the page.
+            return RedirectResponse(
+                f"{back}{sep}{urlencode({'error': str(e)}, quote_via=quote)}",
+                status_code=303)
+        return RedirectResponse(back, status_code=303)
 
     @app.post("/inbox/ack")
     def ack(inbox_id: str = Form("")):

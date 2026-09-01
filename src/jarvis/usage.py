@@ -25,15 +25,24 @@ previous turn had cached is invalidated and the whole accumulated context is re-
 as a cache WRITE, at 1.25x, instead of a cache READ at 0.1x — twice over, in fact, on
 two consecutive calls.
 
-The cause is upstream and Jarvis cannot fix it: Claude Code's system prompt carries a
-dynamic per-machine section that includes `git status`, so a worker — whose whole job
-is editing files in its worktree — presents a different prompt prefix on its next turn.
-Confirmed in a clean room at 27k of context: a git repo whose turn edited a file goes
-cold, the same repo read-only stays warm, and `--exclude-dynamic-system-prompt-sections`
-relocates the section without stabilising it. It is NOT TTL (a 10-second boundary after
-an edit is cold; a 54-minute one after a read-only turn is warm) and NOT the MCP set.
-Evidence and the four-call repro:
-`docs/superpowers/specs/2026-08-08-token-spend-findings.md`.
+A boundary goes cold for one of two reasons, and they have OPPOSITE remedies, which is
+why `rewrite_ttl_write`/`rewrite_prefix_write` split the tax by cause rather than
+reporting one number:
+
+- THE PREFIX MOVED. Claude Code's system prompt carries a dynamic per-machine section
+  including `git status`, so a worker — whose whole job is editing files in its
+  worktree — presents a different prefix next turn. Time is not the variable: a
+  10-second boundary after an edit is cold and a 54-minute one after a read-only turn
+  is warm. `dispatch._write_worker_settings` sets `includeGitInstructions: false`,
+  which removes the snapshot and is the ONLY switch that does
+  (`--exclude-dynamic-system-prompt-sections` merely relocates it). No cache TTL can
+  help here — the entry is alive and does not match.
+- THE ENTRY EXPIRED. The gap exceeded the write's TTL, so nothing survives, not even
+  the static system prompt. Only this half would be bought back by a longer TTL.
+
+Telling them apart is what makes the TTL decision answerable, and confusing them is how
+a 12-second boundary got read as a 14-minute one:
+`docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md`.
 
 What Jarvis controls is the number of boundaries, not their price — which is why
 `Daemon.deliver_messages` coalesces everything queued for a work order into one turn,
@@ -97,6 +106,14 @@ DEFAULT_PRICE = PRICES["opus"]
 CACHE_WRITE_RATE = 1.25  # x input price, at the 5-minute TTL
 CACHE_WRITE_1H_RATE = 2.0  # x input price, at the 1-hour TTL
 CACHE_READ_RATE = 0.10  # x input price, under either TTL
+#: The TTL Jarvis buys (`claude_cli.PROMPT_CACHE_5M_ENV`). A boundary closer together
+#: than this cannot be an expiry, whatever else it looks like.
+WRITE_TTL_SECONDS = 300.0
+#: There is no module-level default for the cold-prefix floor on purpose. It is
+#: `os.cold_prefix_floor`, every reader passes it in, and a caller with no catalog gets
+#: the catalog's own error rather than a number this module invented — a report that
+#: silently classified boundaries against a guessed threshold would print a finding the
+#: configuration never produced.
 
 #: The four things a bill can be charged for, in the order they are rendered. Named here
 #: because every surface that breaks a line item down by class walks this list, and a
@@ -186,6 +203,16 @@ class Usage:
     context_peak: int = 0
     rewrite_excess: int = 0
     resume_boundaries: int = 0
+    #: Cache-write tokens observed AT a cold boundary, split by which of the two causes
+    #: the docstring describes produced it. These are raw observations and their sum is
+    #: NOT `rewrite_excess` — that has its own threshold-free definition. They exist to
+    #: carry the RATIO, which is the only part that merges honestly across sessions
+    #: (kn-7a2180ba: make the finer accounting a partition of the coarser, never an
+    #: addend). `rewrite_ttl_excess` applies the ratio and IS a partition.
+    rewrite_ttl_write: int = 0
+    rewrite_prefix_write: int = 0
+    #: How many of `resume_boundaries` were the TTL expiring. The rest moved the prefix.
+    boundaries_ttl: int = 0
     cost_by_model: dict[str, float] = field(default_factory=dict)
     #: The TTL split of `cache_write`, where the source reported one. Their sum can be
     #: LESS than `cache_write` (a partial sample) and is zero when nothing is known —
@@ -224,6 +251,9 @@ class Usage:
             context_peak=max(self.context_peak, other.context_peak),
             rewrite_excess=self.rewrite_excess + other.rewrite_excess,
             resume_boundaries=self.resume_boundaries + other.resume_boundaries,
+            rewrite_ttl_write=self.rewrite_ttl_write + other.rewrite_ttl_write,
+            rewrite_prefix_write=self.rewrite_prefix_write + other.rewrite_prefix_write,
+            boundaries_ttl=self.boundaries_ttl + other.boundaries_ttl,
             cost_by_model=merged,
             cache_1h=self.cache_1h + other.cache_1h,
             cache_5m=self.cache_5m + other.cache_5m,
@@ -262,6 +292,22 @@ class Usage:
             - CACHE_READ_RATE
         return self.rewrite_excess * excess * rate / 1e6
 
+    @property
+    def rewrite_ttl_share(self) -> float | None:
+        """Of the tax, the fraction a longer cache TTL could have bought back.
+
+        None when no boundary was classified — an honest 'not measured', which the
+        renderers must not print as 0% (that would read as a finding).
+        """
+        seen = self.rewrite_ttl_write + self.rewrite_prefix_write
+        return self.rewrite_ttl_write / seen if seen else None
+
+    @property
+    def rewrite_ttl_excess(self) -> int:
+        """`rewrite_excess` apportioned to TTL expiry; the remainder moved the prefix."""
+        share = self.rewrite_ttl_share
+        return round(self.rewrite_excess * share) if share is not None else 0
+
     def _blended_input_rate(self) -> float:
         models = [m for m in self.cost_by_model if price_for(m)[0]]
         if not models:
@@ -283,6 +329,9 @@ class Usage:
             "context_peak": self.context_peak,
             "rewrite_excess": self.rewrite_excess,
             "resume_boundaries": self.resume_boundaries,
+            "rewrite_ttl_share": self.rewrite_ttl_share,
+            "rewrite_ttl_excess": self.rewrite_ttl_excess,
+            "boundaries_ttl": self.boundaries_ttl,
             "list_cost_usd": round(self.list_cost_usd, 2),
             "rewrite_cost_usd": round(self.rewrite_cost_usd, 2),
             "cost_by_model": {m: round(c, 2) for m, c in self.cost_by_model.items()},
@@ -621,14 +670,16 @@ def session_calls(session_id: str, root: Path | None = None,
     return calls
 
 
-def _usage_of(path: Path) -> Usage:
+def _usage_of(path: Path, cold_prefix_floor: int) -> Usage:
     messages = _assistant_messages(path)
     if not messages:
         return Usage()
     usage = Usage(messages=len(messages))
     previous_read: int | None = None
+    previous_ts: float | None = None
     for message in messages:
         model = message.get("model") or ""
+        ts = message.get("ts") or None
         plain = message.get("input_tokens", 0)
         write = message.get("cache_creation_input_tokens", 0)
         read = message.get("cache_read_input_tokens", 0)
@@ -653,7 +704,17 @@ def _usage_of(path: Path) -> Usage:
         # on exactly (turns - 1) for every work order measured.
         if previous_read is not None and read < previous_read:
             usage.resume_boundaries += 1
+            # Expired, or the prefix moved: findings/2026-08-30-where-the-800-dollars-went.md
+            gap = (ts - previous_ts) if (ts and previous_ts) else None
+            expired = (gap is not None and gap >= WRITE_TTL_SECONDS
+                       and read <= cold_prefix_floor)
+            if expired:
+                usage.rewrite_ttl_write += write
+                usage.boundaries_ttl += 1
+            else:
+                usage.rewrite_prefix_write += write
         previous_read = read
+        previous_ts = ts
         # Per MESSAGE, where the TTL split is exact rather than a sample — which is the
         # most accurate this estimate can be made without the CLI's own figure.
         classes = class_costs(model, input=plain, cache_write=write, cache_read=read,
@@ -722,9 +783,14 @@ def index_sessions(root: Path | None = None) -> dict[str, list[Path]]:
     return index
 
 
-def read_session(session_id: str, root: Path | None = None,
+def read_session(session_id: str, cold_prefix_floor: int,
+                 root: Path | None = None,
                  index: dict[str, list[Path]] | None = None) -> SessionUsage:
-    """Spend for one session id, subagents included but reported separately."""
+    """Spend for one session id, subagents included but reported separately.
+
+    `cold_prefix_floor` is `os.cold_prefix_floor` and is REQUIRED: a caller that cannot
+    reach a catalog must fail rather than classify against a guessed threshold.
+    """
     result = SessionUsage(session_id=session_id)
     if index is None:
         index = index_sessions(root)
@@ -733,14 +799,14 @@ def read_session(session_id: str, root: Path | None = None,
         return result
     result.found = True
     for path in sorted(paths):
-        result.main = result.main + _usage_of(path)
+        result.main = result.main + _usage_of(path, cold_prefix_floor)
         # Claude Code writes each subagent's own transcript beside the parent's, under
         # a directory named for the parent session — beside whichever segment the
         # subagent was spawned from.
         subagent_dir = path.with_suffix("") / "subagents"
         if subagent_dir.is_dir():
             for sub in sorted(subagent_dir.glob("*.jsonl")):
-                sub_usage = _usage_of(sub)
+                sub_usage = _usage_of(sub, cold_prefix_floor)
                 if sub_usage.messages:
                     result.subagents = result.subagents + sub_usage
                     result.subagent_count += 1
