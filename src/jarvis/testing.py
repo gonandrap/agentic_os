@@ -616,6 +616,33 @@ elif "-p" in argv and "--resume" not in argv:
                          "reason": "test-forced objection that must force nothing"}
         emit_headless(json.dumps(reply))
         sys.exit(0)
+    # NEO REVIEWING A COST ALARM, and it is claimed by its system prompt for exactly the
+    # reason the supervisor branch above is: this call's user prompt is the EVIDENCE
+    # PACKET, so a FORCE token a test put in a work order description would otherwise be
+    # read twice — once by the supervisor and again here.
+    if "You are Neo, reviewing a COST ALARM" in system:
+        if "FORCE_ALARM_NEO_FAIL" in prompt:
+            sys.stderr.write("neo alarm call failed (test-forced)\n"); sys.exit(1)
+        if "FORCE_ALARM_NEO_ESCALATE" in prompt:
+            reply = {"escalate": True, "answer": "",
+                     "reason": "test-forced escalation: this one needs the user"}
+        else:
+            # ANSWERING IS THE DEFAULT, unlike the gate and plan branches. Those default
+            # to the safe answer because the test fleet must not ship code unreviewed;
+            # here the interesting path — the one that acks the alarm, writes the advice
+            # event and must NOT message the worker — is the answer.
+            reply = {"escalate": False,
+                     "answer": "It is running the test suite, which takes about an hour "
+                               "on this repo. Nothing is wrong.",
+                     "reason": "test verdict: the turn's shape accounts for the spend"}
+        if "FORCE_DISPATCH" in prompt:
+            # Honoured HERE as well as on the shared path below, because the alarm
+            # branch exits before reaching it — and "an alarm never dispatches a
+            # cleanup" is only provable against a verdict that actually asks for one.
+            reply["dispatch"] = {"title": "test-forced ledger cleanup",
+                                 "description": "entries A and B contradict; B won"}
+        emit_headless(json.dumps(reply))
+        sys.exit(0)
     if "FORCE_FAIL" in prompt:
         sys.stderr.write("model call failed (test-forced)\n"); sys.exit(1)
     if "FORCE_ESCALATE" in prompt:

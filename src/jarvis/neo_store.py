@@ -38,14 +38,21 @@ OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
 
 # What Neo is being asked for. `question` is an open decision ("which library?");
 # `approval` is a privileged-action gate ("may I merge this PR?"); `plan` is a feature
-# order's decomposition ("release these six work orders?"). Each of the latter two gets
-# its own persona and a verdict with an approve/reject bit — see gates.py and plans.py.
+# order's decomposition ("release these six work orders?"); `alarm` is a cost alarm the
+# supervisor could not settle ("is this turn worth what it is spending?"). Each of the
+# latter three gets its own persona — see gates.py, plans.py and supervisor.py.
 #
 # `plan` is deliberately NOT routed through the approvals table even though the shape
 # rhymes: `approvals` is a receipt for one command string, and its `dismissed` count is
 # the OS's classifier false-positive rate. Plan reviews are neither, and mixing them in
 # would corrupt the one metric that says whether the gate recognisers are improving.
-Q_KINDS = ("question", "approval", "plan")
+#
+# ADDING A KIND IS FOUR EDITS, NOT ONE (kn-9b18a8eb, and §3 of
+# docs/superpowers/specs/2026-08-31-the-supervisor.md): this tuple, a `deliver()` branch
+# in `Daemon._neo_drain`, the `ops._neo_attention` filter and the
+# `invariants.check_neo_escalations_are_live` filter. A kind with no `deliver()` branch
+# falls through to `queue_message` and speaks to the worker.
+Q_KINDS = ("question", "approval", "plan", "alarm")
 
 # The panel's seats — see docs/superpowers/specs/2026-08-02-neo-team-design.md.
 # `premise` asks whether this was even the question that was asked (and routes),

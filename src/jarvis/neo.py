@@ -159,17 +159,22 @@ def build_system_prompt(store: NeoStore, project: str, learnings_limit: int = 50
     """Persona + learnings. Byte-stable across questions (per project and kind) so
     consecutive headless calls of the same kind share a cached prompt prefix.
 
-    Each kind gets its own persona, and for the same reason in both cases: the general
-    answerer persona is told to escalate anything that publishes or touches production,
-    which is right for open questions and would send every release — and every plan
-    whose children mention shipping — straight to the user, which is the attention cost
-    both features exist to remove.
+    Each kind gets its own persona, and for the same reason in all three cases: the
+    general answerer persona is told to escalate anything that publishes or touches
+    production, which is right for open questions and would send every release — every
+    plan whose children mention shipping, and every cost alarm, since an alarm is about
+    spend by construction — straight to the user, which is the attention cost all three
+    features exist to remove.
+
+    Each persona lives in the module that OWNS the kind, never here: the prose is judged
+    beside the code that files the question.
     """
     from .gates import REVIEWER_PERSONA
     from .plans import PLAN_REVIEWER_PERSONA
+    from .supervisor import ALARM_REVIEWER_PERSONA
 
-    persona = {"approval": REVIEWER_PERSONA, "plan": PLAN_REVIEWER_PERSONA}.get(
-        kind, PERSONA)
+    persona = {"approval": REVIEWER_PERSONA, "plan": PLAN_REVIEWER_PERSONA,
+               "alarm": ALARM_REVIEWER_PERSONA}.get(kind, PERSONA)
     parts = [persona, "", "# Learnings (from the user's reviews of your past answers)"]
     parts += render_learnings(store.learnings(project, limit=learnings_limit),
                               budget=learnings_chars)

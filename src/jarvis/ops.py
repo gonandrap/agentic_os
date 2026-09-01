@@ -336,10 +336,11 @@ def ui_health() -> dict[str, Any]:
 def _neo_attention() -> tuple[dict[str, int], list[dict[str, Any]]]:
     """`(counts, questions Neo handed back to the user)` — one open of Neo's DB.
 
-    `approval` and `plan` questions are dropped here rather than at the display: both are
-    reported by the thing that actually carries the decision (the gate item, the feature
-    order), and telling the user to `jarvis neo answer` a question whose real resolution
-    is `jarvis gate approve` sends them to the wrong command.
+    `approval`, `plan` and `alarm` questions are dropped here rather than at the display:
+    each is reported by the thing that actually carries the decision (the gate item, the
+    feature order, the alarm), and telling the user to `jarvis neo answer` a question
+    whose real resolution is `jarvis gate approve` — or `jarvis alarms review` — sends
+    them to the wrong command.
     """
     from .neo_store import NeoStore
 
@@ -347,7 +348,7 @@ def _neo_attention() -> tuple[dict[str, int], list[dict[str, Any]]]:
     try:
         return (neo.counts(),
                 [q for q in neo.list_questions(statuses=("escalated", "failed"))
-                 if q.get("kind") not in ("approval", "plan")])
+                 if q.get("kind") not in ("approval", "plan", "alarm")])
     finally:
         neo.close()
 
@@ -2725,6 +2726,26 @@ def neo_review(question_id: int, approved: bool, feedback: str = "",
             "forwarded_to_worker": forwarded}
 
 
+def _alarm_review_hint(q: dict[str, Any]) -> str:
+    """The command that really decides an alarm question, naming the alarm when it can.
+
+    Best-effort by design: this only ever builds the tail of a refusal, so a project that
+    has moved or a work order that has gone must degrade to the general command rather
+    than replace one error with another.
+    """
+    try:
+        _name, path, _wo = find_work_order(q["wo_id"], q.get("project"))
+        store = ProjectStore(path)
+        try:
+            alarm = store.alarm_for_question(q["id"])
+        finally:
+            store.close()
+    except (OpsError, KeyError):
+        alarm = None
+    return (f"review it with: jarvis alarms review {alarm['id']}" if alarm
+            else "review it with: jarvis alarms review <al-id>")
+
+
 def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
     """The user answers a question Neo escalated; the answer flows to the worker
     through the same delivery path Neo's answers use."""
@@ -2738,6 +2759,16 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
         if q["status"] not in ("escalated", "failed", "queued"):
             raise OpsError(f"neo question {question_id} is {q['status']} — "
                            "only escalated/failed/queued questions take a user answer")
+        # AN ALARM QUESTION HAS NO WORKER TO ANSWER. Nobody asked it — the supervisor
+        # did, about a turn the worker was never told anything about — so the delivery
+        # below would push a message into a session that is still burning money, which
+        # is the exact cost the alarm exists to report. Refused HERE rather than only in
+        # the template, because `jarvis neo answer` reaches this too. See §3 of
+        # docs/superpowers/specs/2026-08-31-the-supervisor.md.
+        if q.get("kind") == "alarm":
+            raise OpsError(f"neo question {question_id} is a cost alarm, and answering "
+                           f"it would message the worker mid-turn — "
+                           f"{_alarm_review_hint(q)}")
         neo.record_answer(question_id, answer, answered_by="user")
         neo.review(question_id, approved=True)  # user-authored ⇒ nothing to review
     finally:

@@ -1603,6 +1603,11 @@ class Daemon:
                     self._deliver_gate_verdict(central, pstore, q, verdict)
                 elif q.get("kind") == "plan":
                     self._deliver_plan_verdict(central, store, pstore, q, verdict)
+                elif q.get("kind") == "alarm":
+                    # ABOVE the escalate branch, because this kind owns both outcomes —
+                    # and the branch below it messages the WORKER, which no alarm may
+                    # ever do (§3).
+                    self._deliver_alarm_verdict(central, pstore, q, verdict)
                 elif verdict["escalate"]:
                     # A headline, never the verbatim question: this row's job is to get
                     # the user's attention, and every inbox row reaches every sink
@@ -1640,7 +1645,11 @@ class Daemon:
                     # OS delivering it, and `waiting_input` outliving that reads as a
                     # USER blocker on every surface that renders it.
                     invariants.end_wait_if_nothing_is_out(pstore, q["wo_id"])
-                if pstore and q.get("kind") not in ("approval", "plan"):
+                # `alarm` joins the two exclusions for a reason of its own: a cleanup
+                # work order dispatched off a COST OBSERVATION is a work order nobody
+                # asked for, and it would spend a worker session to fix the record about
+                # a turn that was only ever being watched.
+                if pstore and q.get("kind") not in ("approval", "plan", "alarm"):
                     self._dispatch_neo_cleanup(pstore, q, verdict)
             finally:
                 if pstore:
@@ -1873,6 +1882,94 @@ class Daemon:
             wo_id=fo.get("plan_wo_id"),
         )
         log.info("plan for %s escalated to the user: %s", fo["id"], reason)
+
+    def _deliver_alarm_verdict(self, central: CentralStore, pstore: ProjectStore | None,
+                               q: dict, verdict: dict) -> None:
+        """Apply Neo's reading of a cost alarm the supervisor could not settle — §3.
+
+        NOTHING HERE SPEAKS TO THE WORKER, and that is the whole reason this branch
+        exists rather than the alarm kind falling through `_neo_drain`'s tail: there was
+        no worker question, and a message into a turn already burning money re-sends the
+        entire conversation at the cache-write rate — the exact cost the alarm was raised
+        to report.
+
+        NEO'S ADVICE ENDS THE ALARM. It does not go back to the supervisor for a second
+        opinion: the supervisor already gave the one it had, and the loop would spend a
+        call per round to reach an answer the OS is already holding.
+        """
+        from . import db as db_mod, ops, supervisor
+
+        if pstore is None:
+            log.error("alarm verdict for question %s has no project store", q["id"])
+            return
+        alarm = pstore.alarm_for_question(q["id"])
+        if alarm is None:
+            log.warning("alarm question %s judges no alarm (work order deleted?)",
+                        q["id"])
+            return
+        if alarm["status"] != "escalated":
+            # The user got there first through `jarvis alarms review`, which closes the
+            # question on its way past. The decision is taken; Neo's is the stale one.
+            log.info("alarm question %s: %s is already %s, dropping Neo's verdict",
+                     q["id"], alarm["id"], alarm["status"])
+            return
+
+        if verdict["escalate"]:
+            # The alarm STAYS `escalated` and is now the user's — the same shape a gate
+            # escalation leaves behind, and for the same reason: the row must still be
+            # claimable by the command that really decides it.
+            central.add_inbox(
+                project=q["project"], level="warning",
+                title=supervisor.ESCALATED_INBOX_TITLE.format(alarm_id=alarm["id"]),
+                body=f"{alarm['reason']}\n"
+                     f"The supervisor could not settle it: {alarm['verdict_reason']}\n"
+                     f"Neo declined to decide: {(verdict['reason'] or '')[:200]}\n"
+                     f"Read it with: jarvis alarms show {alarm['id']}\n"
+                     f"The question in full: jarvis neo show {q['id']}",
+                wo_id=q["wo_id"])
+            pstore.flag_attention(q["wo_id"], supervisor.ALARM_BLOCKER.format(
+                alarm_id=alarm["id"]))
+            log.info("alarm %s escalated to the user by neo", alarm["id"])
+            return
+
+        # The PROJECT's clip, not a literal: `note` is what the user is shown instead of
+        # an interruption and it reaches every sink, Telegram included.
+        cfg = self._supervisor_config(q["project"])
+        note = (verdict["answer"] or "").strip()[:cfg.note_chars]
+        pstore.update_alarm(
+            alarm["id"], status="acked", verdict="ack", note=note,
+            verdict_reason=supervisor.NEO_ANSWERED_REASON.format(
+                reason=verdict["reason"] or "(no reason given)"),
+            decided_at=db_mod.now())
+        pstore.add_event(q["wo_id"], "alarm_advice",
+                         {"alarm_id": alarm["id"], "neo_question_id": q["id"],
+                          "answer": note})
+        # §2's ack path exactly, `ops.ack_attention` and never `clear_attention`: that
+        # one wipes `acknowledged_blockers` and discards the user's own dismissals.
+        try:
+            ops.ack_attention(q["wo_id"])
+        except ops.OpsError as exc:
+            log.info("alarm %s acked by neo; attention left up: %s", alarm["id"], exc)
+        central.add_inbox(
+            project=q["project"], level="info",
+            title=supervisor.ADVICE_INBOX_TITLE.format(wo_id=q["wo_id"]),
+            body=f"{note}\n{supervisor.ALARM_PATH.format(project=q['project'], alarm_id=alarm['id'])}",
+            wo_id=q["wo_id"])
+        log.info("neo answered alarm %s", alarm["id"])
+
+    def _supervisor_config(self, project: str) -> Any:
+        """This project's supervisor settings, falling back to the shipped defaults.
+
+        A verdict can outlive the project's presence in the catalog — the drain reads a
+        question filed on an earlier tick — and losing Neo's answer over a missing config
+        block would be the failure this feature exists to prevent.
+        """
+        from .catalog import CatalogError, SupervisorConfig
+
+        try:
+            return self.catalog.project(project).supervisor
+        except CatalogError:
+            return SupervisorConfig()
 
     def _deliver_gate_verdict(self, central: CentralStore, pstore: ProjectStore | None,
                               q: dict, verdict: dict) -> None:
