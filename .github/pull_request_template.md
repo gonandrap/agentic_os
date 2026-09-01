@@ -16,6 +16,13 @@
 
 -
 
+## Alarms raised
+
+<!-- One bullet per cost alarm this work order raised, each with its al- id and link.
+     `jarvis alarms --wo $JARVIS_WO_ID`. Write "None." if it raised none. -->
+
+-
+
 ## Learnings
 
 <!-- One bullet per knowledge-base entry this work wrote, each with its kn- id.

@@ -99,6 +99,31 @@ DEFAULT_AUTOCOMPACT_WINDOW = 400_000
 AUTOCOMPACT_MIN = 100_000    # `claude --autocompact` rejects anything under this
 AUTOCOMPACT_MAX = 1_000_000  # ... or over this
 
+# A cold cache boundary that kept NOTHING was the entry expiring; one that still served
+# the static head of the system prompt was the prefix moving, and no TTL would have
+# helped it. This is the ceiling separating them, and it is configurable because it is a
+# property of THIS FLEET'S PROMPTS — the static head is a project's CLAUDE.md plus the
+# worker briefing, so a fleet of terse projects sits lower and a verbose one higher.
+#
+# IT SITS AT `os.` AND NOT AT `os.defaults.`, WHICH IS THE DELIBERATE PART. Everything
+# under `os.defaults` is a value a project may override, and per-project is the shape
+# this setting most looks like it wants — the static head is literally per project. It
+# is not offered, because the two surfaces that consume the threshold (the fleet cost
+# view and scripts/cache_ttl_cohort.py) walk TRANSCRIPTS rather than work orders and
+# cannot cheaply tell which project a session belonged to. A per-project override would
+# therefore be honoured for a single order's bill and silently ignored by every
+# aggregate — a knob that looks like a feature and behaves like a bug. Offer it only
+# together with session-to-project attribution in those two readers (Neo, question 191).
+#
+# Reasoning and the measured populations:
+# docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
+DEFAULT_COLD_PREFIX_FLOOR = 5_000
+#: Guard rail on the above, and configurable for the same reason it is: a fleet whose
+#: static heads are unusually large needs room to raise the floor. Only the SCHEMA
+#: defaults are literals here; both values are `os.` keys the config console can change
+#: without a release.
+DEFAULT_COLD_PREFIX_FLOOR_MAX = 100_000
+
 
 _MISSING = object()
 
@@ -386,6 +411,9 @@ class OsConfig:
     default_permission_mode: str = DEFAULT_PERMISSION_MODE
     default_max_concurrent: int = DEFAULT_MAX_CONCURRENT
     default_autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
+    #: Read by the cost surfaces, not by a worker launch — see DEFAULT_COLD_PREFIX_FLOOR.
+    cold_prefix_floor: int = DEFAULT_COLD_PREFIX_FLOOR
+    cold_prefix_floor_max: int = DEFAULT_COLD_PREFIX_FLOOR_MAX
     notification_sinks: list[str] = field(default_factory=lambda: ["log"])
     telegram_token_env: str = "JARVIS_TELEGRAM_TOKEN"
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
@@ -419,6 +447,32 @@ class Catalog:
 
 def _err(msg: str) -> CatalogError:
     return CatalogError(f"catalog error: {msg}")
+
+
+def _positive_int_or_err(os_raw: dict[str, Any], key: str, default: int) -> int:
+    value = os_raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _err(f"os.{key} must be an integer")
+    return value
+
+
+def _cold_prefix_floor_or_err(os_raw: dict[str, Any]) -> tuple[int, int]:
+    """`os.cold_prefix_floor` and its guard rail, validated at boot not at report time.
+
+    Rejected here for the same reason the autocompact window is: a bad value would
+    otherwise surface far from its cause — as a cost report quietly reclassifying every
+    boundary, which reads as a finding rather than as a config error.
+    """
+    ceiling = _positive_int_or_err(os_raw, "cold_prefix_floor_max",
+                                   DEFAULT_COLD_PREFIX_FLOOR_MAX)
+    if ceiling <= 0:
+        raise _err(f"os.cold_prefix_floor_max {ceiling} must be positive")
+    floor = _positive_int_or_err(os_raw, "cold_prefix_floor",
+                                 DEFAULT_COLD_PREFIX_FLOOR)
+    if not 0 <= floor <= ceiling:
+        raise _err(f"os.cold_prefix_floor {floor} out of range 0-{ceiling} "
+                   f"(os.cold_prefix_floor_max)")
+    return floor, ceiling
 
 
 def _autocompact_or_err(raw: dict[str, Any], key: str, where: str,
@@ -634,6 +688,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         panel=_parse_panel(neo_raw.get("panel", {})),
     )
 
+    cold_floor, cold_floor_max = _cold_prefix_floor_or_err(os_raw)
     os_cfg = OsConfig(
         default_model=defaults.get("model", DEFAULT_MODEL),
         default_effort=defaults.get("effort"),
@@ -647,6 +702,8 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         telegram_chat_id_env=telegram.get("chat_id_env", "JARVIS_TELEGRAM_CHAT_ID"),
         ui_port=ui.get("port", 8787),
         ui_base_url=str(ui.get("base_url", "") or "").rstrip("/"),
+        cold_prefix_floor=cold_floor,
+        cold_prefix_floor_max=cold_floor_max,
         knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
         knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 40)),
         knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 4000)),

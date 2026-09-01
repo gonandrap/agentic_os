@@ -1,5 +1,60 @@
 {% extends "base.html" %}
 {% block title %}Config — Jarvis{% endblock %}
+
+{% block head %}
+<style>
+  /* Two columns: the key space on the left, one node's settings on the right.
+     `minmax(0, 1fr)` and not `1fr` — a grid track sized by its content is how the
+     right-hand pane grows past the shell and takes the table's rules with it. */
+  .cfg-layout { display: grid; grid-template-columns: 236px minmax(0, 1fr);
+                gap: 16px; align-items: start; }
+  @media (max-width: 820px) { .cfg-layout { grid-template-columns: 1fr; } }
+
+  .cfg-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+             margin: 14px 0 10px; }
+  .cfg-bar select { min-width: 200px; }
+  .cfg-bar input[name=q] { flex: 1 1 220px; min-width: 160px; }
+  .cfg-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0 0 14px; }
+
+  .cfg-tree { list-style: none; margin: 0; padding: 6px 8px; font-size: 13.5px;
+              overflow: hidden; }
+  .cfg-tree ul { list-style: none; margin: 0; padding-left: 10px;
+                 border-left: 1px solid var(--line); }
+  .cfg-tree a { display: flex; gap: 6px; padding: 3px 6px; border-radius: 5px;
+                color: var(--ink-2); }
+  .cfg-tree a:hover { background: var(--raised); text-decoration: none; }
+  .cfg-tree a.on { background: var(--raised); color: var(--ink); font-weight: 600; }
+  .cfg-tree .twist { color: var(--ink-3); width: 9px; flex: none; }
+  .cfg-tree a > span:nth-child(2) { white-space: nowrap; overflow: hidden;
+                                    text-overflow: ellipsis; }
+  .cfg-tree .n { color: var(--ink-3); margin-left: auto; font-family: var(--mono);
+                 font-size: 11.5px; }
+
+  /* `table-layout: fixed` is the whole of the overflow fix: without it a long value or
+     a nowrap button sets the table's width from its content, the percentages below are
+     advisory, and every rule runs past the panel it is drawn in. `overflow: hidden`
+     on the panel is the belt to that braces. */
+  .cfg-panel { overflow: hidden; }
+  .cfg-table { table-layout: fixed; }
+  .cfg-table td, .cfg-table th { overflow-wrap: anywhere; }
+  .cfg-table td { padding: 7px 12px; }
+  .cfg-table th { padding-left: 12px; padding-right: 12px; }
+
+  .cfg-edit { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .cfg-edit .val { flex: 1 1 11ch; min-width: 9ch; font-family: var(--mono);
+                   font-size: 12.5px; }
+  .cfg-edit textarea.val { min-height: 3.4em; resize: vertical; flex-basis: 100%; }
+  /* The reason box was 22px wide at a 900px viewport — a flex item's default
+     `min-width: auto` collapses to its content, and `min-width: 0` made it worse. */
+  .cfg-edit .reason { flex: 1 1 12ch; min-width: 10ch; font-size: 12.5px; }
+  .cfg-edit button { flex: none; white-space: nowrap; }
+  .cfg-group td { background: var(--raised); padding-top: 5px;
+                  padding-bottom: 5px; letter-spacing: 0.05em; }
+  .cfg-val { font-family: var(--mono); font-size: 12.5px; color: var(--ink-2);
+             margin-bottom: 4px; }
+</style>
+{% endblock %}
+
 {% block content %}
 
 {% macro change_line(c) %}
@@ -9,61 +64,122 @@
 {% endif %}
 {% endmacro %}
 
+{% macro tree_nodes(nodes) %}
+<ul>
+  {% for n in nodes %}
+  <li>
+    <a href="/config?scope={{ scope|urlencode }}&amp;node={{ n.path|urlencode }}"
+       class="{{ 'on' if n.here }}">
+      <span class="twist">{{ ('▾' if n.open else '▸') if n.children else '·' }}</span>
+      <span>{{ n.name }}</span><span class="n">{{ n.count }}</span></a>
+    {% if n.children and n.open %}{{ tree_nodes(n.children) }}{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% endmacro %}
+
 <h2>Configuration</h2>
 <p class="kv">
   What the fleet is running, read from <span class="mono">{{ show.catalog }}</span>.
-  This page is <strong>read-only plus boolean toggles</strong> — every other value is
-  changed with <code>jarvis config set</code>, where it is already text.
+  Every setting here is editable, and each save is the same
+  <code>jarvis config set</code> the terminal calls — recorded as a version, with a
+  reason where one is required.
 </p>
 <div class="panel" style="padding: 10px 16px">
-  {% if show.drift %}
-  <div class="tone-warn">⚠ the file is
-    <span class="mono">{{ show.file_version }}</span>, which is NOT the recorded head —
-    <code>jarvis config adopt</code> records it, or <code>jarvis config restore &lt;id&gt;</code>
-    puts the record's version back</div>
-  {% elif show.version %}
+  {# `drift` is also true when the ledger is EMPTY, and "edited outside Jarvis" is the
+     wrong sentence for a fleet nobody has recorded yet — so the version comes first. #}
+  {% if not show.version %}
+  <div class="sub">no version recorded yet — <code>jarvis config adopt</code> records
+    the file as the ledger's first</div>
+  {% elif show.drift %}
+  <div class="tone-warn">⚠ the catalog file has been edited outside Jarvis. The fleet
+    <strong>is</strong> running the file, so nothing is broken and nothing is waiting on
+    you — it is the version ledger that has no row for this edit, so the history below
+    cannot explain the current values. <code>jarvis config adopt</code> files the file as
+    a version; <code>jarvis config restore &lt;id&gt;</code> throws the edit away and puts
+    a recorded version back.</div>
+  {% else %}
   <div class="sub">version <span class="mono">{{ show.version.id }}</span> ·
     {{ show.version.actor }} · {{ fmt_age(show.version.ts) }} ago
     {% if show.version.reason %} · {{ show.version.reason }}{% endif %}</div>
-  {% else %}
-  <div class="sub">no version recorded yet — <code>jarvis config adopt</code> records
-    the file as the ledger's first</div>
   {% endif %}
 </div>
 
-{% for g in groups %}
-<h2>{{ 'os — the fleet' if g.name == 'os' else 'project · ' + g.title }}</h2>
-<div class="panel">
-  <table>
-    <tr><th style="width:32%">setting</th><th style="width:16%">value</th>
-        <th style="width:24%">where it came from</th><th style="width:28%"></th></tr>
-    {% for k in g.settings %}
-    <tr>
-      <td class="mono">{{ k.label }}{% if k.safety %}
-        <span class="tone-warn" title="a safety setting — it changes what a worker is
-              allowed to do, so a reason is required">⚠</span>{% endif %}</td>
-      <td class="mono">{{ k.value|tojson }}</td>
-      <td class="sub" style="white-space:nowrap">
-        {%- if k.version %}set by <a href="#{{ k.version }}" class="mono">{{ k.version }}</a>
-        {%- elif k.written %}set in the catalog file, by no recorded version
-        {%- else %}a default of this build{% endif %}</td>
-      <td>
-        {% if k.bool %}
-        <form method="post" action="/config/set" class="inline"
-              style="display:flex; gap:6px; align-items:center">
-          <input type="hidden" name="path" value="{{ k.path }}">
-          <input type="hidden" name="value" value="{{ 'false' if k.value else 'true' }}">
-          <input type="text" name="reason" style="min-width:0"
-                 placeholder="{{ 'reason — required' if k.safety else 'reason — optional' }}">
-          <button style="white-space:nowrap">{{ 'turn off' if k.value else 'turn on' }}</button>
-        </form>
-        {% endif %}
-      </td>
-    </tr>
+<form class="cfg-bar" method="get" action="/config">
+  <label class="sub" for="cfg-scope">showing</label>
+  <select name="scope" id="cfg-scope" onchange="this.form.submit()">
+    {% for s in scopes %}
+    <option value="{{ s.key }}" {{ 'selected' if s.key == scope }}>{{ s.title }}</option>
     {% endfor %}
-  </table>
+  </select>
+  <input type="search" name="q" value="{{ q }}" placeholder="search settings…">
+  <button class="primary">Search</button>
+  {% if q %}<a class="sub" href="/config?scope={{ scope|urlencode }}">clear</a>{% endif %}
+</form>
+
+<div class="cfg-legend sub">
+  <span><span class="tone-warn">⚠</span> a safety setting: it changes what a worker is
+    <em>allowed</em> to do, so a reason is required before it will save</span>
+  <span>the number beside a tree node is how many settings are under it</span>
 </div>
-{% endfor %}
+
+<div class="cfg-layout">
+  <div class="panel">
+    <div class="cfg-tree" role="navigation" aria-label="settings">
+      <a href="/config?scope={{ scope|urlencode }}" class="{{ 'on' if not node and not q }}">
+        <span class="twist">▾</span><span>{{ scope_short }}</span>
+        <span class="n">{{ total }}</span></a>
+      {{ tree_nodes(tree) }}
+    </div>
+  </div>
+
+  <div class="panel cfg-panel">
+    <table class="cfg-table">
+      <tr><th style="width:31%">setting</th><th style="width:41%">value</th>
+          <th style="width:28%">where it came from</th></tr>
+      {% set ns = namespace(node=None) %}
+      {% for k in rows %}
+      {% if q and k.node != ns.node %}{% set ns.node = k.node %}
+      <tr class="cfg-group"><td colspan="3" class="sub mono">
+        {%- if k.node %}<a href="/config?scope={{ scope|urlencode }}&amp;node={{ k.node|urlencode }}">{{ k.node }}</a>
+        {%- else %}{{ scope_short }}{% endif %}</td></tr>
+      {% endif %}
+      <tr>
+        <td class="mono">{{ k.label }}{% if k.safety %}
+          <span class="tone-warn" title="a safety setting — it changes what a worker is
+                allowed to do, so a reason is required">⚠</span>{% endif %}</td>
+        <td>
+          <form method="post" action="/config/set" class="cfg-edit">
+            <input type="hidden" name="path" value="{{ k.path }}">
+            <input type="hidden" name="back" value="{{ here }}">
+            {% if k.widget == 'bool' %}
+            <span class="cfg-val">{{ k.value|tojson }}</span>
+            <input type="hidden" name="value" value="{{ 'false' if k.value else 'true' }}">
+            {% elif k.widget == 'json' %}
+            <textarea class="val mono" name="value" rows="2">{{ k.text }}</textarea>
+            {% elif k.widget == 'number' %}
+            <input class="val" type="number" step="any" name="value" value="{{ k.text }}">
+            {% else %}
+            <input class="val" type="text" name="value" value="{{ k.text }}">
+            {% endif %}
+            <input class="reason" type="text" name="reason"
+                   placeholder="{{ 'reason — required' if k.safety else 'reason — optional' }}">
+            <button>{{ ('turn off' if k.value else 'turn on') if k.widget == 'bool' else 'Save' }}</button>
+          </form>
+        </td>
+        <td class="sub">
+          {%- if k.version %}set by <a href="#{{ k.version }}" class="mono">{{ k.version }}</a>
+          {%- elif k.written %}set in the catalog file, by no recorded version
+          {%- else %}a default of this build{% endif %}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="3" class="sub">
+        {% if q %}no setting under {{ scope_title }} matches
+          <span class="mono">{{ q }}</span>{% else %}nothing here{% endif %}</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+</div>
 
 <h2>History</h2>
 <div class="panel">
@@ -91,7 +207,9 @@
 
 <h2>Diff</h2>
 <div class="panel" style="padding: 10px 16px">
-  <form method="get" action="/config" style="display:flex; gap:8px; align-items:center">
+  <form method="get" action="/config" style="display:flex; flex-wrap:wrap; gap:8px; align-items:center">
+    <input type="hidden" name="scope" value="{{ scope }}">
+    <input type="hidden" name="node" value="{{ node }}">
     <select name="a">
       {% for row in history %}
       <option value="{{ row.id }}" {{ 'selected' if row.id == a }}>{{ row.id }} · {{ row.actor }} · {{ fmt_age(row.ts) }} ago</option>

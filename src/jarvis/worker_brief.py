@@ -524,8 +524,9 @@ def concision_section() -> str:
         "",
         "This cuts NARRATION OF THE DIFF, and nothing else. It is not licence to "
         "ship a thin body: the summary, the implementation notes, the Neo "
-        "questions, the learnings and the test evidence all stay, because none of "
-        "them is anywhere else. Fill the repository's PR template — your "
+        "questions, the alarms this order raised, the learnings and the test "
+        "evidence all stay, because none of them is anywhere else. Fill the "
+        "repository's PR template — your "
         "`open-a-pull-request` skill has it, and a `gh pr create` missing a "
         "section is denied "
         "(docs/superpowers/specs/2026-08-24-a-pull-request-a-reviewer-can-read.md).",

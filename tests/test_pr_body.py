@@ -26,6 +26,7 @@ def _body(**sections: str) -> str:
         "Summary": "Adds the thing.",
         "Implementation notes": "- chose X over Y because Z",
         "Questions asked to Neo": "- q164 http://localhost:8787/neo/question/164",
+        "Alarms raised": "None.",
         "Learnings": "- kn-abc123 what the next order inherits",
         "Test evidence": (
             "| Kind | Command | Result |\n"
@@ -122,6 +123,22 @@ def test_one_filled_cell_answers_the_table():
 def test_a_section_holding_only_scaffolding_is_empty(content):
     assert hooks.pr_body_problems(_body(Learnings=content)) == [
         "`## Learnings` is still the empty template"]
+
+
+def test_the_alarms_section_is_required_like_every_other():
+    """§7 of docs/superpowers/specs/2026-08-31-the-supervisor.md. The default in
+    `_body()` would turn every test above green without one of them proving the
+    section is enforced, so this asserts the deny string directly."""
+    body = _body().replace("## Alarms raised", "## Alarms")
+
+    assert hooks.pr_body_problems(body) == ["no `## Alarms raised` section"]
+
+
+def test_an_order_that_raised_no_alarm_still_answers_the_section():
+    """`None.` is content; a blank section is the one the hook sends back."""
+    assert hooks.pr_body_problems(_body(**{"Alarms raised": "None."})) == []
+    assert hooks.pr_body_problems(_body(**{"Alarms raised": "-"})) == [
+        "`## Alarms raised` is still the empty template"]
 
 
 def test_a_missing_section_is_named():

@@ -290,6 +290,40 @@ def test_a_question_on_the_timeline_is_a_link_to_the_question(client, daemon, pr
     assert "worker → Neo" in said
 
 
+def test_an_alarm_on_the_timeline_is_a_link_to_that_alarm(client, daemon, project):
+    """§4 of docs/superpowers/specs/2026-08-31-the-supervisor.md.
+
+    The exact href, not `"al-" in page`: the id is printed on the page by the standing
+    of the alarm itself, so the loose assertion passes with no link rendered at all.
+    `/alarms/<project>/<al-id>` is the shape §5 builds and 404s until it does — the
+    assertion that it RESOLVES is that section's, and deliberately not here.
+    """
+    wo = ops.create_work_order("proj_a", "export citations")
+    daemon.tick()
+    _, path, _ = ops.find_work_order(wo["id"], "proj_a")
+    store = ProjectStore(path)
+    alarm = store.add_alarm(wo["id"], "turn_minutes", 1, "running 94 minutes")
+    store.add_event(wo["id"], "cost_alarm",
+                    {"kind": "turn_minutes", "seq": 1, "reason": "running 94 minutes",
+                     "alarm_id": alarm["id"]})
+    store.add_event(wo["id"], "alarm_reviewed",
+                    {"alarm_id": alarm["id"], "verdict": "ack",
+                     "reason": "a long test run, not a stuck turn",
+                     "note": "it is re-running the suite; nothing is stuck"})
+    store.close()
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    said, story = page.split('id="tab-timeline"', 1)
+    assert f'href="/alarms/proj_a/{alarm["id"]}"' in story
+    # The note is speech and lives in the conversation, once. The verdict's reason is
+    # the record's and lives on the timeline, once.
+    assert said.count("it is re-running the suite; nothing is stuck") == 1
+    assert "it is re-running the suite; nothing is stuck" not in story
+    assert "supervisor → you" in said
+    assert story.count("a long test run, not a stuck turn") == 1
+    assert "a long test run, not a stuck turn" not in said
+
+
 def test_the_question_page_holds_the_question_and_its_answer(client, daemon, project):
     wo = ops.create_work_order("proj_a", "risky change")
     daemon.tick()
