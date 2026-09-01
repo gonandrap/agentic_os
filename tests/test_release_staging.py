@@ -553,6 +553,11 @@ def test_stage_writes_the_marker_for_real(tmp_path):
         "tag": "jarvis-0.2.0", "staged_at": marker["staged_at"], "state": "staged",
     }
     assert before <= marker["staged_at"] <= time.time() + 1
+    # This tag carries no scripts/install_prod_service.sh, so the unit re-render (step
+    # 5a) cannot run. Aborting a release over it would be the worse bug — but staying
+    # SILENT about the units is the exact failure that step was added to end.
+    assert "units NOT re-rendered" in r.stdout
+    assert "jarvis doctor" in r.stdout
     # the release itself really happened: tag on origin, prod checkout on the tag
     tags = subprocess.run(["git", "-C", str(tmp_path / "origin.git"), "tag"],
                           capture_output=True, text=True, check=True).stdout

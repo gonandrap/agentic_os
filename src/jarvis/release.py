@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -66,6 +67,35 @@ log = logging.getLogger("jarvisd.release")
 
 UI_UNIT = "jarvis-ui.service"
 DAEMON_UNIT = "jarvis.service"
+
+#: Where `scripts/install_prod_service.sh` installs the two units. Overridable so the
+#: suite can point a check at a rendered unit with no systemd anywhere near it — the
+#: same seam the script's own `--unit-dir` gives its tests.
+UNIT_DIR_ENV = "JARVIS_SYSTEMD_UNIT_DIR"
+
+
+def unit_dir() -> Path:
+    return Path(os.environ.get(UNIT_DIR_ENV) or "~/.config/systemd/user").expanduser()
+
+
+def unit_environment(unit: str, name: str) -> str | None:
+    """One `Environment=<name>=…` value from an installed unit, or None.
+
+    Reads the FILE, not `systemctl show`: what is on disk is what the next start will
+    use, and a stale unit that has not been reloaded is exactly the case worth catching.
+    Deliberately tolerant — a unit that is absent (no services installed) or unreadable
+    is not this function's problem to report.
+    """
+    try:
+        text = (unit_dir() / unit).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    prefix = f"Environment={name}="
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith(prefix):
+            return line[len(prefix):].strip().strip('"')
+    return None
 
 #: How long a `staged` marker may sit before the BOOT check stops waiting for the
 #: reconcile hook and verifies against `staged_at` instead. Generous on purpose: the

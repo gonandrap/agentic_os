@@ -13,14 +13,20 @@
 # Flags:
 #   --dry-run           render the units and print the plan; touch no systemd state
 #   --unit-dir <dir>    where the units go (default: ~/.config/systemd/user)
+#   --no-restart        render, reload and enable, then stop — the caller restarts.
+#                       scripts/shipit.sh uses this: it re-renders the units on every
+#                       release and already owns the restart order (UI inline, daemon
+#                       detached), which this script must not duplicate.
 set -euo pipefail
 
 DRY_RUN=0
+NO_RESTART=0
 UNIT_DIR="$HOME/.config/systemd/user"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dry-run)  DRY_RUN=1; shift ;;
-    --unit-dir) UNIT_DIR="$2"; shift 2 ;;
+    --dry-run)    DRY_RUN=1; shift ;;
+    --no-restart) NO_RESTART=1; shift ;;
+    --unit-dir)   UNIT_DIR="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -87,13 +93,22 @@ fi
 if [ "$DRY_RUN" = 1 ]; then
   echo "[dry-run] systemctl --user daemon-reload"
   echo "[dry-run] systemctl --user enable jarvis.service jarvis-ui.service"
-  echo "[dry-run] systemctl --user restart jarvis-ui.service"
-  echo "[dry-run] systemctl --user restart jarvis.service"
+  if [ "$NO_RESTART" = 1 ]; then
+    echo "[dry-run] (--no-restart) restarts left to the caller"
+  else
+    echo "[dry-run] systemctl --user restart jarvis-ui.service"
+    echo "[dry-run] systemctl --user restart jarvis.service"
+  fi
   exit 0
 fi
 
 systemctl --user daemon-reload
 systemctl --user enable  jarvis.service jarvis-ui.service
+
+if [ "$NO_RESTART" = 1 ]; then
+  echo "units re-rendered and reloaded — restarts left to the caller (--no-restart)"
+  exit 0
+fi
 
 # Restart order matters, for the same reason it does in scripts/shipit.sh: run from a
 # Claude session that Jarvis spawned, this script lives inside jarvis.service's cgroup,
