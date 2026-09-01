@@ -6,6 +6,8 @@ Grouped commands:
   jarvis inspect <wo-id|fo-id>            where its TIME went, and which cache writes
                                           were a defect rather than the cache expiring
   jarvis alarms [project]                 turns raised WHILE they were still burning
+  jarvis alarms show|review <al-id>       one alarm, and your verdict on the
+                                          supervisor's
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
   jarvis fo create|list|show|plan|submit|approve|cancel feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
@@ -236,14 +238,37 @@ def build_parser() -> argparse.ArgumentParser:
                          f"{catalog.DEFAULT_INSPECT_REPORT_JOIN_FLOOR})")
     sp.add_argument("--json", action="store_true")
 
-    sp = sub.add_parser(
+    # `jarvis alarms` and `jarvis alarms <project>` are the two spellings that already
+    # exist, and a bare positional cannot coexist with a subparser group — argparse
+    # would read `proj_a` as an unknown subcommand. So the group is the only positional
+    # and `_normalise_alarms` inserts the implicit `list` before parsing; both old
+    # spellings reach exactly the same code as before. §5 of
+    # docs/superpowers/specs/2026-08-31-the-supervisor.md.
+    alarms = sub.add_parser(
         "alarms",
         help="turns the OS raised WHILE they were still costing money, newest first",
-    )
+    ).add_subparsers(dest="alarms_cmd", required=True)
+
+    sp = alarms.add_parser("list", help="every alarm, newest first (the default)")
     sp.add_argument("project", nargs="?", help="one project (default: the whole fleet)")
     sp.add_argument("--limit", type=int, default=50,
                     help="alarms to show (default: 50)")
     sp.add_argument("--wo", help="one work order's alarms, with their ids")
+    sp.add_argument("--json", action="store_true")
+
+    sp = alarms.add_parser("show", help="one alarm: what fired, and what came of it")
+    sp.add_argument("alarm_id", help="an al-… id (from `jarvis alarms --wo <wo-id>`)")
+    sp.add_argument("--project")
+    sp.add_argument("--json", action="store_true")
+
+    sp = alarms.add_parser(
+        "review", help="approve or correct the supervisor's verdict on one alarm")
+    sp.add_argument("alarm_id")
+    sp.add_argument("--reject", action="store_true",
+                    help="the supervisor got it wrong; --feedback says what it should "
+                         "have decided")
+    sp.add_argument("--feedback", default="", help="required with --reject")
+    sp.add_argument("--project")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
@@ -1347,6 +1372,27 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+#: The `alarms` subcommands. Anything else after `alarms` is the project positional the
+#: command has always taken, so it is a `list` argument and not a typo'd verb.
+ALARMS_SUBCOMMANDS = ("list", "show", "review")
+
+
+def _normalise_alarms(argv: list[str]) -> list[str]:
+    """Insert the implicit `list` so `jarvis alarms [project]` keeps working verbatim.
+
+    Done on argv rather than with a default subparser because argparse has no such
+    thing: a subparser group IS the positional, so `alarms proj_a` would be parsed as
+    an invalid choice. Everything after the inserted word is untouched, flags included.
+    """
+    if not argv or argv[0] != "alarms":
+        return argv
+    # `-h` is the one word that must NOT be read as a list argument: the reader asking
+    # for `jarvis alarms --help` wants the three verbs, not `list`'s flags.
+    if len(argv) > 1 and argv[1] in (*ALARMS_SUBCOMMANDS, "-h", "--help"):
+        return argv
+    return [argv[0], "list", *argv[1:]]
+
+
 def cmd_alarms(args: argparse.Namespace) -> int:
     """The dashboard's `/alarms` page in the terminal — the CLI is the OS.
 
@@ -1355,6 +1401,10 @@ def cmd_alarms(args: argparse.Namespace) -> int:
     """
     from . import ops
 
+    if args.alarms_cmd == "show":
+        return cmd_alarms_show(args)
+    if args.alarms_cmd == "review":
+        return cmd_alarms_review(args)
     rows = ops.list_cost_alarms(args.project, limit=args.limit, wo_id=args.wo)
     if args.json:
         _print(rows, True)
@@ -1376,6 +1426,53 @@ def cmd_alarms(args: argparse.Namespace) -> int:
         print(f"    {row['reason']}")
     if live:
         print("\nack one with: jarvis wo ack <wo-id>")
+    return 0
+
+
+def cmd_alarms_show(args: argparse.Namespace) -> int:
+    """One alarm in full, the terminal's half of `/alarms/<project>/<al-id>`."""
+    from . import ops
+
+    a = ops.alarm_detail(args.alarm_id, project_name=args.project)
+    if args.json:
+        _print(a, True)
+        return 0
+    print(f"{a['id']}  {a['project']}  {a['wo_id']}  {a['title']}")
+    print(f"  {a['kind']}  turn {a['seq']}  {_age(a['ts'])} ago"
+          f"{'  ! still asking' if a['live'] else ''}")
+    print(f"  what fired: {a['reason']}")
+    if a["verdict"]:
+        decided = f"  {_age(a['decided_at'])} ago" if a["decided_at"] else ""
+        print(f"\n  supervisor: {a['verdict']}{decided}")
+        print(f"    why:  {a['verdict_reason'] or '—'}")
+        print(f"    note: {a['note'] or '—'}")
+    else:
+        print(f"\n  supervisor: {a['alarm_status']} — not decided")
+    if a["neo_question_id"]:
+        print(f"  neo (#{a['neo_question_id']}): {a['neo_advice'] or 'not answered yet'}")
+    if a["review_status"] == "unreviewed":
+        if a["verdict"]:
+            print(f"\nreview it: jarvis alarms review {a['id']} "
+                  f"[--reject --feedback \"…\"]")
+    else:
+        print(f"\n  you {a['review_status']} this"
+              f"{': ' + a['review_feedback'] if a['review_feedback'] else ''}")
+    return 0
+
+
+def cmd_alarms_review(args: argparse.Namespace) -> int:
+    """Approve or correct the supervisor. `--reject` is the correction, matching
+    `jarvis neo review` and `jarvis wo review` rather than inventing a third spelling."""
+    from . import ops
+
+    res = ops.review_alarm(args.alarm_id, approved=not args.reject,
+                           feedback=args.feedback, project_name=args.project)
+    if args.json:
+        _print(res, True)
+        return 0
+    print(f"{res['alarm_id']}: {res['review']}")
+    if res["neo_question_closed"]:
+        print("  the Neo question it escalated is closed — you have just answered it")
     return 0
 
 
@@ -2569,7 +2666,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
+    argv = _normalise_alarms(list(sys.argv[1:] if argv is None else argv))
     # accept --json anywhere, not only before the subcommand
     as_json = "--json" in argv
     args = build_parser().parse_args([a for a in argv if a != "--json"])

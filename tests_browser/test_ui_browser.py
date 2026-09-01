@@ -537,6 +537,65 @@ def test_a_burning_turn_is_reviewed_and_acked_in_the_browser(
     _shot(page, "alarms-after-ack")
 
 
+def test_the_three_halves_of_the_alarms_page_and_the_alarm_it_links_to(
+        page, server, project):
+    """§5 of docs/superpowers/specs/2026-08-31-the-supervisor.md, in a browser.
+
+    The supervisor is NOT run: every column it writes is set with `update_alarm`, so
+    this proves the page renders a verdict with `supervisor.py` absent — and a
+    screenshot does not cost a model call.
+    """
+    import time as _time
+
+    from jarvis import ops
+    from jarvis.project_store import ProjectStore
+
+    asking = ops.create_work_order("proj_a", "port the ingest job to the new schema")
+    answered = ops.create_work_order("proj_a", "write the observability design doc")
+    settled = ops.create_work_order("proj_a", "rebuild the nightly index")
+    store = ProjectStore(project)
+    try:
+        store.add_alarm(asking["id"], "long-turn", 3,
+                        "turn 3 has been running 1h12m and is still being billed")
+        store.flag_attention(asking["id"], "a turn is still being billed")
+
+        awaiting = store.add_alarm(
+            answered["id"], "long-turn", 1,
+            "turn 1 has been running 1h48m and is still being billed")
+        store.update_alarm(
+            awaiting["id"], status="acked", verdict="ack",
+            verdict_reason="the session is reading a 4,000-line spec end to end; the "
+                           "hour is the shape of the work, not a stall",
+            note="the design doc is long on purpose — nothing is stuck",
+            decided_at=_time.time() - 240)
+
+        old = store.add_alarm(settled["id"], "cache-write", 6,
+                              "turn 6 re-sent 312k tokens with the cache still warm")
+        store.update_alarm(old["id"], status="acked", verdict="ack",
+                           verdict_reason="a prefix miss, and the turn recovered",
+                           note="one expensive re-write; it did not repeat",
+                           review_status="approved", reviewed_at=_time.time() - 60)
+    finally:
+        store.close()
+
+    page.goto(f"{server}/alarms")
+    body = page.locator("body").inner_text()
+    assert "port the ingest job to the new schema" in body       # asking for you
+    assert "the design doc is long on purpose" in body           # awaiting feedback
+    assert "rebuild the nightly index" in body                   # on the record
+    _shot(page, "alarms-three-halves")
+
+    page.click(f"a[href='/alarms/proj_a/{awaiting['id']}']")
+    one = page.locator("body").inner_text()
+    assert "the hour is the shape of the work" in one
+    assert "That's the right call" in one
+    _shot(page, "alarm-one-in-full")
+
+    page.click("form button.accept")
+    assert "you approved this" in page.locator("body").inner_text()
+    _shot(page, "alarm-after-review")
+
+
 # -- /config -----------------------------------------------------------------------
 # WHY THIS BLOCK EXISTS. Ten defects were reported against the config console at once,
 # and tests/test_ui_config.py -- which asserts on the HTML string -- could not have
