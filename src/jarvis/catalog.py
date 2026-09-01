@@ -284,42 +284,60 @@ class InspectConfig:
     alarm_write_tokens: int = DEFAULT_INSPECT_ALARM_WRITE_TOKENS
 
 
-# -- the supervisor: the agent that answers a cost alarm before the user has to
+# -- the supervisor: it JUDGES a cost alarm, so every number it judges by is a setting
+# rather than a module constant (kn-67cdb54b). Reasoning, and why none of it belongs in
+# `InspectConfig`: docs/superpowers/specs/2026-08-31-the-supervisor.md §2.
 #
-# ABOVE `ProjectSpec` BECAUSE `ProjectSpec` USES IT VIA `field(default_factory=…)`, which
-# is evaluated at class-definition time — the trap that cost `ValidationConfig` a move
-# (kn-6ca2bcd9). Nothing here belongs in `InspectConfig`: that block is thresholds, and
-# `tests/test_inspection.py::test_nothing_in_the_module_hard_codes_a_threshold` AST-walks
-# `inspection.py` for numeric literals against exactly that list.
+# ABOVE `ProjectSpec`, which uses it via `field(default_factory=…)` — below it is a
+# NameError at import (kn-6ca2bcd9).
 
-#: An alarm older than this is never judged. Spend the user can no longer prevent is the
-#: noise the whole mechanism was tuned to avoid, and a model call to describe it is money
-#: spent on a turn that ended yesterday.
+DEFAULT_SUPERVISOR_MODEL = "opus"
+DEFAULT_SUPERVISOR_TIMEOUT = 300
+DEFAULT_SUPERVISOR_LEARNINGS_LIMIT = 50
+
+#: Past this an alarm is skipped unjudged: spend the user can no longer prevent.
 DEFAULT_SUPERVISOR_MAX_AGE_HOURS = 24
+
+#: MUST EXCEED `timeout`, or a claim is reclaimed out from under a call that is still
+#: running and one alarm is judged twice. `_parse_supervisor` refuses a catalog that
+#: breaks the relation.
+DEFAULT_SUPERVISOR_STALE_REVIEWING_SECONDS = 900
+DEFAULT_SUPERVISOR_MAX_REVIEW_ATTEMPTS = 3
+
+#: The evidence packet's ceiling and the clips that fill it. `conversation_` and
+#: `description_` are prefixed because both measure quoted characters (kn-67cdb54b).
+DEFAULT_SUPERVISOR_EVIDENCE_BUDGET_CHARS = 8000
+DEFAULT_SUPERVISOR_CONVERSATION_QUOTE_CHARS = 400
+DEFAULT_SUPERVISOR_QUOTED_TURNS = 3
+DEFAULT_SUPERVISOR_DESCRIPTION_CHARS = 500
+
+#: What the user is told, and how much of an unusable reply is kept as the reason.
+DEFAULT_SUPERVISOR_NOTE_CHARS = 200
+DEFAULT_SUPERVISOR_REASON_CHARS = 200
 
 
 @dataclass
 class SupervisorConfig:
-    """The OS-level agent that reviews a cost alarm and either acks it or wants Neo.
+    """The agent that reviews a cost alarm and either acks it or wants Neo — §2.
 
-    SHIPS DISABLED, and here that is stronger than the caution behind `PanelConfig`: the
-    failure mode is the worst available. A wrong ack puts the attention flag down on a
-    turn that is still burning, which is a strict regression on what PR 159 shipped —
-    whereas every other disabled feature merely fails to add something. Turning it on is
-    a catalog edit gated on the review loop being run by hand over real alarms; see §2 of
-    docs/superpowers/specs/2026-08-31-the-supervisor.md.
-
-    Field-level per-project inheritance (`_parse_supervisor`), the shape
-    `_parse_validation` and `_parse_inspect` both use: what counts as an explicable turn
-    differs by project for the same reason a threshold does, and `ProjectSpec.supervisor`
-    is fully resolved so no caller consults two objects.
+    SHIPS DISABLED: a wrong ack makes a burning turn invisible, which is a strict
+    regression on what PR 159 shipped. Field-level per-project inheritance
+    (`_parse_supervisor`), as `_parse_inspect` does it.
     """
 
     enabled: bool = False
-    model: str = "opus"
-    timeout: int = 300
-    learnings_limit: int = 50
+    model: str = DEFAULT_SUPERVISOR_MODEL
+    timeout: int = DEFAULT_SUPERVISOR_TIMEOUT
+    learnings_limit: int = DEFAULT_SUPERVISOR_LEARNINGS_LIMIT
     max_age_hours: int = DEFAULT_SUPERVISOR_MAX_AGE_HOURS
+    stale_reviewing_seconds: int = DEFAULT_SUPERVISOR_STALE_REVIEWING_SECONDS
+    max_review_attempts: int = DEFAULT_SUPERVISOR_MAX_REVIEW_ATTEMPTS
+    evidence_budget_chars: int = DEFAULT_SUPERVISOR_EVIDENCE_BUDGET_CHARS
+    conversation_quote_chars: int = DEFAULT_SUPERVISOR_CONVERSATION_QUOTE_CHARS
+    quoted_turns: int = DEFAULT_SUPERVISOR_QUOTED_TURNS
+    description_chars: int = DEFAULT_SUPERVISOR_DESCRIPTION_CHARS
+    note_chars: int = DEFAULT_SUPERVISOR_NOTE_CHARS
+    reason_chars: int = DEFAULT_SUPERVISOR_REASON_CHARS
 
 
 @dataclass
@@ -633,36 +651,28 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
 
 def _parse_supervisor(raw: Any, base: SupervisorConfig | None = None,
                       where: str = "os.supervisor") -> SupervisorConfig:
-    """`os.supervisor`, or a project's override of it, with the same field-level
-    inheritance `_parse_inspect` uses (kn-6ca2bcd9).
+    """`os.supervisor`, or a project's override of it — §2, and `_parse_inspect`'s shape.
 
-    `timeout` is refused below 1 for the reason a threshold is, and refused at or above
-    `supervisor.STALE_REVIEWING_SECONDS` for a sharper one: a claim reclaimed out from
-    under a call that is still running gets the same alarm judged twice, and the second
-    verdict overwrites the first. That relation is the whole point of the stale cutoff,
-    so it is enforced where a `jarvis config set` typo can be named rather than left to
-    a comment.
+    Every number is refused below 1, and `timeout` at or above `stale_reviewing_seconds`:
+    below that cutoff a claim is reclaimed out from under a call that is still running
+    and one alarm is judged twice. The numeric fields are read reflectively so a field
+    added above reaches the catalog with no edit here.
     """
-    from .supervisor import STALE_REVIEWING_SECONDS
-
     base = base or SupervisorConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
+    numbers = {k: v for k, v in vars(base).items() if k not in ("enabled", "model")}
     cfg = SupervisorConfig(
         enabled=bool(raw.get("enabled", base.enabled)),
         model=str(raw.get("model", base.model) or base.model),
-        timeout=int(raw.get("timeout", base.timeout)),
-        learnings_limit=int(raw.get("learnings_limit", base.learnings_limit)),
-        max_age_hours=int(raw.get("max_age_hours", base.max_age_hours)),
+        **{k: int(raw.get(k, v)) for k, v in numbers.items()},
     )
     for name, value in vars(cfg).items():
         if isinstance(value, int) and not isinstance(value, bool) and value < 1:
             raise _err(f"{where}.{name} must be >= 1")
-    if cfg.timeout >= STALE_REVIEWING_SECONDS:
-        raise _err(f"{where}.timeout must be under {STALE_REVIEWING_SECONDS}s "
-                   f"(supervisor.STALE_REVIEWING_SECONDS), or a claim is reclaimed out "
-                   f"from under a call that is still running and one alarm is judged "
-                   f"twice")
+    if cfg.timeout >= cfg.stale_reviewing_seconds:
+        raise _err(f"{where}.timeout must be under {where}.stale_reviewing_seconds "
+                   f"({cfg.stale_reviewing_seconds}s), or an alarm is judged twice")
     return cfg
 
 

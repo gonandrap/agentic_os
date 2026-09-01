@@ -1435,10 +1435,8 @@ class ProjectStore:
     def claim_next_alarm(self) -> dict[str, Any] | None:
         """Atomically claim the OLDEST alarm still `raised`, or None.
 
-        FIFO, and for a second reason on top of the one `NeoStore.claim_next` gives: the
-        supervisor's system prompt is byte-stable per project, so draining in order keeps
-        the shared prefix inside the prompt-cache TTL — and the oldest alarm is also the
-        one closest to `max_age_hours`, past which it is never judged at all.
+        FIFO keeps the supervisor's byte-stable prompt prefix inside the cache TTL, and
+        the oldest alarm is also the one closest to expiring unjudged.
         """
         cur = self.conn.execute(
             """UPDATE wo_alarms SET status='reviewing', claimed_at=?
@@ -1450,29 +1448,19 @@ class ProjectStore:
         row = cur.fetchone()
         return dict(row) if row else None
 
-    def reclaim_stale_alarms(self, older_than: float | None = None,
-                             max_attempts: int | None = None) -> dict[str, list[str]]:
+    def reclaim_stale_alarms(self, older_than: float,
+                             max_attempts: int) -> dict[str, list[str]]:
         """Unstick alarms parked in `reviewing` by a drain that never finished.
 
-        SHIPPED WITH `claim_next_alarm` AND NOT AFTER IT. `NeoStore.claim_next` went out
+        SHIPPED WITH `claim_next_alarm`, NOT AFTER IT: `NeoStore.claim_next` went out
         without its counterpart and a daemon restart mid-drain parked a question for ever
-        (bl-3f5f1464); an alarm stranded the same way is worse, because the attention flag
-        it left up is the user's only sign anything was ever wrong.
+        (bl-3f5f1464). Past `older_than` a row goes back to `raised` with `attempts`
+        incremented; at `max_attempts` it is `failed` instead — out of the queue, not
+        looping, and still flagged.
 
-        Rows past `older_than` seconds go back to `raised` with `attempts` incremented; a
-        row already at `max_attempts` is `failed` instead — out of the queue, not looping.
-        `failed` also leaves the flag up, which is the correct end state for an alarm
-        nobody managed to judge.
-
-        `older_than` MUST exceed the supervisor's call timeout; `catalog._parse_supervisor`
-        refuses a configuration where it does not.
-
-        Returns {"requeued": [alarm id, ...], "failed": [...]}.
+        Both bounds come from `catalog.SupervisorConfig`. Returns
+        {"requeued": [alarm id, ...], "failed": [...]}.
         """
-        from .supervisor import MAX_REVIEW_ATTEMPTS, STALE_REVIEWING_SECONDS
-
-        older_than = STALE_REVIEWING_SECONDS if older_than is None else older_than
-        max_attempts = MAX_REVIEW_ATTEMPTS if max_attempts is None else max_attempts
         cutoff = db.now() - older_than
         # Give up FIRST, then re-queue — `NeoStore.reclaim_stale`'s ordering and its
         # reason: the other way round increments a row to the ceiling and then fails it

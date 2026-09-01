@@ -69,6 +69,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 log = logging.getLogger("jarvisd")
 
 RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injected only)
+SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: Ask GitHub about parked pull requests every N ticks — ~2 minutes at the default 5s
 #: interval. Its own cadence rather than the reconcile one because it is the only step
 #: that leaves the machine: one `gh` subprocess per parked work order per poll. Two
@@ -1946,26 +1947,19 @@ class Daemon:
     # -- 5c. the supervisor: answering a cost alarm (see `jarvis.supervisor`) ---------
 
     def _supervised_projects(self) -> list[ProjectSpec]:
-        """Projects whose supervisor is on, read from the PROJECT's resolved config.
-
-        Never from `catalog.os.supervisor.enabled` alone: the block inherits field by
-        field, so a fleet that is off with one project switched on is a legal — and the
-        expected first — configuration, and a fleet-wide short circuit would silently
-        ignore it.
-        """
+        """Projects whose supervisor is on, read from the PROJECT's resolved config —
+        never from `os.supervisor.enabled` alone, which the per-project block legally
+        overrides and which is the expected first configuration."""
         return [p for p in self.catalog.projects
                 if p.supervisor.enabled and p.path.is_dir()]
 
     def supervisor_tick(self) -> None:
-        """Kick a review drain when alarms are waiting and none is running.
+        """Kick a review drain when alarms are waiting and none is running — §2.
 
         Mirrors `neo_tick`, including where the reclaim goes: BEFORE the queued count is
         read, so an alarm rescued this tick is judged this tick, and BEHIND the drain
         guard, so it can never re-queue an alarm out from under a call still running.
-
-        WITH NO PROJECT SUPERVISED THIS COSTS NOTHING — not a store opened, not a row
-        read — which is what makes "byte-identical when disabled" a property of the code
-        rather than of a test's luck.
+        With no project supervised it opens no store and reads no row.
         """
         supervised = self._supervised_projects()
         if not supervised or self.supervisor_draining:
@@ -1973,7 +1967,8 @@ class Daemon:
         waiting = 0
         for project in supervised:
             store = self.store_for(project)
-            stale = store.reclaim_stale_alarms()
+            stale = store.reclaim_stale_alarms(project.supervisor.stale_reviewing_seconds,
+                                               project.supervisor.max_review_attempts)
             if stale["requeued"] or stale["failed"]:
                 log.warning("supervisor reclaimed stranded alarms in %s: "
                             "requeued=%s failed=%s",
@@ -2010,18 +2005,14 @@ class Daemon:
     def _drain_project_alarms(self, project: ProjectSpec, pstore: ProjectStore,
                               neo_store: Any, central: CentralStore,
                               supervisor_mod: Any) -> None:
-        """Claim and judge one project's alarms until the queue is empty.
+        """Claim and judge one project's alarms until the queue is empty — §2.
 
-        WHICH ALARMS ARE JUDGED, and every exclusion leaves the queue rather than sitting
-        in it: an alarm nothing will ever look at again must not be claimable, or the
-        drain re-reads it on every tick for ever.
-
-        An alarm on an order that has SINCE SETTLED is still judged. The spend is a fact
-        and the user still deserves the note; only age excludes one, because spend the
-        user can no longer prevent is the noise the whole mechanism was tuned to avoid.
+        Every exclusion moves the alarm OUT of the queue rather than leaving it in: one
+        nothing will look at again must not stay claimable. An alarm on an order that has
+        since settled is still judged; only age excludes one.
         """
         cfg = project.supervisor
-        max_age = cfg.max_age_hours * 3600
+        max_age = cfg.max_age_hours * SECONDS_PER_HOUR
         while True:
             alarm = pstore.claim_next_alarm()
             if alarm is None:
@@ -2030,7 +2021,7 @@ class Daemon:
             if age > max_age:
                 pstore.update_alarm(
                     alarm["id"], status="skipped", decided_at=db.now(),
-                    verdict_reason=f"raised {age / 3600:.0f}h ago, past the "
+                    verdict_reason=f"raised {age / SECONDS_PER_HOUR:.0f}h ago, past the "
                                    f"{cfg.max_age_hours}h review window — the spend can "
                                    f"no longer be prevented")
                 continue
@@ -2041,11 +2032,10 @@ class Daemon:
                                     verdict_reason="the work order is gone")
                 continue
             verdict = supervisor_mod.review(
-                pstore, neo_store, project.name, wo, alarm,
-                model=cfg.model, timeout=cfg.timeout, central=central,
-                cfg=project.inspect)
+                pstore, neo_store, project.name, wo, alarm, cfg,
+                central=central, inspect_cfg=project.inspect)
             log.info("[%s] alarm %s: %s (%s)", project.name, alarm["id"],
-                     verdict["decision"], verdict["reason"][:120])
+                     verdict["decision"], verdict["reason"][:cfg.reason_chars])
 
     # -- 7. invariants (post-conditions) --------------------------------------------------
 

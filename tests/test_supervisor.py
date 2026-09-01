@@ -4,11 +4,11 @@
 
 WHAT THESE TESTS ARE BUILT TO AVOID. A test that reaches the daemon without explicitly
 enabling the supervisor exercises the disabled path and still gets a perfectly good
-result — nothing fails, so the assertions are all about CALL COUNTS and ROWS rather than
-about a verdict having come back. And the ack test that looks right grades nothing:
-`needs_attention == 0` passes just as well if `ProjectStore.clear_attention` had been
-used, which is the exact regression the ack path forbids. The assertion that
-discriminates is the user's own earlier acknowledgement still being on the row.
+result — nothing fails — so the assertions are on CALL COUNTS and ROWS, never on a
+verdict having come back. And `needs_attention == 0` grades nothing on its own:
+`ProjectStore.clear_attention` reaches it too, and that is the regression the ack path
+forbids. What discriminates is a re-derivable blocker landing in
+`acknowledged_blockers`, which only `ops.ack_attention` writes.
 """
 
 from __future__ import annotations
@@ -24,6 +24,16 @@ from jarvis import catalog, db, ops, supervisor, usage
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
+
+#: The shipped supervisor defaults. Named once so a test asserts against the CATALOG
+#: rather than against a literal it copied from it.
+CFG = catalog.SupervisorConfig()
+
+
+def _reclaim(store):
+    """`reclaim_stale_alarms` at the shipped bounds — both now come from the catalog."""
+    return store.reclaim_stale_alarms(CFG.stale_reviewing_seconds,
+                                      CFG.max_review_attempts)
 
 
 def _stamp(at: float) -> str:
@@ -331,15 +341,15 @@ def test_a_reply_with_no_decision_raises_rather_than_defaulting():
     from jarvis import structured
 
     with pytest.raises(structured.InvalidOutput, match="decision"):
-        supervisor._validate({"reason": "r", "note": "n", "question": ""})
+        supervisor._validate({"reason": "r", "note": "n", "question": ""}, 200)
     with pytest.raises(structured.InvalidOutput, match="decision"):
-        supervisor._validate({"decision": "cancel the turn", "reason": "r"})
+        supervisor._validate({"decision": "cancel the turn", "reason": "r"}, 200)
 
 
 def test_the_fail_safe_escalates_and_marks_itself_failed():
     """A failure must never become an ack, and it must not be mistaken for a judgement
     either: `failed` is what puts the alarm at `failed` rather than at `escalated`."""
-    verdict = supervisor._failed_verdict("well, it depends")
+    verdict = supervisor._failed_verdict("well, it depends", 200)
 
     assert verdict["decision"] == "escalate"
     assert verdict["failed"] is True
@@ -387,6 +397,41 @@ def test_with_the_catalog_untouched_nothing_is_judged_and_nothing_is_spent(
         store.close()
 
 
+def test_nothing_in_the_module_hard_codes_a_threshold():
+    """THE MAGIC-NUMBER GUARD, modelled on `test_inspection.py`'s. The supervisor JUDGES,
+    so every number it judges by is policy and belongs in `catalog.SupervisorConfig`
+    where `jarvis config set` can reach it per project (kn-67cdb54b).
+
+    Kept non-vacuous by asserting the allow-list is small — a growing exemption list is
+    how this test stops meaning anything.
+    """
+    tree = ast.parse(Path(supervisor.__file__).read_text())
+    allowed = {0, 1, 60}  # list indices, and seconds-per-minute — a unit, not a setting
+    literals = {node.value for node in ast.walk(tree)
+                if isinstance(node, ast.Constant)
+                and isinstance(node.value, (int, float))
+                and not isinstance(node.value, bool)}
+
+    assert not (literals - allowed), (
+        f"undeclared numeric literal(s) {sorted(literals - allowed)} in supervisor.py — "
+        "a threshold belongs in catalog.SupervisorConfig, not in the code that reads it")
+
+
+def test_every_supervisor_setting_reaches_the_config_console(tmp_path):
+    """`config_version.resolve` is reflective, so a field added to `SupervisorConfig`
+    becomes a `jarvis config set` key with no edit to the console — but only if it is on
+    the dataclass. This fails if a number goes back to being a module constant."""
+    from jarvis import config_version
+
+    cat = catalog.parse_catalog({"os": {}, "projects": [{"name": "p",
+                                                         "path": str(tmp_path)}]})
+    resolved = config_version.resolve(cat)
+
+    for field_name in vars(catalog.SupervisorConfig()):
+        assert f"os.supervisor.{field_name}" in resolved, field_name
+        assert f"projects.p.supervisor.{field_name}" in resolved, field_name
+
+
 def test_the_off_switch_is_a_safety_key_and_inherits_field_by_field(tmp_path):
     """Turning the supervisor off fleet-wide removes a reviewer, which is the same class
     of act as `os.neo.enabled` — and a project may turn it on while the fleet is off,
@@ -418,11 +463,12 @@ def test_the_stale_cutoff_exceeds_the_call_timeout(tmp_path):
     """A cutoff at or below the timeout re-claims an alarm out from under a call that is
     still running: the same alarm is judged twice and the second verdict overwrites the
     first. Refused in the parser, not left to a comment."""
-    assert supervisor.STALE_REVIEWING_SECONDS > catalog.SupervisorConfig().timeout
+    shipped = catalog.SupervisorConfig()
+    assert shipped.stale_reviewing_seconds > shipped.timeout
 
-    with pytest.raises(catalog.CatalogError, match="STALE_REVIEWING_SECONDS"):
+    with pytest.raises(catalog.CatalogError, match="stale_reviewing_seconds"):
         catalog.parse_catalog({
-            "os": {"supervisor": {"timeout": supervisor.STALE_REVIEWING_SECONDS}},
+            "os": {"supervisor": {"timeout": shipped.stale_reviewing_seconds}},
             "projects": []})
 
 
@@ -451,7 +497,7 @@ def test_a_stranded_review_is_returned_to_the_queue_then_given_up_on(
     started()
     store, _ = _one_alarm(started)
     try:
-        long_ago = db.now() - supervisor.STALE_REVIEWING_SECONDS - 60
+        long_ago = db.now() - CFG.stale_reviewing_seconds - 60
         with monkeypatch.context() as m:
             m.setattr("jarvis.db.now", lambda: long_ago)
             claimed = store.claim_next_alarm()
@@ -459,17 +505,15 @@ def test_a_stranded_review_is_returned_to_the_queue_then_given_up_on(
         assert claimed["claimed_at"] == long_ago
 
         # Reclaimed, on the real clock, up to the ceiling...
-        for attempt in range(1, supervisor.MAX_REVIEW_ATTEMPTS + 1):
-            assert store.reclaim_stale_alarms() == {"requeued": [claimed["id"]],
-                                                    "failed": []}
+        for attempt in range(1, CFG.max_review_attempts + 1):
+            assert _reclaim(store) == {"requeued": [claimed["id"]], "failed": []}
             assert store.get_alarm(claimed["id"])["attempts"] == attempt
             with monkeypatch.context() as m:
                 m.setattr("jarvis.db.now", lambda: long_ago)
                 assert store.claim_next_alarm()["id"] == claimed["id"]
 
         # ... and then given up on: out of the queue, never looping in it.
-        assert store.reclaim_stale_alarms() == {"requeued": [],
-                                                "failed": [claimed["id"]]}
+        assert _reclaim(store) == {"requeued": [], "failed": [claimed["id"]]}
         row = store.get_alarm(claimed["id"])
         assert row["status"] == "failed"
         assert "stranded in reviewing" in row["verdict_reason"]
@@ -497,7 +541,7 @@ def test_the_tick_rescues_a_stranded_alarm_and_judges_it_in_the_same_pass(
     store = ProjectStore(ops.find_work_order(wo_id)[1])
     try:
         (row,) = store.alarms_of(wo_id)
-        long_ago = db.now() - supervisor.STALE_REVIEWING_SECONDS - 60
+        long_ago = db.now() - CFG.stale_reviewing_seconds - 60
         with monkeypatch.context() as m:
             # Patched while CREATING the claim, so `claimed_at` is genuinely in the past;
             # the reclaim below then runs on the unpatched clock. `monkeypatch.undo()`
@@ -522,7 +566,7 @@ def test_a_fresh_claim_is_not_reclaimed(started):
     store, _ = _one_alarm(started)
     try:
         claimed = store.claim_next_alarm()
-        assert store.reclaim_stale_alarms() == {"requeued": [], "failed": []}
+        assert _reclaim(store) == {"requeued": [], "failed": []}
         assert store.get_alarm(claimed["id"])["status"] == "reviewing"
     finally:
         store.close()
@@ -603,11 +647,11 @@ def test_the_evidence_packet_is_capped_and_says_so(started, monkeypatch, tmp_pat
 
         packet = supervisor.build_evidence(
             store, store.get_work_order(wo["id"]), alarm,
-            daemon.catalog.projects[0].inspect)
+            CFG, daemon.catalog.projects[0].inspect)
     finally:
         store.close()
 
-    assert len(packet) < supervisor.EVIDENCE_BUDGET_CHARS
+    assert len(packet) < CFG.evidence_budget_chars
     # THE OMISSION IS STATED. A judge that cannot see it was shown a fraction weighs the
     # fraction as the whole.
     assert "omitted" in packet
@@ -628,7 +672,7 @@ def test_the_packet_carries_the_alarm_the_order_and_what_the_worker_last_said(
         store.queue_message(wo_id, "still drafting section four")
         (alarm,) = store.alarms_of(wo_id)
         packet = supervisor.build_evidence(store, store.get_work_order(wo_id), alarm,
-                                           daemon.catalog.projects[0].inspect)
+                                           CFG, daemon.catalog.projects[0].inspect)
     finally:
         store.close()
 
