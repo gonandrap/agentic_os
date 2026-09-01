@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -1072,6 +1073,39 @@ def round_line(rnd: dict[str, Any]) -> str:
     return (f"round {rnd['round']} · {rnd['fingerprint']} · {rnd['outcome']}"
             f" · config {rnd.get('config_version') or 'not recorded'}"
             + (f" — {reason}" if reason else ""))
+
+
+#: How each `wo_alarms.status` reads to a person, frozen with the statuses themselves in
+#: §4 of docs/superpowers/specs/2026-08-31-the-supervisor.md. `raised` is the COMMON case,
+#: not the interesting one: the supervisor ships off.
+ALARM_STANDING = {
+    "raised": "raised",
+    "reviewing": "with the supervisor",
+    "acked": "acked by the supervisor",
+    "escalated": "escalated to Neo",
+    "skipped": "not reviewed",
+    "failed": "supervisor failed",
+}
+
+
+def alarm_standing_line(alarms: list[dict[str, Any]]) -> str:
+    """One work order's alarms on one line: how many, how they stand, and their ids.
+
+    `round_line`'s job for the other thing that judges a work order — one formatter, so
+    the surfaces cannot word the same standing two different ways. Pure: it reads the
+    `wo_alarms` rows the caller already has and opens nothing.
+
+    The ids are the point of the line. An alarm is an object with a page of its own now
+    (`/alarms/<project>/<al-id>`, `jarvis alarms show`), so a count with no ids tells a
+    reader something is there and gives them no way to reach it.
+    """
+    if not alarms:
+        return ""
+    counts = Counter(a["status"] for a in alarms)
+    order = [*ALARM_STANDING, *sorted(k for k in counts if k not in ALARM_STANDING)]
+    standing = ", ".join(f"{counts[s]} {ALARM_STANDING.get(s, s)}"
+                         for s in order if counts.get(s))
+    return f"{len(alarms)} ({standing}) — " + ", ".join(a["id"] for a in alarms)
 
 
 def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
