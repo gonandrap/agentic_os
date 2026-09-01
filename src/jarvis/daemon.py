@@ -69,6 +69,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 log = logging.getLogger("jarvisd")
 
 RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injected only)
+SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: Ask GitHub about parked pull requests every N ticks — ~2 minutes at the default 5s
 #: interval. Its own cadence rather than the reconcile one because it is the only step
 #: that leaves the machine: one `gh` subprocess per parked work order per poll. Two
@@ -176,6 +177,14 @@ class Daemon:
         # prefix on every other call.
         self.digest_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="digest")
         self.digesting = False
+        # The supervisor gets its OWN thread, and NOT Neo's. The panel's seats already
+        # run inside the single Neo thread, so the whole question FIFO waits on the
+        # slowest of them; adding an alarm review there would make a slow supervisor
+        # delay every worker parked on a question. Not the tick thread either — a model
+        # call inside the per-project loop stalls the tick for the entire fleet.
+        self.supervisor_pool = ThreadPoolExecutor(max_workers=1,
+                                                  thread_name_prefix="supervisor")
+        self.supervisor_draining = False
         # Validation runs off the tick thread for the same reason Neo does, only more
         # so: a round is up to five headless calls at a 300s timeout each, and run
         # inline it would freeze every project in the catalog behind one work order's
@@ -480,6 +489,10 @@ class Daemon:
         # After the drain is kicked, never before: a question digested this tick is one
         # whose answer has already landed, and the drain is what lands it.
         self.digest_tick()
+        # After the project loop, so an alarm `check_burning_turns` raised on this tick is
+        # judged on this tick rather than one reconcile interval later — and OUTSIDE it,
+        # so no project waits on another project's review.
+        self.supervisor_tick()
 
         # Before routing: a dashboard failure raised here goes out with this tick's
         # notifications instead of waiting for the next one.
@@ -1930,6 +1943,99 @@ class Daemon:
                 wo_id=q["wo_id"],
             )
         log.info("gate %s %s by neo for %s", approval["id"], ruling, q["wo_id"])
+
+    # -- 5c. the supervisor: answering a cost alarm (see `jarvis.supervisor`) ---------
+
+    def _supervised_projects(self) -> list[ProjectSpec]:
+        """Projects whose supervisor is on, read from the PROJECT's resolved config —
+        never from `os.supervisor.enabled` alone, which the per-project block legally
+        overrides and which is the expected first configuration."""
+        return [p for p in self.catalog.projects
+                if p.supervisor.enabled and p.path.is_dir()]
+
+    def supervisor_tick(self) -> None:
+        """Kick a review drain when alarms are waiting and none is running — §2.
+
+        Mirrors `neo_tick`, including where the reclaim goes: BEFORE the queued count is
+        read, so an alarm rescued this tick is judged this tick, and BEHIND the drain
+        guard, so it can never re-queue an alarm out from under a call still running.
+        With no project supervised it opens no store and reads no row.
+        """
+        supervised = self._supervised_projects()
+        if not supervised or self.supervisor_draining:
+            return
+        waiting = 0
+        for project in supervised:
+            store = self.store_for(project)
+            stale = store.reclaim_stale_alarms(project.supervisor.stale_reviewing_seconds,
+                                               project.supervisor.max_review_attempts)
+            if stale["requeued"] or stale["failed"]:
+                log.warning("supervisor reclaimed stranded alarms in %s: "
+                            "requeued=%s failed=%s",
+                            project.name, stale["requeued"], stale["failed"])
+            waiting += len(store.alarms_across(statuses=("raised",)))
+        if not waiting:
+            return
+        self.supervisor_draining = True
+        future = self.supervisor_pool.submit(self._supervisor_drain, supervised)
+        future.add_done_callback(
+            lambda f: setattr(self, "supervisor_draining", False))
+
+    def _supervisor_drain(self, projects: list[ProjectSpec]) -> None:
+        """Judge every raised alarm, project by project (on the supervisor thread)."""
+        from . import supervisor as supervisor_mod
+        from .neo_store import NeoStore
+
+        neo_store = NeoStore()   # thread-local connections, as `_neo_drain` opens its own
+        central = CentralStore()
+        try:
+            for project in projects:
+                pstore = ProjectStore(project.path)
+                try:
+                    self._drain_project_alarms(project, pstore, neo_store, central,
+                                               supervisor_mod)
+                except Exception:  # noqa: BLE001 — one project must not stop the rest
+                    log.exception("supervisor drain failed for %s", project.name)
+                finally:
+                    pstore.close()
+        finally:
+            neo_store.close()
+            central.close()
+
+    def _drain_project_alarms(self, project: ProjectSpec, pstore: ProjectStore,
+                              neo_store: Any, central: CentralStore,
+                              supervisor_mod: Any) -> None:
+        """Claim and judge one project's alarms until the queue is empty — §2.
+
+        Every exclusion moves the alarm OUT of the queue rather than leaving it in: one
+        nothing will look at again must not stay claimable. An alarm on an order that has
+        since settled is still judged; only age excludes one.
+        """
+        cfg = project.supervisor
+        max_age = cfg.max_age_hours * SECONDS_PER_HOUR
+        while True:
+            alarm = pstore.claim_next_alarm()
+            if alarm is None:
+                return
+            age = time.time() - float(alarm["ts"] or 0.0)
+            if age > max_age:
+                pstore.update_alarm(
+                    alarm["id"], status="skipped", decided_at=db.now(),
+                    verdict_reason=f"raised {age / SECONDS_PER_HOUR:.0f}h ago, past the "
+                                   f"{cfg.max_age_hours}h review window — the spend can "
+                                   f"no longer be prevented")
+                continue
+            try:
+                wo = pstore.get_work_order(alarm["wo_id"])
+            except KeyError:
+                pstore.update_alarm(alarm["id"], status="skipped", decided_at=db.now(),
+                                    verdict_reason="the work order is gone")
+                continue
+            verdict = supervisor_mod.review(
+                pstore, neo_store, project.name, wo, alarm, cfg,
+                central=central, inspect_cfg=project.inspect)
+            log.info("[%s] alarm %s: %s (%s)", project.name, alarm["id"],
+                     verdict["decision"], verdict["reason"][:cfg.reason_chars])
 
     # -- 7. invariants (post-conditions) --------------------------------------------------
 

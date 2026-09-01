@@ -81,6 +81,7 @@ KIND_LABELS = {
     "panel_seat": "panel seat",
     "validation_seat": "validation seat",
     "digest": "dashboard digest",
+    "supervisor": "supervisor reviewing an alarm",
     WORKER_SUBPROCESS: "worker subprocess",
 }
 

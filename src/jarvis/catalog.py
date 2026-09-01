@@ -25,6 +25,9 @@ SAFETY_KEYS = (
     # acceptance walk is written in (§10.3).
     "*.validation.*",
     "os.neo.enabled",
+    # Same class of act as turning Neo off: it removes a reviewer, and the change is
+    # invisible on every surface until the thing it was reviewing goes wrong.
+    "os.supervisor.enabled",
 )
 
 # Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
@@ -281,6 +284,62 @@ class InspectConfig:
     alarm_write_tokens: int = DEFAULT_INSPECT_ALARM_WRITE_TOKENS
 
 
+# -- the supervisor: it JUDGES a cost alarm, so every number it judges by is a setting
+# rather than a module constant (kn-67cdb54b). Reasoning, and why none of it belongs in
+# `InspectConfig`: docs/superpowers/specs/2026-08-31-the-supervisor.md §2.
+#
+# ABOVE `ProjectSpec`, which uses it via `field(default_factory=…)` — below it is a
+# NameError at import (kn-6ca2bcd9).
+
+DEFAULT_SUPERVISOR_MODEL = "opus"
+DEFAULT_SUPERVISOR_TIMEOUT = 300
+DEFAULT_SUPERVISOR_LEARNINGS_LIMIT = 50
+
+#: Past this an alarm is skipped unjudged: spend the user can no longer prevent.
+DEFAULT_SUPERVISOR_MAX_AGE_HOURS = 24
+
+#: MUST EXCEED `timeout`, or a claim is reclaimed out from under a call that is still
+#: running and one alarm is judged twice. `_parse_supervisor` refuses a catalog that
+#: breaks the relation.
+DEFAULT_SUPERVISOR_STALE_REVIEWING_SECONDS = 900
+DEFAULT_SUPERVISOR_MAX_REVIEW_ATTEMPTS = 3
+
+#: The evidence packet's ceiling and the clips that fill it. `conversation_` and
+#: `description_` are prefixed because both measure quoted characters (kn-67cdb54b).
+DEFAULT_SUPERVISOR_EVIDENCE_BUDGET_CHARS = 8000
+DEFAULT_SUPERVISOR_CONVERSATION_QUOTE_CHARS = 400
+DEFAULT_SUPERVISOR_QUOTED_TURNS = 3
+DEFAULT_SUPERVISOR_DESCRIPTION_CHARS = 500
+
+#: What the user is told, and how much of an unusable reply is kept as the reason.
+DEFAULT_SUPERVISOR_NOTE_CHARS = 200
+DEFAULT_SUPERVISOR_REASON_CHARS = 200
+
+
+@dataclass
+class SupervisorConfig:
+    """The agent that reviews a cost alarm and either acks it or wants Neo — §2.
+
+    SHIPS DISABLED: a wrong ack makes a burning turn invisible, which is a strict
+    regression on what PR 159 shipped. Field-level per-project inheritance
+    (`_parse_supervisor`), as `_parse_inspect` does it.
+    """
+
+    enabled: bool = False
+    model: str = DEFAULT_SUPERVISOR_MODEL
+    timeout: int = DEFAULT_SUPERVISOR_TIMEOUT
+    learnings_limit: int = DEFAULT_SUPERVISOR_LEARNINGS_LIMIT
+    max_age_hours: int = DEFAULT_SUPERVISOR_MAX_AGE_HOURS
+    stale_reviewing_seconds: int = DEFAULT_SUPERVISOR_STALE_REVIEWING_SECONDS
+    max_review_attempts: int = DEFAULT_SUPERVISOR_MAX_REVIEW_ATTEMPTS
+    evidence_budget_chars: int = DEFAULT_SUPERVISOR_EVIDENCE_BUDGET_CHARS
+    conversation_quote_chars: int = DEFAULT_SUPERVISOR_CONVERSATION_QUOTE_CHARS
+    quoted_turns: int = DEFAULT_SUPERVISOR_QUOTED_TURNS
+    description_chars: int = DEFAULT_SUPERVISOR_DESCRIPTION_CHARS
+    note_chars: int = DEFAULT_SUPERVISOR_NOTE_CHARS
+    reason_chars: int = DEFAULT_SUPERVISOR_REASON_CHARS
+
+
 @dataclass
 class ProjectSpec:
     name: str
@@ -300,6 +359,7 @@ class ProjectSpec:
     # docs/superpowers/specs/2026-08-27-the-config-console.md §1.2.
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -387,6 +447,7 @@ class OsConfig:
     neo: NeoConfig = field(default_factory=NeoConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
 
 
 @dataclass
@@ -588,6 +649,33 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
     return cfg
 
 
+def _parse_supervisor(raw: Any, base: SupervisorConfig | None = None,
+                      where: str = "os.supervisor") -> SupervisorConfig:
+    """`os.supervisor`, or a project's override of it — §2, and `_parse_inspect`'s shape.
+
+    Every number is refused below 1, and `timeout` at or above `stale_reviewing_seconds`:
+    below that cutoff a claim is reclaimed out from under a call that is still running
+    and one alarm is judged twice. The numeric fields are read reflectively so a field
+    added above reaches the catalog with no edit here.
+    """
+    base = base or SupervisorConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    numbers = {k: v for k, v in vars(base).items() if k not in ("enabled", "model")}
+    cfg = SupervisorConfig(
+        enabled=bool(raw.get("enabled", base.enabled)),
+        model=str(raw.get("model", base.model) or base.model),
+        **{k: int(raw.get(k, v)) for k, v in numbers.items()},
+    )
+    for name, value in vars(cfg).items():
+        if isinstance(value, int) and not isinstance(value, bool) and value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    if cfg.timeout >= cfg.stale_reviewing_seconds:
+        raise _err(f"{where}.timeout must be under {where}.stale_reviewing_seconds "
+                   f"({cfg.stale_reviewing_seconds}s), or an alarm is judged twice")
+    return cfg
+
+
 def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     if not isinstance(data, dict):
         raise _err("top level must be an object")
@@ -632,6 +720,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         neo=neo_cfg,
         validation=_parse_validation(os_raw.get("validation", {})),
         inspect=_parse_inspect(os_raw.get("inspect", {})),
+        supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")
@@ -687,6 +776,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         inspect_cfg = _parse_inspect(
             p.get("inspect", {}), base=os_cfg.inspect,
             where=f"projects[{i}] ({name}).inspect")
+        supervisor_cfg = _parse_supervisor(
+            p.get("supervisor", {}), base=os_cfg.supervisor,
+            where=f"projects[{i}] ({name}).supervisor")
         projects.append(
             ProjectSpec(
                 name=name,
@@ -699,6 +791,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 gates=gate_cfg,
                 validation=validation_cfg,
                 inspect=inspect_cfg,
+                supervisor=supervisor_cfg,
                 raw=p,
             )
         )

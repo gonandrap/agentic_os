@@ -1432,6 +1432,65 @@ class ProjectStore:
             (*args, limit)).fetchall()
         return db.rows_to_dicts(rows)
 
+    def claim_next_alarm(self) -> dict[str, Any] | None:
+        """Atomically claim the OLDEST alarm still `raised`, or None.
+
+        FIFO keeps the supervisor's byte-stable prompt prefix inside the cache TTL, and
+        the oldest alarm is also the one closest to expiring unjudged.
+        """
+        cur = self.conn.execute(
+            """UPDATE wo_alarms SET status='reviewing', claimed_at=?
+               WHERE id = (SELECT id FROM wo_alarms WHERE status='raised'
+                           ORDER BY ts LIMIT 1)
+               RETURNING *""",
+            (db.now(),),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def reclaim_stale_alarms(self, older_than: float,
+                             max_attempts: int) -> dict[str, list[str]]:
+        """Unstick alarms parked in `reviewing` by a drain that never finished.
+
+        SHIPPED WITH `claim_next_alarm`, NOT AFTER IT: `NeoStore.claim_next` went out
+        without its counterpart and a daemon restart mid-drain parked a question for ever
+        (bl-3f5f1464). Past `older_than` a row goes back to `raised` with `attempts`
+        incremented; at `max_attempts` it is `failed` instead — out of the queue, not
+        looping, and still flagged.
+
+        Both bounds come from `catalog.SupervisorConfig`. Returns
+        {"requeued": [alarm id, ...], "failed": [...]}.
+        """
+        cutoff = db.now() - older_than
+        # Give up FIRST, then re-queue — `NeoStore.reclaim_stale`'s ordering and its
+        # reason: the other way round increments a row to the ceiling and then fails it
+        # in the same call, spending an attempt the alarm never got to use.
+        failed = [
+            str(r["id"])
+            for r in self.conn.execute(
+                """UPDATE wo_alarms
+                      SET status='failed',
+                          verdict_reason='the supervisor never finished: stranded in '
+                                         || 'reviewing after ' || attempts
+                                         || ' reclaim attempt(s)'
+                    WHERE status='reviewing' AND attempts >= ?
+                      AND COALESCE(claimed_at, ts) < ?
+                RETURNING id""",
+                (max_attempts, cutoff),
+            ).fetchall()
+        ]
+        requeued = [
+            str(r["id"])
+            for r in self.conn.execute(
+                """UPDATE wo_alarms SET status='raised', claimed_at=NULL,
+                                        attempts=attempts + 1
+                    WHERE status='reviewing' AND COALESCE(claimed_at, ts) < ?
+                RETURNING id""",
+                (cutoff,),
+            ).fetchall()
+        ]
+        return {"requeued": requeued, "failed": failed}
+
     def update_alarm(self, alarm_id: str, **fields: Any) -> None:
         for column, vocabulary in (("status", ALARM_STATUSES),
                                    ("verdict", ALARM_VERDICTS),
