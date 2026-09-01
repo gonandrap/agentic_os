@@ -95,18 +95,35 @@ def _neo_question_id(p: dict[str, Any]) -> int | None:
         return None
 
 
+#: The four kinds carrying one cost alarm's life, frozen in §1 of
+#: docs/superpowers/specs/2026-08-31-the-supervisor.md. Spelled out here rather than
+#: imported from `project_store`: this module is a leaf and opens no store.
+ALARM_KINDS = frozenset({"cost_alarm", "alarm_reviewed", "alarm_escalated",
+                         "alarm_advice"})
+
+
 def _ref(kind: str, p: dict[str, Any]) -> dict[str, Any] | None:
     """The record this entry points at, or None. Surface-neutral by design — §3.
 
     Never a URL and never an anchor: the dashboard resolves a `neo_question` to
-    `/neo/question/<id>` and a `message` to the conversation turn `build_conversation`
-    gave the same id, while `jarvis wo show` prints the label and the CLI's own
-    commands reach the same two records.
+    `/neo/question/<id>`, an `alarm` to `/alarms/<project>/<al-id>` and a `message` to
+    the conversation turn `build_conversation` gave the same id, while `jarvis wo show`
+    prints the label and the CLI's own commands reach the same three records.
     """
     if kind == "question_asked":
         qid = _neo_question_id(p)
         if qid is not None:
             return {"kind": "neo_question", "id": qid, "label": f"question #{qid}"}
+    if kind in ALARM_KINDS:
+        # The alarm, even on the two kinds that also carry a `neo_question_id`: a ref is
+        # singular, and the alarm's own page is where the verdict, Neo's question and the
+        # review control all are (§4, §5).
+        #
+        # A `cost_alarm` row written before §1 has no `alarm_id` and so gets no ref — a
+        # pointer that cannot resolve is not a saving, corollary 1 of §1.
+        alarm_id = p.get("alarm_id")
+        if alarm_id:
+            return {"kind": "alarm", "id": str(alarm_id), "label": f"alarm {alarm_id}"}
     return None
 
 
@@ -166,6 +183,23 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # turn raises the flag, so the rest exist only here, and this is the row that
         # says a turn was already known to be expensive while it was still running.
         return "Costing money while it runs", p.get("reason") or ""
+    # The supervisor's three. Same trap as the validation kinds below, already paid for
+    # once here: `event_level` calls an unknown kind "signal", so a kind with no branch
+    # renders as its own name beside a JSON blob and looks fine on the page.
+    if kind == "alarm_reviewed":
+        # The verdict's REASON, which is for the record. `note` is speech addressed to
+        # the user and belongs to the conversation, which renders it from this same
+        # payload — a fallback here would print it twice on one page (§4).
+        verb = ("cleared this alarm" if p.get("verdict") == "ack"
+                else "could not settle this alarm")
+        return f"The supervisor {verb}", p.get("reason") or ""
+    if kind == "alarm_escalated":
+        qid = _neo_question_id(p)
+        # The question number as text, not as the ref: this entry spends its one pointer
+        # on the alarm, whose page quotes the question beside the verdict anyway.
+        return "Alarm handed to Neo", f"question #{qid}" if qid is not None else ""
+    if kind == "alarm_advice":
+        return "Neo advised the supervisor", ""  # the answer is in the conversation
     if kind == "assumption":
         n = p.get("n")  # the number, not the text — §4
         return (f"Assumption #{n} recorded" if n else "Assumption recorded"), ""
@@ -345,6 +379,10 @@ def build_conversation(events: list[dict[str, Any]],
     built from the project store alone can show what was asked — and without it the
     conversation opens on Neo's answer to a question that appears nowhere.
 
+    The supervisor's note and Neo's advice on a cost alarm arrive the same way and for
+    the same reason (§4). A VERDICT is not speech and stays on the timeline; a note
+    addressed to the user, and the advice that produced it, are.
+
     Each turn: {ts, kind, who, content, anchor, ref, msg_id, source, status, inbound}.
     `anchor` is the id every surface gives the turn, so that a timeline entry's
     `{"kind": "message", "id": …}` ref resolves to the words. Stays pure — it never
@@ -352,20 +390,33 @@ def build_conversation(events: list[dict[str, Any]],
     """
     turns: list[dict[str, Any]] = []
     for e in events:
-        if e.get("kind") != "question_asked":
+        kind = e.get("kind")
+        if kind not in ("question_asked", "alarm_reviewed", "alarm_advice"):
             continue
         p = _payload(e)
-        text = str(p.get("question") or "")
+        # `note` is empty by contract when the supervisor escalates, so the same guard
+        # that keeps a text-less question out also keeps an escalation's verdict out.
+        # An empty bubble is worse than no bubble; the timeline still has the event.
+        text = str(p.get({"question_asked": "question", "alarm_reviewed": "note",
+                          "alarm_advice": "answer"}[kind]) or "")
         if not text:
-            # Nothing was said that we can show. An empty bubble is worse than no
-            # bubble; the timeline still records that a question was asked.
             continue
-        qid = _neo_question_id(p)
+        if kind == "question_asked":
+            qid = _neo_question_id(p)
+            turns.append({
+                "ts": e.get("ts") or 0.0, "kind": "question", "who": "worker → Neo",
+                "content": text, "anchor": f"q-{qid}" if qid is not None else "",
+                "ref": _ref(kind, p), "msg_id": None,
+                "source": "neo", "status": "", "inbound": False,
+            })
+            continue
         turns.append({
-            "ts": e.get("ts") or 0.0, "kind": "question", "who": "worker → Neo",
-            "content": text, "anchor": f"q-{qid}" if qid is not None else "",
-            "ref": _ref("question_asked", p), "msg_id": None,
-            "source": "neo", "status": "", "inbound": False,
+            "ts": e.get("ts") or 0.0,
+            "kind": "note" if kind == "alarm_reviewed" else "advice",
+            "who": ("supervisor → you" if kind == "alarm_reviewed"
+                    else "neo → supervisor"),
+            "content": text, "anchor": "", "ref": _ref(kind, p), "msg_id": None,
+            "source": "", "status": "", "inbound": False,
         })
     for m in messages:
         mid = m.get("id")

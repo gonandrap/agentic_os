@@ -271,7 +271,9 @@
       {%- if turn.status %} · {{ turn.status }}{% endif %} · {{ fmt_age(turn.ts) }} ago
       {#- Straight to the deliberation that produced the answer below. -#}
       {%- if turn.ref and turn.ref.kind == 'neo_question' %}
-      · <a href="/neo/question/{{ turn.ref.id }}">{{ turn.ref.label }} →</a>{% endif %}
+      · <a href="/neo/question/{{ turn.ref.id }}">{{ turn.ref.label }} →</a>
+      {%- elif turn.ref and turn.ref.kind == 'alarm' %}
+      · <a href="/alarms/{{ project }}/{{ turn.ref.id }}">{{ turn.ref.label }} →</a>{% endif %}
       {#- What answering this message cost. It is the TURN's line, not a second
           accounting of the message: a message is an ask, and the turn it set going is
           what was paid for. Shown here because this is where the reader already is. -#}
@@ -324,6 +326,8 @@
           below opens whichever panel the anchor is in. -#}
       {%- if e.ref and e.ref.kind == 'neo_question' %}
       <a href="/neo/question/{{ e.ref.id }}">{{ e.ref.label }} →</a>
+      {%- elif e.ref and e.ref.kind == 'alarm' %}
+      <a href="/alarms/{{ project }}/{{ e.ref.id }}">{{ e.ref.label }} →</a>
       {%- elif e.ref and e.ref.kind == 'message' %}
       <a href="#msg-{{ e.ref.id }}">{{ e.ref.label }} →</a>{% endif %}
       {%- if e.detail %}
