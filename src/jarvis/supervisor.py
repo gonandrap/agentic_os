@@ -58,10 +58,17 @@ Output STRICT JSON, nothing else:
 ALARM_REVIEWER_PERSONA = """You are Neo, reviewing a COST ALARM inside the Jarvis \
 agentic OS.
 
-The OS raised an alarm on a work order whose turn was still running — too long, blocked
-on a subagent too long, or re-sending too much of its conversation. A supervisor agent
-looked first and could not settle it, so it is yours. You are the second reader and the
-last one before the user is interrupted.
+The OS raised an alarm on a session whose turn was still running — too long, blocked on a
+subagent too long, or re-sending too much of its conversation. A supervisor agent looked
+first and could not settle it, so it is yours. You are the second reader and the last one
+before the user is interrupted.
+
+READ THE PACKET'S "this session is" LINE BEFORE YOU JUDGE THE NUMBERS. The alarm is
+always raised against a work order, but a work order is not always a worker: it may be a
+FEATURE ORDER's planner, decomposing one ask by reading a whole codebase, or its manager,
+which sits idle for the feature's entire life and wakes only on a message. What counts as
+a long turn differs between the three, and the same figure is routine on one and a symptom
+on another.
 
 YOU DECIDE NOTHING ABOUT THE WORK ORDER. Nobody messages the worker, cancels the turn or
 changes a status on the strength of your reply — the OS records your reading against the
@@ -146,6 +153,31 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + " […]"
 
 
+def _what_it_is(wo: dict[str, Any]) -> str:
+    """What KIND of session is burning, in the judge's words.
+
+    Every alarm is raised against a `work_orders` row (`Daemon.check_burning_turns` walks
+    the running ones), but `WO_KINDS` has three members and two of them belong to a
+    FEATURE order — so "a work order" alone hides the thing that most changes what normal
+    looks like. A planner reading a whole codebase for an hour is doing its job; a worker
+    doing the same on a one-file fix is not. Reported as evidence rather than instructed
+    in the persona, because a judge told to weigh something it cannot see is being asked
+    to guess (PR 173 review).
+    """
+    parent = wo.get("parent_id")
+    kind = wo.get("kind") or "worker"
+    belongs = f" of feature order {parent}" if parent else ""
+    if kind == "planner":
+        return (f"the PLANNER{belongs} — one session reading the codebase to decompose "
+                f"a single ask into work orders, so it is expected to be long and "
+                f"read-heavy")
+    if kind == "manager":
+        return (f"the MANAGER{belongs} — it sits idle for that feature's whole life and "
+                f"wakes only on a message, so a long WALL clock is normal and long "
+                f"GENERATING time is not")
+    return "an ordinary work order" + (f", a child{belongs}" if parent else "")
+
+
 def _session_lines(wo: dict[str, Any], inspect_cfg: Any) -> list[str]:
     """The per-turn split — `live_alarms`' own read, re-rendered. No model call."""
     from . import inspection
@@ -202,6 +234,7 @@ def build_evidence(pstore: Any, wo: dict[str, Any], alarm: dict[str, Any],
     ], [
         "# The work order",
         f"{wo.get('id')} [{wo.get('status')}] on {wo.get('model') or '(default model)'}",
+        f"this session is {_what_it_is(wo)}",
         f"title: {wo.get('title')}",
         f"brief: {_clip(str(wo.get('description') or ''), cfg.description_chars)}",
     ], [

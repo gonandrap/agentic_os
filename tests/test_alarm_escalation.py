@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import ops, supervisor, usage
+from jarvis import catalog, ops, supervisor, usage
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.neo_store import NeoStore
@@ -524,6 +524,55 @@ def test_the_persona_lives_with_the_code_that_files_the_question(jarvis_home):
 
     assert "ALARM_REVIEWER_PERSONA" in source
     assert "You are Neo, reviewing a COST ALARM" not in source
+
+
+@pytest.mark.parametrize("kind,parent,expected", [
+    ("worker", None, "an ordinary work order"),
+    ("worker", "fo-1", "a child of feature order fo-1"),
+    ("planner", "fo-1", "the PLANNER of feature order fo-1"),
+    ("manager", "fo-1", "the MANAGER of feature order fo-1"),
+    (None, None, "an ordinary work order"),   # a row written before `kind` existed
+])
+def test_the_packet_says_which_of_the_three_session_shapes_is_burning(
+        kind, parent, expected):
+    """An alarm is always raised against a work order, but `WO_KINDS` has three members
+    and two of them belong to a FEATURE order (PR 173 review). An hour is routine on a
+    planner reading a codebase and a symptom on a one-file worker, so the judge is shown
+    which it is rather than told to weigh something it cannot see.
+
+    Parametrised across all three plus the no-`kind` row: a helper that returned the same
+    sentence for everything would satisfy any single case.
+    """
+    assert expected in supervisor._what_it_is(
+        {"kind": kind, "parent_id": parent})
+    # Non-vacuous: the three shapes must actually differ from one another.
+    said = {supervisor._what_it_is({"kind": k, "parent_id": "fo-1"})
+            for k in ("worker", "planner", "manager")}
+    assert len(said) == 3
+
+
+def test_both_judges_are_shown_the_session_shape_in_the_same_packet(
+        started, monkeypatch, tmp_path):
+    """`build_evidence` is the supervisor's prompt AND, forwarded as the escalation
+    context, Neo's — so one line reaches both readers and they cannot disagree about what
+    kind of session they are looking at."""
+    daemon = started()
+    wo_id = _burning(daemon, monkeypatch, tmp_path, description="a long brief")
+    store = ProjectStore(ops.find_work_order(wo_id)[1])
+    try:
+        wo = store.get_work_order(wo_id)
+        (alarm,) = store.alarms_of(wo_id)
+        packet = supervisor.build_evidence(
+            store, wo, alarm, catalog.SupervisorConfig(),
+            daemon.catalog.projects[0].inspect)
+    finally:
+        store.close()
+
+    assert "this session is an ordinary work order" in packet
+    assert packet in supervisor.escalation_context(
+        packet, {"reason": "cannot account for it"})
+    assert 'READ THE PACKET\'S "this session is" LINE' in \
+        supervisor.ALARM_REVIEWER_PERSONA
 
 
 def test_the_alarm_reviewer_is_told_not_to_escalate_on_spend_alone():
