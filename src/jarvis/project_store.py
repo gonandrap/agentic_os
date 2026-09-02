@@ -157,34 +157,64 @@ PRE_APPROVED_KEY = "pre_approved"
 # `os.validation.enabled` was false. See docs/superpowers/specs/2026-08-29-feature-order-resume.md.
 SUPERSEDED_CHILDREN_KEY = "superseded_children"
 
-# -- the cost alarm's vocabulary ---------------------------------------------------
+# -- the alarm's vocabulary ---------------------------------------------------------
 #
 # In the STORE because four surfaces have to agree on it and none of them may depend on
 # another: the daemon raises, the supervisor judges, Neo answers and the timeline
 # renders. §1 of docs/superpowers/specs/2026-08-31-the-supervisor.md freezes all four.
+#
+# Every value later sections write is declared HERE, in one pass. §1 of
+# docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md: two sections
+# editing the same tuple is a conflict for no reason; one section declaring them all is
+# free.
 
 ALARM_STATUSES = (
     "raised",     # on the supervisor's queue, awaiting a look
     "reviewing",  # claimed by a supervisor tick
     "acked",      # judged and answered with a note to the user
     "escalated",  # judged and handed to Neo
+    "proposed",   # judged, and a remedy is waiting on a gate grant (§5, health spec)
     "skipped",    # never offered to the supervisor — backfilled history, or declined
     "failed",     # the review could not be completed; the alarm stays unresolved
 )
-# The supervisor reads and reports; it never acts on a work order.
-ALARM_VERDICTS = ("ack", "escalate")
+# The supervisor reads, reports, and — from §5 — may ASK to act. It still never acts:
+# `propose` requests a gate grant, and applying the remedy is `remedies.py`'s alone.
+ALARM_VERDICTS = ("ack", "escalate", "propose")
 ALARM_REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
 
-# The four `wo_events` kinds that carry an alarm's life, and their payloads:
+# What an alarm is ABOUT, and what noticed it. Both columns default, so every row
+# written before the health spec reads back as exactly what it was — a cost alarm about
+# a work order — without a backfill.
+ALARM_SUBJECTS = ("work_order", "feature_order")
+ALARM_SOURCES = ("cost", "health")
+
+# A subject-level finding judges the unit rather than a turn, so it has no `seq` to
+# carry — and `wo_alarms.seq` is NOT NULL, which `ALTER TABLE ADD COLUMN` cannot relax.
+# This is the sentinel that fills it, and every surface printing a turn number renders
+# it as "no turn": `turn -1` reaching the user is the failure this constant names.
+NO_TURN = -1
+
+# The `wo_events` kinds that carry an alarm's life, and their payloads:
 #
 #   cost_alarm       {kind, seq, reason, alarm_id}   the raise (daemon)
 #   alarm_reviewed   {alarm_id, verdict, reason, note}
 #   alarm_escalated  {alarm_id, neo_question_id}
 #   alarm_advice     {alarm_id, neo_question_id, answer}
+#   health_finding   {alarm_id, probe, subject_kind, subject_id, reason}      (§4)
+#   health_reviewed  {subject_kind, subject_id, trigger, findings}            (§4)
+#   remedy_proposed  {alarm_id, approval_id, remedy, argument}                (§5)
+#   remedy_applied   {alarm_id, approval_id, remedy, result}                  (§5)
+#   remedy_refused   {alarm_id, approval_id, remedy, reason}                  (§5)
+#
+# Duplicated by `timeline.ALARM_KINDS`, which is a leaf and may not import a store; a
+# test asserts the two are equal, because a kind in only one of them means every deep
+# link on §6's page stops resolving with no error anywhere.
 #
 # `cost_alarm`'s first three keys are UNCHANGED and load-bearing: they are the dedupe
 # memory that makes it one alarm per turn per kind (see `Daemon.check_burning_turns`).
-ALARM_EVENT_KINDS = ("cost_alarm", "alarm_reviewed", "alarm_escalated", "alarm_advice")
+ALARM_EVENT_KINDS = ("cost_alarm", "alarm_reviewed", "alarm_escalated", "alarm_advice",
+                     "health_finding", "health_reviewed",
+                     "remedy_proposed", "remedy_applied", "remedy_refused")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS work_orders (
@@ -604,6 +634,22 @@ ADDED_COLUMNS = {
         # `PreToolUse` carries `agent_type` for a subagent's call and omits the key
         # entirely for the lead's, so the payload can always tell the two apart.
         "agent_type": "TEXT",
+    },
+    # An alarm can name a FEATURE ORDER as its subject and a health probe as its source.
+    # All four are additive with defaults and no CHECK: `_migrate` runs inside
+    # `ProjectStore.__init__` — every CLI invocation and every reconcile of every
+    # project, over live production databases — and a twelve-step table rebuild there is
+    # not an option. So `wo_id` stays `NOT NULL` and means the CARRIER (see
+    # `carrier_for_feature`), and `fo_id` carries no foreign key.
+    #
+    # The pairing the schema cannot express — `subject_kind == 'feature_order'` iff
+    # `fo_id` — is enforced in `add_finding`, because a constraint neither the database
+    # nor Python enforces is one that fails as a wrong page three weeks later.
+    "wo_alarms": {
+        "subject_kind": "TEXT NOT NULL DEFAULT 'work_order'",   # ALARM_SUBJECTS
+        "fo_id": "TEXT",                                        # set iff feature_order
+        "source": "TEXT NOT NULL DEFAULT 'cost'",               # ALARM_SOURCES
+        "probe": "TEXT",                                        # the probe id (§2)
     },
 }
 
@@ -1374,6 +1420,38 @@ class ProjectStore:
         )
         return self.get_alarm(alarm_id)
 
+    def add_finding(self, wo_id: str, *, kind: str, reason: str, seq: int = NO_TURN,
+                    source: str = "cost", probe: str | None = None,
+                    subject_kind: str = "work_order",
+                    fo_id: str | None = None) -> dict[str, Any]:
+        """Record one finding — the general raise, of which `add_alarm` is the cost case.
+
+        A second entry point rather than a widened `add_alarm`, because `add_alarm`'s one
+        call site sits inside `Daemon.check_burning_turns`' `(kind, seq)` dedupe, which
+        §1 of docs/superpowers/specs/2026-08-31-the-supervisor.md spent a section
+        protecting: moved or re-signatured, every cost alarm re-raises on every reconcile
+        tick for the life of the turn.
+
+        `wo_id` is always the CARRIER. For a feature-order subject that is
+        `carrier_for_feature(fo_id)`, and the pairing below is the whole of the
+        constraint the schema could not carry.
+        """
+        assert subject_kind in ALARM_SUBJECTS, subject_kind
+        assert source in ALARM_SOURCES, source
+        if (subject_kind == "feature_order") != bool(fo_id):
+            raise ValueError(
+                f"subject_kind={subject_kind!r} and fo_id={fo_id!r} disagree: "
+                "a feature_order finding needs an fo_id, and a work_order one has none")
+        alarm_id = db.new_id("al")
+        self.conn.execute(
+            """INSERT INTO wo_alarms (id, wo_id, ts, kind, seq, reason,
+                                      subject_kind, fo_id, source, probe)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (alarm_id, wo_id, db.now(), kind, int(seq), reason,
+             subject_kind, fo_id, source, probe),
+        )
+        return self.get_alarm(alarm_id)
+
     def get_alarm(self, alarm_id: str) -> dict[str, Any]:
         row = self.conn.execute(
             "SELECT * FROM wo_alarms WHERE id=?", (alarm_id,)).fetchone()
@@ -1382,12 +1460,26 @@ class ProjectStore:
         return dict(row)
 
     def alarms_of(self, wo_id: str) -> list[dict[str, Any]]:
-        """Every alarm on one work order, oldest first."""
+        """Every alarm on one work order, oldest first.
+
+        By CARRIER, so a feature finding appears on the order that carried it — which is
+        where its record belongs and where `jarvis wo show` reads it back.
+        """
         return db.rows_to_dicts(self.conn.execute(
             "SELECT * FROM wo_alarms WHERE wo_id=? ORDER BY ts", (wo_id,)).fetchall())
 
+    def alarms_for_feature(self, fo_id: str) -> list[dict[str, Any]]:
+        """Every finding ABOUT one feature order, oldest first, whatever carried it.
+
+        The counterpart of `alarms_of`: a feature reached through two carriers has its
+        findings in two places, and this is the read that puts them back together.
+        """
+        return db.rows_to_dicts(self.conn.execute(
+            "SELECT * FROM wo_alarms WHERE fo_id=? ORDER BY ts", (fo_id,)).fetchall())
+
     def alarms_across(self, limit: int = 200, statuses: tuple[str, ...] | None = None,
-                      wo_id: str | None = None) -> list[dict[str, Any]]:
+                      wo_id: str | None = None, fo_id: str | None = None,
+                      sources: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
         """Every alarm in the project, NEWEST first, with its work order.
 
         The work-order columns are the same ones `events_across` brings along and for
@@ -1403,6 +1495,12 @@ class ProjectStore:
         `ops.list_cost_alarms` has published since PR 159. The two tables both have a
         `status`, and `SELECT a.*, w.*` would have silently handed one of them to every
         caller depending on column order, so both are spelled out.
+
+        THE FEATURE JOIN IS UNCONDITIONAL AND `fo_id` IS A `WHERE` FILTER, NOT A JOIN
+        SWITCH. `ops._find_alarm` and `ops.list_cost_alarms`' unfiltered path — which
+        together feed the alarm page, the badge, `/alarms/{project}/{alarm_id}` and
+        `jarvis alarms show` — never pass `fo_id`, so joining only when it is supplied
+        would leave every one of those surfaces rendering the CARRIER's title.
         """
         where = ["1=1"]
         args: list[Any] = []
@@ -1415,6 +1513,12 @@ class ProjectStore:
             # nothing for an order that has alarms.
             where.append("a.wo_id=?")
             args.append(wo_id)
+        if fo_id:
+            where.append("a.fo_id=?")
+            args.append(fo_id)
+        if sources:
+            where.append(f"a.source IN ({','.join('?' for _ in sources)})")
+            args.extend(sources)
         rows = self.conn.execute(
             "SELECT a.id AS id, a.wo_id AS wo_id, a.ts AS ts, a.kind AS kind,"
             " a.seq AS seq, a.reason AS reason, a.status AS alarm_status,"
@@ -1424,10 +1528,14 @@ class ProjectStore:
             " a.neo_question_id AS neo_question_id,"
             " a.review_status AS review_status, a.review_feedback AS review_feedback,"
             " a.reviewed_at AS reviewed_at,"
+            " a.subject_kind AS subject_kind, a.fo_id AS fo_id,"
+            " a.source AS source, a.probe AS probe,"
             " w.title AS title, w.status AS status, w.hidden AS hidden,"
             " w.needs_attention AS needs_attention,"
-            " w.attention_reason AS attention_reason"
+            " w.attention_reason AS attention_reason,"
+            " f.title AS fo_title, f.status AS fo_status"
             " FROM wo_alarms a JOIN work_orders w ON w.id = a.wo_id"
+            " LEFT JOIN feature_orders f ON f.id = a.fo_id"
             f" WHERE {' AND '.join(where)} ORDER BY a.ts DESC LIMIT ?",
             (*args, limit)).fetchall()
         return db.rows_to_dicts(rows)
@@ -1698,6 +1806,38 @@ class ProjectStore:
             "SELECT * FROM work_orders WHERE parent_id=? AND kind='manager' "
             "ORDER BY created_at LIMIT 1", (fo_id,)
         ).fetchone()
+        return dict(row) if row else None
+
+    def carrier_for_feature(self, fo_id: str) -> dict[str, Any] | None:
+        """The work order that carries a record ABOUT this feature: manager, planner,
+        newest child, or None.
+
+        A feature order has no timeline and no alarms of its own — `wo_events.wo_id` and
+        `wo_alarms.wo_id` are real foreign keys into `work_orders` — so anything said
+        about a feature is recorded on whichever work order carried it. This is the
+        general rule; `ops.feature_event`'s manager-only carrier is the narrow case of
+        it, kept narrow because the validation loop addresses the manager specifically.
+        Two rules that disagree would put a feature's record in two places.
+
+        The order of the ladder is longest-lived first: the manager exists for the whole
+        feature, the planner for its planning, a child only for its own piece. None means
+        the feature has no session at all — a `pending` feature nobody has planned — and
+        there is nothing to observe. §1 of
+        docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+        """
+        manager = self.manager_work_order(fo_id)
+        if manager:
+            return manager
+        row = self.conn.execute(
+            "SELECT w.* FROM feature_orders f JOIN work_orders w ON w.id = f.plan_wo_id"
+            " WHERE f.id=?", (fo_id,)).fetchone()
+        if row:
+            return dict(row)
+        # Newest, not oldest: `feature_children` is ordered by the plan's dependency
+        # order, and the newest child is the one whose session is likeliest still live.
+        row = self.conn.execute(
+            "SELECT * FROM work_orders WHERE parent_id=? AND kind='worker'"
+            " ORDER BY created_at DESC LIMIT 1", (fo_id,)).fetchone()
         return dict(row) if row else None
 
     # -- turns (the worker's conversation) --------------------------------------

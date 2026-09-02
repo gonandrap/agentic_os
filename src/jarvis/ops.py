@@ -36,6 +36,7 @@ from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
+    NO_TURN,
     OPEN_STATUSES,
     ProjectStore,
 )
@@ -1083,9 +1084,21 @@ ALARM_STANDING = {
     "reviewing": "with the supervisor",
     "acked": "acked by the supervisor",
     "escalated": "escalated to Neo",
+    "proposed": "a remedy proposed",
     "skipped": "not reviewed",
     "failed": "supervisor failed",
 }
+
+
+def turn_label(seq: int | None) -> str:
+    """"turn 3", or "no turn" for a finding that judged a subject rather than a turn.
+
+    One formatter for the same reason `alarm_standing_line` is one: `wo_alarms.seq` is
+    NOT NULL and a subject-level finding stores `project_store.NO_TURN`, so every
+    surface that prints it would otherwise be one edit away from showing the user
+    `turn -1`. §1 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+    """
+    return "no turn" if seq is None or seq == NO_TURN else f"turn {seq}"
 
 
 def alarm_standing_line(alarms: list[dict[str, Any]]) -> str:
@@ -1359,6 +1372,11 @@ def feature_event(store: ProjectStore, fo_id: str, kind: str,
     while `os.validation.enabled` was false has none, and the user can cancel one — and
     the caller must not treat a lost event as a written one: the round machine counts
     transport outages from these rows.
+
+    Manager-only ON PURPOSE, and it is the NARROW case of
+    `ProjectStore.carrier_for_feature`: this loop addresses the manager specifically, so
+    falling back to a planner or a child would file a round on a session that is not the
+    one being asked. Anything not addressed to the manager uses the general rule.
     """
     manager = store.manager_work_order(fo_id)
     if not manager:
@@ -4379,19 +4397,38 @@ def inspect_report(target: str, project: str | None = None, *,
 
 
 def _alarm_dict(name: str, row: dict[str, Any]) -> dict[str, Any]:
-    """The sixteen keys `list_cost_alarms` publishes, from one `alarms_across` row.
+    """The twenty keys `list_cost_alarms` publishes, from one `alarms_across` row.
 
-    Frozen by §1 of docs/superpowers/specs/2026-08-31-the-supervisor.md and bound by
-    four surfaces written against it at once, so it lives in one function rather than
-    inline: the review reads below build on top of this dict and must not be able to
-    drift from it. Anything a review surface needs beyond these keys is ADDED by
-    `_reviewable`, never smuggled in here.
+    Frozen at sixteen by §1 of docs/superpowers/specs/2026-08-31-the-supervisor.md
+    (`kn-4d8449f1`) and bound by four surfaces written against it at once, so it lives
+    in one function rather than inline: the review reads below build on top of this dict
+    and must not be able to drift from it. Anything a review surface needs beyond these
+    keys is ADDED by `_reviewable`, never smuggled in here.
+
+    §1 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md adds four —
+    `source`, `probe`, `subject_kind`, `subject_id` — and the licence stops there.
+    `subject_id` is published rather than derived so no surface has to branch to build a
+    link.
+
+    TWO OF THE SIXTEEN NOW COME FROM THE SUBJECT AND ONE DELIBERATELY DOES NOT, and that
+    split is what lets every template render a feature finding unchanged:
+
+    - `title` and `status` are the SUBJECT's — the feature order's when there is one.
+      A reader asked what is wrong; the carrier is plumbing.
+    - `live` stays the CARRIER's `needs_attention`, because a feature order's attention
+      flag has no `acknowledged_blockers` analogue and is wiped unconditionally at eight
+      sites. The ack has to be able to stick, so the flag lives on the work order.
+
+    For every alarm on the tree today the subject IS the carrier, so swapping those two
+    rules is a no-op on the whole suite — only a fixture whose feature and carrier carry
+    different titles and statuses can tell them apart.
     """
+    feature = row.get("subject_kind") == "feature_order"
     return {
         "project": name,
         "wo_id": row["wo_id"],
-        "title": row["title"],
-        "status": row["status"],
+        "title": (row["fo_title"] if feature else row["title"]),
+        "status": (row["fo_status"] if feature else row["status"]),
         "hidden": bool(row["hidden"]),
         "ts": row["ts"],
         "kind": row["kind"],
@@ -4404,11 +4441,16 @@ def _alarm_dict(name: str, row: dict[str, Any]) -> dict[str, Any]:
         "note": row["note"],
         "review_status": row["review_status"],
         "neo_question_id": row["neo_question_id"],
+        "source": row["source"],
+        "probe": row["probe"],
+        "subject_kind": row["subject_kind"],
+        "subject_id": row["fo_id"] or row["wo_id"],
     }
 
 
 def list_cost_alarms(project_name: str | None = None, limit: int = 200,
-                     wo_id: str | None = None) -> list[dict[str, Any]]:
+                     wo_id: str | None = None, fo_id: str | None = None,
+                     sources: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
     """Every turn the OS raised WHILE it was burning, newest first, across the fleet.
 
     Read off `wo_alarms` rows since §1 of
@@ -4421,6 +4463,9 @@ def list_cost_alarms(project_name: str | None = None, limit: int = 200,
     for the user, never `alarm_status`. That is why several alarms on one order share it
     — one ack answers all of them, and the page has to be able to say so rather than
     offering four buttons that do the same thing.
+
+    `fo_id` and `sources` are filters, not modes: the unfiltered read still returns
+    every finding, feature-subject ones included, with its subject already resolved.
     """
     paths = registered_project_paths()
     if project_name:
@@ -4433,7 +4478,8 @@ def list_cost_alarms(project_name: str | None = None, limit: int = 200,
             continue
         store = ProjectStore(path)
         try:
-            rows = store.alarms_across(limit=limit, wo_id=wo_id)
+            rows = store.alarms_across(limit=limit, wo_id=wo_id, fo_id=fo_id,
+                                       sources=sources)
         finally:
             store.close()
         out.extend(_alarm_dict(name, row) for row in rows)

@@ -5,7 +5,8 @@ Grouped commands:
   jarvis cost [project|wo-id|fo-id]       what the work has cost in tokens
   jarvis inspect <wo-id|fo-id>            where its TIME went, and which cache writes
                                           were a defect rather than the cache expiring
-  jarvis alarms [project]                 turns raised WHILE they were still burning
+  jarvis alarms [project] [--wo|--fo|--source]   findings, newest first: a turn raised
+                                          WHILE it burned, or a probe's symptom
   jarvis alarms show|review <al-id>       one alarm, and your verdict on the
                                           supervisor's
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
@@ -184,6 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
     # A leaf module with no store or CLI dependency, so importing it here costs nothing
     # and lets `--help` state the shipped defaults rather than repeating their values.
     from . import catalog
+    from .project_store import ALARM_SOURCES
 
     p = argparse.ArgumentParser(prog="jarvis", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -254,6 +256,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=50,
                     help="alarms to show (default: 50)")
     sp.add_argument("--wo", help="one work order's alarms, with their ids")
+    sp.add_argument("--fo", help="one feature order's findings, however they were "
+                                "carried, with their ids")
+    sp.add_argument("--source", choices=ALARM_SOURCES,
+                    help="cost (a burning turn) or health (a probe found a symptom)")
     sp.add_argument("--json", action="store_true")
 
     sp = alarms.add_parser("show", help="one alarm: what fired, and what came of it")
@@ -1406,24 +1412,28 @@ def cmd_alarms(args: argparse.Namespace) -> int:
         return cmd_alarms_show(args)
     if args.alarms_cmd == "review":
         return cmd_alarms_review(args)
-    rows = ops.list_cost_alarms(args.project, limit=args.limit, wo_id=args.wo)
+    rows = ops.list_cost_alarms(args.project, limit=args.limit, wo_id=args.wo,
+                                fo_id=args.fo,
+                                sources=(args.source,) if args.source else None)
     if args.json:
         _print(rows, True)
         return 0
     if not rows:
-        print(f"no cost alarm has ever been raised against {args.wo}" if args.wo
+        subject = args.wo or args.fo
+        print(f"no cost alarm has ever been raised against {subject}" if subject
               else "no cost alarm has ever been raised")
         return 0
     live = [r for r in rows if r["live"]]
     print(f"{len(live)} asking for you · {len(rows) - len(live)} on the record\n")
     for row in rows:
         mark = "!" if row["live"] else " "
-        # The id only on the read that asked for one order: §1 of
+        # The id only on the reads that asked for one subject: §1 of
         # docs/superpowers/specs/2026-08-31-the-supervisor.md wants every surface that
         # reads alarms today to render exactly as it does today.
-        who = f"{row['id']}  " if args.wo else f"{row['wo_id']}  {row['project']}  "
+        who = (f"{row['id']}  " if (args.wo or args.fo)
+               else f"{row['subject_id']}  {row['project']}  ")
         print(f"{mark} {who}{row['kind']}  "
-              f"turn {row['seq']}  {_age(row['ts'])} ago")
+              f"{ops.turn_label(row['seq'])}  {_age(row['ts'])} ago")
         print(f"    {row['reason']}")
     if live:
         print("\nack one with: jarvis wo ack <wo-id>")
@@ -1438,8 +1448,8 @@ def cmd_alarms_show(args: argparse.Namespace) -> int:
     if args.json:
         _print(a, True)
         return 0
-    print(f"{a['id']}  {a['project']}  {a['wo_id']}  {a['title']}")
-    print(f"  {a['kind']}  turn {a['seq']}  {_age(a['ts'])} ago"
+    print(f"{a['id']}  {a['project']}  {a['subject_id']}  {a['title']}")
+    print(f"  {a['kind']}  {ops.turn_label(a['seq'])}  {_age(a['ts'])} ago"
           f"{'  ! still asking' if a['live'] else ''}")
     print(f"  what fired: {a['reason']}")
     if a["verdict"]:
