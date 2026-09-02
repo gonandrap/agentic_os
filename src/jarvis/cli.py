@@ -8,6 +8,8 @@ Grouped commands:
   jarvis alarms [project]                 turns raised WHILE they were still burning
   jarvis alarms show|review <al-id>       one alarm, and your verdict on the
                                           supervisor's
+  jarvis supervisor probes [project]      what this project is watched for, and where
+                                          each answer came from
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
   jarvis fo create|list|show|plan|submit|approve|cancel feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
@@ -269,6 +271,18 @@ def build_parser() -> argparse.ArgumentParser:
                          "have decided")
     sp.add_argument("--feedback", default="", help="required with --reject")
     sp.add_argument("--project")
+    sp.add_argument("--json", action="store_true")
+
+    # the supervisor's own settings, as opposed to what it decided —
+    # docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §2.
+    sup = sub.add_parser(
+        "supervisor", help="what the supervisor watches for, and how it is configured",
+    ).add_subparsers(dest="supervisor_cmd", required=True)
+    sp = sup.add_parser(
+        "probes", help="the health probes in force, and where each one came from")
+    sp.add_argument("project", nargs="?",
+                    help="one project (default: the fleet's own list)")
+    sp.add_argument("--catalog", help="read this catalog instead of the registered one")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
@@ -1475,6 +1489,42 @@ def cmd_alarms_review(args: argparse.Namespace) -> int:
     if res["neo_question_closed"]:
         print("  the Neo question it escalated is closed — you have just answered it")
     return 0
+
+
+def cmd_supervisor(args: argparse.Namespace) -> int:
+    """`jarvis supervisor probes [project]` — the symptom catalogue, resolved.
+
+    THE SOURCE COLUMN IS THE COMMAND. A resolved list on its own answers "what is this
+    watched for"; the source answers "and who decided that", which is the half that goes
+    wrong silently when inheritance is by id (§2). The prompts themselves are shown
+    truncated: they are paragraphs, and a terminal that dumps five of them buries the
+    inheritance the reader came for. `--json` carries them whole.
+    """
+    from . import ops
+
+    rows = ops.supervisor_probes(args.project, catalog_path=args.catalog)
+    if args.json:
+        _print(rows, True)
+        return 0
+
+    scope = f"project {args.project}" if args.project else "the fleet"
+    print(f"health probes for {scope} ({len(rows)}, "
+          f"{sum(1 for r in rows if r['enabled'])} enabled)\n")
+    for row in rows:
+        mark = "·" if row["enabled"] else "✗"
+        print(f"{mark} {row['id']:<20} {row['source']:<17} "
+              f"{'' if row['enabled'] else 'disabled  '}"
+              f"{'+'.join(row['subjects'])}")
+        print(f"    {row['title']} — {_one_line(row['prompt'], 110)}")
+    if not rows:
+        print("no probes are configured — this project is watched for nothing")
+    return 0
+
+
+def _one_line(text: str, limit: int) -> str:
+    """A paragraph as a single clipped line, for a listing."""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else flat[:limit].rstrip() + "…"
 
 
 def cmd_cost(args: argparse.Namespace) -> int:
@@ -2693,6 +2743,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_inspect(args)
         if args.cmd == "alarms":
             return cmd_alarms(args)
+        if args.cmd == "supervisor":
+            return cmd_supervisor(args)
         if args.cmd == "adopt":
             return cmd_adopt(args)
         if args.cmd == "wo":

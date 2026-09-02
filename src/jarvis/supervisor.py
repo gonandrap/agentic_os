@@ -63,9 +63,20 @@ UNREADABLE_PREFIX = "unreadable supervisor output: "
 
 
 def build_system_prompt(store: Any, project: str,
-                        learnings_limit: int | None = None) -> str:
-    """Persona + learnings, byte-stable per project so consecutive reviews share a
-    cached prefix.
+                        learnings_limit: int | None = None,
+                        probes: Any = ()) -> str:
+    """Persona + learnings + (optionally) a symptom checklist, byte-stable per project
+    so consecutive reviews share a cached prefix.
+
+    `probes=()` MUST PRODUCE EXACTLY WHAT THIS FUNCTION PRODUCED BEFORE THE CHECKLIST
+    EXISTED, down to the byte, and a committed literal in `tests/test_probes.py` pins it.
+    The
+    cost review (§2 of the supervisor spec) and the health sweep
+    (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §4) share this
+    function, and a checklist header appended unconditionally would move the cost
+    review's cached prefix and silently reprice every review. The checklist is APPENDED
+    rather than interleaved for the same reason: the sweep's prompt extends the review's
+    prefix instead of forking it.
 
     `neo_store.SUPERVISOR_SEAT` is a LEARNING SCOPE, not a panel seat — see
     `neo_store.LEARNING_SCOPES`. Rendering goes through `neo.render_learnings` so the
@@ -76,19 +87,22 @@ def build_system_prompt(store: Any, project: str,
     `None` means `catalog.SupervisorConfig.learnings_limit` — the default lives there,
     not here.
     """
-    from . import neo
+    from . import neo, probes as probes_mod
     from .catalog import SupervisorConfig
     from .neo_store import SUPERVISOR_SEAT
 
     if learnings_limit is None:
         learnings_limit = SupervisorConfig().learnings_limit
-    return "\n".join([
+    parts = [
         SUPERVISOR_PERSONA,
         "",
         "# Learnings (from the user's corrections of your past decisions)",
         *neo.render_learnings(
             store.learnings(project, limit=learnings_limit, seat=SUPERVISOR_SEAT)),
-    ])
+    ]
+    if probes:
+        parts += ["", probes_mod.render_checklist(probes)]
+    return "\n".join(parts)
 
 
 def learning_from_review(alarm: dict[str, Any], feedback: str) -> str:

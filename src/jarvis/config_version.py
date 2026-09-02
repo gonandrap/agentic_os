@@ -97,6 +97,12 @@ def _jsonable(value: Any) -> Any:
     rebuild the dataclass it came from — see `_coerce` for the way back."""
     if isinstance(value, Path):
         return str(value)
+    # A dataclass reached as a VALUE rather than as a namespace to flatten —
+    # `catalog.SupervisorConfig.probes` is a tuple of them. Same predicate as `_flatten`
+    # above. `_coerce`, the way back, needs no matching branch: its only caller is
+    # `validation_config_from_resolved`, and `ValidationConfig` holds no dataclass.
+    if is_dataclass(value) and not isinstance(value, type):
+        return {f.name: _jsonable(getattr(value, f.name)) for f in fields(value)}
     if isinstance(value, (frozenset, set)):
         return sorted(str(v) for v in value)
     if isinstance(value, (tuple, list)):
