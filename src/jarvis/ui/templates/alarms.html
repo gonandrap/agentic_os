@@ -42,7 +42,14 @@
        single sentence, so there was only ever one ask to answer. It posts to the CARRIER
        work order even when the subject is a feature — `work_orders` is where the ack has
        an `acknowledged_blockers` column to stick in. `back` returns the user to this
-       queue instead of the order's page: they are working through a list. #}
+       queue instead of the order's page: they are working through a list.
+
+       KNOWN, AND DELIBERATELY NOT FIXED HERE (Neo, question 216): a feature whose
+       findings were filed through TWO carriers is one group with one button, and that
+       button clears one carrier's flag — so the group returns still labelled "all N".
+       `carrier_for_feature` is deterministic, so this only arises when the carrier
+       changed between sweeps. Widening the ack to every carrier is ack semantics and
+       belongs where `ops.ack_attention` is being extended, not in a read. #}
     <form method="post" action="/wo/{{ g.project }}/{{ g.wo_id }}/ack" class="inline"
           style="margin-top:10px">
       <input type="hidden" name="back" value="alarms">
