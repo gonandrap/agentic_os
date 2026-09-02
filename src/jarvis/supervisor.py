@@ -18,6 +18,7 @@ from . import claude_cli, structured
 log = logging.getLogger("supervisor")
 
 SECONDS_PER_MINUTE = 60  # a unit, not a setting
+SECONDS_PER_HOUR = 60 * SECONDS_PER_MINUTE  # likewise; a feature's clock runs in days
 
 
 SUPERVISOR_PERSONA = """You are the SUPERVISOR inside the Jarvis agentic OS.
@@ -145,46 +146,204 @@ def _session_lines(wo: dict[str, Any], inspect_cfg: Any) -> list[str]:
     return lines or ["(the session has no turns yet)"]
 
 
-def build_evidence(pstore: Any, wo: dict[str, Any], alarm: dict[str, Any],
-                   cfg: Any = None, inspect_cfg: Any = None) -> str:
-    """Everything the supervisor is shown, under `cfg.evidence_budget_chars`.
+#: A child the plan has finished with. Everything else is still in flight, and a health
+#: probe about a feature is nearly always about what is still in flight.
+SETTLED_CHILD_STATUSES = ("completed", "cancelled")
 
-    THE WORKER'S TRANSCRIPT IS NOT IN HERE and must not be added — see §2 for why. The
-    clip is stated rather than silent: a judge that cannot see it was shown a fraction
-    weighs the fraction as the whole.
+#: The order the child tree is CLIPPED in, worst first. Named buckets rather than four
+#: integer ranks because `test_nothing_in_the_module_hard_codes_a_threshold` allows this
+#: module no numeric literal, and the names read better than the numbers would anyway.
+CHILD_TRIAGE = ("failed", "blocked", "unfinished", "settled")
+
+#: A feature with no carrier has nothing on record that anyone said about it, and saying
+#: so is not the same as saying nothing.
+NO_CARRIER_LINE = ("(no work order carries this feature, so nothing said about it is on "
+                   "record)")
+
+
+def _feature_lines(fo: dict[str, Any], carrier: dict[str, Any] | None,
+                   cfg: Any) -> list[str]:
+    """`updated_at` IS the status clock: `set_feature_status` goes through
+    `update_feature_order`, which stamps it on every move."""
+    from . import db
+
+    held = max(0.0, db.now() - float(fo.get("updated_at") or 0.0)) / SECONDS_PER_HOUR
+    attention = (f"yes — {fo.get('attention_reason') or '(no reason recorded)'}"
+                 if fo.get("needs_attention") else "no")
+    return [
+        "# The feature",
+        f"{fo.get('id')} [{fo.get('status')}] for {held:.0f} hour(s)",
+        f"title: {fo.get('title')}",
+        f"carrier: {carrier['id'] if carrier else '(none)'}",
+        f"needs attention: {attention}",
+        f"brief: {_clip(str(fo.get('description') or ''), cfg.description_chars)}",
+    ]
+
+
+def _child_rank(child: dict[str, Any]) -> tuple[int, float]:
+    """What survives the clip when the tree does not fit: what is wrong, then what is
+    stuck, then what is oldest and unfinished. A judge shown only the completed half of
+    a feature would call a collapsing one healthy."""
+    from . import db
+
+    status = str(child.get("status") or "")
+    if status == "failed":
+        bucket = "failed"
+    elif status == "pending" and db.from_json(child.get("depends_on"), []):
+        bucket = "blocked"
+    elif status not in SETTLED_CHILD_STATUSES:
+        bucket = "unfinished"
+    else:
+        bucket = "settled"
+    return (CHILD_TRIAGE.index(bucket), float(child.get("created_at") or 0.0))
+
+
+def _child_line(child: dict[str, Any]) -> str:
+    from . import db
+
+    deps = db.from_json(child.get("depends_on"), []) or []
+    facts = [f"spec section: {child.get('spec_section') or '(none)'}",
+             f"depends on {', '.join(deps)}" if deps else "depends on nothing",
+             "has a PR" if child.get("pr_url") else "no PR"]
+    if child.get("superseded"):
+        facts.append("superseded")
+    return (f"- {child.get('id')} [{child.get('status')}] {child.get('title')} — "
+            + ", ".join(facts))
+
+
+def _child_lines(children: list[dict[str, Any]], budget: int) -> list[str]:
+    """The tree, bounded WITHIN its section — it is the one section that scales with the
+    feature rather than with the settings, so whole-section clipping alone would let a
+    twelve-child feature push every later section off the end.
+
+    Chosen by `_child_rank`, RENDERED in the plan's own order: `feature_children` is
+    oldest-first because creation order IS the dependency order, and reading the graph
+    out of order costs the judge its structure. The omission is counted for the same
+    reason the packet's own is stated.
     """
-    from . import db, timeline
-    from .catalog import InspectConfig, SupervisorConfig
+    kept: set[str] = set()
+    spent = 0
+    for child in sorted(children, key=_child_rank):
+        line = _child_line(child)
+        if kept and spent + len(line) > budget:
+            break
+        spent += len(line) + len("\n")
+        kept.add(str(child.get("id")))
 
-    cfg = cfg or SupervisorConfig()
-    inspect_cfg = inspect_cfg or InspectConfig()
-    standing = max(0.0, db.now() - float(alarm.get("ts") or 0.0))
-    minutes = standing / SECONDS_PER_MINUTE
+    lines = [_child_line(c) for c in children if str(c.get("id")) in kept]
+    dropped = [c for c in children if str(c.get("id")) not in kept]
+    if dropped:
+        statuses = sorted({str(c.get("status") or "") for c in dropped})
+        tail = f"all {statuses[0]}" if len(statuses) == 1 else "of mixed status"
+        lines.append(f"…and {len(dropped)} further children, {tail}")
+    return lines or ["(this feature has no children yet)"]
 
-    sections: list[list[str]] = [[
-        "# The alarm",
-        f"kind: {alarm.get('kind')}",
-        f"reason: {alarm.get('reason')}",
-        f"raised on turn {alarm.get('seq')}, {minutes:.0f} minute(s) ago",
-    ], [
-        "# The work order",
-        f"{wo.get('id')} [{wo.get('status')}] on {wo.get('model') or '(default model)'}",
-        f"title: {wo.get('title')}",
-        f"brief: {_clip(str(wo.get('description') or ''), cfg.description_chars)}",
-    ], [
-        "# The session, turn by turn",
-        *_session_lines(wo, inspect_cfg),
-    ]]
 
-    conversation = timeline.build_conversation(
-        pstore.list_events(wo["id"]), pstore.list_messages(wo["id"]))
+def _answered_lines(pstore: Any, fo_id: str) -> list[str]:
+    """What the user already ruled on with `jarvis fo resume`. Without it the supervisor
+    re-reports a decision that has been taken — see §3 on why that is the worst thing
+    this feature could do."""
+    lines = ["# What the user has already answered for"]
+    for entry in pstore.superseded_children(fo_id):
+        lines.append(f"- {entry.get('wo_id')}: {entry.get('note') or '(no note given)'}")
+    if len(lines) == 1:
+        lines.append("(nothing about this feature has been ruled on)")
+    return lines
+
+
+def _validation_lines(pstore: Any, fo_id: str, cfg: Any) -> list[str]:
+    lines = ["# How validation has judged it"]
+    for round_ in pstore.validation_rounds(fo_id=fo_id):
+        reason = _clip(str(round_.get("reason") or ""), cfg.conversation_quote_chars)
+        lines.append(f"- round {round_.get('round')}: {round_.get('outcome')} — "
+                     f"{reason or '(no reason recorded)'}")
+    if len(lines) == 1:
+        lines.append("(it has never been through validation)")
+    return lines
+
+
+def _said_lines(pstore: Any, wo_id: str | None, cfg: Any) -> list[str]:
+    """The last `cfg.quoted_turns` of `timeline.build_conversation`, for a work order or
+    for a feature's CARRIER — one read, because two renderings of what was said is how
+    two surfaces come to quote different things."""
+    from . import timeline
+
     said = ["# What was last said about this order"]
+    if wo_id is None:
+        said.append(NO_CARRIER_LINE)
+        return said
+    conversation = timeline.build_conversation(
+        pstore.list_events(wo_id), pstore.list_messages(wo_id))
     for turn in conversation[-cfg.quoted_turns:]:
         said.append(f"- {turn['who']}: "
                     f"{_clip(str(turn.get('content') or ''), cfg.conversation_quote_chars)}")
     if len(said) == 1:
         said.append("(nothing has been said about it since it was dispatched)")
-    sections.append(said)
+    return said
+
+
+def build_evidence(pstore: Any, subject: dict[str, Any], alarm: dict[str, Any],
+                   cfg: Any = None, inspect_cfg: Any = None) -> str:
+    """Everything the supervisor is shown, under `cfg.evidence_budget_chars`.
+
+    `subject` is `{"kind": "work_order" | "feature_order", "row": <the store row>}`.
+    One builder for both, not two: the alarm section, the budget and the stated omission
+    are the same discipline whichever is being judged, and the work-order packet's bytes
+    are a cached prompt prefix that a second implementation would drift from (§3).
+
+    THE WORKER'S TRANSCRIPT IS NOT IN HERE and must not be added — see §2 for why. The
+    clip is stated rather than silent: a judge that cannot see it was shown a fraction
+    weighs the fraction as the whole.
+    """
+    from . import db
+    from .catalog import InspectConfig, SupervisorConfig
+    from .project_store import NO_TURN
+
+    cfg = cfg or SupervisorConfig()
+    inspect_cfg = inspect_cfg or InspectConfig()
+    standing = max(0.0, db.now() - float(alarm.get("ts") or 0.0))
+    minutes = standing / SECONDS_PER_MINUTE
+    # A subject-level finding was raised on no turn, and `-1` reaching the supervisor's
+    # own prompt is nonsense it would have to interpret (§3).
+    seq = alarm.get("seq")
+    raised = ("raised on no particular turn" if seq == NO_TURN
+              else f"raised on turn {seq}")
+
+    sections: list[list[str]] = [[
+        "# The alarm",
+        f"kind: {alarm.get('kind')}",
+        f"reason: {alarm.get('reason')}",
+        f"{raised}, {minutes:.0f} minute(s) ago",
+    ]]
+
+    row = subject["row"]
+    if subject["kind"] == "feature_order":
+        # No `_session_lines` here: a feature has no session, and reading the carrier's
+        # would show the judge a transcript of work that is not what it is judging.
+        fo_id = row["id"]
+        carrier = pstore.carrier_for_feature(fo_id)
+        rest = [_feature_lines(row, carrier, cfg),
+                _answered_lines(pstore, fo_id),
+                _validation_lines(pstore, fo_id, cfg),
+                _said_lines(pstore, carrier["id"] if carrier else None, cfg)]
+        # An equal share of the budget, so the tree's bound moves with the setting and
+        # this module goes on holding no numbers of its own. `+ 1` counts the tree.
+        tree = ["# The child tree",
+                *_child_lines(pstore.feature_children(fo_id),
+                              cfg.evidence_budget_chars
+                              // (len(sections) + len(rest) + 1))]
+        sections += [rest[0], tree, *rest[1:]]
+    else:
+        sections.append([
+            "# The work order",
+            f"{row.get('id')} [{row.get('status')}] on "
+            f"{row.get('model') or '(default model)'}",
+            f"title: {row.get('title')}",
+            f"brief: {_clip(str(row.get('description') or ''), cfg.description_chars)}",
+        ])
+        sections.append(["# The session, turn by turn",
+                         *_session_lines(row, inspect_cfg)])
+        sections.append(_said_lines(pstore, row["id"], cfg))
 
     # Whole sections, never a mid-line cut: half a cache-write line reads as a fact.
     packet: list[str] = []
@@ -264,7 +423,8 @@ def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any],
     record = record or agent_usage.record
     try:
         verdict = structured.request(
-            build_evidence(pstore, wo, alarm, cfg, inspect_cfg),
+            build_evidence(pstore, {"kind": "work_order", "row": wo}, alarm,
+                           cfg, inspect_cfg),
             validate=lambda data: _validate(data, cfg.note_chars),
             system_prompt=build_system_prompt(neo_store, project, cfg.learnings_limit),
             model=cfg.model,

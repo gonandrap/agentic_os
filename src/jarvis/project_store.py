@@ -175,6 +175,13 @@ ALARM_STATUSES = (
 ALARM_VERDICTS = ("ack", "escalate")
 ALARM_REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
 
+# `wo_alarms.seq` for a finding about the SUBJECT rather than about one of its turns.
+# The column stays NOT NULL — relaxing it means a table rebuild inside `_migrate()`, on
+# every store open over live databases — so the absence of a turn is a sentinel, and
+# every surface that prints a turn renders it as prose instead of as `-1`. §1 of
+# docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+NO_TURN = -1
+
 # The four `wo_events` kinds that carry an alarm's life, and their payloads:
 #
 #   cost_alarm       {kind, seq, reason, alarm_id}   the raise (daemon)
@@ -1699,6 +1706,39 @@ class ProjectStore:
             "ORDER BY created_at LIMIT 1", (fo_id,)
         ).fetchone()
         return dict(row) if row else None
+
+    def carrier_for_feature(self, fo_id: str) -> dict[str, Any] | None:
+        """The work order that carries something said ABOUT this feature — manager,
+        then planner, then newest child, then None.
+
+        `ops.feature_event` states the pattern ("a feature order has no timeline of its
+        own"), but its rule is manager-only and `manager_work_order` returns None for
+        every feature planned while `os.validation.enabled` was false, which is every
+        feature on the fleet today. Hence three rungs rather than one.
+
+        Reads `feature_orders` directly rather than through `get_feature_order`, which
+        raises on an unknown id: a carrier lookup is a question about routing and the
+        honest answer for a feature that no longer exists is None, as
+        `superseded_children` decided for the same reason. §1 of
+        docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+        """
+        manager = self.manager_work_order(fo_id)
+        if manager:
+            return manager
+        feature = self.conn.execute(
+            "SELECT plan_wo_id FROM feature_orders WHERE id=?", (fo_id,)
+        ).fetchone()
+        if feature and feature["plan_wo_id"]:
+            planner = self.conn.execute(
+                "SELECT * FROM work_orders WHERE id=?", (feature["plan_wo_id"],)
+            ).fetchone()
+            if planner:
+                return dict(planner)
+        newest = self.conn.execute(
+            "SELECT * FROM work_orders WHERE parent_id=? AND kind='worker' "
+            "ORDER BY created_at DESC LIMIT 1", (fo_id,)
+        ).fetchone()
+        return dict(newest) if newest else None
 
     # -- turns (the worker's conversation) --------------------------------------
 

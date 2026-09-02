@@ -619,6 +619,14 @@ def test_an_alarm_on_a_settled_order_is_still_judged(
 # -- the evidence packet ---------------------------------------------------------------
 
 
+def _wo_subject(store, wo_id: str) -> dict:
+    return {"kind": "work_order", "row": store.get_work_order(wo_id)}
+
+
+def _fo_subject(store, fo_id: str) -> dict:
+    return {"kind": "feature_order", "row": store.get_feature_order(fo_id)}
+
+
 def test_the_evidence_packet_is_capped_and_says_so(started, monkeypatch, tmp_path):
     """A DELIBERATELY HUGE SESSION. The alarm is often ABOUT a 300k re-write, so an
     instrument that pasted the conversation in would be one of the largest calls the OS
@@ -646,7 +654,7 @@ def test_the_evidence_packet_is_capped_and_says_so(started, monkeypatch, tmp_pat
         alarm = store.add_alarm(wo["id"], "big-rewrite", 1, "q" * 3_000)
 
         packet = supervisor.build_evidence(
-            store, store.get_work_order(wo["id"]), alarm,
+            store, _wo_subject(store, wo["id"]), alarm,
             CFG, daemon.catalog.projects[0].inspect)
     finally:
         store.close()
@@ -671,7 +679,7 @@ def test_the_packet_carries_the_alarm_the_order_and_what_the_worker_last_said(
     try:
         store.queue_message(wo_id, "still drafting section four")
         (alarm,) = store.alarms_of(wo_id)
-        packet = supervisor.build_evidence(store, store.get_work_order(wo_id), alarm,
+        packet = supervisor.build_evidence(store, _wo_subject(store, wo_id), alarm,
                                            CFG, daemon.catalog.projects[0].inspect)
     finally:
         store.close()
@@ -681,6 +689,250 @@ def test_the_packet_carries_the_alarm_the_order_and_what_the_worker_last_said(
     assert "a long brief about the console" in packet
     assert "turn 1:" in packet and "generating" in packet
     assert "still drafting section four" in packet
+
+
+#: A clock and a transcript that do not move, so the packet below is a literal rather
+#: than a description of one. `build_evidence`'s first section renders "N minute(s) ago"
+#: off `db.now`, which is why it is pinned rather than merely started from.
+FIXED_NOW = 1_780_000_000.0
+FIXED_TURN_AT = FIXED_NOW - 3600.0
+
+
+def _fixed_transcript(path: Path) -> None:
+    """Two turns, both settled, at absolute times — nothing here is relative to the real
+    clock, so every wall/generating/idle number in the packet is a constant."""
+    path.write_text("".join(json.dumps(r) + "\n" for r in [
+        _prompt_row(FIXED_TURN_AT, "You are the worker agent for wo-1"),
+        _assistant_row(FIXED_TURN_AT + 30, "m1"),
+        _prompt_row(FIXED_TURN_AT + 120, "carry on"),
+        _assistant_row(FIXED_TURN_AT + 150, "m2"),
+    ]))
+
+
+#: THE WORK-ORDER PACKET, COMMITTED. It is the cached prompt prefix of every review the
+#: OS runs: a packet that changes shape reprices them all, silently. Only `{wo_id}` is
+#: substituted, because the id is generated — everything else is bytes.
+EXPECTED_WORK_ORDER_PACKET = """\
+# The alarm
+kind: long-turn
+reason: turn 1 has run for 2 hours
+raised on turn 1, 0 minute(s) ago
+
+# The work order
+{wo_id} [running] on claude-opus-5
+title: write the design doc
+brief: a long brief about the console
+
+# The session, turn by turn
+- turn 1: 120s wall (30s generating, 0s blocked, 0s tools, 90s idle), context peak 0
+    started by [dispatch] You are the worker agent for wo-1
+- turn 2: 30s wall (30s generating, 0s blocked, 0s tools, 0s idle), context peak 0
+    started by [a message] carry on
+
+# What was last said about this order
+- you → worker: still drafting section four"""
+
+
+def test_the_work_order_packet_is_byte_for_byte_what_it_has_always_been(
+        started, monkeypatch, tmp_path):
+    """Reshaping `build_evidence`'s arguments into a subject dict must not move one byte
+    of what it produced before (§3). 'Capture, refactor, compare' leaves nothing behind;
+    this literal outlives the commit that made it."""
+    daemon = started()
+    root = tmp_path / "projects"
+    (root / "-proj").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    monkeypatch.setattr(db, "now", lambda: FIXED_NOW)
+
+    wo = ops.create_work_order("proj_a", "write the design doc",
+                               description="a long brief about the console")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        _fixed_transcript(root / "-proj" / f"{wo['id']}.jsonl")
+        store.update_work_order(wo["id"], status="running", session_id=wo["id"],
+                                model="claude-opus-5")
+        store.queue_message(wo["id"], "still drafting section four")
+        alarm = store.add_alarm(wo["id"], "long-turn", 1, "turn 1 has run for 2 hours")
+        packet = supervisor.build_evidence(store, _wo_subject(store, wo["id"]), alarm,
+                                           CFG, daemon.catalog.projects[0].inspect)
+    finally:
+        store.close()
+
+    assert packet == EXPECTED_WORK_ORDER_PACKET.format(wo_id=wo["id"])
+
+
+# -- the evidence packet for a FEATURE order -------------------------------------------
+
+
+def _feature(store, *, children: list[dict], title="the console feature",
+             status="executing", carrier=True) -> str:
+    """A feature and its child tree, written straight to the store.
+
+    Each `children` entry is `{status, title, spec_section?, depends_on?, pr_url?}`.
+    The carrier is the PLANNER rung of `carrier_for_feature`: a feature planned with
+    `os.validation.enabled` off has no manager, which is every feature on the fleet.
+    """
+    fo = store.create_feature_order(title, description="widen the console")
+    plan_wo_id = None
+    if carrier:
+        plan_wo_id = store.create_work_order("plan the console feature",
+                                             kind="planner", parent_id=fo["id"])["id"]
+    store.update_feature_order(fo["id"], status=status, plan_wo_id=plan_wo_id)
+    for spec in children:
+        child = store.create_work_order(
+            spec["title"], parent_id=fo["id"], kind="worker",
+            spec_section=spec.get("spec_section"),
+            depends_on=spec.get("depends_on"))
+        store.update_work_order(child["id"], status=spec["status"],
+                                pr_url=spec.get("pr_url"))
+        spec["id"] = child["id"]
+    return fo["id"]
+
+
+def test_the_feature_packet_names_the_tree_the_rulings_and_the_verdicts(
+        started, project):
+    """The four reads the feature page already makes, in the judge's own packet — and
+    NOT the work-order branch, which is what a fall-through would produce."""
+    started()
+    store = ProjectStore(project)
+    try:
+        children = [{"status": "failed", "title": "the broken one",
+                     "spec_section": "2 — the parser"},
+                    {"status": "completed", "title": "the finished one",
+                     "pr_url": "https://example.invalid/pr/1"}]
+        fo_id = _feature(store, children=children, status="executing")
+        store.supersede_children(fo_id, [children[0]["id"]],
+                                 note="the parser was dropped on purpose")
+        round_ = store.open_validation_round(fo_id=fo_id, fingerprint="f1")
+        store.close_validation_round(round_["id"], outcome="rejected",
+                                     reason="the plan skips the migration")
+        alarm = store.add_alarm(store.carrier_for_feature(fo_id)["id"],
+                                "failing-children", 1, "two children have failed")
+
+        packet = supervisor.build_evidence(store, _fo_subject(store, fo_id), alarm, CFG)
+    finally:
+        store.close()
+
+    assert "# The feature" in packet
+    assert f"{fo_id} [executing]" in packet
+    assert children[0]["id"] in packet
+    assert "2 — the parser" in packet
+    assert "the parser was dropped on purpose" in packet
+    assert "round 1: rejected — the plan skips the migration" in packet
+    # The catch for a fall-through into the work-order branch, which would otherwise
+    # produce a perfectly plausible packet about the carrier.
+    assert "# The work order" not in packet
+
+
+def test_a_twelve_child_tree_is_clipped_to_the_worst_children_and_says_how_many(
+        started, project):
+    """`worker_brief.CORE_BUDGET_CHARS`' pin, applied to the one section that scales with
+    the feature. Under the budget AND substantial: an empty stub is under it too."""
+    started()
+    store = ProjectStore(project)
+    try:
+        pad = "x" * 180
+        children = (
+            [{"status": "failed", "title": f"broken {i} {pad}"} for i in range(3)]
+            + [{"status": "pending", "title": f"blocked {pad}",
+                "depends_on": []}]
+            + [{"status": "running", "title": f"in flight {pad}"}]
+            + [{"status": "completed", "title": f"done {i} {pad}"} for i in range(7)]
+        )
+        fo_id = _feature(store, children=children)
+        store.update_work_order(children[3]["id"],
+                                depends_on=db.to_json([children[0]["id"]]))
+        alarm = store.add_alarm(store.carrier_for_feature(fo_id)["id"],
+                                "failing-children", 1, "three children have failed")
+
+        packet = supervisor.build_evidence(store, _fo_subject(store, fo_id), alarm, CFG)
+    finally:
+        store.close()
+
+    assert len(packet) < CFG.evidence_budget_chars
+    assert len(packet) > 1000
+    tree = packet.split("# The child tree\n", 1)[1].split("\n\n", 1)[0]
+    assert tree.endswith("…and 7 further children, all completed")
+    assert "and 7 further children" in packet
+    # Worst first is the whole point: the three failures survive the clip and a
+    # completed child does not.
+    for failed in children[:3]:
+        assert failed["id"] in packet
+    assert children[-1]["id"] not in packet
+
+
+def test_a_feature_with_no_carrier_says_so_rather_than_raising(started, project):
+    started()
+    store = ProjectStore(project)
+    try:
+        fo_id = _feature(store, children=[], carrier=False)
+        wo = ops.create_work_order("proj_a", "an unrelated order")
+        alarm = ProjectStore(ops.find_work_order(wo["id"])[1]).add_alarm(
+            wo["id"], "stalled-feature", 1, "nothing has moved for a week")
+        packet = supervisor.build_evidence(store, _fo_subject(store, fo_id), alarm, CFG)
+    finally:
+        store.close()
+
+    assert "# The feature" in packet
+    assert supervisor.NO_CARRIER_LINE in packet
+    assert "(this feature has no children yet)" in packet
+
+
+def test_the_transcript_is_read_for_a_work_order_and_never_for_a_feature(
+        started, project, monkeypatch, tmp_path):
+    """A feature has no session. Asserted as a CALL COUNT with both arms in one test: a
+    zero on its own is green on a path that never ran."""
+    from jarvis import inspection
+
+    daemon = started()
+    root = tmp_path / "projects"
+    (root / "-proj").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    reads: list[str] = []
+    real = inspection.read_session
+    monkeypatch.setattr(inspection, "read_session",
+                        lambda sid, cfg=None: (reads.append(sid), real(sid, cfg))[1])
+
+    inspect_cfg = daemon.catalog.projects[0].inspect
+    store = ProjectStore(project)
+    try:
+        wo = ops.create_work_order("proj_a", "the long one")
+        _fixed_transcript(root / "-proj" / f"{wo['id']}.jsonl")
+        store.update_work_order(wo["id"], status="running", session_id=wo["id"])
+        alarm = store.add_alarm(wo["id"], "long-turn", 1, "still going")
+        supervisor.build_evidence(store, _wo_subject(store, wo["id"]), alarm, CFG,
+                                  inspect_cfg)
+        assert reads == [wo["id"]]
+
+        fo_id = _feature(store, children=[{"status": "running", "title": "a child"}])
+        supervisor.build_evidence(store, _fo_subject(store, fo_id), alarm, CFG,
+                                  inspect_cfg)
+    finally:
+        store.close()
+
+    assert reads == [wo["id"]]
+
+
+def test_a_subject_level_finding_is_raised_on_no_particular_turn(started, project):
+    """`NO_TURN` is `-1` and reaches the supervisor's OWN prompt. Both arms in one test:
+    the prose for a finding, the number for a cost alarm."""
+    from jarvis.project_store import NO_TURN
+
+    started()
+    store = ProjectStore(project)
+    try:
+        wo = ops.create_work_order("proj_a", "the carrier")
+        finding = store.add_alarm(wo["id"], "failing-children", NO_TURN, "a symptom")
+        cost = store.add_alarm(wo["id"], "long-turn", 1, "a long turn")
+        subject = _wo_subject(store, wo["id"])
+        health_packet = supervisor.build_evidence(store, subject, finding, CFG)
+        cost_packet = supervisor.build_evidence(store, subject, cost, CFG)
+    finally:
+        store.close()
+
+    assert "raised on no particular turn" in health_packet
+    assert "turn -1" not in health_packet
+    assert "raised on turn 1," in cost_packet
 
 
 def test_the_system_prompt_is_byte_stable_across_reviews(jarvis_home):
