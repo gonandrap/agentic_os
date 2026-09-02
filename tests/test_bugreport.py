@@ -380,6 +380,88 @@ def test_the_search_list_covers_the_snap_default():
     assert "/snap/bin" in bugreport.GH_SEARCH_DIRS
 
 
+# -- heal_path: the half that reaches WORKERS -----------------------------------
+#
+# `gh_bin()` resolves `gh` for Python callers, and the service unit's PATH covers the
+# daemon — but a worker shells out to a bare `gh` from bash, so only the PATH the daemon
+# passes on reaches it. `heal_path` is what puts the missing directories there.
+
+
+def test_heal_path_adds_a_missing_directory_that_exists(tmp_path, monkeypatch):
+    snap = tmp_path / "snap" / "bin"
+    snap.mkdir(parents=True)
+    monkeypatch.setattr(bugreport, "GH_SEARCH_DIRS", (str(snap),))
+    env = {"PATH": "/usr/bin:/bin"}
+
+    assert bugreport.heal_path(env) == [str(snap)]
+    assert env["PATH"].split(_os.pathsep) == ["/usr/bin", "/bin", str(snap)]
+
+
+def test_heal_path_appends_so_nothing_is_ever_shadowed(tmp_path, monkeypatch):
+    """APPEND, never prepend. The list includes /usr/bin and /bin, and a snap-installed
+    `node` or `python` ahead of the production venv would change which interpreter the
+    whole fleet runs — a far worse bug than the one being fixed."""
+    snap = tmp_path / "snap" / "bin"
+    snap.mkdir(parents=True)
+    monkeypatch.setattr(bugreport, "GH_SEARCH_DIRS", (str(snap),))
+    env = {"PATH": "/venv/bin:/usr/bin"}
+
+    bugreport.heal_path(env)
+
+    assert env["PATH"].startswith("/venv/bin:/usr/bin"), \
+        "an existing entry lost precedence"
+
+
+def test_heal_path_skips_directories_that_do_not_exist(tmp_path, monkeypatch):
+    """A PATH entry pointing nowhere is noise in every `command not found` message the
+    fleet ever prints, and it is what a naive 'just add them all' would leave behind."""
+    monkeypatch.setattr(bugreport, "GH_SEARCH_DIRS", (str(tmp_path / "nope"),))
+    env = {"PATH": "/usr/bin"}
+
+    assert bugreport.heal_path(env) == []
+    assert env["PATH"] == "/usr/bin"
+
+
+def test_heal_path_is_idempotent(tmp_path, monkeypatch):
+    snap = tmp_path / "snap" / "bin"
+    snap.mkdir(parents=True)
+    monkeypatch.setattr(bugreport, "GH_SEARCH_DIRS", (str(snap),))
+    env = {"PATH": "/usr/bin"}
+
+    bugreport.heal_path(env)
+    once = env["PATH"]
+    assert bugreport.heal_path(env) == []
+    assert env["PATH"] == once, "a restarting daemon would grow its own PATH forever"
+
+
+def test_the_daemon_heals_its_path_before_it_spawns_anything(monkeypatch):
+    """Ordering is the whole point: a worker inherits `os.environ` as it stands when
+    `claude_cli.spawn_turn` copies it, so healing after the first dispatch is too late."""
+    from jarvis import daemon
+
+    order = []
+    monkeypatch.setattr(daemon.bugreport, "heal_path", lambda: order.append("heal") or [])
+    monkeypatch.setattr(daemon, "load_catalog",
+                        lambda p: order.append("catalog") or object())
+    monkeypatch.setattr(daemon, "ensure_home", lambda: None)
+
+    class _Stop(Exception):
+        pass
+
+    class _FakeDaemon:
+        def __init__(self, *a, **k):
+            order.append("daemon")
+
+        def run_forever(self):
+            raise _Stop
+
+    monkeypatch.setattr(daemon, "Daemon", _FakeDaemon)
+    with pytest.raises(_Stop):
+        daemon.run_daemon("catalog.json", log_to_file=False)
+
+    assert order[0] == "heal"
+
+
 # -- the CLI --------------------------------------------------------------------
 
 

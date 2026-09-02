@@ -173,6 +173,17 @@ If a tool lives somewhere the script does not look, add its directory to that fa
 list — and to `GH_SEARCH_DIRS` in `src/jarvis/bugreport.py`, its mirror, which is what
 lets an already-installed daemon find `gh` without being re-installed.
 
+**Three things keep that PATH applied**, because writing the fix into the script was not
+enough on its own: the units are installed by hand, once, so the #90 fix sat rendered
+but unapplied from 2026-07-19 until 2026-09-01 while every worker kept getting a bash
+with no `gh`.
+
+| | What it does | When |
+|---|---|---|
+| `scripts/shipit.sh` step 5a | re-renders both units from the tag being deployed (`install_prod_service.sh --no-restart`; the restarts stay with shipit, which owns their order) | every release, staged or not |
+| `bugreport.heal_path` | appends the missing `GH_SEARCH_DIRS` to the daemon's own `os.environ["PATH"]` at start-up, which every worker then inherits — appends, never prepends, so nothing shadows the prod venv | every daemon start |
+| `INV-SERVICE-PATH` | reports an installed unit whose PATH cannot reach `gh`, reading the file rather than the healed process | `jarvis doctor` |
+
 ### Worker turns run outside the daemon's cgroup
 
 `systemd --user` defaults to `KillMode=control-group`, so anything left in

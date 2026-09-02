@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import MutableMapping
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -40,10 +41,35 @@ GH_BIN_ENV = "JARVIS_GH_BIN"
 #:
 #: The service PATH is the real fix and `scripts/install_prod_service.sh` writes it —
 #: THIS LIST IS MIRRORED THERE, keep the two in step. This scan is the second half: it
-#: heals a daemon whose unit was rendered before that fix, without a re-install. It
-#: cannot help workers, which shell out to a bare `gh` from bash; only the unit's PATH
-#: reaches those.
+#: heals a daemon whose unit was rendered before that fix, without a re-install, for
+#: Python callers. Workers shell out to a bare `gh` from bash and are reached by
+#: neither — `heal_path` below is what covers them.
 GH_SEARCH_DIRS = ("/snap/bin", "~/.local/bin", "/usr/local/bin", "/usr/bin", "/bin")
+
+
+def heal_path(environ: MutableMapping[str, str] | None = None) -> list[str]:
+    """Put the missing `GH_SEARCH_DIRS` back on PATH, so spawned children inherit them.
+
+    The third half of #41/#90, and the one the two existing halves say out loud they
+    cannot be: `install_prod_service.sh` writes the service PATH but only a re-run
+    applies it, and `gh_bin()`'s scan reaches Python callers only. A WORKER shells out
+    to a bare `gh` from bash, and nothing but the inherited PATH reaches that — which
+    is why the fix sat rendered-but-unapplied on this fleet for a release and a half
+    (the installed unit predated it; see `invariants.check_service_path`).
+
+    APPENDS rather than prepends, and only directories that exist and are not already
+    there: every entry keeps its current precedence, so a snap-installed `node` or
+    `python` can never shadow the venv's. Returns what it added, for the caller to log.
+    """
+    env = os.environ if environ is None else environ
+    current = env.get("PATH", "")
+    present = {p for p in current.split(os.pathsep) if p}
+    added = [d for d in (str(Path(d).expanduser()) for d in GH_SEARCH_DIRS)
+             if d not in present and Path(d).is_dir()]
+    if added:
+        env["PATH"] = os.pathsep.join([*(p for p in current.split(os.pathsep) if p),
+                                       *added])
+    return added
 
 
 class BugReportError(RuntimeError):
