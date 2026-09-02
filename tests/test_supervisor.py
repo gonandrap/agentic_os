@@ -683,11 +683,17 @@ def test_the_packet_carries_the_alarm_the_order_and_what_the_worker_last_said(
     assert "still drafting section four" in packet
 
 
-def test_the_system_prompt_is_byte_stable_across_reviews():
+def test_the_system_prompt_is_byte_stable_across_reviews(jarvis_home):
     """Consecutive reviews share a cached prompt prefix — the property
     `neo.build_system_prompt` is built for and the reason the drain is FIFO."""
-    first = supervisor.build_system_prompt(None, "proj_a")
-    second = supervisor.build_system_prompt(None, "proj_a")
+    from jarvis.neo_store import NeoStore
+
+    store = NeoStore()
+    try:
+        first = supervisor.build_system_prompt(store, "proj_a")
+        second = supervisor.build_system_prompt(store, "proj_a")
+    finally:
+        store.close()
 
     assert first == second
     assert first.startswith(supervisor.SUPERVISOR_PERSONA)
