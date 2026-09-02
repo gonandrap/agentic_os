@@ -253,7 +253,7 @@ DAEMON_SVC="jarvis.service"
 INSTALLER="$PROD_DIR/scripts/install_prod_service.sh"
 if ! unit_installed "$DAEMON_SVC" && ! unit_installed "$UI_SVC"; then
   :
-elif [ "$DRY_RUN" != 1 ] && [ ! -f "$INSTALLER" ]; then
+elif [ ! -f "$INSTALLER" ]; then
   # A tag old enough to predate the installer is still a legal thing to deploy, and
   # aborting the release over a re-render would be worse than not doing it. Say so:
   # silence about the units is the failure mode this step exists to end.

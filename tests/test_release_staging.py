@@ -553,11 +553,12 @@ def test_stage_writes_the_marker_for_real(tmp_path):
         "tag": "jarvis-0.2.0", "staged_at": marker["staged_at"], "state": "staged",
     }
     assert before <= marker["staged_at"] <= time.time() + 1
-    # This tag carries no scripts/install_prod_service.sh, so the unit re-render (step
-    # 5a) cannot run. Aborting a release over it would be the worse bug — but staying
-    # SILENT about the units is the exact failure that step was added to end.
-    assert "units NOT re-rendered" in r.stdout
-    assert "jarvis doctor" in r.stdout
+    # This tag carries no scripts/install_prod_service.sh, so step 5a cannot re-render
+    # the units — and the returncode above is the assertion that matters: a release must
+    # not abort over that. What it PRINTS is not asserted here, because whether step 5a
+    # is reached at all depends on the host having jarvis units installed, and a test
+    # that passes on a developer's machine and fails on CI is worse than no test.
+    # tests/test_shipit.py drives both branches deterministically in --dry-run.
     # the release itself really happened: tag on origin, prod checkout on the tag
     tags = subprocess.run(["git", "-C", str(tmp_path / "origin.git"), "tag"],
                           capture_output=True, text=True, check=True).stdout
