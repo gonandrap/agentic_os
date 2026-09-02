@@ -40,13 +40,13 @@ def prod(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def _run(prod_root: Path, tmp_path: Path, *,
-         path: str = BASE_PATH) -> subprocess.CompletedProcess[str]:
+def _run(prod_root: Path, tmp_path: Path, *, path: str = BASE_PATH,
+         args: list[str] | None = None) -> subprocess.CompletedProcess[str]:
     unit_dir = tmp_path / "units"
     env = {"PATH": path, "HOME": str(tmp_path / "home"),
            "PRODUCTION_CODE": str(prod_root), "USER": os.environ.get("USER", "t")}
     return subprocess.run(
-        ["bash", str(SCRIPT), "--dry-run", "--unit-dir", str(unit_dir)],
+        ["bash", str(SCRIPT), "--dry-run", "--unit-dir", str(unit_dir), *(args or [])],
         capture_output=True, text=True, env=env, check=False)
 
 
@@ -167,3 +167,108 @@ def test_it_refuses_when_production_is_not_deployed(tmp_path):
 
     assert result.returncode != 0
     assert "not deployed yet" in result.stderr
+
+
+# -- --no-restart: the seam shipit re-renders through ---------------------------
+
+
+def test_no_restart_reloads_but_leaves_the_restarts_to_the_caller(prod, tmp_path):
+    """`shipit` re-renders on every release and already owns the restart ORDER — UI
+    inline, daemon detached, because a shipping worker lives in jarvis.service's cgroup.
+    A second copy of that ordering here is how a release kills the script running it."""
+    result = _run(prod, tmp_path, args=["--no-restart"])
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "units" / "jarvis.service").is_file()
+    assert "[dry-run] systemctl --user daemon-reload" in result.stdout
+    assert "restart jarvis" not in result.stdout
+
+
+# -- the doctor check that catches an install nobody re-ran ---------------------
+#
+# The units are installed by hand, once. So when #90's fix landed in this script, the
+# fleet kept running units rendered before it for a release and a half: every worker got
+# a bash with no `gh`, and nothing anywhere compared the two. `shipit` re-rendering is
+# the cure; this is the alarm for when that stops happening.
+
+
+def _installed(unit_dir: Path, unit: str, path_value: str) -> None:
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    (unit_dir / unit).write_text(
+        f"[Service]\nEnvironment=JARVIS_HOME=/x\nEnvironment=PATH={path_value}\n")
+
+
+@pytest.fixture()
+def units(tmp_path, monkeypatch) -> Path:
+    unit_dir = tmp_path / "installed-units"
+    monkeypatch.setenv("JARVIS_SYSTEMD_UNIT_DIR", str(unit_dir))
+    return unit_dir
+
+
+def _violations(monkeypatch, gh: Path):
+    from jarvis import bugreport, invariants
+    monkeypatch.setenv(bugreport.GH_BIN_ENV, str(gh))
+    return list(invariants.check_service_path())
+
+
+def test_a_unit_whose_path_cannot_reach_gh_is_a_violation(units, tmp_path, monkeypatch):
+    from jarvis import release
+    gh = _fake_gh(tmp_path / "snap" / "bin")
+    _installed(units, release.DAEMON_UNIT, BASE_PATH)
+
+    found = _violations(monkeypatch, gh)
+
+    assert [v.invariant for v in found] == ["INV-SERVICE-PATH"]
+    assert found[0].context["units"] == [release.DAEMON_UNIT]
+    assert str(gh.parent) in found[0].detail
+    assert "install_prod_service.sh" in found[0].detail, "no way out is named"
+
+
+def test_a_unit_that_reaches_gh_is_silent(units, tmp_path, monkeypatch):
+    from jarvis import release
+    gh = _fake_gh(tmp_path / "snap" / "bin")
+    for unit in (release.DAEMON_UNIT, release.UI_UNIT):
+        _installed(units, unit, f"{gh.parent}:{BASE_PATH}")
+
+    assert _violations(monkeypatch, gh) == []
+
+
+def test_it_reads_the_file_rather_than_the_running_process(units, tmp_path, monkeypatch):
+    """`bugreport.heal_path` repairs the DAEMON's PATH at start-up, so the live process
+    is fine while the unit that starts it is not. Checking `os.environ` would therefore
+    report nothing — and the stale unit would survive every future restart."""
+    from jarvis import release
+    gh = _fake_gh(tmp_path / "snap" / "bin")
+    _installed(units, release.DAEMON_UNIT, BASE_PATH)
+    monkeypatch.setenv("PATH", f"{gh.parent}:{BASE_PATH}")
+
+    assert len(_violations(monkeypatch, gh)) == 1
+
+
+def test_no_units_installed_is_not_a_violation(units, tmp_path, monkeypatch):
+    """Every dev checkout has no units at all; a doctor that shouts there is a doctor
+    nobody runs."""
+    gh = _fake_gh(tmp_path / "snap" / "bin")
+
+    assert _violations(monkeypatch, gh) == []
+
+
+def test_gh_missing_everywhere_is_someone_else_s_violation(units, monkeypatch):
+    """A machine with no `gh` at all is a real problem, but not a STALE UNIT — and
+    `bugreport.gh_missing_message` is where that one is already explained."""
+    from jarvis import bugreport, invariants, release
+    _installed(units, release.DAEMON_UNIT, BASE_PATH)
+    monkeypatch.delenv(bugreport.GH_BIN_ENV, raising=False)
+    monkeypatch.setattr(bugreport, "GH_SEARCH_DIRS", ())
+    monkeypatch.setenv("PATH", "")
+
+    assert list(invariants.check_service_path()) == []
+
+
+def test_the_check_is_doctor_only(units):
+    """`OS_INVARIANTS` runs on `jarvis doctor`; the reconcile tick must not file an
+    inbox item every five seconds about a unit only a human can re-render."""
+    from jarvis import invariants
+
+    assert invariants.check_service_path in invariants.OS_INVARIANTS
+    assert invariants.check_service_path not in invariants.INVARIANTS

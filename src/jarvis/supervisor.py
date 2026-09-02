@@ -134,18 +134,47 @@ UNREADABLE_PREFIX = "unreadable supervisor output: "
 def build_system_prompt(store: Any, project: str,
                         learnings_limit: int | None = None) -> str:
     """Persona + learnings, byte-stable per project so consecutive reviews share a
-    cached prefix. `store`/`learnings_limit` are the seam §6 fills; the empty block is
-    rendered rather than omitted so §6 extends the prefix instead of moving it.
+    cached prefix.
+
+    `neo_store.SUPERVISOR_SEAT` is a LEARNING SCOPE, not a panel seat — see
+    `neo_store.LEARNING_SCOPES`. Rendering goes through `neo.render_learnings` so the
+    character budget, the oldest-first truncation that keeps this block append-only and
+    the "N older learnings not shown" note are the ones Neo and every panel seat already
+    obey; a second renderer is how the blocks come to differ.
 
     `None` means `catalog.SupervisorConfig.learnings_limit` — the default lives there,
     not here.
     """
+    from . import neo
+    from .catalog import SupervisorConfig
+    from .neo_store import SUPERVISOR_SEAT
+
+    if learnings_limit is None:
+        learnings_limit = SupervisorConfig().learnings_limit
     return "\n".join([
         SUPERVISOR_PERSONA,
         "",
         "# Learnings (from the user's corrections of your past decisions)",
-        "(none yet — escalate when unsure)",
+        *neo.render_learnings(
+            store.learnings(project, limit=learnings_limit, seat=SUPERVISOR_SEAT)),
     ])
+
+
+def learning_from_review(alarm: dict[str, Any], feedback: str) -> str:
+    """Distil the user's correction of a verdict into what the next review is shown.
+
+    Separate from `neo.learning_from_review` rather than a widening of it: that one takes
+    a Neo question and an alarm is not one, so accepting both shapes would put a branch in
+    the middle of Neo's own review path for no gain (§6).
+
+    Nothing here is clipped. Every component but `feedback` is already bounded by a
+    `SupervisorConfig` setting at the moment it was written, and the one that is not is
+    the user's own ruling — which is exactly the text `render_learnings` is written never
+    to drop silently.
+    """
+    return (f"On a {alarm.get('kind')} alarm ({alarm.get('reason')}) the supervisor "
+            f"decided {alarm.get('verdict')} because {alarm.get('verdict_reason')}. "
+            f"The user's ruling: {feedback}")
 
 
 def _clip(text: str, limit: int) -> str:

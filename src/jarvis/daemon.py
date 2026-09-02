@@ -49,7 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import bus, claude_cli, db, worker_session
+from . import bugreport, bus, claude_cli, db, worker_session
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
@@ -2674,6 +2674,14 @@ def run_daemon(catalog_path: str | Path, poll_interval: float = 5.0,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         handlers=handlers,
     )
+    # Before anything is spawned: every worker inherits this process's PATH verbatim
+    # (`claude_cli.spawn_turn`, and `systemd_units`' --setenv forwarding), so a unit
+    # rendered before the #41/#90 fix hands every one of them a bash with no `gh`.
+    added = bugreport.heal_path()
+    if added:
+        log.warning("PATH did not include %s — appended for this process and every "
+                    "worker it spawns; the installed unit is stale, re-run "
+                    "scripts/install_prod_service.sh", ", ".join(added))
     catalog = load_catalog(catalog_path)
     Daemon(catalog, poll_interval=poll_interval).run_forever()
 
