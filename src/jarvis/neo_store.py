@@ -65,6 +65,17 @@ Q_KINDS = ("question", "approval", "plan", "alarm")
 # should have to depend on the other.
 SEATS = ("premise", "record", "blast", "taste", "chair")
 
+#: The alarm supervisor's learnings live in this table too, scoped by the same `seat`
+#: column — §6 of docs/superpowers/specs/2026-08-31-the-supervisor.md.
+SUPERVISOR_SEAT = "supervisor"
+
+# The seat values a LEARNING may legally carry, which is a wider vocabulary than the
+# panel's roster. `SUPERVISOR_SEAT` is deliberately NOT in `SEATS`: that constant is what
+# `catalog` parses a roster against, so adding it there would let a catalog seat the
+# supervisor on Neo's panel, where it has no definition and no mandate. `ops.validate_seat`
+# widens against this; every roster validator stays on `SEATS`.
+LEARNING_SCOPES = SEATS + (SUPERVISOR_SEAT,)
+
 # How one seat's contribution ended. A seat that errors or times out is recorded as
 # `abstained` and the panel proceeds; `failed` is for a call that came back unusable.
 OPINION_STATUSES = ("ok", "abstained", "failed")

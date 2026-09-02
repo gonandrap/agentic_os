@@ -248,3 +248,71 @@ def test_explicit_version_is_respected(tmp_path):
     r = _dry_run(repo, tmp_path / "prod", "1.5.0")
     assert r.returncode == 0, r.stderr
     assert "jarvis-1.5.0" in r.stdout
+
+
+# -- re-rendering the units ------------------------------------------------------
+#
+# Installing the units was a one-time manual step, so #90's `gh` PATH fix sat in
+# install_prod_service.sh unapplied for a release and a half while every worker kept
+# getting a bash with no `gh`. A release is the one moment the two are guaranteed to be
+# looked at together.
+
+
+def _deployed(tmp_path: Path) -> Path:
+    """A production root already carrying the installer, as every current tag does.
+
+    Step 5a only re-renders what the deployed tag can render, so which branch it takes
+    is decided by this file — not by whether the machine running the test happens to
+    have jarvis units installed. That distinction is what made the first version of
+    these tests pass locally and fail on CI.
+    """
+    prod = tmp_path / "prod"
+    (prod / "jarvis_os" / "scripts").mkdir(parents=True)
+    (prod / "jarvis_os" / "scripts" / "install_prod_service.sh").write_text("#!/bin/sh\n")
+    return prod
+
+
+def test_the_units_are_re_rendered_from_the_deployed_tag(tmp_path):
+    """From PROD_DIR, not this checkout: the units must describe the version going live,
+    and after step 5 that is what is checked out there."""
+    repo = _make_repo(tmp_path)
+    prod = _deployed(tmp_path)
+    r = _dry_run(repo, prod, "0.2.0")
+    assert r.returncode == 0, r.stderr
+
+    assert f"{prod}/jarvis_os/scripts/install_prod_service.sh' --no-restart" in r.stdout
+
+
+def test_the_re_render_happens_before_anything_is_restarted(tmp_path):
+    """A unit rendered after the restart is a unit that takes effect a release late —
+    which is the same silent lag this whole step exists to remove."""
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, _deployed(tmp_path), "0.2.0")
+    out = r.stdout
+
+    assert out.index("install_prod_service.sh") < out.index("restart 'jarvis-ui.service'")
+    assert out.index("install_prod_service.sh") < out.index("systemd-run --user")
+
+
+def test_a_staged_release_re_renders_too(tmp_path):
+    """`--stage` exits before the restarts and hands them to the daemon (release.py).
+    The units have to be written by then, because that restart is what reads them."""
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, _deployed(tmp_path), "0.2.0", "--stage", "--wo", "wo-1234abcd")
+    assert r.returncode == 0, r.stderr
+
+    assert "install_prod_service.sh' --no-restart" in r.stdout
+    assert "services NOT restarted" in r.stdout
+
+
+def test_a_tag_without_the_installer_says_so_instead_of_aborting(tmp_path):
+    """A tag old enough to predate install_prod_service.sh is still legal to deploy, and
+    failing a release over a re-render would be the worse bug. But silence about the
+    units is precisely what this step exists to end, so it has to say which it did."""
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", "0.2.0")   # no installer deployed
+
+    assert r.returncode == 0, r.stderr
+    assert "units NOT re-rendered" in r.stdout
+    assert "jarvis doctor" in r.stdout
+    assert "--no-restart" not in r.stdout, "claimed a re-render it could not do"

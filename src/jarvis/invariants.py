@@ -29,6 +29,7 @@ in `INVARIANTS`. Give it a stable id — ids appear in work order timelines and 
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1645,10 +1646,57 @@ def check_config_drift() -> Iterator[Violation]:
     )
 
 
+def check_service_path() -> Iterator[Violation]:
+    """INV-SERVICE-PATH — the installed units' PATH must reach `gh`.
+
+    A unit's `Environment=PATH=` is the daemon's PATH and therefore every worker's
+    (`claude_cli.spawn_turn` copies `os.environ`), so a `gh` missing from it means
+    `gh pr create` dies at the end of a work order, `jarvis bug report` fails fleet-wide
+    and PR-merge polling is silently off — issues #41 and #90.
+
+    Those were fixed in `scripts/install_prod_service.sh`, and the fix then sat on disk
+    unapplied for a release and a half, because installing the units is a one-time
+    manual step and nothing ever compared what the script renders with what is
+    installed. This is that comparison, narrowed to the part that has actually broken.
+
+    Reads the FILE, not `systemctl show`: what is on disk is what the next start uses.
+    `bugreport.heal_path` repairs the running process, so the live daemon can be healthy
+    while the unit that starts it is not — checking `os.environ` would report nothing.
+
+    A `jarvis doctor` check only (see `check_config_drift` on why `OS_INVARIANTS` stays
+    off the reconcile tick). Not repairable: rewriting a systemd unit and reloading the
+    manager is a privileged action, not something a read-only check may do.
+    """
+    from . import bugreport, release
+
+    gh = bugreport.gh_bin()
+    if os.sep not in gh:
+        return  # `gh` is nowhere on this machine: a real problem, but not this one's,
+                # and `bugreport.gh_missing_message` already explains that one
+    gh_dir = str(Path(gh).parent)
+    stale = [unit for unit in (release.DAEMON_UNIT, release.UI_UNIT)
+             # None = not installed, or carrying no PATH: nothing to be stale about
+             if (value := release.unit_environment(unit, "PATH")) is not None
+             and gh_dir not in value.split(os.pathsep)]
+    if not stale:
+        return
+    yield Violation(
+        invariant="INV-SERVICE-PATH",
+        detail=(f"`gh` is at {gh}, but {' and '.join(stale)} carry a PATH without "
+                f"{gh_dir} — every worker they spawn gets a shell where `gh` is not "
+                f"found, so `gh pr create`, `jarvis bug report` and PR-merge polling "
+                f"all fail. Re-render the units by re-running "
+                f"scripts/install_prod_service.sh (it restarts the services)."),
+        context={"gh": gh, "gh_dir": gh_dir, "units": stale,
+                 "unit_dir": str(release.unit_dir())},
+    )
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
     check_gate_canaries,
     check_config_drift,
+    check_service_path,
 )
 
 

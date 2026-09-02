@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from . import agent_usage, systemd_units
+from . import agent_usage, release, systemd_units
 from .bugreport import GH_BIN_ENV
 from .claude_cli import CLAUDE_BIN_ENV, CREDENTIALS_ENV
 from .notify import DISABLE_EXTERNAL_SINKS_ENV
@@ -125,6 +125,12 @@ def gate_environment(root: Path) -> dict[str, str]:
         # login. Pointed at a path inside the sandbox that no test writes unless it means
         # to, so the default answer is "cannot tell, do not resume".
         CREDENTIALS_ENV: str(root / "claude-credentials.json"),
+        # The developer's own installed `jarvis.service`, which `INV-SERVICE-PATH`
+        # reads. Left ambient, `jarvis doctor` in a test would pass or fail on whether
+        # the human last re-ran install_prod_service.sh — and it currently fails, which
+        # is the entire subject of that check. Pointed at an empty directory inside the
+        # sandbox: no units installed reads as nothing to be stale about.
+        release.UNIT_DIR_ENV: str(root / "systemd-units"),
     }
     if not os.environ.get(LLM_EVALS_ENV):
         env[CLAUDE_BIN_ENV] = str(_blocked_bin(root, "claude", BLOCKED_CLAUDE))

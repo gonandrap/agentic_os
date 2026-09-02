@@ -229,6 +229,41 @@ JSON
   fi
 fi
 
+# --- 5a. re-render the units from the tag being shipped -------------------------
+#
+# The units carry the daemon's PATH, and the daemon's PATH is every worker's. Because
+# rendering them was a one-time manual step that nothing repeated, the #41/#90 `gh`
+# fix sat in install_prod_service.sh unapplied for a release and a half while every
+# worker kept getting a shell with no `gh`. Re-rendering here is what keeps the
+# installed units in step with the script that writes them; `jarvis doctor`'s
+# INV-SERVICE-PATH is the other half, and reports the drift if this stops running.
+#
+# Run from PROD_DIR so the units match the tag just deployed, and --no-restart because
+# steps 6 and 8 below already own the restart order. Only when the units are already
+# installed: shipping is not the moment to decide a machine should have services it
+# has never had. Before 5b on purpose — the staged path restarts later, into these.
+unit_installed() {  # unit_installed <unit>; a dry run always prints the full plan
+  if [ "$DRY_RUN" = 1 ]; then return 0; fi
+  systemctl --user list-unit-files "$1" 2>/dev/null | grep -q "$1"
+}
+
+UI_SVC="jarvis-ui.service"
+DAEMON_SVC="jarvis.service"
+
+INSTALLER="$PROD_DIR/scripts/install_prod_service.sh"
+if ! unit_installed "$DAEMON_SVC" && ! unit_installed "$UI_SVC"; then
+  :
+elif [ ! -f "$INSTALLER" ]; then
+  # A tag old enough to predate the installer is still a legal thing to deploy, and
+  # aborting the release over a re-render would be worse than not doing it. Say so:
+  # silence about the units is the failure mode this step exists to end.
+  say "NOTE: $INSTALLER is missing in $TAG — units NOT re-rendered, and they may be"
+  say "      stale. Check with: jarvis doctor (INV-SERVICE-PATH)"
+else
+  say "re-rendering the systemd units from $TAG"
+  run "'$INSTALLER' --no-restart"
+fi
+
 # --- 5b. --stage: stop here and hand the restarts to the daemon ------------------
 #
 # Everything that had to happen has happened: the tag is on origin and production's
@@ -274,14 +309,6 @@ fi
 #   * jarvis-ui.service never hosts us → restart it inline and verify it here;
 #   * jarvis.service may host us → hand its restart to a transient systemd unit that
 #     lives outside our cgroup, after everything else is done.
-unit_installed() {  # unit_installed <unit>; a dry run always prints the full plan
-  if [ "$DRY_RUN" = 1 ]; then return 0; fi
-  systemctl --user list-unit-files "$1" 2>/dev/null | grep -q "$1"
-}
-
-UI_SVC="jarvis-ui.service"
-DAEMON_SVC="jarvis.service"
-
 any_installed=0
 if unit_installed "$UI_SVC"; then
   any_installed=1
