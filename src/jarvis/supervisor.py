@@ -390,7 +390,8 @@ def _said_lines(pstore: Any, wo_id: str | None, cfg: Any) -> list[str]:
     return said
 
 
-def build_evidence(pstore: Any, subject: dict[str, Any], alarm: dict[str, Any],
+def build_evidence(pstore: Any, subject: dict[str, Any],
+                   alarm: dict[str, Any] | None,
                    cfg: Any = None, inspect_cfg: Any = None) -> str:
     """Everything the supervisor is shown, under `cfg.evidence_budget_chars`.
 
@@ -398,6 +399,12 @@ def build_evidence(pstore: Any, subject: dict[str, Any], alarm: dict[str, Any],
     One builder for both, not two: the alarm section, the budget and the stated omission
     are the same discipline whichever is being judged, and the work-order packet's bytes
     are a cached prompt prefix that a second implementation would drift from (§3).
+
+    `alarm=None` IS THE HEALTH SWEEP, which runs before any alarm exists (§4): the alarm
+    section is omitted entirely rather than synthesised. A fabricated row would put a
+    `kind` and a `reason` the OS never raised into the judge's prompt, and the judge
+    cannot tell an invented fact from a recorded one. `review_health` states why it is
+    looking in its own header instead. Neo settled this on question 223.
 
     THE WORKER'S TRANSCRIPT IS NOT IN HERE and must not be added — see §2 for why. The
     clip is stated rather than silent: a judge that cannot see it was shown a fraction
@@ -409,20 +416,22 @@ def build_evidence(pstore: Any, subject: dict[str, Any], alarm: dict[str, Any],
 
     cfg = cfg or SupervisorConfig()
     inspect_cfg = inspect_cfg or InspectConfig()
-    standing = max(0.0, db.now() - float(alarm.get("ts") or 0.0))
-    minutes = standing / SECONDS_PER_MINUTE
-    # A subject-level finding was raised on no turn, and `-1` reaching the supervisor's
-    # own prompt is nonsense it would have to interpret (§3).
-    seq = alarm.get("seq")
-    raised = ("raised on no particular turn" if seq == NO_TURN
-              else f"raised on turn {seq}")
 
-    sections: list[list[str]] = [[
-        "# The alarm",
-        f"kind: {alarm.get('kind')}",
-        f"reason: {alarm.get('reason')}",
-        f"{raised}, {minutes:.0f} minute(s) ago",
-    ]]
+    sections: list[list[str]] = []
+    if alarm is not None:
+        standing = max(0.0, db.now() - float(alarm.get("ts") or 0.0))
+        minutes = standing / SECONDS_PER_MINUTE
+        # A subject-level finding was raised on no turn, and `-1` reaching the
+        # supervisor's own prompt is nonsense it would have to interpret (§3).
+        seq = alarm.get("seq")
+        raised = ("raised on no particular turn" if seq == NO_TURN
+                  else f"raised on turn {seq}")
+        sections.append([
+            "# The alarm",
+            f"kind: {alarm.get('kind')}",
+            f"reason: {alarm.get('reason')}",
+            f"{raised}, {minutes:.0f} minute(s) ago",
+        ])
 
     row = subject["row"]
     if subject["kind"] == "feature_order":
@@ -564,6 +573,202 @@ def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any],
         if own_central:
             central.close()
     return verdict
+
+
+# -- the health sweep ------------------------------------------------------------------
+#
+# §4 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md. ONE MODEL
+# CALL PER UNIT, NOT ONE PER PROBE: the checklist rides in the system prompt beside the
+# persona and the learnings, so N probes over M units on every sweep is one call per unit
+# sharing a byte-stable cached prefix per project, rather than N x M calls asking the
+# same thing in pieces.
+
+#: What the judge is told about WHY it is being asked now. "nothing has moved" and
+#: "something just moved" are different questions; a judge shown neither answers a third.
+HEALTH_WHY = {
+    "first-look": "This unit has never been checked before. Judge it as it stands.",
+    "changed": "Its record has moved since the last check.",
+    "stale": "Its record has NOT moved at all since the last check, and that stillness "
+             "is why you are being asked now.",
+}
+
+#: The sweep's user prompt opens with this, above the evidence packet.
+HEALTH_HEADER = "# Why you are looking now"
+
+#: The attention reason a finding puts on the CARRIER, and there are two because a
+#: finding about a FEATURE lands on a work order that is not itself in trouble: that flag
+#: has to say which record to open, and a finding about the carrier itself does not.
+HEALTH_BLOCKER = "{reason}"
+HEALTH_FEATURE_BLOCKER = "{fo_id}: {reason}"
+
+#: `health_reviews.detail` recognises the unreadable-output path by this prefix, as
+#: `review` does with `UNREADABLE_PREFIX`.
+UNREADABLE_SWEEP_PREFIX = "unreadable health sweep output: "
+
+NO_CARRIER_DETAIL = ("no work order carries this feature, so a finding about it has "
+                     "nowhere to be recorded")
+
+
+def _validate_findings(data: dict[str, Any], armed_ids: set[str],
+                       cfg: Any) -> dict[str, Any]:
+    """Normalise a parsed sweep reply, or raise.
+
+    A MISSING `findings` IS A BAD SHAPE, NOT AN EMPTY ONE — it is what says this is a
+    sweep reply at all, exactly the call `_validate` makes about `decision`. Defaulting
+    it to `[]` would read every unreadable reply as a clean bill of health.
+
+    A probe id nobody armed is DROPPED rather than raised on: a hallucinated id is one
+    bad finding, not a bad reply, and refusing the whole reply over it throws away the
+    findings that were good.
+    """
+    if "findings" not in data:
+        raise structured.InvalidOutput("no `findings` field in the sweep's reply")
+    findings = []
+    for item in data.get("findings") or []:
+        if not isinstance(item, dict):
+            continue
+        probe = str(item.get("probe") or "").strip()
+        if probe not in armed_ids:
+            log.warning("health sweep named a probe that is not armed: %r", probe)
+            continue
+        findings.append({"probe": probe,
+                         "reason": _clip(str(item.get("reason") or ""),
+                                         cfg.reason_chars),
+                         "evidence": _clip(str(item.get("evidence") or ""),
+                                           cfg.reason_chars)})
+    return {"findings": findings, "failed": False, "reason": ""}
+
+
+def _nothing_found(reason: str) -> dict[str, Any]:
+    """THE FAIL-SAFE, AND ITS POLARITY IS THE OPPOSITE OF `_failed_verdict`'S.
+
+    `review`'s fallback ESCALATES, because output nobody can read must not become an ack
+    that hides a burning turn. This one FINDS NOTHING, because output nobody can read
+    must not become an attention item the user cannot trace to anything.
+
+    Both obey one rule — a failure never invents a judgement — and they land on opposite
+    sides of it because the judgements point in opposite directions. Do not "fix" either
+    one to match the other.
+    """
+    return {"findings": [], "failed": True, "reason": reason}
+
+
+def review_health(pstore: Any, neo_store: Any, project: str, subject: dict[str, Any],
+                  probes: Any, cfg: Any, trigger: str, record: Any = None,
+                  inspect_cfg: Any = None) -> dict[str, Any]:
+    """Judge one open unit against the project's armed probes; raise what is wrong.
+
+    `subject` is `build_evidence`'s dict. Returns the reply plus the alarm ids raised.
+
+    THE FINGERPRINT IS COMPUTED HERE rather than passed in, so the ledger row records the
+    state that was actually judged. The daemon computed one a moment earlier to decide
+    whether to look at all; if the unit moved in between, this is the honest value and
+    the next sweep sees a `changed` trigger for a change that really happened.
+
+    AND THEN IT STOPS. A finding is an ordinary alarm: `_drain_project_alarms` claims it,
+    `review` judges it, and every surface downstream already exists. Two model calls per
+    finding buys one review path, one surface and one memory — the sweep answers *is
+    something wrong*, the review answers *does the user need to know*.
+    """
+    from . import agent_usage, health, probes as probes_mod
+    from .paths import ensure_home
+    from .project_store import NO_TURN
+
+    record = record or agent_usage.record
+    kind, row = subject["kind"], subject["row"]
+    subject_id = row["id"]
+    fingerprint = health.fingerprint(pstore, subject)
+    carrier = (pstore.carrier_for_feature(subject_id) if kind == "feature_order"
+               else row)
+    if carrier is None:
+        # Refused BEFORE the call, not after: a finding with nowhere to be recorded is a
+        # model call bought and thrown away.
+        pstore.record_health_review(kind, subject_id, fingerprint=fingerprint,
+                                    trigger=trigger, outcome="failed",
+                                    detail=NO_CARRIER_DETAIL)
+        return {**_nothing_found(NO_CARRIER_DETAIL), "raised": [], "outcome": "failed"}
+
+    armed = probes_mod.armed(probes, kind)
+    armed_ids = {p.id for p in armed}
+    packet = "\n\n".join([
+        "\n".join([HEALTH_HEADER, HEALTH_WHY.get(trigger, trigger)]),
+        build_evidence(pstore, subject, None, cfg, inspect_cfg),
+    ])
+    try:
+        reply = structured.request(
+            packet,
+            validate=lambda data: _validate_findings(data, armed_ids, cfg),
+            system_prompt=build_system_prompt(neo_store, project, cfg.learnings_limit,
+                                              probes=armed),
+            model=cfg.model,
+            # The FAIL-SAFE shape, as `review` uses it: asking again spends a call to
+            # learn the same thing, and this fallback reaches nobody at all, so a retry
+            # buys silence one tick earlier at the price of a second bill.
+            attempts=1,
+            on_invalid=lambda raw: _nothing_found(
+                f"{UNREADABLE_SWEEP_PREFIX}{_clip(raw, cfg.reason_chars)}"),
+            timeout=cfg.timeout,
+            # Neutral cwd, `review`'s reason: a project directory pulls its CLAUDE.md in
+            # and breaks prefix stability.
+            cwd=ensure_home(),
+            on_usage=agent_usage.recorder(
+                "health", project=project, wo_id=carrier["id"], label=trigger,
+                model=cfg.model, record=record),
+        )
+    except claude_cli.ClaudeCliError as exc:
+        # `on_invalid` does NOT cover this: `ClaudeCliError` propagates untouched by
+        # design (kn-9b18a8eb), and without this the sweep raises out of the daemon's
+        # own thread pool.
+        reply = _nothing_found(f"the health sweep could not be reached: "
+                               f"{_clip(str(exc), cfg.reason_chars)}")
+
+    if reply["failed"]:
+        # THE FINGERPRINT IS NOT RECORDED AS REVIEWED — `last_health_review` skips a
+        # `failed` row — so the next tick looks again rather than counting a failure as
+        # a look. No alarm and no event either: a failure never becomes a judgement.
+        pstore.record_health_review(kind, subject_id, fingerprint=fingerprint,
+                                    trigger=trigger, outcome="failed",
+                                    detail=reply["reason"])
+        log.warning("[%s] health sweep of %s failed: %s", project, subject_id,
+                    reply["reason"])
+        return {**reply, "raised": [], "outcome": "failed"}
+
+    # READ BEFORE THIS SWEEP'S OWN ROW IS WRITTEN, or it deduplicates its own findings.
+    already = pstore.probes_reported_at(kind, subject_id, fingerprint)
+    raised = []
+    for finding in reply["findings"]:
+        if finding["probe"] in already:
+            continue
+        alarm = pstore.add_finding(
+            carrier["id"], kind=finding["probe"], reason=finding["reason"],
+            seq=NO_TURN, source="health", probe=finding["probe"], subject_kind=kind,
+            fo_id=subject_id if kind == "feature_order" else None)
+        pstore.add_event(carrier["id"], "health_finding",
+                         {"alarm_id": alarm["id"], "probe": finding["probe"],
+                          "subject_kind": kind, "subject_id": subject_id,
+                          "reason": finding["reason"]})
+        raised.append(alarm["id"])
+        log.info("[%s] health finding on %s: %s", project, subject_id,
+                 finding["reason"])
+
+    outcome = "findings" if reply["findings"] else "clear"
+    pstore.record_health_review(
+        kind, subject_id, fingerprint=fingerprint, trigger=trigger, outcome=outcome,
+        findings=len(reply["findings"]),
+        # What the sweep REPORTED, not what it raised: this is the dedupe memory, and
+        # recording only what was raised would let a deduped probe raise again two
+        # sweeps later at the same unchanged fingerprint.
+        detail=",".join(f["probe"] for f in reply["findings"]))
+    pstore.add_event(carrier["id"], "health_reviewed",
+                     {"subject_kind": kind, "subject_id": subject_id,
+                      "trigger": trigger, "findings": len(reply["findings"])})
+    if raised and not carrier.get("needs_attention"):
+        first = reply["findings"][0]
+        pstore.flag_attention(carrier["id"], (
+            HEALTH_FEATURE_BLOCKER.format(fo_id=subject_id, reason=first["reason"])
+            if kind == "feature_order"
+            else HEALTH_BLOCKER.format(reason=first["reason"])))
+    return {**reply, "raised": raised, "outcome": outcome}
 
 
 def escalation_context(evidence: str, verdict: dict[str, Any]) -> str:
