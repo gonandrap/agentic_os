@@ -8,6 +8,16 @@
   is how they come to show different things.
 #}
 
+{# THE ALARM'S SUBJECT, WHEREVER ONE IS LINKED. `subject_id` and `subject_kind` are on
+   the published dict precisely so no surface has to branch to build this href, and
+   pointing at the CARRIER instead would send a reader asking about a feature to a
+   single work order that is merely where the finding was filed. §1 of
+   docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md. #}
+{% macro subject_link(a) -%}
+<a href="/{{ 'fo' if a.subject_kind == 'feature_order' else 'wo' }}/{{ a.project }}/{{ a.subject_id }}"
+   class="mono">{{ a.subject_id }}</a>
+{%- endmacro %}
+
 {# What the supervisor decided and why. TWO SENTENCES, NOT ONE: `verdict_reason` is its
    argument for the verdict and `note` is what it wrote to the user, and collapsing them
    would lose whichever the reader happened to need. §5 of
@@ -15,8 +25,8 @@
 {% macro verdict_body(a) %}
   <div class="who">
     {{ a.project }} ·
-    <a href="/wo/{{ a.project }}/{{ a.wo_id }}" class="mono">{{ a.wo_id }}</a> ·
-    <span class="tone-warn">{{ a.kind }}</span> · turn {{ a.seq }} ·
+    {{ subject_link(a) }} ·
+    <span class="tone-warn">{{ a.kind }}</span> · {{ turn_label(a.seq) }} ·
     {{ fmt_age(a.ts) }} ago
   </div>
   <div style="margin:6px 0">{{ a.title }}</div>

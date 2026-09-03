@@ -545,7 +545,7 @@ def test_an_escalation_is_not_an_empty_speech_bubble():
 
 
 def test_every_alarm_status_has_a_reading_a_person_can_use():
-    """All six, because the supervisor ships OFF and `raised` is therefore the common
+    """All seven, because the supervisor ships OFF and `raised` is therefore the common
     case — an example built from `acked` alone would grade the interesting one only.
     The ids are asserted too: they are what makes the line reachable rather than a
     count of things the reader cannot open."""
@@ -555,9 +555,10 @@ def test_every_alarm_status_has_a_reading_a_person_can_use():
     assert set(ALARM_STANDING) == set(ALARM_STATUSES)
     alarms = [{"id": f"al-{i}", "status": s} for i, s in enumerate(ALARM_STATUSES)]
     assert alarm_standing_line(alarms) == (
-        "6 (1 raised, 1 with the supervisor, 1 acked by the supervisor, "
-        "1 escalated to Neo, 1 not reviewed, 1 supervisor failed) — "
-        "al-0, al-1, al-2, al-3, al-4, al-5")
+        "7 (1 raised, 1 with the supervisor, 1 acked by the supervisor, "
+        "1 escalated to Neo, 1 a remedy proposed, 1 not reviewed, "
+        "1 supervisor failed) — "
+        "al-0, al-1, al-2, al-3, al-4, al-5, al-6")
     assert alarm_standing_line([{"id": "al-1a2b", "status": "acked"},
                                 {"id": "al-3c4d", "status": "escalated"}]) == (
         "2 (1 acked by the supervisor, 1 escalated to Neo) — al-1a2b, al-3c4d")

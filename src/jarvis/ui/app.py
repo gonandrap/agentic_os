@@ -23,6 +23,7 @@ from ..project_store import (
     FO_OPEN_STATUSES,
     FO_STATUSES,
     FO_TERMINAL_STATUSES,
+    NO_TURN,
     OPEN_STATUSES,
     TERMINAL_STATUSES,
     WO_STATUSES,
@@ -230,13 +231,18 @@ def gate_badge() -> int | None:
 
 
 def alarm_badge() -> int | None:
-    """How many work orders are asking for the user BECAUSE of a cost alarm.
+    """How many SUBJECTS are asking for the user because of an alarm.
 
-    Counted over orders, not over events: several alarms on one turn are one ask and
-    one ack. Never raises — a badge must not be the reason a page 500s.
+    Counted over subjects, not over events: several alarms on one thing are one ask and
+    one ack. Over `subject_id` rather than `wo_id` since §1 of
+    docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md — findings on two
+    features that share a carrier are two asks, and findings on one feature reached
+    through two carriers are one. Never raises: a badge must not be the reason a page
+    500s.
     """
     try:
-        return len({a["wo_id"] for a in ops.list_cost_alarms() if a["live"]}) or None
+        return len({a["subject_id"] for a in ops.list_cost_alarms()
+                    if a["live"]}) or None
     except Exception:  # noqa: BLE001 — see docstring
         return None
 
@@ -527,6 +533,9 @@ def create_app() -> FastAPI:
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         fo_status_meta=FO_STATUS_META, level_tone=LEVEL_TONE, fmt_age=fmt_age,
+        # Shared with `jarvis alarms` rather than spelled inline, so neither surface can
+        # be the one that shows a subject-level finding as `turn -1`.
+        turn_label=ops.turn_label, no_turn=NO_TURN,
         # "a worker turn may be in flight right now", so the page can withhold the
         # `claude --resume` invitation rather than put a second driver on one session.
         active_statuses=ACTIVE_STATUSES,
@@ -1030,9 +1039,11 @@ def create_app() -> FastAPI:
         is a queue the user is meant to empty, the bottom is the record of what the
         fleet has spent and is meant to be long.
 
-        Acking is per WORK ORDER, not per alarm, and the page groups the live half that
-        way — one order with three alarms is one decision. That is not a shortcut: the
-        attention flag carries one sentence, so there was never more than one ask.
+        Acking is per SUBJECT, not per alarm, and the page groups the live half that
+        way — one thing with three alarms is one decision. That is not a shortcut: the
+        attention flag carries one sentence, so there was never more than one ask. The
+        BUTTON still posts to the carrier work order, because that is where the ack has
+        an `acknowledged_blockers` column to stick in.
 
         The middle half comes from its own read rather than being filtered out of
         `rows`: the supervisor's reasoning and Neo's advice are not in the frozen
@@ -1042,7 +1053,7 @@ def create_app() -> FastAPI:
         rows = ops.list_cost_alarms()
         live: dict[str, dict] = {}
         for a in (r for r in rows if r["live"]):
-            group = live.setdefault(a["wo_id"], {**a, "alarms": []})
+            group = live.setdefault(a["subject_id"], {**a, "alarms": []})
             group["alarms"].append(a)
         return render(request, "alarms.html", active="alarms",
                       live=list(live.values()),
