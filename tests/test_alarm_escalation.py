@@ -563,8 +563,8 @@ def test_both_judges_are_shown_the_session_shape_in_the_same_packet(
         wo = store.get_work_order(wo_id)
         (alarm,) = store.alarms_of(wo_id)
         packet = supervisor.build_evidence(
-            store, wo, alarm, catalog.SupervisorConfig(),
-            daemon.catalog.projects[0].inspect)
+            store, {"kind": "work_order", "row": wo}, alarm,
+            catalog.SupervisorConfig(), daemon.catalog.projects[0].inspect)
     finally:
         store.close()
 
