@@ -907,22 +907,23 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
     one whose decision was taken elsewhere goes on asking the user for a ruling nobody
     can give. Three were doing that in production, the oldest for a fortnight, and none
     was of kind `question`: an `approval` question is closed only through
-    `approvals.neo_question_id` and a `plan` question only through
-    `feature_orders.plan_question_id`, and both subjects can move that pointer or retire
-    without closing what it pointed at.
+    `approvals.neo_question_id`, a `plan` question only through
+    `feature_orders.plan_question_id` and an `alarm` question only through
+    `wo_alarms.neo_question_id` — and every one of those subjects can move that pointer
+    or retire without closing what it pointed at.
 
-    The point fixes (`ops.submit_plan`, `ops.cancel_feature_order`, `gates.open_gate`)
-    close them as the pointer moves, which is the only moment that can name what replaced
-    it. This derives the same fact from the subject's current state instead, so a fourth
-    site that forgets costs one tick rather than for ever — and it is what clears the
-    rows already stranded.
+    The point fixes (`ops.submit_plan`, `ops.cancel_feature_order`, `gates.open_gate`,
+    `ops.review_alarm`) close them as the pointer moves, which is the only moment that
+    can name what replaced it. This derives the same fact from the subject's current
+    state instead, so a site that forgets costs one tick rather than for ever — and it is
+    what clears the rows already stranded.
 
-    LIVE means the subject still has this decision open: a `pending` approval, or a
-    feature order in `plan_review` still pointing at this very question. Everything else
-    is moot, which is the same "only the LATEST round counts" reading
-    `_validation_escalated` uses. A question whose subject this project does not know is
-    left alone — that is how another project's rows are skipped, since the checks run per
-    project while Neo's database is OS-wide.
+    LIVE means the subject still has this decision open: a `pending` approval, a feature
+    order in `plan_review`, or an `escalated` alarm — each still pointing at this very
+    question. Everything else is moot, which is the same "only the LATEST round counts"
+    reading `_validation_escalated` uses. A question whose subject this project does not
+    know is left alone — that is how another project's rows are skipped, since the checks
+    run per project while Neo's database is OS-wide.
 
     Repairs on the daemon tick rather than behind `--repair` as INV-MANAGER-MISSING does:
     closing a question the OS can prove is moot creates nothing, authorises nothing and
@@ -934,10 +935,11 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
     neo = NeoStore()
     try:
         held = [q for q in neo.list_questions(statuses=USER_HELD_Q_STATUSES)
-                if q["kind"] in ("approval", "plan")]
+                if q["kind"] in ("approval", "plan", "alarm")]
         for q in held:
-            moot = (_stale_approval_question(store, q) if q["kind"] == "approval"
-                    else _stale_plan_question(store, q))
+            moot = {"approval": _stale_approval_question,
+                    "plan": _stale_plan_question,
+                    "alarm": _stale_alarm_question}[q["kind"]](store, q)
             if moot is None:
                 continue
             answer, why = moot
@@ -995,6 +997,24 @@ def _stale_plan_question(store: ProjectStore,
         return None
     return (f"SUPERSEDED — {fo['id']} is {fo['status']}",
             f"{fo['id']} left plan review and is now {fo['status']}")
+
+
+def _stale_alarm_question(store: ProjectStore,
+                          q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) if this alarm question is moot, else None.
+
+    A MISSING ROW IS LEFT ALONE, as in both siblings: the checks run per project against
+    an OS-wide `neo.db`, so "no such alarm here" is how another project's rows are
+    skipped and cannot be told apart from a subject that has gone. The one way it could
+    genuinely go — deleting the work order, which cascades `wo_alarms` — already erases
+    the question itself (`ops.delete_work_order` → `NeoStore.purge_work_order`), so
+    nothing is leaked by declining to guess.
+    """
+    alarm = store.alarm_for_question(q["id"])
+    if alarm is None or alarm["status"] == "escalated":
+        return None
+    return (f"SUPERSEDED — alarm {alarm['id']} is {alarm['status']}",
+            f"alarm {alarm['id']} was already {alarm['status']}")
 
 
 def _envelope_violation(env: dict[str, Any], repair: str) -> Violation:

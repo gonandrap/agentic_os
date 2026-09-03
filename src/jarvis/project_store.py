@@ -1388,6 +1388,17 @@ class ProjectStore:
             raise KeyError(alarm_id)
         return dict(row)
 
+    def alarm_for_question(self, question_id: int) -> dict[str, Any] | None:
+        """The alarm this Neo question was escalated from, if any.
+
+        The third of `approval_for_question`'s family and it exists for the same reason:
+        Neo's database is OS-wide and knows nothing about a project's tables, so the
+        back-link is resolved from this side.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM wo_alarms WHERE neo_question_id=?", (question_id,)).fetchone()
+        return dict(row) if row else None
+
     def alarms_of(self, wo_id: str) -> list[dict[str, Any]]:
         """Every alarm on one work order, oldest first."""
         return db.rows_to_dicts(self.conn.execute(

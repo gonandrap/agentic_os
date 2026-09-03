@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import probes as probes_mod
 from .gates import GateConfig
 from .neo_store import Q_KINDS, SEATS
 from .project_store import VALIDATOR_SEATS
@@ -28,6 +29,9 @@ SAFETY_KEYS = (
     # Same class of act as turning Neo off: it removes a reviewer, and the change is
     # invisible on every surface until the thing it was reviewing goes wrong.
     "os.supervisor.enabled",
+    # And the same again for the health sweep, which is a separate watcher with a
+    # separate switch — docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §2.
+    "os.supervisor.health_enabled",
 )
 
 # Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
@@ -315,6 +319,28 @@ DEFAULT_SUPERVISOR_DESCRIPTION_CHARS = 500
 DEFAULT_SUPERVISOR_NOTE_CHARS = 200
 DEFAULT_SUPERVISOR_REASON_CHARS = 200
 
+# -- the health sweep's numbers, created here so §4 touches no catalog code and the two
+# can be reviewed apart. NOTHING IN THIS RELEASE READS THEM:
+# docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §2 ships the list
+# and §4 ships the trigger that reads it.
+
+#: How often the sweep runs, and the floor between two looks at the SAME unit — a unit
+#: nothing has happened to is not judged twice.
+DEFAULT_SUPERVISOR_HEALTH_EVERY_TICKS = 20
+DEFAULT_SUPERVISOR_HEALTH_MIN_INTERVAL_MINUTES = 30
+
+#: How long a unit's fingerprint may sit still before that stillness is itself the thing
+#: worth looking at (§4's `stale` clause).
+DEFAULT_SUPERVISOR_HEALTH_STALE_MINUTES = 720
+
+#: The per-tick ceiling: the sweep is the standing cost of watching, so it is bounded
+#: before it is enabled rather than after a bill arrives.
+DEFAULT_SUPERVISOR_HEALTH_MAX_UNITS_PER_TICK = 4
+
+#: Every armed probe rides in ONE system prompt, so both of these bound that prompt.
+DEFAULT_SUPERVISOR_MAX_ENABLED_PROBES = 12
+DEFAULT_SUPERVISOR_PROBE_PROMPT_CHARS = 800
+
 
 @dataclass
 class SupervisorConfig:
@@ -338,6 +364,19 @@ class SupervisorConfig:
     description_chars: int = DEFAULT_SUPERVISOR_DESCRIPTION_CHARS
     note_chars: int = DEFAULT_SUPERVISOR_NOTE_CHARS
     reason_chars: int = DEFAULT_SUPERVISOR_REASON_CHARS
+
+    # The health sweep. `probes` is a whole immutable list rather than a scalar, so
+    # `jarvis config set <p> supervisor.probes` addresses all of it at once and a single
+    # probe is not editable from the console — a catalog file edit is the intended
+    # route (§2), and bl-8e47dd53 tracks the console form.
+    probes: tuple[probes_mod.HealthProbe, ...] = probes_mod.DEFAULT_PROBES
+    health_enabled: bool = False
+    health_every_ticks: int = DEFAULT_SUPERVISOR_HEALTH_EVERY_TICKS
+    health_min_interval_minutes: int = DEFAULT_SUPERVISOR_HEALTH_MIN_INTERVAL_MINUTES
+    health_stale_minutes: int = DEFAULT_SUPERVISOR_HEALTH_STALE_MINUTES
+    health_max_units_per_tick: int = DEFAULT_SUPERVISOR_HEALTH_MAX_UNITS_PER_TICK
+    max_enabled_probes: int = DEFAULT_SUPERVISOR_MAX_ENABLED_PROBES
+    probe_prompt_chars: int = DEFAULT_SUPERVISOR_PROBE_PROMPT_CHARS
 
 
 @dataclass
@@ -649,6 +688,85 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
     return cfg
 
 
+#: Fields of `SupervisorConfig` that are NOT whole numbers. The reflective parse below
+#: casts everything else with `int()`, so a non-numeric field missing from this set is a
+#: `TypeError` on every catalog load — or, for a bool, a silent `int(False) == 0` that
+#: trips the `>= 1` floor instead and blames the wrong key.
+_SUPERVISOR_NON_NUMERIC = ("enabled", "model", "probes", "health_enabled")
+
+
+def _parse_probes(raw: Any, base: tuple[probes_mod.HealthProbe, ...],
+                  where: str) -> tuple[probes_mod.HealthProbe, ...]:
+    """`supervisor.probes` merged over `base` by id — `probes.resolve`'s rule (§2).
+
+    Shape is refused HERE, where the message can name the offending id, and the merge
+    happens in `probes` because the merge rule is that module's decision. An entry names
+    only the fields it changes, so an unknown key is IGNORED rather than refused — the
+    same forward compatibility `parse_catalog` gives every other block.
+    """
+    if raw is None:
+        return tuple(base)
+    if not isinstance(raw, list):
+        raise _err(f'"{where}" must be a list of probe objects')
+
+    known = {p.id for p in base}
+    seen: set[str] = set()
+    entries: list[dict[str, Any]] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise _err(f"{where}[{i}] must be an object")
+        pid = str(item.get("id") or "")
+        if not probes_mod.ID_PATTERN.match(pid):
+            raise _err(f"{where}[{i}].id {pid!r} must be lowercase kebab-case "
+                       f"([a-z0-9-])")
+        if pid in seen:
+            raise _err(f"{where}: duplicate probe id {pid!r}")
+        seen.add(pid)
+        entry: dict[str, Any] = {"id": pid}
+        if "title" in item:
+            entry["title"] = str(item["title"])
+        if "prompt" in item:
+            entry["prompt"] = str(item["prompt"])
+        if "enabled" in item:
+            entry["enabled"] = bool(item["enabled"])
+        if "subjects" in item:
+            subjects = item["subjects"]
+            if not isinstance(subjects, list) or not subjects:
+                raise _err(f"{where}: probe {pid!r} subjects must be a non-empty list")
+            for subject in subjects:
+                if subject not in probes_mod.SUBJECTS:
+                    raise _err(f"{where}: probe {pid!r} names unknown subject "
+                               f"{str(subject)!r}, not one of "
+                               f"{list(probes_mod.SUBJECTS)}")
+            entry["subjects"] = tuple(str(s) for s in subjects)
+        if pid not in known:
+            missing = [k for k in ("title", "prompt") if k not in entry]
+            if missing:
+                raise _err(f"{where}: new probe {pid!r} must give "
+                           f"{' and '.join(missing)}")
+        entries.append(entry)
+    return probes_mod.resolve(base, entries)
+
+
+def _check_probes(cfg: SupervisorConfig, where: str) -> None:
+    """The refusals that need the RESOLVED list and the numbers beside it, so they run
+    after both exist."""
+    for probe in cfg.probes:
+        if probe.id in probes_mod.RESERVED_IDS:
+            raise _err(f"{where}: probe id {probe.id!r} is one of `jarvis inspect`'s "
+                       f"alarm kinds — two different things would read as one on every "
+                       f"surface")
+        if len(probe.prompt) > cfg.probe_prompt_chars:
+            raise _err(f"{where}: probe {probe.id!r} prompt is {len(probe.prompt)} "
+                       f"characters, over {where}.probe_prompt_chars "
+                       f"({cfg.probe_prompt_chars})")
+    enabled = [p.id for p in cfg.probes if p.enabled]
+    if len(enabled) > cfg.max_enabled_probes:
+        raise _err(f"{where}: {len(enabled)} probes enabled, over "
+                   f"{where}.max_enabled_probes ({cfg.max_enabled_probes}) — they all "
+                   f"ride in one prompt: {', '.join(sorted(enabled))}")
+
+
 def _parse_supervisor(raw: Any, base: SupervisorConfig | None = None,
                       where: str = "os.supervisor") -> SupervisorConfig:
     """`os.supervisor`, or a project's override of it — §2, and `_parse_inspect`'s shape.
@@ -656,15 +774,20 @@ def _parse_supervisor(raw: Any, base: SupervisorConfig | None = None,
     Every number is refused below 1, and `timeout` at or above `stale_reviewing_seconds`:
     below that cutoff a claim is reclaimed out from under a call that is still running
     and one alarm is judged twice. The numeric fields are read reflectively so a field
-    added above reaches the catalog with no edit here.
+    added above reaches the catalog with no edit here — which is why the exclusion set is
+    a named constant and every non-number must join it. Excluding a field is only half
+    the fix: it must then be read explicitly below, or the catalog can never set it.
     """
     base = base or SupervisorConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
-    numbers = {k: v for k, v in vars(base).items() if k not in ("enabled", "model")}
+    numbers = {k: v for k, v in vars(base).items()
+               if k not in _SUPERVISOR_NON_NUMERIC}
     cfg = SupervisorConfig(
         enabled=bool(raw.get("enabled", base.enabled)),
         model=str(raw.get("model", base.model) or base.model),
+        health_enabled=bool(raw.get("health_enabled", base.health_enabled)),
+        probes=_parse_probes(raw.get("probes"), base.probes, f"{where}.probes"),
         **{k: int(raw.get(k, v)) for k, v in numbers.items()},
     )
     for name, value in vars(cfg).items():
@@ -673,6 +796,7 @@ def _parse_supervisor(raw: Any, base: SupervisorConfig | None = None,
     if cfg.timeout >= cfg.stale_reviewing_seconds:
         raise _err(f"{where}.timeout must be under {where}.stale_reviewing_seconds "
                    f"({cfg.stale_reviewing_seconds}s), or an alarm is judged twice")
+    _check_probes(cfg, where)
     return cfg
 
 

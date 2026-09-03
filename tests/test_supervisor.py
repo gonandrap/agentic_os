@@ -272,9 +272,12 @@ def test_a_pending_assumption_leaves_the_flag_up_and_the_alarm_is_still_acked(
 
 def test_an_escalate_verdict_records_the_intent_and_leaves_the_flag_up(
         started, catalog_file, monkeypatch, tmp_path):
-    """§3 files the Neo question; here `escalate` degrades to exactly the pre-supervisor
-    behaviour. `neo_question_id` is NULL and no message is queued to the worker — the
-    supervisor never speaks to one."""
+    """The verdict half of §3's escalation, on the order that raised the alarm.
+
+    The Neo question it files, and everything that happens to the answer, is
+    `tests/test_alarm_escalation.py`. What stays true here: the flag is up and no message
+    is queued to the worker — the supervisor never speaks to one.
+    """
     _enable(catalog_file)
     daemon = started()
     wo_id = _burning(daemon, monkeypatch, tmp_path,
@@ -284,7 +287,6 @@ def test_an_escalate_verdict_records_the_intent_and_leaves_the_flag_up(
     alarm = _alarm(wo_id)
     assert alarm["status"] == "escalated"
     assert alarm["verdict"] == "escalate"
-    assert alarm["neo_question_id"] is None
     assert not alarm["note"]
 
     store = ProjectStore(ops.find_work_order(wo_id)[1])
@@ -720,6 +722,7 @@ raised on turn 1, 0 minute(s) ago
 
 # The work order
 {wo_id} [running] on claude-opus-5
+this session is an ordinary work order
 title: write the design doc
 brief: a long brief about the console
 

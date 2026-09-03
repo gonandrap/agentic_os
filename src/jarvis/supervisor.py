@@ -56,17 +56,97 @@ Output STRICT JSON, nothing else:
   {"decision": "escalate", "reason": "<why, 1-2 sentences, for the record>",
    "note": "", "question": "<the one question to put to Neo>"}"""
 
-#: User-facing copy: inbox rows reach every sink, Telegram included.
+ALARM_REVIEWER_PERSONA = """You are Neo, reviewing a COST ALARM inside the Jarvis \
+agentic OS.
+
+The OS raised an alarm on a session whose turn was still running — too long, blocked on a
+subagent too long, or re-sending too much of its conversation. A supervisor agent looked
+first and could not settle it, so it is yours. You are the second reader and the last one
+before the user is interrupted.
+
+READ THE PACKET'S "this session is" LINE BEFORE YOU JUDGE THE NUMBERS. The alarm is
+always raised against a work order, but a work order is not always a worker: it may be a
+FEATURE ORDER's planner, decomposing one ask by reading a whole codebase, or its manager,
+which sits idle for the feature's entire life and wakes only on a message. What counts as
+a long turn differs between the three, and the same figure is routine on one and a symptom
+on another.
+
+YOU DECIDE NOTHING ABOUT THE WORK ORDER. Nobody messages the worker, cancels the turn or
+changes a status on the strength of your reply — the OS records your reading against the
+alarm and stops. So do not tell anyone to intervene, and do not phrase your answer as
+though someone would.
+
+ANSWER when the evidence accounts for the spend, or accounts for it well enough that a
+person reading your words would not go and look. Your answer is what the user is shown
+INSTEAD of an interruption, so it must stand alone: say what the order is doing and why
+the number is what it is, in plain words, without the reader opening anything. That is
+the whole value of this call — an answer costs the user nothing and an escalation costs
+them a glance.
+
+ESCALATE when the spend genuinely needs the user's judgement: a turn with no visible
+progress at any point, a conversation re-sent again and again rather than once, a join
+that has outlived any plausible subagent, or evidence so thin that any answer you gave
+would be a guess dressed as a reading. Also escalate when what you can see suggests the
+work order was briefed wrongly — that is a decision about the WORK, and only the user
+takes those.
+
+DO NOT ESCALATE MERELY BECAUSE MONEY WAS SPENT. The general answerer persona sends
+anything touching production to the user; that instinct is wrong here. Every alarm is
+about spend by construction, so applying it would send every alarm up and this whole path
+would have bought nothing. The question is not "is this expensive" but "does this need
+THEM".
+
+You cannot look anything up: this call is headless and the packet below is all there is.
+When it is not enough to answer, say so and escalate — that is an honest reading, not a
+failure.
+
+Output STRICT JSON, nothing else:
+  {"escalate": false, "answer": "<what the user is told, plain words, stands alone>",
+   "reason": "<one line: what you read it against, for the record>"}
+  {"escalate": true,  "answer": "",
+   "reason": "<one line: why this needs the user>"}"""
+
+#: User-facing copy: inbox rows reach every sink, Telegram included. Here rather than at
+#: the two call sites because §2's ack and §3's advice are the same row to a reader, and
+#: two copies of a title is how they come to word it differently.
 ACK_INBOX_TITLE = "Supervisor cleared an alarm on {wo_id}"
+ADVICE_INBOX_TITLE = "Neo cleared an alarm on {wo_id}"
+ESCALATED_INBOX_TITLE = "A cost alarm needs you: {alarm_id}"
+
+#: The alarm's own page — the anchor `/alarms` cannot be, since a list has no per-row
+#: identity. Mirrors `timeline._ref`'s `alarm` kind, which is where a work order's
+#: timeline points at the same object.
+ALARM_PATH = "/alarms/{project}/{alarm_id}"
+
+#: The attention reason an unsettled alarm carries. One string, because the supervisor
+#: writes it when it cannot reach Neo and the daemon writes it when Neo hands the alarm
+#: back, and a flag worded two ways reads as two different problems.
+ALARM_BLOCKER = "cost alarm {alarm_id} needs you — `jarvis alarms show {alarm_id}`"
+
+#: `verdict_reason` on an alarm Neo answered. NAMES NEO because the column is read on
+#: `/alarms` and by `jarvis alarms show` beside alarms the supervisor settled alone, and
+#: those are two different judgements by two different agents.
+NEO_ANSWERED_REASON = "escalated to Neo, which answered: {reason}"
 
 #: `review` recognises the unreadable-output path by this prefix, as `neo` does.
 UNREADABLE_PREFIX = "unreadable supervisor output: "
 
 
 def build_system_prompt(store: Any, project: str,
-                        learnings_limit: int | None = None) -> str:
-    """Persona + learnings, byte-stable per project so consecutive reviews share a
-    cached prefix.
+                        learnings_limit: int | None = None,
+                        probes: Any = ()) -> str:
+    """Persona + learnings + (optionally) a symptom checklist, byte-stable per project
+    so consecutive reviews share a cached prefix.
+
+    `probes=()` MUST PRODUCE EXACTLY WHAT THIS FUNCTION PRODUCED BEFORE THE CHECKLIST
+    EXISTED, down to the byte, and a committed literal in `tests/test_probes.py` pins it.
+    The
+    cost review (§2 of the supervisor spec) and the health sweep
+    (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §4) share this
+    function, and a checklist header appended unconditionally would move the cost
+    review's cached prefix and silently reprice every review. The checklist is APPENDED
+    rather than interleaved for the same reason: the sweep's prompt extends the review's
+    prefix instead of forking it.
 
     `neo_store.SUPERVISOR_SEAT` is a LEARNING SCOPE, not a panel seat — see
     `neo_store.LEARNING_SCOPES`. Rendering goes through `neo.render_learnings` so the
@@ -77,19 +157,22 @@ def build_system_prompt(store: Any, project: str,
     `None` means `catalog.SupervisorConfig.learnings_limit` — the default lives there,
     not here.
     """
-    from . import neo
+    from . import neo, probes as probes_mod
     from .catalog import SupervisorConfig
     from .neo_store import SUPERVISOR_SEAT
 
     if learnings_limit is None:
         learnings_limit = SupervisorConfig().learnings_limit
-    return "\n".join([
+    parts = [
         SUPERVISOR_PERSONA,
         "",
         "# Learnings (from the user's corrections of your past decisions)",
         *neo.render_learnings(
             store.learnings(project, limit=learnings_limit, seat=SUPERVISOR_SEAT)),
-    ])
+    ]
+    if probes:
+        parts += ["", probes_mod.render_checklist(probes)]
+    return "\n".join(parts)
 
 
 def learning_from_review(alarm: dict[str, Any], feedback: str) -> str:
@@ -112,6 +195,31 @@ def learning_from_review(alarm: dict[str, Any], feedback: str) -> str:
 def _clip(text: str, limit: int) -> str:
     text = (text or "").strip()
     return text if len(text) <= limit else text[:limit] + " […]"
+
+
+def _what_it_is(wo: dict[str, Any]) -> str:
+    """What KIND of session is burning, in the judge's words.
+
+    Every alarm is raised against a `work_orders` row (`Daemon.check_burning_turns` walks
+    the running ones), but `WO_KINDS` has three members and two of them belong to a
+    FEATURE order — so "a work order" alone hides the thing that most changes what normal
+    looks like. A planner reading a whole codebase for an hour is doing its job; a worker
+    doing the same on a one-file fix is not. Reported as evidence rather than instructed
+    in the persona, because a judge told to weigh something it cannot see is being asked
+    to guess (PR 173 review).
+    """
+    parent = wo.get("parent_id")
+    kind = wo.get("kind") or "worker"
+    belongs = f" of feature order {parent}" if parent else ""
+    if kind == "planner":
+        return (f"the PLANNER{belongs} — one session reading the codebase to decompose "
+                f"a single ask into work orders, so it is expected to be long and "
+                f"read-heavy")
+    if kind == "manager":
+        return (f"the MANAGER{belongs} — it sits idle for that feature's whole life and "
+                f"wakes only on a message, so a long WALL clock is normal and long "
+                f"GENERATING time is not")
+    return "an ordinary work order" + (f", a child{belongs}" if parent else "")
 
 
 def _session_lines(wo: dict[str, Any], inspect_cfg: Any) -> list[str]:
@@ -338,6 +446,7 @@ def build_evidence(pstore: Any, subject: dict[str, Any], alarm: dict[str, Any],
             "# The work order",
             f"{row.get('id')} [{row.get('status')}] on "
             f"{row.get('model') or '(default model)'}",
+            f"this session is {_what_it_is(row)}",
             f"title: {row.get('title')}",
             f"brief: {_clip(str(row.get('description') or ''), cfg.description_chars)}",
         ])
@@ -421,10 +530,13 @@ def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any],
     from .paths import ensure_home
 
     record = record or agent_usage.record
+    # Hoisted out of the call because the ESCALATION carries it: Neo answers from the
+    # question and its context alone, so a thin context is a thin answer (§3).
+    evidence = build_evidence(pstore, {"kind": "work_order", "row": wo}, alarm,
+                              cfg, inspect_cfg)
     try:
         verdict = structured.request(
-            build_evidence(pstore, {"kind": "work_order", "row": wo}, alarm,
-                           cfg, inspect_cfg),
+            evidence,
             validate=lambda data: _validate(data, cfg.note_chars),
             system_prompt=build_system_prompt(neo_store, project, cfg.learnings_limit),
             model=cfg.model,
@@ -447,15 +559,45 @@ def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any],
     own_central = central is None
     central = central or CentralStore()
     try:
-        _apply(pstore, central, project, wo, alarm, verdict)
+        _apply(pstore, neo_store, central, project, wo, alarm, verdict, evidence)
     finally:
         if own_central:
             central.close()
     return verdict
 
 
-def _apply(pstore: Any, central: Any, project: str, wo: dict[str, Any],
-           alarm: dict[str, Any], verdict: dict[str, Any]) -> None:
+def escalation_context(evidence: str, verdict: dict[str, Any]) -> str:
+    """What Neo is handed with the question — §3.
+
+    THE SUPERVISOR'S OWN READING IS APPENDED RATHER THAN SUBSTITUTED. Neo's call is
+    headless and it can look nothing up, so dropping the packet to save tokens would
+    leave it ruling on a one-line summary of a judgement it is being asked to re-take.
+    """
+    return "\n\n".join([
+        evidence,
+        "\n".join([
+            "# What the supervisor made of it",
+            "It could not settle this alarm and handed it to you.",
+            f"Its reasoning: {verdict['reason']}",
+        ]),
+    ])
+
+
+def _question_for(verdict: dict[str, Any], alarm: dict[str, Any]) -> str:
+    """The one question put to Neo, never empty.
+
+    A model that escalates without filling `question` in has still made a real judgement
+    — `_validate` will not invent a decision, but it does tolerate a missing question —
+    and a `questions` row with no text is unanswerable by Neo AND unreadable by the user
+    it would then be escalated to.
+    """
+    return verdict["question"].strip() or (
+        f"The supervisor could not settle this alarm: {alarm['reason']}. "
+        f"Does this spend need the user?")
+
+
+def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str, Any],
+           alarm: dict[str, Any], verdict: dict[str, Any], evidence: str) -> None:
     """Write the verdict down. THE ALARM ROW IS THE MEMORY: `invariants.true_blockers`
     has no branch for a live cost alarm, so `ack_attention(wo_id, [])` records nothing
     durable and only §1's dedupe keeps the flag down. See §2.
@@ -471,13 +613,8 @@ def _apply(pstore: Any, central: Any, project: str, wo: dict[str, Any],
         return
 
     if verdict["decision"] == "escalate":
-        # §3 fills in `neo_question_id` and actually asks; until then this degrades to
-        # the pre-supervisor behaviour — the flag stays up.
-        pstore.update_alarm(alarm_id, status="escalated", verdict="escalate",
-                            verdict_reason=verdict["reason"], decided_at=decided)
-        pstore.add_event(wo["id"], "alarm_reviewed",
-                         {"alarm_id": alarm_id, "verdict": "escalate",
-                          "reason": verdict["reason"], "note": ""})
+        _escalate(pstore, neo_store, central, project, wo, alarm, verdict, evidence,
+                  decided)
         return
 
     pstore.update_alarm(alarm_id, status="acked", verdict="ack",
@@ -499,3 +636,64 @@ def _apply(pstore: Any, central: Any, project: str, wo: dict[str, Any],
     central.add_inbox(project=project, level="info",
                       title=ACK_INBOX_TITLE.format(wo_id=wo["id"]),
                       body=verdict["note"], wo_id=wo["id"])
+
+
+def _escalate(pstore: Any, neo_store: Any, central: Any, project: str,
+              wo: dict[str, Any], alarm: dict[str, Any], verdict: dict[str, Any],
+              evidence: str, decided: float) -> None:
+    """Hand the alarm to Neo — §3. The verdict is recorded either way.
+
+    `alarm_reviewed` still carries the verdict, exactly as §2 wrote it, and
+    `alarm_escalated` carries the handoff. Two events rather than one widened payload:
+    §4's renderer and `ALARM_EVENT_KINDS` were frozen against that split, and the
+    conversation surface reads `alarm_reviewed`'s `note` — empty by contract here —
+    while the timeline reads its `reason`.
+    """
+    from .project_store import OPEN_STATUSES
+
+    alarm_id = alarm["id"]
+    fields = {"status": "escalated", "verdict": "escalate",
+              "verdict_reason": verdict["reason"], "decided_at": decided}
+    reviewed = {"alarm_id": alarm_id, "verdict": "escalate",
+                "reason": verdict["reason"], "note": ""}
+
+    # NOTHING TO ASK ABOUT. Neo can advise nothing about a session that has stopped: the
+    # spend is a fact, the turn cannot be steered, and the only reading left is the
+    # user's. Filing the question anyway would spend a call to reach that conclusion and
+    # leave a row `neo_store.supersede` then has to clean up.
+    if wo["status"] not in OPEN_STATUSES:
+        pstore.update_alarm(alarm_id, **fields)
+        pstore.add_event(wo["id"], "alarm_reviewed", reviewed)
+        _flag_the_user(pstore, central, project, wo, alarm, verdict["reason"],
+                       why=f"the work order is {wo['status']} — Neo has nothing to "
+                           f"advise about a session that has stopped")
+        return
+
+    question = neo_store.ask(project, wo["id"], _question_for(verdict, alarm),
+                             context=escalation_context(evidence, verdict),
+                             kind="alarm")
+    pstore.update_alarm(alarm_id, neo_question_id=question["id"], **fields)
+    pstore.add_event(wo["id"], "alarm_reviewed", reviewed)
+    pstore.add_event(wo["id"], "alarm_escalated",
+                     {"alarm_id": alarm_id, "neo_question_id": question["id"]})
+    log.info("alarm %s escalated to neo as question %s", alarm_id, question["id"])
+
+
+def _flag_the_user(pstore: Any, central: Any, project: str, wo: dict[str, Any],
+                   alarm: dict[str, Any], reason: str, why: str) -> None:
+    """Put an unsettled alarm in front of the user without going through Neo.
+
+    THE INBOX ROW IS THE DURABLE HALF, and the attention flag alone is not enough:
+    `invariants.check_no_phantom_attention` clears the flag on any work order that has
+    settled, which is exactly the case this path exists for, so an escalation that only
+    raised the flag would evaporate on the next reconcile tick.
+    """
+    alarm_id = alarm["id"]
+    pstore.flag_attention(wo["id"], ALARM_BLOCKER.format(alarm_id=alarm_id))
+    central.add_inbox(project=project, level="warning",
+                      title=ESCALATED_INBOX_TITLE.format(alarm_id=alarm_id),
+                      body=f"{alarm['reason']}\n"
+                           f"The supervisor could not settle it: {reason}\n"
+                           f"It was not put to Neo: {why}.\n"
+                           f"Read it with: jarvis alarms show {alarm_id}",
+                      wo_id=wo["id"])
