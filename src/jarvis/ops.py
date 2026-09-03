@@ -27,7 +27,7 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import config_version, db, invariants
+from . import config_version, db, fleet, invariants
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import CentralStore
 from .daemon import daemon_running
@@ -359,11 +359,17 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         pid = daemon_running()
         projects = []
         attention: list[dict[str, Any]] = []
-        # Best-effort map of each project's worker permission mode, to catch a fleet
-        # misconfigured into a mode that stalls background workers (see below).
+        # Two things off the catalog. A best-effort map of each project's worker
+        # permission mode, to catch a fleet misconfigured into a mode that stalls
+        # background workers (see below) — and the ACCOUNT's own state: how many worker
+        # turns are in flight against `os.defaults.max_in_flight`, and whether Claude is
+        # refusing them (src/jarvis/fleet.py). The second is what a `pending` work order
+        # that is not starting can be waiting for, and no per-project read can see it.
+        fleet_state = None
         try:
             _cat = catalog or resolve_catalog()
             mode_by_project = {ps.name: ps.worker.permission_mode for ps in _cat.projects}
+            fleet_state = fleet.current(_cat)
         except (OpsError, CatalogError):
             mode_by_project = {}
         # Read Neo's questions BEFORE the project loop, not after it: a question Neo sent
@@ -493,7 +499,11 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                          # Same rule, for the other reason a work order can be sitting
                          # still: the transport dropped its turn — the usage limit, or
                          # the API failing — and it retries itself at N.
-                         "pause": invariants.pause_note(store, wo)}
+                         "pause": invariants.pause_note(store, wo),
+                         # And the whole answer in one string, fleet state included, so
+                         # `jarvis status` prints what the dashboard shows rather than a
+                         # bare status word.
+                         "status_label": invariants.status_label(store, wo, fleet_state)}
                         for wo in open_wos
                     ],
                     "settings_drift": drift,

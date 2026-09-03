@@ -49,7 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import bugreport, bus, claude_cli, db, worker_session
+from . import bugreport, bus, claude_cli, db, fleet, worker_session
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
@@ -223,6 +223,17 @@ class Daemon:
         if project.name not in self.stores:
             self.stores[project.name] = ProjectStore(project.path)
         return self.stores[project.name]
+
+    def _fleet_stores(self) -> dict[str, ProjectStore]:
+        """Every live project's store, for a question about the account (`fleet.read`).
+
+        Built from the catalog rather than handing over `self.stores`, which holds only
+        the projects some earlier tick happened to open — on the first tick after a
+        restart that is none of them, and an account-wide hold that a restart clears is
+        not a hold.
+        """
+        return {p.name: self.store_for(p)
+                for p in self.catalog.projects if p.path.is_dir()}
 
     # -- configuration reload ---------------------------------------------------
 
@@ -401,6 +412,19 @@ class Daemon:
         # or the listing failed — and is NOT the same as an empty roster, which would
         # mean every injected session ended. Session tracking is skipped on None.
         sessions_by_project: dict[str, list[claude_cli.BgSession]] | None = None
+        # The ACCOUNT's state, read ONCE for the whole tick and then spent down as turns
+        # launch. Outside the project loop because it is not a project's fact: a fleet
+        # count re-read per project would let each project's dispatch pass believe the
+        # previous one's launches had not happened, which is how a cap of 3 lets a
+        # ten-project fleet start thirty turns.
+        #
+        # Turns are settled INSIDE the loop, below, so this count is a tick old for the
+        # projects settled after the first. It can therefore hold a slot for a turn that
+        # has just ended, never release one for a turn that is still running — the safe
+        # direction, and self-correcting one tick later.
+        state = fleet.read(self.catalog.os.max_in_flight, self._fleet_stores())
+        if fleet.announce(self.central, state):
+            log.warning("fleet held: %s", state.blocked())
         # The roster is a subprocess, and tracking injected sessions is the only thing
         # left that reads it. With nothing injected there is nothing to track, so the
         # common case — a project driven entirely by dispatched work orders — pays
@@ -433,7 +457,7 @@ class Daemon:
                 # message goes out, or the user's earlier message — already marked
                 # delivered, and living only on that turn row — would be skipped.
                 if retry_paused:
-                    self.retry_paused_turns(project, store)
+                    self.retry_paused_turns(project, store, state)
                 # Before delivery, not after: an envelope BECOMES a queued message,
                 # so routing it first lets it go out as this tick's turn instead of
                 # waiting a whole poll interval for the next pass. With no envelope ever
@@ -453,7 +477,7 @@ class Daemon:
                 # pending work order, so it is claimed by the same pass rather than
                 # waiting a whole poll interval to start.
                 self.plan_features(project, store)
-                self.dispatch_pending(project, store)
+                self.dispatch_pending(project, store, state)
                 if poll_prs:
                     self.poll_pull_requests(project, store)
                 # After the pull-request poll, so the merge that completes a feature's
@@ -549,8 +573,24 @@ class Daemon:
 
     # -- 4. dispatch -------------------------------------------------------------
 
-    def dispatch_pending(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def dispatch_pending(self, project: ProjectSpec, store: ProjectStore,
+                         state: fleet.Fleet | None = None) -> None:
+        """Claim and launch what this project may run — under BOTH caps.
+
+        `max_concurrent` rations the project; `state` rations the account, which is not
+        divided among projects and is what ran out on 2026-09-02 (src/jarvis/fleet.py).
+        Whichever is tighter binds, the same way the per-feature cap already sits beside
+        the project one in `claim_next_pending`.
+
+        The fleet check goes BEFORE the claim, not after: a claimed work order is already
+        `dispatching`, and leaving one there with no turn behind it is the state
+        `settle_work_order` fails as "worker turn never started". Held back, it never
+        leaves `pending` and nothing is written at all — the same nothing a
+        dependency-blocked order costs, and why neither raises attention.
+        """
         while store.count_active() < project.max_concurrent:
+            if state is not None and state.blocked():
+                return
             wo = store.claim_next_pending()
             if wo is None:
                 return
@@ -561,6 +601,9 @@ class Daemon:
                 )
             except claude_cli.ClaudeCliError as e:
                 log.error("[%s] dispatch of %s failed: %s", project.name, wo["id"], e)
+                continue
+            if state is not None:
+                state.launched()
 
     # -- staged releases (thin hooks; all logic in src/jarvis/release.py) --------------
 
@@ -850,7 +893,8 @@ class Daemon:
 
     # -- 2b. self-healing after the transport fails -----------------------------------
 
-    def retry_paused_turns(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def retry_paused_turns(self, project: ProjectSpec, store: ProjectStore,
+                           state: fleet.Fleet | None = None) -> None:
         """Relaunch the turns the transport lost, once their wait is up.
 
         The OS's only loop that repairs a work order without being asked, and it is
@@ -872,8 +916,17 @@ class Daemon:
         same for all: a refused turn was never sent, so the prompt goes again verbatim; a
         turn that died in flight already reached the model, so the worker is nudged to
         continue instead.
+
+        UNDER THE FLEET CAP, and this pass is the one that most needs it. Four siblings
+        refused by the same window come due in the same second, and on 2026-09-02 they
+        resumed together: 362k + 361k + 325k + 322k tokens re-written at the cache-WRITE
+        rate, and four `uv run pytest` runs on one machine. Nothing is lost by staggering
+        them — a turn held here is not skipped, it is picked up by the next pass ten
+        seconds later, because `turn_pause` is re-derived and stays due.
         """
         for wo in store.list_work_orders(statuses=ACTIVE_STATUSES):
+            if state is not None and state.blocked():
+                return
             if wo["origin"] in UNGOVERNED_ORIGINS:
                 continue  # the user's own session; Jarvis does not drive it
             try:
@@ -894,6 +947,8 @@ class Daemon:
             except Exception:  # noqa: BLE001 — one work order must not stall the rest
                 log.exception("[%s] retry of %s failed", project.name, wo["id"])
                 continue
+            if state is not None:
+                state.launched()
             log.info("[%s] %s resumed after %s (attempt %s/%s, turn %s)",
                      project.name, wo["id"], pause.reason, pause.attempts,
                      pause.max_attempts or "∞", turn["seq"])

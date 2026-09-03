@@ -47,6 +47,7 @@ from .project_store import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .fleet import Fleet
     from .project_store import ProjectStore
 
 # Statuses where the user is the one holding the work up. A `running` worker is not
@@ -314,7 +315,8 @@ def dead_dependencies(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str,
             if dep["status"] in DEPENDENCY_DEAD_STATUSES or dep["status"] == "missing"]
 
 
-def status_label(store: ProjectStore, wo: dict[str, Any]) -> str:
+def status_label(store: ProjectStore, wo: dict[str, Any],
+                 fleet: Fleet | None = None) -> str:
     """How this work order's status should read to a human.
 
     `pending` alone promises "will start as soon as a slot frees", which is a lie for a
@@ -354,6 +356,15 @@ def status_label(store: ProjectStore, wo: dict[str, Any]) -> str:
         parent, limit, active = cap
         return (f"pending — waiting for a slot in {parent} "
                 f"({active}/{limit} children running)")
+    # LAST, and only for a caller that HAS the fleet's state: this one is a fact about
+    # the account rather than about the work order, so it is the least specific of the
+    # three answers — and a caller holding one project's store cannot know it. `None`
+    # renders the bare "pending" the surface would have printed anyway, rather than a
+    # guess. Like the two above, it raises no attention: the window reopens and the slot
+    # frees, neither of which is a decision anyone owes (`fleet.blocked`).
+    held = fleet.blocked() if fleet is not None else ""
+    if held:
+        return f"pending — {held}"
     return "pending"
 
 
@@ -365,7 +376,7 @@ def status_label(store: ProjectStore, wo: dict[str, Any]) -> str:
 PAUSE_OVERDUE_GRACE = 15 * 60
 
 
-def _clock(ts: float) -> str:
+def clock(ts: float) -> str:
     """A moment as the reader's own clock reads it, WITH THE DATE unless it is today.
 
     A bare "%H:%M" is only unambiguous within the day it is written, and the pause note
@@ -409,7 +420,7 @@ def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
     midnight is owed the reason nothing is happening, and the time it will happen again.
 
     Every surface renders this one string (the CLI through `status_label`, the dashboard
-    through `ops.os_status`) so they cannot disagree about the answer. `_clock` carries
+    through `ops.os_status`) so they cannot disagree about the answer. `clock` carries
     the date whenever the retry is not today, which a usage window over 24h out and every
     7-day reset genuinely is.
 
@@ -423,10 +434,10 @@ def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
     if pause is None or pause.exhausted:
         return ""
     if pause.reason == worker_session.PAUSE_AUTH:
-        # The one pause with no moment to name — it resumes on an ACTION. `_clock` would
+        # The one pause with no moment to name — it resumes on an ACTION. `clock` would
         # be asked to render `NEVER`, and any time it could print would be a guess.
         return "Claude Code sign-in expired, resuming once you sign in again"
-    when = _clock(pause.retry_at)
+    when = clock(pause.retry_at)
     if pause.reason == worker_session.PAUSE_USAGE_LIMIT:
         return f"Claude usage limit reached, retrying by itself at {when}"
     what = f"Claude API error {pause.status}" if pause.status else "Claude API error"
@@ -1088,8 +1099,8 @@ def check_paused_turns_resume(store: ProjectStore) -> Iterator[Violation]:
         yield Violation(
             invariant="INV-PAUSE-OVERDUE", wo_id=wo["id"],
             detail=(f"paused for the {worker_session.PAUSE_NOUN.get(pause.reason, pause.reason)} since "
-                    f"{_clock(pause.turn.get('ended_at') or pause.turn['started_at'])}, "
-                    f"due to retry at {_clock(pause.retry_at)} and still not relaunched "
+                    f"{clock(pause.turn.get('ended_at') or pause.turn['started_at'])}, "
+                    f"due to retry at {clock(pause.retry_at)} and still not relaunched "
                     f"{_span(overdue)} later — the OS is not healing this by itself"),
             context={"reason": pause.reason, "retry_at": pause.retry_at,
                      "overdue_seconds": round(overdue),
@@ -1152,8 +1163,8 @@ def check_pause_deadline_stable(store: ProjectStore) -> Iterator[Violation]:
             continue
         yield Violation(
             invariant="INV-PAUSE-DRIFT", wo_id=wo["id"],
-            detail=(f"the retry deadline moved: recorded {_clock(float(recorded))} when "
-                    f"the turn was refused, re-derived as {_clock(pause.reset_at)} now — "
+            detail=(f"the retry deadline moved: recorded {clock(float(recorded))} when "
+                    f"the turn was refused, re-derived as {clock(pause.reset_at)} now — "
                     f"the pause is not a pure function of the turn, so the retry pass is "
                     f"chasing a moment that keeps moving"),
             context={"recorded_reset_at": float(recorded),
