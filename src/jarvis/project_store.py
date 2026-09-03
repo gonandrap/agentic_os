@@ -1914,6 +1914,17 @@ class ProjectStore:
         ).fetchall()
         return db.rows_to_dicts(rows)
 
+    def count_running_turns(self) -> int:
+        """How many of this project's turns are in flight — see src/jarvis/fleet.py.
+
+        Deliberately NOT `count_active`: that counts work-order STATUSES, and a work
+        order parked in `waiting_input` on a Neo question holds a slot while spending no
+        tokens. The fleet cap rations the account, so it counts the thing that draws on
+        it (kn-5c32dde8 records the same distinction biting the project-wide cap).
+        """
+        return int(self.conn.execute(
+            "SELECT COUNT(*) FROM wo_turns WHERE state='running'").fetchone()[0])
+
     def list_turns(self, wo_id: str, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq LIMIT ?", (wo_id, limit)

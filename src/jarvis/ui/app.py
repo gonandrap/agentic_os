@@ -13,7 +13,8 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import bill, invariants, ops, specs, uilog
+from .. import bill, fleet, invariants, ops, specs, uilog
+from ..catalog import CatalogError
 from ..central_store import CentralStore
 from ..daemon import daemon_running
 from ..inspection import ALARM_KINDS
@@ -32,6 +33,22 @@ from ..project_store import (
 from ..timeline import build_conversation, build_timeline, count_debug
 
 TEMPLATES = Path(__file__).parent / "templates"
+
+
+def _fleet_if_pending(wo: dict) -> "fleet.Fleet | None":
+    """The account's state, but ONLY for a `pending` order (src/jarvis/fleet.py).
+
+    Nothing else's label can change with it, and reading it opens every project's store —
+    not a cost to pay on every page view. None when the catalog cannot be resolved: a
+    page that cannot answer "why is it waiting" still has to render.
+    """
+    if wo["status"] != "pending":
+        return None
+    try:
+        return fleet.current(ops.resolve_catalog())
+    except (ops.OpsError, CatalogError):
+        return None
+
 
 STATUS_META = {
     "pending":       {"word": "pending",     "icon": "◌", "tone": "muted"},
@@ -780,7 +797,7 @@ def create_app() -> FastAPI:
             # other surface derives it from. The header used to build its own wording
             # out of STATUS_META alone, which is how a listing and a header came to
             # disagree about the same work order once before (PR 65).
-            label = invariants.status_label(store, wo)
+            label = invariants.status_label(store, wo, _fleet_if_pending(wo))
             validation = ops.validation_detail(store, wo_id=wo_id)
             # WHERE THE REST OF THIS ORDER IS. The brief is deliberately only the margin
             # around a section of the feature's spec now, so a page that showed the brief

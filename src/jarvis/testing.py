@@ -1326,7 +1326,12 @@ def project(tmp_path, claude_json):
 def catalog_file(tmp_path, project):
     data = {
         "os": {
-            "defaults": {"model": "sonnet"},  # permission_mode falls to default (auto)
+            # `max_in_flight` well out of the way: the shipped default (3) is TIGHTER
+            # than the project default (5), so leaving it alone would make the fleet cap
+            # the binding one in every test that is really about the project cap or a
+            # feature's `max_parallel` — those would pass or fail for the wrong reason.
+            # Tests of the fleet cap itself set their own (tests/test_fleet_cap.py).
+            "defaults": {"model": "sonnet", "max_in_flight": 50},  # permission_mode: auto
             "notifications": {"sinks": ["log"]},
         },
         "projects": [

@@ -45,6 +45,7 @@ _RENAMES: dict[type, dict[str, str]] = {
         "default_effort": "defaults.effort",
         "default_permission_mode": "defaults.permission_mode",
         "default_max_concurrent": "defaults.max_concurrent",
+        "max_in_flight": "defaults.max_in_flight",
         "default_autocompact_window": "defaults.autocompact_window",
         "notification_sinks": "notifications.sinks",
         "telegram_token_env": "notifications.telegram.token_env",

@@ -886,7 +886,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             icon = STATUS_ICON.get(wo["status"], "•")
             badge = ORIGIN_BADGE.get(wo["origin"], wo["origin"])
             att = f"  ⚠ {wo['attention_reason']}" if wo["needs_attention"] else ""
-            print(f"    {icon} {wo['id']} [{badge}] {wo['title']} ({wo['status']}){att}")
+            # `status_label`, not `status`: for a `pending` order it also says WHY it is
+            # not starting — a dependency, a feature's slot cap, or the account's
+            # (`invariants.status_label`). A bare "pending" reads as "about to start".
+            print(f"    {icon} {wo['id']} [{badge}] {wo['title']} "
+                  f"({wo.get('status_label') or wo['status']}){att}")
     if st["backlog"]["open"]:
         print(f"\n🗂 backlog: {st['backlog']['open']} open items — `jarvis backlog list`")
     return 0
