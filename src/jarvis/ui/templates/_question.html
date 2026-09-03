@@ -88,6 +88,14 @@
   <div class="sub" style="margin-top:8px">This is a privileged-action request —
     typing a reply here would not open the gate.
     <a href="/gates">decide it on the gates tab →</a></div>
+  {% elif q.kind == 'alarm' %}
+  {# Worse than useless here: the worker was never told anything about this alarm, and a
+     reply would land in a turn that is still burning money — the very cost the alarm was
+     raised to report. `ops.neo_answer_escalated` refuses it too; this is the half that
+     stops the user typing into a box that then errors. #}
+  <div class="sub" style="margin-top:8px">This is a cost alarm — the worker was never
+    asked, and a reply here would interrupt a turn that is still running.
+    <a href="/alarms">review it on the alarms tab →</a></div>
   {% else %}
   <form method="post" action="/neo/{{ q.id }}/answer" style="margin-top:8px">
     <input type="hidden" name="next" value="{{ back }}">
