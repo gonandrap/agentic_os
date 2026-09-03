@@ -46,9 +46,13 @@ def _stamp(at: float) -> str:
 
 
 def _rows(at: float) -> str:
-    """The smallest transcript `inspection.live_alarms` will raise a `long-turn` on."""
+    """The smallest transcript `inspection.live_alarms` will raise a `long-turn` on.
+
+    Its prompt row lands AFTER `at`, as `claude` writes it: a transcript turn older than
+    the dispatch is the previous turn, and `alarms` refuses to judge one.
+    """
     return "".join(json.dumps(r) + "\n" for r in [
-        {"type": "user", "timestamp": _stamp(at), "message": {"content": "go"},
+        {"type": "user", "timestamp": _stamp(at + 1), "message": {"content": "go"},
          "promptSource": "sdk"},
         {"type": "assistant", "timestamp": _stamp(at + 5),
          "message": {"id": "m1", "model": "claude-opus-5",

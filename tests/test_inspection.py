@@ -377,12 +377,12 @@ def test_each_threshold_raises_its_own_alarm():
     big_write, _ = burning(wall=60, write=cfg.alarm_write_tokens + 1)
     blocked, when = burning(join=cfg.alarm_join_seconds + 1)
 
-    assert [a.kind for a in inspection.alarms(long_turn, cfg, now=now)] == \
-        [inspection.TURN_ALARM]
-    assert [a.kind for a in inspection.alarms(big_write, cfg, now=60)] == \
-        [inspection.WRITE_ALARM]
-    assert [a.kind for a in inspection.alarms(blocked, cfg, now=when)] == \
-        [inspection.JOIN_ALARM]
+    assert [a.kind for a in inspection.alarms(long_turn, cfg, now=now,
+                                              dispatched=0.0)] == [inspection.TURN_ALARM]
+    assert [a.kind for a in inspection.alarms(big_write, cfg, now=60,
+                                              dispatched=0.0)] == [inspection.WRITE_ALARM]
+    assert [a.kind for a in inspection.alarms(blocked, cfg, now=when,
+                                              dispatched=0.0)] == [inspection.JOIN_ALARM]
 
 
 def test_the_alarm_measures_the_running_turn_against_the_wall_clock():
@@ -391,8 +391,9 @@ def test_the_alarm_measures_the_running_turn_against_the_wall_clock():
     anatomy, _ = burning(wall=60)
     cfg = InspectConfig(alarm_turn_minutes=10)
 
-    assert inspection.alarms(anatomy, cfg) == []
-    assert inspection.alarms(anatomy, cfg, now=11 * 60)[0].kind == inspection.TURN_ALARM
+    assert inspection.alarms(anatomy, cfg, dispatched=0.0) == []
+    assert inspection.alarms(anatomy, cfg, now=11 * 60,
+                             dispatched=0.0)[0].kind == inspection.TURN_ALARM
 
 
 def test_nothing_is_raised_about_a_turn_that_is_already_paid_for():
@@ -402,7 +403,7 @@ def test_nothing_is_raised_about_a_turn_that_is_already_paid_for():
     quiet = inspection.Turn(seq=2, started=10_000.0, ended=10_060.0)
     anatomy = inspection.Anatomy(session_id="s", found=True, turns=[spent, quiet])
 
-    assert inspection.alarms(anatomy, InspectConfig(), now=10_060.0) == []
+    assert inspection.alarms(anatomy, InspectConfig(), now=10_060.0, dispatched=0.0) == []
 
 
 def test_a_join_still_open_past_the_cache_ttl_is_raised_from_the_live_file(
@@ -421,8 +422,9 @@ def test_a_join_still_open_past_the_cache_ttl_is_raised_from_the_live_file(
                                   "input": {"task_id": "abc"}}]}},
     ])
 
-    quiet = inspection.live_alarms(session, InspectConfig(), now=200)
-    loud = inspection.live_alarms(session, InspectConfig(), wo_id="wo-1", now=400)
+    quiet = inspection.live_alarms(session, InspectConfig(), now=200, dispatched=0.0)
+    loud = inspection.live_alarms(session, InspectConfig(), wo_id="wo-1", now=400,
+                                  dispatched=0.0)
 
 
     assert quiet == []
@@ -438,13 +440,106 @@ def test_a_join_that_came_back_is_not_an_alarm(write_transcript):
         *tool_rows(10, 400, "t1", "TaskOutput", {"task_id": "abc"}),
     ])
 
-    assert inspection.live_alarms(session, InspectConfig(), now=500) == []
+    assert inspection.live_alarms(session, InspectConfig(), now=500, dispatched=0.0) == []
+
+
+def synthetic_row(at: float, mid: str, text: str) -> dict:
+    """The zero-token assistant message Claude Code writes ITSELF — the usage-limit
+    notice, and the copy of it laid down beside the next prompt."""
+    return {
+        "type": "assistant", "timestamp": stamp(at),
+        "message": {"id": mid, "model": usage.SYNTHETIC_MODEL,
+                    "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+                              "cache_read_input_tokens": 0, "output_tokens": 0},
+                    "content": [{"type": "text", "text": text}]},
+    }
+
+
+# wo-c83d7e93's real shape: 66 seconds of work at 08:22, the session limit, then the
+# next turn dispatched at the 11:40 reset.
+LIMIT_HIT, RESET = 30_133.0, 42_008.0
+
+
+def session_limit_transcript(write_transcript, session: str = "limited") -> str:
+    return write_transcript(session, [
+        prompt_row(LIMIT_HIT, "You are the worker agent for wo-1"),
+        *[assistant_row(LIMIT_HIT + 3 + i * 6, f"m{i}") for i in range(11)],
+        synthetic_row(LIMIT_HIT + 64, "s1", "You've hit your session limit"),
+        synthetic_row(RESET, "s2", "You've hit your session limit"),
+        prompt_row(RESET + 2, "<task-notification> carry on"),
+        assistant_row(RESET + 8, "m11"),
+    ])
+
+
+def test_a_turn_the_transcript_has_not_reached_yet_is_not_judged(write_transcript):
+    """THE DISPATCH RACE, and it is the whole of the fleet's `long-turn` history. Between
+    Jarvis opening the turn row and `claude` writing that turn's first row, the last
+    transcript turn is still the PREVIOUS one, so `now - turn.started` measures the
+    inter-turn gap: 197 minutes across a usage-limit window on three orders, 16.2 hours
+    on a fourth parked overnight."""
+    session = write_transcript("raced", [
+        prompt_row(LIMIT_HIT, "You are the worker agent for wo-1"),
+        assistant_row(LIMIT_HIT + 60, "m1"),
+    ])
+    cfg = InspectConfig()
+
+    raced = inspection.live_alarms(session, cfg, now=RESET + 1, dispatched=RESET)
+    stale = inspection.live_alarms(session, cfg, now=RESET + 1, dispatched=0.0)
+
+    assert raced == [], "the turn being judged has written nothing yet"
+    assert [a.kind for a in stale] == [inspection.TURN_ALARM], "and this was the bug"
+
+
+def test_the_alarm_returns_once_the_dispatched_turn_is_in_the_transcript(
+        write_transcript):
+    """The guard is evidence, not suppression: the moment the new turn writes its prompt
+    row it is judged, and against its OWN start."""
+    session = session_limit_transcript(write_transcript)
+    two_hours = RESET + 2 + 2 * 3600
+
+    raised = inspection.live_alarms(session, InspectConfig(), wo_id="wo-1",
+                                    now=two_hours, dispatched=RESET)
+
+    assert [a.kind for a in raised] == [inspection.TURN_ALARM]
+    assert "running 120 minutes" in raised[0].reason
+    # "still being billed" now carries what it is billed FOR, so a turn wedged with no
+    # call in flight cannot hide behind the wall clock.
+    assert "1 API call, the last one 119m ago" in raised[0].reason
+
+
+def test_a_synthetic_row_is_not_an_api_call_anywhere(write_transcript):
+    """`<synthetic>` is Claude Code writing an assistant message itself and it was never
+    billed, so counting one as a call misreports the turn three ways at once: the call
+    count, the context peak, and — the one that matters — the moment it stopped working."""
+    session = session_limit_transcript(write_transcript)
+
+    first, second = inspection.read_session(session).turns
+
+    assert (len(first.calls), first.usage.messages) == (11, 11)
+    assert first.context_peak == 0  # the fixture's calls carry output only
+    assert len(second.calls) == 1
+    assert usage.session_calls(session) == first.calls + second.calls
+
+
+def test_the_dead_gap_after_a_session_limit_is_idle_and_not_generating(
+        write_transcript):
+    """The acceptance case. The trailing `<synthetic>` two seconds before the next prompt
+    dragged `active_ended` to the end of the turn, `idle` collapsed to zero, and `jarvis
+    inspect` reported 197.8 minutes of GENERATING for 66 seconds of real work."""
+    session = session_limit_transcript(write_transcript)
+
+    first, _ = inspection.read_session(session).turns
+
+    assert round(first.generating / 60) == 1
+    assert round(first.idle / 60) == 197
+    assert first.share()["idle"] > 0.99
 
 
 def test_the_alarm_can_be_turned_off():
     anatomy, now = burning(wall=10 * 3600)
 
-    assert inspection.alarms(anatomy, InspectConfig(enabled=False), now=now) == []
+    assert inspection.alarms(anatomy, InspectConfig(enabled=False), now=now,
+                             dispatched=0.0) == []
 
 
 def test_the_defaults_are_the_measured_ones():
@@ -593,7 +688,9 @@ def test_a_burning_turn_reaches_the_user_the_way_everything_else_does(
         turn = store.create_turn(wo["id"], "dispatch", "go")
         started_at = turn["started_at"]
         (root / "-proj" / "burning.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
-            prompt_row(started_at, "You are the worker agent for wo-1"),
+            # AFTER the turn row, as `claude` writes it: a transcript turn older than the
+            # dispatch is the PREVIOUS turn and `alarms` refuses to judge one.
+            prompt_row(started_at + 1, "You are the worker agent for wo-1"),
             assistant_row(started_at + 5, "m1"),
         ]))
         store.update_work_order(wo["id"], status="running", session_id="burning")
@@ -648,7 +745,7 @@ def _burning(daemon, monkeypatch, tmp_path, title="the long one"):
         at = turn["started_at"]
         (root / "-proj" / f"{wo['id']}.jsonl").write_text(
             "".join(json.dumps(r) + "\n" for r in [
-                prompt_row(at, "You are the worker agent for wo-1"),
+                prompt_row(at + 1, "You are the worker agent for wo-1"),
                 assistant_row(at + 5, "m1"),
             ]))
         store.update_work_order(wo["id"], status="running", session_id=wo["id"])
