@@ -2212,7 +2212,8 @@ class Daemon:
                 continue
             try:
                 raised = inspection.live_alarms(session_id, cfg, wo_id=wo["id"],
-                                                now=now, index=index)
+                                                now=now, index=index,
+                                                dispatched=turn["started_at"])
             except OSError:
                 continue  # a transcript Jarvis cannot read is not a work order in trouble
             seen = [db.from_json(e["payload"], {}) or {}

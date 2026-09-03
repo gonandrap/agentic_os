@@ -95,7 +95,9 @@ def _burning(daemon, monkeypatch, tmp_path, title="the long one", description=""
         at = turn["started_at"]
         (root / "-proj" / f"{wo['id']}.jsonl").write_text(
             "".join(json.dumps(r) + "\n" for r in [
-                _prompt_row(at, "You are the worker agent for wo-1"),
+                # AFTER the turn row, as `claude` writes it: a transcript turn older
+                # than the dispatch is the PREVIOUS turn, which `alarms` will not judge.
+                _prompt_row(at + 1, "You are the worker agent for wo-1"),
                 _assistant_row(at + 5, "m1"),
             ]))
         store.update_work_order(wo["id"], status="running", session_id=wo["id"])

@@ -678,7 +678,7 @@ TURN_ALARM, JOIN_ALARM, WRITE_ALARM = "long-turn", "long-join", "big-rewrite"
 #: own `reason` is about one turn and carries its numbers; this is the standing meaning,
 #: and it lives beside the constants so a dashboard and the CLI cannot drift on it.
 ALARM_KINDS = {
-    TURN_ALARM: "a turn still generating, still being billed",
+    TURN_ALARM: "a turn still running, still being billed",
     JOIN_ALARM: "a join open past the cache TTL — the wait is paid for twice",
     WRITE_ALARM: "the conversation sent again, at the cache-write rate",
 }
@@ -700,8 +700,25 @@ class Alarm:
         return {"kind": self.kind, "reason": self.reason}
 
 
+def _spend_so_far(turn: Turn, now: float | None) -> str:
+    """What the turn has actually bought, so "still being billed" can be checked.
+
+    The claim the alarm makes is about money, and a turn wedged on a permission prompt
+    makes no API call while its wall clock runs. Naming the last call is what tells the
+    two apart at a glance, and it is the half of "still being billed" that the wall
+    clock alone could never show.
+    """
+    if not turn.calls:
+        return "no API call yet"
+    made = f"{len(turn.calls)} API call" + ("s" if len(turn.calls) > 1 else "")
+    ago = (now - max(call.ts for call in turn.calls)) if now else 0.0
+    if ago < 60:
+        return f"{made}, the last one seconds ago"
+    return f"{made}, the last one {int(ago // 60)}m ago"
+
+
 def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
-           now: float | None = None) -> list[Alarm]:
+           now: float | None = None, *, dispatched: float) -> list[Alarm]:
     """What is wrong with the turn that is running, most actionable first.
 
     Judges THE LAST TURN ONLY. Everything before it is already paid for and belongs on
@@ -712,10 +729,21 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
     generating has written no row for minutes, so its clock has to be measured against
     the wall and not against its own last line — measuring it against the transcript
     would report an hour-long turn as however long ago it last spoke.
+
+    `dispatched` is the EVIDENCE that the last transcript turn is the one the caller
+    means, and it has no default because there is no honest fallback: measuring `now -
+    turn.started` against a turn the transcript has moved past charges the whole
+    inter-turn gap to a turn that has not started. Every `long-turn` alarm the fleet
+    raised before this was that race — three of them the 197 minutes from a session
+    limit to its reset, one the 16 hours a work order sat parked overnight. Pass the
+    turn RECORD's dispatch time; a transcript turn older than it is the previous turn,
+    and nothing is known about the new one yet.
     """
     if not anatomy.found or not anatomy.turns or not cfg.enabled:
         return []
     turn = anatomy.turns[-1]
+    if turn.started < dispatched:
+        return []
     wall = max(turn.wall, (now - turn.started) if now else 0.0)
     raised: list[Alarm] = []
     hint = f" — `jarvis inspect {wo_id}`" if wo_id else ""
@@ -723,7 +751,7 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
     if wall >= cfg.alarm_turn_minutes * 60:
         raised.append(Alarm(TURN_ALARM, (
             f"this turn has been running {int(wall // 60)} minutes and is still being "
-            f"billed{hint}")))
+            f"billed ({_spend_so_far(turn, now)}){hint}")))
     for span in turn.spans:
         if span.is_join and not span.finished and now and \
                 now - span.started >= cfg.alarm_join_seconds:
@@ -744,7 +772,8 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
 
 
 def live_alarms(session_id: str, cfg: InspectConfig, *, wo_id: str = "",
-                now: float | None = None, root: Path | None = None,
+                now: float | None = None, dispatched: float,
+                root: Path | None = None,
                 index: dict[str, list[Path]] | None = None) -> list[Alarm]:
     """`alarms` for a session id — one transcript read, no paid call, nothing written.
 
@@ -754,4 +783,4 @@ def live_alarms(session_id: str, cfg: InspectConfig, *, wo_id: str = "",
     """
     reading = replace(cfg, report_write_floor=cfg.alarm_write_tokens)
     anatomy = read_session(session_id, reading, root=root, index=index)
-    return alarms(anatomy, cfg, wo_id=wo_id, now=now)
+    return alarms(anatomy, cfg, wo_id=wo_id, now=now, dispatched=dispatched)

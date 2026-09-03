@@ -585,7 +585,33 @@ def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
                 value = creation.get(key)
                 if isinstance(value, int):
                     entry[key] = max(entry.get(key, 0), value)
-    return [by_id[mid] for mid in order]
+    # Filtered AFTER the merge, never per row: `ts` is the FIRST copy of a message and
+    # that copy can be the one carrying no counts yet.
+    return [entry for entry in (by_id[mid] for mid in order) if _is_api_call(entry)]
+
+
+#: The token classes an API call is billed in. A message carrying none of them was not
+#: a call to the API — see `_is_api_call`.
+_CALL_TOKEN_KEYS = ("input_tokens", "cache_creation_input_tokens",
+                    "cache_read_input_tokens", "output_tokens")
+
+
+def _is_api_call(message: dict[str, Any]) -> bool:
+    """Whether a merged assistant message stands for a call to the API.
+
+    A `<synthetic>` row is Claude Code writing an assistant message ITSELF — the usage
+    notice, a cancellation — and it is not a call ANYWHERE: not in the count, not in the
+    tokens, and above all not in the CLOCK. `inspection._close_turns` reads the last
+    call's timestamp as the moment a turn stopped working, and one synthetic row written
+    beside the next prompt dragged wo-c83d7e93 turn 1's active end three hours past its
+    last real call, reporting 197 minutes of GENERATING for 66 seconds of work.
+
+    Zero tokens in every class is the same judgement made without the label: it is what
+    "was not billed" means, and it catches a placeholder Claude Code spells differently.
+    """
+    if (message.get("model") or "") == SYNTHETIC_MODEL:
+        return False
+    return any(message.get(key, 0) for key in _CALL_TOKEN_KEYS)
 
 
 #: Claude Code's model id for a message it wrote itself rather than getting from the
