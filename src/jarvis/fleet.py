@@ -63,12 +63,18 @@ class Fleet:
     one's launches had not happened.
     """
 
-    def __init__(self, cap: int, in_flight: int, outage: Outage | None = None):
+    def __init__(self, cap: int, in_flight: int, outage: Outage | None = None,
+                 at: float | None = None):
         self.cap = cap
         self.in_flight = in_flight
         self.outage = outage
+        #: The clock this reading was taken against. ONE per read, and `blocked` uses it
+        #: rather than asking the clock again: a tick claims work orders in a loop and
+        #: calls `blocked` on each, so a second clock would let the hold lift halfway
+        #: through a tick. Same rule, for the same reason, as `invariants.clock`.
+        self.at = time.time() if at is None else at
 
-    def blocked(self, now: float | None = None) -> str:
+    def blocked(self) -> str:
         """Why nothing may launch, in words for the user — or "" when something may.
 
         The outage outranks the cap because it is the more useful of the two true
@@ -77,8 +83,7 @@ class Fleet:
         ranking, and the same reasoning, as the dependency label above the slot label in
         `invariants.status_label`.
         """
-        now = time.time() if now is None else now
-        if self.outage is not None and now < self.outage.reopens_at:
+        if self.outage is not None and self.at < self.outage.reopens_at:
             return ("the Claude usage window is spent, reopening at "
                     f"{clock(self.outage.reopens_at)}")
         if self.in_flight >= self.cap:
@@ -120,7 +125,7 @@ def read(cap: int, stores: Mapping[str, ProjectStore],
             if outage is None or pause.retry_at > outage.reopens_at:
                 outage = Outage(project=name, wo_id=wo["id"],
                                 reopens_at=pause.retry_at, message=pause.message)
-    return Fleet(cap, in_flight, outage)
+    return Fleet(cap, in_flight, outage, at=now)
 
 
 def current(cat: Any, now: float | None = None) -> Fleet:
