@@ -95,11 +95,15 @@ def _neo_question_id(p: dict[str, Any]) -> int | None:
         return None
 
 
-#: The four kinds carrying one cost alarm's life, frozen in §1 of
-#: docs/superpowers/specs/2026-08-31-the-supervisor.md. Spelled out here rather than
-#: imported from `project_store`: this module is a leaf and opens no store.
+#: The kinds carrying one alarm's life, frozen in §1 of
+#: docs/superpowers/specs/2026-08-31-the-supervisor.md and grown by §1 of
+#: docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md. Spelled out here
+#: rather than imported from `project_store`: this module is a leaf and opens no store.
+#: A test asserts equality with `project_store.ALARM_EVENT_KINDS` — one growing without
+#: the other stops `_ref` resolving the new kinds, with no error anywhere.
 ALARM_KINDS = frozenset({"cost_alarm", "alarm_reviewed", "alarm_escalated",
-                         "alarm_advice"})
+                         "alarm_advice", "health_finding", "health_reviewed",
+                         "remedy_proposed", "remedy_applied", "remedy_refused"})
 
 
 def _ref(kind: str, p: dict[str, Any]) -> dict[str, Any] | None:
