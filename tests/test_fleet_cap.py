@@ -224,8 +224,9 @@ def test_the_four_refusals_are_one_outage_and_burn_no_retries(tmp_path, project)
     state = fleet.read(3, {"proj_a": store}, now=_epoch("2026-09-02T16:40:00Z"))
     assert state.outage is not None
     assert state.outage.reopens_at == reopens.pop()
-    assert state.blocked(now=_epoch("2026-09-02T16:40:00Z"))
-    assert not state.blocked(now=_epoch("2026-09-02T18:41:00Z")), (
+    assert state.blocked()
+    assert not fleet.read(3, {"proj_a": store},
+                          now=_epoch("2026-09-02T18:41:00Z")).blocked(), (
         "the hold must end at the reset the refusal named")
     store.close()
 
