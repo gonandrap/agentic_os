@@ -75,6 +75,27 @@ def worker_stalls_on_prompts(mode: str) -> bool:
 DEFAULT_MAX_CONCURRENT = 5
 
 
+# -- the account, which is not a project -------------------------------------------
+#
+# `max_concurrent` above caps a PROJECT. The thing that ran out on 2026-09-02 was the
+# ACCOUNT: four children of one feature order launched together, and three of them paid
+# 51-72s of Opus time to be told the session window was already spent. A per-project cap
+# could not have prevented that and no arrangement of per-project caps can, because the
+# limit is not divided among projects. Hence one number, fleet-wide, with no per-project
+# override to layer: the resource being rationed is shared, so a project that named its
+# own share would be naming a share of something it does not own.
+#
+# THE UNIT IS A TURN IN FLIGHT (`wo_turns.state='running'`), not an active work order.
+# `count_active` counts `waiting_input` too, and a work order parked on a Neo question
+# spends no tokens — capping on it would ration the fleet against orders that are not
+# using the thing that ran out. See src/jarvis/fleet.py.
+#
+# 3, because the incident ran four Opus workers plus a planner while Neo answers and
+# validation-panel seats drew on the same account (Neo, question 219). It leaves headroom
+# for those without serialising the fleet.
+DEFAULT_MAX_IN_FLIGHT = 3
+
+
 # How large a worker's conversation is allowed to grow before Claude Code compacts it
 # (`claude --autocompact <tokens>`). This is the single biggest lever the OS has on its
 # own bill and it is on by default — see
@@ -467,6 +488,9 @@ class OsConfig:
     default_effort: str | None = None
     default_permission_mode: str = DEFAULT_PERMISSION_MODE
     default_max_concurrent: int = DEFAULT_MAX_CONCURRENT
+    #: Fleet-wide worker turns in flight. No `ProjectSpec` twin on purpose — see
+    #: DEFAULT_MAX_IN_FLIGHT.
+    max_in_flight: int = DEFAULT_MAX_IN_FLIGHT
     default_autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
     #: Read by the cost surfaces, not by a worker launch — see DEFAULT_COLD_PREFIX_FLOOR.
     cold_prefix_floor: int = DEFAULT_COLD_PREFIX_FLOOR
@@ -828,6 +852,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         default_effort=defaults.get("effort"),
         default_permission_mode=defaults.get("permission_mode", DEFAULT_PERMISSION_MODE),
         default_max_concurrent=int(defaults.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),
+        max_in_flight=int(defaults.get("max_in_flight", DEFAULT_MAX_IN_FLIGHT)),
         default_autocompact_window=_autocompact_or_err(
             defaults, "autocompact_window", "os.defaults.autocompact_window",
             DEFAULT_AUTOCOMPACT_WINDOW),
@@ -850,6 +875,8 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")
     if os_cfg.default_max_concurrent < 1:
         raise _err("os.defaults.max_concurrent must be >= 1")
+    if os_cfg.max_in_flight < 1:
+        raise _err("os.defaults.max_in_flight must be >= 1")
 
     projects_raw = data.get("projects", [])
     if not isinstance(projects_raw, list):
