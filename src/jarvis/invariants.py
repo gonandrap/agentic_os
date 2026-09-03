@@ -1017,6 +1017,55 @@ def _stale_alarm_question(store: ProjectStore,
             f"alarm {alarm['id']} was already {alarm['status']}")
 
 
+def check_proposed_remedies_are_live(store: ProjectStore) -> Iterator[Violation]:
+    """INV-REMEDY-PROPOSAL-STALE — a proposal nobody can answer must not sit for ever.
+
+    An alarm at `proposed` is holding the attention flag up on behalf of a gate request
+    that a reviewer is expected to decide. When that request has been closed some other
+    way — superseded by `gates.open_gate`, expired by the sweep, or gone with a deleted
+    row — nothing else moves the alarm, and it goes on saying "the OS is waiting for
+    permission" about a request that no longer exists.
+
+    ABSENCE IS DECISIVE HERE, WHICH IS THE OPPOSITE OF `_stale_alarm_question`'s RULE,
+    and the difference is which database the subject lives in. That check runs per
+    project against an OS-WIDE `neo.db`, so "no such alarm here" is how another project's
+    rows are skipped and cannot be told apart from a subject that has gone. An approval
+    is in THIS project's database beside the alarm that points at it, and the pointer is
+    an id this project wrote — so a missing row means missing, not "somebody else's".
+
+    `approved` is left alone: `Daemon.remedy_tick` is about to apply it, and closing it
+    here would race the application it is waiting for.
+    """
+    from .supervisor import ALARM_BLOCKER
+
+    readonly = getattr(store, "readonly", False)
+    for alarm in store.alarms_across(statuses=("proposed",)):
+        approval_id = alarm.get("remedy_approval_id")
+        approval = store.get_approval(int(approval_id)) if approval_id else None
+        if approval is not None and approval["status"] in ("pending", "approved"):
+            continue
+        was = approval["status"] if approval else "gone"
+        why = (f"its gate request is {was}, so nothing will decide it and the remedy "
+               f"can never be applied")
+        if not readonly:
+            store.update_alarm(alarm["id"], status="escalated",
+                               verdict_reason=f"the {alarm['remedy']} proposal was "
+                                              f"abandoned: {why}")
+            store.flag_attention(alarm["wo_id"], ALARM_BLOCKER.format(
+                alarm_id=alarm["id"]))
+        yield Violation(
+            invariant="INV-REMEDY-PROPOSAL-STALE",
+            wo_id=alarm["wo_id"],
+            detail=(f"alarm {alarm['id']} was still proposing `{alarm['remedy']}`, but "
+                    f"{why}"),
+            repaired=True,
+            repair=("would return it to " if readonly else "returned it to ")
+                   + "escalated, with the user",
+            context={"alarm_id": alarm["id"], "remedy": alarm["remedy"],
+                     "approval_id": approval_id, "approval_status": was},
+        )
+
+
 def _envelope_violation(env: dict[str, Any], repair: str) -> Violation:
     return Violation(
         invariant="INV-ENVELOPE-STUCK",
@@ -1736,6 +1785,9 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # only, which no work-order check looks at
     check_neo_escalations_are_live,  # order-free: it writes to Neo's store only, and
                                    # touches no flag any other check reads
+    check_proposed_remedies_are_live,  # after the flag checks: it RAISES a flag, and one
+                                   # raised before them is read as phantom attention on
+                                   # an alarm `true_blockers` cannot re-derive
     check_envelopes_move,          # last: it delivers, and delivery changes work orders
     check_no_lost_feedback,        # ...and after it, because that delivery is what
                                    # marks an envelope undeliverable in the first place

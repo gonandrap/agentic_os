@@ -1,7 +1,7 @@
 # Jarvis OS codebase map
 
 `jarvis-os` Python package, stdlib-only core (argparse + sqlite3 + json). Source in
-`src/jarvis/`, 25 modules. Read this instead of re-exploring the tree.
+`src/jarvis/`, 26 modules. Read this instead of re-exploring the tree.
 
 ## Modules (responsibility — key symbols — intra-package imports)
 
@@ -29,6 +29,19 @@
   by `ops.supervisor_probes` / `jarvis supervisor probes`, appended to
   `supervisor.build_system_prompt(..., probes=…)`. Spec:
   docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §2.
+- `remedies.py` — THE ONLY MODULE THAT ACTS on a work order nobody asked it to touch.
+  A CLOSED registry of two non-destructive actions (`REMEDIES`/`SHIPPED_REMEDIES` =
+  `nudge`, `unblock`), each a `Remedy` carrying the `headline`/`blast` words a reviewer
+  and the judge both read. `propose()` files a `self_heal` `approvals` row + a
+  `kind="approval"` Neo question (never `gates.file_request`, which would park the work
+  order); `apply()` refuses unless the approval is `approved` and `gates.open_gate`
+  yields a live grant; `record_verdict()` is what `gates.apply_decision` calls instead
+  of messaging a worker that never asked. `RemedyRefused` means nothing was done.
+  Stdlib-only at module level so `catalog._parse_remedies` can import it. Four
+  independent refusals: the registry, `catalog.RemedyConfig` (`os.supervisor.remedies`,
+  ships off with an empty allow-list), the grant, and an AST pin in
+  `tests/test_remedies.py` keeping every acting call inside a handler. Spec:
+  docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §5.
 - `testing.py` — reusable pytest fixtures + the fake `claude` executable so suites never
   touch the real CLI. `FAKE_CLAUDE`:16, fixtures `jarvis_home`:124, `fake_claude`:131,
   `claude_json`:194, `project`:209, `catalog_file`:216, `make_git_project()`:184.

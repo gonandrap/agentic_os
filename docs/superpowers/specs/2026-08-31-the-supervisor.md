@@ -1005,10 +1005,15 @@ fails every section; `SKILL.md` contains the heading verbatim plus the literal
 ## Out of scope, and filed
 
 - **The supervisor acting on the work order** — sending the worker guidance, or cancelling
-  a burning turn. The verdict vocabulary is `{ack, escalate}` and section 2 pins it in
-  code. An agent that can message or kill a running worker on a cost heuristic is a much
-  larger blast radius than one that can route an attention item, and it needs a gate of
-  its own.
+  a burning turn. This WAS out of scope here, and the reasoning still holds and is still
+  why the gate exists: an agent that can message or kill a running worker on a cost
+  heuristic is a much larger blast radius than one that can route an attention item, and
+  it needs a gate of its own. It was given one in
+  `docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md` §5, which widens
+  the vocabulary to `{ack, escalate, propose}` and builds exactly that gate: `propose`
+  names an id from a closed registry in `remedies.py` and files a `self_heal` approval,
+  and `supervisor.py` still names no acting function — section 2's AST pin is unchanged
+  and still passes. Cancelling a turn and setting a status remain excluded there too.
 - **The supervisor triaging any other kind of attention item.** Alarms only.
 - **Auditing every remaining surface where a Neo question is shown.** In scope: the five
   the user listed, plus `jarvis wo show` and `jarvis status`. Neo questions also surface in

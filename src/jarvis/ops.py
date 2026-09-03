@@ -2932,7 +2932,14 @@ def decide_gate(approval_id: int, verdict: str, reason: str = "",
         gates.apply_decision(store, approval_id, verdict=verdict,
                              reason=reason or "approved by the user", decided_by="user",
                              central=central, project=name)
-        store.clear_attention(approval["wo_id"])
+        # The flag this takes down is the one an ESCALATED gate raised, and the user has
+        # just answered it. A `self_heal` denial is the one case where the flag standing
+        # after the verdict is not stale: `remedies.record_verdict` has just raised it
+        # for the alarm, whose symptom the refusal did not address, and clearing it here
+        # would put it down for good — nothing re-derives a live alarm in
+        # `invariants.true_blockers`.
+        if approval["kind"] != gates.SELF_HEAL:
+            store.clear_attention(approval["wo_id"])
     finally:
         central.close()
         store.close()

@@ -313,7 +313,13 @@ CREATE TABLE IF NOT EXISTS wo_alarms (
     neo_question_id INTEGER,
     review_status TEXT NOT NULL DEFAULT 'unreviewed',  -- ALARM_REVIEW_STATUSES
     review_feedback TEXT,
-    reviewed_at REAL
+    reviewed_at REAL,
+    -- The remedy the supervisor proposed, its argument, and the `self_heal` approval
+    -- that must be granted before `remedies.apply` may run it. Also in ADDED_COLUMNS:
+    -- this table already ships, so a live database gets them only there.
+    remedy TEXT,                            -- a key of remedies.REMEDIES
+    remedy_argument TEXT,                   -- what to say, or why, in the judge's words
+    remedy_approval_id INTEGER
 );
 CREATE TABLE IF NOT EXISTS wo_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -650,6 +656,12 @@ ADDED_COLUMNS = {
         "fo_id": "TEXT",                                        # set iff feature_order
         "source": "TEXT NOT NULL DEFAULT 'cost'",               # ALARM_SOURCES
         "probe": "TEXT",                                        # the probe id (§2)
+        # The proposed remedy and the gate grant that must open before it runs (§5).
+        # Nullable with no default: a row raised before this shipped proposed nothing,
+        # which is what NULL already says.
+        "remedy": "TEXT",
+        "remedy_argument": "TEXT",
+        "remedy_approval_id": "INTEGER",
     },
 }
 
@@ -1470,6 +1482,18 @@ class ProjectStore:
             "SELECT * FROM wo_alarms WHERE neo_question_id=?", (question_id,)).fetchone()
         return dict(row) if row else None
 
+    def alarm_for_remedy_approval(self, approval_id: int) -> dict[str, Any] | None:
+        """The alarm whose proposed remedy this `self_heal` approval authorises, if any.
+
+        `alarm_for_question`'s sibling, resolved from this side for the same reason:
+        `gates.apply_decision` is handed an approval and has no other way back to the
+        alarm the verdict is really about (§5).
+        """
+        row = self.conn.execute(
+            "SELECT * FROM wo_alarms WHERE remedy_approval_id=?",
+            (approval_id,)).fetchone()
+        return dict(row) if row else None
+
     def alarms_of(self, wo_id: str) -> list[dict[str, Any]]:
         """Every alarm on one work order, oldest first.
 
@@ -1541,6 +1565,8 @@ class ProjectStore:
             " a.reviewed_at AS reviewed_at,"
             " a.subject_kind AS subject_kind, a.fo_id AS fo_id,"
             " a.source AS source, a.probe AS probe,"
+            " a.remedy AS remedy, a.remedy_argument AS remedy_argument,"
+            " a.remedy_approval_id AS remedy_approval_id,"
             " w.title AS title, w.status AS status, w.hidden AS hidden,"
             " w.needs_attention AS needs_attention,"
             " w.attention_reason AS attention_reason,"

@@ -422,7 +422,13 @@ def test_nothing_in_the_module_hard_codes_a_threshold():
 def test_every_supervisor_setting_reaches_the_config_console(tmp_path):
     """`config_version.resolve` is reflective, so a field added to `SupervisorConfig`
     becomes a `jarvis config set` key with no edit to the console — but only if it is on
-    the dataclass. This fails if a number goes back to being a module constant."""
+    the dataclass. This fails if a number goes back to being a module constant.
+
+    A field that is itself a dataclass (`remedies`) is FLATTENED by `_flatten`, so it
+    reaches the console as its leaves rather than under its own name. Both forms count,
+    and the prefix form still has to produce at least one key — otherwise a block that
+    resolved to nothing would pass on the strength of its own name.
+    """
     from jarvis import config_version
 
     cat = catalog.parse_catalog({"os": {}, "projects": [{"name": "p",
@@ -430,8 +436,10 @@ def test_every_supervisor_setting_reaches_the_config_console(tmp_path):
     resolved = config_version.resolve(cat)
 
     for field_name in vars(catalog.SupervisorConfig()):
-        assert f"os.supervisor.{field_name}" in resolved, field_name
-        assert f"projects.p.supervisor.{field_name}" in resolved, field_name
+        for path in (f"os.supervisor.{field_name}",
+                     f"projects.p.supervisor.{field_name}"):
+            leaves = [k for k in resolved if k.startswith(f"{path}.")]
+            assert path in resolved or leaves, field_name
 
 
 def test_the_off_switch_is_a_safety_key_and_inherits_field_by_field(tmp_path):

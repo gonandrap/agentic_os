@@ -507,7 +507,25 @@ elif "-p" in argv and "--resume" not in argv:
             emit_headless(json.dumps({"reason": "a reply that decides nothing",
                                       "note": "", "question": ""}))
             sys.exit(0)
-        if "FORCE_SUPERVISOR_ESCALATE" in prompt:
+        if "FORCE_SUPERVISOR_BAD_REMEDY" in prompt:
+            # A `propose` naming an id the registry does not have. The verdict must FAIL
+            # rather than quietly become an escalation, and this is the only shape that
+            # can tell those apart — checked before the valid propose so a description
+            # carrying both tokens takes the stricter branch.
+            reply = {"decision": "propose", "remedy": "reboot-the-daemon",
+                     "argument": "turn it off and on again",
+                     "reason": "test-forced bad remedy", "note": ""}
+        elif "FORCE_SUPERVISOR_PROPOSE_UNBLOCK" in prompt:
+            reply = {"decision": "propose", "remedy": "unblock",
+                     "argument": "its dependency was cancelled and will never clear",
+                     "reason": "test-forced unblock proposal",
+                     "note": "It is stranded behind work that was cancelled."}
+        elif "FORCE_SUPERVISOR_PROPOSE" in prompt:
+            reply = {"decision": "propose", "remedy": "nudge",
+                     "argument": "Where have you got to, and what are you waiting on?",
+                     "reason": "test-forced nudge proposal",
+                     "note": "Asking it where it has got to."}
+        elif "FORCE_SUPERVISOR_ESCALATE" in prompt:
             reply = {"decision": "escalate", "reason": "test-forced escalation",
                      "note": "", "question": "is this turn making progress?"}
         else:
