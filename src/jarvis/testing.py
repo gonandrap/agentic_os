@@ -495,6 +495,40 @@ elif "-p" in argv and "--resume" not in argv:
     # verdict. The forcing tokens here are therefore read from the packet but only after
     # this branch has claimed the call.
     if "You are the SUPERVISOR inside the Jarvis agentic OS." in system:
+        # A HEALTH SWEEP SHARES THAT PERSONA AND IS A DIFFERENT CALL (§4 of
+        # docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md). Without
+        # this arm every sweep is answered `{"decision": "ack"}`, which carries no
+        # `findings` at all: `review_health`'s validator refuses it, the fail-safe finds
+        # nothing, and every "no alarm was raised" assertion passes for the wrong reason.
+        # Claimed on the CHECKLIST, which only a sweep's system prompt carries.
+        if "# The symptom checklist" in system:
+            if "FORCE_HEALTH_FAIL" in prompt:
+                sys.stderr.write("health sweep failed (test-forced)\n"); sys.exit(1)
+            if "FORCE_HEALTH_GARBAGE" in prompt:
+                emit_headless("nothing jumps out at me about this one, honestly")
+                sys.exit(0)
+            if "FORCE_HEALTH_NO_FINDINGS" in prompt:
+                # Well-formed JSON with no `findings`: the third failure shape, and the
+                # one the validator must RAISE on rather than read as a clean bill.
+                emit_headless(json.dumps({"reason": "a reply that reports nothing"}))
+                sys.exit(0)
+            if "FORCE_HEALTH_CLEAR" in prompt:
+                emit_headless(json.dumps({"findings": []}))
+                sys.exit(0)
+            # One finding, on a probe read back OUT OF THE CHECKLIST the caller built: a
+            # hard-coded id stops matching the moment a test arms a different list, and
+            # `review_health` drops an id it did not arm. `FAKE_HEALTH_PROBE` is how a
+            # test forces exactly that drop.
+            listed = [line[3:].split(" — ")[0].strip()
+                      for line in system.split("# The symptom checklist", 1)[1].splitlines()
+                      if line.startswith("## ")]
+            probe = os.environ.get("FAKE_HEALTH_PROBE") or (listed[0] if listed else "")
+            emit_headless(json.dumps({"findings": [{
+                "probe": probe,
+                "reason": f"test finding: {probe} is true of this unit",
+                "evidence": "what the packet says about it",
+            }]}))
+            sys.exit(0)
         if "FORCE_SUPERVISOR_FAIL" in prompt:
             sys.stderr.write("supervisor call failed (test-forced)\n"); sys.exit(1)
         if "FORCE_SUPERVISOR_GARBAGE" in prompt:
