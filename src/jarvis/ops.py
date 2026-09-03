@@ -4472,6 +4472,55 @@ def list_cost_alarms(project_name: str | None = None, limit: int = 200,
     return out[:limit]
 
 
+# -- the symptom catalogue: what a project is watched for ------------------------------
+
+
+def supervisor_probes(project_name: str | None = None,
+                      catalog_path: str | None = None) -> list[dict[str, Any]]:
+    """The health probes in force, each with WHERE ITS ANSWER CAME FROM.
+
+    `kn-42c52cec`'s lesson: a resolved value the user cannot see is a value they cannot
+    trust, and probe inheritance is exactly the kind of resolution that goes wrong
+    quietly — a project that switches one off looks identical, on every other surface,
+    to a project that never had it. `source` is the whole point of the read:
+
+    - `fleet` — the OS list's entry, untouched here;
+    - `project override` — the project named this id and changed something, INCLUDING
+      disabling it (a disabled probe is present and marked, never absent, so what the
+      fleet watches for stays legible);
+    - `project addition` — an id the OS list does not have.
+
+    Raises rather than answering `None` on an unreadable catalog: unlike
+    `validation_config`, nothing depends on this to keep working — it is a read someone
+    typed, and a silent empty list would read as "this project is watched for nothing".
+
+    §2 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+    """
+    from dataclasses import asdict
+
+    catalog = resolve_catalog(catalog_path)
+    fleet = {p.id: p for p in catalog.os.supervisor.probes}
+    if project_name is None:
+        resolved = catalog.os.supervisor.probes
+    else:
+        resolved = project_spec(catalog, project_name).supervisor.probes
+
+    out: list[dict[str, Any]] = []
+    for probe in resolved:
+        base = fleet.get(probe.id)
+        if base is None:
+            source = "project addition"
+        elif base != probe:
+            source = "project override"
+        else:
+            source = "fleet"
+        row = asdict(probe)
+        row["subjects"] = list(probe.subjects)
+        row["source"] = source
+        out.append(row)
+    return out
+
+
 # -- the review loop: what the supervisor decided, and what the user makes of it -------
 #
 # `list_cost_alarms`' dict is frozen and four surfaces bind it, so the two review reads
