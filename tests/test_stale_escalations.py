@@ -320,6 +320,66 @@ def test_another_projects_escalation_is_not_this_projects_to_close(escalated_pla
     assert question(neo, elsewhere["id"])["status"] == "escalated"
 
 
+# -- alarms: the third pointer, and the third subject that can move it -----------------
+
+
+@pytest.fixture()
+def escalated_alarm(store, neo):
+    """An alarm handed to Neo, with `wo_alarms.neo_question_id` pointing at the question.
+
+    Written through the store rather than driven through a supervisor call: what is
+    under test here is the invariant reading the POINTER, and a model call would make
+    this file depend on the supervisor being enabled in the catalog.
+    """
+    wo = store.create_work_order(title="the long one", description="")
+    alarm = store.add_alarm(wo["id"], "long-turn", 1, "still being billed")
+    q = neo.ask("proj_a", wo["id"], "does this spend need the user?",
+                context="the packet", kind="alarm")
+    store.update_alarm(alarm["id"], status="escalated", verdict="escalate",
+                       verdict_reason="cannot account for it", neo_question_id=q["id"])
+    neo.mark(q["id"], "escalated", reason="the user must rule")
+    return wo, alarm, q["id"]
+
+
+def test_an_alarm_decided_elsewhere_stops_asking_on_the_tick(escalated_alarm, store, neo):
+    """The site nothing else owns: an alarm moved off `escalated` by any route at all.
+
+    `ops.review_alarm` supersedes as it goes, so this drives the row directly — that IS
+    the case, a pointer moved behind the OS's back, and it is what the invariant costs
+    one tick instead of for ever.
+    """
+    wo, alarm, stale = escalated_alarm
+    store.update_alarm(alarm["id"], status="acked", verdict="ack", note="it is fine")
+
+    violations = [v for v in check_project(store, repair=True)
+                  if v.invariant == "INV-NEO-ESCALATION-STALE"]
+
+    assert [v.context["question_id"] for v in violations] == [stale]
+    assert violations[0].context["kind"] == "alarm"
+    assert violations[0].repaired
+    closed = question(neo, stale)
+    assert closed["status"] == "answered"
+    assert closed["answered_by"] == "os"
+    assert alarm["id"] in closed["answer"]
+
+
+def test_an_alarm_still_with_the_user_keeps_its_escalation(escalated_alarm, store, neo):
+    """The other half of the cutoff. Without this, "the invariant closes it" is
+    indistinguishable from "the invariant closes everything"."""
+    wo, alarm, stale = escalated_alarm
+
+    violations = check_project(store, repair=True)
+
+    assert [v for v in violations if v.invariant == "INV-NEO-ESCALATION-STALE"] == []
+    assert question(neo, stale)["status"] == "escalated"
+
+
+# The point fix beside this net — `ops.review_alarm` superseding the question as the
+# user decides the alarm — is already pinned by
+# `tests/test_alarm_review.py::…neo_question_closed`. What is only testable here is the
+# case where nobody called it.
+
+
 # -- the listing that showed them ------------------------------------------------------
 
 
