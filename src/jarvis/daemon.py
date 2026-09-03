@@ -185,6 +185,7 @@ class Daemon:
         self.supervisor_pool = ThreadPoolExecutor(max_workers=1,
                                                   thread_name_prefix="supervisor")
         self.supervisor_draining = False
+        self.remedy_applying = False
         # Validation runs off the tick thread for the same reason Neo does, only more
         # so: a round is up to five headless calls at a 300s timeout each, and run
         # inline it would freeze every project in the catalog behind one work order's
@@ -493,6 +494,11 @@ class Daemon:
         # judged on this tick rather than one reconcile interval later — and OUTSIDE it,
         # so no project waits on another project's review.
         self.supervisor_tick()
+        # Straight after, and never merged into it: a proposal filed above cannot be
+        # applied on the tick that filed it (its gate is `pending`), so the two only ever
+        # meet across ticks — and the separation is what keeps the deciding half free of
+        # the acting half. See spec 2026-09-02, §5.
+        self.remedy_tick()
 
         # Before routing: a dashboard failure raised here goes out with this tick's
         # notifications instead of waiting for the next one.
@@ -2077,6 +2083,85 @@ class Daemon:
         future = self.supervisor_pool.submit(self._supervisor_drain, supervised)
         future.add_done_callback(
             lambda f: setattr(self, "supervisor_draining", False))
+
+    def remedy_tick(self) -> None:
+        """Apply the remedies whose gate has since opened — §5 of
+        docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+
+        SHARES `supervisor_pool`, WHICH IS SINGLE-THREADED, and that is the point rather
+        than thrift: an alarm being judged and the same alarm being acted on are two
+        writes to one row, and the pool is what serialises them. Nothing here calls a
+        model, so the work is cheap; what it is queued behind is a review that is not.
+
+        Only the APPROVED are picked up. A denial or a dismissal is applied at verdict
+        time by `remedies.record_verdict`, and one whose approval vanished is closed by
+        `invariants.check_proposed_remedies_are_live` — so an alarm still sitting at
+        `proposed` here is one whose reviewer has not answered.
+        """
+        supervised = [p for p in self._supervised_projects()
+                      if p.supervisor.remedies.enabled]
+        if not supervised or self.remedy_applying:
+            return
+        ready: list[tuple[ProjectSpec, str]] = []
+        for project in supervised:
+            store = self.store_for(project)
+            for alarm in store.alarms_across(statuses=("proposed",)):
+                approval_id = alarm.get("remedy_approval_id")
+                approval = store.get_approval(int(approval_id)) if approval_id else None
+                if approval is not None and approval["status"] == "approved":
+                    ready.append((project, alarm["id"]))
+        if not ready:
+            return
+        self.remedy_applying = True
+        future = self.supervisor_pool.submit(self._apply_remedies, ready)
+        future.add_done_callback(
+            lambda f: setattr(self, "remedy_applying", False))
+
+    def _apply_remedies(self, ready: list[tuple[ProjectSpec, str]]) -> None:
+        """Run each approved remedy on the supervisor thread. Re-reads every row.
+
+        Re-read rather than carried: the tick chose these under a snapshot taken before
+        the pool ran, and `remedies.apply` refuses on anything that has moved since —
+        which is the behaviour that makes the recheck worth having rather than a cost.
+        """
+        from . import remedies
+
+        central = CentralStore()
+        try:
+            for project, alarm_id in ready:
+                pstore = ProjectStore(project.path)
+                try:
+                    self._apply_one_remedy(project, pstore, central, alarm_id, remedies)
+                except remedies.RemedyRefused as exc:
+                    log.warning("[%s] remedy for %s refused: %s", project.name,
+                                alarm_id, exc)
+                except Exception:  # noqa: BLE001 — one alarm must not stop the rest
+                    log.exception("[%s] applying the remedy for %s failed",
+                                  project.name, alarm_id)
+                finally:
+                    pstore.close()
+        finally:
+            central.close()
+
+    def _apply_one_remedy(self, project: ProjectSpec, pstore: ProjectStore,
+                          central: CentralStore, alarm_id: str,
+                          remedies: Any) -> None:
+        alarm = pstore.get_alarm(alarm_id)
+        if alarm["status"] != "proposed":
+            return
+        approval_id = alarm.get("remedy_approval_id")
+        approval = pstore.get_approval(int(approval_id)) if approval_id else None
+        subject = self._alarm_subject(pstore, alarm, remedies)
+        result = remedies.apply(pstore, central, project.name, approval, alarm, subject)
+        log.info("[%s] remedy %s applied for %s: %s", project.name, alarm["remedy"],
+                 alarm_id, result)
+
+    def _alarm_subject(self, pstore: ProjectStore, alarm: dict,
+                       remedies: Any) -> dict:
+        """The work order or feature order an alarm is about — §1's two subject kinds."""
+        if remedies.subject_kind(alarm) == "feature_order":
+            return pstore.get_feature_order(alarm["fo_id"])
+        return pstore.get_work_order(alarm["wo_id"])
 
     def _supervisor_drain(self, projects: list[ProjectSpec]) -> None:
         """Judge every raised alarm, project by project (on the supervisor thread)."""

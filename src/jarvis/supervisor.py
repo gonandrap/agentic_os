@@ -1,11 +1,14 @@
-"""The supervisor: it reads a cost alarm and either acks it or wants Neo.
+"""The supervisor: it reads an alarm and acks it, wants Neo, or proposes a remedy.
 
-docs/superpowers/specs/2026-08-31-the-supervisor.md §2. Every threshold is
+docs/superpowers/specs/2026-08-31-the-supervisor.md §2, widened by §5 of
+docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md. Every threshold is
 `catalog.SupervisorConfig`; the module holds no numbers of its own.
 
-THE VERDICT VOCABULARY IS EXACTLY `{ack, escalate}`. It never messages a worker, cancels
-a turn or sets a status — a safety rule pinned by an AST walk over this file, not by the
-persona (`tests/test_supervisor.py`).
+THE VERDICT VOCABULARY IS EXACTLY `{ack, escalate, propose}`, AND `propose` IS STILL NOT
+AN ACTION. This module names an id from `remedies.REMEDIES` and files a gate request; it
+never messages a worker, cancels a turn or sets a status, and it holds no remedy's prose,
+target or handler — a safety rule pinned by an AST walk over this file, not by the
+persona (`tests/test_supervisor.py`). `remedies.py` acts, and only under a grant.
 """
 
 from __future__ import annotations
@@ -44,17 +47,36 @@ it is the honest answer whenever the evidence does not settle the question, and 
 the user exactly what they were going to pay anyway. PREFER IT WHEN UNSURE. A wrong ack
 hides a turn that is still burning money; a wrong escalation costs one glance.
 
+PROPOSE when one of the remedies listed below would plainly help and you can say exactly
+why. A proposal is not an action: it names a remedy from a closed list and files a request
+that a reviewer must approve before anything happens, and the flag stays UP until it does.
+Propose only what is listed for you — the list below is the whole vocabulary, and there is
+no free-text action. Two ways of asking wrongly are both recorded as your mistake rather
+than quietly turned into something else:
+
+- naming no remedy, or a remedy that does not exist, FAILS the verdict outright. The alarm
+  is recorded as unjudged and the user is interrupted. It is not read as an escalation,
+  because a judge that asked for an action it could not name did not mean to escalate;
+- naming a remedy this project has not armed, or one that does not apply to this kind of
+  subject, is refused and the alarm goes to the user with your reasoning attached.
+
 WHAT YOU MAY NOT DO, and the OS enforces it in code rather than trusting this paragraph:
 you do not message the worker, cancel its turn, change its status, or act on the work order
-in any way. Your entire output is a judgement. Do not offer to intervene and do not phrase
-the note as though you had.
+in any way. Even a proposal you make is carried out by a different part of the OS, only
+after a reviewer has agreed and only for the exact remedy you named. Your entire output is
+a judgement. Do not offer to intervene and do not phrase the note as though you had.
 
 Output STRICT JSON, nothing else:
   {"decision": "ack", "reason": "<why, 1-2 sentences, for the record>",
    "note": "<what the user is told, <= 200 chars, plain words>", "question": ""}
   or
   {"decision": "escalate", "reason": "<why, 1-2 sentences, for the record>",
-   "note": "", "question": "<the one question to put to Neo>"}"""
+   "note": "", "question": "<the one question to put to Neo>"}
+  or
+  {"decision": "propose", "remedy": "<one of the ids listed below>",
+   "argument": "<what to say, or why>",
+   "reason": "<why, 1-2 sentences, for the record>",
+   "note": "<what the user is told, plain words>"}"""
 
 ALARM_REVIEWER_PERSONA = """You are Neo, reviewing a COST ALARM inside the Jarvis \
 agentic OS.
@@ -75,6 +97,13 @@ YOU DECIDE NOTHING ABOUT THE WORK ORDER. Nobody messages the worker, cancels the
 changes a status on the strength of your reply — the OS records your reading against the
 alarm and stops. So do not tell anyone to intervene, and do not phrase your answer as
 though someone would.
+
+THAT REMAINS TRUE EVEN THOUGH THE OS CAN NOW ACT. The supervisor may propose one of a
+closed, non-destructive set of remedies, and the ONLY thing that authorises one is a
+separate `self_heal` gate request reviewed on its own terms. This reply is not that
+request and cannot become it. If the packet says a remedy was proposed and refused, the
+refusal already happened and the symptom is what is left for you to read; if it says one
+was applied, say what that changes about the reading and nothing more.
 
 ANSWER when the evidence accounts for the spend, or accounts for it well enough that a
 person reading your words would not go and look. Your answer is what the user is shown
@@ -134,7 +163,7 @@ UNREADABLE_PREFIX = "unreadable supervisor output: "
 
 def build_system_prompt(store: Any, project: str,
                         learnings_limit: int | None = None,
-                        probes: Any = ()) -> str:
+                        probes: Any = (), armed_remedies: Any = ()) -> str:
     """Persona + learnings + (optionally) a symptom checklist, byte-stable per project
     so consecutive reviews share a cached prefix.
 
@@ -154,10 +183,16 @@ def build_system_prompt(store: Any, project: str,
     the "N older learnings not shown" note are the ones Neo and every panel seat already
     obey; a second renderer is how the blocks come to differ.
 
+    `armed_remedies` obeys the same rule as `probes` and for the same reason: the empty
+    default must leave the prompt byte-identical, so a project that arms nothing pays
+    nothing and the cost review's cached prefix does not move. WHICH remedies are armed
+    is per project, so the list cannot live in the persona constant — the persona says
+    what `propose` means and this says what may be proposed here (§5).
+
     `None` means `catalog.SupervisorConfig.learnings_limit` — the default lives there,
     not here.
     """
-    from . import neo, probes as probes_mod
+    from . import neo, probes as probes_mod, remedies as remedies_mod
     from .catalog import SupervisorConfig
     from .neo_store import SUPERVISOR_SEAT
 
@@ -172,6 +207,8 @@ def build_system_prompt(store: Any, project: str,
     ]
     if probes:
         parts += ["", probes_mod.render_checklist(probes)]
+    if armed_remedies:
+        parts += ["", remedies_mod.render_catalogue(tuple(armed_remedies))]
     return "\n".join(parts)
 
 
@@ -477,18 +514,40 @@ def _validate(data: dict[str, Any], note_chars: int) -> dict[str, Any]:
     supervisor verdict at all. `neo._validate_verdict` makes the same call about
     `escalate`. Defaulting to `ack` would hide a burning turn; to `escalate` would
     record a judgement nobody made.
+
+    A `propose` NAMING NO REMEDY, OR ONE THE REGISTRY DOES NOT HAVE, IS THE SAME KIND OF
+    BAD SHAPE and is deliberately NOT downgraded to `escalate`. A judge that asked for
+    an action it could not name did not mean to escalate, and recording that it did puts
+    a judgement nobody made on the record — the failure this whole function exists to
+    refuse. Whether the project ALLOWS the named remedy is a separate question and not
+    this one: it is answered by `remedies.propose`, which can say so on the alarm.
     """
+    from . import remedies
+
     decision = str(data.get("decision") or "").strip().lower()
     if not decision:
         raise structured.InvalidOutput("no `decision` field in the supervisor's reply")
-    if decision not in ("ack", "escalate"):
+    if decision not in ("ack", "escalate", "propose"):
         raise structured.InvalidOutput(
-            f"`decision` must be 'ack' or 'escalate', got {decision!r}")
+            f"`decision` must be 'ack', 'escalate' or 'propose', got {decision!r}")
+    remedy = str(data.get("remedy") or "").strip()
+    if decision == "propose":
+        if not remedy:
+            raise structured.InvalidOutput(
+                "`decision` is 'propose' with no `remedy` — name one of "
+                f"{list(remedies.SHIPPED_REMEDIES)}")
+        if remedy not in remedies.REMEDIES:
+            raise structured.InvalidOutput(
+                f"no such remedy {remedy!r} — the OS has "
+                f"{list(remedies.SHIPPED_REMEDIES)}")
     return {
         "decision": decision,
         "reason": str(data.get("reason") or ""),
-        "note": str(data.get("note") or "")[:note_chars] if decision == "ack" else "",
+        "note": (str(data.get("note") or "")[:note_chars]
+                 if decision in ("ack", "propose") else ""),
         "question": str(data.get("question") or "") if decision == "escalate" else "",
+        "remedy": remedy if decision == "propose" else "",
+        "argument": str(data.get("argument") or "") if decision == "propose" else "",
         "failed": False,
     }
 
@@ -500,7 +559,8 @@ def _failed_verdict(raw: str, reason_chars: int) -> dict[str, Any]:
     `failed` is what puts the alarm at `failed` rather than at `escalated` — nobody
     judged it. `Daemon._neo_drain` reads Neo's equivalent flag the same way.
     """
-    return {"decision": "escalate", "note": "", "question": "", "failed": True,
+    return {"decision": "escalate", "note": "", "question": "", "remedy": "",
+            "argument": "", "failed": True,
             "reason": f"{UNREADABLE_PREFIX}{(raw or '')[:reason_chars]}"}
 
 
@@ -508,7 +568,8 @@ def _transport_failure(exc: Exception, reason_chars: int) -> dict[str, Any]:
     """A call that never happened, which `structured.request`'s `on_invalid` does NOT
     cover — `ClaudeCliError` propagates untouched by design (kn-9b18a8eb). Without this
     the review raises out of the daemon's own thread pool."""
-    return {"decision": "escalate", "note": "", "question": "", "failed": True,
+    return {"decision": "escalate", "note": "", "question": "", "remedy": "",
+            "argument": "", "failed": True,
             "reason": f"the supervisor could not be reached: {str(exc)[:reason_chars]}"}
 
 
@@ -538,7 +599,9 @@ def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any],
         verdict = structured.request(
             evidence,
             validate=lambda data: _validate(data, cfg.note_chars),
-            system_prompt=build_system_prompt(neo_store, project, cfg.learnings_limit),
+            system_prompt=build_system_prompt(neo_store, project, cfg.learnings_limit,
+                                              armed_remedies=cfg.remedies.allowed
+                                              if cfg.remedies.enabled else ()),
             model=cfg.model,
             # Neo's FAIL-SAFE shape, not the panel chair's retry shape: asking again
             # spends a call to learn the same thing, and the fallback already reaches
@@ -559,7 +622,8 @@ def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any],
     own_central = central is None
     central = central or CentralStore()
     try:
-        _apply(pstore, neo_store, central, project, wo, alarm, verdict, evidence)
+        _apply(pstore, neo_store, central, project, wo, alarm, verdict, evidence,
+               cfg)
     finally:
         if own_central:
             central.close()
@@ -597,7 +661,8 @@ def _question_for(verdict: dict[str, Any], alarm: dict[str, Any]) -> str:
 
 
 def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str, Any],
-           alarm: dict[str, Any], verdict: dict[str, Any], evidence: str) -> None:
+           alarm: dict[str, Any], verdict: dict[str, Any], evidence: str,
+           cfg: Any) -> None:
     """Write the verdict down. THE ALARM ROW IS THE MEMORY: `invariants.true_blockers`
     has no branch for a live cost alarm, so `ack_attention(wo_id, [])` records nothing
     durable and only §1's dedupe keeps the flag down. See §2.
@@ -615,6 +680,10 @@ def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str
     if verdict["decision"] == "escalate":
         _escalate(pstore, neo_store, central, project, wo, alarm, verdict, evidence,
                   decided)
+        return
+
+    if verdict["decision"] == "propose":
+        _propose(pstore, neo_store, central, project, wo, alarm, verdict, evidence, cfg)
         return
 
     pstore.update_alarm(alarm_id, status="acked", verdict="ack",
@@ -636,6 +705,36 @@ def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str
     central.add_inbox(project=project, level="info",
                       title=ACK_INBOX_TITLE.format(wo_id=wo["id"]),
                       body=verdict["note"], wo_id=wo["id"])
+
+
+def _propose(pstore: Any, neo_store: Any, central: Any, project: str,
+             wo: dict[str, Any], alarm: dict[str, Any], verdict: dict[str, Any],
+             evidence: str, cfg: Any) -> None:
+    """Hand the named remedy to `remedies.propose`, which owns every write — §5.
+
+    THE ATTENTION FLAG STAYS UP WHILE A PROPOSAL IS OUT, and it needs nothing here: the
+    raise already put it up and nothing in this branch takes it down. The OS wants to do
+    something to the user's work and has not been told it may, which is exactly what the
+    flag says.
+
+    A REFUSAL IS THE USER'S TO READ. `propose` writes the reason on the alarm and files
+    nothing; the flag alone would evaporate on a settled order
+    (`invariants.check_no_phantom_attention`), so the inbox row is the durable half and
+    it goes through the same `_flag_the_user` an unaskable escalation uses.
+    """
+    from . import remedies
+
+    outcome = remedies.propose(
+        pstore, neo_store, project, wo, alarm, verdict["remedy"], verdict["argument"],
+        cfg.remedies, evidence=evidence, reason=verdict["reason"],
+        note=verdict["note"])
+    if outcome["proposed"]:
+        log.info("alarm %s proposes %s (gate request %s)", alarm["id"],
+                 verdict["remedy"], outcome["approval"]["id"])
+        return
+    _flag_the_user(pstore, central, project, wo, alarm, verdict["reason"],
+                   why=f"the `{verdict['remedy']}` remedy it wanted was refused — "
+                       f"{outcome['reason']}")
 
 
 def _escalate(pstore: Any, neo_store: Any, central: Any, project: str,

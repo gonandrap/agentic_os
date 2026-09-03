@@ -32,6 +32,10 @@ SAFETY_KEYS = (
     # And the same again for the health sweep, which is a separate watcher with a
     # separate switch — docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §2.
     "os.supervisor.health_enabled",
+    # What the OS is permitted to DO, not merely to watch (§5). `*.` rather than `os.`
+    # for `*.validation.*`'s reason: the per-project form is the same switch with a
+    # smaller blast radius, and both halves — the flag and the allow-list — widen it.
+    "*.supervisor.remedies.*",
 )
 
 # Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
@@ -342,6 +346,29 @@ DEFAULT_SUPERVISOR_MAX_ENABLED_PROBES = 12
 DEFAULT_SUPERVISOR_PROBE_PROMPT_CHARS = 800
 
 
+@dataclass(frozen=True)
+class RemedyConfig:
+    """What the supervisor is permitted to PROPOSE doing about a unit it judged ill —
+    docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §5.
+
+    TWO SWITCHES RATHER THAN ONE, DELIBERATELY. `enabled: true` with `allowed: []` means
+    the supervisor may reason about remedies and nothing is ever applied — a genuinely
+    useful shipping state, and the one the fleet should run first. Collapsing them into
+    a single flag would make "let me watch it want to act" unexpressible.
+
+    Ships with both off. `allowed` names ids of `remedies.REMEDIES`; an unknown one is a
+    `CatalogError` naming the known ids, `GateConfig.parse`'s rule and for its reason — a
+    typo must not silently leave a permission unset.
+
+    Defined ABOVE `SupervisorConfig` because it is reached through
+    `field(default_factory=...)`, which is a `NameError` at import the other way round
+    (kn-67cdb54b).
+    """
+
+    enabled: bool = False
+    allowed: tuple[str, ...] = ()
+
+
 @dataclass
 class SupervisorConfig:
     """The agent that reviews a cost alarm and either acks it or wants Neo — §2.
@@ -377,6 +404,11 @@ class SupervisorConfig:
     health_max_units_per_tick: int = DEFAULT_SUPERVISOR_HEALTH_MAX_UNITS_PER_TICK
     max_enabled_probes: int = DEFAULT_SUPERVISOR_MAX_ENABLED_PROBES
     probe_prompt_chars: int = DEFAULT_SUPERVISOR_PROBE_PROMPT_CHARS
+
+    # What it may PROPOSE doing about what it finds (§5). A whole block rather than a
+    # scalar, for `probes`' reason: `jarvis config set <p> supervisor.remedies.allowed`
+    # addresses the permission as one list.
+    remedies: RemedyConfig = field(default_factory=RemedyConfig)
 
 
 @dataclass
@@ -692,7 +724,32 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
 #: casts everything else with `int()`, so a non-numeric field missing from this set is a
 #: `TypeError` on every catalog load — or, for a bool, a silent `int(False) == 0` that
 #: trips the `>= 1` floor instead and blames the wrong key.
-_SUPERVISOR_NON_NUMERIC = ("enabled", "model", "probes", "health_enabled")
+_SUPERVISOR_NON_NUMERIC = ("enabled", "model", "probes", "health_enabled", "remedies")
+
+
+def _parse_remedies(raw: Any, base: RemedyConfig, where: str) -> RemedyConfig:
+    """`supervisor.remedies`, or a project's override of it — field-level, like the rest.
+
+    An unknown id is refused with the known ones named. Same call `GateConfig.parse`
+    makes about an unknown gate name and for the same reason: a permission the user
+    believes they granted, silently unset, is the failure this whole block exists to
+    make impossible.
+    """
+    from . import remedies as remedies_mod
+
+    if raw is None:
+        return base
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    allowed_raw = raw.get("allowed", base.allowed)
+    if isinstance(allowed_raw, (str, bytes)) or not isinstance(allowed_raw, (list, tuple)):
+        raise _err(f'"{where}.allowed" must be a list of remedy ids')
+    allowed = tuple(str(item) for item in allowed_raw)
+    for remedy_id in allowed:
+        if remedy_id not in remedies_mod.REMEDIES:
+            raise _err(f"{where}.allowed names unknown remedy {remedy_id!r} — "
+                       f"known: {', '.join(remedies_mod.SHIPPED_REMEDIES)}")
+    return RemedyConfig(enabled=bool(raw.get("enabled", base.enabled)), allowed=allowed)
 
 
 def _parse_probes(raw: Any, base: tuple[probes_mod.HealthProbe, ...],
@@ -788,6 +845,8 @@ def _parse_supervisor(raw: Any, base: SupervisorConfig | None = None,
         model=str(raw.get("model", base.model) or base.model),
         health_enabled=bool(raw.get("health_enabled", base.health_enabled)),
         probes=_parse_probes(raw.get("probes"), base.probes, f"{where}.probes"),
+        remedies=_parse_remedies(raw.get("remedies"), base.remedies,
+                                 f"{where}.remedies"),
         **{k: int(raw.get(k, v)) for k, v in numbers.items()},
     )
     for name, value in vars(cfg).items():

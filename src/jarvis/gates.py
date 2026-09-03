@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING, Any, Iterable
 from .gate_rules import (  # re-exported: this is still the module callers import
     KIND_NAMES,
     KINDS,
+    SELF_HEAL,
     GateKind,
     RuleSet,
     reads_only,
@@ -65,10 +66,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .project_store import ProjectStore
 
 __all__ = [
-    "APPROVAL_STATUSES", "GRANT_MAX_USES", "GRANT_TTL_SECONDS", "GateConfig",
+    "APPROVAL_STATUSES", "GRANT_MAX_USES", "GRANT_TTL_SECONDS", "SELF_HEAL",
+    "GateConfig",
     "GateKind", "GatedAction", "KINDS", "KIND_NAMES", "REVIEWER_PERSONA", "RuleSet",
     "VERDICTS", "apply_decision", "build_request_question", "classify",
-    "deny_conflicts", "file_request", "reads_only", "scannable", "summarise",
+    "deny_conflicts", "file_request", "open_gate", "reads_only", "scannable",
+    "summarise",
 ]
 
 # How long an approval stays usable, and how many attempts it covers. The window is
@@ -277,8 +280,34 @@ def deny_conflicts(config: GateConfig, deny_rules: Iterable[str]
 # positives; Neo was following it correctly. "Was this even a gated action" has to be
 # answered BEFORE "should this gated action proceed", because it is a question about a
 # different subject: the classifier, not the worker.
-REVIEWER_PERSONA = """You are Neo, reviewing a PRIVILEGED ACTION REQUEST inside the \
+#
+# And the `self_heal` carve-out sits ABOVE it for the same reason it exists at all: a
+# self_heal row's `command` is a rendered intent, so the premise check — first, and
+# highest priority — describes it exactly, and the persona would have forced DISMISS on
+# every proposal and then asked for an `exempt_pattern` derived from prose. See spec
+# 2026-09-02, §5.
+REVIEWER_PERSONA ="""You are Neo, reviewing a PRIVILEGED ACTION REQUEST inside the \
 Jarvis agentic OS.
+
+BEFORE ANYTHING ELSE: if the request below opens with `SELF-HEAL REQUEST`, three of the
+rules that follow are switched off for it and the rest apply unchanged.
+
+That request was filed by the OS itself, not by a worker, and it carries a rendered
+intent (`heal <alarm>: <remedy> <subject> — …`) where the others carry a shell command.
+It is a genuine privileged action: approving it lets the OS reach a session the user is
+paying for, on the strength of its own judgement.
+
+- The premise check does not apply, and neither does the read-only test. There is no
+  command to inspect; the action is the remedy named in the request.
+- NEVER DISMISS ONE, and never propose an `exempt_pattern` for one. Dismissal exists to
+  correct the recogniser, and the recogniser did not fire here — nothing classifies into
+  this gate. A pattern derived from an intent string would be a rule about prose.
+- Judge it on the remedy's own blast line — what it touches and what it cannot undo —
+  against the evidence packet and the supervisor's reasoning, both quoted in full.
+  Approve, deny, or escalate; deny whenever the case for acting is not made, which
+  leaves the symptom with the user and costs nothing but a tick.
+
+Everything below is about the other kinds.
 
 A worker agent ran a command that the OS's recogniser matched as privileged — merging a
 pull request, cutting a release, restarting a service. The command was blocked and handed
@@ -726,10 +755,29 @@ def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
         finally:
             if own:
                 store_c.close()
-    message = (dismissed_message(approval, reason, decided_by, learned)
-               if verdict == "dismissed"
-               else _VERDICT_MESSAGE[verdict](approval, reason, decided_by))
-    store.queue_message(approval["wo_id"], message, source="gate")
+    # A `self_heal` request was filed by the OS against a session that never asked, so
+    # the two moves this function makes for a worker are both wrong for it. The message
+    # is addressed to nobody: on a denial it is noise delivered into a running turn —
+    # precisely the act this gate exists to fence — and on an approval it is redundant,
+    # because the remedy itself is the intervention. And there is no wait to end: nothing
+    # set one, since `remedies.propose` deliberately does not park the work order.
+    #
+    # ONE GUARD IN THE SHARED FUNCTION, NOT A SECOND DECISION PATH. Two paths over one
+    # table is how the two come to leave different state behind; everything below —
+    # `decide_approval`, the `gate_decided`/`gate_dismissed` event, dismissal learning —
+    # is inherited unchanged. See
+    # docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §5.
+    self_heal = approval["kind"] == SELF_HEAL
+    if self_heal:
+        from . import remedies
+
+        remedies.record_verdict(store, approval, verdict, reason, decided_by,
+                                central=central, project=project)
+    else:
+        message = (dismissed_message(approval, reason, decided_by, learned)
+                   if verdict == "dismissed"
+                   else _VERDICT_MESSAGE[verdict](approval, reason, decided_by))
+        store.queue_message(approval["wo_id"], message, source="gate")
     if verdict == "dismissed":
         store.add_event(approval["wo_id"], "gate_dismissed", {
             "approval_id": approval_id,
@@ -768,9 +816,14 @@ def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
     # since a second request still with Neo — or one escalated to the user, which
     # `pending_approvals` also returns — is still a genuine wait. `end_wait_if_nothing_is_out`
     # counts an unanswered Neo QUESTION as out too: this work order can be waiting on both.
-    from .invariants import end_wait_if_nothing_is_out
+    #
+    # A `self_heal` verdict skips it entirely, for the reason at the top of the guard:
+    # there was no wait to end, so the only thing this could do here is move a status
+    # nothing in this flow set.
+    if not self_heal:
+        from .invariants import end_wait_if_nothing_is_out
 
-    end_wait_if_nothing_is_out(store, approval["wo_id"])
+        end_wait_if_nothing_is_out(store, approval["wo_id"])
     return approval
 
 
