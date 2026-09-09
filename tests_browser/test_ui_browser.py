@@ -508,7 +508,10 @@ def test_a_burning_turn_is_reviewed_and_acked_in_the_browser(
             return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(t))
         (root / "-proj" / f"{wo['id']}.jsonl").write_text(
             "".join(json.dumps(r) + "\n" for r in [
-                {"type": "user", "timestamp": stamp(at), "promptSource": "sdk",
+                # AFTER the turn row, as `claude` writes it — and `stamp` floors to the
+                # second, so it has to be a whole one. A transcript turn older than the
+                # dispatch is the PREVIOUS turn, which `inspection.alarms` will not judge.
+                {"type": "user", "timestamp": stamp(at + 1), "promptSource": "sdk",
                  "message": {"content": "You are the worker agent for " + wo["id"]}},
                 {"type": "assistant", "timestamp": stamp(at + 5),
                  "message": {"id": "m1", "model": "claude-opus-5",
