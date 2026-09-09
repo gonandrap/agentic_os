@@ -5,9 +5,12 @@ Grouped commands:
   jarvis cost [project|wo-id|fo-id]       what the work has cost in tokens
   jarvis inspect <wo-id|fo-id>            where its TIME went, and which cache writes
                                           were a defect rather than the cache expiring
-  jarvis alarms [project]                 turns raised WHILE they were still burning
+  jarvis alarms [project] [--wo|--fo|--source]   findings, newest first: a turn raised
+                                          WHILE it burned, or a probe's symptom
   jarvis alarms show|review <al-id>       one alarm, and your verdict on the
                                           supervisor's
+  jarvis supervisor probes [project]      what this project is watched for, and where
+                                          each answer came from
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
   jarvis fo create|list|show|plan|submit|approve|cancel feature orders (planned sets)
   jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
@@ -184,6 +187,7 @@ def build_parser() -> argparse.ArgumentParser:
     # A leaf module with no store or CLI dependency, so importing it here costs nothing
     # and lets `--help` state the shipped defaults rather than repeating their values.
     from . import catalog
+    from .project_store import ALARM_SOURCES
 
     p = argparse.ArgumentParser(prog="jarvis", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -254,6 +258,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=50,
                     help="alarms to show (default: 50)")
     sp.add_argument("--wo", help="one work order's alarms, with their ids")
+    sp.add_argument("--fo", help="one feature order's findings, however they were "
+                                "carried, with their ids")
+    sp.add_argument("--source", choices=ALARM_SOURCES,
+                    help="cost (a burning turn) or health (a probe found a symptom)")
     sp.add_argument("--json", action="store_true")
 
     sp = alarms.add_parser("show", help="one alarm: what fired, and what came of it")
@@ -269,6 +277,18 @@ def build_parser() -> argparse.ArgumentParser:
                          "have decided")
     sp.add_argument("--feedback", default="", help="required with --reject")
     sp.add_argument("--project")
+    sp.add_argument("--json", action="store_true")
+
+    # the supervisor's own settings, as opposed to what it decided —
+    # docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §2.
+    sup = sub.add_parser(
+        "supervisor", help="what the supervisor watches for, and how it is configured",
+    ).add_subparsers(dest="supervisor_cmd", required=True)
+    sp = sup.add_parser(
+        "probes", help="the health probes in force, and where each one came from")
+    sp.add_argument("project", nargs="?",
+                    help="one project (default: the fleet's own list)")
+    sp.add_argument("--catalog", help="read this catalog instead of the registered one")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
@@ -866,7 +886,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             icon = STATUS_ICON.get(wo["status"], "•")
             badge = ORIGIN_BADGE.get(wo["origin"], wo["origin"])
             att = f"  ⚠ {wo['attention_reason']}" if wo["needs_attention"] else ""
-            print(f"    {icon} {wo['id']} [{badge}] {wo['title']} ({wo['status']}){att}")
+            # `status_label`, not `status`: for a `pending` order it also says WHY it is
+            # not starting — a dependency, a feature's slot cap, or the account's
+            # (`invariants.status_label`). A bare "pending" reads as "about to start".
+            print(f"    {icon} {wo['id']} [{badge}] {wo['title']} "
+                  f"({wo.get('status_label') or wo['status']}){att}")
     if st["backlog"]["open"]:
         print(f"\n🗂 backlog: {st['backlog']['open']} open items — `jarvis backlog list`")
     return 0
@@ -1406,24 +1430,28 @@ def cmd_alarms(args: argparse.Namespace) -> int:
         return cmd_alarms_show(args)
     if args.alarms_cmd == "review":
         return cmd_alarms_review(args)
-    rows = ops.list_cost_alarms(args.project, limit=args.limit, wo_id=args.wo)
+    rows = ops.list_cost_alarms(args.project, limit=args.limit, wo_id=args.wo,
+                                fo_id=args.fo,
+                                sources=(args.source,) if args.source else None)
     if args.json:
         _print(rows, True)
         return 0
     if not rows:
-        print(f"no cost alarm has ever been raised against {args.wo}" if args.wo
+        subject = args.wo or args.fo
+        print(f"no cost alarm has ever been raised against {subject}" if subject
               else "no cost alarm has ever been raised")
         return 0
     live = [r for r in rows if r["live"]]
     print(f"{len(live)} asking for you · {len(rows) - len(live)} on the record\n")
     for row in rows:
         mark = "!" if row["live"] else " "
-        # The id only on the read that asked for one order: §1 of
+        # The id only on the reads that asked for one subject: §1 of
         # docs/superpowers/specs/2026-08-31-the-supervisor.md wants every surface that
         # reads alarms today to render exactly as it does today.
-        who = f"{row['id']}  " if args.wo else f"{row['wo_id']}  {row['project']}  "
+        who = (f"{row['id']}  " if (args.wo or args.fo)
+               else f"{row['subject_id']}  {row['project']}  ")
         print(f"{mark} {who}{row['kind']}  "
-              f"turn {row['seq']}  {_age(row['ts'])} ago")
+              f"{ops.turn_label(row['seq'])}  {_age(row['ts'])} ago")
         print(f"    {row['reason']}")
     if live:
         print("\nack one with: jarvis wo ack <wo-id>")
@@ -1438,8 +1466,8 @@ def cmd_alarms_show(args: argparse.Namespace) -> int:
     if args.json:
         _print(a, True)
         return 0
-    print(f"{a['id']}  {a['project']}  {a['wo_id']}  {a['title']}")
-    print(f"  {a['kind']}  turn {a['seq']}  {_age(a['ts'])} ago"
+    print(f"{a['id']}  {a['project']}  {a['subject_id']}  {a['title']}")
+    print(f"  {a['kind']}  {ops.turn_label(a['seq'])}  {_age(a['ts'])} ago"
           f"{'  ! still asking' if a['live'] else ''}")
     print(f"  what fired: {a['reason']}")
     if a["verdict"]:
@@ -1475,6 +1503,42 @@ def cmd_alarms_review(args: argparse.Namespace) -> int:
     if res["neo_question_closed"]:
         print("  the Neo question it escalated is closed — you have just answered it")
     return 0
+
+
+def cmd_supervisor(args: argparse.Namespace) -> int:
+    """`jarvis supervisor probes [project]` — the symptom catalogue, resolved.
+
+    THE SOURCE COLUMN IS THE COMMAND. A resolved list on its own answers "what is this
+    watched for"; the source answers "and who decided that", which is the half that goes
+    wrong silently when inheritance is by id (§2). The prompts themselves are shown
+    truncated: they are paragraphs, and a terminal that dumps five of them buries the
+    inheritance the reader came for. `--json` carries them whole.
+    """
+    from . import ops
+
+    rows = ops.supervisor_probes(args.project, catalog_path=args.catalog)
+    if args.json:
+        _print(rows, True)
+        return 0
+
+    scope = f"project {args.project}" if args.project else "the fleet"
+    print(f"health probes for {scope} ({len(rows)}, "
+          f"{sum(1 for r in rows if r['enabled'])} enabled)\n")
+    for row in rows:
+        mark = "·" if row["enabled"] else "✗"
+        print(f"{mark} {row['id']:<20} {row['source']:<17} "
+              f"{'' if row['enabled'] else 'disabled  '}"
+              f"{'+'.join(row['subjects'])}")
+        print(f"    {row['title']} — {_one_line(row['prompt'], 110)}")
+    if not rows:
+        print("no probes are configured — this project is watched for nothing")
+    return 0
+
+
+def _one_line(text: str, limit: int) -> str:
+    """A paragraph as a single clipped line, for a listing."""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else flat[:limit].rstrip() + "…"
 
 
 def cmd_cost(args: argparse.Namespace) -> int:
@@ -2693,6 +2757,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_inspect(args)
         if args.cmd == "alarms":
             return cmd_alarms(args)
+        if args.cmd == "supervisor":
+            return cmd_supervisor(args)
         if args.cmd == "adopt":
             return cmd_adopt(args)
         if args.cmd == "wo":

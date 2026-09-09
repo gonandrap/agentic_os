@@ -45,6 +45,7 @@ _RENAMES: dict[type, dict[str, str]] = {
         "default_effort": "defaults.effort",
         "default_permission_mode": "defaults.permission_mode",
         "default_max_concurrent": "defaults.max_concurrent",
+        "max_in_flight": "defaults.max_in_flight",
         "default_autocompact_window": "defaults.autocompact_window",
         "notification_sinks": "notifications.sinks",
         "telegram_token_env": "notifications.telegram.token_env",
@@ -97,6 +98,12 @@ def _jsonable(value: Any) -> Any:
     rebuild the dataclass it came from — see `_coerce` for the way back."""
     if isinstance(value, Path):
         return str(value)
+    # A dataclass reached as a VALUE rather than as a namespace to flatten —
+    # `catalog.SupervisorConfig.probes` is a tuple of them. Same predicate as `_flatten`
+    # above. `_coerce`, the way back, needs no matching branch: its only caller is
+    # `validation_config_from_resolved`, and `ValidationConfig` holds no dataclass.
+    if is_dataclass(value) and not isinstance(value, type):
+        return {f.name: _jsonable(getattr(value, f.name)) for f in fields(value)}
     if isinstance(value, (frozenset, set)):
         return sorted(str(v) for v in value)
     if isinstance(value, (tuple, list)):

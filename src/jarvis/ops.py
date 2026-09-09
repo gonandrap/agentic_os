@@ -27,7 +27,7 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import config_version, db, invariants
+from . import config_version, db, fleet, invariants
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import CentralStore
 from .daemon import daemon_running
@@ -36,6 +36,7 @@ from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
+    NO_TURN,
     OPEN_STATUSES,
     ProjectStore,
 )
@@ -359,11 +360,17 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         pid = daemon_running()
         projects = []
         attention: list[dict[str, Any]] = []
-        # Best-effort map of each project's worker permission mode, to catch a fleet
-        # misconfigured into a mode that stalls background workers (see below).
+        # Two things off the catalog. A best-effort map of each project's worker
+        # permission mode, to catch a fleet misconfigured into a mode that stalls
+        # background workers (see below) — and the ACCOUNT's own state: how many worker
+        # turns are in flight against `os.defaults.max_in_flight`, and whether Claude is
+        # refusing them (src/jarvis/fleet.py). The second is what a `pending` work order
+        # that is not starting can be waiting for, and no per-project read can see it.
+        fleet_state = None
         try:
             _cat = catalog or resolve_catalog()
             mode_by_project = {ps.name: ps.worker.permission_mode for ps in _cat.projects}
+            fleet_state = fleet.current(_cat)
         except (OpsError, CatalogError):
             mode_by_project = {}
         # Read Neo's questions BEFORE the project loop, not after it: a question Neo sent
@@ -493,7 +500,11 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                          # Same rule, for the other reason a work order can be sitting
                          # still: the transport dropped its turn — the usage limit, or
                          # the API failing — and it retries itself at N.
-                         "pause": invariants.pause_note(store, wo)}
+                         "pause": invariants.pause_note(store, wo),
+                         # And the whole answer in one string, fleet state included, so
+                         # `jarvis status` prints what the dashboard shows rather than a
+                         # bare status word.
+                         "status_label": invariants.status_label(store, wo, fleet_state)}
                         for wo in open_wos
                     ],
                     "settings_drift": drift,
@@ -1084,9 +1095,21 @@ ALARM_STANDING = {
     "reviewing": "with the supervisor",
     "acked": "acked by the supervisor",
     "escalated": "escalated to Neo",
+    "proposed": "a remedy proposed",
     "skipped": "not reviewed",
     "failed": "supervisor failed",
 }
+
+
+def turn_label(seq: int | None) -> str:
+    """"turn 3", or "no turn" for a finding that judged a subject rather than a turn.
+
+    One formatter for the same reason `alarm_standing_line` is one: `wo_alarms.seq` is
+    NOT NULL and a subject-level finding stores `project_store.NO_TURN`, so every
+    surface that prints it would otherwise be one edit away from showing the user
+    `turn -1`. §1 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+    """
+    return "no turn" if seq is None or seq == NO_TURN else f"turn {seq}"
 
 
 def alarm_standing_line(alarms: list[dict[str, Any]]) -> str:
@@ -1360,6 +1383,11 @@ def feature_event(store: ProjectStore, fo_id: str, kind: str,
     while `os.validation.enabled` was false has none, and the user can cancel one — and
     the caller must not treat a lost event as a written one: the round machine counts
     transport outages from these rows.
+
+    Manager-only ON PURPOSE, and it is the NARROW case of
+    `ProjectStore.carrier_for_feature`: this loop addresses the manager specifically, so
+    falling back to a planner or a child would file a round on a session that is not the
+    one being asked. Anything not addressed to the manager uses the general rule.
     """
     manager = store.manager_work_order(fo_id)
     if not manager:
@@ -4410,19 +4438,38 @@ def inspect_report(target: str, project: str | None = None, *,
 
 
 def _alarm_dict(name: str, row: dict[str, Any]) -> dict[str, Any]:
-    """The sixteen keys `list_cost_alarms` publishes, from one `alarms_across` row.
+    """The twenty keys `list_cost_alarms` publishes, from one `alarms_across` row.
 
-    Frozen by §1 of docs/superpowers/specs/2026-08-31-the-supervisor.md and bound by
-    four surfaces written against it at once, so it lives in one function rather than
-    inline: the review reads below build on top of this dict and must not be able to
-    drift from it. Anything a review surface needs beyond these keys is ADDED by
-    `_reviewable`, never smuggled in here.
+    Frozen at sixteen by §1 of docs/superpowers/specs/2026-08-31-the-supervisor.md
+    (`kn-4d8449f1`) and bound by four surfaces written against it at once, so it lives
+    in one function rather than inline: the review reads below build on top of this dict
+    and must not be able to drift from it. Anything a review surface needs beyond these
+    keys is ADDED by `_reviewable`, never smuggled in here.
+
+    §1 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md adds four —
+    `source`, `probe`, `subject_kind`, `subject_id` — and the licence stops there.
+    `subject_id` is published rather than derived so no surface has to branch to build a
+    link.
+
+    TWO OF THE SIXTEEN NOW COME FROM THE SUBJECT AND ONE DELIBERATELY DOES NOT, and that
+    split is what lets every template render a feature finding unchanged:
+
+    - `title` and `status` are the SUBJECT's — the feature order's when there is one.
+      A reader asked what is wrong; the carrier is plumbing.
+    - `live` stays the CARRIER's `needs_attention`, because a feature order's attention
+      flag has no `acknowledged_blockers` analogue and is wiped unconditionally at eight
+      sites. The ack has to be able to stick, so the flag lives on the work order.
+
+    For every alarm on the tree today the subject IS the carrier, so swapping those two
+    rules is a no-op on the whole suite — only a fixture whose feature and carrier carry
+    different titles and statuses can tell them apart.
     """
+    feature = row.get("subject_kind") == "feature_order"
     return {
         "project": name,
         "wo_id": row["wo_id"],
-        "title": row["title"],
-        "status": row["status"],
+        "title": (row["fo_title"] if feature else row["title"]),
+        "status": (row["fo_status"] if feature else row["status"]),
         "hidden": bool(row["hidden"]),
         "ts": row["ts"],
         "kind": row["kind"],
@@ -4435,11 +4482,16 @@ def _alarm_dict(name: str, row: dict[str, Any]) -> dict[str, Any]:
         "note": row["note"],
         "review_status": row["review_status"],
         "neo_question_id": row["neo_question_id"],
+        "source": row["source"],
+        "probe": row["probe"],
+        "subject_kind": row["subject_kind"],
+        "subject_id": row["fo_id"] or row["wo_id"],
     }
 
 
 def list_cost_alarms(project_name: str | None = None, limit: int = 200,
-                     wo_id: str | None = None) -> list[dict[str, Any]]:
+                     wo_id: str | None = None, fo_id: str | None = None,
+                     sources: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
     """Every turn the OS raised WHILE it was burning, newest first, across the fleet.
 
     Read off `wo_alarms` rows since §1 of
@@ -4452,6 +4504,9 @@ def list_cost_alarms(project_name: str | None = None, limit: int = 200,
     for the user, never `alarm_status`. That is why several alarms on one order share it
     — one ack answers all of them, and the page has to be able to say so rather than
     offering four buttons that do the same thing.
+
+    `fo_id` and `sources` are filters, not modes: the unfiltered read still returns
+    every finding, feature-subject ones included, with its subject already resolved.
     """
     paths = registered_project_paths()
     if project_name:
@@ -4464,12 +4519,62 @@ def list_cost_alarms(project_name: str | None = None, limit: int = 200,
             continue
         store = ProjectStore(path)
         try:
-            rows = store.alarms_across(limit=limit, wo_id=wo_id)
+            rows = store.alarms_across(limit=limit, wo_id=wo_id, fo_id=fo_id,
+                                       sources=sources)
         finally:
             store.close()
         out.extend(_alarm_dict(name, row) for row in rows)
     out.sort(key=lambda r: r["ts"], reverse=True)
     return out[:limit]
+
+
+# -- the symptom catalogue: what a project is watched for ------------------------------
+
+
+def supervisor_probes(project_name: str | None = None,
+                      catalog_path: str | None = None) -> list[dict[str, Any]]:
+    """The health probes in force, each with WHERE ITS ANSWER CAME FROM.
+
+    `kn-42c52cec`'s lesson: a resolved value the user cannot see is a value they cannot
+    trust, and probe inheritance is exactly the kind of resolution that goes wrong
+    quietly — a project that switches one off looks identical, on every other surface,
+    to a project that never had it. `source` is the whole point of the read:
+
+    - `fleet` — the OS list's entry, untouched here;
+    - `project override` — the project named this id and changed something, INCLUDING
+      disabling it (a disabled probe is present and marked, never absent, so what the
+      fleet watches for stays legible);
+    - `project addition` — an id the OS list does not have.
+
+    Raises rather than answering `None` on an unreadable catalog: unlike
+    `validation_config`, nothing depends on this to keep working — it is a read someone
+    typed, and a silent empty list would read as "this project is watched for nothing".
+
+    §2 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+    """
+    from dataclasses import asdict
+
+    catalog = resolve_catalog(catalog_path)
+    fleet = {p.id: p for p in catalog.os.supervisor.probes}
+    if project_name is None:
+        resolved = catalog.os.supervisor.probes
+    else:
+        resolved = project_spec(catalog, project_name).supervisor.probes
+
+    out: list[dict[str, Any]] = []
+    for probe in resolved:
+        base = fleet.get(probe.id)
+        if base is None:
+            source = "project addition"
+        elif base != probe:
+            source = "project override"
+        else:
+            source = "fleet"
+        row = asdict(probe)
+        row["subjects"] = list(probe.subjects)
+        row["source"] = source
+        out.append(row)
+    return out
 
 
 # -- the review loop: what the supervisor decided, and what the user makes of it -------

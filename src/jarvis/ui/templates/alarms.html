@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_alarm.html" import verdict_body, review_form %}
+{% from "_alarm.html" import verdict_body, review_form, subject_link %}
 {% block title %}Alarms — Jarvis{% endblock %}
 {% block content %}
 
@@ -24,23 +24,32 @@
 <h2>Asking for you</h2>
 <div class="panel">
   {% for g in live %}
-  <div class="msg" id="alarm-{{ g.wo_id }}">
+  <div class="msg" id="alarm-{{ g.subject_id }}">
     <div class="who tone-warn">{{ g.project }} ·
-      <a href="/wo/{{ g.project }}/{{ g.wo_id }}" class="mono">{{ g.wo_id }}</a> ·
+      {{ subject_link(g) }} ·
       {{ g.status }} · {{ fmt_age(g.alarms[0].ts) }} ago</div>
     <div style="margin:6px 0">{{ g.title }}</div>
     <ul class="timeline" style="border-top:1px solid var(--line); margin-top:8px">
       {% for a in g.alarms %}
-      <li><span class="tone-warn">{{ a.kind }}</span> · turn {{ a.seq }} ·
+      <li><span class="tone-warn">{{ a.kind }}</span> · {{ turn_label(a.seq) }} ·
         {{ fmt_ts(a.ts) }} ·
         <a href="/alarms/{{ a.project }}/{{ a.id }}" class="mono">{{ a.id }}</a>
         <span class="detail">{{ a.reason }}</span>
       </li>
       {% endfor %}
     </ul>
-    {# One button for the whole order, not one per alarm: the attention flag carries a
-       single sentence, so there was only ever one ask to answer. `back` returns the user
-       to this queue instead of the order's page — they are working through a list. #}
+    {# One button for the whole subject, not one per alarm: the attention flag carries a
+       single sentence, so there was only ever one ask to answer. It posts to the CARRIER
+       work order even when the subject is a feature — `work_orders` is where the ack has
+       an `acknowledged_blockers` column to stick in. `back` returns the user to this
+       queue instead of the order's page: they are working through a list.
+
+       KNOWN, AND DELIBERATELY NOT FIXED HERE (Neo, question 216): a feature whose
+       findings were filed through TWO carriers is one group with one button, and that
+       button clears one carrier's flag — so the group returns still labelled "all N".
+       `carrier_for_feature` is deterministic, so this only arises when the carrier
+       changed between sweeps. Widening the ack to every carrier is ack semantics and
+       belongs where `ops.ack_attention` is being extended, not in a read. #}
     <form method="post" action="/wo/{{ g.project }}/{{ g.wo_id }}/ack" class="inline"
           style="margin-top:10px">
       <input type="hidden" name="back" value="alarms">
@@ -88,16 +97,18 @@
     tick.
   </p>
   <table>
-    <tr><th>when</th><th>project / wo</th><th>kind</th><th>turn</th><th>what it said</th>
-      <th>supervisor</th><th>you</th></tr>
+    <tr><th>when</th><th>project / subject</th><th>kind</th><th>turn</th>
+      <th>what it said</th><th>supervisor</th><th>you</th></tr>
     {% for a in history %}
     <tr>
       <td class="mono">{{ fmt_ts(a.ts) }}<div class="sub">{{ fmt_age(a.ts) }} ago</div></td>
       <td class="mono" style="white-space:nowrap">{{ a.project }}<br>
-        <a href="/wo/{{ a.project }}/{{ a.wo_id }}">{{ a.wo_id }}</a></td>
+        {{ subject_link(a) }}</td>
       <td class="mono">{{ a.kind }}
         <div class="sub">{{ kinds.get(a.kind, '') }}</div></td>
-      <td class="mono">{{ a.seq if a.seq is not none else '—' }}</td>
+      {# The column is already headed "turn", so it carries the number alone — and a
+         subject-level finding gets the em dash this cell already uses for "none". #}
+      <td class="mono">{{ '—' if a.seq is none or a.seq == no_turn else a.seq }}</td>
       <td><a href="/alarms/{{ a.project }}/{{ a.id }}">{{ a.reason }}</a>
         <div class="sub">{{ a.title }}{% if a.hidden %} · hidden{% endif %}</div></td>
       <td class="mono">{{ a.verdict or a.alarm_status }}</td>

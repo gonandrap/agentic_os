@@ -103,7 +103,8 @@ uv tool install --editable ".[ui]"       # or: ./install.sh --tag jarvis-X.Y.Z
 ```json
 {
   "os": {
-    "defaults": { "model": "claude-opus-5", "permission_mode": "auto", "max_concurrent": 5 },
+    "defaults": { "model": "claude-opus-5", "permission_mode": "auto",
+                  "max_concurrent": 5, "max_in_flight": 3 },
     "notifications": { "sinks": ["log", "telegram"] }
   },
   "projects": [

@@ -49,13 +49,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import bugreport, bus, claude_cli, db, worker_session
+from . import bugreport, bus, claude_cli, db, fleet, worker_session
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     ACTIVE_STATUSES,
+    FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
     OPEN_STATUSES,
     PRE_APPROVED_KEY,
@@ -185,6 +186,14 @@ class Daemon:
         self.supervisor_pool = ThreadPoolExecutor(max_workers=1,
                                                   thread_name_prefix="supervisor")
         self.supervisor_draining = False
+        # THE SWEEP GETS ITS OWN POOL AND ITS OWN GUARD, and not the supervisor's — §4
+        # of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md. The
+        # supervisor is event-driven off a threshold and answers a turn that is burning
+        # money right now; a fleet sweep queued in front of it would delay the thing the
+        # whole mechanism was built for. The tick thread and Neo's are out for the same
+        # reasons they are out for the supervisor.
+        self.health_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="health")
+        self.health_sweeping = False
         # Validation runs off the tick thread for the same reason Neo does, only more
         # so: a round is up to five headless calls at a 300s timeout each, and run
         # inline it would freeze every project in the catalog behind one work order's
@@ -223,6 +232,17 @@ class Daemon:
         if project.name not in self.stores:
             self.stores[project.name] = ProjectStore(project.path)
         return self.stores[project.name]
+
+    def _fleet_stores(self) -> dict[str, ProjectStore]:
+        """Every live project's store, for a question about the account (`fleet.read`).
+
+        Built from the catalog rather than handing over `self.stores`, which holds only
+        the projects some earlier tick happened to open — on the first tick after a
+        restart that is none of them, and an account-wide hold that a restart clears is
+        not a hold.
+        """
+        return {p.name: self.store_for(p)
+                for p in self.catalog.projects if p.path.is_dir()}
 
     # -- configuration reload ---------------------------------------------------
 
@@ -401,6 +421,19 @@ class Daemon:
         # or the listing failed — and is NOT the same as an empty roster, which would
         # mean every injected session ended. Session tracking is skipped on None.
         sessions_by_project: dict[str, list[claude_cli.BgSession]] | None = None
+        # The ACCOUNT's state, read ONCE for the whole tick and then spent down as turns
+        # launch. Outside the project loop because it is not a project's fact: a fleet
+        # count re-read per project would let each project's dispatch pass believe the
+        # previous one's launches had not happened, which is how a cap of 3 lets a
+        # ten-project fleet start thirty turns.
+        #
+        # Turns are settled INSIDE the loop, below, so this count is a tick old for the
+        # projects settled after the first. It can therefore hold a slot for a turn that
+        # has just ended, never release one for a turn that is still running — the safe
+        # direction, and self-correcting one tick later.
+        state = fleet.read(self.catalog.os.max_in_flight, self._fleet_stores())
+        if fleet.announce(self.central, state):
+            log.warning("fleet held: %s", state.blocked())
         # The roster is a subprocess, and tracking injected sessions is the only thing
         # left that reads it. With nothing injected there is nothing to track, so the
         # common case — a project driven entirely by dispatched work orders — pays
@@ -433,7 +466,7 @@ class Daemon:
                 # message goes out, or the user's earlier message — already marked
                 # delivered, and living only on that turn row — would be skipped.
                 if retry_paused:
-                    self.retry_paused_turns(project, store)
+                    self.retry_paused_turns(project, store, state)
                 # Before delivery, not after: an envelope BECOMES a queued message,
                 # so routing it first lets it go out as this tick's turn instead of
                 # waiting a whole poll interval for the next pass. With no envelope ever
@@ -453,7 +486,7 @@ class Daemon:
                 # pending work order, so it is claimed by the same pass rather than
                 # waiting a whole poll interval to start.
                 self.plan_features(project, store)
-                self.dispatch_pending(project, store)
+                self.dispatch_pending(project, store, state)
                 if poll_prs:
                     self.poll_pull_requests(project, store)
                 # After the pull-request poll, so the merge that completes a feature's
@@ -493,6 +526,12 @@ class Daemon:
         # judged on this tick rather than one reconcile interval later — and OUTSIDE it,
         # so no project waits on another project's review.
         self.supervisor_tick()
+        # AFTER the supervisor's kick, never before: both run off their own pools, and
+        # the order here is the order the two get their turn at the catalog. A sweep
+        # that raised on this tick is judged on the next one, which is the cadence §4
+        # designs for — the sweep answers "is something wrong", the review answers
+        # "does the user need to know".
+        self.health_tick()
 
         # Before routing: a dashboard failure raised here goes out with this tick's
         # notifications instead of waiting for the next one.
@@ -549,8 +588,24 @@ class Daemon:
 
     # -- 4. dispatch -------------------------------------------------------------
 
-    def dispatch_pending(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def dispatch_pending(self, project: ProjectSpec, store: ProjectStore,
+                         state: fleet.Fleet | None = None) -> None:
+        """Claim and launch what this project may run — under BOTH caps.
+
+        `max_concurrent` rations the project; `state` rations the account, which is not
+        divided among projects and is what ran out on 2026-09-02 (src/jarvis/fleet.py).
+        Whichever is tighter binds, the same way the per-feature cap already sits beside
+        the project one in `claim_next_pending`.
+
+        The fleet check goes BEFORE the claim, not after: a claimed work order is already
+        `dispatching`, and leaving one there with no turn behind it is the state
+        `settle_work_order` fails as "worker turn never started". Held back, it never
+        leaves `pending` and nothing is written at all — the same nothing a
+        dependency-blocked order costs, and why neither raises attention.
+        """
         while store.count_active() < project.max_concurrent:
+            if state is not None and state.blocked():
+                return
             wo = store.claim_next_pending()
             if wo is None:
                 return
@@ -561,6 +616,9 @@ class Daemon:
                 )
             except claude_cli.ClaudeCliError as e:
                 log.error("[%s] dispatch of %s failed: %s", project.name, wo["id"], e)
+                continue
+            if state is not None:
+                state.launched()
 
     # -- staged releases (thin hooks; all logic in src/jarvis/release.py) --------------
 
@@ -850,7 +908,8 @@ class Daemon:
 
     # -- 2b. self-healing after the transport fails -----------------------------------
 
-    def retry_paused_turns(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def retry_paused_turns(self, project: ProjectSpec, store: ProjectStore,
+                           state: fleet.Fleet | None = None) -> None:
         """Relaunch the turns the transport lost, once their wait is up.
 
         The OS's only loop that repairs a work order without being asked, and it is
@@ -872,8 +931,17 @@ class Daemon:
         same for all: a refused turn was never sent, so the prompt goes again verbatim; a
         turn that died in flight already reached the model, so the worker is nudged to
         continue instead.
+
+        UNDER THE FLEET CAP, and this pass is the one that most needs it. Four siblings
+        refused by the same window come due in the same second, and on 2026-09-02 they
+        resumed together: 362k + 361k + 325k + 322k tokens re-written at the cache-WRITE
+        rate, and four `uv run pytest` runs on one machine. Nothing is lost by staggering
+        them — a turn held here is not skipped, it is picked up by the next pass ten
+        seconds later, because `turn_pause` is re-derived and stays due.
         """
         for wo in store.list_work_orders(statuses=ACTIVE_STATUSES):
+            if state is not None and state.blocked():
+                return
             if wo["origin"] in UNGOVERNED_ORIGINS:
                 continue  # the user's own session; Jarvis does not drive it
             try:
@@ -894,6 +962,8 @@ class Daemon:
             except Exception:  # noqa: BLE001 — one work order must not stall the rest
                 log.exception("[%s] retry of %s failed", project.name, wo["id"])
                 continue
+            if state is not None:
+                state.launched()
             log.info("[%s] %s resumed after %s (attempt %s/%s, turn %s)",
                      project.name, wo["id"], pause.reason, pause.attempts,
                      pause.max_attempts or "∞", turn["seq"])
@@ -2134,6 +2204,94 @@ class Daemon:
             log.info("[%s] alarm %s: %s (%s)", project.name, alarm["id"],
                      verdict["decision"], verdict["reason"][:cfg.reason_chars])
 
+    # -- 5d. the health sweep: looking before anything crosses a threshold ------------
+
+    def _health_projects(self) -> list[ProjectSpec]:
+        """Projects being swept on THIS tick — §4 of
+        docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+
+        Two switches, not one: `health_enabled` sits on top of `supervisor.enabled`,
+        because a project may want a reviewer for its cost alarms without also paying
+        the standing cost of watching. The cadence is per project for the same reason
+        every other threshold is.
+        """
+        return [p for p in self.catalog.projects
+                if p.supervisor.enabled and p.supervisor.health_enabled
+                and p.path.is_dir()
+                and self.tick_count % p.supervisor.health_every_ticks == 1]
+
+    def health_tick(self) -> None:
+        """Kick a sweep when a unit is due and none is running.
+
+        Modelled on `supervisor_tick`, including the guard: a sweep still in flight must
+        never have a second one queued behind it, because the candidate list would be
+        computed against state the first one is still writing. With no project swept it
+        opens no store and reads no row.
+        """
+        due = self._health_projects()
+        if not due or self.health_sweeping:
+            return
+        self.health_sweeping = True
+        future = self.health_pool.submit(self._health_sweep, due)
+        future.add_done_callback(lambda f: setattr(self, "health_sweeping", False))
+
+    def _health_candidates(self, pstore: ProjectStore,
+                           cfg: Any) -> list[tuple[float, dict, str]]:
+        """Every open unit due for a look, LONGEST-UNREVIEWED FIRST.
+
+        The order is what makes `health_max_units_per_tick` a rotation rather than a
+        starvation: sorted by last look, the units the cap cut off this tick are the
+        ones at the front of the next one.
+
+        `waiting_input` is in `OPEN_STATUSES` and belongs here on purpose — an order
+        parked behind a message nobody will send is exactly what `waiting-on-nobody`
+        exists to catch, and it is invisible to every cost heuristic.
+        """
+        from . import health
+
+        now = db.now()
+        subjects = [{"kind": "work_order", "row": wo}
+                    for wo in pstore.list_work_orders(statuses=OPEN_STATUSES)
+                    if wo["origin"] not in UNGOVERNED_ORIGINS]
+        subjects += [{"kind": "feature_order", "row": fo}
+                     for fo in pstore.list_feature_orders(statuses=FO_OPEN_STATUSES)
+                     # A feature with no carrier has no session at all and nothing to
+                     # record a finding on — see `carrier_for_feature`.
+                     if pstore.carrier_for_feature(fo["id"]) is not None]
+        out = []
+        for subject in subjects:
+            row = subject["row"]
+            last = pstore.last_health_review(subject["kind"], row["id"])
+            trigger = health.due(last, health.fingerprint(pstore, subject), cfg, now,
+                                 float(row.get("created_at") or 0.0))
+            if trigger:
+                out.append((float(last["ts"]) if last else 0.0, subject, trigger))
+        out.sort(key=lambda c: c[0])
+        return out
+
+    def _health_sweep(self, projects: list[ProjectSpec]) -> None:
+        """Sweep each project's due units, capped (on the health thread)."""
+        from . import supervisor as supervisor_mod
+        from .neo_store import NeoStore
+
+        neo_store = NeoStore()   # thread-local connections, as `_supervisor_drain` does
+        try:
+            for project in projects:
+                cfg = project.supervisor
+                pstore = ProjectStore(project.path)
+                try:
+                    for _, subject, trigger in self._health_candidates(
+                            pstore, cfg)[:cfg.health_max_units_per_tick]:
+                        supervisor_mod.review_health(
+                            pstore, neo_store, project.name, subject, cfg.probes, cfg,
+                            trigger, inspect_cfg=project.inspect)
+                except Exception:  # noqa: BLE001 — one project must not stop the rest
+                    log.exception("health sweep failed for %s", project.name)
+                finally:
+                    pstore.close()
+        finally:
+            neo_store.close()
+
     # -- 7. invariants (post-conditions) --------------------------------------------------
 
     def check_invariants(self, project: ProjectSpec, store: ProjectStore) -> None:
@@ -2212,7 +2370,8 @@ class Daemon:
                 continue
             try:
                 raised = inspection.live_alarms(session_id, cfg, wo_id=wo["id"],
-                                                now=now, index=index)
+                                                now=now, index=index,
+                                                dispatched=turn["started_at"])
             except OSError:
                 continue  # a transcript Jarvis cannot read is not a work order in trouble
             seen = [db.from_json(e["payload"], {}) or {}

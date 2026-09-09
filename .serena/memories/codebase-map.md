@@ -20,6 +20,15 @@
   Also `run_headless()` (Neo), `_briefing_args()`, `ClaudeCliError`.
 - `timeline.py` — render `wo_events` into a human timeline. `build_timeline()`:95,
   `count_debug()`:123, `event_level()`:40, `DEBUG_KINDS`:19, `STATUS_LABEL`:28.
+- `probes.py` — the HEALTH PROBES: what counts as a work order or feature order going
+  badly, as prose the supervisor is handed. `HealthProbe`, `DEFAULT_PROBES` (five shipped
+  symptoms), `resolve(base, override)` (per-project inheritance is MERGE BY ID, not
+  replacement — a project may disable an inherited probe, never delete it),
+  `armed(probes, subject_kind)`, `render_checklist()`, `RESERVED_IDS` (a probe id may not
+  shadow an `inspection` alarm kind). Held by `catalog.SupervisorConfig.probes`, read out
+  by `ops.supervisor_probes` / `jarvis supervisor probes`, appended to
+  `supervisor.build_system_prompt(..., probes=…)`. Spec:
+  docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §2.
 - `testing.py` — reusable pytest fixtures + the fake `claude` executable so suites never
   touch the real CLI. `FAKE_CLAUDE`:16, fixtures `jarvis_home`:124, `fake_claude`:131,
   `claude_json`:194, `project`:209, `catalog_file`:216, `make_git_project()`:184.
