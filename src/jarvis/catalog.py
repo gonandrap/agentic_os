@@ -284,6 +284,14 @@ DEFAULT_INSPECT_ALARM_JOIN_SECONDS = 300
 #: single event.
 DEFAULT_INSPECT_ALARM_WRITE_TOKENS = 300_000
 
+#: How long a work order may sit with its turn ended and nothing in flight before
+#: `invariants.parked_reason` calls it parked. THE ONE THRESHOLD HERE THAT IS NOT ABOUT
+#: SPEND: the other three ask "is this costing too much", this one asks "is anything
+#: going to happen to this at all". An hour rather than minutes because the ordinary
+#: settlement path moves a finished turn within one reconcile tick, so anything still
+#: sitting here an hour later is not slow, it is stopped — wo-a4bd6958 sat 7h13m.
+DEFAULT_INSPECT_ALARM_PARKED_MINUTES = 60
+
 
 @dataclass
 class InspectConfig:
@@ -295,9 +303,12 @@ class InspectConfig:
     project — an hour-long turn is routine where the work is a design document and a
     symptom where it is a one-file fix.
 
-    `enabled` turns only the ALARM off, never the report: `jarvis inspect` reads files
+    `enabled` turns only the ALARMS off, never the report: `jarvis inspect` reads files
     that are already on disk and costs nothing until someone runs it, whereas the alarm
-    reads a transcript per running work order per reconcile tick.
+    reads a transcript per running work order per reconcile tick. It covers
+    `alarm_parked_minutes` too (`invariants._parked_minutes`) — one switch for "raise
+    nothing here", because a second way to turn one thing off is a second way to be
+    surprised by it.
     """
 
     enabled: bool = True
@@ -307,6 +318,7 @@ class InspectConfig:
     alarm_turn_minutes: int = DEFAULT_INSPECT_ALARM_TURN_MINUTES
     alarm_join_seconds: int = DEFAULT_INSPECT_ALARM_JOIN_SECONDS
     alarm_write_tokens: int = DEFAULT_INSPECT_ALARM_WRITE_TOKENS
+    alarm_parked_minutes: int = DEFAULT_INSPECT_ALARM_PARKED_MINUTES
 
 
 # -- the supervisor: it JUDGES a cost alarm, so every number it judges by is a setting
@@ -705,6 +717,8 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
                                        base.alarm_join_seconds)),
         alarm_write_tokens=int(raw.get("alarm_write_tokens",
                                        base.alarm_write_tokens)),
+        alarm_parked_minutes=int(raw.get("alarm_parked_minutes",
+                                         base.alarm_parked_minutes)),
     )
     for name, value in vars(cfg).items():
         if name != "enabled" and value < 1:

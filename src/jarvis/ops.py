@@ -402,6 +402,15 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 # work order's own flag as well says the same thing twice and buries
                 # the actionable line.
                 gate_held = {a["wo_id"] for a in store.escalated_approvals()}
+                # Derived once for the whole strip: a flagged order can be parked AND
+                # owe the user something else, and `true_blockers` deliberately appends
+                # the parking behind the decision rather than over it, so the flag alone
+                # cannot carry both (invariants.parked_reason).
+                parked_by_id = {}
+                for wo in flagged.values():
+                    reason = invariants.parked_reason(store, wo)
+                    if reason:
+                        parked_by_id[wo["id"]] = reason
                 # A feature order contributes ONE line to the strip, never one per child.
                 # Its children keep their own flags — nothing is cleared, and they are
                 # right there on the feature's page — but they are rolled up here rather
@@ -425,6 +434,12 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         "title": wo["title"], "status": wo["status"],
                         "reason": wo["attention_reason"],
                     }
+                    # …and the half the flag could not carry. Optional the way `attach`
+                    # and `resume_auto` are: present only where it says something the
+                    # reason does not.
+                    parked = parked_by_id.get(wo["id"])
+                    if parked and parked != wo["attention_reason"]:
+                        item["parked"] = parked
                     # A worker blocked on a permission prompt can't be approved from
                     # jarvis — surface the native escape hatch instead. `--resume`, not
                     # `attach`: attaching is a background-agent verb and worker turns are
@@ -467,8 +482,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     if kids:
                         reasons.append(
                             f"{len(kids)} of its work orders need you: "
-                            + ", ".join(f"{k['id']} ({k['attention_reason']})"
-                                        for k in kids)
+                            + ", ".join(_child_note(k, parked_by_id) for k in kids)
                         )
                     progress = feature_progress(store, fo)
                     attention.append({
@@ -601,6 +615,18 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
 
 
 # -- work orders -----------------------------------------------------------------------------
+
+def _child_note(wo: dict[str, Any], parked: dict[str, str]) -> str:
+    """One rolled-up child on a feature order's attention line.
+
+    Its own reason, plus the parking when the reason does not already say it. The rollup
+    is what a feature's children get INSTEAD of a line each, so this is the only place
+    `jarvis status` can name a parked child — which is the shape wo-a4bd6958 was.
+    """
+    note = f"{wo['id']} ({wo['attention_reason']})"
+    extra = parked.get(wo["id"])
+    return f"{note} — {extra}" if extra and extra != wo["attention_reason"] else note
+
 
 def registered_project_paths() -> dict[str, Path]:
     central = CentralStore()
@@ -933,6 +959,16 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
         return {"what": "signin", "stalled": False,
                 "detail": "Claude Code could not authenticate — run `/login`, and the "
                           "OS resumes this and every other parked order by itself"}
+    # ...and the two pauses that DO name a moment. `Daemon.retry_paused_turns` relaunches
+    # these unaided, so the work order is waiting on the OS. Without this branch the
+    # fall-through calls a scheduled retry an unanswered permission prompt — and
+    # `invariants.parked_reason`, which reads this answer to decide whether anything is
+    # coming, would inherit the mistake as an attention item for a turn already booked in.
+    if pause is not None and pause.resumable:
+        return {"what": "retry_pending", "stalled": False,
+                "detail": f"the turn stopped on a "
+                          f"{worker_session.PAUSE_NOUN[pause.reason]} error and the OS "
+                          f"relaunches it by itself"}
     # A live turn means "working" for every status EXCEPT `waiting_input`, where it means
     # the opposite: a permission prompt blocks INSIDE the turn, so the process is alive
     # and going nowhere. That is the one case this command was written for, and reading
@@ -4358,6 +4394,28 @@ def inspect_config(project: str | None = None) -> Any:
         catalog = resolve_catalog()
         return (catalog.os.inspect if project is None
                 else catalog.project(project).inspect)
+    except (OpsError, CatalogError, OSError, ValueError):
+        return InspectConfig()
+
+
+def inspect_config_at(project_path: Path) -> Any:
+    """`inspect_config` for the project rooted at `project_path`.
+
+    For the caller that holds a `ProjectStore` and no project name —
+    `invariants.parked_reason`, which is reached from `true_blockers` and therefore from
+    every surface that asks what a work order needs. Falls back to the OS block, then to
+    the shipped defaults, for the reason `inspect_config` gives: a threshold with no
+    catalog behind it is still a threshold, and having none would mean having no check.
+    """
+    from .catalog import InspectConfig
+
+    try:
+        catalog = resolve_catalog()
+        target = Path(project_path).resolve()
+        for spec in catalog.projects:
+            if Path(spec.path).resolve() == target:
+                return spec.inspect
+        return catalog.os.inspect
     except (OpsError, CatalogError, OSError, ValueError):
         return InspectConfig()
 

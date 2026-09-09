@@ -61,7 +61,12 @@ BLOCKED_STATUSES = ("waiting_input", "needs_review", "failed", "pending",
                     # `waiting_pr_merge` is silent in the ordinary case and returns no
                     # blockers below — it is here for the one state that does, the
                     # conflict the worker could not resolve (spec §5).
-                    "waiting_pr_merge")
+                    "waiting_pr_merge",
+                    # ...and the two the OS calls work-in-progress, here for the one
+                    # state THEY have: a turn that ended without finishing the work and
+                    # nothing in flight behind it (`parked_reason`). Silent otherwise —
+                    # a running worker is still not blocked on anything the user can see.
+                    "running", "dispatching")
 # Statuses where nothing can possibly be pending: the work order is over.
 TERMINAL_STATUSES = ("completed", "cancelled")
 
@@ -122,6 +127,37 @@ AUTH_BLOCKER = ("Claude Code could not authenticate — sign in again and it res
 #: state until this constant existed.
 IDLE_NO_FINISH_BLOCKER = ("the worker stopped mid-task without `jarvis wo finish` — "
                           "nothing it started is still running; review the session")
+
+SECONDS_PER_MINUTE = 60  # a unit, not a setting
+
+#: What a work order says when its turn has ended, nothing is in flight, and the OS is
+#: still calling it work in progress. FREE OF ANY ELAPSED TIME, deliberately: this string
+#: is compared against `attention_reason` by INV-ATTENTION-REASON and stored verbatim by
+#: `ProjectStore.ack_attention`, so a reason that ticked would be rewritten every
+#: reconcile and could never be acknowledged.
+PARKED_BLOCKER = ("the worker parked mid-task — nothing is in flight to move it; read "
+                  "its last message, then `jarvis wo send` or `jarvis wo done`")
+
+#: The other shape of the same fact, and the one that cost wo-a4bd6958 seven hours: the
+#: work order HAS a recorded finish, was sent back to work afterwards, and stopped again
+#: without finishing. `Daemon.settle_work_order` reads `result_summary` as a lifetime
+#: fact, so no later turn can reach its IDLE_NO_FINISH branch — the order settles under
+#: whatever the earlier finish left behind and says nothing about the turn that stopped.
+STALE_FINISH_BLOCKER = ("the worker went back to work after finishing and stopped again "
+                        "without finishing — its recorded summary is older than its last "
+                        "turn; read that turn, then `jarvis wo send`")
+
+#: Where "nothing is in flight" is worth saying. `validating` is excluded because the
+#: round machine owns that work order and INV-VALIDATION-STRANDED already watches it;
+#: `pending` has no turn to be parked after; `waiting_pr_merge` is waiting on
+#: `Daemon.poll_pull_requests`, which is in flight by definition.
+PARKABLE_STATUSES = ("dispatching", "running", "waiting_input", "needs_review")
+
+#: The `ops.waiting_on` answers that mean the OS itself will do the next thing, with
+#: nobody typing. A list of what IS coming rather than a second guess at what is not:
+#: everything else that function can answer means the work order has stopped.
+IN_FLIGHT_WAITS = ("turn_running", "queued_message", "neo_question", "gate_with_neo",
+                   "retry_pending", "signin", "pending")
 
 
 @dataclass
@@ -184,7 +220,8 @@ DEAD_DEPENDENCY_BLOCKER = "blocked by a dependency that can never complete"
 # -- the derivation everything else is checked against ------------------------------
 
 
-def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
+def true_blockers(store: ProjectStore, wo: dict[str, Any],
+                  now: float | None = None) -> list[str]:
     """The reasons this work order genuinely needs the user, derived from state alone.
 
     Ordered most-actionable first, so `[0]` is the canonical attention reason. This is
@@ -287,11 +324,85 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
     if wo["status"] == "waiting_pr_merge" and \
             store.pr_conflict_attempts(wo["id"]) >= PR_CONFLICT_MAX_ATTEMPTS:
         blockers.append(PR_CONFLICT_BLOCKER)
+    # LAST, and never INSTEAD of anything: a work order can be parked and also owe the
+    # user a decision, and overwriting the decision with the parking is exactly the
+    # silent relabelling kn-78346a2d describes. It is appended only when nothing already
+    # here has told the user the worker has stopped — an assumption review is the one
+    # blocker that says who owes what without saying anything about the session behind
+    # it, which is how wo-a4bd6958 sat for 7h13m under a four-hour-old assumptions line.
+    if all(_mentions_assumptions(b) for b in blockers):
+        parked = parked_reason(store, wo, now=now)
+        if parked:
+            blockers.append(parked)
     # What the user has already looked at and dismissed stops being a blocker — but only
     # exactly that. Anything new still gets through (a pending assumption never can be
     # acknowledged away; `jarvis wo ack` refuses).
     acked = db.from_json(wo.get("acknowledged_blockers"), []) or []
     return [b for b in blockers if b not in acked]
+
+
+def _parked_minutes(store: ProjectStore) -> tuple[bool, int]:
+    """Whether the parked check is armed for THIS project, and after how long.
+
+    Per project like every other `inspect.alarm_*` number, and behind the same
+    `inspect.enabled` switch — that flag is `InspectConfig`'s single "raise nothing here",
+    and a second way to turn one thing off is a second way to be surprised by it.
+    """
+    from .ops import inspect_config_at
+
+    cfg = inspect_config_at(store.project_path)
+    return bool(cfg.enabled), int(cfg.alarm_parked_minutes)
+
+
+def parked_reason(store: ProjectStore, wo: dict[str, Any],
+                  now: float | None = None) -> str | None:
+    """Why nothing is going to happen to this work order — or None if something is.
+
+    THE PREDICATE IS `ops.waiting_on`, NOT A SECOND OPINION. That function already
+    answers "what is this order actually waiting for" for `jarvis wo resume-auto`, and
+    its answers divide cleanly into things the OS will do next (`IN_FLIGHT_WAITS`) and
+    everything else. Deriving the same split again here is how the attention list and
+    `resume-auto` come to disagree about one work order.
+
+    Two shapes, and the second is why this is not merely the first. An order the OS still
+    calls `running` with a finished turn behind it is INVISIBLY stopped — no status in
+    `BLOCKED_STATUSES` reached it before this. An order that finished, was sent back to
+    work and stopped again is VISIBLY stopped and flagged for the wrong thing, which is
+    what `STALE_FINISH_BLOCKER` says.
+
+    Ordered cheapest first, and that ordering is load-bearing rather than tidy: this runs
+    from `true_blockers`, which runs for every work order on every reconcile tick, and
+    the catalog read and `waiting_on`'s cross-database question about Neo both sit behind
+    the two free row checks. No model, no transcript.
+    """
+    if wo.get("origin") in UNGOVERNED_ORIGINS or wo.get("kind") == "manager":
+        # A manager is idle BY DESIGN between its feature's messages, and an injected
+        # session was never briefed on `jarvis wo finish`. `true_blockers` excuses both
+        # above for those reasons; excusing them in one place and not the other would
+        # give every feature order in the fleet a permanent second flag.
+        return None
+    if wo["status"] not in PARKABLE_STATUSES:
+        return None
+    turn = store.latest_turn(wo["id"])
+    if turn is None or turn["state"] != "done" or not turn["ended_at"]:
+        return None
+    enabled, minutes = _parked_minutes(store)
+    if not enabled:
+        return None
+    now = time.time() if now is None else now
+    if now - float(turn["ended_at"]) < minutes * SECONDS_PER_MINUTE:
+        return None
+    from .ops import waiting_on
+
+    if waiting_on(store, wo)["what"] in IN_FLIGHT_WAITS:
+        return None
+    finished = store.events_of_kind(wo["id"], "finished")
+    if finished and float(finished[-1]["ts"]) < float(turn["started_at"]):
+        return STALE_FINISH_BLOCKER
+    # A `needs_review` order with no stale finish is doing exactly what that status says,
+    # and is already flagged for it. A second line on every review the user has not got
+    # to yet is the noise this check exists to avoid producing.
+    return None if wo["status"] == "needs_review" else PARKED_BLOCKER
 
 
 def _validation_escalated(store: ProjectStore, wo: dict[str, Any]) -> bool:
