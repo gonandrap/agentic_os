@@ -82,6 +82,12 @@ KIND_LABELS = {
     "validation_seat": "validation seat",
     "digest": "dashboard digest",
     "supervisor": "supervisor reviewing an alarm",
+    # A SEPARATE KIND FROM `supervisor`, not a label on it (§4 of
+    # docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md). The sweep
+    # is the standing cost of WATCHING and the review is the per-alarm cost of
+    # JUDGING; folded together, `jarvis cost` cannot answer "what does watching
+    # cost" — the first question anyone asks before turning this on.
+    "health": "supervisor health review",
     WORKER_SUBPROCESS: "worker subprocess",
 }
 

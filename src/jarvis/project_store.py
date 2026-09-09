@@ -188,6 +188,12 @@ ALARM_REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
 ALARM_SUBJECTS = ("work_order", "feature_order")
 ALARM_SOURCES = ("cost", "health")
 
+# How one health sweep ended (`health_reviews.outcome`, §4). `clear` and `failed` are
+# not the same answer and the difference is the whole fail-safe: `clear` is the model
+# saying it found nothing, `failed` is nobody having judged at all — which is why a
+# `failed` sweep does not record its fingerprint as reviewed and the next tick retries.
+HEALTH_OUTCOMES = ("clear", "findings", "failed")
+
 # A subject-level finding judges the unit rather than a turn, so it has no `seq` to
 # carry — and `wo_alarms.seq` is NOT NULL, which `ALTER TABLE ADD COLUMN` cannot relax.
 # This is the sentinel that fills it, and every surface printing a turn number renders
@@ -314,6 +320,32 @@ CREATE TABLE IF NOT EXISTS wo_alarms (
     review_status TEXT NOT NULL DEFAULT 'unreviewed',  -- ALARM_REVIEW_STATUSES
     review_feedback TEXT,
     reviewed_at REAL
+);
+-- THE LEDGER OF LOOKING, and it is deliberately NOT `wo_alarms` (§4 of
+-- docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md). A sweep that
+-- found nothing is the common case; writing it as an alarm would fill `alarms_across`,
+-- `list_cost_alarms`, /alarms and `jarvis wo show`'s alarm line with rows that say
+-- nothing, and every surface would then need the same filter.
+--
+-- No foreign key: the subject is either a work order or a feature order and neither can
+-- carry a cascade for both, so `delete_work_order` deletes these rows itself. No
+-- migration either — the table is new, and `CREATE TABLE IF NOT EXISTS` is what every
+-- open already runs.
+--
+-- `fingerprint` is the DEDUPE MEMORY as well as the trigger's input: a finding is not
+-- re-raised for a (subject, probe) pair already reported at the same fingerprint. That
+-- is why `detail` carries the probe ids a sweep REPORTED (comma-separated) when
+-- `outcome='findings'`, and the failure's reason when `outcome='failed'`.
+CREATE TABLE IF NOT EXISTS health_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    subject_kind TEXT NOT NULL,         -- ALARM_SUBJECTS
+    subject_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,          -- health.fingerprint
+    trigger TEXT NOT NULL,              -- health.TRIGGERS
+    outcome TEXT NOT NULL,              -- HEALTH_OUTCOMES
+    findings INTEGER NOT NULL DEFAULT 0,
+    detail TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS wo_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -496,6 +528,7 @@ CREATE INDEX IF NOT EXISTS idx_events_wo ON wo_events(wo_id);
 -- and the alarm backfill's guard on EVERY ProjectStore open, which is every CLI
 -- invocation. Neither had one before and both were full scans of the busiest table.
 CREATE INDEX IF NOT EXISTS idx_events_kind ON wo_events(kind);
+CREATE INDEX IF NOT EXISTS idx_health_subject ON health_reviews(subject_kind, subject_id, ts);
 CREATE INDEX IF NOT EXISTS idx_alarms_wo ON wo_alarms(wo_id, ts);
 CREATE INDEX IF NOT EXISTS idx_alarms_status ON wo_alarms(status);
 CREATE INDEX IF NOT EXISTS idx_msgs_status ON wo_messages(status);
@@ -1076,6 +1109,15 @@ class ProjectStore:
                                ("notifications", "notifications")):
                 cur = self.conn.execute(f"DELETE FROM {table} WHERE wo_id=?", (wo_id,))
                 deleted[key] = cur.rowcount
+            # `health_reviews` has no foreign key — its subject may be either kind, and
+            # neither can carry a cascade for both — so it is deleted by hand. NOT a
+            # seventh key in `deleted`: that dict is asserted with `==` over exactly six
+            # (tests/test_wo_hide_delete.py::test_delete_work_order_cascades), and §4 of
+            # docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md keeps it
+            # at six on purpose.
+            self.conn.execute(
+                "DELETE FROM health_reviews WHERE subject_kind='work_order' "
+                "AND subject_id=?", (wo_id,))
             self.conn.execute("DELETE FROM work_orders WHERE id=?", (wo_id,))
             self.conn.execute("COMMIT")
         except Exception:
@@ -1623,6 +1665,67 @@ class ProjectStore:
         self.conn.execute(
             f"UPDATE wo_alarms SET {cols} WHERE id=?", (*fields.values(), alarm_id))
 
+    # -- health_reviews: the ledger of LOOKING, not of finding (§4) ------------------
+
+    def record_health_review(self, subject_kind: str, subject_id: str, *,
+                             fingerprint: str, trigger: str, outcome: str,
+                             findings: int = 0, detail: str = "") -> int:
+        """One sweep, whatever it concluded. Returns the row id."""
+        assert subject_kind in ALARM_SUBJECTS, subject_kind
+        assert outcome in HEALTH_OUTCOMES, outcome
+        cur = self.conn.execute(
+            """INSERT INTO health_reviews (ts, subject_kind, subject_id, fingerprint,
+                                           trigger, outcome, findings, detail)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (db.now(), subject_kind, subject_id, fingerprint, trigger, outcome,
+             int(findings), detail),
+        )
+        return int(cur.lastrowid or 0)
+
+    def last_health_review(self, subject_kind: str,
+                           subject_id: str) -> dict[str, Any] | None:
+        """The most recent sweep of one unit, or None if it has never been looked at.
+
+        A `failed` sweep is EXCLUDED. `health.due` compares the recorded fingerprint
+        against the live one to decide whether to look again, and a failure recorded a
+        fingerprint nobody judged: counted as a look, an unreadable reply would suppress
+        the retry §4 requires.
+        """
+        row = self.conn.execute(
+            """SELECT * FROM health_reviews
+                WHERE subject_kind=? AND subject_id=? AND outcome!='failed'
+             ORDER BY ts DESC, id DESC LIMIT 1""",
+            (subject_kind, subject_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def health_reviews_of(self, subject_kind: str,
+                          subject_id: str) -> list[dict[str, Any]]:
+        """Every sweep of one unit, oldest first."""
+        return db.rows_to_dicts(self.conn.execute(
+            """SELECT * FROM health_reviews WHERE subject_kind=? AND subject_id=?
+             ORDER BY ts, id""", (subject_kind, subject_id)).fetchall())
+
+    def probes_reported_at(self, subject_kind: str, subject_id: str,
+                           fingerprint: str) -> set[str]:
+        """Which probes a sweep has already reported about this unit AT THIS FINGERPRINT.
+
+        THE DEDUPE PREDICATE, and it deliberately says nothing about an alarm's STATUS.
+        Keying on "no open alarm for this probe" would re-raise the moment the supervisor
+        acks one — which is every time the supervisor works correctly, and is how the
+        attention flag comes back the instant the user puts it down (§4). A health
+        finding has no turn to key on the way a cost alarm does; an unchanged fingerprint
+        is what says nothing has happened since.
+        """
+        found: set[str] = set()
+        for row in self.conn.execute(
+                """SELECT detail FROM health_reviews
+                    WHERE subject_kind=? AND subject_id=? AND fingerprint=?
+                      AND outcome='findings'""",
+                (subject_kind, subject_id, fingerprint)).fetchall():
+            found.update(p for p in str(row["detail"] or "").split(",") if p)
+        return found
+
     def _this_conflict(self, wo_id: str, kind: str) -> int:
         """Events of `kind` since the last `pr_conflict_cleared` — this EPISODE's.
 
@@ -1648,6 +1751,20 @@ class ProjectStore:
         episode on a work order that may be flagged for something else entirely.
         """
         return bool(self._this_conflict(wo_id, "pr_conflict_unresolved"))
+
+    def count_events(self, wo_id: str, exclude: tuple[str, ...] = ()) -> int:
+        """How many events this work order has, unbounded, minus the kinds named.
+
+        `list_events` caps at 200, which is fine for a page and wrong for
+        `health.fingerprint`: a busy order's count would freeze at the cap and the unit
+        would read as motionless for ever (§4). `exclude` is there for the same caller —
+        see `health.fingerprint` for why it must not count the OS looking.
+        """
+        holes = ",".join("?" for _ in exclude)
+        clause = f" AND kind NOT IN ({holes})" if exclude else ""
+        return int(self.conn.execute(
+            f"SELECT COUNT(*) FROM wo_events WHERE wo_id=?{clause}",
+            (wo_id, *exclude)).fetchone()[0])
 
     def list_events(self, wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.conn.execute(

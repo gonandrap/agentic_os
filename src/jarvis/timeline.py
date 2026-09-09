@@ -42,6 +42,13 @@ DEBUG_KINDS = frozenset({
     # Same moment as the message carrying the answer, so the message is the entry — §5.
     "neo_answered",
     "escalation_answered",
+    # THE SWEEP LOOKING, which is not the same event as the sweep FINDING something.
+    # `health_finding` is a signal and stays one; this fires on every sweep including
+    # the clear ones, which on a long-running order is dozens a day. §4 of
+    # docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md keeps the
+    # ledger of looking out of the surfaces for exactly this reason; the same argument
+    # applies to the default timeline.
+    "health_reviewed",
 })
 
 STATUS_LABEL = {

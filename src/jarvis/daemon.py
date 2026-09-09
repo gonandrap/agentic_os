@@ -56,6 +56,7 @@ from .dispatch import dispatch_work_order
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     ACTIVE_STATUSES,
+    FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
     OPEN_STATUSES,
     PRE_APPROVED_KEY,
@@ -185,6 +186,14 @@ class Daemon:
         self.supervisor_pool = ThreadPoolExecutor(max_workers=1,
                                                   thread_name_prefix="supervisor")
         self.supervisor_draining = False
+        # THE SWEEP GETS ITS OWN POOL AND ITS OWN GUARD, and not the supervisor's — §4
+        # of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md. The
+        # supervisor is event-driven off a threshold and answers a turn that is burning
+        # money right now; a fleet sweep queued in front of it would delay the thing the
+        # whole mechanism was built for. The tick thread and Neo's are out for the same
+        # reasons they are out for the supervisor.
+        self.health_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="health")
+        self.health_sweeping = False
         # Validation runs off the tick thread for the same reason Neo does, only more
         # so: a round is up to five headless calls at a 300s timeout each, and run
         # inline it would freeze every project in the catalog behind one work order's
@@ -493,6 +502,12 @@ class Daemon:
         # judged on this tick rather than one reconcile interval later — and OUTSIDE it,
         # so no project waits on another project's review.
         self.supervisor_tick()
+        # AFTER the supervisor's kick, never before: both run off their own pools, and
+        # the order here is the order the two get their turn at the catalog. A sweep
+        # that raised on this tick is judged on the next one, which is the cadence §4
+        # designs for — the sweep answers "is something wrong", the review answers
+        # "does the user need to know".
+        self.health_tick()
 
         # Before routing: a dashboard failure raised here goes out with this tick's
         # notifications instead of waiting for the next one.
@@ -2133,6 +2148,94 @@ class Daemon:
                 central=central, inspect_cfg=project.inspect)
             log.info("[%s] alarm %s: %s (%s)", project.name, alarm["id"],
                      verdict["decision"], verdict["reason"][:cfg.reason_chars])
+
+    # -- 5d. the health sweep: looking before anything crosses a threshold ------------
+
+    def _health_projects(self) -> list[ProjectSpec]:
+        """Projects being swept on THIS tick — §4 of
+        docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+
+        Two switches, not one: `health_enabled` sits on top of `supervisor.enabled`,
+        because a project may want a reviewer for its cost alarms without also paying
+        the standing cost of watching. The cadence is per project for the same reason
+        every other threshold is.
+        """
+        return [p for p in self.catalog.projects
+                if p.supervisor.enabled and p.supervisor.health_enabled
+                and p.path.is_dir()
+                and self.tick_count % p.supervisor.health_every_ticks == 1]
+
+    def health_tick(self) -> None:
+        """Kick a sweep when a unit is due and none is running.
+
+        Modelled on `supervisor_tick`, including the guard: a sweep still in flight must
+        never have a second one queued behind it, because the candidate list would be
+        computed against state the first one is still writing. With no project swept it
+        opens no store and reads no row.
+        """
+        due = self._health_projects()
+        if not due or self.health_sweeping:
+            return
+        self.health_sweeping = True
+        future = self.health_pool.submit(self._health_sweep, due)
+        future.add_done_callback(lambda f: setattr(self, "health_sweeping", False))
+
+    def _health_candidates(self, pstore: ProjectStore,
+                           cfg: Any) -> list[tuple[float, dict, str]]:
+        """Every open unit due for a look, LONGEST-UNREVIEWED FIRST.
+
+        The order is what makes `health_max_units_per_tick` a rotation rather than a
+        starvation: sorted by last look, the units the cap cut off this tick are the
+        ones at the front of the next one.
+
+        `waiting_input` is in `OPEN_STATUSES` and belongs here on purpose — an order
+        parked behind a message nobody will send is exactly what `waiting-on-nobody`
+        exists to catch, and it is invisible to every cost heuristic.
+        """
+        from . import health
+
+        now = db.now()
+        subjects = [{"kind": "work_order", "row": wo}
+                    for wo in pstore.list_work_orders(statuses=OPEN_STATUSES)
+                    if wo["origin"] not in UNGOVERNED_ORIGINS]
+        subjects += [{"kind": "feature_order", "row": fo}
+                     for fo in pstore.list_feature_orders(statuses=FO_OPEN_STATUSES)
+                     # A feature with no carrier has no session at all and nothing to
+                     # record a finding on — see `carrier_for_feature`.
+                     if pstore.carrier_for_feature(fo["id"]) is not None]
+        out = []
+        for subject in subjects:
+            row = subject["row"]
+            last = pstore.last_health_review(subject["kind"], row["id"])
+            trigger = health.due(last, health.fingerprint(pstore, subject), cfg, now,
+                                 float(row.get("created_at") or 0.0))
+            if trigger:
+                out.append((float(last["ts"]) if last else 0.0, subject, trigger))
+        out.sort(key=lambda c: c[0])
+        return out
+
+    def _health_sweep(self, projects: list[ProjectSpec]) -> None:
+        """Sweep each project's due units, capped (on the health thread)."""
+        from . import supervisor as supervisor_mod
+        from .neo_store import NeoStore
+
+        neo_store = NeoStore()   # thread-local connections, as `_supervisor_drain` does
+        try:
+            for project in projects:
+                cfg = project.supervisor
+                pstore = ProjectStore(project.path)
+                try:
+                    for _, subject, trigger in self._health_candidates(
+                            pstore, cfg)[:cfg.health_max_units_per_tick]:
+                        supervisor_mod.review_health(
+                            pstore, neo_store, project.name, subject, cfg.probes, cfg,
+                            trigger, inspect_cfg=project.inspect)
+                except Exception:  # noqa: BLE001 — one project must not stop the rest
+                    log.exception("health sweep failed for %s", project.name)
+                finally:
+                    pstore.close()
+        finally:
+            neo_store.close()
 
     # -- 7. invariants (post-conditions) --------------------------------------------------
 
