@@ -793,6 +793,11 @@ def create_app() -> FastAPI:
             # And why a `waiting_input` one is not in fact waiting on the reader. Both
             # notes are display; `true_blockers` decides what actually costs attention.
             waiting = ops.waiting_on(store, wo)
+            # ...and the blocker the flag could not carry. `attention_reason` is ONE
+            # column fed from `true_blockers[0]`, so an order that is parked AND owes a
+            # decision reports only the decision — which is how wo-a4bd6958 spent 7h13m
+            # under a four-hour-old assumptions line. Listings link; this page tells.
+            parked = invariants.parked_reason(store, wo)
             # How this status should READ — derived once, in the one function every
             # other surface derives it from. The header used to build its own wording
             # out of STATUS_META alone, which is how a listing and a header came to
@@ -809,7 +814,7 @@ def create_app() -> FastAPI:
             store.close()
         show_debug = debug not in ("", "0", "false")
         bill = wo_bill(wo_id, pname)
-        return render(request, "work_order.html", project=pname, wo=wo,
+        return render(request, "work_order.html", project=pname, wo=wo, parked=parked,
                       pause=pause, waiting=waiting, status_label=label,
                       validation=validation, spec=spec,
                       timeline=build_timeline(wo, events, messages,

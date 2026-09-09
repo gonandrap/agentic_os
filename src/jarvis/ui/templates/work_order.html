@@ -120,6 +120,10 @@
       </form>
       {% endif %}
     </p>
+    {# The second blocker, when the one reason slot above is already spoken for. #}
+    {% if parked and parked != wo.attention_reason %}
+      <p class="st tone-warn"><span class="i">◭</span>{{ parked }}</p>
+    {% endif %}
     {# The escape hatch, and ONLY for the one thing it can fix. `waiting.what == 'prompt'`
        means nothing else accounts for the wait — no gate, no question with Neo, no queued
        message, no turn in flight. Offered for every `waiting_input` work order, as it
