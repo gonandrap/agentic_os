@@ -303,6 +303,39 @@ def test_a_parked_child_is_named_on_its_feature_orders_rolled_up_line(
     assert STALE_FINISH_BLOCKER in line["reason"]
 
 
+def test_the_dashboard_shows_the_blocker_the_flag_could_not_carry(
+        project, catalog_file, jarvis_home, fake_claude, monkeypatch):
+    """`attention_reason` is one column fed from `true_blockers[0]`, so a masked order
+    reports only the decision. Listings link; the work order's own page tells."""
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    store = ProjectStore(project)
+    restore = _rewind(monkeypatch, LONG_ENOUGH)
+    masked = _wo_a4bd6958(store)
+    ordinary = _parked_running(store, title="nothing to add")
+    restore()
+    check_project(store)  # the reconciler is what puts the flag on `ordinary`
+    store.close()
+    ops.start_os(str(catalog_file), foreground=True)
+    client = TestClient(create_app(), follow_redirects=False)
+
+    def second_blocker(text: str) -> str:
+        # The added paragraph exactly. Matched as markup rather than by counting the
+        # bare sentence, which also appears in the `attention` timeline event below it.
+        return f'<p class="st tone-warn"><span class="i">◭</span>{text}</p>'
+
+    page = client.get(f"/wo/proj_a/{masked['id']}").text
+
+    assert "assumptions pending review" in page
+    assert second_blocker(STALE_FINISH_BLOCKER) in page
+    # ...and nothing added to an order whose one reason already says it.
+    other = client.get(f"/wo/proj_a/{ordinary['id']}").text
+    assert second_blocker(PARKED_BLOCKER) not in other
+    assert PARKED_BLOCKER in other
+
+
 # -- the threshold is a setting ------------------------------------------------------
 
 
