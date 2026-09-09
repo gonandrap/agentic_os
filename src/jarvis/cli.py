@@ -853,6 +853,10 @@ def cmd_status(args: argparse.Namespace) -> int:
             ident = a["wo_id"] or a.get("fo_id")
             print(f"  • [{a['project']}]{' ' + ident if ident else ''} {a['title']} "
                   f"— {a['reason']}")
+            if a.get("parked"):
+                # The flag carries one sentence and this order needed two: what the user
+                # owes it, and the fact that its worker stopped (invariants.parked_reason).
+                print(f"      also: {a['parked']}")
             if a.get("attach"):
                 # `resume_auto` is present only where a permission prompt is possible at
                 # all. Where it is not — everywhere in a fleet running `auto` — naming it
