@@ -845,7 +845,13 @@ FAKE_SYSTEMCTL = r"""#!/usr/bin/env python3
 '''Fake `systemctl --user` for tests: answers about units the fake systemd-run made.
 
 Only the three verbs the turn transport uses — `show -p MainPID`, `show -p ActiveState`
-and `stop`. An unknown unit answers exactly as a `--collect`ed one does: MainPID 0,
+and `stop`. MainPID is the pid the unit was STARTED with and outlives that process;
+ActiveState is the liveness answer. They are deliberately not the same question: a fake
+`claude` turn can be over before the first `systemctl` read (~30ms of interpreter start),
+and a liveness-derived MainPID then answers 0 for every one of `main_pid`'s attempts, so
+a turn that ran perfectly reads as a unit that never reported a pid.
+
+An unknown unit — never started, or `stop`ped and so `--collect`ed — answers MainPID 0,
 ActiveState inactive. That is the normal case after a turn finishes, not an error.
 '''
 import json, os, signal, sys
@@ -877,20 +883,26 @@ def alive(pid):
 
 if argv[:1] == ["show"]:
     rec = load(argv[1])
-    up = bool(rec) and alive(rec["pid"])
+    if rec and rec.get("collected"):
+        rec = None
     if "--property=MainPID" in argv:
-        print(rec["pid"] if up else 0)
+        print(rec["pid"] if rec else 0)
     elif "--property=ActiveState" in argv:
-        print("active" if up else "inactive")
+        print("active" if rec and alive(rec["pid"]) else "inactive")
     else:
         sys.stderr.write(f"fake systemctl: unhandled show {argv}\n"); sys.exit(2)
 elif argv[:1] == ["stop"]:
     rec = load(argv[1])
-    if rec and alive(rec["pid"]):
-        try:
-            os.killpg(os.getpgid(rec["pid"]), signal.SIGTERM)
-        except OSError:
-            pass
+    if rec:
+        if alive(rec["pid"]):
+            try:
+                os.killpg(os.getpgid(rec["pid"]), signal.SIGTERM)
+            except OSError:
+                pass
+        # `--collect`: a stopped unit unloads, and then it answers as an unknown one.
+        rec["collected"] = True
+        with open(os.path.join(units_dir, argv[1] + ".json"), "w") as f:
+            json.dump(rec, f)
 else:
     sys.stderr.write(f"fake systemctl: unhandled argv {argv}\n"); sys.exit(2)
 """
