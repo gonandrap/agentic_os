@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -1148,6 +1148,49 @@ def turn_label(seq: int | None) -> str:
     return "no turn" if seq is None or seq == NO_TURN else f"turn {seq}"
 
 
+def alarm_kind_label(alarm: dict[str, Any],
+                     titles: dict[str, dict[str, str]]) -> str:
+    """WHAT RAISED THIS ALARM, as user copy: a probe's title, or a cost alarm's kind.
+
+    `wo_alarms.kind` holds the probe id for a health finding, and a kebab id is a
+    database value — `no-progress` on the page where `Nothing is moving` belongs (§6).
+    A cost alarm keeps the rendering it has had since PR 159, so this is additive on
+    every row that existed before the sweep.
+
+    `titles` is `probe_titles()`, passed in rather than resolved here: this is called
+    once per row and resolving it inside would re-read the catalog for each one. Falls
+    back to the id for a probe the catalog no longer has, because a finding outlives the
+    setting that raised it and an empty cell says less than the id does.
+    """
+    if alarm.get("source") == "health" and alarm.get("probe"):
+        by_project = titles.get(str(alarm.get("project") or ""), {})
+        return by_project.get(str(alarm["probe"])) or str(alarm["probe"])
+    return str(alarm.get("kind") or "")
+
+
+def remedy_line(alarm: dict[str, Any]) -> str:
+    """One alarm's remedy on one line, or "" when none was proposed.
+
+    THE TERMINAL'S HALF of `_alarm.html`'s `remedy_block`: the same three facts in the
+    same order — what was asked for, who is holding the decision, and whether anything
+    has actually happened — because a reader moving between the page and the CLI being
+    told two different things is the failure `alarm_standing_line` also exists to stop.
+    §6 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+    """
+    if not alarm.get("remedy"):
+        return ""
+    gate = (f" (gate request #{alarm['remedy_approval_id']})"
+            if alarm.get("remedy_approval_id") else "")
+    if alarm.get("remedy_result"):
+        outcome = f"it did: {alarm['remedy_result']}"
+    elif alarm.get("alarm_status") == "proposed":
+        outcome = "nothing has been done — it needs your permission first"
+    else:
+        outcome = "nothing was done — the remedy was not granted"
+    return (f"{alarm['remedy']}{gate}: {alarm.get('remedy_argument') or ''} "
+            f"· {outcome}")
+
+
 def alarm_standing_line(alarms: list[dict[str, Any]]) -> str:
     """One work order's alarms on one line: how many, how they stand, and their ids.
 
@@ -2211,6 +2254,11 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
             # child's page. Empty for every unit that has never been validated, and it
             # is the emptiness the surfaces branch on — no rounds, no section.
             "validation_rounds": validation_rounds(store, fo_id=fo_id),
+            # Every finding ABOUT this feature, whatever carried it, on the same
+            # always-present rule as the rounds — and the rows themselves, exactly as
+            # `jarvis wo show --json` carries a work order's (§6). By subject, never by
+            # carrier: a child's own alarm belongs on the child.
+            "alarms": store.alarms_for_feature(fo_id),
             "children": children,
             "progress": feature_progress(store, fo),
             # Only meaningful next to `max_parallel`, but returned unconditionally so a
@@ -4642,6 +4690,26 @@ def supervisor_probes(project_name: str | None = None,
     return out
 
 
+def probe_titles(catalog_path: str | None = None) -> dict[str, dict[str, str]]:
+    """{project: {probe id: title}} for the whole fleet, in ONE catalog load.
+
+    Per project rather than one flat map, because a probe id is only unique within a
+    project: two projects may define the same id with different words, and a flat map
+    would render one project's title over the other's finding.
+
+    ANSWERS {} ON AN UNREADABLE CATALOG rather than raising, which is the opposite of
+    `supervisor_probes`' rule and for the opposite reason: that is a read someone typed,
+    this one decorates rows that must render regardless. Every surface falls back to the
+    probe id, so a missing catalog costs a less readable page and never a page (§6).
+    """
+    try:
+        catalog = resolve_catalog(catalog_path)
+    except (OpsError, CatalogError):
+        return {}
+    return {spec.name: {p.id: p.title for p in spec.supervisor.probes}
+            for spec in catalog.projects}
+
+
 # -- the review loop: what the supervisor decided, and what the user makes of it -------
 #
 # `list_cost_alarms`' dict is frozen and four surfaces bind it, so the two review reads
@@ -4652,7 +4720,9 @@ def supervisor_probes(project_name: str | None = None,
 
 
 def _reviewable(name: str, row: dict[str, Any],
-                answers: dict[int, dict[str, Any]]) -> dict[str, Any]:
+                answers: dict[int, dict[str, Any]],
+                titles: dict[str, dict[str, str]] | None = None,
+                results: dict[str, str] | None = None) -> dict[str, Any]:
     """One alarm as a review surface reads it: the frozen dict plus the reasoning.
 
     `verdict_reason` is the supervisor's argument and `note` is what it wrote to the
@@ -4660,6 +4730,10 @@ def _reviewable(name: str, row: dict[str, Any],
     ANSWER text, which lives in neo.db and no per-project read can reach — passed in
     already fetched so this stays a pure projection and the caller opens Neo once for
     the whole queue rather than once per escalated row.
+
+    `remedy_result` arrives the same way and for the same reason: `wo_alarms` records
+    that a remedy was proposed and settled, and WHAT IT DID is the `remedy_applied`
+    event's payload (§5) — one read per project rather than one per row.
     """
     view = _alarm_dict(name, row)
     question = answers.get(row["neo_question_id"]) if row["neo_question_id"] else None
@@ -4671,7 +4745,14 @@ def _reviewable(name: str, row: dict[str, Any],
         "reviewed_at": row["reviewed_at"],
         "neo_advice": (question or {}).get("answer"),
         "neo_question_status": (question or {}).get("status"),
+        # What the supervisor asked to do about it, and what came of it — §6.
+        "remedy": row.get("remedy"),
+        "remedy_argument": row.get("remedy_argument"),
+        "remedy_approval_id": row.get("remedy_approval_id"),
+        "remedy_result": (results or {}).get(row["id"]),
     })
+    # The frozen dict carries the probe ID; every review surface renders its TITLE.
+    view["kind_label"] = alarm_kind_label(view, titles or {})
     return view
 
 
@@ -4690,14 +4771,42 @@ def _neo_answers(question_ids: Sequence[int]) -> dict[int, dict[str, Any]]:
     return {qid: q for qid, q in found.items() if q is not None}
 
 
-def alarm_review_queue(project_name: str | None = None, limit: int = 200
-                       ) -> list[dict[str, Any]]:
-    """Alarms the supervisor answered and the user has not yet looked at, newest first.
+def _remedy_results(store: ProjectStore, rows: list[dict[str, Any]], limit: int,
+                    wo_id: str | None = None) -> dict[str, str]:
+    """{alarm id: what the remedy actually did}, from the `remedy_applied` events.
 
-    `acked` + `unreviewed`, per §5 of the supervisor spec. Deliberately NOT the whole
-    unreviewed set: an `escalated` alarm is still with Neo and is asked about by the
-    attention flag, so listing it here would ask the user for the same decision twice
-    in two different words.
+    Skipped entirely when no row in hand names a remedy, which is every project on the
+    fleet as things ship: the read costs nothing where nothing was ever proposed.
+
+    `wo_id` is the ONE-ALARM read and it is uncapped: a per-alarm page that fell off the
+    end of the fleet-wide limit would show a remedy with no outcome, which reads as one
+    that never ran. Reversed because the two store reads order oppositely and everything
+    below wants newest-first.
+    """
+    if not any(r.get("remedy") for r in rows):
+        return {}
+    out: dict[str, str] = {}
+    stream = (list(reversed(store.events_of_kind(wo_id, "remedy_applied"))) if wo_id
+              else store.events_across("remedy_applied", limit=max(limit, 200)))
+    for event in stream:
+        payload = db.from_json(event.get("payload"), {}) or {}
+        alarm_id = str(payload.get("alarm_id") or "")
+        # Newest first, so the first one wins — a grant covers ONE application, but an
+        # alarm re-proposed after a refusal could carry two.
+        if alarm_id and alarm_id not in out:
+            out[alarm_id] = str(payload.get("result") or "")
+    return out
+
+
+def _enriched_alarms(project_name: str | None, limit: int,
+                     read: Callable[[ProjectStore], list[dict[str, Any]]]
+                     ) -> list[dict[str, Any]]:
+    """`read` over every registered project, through `_reviewable`.
+
+    ONE walk for the two fleet-wide review reads. The alternative — a second loop that
+    also opens a store, Neo and the catalog — is how the queue and the feed come to
+    show the same alarm differently, which is the whole argument for `_reviewable`
+    being a single function.
     """
     paths = registered_project_paths()
     if project_name:
@@ -4705,17 +4814,54 @@ def alarm_review_queue(project_name: str | None = None, limit: int = 200
             raise OpsError(f"project {project_name!r} not registered")
         paths = {project_name: paths[project_name]}
     rows: list[tuple[str, dict[str, Any]]] = []
+    results: dict[str, str] = {}
     for name, path in paths.items():
         if not path.is_dir():
             continue
         store = ProjectStore(path)
         try:
-            found = store.alarms_across(limit=limit, statuses=("acked",))
+            found = read(store)
+            results.update(_remedy_results(store, found, limit))
         finally:
             store.close()
-        rows.extend((name, r) for r in found if r["review_status"] == "unreviewed")
+        rows.extend((name, r) for r in found)
     answers = _neo_answers([r["neo_question_id"] for _, r in rows])
-    out = [_reviewable(name, row, answers) for name, row in rows]
+    titles = probe_titles()
+    return [_reviewable(name, row, answers, titles, results) for name, row in rows]
+
+
+def alarm_feed(project_name: str | None = None, limit: int = 200,
+               wo_id: str | None = None, fo_id: str | None = None,
+               sources: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+    """`list_cost_alarms`' rows as a REVIEW surface reads them, newest first.
+
+    The same filters and the same order, plus everything the frozen dict may not carry:
+    the supervisor's argument, Neo's advice, the probe's title and the remedy. A second
+    function rather than six more keys on the published dict — `kn-4d8449f1`'s rule,
+    and the four surfaces binding that dict are why it holds.
+    """
+    out = _enriched_alarms(project_name, limit, lambda store: store.alarms_across(
+        limit=limit, wo_id=wo_id, fo_id=fo_id, sources=sources))
+    out.sort(key=lambda r: r["ts"], reverse=True)
+    return out[:limit]
+
+
+def alarm_review_queue(project_name: str | None = None, limit: int = 200
+                       ) -> list[dict[str, Any]]:
+    """Alarms the supervisor answered and the user has not yet looked at, newest first.
+
+    `acked` + `unreviewed`, per §5 of the supervisor spec. Deliberately NOT the whole
+    unreviewed set: an `escalated` alarm is still with Neo and is asked about by the
+    attention flag, so listing it here would ask the user for the same decision twice
+    in two different words. A `proposed` one is out for the same reason and one more:
+    the way to answer it is `jarvis gate approve|deny`, not a verdict on a verdict.
+
+    An APPLIED remedy lands here, because `remedies.apply` leaves the alarm `acked` —
+    "addressed by the supervisor on your behalf" is exactly what this half is (§6).
+    """
+    out = _enriched_alarms(project_name, limit, lambda store: [
+        r for r in store.alarms_across(limit=limit, statuses=("acked",))
+        if r["review_status"] == "unreviewed"])
     out.sort(key=lambda r: r["decided_at"] or r["ts"], reverse=True)
     return out[:limit]
 
@@ -4756,9 +4902,27 @@ def alarm_detail(alarm_id: str, project_name: str | None = None) -> dict[str, An
 
     The anchor `/alarms` cannot be: a list has no per-row identity, and both the work
     order's timeline and a Neo escalation's inbox line link straight at one alarm.
+
+    THE PAGE'S ONE EXTRA OVER THE LIST is the gate request behind a proposed remedy —
+    its verdict, and the EVIDENCE PACKET the finding cited, which is stored nowhere else
+    in the OS: `wo_alarms` keeps the reason, and what the judge was actually shown
+    survives only on the `self_heal` approval `remedies.propose` filed (§6).
     """
-    name, _, row = _find_alarm(alarm_id, project_name)
-    return _reviewable(name, row, _neo_answers([row["neo_question_id"]]))
+    name, path, row = _find_alarm(alarm_id, project_name)
+    store = ProjectStore(path)
+    try:
+        results = _remedy_results(store, [row], 200, wo_id=row["wo_id"])
+        gate = (store.get_approval(int(row["remedy_approval_id"]))
+                if row.get("remedy_approval_id") else None)
+    finally:
+        store.close()
+    view = _reviewable(name, row, _neo_answers([row["neo_question_id"]]),
+                       probe_titles(), results)
+    view["gate"] = ({k: gate[k] for k in ("id", "kind", "status", "escalated",
+                                          "decided_by", "decision_reason",
+                                          "justification", "evidence")}
+                    if gate else None)
+    return view
 
 
 def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
@@ -4779,9 +4943,19 @@ def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
                        "have decided?")
     name, path, row = _find_alarm(alarm_id, project_name)
     if row["alarm_status"] not in ("acked", "escalated"):
+        # A REFUSAL THAT DOES NOT SAY WHERE TO GO IS A BUG REPORT. `proposed` is the
+        # status a user is most likely to arrive here with — the supervisor is asking
+        # them for something — and the thing it asks for is a gate verdict, not a
+        # verdict on the verdict (§6).
+        where = ""
+        if row["alarm_status"] == "proposed":
+            gate = row["remedy_approval_id"] or "<id>"
+            where = (f" — it is asking permission to {row['remedy'] or 'act'}, so "
+                     f"answer it with `jarvis gate approve {gate}` or "
+                     f"`jarvis gate deny {gate} --reason \"…\"`")
         raise OpsError(f"alarm {alarm_id} is {row['alarm_status']}, and only an alarm "
                        f"the supervisor has decided ('acked' or 'escalated') can be "
-                       f"reviewed")
+                       f"reviewed{where}")
     review = "approved" if approved else "corrected"
     store = ProjectStore(path)
     try:
