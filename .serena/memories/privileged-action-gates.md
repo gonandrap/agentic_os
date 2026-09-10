@@ -118,7 +118,37 @@ row also clears a command through `usable_grant` but is bounded by scope alone �
 | `request_gate_approval` / `decide_gate` / `list_gates` / `show_gate` | `ops.py` |
 | `jarvis gate request|list|show|approve|deny|dismiss` | `cli.cmd_gate` |
 
-Gate kinds: `pr_merge`, `release`, `service_restart`, `push_protected`.
+Gate kinds: `pr_merge`, `release`, `service_restart`, `push_protected`, `config_write`,
+`self_heal`.
+
+## `self_heal` — the kind that is unlike the others in three ways
+
+Added by wo-805b4319 (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md
+§5). It is how the SUPERVISOR gets permission to act on a work order or feature order it
+judged unhealthy, and the whole reason to reuse the gate is that it buys Neo's review,
+the escalation path, `jarvis gate list|show|approve|deny`, `/gates` and the audit trail
+with **no new Neo question kind** — the request rides `kind="approval"`, which is where
+`Daemon._deliver_gate_verdict` already looks its subject up in `approvals`.
+
+1. **Nothing classifies into it.** No `SEED_MATCHES`, no `SEED_CANARIES`, no
+   `conflict_markers`. `gates.classify` returns it for no string, and a test pins that
+   against `gate_rules`' own canary corpus. Every other kind catches a command a worker
+   typed; this one is filed programmatically by `remedies.propose`.
+2. **It does not ride `GateConfig.enabled`.** The command gates are opt-in per project
+   because gating them trades one bottleneck for a slower one. This one is MANDATORY —
+   it is the only thing between a health judgement and a running session — so
+   `remedies.propose` never consults `GateConfig`. What a project controls is
+   `os.supervisor.remedies.allowed`, the other direction.
+3. **`approvals.command` is not a command.** It holds a rendered intent
+   (`heal al-1a2b: nudge wo-3c4d — "…"`). Nothing executes it.
+
+Two guards keep the worker-facing plumbing switched off, and both are easy to undo by
+accident. `gates.apply_decision` delegates a `self_heal` verdict to
+`remedies.record_verdict` instead of `queue_message` + `end_wait_if_nothing_is_out` — a
+message into a turn nobody asked about is precisely the act this gate fences. And
+`ops.decide_gate` skips its `clear_attention` for this kind: on a denial the flag
+standing afterwards is the ALARM's, and `invariants.true_blockers` has no branch that
+re-derives a live alarm, so clearing it would put it down for good.
 
 ## Two behaviours that are deliberate, not bugs
 
