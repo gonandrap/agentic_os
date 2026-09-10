@@ -157,7 +157,7 @@ def pr_title_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str,
 #: (`.github/pull_request_template.md` and the skill's bundled copy) are asserted
 #: against this tuple by tests/test_pr_body.py, so the three cannot drift.
 PR_BODY_SECTIONS = ("Summary", "Implementation notes", "Questions asked to Neo",
-                    "Alarms raised", "Learnings", "Test evidence")
+                    "Alarms raised", "Learnings", "Test evidence", "Screenshots")
 
 # GitHub renders neither of these, so neither can mislink or count as content.
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -191,6 +191,27 @@ def mislinking_ref(body: str) -> str | None:
     for m in _BARE_REF.finditer(scannable):
         if not _REF_IS_DELIBERATE.search(scannable[:m.start()].rstrip()):
             return m.group(0)
+    return None
+
+
+#: A markdown image, and the only target form GitHub renders in a body. The target is
+#: the first thing after `(` — a `<…>` form or a bare path, before any title string.
+_MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\(\s*(<[^>\n]+>|[^)\s]+)")
+_ABSOLUTE_URL = re.compile(r"https?://", re.IGNORECASE)
+
+
+def unrenderable_image(body: str) -> str | None:
+    """The first markdown image target in `body` that GitHub will not render, or None.
+
+    S5 of the design doc. kn-72cec521: GitHub resolves a repo-relative path for a link
+    and not for an image, so `![x](docs/screenshots/x.png)` looks right when written and
+    is a broken icon in review (PR 173).
+    """
+    scannable = _blank_out(_CODE_SPAN, _blank_out(_HTML_COMMENT, body))
+    for m in _MARKDOWN_IMAGE.finditer(scannable):
+        target = m.group(1).strip("<>")
+        if not _ABSOLUTE_URL.match(target):
+            return target
     return None
 
 
@@ -233,6 +254,13 @@ def pr_body_problems(body: str) -> list[str]:
             f"`{ref}` — GitHub links that to issue/PR {ref[1:]}. Say `item {ref[1:]} "
             f"of the work order`, or `issue {ref}` if you really do mean that issue, "
             f"or put it in backticks if it is a literal")
+    image = unrenderable_image(body)
+    if image is not None:
+        problems.append(
+            f"`![…]({image})` renders broken — GitHub resolves a relative path for a "
+            f"link, not for an image. Link it by raw URL at the commit SHA: "
+            f"`https://raw.githubusercontent.com/<owner>/<repo>/<sha>/{image}` "
+            f"(the SHA from `git rev-parse HEAD`, and push before you post the body)")
     return problems
 
 
