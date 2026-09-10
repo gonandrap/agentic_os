@@ -1,6 +1,6 @@
 ---
 name: open-a-pull-request
-description: Use when opening a pull request for a work order — before running `gh pr create`. Fills the repository's PR template with the summary, implementation notes, Neo questions, alarms raised, learnings and test evidence a reviewer needs, and keeps GitHub from turning a work-order item number into a link to someone else's PR.
+description: Use when opening a pull request for a work order — before running `gh pr create`. Fills the repository's PR template with the summary, implementation notes, Neo questions, alarms raised, learnings, test evidence and screenshots a reviewer needs, and keeps GitHub from turning a work-order item number into a link to someone else's PR or a screenshot into a broken-image icon.
 ---
 
 # Opening a pull request
@@ -9,7 +9,7 @@ The pull request is the only artifact of your work order that a reviewer reads b
 the diff, and the only one that outlives the OS's records. It is also the one your
 operating contract tells you to keep terse — and terse is not the same as thin. The
 brief's "a PR body hints, it does not explain" deletes **narration of the diff**. It
-does not delete the six things below, which the diff cannot tell anyone.
+does not delete the seven things below, which the diff cannot tell anyone.
 
 A `gh pr create` whose body is missing a section, or which contains a bare `#N`, is
 **denied by a hook** with the fix named. Filling the template correctly the first time
@@ -26,7 +26,7 @@ cat .github/pull_request_template.md 2>/dev/null \
 ```
 
 If the repository has none, use this skill's bundled copy —
-`pull_request_template.md`, beside this file. Its six `##` headings are what the hook
+`pull_request_template.md`, beside this file. Its seven `##` headings are what the hook
 requires, so do not rename or drop any of them.
 
 ## 2. Fill every section
@@ -85,7 +85,37 @@ gets to decide whether the second one is acceptable. If your change touches a pr
 a contract or a heuristic, the A/B row is the one that matters: see `kn-fe226ab1`,
 where prose that every free test approved changed worker behaviour 0/5.
 
-## 3. Never write a bare `#N`
+**Screenshots** — one image per thing the change claims to do, for any PR that touches
+a rendered surface. A UI change without a screenshot is unreviewed (`kn-c531a831`): the
+UI row above says the tests passed, and server-rendered assertions see strings, never
+layout — 13 of them passed on the page that wrapped every table row onto three lines.
+`scripts/screenshot_config_console.py` is the shape to copy; playwright and chromium are
+already installed. Write `None — no rendered surface changed.` when none applies.
+
+## 3. Link every image by raw URL at the commit SHA
+
+`gh` cannot upload an image, so the PNGs are committed (`docs/screenshots/`) and linked.
+GitHub resolves a repo-relative path for a **link** and not for an **image**, so
+`![x](docs/screenshots/x.png)` is a broken icon in review while `[x](docs/…)` beside it
+works — which is why this survives being written and fails in front of the reviewer
+(`kn-72cec521`, PR 173). **The hook denies any image target that is not an absolute
+`http(s)` URL.**
+
+```
+https://raw.githubusercontent.com/<owner>/<repo>/<COMMIT-SHA>/docs/screenshots/<name>.png
+```
+
+Pin the SHA, not the branch: a branch URL 404s the moment the branch is deleted after
+merge, and the merged record is the one anybody reads later.
+
+Push the branch first — raw.githubusercontent serves from the remote — then verify each
+URL before you post the body:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' <url>   # 200 image/png
+```
+
+## 4. Never write a bare `#N`
 
 GitHub turns `#2` into a link to pull request 2, whoever's it is. Work orders number
 their own items, so "as in #2" in a work order description becomes a link to a
@@ -102,7 +132,7 @@ The hook allows `#N` when `issue`, `issues`, `PR`, `PRs`, `pull request` or
 `pull requests` immediately precedes it, and inside code spans and fenced blocks. Every
 other bare `#N` is denied.
 
-## 4. Title and footer
+## 5. Title and footer
 
 Your operating contract already fixes both: the title starts with `[<wo-id>] `, and the
 body ends with the Claude Code attribution line from your git briefing. The hook checks
