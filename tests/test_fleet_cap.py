@@ -179,17 +179,27 @@ def test_the_cap_counts_the_whole_fleet_not_one_project(jarvis_home, fake_claude
 
 
 def test_a_turn_parked_on_a_question_does_not_spend_a_fleet_slot(tmp_path, project):
-    """The unit is a turn in flight, NOT an active work order. `count_active` counts
-    `waiting_input`, and an order parked on a Neo question spends no tokens — rationing
-    the account against it would ration the fleet against orders that are not using the
-    thing that ran out (kn-5c32dde8)."""
+    """The unit is a turn in flight, NOT an active work order (kn-5c32dde8).
+
+    Since issue #134 the PROJECT cap agrees about a parked order, so the shape that
+    keeps the two apart is the second half: a usage-limit pause leaves its work order
+    `running`, which holds a project slot while drawing nothing from the account.
+    """
     store = ProjectStore(project)
     wo = store.create_work_order("parked on a question", origin="manual")
     turn = store.create_turn(wo["id"], kind="dispatch", prompt="go")
     store.finish_turn(turn["id"], "done", result="asked Neo")
     store.set_status(wo["id"], "waiting_input")
 
-    assert store.count_active() == 1
+    assert store.count_active() == 0
+    assert fleet.read(3, {"proj_a": store}).in_flight == 0
+
+    refused = store.create_work_order("refused by the usage window", origin="manual")
+    lost = store.create_turn(refused["id"], kind="dispatch", prompt="go")
+    store.finish_turn(lost["id"], "done", result="usage limit reached")
+    store.set_status(refused["id"], "running")
+
+    assert store.count_active() == 1, "a paused turn's order still holds its slot"
     assert fleet.read(3, {"proj_a": store}).in_flight == 0
     store.close()
 

@@ -8,7 +8,7 @@ orders that own work orders in sets.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -97,17 +97,49 @@ UNGOVERNED_ORIGINS = ("adhoc", "injected")
 # report and decides what happens next, instead of finishing a job and exiting.
 WO_KINDS = ("worker", "planner", "manager")
 
-# A work order occupying a slot: dispatched, running, or waiting on something. One
-# constant rather than a literal at each site, because the two readers must agree — the
-# project-wide cap (`count_active`, spent by `Daemon.dispatch_pending`) and the
-# per-feature cap (`claim_next_pending`, spent by `feature_orders.max_parallel`) would
-# otherwise be free to mean different things by "active".
+# A work order with a LIVE SESSION: dispatched, running, or parked mid-conversation on
+# somebody else. The per-feature cap (`claim_next_pending`, spent by
+# `feature_orders.max_parallel`), the retry sweep and every "a turn may be in flight"
+# reader mean this.
 #
-# `validating` counts: the work order still holds a live session the OS intends to
-# resume with the panel's verdict, so it must spend a slot. Without it a project capped
-# at two could pile six work orders into validation and then run five concurrent turns
-# the moment a tick rejected them.
+# NOT what the project-wide `max_concurrent` counts any more — see `SLOT_STATUSES` below
+# and issue #134. The two were one constant until then, on the reasoning that its readers
+# must agree; they are two because the readers turned out to be asking different
+# questions, and the split is deliberate rather than drift.
 ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
+
+# What spends one of a project's `max_concurrent` slots: a work order whose turn is
+# actually executing, plus the claim that is about to launch one (issue #134).
+#
+# `waiting_input` and `validating` are OUT. Both park a work order on somebody else — a
+# Neo question, a gate, the panel — with no turn in flight and no tokens moving, and
+# counting them meant a project capped at 5 could have one turn running and refuse to
+# claim a sixth order. `dispatching` is IN even though it is transient
+# (`dispatch_work_order` reaches `running` in the same call): a crash between the claim
+# and the launch must not read as a free slot.
+#
+# Narrowing this needs the cap enforced where a parked order RESUMES as well as where one
+# is claimed, or six rejected rounds all restart at once and blow past it — see
+# `Daemon.deliver_messages` and `Daemon.retry_paused_turns`, which is where that is done.
+SLOT_STATUSES = ("dispatching", "running")
+
+
+def resume_spends_slot(wo: Mapping[str, Any]) -> bool:
+    """Would starting a turn on this work order NOW take a `max_concurrent` slot it is
+    not already holding?
+
+    `count_active`'s predicate asked of one row, and negated — the question the two
+    places that enforce the cap on a RESUME have (`Daemon.deliver_messages` and
+    `Daemon.retry_paused_turns`), where counting the table answers the wrong thing.
+
+    Both clauses are load-bearing and both are easy to drop. A manager is exempt from
+    the count, so holding its message against a cap it does not contribute to would
+    strand a feature's coordinator behind its own children. A work order already in
+    `SLOT_STATUSES` is holding the slot its next turn runs in — most of all the one
+    parked on a usage limit, which stays `running` with no turn in flight — so charging
+    it again would refuse to resume the very order the cap is counting.
+    """
+    return wo.get("kind") != "manager" and wo["status"] not in SLOT_STATUSES
 
 # -- the message bus (see bus.py, and the validation-panel design doc) ----------------
 #
@@ -978,24 +1010,26 @@ class ProjectStore:
     def count_active(self) -> int:
         """How many work orders are spending one of this project's `max_concurrent` slots.
 
+        `SLOT_STATUSES`, not `ACTIVE_STATUSES`: the slot is for a turn that is executing,
+        not for a record that is waiting on somebody (issue #134).
+
         **Managers are exempt, and the exemption is load-bearing.** A project manager
-        order sits in `waiting_input` — an ACTIVE status — for the entire life of its
-        feature, because idle between messages is what it is FOR. Counted, two features in
-        flight would spend a `max_concurrent: 2` project's whole budget on two sessions
-        doing nothing, `Daemon.dispatch_pending` would never claim another work order, and
-        the project would stop with nothing on any surface saying why. A coordinator is
-        not a piece of the work — the same reasoning that already exempts the planner from
-        a feature's `max_parallel`, applied to the project-wide cap.
+        order is idle between messages for the entire life of its feature, because that
+        is what it is FOR. A coordinator is not a piece of the work — the same reasoning
+        that already exempts the planner from a feature's `max_parallel`, applied to the
+        project-wide cap, and it still bites now that parking is free: a manager runs a
+        turn every time its feature reports, and two features would otherwise spend a
+        `max_concurrent: 2` project's whole budget on bookkeeping.
 
         INV-MANAGER-SLOTS re-derives this from live state, because a regression here is
         invisible from every other surface: nothing looks wrong when a project simply
         stops claiming.
         """
-        marks = ",".join("?" for _ in ACTIVE_STATUSES)
+        marks = ",".join("?" for _ in SLOT_STATUSES)
         row = self.conn.execute(
             f"SELECT COUNT(*) c FROM work_orders "
             f"WHERE status IN ({marks}) AND kind != 'manager'",
-            ACTIVE_STATUSES,
+            SLOT_STATUSES,
         ).fetchone()
         return row["c"]
 

@@ -43,6 +43,7 @@ from .project_store import (
     DEPENDENCY_DEAD_STATUSES,
     FO_OPEN_STATUSES,
     OPEN_STATUSES,
+    SLOT_STATUSES,
     UNGOVERNED_ORIGINS,
 )
 
@@ -1507,10 +1508,10 @@ def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
     """INV-MANAGER-SLOTS — a project manager order must not spend a concurrency slot.
 
     `ProjectStore.count_active` is what `Daemon.dispatch_pending` compares against
-    `max_concurrent`, and it excludes `kind='manager'` on purpose: a manager sits in
-    `waiting_input` — an ACTIVE status — for the entire life of its feature, because idle
-    between messages is what it is FOR. Counted, two features in flight would spend a
-    `max_concurrent: 2` project's whole budget on two sessions doing nothing and the
+    `max_concurrent`, and it excludes `kind='manager'` on purpose: a manager runs a turn
+    every time its feature reports and is idle in between, for the whole life of that
+    feature, because coordinating is what it is FOR. Counted, two features in flight
+    would spend a `max_concurrent: 2` project's whole budget on bookkeeping and the
     project would stop claiming work altogether.
 
     That failure is why this check exists rather than a comment. It degrades into "the
@@ -1520,11 +1521,12 @@ def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
     be regressed by an innocent-looking edit years from now, so it is re-derived from live
     state instead of trusted.
 
-    Predicate: `count_active()` equals the number of work orders in ACTIVE_STATUSES whose
-    kind is not `manager`. Both sides are computed here, one through the method under test
-    and one directly in SQL, so the check cannot pass by sharing the bug — which is also
-    why it does not count `list_work_orders`, whose `limit` would quietly under-report on
-    exactly the busy project where a lost slot hurts most.
+    Predicate: `count_active()` equals the number of work orders in SLOT_STATUSES whose
+    kind is not `manager` — the cap's set since issue #134, NOT `ACTIVE_STATUSES`. Both
+    sides are computed here, one through the method under test and one directly in SQL,
+    so the check cannot pass by sharing the bug — which is also why it does not count
+    `list_work_orders`, whose `limit` would quietly under-report on exactly the busy
+    project where a lost slot hurts most.
 
     NOT repairable, and it must not try: a code regression is not derivable from state,
     and there is nothing in the database to fix — writing to rows here would corrupt
@@ -1535,11 +1537,11 @@ def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
     all: with none, both sides count the same rows and the difference is zero.
     """
     counted = store.count_active()
-    marks = ",".join("?" for _ in ACTIVE_STATUSES)
+    marks = ",".join("?" for _ in SLOT_STATUSES)
     row = store.conn.execute(
         f"SELECT COUNT(*) c FROM work_orders "
         f"WHERE status IN ({marks}) AND kind != 'manager'",
-        ACTIVE_STATUSES,
+        SLOT_STATUSES,
     ).fetchone()
     expected = int(row["c"])
     if counted == expected:
@@ -1548,10 +1550,11 @@ def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
         invariant="INV-MANAGER-SLOTS",
         detail=(
             f"`ProjectStore.count_active` returned {counted} where {expected} work "
-            f"orders are active and not managers: the manager exemption has regressed. "
-            f"A project manager order is designed to sit in `waiting_input` for its "
-            f"feature's whole life, so counting one spends a `max_concurrent` slot for "
-            f"ever and the project silently stops dispatching. Restore the "
+            f"orders hold a slot and are not managers: the manager exemption has "
+            f"regressed. A project manager order runs a turn every time its feature "
+            f"reports, for that feature's whole life, so counting one spends a "
+            f"`max_concurrent` slot the work itself needs and the project dispatches "
+            f"less and less. Restore the "
             f"`kind != 'manager'` filter in `count_active` (project_store.py); the "
             f"reasoning is in that method's docstring and in work order wo-9652be2f."
         ),

@@ -232,14 +232,14 @@ all of them:
 | the attention rollup (`:531`, `:535`) | the manager does not distort the "N of M children need you" line |
 
 **The one exception, and it is a fleet-wide deadlock if missed.** `count_active`
-(`project_store.py:546`) has **no kind filter at all** — it counts every work order in
-`ACTIVE_STATUSES`, and `waiting_input` is one of them. A manager is *designed* to sit idle in
-`waiting_input` for the entire life of its feature. So:
+(`project_store.py`) has **no kind filter at all** — it counts every work order in the
+concurrency set regardless of kind. A manager is *designed* to be idle between messages
+for the entire life of its feature. So:
 
 ```
    max_concurrent: 2
    two feature orders in flight
-   → two managers parked in waiting_input
+   → two managers holding a slot each
    → count_active() == 2
    → dispatch_pending never claims another work order. The project stops.
 ```
@@ -247,6 +247,12 @@ all of them:
 `count_active` must exclude `kind='manager'`. A coordinator is not a piece of the work —
 the same reasoning that already exempts the planner from `max_parallel`, applied to the
 project-wide cap.
+
+> Superseded in part by issue #134: the cap's set is `SLOT_STATUSES`
+> (`dispatching`, `running`), not `ACTIVE_STATUSES`, so a manager parked in
+> `waiting_input` no longer spends a slot by parking. The exemption stands and is still
+> checked by INV-MANAGER-SLOTS — a manager runs a turn every time its feature reports,
+> and those are what would otherwise be charged to the work's budget.
 
 ### The other three things a long-lived idle session breaks
 
@@ -333,6 +339,13 @@ give-up transition flags anyone.
 holds a live session the OS intends to resume. A *manager* does not, per the section above.
 Those two facts look contradictory and are not: the work order will be resumed within
 minutes and the manager may idle for days.
+
+> Superseded by issue #134: `validating` no longer spends a `max_concurrent` slot — the
+> panel is judging and no turn is in flight. It still spends a feature's `max_parallel`,
+> which is what `ACTIVE_STATUSES` now means on its own. The herd this paragraph was
+> guarding against — six rejected rounds resuming at once — is stopped at delivery
+> instead: `Daemon.deliver_messages` is under the cap, and a round's feedback reaches
+> its worker as a queued message.
 
 **Feature validation happens after the children have merged**, so its diff is real merged
 code on the default branch. Work-order validation happens after the PR is opened and before

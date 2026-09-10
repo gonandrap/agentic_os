@@ -75,7 +75,8 @@ def worker_stalls_on_prompts(mode: str) -> bool:
 
 
 # Default simultaneous work orders per project; the rest queue (catalog-tunable per
-# project, or fleet-wide via os.defaults.max_concurrent).
+# project, or fleet-wide via os.defaults.max_concurrent). A slot is spent by a turn that
+# is executing, not by a record waiting on somebody — `project_store.SLOT_STATUSES`.
 DEFAULT_MAX_CONCURRENT = 5
 
 
@@ -89,10 +90,11 @@ DEFAULT_MAX_CONCURRENT = 5
 # override to layer: the resource being rationed is shared, so a project that named its
 # own share would be naming a share of something it does not own.
 #
-# THE UNIT IS A TURN IN FLIGHT (`wo_turns.state='running'`), not an active work order.
-# `count_active` counts `waiting_input` too, and a work order parked on a Neo question
-# spends no tokens — capping on it would ration the fleet against orders that are not
-# using the thing that ran out. See src/jarvis/fleet.py.
+# THE UNIT IS A TURN IN FLIGHT (`wo_turns.state='running'`), not a work-order status.
+# The two now agree about parked orders — issue #134 took `waiting_input` and
+# `validating` out of `count_active` for the same reason this cap never counted them —
+# but they still differ: a usage-limit pause leaves its order `running`, spending a
+# project slot while it draws nothing from the account. See src/jarvis/fleet.py.
 #
 # 3, because the incident ran four Opus workers plus a planner while Neo answers and
 # validation-panel seats drew on the same account (Neo, question 219). It leaves headroom
