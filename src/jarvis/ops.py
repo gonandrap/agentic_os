@@ -2964,10 +2964,30 @@ def request_gate_approval(wo_id: str, command: str, why: str = "", evidence: str
     try:
         existing = store.latest_approval_for(wo_id, action.kind, action.command)
         if existing and existing["status"] == "pending":
+            # The case goes onto the STANDING request. Filing a second one is
+            # reviewer-shopping (kn-76b155a0) and dropping the text is issue 185 — the
+            # failure that made the gate's own printed advice unfollowable.
+            note = ("an identical request is already under review — end your "
+                    "turn; the verdict arrives as your next user turn")
+            if why.strip() or evidence.strip():
+                neo = NeoStore()
+                try:
+                    gates.amend_request(store, neo, wo, action, existing,
+                                        justification=why, evidence=evidence)
+                    question = (neo.get(existing["neo_question_id"])
+                                if existing["neo_question_id"] else None)
+                finally:
+                    neo.close()
+                read_already = question is not None and question["status"] != "queued"
+                note = (f"your case was attached to request {existing['id']}, which was "
+                        f"already under review — no second request was filed. "
+                        + ("The reviewer may already have read the earlier text, so a "
+                           "verdict that ignores this case is not a refusal of it: "
+                           "address the reason and request afresh. "
+                           if read_already else "")
+                        + "END YOUR TURN; the verdict arrives as your next user turn")
             return {"project": name, "wo_id": wo_id, "approval_id": existing["id"],
-                    "kind": action.kind, "status": "pending",
-                    "note": "an identical request is already under review — end your "
-                            "turn; the verdict arrives as your next user turn"}
+                    "kind": action.kind, "status": "pending", "note": note}
         grant = store.usable_grant(wo_id, action.kind, action.command)
         if grant:
             return {"project": name, "wo_id": wo_id, "approval_id": grant["id"],

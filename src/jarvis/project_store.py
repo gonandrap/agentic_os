@@ -2358,6 +2358,27 @@ class ProjectStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def amend_approval(self, approval_id: int, justification: str,
+                       evidence: str) -> dict[str, Any]:
+        """Write a fuller case onto a request that is still pending. See `gates.amend_request`.
+
+        Only the two case fields move. The command, the recogniser and the status are the
+        request's identity — a worker that wants a different command files a different
+        request, which is the whole point of exact-string matching.
+        """
+        approval = self.get_approval(approval_id)
+        if approval is None:
+            raise KeyError(f"approval {approval_id} not found")
+        self.conn.execute(
+            "UPDATE approvals SET justification=?, evidence=? WHERE id=?",
+            (justification, evidence, approval_id),
+        )
+        self.add_event(approval["wo_id"], "gate_amended", {
+            "approval_id": approval_id, "kind": approval["kind"],
+            "command": approval["command"],
+        })
+        return self.get_approval(approval_id)  # type: ignore[return-value]
+
     def link_neo_question(self, approval_id: int, question_id: int) -> None:
         self.conn.execute("UPDATE approvals SET neo_question_id=? WHERE id=?",
                           (question_id, approval_id))

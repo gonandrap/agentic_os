@@ -207,6 +207,27 @@ class NeoStore:
         row = self.conn.execute("SELECT * FROM questions WHERE id=?", (question_id,)).fetchone()
         return dict(row) if row else None
 
+    def revise_question(self, question_id: int, question: str) -> bool:
+        """Rewrite an OPEN question's text where it stands. Returns whether it changed.
+
+        The subject gained a fact the reviewer has to see — a gate request whose worker
+        came back and made its case (`gates.amend_request`). Rewriting beats asking again:
+        a second row is a second question about one decision, and every pointer at the
+        first one (`approvals.neo_question_id`) would have to move with it.
+
+        Guarded on OPEN_Q_STATUSES for the same reason `supersede` is: a decided question
+        is a record of what was actually asked, and editing it would make the answer
+        beneath it read as a reply to text nobody was shown.
+        """
+        q = self.get(question_id)
+        if q is None or q["status"] not in OPEN_Q_STATUSES:
+            return False
+        # The digest is a rendering of the old text — see `set_digest`. Clearing it puts
+        # the row back in `questions_needing_digest` so the dashboard re-derives one.
+        self.conn.execute("UPDATE questions SET question=?, digest=NULL WHERE id=?",
+                          (question, question_id))
+        return True
+
     def claim_next(self) -> dict[str, Any] | None:
         """Atomically claim the OLDEST queued question (FIFO — answering in order
         keeps Neo's shared prompt prefix warm in the Anthropic cache)."""

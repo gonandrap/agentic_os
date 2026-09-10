@@ -267,6 +267,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         who = f" (seat `{p['agent_type']}`)" if p.get("agent_type") else ""
         return (f"Asked permission to {p.get('kind') or 'act'}{who}",
                 p.get("command") or "")
+    if kind == "gate_amended":
+        # Not a second request — the same one, better argued. Said that way because a
+        # reader counting attempts at a privileged action must not count this as one.
+        return (f"Made the case for the pending `{p.get('kind') or 'gate'}` request",
+                p.get("command") or "")
     if kind == "gate_decided":
         verb = "Approved" if p.get("decision") == "approved" else "Denied"
         return (f"{verb} by {p.get('by') or '?'}: {p.get('kind') or 'gate'}",

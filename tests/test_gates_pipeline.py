@@ -300,6 +300,108 @@ def test_asking_twice_reuses_the_open_request(fleet):
     assert second["approval_id"] == first["approval_id"]
     assert "already under review" in second["note"]
 
+    store = fleet.store()
+    try:
+        assert len(store.list_approvals(fleet.wo_id)) == 1
+        # The second case did not overwrite the first: nobody retracted "a".
+        assert store.get_approval(first["approval_id"])["justification"] == \
+            "a\n\nAMENDED by the worker:\nb"
+    finally:
+        store.close()
+
+
+def test_the_case_reaches_the_reviewer_after_running_the_command_directly(fleet):
+    """GitHub issue 185, end to end.
+
+    The gate blocks a direct attempt, files a request whose justification is the
+    placeholder, and tells the worker to run `jarvis gate request` to make the case. That
+    advice was unfollowable: the request deduped onto the pending row and threw the text
+    away, leaving the reviewer nothing to judge but "no case was made".
+    """
+    blocked = fleet.attempt("./scripts/shipit.sh")
+    assert _decision(blocked) == "deny"
+    filed = fleet.approval()
+    assert filed["justification"] == gates.NO_CASE_JUSTIFICATION
+
+    result = ops.request_gate_approval(
+        fleet.wo_id, "./scripts/shipit.sh",
+        why="main is green and tagged", evidence="PR 42, 1068 passed, 0 failed")
+
+    assert result["approval_id"] == filed["id"]
+    assert "attached to request" in result["note"]
+    shown = ops.show_gate(filed["id"])
+    # The placeholder is a statement that no case exists, so a real case replaces it.
+    assert shown["justification"] == "main is green and tagged"
+    assert shown["evidence"] == "PR 42, 1068 passed, 0 failed"
+    assert "no case was made" not in shown["neo_question"]["question"]
+    assert "main is green and tagged" in shown["neo_question"]["question"]
+    assert "PR 42, 1068 passed, 0 failed" in shown["neo_question"]["question"]
+
+
+def test_the_amended_case_is_what_neo_actually_reviews(fleet):
+    """The point of the rewrite: the verdict is reached on the fuller text."""
+    fleet.attempt("./scripts/shipit.sh")
+    ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh",
+                              why="FORCE_APPROVE — main is green")
+    fleet.daemon._neo_drain()
+
+    approval = fleet.approval()
+    assert approval["status"] == "approved"
+    assert _decision(fleet.attempt("./scripts/shipit.sh")) == "allow"
+
+
+def test_amending_an_escalated_request_warns_that_it_may_have_been_read(fleet):
+    """Neo escalated, so the user holds the request. The case still goes on — refusing
+    it would throw the worker's text away, which is the bug — but the worker is told the
+    reviewer may already have read the earlier text."""
+    fleet.attempt("./scripts/shipit.sh")
+    approval = fleet.approval()
+    neo = NeoStore()
+    try:
+        neo.mark(approval["neo_question_id"], "escalated", "no justification given")
+    finally:
+        neo.close()
+
+    result = ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh",
+                                       why="the case nobody had made")
+
+    assert result["approval_id"] == approval["id"]
+    assert "may already have read the earlier text" in result["note"]
+    shown = ops.show_gate(approval["id"])
+    assert shown["justification"] == "the case nobody had made"
+    assert "the case nobody had made" in shown["neo_question"]["question"]
+
+
+def test_amending_files_no_second_request_and_no_second_question(fleet):
+    """A competing request for one action is reviewer-shopping (kn-76b155a0)."""
+    fleet.attempt("./scripts/shipit.sh")
+    ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh", why="x", evidence="y")
+
+    store = fleet.store()
+    try:
+        assert len(store.list_approvals(fleet.wo_id)) == 1
+    finally:
+        store.close()
+    neo = NeoStore()
+    try:
+        assert len(neo.list_questions()) == 1
+    finally:
+        neo.close()
+
+
+def test_amending_shows_on_the_timeline_as_a_case_not_an_attempt(fleet):
+    """A reader counting attempts at a privileged action must not count this as one."""
+    fleet.attempt("./scripts/shipit.sh")
+    ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh", why="the case")
+
+    store = fleet.store()
+    try:
+        kinds = [e["kind"] for e in store.list_events(fleet.wo_id)]
+    finally:
+        store.close()
+    assert kinds.count("gate_requested") == 1
+    assert kinds.count("gate_amended") == 1
+
 
 def test_asking_when_already_approved_says_so(fleet):
     ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh",

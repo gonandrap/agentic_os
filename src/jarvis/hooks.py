@@ -418,7 +418,9 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
             return _deny(
                 f"Gate `{action.kind}`: approval request {prior['id']} for this exact "
                 f"command is already under review. END YOUR TURN — the verdict arrives "
-                f"as your next user turn. Do not retry in a loop."
+                f"as your next user turn. Do not retry in a loop.\n\n"
+                f"If you have not made the case yet, `jarvis gate request` attaches one "
+                f"to request {prior['id']} — it never files a second."
             )
         if prior is not None and prior["status"] == "denied":
             return _deny(
@@ -433,10 +435,7 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
         try:
             approval, question = gates.file_request(
                 store, neo, env.get("JARVIS_PROJECT", ""), wo, action,
-                justification=(
-                    "(none — the worker ran the command directly rather than filing a "
-                    "request, so no case was made for it)"
-                ),
+                justification=gates.NO_CASE_JUSTIFICATION,
                 # Which SEAT attempted it, if a subagent did. `JARVIS_WO_ID` is
                 # per-session, so the request is filed against the work order either way;
                 # this is the only thing that keeps the record from saying the lead ran a

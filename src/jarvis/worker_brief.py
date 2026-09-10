@@ -580,6 +580,10 @@ def gates_section(wo_id: str = WO_PLACEHOLDER,
         f"--why \"<why this is ready>\" --evidence \"<PR number, test results, "
         f"checks>\"",
         "",
+        "Late is better than never: running that AFTER the automatic request was "
+        "filed attaches your case to it. It is never a second request — one "
+        "action gets one review.",
+        "",
         "Then END YOUR TURN. The verdict arrives as your next user turn. If "
         "approved, run that exact command — the approval is scoped to that one "
         "string and expires, so do not reword it. If denied, fix what the reason "

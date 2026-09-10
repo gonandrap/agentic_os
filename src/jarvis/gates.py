@@ -68,8 +68,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "APPROVAL_STATUSES", "GRANT_MAX_USES", "GRANT_TTL_SECONDS", "SELF_HEAL",
     "GateConfig",
-    "GateKind", "GatedAction", "KINDS", "KIND_NAMES", "REVIEWER_PERSONA", "RuleSet",
-    "VERDICTS", "apply_decision", "build_request_question", "classify",
+    "GateKind", "GatedAction", "KINDS", "KIND_NAMES", "NO_CASE_JUSTIFICATION",
+    "REVIEWER_PERSONA", "RuleSet",
+    "VERDICTS", "amend_request", "apply_decision", "build_request_question", "classify",
     "deny_conflicts", "file_request", "open_gate", "reads_only", "scannable",
     "summarise",
 ]
@@ -102,6 +103,14 @@ APPROVAL_STATUSES = ("pending", "approved", "denied", "dismissed", "expired")
 # records no authorisation, and is counted separately so the false-positive rate is a
 # number someone can watch rather than an anecdote.
 VERDICTS = ("approved", "denied", "dismissed")
+
+# What the justification says when the hook filed the request because the worker ran the
+# command instead of asking. It is a placeholder for a case nobody made — so `amend_request`
+# REPLACES it rather than appending under it, and the hook's own advice ("run `jarvis gate
+# request` to make the case properly") is what produces the amendment. Named here because
+# both writer and reader must agree on the string: see GitHub issue 185.
+NO_CASE_JUSTIFICATION = ("(none — the worker ran the command directly rather than filing "
+                         "a request, so no case was made for it)")
 
 
 @dataclass(frozen=True)
@@ -542,6 +551,63 @@ def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any]
     if wo.get("status") in ("running", "dispatching"):
         store.set_status(wo["id"], "waiting_input")
     return approval, question
+
+
+def _merge_case(existing: str, addition: str) -> str:
+    """The prior case plus the new one, as one field a reviewer reads top to bottom.
+
+    The placeholder is a statement that no case exists, so a real case REPLACES it —
+    leaving it above an amendment would keep telling the reviewer the exact falsehood
+    issue 185 is about. Anything else the worker wrote stands and the new text is
+    appended under it: the first case may be what a reviewer has already partly read,
+    and silently overwriting it would lose an argument nobody retracted.
+    """
+    prior = existing.strip()
+    addition = addition.strip()
+    if not addition:
+        return existing
+    if not prior or prior == NO_CASE_JUSTIFICATION:
+        return addition
+    if addition in prior:
+        return existing
+    return f"{prior}\n\nAMENDED by the worker:\n{addition}"
+
+
+def amend_request(store: ProjectStore, neo: Any, wo: dict[str, Any],
+                  action: GatedAction, approval: dict[str, Any],
+                  justification: str = "", evidence: str = "") -> dict[str, Any]:
+    """Attach a case to a request that is already pending. Returns the amended approval.
+
+    The alternative — filing a second request — is reviewer-shopping in effect even when
+    it is not in intent (kn-76b155a0), and the alternative to that, refusing the
+    amendment, throws the worker's text away, which is issue 185 itself. So the case goes
+    onto the standing request and the reviewer's question text is rewritten in place.
+
+    IN PLACE, never a fresh question re-linked to this approval: `daemon._deliver_gate_verdict`
+    resolves the approval through `approvals.neo_question_id`, so moving that pointer
+    while a verdict is in flight strands the verdict with nothing to apply it to.
+
+    A question Neo is mid-review on, or one already escalated to the user, is amended
+    all the same — the reviewer may have read the earlier text, and the caller is told so
+    rather than the worker losing the case for a race it cannot see.
+    """
+    from .neo_store import OPEN_Q_STATUSES
+
+    amended = store.amend_approval(
+        approval["id"],
+        justification=_merge_case(approval["justification"], justification),
+        evidence=_merge_case(approval["evidence"], evidence),
+    )
+    question = neo.get(approval["neo_question_id"]) if approval["neo_question_id"] else None
+    if question is not None and question["status"] in OPEN_Q_STATUSES:
+        history = [a for a in store.list_approvals(wo["id"], limit=HISTORY_LIMIT)
+                   if a["id"] != approval["id"]]
+        neo.revise_question(
+            question["id"],
+            build_request_question(action, wo, amended["justification"],
+                                   amended["evidence"], amended["agent_type"], history),
+        )
+    return amended
 
 
 # -- opening the gate ------------------------------------------------------------------
