@@ -211,6 +211,34 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return "Alarm handed to Neo", f"question #{qid}" if qid is not None else ""
     if kind == "alarm_advice":
         return "Neo advised the supervisor", ""  # the answer is in the conversation
+    # The health sweep's two and the remedy's three (§6 of
+    # docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md). A PROBE ID
+    # and a REMEDY ID are database values, so they ride in the detail rather than in the
+    # label: this module is a leaf and cannot reach the catalog that holds a probe's
+    # title, which `/alarms` renders instead.
+    if kind == "health_finding":
+        return "The supervisor found something wrong", p.get("reason") or ""
+    if kind == "health_reviewed":
+        found = p.get("findings") or 0
+        return ("The supervisor checked this over",
+                f"{p.get('trigger') or 'swept'} · "
+                + (f"{found} finding(s)" if found else "nothing found"))
+    if kind == "remedy_proposed":
+        # PERMISSION ASKED, NOTHING DONE, and the label has to carry that alone: this
+        # entry and `remedy_applied` sit next to each other on a settled order, and a
+        # reader who takes the first for the act goes looking for an effect only the
+        # second one had.
+        return ("The supervisor asked permission to act",
+                f"{p.get('remedy') or 'a remedy'}: {p.get('argument') or ''}")
+    if kind == "remedy_applied":
+        return ("The supervisor acted",
+                f"{p.get('remedy') or 'a remedy'}: {p.get('result') or ''}")
+    if kind == "remedy_refused":
+        # Two payload shapes arrive here — the catalog refusing to file the proposal at
+        # all, and a reviewer denying it — and `by` is what tells them apart (§5).
+        by = f" by {p['by']}" if p.get("by") else ""
+        return (f"The {p.get('remedy') or 'proposed'} remedy was refused{by}",
+                p.get("reason") or "")
     if kind == "assumption":
         n = p.get("n")  # the number, not the text — §4
         return (f"Assumption #{n} recorded" if n else "Assumption recorded"), ""
@@ -335,6 +363,13 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
 #: docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md).
 UNAUTHORED_SOURCES = frozenset({"pr-conflict"})
 
+#: `remedies.MESSAGE_SOURCE`, spelled out here for the reason `ALARM_KINDS` is: this
+#: module is a leaf and opens nothing. A test pins the two equal. Deliberately NOT a
+#: member of `UNAUTHORED_SOURCES` above — an unauthored message is one nobody decided,
+#: and the supervisor decided this one, under a grant it had to be given first (§6 of
+#: docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md).
+SUPERVISOR_SOURCE = "supervisor"
+
 
 def _message_label(m: dict[str, Any]) -> str:
     """Who is speaking, from the message's own `source` — §5.
@@ -346,6 +381,8 @@ def _message_label(m: dict[str, Any]) -> str:
         return "worker → you"
     if m.get("source") == "neo":
         return "neo → worker"
+    if m.get("source") == SUPERVISOR_SOURCE:
+        return "supervisor → worker"
     if m.get("source") in UNAUTHORED_SOURCES:
         return "jarvis → worker"
     return "you → worker"
@@ -364,6 +401,10 @@ def _message_event_label(m: dict[str, Any]) -> str:
         # `source="neo"` is written in exactly one place (`daemon._neo_drain`), and only
         # for the message carrying an answer — so this cannot mislabel anything else.
         return "Neo answered the worker"
+    if m.get("source") == SUPERVISOR_SOURCE:
+        # The same arm as `_message_label`'s, and it needs its own: without it a nudge
+        # the user never sent reads on the timeline as "You messaged the worker".
+        return "The supervisor messaged the worker"
     if m.get("source") in UNAUTHORED_SOURCES:
         return "Jarvis messaged the worker"
     return "You messaged the worker"

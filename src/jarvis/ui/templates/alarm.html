@@ -15,9 +15,33 @@
   {{ verdict_body(a) }}
 </div>
 
+{# THE EVIDENCE THE FINDING CITED, which exists nowhere else in the OS: `wo_alarms`
+   keeps the reason, and what the judge was actually shown survives only on the
+   `self_heal` request its proposal filed. §6 of
+   docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md. #}
+{% if a.gate and a.gate.evidence %}
+<h2>What the supervisor was looking at</h2>
+<div class="panel" style="padding: 14px 16px;">
+  <pre class="request-text">{{ a.gate.evidence }}</pre>
+</div>
+{% endif %}
+
 <h2>Your review</h2>
 <div class="panel" style="padding: 14px 16px;">
-  {% if a.review_status != 'unreviewed' %}
+  {% if a.alarm_status == 'proposed' %}
+  {# NOT the review control. `ops.review_alarm` refuses a proposed alarm, so offering
+     the buttons here would post a decision that can only come back as an error — and
+     the decision the OS is actually waiting for is a gate verdict. #}
+  <p class="kv" style="margin-bottom:0">The supervisor is asking permission to
+    <span class="mono">{{ a.remedy }}</span>, and nothing has been done. Answer it on
+    {% if a.remedy_approval_id %}
+    <a href="/gates#gate-{{ a.remedy_approval_id }}">gate request
+      #{{ a.remedy_approval_id }}</a>, or with
+    <span class="mono">jarvis gate approve {{ a.remedy_approval_id }}</span> /
+    <span class="mono">jarvis gate deny {{ a.remedy_approval_id }} --reason "…"</span>.
+    {% else %}<a href="/gates">the gates page</a>.{% endif %}
+    Your verdict on how it JUDGED this comes back here once it has been decided.</p>
+  {% elif a.review_status != 'unreviewed' %}
   {{ review_standing(a) }}
   {% elif a.verdict %}
   <p class="kv" style="margin-bottom:0">Was that the right call? Approving teaches the
