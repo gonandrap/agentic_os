@@ -2946,6 +2946,15 @@ def request_gate_approval(wo_id: str, command: str, why: str = "", evidence: str
     from .neo_store import NeoStore
 
     name, path, wo = find_work_order(wo_id, project_name)
+    # No case, no request. This is the whole point of the hold: a reviewer is never
+    # handed a privileged action nobody argued for, and the one command that can make
+    # that argument must not be the thing that files an unargued one.
+    if not why.strip() and not evidence.strip():
+        raise OpsError(
+            "a gate request needs a case — pass --why (and --evidence: the PR, the test "
+            "results, the checks). The reviewer sees only what you write here, and a "
+            "request with nothing in it can only be refused."
+        )
     config = _project_gate_config(name)
     if not config:
         raise OpsError(
@@ -2963,21 +2972,31 @@ def request_gate_approval(wo_id: str, command: str, why: str = "", evidence: str
     store = ProjectStore(path)
     try:
         existing = store.latest_approval_for(wo_id, action.kind, action.command)
-        if existing and existing["status"] == "pending":
-            # The case goes onto the STANDING request. Filing a second one is
-            # reviewer-shopping (kn-76b155a0) and dropping the text is issue 185 — the
+        if existing and existing["status"] in (gates.AWAITING_CASE, "pending"):
+            # The case goes onto the STANDING request, never a second one: that would be
+            # reviewer-shopping (kn-76b155a0), and dropping the text is issue 185 — the
             # failure that made the gate's own printed advice unfollowable.
-            note = ("an identical request is already under review — end your "
-                    "turn; the verdict arrives as your next user turn")
-            if why.strip() or evidence.strip():
-                neo = NeoStore()
-                try:
-                    gates.amend_request(store, neo, wo, action, existing,
-                                        justification=why, evidence=evidence)
+            held = existing["status"] == gates.AWAITING_CASE
+            neo = NeoStore()
+            try:
+                gates.amend_request(store, neo, wo, action, existing,
+                                    justification=why, evidence=evidence)
+                if held:
+                    # The case has arrived, so the request can finally be seen. This is
+                    # the moment the reviewer's question is written, and it is written
+                    # from the amended row — which is why it never contains a placeholder.
+                    question = gates.queue_for_review(store, neo, name, wo, action,
+                                                      store.get_approval(existing["id"]))
+                else:
                     question = (neo.get(existing["neo_question_id"])
                                 if existing["neo_question_id"] else None)
-                finally:
-                    neo.close()
+            finally:
+                neo.close()
+            if held:
+                note = (f"your case was filed and request {existing['id']} is now under "
+                        f"review — END YOUR TURN; the verdict arrives as your next "
+                        f"user turn")
+            else:
                 read_already = question is not None and question["status"] != "queued"
                 note = (f"your case was attached to request {existing['id']}, which was "
                         f"already under review — no second request was filed. "
@@ -2987,7 +3006,9 @@ def request_gate_approval(wo_id: str, command: str, why: str = "", evidence: str
                            if read_already else "")
                         + "END YOUR TURN; the verdict arrives as your next user turn")
             return {"project": name, "wo_id": wo_id, "approval_id": existing["id"],
-                    "kind": action.kind, "status": "pending", "note": note}
+                    "kind": action.kind, "status": "pending",
+                    "neo_question_id": question["id"] if question else None,
+                    "note": note}
         grant = store.usable_grant(wo_id, action.kind, action.command)
         if grant:
             return {"project": name, "wo_id": wo_id, "approval_id": grant["id"],
@@ -3035,7 +3056,10 @@ def decide_gate(approval_id: int, verdict: str, reason: str = "",
                        "false-positive count")
 
     name, path, approval = _find_approval(approval_id, project_name)
-    if approval["status"] != "pending":
+    # `awaiting_case` decides too. The hold keeps NEO from ruling on a request nobody
+    # argued; the user is not Neo — they can read the command, and the alternative is a
+    # dead end where the only way out is waiting for the TTL to refuse it.
+    if approval["status"] not in ("pending", gates.AWAITING_CASE):
         raise OpsError(
             f"approval {approval_id} is already {approval['status']}"
             + (f" (by {approval['decided_by']})" if approval["decided_by"] else "")
@@ -3117,6 +3141,8 @@ def list_gates(project_name: str | None = None, wo_id: str | None = None,
     command string. One NeoStore is opened for the whole list, so this is cheap
     enough to render a page from.
     """
+    from . import gates
+
     paths = registered_project_paths()
     if project_name:
         if project_name not in paths:
@@ -3130,7 +3156,10 @@ def list_gates(project_name: str | None = None, wo_id: str | None = None,
         try:
             store.expire_approvals()
             rows = store.list_approvals(
-                wo_id, statuses=("pending",) if pending_only else None
+                # `awaiting_case` counts as outstanding here even though no reviewer
+                # holds it: a request invisible on the one list that shows open gates is
+                # a privileged action nobody can find.
+                wo_id, statuses=("pending", gates.AWAITING_CASE) if pending_only else None
             )
         finally:
             store.close()

@@ -512,6 +512,10 @@ class Daemon:
                     # Before the invariants, because it is a fact about work that is
                     # still RUNNING rather than about state that has settled.
                     self.check_burning_turns(project, store)
+                    # Also before them: this is the only thing that ever closes a gate
+                    # request no reviewer can see, so leaving it until after would let
+                    # the invariants judge a hold the OS was about to refuse.
+                    self.refuse_unargued_gates(project, store)
                     # Last: check the state everything above just produced.
                     self.check_invariants(project, store)
                 self.central.touch_project(project.name)
@@ -2416,6 +2420,28 @@ class Daemon:
                     pstore.close()
         finally:
             neo_store.close()
+
+    def refuse_unargued_gates(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Close every gate request whose case never came. See `gates.sweep_unargued`.
+
+        The other half of holding an unargued request back from review: nothing else can
+        ever close one, because there is no Neo question to answer and no escalation for
+        the user to see. Without this the hold leaks.
+        """
+        from . import gates
+
+        if not project.gates:
+            return
+        try:
+            refused = gates.sweep_unargued(
+                store, project.gates.case_ttl_seconds,
+                central=self.central, project=project.name)
+        except Exception:  # noqa: BLE001 — one project's sweep must not stop the tick
+            log.exception("project %s: refusing unargued gates failed", project.name)
+            return
+        for approval in refused:
+            log.info("gate %s (%s) refused: no case was made for it",
+                     approval["id"], approval["kind"])
 
     # -- 7. invariants (post-conditions) --------------------------------------------------
 

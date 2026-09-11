@@ -69,6 +69,16 @@ def fleet(jarvis_home, fake_claude, gated_catalog, project):
                 {"tool_name": "Bash", "tool_input": {"command": command},
                  "cwd": str(project)}, self.env())
 
+        def request(self, command, why="tests are green", evidence=""):
+            """Attempt it, then argue it — a compliant worker's two moves, in one call.
+
+            The attempt alone leaves the request `awaiting_case` and in front of nobody
+            (gates.AWAITING_CASE); the second move is what starts a review.
+            """
+            self.attempt(command)
+            return ops.request_gate_approval(self.wo_id, command, why=why,
+                                             evidence=evidence)
+
         def approval(self):
             store = self.store()
             try:
@@ -322,14 +332,19 @@ def test_the_case_reaches_the_reviewer_after_running_the_command_directly(fleet)
     assert _decision(blocked) == "deny"
     filed = fleet.approval()
     assert filed["justification"] == gates.NO_CASE_JUSTIFICATION
+    # ...and it is in front of NOBODY, which is what makes the case below reach the
+    # reviewer first rather than racing a drain that already claimed the question.
+    assert filed["status"] == gates.AWAITING_CASE
+    assert filed["neo_question_id"] is None
 
     result = ops.request_gate_approval(
         fleet.wo_id, "./scripts/shipit.sh",
         why="main is green and tagged", evidence="PR 42, 1068 passed, 0 failed")
 
     assert result["approval_id"] == filed["id"]
-    assert "attached to request" in result["note"]
+    assert "now under review" in result["note"]
     shown = ops.show_gate(filed["id"])
+    assert shown["status"] == "pending"
     # The placeholder is a statement that no case exists, so a real case replaces it.
     assert shown["justification"] == "main is green and tagged"
     assert shown["evidence"] == "PR 42, 1068 passed, 0 failed"
@@ -354,22 +369,22 @@ def test_amending_an_escalated_request_warns_that_it_may_have_been_read(fleet):
     """Neo escalated, so the user holds the request. The case still goes on — refusing
     it would throw the worker's text away, which is the bug — but the worker is told the
     reviewer may already have read the earlier text."""
-    fleet.attempt("./scripts/shipit.sh")
+    fleet.request("./scripts/shipit.sh", why="a first pass at the case")
     approval = fleet.approval()
     neo = NeoStore()
     try:
-        neo.mark(approval["neo_question_id"], "escalated", "no justification given")
+        neo.mark(approval["neo_question_id"], "escalated", "not enough evidence")
     finally:
         neo.close()
 
     result = ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh",
-                                       why="the case nobody had made")
+                                       why="the evidence they asked for")
 
     assert result["approval_id"] == approval["id"]
     assert "may already have read the earlier text" in result["note"]
     shown = ops.show_gate(approval["id"])
-    assert shown["justification"] == "the case nobody had made"
-    assert "the case nobody had made" in shown["neo_question"]["question"]
+    assert shown["justification"].endswith("the evidence they asked for")
+    assert "the evidence they asked for" in shown["neo_question"]["question"]
 
 
 def test_amending_files_no_second_request_and_no_second_question(fleet):
@@ -401,6 +416,145 @@ def test_amending_shows_on_the_timeline_as_a_case_not_an_attempt(fleet):
         store.close()
     assert kinds.count("gate_requested") == 1
     assert kinds.count("gate_amended") == 1
+
+
+# -- the hold: no reviewer ever reads an unargued request -----------------------------
+# docs/superpowers/specs/2026-09-11-holding-an-unargued-gate.md
+
+
+def test_neo_never_sees_a_held_request_however_many_ticks_pass(fleet):
+    """The property the hold exists for. The old design filed straight to Neo and hoped
+    the worker's case won a race against a 5-second poll; this is why it no longer is one.
+    """
+    fleet.attempt("./scripts/shipit.sh")
+
+    for _ in range(3):
+        fleet.daemon.tick()
+        fleet.daemon._neo_drain()
+
+    approval = fleet.approval()
+    assert approval["status"] == gates.AWAITING_CASE
+    assert approval["decided_by"] is None
+    neo = NeoStore()
+    try:
+        assert neo.list_questions() == []
+    finally:
+        neo.close()
+
+
+def test_a_request_with_no_case_is_refused_before_it_is_filed(fleet):
+    """The one command that can argue a request must not be able to file an unargued one."""
+    with pytest.raises(ops.OpsError, match="needs a case"):
+        ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh")
+    with pytest.raises(ops.OpsError, match="needs a case"):
+        ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh", why="  ",
+                                  evidence=" ")
+    store = fleet.store()
+    try:
+        assert store.list_approvals(fleet.wo_id) == []
+    finally:
+        store.close()
+
+
+def test_a_held_request_whose_case_never_comes_is_refused_on_a_timer(fleet):
+    """Nothing else can ever close one: no question to answer, no escalation to see."""
+    fleet.attempt("./scripts/shipit.sh")
+    approval = fleet.approval()
+
+    store = fleet.store()
+    try:
+        # Wind the filing back past the window rather than sleeping through it.
+        store.conn.execute("UPDATE approvals SET ts = ts - 7200 WHERE id=?",
+                           (approval["id"],))
+        refused = gates.sweep_unargued(store, gates.DEFAULT_CASE_TTL_SECONDS)
+    finally:
+        store.close()
+
+    assert [r["id"] for r in refused] == [approval["id"]]
+    closed = fleet.approval()
+    assert closed["status"] == "denied"      # refused, not quietly expired
+    assert closed["decided_by"] == "os"
+    assert "no case was made" in closed["decision_reason"]
+    # The worker is told, because the worker is who has to act — and the denial routes it
+    # back to `jarvis gate request`, which is the thing it should have run.
+    store = fleet.store()
+    try:
+        body = "\n".join(m["content"] for m in store.queued_messages(fleet.wo_id))
+    finally:
+        store.close()
+    assert "DENIED" in body
+    assert "jarvis gate request" in body
+
+
+def test_the_daemon_is_what_refuses_it(fleet):
+    """The sweep has to be wired into a tick or the hold leaks in production."""
+    fleet.attempt("./scripts/shipit.sh")
+    approval = fleet.approval()
+    store = fleet.store()
+    try:
+        store.conn.execute("UPDATE approvals SET ts = ts - 7200 WHERE id=?",
+                           (approval["id"],))
+    finally:
+        store.close()
+
+    for _ in range(7):   # RECONCILE_EVERY_TICKS
+        fleet.daemon.tick()
+
+    assert fleet.approval()["status"] == "denied"
+
+
+def test_a_request_still_inside_its_window_is_left_alone(fleet):
+    fleet.attempt("./scripts/shipit.sh")
+    store = fleet.store()
+    try:
+        assert gates.sweep_unargued(store, gates.DEFAULT_CASE_TTL_SECONDS) == []
+    finally:
+        store.close()
+    assert fleet.approval()["status"] == gates.AWAITING_CASE
+
+
+def test_the_refusal_leaves_the_command_blocked_and_a_fresh_request_possible(fleet):
+    """A refusal authorises nothing, and the worker's route back is a real request."""
+    fleet.attempt("./scripts/shipit.sh")
+    approval = fleet.approval()
+    store = fleet.store()
+    try:
+        store.conn.execute("UPDATE approvals SET ts = ts - 7200 WHERE id=?",
+                           (approval["id"],))
+        gates.sweep_unargued(store, gates.DEFAULT_CASE_TTL_SECONDS)
+    finally:
+        store.close()
+
+    assert _decision(fleet.attempt("./scripts/shipit.sh")) == "deny"
+    again = ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh",
+                                      why="here is the case, at last")
+    assert again["approval_id"] != approval["id"]
+    assert ops.show_gate(again["approval_id"])["status"] == "pending"
+
+
+def test_a_held_gate_does_not_ask_the_user_for_anything(fleet):
+    """It is the WORKER's move, so the park must not read as "waiting on your input"."""
+    from jarvis.invariants import check_project, true_blockers
+
+    fleet.attempt("./scripts/shipit.sh")
+    store = fleet.store()
+    try:
+        wo = store.get_work_order(fleet.wo_id)
+        assert wo["status"] == "waiting_input"
+        assert true_blockers(store, wo) == []
+        check_project(store, repair=True)
+        assert store.get_work_order(fleet.wo_id)["needs_attention"] == 0
+    finally:
+        store.close()
+
+
+def test_the_case_ttl_is_a_per_project_catalog_setting(fleet):
+    """A threshold a surface judges by belongs in the catalog, not in a module — kn-67cdb54b."""
+    cfg = gates.GateConfig.parse({"enabled": ["release"], "case_ttl_seconds": 120})
+    assert cfg.case_ttl_seconds == 120
+    assert gates.GateConfig.from_json(cfg.to_json()).case_ttl_seconds == 120
+    with pytest.raises(ValueError, match="must be positive"):
+        gates.GateConfig.parse({"enabled": ["release"], "case_ttl_seconds": 0})
 
 
 def test_asking_when_already_approved_says_so(fleet):
@@ -573,6 +727,9 @@ def test_user_can_dismiss_a_gate_the_classifier_got_wrong(fleet):
     fleet.attempt(command)
     approval = fleet.approval()
 
+    # A held request decides fine. The user is not Neo — they can read the command —
+    # and a false positive needs no case at all, so waiting for one would be absurd.
+    assert approval["status"] == gates.AWAITING_CASE
     ops.decide_gate(approval["id"], verdict="dismissed",
                     reason="the literal is a -k test selector; this runs a test")
 
@@ -580,7 +737,8 @@ def test_user_can_dismiss_a_gate_the_classifier_got_wrong(fleet):
     assert fleet.approval()["status"] == "dismissed"
     neo = NeoStore()
     try:
-        assert neo.get(approval["neo_question_id"])["answer"] == "DISMISSED"
+        # Nothing was ever put to a reviewer, so there is no question to close.
+        assert neo.list_questions() == []
     finally:
         neo.close()
 
@@ -599,7 +757,7 @@ def test_decide_gate_refuses_a_verdict_it_does_not_understand(fleet):
     approval = fleet.approval()
     with pytest.raises(ops.OpsError, match="unknown verdict"):
         ops.decide_gate(approval["id"], verdict="probably", reason="hmm")
-    assert fleet.approval()["status"] == "pending"
+    assert fleet.approval()["status"] == gates.AWAITING_CASE
 
 
 def test_the_false_positive_rate_is_reportable_across_the_fleet(fleet):

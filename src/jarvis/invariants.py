@@ -601,9 +601,17 @@ def _mentions_assumptions(reason: str | None) -> bool:
 
 
 def _waiting_on_neo_gate(store: ProjectStore, wo: dict[str, Any]) -> bool:
-    """True when this work order is parked on a privileged-action request that Neo has
-    not answered yet. Not a user blocker: Neo is the one holding it."""
-    return any(not a["escalated"] for a in store.pending_approvals(wo["id"]))
+    """True when this work order is parked on a privileged-action request the user does
+    not hold. Not a user blocker either way — but for two different reasons.
+
+    A `pending` request is with Neo. An `awaiting_case` one is with the WORKER, which
+    still asks the user for nothing: it is held precisely because nobody has argued it
+    yet, and the OS refuses it on a timer if nobody ever does (`gates.sweep_unargued`).
+    Omitting the second reads the park as the generic "waiting on your input" — the
+    false flag GitHub issue 100 was, arrived at down a different road.
+    """
+    return (any(not a["escalated"] for a in store.pending_approvals(wo["id"]))
+            or bool(store.held_approvals(wo["id"])))
 
 
 def awaiting_neo(wo_id: str) -> dict[str, Any] | None:
@@ -664,7 +672,12 @@ def end_wait_if_nothing_is_out(store: ProjectStore, wo_id: str) -> bool:
     """
     if store.get_work_order(wo_id)["status"] != "waiting_input":
         return False
-    if store.pending_approvals(wo_id) or awaiting_neo(wo_id):
+    # `held_approvals` counts as out. Nobody is reviewing one, but the work order is not
+    # free either: the OS will refuse it on a timer and message the worker (see
+    # `gates.sweep_unargued`), and ending the wait now would say the turn has somewhere
+    # to go when it does not.
+    if (store.pending_approvals(wo_id) or store.held_approvals(wo_id)
+            or awaiting_neo(wo_id)):
         return False
     store.set_status(wo_id, "running")
     return True

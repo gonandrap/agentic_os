@@ -100,6 +100,9 @@ LEVEL_TONE = {"info": "muted", "warning": "warn", "critical": "bad"}
 # `dismissed` is neutral-toned on purpose: nothing was permitted and nothing was
 # refused, so neither the ok nor the bad colour tells the truth about it.
 GATE_META = {
+    # Recorded, unargued, in front of nobody. Its own word because calling it "pending"
+    # would tell the reader a reviewer is holding it when the worker is — gates.AWAITING_CASE.
+    "awaiting_case": {"word": "awaiting case", "icon": "✎", "tone": "warn"},
     "pending":   {"word": "pending",   "icon": "◌", "tone": "warn"},
     "approved":  {"word": "approved",  "icon": "✓", "tone": "ok"},
     "denied":    {"word": "denied",    "icon": "✗", "tone": "bad"},

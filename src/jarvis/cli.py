@@ -1952,7 +1952,8 @@ def cmd_fo(args: argparse.Namespace) -> int:
     return 0
 
 
-GATE_ICON = {"pending": "⏸", "approved": "✅", "denied": "⛔", "dismissed": "⊘",
+GATE_ICON = {"awaiting_case": "✎", "pending": "⏸", "approved": "✅",
+             "denied": "⛔", "dismissed": "⊘",
              "expired": "⌛"}
 
 
@@ -2016,7 +2017,10 @@ def cmd_gate(args: argparse.Namespace) -> int:
             for r in rows:
                 icon = GATE_ICON.get(r["status"], "•")
                 where = "you" if r["escalated"] else "neo"
-                if r["status"] == "pending":
+                if r["status"] == "awaiting_case":
+                    # Never "pending": nobody is holding it. It is the worker's move.
+                    state = "awaiting the worker's case — no reviewer sees it yet"
+                elif r["status"] == "pending":
                     state = f"pending (with {where})"
                 elif r["status"] == "dismissed":
                     state = f"dismissed by {r['decided_by'] or '?'} — not a gated action"
@@ -2025,7 +2029,10 @@ def cmd_gate(args: argparse.Namespace) -> int:
                 print(f"{icon} {r['id']} [{r['project']}] {r['kind']} · {state} "
                       f"· {r['wo_id']} · {_age(r['ts'])} ago")
                 print(f"    {r['command']}")
-                if r["status"] == "pending" and r["escalated"]:
+                if r["status"] == "awaiting_case":
+                    print(f"    ↳ jarvis gate request {r['wo_id']} \"{r['command']}\" "
+                          f"--why \"...\" --evidence \"...\"   (the worker's move)")
+                elif r["status"] == "pending" and r["escalated"]:
                     print(f"    ↳ Neo escalated: {r['escalation_reason']}")
                     print(f"    ↳ jarvis gate approve {r['id']} --reason \"...\"  |  "
                           f"jarvis gate deny {r['id']} --reason \"...\"  |  "

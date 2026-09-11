@@ -341,7 +341,7 @@ def gate_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any
         return None
 
     try:
-        return _resolve_gate(action, wo_id, env, payload)
+        return _resolve_gate(action, wo_id, env, payload, config)
     except Exception as e:  # noqa: BLE001 — fail closed; see the docstring
         return _deny(
             f"Gate `{action.kind}`: the OS could not verify approval for this command "
@@ -380,8 +380,15 @@ def _classify(command: str, config: Any) -> Any:
         central.close()
 
 
+def _case_deadline(config: Any) -> str:
+    """The sentence that turns the hold into a deadline the worker can see."""
+    return (f"If no case is made within "
+            f"{int(config.case_ttl_seconds // 60)} minutes the request is refused "
+            f"automatically, unreviewed.")
+
+
 def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
-                  payload: dict[str, Any]) -> dict[str, Any]:
+                  payload: dict[str, Any], config: Any) -> dict[str, Any]:
     from . import gates
     from .neo_store import NeoStore
 
@@ -414,6 +421,15 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
             )
 
         prior = store.latest_approval_for(wo_id, action.kind, action.command)
+        if prior is not None and prior["status"] == gates.AWAITING_CASE:
+            return _deny(
+                f"Gate `{action.kind}`: request {prior['id']} for this exact command is "
+                f"recorded but NOT under review, and retrying the command will not start "
+                f"one. It is waiting for your case, and only this starts the review:\n"
+                f"    jarvis gate request {wo_id} \"{action.command}\" "
+                f"--why \"<why this is ready>\" --evidence \"<PR, tests, checks>\"\n\n"
+                f"{_case_deadline(config)} Then END YOUR TURN."
+            )
         if prior is not None and prior["status"] == "pending":
             return _deny(
                 f"Gate `{action.kind}`: approval request {prior['id']} for this exact "
@@ -433,9 +449,12 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
         wo = store.get_work_order(wo_id)
         neo = NeoStore()
         try:
-            approval, question = gates.file_request(
+            # HELD, not queued. You ran the command instead of arguing for it, so there is
+            # no case to review yet — and handing a reviewer the placeholder now would get
+            # it decided before yours could arrive (GitHub issue 185).
+            approval, _ = gates.file_request(
                 store, neo, env.get("JARVIS_PROJECT", ""), wo, action,
-                justification=gates.NO_CASE_JUSTIFICATION,
+                justification=gates.NO_CASE_JUSTIFICATION, hold=True,
                 # Which SEAT attempted it, if a subagent did. `JARVIS_WO_ID` is
                 # per-session, so the request is filed against the work order either way;
                 # this is the only thing that keeps the record from saying the lead ran a
@@ -447,15 +466,15 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
             neo.close()
         return _deny(
             f"Gate `{action.kind}`: {action.summary} needs approval, so this attempt was "
-            f"blocked and approval request {approval['id']} was filed for review "
-            f"(Neo question {question['id']}).\n\n"
-            f"END YOUR TURN NOW — the verdict arrives as your next user turn, and the "
-            f"retry will go through if it is approved.\n\n"
-            f"You filed no justification because you ran the command directly. To make "
-            f"the case properly (branch, PR, test results — reviewers see only what you "
-            f"write), run:\n"
+            f"blocked and request {approval['id']} was recorded.\n\n"
+            f"NOBODY IS REVIEWING IT YET. You ran the command rather than asking, so the "
+            f"request carries no case, and no reviewer is shown one. Make it — reviewers "
+            f"see only what you write (branch, PR, test results):\n"
             f"    jarvis gate request {wo_id} \"{action.command}\" "
-            f"--why \"<why this is ready to ship>\" --evidence \"<PR, tests, checks>\""
+            f"--why \"<why this is ready to ship>\" --evidence \"<PR, tests, checks>\"\n\n"
+            f"That command starts the review. {_case_deadline(config)}\n\n"
+            f"Then END YOUR TURN — the verdict arrives as your next user turn, and the "
+            f"retry will go through if it is approved."
         )
     finally:
         store.close()

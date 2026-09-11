@@ -475,7 +475,11 @@ CREATE TABLE IF NOT EXISTS approvals (
     matched TEXT NOT NULL DEFAULT '',       -- the recogniser that fired
     justification TEXT NOT NULL DEFAULT '',
     evidence TEXT NOT NULL DEFAULT '',
-    -- pending | approved | denied | dismissed | expired.
+    -- awaiting_case | pending | approved | denied | dismissed | expired.
+    -- `awaiting_case` is filed-but-unargued: the worker ran the command instead of
+    -- asking, so no Neo question exists yet and nothing in the OS acts on the row until
+    -- the worker makes its case. It is the ONLY status no reviewer can see, which is why
+    -- it is also the only one with a TTL that refuses it — see gates.AWAITING_CASE.
     -- `dismissed` is not a verdict on a privileged action, it is a verdict on the
     -- CLASSIFIER: the command never performed one and the gate matched it by mistake.
     -- It clears the command like an approval does but records no authorisation, and it
@@ -2322,21 +2326,35 @@ class ProjectStore:
     def add_approval(self, wo_id: str, kind: str, command: str, matched: str = "",
                      justification: str = "", evidence: str = "",
                      max_uses: int = 3,
-                     agent_type: str | None = None) -> dict[str, Any]:
+                     agent_type: str | None = None,
+                     status: str = "pending") -> dict[str, Any]:
         cur = self.conn.execute(
             """INSERT INTO approvals (wo_id, ts, kind, command, matched, justification,
-                                      evidence, max_uses, agent_type)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                                      evidence, max_uses, agent_type, status)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (wo_id, db.now(), kind, command, matched, justification, evidence, max_uses,
-             agent_type),
+             agent_type, status),
         )
         approval_id = int(cur.lastrowid)  # type: ignore[arg-type]
         self.add_event(wo_id, "gate_requested", {
             "approval_id": approval_id, "kind": kind, "command": command,
+            # Whether a reviewer can see it yet. The timeline is read on its own, and
+            # "asked permission" is the wrong thing to say about a request that is still
+            # waiting for the worker to argue it — see gates.AWAITING_CASE.
+            "held": status == "awaiting_case",
             # In the payload as well as the column: the timeline is read on its own, and
             # "the planner ran this" is exactly the wrong thing for it to imply.
             **({"agent_type": agent_type} if agent_type else {}),
         })
+        return self.get_approval(approval_id)  # type: ignore[return-value]
+
+    def start_review(self, approval_id: int, question_id: int) -> dict[str, Any]:
+        """Link the reviewer's question and open the request to review. See
+        `gates.queue_for_review` — the one transition out of `awaiting_case`."""
+        self.conn.execute(
+            "UPDATE approvals SET neo_question_id=?, status='pending' WHERE id=?",
+            (question_id, approval_id),
+        )
         return self.get_approval(approval_id)  # type: ignore[return-value]
 
     def get_approval(self, approval_id: int) -> dict[str, Any] | None:
@@ -2446,7 +2464,10 @@ class ProjectStore:
         approval = self.get_approval(approval_id)
         if approval is None:
             raise KeyError(f"approval {approval_id} not found")
-        if approval["status"] != "pending":
+        # `awaiting_case` too: a request nobody ever argued is no more answerable than a
+        # pending one once its work order is over, and it has even less claim on the
+        # record — see gates.AWAITING_CASE.
+        if approval["status"] not in ("pending", "awaiting_case"):
             return approval
         self.conn.execute(
             """UPDATE approvals SET status='expired', decided_by='os',
@@ -2526,8 +2547,17 @@ class ProjectStore:
         return db.rows_to_dicts(self.conn.execute(q, params).fetchall())
 
     def pending_approvals(self, wo_id: str | None = None) -> list[dict[str, Any]]:
-        """Requests still awaiting a verdict — from Neo or, once escalated, the user."""
+        """Requests still awaiting a verdict — from Neo or, once escalated, the user.
+
+        `awaiting_case` is deliberately NOT here: nobody is deciding one, so every caller
+        that asks "what is a reviewer holding?" would be told something false. Ask
+        `held_approvals` for those.
+        """
         return self.list_approvals(wo_id, statuses=("pending",))
+
+    def held_approvals(self, wo_id: str | None = None) -> list[dict[str, Any]]:
+        """Requests recorded but not yet argued, so not yet in front of anyone."""
+        return self.list_approvals(wo_id, statuses=("awaiting_case",))
 
     def expire_approvals(self) -> int:
         """Move spent or timed-out grants to `expired` so listings tell the truth.

@@ -66,13 +66,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .project_store import ProjectStore
 
 __all__ = [
-    "APPROVAL_STATUSES", "GRANT_MAX_USES", "GRANT_TTL_SECONDS", "SELF_HEAL",
+    "APPROVAL_STATUSES", "AWAITING_CASE", "DEFAULT_CASE_TTL_SECONDS", "GRANT_MAX_USES",
+    "GRANT_TTL_SECONDS", "SELF_HEAL",
     "GateConfig",
     "GateKind", "GatedAction", "KINDS", "KIND_NAMES", "NO_CASE_JUSTIFICATION",
     "REVIEWER_PERSONA", "RuleSet",
     "VERDICTS", "amend_request", "apply_decision", "build_request_question", "classify",
-    "deny_conflicts", "file_request", "open_gate", "reads_only", "scannable",
-    "summarise",
+    "deny_conflicts", "file_request", "open_gate", "queue_for_review", "reads_only",
+    "scannable", "summarise", "sweep_unargued",
 ]
 
 # How long an approval stays usable, and how many attempts it covers. The window is
@@ -83,7 +84,26 @@ __all__ = [
 GRANT_TTL_SECONDS = 3600
 GRANT_MAX_USES = 3
 
-APPROVAL_STATUSES = ("pending", "approved", "denied", "dismissed", "expired")
+APPROVAL_STATUSES = ("awaiting_case", "pending", "approved", "denied", "dismissed",
+                     "expired")
+
+# Filed, recorded, and DELIBERATELY not in front of a reviewer yet: the worker ran the
+# command instead of asking, so the only justification on the row is the placeholder
+# below. Nothing in the OS acts on a request in this status — no Neo question exists for
+# it — until the worker comes back and makes its case, which is the one transition out of
+# it (`queue_for_review`). See docs/superpowers/specs/2026-09-11-holding-an-unargued-gate.md.
+#
+# The alternative, filing straight to Neo and letting a late case amend the row, loses the
+# race it depends on: the daemon polls every 5s and the worker's next tool call costs a
+# model turn, so the reviewer reads the placeholder first nearly every time.
+AWAITING_CASE = "awaiting_case"
+
+# How long a held request waits for its case before the OS refuses it. It must expire:
+# nothing else closes a request no reviewer can see, and an unargued privileged action
+# left open for ever is a worse record than a refused one. Per-project via
+# `gates.case_ttl_seconds` in the catalog — kn-67cdb54b — because how long a worker
+# plausibly takes to come back with test results is a fact about the project, not the OS.
+DEFAULT_CASE_TTL_SECONDS = 600.0
 
 # The verdicts a reviewer can reach. `dismissed` is not a softer denial and not a quieter
 # approval — it answers a different question.
@@ -125,6 +145,7 @@ class GateConfig:
 
     enabled: frozenset[str] = frozenset()
     extra_patterns: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    case_ttl_seconds: float = DEFAULT_CASE_TTL_SECONDS
 
     def __bool__(self) -> bool:
         return bool(self.enabled)
@@ -133,6 +154,9 @@ class GateConfig:
         return json.dumps({
             "enabled": sorted(self.enabled),
             "patterns": {k: list(v) for k, v in sorted(self.extra_patterns.items())},
+            # Rides along to the worker so the hook can tell it how long it has to make
+            # the case. A deadline the blocked worker is not told is not a deadline.
+            "case_ttl_seconds": self.case_ttl_seconds,
         }, sort_keys=True)
 
     @classmethod
@@ -188,7 +212,16 @@ class GateConfig:
                 except re.error as e:
                     raise ValueError(f"gates.patterns.{name}: bad regex {p!r}: {e}") from e
             extra[name] = tuple(str(p) for p in pats)
-        return cls(enabled=frozenset(enabled), extra_patterns=extra)
+
+        ttl_raw = data.get("case_ttl_seconds", DEFAULT_CASE_TTL_SECONDS)
+        try:
+            ttl = float(ttl_raw)
+        except (TypeError, ValueError):
+            raise ValueError('"gates.case_ttl_seconds" must be a number of seconds') from None
+        if ttl <= 0:
+            raise ValueError('"gates.case_ttl_seconds" must be positive — a held request '
+                             'that never expires is the leak this setting bounds')
+        return cls(enabled=frozenset(enabled), extra_patterns=extra, case_ttl_seconds=ttl)
 
 
 @dataclass(frozen=True)
@@ -516,13 +549,18 @@ def build_request_question(action: GatedAction, wo: dict[str, Any],
 
 def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any],
                  action: GatedAction, justification: str = "", evidence: str = "",
-                 max_uses: int = GRANT_MAX_USES,
-                 agent_type: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Record an approval request and queue it for review. Returns (approval, question).
+                 max_uses: int = GRANT_MAX_USES, agent_type: str | None = None,
+                 hold: bool = False,
+                 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Record an approval request. Returns (approval, question), question None if held.
 
     One path for both entry points — the hook (a worker that just ran the command) and
     `jarvis gate request` (a worker making its case first) — so a gate behaves the same
     however it was reached.
+
+    `hold` is what makes the two differ in the one way they must. The hook has no case to
+    pass on, so it files `AWAITING_CASE`: recorded, the worker parked, and NO Neo question
+    yet, because the case is still coming. `queue_for_review` is the only way out.
 
     The request rides the existing Neo queue rather than a parallel review pipeline,
     which is what gives it escalation-to-user, `jarvis neo list` and answer delivery
@@ -531,26 +569,77 @@ def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any]
     `agent_type` reaches here only from the hook: `jarvis gate request` is a shell
     command, so whoever ran it had a shell, and the seats have none.
     """
-    # Read before the insert, so the reviewer's history is everything BUT this request.
-    history = store.list_approvals(wo["id"], limit=HISTORY_LIMIT)
     approval = store.add_approval(
         wo["id"], action.kind, action.command, matched=action.matched,
         justification=justification, evidence=evidence, max_uses=max_uses,
-        agent_type=agent_type,
+        agent_type=agent_type, status=AWAITING_CASE if hold else "pending",
     )
-    question = neo.ask(
-        project, wo["id"],
-        build_request_question(action, wo, justification, evidence, agent_type, history),
-        context=f"{wo.get('title') or ''}\n{(wo.get('description') or '')[:800]}",
-        kind="approval",
-    )
-    store.link_neo_question(approval["id"], question["id"])
+    question = None if hold else queue_for_review(store, neo, project, wo, action,
+                                                  approval)
     # The worker has nothing to do until a verdict lands. Saying so keeps the reconciler
     # from reading the idle session as "finished without `jarvis wo finish`" and filing
-    # it for review — a gate request is a wait, not an abandonment.
+    # it for review — a gate request is a wait, not an abandonment. True of a held request
+    # too: what it waits for is the worker's own next command.
     if wo.get("status") in ("running", "dispatching"):
         store.set_status(wo["id"], "waiting_input")
     return approval, question
+
+
+def queue_for_review(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any],
+                     action: GatedAction, approval: dict[str, Any]) -> dict[str, Any]:
+    """Put a recorded request in front of a reviewer. Returns the Neo question.
+
+    The single door from `AWAITING_CASE` to `pending`, and the single place a reviewer's
+    question text is first written — so "no reviewer ever reads a request nobody argued
+    for" is a property of one function rather than a convention six callers must keep.
+    """
+    # Read before the question, so the reviewer's history is everything BUT this request.
+    history = [a for a in store.list_approvals(wo["id"], limit=HISTORY_LIMIT)
+               if a["id"] != approval["id"]]
+    question = neo.ask(
+        project, wo["id"],
+        build_request_question(action, wo, approval["justification"],
+                               approval["evidence"], approval["agent_type"], history),
+        context=f"{wo.get('title') or ''}\n{(wo.get('description') or '')[:800]}",
+        kind="approval",
+    )
+    store.start_review(approval["id"], question["id"])
+    return question
+
+
+def sweep_unargued(store: ProjectStore, ttl_seconds: float,
+                   central: CentralStore | None = None,
+                   project: str = "") -> list[dict[str, Any]]:
+    """Refuse every held request whose case never came. Returns the rows it refused.
+
+    The cost of holding a request back from review is that nothing else will ever close
+    it: there is no question for Neo to answer and no escalation for the user to see, so
+    without this a worker that wandered off leaves an unargued privileged action open for
+    ever. The clock starts at filing, and it is the project's (`gates.case_ttl_seconds`).
+
+    A DENIAL rather than an expiry, though it is the OS refusing rather than a reviewer.
+    `expired` is a status the worker is never told about, and the worker is exactly who
+    has to act: the denial message says what was missing, and the hook's denied branch
+    then routes the retry into `jarvis gate request` with a real case. Nothing was
+    authorised and nothing is lost — the command string stays blocked and a properly
+    argued request is a fresh row.
+    """
+    from . import db
+
+    cutoff = db.now() - ttl_seconds
+    refused = []
+    for approval in store.list_approvals(statuses=(AWAITING_CASE,)):
+        if approval["ts"] > cutoff:
+            continue
+        refused.append(apply_decision(
+            store, approval["id"], verdict="denied",
+            reason=(f"no case was made for it within {int(ttl_seconds // 60)} minutes. "
+                    f"The command was run directly, so nothing was ever put to a "
+                    f"reviewer — file it again with `jarvis gate request` and say why "
+                    f"it is ready."),
+            decided_by="os", central=central, project=project,
+        ))
+    return refused
 
 
 def _merge_case(existing: str, addition: str) -> str:
@@ -637,7 +726,12 @@ def open_gate(store: ProjectStore, grant: dict[str, Any],
     approval = store.consume_grant(grant["id"])
     if approval["status"] != "approved":
         return approval
-    for pending in store.pending_approvals(approval["wo_id"]):
+    # Held requests are swept too. One filed by the hook is the likeliest duplicate there
+    # is — the decorated retry that tripped the gate is exactly how the second row gets
+    # written — and leaving it would keep an unargued request open for an action that has
+    # already run under authorisation.
+    for pending in (store.pending_approvals(approval["wo_id"])
+                    + store.held_approvals(approval["wo_id"])):
         if pending["id"] == approval["id"] or pending["kind"] != approval["kind"]:
             continue
         if approval["command"] not in pending["command"]:
