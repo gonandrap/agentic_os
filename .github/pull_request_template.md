@@ -42,3 +42,13 @@
 | UI | | |
 | Eval | | |
 | A/B | | |
+
+## Screenshots
+
+<!-- One image per thing the change claims to do, for any PR that touches a rendered
+     surface: a passing UI test is not evidence of what the page looks like. Link by
+     raw URL at the commit SHA — a relative path renders broken and is denied:
+     https://raw.githubusercontent.com/<owner>/<repo>/<sha>/docs/screenshots/<name>.png
+     Write "None — no rendered surface changed." if none applies. -->
+
+-

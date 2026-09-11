@@ -1071,8 +1071,14 @@ def create_app() -> FastAPI:
         `rows`: the supervisor's reasoning and Neo's advice are not in the frozen
         `list_cost_alarms` dict, and widening that dict is what four sibling surfaces
         bind against. See `ops.alarm_review_queue`.
+
+        THREE HALVES AND NO FOURTH (§6 of the health spec). A proposed remedy is still
+        "asking for you" until it is decided and an applied one is "addressed by the
+        supervisor" like any ack, so both land in a queue that already exists. The rows
+        come from `alarm_feed` rather than `list_cost_alarms` because a remedy and a
+        probe's title are not on the frozen dict either.
         """
-        rows = ops.list_cost_alarms()
+        rows = ops.alarm_feed()
         live: dict[str, dict] = {}
         for a in (r for r in rows if r["live"]):
             group = live.setdefault(a["subject_id"], {**a, "alarms": []})

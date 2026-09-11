@@ -1434,9 +1434,11 @@ def cmd_alarms(args: argparse.Namespace) -> int:
         return cmd_alarms_show(args)
     if args.alarms_cmd == "review":
         return cmd_alarms_review(args)
-    rows = ops.list_cost_alarms(args.project, limit=args.limit, wo_id=args.wo,
-                                fo_id=args.fo,
-                                sources=(args.source,) if args.source else None)
+    # `alarm_feed`, not `list_cost_alarms`: the probe's title and the remedy are not on
+    # the frozen dict, and a fact that reaches the page and not the terminal is a bug.
+    rows = ops.alarm_feed(args.project, limit=args.limit, wo_id=args.wo,
+                          fo_id=args.fo,
+                          sources=(args.source,) if args.source else None)
     if args.json:
         _print(rows, True)
         return 0
@@ -1454,9 +1456,11 @@ def cmd_alarms(args: argparse.Namespace) -> int:
         # reads alarms today to render exactly as it does today.
         who = (f"{row['id']}  " if (args.wo or args.fo)
                else f"{row['subject_id']}  {row['project']}  ")
-        print(f"{mark} {who}{row['kind']}  "
+        print(f"{mark} {who}{row['kind_label']}  "
               f"{ops.turn_label(row['seq'])}  {_age(row['ts'])} ago")
         print(f"    {row['reason']}")
+        if row["remedy"]:
+            print(f"    remedy: {ops.remedy_line(row)}")
     if live:
         print("\nack one with: jarvis wo ack <wo-id>")
     return 0
@@ -1471,7 +1475,7 @@ def cmd_alarms_show(args: argparse.Namespace) -> int:
         _print(a, True)
         return 0
     print(f"{a['id']}  {a['project']}  {a['subject_id']}  {a['title']}")
-    print(f"  {a['kind']}  {ops.turn_label(a['seq'])}  {_age(a['ts'])} ago"
+    print(f"  {a['kind_label']}  {ops.turn_label(a['seq'])}  {_age(a['ts'])} ago"
           f"{'  ! still asking' if a['live'] else ''}")
     print(f"  what fired: {a['reason']}")
     if a["verdict"]:
@@ -1481,9 +1485,20 @@ def cmd_alarms_show(args: argparse.Namespace) -> int:
         print(f"    note: {a['note'] or '—'}")
     else:
         print(f"\n  supervisor: {a['alarm_status']} — not decided")
+    if a["remedy"]:
+        print(f"    remedy: {ops.remedy_line(a)}")
     if a["neo_question_id"]:
         print(f"  neo (#{a['neo_question_id']}): {a['neo_advice'] or 'not answered yet'}")
-    if a["review_status"] == "unreviewed":
+    # The evidence packet, on the terminal's half of the page that carries it: it is
+    # stored on the gate request and nowhere else, so nothing else can print it (§6).
+    if a["gate"] and a["gate"]["evidence"]:
+        print(f"\n  what it was looking at:\n"
+              + "\n".join(f"    {line}" for line in a["gate"]["evidence"].splitlines()))
+    if a["alarm_status"] == "proposed":
+        gate = a["remedy_approval_id"] or "<id>"
+        print(f"\nit is asking permission to act — answer it with: "
+              f"jarvis gate approve {gate} | jarvis gate deny {gate} --reason \"…\"")
+    elif a["review_status"] == "unreviewed":
         if a["verdict"]:
             print(f"\nreview it: jarvis alarms review {a['id']} "
                   f"[--reject --feedback \"…\"]")
@@ -1878,6 +1893,12 @@ def cmd_fo(args: argparse.Namespace) -> int:
                 print("\nvalidation:")
                 for rnd in detail["validation_rounds"]:
                     print(f"  {ops.round_line(rnd)}")
+            # `jarvis wo show`'s line, from the same formatter and in the same words —
+            # a feature is watched by the same supervisor as a work order and a second
+            # wording for one standing is how the two surfaces come to disagree (§6).
+            # Silent when there is none, which is every feature until a sweep is armed.
+            if detail["alarms"]:
+                print(f"\nalarms: {ops.alarm_standing_line(detail['alarms'])}")
             if detail["plan_text"]:
                 print(f"\nplan:\n{detail['plan_text']}")
             if detail["max_parallel"]:

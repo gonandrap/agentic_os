@@ -18,6 +18,38 @@
    class="mono">{{ a.subject_id }}</a>
 {%- endmacro %}
 
+{# WHAT RAISED IT, in the words the user chose. `kind_label` is `ops.alarm_kind_label`,
+   already resolved on every enriched read: a probe's TITLE for a health finding and the
+   kind for a cost alarm, so no template has to know which is which. The fallback is for
+   a caller still handing over the frozen `list_cost_alarms` dict. §6 of
+   docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md. #}
+{% macro what_fired(a) -%}
+<span class="tone-warn">{{ a.kind_label or a.kind }}</span>
+{%- endmacro %}
+
+{# THE REMEDY, WHEREVER THE ALARM IS READ, and nothing at all when none was proposed —
+   which is every alarm on a fleet that ships this off. Three facts and they are three
+   different questions: what was asked for, who is deciding it, and whether it has
+   actually happened yet. `remedy_result` is the only one of them that says the session
+   was touched. §6. #}
+{% macro remedy_block(a) %}
+  {% if a.remedy %}
+  <div class="sub" style="margin-top:6px">
+    The supervisor asked to <span class="mono">{{ a.remedy }}</span>:
+    {{ a.remedy_argument }}
+    {% if a.remedy_approval_id %}
+    <a href="/gates#gate-{{ a.remedy_approval_id }}">gate request
+      #{{ a.remedy_approval_id }} →</a>
+    {% endif %}
+  </div>
+  <div class="sub">
+    {% if a.remedy_result %}What it did: {{ a.remedy_result }}
+    {% elif a.alarm_status == 'proposed' %}Nothing has been done — it needs your permission first.
+    {% else %}Nothing was done — the remedy was not granted.{% endif %}
+  </div>
+  {% endif %}
+{% endmacro %}
+
 {# What the supervisor decided and why. TWO SENTENCES, NOT ONE: `verdict_reason` is its
    argument for the verdict and `note` is what it wrote to the user, and collapsing them
    would lose whichever the reader happened to need. §5 of
@@ -26,7 +58,7 @@
   <div class="who">
     {{ a.project }} ·
     {{ subject_link(a) }} ·
-    <span class="tone-warn">{{ a.kind }}</span> · {{ turn_label(a.seq) }} ·
+    {{ what_fired(a) }} · {{ turn_label(a.seq) }} ·
     {{ fmt_age(a.ts) }} ago
   </div>
   <div style="margin:6px 0">{{ a.title }}</div>
@@ -34,11 +66,16 @@
   {% if a.verdict %}
   <p class="kv" style="margin-top:10px">
     {% if a.verdict == 'ack' %}<span class="st tone-ok"><span class="i">✓</span>acked</span>
+    {# A THIRD VERDICT, and it is not an escalation: the supervisor asked to ACT and is
+       waiting to be allowed to. Rendered as one before §6, a proposal read on the page
+       as something Neo already had. #}
+    {% elif a.verdict == 'propose' %}<span class="st tone-warn"><span class="i">⚑</span>a remedy proposed</span>
     {% else %}<span class="st tone-warn"><span class="i">↑</span>escalated</span>{% endif %}
     by the supervisor{% if a.decided_at %}, {{ fmt_age(a.decided_at) }} ago{% endif %}
   </p>
   {% if a.verdict_reason %}<div class="sub">Why: {{ a.verdict_reason }}</div>{% endif %}
   {% if a.note %}<div style="margin:6px 0; white-space:pre-wrap">{{ a.note }}</div>{% endif %}
+  {{ remedy_block(a) }}
   {% else %}
   <p class="kv" style="margin-top:10px">
     <span class="st tone-muted"><span class="i">◌</span>{{ a.alarm_status }}</span>
