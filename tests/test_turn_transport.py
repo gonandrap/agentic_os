@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -195,6 +196,36 @@ def test_a_turn_runs_in_its_own_unit_and_reports_that_units_main_pid(
     assert fake_claude.wait_calls(lambda c: "-p" in c["argv"]), "the turn never ran"
 
 
+def test_a_units_main_pid_outlives_the_process_that_ran_it(
+        fake_claude, fake_systemd, tmp_path) -> None:
+    """The property every pid assertion in this file rests on.
+
+    A fake turn is over in less time than a `systemctl` read costs, so a MainPID derived
+    from liveness answers 0 for every attempt `main_pid` makes and a turn that ran
+    perfectly reads as one that never reported a pid — intermittently, on whichever test
+    file happened to run first.
+    """
+    unit = "jarvis-turn-wo-2-1.service"
+    spawned = _spawn(tmp_path, unit=unit)
+    _wait_until(lambda: not systemd_units.unit_active(unit), "the turn never finished")
+
+    assert systemd_units.main_pid(unit) == spawned.pid
+
+
+def test_a_stopped_units_pid_does_not_outlive_the_unit(
+        fake_claude, fake_systemd, tmp_path) -> None:
+    """The bound on the one above: `--collect` unloads a stopped unit, and an unloaded
+    unit answers as one that was never started."""
+    fake_claude.hold_turns()
+    unit = "jarvis-turn-wo-3-1.service"
+    assert _spawn(tmp_path, unit=unit).pid
+
+    assert systemd_units.stop_unit(unit)
+
+    assert systemd_units.main_pid(unit, attempts=1) is None
+    assert not systemd_units.unit_active(unit)
+
+
 def test_the_turn_in_a_unit_still_buys_the_five_minute_cache_write(
         fake_claude, fake_systemd, tmp_path, monkeypatch) -> None:
     """`--setenv` is now the only way the flag reaches a worker, so the property
@@ -355,6 +386,16 @@ def _ctl_calls(fake_systemd) -> list[dict]:
     path = fake_systemd.dir / "ctl-calls.jsonl"
     return ([json.loads(line) for line in path.read_text().splitlines()]
             if path.exists() else [])
+
+
+def _wait_until(done: Callable[[], bool], message: str,
+                timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if done():
+            return
+        time.sleep(0.02)
+    raise AssertionError(message)
 
 
 def _has_result(outfile: Path) -> bool:
