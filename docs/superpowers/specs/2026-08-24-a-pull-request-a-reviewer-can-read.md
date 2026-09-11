@@ -20,15 +20,19 @@ no statement of what survives the cut is an instruction to minimise, and a model
 minimising against no floor arrives at three sentences.
 
 So the fix is not a better sentence about brevity. It is a **named set of things the
-body must contain**, which brevity applies *within* rather than *to*. Five sections:
+body must contain**, which brevity applies *within* rather than *to*. Seven sections
+(`Alarms raised` arrived with §7 of `2026-08-31-the-supervisor.md`, `Screenshots` with
+S5 below):
 
 | Section | Why the diff cannot supply it |
 |---|---|
 | Summary | what changed and why |
 | Implementation notes | the alternatives rejected, the risk, where to start |
 | Questions asked to Neo | the decisions that were not the worker's to take |
+| Alarms raised | what this order burned while it ran |
 | Learnings | what the next work order inherits, by `kn-` id |
 | Test evidence | what was run and what it reported |
+| Screenshots | what the rendered surface actually looks like now |
 
 Test evidence keeps all four of its rows — unit, UI, eval, A/B — filled or explicitly
 n/a **with a reason**, because "no UI test" and "no UI change" are different facts and
@@ -85,3 +89,29 @@ The templates are not generated from the constant; they are **asserted against i
 `tests/test_pr_body.py`, along with the byte-equality of the two copies. A generated
 template would have to be built at install time in every project; an asserted one fails
 CI the moment the three disagree, which is the only failure mode that matters.
+
+## S5. The screenshot rule, and the URL form that is the whole of it
+
+kn-c531a831 is the user's standing instruction: **a UI change without a screenshot is
+unreviewed.** It had lived only in spec prose, which is the shape S2 already measured as
+worthless — so it becomes the seventh section, answered by pictures or by
+`None — no rendered surface changed.`, on the same footing as every other.
+
+That alone would not have caught the failure that prompted this. GitHub resolves a
+repo-relative path in a body for a **link** and not for an **image**, so PR 173 shipped
+two broken-image icons past a green hook, a filled template and a `--evidence` line that
+truthfully said "screenshots in the PR body" (kn-72cec521). `unrenderable_image` is the
+part that catches it: every markdown image target that is not an absolute `http(s)` URL
+is denied, with the raw URL at the commit SHA named in the deny.
+
+The check is narrow in the same two ways `mislinking_ref` is, and for the same reason —
+it blanks code spans, fenced blocks and HTML comments before scanning, so a template's
+own example and a skill's counter-example cannot trip it. An absolute URL is not
+inspected further: whether it *resolves* is `curl`'s job, and the skill makes that the
+last step before posting. A branch URL resolves today and 404s the moment the branch is
+deleted after merge, which no hook can see and only the SHA rule prevents.
+
+Five copies now, not the three S4 names: `hooks.PR_BODY_SECTIONS`, the two templates,
+and the two prose enumerations kn-aefb5cb3 found — `worker_brief.concision_section` and
+the skill's frontmatter `description`. `tests/test_pr_body.py` asserts the first four and
+now the concision one; the description is still guarded only by review.

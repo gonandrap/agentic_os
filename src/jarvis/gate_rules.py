@@ -92,6 +92,11 @@ EXEMPTIBLE_POSITIONS = (HEREDOC, QUOTED)
 
 SOURCES = ("builtin", "neo", "user")
 
+#: The gate kind the OS files against ITSELF. Named here rather than spelled at the six
+#: call sites that branch on it, because a typo in one of them silently restores the
+#: worker-messaging path this kind exists to switch off (§5).
+SELF_HEAL = "self_heal"
+
 
 # -- what a gate IS (metadata; the patterns live in the table) ------------------------
 
@@ -145,6 +150,27 @@ KINDS: tuple[GateKind, ...] = (
         summary="change the fleet's own configuration (this can turn gates, validation "
                 "and worker permission modes off)",
         conflict_markers=("jarvis config",),
+    ),
+    # THE ONLY KIND NOTHING CLASSIFIES INTO, and the only one a project cannot switch
+    # off. Every kind above exists to catch a command a WORKER typed, so it has
+    # recognisers and rides `GateConfig.enabled`; this one is filed programmatically by
+    # `remedies.propose` when the supervisor wants to act on a unit it judged unhealthy,
+    # and it is the only thing standing between a health judgement and a running
+    # session — so `remedies.propose` never consults `GateConfig` and there is nothing
+    # to disable. What a project controls instead is `supervisor.remedies.allowed`,
+    # which is the other direction: what may be ASKED for, not whether asking is
+    # required. Deliberately no `SEED_MATCHES` and no `SEED_CANARIES` entry, and
+    # `gates.classify` therefore returns it for nothing —
+    # docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §5.
+    #
+    # No `conflict_markers` for the same reason: `deny_conflicts` asks whether a
+    # project's `permissions.deny` rules would shadow a gate, and nothing this gate
+    # authorises is ever run through a shell.
+    GateKind(
+        name=SELF_HEAL,
+        summary="let the supervisor act on a work order or feature order it judged "
+                "unhealthy (this reaches a running session)",
+        conflict_markers=(),
     ),
 )
 
