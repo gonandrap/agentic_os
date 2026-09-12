@@ -2110,6 +2110,14 @@ def _cfg_value(value: Any) -> str:
 
 
 def _cfg_change(change: dict) -> str:
+    from . import ops
+
+    # No arrow for a document-only write: there is nothing on either side of it.
+    if change["kind"] in ops.DOCUMENT_ONLY_KINDS:
+        where = ("the catalog now says so" if change["kind"] == "pinned"
+                 else "back on its default")
+        return (f"= {change['path']} = {_cfg_value(change['new'])} "
+                f"(unchanged — {where})")
     sign = {"added": "+", "removed": "-", "changed": "~"}[change["kind"]]
     if change["kind"] == "added":
         return f"{sign} {change['path']} = {_cfg_value(change['new'])}"
@@ -2120,9 +2128,11 @@ def _cfg_change(change: dict) -> str:
 
 
 def _print_config_write(data: dict) -> None:
+    from . import ops
+
     change = data["change"]
     print(f"✓ {_cfg_change(change)}")
-    if data["safety"]:
+    if data["safety"] and change["kind"] not in ops.DOCUMENT_ONLY_KINDS:
         print("  ⚠ SAFETY SETTING — this changes what a worker is allowed to do")
     print(f"  {data['apply']} — {data['note']}")
     print(f"  {data['version']['id']}"
