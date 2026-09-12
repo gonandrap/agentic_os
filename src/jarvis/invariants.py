@@ -154,11 +154,39 @@ STALE_FINISH_BLOCKER = ("the worker went back to work after finishing and stoppe
 #: `Daemon.poll_pull_requests`, which is in flight by definition.
 PARKABLE_STATUSES = ("dispatching", "running", "waiting_input", "needs_review")
 
+#: What a work order says when something the user sent it is still sitting in the queue
+#: and the worker has never seen it. GitHub issue 43: the delivery loop held messages for
+#: ever with no timeline event, no retry counter and no invariant, so Neo's gate verdict,
+#: two `jarvis wo send` messages and the documented cure all failed silently and the
+#: fleet went on reporting healthy.
+#:
+#: FREE OF ANY ELAPSED TIME, under the rule PARKED_BLOCKER states: INV-ATTENTION-REASON
+#: compares this against `attention_reason` and `ProjectStore.ack_attention` stores it
+#: verbatim, so a reason that ticked could never be acknowledged. The minutes and the
+#: hold go in the violation's detail, which nothing compares.
+MESSAGE_STUCK_BLOCKER = ("a message you sent is still queued and the worker has not seen "
+                         "it — `jarvis wo resume-auto` for what is holding it")
+
+#: Where an undelivered message is a defect rather than a wait. `pending` is absent
+#: because an undispatched order's message goes out as its second turn and a
+#: dependency-blocked order is never an attention item just for waiting (its
+#: unrecoverable case is DEAD_DEPENDENCY_BLOCKER's); `validating` for the reason it is
+#: absent from BLOCKED_STATUSES; the terminal pair because INV-ATTENTION-PHANTOM clears
+#: any flag raised there, so the two checks would fight every tick.
+MESSAGE_STUCK_STATUSES = ("dispatching", "running", "waiting_input", "needs_review",
+                          "failed", "waiting_pr_merge")
+
 #: The `ops.waiting_on` answers that mean the OS itself will do the next thing, with
 #: nobody typing. A list of what IS coming rather than a second guess at what is not:
 #: everything else that function can answer means the work order has stopped.
 IN_FLIGHT_WAITS = ("turn_running", "queued_message", "neo_question", "gate_with_neo",
                    "retry_pending", "signin", "pending")
+
+#: What `parked_reason` stays silent about. `message_stuck` is the one answer that means
+#: the work order HAS stopped and is still not this check's to report: `true_blockers`
+#: raises MESSAGE_STUCK_BLOCKER for it directly, and that sentence names what the user is
+#: missing where PARKED_BLOCKER would only say the worker went quiet.
+SPOKEN_FOR_WAITS = IN_FLIGHT_WAITS + ("message_stuck",)
 
 
 @dataclass
@@ -325,6 +353,14 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     if wo["status"] == "waiting_pr_merge" and \
             store.pr_conflict_attempts(wo["id"]) >= PR_CONFLICT_MAX_ATTEMPTS:
         blockers.append(PR_CONFLICT_BLOCKER)
+    # A message the user sent that the worker will never see (GitHub issue 43). Derived
+    # here rather than flagged at the delivery site because `deliver_messages` never runs
+    # for these — the hold is the absence of an attempt, so there is no call site to
+    # raise it from — and because INV-ATTENTION-REASON rewrites any reason this function
+    # cannot re-derive. Above the parked line on purpose: both say the worker has
+    # stopped, and this one also says what the user is missing.
+    if stuck_message(store, wo, now=now) is not None:
+        blockers.append(MESSAGE_STUCK_BLOCKER)
     # LAST, and never INSTEAD of anything: a work order can be parked and also owe the
     # user a decision, and overwriting the decision with the parking is exactly the
     # silent relabelling kn-78346a2d describes. It is appended only when nothing already
@@ -340,6 +376,52 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # acknowledged away; `jarvis wo ack` refuses).
     acked = db.from_json(wo.get("acknowledged_blockers"), []) or []
     return [b for b in blockers if b not in acked]
+
+
+def stuck_message(store: ProjectStore, wo: dict[str, Any],
+                  now: float | None = None) -> tuple[dict[str, Any], str] | None:
+    """The message this work order was sent and will never receive, and what holds it.
+
+    `None` while delivery is still accounted for. Three waits are excused, and each is
+    excused because something else already owns it — a second check saying the same thing
+    later is how one problem becomes two lines on the attention list:
+
+    * a turn in flight (`worker_session.busy`) — delivery waits for it by design, and a
+      turn that runs too long is `inspect.alarm_turn_minutes`' subject, not this one;
+    * a pause whose retry clock has not yet struck — the OS has named a moment and has
+      not missed it. A usage limit can legitimately hold a message until the reset, and
+      INV-PAUSE-OVERDUE is what fires if the relaunch then does not happen;
+    * anything younger than `messaging.stuck_minutes`.
+
+    What is left is the shape GitHub issue 43 measured: nothing is coming, and no surface
+    says so. The reason returned names the hold rather than the symptom, because the
+    blocker string cannot (see MESSAGE_STUCK_BLOCKER).
+    """
+    from .ops import messaging_config_at
+
+    if wo["status"] not in MESSAGE_STUCK_STATUSES:
+        return None
+    queued = store.queued_messages(wo["id"])
+    if not queued:
+        return None
+    oldest = queued[0]  # `queued_messages` is chronological
+    now = time.time() if now is None else now
+    minutes = int(messaging_config_at(store.project_path).stuck_minutes)
+    if now - float(oldest["ts"]) < minutes * SECONDS_PER_MINUTE:
+        return None
+    if worker_session.busy(store, wo["id"]):
+        return None
+    pause = worker_session.turn_pause(store, wo["id"])
+    if pause is not None and pause.resumable and not pause.due(now=now):
+        return None
+    if not wo.get("session_id"):
+        why = "it has no session to resume"
+    elif pause is not None:
+        why = (f"its last turn is parked on a {worker_session.PAUSE_NOUN[pause.reason]} "
+               f"error that will not retry")
+    else:
+        why = "the delivery pass has not attempted it"
+    return oldest, why
 
 
 def _parked_minutes(store: ProjectStore) -> tuple[bool, int]:
@@ -395,7 +477,7 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
         return None
     from .ops import waiting_on
 
-    if waiting_on(store, wo)["what"] in IN_FLIGHT_WAITS:
+    if waiting_on(store, wo)["what"] in SPOKEN_FOR_WAITS:
         return None
     finished = store.events_of_kind(wo["id"], "finished")
     if finished and float(finished[-1]["ts"]) < float(turn["started_at"]):
@@ -906,6 +988,56 @@ def check_blocked_work_is_surfaced(store: ProjectStore) -> Iterator[Violation]:
                    f"but was not flagged",
             repaired=True,
             repair=f"flagged: {blockers[0]!r}",
+        )
+
+
+def check_messages_are_delivered(store: ProjectStore) -> Iterator[Violation]:
+    """INV-MESSAGE-STUCK — a message queued for a worker must not sit undelivered for ever.
+
+    GitHub issue 43. `Daemon.deliver_messages` holds a message on four paths and every
+    one of them is silent: the row stays `queued`, which from the outside is
+    indistinguishable from one about to go out, and `ops.waiting_on` answers
+    `queued_message` — a member of IN_FLIGHT_WAITS, so `parked_reason` reads the hold as
+    the OS being about to act and every surface reports the work order healthy. Fifteen
+    messages across four work orders were rotting when the issue was filed, including a
+    gate verdict and the user's own two follow-ups.
+
+    The predicate and its three excused waits are `stuck_message`'s. What is added here
+    is the DIAGNOSIS, which is the reason this is its own invariant rather than a line of
+    INV-ATTENTION-MISSING: that check can only say "needs the user", and the useful fact
+    is which message, for how long, and what is holding it.
+
+    The repair is the flag, raised through `true_blockers` and never with a reason of its
+    own — a work order can owe the user an assumption review AND be missing a message,
+    and overwriting the first with the second is the silent relabelling kn-78346a2d
+    describes. Runs immediately before INV-ATTENTION-MISSING, which skips anything
+    already flagged, so the flag goes up exactly once whichever of the two sees it first.
+    A blocker the user has acknowledged leaves `true_blockers` and the flag stays down;
+    the violation is still reported, because `jarvis doctor` answers "is this healthy",
+    not "have you been told".
+    """
+    readonly = getattr(store, "readonly", False)
+    now = time.time()
+    for wo in store.list_work_orders(statuses=MESSAGE_STUCK_STATUSES,
+                                     include_hidden=True):
+        found = stuck_message(store, wo, now=now)
+        if found is None:
+            continue
+        msg, why = found
+        waited = int((now - float(msg["ts"])) // SECONDS_PER_MINUTE)
+        blockers = [] if wo["needs_attention"] else true_blockers(store, wo, now=now)
+        if blockers and not readonly:
+            store.flag_attention(wo["id"], blockers[0])
+        yield Violation(
+            invariant="INV-MESSAGE-STUCK",
+            wo_id=wo["id"],
+            detail=(f"message {msg['id']} has been queued {waited} minute(s) and the "
+                    f"worker has not seen it: {why}"),
+            repaired=bool(blockers),
+            repair=(("would flag: " if readonly else "flagged: ") + repr(blockers[0]))
+                   if blockers else "",
+            context={"msg_id": msg["id"], "source": msg["source"],
+                     "waited_minutes": waited, "hold": why},
         )
 
 
@@ -1909,6 +2041,9 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_adhoc_not_governed,      # retire before the flag checks judge the leftovers
     check_legacy_adhoc_retired,    # ...and before them, let go of what nothing tracks
     check_no_phantom_attention,
+    check_messages_are_delivered,  # before INV-ATTENTION-MISSING, which skips anything
+                                   # already flagged: whichever sees it first raises the
+                                   # same `true_blockers[0]`, so the flag goes up once
     check_blocked_work_is_surfaced,
     check_attention_has_reason,
     check_manager_slots,           # a canary, not a state check: it repairs nothing and

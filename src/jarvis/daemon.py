@@ -1049,7 +1049,11 @@ class Daemon:
                 store.mark_message(msg["id"], "failed")
                 continue
             if not wo.get("session_id"):
-                continue  # not dispatched yet; the worker prompt will carry it instead
+                # Not dispatched yet. NOTHING carries it into the dispatch prompt —
+                # it goes out as the order's second turn, once `start` mints a session —
+                # so a work order that never dispatches holds it for ever, which is what
+                # INV-MESSAGE-STUCK is watching for.
+                continue
             if worker_session.busy(store, wo["id"]):
                 continue  # mid-turn: one turn at a time, and resume would refuse anyway
             pause = worker_session.turn_pause(store, wo["id"])
