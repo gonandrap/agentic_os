@@ -334,7 +334,7 @@ class InspectConfig:
 
 #: `Daemon.deliver_messages` sends within one reconcile tick, so this is not a
 #: latency bar — it is the point past which every ACCOUNTED wait has been excused by
-#: `invariants._stuck_message` and what is left is a message the worker will never see.
+#: `invariants.stuck_message` and what is left is a message the worker will never see.
 #: An hour rather than minutes for `DEFAULT_INSPECT_ALARM_PARKED_MINUTES`' reason: the
 #: one unaccounted wait that is legitimately long is a project whose `max_concurrent`
 #: slots are all full, and flagging that after minutes would put a line on the

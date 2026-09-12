@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from jarvis import db, ops
+from jarvis import db, ops, worker_session
 from jarvis.catalog import DEFAULT_MESSAGING_STUCK_MINUTES, parse_catalog
 from jarvis.invariants import (
     MESSAGE_STUCK_BLOCKER,
@@ -187,14 +187,39 @@ def test_it_names_a_retry_that_came_due_and_never_happened(project):
         "its usage-limit retry came due and has not happened"
 
 
-def test_it_names_a_pause_that_will_never_retry(project):
+def test_a_pause_that_will_never_retry_does_not_hold_delivery(project):
     """An auth pause whose sign-in has not changed since the turn died: `retry_at` is
-    `NEVER`, so nothing is coming and the account is what has to change."""
+    `NEVER`, so nothing will relaunch that turn and the message is the only thing that
+    can restart the conversation. `delivery_hold` therefore returns None and the message
+    is diagnosed as one the pass was FREE to send — which is the finding, because if it
+    really cannot be sent `Daemon._deliver` marks it `failed` and flags.
+    """
     store = ProjectStore(project)
     wo = _paused(store, "Invalid API key · Please run /login", "auth_error")
 
-    assert stuck_message(store, wo)[1] == \
-        "its last turn is parked on a Claude Code authentication error that will not retry"
+    assert worker_session.delivery_hold(store, wo) is None
+    assert stuck_message(store, wo)[1] == "the delivery pass has not attempted it"
+
+
+def test_the_delivery_pass_and_the_diagnosis_read_the_same_decision(project):
+    """The seam review round 2 asked for. A fourth skip added to `deliver_messages`
+    used to leave the diagnosis saying "the delivery pass has not attempted it" about a
+    message the pass had just declined; both now go through `delivery_hold`, so a hold
+    it reports is a hold the loop honours and vice versa."""
+    store = ProjectStore(project)
+    free = _sent_and_never_delivered(store)
+    _age_the_message(store, free["id"])
+    held = _sent_and_never_delivered(store)
+    store.create_turn(held["id"], "message", "an earlier message")
+    _age_the_message(store, held["id"])
+
+    assert worker_session.delivery_hold(store, free) is None
+    assert stuck_message(store, free)[1] == "the delivery pass has not attempted it"
+
+    hold = worker_session.delivery_hold(store, held)
+
+    assert hold.kind == worker_session.HOLD_TURN_IN_FLIGHT and hold.accounted
+    assert stuck_message(store, held) is None
 
 
 # -- the noise rule: every wait something else already owns -----------------------------

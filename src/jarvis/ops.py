@@ -4584,7 +4584,7 @@ def inspect_config_at(project_path: Path) -> Any:
 def messaging_config_at(project_path: Path) -> Any:
     """`os.messaging` for the project rooted at `project_path`.
 
-    `inspect_config_at`'s twin, for `invariants._stuck_message` — an invariant is handed
+    `inspect_config_at`'s twin, for `invariants.stuck_message` — an invariant is handed
     a `ProjectStore` and no project name, and falls back to the OS block and then to the
     shipped defaults for the reason that function gives: a check with no threshold is no
     check.

@@ -224,6 +224,77 @@ def busy(store: ProjectStore, wo_id: str) -> dict[str, Any] | None:
     return turn if turn and turn["state"] == "running" else None
 
 
+#: `DeliveryHold.kind`, so a caller can branch on the hold without matching its prose.
+HOLD_NO_SESSION = "no_session"
+HOLD_TURN_IN_FLIGHT = "turn_in_flight"
+HOLD_RETRY_BOOKED = "retry_booked"
+HOLD_RETRY_OVERDUE = "retry_overdue"
+
+
+@dataclass(frozen=True)
+class DeliveryHold:
+    """Why `Daemon.deliver_messages` will not start a turn for this work order now.
+
+    ONE HOME FOR THE DECISION, and the reason it has to be one is that two callers ask
+    the same question for opposite purposes: the delivery pass asks "may I send", and
+    `invariants.stuck_message` asks "is this silence a defect". Derived separately they
+    drift, and the drift is invisible — a fourth skip added to the loop would leave the
+    diagnosis saying "the delivery pass has not attempted it" about a message the pass
+    had just declined, which is the one sentence GitHub issue 43 exists to get right.
+
+    `accounted` is what the second caller needs: something else already owns this wait,
+    so it is not a defect and must not raise a second line about one stopped worker.
+    `reason` is one clause, written to be read after "because".
+    """
+
+    kind: str
+    accounted: bool
+    reason: str
+
+
+def delivery_hold(store: ProjectStore, wo: dict[str, Any],
+                  now: float | None = None) -> DeliveryHold | None:
+    """The hold on this work order's queued messages, or None if delivery may go.
+
+    A NON-RESUMABLE PAUSE IS NOT A HOLD. The turn is dead and nothing will relaunch it,
+    so the message is the only thing that can start the conversation again — and if the
+    account really cannot answer, `Daemon._deliver` marks the message `failed` and
+    flags, which is a louder answer than holding it for ever would be.
+
+    `pending` is not judged here either. An undispatched order has no session by
+    definition, and whether that is a wait or a defect is a question about the work
+    order rather than about delivery (`invariants.MESSAGE_STUCK_STATUSES`).
+    """
+    if not wo.get("session_id"):
+        # Nothing carries a queued message into a dispatch prompt — it goes out as the
+        # order's SECOND turn, once `start` mints a session.
+        return DeliveryHold(HOLD_NO_SESSION, accounted=False,
+                            reason="it has no session to resume")
+    if busy(store, wo["id"]):
+        # Mid-turn: one turn at a time, and `--resume` would refuse anyway.
+        return DeliveryHold(HOLD_TURN_IN_FLIGHT, accounted=True,
+                            reason="a turn is already in flight")
+    pause = turn_pause(store, wo["id"])
+    if pause is None or not pause.resumable:
+        return None
+    # The lost turn has to go out first — it is holding a message already marked
+    # `delivered`, so sending this one now would silently jump the queue.
+    #
+    # `resumable`, not `exhausted`: the two answer differently only for an auth pause
+    # whose sign-in has not changed, and that one never exhausts by design — holding on
+    # it would hold `jarvis wo send … "retry"` for ever, which is the manual escape
+    # hatch for a sign-in the OS cannot see (Neo, question 169).
+    noun = PAUSE_NOUN[pause.reason]
+    if not pause.due(now=now):
+        return DeliveryHold(HOLD_RETRY_BOOKED, accounted=True,
+                            reason=f"its {noun} retry is booked and has not come due")
+    # Past its own deadline and still here: the relaunch `Daemon.retry_paused_turns`
+    # owes did not happen. INV-PAUSE-OVERDUE reports that; this is the half of it the
+    # user can see, because their message is what is waiting behind it.
+    return DeliveryHold(HOLD_RETRY_OVERDUE, accounted=False,
+                        reason=f"its {noun} retry came due and has not happened")
+
+
 def start(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
           prompt: str) -> dict[str, Any]:
     """Open the conversation: turn 1, in a fresh worktree, under a minted session id."""

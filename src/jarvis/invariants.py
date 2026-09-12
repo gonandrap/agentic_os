@@ -382,20 +382,21 @@ def stuck_message(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> tuple[dict[str, Any], str] | None:
     """The message this work order was sent and will never receive, and what holds it.
 
-    `None` while delivery is still accounted for. Three waits are excused, and each is
+    `None` while delivery is still accounted for. Four waits are excused, and each is
     excused because something else already owns it — a second check saying the same thing
     later is how one problem becomes two lines on the attention list:
 
-    * a turn in flight (`worker_session.busy`) — delivery waits for it by design, and a
-      turn that runs too long is `inspect.alarm_turn_minutes`' subject, not this one;
-    * a pause whose retry clock has not yet struck — the OS has named a moment and has
-      not missed it. A usage limit can legitimately hold a message until the reset, and
-      INV-PAUSE-OVERDUE is what fires if the relaunch then does not happen;
-    * anything younger than `messaging.stuck_minutes`.
+    * a status outside MESSAGE_STUCK_STATUSES, whose own note says who owns each one;
+    * anything younger than `messaging.stuck_minutes`;
+    * and the two `worker_session.delivery_hold` marks `accounted` — a turn in flight,
+      and a retry the OS has booked and not yet missed.
 
-    What is left is the shape GitHub issue 43 measured: nothing is coming, and no surface
-    says so. The reason returned names the hold rather than the symptom, because the
-    blocker string cannot (see MESSAGE_STUCK_BLOCKER).
+    THE HOLD IS NOT RE-DERIVED HERE. `delivery_hold` is the same call
+    `Daemon.deliver_messages` skips on, so "the delivery pass declined this" and "this is
+    why" cannot drift; asking the same questions again independently is how they would.
+    What is left over — no hold at all, or one nothing owns — is the shape GitHub issue
+    43 measured: nothing is coming, and no surface says so. The reason names the hold
+    rather than the symptom, because the blocker string cannot (MESSAGE_STUCK_BLOCKER).
     """
     from .ops import messaging_config_at
 
@@ -409,26 +410,12 @@ def stuck_message(store: ProjectStore, wo: dict[str, Any],
     minutes = int(messaging_config_at(store.project_path).stuck_minutes)
     if now - float(oldest["ts"]) < minutes * SECONDS_PER_MINUTE:
         return None
-    if worker_session.busy(store, wo["id"]):
+    hold = worker_session.delivery_hold(store, wo, now=now)
+    if hold is not None and hold.accounted:
         return None
-    pause = worker_session.turn_pause(store, wo["id"])
-    if pause is not None and pause.resumable and not pause.due(now=now):
-        return None
-    if not wo.get("session_id"):
-        why = "it has no session to resume"
-    elif pause is not None and pause.resumable:
-        # Past its own deadline and still here: the relaunch INV-PAUSE-OVERDUE watches
-        # for did not happen, and the message is waiting behind it. Said separately from
-        # the branch below because the two ask for opposite things — this one is a
-        # liveness failure in the OS, that one is the account's or the API's problem.
-        why = (f"its {worker_session.PAUSE_NOUN[pause.reason]} retry came due and has "
-               f"not happened")
-    elif pause is not None:
-        why = (f"its last turn is parked on a {worker_session.PAUSE_NOUN[pause.reason]} "
-               f"error that will not retry")
-    else:
-        why = "the delivery pass has not attempted it"
-    return oldest, why
+    # No hold at all is its own finding: the pass was free to send and the message is
+    # still here, which is a daemon that is not turning the queue.
+    return oldest, hold.reason if hold else "the delivery pass has not attempted it"
 
 
 def _parked_minutes(store: ProjectStore) -> tuple[bool, int]:
