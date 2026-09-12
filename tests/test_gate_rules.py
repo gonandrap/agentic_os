@@ -42,6 +42,19 @@ HEREDOC_INTO_SHELL = """cat <<'EOF' | bash
 scripts/shipit.sh
 EOF"""
 
+# Issue #203, verbatim from `jarvis gate show 95` on prod jarvis-0.9.0: a read-only
+# classifier probe, gated as a release and refused 10 minutes later by `sweep_unargued`.
+# Everything after `-c` is one double-quoted argument that `python3` reads and no shell
+# ever re-parses.
+APPROVAL_95 = r'''python3 -c "
+import sys; sys.path.insert(0,'src')
+from jarvis import gate_rules as g
+c=\"git commit -F - <<'EOF'\nmentions scripts/shipit.sh\nEOF\n|| find . -name x\"
+for cmd in [c, \"cat <<'EOF' | bash\nscripts/shipit.sh\nEOF\", \"python <<EOF\nrun('scripts/shipit.sh')\nEOF\", 'eval \"bash scripts/shipit.sh\"']:
+    s=g.shape_of(cmd,'shipit')
+    print(repr(cmd[:40]),'->',s.position, s.owner, sorted(s.names))
+"'''
+
 
 @pytest.fixture()
 def central(jarvis_home):
@@ -302,26 +315,74 @@ def test_the_seed_fallback_restores_recognisers_and_no_exemptions():
     assert classify("./scripts/shipit.sh", seeds) is not None
 
 
+# -- the invoker test is positional (issue #203) --------------------------------------
+
+
+def test_a_shell_invoker_named_inside_a_quoted_payload_does_not_disarm_blanking():
+    """Approval 95, verbatim: a read-only probe gated as a release.
+
+    Its payload names a shell-invoker keyword at offset 280 and the release script a few
+    characters later, both only as Python string literals. Searching the raw string for
+    the invoker matched the first, `scannable` handed the command back whole, and the
+    second then tripped the release gate on a command that runs nothing.
+    """
+    assert gate_rules.scannable(APPROVAL_95) != APPROVAL_95
+    assert "shipit" not in gate_rules.scannable(APPROVAL_95)
+    assert classify(APPROVAL_95, gate_rules.RuleSet.from_seeds()) is None
+
+
+def test_a_shell_invoker_in_executable_position_still_scans_the_command_whole():
+    """The pairing. Positional means the keyword still counts where the shell reaches
+    it — quoting the payload of something that re-parses it buys nothing."""
+    for command in ('sh -c "scripts/shipit.sh"',
+                    'eval "bash scripts/shipit.sh"',
+                    'echo x | xargs "./scripts/shipit.sh"'):
+        assert gate_rules.scannable(command) == command, command
+        assert classify(command, gate_rules.RuleSet.from_seeds()) is not None, command
+
+
+def test_a_reader_whose_argument_names_a_shell_invoker_still_only_reads():
+    """`reads_only` ran the same raw search, so a note about a shell cost a reader its
+    exemption. The exemption cannot widen: an invoker the shell reaches is never a
+    reader's argv0, so the test is belt-and-braces either way."""
+    assert gate_rules.reads_only('grep -n "eval" src/jarvis/gate_rules.py')
+    assert not gate_rules.reads_only('cat notes.md | xargs ./scripts/shipit.sh')
+
+
+def test_a_heredoc_handed_to_an_interpreter_is_a_canary():
+    """Approval 96, the conservative TRUE positive the fix must not turn into a miss:
+    a heredoc body is a program to `python3`, so no learned rule may ever clear it.
+
+    Pinned as a canary because `Shape.exemptible` already says so via `_EXECUTORS`, and a
+    property nothing tests is a property the next edit can drop.
+    """
+    command = "python3 - <<'PY'\nscripts/shipit.sh\nPY"
+    assert command in [c for _, c in gate_rules.SEED_CANARIES]
+    assert classify(command, gate_rules.RuleSet.from_seeds()) is not None
+    shape = gate_rules.shape_of(command, "shipit")
+    assert shape.position == gate_rules.HEREDOC and not shape.exemptible
+
+
+def test_learning_the_commit_shape_does_not_clear_an_interpreter_heredoc(central):
+    learn(central, HEREDOC_COMMIT)
+    after = gate_rules.RuleSet.load(central)
+    assert after.check_canaries() == []
+    assert classify("python3 - <<'PY'\nscripts/shipit.sh\nPY", after) is not None
+
+
 # -- the known holes this mechanism now covers ----------------------------------------
 
 
-def test_the_eval_in_prose_hole_becomes_learnable(central):
-    """kn-1ecbbff2: the bare word `eval` anywhere turns off quote-blanking, so a summary
-    reporting "eval scorecard 36/36" and naming a gated verb is scanned as code.
-
-    Still gated on a first encounter — `scannable` cannot tell the two apart — but the
-    shape is now something a dismissal can settle for good, which is the difference
-    between a defect and a defect that keeps costing reviews.
+def test_the_eval_in_prose_hole_is_closed(central):
+    """kn-1ecbbff2: the bare word `eval` anywhere used to turn off quote-blanking, so a
+    summary reporting "eval scorecard 36/36" and naming a gated verb was scanned as code
+    and gated. It cost a review every time, and no dismissal was needed to settle it —
+    the word is inside the quoted argument, where nothing re-parses it (issue #203).
     """
     command = ('jarvis wo finish wo-1 --summary "eval scorecard 36/36; '
                'do not gh pr merge until reviewed"')
-    action = classify(command, gate_rules.RuleSet.load(central))
-    assert action is not None  # the hole, unchanged
-
-    learn(central, command)
-
     assert classify(command, gate_rules.RuleSet.load(central)) is None
-    # …and it did not become a licence to merge.
+    # …and the same words with nothing quoting them are still a merge.
     assert classify("gh pr merge 31", gate_rules.RuleSet.load(central)) is not None
 
 
