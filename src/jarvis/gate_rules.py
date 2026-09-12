@@ -281,12 +281,18 @@ _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _REDIRECT_TARGET = re.compile(r"&\d+|[^\s<>&|;]+")
 _DISCARD = ("/dev/null",)
 
-# Readers that can write a file anyway, with no redirection to give them away: `tee`
-# takes a filename, `sort` has `-o`, and `sed` has the `w` command — which lives inside
-# a quoted script, so spotting it means parsing sed. Hence the blunt membership test:
-# naming one of these is a handoff whether or not it wrote anything. It costs nothing
-# unless an executor is in the chain too, which is the only case where it matters.
-_MAY_WRITE = frozenset({"tee", "sort", "sed"})
+# Every entry of `_READERS` that can write a file anyway, with no redirection to give it
+# away: `tee` takes a filename, `sort` has `-o`, `uniq` writes its SECOND positional
+# argument, `yq` has `-i`, and `sed` has the `w` command — which lives inside a quoted
+# script, so spotting it means parsing sed. Hence the blunt membership test: naming one
+# of these is a handoff whether or not it wrote anything. It costs nothing unless the
+# chain stops being all-readers, which is the only case where it matters.
+_MAY_WRITE = frozenset({"tee", "sort", "uniq", "yq", "sed"})
+
+# …and the subset of those whose write is an IN-PLACE edit of the file named. That is
+# not a handoff, it is a modification of the gated target itself, so it costs the
+# segment its reader status outright rather than merely arming `_hands_off`.
+_INPLACE = frozenset({"sed", "yq"})
 
 
 def heredoc_spans(command: str) -> list[tuple[int, int, int]]:
@@ -487,9 +493,9 @@ def reads_only(command: str) -> bool:
         name = words[0].lstrip("\\")
         if name not in _READERS:
             return False
-        # `sed -n '1,20p' f` reads; `sed -i s/a/b/ f` rewrites the file.
-        if name == "sed" and any(w.startswith("-i") or w == "--in-place"
-                                 for w in words[1:]):
+        # `sed -n '1,20p' f` reads; `sed -i s/a/b/ f` rewrites the file. `yq -i` too.
+        if name in _INPLACE and any(w.startswith("-i") or w == "--in-place"
+                                    for w in words[1:]):
             return False
     return True
 
@@ -536,10 +542,16 @@ def read_only_mentions(command: str, pattern: str) -> bool:
     there the reader's output really does reach the executor.
 
     …and so does everything, the moment the reading segment could WRITE what it read.
-    A `_hands_off` reader puts the chain back under the old chain-wide test, because at
-    that point the literal can travel by a route this parser does not follow. The two
-    halves of that are the whole safety argument: `find` after a plain `cat` stays
-    exempt, `bash` after a `cat >` does not.
+    A `_hands_off` reader puts the chain back under `reads_only`, because at that point
+    the literal can travel by a route this parser does not follow. The two halves of
+    that are the whole safety argument: `find` after a plain `cat` stays exempt, `bash`
+    after a `cat >` does not.
+
+    It has to be `reads_only` — the reader WHITELIST — and not "no known executor in the
+    chain". A blacklist is one rename away from silence: `cat scripts/shipit.sh >
+    /tmp/s.sh && chmod +x /tmp/s.sh && /tmp/s.sh` runs the release script without naming
+    a single member of `_EXECUTORS`, and `chmod` is not something anyone will remember
+    to add to it.
 
     Fails closed twice over. A pattern that matches no single segment — it straddled a
     separator, or only the whole string matched — clears nothing.
@@ -559,7 +571,7 @@ def read_only_mentions(command: str, pattern: str) -> bool:
             return False
         handoff = handoff or _hands_off(segment)
     if handoff:
-        return named and not (command_names(command) & _EXECUTORS)
+        return named and reads_only(command)
     return named
 
 
@@ -816,6 +828,9 @@ SEED_CANARIES: tuple[tuple[str, str], ...] = (
     # …and the one that is neither: a reader whose output is WRITTEN somewhere the next
     # command runs it. Nothing pipes here and no executor names the script.
     ("release", "cat scripts/shipit.sh > /tmp/s.sh && bash /tmp/s.sh"),
+    # The same, run without naming any member of `_EXECUTORS` at all. Pins that the
+    # handoff falls back to the reader whitelist rather than to a list of bad names.
+    ("release", "cat scripts/shipit.sh > /tmp/s.sh && chmod +x /tmp/s.sh && /tmp/s.sh"),
     ("service_restart", "sudo systemctl restart jarvis-daemon"),
     ("service_restart", "systemctl --user stop jarvisd"),
     ("push_protected", "git push origin main"),

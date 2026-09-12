@@ -1229,6 +1229,15 @@ def test_the_segment_that_names_the_literal_is_the_one_that_must_only_read(comma
     # command and `sort` has `-o`, both inside arguments this parser does not read.
     "sed -n '1,200w /tmp/s.sh' scripts/shipit.sh; bash /tmp/s.sh",
     "sort -o /tmp/s.sh scripts/shipit.sh && sh /tmp/s.sh",
+    "uniq scripts/shipit.sh /tmp/s.sh && sh /tmp/s.sh",
+    "yq -i '.x = 1' scripts/shipit.sh",     # -i edits the target, not a handoff at all
+    # Round 2 of review: the chain that runs it without naming anything in `_EXECUTORS`.
+    # This is why the handoff falls back to the reader WHITELIST and not to "no known
+    # executor" — `chmod` will never be on a blacklist anyone remembers to extend.
+    "cat scripts/shipit.sh > /tmp/s.sh && chmod +x /tmp/s.sh && /tmp/s.sh",
+    "head -200 scripts/shipit.sh > /tmp/s.sh; . /tmp/s.sh",
+    "cat scripts/shipit.sh > /tmp/s.sh && zsh /tmp/s.sh",
+    "cat scripts/shipit.sh > /tmp/s.sh && install -m755 /tmp/s.sh /usr/local/bin/go",
 ])
 def test_a_reader_that_writes_hands_the_literal_on_and_loses_the_exemption(command):
     assert gates.classify(command, ALL_GATES) is not None, f"{command!r} must be gated"
