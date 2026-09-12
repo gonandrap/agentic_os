@@ -79,7 +79,7 @@ __all__ = [
     "VERDICTS", "abandoned_message", "amend_request", "apply_decision",
     "build_contest_question", "build_request_question", "classify", "contest_command",
     "deny_conflicts", "exits_advice", "file_request", "open_gate", "queue_for_review",
-    "asks", "kind_of",
+    "asks", "explain_command", "kind_of",
     "question_text", "reads_only", "render_user_messages", "request_command", "scannable",
     "summarise", "sweep_unargued",
 ]
@@ -387,8 +387,28 @@ def asks(kind: str) -> tuple[str, str]:
     return found.why_ask, found.evidence_ask
 
 
+def _handle(wo_id: str, command: str, approval_id: int | str | None) -> str:
+    """How an exit ADDRESSES the blocked command: by request id where one exists.
+
+    The command string is the obvious handle and it is the one a blocked worker often
+    cannot type. A session in a git worktree runs under an isolation guard that inspects
+    the ARGUMENTS of every command, and refuses any whose text it cannot prove is not a
+    git operation — so `jarvis gate explain "git commit -F - <<'MSG'…"` is refused before
+    it runs, and so is the request and the contest. The guard is outside this OS and
+    cannot be fixed from here; the commands that trip a gate are exactly the ones whose
+    text it rejects. Measured on wo-4fc128ca: two requests reached the TTL with no case
+    because EVERY attempt to file one was refused, not because the worker walked away.
+
+    The id needs no quoting and names no shell, so it clears that guard — and the OS has
+    had the string on the `approvals` row since the block, so nothing is lost by not
+    re-typing it. Spec 2026-09-12 §8.
+    """
+    return str(approval_id) if approval_id is not None else f"{wo_id} \"{command}\""
+
+
 def request_command(wo_id: str, command: str, kind: str = "",
-                    why: str = "", evidence: str = "") -> str:
+                    why: str = "", evidence: str = "",
+                    approval_id: int | str | None = None) -> str:
     """The command that puts a case for a real privileged action in front of a reviewer.
 
     The placeholders come from the KIND, because "why this is ready to ship" is a
@@ -398,23 +418,32 @@ def request_command(wo_id: str, command: str, kind: str = "",
     real question).
     """
     kind_why, kind_evidence = asks(kind)
-    return (f"jarvis gate request {wo_id} \"{command}\" "
+    return (f"jarvis gate request {_handle(wo_id, command, approval_id)} "
             f"--why \"{why or f'<{kind_why}>'}\" "
             f"--evidence \"{evidence or f'<{kind_evidence}>'}\"")
 
 
 def contest_command(wo_id: str, command: str,
-                    why: str = "<why this performs no privileged action>") -> str:
+                    why: str = "<why this performs no privileged action>",
+                    approval_id: int | str | None = None) -> str:
     """The command that disputes the MATCH rather than arguing for the action.
 
     No per-kind ask here, and that is the point: a contest asserts the command performs
     no privileged action of ANY kind, so the question is the same whichever recogniser
     fired.
     """
-    return f"jarvis gate contest {wo_id} \"{command}\" --why \"{why}\""
+    return (f"jarvis gate contest {_handle(wo_id, command, approval_id)} "
+            f"--why \"{why}\"")
 
 
-def exits_advice(wo_id: str, command: str, kind: str = "") -> str:
+def explain_command(command: str, approval_id: int | str | None = None) -> str:
+    """The diagnosis step, addressed the same way — see `_handle`."""
+    handle = str(approval_id) if approval_id is not None else f"\"{command}\""
+    return f"jarvis gate explain {handle}"
+
+
+def exits_advice(wo_id: str, command: str, kind: str = "",
+                 approval_id: int | str | None = None) -> str:
     """The two ways out of a block, and the diagnosis that picks between them.
 
     ONE RENDERER, because the failure this fixes is a worker handed advice it cannot
@@ -429,20 +458,26 @@ def exits_advice(wo_id: str, command: str, kind: str = "") -> str:
     a row. See docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §3.
 
     `kind` shapes the request line's placeholders and nothing else — §6.
+    `approval_id` changes how all three address the command — see `_handle`, §8.
     """
     return (
         f"TWO WAYS OUT. If you cannot tell which you need, ask the OS first — it reports "
         f"where the matched literal sits and whether the shell would run it:\n"
-        f"    jarvis gate explain \"{command}\"\n\n"
+        f"    {explain_command(command, approval_id)}\n\n"
         f"If the command DOES perform the action, make the case:\n"
-        f"    {request_command(wo_id, command, kind)}\n\n"
+        f"    {request_command(wo_id, command, kind, approval_id=approval_id)}\n\n"
         f"If it does NOT — the recogniser matched text it is only reading or writing "
         f"about (a name in a grep pattern, a path in a commit message, a string in a "
         f"heredoc) — contest the match. That asks a reviewer to DISMISS it as a "
         f"classifier false positive; it authorises nothing and it is not a request for "
         f"permission, so it needs no PR and no test results:\n"
-        f"    {contest_command(wo_id, command)}\n\n"
-        f"Do not guess between them: answering the request's two questions about a "
+        f"    {contest_command(wo_id, command, approval_id=approval_id)}\n\n"
+        + ("All three address the block by its REQUEST NUMBER, not by the command "
+           "string: the OS already has the string, and re-typing it into an argument is "
+           "how a worker in a git worktree finds its own way out refused by the "
+           "isolation guard (§8). Neither exit ever runs the command.\n\n"
+           if approval_id is not None else "")
+        + f"Do not guess between them: answering the request's two questions about a "
         f"command that performs no privileged action means writing something false into "
         f"the only text the reviewer sees, and walking away leaves the block on the "
         f"record with nobody ever told the recogniser was wrong."
@@ -940,7 +975,8 @@ def abandoned_message(approval: dict[str, Any], ttl_seconds: float) -> str:
         f"If you worked around the block, come back and finish this: a match nobody "
         f"contests is a classifier defect nobody ever hears about, and the next worker "
         f"loses the same turn you did.\n\n"
-        + exits_advice(approval["wo_id"], approval["command"], approval["kind"])
+        + exits_advice(approval["wo_id"], approval["command"], approval["kind"],
+                       approval["id"])
     )
 
 
@@ -1121,7 +1157,7 @@ def denied_message(approval: dict[str, Any], reason: str, by: str) -> str:
             f"You argued that this performs no privileged action and the reviewer "
             f"disagreed, so the match stands. Do not retry it as-is. If the work is "
             f"genuinely ready, make the real case:\n"
-            f"    {request_command(approval['wo_id'], approval['command'], approval['kind'])}\n"
+            f"    {request_command(approval['wo_id'], approval['command'], approval['kind'], approval_id=approval['id'])}\n"
             f"Otherwise leave it and finish the work order explaining what is left."
         )
     return (

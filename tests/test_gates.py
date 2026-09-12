@@ -1231,7 +1231,7 @@ def test_a_dismissed_gate_asks_nothing_of_the_user(gated):
 # docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §3.
 
 
-def _names_both_exits(text, wo_id, command, kind="release"):
+def _names_both_exits(text, wo_id, command, kind="release", approval_id=None):
     """The property every blocking surface must have, asserted in one place.
 
     Pinned as a shared predicate rather than three copies of the literals: the rendered
@@ -1240,18 +1240,30 @@ def _names_both_exits(text, wo_id, command, kind="release"):
 
     `kind` is passed through because the request line's placeholders belong to the kind
     (§6) — a surface that dropped it would still name both exits, and would still ask a
-    service restart for a PR number.
+    service restart for a PR number. `approval_id` is the stronger check still: an exit
+    that re-quotes the blocked command into its own arguments is refused by the worktree
+    isolation guard before it runs, so a surface can name both exits and offer neither
+    (§8).
     """
-    assert f'jarvis gate explain "{command}"' in text
-    assert gates.request_command(wo_id, command, kind) in text
-    assert gates.contest_command(wo_id, command) in text
+    assert gates.explain_command(command, approval_id) in text
+    assert gates.request_command(wo_id, command, kind, approval_id=approval_id) in text
+    assert gates.contest_command(wo_id, command, approval_id=approval_id) in text
+    if approval_id is not None:
+        for line in text.splitlines():
+            if line.strip().startswith("jarvis gate "):
+                assert command not in line, f"exit re-quotes the blocked command: {line}"
+
+
+def _latest_gate_id(gated):
+    return gated.store.list_approvals(gated.wo["id"])[0]["id"]
 
 
 def test_the_block_names_the_diagnosis_and_both_exits(gated):
     """A worker that cannot tell which exit it needs is told to run `explain` first."""
     reason = _reason(gated.attempt("./scripts/shipit.sh"))
 
-    _names_both_exits(reason, gated.wo["id"], "./scripts/shipit.sh")
+    _names_both_exits(reason, gated.wo["id"], "./scripts/shipit.sh",
+                      approval_id=_latest_gate_id(gated))
     assert reason.index("gate explain") < reason.index("gate request")
 
 
@@ -1262,7 +1274,8 @@ def test_the_retry_message_names_them_too(gated):
     reason = _reason(gated.attempt("./scripts/shipit.sh"))
 
     assert "NOT under review" in reason
-    _names_both_exits(reason, gated.wo["id"], "./scripts/shipit.sh")
+    _names_both_exits(reason, gated.wo["id"], "./scripts/shipit.sh",
+                      approval_id=_latest_gate_id(gated))
 
 
 def test_the_abandonment_message_names_them_as_well(gated):
@@ -1272,7 +1285,8 @@ def test_the_abandonment_message_names_them_as_well(gated):
 
     text = gates.abandoned_message(approval, gates.DEFAULT_CASE_TTL_SECONDS)
 
-    _names_both_exits(text, gated.wo["id"], "./scripts/shipit.sh")
+    _names_both_exits(text, gated.wo["id"], "./scripts/shipit.sh",
+                      approval_id=approval["id"])
 
 
 def test_a_second_block_after_an_abandonment_says_so(gated):
@@ -1283,7 +1297,8 @@ def test_a_second_block_after_an_abandonment_says_so(gated):
 
     reason = _reason(gated.attempt("./scripts/shipit.sh"))
     assert "ABANDONED" in reason
-    _names_both_exits(reason, gated.wo["id"], "./scripts/shipit.sh")
+    _names_both_exits(reason, gated.wo["id"], "./scripts/shipit.sh",
+                      approval_id=_latest_gate_id(gated))
 
 
 def test_the_block_asks_a_service_restart_its_own_two_questions(gated):
@@ -1292,7 +1307,8 @@ def test_the_block_asks_a_service_restart_its_own_two_questions(gated):
     command = "sudo systemctl restart jarvis"
     reason = _reason(gated.attempt(command))
 
-    _names_both_exits(reason, gated.wo["id"], command, "service_restart")
+    _names_both_exits(reason, gated.wo["id"], command, "service_restart",
+                      _latest_gate_id(gated))
     assert "why this service has to be interrupted, and why now" in reason
     assert "what that work loses when it bounces" in reason
     assert "ready to ship" not in reason
@@ -1304,7 +1320,8 @@ def test_the_block_asks_a_config_write_its_own_two_questions(gated):
     command = "jarvis config set proj_a gates.case_ttl_seconds 120"
     reason = _reason(gated.attempt(command))
 
-    _names_both_exits(reason, gated.wo["id"], command, "config_write")
+    _names_both_exits(reason, gated.wo["id"], command, "config_write",
+                      _latest_gate_id(gated))
     assert "why this setting has to change" in reason
     assert "the value after, and what the change switches off" in reason
     assert "ready to ship" not in reason

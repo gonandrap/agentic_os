@@ -592,6 +592,15 @@ def gates_section(wo_id: str = WO_PLACEHOLDER,
         f"--why \"<the --why your kind asks for, above>\" "
         f"--evidence \"<the --evidence your kind asks for, above>\"",
         "",
+        "",
+        "ONCE YOU HAVE BEEN BLOCKED, address the request by its NUMBER instead — "
+        "the block prints it, the OS already has the command string, and re-typing "
+        "the string into an argument is how a worker in a git worktree finds its "
+        "own way out refused by the isolation guard:",
+        f"    jarvis gate request <request-number> --why \"...\" --evidence \"...\"",
+        "    jarvis gate contest <request-number> --why \"...\"",
+        "    jarvis gate explain <request-number>",
+        "",
         "Attempting one directly is safe but it is NOT a request. The attempt is "
         "blocked and the OS records it, holding it back from review precisely "
         "because you have argued nothing yet — so nobody is looking at it, and "

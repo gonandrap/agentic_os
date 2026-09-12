@@ -1008,6 +1008,42 @@ def test_a_held_request_becomes_a_contest_rather_than_a_second_row(fleet):
     assert gates.NO_CASE_JUSTIFICATION not in rows[0]["justification"]
 
 
+def test_both_exits_are_reachable_by_request_number(fleet):
+    """The exit a worker can actually TYPE.
+
+    A session in a git worktree runs under an isolation guard that inspects a command's
+    arguments and refuses any whose text it cannot prove is not a git operation — which
+    is most of what trips a gate. On wo-4fc128ca two requests reached the TTL with no
+    case because every attempt to file one was refused, not because the worker walked
+    away. The request number needs no quoting and names no shell. Spec 2026-09-12 §8.
+    """
+    fleet.attempt(PROSE)
+    held = fleet.approval()
+
+    assert ops.resolve_gate_target(str(held["id"])) == (fleet.wo_id, PROSE)
+    out = ops.contest_gate_match(*ops.resolve_gate_target(str(held["id"])),
+                                 why="the literal is in the commit message")
+    assert out["contested"] is True
+    row = fleet.approval()
+    assert row["id"] == held["id"] and row["status"] == "pending"
+
+
+def test_explain_takes_a_request_number_too(fleet):
+    """The diagnosis step is the first thing a block tells a worker to run, so it is the
+    first thing the guard refuses if it has to carry the command string."""
+    fleet.attempt(PROSE)
+    held = fleet.approval()
+
+    by_id = ops.explain_gate(str(held["id"]))
+    assert by_id["command"] == PROSE
+    assert by_id["gated"] == ops.explain_gate(PROSE)["gated"]
+
+
+def test_a_request_number_that_is_not_one_says_what_to_type(fleet):
+    with pytest.raises(ops.OpsError, match="neither a request number nor a work order"):
+        ops.resolve_gate_target("wo-nope")
+
+
 def test_a_contest_is_never_parked_behind_the_case_clock(fleet):
     """A contest has to be decidable in seconds, not held for the TTL.
 

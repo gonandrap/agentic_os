@@ -432,8 +432,8 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
                 f"Gate `{action.kind}`: request {prior['id']} for this exact command is "
                 f"recorded but NOT under review, and retrying the command will not start "
                 f"one. It is waiting for you — for a case, or for a contest.\n\n"
-                f"{gates.exits_advice(wo_id, action.command, action.kind)}\n\n"
-                f"{_case_deadline(config)} Then END YOUR TURN."
+                f"{gates.exits_advice(wo_id, action.command, action.kind, prior['id'])}"
+                f"\n\n{_case_deadline(config)} Then END YOUR TURN."
             )
         if prior is not None and prior["status"] == "pending":
             return _deny(
@@ -484,7 +484,8 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
             + ("A previous request for this exact command was ABANDONED — it timed out "
                "with no case and no contest. Do not do that again: take one of the two "
                "exits below.\n\n" if prior_abandoned else "")
-            + f"{gates.exits_advice(wo_id, action.command, action.kind)}\n\n"
+            + f"{gates.exits_advice(wo_id, action.command, action.kind, approval['id'])}"
+            f"\n\n"
             f"Either one starts the review. {_case_deadline(config)}\n\n"
             f"Then END YOUR TURN — the verdict arrives as your next user turn, and the "
             f"retry will go through if it is approved or dismissed."

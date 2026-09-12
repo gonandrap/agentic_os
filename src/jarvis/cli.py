@@ -519,8 +519,16 @@ def build_parser() -> argparse.ArgumentParser:
     ).add_subparsers(dest="ga_cmd", required=True)
     g = ga.add_parser("request",
                       help="(workers) ask permission to run a privileged command")
-    g.add_argument("wo_id")
-    g.add_argument("command", help="the EXACT command you will run if approved")
+    # Two spellings, and the SHORT one is the one a blocked worker can actually type: a
+    # session in a git worktree runs under an isolation guard that inspects arguments and
+    # refuses any it cannot prove is not a git operation, which is most of what trips a
+    # gate. Spec 2026-09-12 §8.
+    g.add_argument("wo_id", metavar="request-number | wo-id",
+                   help="the request number the block printed — or a work order id, "
+                        "followed by the command")
+    g.add_argument("command", nargs="?",
+                   help="the EXACT command you will run if approved; omit it when you "
+                        "gave a request number")
     # Kind-neutral, because the parser is built before any command is parsed. What each
     # kind actually asks for is in `jarvis brief gates` and in the block message itself,
     # both rendered from gate_rules (spec 2026-09-12 §6).
@@ -535,8 +543,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="(workers) dispute the MATCH: this command performs no privileged action. "
              "Reaches the reviewer as a candidate dismissal, and authorises nothing",
     )
-    g.add_argument("wo_id")
-    g.add_argument("command", help="the EXACT command that was blocked")
+    g.add_argument("wo_id", metavar="request-number | wo-id",
+                   help="the request number the block printed — or a work order id, "
+                        "followed by the command")
+    g.add_argument("command", nargs="?",
+                   help="the EXACT command that was blocked; omit it when you gave a "
+                        "request number")
     g.add_argument("--why", required=True,
                    help="why this performs no privileged action — where the matched "
                         "text sits, and what the command really does")
@@ -580,10 +592,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--reason", required=True)
     g = ga.add_parser(
         "explain",
-        help="why a command would or would not trip a gate — paste the exact string "
-             "from a gate record to diagnose a false positive",
+        help="why a command would or would not trip a gate — give the request number "
+             "the block printed, or paste the exact string, to diagnose a false positive",
     )
-    g.add_argument("command")
+    g.add_argument("command", metavar="request-number | command")
     g.add_argument("--project")
 
     # config (the versioned configuration console) ---------------------------------------
@@ -2049,11 +2061,13 @@ def cmd_gate(args: argparse.Namespace) -> int:
     from . import gates, ops
 
     if args.ga_cmd == "request":
+        wo_id, command = ops.resolve_gate_target(args.wo_id, args.command, args.project)
         _print(ops.request_gate_approval(
-            args.wo_id, args.command, why=args.why, evidence=args.evidence,
+            wo_id, command, why=args.why, evidence=args.evidence,
             project_name=args.project), args.json)
     elif args.ga_cmd == "contest":
-        _print(ops.contest_gate_match(args.wo_id, args.command, why=args.why,
+        wo_id, command = ops.resolve_gate_target(args.wo_id, args.command, args.project)
+        _print(ops.contest_gate_match(wo_id, command, why=args.why,
                                       project_name=args.project), args.json)
     elif args.ga_cmd == "list":
         rows = ops.list_gates(project_name=args.project, wo_id=args.wo,
@@ -2083,9 +2097,12 @@ def cmd_gate(args: argparse.Namespace) -> int:
                       f"· {r['wo_id']} · {_age(r['ts'])} ago")
                 print(f"    {r['command']}")
                 if r["status"] == "awaiting_case":
-                    print(f"    ↳ {gates.request_command(r['wo_id'], r['command'], '...', '...')}"
+                    # Addressed by request number, exactly as the block told the worker —
+                    # the command is printed on the line above, and re-quoting it here is
+                    # what the isolation guard refuses (§8).
+                    print(f"    ↳ {gates.request_command(r['wo_id'], r['command'], r['kind'], '...', '...', approval_id=r['id'])}"
                           f"   (the worker's move)")
-                    print(f"    ↳ {gates.contest_command(r['wo_id'], r['command'], '...')}"
+                    print(f"    ↳ {gates.contest_command(r['wo_id'], r['command'], '...', approval_id=r['id'])}"
                           f"   (…or this, if the gate matched it by mistake)")
                 elif r["status"] == "pending" and r["escalated"]:
                     print(f"    ↳ Neo escalated: {r['escalation_reason']}")

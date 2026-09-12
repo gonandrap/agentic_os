@@ -2981,6 +2981,26 @@ def _project_gate_config(project_name: str):
     return GateConfig()
 
 
+def resolve_gate_target(target: str, command: str | None = None,
+                        project_name: str | None = None) -> tuple[str, str]:
+    """`(wo_id, command)` from either spelling of a gate exit: `<wo> "<cmd>"` or `<id>`.
+
+    The id spelling exists because the command spelling is unusable for a large part of
+    what trips a gate — see `gates._handle` and spec 2026-09-12 §8. Nothing is looked up
+    that the blocking message did not already print.
+    """
+    if command is not None:
+        return target, command
+    if not target.strip().isdigit():
+        raise OpsError(
+            f"{target!r} is neither a request number nor a work order with a command "
+            f"after it. Either `jarvis gate <verb> <request-number> …` (the number the "
+            f"block printed) or `jarvis gate <verb> <wo-id> \"<the exact command>\" …`."
+        )
+    _, _, approval = _find_approval(int(target.strip()), project_name)
+    return approval["wo_id"], approval["command"]
+
+
 def request_gate_approval(wo_id: str, command: str, why: str = "", evidence: str = "",
                           project_name: str | None = None) -> dict[str, Any]:
     """(Workers) ask for permission to run a privileged command, making the case for it.
@@ -3403,6 +3423,9 @@ def retract_gate_rule(rule_id: str, reason: str) -> dict[str, Any]:
 def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any]:
     """Why this command would, or would not, trip a gate.
 
+    `command` may be a request NUMBER instead, which is how a blocked worker can reach
+    this at all — §8.
+
     The diagnostic that a false positive used to require reading source code to get. A
     gate record holds the exact string that fired, so pasting it here is a mechanical
     two-minute answer to "why was this blocked" — which is the difference between
@@ -3417,6 +3440,9 @@ def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any
         shape_of,
     )
 
+    if command.strip().isdigit():
+        _, _, approval = _find_approval(int(command.strip()), project_name)
+        command = approval["command"]
     # Without a project, every gate is treated as live: the question being asked is what
     # the RULES say, and answering it against an empty enabled-set would return "nothing
     # fires" for a command that fires four gates in any project that has them on.

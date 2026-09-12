@@ -176,6 +176,54 @@ raising there would block every gated command on every worker mid-upgrade.
 A contest is never held at all (§1), so this clock never applies to one: the worker that
 takes the exit this spec adds waits on a reviewer, not on a timer.
 
+### 8. An exit addressed by the command string is not an exit
+
+Everything above assumes a blocked worker can *run* the command it is told to run. For a
+large part of what trips a gate, it cannot.
+
+A session working in a git worktree runs under an isolation guard that inspects a
+command's **arguments** and refuses any whose text it cannot prove is not a git
+operation. Verified live from this work order's own worktree:
+
+```
+$ jarvis gate explain "git status"
+This session is isolated in the worktree …, but this command runs jarvis with the
+text git status in a plain command, so what it runs cannot be shown not to be git.
+Refusing to run it …
+```
+
+The overlap is total by construction: the commands that trip a gate are the ones whose
+text mentions shipping, merging, pushing or restarting, and those are exactly the strings
+the guard will not carry. wo-4fc128ca is the measurement — three `release` gates on
+read-only commands, one dismissed by the user as a recogniser defect, **two TTL-denied
+because every attempt to file their case was refused by the guard**. That is not a worker
+walking away, and the abandonment count would have recorded it as one.
+
+The guard is not this OS's code and cannot be fixed from here. What can be fixed is the
+*need* to put the command string in an argument at all: the OS has had the string on the
+`approvals` row since the moment it blocked the command, and the block already prints the
+request number. So all three exits take that number:
+
+```
+jarvis gate explain <request-number>
+jarvis gate request <request-number> --why "…" --evidence "…"
+jarvis gate contest <request-number> --why "…"
+```
+
+A number needs no quoting and names no shell, so it clears the guard. `<wo-id> "<cmd>"`
+still works — it is the only spelling available before a block has happened — and
+`ops.resolve_gate_target` is the one place that tells them apart (a lone all-digit
+positional is a request number). `gates._handle` is the matching renderer, so every
+blocking surface prints the spelling the worker can actually type, and
+`tests/test_gates.py::_names_both_exits` asserts that no exit line re-quotes the blocked
+command.
+
+Worth stating plainly, because it is the property the guard is protecting and the reason
+this is safe: neither exit ever *runs* the string. `gate request` and `gate contest`
+write a row; `gate explain` reads the rule base. Jarvis's own recogniser already knew
+this — a bare `jarvis gate …` invocation does not trip a gate, while
+`jarvis gate explain "…"; ./scripts/shipit.sh` still does.
+
 ## What this is not
 
 It is not a way for a worker to clear its own gate. A contest is a claim, reviewed by
