@@ -21,7 +21,7 @@ import pytest
 
 from jarvis import gates, ops
 from jarvis.hooks import handle_hook, main_hook, preflight_decision
-from jarvis.invariants import check_project
+from jarvis.invariants import TERMINAL_STATUSES, check_project
 from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
 
@@ -140,10 +140,15 @@ def test_an_ordinary_turn_ends(worker):
     assert worker.stop().get("decision") is None
 
 
-def test_a_settled_work_order_is_not_held(worker):
-    """Nothing left to argue for: the worker is being taken down, not walking away."""
+@pytest.mark.parametrize("status", TERMINAL_STATUSES)
+def test_a_settled_work_order_is_not_held(worker, status):
+    """Nothing left to argue for: the worker is being taken down, not walking away.
+
+    Parametrised over the sweeper's own set rather than a literal pair, so a status that
+    settles a work order for `check_no_orphan_gate_requests` and not for the hook fails
+    here instead of stranding a dead worker at every turn boundary."""
     worker.attempt(MERGE)
-    worker.store.set_status(worker.wo["id"], "cancelled")
+    worker.store.set_status(worker.wo["id"], status)
 
     assert worker.stop().get("decision") is None
 
@@ -260,7 +265,23 @@ def test_finish_works_once_the_gate_is_decided(worker):
     assert worker.store.get_work_order(worker.wo["id"])["status"] != "running"
 
 
-# -- 4. the tripwire behind all three --------------------------------------------------
+# -- 4. one name for "still on its way to a verdict" -----------------------------------
+
+
+def test_open_approvals_is_both_statuses(worker):
+    """`ops.finish` and `check_no_orphan_gate_requests` both mean the same thing by an
+    open request, so they read it from the same place."""
+    worker.attempt(MERGE)
+    assert [a["status"] for a in worker.store.open_approvals(worker.wo["id"])] \
+        == [gates.AWAITING_CASE]
+
+    worker.argue(MERGE)
+
+    assert [a["status"] for a in worker.store.open_approvals(worker.wo["id"])] \
+        == ["pending"]
+
+
+# -- 5. the tripwire behind all three --------------------------------------------------
 
 
 def test_a_held_request_on_a_settled_work_order_is_an_orphan_too(worker):

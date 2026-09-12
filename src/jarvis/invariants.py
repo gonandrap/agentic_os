@@ -845,9 +845,7 @@ def check_no_orphan_gate_requests(store: ProjectStore) -> Iterator[Violation]:
     it is a worker that is gone.
     """
     for wo in store.list_work_orders(statuses=TERMINAL_STATUSES, include_hidden=True):
-        open_requests = (store.pending_approvals(wo["id"])
-                         + store.held_approvals(wo["id"]))
-        for approval in open_requests:
+        for approval in store.open_approvals(wo["id"]):
             store.supersede_approval(approval["id"], (
                 f"work order is {wo['status']} — no worker is left to run this command, "
                 f"so there is nothing to authorise or refuse"

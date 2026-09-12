@@ -493,6 +493,13 @@ def under_review_decision(payload: dict[str, Any],
     Fails OPEN, unlike `gate_decision`. An unreadable database here would block every
     tool call in every worker session; the privileged command itself stays blocked
     regardless, because the gate that judges it fails closed.
+
+    It opens the store on every Bash call and every file write, and unlike
+    `_post_tool_compaction` there is no flag file to keep it to one `stat`: a request
+    goes pending in another process (Neo's drain, the user's `jarvis gate request`), so
+    anything cached in the worktree would be a stale copy of the fact that matters. The
+    cost is in line with the path it sits on — `gate_decision` above it already opens
+    `os.db` for the rule base on every Bash call.
     """
     ctx = _worker_context(env, Path(payload.get("cwd") or "."))
     if ctx is None:
@@ -538,12 +545,18 @@ def held_request_turn_block(store: ProjectStore, wo_id: str, payload: dict[str, 
     because of this hook, and a worker that ignored the reason twice is better parked
     than spun.
     """
+    from . import gates
+    from .invariants import TERMINAL_STATUSES
+
     if payload.get("stop_hook_active"):
         return None
     held = store.held_approvals(wo_id)
-    if not held or store.get_work_order(wo_id)["status"] in ("completed", "cancelled"):
+    # The SAME set the sweeper reads (`check_no_orphan_gate_requests`), not a second
+    # spelling of it — kn-d4d5a967. A status that settles a work order there and not
+    # here would leave a dead one held at every turn boundary by a request already
+    # superseded.
+    if not held or store.get_work_order(wo_id)["status"] in TERMINAL_STATUSES:
         return None
-    from . import gates
 
     request = held[0]
     config = gates.GateConfig.from_json(env.get("JARVIS_GATES"))
@@ -560,8 +573,10 @@ def held_request_turn_block(store: ProjectStore, wo_id: str, payload: dict[str, 
             f"it. Make the case now, in this turn:\n"
             f"    jarvis gate request {wo_id} \"{request['command']}\" "
             f"--why \"<why this is ready>\" --evidence \"<PR, tests, checks>\"\n\n"
-            + (_case_deadline(config) + " " if config else "")
-            + "Then end the turn — the verdict arrives as your next user turn."
+            # `from_json` always returns a config, falling back to the default TTL, so
+            # this reads the same clock `Daemon.refuse_unargued_gates` runs on.
+            f"{_case_deadline(config)} "
+            f"Then end the turn — the verdict arrives as your next user turn."
         ),
     }
 

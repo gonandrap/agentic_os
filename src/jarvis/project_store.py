@@ -2601,6 +2601,16 @@ class ProjectStore:
         """Requests recorded but not yet argued, so not yet in front of anyone."""
         return self.list_approvals(wo_id, statuses=("awaiting_case",))
 
+    def open_approvals(self, wo_id: str | None = None) -> list[dict[str, Any]]:
+        """Every request still on its way to a verdict, held or pending.
+
+        The two above answer "who is holding this"; this one answers "is anything still
+        unresolved", which is the question every caller that must not settle over a gate
+        is really asking (`ops.finish`, `invariants.check_no_orphan_gate_requests`).
+        Named once so a seventh status cannot reach one of them and not the other.
+        """
+        return self.pending_approvals(wo_id) + self.held_approvals(wo_id)
+
     def expire_approvals(self) -> int:
         """Move spent or timed-out grants to `expired` so listings tell the truth.
 

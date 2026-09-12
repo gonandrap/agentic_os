@@ -1639,9 +1639,9 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
     cfg = validation_config(name)
     store = ProjectStore(path)
     try:
-        open_request = store.pending_approvals(wo_id) or store.held_approvals(wo_id)
-        if open_request:
-            raise OpsError(gate_still_open(wo_id, open_request[0]))
+        open_requests = store.open_approvals(wo_id)
+        if open_requests:
+            raise OpsError(gate_still_open(wo_id, open_requests[0]))
         fields: dict[str, Any] = {"result_summary": summary}
         if pr_url:
             fields["pr_url"] = pr_url
