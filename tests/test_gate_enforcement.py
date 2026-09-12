@@ -107,7 +107,7 @@ def test_the_turn_cannot_end_on_a_request_nobody_is_reviewing(worker):
     approval = worker.store.held_approvals(worker.wo["id"])[0]
     assert f"request {approval['id']}" in blocked["reason"]
     # The way out has to be in the reason: this is the only text the worker gets.
-    assert f'jarvis gate request {worker.wo["id"]} "{MERGE}"' in blocked["reason"]
+    assert gates.case_command(worker.wo["id"], MERGE) in blocked["reason"]
     # And on the record, because nobody reads the worker's transcript.
     held = [e for e in worker.store.list_events(worker.wo["id"])
             if e["kind"] == "gate_turn_held"]
@@ -251,7 +251,36 @@ def test_finish_refuses_while_a_request_is_open(worker, argue):
     if argue:
         assert "End your turn" in str(e.value)
     else:
-        assert "jarvis gate request" in str(e.value)
+        assert gates.case_command(worker.wo["id"], MERGE) in str(e.value)
+
+
+def test_both_refusals_hand_out_the_same_command(worker):
+    """`gates.case_command` renders it once for six surfaces. Pinned from the two that
+    fire at a blocked worker, so a renamed flag cannot break one silently while the
+    other's test keeps passing."""
+    worker.attempt(MERGE)
+    with pytest.raises(ops.OpsError) as e:
+        ops.finish(worker.wo["id"], "shipped it")
+    line = gates.case_command(worker.wo["id"], MERGE)
+
+    assert line in worker.stop()["reason"]
+    assert line in str(e.value)
+    # ...and the shape itself, once, so the shared renderer is not free to say anything.
+    assert line == (f'jarvis gate request {worker.wo["id"]} "{MERGE}" '
+                    f'--why "<why this is ready>" --evidence "<PR, tests, checks>"')
+
+
+def test_a_held_request_leads_when_both_are_open(worker):
+    """The way on differs by status and only a held request can be acted on this turn,
+    so which one the refusal describes must not depend on list order."""
+    worker.attempt(MERGE)
+    worker.argue(MERGE)
+    worker.attempt(RELEASE)  # held, filed after the pending one
+
+    with pytest.raises(ops.OpsError) as e:
+        ops.finish(worker.wo["id"], "shipped it")
+
+    assert gates.case_command(worker.wo["id"], RELEASE) in str(e.value)
 
 
 def test_finish_works_once_the_gate_is_decided(worker):

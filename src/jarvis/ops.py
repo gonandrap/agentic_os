@@ -1588,12 +1588,11 @@ def declared_evidence(store: ProjectStore, wo_id: str) -> str:
 
 def gate_still_open(wo_id: str, request: dict[str, Any]) -> str:
     """Why this work order cannot settle yet, and the one way on from where it is."""
-    from .gates import AWAITING_CASE
+    from .gates import AWAITING_CASE, case_command
 
     if request["status"] == AWAITING_CASE:
         way_on = (f"Nobody is reviewing it: it carries no case. Make one —\n"
-                  f"    jarvis gate request {wo_id} \"{request['command']}\" "
-                  f"--why \"<why this is ready>\" --evidence \"<PR, tests, checks>\"")
+                  f"    {case_command(wo_id, request['command'])}")
     else:
         way_on = ("It is under review. End your turn — the verdict arrives as your "
                   "next user turn, and you finish from there.")
@@ -1641,7 +1640,15 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
     try:
         open_requests = store.open_approvals(wo_id)
         if open_requests:
-            raise OpsError(gate_still_open(wo_id, open_requests[0]))
+            # WHICH request the message describes is a choice, not a consequence of how
+            # `open_approvals` happens to order its two halves: the way on differs by
+            # status, and a held one is the only one the worker can act on this turn, so
+            # it leads whenever both are open.
+            from .gates import AWAITING_CASE
+
+            raise OpsError(gate_still_open(wo_id, next(
+                (a for a in open_requests if a["status"] == AWAITING_CASE),
+                open_requests[0])))
         fields: dict[str, Any] = {"result_summary": summary}
         if pr_url:
             fields["pr_url"] = pr_url

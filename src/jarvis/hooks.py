@@ -380,6 +380,11 @@ def _classify(command: str, config: Any) -> Any:
         central.close()
 
 
+#: What the `--why` placeholder says on the one denial that fires at the moment the
+#: worker tried to ship, rather than on a retry. Only the wording differs.
+READY_TO_SHIP = "<why this is ready to ship>"
+
+
 def _case_deadline(config: Any) -> str:
     """The sentence that turns the hold into a deadline the worker can see."""
     return (f"If no case is made within "
@@ -426,8 +431,7 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
                 f"Gate `{action.kind}`: request {prior['id']} for this exact command is "
                 f"recorded but NOT under review, and retrying the command will not start "
                 f"one. It is waiting for your case, and only this starts the review:\n"
-                f"    jarvis gate request {wo_id} \"{action.command}\" "
-                f"--why \"<why this is ready>\" --evidence \"<PR, tests, checks>\"\n\n"
+                f"    {gates.case_command(wo_id, action.command)}\n\n"
                 f"{_case_deadline(config)} Then END YOUR TURN."
             )
         if prior is not None and prior["status"] == "pending":
@@ -470,8 +474,7 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
             f"NOBODY IS REVIEWING IT YET. You ran the command rather than asking, so the "
             f"request carries no case, and no reviewer is shown one. Make it — reviewers "
             f"see only what you write (branch, PR, test results):\n"
-            f"    jarvis gate request {wo_id} \"{action.command}\" "
-            f"--why \"<why this is ready to ship>\" --evidence \"<PR, tests, checks>\"\n\n"
+            f"    {gates.case_command(wo_id, action.command, why=READY_TO_SHIP)}\n\n"
             f"That command starts the review. {_case_deadline(config)}\n\n"
             f"Then END YOUR TURN — the verdict arrives as your next user turn, and the "
             f"retry will go through if it is approved."
@@ -571,8 +574,7 @@ def held_request_turn_block(store: ProjectStore, wo_id: str, payload: dict[str, 
             f"({request['kind']}) is recorded but NOT under review, and ending here "
             f"leaves it that way — no reviewer is shown it and nothing else can close "
             f"it. Make the case now, in this turn:\n"
-            f"    jarvis gate request {wo_id} \"{request['command']}\" "
-            f"--why \"<why this is ready>\" --evidence \"<PR, tests, checks>\"\n\n"
+            f"    {gates.case_command(wo_id, request['command'])}\n\n"
             # `from_json` always returns a config, falling back to the default TTL, so
             # this reads the same clock `Daemon.refuse_unargued_gates` runs on.
             f"{_case_deadline(config)} "

@@ -71,7 +71,8 @@ __all__ = [
     "GateConfig",
     "GateKind", "GatedAction", "KINDS", "KIND_NAMES", "NO_CASE_JUSTIFICATION",
     "REVIEWER_PERSONA", "RuleSet",
-    "VERDICTS", "amend_request", "apply_decision", "build_request_question", "classify",
+    "VERDICTS", "amend_request", "apply_decision", "build_request_question",
+    "case_command", "classify",
     "deny_conflicts", "file_request", "open_gate", "queue_for_review", "reads_only",
     "render_user_messages", "scannable", "summarise", "sweep_unargued",
 ]
@@ -131,6 +132,22 @@ VERDICTS = ("approved", "denied", "dismissed")
 # both writer and reader must agree on the string: see GitHub issue 185.
 NO_CASE_JUSTIFICATION = ("(none — the worker ran the command directly rather than filing "
                          "a request, so no case was made for it)")
+
+
+def case_command(wo_id: str, command: str, why: str = "<why this is ready>",
+                 evidence: str = "<PR, tests, checks>") -> str:
+    """The one command that turns a recorded request into a reviewed one.
+
+    Seven call sites tell a worker to run it: the hook's three denials, `ops.finish`'s
+    refusal, `jarvis gate list`, and both halves of the briefing. In every one of them
+    the rendered line is the ONLY thing the reader gets, so spelled out per site a
+    renamed flag would leave six of them handing out a command that no longer parses,
+    and only the tested one would say so. `why` and `evidence` vary because the surfaces
+    do: a briefing shows placeholders, a listing shows ellipses, a block names what the
+    case has to argue.
+    """
+    return (f'jarvis gate request {wo_id} "{command}" '
+            f'--why "{why}" --evidence "{evidence}"')
 
 
 @dataclass(frozen=True)

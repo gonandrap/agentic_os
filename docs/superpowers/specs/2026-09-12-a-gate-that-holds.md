@@ -44,6 +44,12 @@ the block terminates by construction.
 `stop_hook_active` caps it at one continuation. A worker that ignored the reason twice is
 better parked than spun.
 
+One skip, and it reads the sweeper's own set: a work order in `invariants.TERMINAL_STATUSES`
+is not held. There is nothing left to argue for — no worker will run the command — and
+`INV-GATE-ORPHAN` supersedes the request on the next tick anyway, so holding it would pin
+a dead session at every turn boundary over a request already closed. The two must name the
+same set (kn-d4d5a967), and the test is parametrised over it rather than over a copy.
+
 ### 2. PreToolUse narrows the session while a request is under review
 
 `hooks.under_review_decision` denies every Bash call that is not `jarvis …`
@@ -68,7 +74,14 @@ blocked regardless, since the gate that judges it fails closed.
 `ops.finish` raises while any request is `pending` or `awaiting_case`. This is the route
 neither of the others can close, because the command that takes it is a `jarvis …`
 contract command that §2 must keep allowed. The refusal names the way on, which differs by
-status: argue a held request, or end the turn and wait for a pending one.
+status: argue a held request, or end the turn and wait for a pending one. When both are
+open it describes the held one, chosen explicitly rather than by list order, because that
+is the only one the worker can act on without ending the turn.
+
+The line it hands out — `jarvis gate request <wo> "<cmd>" --why … --evidence …` — is
+rendered by `gates.case_command`, which is also what the three hook denials, `jarvis gate
+list` and the briefing print. It is the only text a blocked worker gets, so a renamed flag
+has to break every copy of it at once or it breaks none of them visibly.
 
 Not a trap. Every open request reaches a verdict without the worker doing anything —
 Neo's drain for a pending one, `Daemon.refuse_unargued_gates` for a held one — and the
