@@ -1048,23 +1048,12 @@ class Daemon:
             except KeyError:
                 store.mark_message(msg["id"], "failed")
                 continue
-            if not wo.get("session_id"):
-                continue  # not dispatched yet; the worker prompt will carry it instead
-            if worker_session.busy(store, wo["id"]):
-                continue  # mid-turn: one turn at a time, and resume would refuse anyway
-            pause = worker_session.turn_pause(store, wo["id"])
-            if pause is not None and pause.resumable:
-                # Parked on the usage limit or on a broken API. The lost turn has to go
-                # out first — it is holding a message already marked `delivered`, so
-                # sending this one now would silently jump the queue. Held, not dropped:
-                # the same queue delivers it as the next turn once the retry gets
-                # through.
-                #
-                # `resumable`, not `exhausted`: the two answer differently only for an
-                # auth pause whose sign-in has not changed, and that one never exhausts
-                # by design — holding on it would hold `jarvis wo send … "retry"` for
-                # ever, which is the manual escape hatch for a sign-in the OS cannot see
-                # (Neo, question 169).
+            # Every per-work-order hold, in the one place that decides them
+            # (`worker_session.delivery_hold`). Held, not dropped: the same queue sends
+            # it as the next turn once the hold clears. The same call answers
+            # `invariants.stuck_message`, which is what keeps "nothing is coming" and
+            # "this is why" from drifting apart.
+            if worker_session.delivery_hold(store, wo) is not None:
                 continue
             pending.setdefault(wo["id"], []).append(dict(msg))
         # Chronological, because `queued_messages` is and a dict keeps insertion order:

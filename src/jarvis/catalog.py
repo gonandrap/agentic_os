@@ -327,6 +327,34 @@ class InspectConfig:
     alarm_parked_minutes: int = DEFAULT_INSPECT_ALARM_PARKED_MINUTES
 
 
+# -- message delivery: how long a queued message may stay undelivered before the OS
+# calls it stuck. A threshold a surface judges by, so it is a setting and not a module
+# constant (kn-67cdb54b), and ABOVE `ProjectSpec` for the `field(default_factory=…)`
+# reason kn-6ca2bcd9 gives.
+
+#: `Daemon.deliver_messages` sends within one reconcile tick, so this is not a
+#: latency bar — it is the point past which every ACCOUNTED wait has been excused by
+#: `invariants.stuck_message` and what is left is a message the worker will never see.
+#: An hour rather than minutes for `DEFAULT_INSPECT_ALARM_PARKED_MINUTES`' reason: the
+#: one unaccounted wait that is legitimately long is a project whose `max_concurrent`
+#: slots are all full, and flagging that after minutes would put a line on the
+#: attention list for a fleet that is merely busy.
+DEFAULT_MESSAGING_STUCK_MINUTES = 60
+
+
+@dataclass
+class MessagingConfig:
+    """When a message queued for a worker stops being in flight and becomes a defect.
+
+    Per project as well as fleet-wide, with the field-level inheritance `_parse_inspect`
+    uses, and for the same reason: "how long is too long" is a claim about what is
+    normal, and a project that runs one work order at a time queues behind itself far
+    more than one that runs five.
+    """
+
+    stuck_minutes: int = DEFAULT_MESSAGING_STUCK_MINUTES
+
+
 # -- the supervisor: it JUDGES a cost alarm, so every number it judges by is a setting
 # rather than a module constant (kn-67cdb54b). Reasoning, and why none of it belongs in
 # `InspectConfig`: docs/superpowers/specs/2026-08-31-the-supervisor.md §2.
@@ -466,6 +494,7 @@ class ProjectSpec:
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
+    messaging: MessagingConfig = field(default_factory=MessagingConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -557,6 +586,7 @@ class OsConfig:
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
+    messaging: MessagingConfig = field(default_factory=MessagingConfig)
 
 
 @dataclass
@@ -760,6 +790,26 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
     return cfg
 
 
+def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
+                     where: str = "os.messaging") -> MessagingConfig:
+    """`os.messaging`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    Refused rather than clamped below 1, for that function's reason: zero would call
+    every message the fleet has just queued stuck, and it arrives by a typo in a
+    `jarvis config set` that this is the last place able to name.
+    """
+    base = base or MessagingConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    cfg = MessagingConfig(
+        stuck_minutes=int(raw.get("stuck_minutes", base.stuck_minutes)),
+    )
+    for name, value in vars(cfg).items():
+        if value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    return cfg
+
+
 #: Fields of `SupervisorConfig` that are NOT whole numbers. The reflective parse below
 #: casts everything else with `int()`, so a non-numeric field missing from this set is a
 #: `TypeError` on every catalog load — or, for a bool, a silent `int(False) == 0` that
@@ -945,6 +995,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         validation=_parse_validation(os_raw.get("validation", {})),
         inspect=_parse_inspect(os_raw.get("inspect", {})),
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
+        messaging=_parse_messaging(os_raw.get("messaging", {})),
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")
@@ -1005,6 +1056,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         supervisor_cfg = _parse_supervisor(
             p.get("supervisor", {}), base=os_cfg.supervisor,
             where=f"projects[{i}] ({name}).supervisor")
+        messaging_cfg = _parse_messaging(
+            p.get("messaging", {}), base=os_cfg.messaging,
+            where=f"projects[{i}] ({name}).messaging")
         projects.append(
             ProjectSpec(
                 name=name,
@@ -1018,6 +1072,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 validation=validation_cfg,
                 inspect=inspect_cfg,
                 supervisor=supervisor_cfg,
+                messaging=messaging_cfg,
                 raw=p,
             )
         )
