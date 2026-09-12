@@ -211,10 +211,15 @@ def test_gates_section_is_the_full_gate_briefing():
     from jarvis import worker_brief
     text = worker_brief.render_section("gates", wo_id="wo-1",
                                        gates_enabled=("release",))
-    for phrase in ("gated, NOT forbidden", "jarvis gate request wo-1", "DISMISSED",
+    for phrase in ("gated, NOT forbidden", "jarvis gate request wo-1", "DISMISSAL",
+                   "jarvis gate contest wo-1", "jarvis gate explain",
                    "pending or escalated", "second request",
                    "leave the original standing"):
         assert phrase in text, f"lost from the gates section: {phrase!r}"
+    # The ask belongs to the KIND, and only the live kinds' asks are shown — the brief is
+    # the surface a worker reads before it is ever blocked (spec 2026-09-12 §6).
+    assert "why this is ready to ship" in text
+    assert "why this service has to be interrupted" not in text
     assert "pr_merge" not in text, "a gate the project has not enabled is listed"
     # With no project context (bare `jarvis brief gates`) every kind is described,
     # because the section must always render something true.

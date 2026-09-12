@@ -53,7 +53,9 @@ authorised and nothing is lost — the command string stays blocked.
 > property of the code, not of the status. The sweep now writes `expired` with
 > `closed_as='abandoned'` and queues the worker a message, because a denial asserts that a
 > reviewer refused a privileged action — and on the evidence these are mostly commands
-> that were never privileged at all.
+> that were never privileged at all. The **default dropped 600s → 240s** at the same
+> time (§7): the hold's clock is the blocked worker's idle time, and 600s outlived the
+> prompt cache, so every hold billed a full conversation re-write at the write rate.
 
 ### What the user can still do
 

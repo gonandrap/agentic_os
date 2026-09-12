@@ -607,6 +607,38 @@ def test_the_case_ttl_is_a_per_project_catalog_setting(fleet):
         gates.GateConfig.parse({"enabled": ["release"], "case_ttl_seconds": 0})
 
 
+def test_a_held_work_order_does_not_idle_across_the_prompt_cache_ttl():
+    """The hold's clock IS the worker's idle time, so it has to fit inside the cache.
+
+    A blocked worker is told to end its turn and nothing wakes it until a verdict or the
+    sweep arrives; if that takes longer than the prompt cache lives, the next turn
+    re-sends the whole conversation at the WRITE rate for nothing. Measured on
+    wo-5efc2de6 against the old 600s value: six writes, every one labelled `ttl-expiry`,
+    gaps of 8.4-10.2 minutes. Spec 2026-09-12 §7.
+    """
+    assert gates.DEFAULT_CASE_TTL_SECONDS < gates.CASE_TTL_CEILING_SECONDS
+
+
+def test_the_ceiling_is_the_prompt_cache_ttl_itself():
+    """`gates` duplicates the literal rather than importing `usage` — it is on the
+    PreToolUse hook's hot path — so the two are pinned here (kn-1449447a §3)."""
+    from jarvis import usage
+    assert gates.CASE_TTL_CEILING_SECONDS == usage.WRITE_TTL_SECONDS
+
+
+def test_a_catalog_ttl_past_the_cache_is_clamped_rather_than_refused(caplog):
+    """CLAMPED, unlike every other sanity check in `parse`, which raises.
+
+    `parse` runs inside the PreToolUse hook and a settings file written by the previous
+    release legally carries 600 — raising there would block every gated command on every
+    worker mid-upgrade.
+    """
+    with caplog.at_level("WARNING"):
+        cfg = gates.GateConfig.parse({"enabled": ["release"], "case_ttl_seconds": 600})
+    assert cfg.case_ttl_seconds == gates.DEFAULT_CASE_TTL_SECONDS
+    assert "prompt-cache" in caplog.text
+
+
 def test_asking_when_already_approved_says_so(fleet):
     ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh",
                               why="FORCE_APPROVE — ready")
@@ -974,6 +1006,26 @@ def test_a_held_request_becomes_a_contest_rather_than_a_second_row(fleet):
     assert [r["id"] for r in rows] == [held["id"]]
     assert rows[0]["status"] == "pending" and rows[0]["contested"] == 1
     assert gates.NO_CASE_JUSTIFICATION not in rows[0]["justification"]
+
+
+def test_a_contest_is_never_parked_behind_the_case_clock(fleet):
+    """A contest has to be decidable in seconds, not held for the TTL.
+
+    The hold exists so no reviewer sees a privileged action nobody argued for; a contest
+    argues there is no privileged action, which IS the case the reviewer needs. Left
+    held it would be swept as abandoned while its argument sat unread, and the worker
+    would pay the cache re-write for the wait — spec 2026-09-12 §7.
+    """
+    fleet.attempt(PROSE)
+    ops.contest_gate_match(fleet.wo_id, PROSE, why="the literal is in the message")
+
+    store = fleet.store()
+    try:
+        store.conn.execute("UPDATE approvals SET ts = ts - 7200")
+        assert gates.sweep_unargued(store, gates.DEFAULT_CASE_TTL_SECONDS) == []
+        assert store.list_approvals(fleet.wo_id)[0]["status"] == "pending"
+    finally:
+        store.close()
 
 
 def test_contesting_something_that_was_never_gated_says_so(fleet):

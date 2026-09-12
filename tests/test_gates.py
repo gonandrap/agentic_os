@@ -1231,15 +1231,19 @@ def test_a_dismissed_gate_asks_nothing_of_the_user(gated):
 # docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §3.
 
 
-def _names_both_exits(text, wo_id, command):
+def _names_both_exits(text, wo_id, command, kind="release"):
     """The property every blocking surface must have, asserted in one place.
 
     Pinned as a shared predicate rather than three copies of the literals: the rendered
     line is the only thing each reader gets, so a flag renamed in one surface and not the
     others is advice that no longer parses (kn-467d1ecd).
+
+    `kind` is passed through because the request line's placeholders belong to the kind
+    (§6) — a surface that dropped it would still name both exits, and would still ask a
+    service restart for a PR number.
     """
     assert f'jarvis gate explain "{command}"' in text
-    assert gates.request_command(wo_id, command) in text
+    assert gates.request_command(wo_id, command, kind) in text
     assert gates.contest_command(wo_id, command) in text
 
 
@@ -1280,6 +1284,58 @@ def test_a_second_block_after_an_abandonment_says_so(gated):
     reason = _reason(gated.attempt("./scripts/shipit.sh"))
     assert "ABANDONED" in reason
     _names_both_exits(reason, gated.wo["id"], "./scripts/shipit.sh")
+
+
+def test_the_block_asks_a_service_restart_its_own_two_questions(gated):
+    """Not "why this is ready to ship". Nothing ships when a service bounces, and the
+    reviewer is shown nothing but what the worker wrote — spec 2026-09-12 §6."""
+    command = "sudo systemctl restart jarvis"
+    reason = _reason(gated.attempt(command))
+
+    _names_both_exits(reason, gated.wo["id"], command, "service_restart")
+    assert "why this service has to be interrupted, and why now" in reason
+    assert "what that work loses when it bounces" in reason
+    assert "ready to ship" not in reason
+
+
+def test_the_block_asks_a_config_write_its_own_two_questions(gated):
+    """The other kind with no PR behind it: what the setting is now, what it becomes,
+    and what the change switches off."""
+    command = "jarvis config set proj_a gates.case_ttl_seconds 120"
+    reason = _reason(gated.attempt(command))
+
+    _names_both_exits(reason, gated.wo["id"], command, "config_write")
+    assert "why this setting has to change" in reason
+    assert "the value after, and what the change switches off" in reason
+    assert "ready to ship" not in reason
+
+
+def test_every_kind_asks_for_something_a_worker_could_actually_supply():
+    """The defect was one frame hardcoded for all six. Cheap guard against the next kind
+    being added without one of its own."""
+    seen = {(k.why_ask, k.evidence_ask) for k in gates.KINDS}
+
+    assert len(seen) == len(gates.KINDS)
+    assert not [k for k in gates.KINDS if not k.why_ask or not k.evidence_ask]
+
+
+def test_a_contest_asks_no_per_kind_question(gated):
+    """A contest asserts the command performs no privileged action of ANY kind, so the
+    question is the same whichever recogniser fired."""
+    one = gates.contest_command(gated.wo["id"], "sudo systemctl restart jarvis")
+    two = gates.contest_command(gated.wo["id"], "./scripts/shipit.sh")
+
+    assert (one.replace("sudo systemctl restart jarvis", "X")
+            == two.replace("./scripts/shipit.sh", "X"))
+
+
+def test_the_block_still_tells_the_worker_to_end_its_turn(gated):
+    """"Blocked on a gate" and "idle in-turn" must never coincide: nothing wakes a worker
+    that sits spinning, and its next turn re-sends the whole conversation at the write
+    rate. The instruction has to survive the deny payload into the worker's context —
+    spec 2026-09-12 §7."""
+    for command in ("./scripts/shipit.sh", "sudo systemctl restart jarvis"):
+        assert "END YOUR TURN" in _reason(gated.attempt(command))
 
 
 def test_the_contest_question_carries_the_structural_reading(gated):

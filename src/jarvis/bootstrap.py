@@ -47,7 +47,13 @@ from .paths import project_state_dir
 # 15-minute eval, signed off on the promise of a wake-up that does not exist, and the run
 # died with its process (wo-2df8828c). Prose is again the whole mechanism, and it only
 # helps the workers whose repo has it.
-TEMPLATE_VERSION = 10
+# v11 = the second exit. A worker handed a false positive was offered only "argue this is
+# ready to ship" and, three times running, walked away and worked around the gate instead
+# (wo-5efc2de6) — so `jarvis gate contest` is named here, beside `explain` as the way to
+# tell the two exits apart. The same bump carries the per-kind ask: the request placeholders
+# were the RELEASE question for all six kinds, and the reviewer sees nothing but what the
+# worker wrote. Prose is the whole mechanism again, so it has to reach every managed repo.
+TEMPLATE_VERSION = 11
 ASSETS = Path(__file__).parent / "assets"
 
 
@@ -299,16 +305,24 @@ def _gates_section(project: ProjectSpec) -> str:
         "independent reviewer (Neo, the user's delegate) decides whether they run.",
         "",
     ]
-    lines += [f"- `{k.name}` — {k.summary}" for k in live]
+    # With the two questions each kind's own request has to answer — a reviewer sees
+    # nothing but what the worker wrote. Spec 2026-09-12 §6.
+    for k in live:
+        lines += [
+            f"- `{k.name}` — {k.summary}",
+            f"  - `--why`: {k.why_ask}",
+            f"  - `--evidence`: {k.evidence_ask}",
+        ]
     lines += [
         "",
         "Ask before acting — the reviewer sees ONLY the text you write, so a request with",
-        "evidence is far more likely to be approved than a bare attempt:",
+        "evidence is far more likely to be approved than a bare attempt. Answer the two",
+        "questions listed above for the kind that fired:",
         "",
         "```bash",
         'jarvis gate request "$JARVIS_WO_ID" "<the exact command>" \\',
-        '    --why "<why this is ready to ship>" \\',
-        '    --evidence "<PR number, test results, checks>"',
+        '    --why "<the --why your kind asks for>" \\',
+        '    --evidence "<the --evidence your kind asks for>"',
         "```",
         "",
         "Then END YOUR TURN. The verdict arrives as your next user turn. If approved, run",
@@ -320,8 +334,8 @@ def _gates_section(project: ProjectSpec) -> str:
         "commands by matching text, so it sometimes fires on one that merely *names* a",
         "privileged action — a release script inside a grep pattern, a path quoted in a PR",
         "body. That is a defect in the OS, not a refusal, and the request above is the wrong",
-        "move for it: there is no PR and nothing 'ready to ship' to put in it. Contest the",
-        "match instead, and nothing is authorised either way:",
+        "move for it: the command does none of these things, so both answers would be false.",
+        "Contest the match instead, and nothing is authorised either way:",
         "",
         "```bash",
         'jarvis gate explain "<the exact command>"   # which exit do you need?',

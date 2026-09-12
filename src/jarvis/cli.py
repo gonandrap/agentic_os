@@ -521,9 +521,14 @@ def build_parser() -> argparse.ArgumentParser:
                       help="(workers) ask permission to run a privileged command")
     g.add_argument("wo_id")
     g.add_argument("command", help="the EXACT command you will run if approved")
-    g.add_argument("--why", default="", help="why this is ready to ship")
+    # Kind-neutral, because the parser is built before any command is parsed. What each
+    # kind actually asks for is in `jarvis brief gates` and in the block message itself,
+    # both rendered from gate_rules (spec 2026-09-12 §6).
+    g.add_argument("--why", default="",
+                   help="why this action should proceed — each gate kind asks a "
+                        "different question; the block message states yours")
     g.add_argument("--evidence", default="",
-                   help="PR number, test results, checks — the reviewer sees only this")
+                   help="what a reviewer can check — the reviewer sees only this")
     g.add_argument("--project")
     g = ga.add_parser(
         "contest",

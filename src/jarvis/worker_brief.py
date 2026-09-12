@@ -241,7 +241,9 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             f"forbidden: an attempt is blocked, filed for review, and the gate's "
             f"full instructions arrive when one fires. You make a stronger case by "
             f"asking first — `jarvis gate request {wo_id} \"<the exact command>\" "
-            f"--why \"<why this is ready>\" --evidence \"<PR, tests, checks>\"`. If a "
+            f"--why \"<why this action should proceed>\" --evidence \"<what a "
+            f"reviewer can check>\"`; each kind asks for something different and "
+            f"`jarvis brief gates` says what. If a "
             f"gate fires on a command that ships NOTHING, that is a classifier bug and "
             f"the request above is the wrong move: contest it instead — `jarvis gate "
             f"contest {wo_id} \"<the exact command>\" --why \"<why this performs no "
@@ -567,7 +569,16 @@ def gates_section(wo_id: str = WO_PLACEHOLDER,
         "These actions are reviewed before they run — an independent reviewer "
         "(Neo, the user's delegate) decides, and approval lets you proceed:",
     ]
-    lines += [f"- `{k.name}` — {k.summary}" for k in live]
+    # Each kind is listed WITH the two questions its own request has to answer. The
+    # reviewer is shown nothing but what the worker wrote, so a worker told to supply a
+    # PR number for a service restart supplies the wrong thing and the verdict is decided
+    # on it. Spec 2026-09-12 §6.
+    for k in live:
+        lines += [
+            f"- `{k.name}` — {k.summary}",
+            f"    --why: {k.why_ask}",
+            f"    --evidence: {k.evidence_ask}",
+        ]
     if not enabled:
         lines += [
             "(All kinds are listed because no project context was given; your "
@@ -578,8 +589,8 @@ def gates_section(wo_id: str = WO_PLACEHOLDER,
         "ASK FIRST. This is the only command that starts a review, because the "
         "reviewer sees ONLY the text you write:",
         f"    jarvis gate request {wo_id} \"<the exact command>\" "
-        f"--why \"<why this is ready>\" --evidence \"<PR number, test results, "
-        f"checks>\"",
+        f"--why \"<the --why your kind asks for, above>\" "
+        f"--evidence \"<the --evidence your kind asks for, above>\"",
         "",
         "Attempting one directly is safe but it is NOT a request. The attempt is "
         "blocked and the OS records it, holding it back from review precisely "
@@ -599,8 +610,8 @@ def gates_section(wo_id: str = WO_PLACEHOLDER,
         "command that merely NAMES one of these actions: a release script inside a "
         "grep pattern, a path quoted in a PR body, a heredoc that writes a file. "
         "That is an OS bug, not a refusal, and the command above is the wrong one "
-        "for it — there is no PR, no test result and nothing 'ready to ship' to "
-        "write in it. Contest the match instead:",
+        "for it — the command performs none of these actions, so every answer the "
+        "request asks you for would be false. Contest the match instead:",
         f"    jarvis gate contest {wo_id} \"<the exact command>\" "
         f"--why \"<why this performs no privileged action>\"",
         "",

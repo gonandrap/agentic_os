@@ -46,6 +46,7 @@ file keeps the lifecycle: what a gate MEANS, who reviews it, and what a verdict 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterable
@@ -65,8 +66,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .neo_store import NeoStore
     from .project_store import ProjectStore
 
+log = logging.getLogger(__name__)
+
 __all__ = [
-    "APPROVAL_STATUSES", "AWAITING_CASE", "DEFAULT_CASE_TTL_SECONDS", "GRANT_MAX_USES",
+    "APPROVAL_STATUSES", "AWAITING_CASE", "CASE_TTL_CEILING_SECONDS",
+    "DEFAULT_CASE_TTL_SECONDS", "GRANT_MAX_USES",
     "GRANT_TTL_SECONDS", "SELF_HEAL",
     "GateConfig",
     "CONTEST_HEADER", "CONTEST_NOT_AN_AUTHORISATION",
@@ -75,6 +79,7 @@ __all__ = [
     "VERDICTS", "abandoned_message", "amend_request", "apply_decision",
     "build_contest_question", "build_request_question", "classify", "contest_command",
     "deny_conflicts", "exits_advice", "file_request", "open_gate", "queue_for_review",
+    "asks", "kind_of",
     "question_text", "reads_only", "render_user_messages", "request_command", "scannable",
     "summarise", "sweep_unargued",
 ]
@@ -106,7 +111,27 @@ AWAITING_CASE = "awaiting_case"
 # privileged action left open for ever is a worse record than a closed one. Per-project via
 # `gates.case_ttl_seconds` in the catalog — kn-67cdb54b — because how long a worker
 # plausibly takes to come back with test results is a fact about the project, not the OS.
-DEFAULT_CASE_TTL_SECONDS = 600.0
+#
+# UNDER THE PROMPT CACHE'S TTL, AND THAT IS THE WHOLE CHOICE OF NUMBER. A blocked worker
+# is told to end its turn, and when it obeys, NOTHING else will ever wake it: a held
+# request has no reviewer and therefore no verdict, so this sweep's own message is the
+# next thing the worker ever receives. The clock is therefore the worker's idle gap, and
+# an idle gap past the cache TTL re-sends the entire conversation at the cache-WRITE
+# rate. Measured on wo-5efc2de6: six cache writes, every one labelled `ttl-expiry`, gaps
+# of 8.4-10.2 minutes against the old 600s value, ~914k tokens re-written of which the
+# two gate holds account for ~201k. `jarvis inspect wo-5efc2de6` still prints it.
+#
+# 240s leaves a minute of headroom under `usage.WRITE_TTL_SECONDS`. It is not a guess at
+# how long a worker needs — the only thing that clears a hold is ONE tool call, which a
+# worker that is still working makes in seconds and a worker that has parked will never
+# make however long it waits.
+DEFAULT_CASE_TTL_SECONDS = 240.0
+
+#: The ceiling a project's own `gates.case_ttl_seconds` is clamped to, for the reason
+#: above. Duplicates `usage.WRITE_TTL_SECONDS` rather than importing it — `gates` is
+#: loaded by the PreToolUse hook on every Bash call and `usage` is not on that path — so
+#: a test pins the two literals against each other (kn-1449447a §3 is the same pattern).
+CASE_TTL_CEILING_SECONDS = 300.0
 
 # The verdicts a reviewer can reach. `dismissed` is not a softer denial and not a quieter
 # approval — it answers a different question.
@@ -241,6 +266,19 @@ class GateConfig:
         if ttl <= 0:
             raise ValueError('"gates.case_ttl_seconds" must be positive — a held request '
                              'that never expires is the leak this setting bounds')
+        if ttl >= CASE_TTL_CEILING_SECONDS:
+            # CLAMPED, not refused, and the asymmetry with the check above is deliberate.
+            # A too-short hold is broken; a too-long one is merely expensive — it parks
+            # the worker past the prompt cache's TTL and re-sends the whole conversation
+            # at the write rate (see DEFAULT_CASE_TTL_SECONDS). Raising would also break
+            # on upgrade: a worker-settings file written by the previous release legally
+            # carries 600, and this same `parse` runs inside the PreToolUse hook.
+            log.warning(
+                "gates.case_ttl_seconds=%.0f is at or past the %.0fs prompt-cache TTL; "
+                "clamped to %.0f. A worker parked longer than the cache lives re-sends "
+                "its whole conversation at the cache-write rate.",
+                ttl, CASE_TTL_CEILING_SECONDS, DEFAULT_CASE_TTL_SECONDS)
+            ttl = DEFAULT_CASE_TTL_SECONDS
         return cls(enabled=frozenset(enabled), extra_patterns=extra, case_ttl_seconds=ttl)
 
 
@@ -329,21 +367,54 @@ def deny_conflicts(config: GateConfig, deny_rules: Iterable[str]
 # -- what a blocked worker is told to do ----------------------------------------------
 
 
-def request_command(wo_id: str, command: str,
-                    why: str = "<why this is ready to ship>",
-                    evidence: str = "<PR, tests, checks>") -> str:
-    """The command that puts a case for a real privileged action in front of a reviewer."""
+def kind_of(name: str) -> GateKind | None:
+    """One `GateKind` by name, or None. The lookup every render site needs and no
+    caller should re-derive by scanning `KINDS`."""
+    return next((k for k in KINDS if k.name == name), None)
+
+
+def asks(kind: str) -> tuple[str, str]:
+    """What `--why` and `--evidence` should contain FOR THIS GATE. See `GateKind`.
+
+    An unknown kind falls back to the field defaults rather than raising: this renders
+    the text a blocked worker reads, and a `KeyError` there would replace usable advice
+    with no advice at all.
+    """
+    found = kind_of(kind)
+    if found is None:
+        return GateKind(name=kind, summary="").why_ask, GateKind(name=kind,
+                                                                 summary="").evidence_ask
+    return found.why_ask, found.evidence_ask
+
+
+def request_command(wo_id: str, command: str, kind: str = "",
+                    why: str = "", evidence: str = "") -> str:
+    """The command that puts a case for a real privileged action in front of a reviewer.
+
+    The placeholders come from the KIND, because "why this is ready to ship" is a
+    question only a release can answer — a worker asked it about a service restart
+    writes something that is not what the reviewer needs, and the reviewer sees nothing
+    else. Pass `why`/`evidence` to override (a listing shows ellipses; a block shows the
+    real question).
+    """
+    kind_why, kind_evidence = asks(kind)
     return (f"jarvis gate request {wo_id} \"{command}\" "
-            f"--why \"{why}\" --evidence \"{evidence}\"")
+            f"--why \"{why or f'<{kind_why}>'}\" "
+            f"--evidence \"{evidence or f'<{kind_evidence}>'}\"")
 
 
 def contest_command(wo_id: str, command: str,
                     why: str = "<why this performs no privileged action>") -> str:
-    """The command that disputes the MATCH rather than arguing for the action."""
+    """The command that disputes the MATCH rather than arguing for the action.
+
+    No per-kind ask here, and that is the point: a contest asserts the command performs
+    no privileged action of ANY kind, so the question is the same whichever recogniser
+    fired.
+    """
     return f"jarvis gate contest {wo_id} \"{command}\" --why \"{why}\""
 
 
-def exits_advice(wo_id: str, command: str) -> str:
+def exits_advice(wo_id: str, command: str, kind: str = "") -> str:
     """The two ways out of a block, and the diagnosis that picks between them.
 
     ONE RENDERER, because the failure this fixes is a worker handed advice it cannot
@@ -356,22 +427,25 @@ def exits_advice(wo_id: str, command: str) -> str:
     whether its own command performs the action — that is precisely why the gate matched
     it — and asking it to pick an exit blind is what produced three abandoned requests in
     a row. See docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §3.
+
+    `kind` shapes the request line's placeholders and nothing else — §6.
     """
     return (
         f"TWO WAYS OUT. If you cannot tell which you need, ask the OS first — it reports "
         f"where the matched literal sits and whether the shell would run it:\n"
         f"    jarvis gate explain \"{command}\"\n\n"
         f"If the command DOES perform the action, make the case:\n"
-        f"    {request_command(wo_id, command)}\n\n"
+        f"    {request_command(wo_id, command, kind)}\n\n"
         f"If it does NOT — the recogniser matched text it is only reading or writing "
         f"about (a name in a grep pattern, a path in a commit message, a string in a "
         f"heredoc) — contest the match. That asks a reviewer to DISMISS it as a "
         f"classifier false positive; it authorises nothing and it is not a request for "
         f"permission, so it needs no PR and no test results:\n"
         f"    {contest_command(wo_id, command)}\n\n"
-        f"Do not guess between them: arguing that a false positive is \"ready to ship\" "
-        f"is a claim about work that does not exist, and walking away leaves the block "
-        f"on the record with nobody ever told the recogniser was wrong."
+        f"Do not guess between them: answering the request's two questions about a "
+        f"command that performs no privileged action means writing something false into "
+        f"the only text the reviewer sees, and walking away leaves the block on the "
+        f"record with nobody ever told the recogniser was wrong."
     )
 
 
@@ -517,7 +591,11 @@ APPROVE when all of these hold:
   with the project's checks or tests reported passing. For a RELEASE of code that is
   already on the main branch, that evidence is CI's verdict on the exact merged commits.
   The merge is what asserts the code is ready; a green CI run on those commits IS the
-  check, and it is complete evidence on its own.
+  check, and it is complete evidence on its own. This clause is written for the kinds
+  that SHIP CODE. Some gates do not — restarting a service, writing a fleet setting —
+  and for those the same question is asked of different facts: the evidence box names
+  what was asked for, and that is what to judge. Never hold a service restart to the
+  absence of a pull request.
 - The command matches the stated intent — the PR number, tag or service named is the
   one the request is about, and nothing extra rides along.
 - Consequences are recoverable by ordinary means (revert the merge, ship the previous
@@ -673,7 +751,10 @@ def build_request_question(action: GatedAction, wo: dict[str, Any],
     parts += ["", "The worker's justification:",
               justification.strip() or "(the worker gave none — treat that as a red flag)"]
     if evidence.strip():
-        parts += ["", "Evidence the worker supplied (branch, PR, test results):",
+        # Labelled with what THIS gate asked for. The label used to read "branch, PR,
+        # test results" over a service restart's evidence, which tells the reviewer to
+        # judge it against something nobody asked the worker to supply — §6.
+        parts += ["", f"Evidence the worker supplied ({asks(action.kind)[1]}):",
                   evidence.strip()[:2000]]
     parts += render_user_messages(user_messages)
     parts += render_history(history)
@@ -859,7 +940,7 @@ def abandoned_message(approval: dict[str, Any], ttl_seconds: float) -> str:
         f"If you worked around the block, come back and finish this: a match nobody "
         f"contests is a classifier defect nobody ever hears about, and the next worker "
         f"loses the same turn you did.\n\n"
-        + exits_advice(approval["wo_id"], approval["command"])
+        + exits_advice(approval["wo_id"], approval["command"], approval["kind"])
     )
 
 
@@ -1040,7 +1121,7 @@ def denied_message(approval: dict[str, Any], reason: str, by: str) -> str:
             f"You argued that this performs no privileged action and the reviewer "
             f"disagreed, so the match stands. Do not retry it as-is. If the work is "
             f"genuinely ready, make the real case:\n"
-            f"    {request_command(approval['wo_id'], approval['command'])}\n"
+            f"    {request_command(approval['wo_id'], approval['command'], approval['kind'])}\n"
             f"Otherwise leave it and finish the work order explaining what is left."
         )
     return (

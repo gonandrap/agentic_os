@@ -122,6 +122,60 @@ it is reported separately and never folded into the rate. The rate's denominator
 the three verdicts named positively, which also stops `awaiting_case` and `expired` rows
 diluting it.
 
+### 6. The ask belongs to the kind, not to `release`
+
+The block message's second failure is narrower than the first and reaches every worker,
+not just the ones facing a false positive: `--why "<why this is ready to ship>"` was
+hardcoded for all six kinds. Nothing is "ready to ship" about a `jarvis config set`, and
+there is no PR number to put behind a `systemctl restart`.
+
+This matters past wording. The reviewer's prompt is built from what the worker wrote and
+shows nothing else, so a worker told to supply a PR number for a service restart supplies
+one — and the verdict is decided on the wrong evidence. The right question is a property
+of the kind, and `gate_rules.KINDS` already carries a per-kind `summary` that nobody had
+extended to the ask.
+
+`GateKind` gains `why_ask` and `evidence_ask`, and every surface that renders the ask
+renders them: the hook's fresh block and its `awaiting_case` retry (`gates.exits_advice`
+takes `kind`), `abandoned_message`, `denied_message`'s route back, the standing worker
+brief, `jarvis brief gates`, and `OPERATION.md`. The kind is in hand at all of them; none
+of it needed plumbing. `jarvis gate request --help` stays kind-neutral because argparse
+builds the parser before there is a command to classify, and says where the real question
+is.
+
+A contest has no per-kind ask, and that is the point: it asserts the command performs no
+privileged action of *any* kind, so the question is the same whichever recogniser fired.
+
+`build_request_question` labels the evidence with the same string, so the reviewer sees
+what the worker was asked for and can tell a non-answer from a missing one.
+
+### 7. The hold must fit inside the prompt cache's TTL
+
+A blocked worker is told to end its turn, and when it obeys, nothing wakes it until a
+verdict arrives. The hold's clock is therefore the worker's idle time, and idle time is
+not free: the next turn re-sends the whole conversation, at the cache-**write** rate if
+the cache has expired in between.
+
+Measured on wo-5efc2de6 (`jarvis inspect`): six cache writes, every one labelled
+`ttl-expiry`, gaps of 8.4–10.2 minutes — the old 600s `case_ttl_seconds` almost exactly.
+~914k tokens re-written. The record also settles what the worker did: the turn after the
+gate-95 denial is 30.4s, 92% idle, one call. It ended its turn as instructed. The ten
+minutes are the OS's own clock, not a worker ignoring the instruction, so the fix is the
+clock.
+
+`DEFAULT_CASE_TTL_SECONDS` drops 600 → 240, under `usage.WRITE_TTL_SECONDS` (300s) with
+room for a reconcile tick either side. `CASE_TTL_CEILING_SECONDS` states the constraint
+as a constant and a test pins it against `usage.WRITE_TTL_SECONDS`, because gates is on
+the hook's hot path and cannot import usage (kn-1449447a §3 is the same pattern).
+
+A configured value at or over the ceiling is **clamped with a warning, not refused** —
+unlike the sanity checks beside it, which raise. `GateConfig.parse` runs inside the
+PreToolUse hook, and a settings file written by the previous release legally carries 600:
+raising there would block every gated command on every worker mid-upgrade.
+
+A contest is never held at all (§1), so this clock never applies to one: the worker that
+takes the exit this spec adds waits on a reviewer, not on a timer.
+
 ## What this is not
 
 It is not a way for a worker to clear its own gate. A contest is a claim, reviewed by
