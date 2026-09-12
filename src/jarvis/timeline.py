@@ -292,6 +292,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # plainly so the record cannot be read as "someone approved this quietly".
         return (f"Gate request closed unanswered — the `{p.get('kind') or 'gate'}` "
                 f"question no longer applies", p.get("reason") or "")
+    if kind == "gate_turn_held":
+        # The gate enforcing itself rather than asking. On the record because a reader
+        # who sees a worker carry on after a block deserves to know it was made to.
+        return ("Tried to end the turn with a gate request unargued — held",
+                f"request {p.get('approval_id')}" if p.get("approval_id") else "")
     if kind == "gate_escalated":
         return "Gate approval escalated to you", p.get("reason") or ""
     if kind == "gate_opened":
