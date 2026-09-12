@@ -24,8 +24,11 @@ tested, in isolation, against state that never had both.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from jarvis import gates
 from jarvis import neo as neo_mod
 from jarvis import ops
 from jarvis.catalog import load_catalog
@@ -44,6 +47,18 @@ from jarvis.project_store import ProjectStore
 
 IDLE_NOTIFICATION = "Claude is waiting for your input"
 GENERIC_BLOCKER = "worker is waiting on your input"
+
+
+def ignored_reason(store: ProjectStore, wo_id: str) -> str:
+    """The reason the `Notification` branch recorded for swallowing the idle prompt.
+
+    Asserted on rather than merely counted: the reason is the only record of WHICH wait
+    the work order was parked on, so a test that checks the event exists and stops there
+    goes green on a version that has collapsed every wait into one string.
+    """
+    ignored = [e for e in store.list_events(wo_id) if e["kind"] == "notification_ignored"]
+    assert len(ignored) == 1, f"expected exactly one notification_ignored, got {ignored}"
+    return json.loads(ignored[0]["payload"])["reason"]
 
 
 # -- fixtures -------------------------------------------------------------------------
@@ -260,6 +275,39 @@ def test_the_idle_prompt_is_ignored_while_a_gate_is_with_neo(project):
     )
 
     assert not store.get_work_order(wo["id"])["needs_attention"]
+    assert ignored_reason(store, wo["id"]) == \
+        "idle prompt while parked on a privileged-action gate awaiting a verdict"
+
+
+def test_the_idle_prompt_is_ignored_while_a_gate_awaits_the_worker_s_case(project):
+    """GitHub issue 197, the fourth road in. A hook-filed request is HELD
+    (`gates.AWAITING_CASE`) and never reaches `pending_approvals` — kn-30036661 names the
+    readers taught about held requests, and this one was missed."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship it")
+    store.set_status(wo["id"], "running")
+    action = gates.GatedAction(kind="release", summary="cut a release",
+                               command="scripts/shipit.sh", matched="shipit")
+    approval, question = gates.file_request(store, None, "proj",
+                                            store.get_work_order(wo["id"]), action,
+                                            hold=True)
+    assert question is None and approval["status"] == gates.AWAITING_CASE
+    assert store.get_work_order(wo["id"])["status"] == "waiting_input"
+
+    handle_hook(
+        {"hook_event_name": "Notification", "session_id": "s1",
+         "cwd": str(project), "message": IDLE_NOTIFICATION},
+        {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)},
+    )
+
+    fresh = store.get_work_order(wo["id"])
+    assert not fresh["needs_attention"]
+    assert store.unrouted_notifications() == []
+    # NOT interchangeable with the pending reason above, and this is what stops the two
+    # branches being merged back into one: a held request is with the worker, and the
+    # timeline must not say a reviewer was holding something nobody had argued for.
+    assert ignored_reason(store, wo["id"]) == \
+        "idle prompt while parked on a privileged-action gate awaiting the worker's case"
 
 
 def test_a_real_permission_prompt_still_reaches_the_user(project):
