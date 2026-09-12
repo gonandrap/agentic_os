@@ -1794,8 +1794,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
+        # `relay=True` marks a surface the human reaches; `ops.user_authorship` decides
+        # whether this particular process is one. A worker running the same command is
+        # not, whatever it passes for --source.
         _print(ops.send_message(args.wo_id, args.message, source=args.source,
-                                project_name=args.project), args.json)
+                                project_name=args.project, relay=True), args.json)
     elif args.wo_cmd == "assume":
         _print(ops.assume(args.wo_id, args.content), args.json)
     elif args.wo_cmd == "ask":

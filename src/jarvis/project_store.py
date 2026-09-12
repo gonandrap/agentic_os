@@ -393,7 +393,8 @@ CREATE TABLE IF NOT EXISTS wo_messages (
     content TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT 'jarvis',  -- jarvis | ui | direct
     status TEXT NOT NULL DEFAULT 'queued',  -- queued | delivered | failed
-    delivered_at REAL
+    delivered_at REAL,
+    authored_by TEXT NOT NULL DEFAULT ''    -- MESSAGE_AUTHOR_USER, or '' for unknown
 );
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -732,7 +733,23 @@ ADDED_COLUMNS = {
         "remedy_argument": "TEXT",
         "remedy_approval_id": "INTEGER",
     },
+    # WHO WROTE THIS MESSAGE, as opposed to `source`, which is which surface filed it.
+    # Additive with an EMPTY default on purpose: every row written before this column
+    # existed reads as "we cannot say", which is the honest answer and deliberately not
+    # the same claim as "the user did not write it". See §2 of
+    # docs/superpowers/specs/2026-09-11-a-gate-request-carries-the-users-words.md.
+    "wo_messages": {
+        "authored_by": "TEXT NOT NULL DEFAULT ''",
+    },
 }
+
+#: `wo_messages.authored_by` when the OS could prove the human typed it. The ONLY value
+#: this column ever takes: everything else is unattributed (`''`), because a stamp that
+#: names a machine author would invite a later reader to treat the set of stamps as a
+#: closed world and ask "which of these is trusted", when the only question that matters
+#: is "is this one the user's". Written by `ops.send_message` alone (§2 of
+#: docs/superpowers/specs/2026-09-11-a-gate-request-carries-the-users-words.md).
+MESSAGE_AUTHOR_USER = "user"
 
 # A dependency is satisfied only when it reaches `completed` — the strict rule of the
 # feature-order design. It is affordable because the merge poller landed first: the user
@@ -1829,10 +1846,20 @@ class ProjectStore:
     # -- messages (user feedback queue) ---------------------------------------
 
     def queue_message(self, wo_id: str, content: str, source: str = "jarvis",
-                      direction: str = "user_to_agent", status: str = "queued") -> int:
+                      direction: str = "user_to_agent", status: str = "queued",
+                      authored_by: str = "") -> int:
+        """Put one message on the work order's queue. Returns its row id.
+
+        `authored_by` defaults to unattributed and every machine caller leaves it there.
+        It is NOT a claim a caller gets to make freely: `ops.send_message` is the only
+        thing that ever passes `MESSAGE_AUTHOR_USER`, and only after proving the calling
+        process is not a dispatched worker session — see its docstring, and §2 of
+        docs/superpowers/specs/2026-09-11-a-gate-request-carries-the-users-words.md.
+        """
         cur = self.conn.execute(
-            "INSERT INTO wo_messages (wo_id, ts, direction, content, source, status) VALUES (?,?,?,?,?,?)",
-            (wo_id, db.now(), direction, content, source, status),
+            "INSERT INTO wo_messages (wo_id, ts, direction, content, source, status, "
+            "authored_by) VALUES (?,?,?,?,?,?,?)",
+            (wo_id, db.now(), direction, content, source, status, authored_by),
         )
         return int(cur.lastrowid)
 
@@ -1874,6 +1901,21 @@ class ProjectStore:
     def list_messages(self, wo_id: str, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM wo_messages WHERE wo_id=? ORDER BY ts LIMIT ?", (wo_id, limit)
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def user_messages(self, wo_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Inbound messages this work order can PROVE the user wrote, newest first.
+
+        The narrow half of `list_messages`, and the narrowness is the whole point: what
+        reads this renders the user's own words into a privileged-action request, so a
+        row a worker could have written must not be in it. `authored_by` is matched
+        exactly, so an unstamped legacy row is excluded rather than grandfathered in.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM wo_messages WHERE wo_id=? AND direction='user_to_agent' "
+            "AND authored_by=? ORDER BY ts DESC, id DESC LIMIT ?",
+            (wo_id, MESSAGE_AUTHOR_USER, limit),
         ).fetchall()
         return db.rows_to_dicts(rows)
 
