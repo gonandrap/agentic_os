@@ -56,6 +56,7 @@ import os
 import re
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -392,30 +393,70 @@ def _production_version() -> str | None:
     return m.group(1) if m else None
 
 
-def production_status(directory: Path | None = None) -> tuple[list[str] | None, str]:
-    """Tracked files modified in the production checkout, or why we could not tell.
+@dataclass(frozen=True)
+class ProductionStatus:
+    """What the production checkout is, as git sees it. Built by `production_status`."""
 
-    `(paths, "")` on success — an empty list means clean. `-uno`: untracked files are not
-    drift. The deploy's `git checkout -f` never removed them either, and `.venv/` and
-    `.jarvis/` live there by design.
+    #: Tracked files modified since the tag was checked out, or None if git could not say.
+    dirty: list[str] | None
+    #: The ref to restore the checkout to — the deployed tag, else the literal `HEAD`.
+    ref: str
+    #: Why `dirty` is None; empty when it is not.
+    error: str
 
-    `(None, reason)` when git could not answer at all: not installed, the checkout
+
+def _production_ref(root: Path) -> str:
+    """The ref that restores the production checkout, resolved FROM GIT.
+
+    Never from `pyproject.toml`: that file is one of the things drift can touch, and a
+    remedy built from a drifted version names a tag nobody ever cut — so the pathspec
+    fails and the reader concludes the CHECK is broken rather than the checkout. Falls
+    back to `HEAD`, which restores the same tree whatever it is called.
+
+    Not to be confused with `_production_version`, which reads the file deliberately:
+    the release handshake is verifying what landed ON DISK, where git was correct and
+    misleading at once (kn-58429229). Different question, different source.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "describe", "--tags", "--exact-match", "HEAD"],
+            capture_output=True, text=True, timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return "HEAD"
+    tag = out.stdout.strip()
+    return tag if out.returncode == 0 and tag else "HEAD"
+
+
+def production_status(directory: Path | None = None) -> ProductionStatus:
+    """Is the production checkout still byte-identical to its tag, and how to fix it.
+
+    `dirty == []` is clean. `-uno`: untracked files are not drift. The deploy's
+    `git checkout -f` never removed them either, and `.venv/` and `.jarvis/` live there
+    by design.
+
+    `dirty is None` means git could not answer at all: not installed, the checkout
     unreadable, or — the realistic one, since the daemon and the user are different uids
     on the same tree — `detected dubious ownership`. Collapsing that into "clean" would
     silence the invariant permanently on the one checkout it exists to watch, so the two
-    are separate return values rather than both `[]`.
+    are distinguishable rather than both `[]`.
+
+    `ref` is here rather than at the call site so the `jarvis-X.Y.Z` naming rule stays in
+    this module, beside the `scripts/shipit.sh` counterpart that mints it.
 
     Backs `invariants.check_production_clean`.
     """
     root = directory or production_code_dir()
+    ref = _production_ref(root)
     try:
         out = subprocess.run(
             ["git", "-c", "core.quotePath=false", "-C", str(root),
              "status", "--porcelain", "-uno"],
             capture_output=True, text=True, timeout=20, check=False)
     except (OSError, subprocess.SubprocessError) as e:
-        return None, f"{type(e).__name__}: {e}"
+        return ProductionStatus(None, ref, f"{type(e).__name__}: {e}")
     if out.returncode != 0:
         detail = (out.stderr or out.stdout).strip().replace("\n", " ")
-        return None, f"git status exited {out.returncode}: {detail or '(no output)'}"
-    return sorted(line[3:] for line in out.stdout.splitlines() if line.strip()), ""
+        return ProductionStatus(
+            None, ref, f"git status exited {out.returncode}: {detail or '(no output)'}")
+    dirty = sorted(line[3:] for line in out.stdout.splitlines() if line.strip())
+    return ProductionStatus(dirty, ref, "")

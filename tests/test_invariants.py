@@ -717,16 +717,19 @@ def test_an_unreadable_catalog_falls_back_to_the_shipped_timeout(monkeypatch):
 # checkout is byte-identical to its tag, and nothing was checking.
 
 
-def _prod_checkout(root: Path) -> Path:
+def _prod_checkout(root: Path, tag: str | None = "jarvis-0.9.0") -> Path:
     """A deployed production checkout: `$PRODUCTION_CODE/jarvis_os`, on a tag, clean."""
     prod = root / "jarvis_os"
     prod.mkdir(parents=True)
     (prod / "pyproject.toml").write_text('[project]\nversion = "0.9.0"\n')
     (prod / "uv.lock").write_text('name = "jarvis-os"\nversion = "0.9.0"\n')
-    for argv in (["init", "-q", "-b", "main"],
-                 ["config", "user.email", "t@example.com"],
-                 ["config", "user.name", "Test"],
-                 ["add", "-A"], ["commit", "-q", "-m", "release"]):
+    argvs = [["init", "-q", "-b", "main"],
+             ["config", "user.email", "t@example.com"],
+             ["config", "user.name", "Test"],
+             ["add", "-A"], ["commit", "-q", "-m", "release"]]
+    if tag:
+        argvs.append(["tag", "-a", tag, "-m", tag])
+    for argv in argvs:
         subprocess.run(["git", "-C", str(prod), *argv], check=True, capture_output=True)
     return prod
 
@@ -809,11 +812,38 @@ def test_the_unknown_case_is_distinguishable_from_clean(tmp_path, monkeypatch):
     """The two must not share a return value — that is how a broken check reads green."""
     prod = _prod_checkout(tmp_path)
     monkeypatch.setenv("PRODUCTION_CODE", str(tmp_path))
-    assert release.production_status(prod) == ([], "")
+    assert release.production_status(prod).dirty == []
+    assert release.production_status(prod).error == ""
 
-    paths, why = release.production_status(tmp_path / "not-a-repo")
-    assert paths is None
-    assert why
+    unknown = release.production_status(tmp_path / "not-a-repo")
+    assert unknown.dirty is None
+    assert unknown.error
+
+
+def test_the_remedy_survives_pyproject_itself_being_the_drift(tmp_path, monkeypatch):
+    """The version on disk is one of the things drift can touch, so the remedy must not
+    be derived from it: a tag built from a drifted version was never cut, the pathspec
+    fails, and the reader concludes the CHECK is broken rather than the checkout."""
+    prod = _prod_checkout(tmp_path)
+    (prod / "pyproject.toml").write_text('[project]\nversion = "6.6.6-tampered"\n')
+
+    found = _prod_violations(tmp_path, monkeypatch)
+    assert len(found) == 1
+    assert found[0].context["paths"] == ["pyproject.toml"]
+    assert found[0].context["ref"] == "jarvis-0.9.0"      # from git, not from the file
+    assert "6.6.6-tampered" not in found[0].detail
+
+
+def test_an_untagged_checkout_falls_back_to_head(tmp_path, monkeypatch):
+    """`HEAD` restores the same tree whatever it is called, so a checkout git cannot name
+    still gets a remedy that works."""
+    prod = _prod_checkout(tmp_path, tag=None)
+    (prod / "uv.lock").write_text('name = "jarvis-os"\nversion = "0.1.1"\n')
+
+    found = _prod_violations(tmp_path, monkeypatch)
+    assert len(found) == 1
+    assert found[0].context["ref"] == "HEAD"
+    assert "checkout -f HEAD" in found[0].detail
 
 
 def test_it_is_a_doctor_check_not_a_reconcile_tick_check():
