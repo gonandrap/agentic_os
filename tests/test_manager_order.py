@@ -11,10 +11,10 @@ function:
 * **With `os.validation.enabled` off, nothing changes.** No manager is created, plan
   release is the call it always was, and every other test in the suite still passes
   unedited. Every test below that needs a manager turns the flag on explicitly.
-* **A long-lived idle session breaks four things, and the first one stops the fleet.**
-  `count_active` has no kind filter, `waiting_input` is an ACTIVE status, and a manager
-  is designed to sit in it for its feature's whole life — so two features in flight would
-  spend a `max_concurrent: 2` project's entire budget on two sessions doing nothing.
+* **A long-lived session breaks four things, and the first one stops the fleet.**
+  `count_active` has no kind filter, and a manager takes a turn every time its feature
+  reports for that feature's whole life — so two features in flight would spend a
+  `max_concurrent: 2` project's entire budget on bookkeeping.
   `test_an_idle_manager_does_not_spend_a_concurrency_slot` is the important test in this
   file; INV-MANAGER-SLOTS is the alarm that proves the exemption is still there.
 
@@ -165,14 +165,15 @@ def test_the_manager_is_created_in_the_same_transaction_as_the_children(boot, st
 
 
 def test_an_idle_manager_does_not_spend_a_concurrency_slot(boot, store):
-    """THE test in this file. `count_active` counts every ACTIVE status and
-    `waiting_input` is one of them, so two features' managers would eat a
-    `max_concurrent: 2` project whole and `dispatch_pending` would never claim anything
-    again — a project that stops with nothing anywhere saying why.
+    """THE test in this file. Two features' managers must not eat a `max_concurrent: 2`
+    project whole and leave `dispatch_pending` unable to claim anything again — a project
+    that stops with nothing anywhere saying why.
 
-    Paired with the control in the same test: two ORDINARY work orders parked in exactly
-    the same status DO take the slots. Without that half, a `count_active` that returned
-    zero unconditionally would pass the first half perfectly.
+    Paired with the control in the same test: two ORDINARY work orders holding a slot DO
+    take them. Without that half, a `count_active` that returned zero unconditionally
+    would pass the first half perfectly. The control runs them, rather than parking them
+    in the manager's own status: since issue #134 a parked order spends no slot whatever
+    its kind, so `waiting_input` would no longer tell the two apart.
     """
     daemon = boot(validation=True, max_concurrent=2)
     spec = daemon.catalog.project("proj_a")
@@ -188,11 +189,11 @@ def test_an_idle_manager_does_not_spend_a_concurrency_slot(boot, store):
 
     assert store.get_work_order(work["id"])["status"] != "pending"
 
-    # The control: the same status, the same count, on two ordinary workers.
+    # The control: two ordinary workers actually running, and the count sees them.
     store.set_status(work["id"], "completed")
     for i in range(2):
         busy = ops.create_work_order("proj_a", f"busy {i}", description="something")
-        store.set_status(busy["id"], "waiting_input")
+        store.set_status(busy["id"], "running")
 
     assert store.count_active() == 2
 
@@ -213,21 +214,24 @@ def test_inv_manager_slots_fires_when_the_exemption_is_removed(boot, store, monk
     fo_id = release(daemon, "CSV export", "one", "two")
     manager = store.manager_work_order(fo_id)
     assert manager is not None
-    store.set_status(manager["id"], "waiting_input")
+    # Mid-turn, because that is where the exemption still does work: since issue #134 a
+    # manager parked in `waiting_input` is outside the cap's set anyway, so a canary
+    # armed on a parked one would fire whether or not the kind filter survived.
+    store.set_status(manager["id"], "running")
 
     def fired() -> list[invariants.Violation]:
         return [v for v in invariants.check_project(store, repair=False)
                 if v.invariant == "INV-MANAGER-SLOTS"]
 
-    assert fired() == [], "healthy state, with an idle manager, says nothing"
+    assert fired() == [], "healthy state, with a manager taking its turn, says nothing"
 
-    from jarvis.project_store import ACTIVE_STATUSES
+    from jarvis.project_store import SLOT_STATUSES
 
     def unfiltered(self) -> int:
-        marks = ",".join("?" for _ in ACTIVE_STATUSES)
+        marks = ",".join("?" for _ in SLOT_STATUSES)
         return self.conn.execute(
             f"SELECT COUNT(*) c FROM work_orders WHERE status IN ({marks})",
-            ACTIVE_STATUSES,
+            SLOT_STATUSES,
         ).fetchone()["c"]
 
     monkeypatch.setattr(ProjectStore, "count_active", unfiltered)

@@ -62,6 +62,7 @@ from .project_store import (
     PRE_APPROVED_KEY,
     UNGOVERNED_ORIGINS,
     ProjectStore,
+    resume_spends_slot,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -947,7 +948,15 @@ class Daemon:
         rate, and four `uv run pytest` runs on one machine. Nothing is lost by staggering
         them — a turn held here is not skipped, it is picked up by the next pass ten
         seconds later, because `turn_pause` is re-derived and stays due.
+
+        AND UNDER `max_concurrent`, which is the second door issue #134 had to close: a
+        resume is not a dispatch, so without this the project cap would be advisory for
+        every order this pass relaunches. It bites narrowly and on purpose — a usage or
+        transient pause leaves its work order `running`, which already holds a slot, so
+        the only thing held here is the AUTH pause, the one parked out of `running` by
+        `_park_on_signin`. Held means the pause stays parked with nothing written.
         """
+        budget = project.max_concurrent - store.count_active()
         for wo in store.list_work_orders(statuses=ACTIVE_STATUSES):
             if state is not None and state.blocked():
                 return
@@ -959,6 +968,9 @@ class Daemon:
                 log.exception("[%s] could not diagnose %s", project.name, wo["id"])
                 continue
             if pause is None or not pause.resumable or not pause.due():
+                continue
+            takes_a_slot = resume_spends_slot(wo)
+            if takes_a_slot and budget <= 0:
                 continue
             try:
                 turn = worker_session.retry(store, project, wo, pause)
@@ -973,6 +985,8 @@ class Daemon:
                 continue
             if state is not None:
                 state.launched()
+            if takes_a_slot:
+                budget -= 1
             log.info("[%s] %s resumed after %s (attempt %s/%s, turn %s)",
                      project.name, wo["id"], pause.reason, pause.attempts,
                      pause.max_attempts or "∞", turn["seq"])
@@ -1009,6 +1023,19 @@ class Daemon:
 
         The coalescing is per work order, not global — two work orders' messages are
         independent conversations and must stay separate turns.
+
+        UNDER `max_concurrent`, and this pass is the half of the cap that issue #134
+        added. A slot is spent by a turn that is executing (`SLOT_STATUSES`), so a work
+        order parked in `waiting_input` or `validating` holds none — and delivery is what
+        un-parks it. Uncapped, six rounds rejected by the same validation tick would all
+        resume in one pass and a project capped at five would be running six turns; the
+        claim-time check in `dispatch_pending` never sees them, because a resume is not a
+        dispatch. Held, the message stays `queued` with nothing written, exactly as a
+        dependency-blocked order stays `pending`, and the next tick delivers it.
+
+        THIS PASS RUNS BEFORE `dispatch_pending` IN THE TICK, which is what makes the
+        hold fair rather than a starvation: a slot that frees goes to the conversation
+        somebody is already waiting on before it goes to new work.
         """
         pending: dict[str, list[dict[str, Any]]] = {}
         for msg in store.queued_messages():  # chronological, so the joins stay in order
@@ -1036,8 +1063,18 @@ class Daemon:
                 # (Neo, question 169).
                 continue
             pending.setdefault(wo["id"], []).append(dict(msg))
+        # Chronological, because `queued_messages` is and a dict keeps insertion order:
+        # the oldest waiting conversation takes the free slot.
+        budget = project.max_concurrent - store.count_active()
         for wo_id, msgs in pending.items():
-            self._deliver(project, store, store.get_work_order(wo_id), msgs)
+            wo = store.get_work_order(wo_id)
+            if resume_spends_slot(wo):
+                if budget <= 0:
+                    log.debug("[%s] holding %s message(s) for %s: all %s slots are full",
+                              project.name, len(msgs), wo_id, project.max_concurrent)
+                    continue
+                budget -= 1
+            self._deliver(project, store, wo, msgs)
 
     def deliver_envelopes(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Route every queued envelope, oldest first (src/jarvis/bus.py).

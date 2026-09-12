@@ -15,6 +15,7 @@ from jarvis.project_store import (
     FO_STATUSES,
     FO_TERMINAL_STATUSES,
     OPEN_STATUSES,
+    SLOT_STATUSES,
     TERMINAL_STATUSES,
     WO_KINDS,
     WO_STATUSES,
@@ -183,9 +184,11 @@ def test_validating_sits_between_the_worker_and_the_review(project):
     assert WO_STATUSES.index("validating") == WO_STATUSES.index("needs_review") - 1
     assert FO_STATUSES.index("validating") == FO_STATUSES.index("executing") + 1
     assert FO_STATUSES.index("validating") == FO_STATUSES.index("completed") - 1
-    # A unit under validation holds a live session and must spend a concurrency slot,
-    # but it is not settled.
+    # A unit under validation holds a live session — so it is open, and it spends a
+    # feature's `max_parallel` — but no turn is in flight, so it spends no
+    # `max_concurrent` slot (issue #134) and it is not settled.
     assert "validating" in OPEN_STATUSES and "validating" in ACTIVE_STATUSES
+    assert "validating" not in SLOT_STATUSES
     assert "validating" in FO_OPEN_STATUSES
     assert "validating" not in TERMINAL_STATUSES
     assert "validating" not in FO_TERMINAL_STATUSES
