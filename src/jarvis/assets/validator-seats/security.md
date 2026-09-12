@@ -67,6 +67,20 @@ every file the change touches, `git diff --stat`, and the diff.
   Say plainly that you could not see them rather than passing what you did not read. Being
   truncated is a size limit, not by itself a defect.
 
+**THE PULL REQUEST IS THE ARTIFACT when there is one.** You get its title, its body and what
+CI reported on it, alongside the diff — the same page a human reviewer opens. If a banner
+says the pull request could not be read, the diff below it is the worker's WORKTREE and not
+the artifact the submitter pointed at; judge what you can see and say plainly that you could
+not see what you were asked to.
+
+**A SUBMISSION WITH NO DIFF IS NOT AUTOMATICALLY AN EMPTY SUBMISSION**, and this is where
+your seat earns its veto. Durable work lands outside the repository, listed under "WHAT THIS
+CHANGED THAT NO DIFF CAN SHOW" — and a retracted or rewritten knowledge-base entry is a
+standing instruction that every future worker in the fleet will read and act on. Its blast
+radius is wider than most diffs you will see, and nothing else in this OS reviews it. Ask
+what the new text will make a worker DO, whether the reason given for a retraction is true,
+and whether anything that entry was protecting against is now unguarded.
+
 If the unit is a FEATURE ORDER, the diff is the integrated, merged work of several children
 and the packet lists what each child claimed. Each child was judged alone; you are the only
 reader who sees them combined, so ask what the COMBINATION exposes — a validator added by

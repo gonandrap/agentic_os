@@ -2416,8 +2416,10 @@ def cmd_learn(args: argparse.Namespace) -> int:
             tags = split_tags(args.tags)
             if args.pin and PINNED_TAG not in tags:
                 tags.append(PINNED_TAG)
-            _print(central.add_knowledge(args.content, project=args.project,
-                                         topic=args.topic, tags=",".join(tags)), args.json)
+            # Through `ops`, not the store: the write is attributed to the work order
+            # that made it and lands on that work order's timeline (issue #200).
+            _print(ops.learn_add(args.content, project=args.project, topic=args.topic,
+                                 tags=",".join(tags), wo_id=reader_wo), args.json)
         elif args.kn_cmd == "list":
             # An audit surface, so retired entries are listed too — `search_knowledge`
             # is the unfiltered read, and `digested` marks what was retracted so a
@@ -2463,7 +2465,8 @@ def cmd_learn(args: argparse.Namespace) -> int:
             _print(row, args.json)
         elif args.kn_cmd == "retract":
             try:
-                row = central.retract_knowledge(args.knowledge_id, args.reason)
+                row = ops.learn_retract(args.knowledge_id, args.reason,
+                                        wo_id=reader_wo)
             except (KeyError, ValueError) as exc:
                 # `.args[0]`, not `str(exc)`: KeyError stringifies to its repr, so the
                 # message would reach the user wrapped in quotes.

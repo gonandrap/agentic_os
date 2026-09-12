@@ -130,7 +130,14 @@ CREATE TABLE IF NOT EXISTS knowledge (
     content TEXT NOT NULL,
     tags TEXT NOT NULL DEFAULT '',
     retired_at REAL,                        -- NULL = standing; set = superseded
-    retired_reason TEXT                     -- why, in the user's words
+    retired_reason TEXT,                    -- why, in the user's words
+    -- WHO WROTE IT, and who retired it. Reads were attributed from the day
+    -- `knowledge_reads` existed and writes were not, which is how a work order whose
+    -- whole deliverable was a retraction reached the validation panel looking like it
+    -- had done nothing at all (issue #200, spec 2026-09-12 §4). '' on every
+    -- pre-existing row and on anything a person typed at a terminal.
+    wo_id TEXT NOT NULL DEFAULT '',         -- the work order that ADDED this entry
+    retired_by_wo_id TEXT NOT NULL DEFAULT ''  -- the work order that RETIRED it
 );
 CREATE TABLE IF NOT EXISTS os_state (
     key TEXT PRIMARY KEY,
@@ -331,6 +338,11 @@ ADDED_COLUMNS = {
         # Retraction. NULL on every pre-existing row, which reads as "standing".
         "retired_at": "REAL",
         "retired_reason": "TEXT",
+        # Write attribution (issue #200). '' on every pre-existing row, which reads as
+        # "not attributed" — and is exactly what those rows were, since nothing recorded
+        # an author until now.
+        "wo_id": "TEXT NOT NULL DEFAULT ''",
+        "retired_by_wo_id": "TEXT NOT NULL DEFAULT ''",
     },
     "backlog": {
         # Where a deferred item came from. The backlog predates deferral routing, so
@@ -578,15 +590,24 @@ class CentralStore:
     # -- knowledge -------------------------------------------------------------------
 
     def add_knowledge(self, content: str, project: str = "", topic: str = "",
-                      tags: str = "") -> dict[str, Any]:
+                      tags: str = "", wo_id: str = "") -> dict[str, Any]:
+        """Write one entry. `wo_id` attributes it — see the column's comment.
+
+        Passed in rather than read from `$JARVIS_WO_ID` here, which is the same shape
+        `record_knowledge_read` uses for the read side: this store is a leaf and the
+        environment is the CLI's business.
+        """
         kid = db.new_id("kn")
         self.conn.execute(
-            "INSERT INTO knowledge (id, project, ts, topic, content, tags) VALUES (?,?,?,?,?,?)",
-            (kid, project, db.now(), topic, content, tags),
+            "INSERT INTO knowledge (id, project, ts, topic, content, tags, wo_id)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (kid, project, db.now(), topic, content, tags, wo_id),
         )
-        return {"id": kid, "project": project, "topic": topic, "content": content, "tags": tags}
+        return {"id": kid, "project": project, "topic": topic, "content": content,
+                "tags": tags, "wo_id": wo_id}
 
-    def retract_knowledge(self, knowledge_id: str, reason: str) -> dict[str, Any]:
+    def retract_knowledge(self, knowledge_id: str, reason: str,
+                          wo_id: str = "") -> dict[str, Any]:
         """Retire a knowledge entry the user has superseded. NOT a delete.
 
         The row stays in the table and keeps being returned by `search_knowledge` — the
@@ -594,6 +615,11 @@ class CentralStore:
 
         Retracting an already-retired entry RAISES rather than re-stamping it: the
         original reason and timestamp record when the user changed their mind.
+
+        `wo_id` lands in `retired_by_wo_id`, a SEPARATE column from `wo_id`: retracting
+        somebody else's entry is the interesting case, not an edge one (wo-28405ea1
+        retracted kn-e30648dc, which it had not written), and overwriting the author
+        would erase who was originally wrong.
         """
         if not reason.strip():
             raise ValueError("a retraction needs a reason: what supersedes this entry?")
@@ -607,11 +633,25 @@ class CentralStore:
                 f"knowledge entry {knowledge_id!r} was already retired: "
                 f"{row['retired_reason']!r}")
         self.conn.execute(
-            "UPDATE knowledge SET retired_at=?, retired_reason=? WHERE id=?",
-            (db.now(), reason.strip(), knowledge_id),
+            "UPDATE knowledge SET retired_at=?, retired_reason=?, retired_by_wo_id=?"
+            " WHERE id=?",
+            (db.now(), reason.strip(), wo_id, knowledge_id),
         )
         return dict(self.conn.execute(
             "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)).fetchone())
+
+    def knowledge_by_work_order(self, wo_id: str) -> list[dict[str, Any]]:
+        """Every knowledge entry this work order wrote or retired, oldest first.
+
+        The query issue #200 said did not exist. Both columns, because a work order that
+        retracts an entry and writes its replacement did TWO things and a reviewer
+        judging it needs to see both — that was the live case (wo-28405ea1).
+        """
+        if not wo_id:
+            return []
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM knowledge WHERE wo_id=? OR retired_by_wo_id=?"
+            " ORDER BY ts ASC", (wo_id, wo_id))]
 
     def record_memory_file(self, content: str, project: str = "", topic: str = "",
                            tags: str = MEMORY_TAG) -> bool:

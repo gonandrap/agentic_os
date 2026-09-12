@@ -348,10 +348,16 @@ def _imports(path: Path) -> set[str]:
 
 def test_the_module_imports_nothing_that_could_have_seen_the_work():
     """Walks the AST, function bodies included: the house style is a lazy import inside
-    the function that needs it, and a `sys.modules` check would miss every one."""
+    the function that needs it, and a `sys.modules` check would miss every one.
+
+    `.github` earns its place on the module's own rule rather than as an exception: it
+    can only ask GitHub questions (`github.READ_ONLY_VERBS`, asserted by
+    `tests/test_github_artifact.py`), so importing it gives this module no way to talk
+    back to the submitter whose work it is gathering. Spec 2026-09-12 §2.
+    """
     found = _imports(Path(evidence.__file__))
     assert found == {"__future__", "hashlib", "subprocess", "dataclasses", "pathlib",
-                     "typing", ".worker_session"}
+                     "typing", ".worker_session", ".github"}
     for forbidden in (".catalog", ".daemon", ".bus", ".neo", ".panel", ".claude_cli",
                       ".neo_store", ".ops", ".project_store"):
         assert forbidden not in found
