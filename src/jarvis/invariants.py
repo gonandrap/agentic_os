@@ -416,6 +416,13 @@ def stuck_message(store: ProjectStore, wo: dict[str, Any],
         return None
     if not wo.get("session_id"):
         why = "it has no session to resume"
+    elif pause is not None and pause.resumable:
+        # Past its own deadline and still here: the relaunch INV-PAUSE-OVERDUE watches
+        # for did not happen, and the message is waiting behind it. Said separately from
+        # the branch below because the two ask for opposite things — this one is a
+        # liveness failure in the OS, that one is the account's or the API's problem.
+        why = (f"its {worker_session.PAUSE_NOUN[pause.reason]} retry came due and has "
+               f"not happened")
     elif pause is not None:
         why = (f"its last turn is parked on a {worker_session.PAUSE_NOUN[pause.reason]} "
                f"error that will not retry")

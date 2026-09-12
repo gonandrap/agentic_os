@@ -22,6 +22,7 @@ from jarvis import db, ops
 from jarvis.catalog import DEFAULT_MESSAGING_STUCK_MINUTES, parse_catalog
 from jarvis.invariants import (
     MESSAGE_STUCK_BLOCKER,
+    PARKED_BLOCKER,
     check_project,
     parked_reason,
     stuck_message,
@@ -134,11 +135,66 @@ def test_resume_auto_says_what_is_holding_it_and_does_not_send_another(project):
 
 
 def test_a_stuck_message_speaks_instead_of_the_parked_line(project):
-    """One stopped worker, one sentence: PARKED_BLOCKER would only say it went quiet."""
+    """One stopped worker, one sentence: PARKED_BLOCKER would only say it went quiet.
+
+    THE FIXTURE HAS TO BE OLD IN THE ROWS, not in a `now` argument. `parked_reason` takes
+    one and `ops.waiting_on`, which it consults, does not — it reads `time.time()` itself
+    — so passing `now=` ages only half the question and the `None` comes back from
+    `queued_message`'s pre-existing IN_FLIGHT_WAITS membership, which is exactly what
+    this test must not be able to pass on. The second assertion is the negative control:
+    with the message delivered, the same fixture IS parked, which is what proves the
+    check was armed and makes reverting `SPOKEN_FOR_WAITS` fail here.
+    """
     store = ProjectStore(project)
     wo = _sent_and_never_delivered(store)
+    _age_the_message(store, wo["id"])
+    _age_the_turn(store, wo["id"])
 
-    assert parked_reason(store, wo, now=_now(store, wo["id"])) is None
+    assert ops.waiting_on(store, wo)["what"] == "message_stuck"
+    assert parked_reason(store, wo) is None
+
+    store.mark_message(store.queued_messages(wo["id"])[0]["id"], "delivered")
+
+    assert parked_reason(store, wo) == PARKED_BLOCKER
+
+
+# -- the hold it names, one test per branch ---------------------------------------------
+# `stuck_message`'s reason is read by a doctor invariant AND by `ops.waiting_on`, so the
+# `worker_session.PAUSE_NOUN` lookup in two of these runs in front of the user.
+
+
+def test_it_names_a_missing_session(project):
+    """`deliver_messages` skips an order with no `session_id`, and nothing carries the
+    message into a dispatch prompt — so one that never dispatches holds it for ever."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("dispatched nowhere")
+    store.set_status(wo["id"], "running")
+    store.queue_message(wo["id"], "carry on")
+    _age_the_message(store, wo["id"])
+    wo = store.get_work_order(wo["id"])
+
+    assert stuck_message(store, wo)[1] == "it has no session to resume"
+
+
+def test_it_names_a_retry_that_came_due_and_never_happened(project):
+    """The pause is resumable and its moment has passed: INV-PAUSE-OVERDUE's subject,
+    with the user's message waiting behind it."""
+    store = ProjectStore(project)
+    wo = _paused(store, f"Claude usage limit reached|{int(db.now()) - 3600}",
+                 "usage_limit")
+
+    assert stuck_message(store, wo)[1] == \
+        "its usage-limit retry came due and has not happened"
+
+
+def test_it_names_a_pause_that_will_never_retry(project):
+    """An auth pause whose sign-in has not changed since the turn died: `retry_at` is
+    `NEVER`, so nothing is coming and the account is what has to change."""
+    store = ProjectStore(project)
+    wo = _paused(store, "Invalid API key · Please run /login", "auth_error")
+
+    assert stuck_message(store, wo)[1] == \
+        "its last turn is parked on a Claude Code authentication error that will not retry"
 
 
 # -- the noise rule: every wait something else already owns -----------------------------
@@ -235,6 +291,30 @@ def test_the_shipped_default_is_an_hour():
 
 
 # -- helpers ---------------------------------------------------------------------------
+
+
+def _paused(store: ProjectStore, error: str, terminal_reason: str) -> dict:
+    """A work order whose last turn died in a pause, with an aged message behind it."""
+    wo = store.create_work_order("parked on the way through")
+    store.update_work_order(wo["id"], session_id="sess-1")
+    store.set_status(wo["id"], "running")
+    turn = store.create_turn(wo["id"], "dispatch", "do the thing")
+    store.finish_turn(turn["id"], "failed", error=error, terminal_reason=terminal_reason)
+    store.queue_message(wo["id"], "carry on")
+    _age_the_message(store, wo["id"])
+    # The turn too: a usage-limit pause is anchored to it (`retry_at` is at least
+    # `ended + RATE_LIMIT_MIN_DELAY`), so a turn that died a moment ago is never overdue
+    # however far back the refusal's own reset moment is set.
+    _age_the_turn(store, wo["id"])
+    return store.get_work_order(wo["id"])
+
+
+def _age_the_turn(store: ProjectStore, wo_id: str) -> None:
+    """Age the settled turn past `inspect.alarm_parked_minutes`, so `parked_reason` gets
+    as far as asking `ops.waiting_on` at all."""
+    store.conn.execute(
+        "UPDATE wo_turns SET started_at=started_at-?, ended_at=ended_at-? WHERE wo_id=?",
+        (LONG_ENOUGH, LONG_ENOUGH, wo_id))
 
 
 def _age_the_message(store: ProjectStore, wo_id: str) -> None:
