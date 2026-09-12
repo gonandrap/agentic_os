@@ -54,6 +54,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -389,3 +390,25 @@ def _production_version() -> str | None:
         return None
     m = re.search(r'^version *= *"([^"]+)"', text, flags=re.MULTILINE)
     return m.group(1) if m else None
+
+
+def production_dirty_paths(directory: Path | None = None) -> list[str]:
+    """Tracked files modified in the production checkout since its tag was checked out.
+
+    `-uno`: untracked files are not drift. The deploy's `git checkout -f` never removed
+    them either, and `.venv/` and `.jarvis/` live there by design.
+
+    Returns `[]` for anything that is not a readable git checkout — a machine with no
+    production deployment has nothing to be dirty. Backs `invariants.check_production_clean`.
+    """
+    root = directory or production_code_dir()
+    try:
+        out = subprocess.run(
+            ["git", "-c", "core.quotePath=false", "-C", str(root),
+             "status", "--porcelain", "-uno"],
+            capture_output=True, text=True, timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return sorted(line[3:] for line in out.stdout.splitlines() if line.strip())

@@ -11,9 +11,11 @@ blocked on a question that did not exist.
 
 from __future__ import annotations
 
+import subprocess
 import time
+from pathlib import Path
 
-from jarvis import cli, ops
+from jarvis import cli, invariants, ops
 from jarvis.catalog import DEFAULT_VALIDATION_TIMEOUT
 from jarvis.hooks import handle_hook
 from jarvis.invariants import (
@@ -706,3 +708,73 @@ def test_an_unreadable_catalog_falls_back_to_the_shipped_timeout(monkeypatch):
     monkeypatch.setattr(ops, "validation_config", lambda: None)
 
     assert _validation_timeout() == DEFAULT_VALIDATION_TIMEOUT
+
+
+# -- INV-PROD-CLEAN: production is what the tag says it is ---------------------------
+#
+# Issue #202 lived for nine releases because its only symptom was a version string.
+# "Reproduce in prod, fix it in dev, ship it" is only trustworthy while the production
+# checkout is byte-identical to its tag, and nothing was checking.
+
+
+def _prod_checkout(root: Path) -> Path:
+    """A deployed production checkout: `$PRODUCTION_CODE/jarvis_os`, on a tag, clean."""
+    prod = root / "jarvis_os"
+    prod.mkdir(parents=True)
+    (prod / "pyproject.toml").write_text('[project]\nversion = "0.9.0"\n')
+    (prod / "uv.lock").write_text('name = "jarvis-os"\nversion = "0.9.0"\n')
+    for argv in (["init", "-q", "-b", "main"],
+                 ["config", "user.email", "t@example.com"],
+                 ["config", "user.name", "Test"],
+                 ["add", "-A"], ["commit", "-q", "-m", "release"]):
+        subprocess.run(["git", "-C", str(prod), *argv], check=True, capture_output=True)
+    return prod
+
+
+def _prod_violations(root: Path, monkeypatch) -> list:
+    monkeypatch.setenv("PRODUCTION_CODE", str(root))
+    return list(invariants.check_production_clean())
+
+
+def test_a_clean_production_checkout_raises_nothing(tmp_path, monkeypatch):
+    _prod_checkout(tmp_path)
+    assert _prod_violations(tmp_path, monkeypatch) == []
+
+
+def test_a_rewritten_lockfile_is_reported_by_name(tmp_path, monkeypatch):
+    """The live defect: a bare `uv` command re-resolves and rewrites uv.lock in place."""
+    prod = _prod_checkout(tmp_path)
+    (prod / "uv.lock").write_text('name = "jarvis-os"\nversion = "0.1.1"\n')
+
+    found = _prod_violations(tmp_path, monkeypatch)
+    assert len(found) == 1
+    assert found[0].invariant == "INV-PROD-CLEAN"
+    assert found[0].context["paths"] == ["uv.lock"]
+    assert "uv.lock" in found[0].detail
+
+
+def test_untracked_files_are_not_drift(tmp_path, monkeypatch):
+    """`.venv/` and `.jarvis/` live in that checkout by design, and the deploy's
+    `git checkout -f` never removed them either."""
+    prod = _prod_checkout(tmp_path)
+    (prod / ".venv").mkdir()
+    (prod / ".venv" / "pyvenv.cfg").write_text("home = /usr\n")
+
+    assert _prod_violations(tmp_path, monkeypatch) == []
+
+
+def test_a_machine_with_no_production_deployment_raises_nothing(tmp_path, monkeypatch):
+    """Every dev checkout runs `jarvis doctor` too."""
+    assert _prod_violations(tmp_path / "nothing-here", monkeypatch) == []
+
+
+def test_a_production_path_that_is_not_a_checkout_raises_nothing(tmp_path, monkeypatch):
+    (tmp_path / "jarvis_os").mkdir()
+    assert _prod_violations(tmp_path, monkeypatch) == []
+
+
+def test_it_is_a_doctor_check_not_a_reconcile_tick_check():
+    """Same rule as `check_service_path` and `check_config_drift`: it shells out to git
+    against a checkout, which is not something the reconcile loop should do every tick."""
+    assert invariants.check_production_clean in invariants.OS_INVARIANTS
+    assert invariants.check_production_clean not in invariants.INVARIANTS
