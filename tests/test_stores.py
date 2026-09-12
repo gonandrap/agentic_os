@@ -1,8 +1,13 @@
+import ast
+import inspect
 import json
 import sqlite3
+import threading
+from pathlib import Path
 
 import pytest
 
+from jarvis import db
 from jarvis.central_store import CentralStore
 from jarvis.project_store import (
     ACTIVE_STATUSES,
@@ -331,3 +336,106 @@ def test_the_manager_is_the_third_and_only_other_work_order_kind(project):
     assert store.get_work_order(manager["id"])["kind"] == "manager"
     with pytest.raises(AssertionError):
         store.create_work_order("x", kind="supervisor")
+
+
+# -- write transactions and a second connection ---------------------------------------
+#
+# The daemon reaches one project database from several threads at once, each with its
+# OWN connection (`Daemon._validate_feature`). WAL lets a reader and a writer coexist,
+# with ONE exception: a transaction that READS before it WRITES holds a snapshot, and
+# the upgrade to a write fails outright if anyone committed after that snapshot was
+# taken. The failure is SQLITE_BUSY_SNAPSHOT — `database is locked`, raised WITHOUT
+# consulting `busy_timeout`, so nothing configured in `db.connect` can wait it out.
+
+
+def _writes_from_another_thread(project) -> tuple[threading.Thread, threading.Event,
+                                                  threading.Event]:
+    """A second connection committing one row, on the daemon's side of the fence.
+
+    Opened INSIDE the thread: a sqlite connection belongs to the thread that made it,
+    which is why the daemon's validate pool opens its own (`Daemon._validate_feature`).
+    """
+    go, done = threading.Event(), threading.Event()
+
+    def interloper() -> None:
+        other = ProjectStore(project)
+        try:
+            assert go.wait(timeout=15)
+            other.create_work_order("what the validate thread was writing")
+            done.set()
+        finally:
+            other.close()
+
+    return threading.Thread(target=interloper, daemon=True), go, done
+
+
+def test_releasing_a_plan_survives_a_commit_from_another_connection(project):
+    """The race that flaked CI: `review_plan` creating a feature's children while the
+    daemon's validate thread commits to the same database. The interloper is let in
+    between the transaction's first read and its first write — the one window in which
+    a snapshot exists to go stale."""
+    store = ProjectStore(project)
+    fo = store.create_feature_order("a feature", description="the ask")
+    plan = [{"key": "one", "title": "Build one", "description": "d", "needs": []},
+            {"key": "two", "title": "Build two", "description": "d", "needs": ["one"]}]
+    thread, go, done = _writes_from_another_thread(project)
+    thread.start()
+
+    read = False
+
+    def let_the_other_thread_in(sql: str) -> None:
+        """Fires as each statement starts, so arming on the INSERT puts the interloper
+        after the SELECT has taken the snapshot and before the write is attempted."""
+        nonlocal read
+        head = sql.strip().split()[0].upper()
+        if head == "SELECT":
+            read = True
+        elif read and head == "INSERT" and not go.is_set():
+            go.set()
+            done.wait(timeout=0.5)  # times out once the write lock is taken up front
+
+    store.conn.set_trace_callback(let_the_other_thread_in)
+    try:
+        created = store.create_plan_children(fo["id"], plan, manager=True)
+    finally:
+        store.conn.set_trace_callback(None)
+        thread.join(timeout=15)
+
+    assert [wo["title"] for wo in created] == ["Build one", "Build two"]
+    assert store.manager_work_order(fo["id"]) is not None
+    assert done.is_set(), "the other connection never got its write in"
+
+
+def test_only_db_write_transaction_opens_a_transaction():
+    """THE GUARD. The hazard above is invisible at the call site — a bare `BEGIN` reads
+    exactly like the safe thing — so the rule is checked on the source rather than left
+    to review. Every `BEGIN`/`COMMIT`/`ROLLBACK` in `src/jarvis` must be inside
+    `db.write_transaction`, which is the one place that knows to make it IMMEDIATE."""
+    body, first = inspect.getsourcelines(db.write_transaction)
+    allowed = range(first, first + len(body))
+    offenders = []
+
+    for path in sorted(Path(db.__file__).parent.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "execute" and node.args):
+                continue
+            sql = node.args[0]
+            if not (isinstance(sql, ast.Constant) and isinstance(sql.value, str)):
+                continue
+            head = (sql.value.strip().split() or [""])[0].upper()
+            if head not in ("BEGIN", "COMMIT", "ROLLBACK"):
+                continue
+            if path.name == "db.py" and node.lineno in allowed:
+                # The one it is allowed to run, and only in its IMMEDIATE form: a
+                # deferred BEGIN here would put the hazard back in every call site at
+                # once, and it reads identically.
+                if head == "BEGIN" and sql.value.strip().upper() != "BEGIN IMMEDIATE":
+                    offenders.append(f"{path.name}:{node.lineno} deferred BEGIN")
+                continue
+            offenders.append(f"{path.name}:{node.lineno} {head}")
+
+    assert offenders == [], (
+        "open transactions with `db.write_transaction`, not a bare BEGIN — its "
+        "docstring says what a deferred one costs")

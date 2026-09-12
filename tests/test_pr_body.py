@@ -35,6 +35,7 @@ def _body(**sections: str) -> str:
             "| UI | n/a | no UI change |\n"
             "| Eval | n/a | no prompt change |\n"
             "| A/B | n/a | no contract change |\n"),
+        "Screenshots": "None — no rendered surface changed.",
     }
     filled.update(sections)
     return "\n".join(f"## {k}\n\n{v}\n" for k, v in filled.items())
@@ -68,6 +69,9 @@ def test_the_skill_names_the_hook_and_the_bare_ref_rule():
     assert "item 2 of the work order" in skill
     for section in hooks.PR_BODY_SECTIONS:
         assert section in skill
+    # ...and the URL form the image rule demands, with the check that proves it resolves
+    assert "raw.githubusercontent.com" in skill
+    assert "curl" in skill
 
 
 def test_the_skill_and_its_template_reach_a_worker(tmp_path):
@@ -89,6 +93,8 @@ def test_the_worker_brief_stops_the_reading_that_produced_pr_143():
     text = concision_section()
     assert "open-a-pull-request" in text
     assert "test evidence" in text.lower()
+    # kn-aefb5cb3: this enumeration is a copy of the section list no other test guards
+    assert "screenshot" in text.lower()
 
 
 # -- the unfilled template is not a body --------------------------------------------
@@ -139,6 +145,60 @@ def test_an_order_that_raised_no_alarm_still_answers_the_section():
     assert hooks.pr_body_problems(_body(**{"Alarms raised": "None."})) == []
     assert hooks.pr_body_problems(_body(**{"Alarms raised": "-"})) == [
         "`## Alarms raised` is still the empty template"]
+
+
+def test_the_screenshots_section_is_required_like_every_other():
+    """kn-aefb5cb3's vacuity trap: the `_body()` default above turns every other test
+    green whether or not the tuple was edited, so this asserts the deny directly."""
+    body = _body().replace("## Screenshots", "## Shots")
+
+    assert hooks.pr_body_problems(body) == ["no `## Screenshots` section"]
+
+
+def test_a_ui_change_answers_the_section_with_pictures_or_says_it_did_not():
+    shot = ("![the alarms page]"
+            "(https://raw.githubusercontent.com/o/r/abc123/docs/screenshots/a.png)")
+
+    assert hooks.pr_body_problems(_body(Screenshots=shot)) == []
+    assert hooks.pr_body_problems(_body(Screenshots="-")) == [
+        "`## Screenshots` is still the empty template"]
+
+
+# -- the image that renders broken --------------------------------------------------
+
+
+@pytest.mark.parametrize("target", [
+    "docs/screenshots/neo-alarm-question.png",   # verbatim, the PR 173 defect
+    "./docs/screenshots/a.png",
+    "/home/u/repo/docs/screenshots/a.png",       # an absolute PATH is not a URL either
+])
+def test_a_relative_image_is_denied_with_the_raw_url_named(target):
+    problems = hooks.pr_body_problems(_body(Screenshots=f"![a shot]({target})"))
+
+    assert len(problems) == 1
+    assert "renders broken" in problems[0]
+    assert f"raw.githubusercontent.com/<owner>/<repo>/<sha>/{target}" in problems[0]
+
+
+@pytest.mark.parametrize("text", [
+    "![a](https://raw.githubusercontent.com/o/r/abc123/docs/screenshots/a.png)",
+    "![a](http://localhost:8787/static/a.png)",           # any absolute http(s) target
+    "![a](<https://example.com/a b.png>)",                # the angle-bracket form
+    '![a](https://example.com/a.png "a title")',          # a title after the target
+    "[the screenshot](docs/screenshots/a.png)",           # a LINK, which GitHub resolves
+    "`![a](docs/screenshots/a.png)`",                     # code span — renders no image
+    "```\n![a](docs/screenshots/a.png)\n```",             # fenced block, same
+    "None.\n<!-- ![a](docs/screenshots/a.png) -->",       # comment, never rendered
+])
+def test_a_renderable_or_unrendered_image_passes(text):
+    assert hooks.pr_body_problems(_body(Screenshots=text)) == []
+
+
+def test_the_first_broken_image_is_the_one_reported():
+    """One fix per deny, in body order — the retry re-runs the check for the rest."""
+    body = _body(Screenshots="![a](https://example.com/a.png)\n![b](docs/b.png)")
+
+    assert hooks.unrenderable_image(body) == "docs/b.png"
 
 
 def test_a_missing_section_is_named():

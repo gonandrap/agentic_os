@@ -223,9 +223,23 @@ def learning_from_review(alarm: dict[str, Any], feedback: str) -> str:
     `SupervisorConfig` setting at the moment it was written, and the one that is not is
     the user's own ruling — which is exactly the text `render_learnings` is written never
     to drop silently.
+
+    TWO WIDENINGS, AND THE COST WORDING IS BYTE-IDENTICAL EITHER SIDE OF THEM (§6 of
+    docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md). A health
+    finding's `kind` is a probe id, not a cost alarm's kind, and "on a no-progress alarm"
+    would teach the next review a vocabulary the OS does not have. And a `propose`
+    verdict IS the remedy: without naming it and its argument, "you were right that it
+    was stuck, wrong to nudge it" and "you should have nudged it" distil to the same
+    sentence.
     """
-    return (f"On a {alarm.get('kind')} alarm ({alarm.get('reason')}) the supervisor "
-            f"decided {alarm.get('verdict')} because {alarm.get('verdict_reason')}. "
+    subject = (f"a {alarm.get('probe')} health finding"
+               if alarm.get("source") == "health" else f"a {alarm.get('kind')} alarm")
+    decided = alarm.get("verdict")
+    if decided == "propose":
+        decided = (f"propose the {alarm.get('remedy')} remedy "
+                   f"({alarm.get('remedy_argument')})")
+    return (f"On {subject} ({alarm.get('reason')}) the supervisor "
+            f"decided {decided} because {alarm.get('verdict_reason')}. "
             f"The user's ruling: {feedback}")
 
 

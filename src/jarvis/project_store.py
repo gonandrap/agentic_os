@@ -1139,8 +1139,7 @@ class ProjectStore:
         """
         self.get_work_order(wo_id)  # KeyError if it doesn't exist
         deleted: dict[str, int] = {}
-        self.conn.execute("BEGIN")
-        try:
+        with db.write_transaction(self.conn):
             # Foreign keys are on, so a feature order still pointing at this work order
             # as its planner would refuse the delete outright. Releasing the link is the
             # right move rather than cascading: the feature order is not the thing being
@@ -1165,10 +1164,6 @@ class ProjectStore:
                 "DELETE FROM health_reviews WHERE subject_kind='work_order' "
                 "AND subject_id=?", (wo_id,))
             self.conn.execute("DELETE FROM work_orders WHERE id=?", (wo_id,))
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
         return deleted
 
     # -- feature orders ----------------------------------------------------------
@@ -1389,8 +1384,7 @@ class ProjectStore:
         """
         by_key: dict[str, str] = {}
         created: list[str] = []
-        self.conn.execute("BEGIN")
-        try:
+        with db.write_transaction(self.conn):
             for child in ordered:
                 wo = self.create_work_order(
                     title=child["title"],
@@ -1404,17 +1398,13 @@ class ProjectStore:
                 created.append(wo["id"])
             if manager:
                 self.create_manager_order(fo_id)
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
         return [self.get_work_order(wo_id) for wo_id in created]
 
     def create_manager_order(self, fo_id: str) -> dict[str, Any]:
         """The feature's project manager order. Opens no transaction of its own.
 
-        Called from inside `create_plan_children`'s transaction, so it must not BEGIN or
-        COMMIT anything: an all-or-nothing release is the whole point of creating it here.
+        Called from inside `create_plan_children`'s transaction, so it must not open one
+        of its own: an all-or-nothing release is the whole point of creating it here.
 
         The description is what a listing and `jarvis wo show` display. The manager's own
         briefing is composed at dispatch by `dispatch.build_worker_prompt`, which reads
@@ -1953,16 +1943,11 @@ class ProjectStore:
         has already been sent; dying before either redelivers the whole envelope, which
         is correct and is what the queue already guarantees for `jarvis wo send`.
         """
-        self.conn.execute("BEGIN")
-        try:
+        with db.write_transaction(self.conn):
             msg_id = self.queue_message(wo_id, content, source=source)
             self.conn.execute(
                 "UPDATE envelopes SET state='delivered', delivered_wo_id=?, note=? "
                 "WHERE id=?", (wo_id, note, env_id))
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
         return msg_id
 
     def envelopes(self, subject_wo_id: str | None = None,
