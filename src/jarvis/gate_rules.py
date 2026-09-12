@@ -61,12 +61,20 @@ bash … shipit … EOF` is a release, and the difference between them is exactl
 ## The unit all of that is judged over
 
 Not the whole command string: the independent command inside it. `||`, `&&`, `;` and `&`
-join commands that share no data, so an executor on one side of one says nothing about
-the other — `cat …/shipit/SKILL.md || find ~ -name SKILL.md` is two reads, and judging
-it whole made it a release (issue #194). A PIPE is the opposite and stays whole, because
-`cat scripts/shipit.sh | bash` really does ship; so do substitutions and heredoc bodies,
-which belong to the command that reads them. `list_segments` draws that line once and
-`read_only_mentions` and `Shape` both work over it.
+join commands that share no STREAM, so an executor on one side of one usually says
+nothing about the other — `cat …/shipit/SKILL.md || find ~ -name SKILL.md` is two reads,
+and judging it whole made it a release (issue #194). A PIPE is the opposite and stays
+whole, because `cat scripts/shipit.sh | bash` really does ship; so do substitutions and
+heredoc bodies, which belong to the command that reads them. `list_segments` draws that
+line once and `read_only_mentions` and `Shape` both work over it.
+
+"Usually" is load-bearing, and getting it wrong is worse here than anywhere else in this
+module. Those segments DO share the filesystem and the environment, so a reader that
+writes — `cat scripts/shipit.sh > /tmp/s.sh && bash /tmp/s.sh` — hands its subject to
+the next command by a route no parser here follows. `_hands_off` spots the handing over
+and puts the whole chain back under the chain-wide test. The asymmetry is on purpose:
+issue #194 was a gate that fired when it should not, and the only thing worse than that
+is one that stays quiet when it should.
 """
 
 from __future__ import annotations
@@ -266,6 +274,19 @@ _SEPARATORS = re.compile(r"\|\||&&|[|;\n]|(?<![<>&])&")
 _LIST_SEPARATORS = re.compile(r"\|\||&&|[;\n]|(?<![<>&|])&(?!&)")
 
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# What a redirection writes to. `>&2` and `2>&1` duplicate a file descriptor and
+# `>/dev/null` discards — neither leaves anything behind. Any other target is a file the
+# next command in the list can open, which is the one way a read hands its subject on.
+_REDIRECT_TARGET = re.compile(r"&\d+|[^\s<>&|;]+")
+_DISCARD = ("/dev/null",)
+
+# Readers that can write a file anyway, with no redirection to give them away: `tee`
+# takes a filename, `sort` has `-o`, and `sed` has the `w` command — which lives inside
+# a quoted script, so spotting it means parsing sed. Hence the blunt membership test:
+# naming one of these is a handoff whether or not it wrote anything. It costs nothing
+# unless an executor is in the chain too, which is the only case where it matters.
+_MAY_WRITE = frozenset({"tee", "sort", "sed"})
 
 
 def heredoc_spans(command: str) -> list[tuple[int, int, int]]:
@@ -473,6 +494,34 @@ def reads_only(command: str) -> bool:
     return True
 
 
+def _hands_off(segment: str) -> bool:
+    """Whether `segment` could leave the thing it read where a later command finds it.
+
+    Commands either side of a list separator share no *stream*, but they do share the
+    filesystem and the environment, and that is how a read reaches an executor without
+    ever being piped to one: `cat scripts/shipit.sh > /tmp/s.sh && bash /tmp/s.sh` is a
+    release written in two commands. Three ways to put it there — a redirection to a
+    real file, a reader that writes one itself, and an assignment — and each test below
+    is deliberately blunt, because being wrong here means a release that never asks.
+    """
+    inert = _inert(segment)
+    if command_names(segment) & _MAY_WRITE:
+        return True
+    if any(_ASSIGNMENT.match(w.lstrip("({")) for w in inert.split()):
+        return True
+    # The operator is located in the inert form, so a `>` inside a quoted argument is not
+    # a redirection — but the TARGET is read back out of the raw segment, because
+    # `> "/tmp/s.sh"` is blanked there and an unreadable target must not read as none.
+    for m in re.finditer(r">>?", inert):
+        target = _REDIRECT_TARGET.match(segment[m.end():].lstrip())
+        if target is None:
+            return True
+        name = target.group(0).strip("\"'")
+        if not name.startswith("&") and name not in _DISCARD:
+            return True
+    return False
+
+
 def read_only_mentions(command: str, pattern: str) -> bool:
     """True when every independent command that NAMES `pattern` can only read it.
 
@@ -486,6 +535,12 @@ def read_only_mentions(command: str, pattern: str) -> bool:
     substitution or a heredoc body inside it is judged whole by `reads_only`, because
     there the reader's output really does reach the executor.
 
+    …and so does everything, the moment the reading segment could WRITE what it read.
+    A `_hands_off` reader puts the chain back under the old chain-wide test, because at
+    that point the literal can travel by a route this parser does not follow. The two
+    halves of that are the whole safety argument: `find` after a plain `cat` stays
+    exempt, `bash` after a `cat >` does not.
+
     Fails closed twice over. A pattern that matches no single segment — it straddled a
     separator, or only the whole string matched — clears nothing.
     """
@@ -493,6 +548,7 @@ def read_only_mentions(command: str, pattern: str) -> bool:
         rx = re.compile(pattern, re.IGNORECASE)
     except re.error:
         return False
+    handoff = False
     named = False
     for start, end in list_segments(command):
         segment = command[start:end]
@@ -501,6 +557,9 @@ def read_only_mentions(command: str, pattern: str) -> bool:
         named = True
         if not reads_only(segment):
             return False
+        handoff = handoff or _hands_off(segment)
+    if handoff:
+        return named and not (command_names(command) & _EXECUTORS)
     return named
 
 
@@ -754,6 +813,9 @@ SEED_CANARIES: tuple[tuple[str, str], ...] = (
     # these two lines are what stops the second fix reaching the first.
     ("release", "cat scripts/shipit.sh | bash"),
     ("release", "ls -la .claude/skills/shipit/ && ./scripts/shipit.sh"),
+    # …and the one that is neither: a reader whose output is WRITTEN somewhere the next
+    # command runs it. Nothing pipes here and no executor names the script.
+    ("release", "cat scripts/shipit.sh > /tmp/s.sh && bash /tmp/s.sh"),
     ("service_restart", "sudo systemctl restart jarvis-daemon"),
     ("service_restart", "systemctl --user stop jarvisd"),
     ("push_protected", "git push origin main"),
