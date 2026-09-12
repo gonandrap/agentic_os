@@ -756,9 +756,15 @@ def _is_current_session(store: ProjectStore, wo_id: str, session_id: str) -> boo
 def _parked_on_the_delegate(store: ProjectStore, wo_id: str) -> str:
     """What this work order is parked on instead of the user — "" when nothing is.
 
-    Only ever consulted for a `waiting_input` work order, which is the state both waits
-    put it in (`ops.ask_question`, `gates.request`). A `running` worker's Notification is
-    a real mid-work block until proven otherwise, and swallowing that would strand it.
+    Only ever consulted for a `waiting_input` work order, which is the state every wait
+    puts it in: `ops.ask_question`, and `gates.file_request` down both its roads — the
+    argued request `jarvis gate request` files, and the held one this hook files itself
+    when a worker runs the command first. A `running` worker's Notification is a real
+    mid-work block until proven otherwise, and swallowing that would strand it.
+
+    The returned reason is recorded verbatim on the `notification_ignored` event, so it
+    must name WHICH wait: "parked" and "parked on something a reviewer is holding" are
+    different facts to whoever reads that timeline afterwards.
     """
     if store.get_work_order(wo_id)["status"] != "waiting_input":
         return ""
@@ -770,8 +776,9 @@ def _parked_on_the_delegate(store: ProjectStore, wo_id: str) -> str:
     if store.pending_approvals(wo_id):
         return "a privileged-action gate awaiting a verdict"
     if store.held_approvals(wo_id):
-        # The fourth reader kn-30036661 lists — and the one it missed. A held request is
-        # with the WORKER, not the user: the OS refuses it on a timer if nobody argues it.
+        # A fourth reader of the held state, beyond the three kn-30036661 lists as the
+        # complete set. Held is with the WORKER, not the user: nobody is reviewing it,
+        # and the OS refuses it on a timer if nobody ever argues it.
         return "a privileged-action gate awaiting the worker's case"
     return ""
 

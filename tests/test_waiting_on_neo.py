@@ -24,6 +24,8 @@ tested, in isolation, against state that never had both.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from jarvis import gates
@@ -45,6 +47,18 @@ from jarvis.project_store import ProjectStore
 
 IDLE_NOTIFICATION = "Claude is waiting for your input"
 GENERIC_BLOCKER = "worker is waiting on your input"
+
+
+def ignored_reason(store: ProjectStore, wo_id: str) -> str:
+    """The reason the `Notification` branch recorded for swallowing the idle prompt.
+
+    Asserted on rather than merely counted: the reason is the only record of WHICH wait
+    the work order was parked on, so a test that checks the event exists and stops there
+    goes green on a version that has collapsed every wait into one string.
+    """
+    ignored = [e for e in store.list_events(wo_id) if e["kind"] == "notification_ignored"]
+    assert len(ignored) == 1, f"expected exactly one notification_ignored, got {ignored}"
+    return json.loads(ignored[0]["payload"])["reason"]
 
 
 # -- fixtures -------------------------------------------------------------------------
@@ -261,6 +275,8 @@ def test_the_idle_prompt_is_ignored_while_a_gate_is_with_neo(project):
     )
 
     assert not store.get_work_order(wo["id"])["needs_attention"]
+    assert ignored_reason(store, wo["id"]) == \
+        "idle prompt while parked on a privileged-action gate awaiting a verdict"
 
 
 def test_the_idle_prompt_is_ignored_while_a_gate_awaits_the_worker_s_case(project):
@@ -287,7 +303,11 @@ def test_the_idle_prompt_is_ignored_while_a_gate_awaits_the_worker_s_case(projec
     fresh = store.get_work_order(wo["id"])
     assert not fresh["needs_attention"]
     assert store.unrouted_notifications() == []
-    assert "notification_ignored" in [e["kind"] for e in store.list_events(wo["id"])]
+    # NOT interchangeable with the pending reason above, and this is what stops the two
+    # branches being merged back into one: a held request is with the worker, and the
+    # timeline must not say a reviewer was holding something nobody had argued for.
+    assert ignored_reason(store, wo["id"]) == \
+        "idle prompt while parked on a privileged-action gate awaiting the worker's case"
 
 
 def test_a_real_permission_prompt_still_reaches_the_user(project):
