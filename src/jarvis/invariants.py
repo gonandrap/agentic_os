@@ -1905,9 +1905,22 @@ def check_production_clean() -> Iterator[Violation]:
     prod = production_code_dir()
     if not (prod / ".git").exists():
         return  # no production deployment on this machine
-    dirty = release.production_dirty_paths(prod)
+    dirty, why = release.production_status(prod)
+    if dirty is None:
+        yield Violation(
+            invariant="INV-PROD-CLEAN",
+            detail=(f"cannot tell whether the production checkout at {prod} still "
+                    f"matches its tag — {why}. Unknown is not clean: this is the one "
+                    f"checkout the invariant exists to watch, so it reports rather "
+                    f"than assumes. Run `git -C {prod} status` as the user the daemon "
+                    f"runs as to see what git is objecting to."),
+            context={"checkout": str(prod), "paths": None, "error": why},
+        )
+        return
     if not dirty:
         return
+    version = release._production_version()
+    tag = f"jarvis-{version}" if version else "HEAD"
     yield Violation(
         invariant="INV-PROD-CLEAN",
         detail=(f"the production checkout at {prod} has {len(dirty)} tracked "
@@ -1915,9 +1928,11 @@ def check_production_clean() -> Iterator[Violation]:
                 f"({', '.join(dirty[:5])}{', …' if len(dirty) > 5 else ''}) — "
                 f"production is meant to be byte-identical to the tag, and every "
                 f"version string it reports is suffixed `-dirty` until it is. Inspect "
-                f"the diff, then discard it with `git -C {prod} checkout -- .` or ship "
-                f"a release (the deploy's `git checkout -f` discards it)."),
-        context={"checkout": str(prod), "paths": dirty},
+                f"the diff, then discard it with `git -C {prod} checkout -f {tag}` "
+                f"(which is what the next deploy does) — not `checkout -- .`, which "
+                f"restores from the index and so cannot clear a STAGED change, and "
+                f"staged changes are part of what is reported above."),
+        context={"checkout": str(prod), "paths": dirty, "tag": tag},
     )
 
 

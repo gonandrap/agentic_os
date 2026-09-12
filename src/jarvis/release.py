@@ -392,14 +392,20 @@ def _production_version() -> str | None:
     return m.group(1) if m else None
 
 
-def production_dirty_paths(directory: Path | None = None) -> list[str]:
-    """Tracked files modified in the production checkout since its tag was checked out.
+def production_status(directory: Path | None = None) -> tuple[list[str] | None, str]:
+    """Tracked files modified in the production checkout, or why we could not tell.
 
-    `-uno`: untracked files are not drift. The deploy's `git checkout -f` never removed
-    them either, and `.venv/` and `.jarvis/` live there by design.
+    `(paths, "")` on success — an empty list means clean. `-uno`: untracked files are not
+    drift. The deploy's `git checkout -f` never removed them either, and `.venv/` and
+    `.jarvis/` live there by design.
 
-    Returns `[]` for anything that is not a readable git checkout — a machine with no
-    production deployment has nothing to be dirty. Backs `invariants.check_production_clean`.
+    `(None, reason)` when git could not answer at all: not installed, the checkout
+    unreadable, or — the realistic one, since the daemon and the user are different uids
+    on the same tree — `detected dubious ownership`. Collapsing that into "clean" would
+    silence the invariant permanently on the one checkout it exists to watch, so the two
+    are separate return values rather than both `[]`.
+
+    Backs `invariants.check_production_clean`.
     """
     root = directory or production_code_dir()
     try:
@@ -407,8 +413,9 @@ def production_dirty_paths(directory: Path | None = None) -> list[str]:
             ["git", "-c", "core.quotePath=false", "-C", str(root),
              "status", "--porcelain", "-uno"],
             capture_output=True, text=True, timeout=20, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return []
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f"{type(e).__name__}: {e}"
     if out.returncode != 0:
-        return []
-    return sorted(line[3:] for line in out.stdout.splitlines() if line.strip())
+        detail = (out.stderr or out.stdout).strip().replace("\n", " ")
+        return None, f"git status exited {out.returncode}: {detail or '(no output)'}"
+    return sorted(line[3:] for line in out.stdout.splitlines() if line.strip()), ""

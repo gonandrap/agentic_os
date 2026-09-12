@@ -49,11 +49,11 @@ scripts/shipit.sh minor            # or patch | major
 scripts/shipit.sh 1.4.0            # explicit version
 ```
 
-shipit cuts `release/jarvis-X.Y.Z` from `main`, bumps `pyproject.toml` **and `uv.lock`**
-+ commits + tags `jarvis-X.Y.Z` **on that release branch** (via a throwaway worktree, so
-`main` is never modified), **pushes the branch and the tag to `origin`**, deploys the tag
-to `$PRODUCTION_CODE/jarvis_os` (`git fetch` + `checkout` + `uv sync --frozen`), restarts
-the services, and notifies Telegram.
+shipit cuts `release/jarvis-X.Y.Z` from `main`, bumps **both `pyproject.toml` and
+`uv.lock`**, commits them and tags `jarvis-X.Y.Z` **on that release branch** (via a
+throwaway worktree, so `main` is never modified), **pushes the branch and the tag to
+`origin`**, deploys the tag to `$PRODUCTION_CODE/jarvis_os` (`git fetch` + `checkout` +
+`uv sync --frozen`), restarts the services, and notifies Telegram.
 
 **The tag is self-consistent, and `jarvis doctor` checks that production still is.**
 `uv.lock` records the root package's own version, so a tag shipping the bumped

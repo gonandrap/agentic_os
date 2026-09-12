@@ -452,6 +452,47 @@ def test_guard_refuses_a_lock_left_at_the_old_version(locked):
     assert "0.1.1" in (r.stdout + r.stderr)
 
 
+def test_guard_refuses_when_the_relock_wrote_no_file(locked):
+    """It must FAIL CLOSED. `diff` against a missing file produces no differing lines,
+    so a guard that only looked at the output would wave the release through."""
+    (locked / "uv.lock").unlink()
+    r = _run_guard(locked, "0.2.0")
+    assert r.returncode != 0
+    assert "left no" in (r.stdout + r.stderr)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read a 000 file")
+def test_guard_refuses_when_diff_cannot_compare_at_all(locked):
+    """diff exits >1 when it could not do the comparison. Same fail-closed rule: an
+    unmade comparison is not a passed one."""
+    (locked / "uv.lock").write_text(_LOCK.replace('version = "0.1.1"', 'version = "0.2.0"'))
+    (locked / "uv.lock").chmod(0o000)
+    try:
+        r = _run_guard(locked, "0.2.0")
+    finally:
+        (locked / "uv.lock").chmod(0o644)
+    assert r.returncode != 0
+    assert "cannot compare" in (r.stdout + r.stderr)
+
+
+def test_refuses_when_diff_is_not_on_path(tmp_path):
+    """A guard that cannot run must stop the release, not be skipped."""
+    repo = _make_repo(tmp_path)
+    stripped = tmp_path / "bin"
+    stripped.mkdir()
+    for tool in ("git", "sed", "grep", "sort", "tail", "mktemp", "uv"):
+        real = shutil.which(tool)
+        if real:
+            (stripped / tool).symlink_to(real)
+    r = subprocess.run(
+        [BASH, str(repo / "scripts" / "shipit.sh"), "--dry-run", "0.2.0"],
+        cwd=str(repo), capture_output=True, text=True,
+        env={"PATH": str(stripped), "HOME": str(tmp_path / "home"),
+             "PRODUCTION_CODE": str(tmp_path / "prod")})
+    assert r.returncode != 0
+    assert "diff not found" in (r.stdout + r.stderr)
+
+
 def test_guard_refuses_when_head_carries_no_lock_at_all(tmp_path):
     wt = tmp_path / "wt"
     wt.mkdir()

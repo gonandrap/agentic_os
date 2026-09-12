@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from . import agent_usage, release, systemd_units
+from . import agent_usage, paths, release, systemd_units
 from .bugreport import GH_BIN_ENV
 from .claude_cli import CLAUDE_BIN_ENV, CREDENTIALS_ENV
 from .notify import DISABLE_EXTERNAL_SINKS_ENV
@@ -79,6 +79,9 @@ def gate_test_environment(root: Path | None = None) -> Path:
     * ``claude`` — a test that forgets `fake_claude` would spawn real background agents
       against real projects and bill real tokens. Left alone when `JARVIS_EVALS_LLM` is
       set, since the LLM-graded evals exist to call the real model.
+    * ``PRODUCTION_CODE`` — the live deployment `INV-PROD-CLEAN` reads. An invariant that
+      reaches outside the sandbox makes `jarvis doctor` tests pass or fail on the state of
+      the developer's machine; this one did, on the very drift it exists to report.
     * ``JARVIS_SPEND_HOME`` — where `agent_usage` files token-accounting rows. Redirected
       with the home in every ordinary run, so a suite against the fake `claude` cannot
       write invented spend into live state. Lifted only when the run BOTH reaches the
@@ -131,6 +134,12 @@ def gate_environment(root: Path) -> dict[str, str]:
         # is the entire subject of that check. Pointed at an empty directory inside the
         # sandbox: no units installed reads as nothing to be stale about.
         release.UNIT_DIR_ENV: str(root / "systemd-units"),
+        # The developer's own production checkout, which `INV-PROD-CLEAN` reads. Exactly
+        # the same trap as the line above: left ambient, `jarvis doctor` in a test passes
+        # or fails on whether a stray `uv` has dirtied the live deployment — which is the
+        # entire subject of that check (issue #202). Pointed at a directory inside the
+        # sandbox holding no checkout: "no production deployment on this machine".
+        paths.PRODUCTION_ROOT_ENV: str(root / "production"),
     }
     if not os.environ.get(LLM_EVALS_ENV):
         env[CLAUDE_BIN_ENV] = str(_blocked_bin(root, "claude", BLOCKED_CLAUDE))
