@@ -8,9 +8,10 @@
 #      target version X.Y.Z (from the latest jarvis-* tag — main's pyproject is NOT
 #      bumped by shipit).
 #   2. Cut branch  release/jarvis-X.Y.Z  from main.
-#   3. Bump pyproject.toml + commit + annotated tag  jarvis-X.Y.Z  *on the release
-#      branch* — main is never modified (done in a throwaway git worktree so the
-#      shared main checkout's HEAD never moves).
+#   3. Bump pyproject.toml AND uv.lock + commit + annotated tag  jarvis-X.Y.Z  *on the
+#      release branch* — main is never modified (done in a throwaway git worktree so the
+#      shared main checkout's HEAD never moves). Both files, or the tag ships a lock
+#      that disagrees with its pyproject and production rewrites it (issue 202).
 #   4. Push the release branch AND the tag to origin.
 #   5. Deploy the tag to  $PRODUCTION_CODE/jarvis_os  from ORIGIN (clone on first run,
 #      then fetch + checkout the tag + `uv sync`), and restart the systemd services.
@@ -120,6 +121,14 @@ if [ "${#BLOCKING[@]}" -gt 0 ]; then
 $(printf '     %s\n' "${BLOCKING[@]}")"
 fi
 
+# Both the version bump (`uv lock`) and the deploy (`uv sync`) need uv; `assert_lock_bump_only`
+# needs diff, and a guard that cannot run must stop the release, not wave it through. Fail
+# here rather than after the tag has been pushed to origin.
+command -v uv >/dev/null \
+  || die "uv not found on PATH — required to relock the release and build the production venv"
+command -v diff >/dev/null \
+  || die "diff not found on PATH — required to verify the release relock touched nothing else"
+
 # Git is the source of truth: a release must be reproducible from the remote alone.
 ORIGIN_URL="$(git remote get-url origin 2>/dev/null)" \
   || die "no 'origin' remote — git is the source of truth for releases"
@@ -146,6 +155,40 @@ bump() {  # bump <X.Y.Z> <major|minor|patch>
     patch) echo "$ma.$mi.$((pa+1))" ;;
   esac
 }
+
+# >>> lock-guard (sliced verbatim by tests/test_shipit.py — keep both markers)
+# A release relock may move exactly ONE thing: the root package's own version. Anything
+# else is a dependency change riding into production inside a release commit, with no
+# review and no record — a worse bug than the inconsistent lock this replaces. So the
+# assertion is exact rather than heuristic: apply the bump to HEAD's lock by hand and
+# require the relocked file to be byte-identical to the result.
+# It must FAIL CLOSED: every step that could leave the comparison unmade is its own
+# `die`, because "no output" and "nothing to compare" are indistinguishable otherwise —
+# and a guard that passes on its own breakage is worse than no guard.
+assert_lock_bump_only() {  # assert_lock_bump_only <worktree> <version>
+  local wt="$1" version="$2" expected stray rc
+  git -C "$wt" cat-file -e HEAD:uv.lock 2>/dev/null \
+    || die "no uv.lock at HEAD — run 'uv lock' on main and land it before releasing"
+  [ -f "$wt/uv.lock" ] \
+    || die "'uv lock' left no $wt/uv.lock — the relock did not happen and the release
+     commit would carry HEAD's lock unchanged, which is the bug this guard exists for"
+  expected="$(mktemp)"
+  git -C "$wt" show HEAD:uv.lock > "$expected" \
+    || { rm -f "$expected"; die "cannot read HEAD:uv.lock in $wt"; }
+  sed -i -E "/^name = \"jarvis-os\"\$/{n;s/^version = \"[^\"]+\"\$/version = \"$version\"/;}" \
+    "$expected" || { rm -f "$expected"; die "cannot apply the version bump to HEAD's lock"; }
+  stray="$(diff -u --label "HEAD:uv.lock, bumped to $version" --label "uv.lock as relocked" \
+           "$expected" "$wt/uv.lock")" && rc=0 || rc=$?
+  rm -f "$expected"
+  # diff: 0 identical, 1 differs, >1 it could not compare them at all.
+  [ "$rc" -le 1 ] || die "cannot compare the relocked uv.lock — diff exited $rc, so the
+     release commit is unverified"
+  [ -z "$stray" ] || die "'uv lock' re-resolved more than the version bump — refusing to
+     ship a release commit that silently moves dependencies. Relock on main, review the
+     diff there, and release from the merged result.
+$stray"
+}
+# <<< lock-guard
 
 # Version numbering derives from the latest release TAG, not pyproject.toml — main's
 # pyproject is never bumped by shipit (the bump lives only on release branches).
@@ -180,7 +223,16 @@ cleanup() { [ "$DRY_RUN" != 1 ] && [ -n "${WT:-}" ] && [ -d "$WT" ] \
 trap cleanup EXIT
 run "git worktree add --quiet '$WT' '$REL_BRANCH'"
 run "sed -i -E '0,/^version *= *\"[^\"]+\"/s//version = \"$VERSION\"/' '$WT/pyproject.toml'"
-run "git -C '$WT' add pyproject.toml"
+# uv.lock records the root package's own version, so a tag carrying the bumped
+# pyproject without the relocked lock is internally inconsistent — and every bare `uv`
+# command in production is then licensed to re-resolve and rewrite it (issue 202).
+run "(cd '$WT' && uv lock)"
+if [ "$DRY_RUN" = 1 ]; then
+  printf '  [dry-run] verify uv.lock moved nothing but jarvis-os → %s\n' "$VERSION"
+else
+  assert_lock_bump_only "$WT" "$VERSION"
+fi
+run "git -C '$WT' add pyproject.toml uv.lock"
 run "git -C '$WT' commit -m 'Release jarvis-$VERSION'"
 say "tagging $TAG on $REL_BRANCH"
 run "git -C '$WT' tag -a '$TAG' -m 'Jarvis OS $VERSION'"

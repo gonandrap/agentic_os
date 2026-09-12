@@ -227,6 +227,17 @@ def test_without_the_llm_flag_the_real_model_is_blocked(tmp_path, monkeypatch):
     assert env[claude_cli.CLAUDE_BIN_ENV].endswith("/claude")
 
 
+def test_the_live_production_checkout_is_out_of_reach(tmp_path):
+    """`INV-PROD-CLEAN` reads `$PRODUCTION_CODE/jarvis_os`. Left ambient, every
+    `jarvis doctor` test passes or fails on whether a stray `uv` command has dirtied the
+    developer's live deployment — which is the drift that check exists to report, so the
+    suite went red the first time the invariant did its job (issue #202)."""
+    env = testing.gate_environment(tmp_path / "probe-gate")
+
+    assert env[paths.PRODUCTION_ROOT_ENV].startswith(str(tmp_path))
+    assert not (Path(env[paths.PRODUCTION_ROOT_ENV]) / "jarvis_os" / ".git").exists()
+
+
 # -- the gate is structural, not per-suite opt-in ------------------------------------
 
 

@@ -11,9 +11,11 @@ blocked on a question that did not exist.
 
 from __future__ import annotations
 
+import subprocess
 import time
+from pathlib import Path
 
-from jarvis import cli, ops
+from jarvis import cli, invariants, ops, release
 from jarvis.catalog import DEFAULT_VALIDATION_TIMEOUT
 from jarvis.hooks import handle_hook
 from jarvis.invariants import (
@@ -706,3 +708,146 @@ def test_an_unreadable_catalog_falls_back_to_the_shipped_timeout(monkeypatch):
     monkeypatch.setattr(ops, "validation_config", lambda: None)
 
     assert _validation_timeout() == DEFAULT_VALIDATION_TIMEOUT
+
+
+# -- INV-PROD-CLEAN: production is what the tag says it is ---------------------------
+#
+# Issue #202 lived for nine releases because its only symptom was a version string.
+# "Reproduce in prod, fix it in dev, ship it" is only trustworthy while the production
+# checkout is byte-identical to its tag, and nothing was checking.
+
+
+def _prod_checkout(root: Path, tag: str | None = "jarvis-0.9.0") -> Path:
+    """A deployed production checkout: `$PRODUCTION_CODE/jarvis_os`, on a tag, clean."""
+    prod = root / "jarvis_os"
+    prod.mkdir(parents=True)
+    (prod / "pyproject.toml").write_text('[project]\nversion = "0.9.0"\n')
+    (prod / "uv.lock").write_text('name = "jarvis-os"\nversion = "0.9.0"\n')
+    argvs = [["init", "-q", "-b", "main"],
+             ["config", "user.email", "t@example.com"],
+             ["config", "user.name", "Test"],
+             ["add", "-A"], ["commit", "-q", "-m", "release"]]
+    if tag:
+        argvs.append(["tag", "-a", tag, "-m", tag])
+    for argv in argvs:
+        subprocess.run(["git", "-C", str(prod), *argv], check=True, capture_output=True)
+    return prod
+
+
+def _prod_violations(root: Path, monkeypatch) -> list:
+    monkeypatch.setenv("PRODUCTION_CODE", str(root))
+    return list(invariants.check_production_clean())
+
+
+def test_a_clean_production_checkout_raises_nothing(tmp_path, monkeypatch):
+    _prod_checkout(tmp_path)
+    assert _prod_violations(tmp_path, monkeypatch) == []
+
+
+def test_a_rewritten_lockfile_is_reported_by_name(tmp_path, monkeypatch):
+    """The live defect: a bare `uv` command re-resolves and rewrites uv.lock in place."""
+    prod = _prod_checkout(tmp_path)
+    (prod / "uv.lock").write_text('name = "jarvis-os"\nversion = "0.1.1"\n')
+
+    found = _prod_violations(tmp_path, monkeypatch)
+    assert len(found) == 1
+    assert found[0].invariant == "INV-PROD-CLEAN"
+    assert found[0].context["paths"] == ["uv.lock"]
+    assert "uv.lock" in found[0].detail
+
+
+def test_untracked_files_are_not_drift(tmp_path, monkeypatch):
+    """`.venv/` and `.jarvis/` live in that checkout by design, and the deploy's
+    `git checkout -f` never removed them either."""
+    prod = _prod_checkout(tmp_path)
+    (prod / ".venv").mkdir()
+    (prod / ".venv" / "pyvenv.cfg").write_text("home = /usr\n")
+
+    assert _prod_violations(tmp_path, monkeypatch) == []
+
+
+def test_a_machine_with_no_production_deployment_raises_nothing(tmp_path, monkeypatch):
+    """Every dev checkout runs `jarvis doctor` too."""
+    assert _prod_violations(tmp_path / "nothing-here", monkeypatch) == []
+
+
+def test_a_production_path_that_is_not_a_checkout_raises_nothing(tmp_path, monkeypatch):
+    (tmp_path / "jarvis_os").mkdir()
+    assert _prod_violations(tmp_path, monkeypatch) == []
+
+
+def test_staged_drift_is_reported_too(tmp_path, monkeypatch):
+    """`git status --porcelain` reports staged changes in the first column, so they are
+    part of what this detects — and the remedy it prints has to be able to clear them."""
+    prod = _prod_checkout(tmp_path)
+    (prod / "uv.lock").write_text('name = "jarvis-os"\nversion = "0.1.1"\n')
+    subprocess.run(["git", "-C", str(prod), "add", "uv.lock"],
+                   check=True, capture_output=True)
+
+    found = _prod_violations(tmp_path, monkeypatch)
+    assert len(found) == 1
+    assert found[0].context["paths"] == ["uv.lock"]
+    # `checkout -- .` restores from the INDEX, so it cannot undo a staged change.
+    assert "checkout -f jarvis-0.9.0" in found[0].detail
+    assert "checkout -- ." not in found[0].detail.replace(
+        "not `checkout -- .`", "")
+
+
+def test_a_checkout_git_cannot_read_is_reported_not_called_clean(tmp_path, monkeypatch):
+    """The realistic failure on the machine this watches is `detected dubious ownership`
+    — the daemon and the user are different uids on one tree. Reporting that as clean
+    would silence the invariant permanently on exactly the checkout it exists for."""
+    prod = _prod_checkout(tmp_path)
+    (prod / ".git" / "config").write_text("[core]\n\tthis is not valid ini\n")
+
+    found = _prod_violations(tmp_path, monkeypatch)
+    assert len(found) == 1
+    assert found[0].invariant == "INV-PROD-CLEAN"
+    assert found[0].context["paths"] is None
+    assert "cannot tell" in found[0].detail
+    assert found[0].context["error"]
+
+
+def test_the_unknown_case_is_distinguishable_from_clean(tmp_path, monkeypatch):
+    """The two must not share a return value — that is how a broken check reads green."""
+    prod = _prod_checkout(tmp_path)
+    monkeypatch.setenv("PRODUCTION_CODE", str(tmp_path))
+    assert release.production_status(prod).dirty == []
+    assert release.production_status(prod).error == ""
+
+    unknown = release.production_status(tmp_path / "not-a-repo")
+    assert unknown.dirty is None
+    assert unknown.error
+
+
+def test_the_remedy_survives_pyproject_itself_being_the_drift(tmp_path, monkeypatch):
+    """The version on disk is one of the things drift can touch, so the remedy must not
+    be derived from it: a tag built from a drifted version was never cut, the pathspec
+    fails, and the reader concludes the CHECK is broken rather than the checkout."""
+    prod = _prod_checkout(tmp_path)
+    (prod / "pyproject.toml").write_text('[project]\nversion = "6.6.6-tampered"\n')
+
+    found = _prod_violations(tmp_path, monkeypatch)
+    assert len(found) == 1
+    assert found[0].context["paths"] == ["pyproject.toml"]
+    assert found[0].context["ref"] == "jarvis-0.9.0"      # from git, not from the file
+    assert "6.6.6-tampered" not in found[0].detail
+
+
+def test_an_untagged_checkout_falls_back_to_head(tmp_path, monkeypatch):
+    """`HEAD` restores the same tree whatever it is called, so a checkout git cannot name
+    still gets a remedy that works."""
+    prod = _prod_checkout(tmp_path, tag=None)
+    (prod / "uv.lock").write_text('name = "jarvis-os"\nversion = "0.1.1"\n')
+
+    found = _prod_violations(tmp_path, monkeypatch)
+    assert len(found) == 1
+    assert found[0].context["ref"] == "HEAD"
+    assert "checkout -f HEAD" in found[0].detail
+
+
+def test_it_is_a_doctor_check_not_a_reconcile_tick_check():
+    """Same rule as `check_service_path` and `check_config_drift`: it shells out to git
+    against a checkout, which is not something the reconcile loop should do every tick."""
+    assert invariants.check_production_clean in invariants.OS_INVARIANTS
+    assert invariants.check_production_clean not in invariants.INVARIANTS

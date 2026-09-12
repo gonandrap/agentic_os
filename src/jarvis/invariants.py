@@ -1879,11 +1879,72 @@ def check_service_path() -> Iterator[Violation]:
     )
 
 
+def check_production_clean() -> Iterator[Violation]:
+    """INV-PROD-CLEAN — the production checkout must be byte-identical to its tag.
+
+    "Reproduce in prod, fix it in dev, ship it" is only trustworthy while prod is
+    exactly what the tag says. Drift there is invisible: nothing errors, `jarvis
+    --version` merely gains a `-dirty` suffix, and the next deploy's `git checkout -f`
+    erases the evidence. Issue #202 went unnoticed for nine releases because the only
+    symptom was a version string nobody read.
+
+    Reports tracked modifications only (`-uno`): untracked files are not drift — `.venv/`
+    and `.jarvis/` live in that checkout by design, and the deploy never removed them.
+    No exemption list, unlike `scripts/shipit.sh`'s clean-tree precondition: the OS's
+    managed-artifact writes land in the DEV checkout registered in the catalog, never in
+    the production one, so anything modified here is genuinely unexplained.
+
+    The ref the remedy names comes from git (`release.production_status`), never from the
+    checkout's `pyproject.toml` — that file is one of the things drift can touch, and a
+    remedy built from a drifted version names a tag nobody cut.
+
+    A `jarvis doctor` check only (see `check_config_drift` on why `OS_INVARIANTS` stays
+    off the reconcile tick). Not repairable: discarding files in a checkout is
+    destructive, and the drift is the one thing worth looking at before it is thrown
+    away.
+    """
+    from . import release
+    from .paths import production_code_dir
+
+    prod = production_code_dir()
+    if not (prod / ".git").exists():
+        return  # no production deployment on this machine
+    status = release.production_status(prod)
+    if status.dirty is None:
+        yield Violation(
+            invariant="INV-PROD-CLEAN",
+            detail=(f"cannot tell whether the production checkout at {prod} still "
+                    f"matches its tag — {status.error}. Unknown is not clean: this is "
+                    f"the one checkout the invariant exists to watch, so it reports "
+                    f"rather than assumes. Run `git -C {prod} status` as the user the "
+                    f"daemon runs as to see what git is objecting to."),
+            context={"checkout": str(prod), "paths": None, "error": status.error},
+        )
+        return
+    if not status.dirty:
+        return
+    dirty = status.dirty
+    yield Violation(
+        invariant="INV-PROD-CLEAN",
+        detail=(f"the production checkout at {prod} has {len(dirty)} tracked "
+                f"file(s) modified since its tag was deployed "
+                f"({', '.join(dirty[:5])}{', …' if len(dirty) > 5 else ''}) — "
+                f"production is meant to be byte-identical to the tag, and every "
+                f"version string it reports is suffixed `-dirty` until it is. Inspect "
+                f"the diff, then discard it with `git -C {prod} checkout -f "
+                f"{status.ref}` (which is what the next deploy does) — not "
+                f"`checkout -- .`, which restores from the index and so cannot clear a "
+                f"STAGED change, and staged changes are part of what is reported above."),
+        context={"checkout": str(prod), "paths": dirty, "ref": status.ref},
+    )
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
     check_gate_canaries,
     check_config_drift,
     check_service_path,
+    check_production_clean,
 )
 
 

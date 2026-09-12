@@ -470,6 +470,12 @@ def _make_repo(tmp_path: Path) -> Path:
     os.chmod(repo / "scripts" / "deploy.sh", 0o755)
     (repo / "pyproject.toml").write_text(
         '[project]\nname = "jarvis-os"\nversion = "0.1.1"\n')
+    # The release commit carries the relocked file too (issue #202), and shipit aborts
+    # if the two disagree — so the fixture has to look like a project that has a lock.
+    (repo / "uv.lock").write_text(
+        'version = 1\nrequires-python = ">=3.13"\n\n'
+        '[[package]]\nname = "jarvis-os"\nversion = "0.1.1"\n'
+        'source = { editable = "." }\n')
     (repo / "README.md").write_text("# dev\n")
     _git(repo, "init", "-q", "-b", "main")
     _git(repo, "config", "user.email", "t@example.com")
@@ -484,12 +490,26 @@ def _make_repo(tmp_path: Path) -> Path:
     return repo
 
 
+#: `uv sync` is a no-op here, but `uv lock` must not be: the release commit carries the
+#: relocked file and shipit aborts unless it matches the bumped pyproject. This does the
+#: one thing a real relock does to a project with no dependencies — move the root
+#: package's version — so the real (non-dry) staged run exercises that whole path
+#: without a resolver or a network.
+_STUB_UV = """#!/bin/sh
+if [ "$1" = "lock" ]; then
+  v=$(grep -m1 -E '^version *= *"' pyproject.toml | sed -E 's/.*"([^"]+)".*/\\1/')
+  sed -i -E '/^name = "jarvis-os"$/{n;s/^version = "[^"]+"$/version = "'"$v"'"/;}' uv.lock
+fi
+exit 0
+"""
+
+
 def _stub_bin(tmp_path: Path, name: str) -> Path:
-    """A no-op stand-in placed first on PATH (`uv sync` in a throwaway repo)."""
+    """A stand-in placed first on PATH (`uv` in a throwaway repo)."""
     d = tmp_path / "stub-bin"
     d.mkdir(exist_ok=True)
     p = d / name
-    p.write_text("#!/bin/sh\nexit 0\n")
+    p.write_text(_STUB_UV if name == "uv" else "#!/bin/sh\nexit 0\n")
     p.chmod(p.stat().st_mode | stat.S_IEXEC)
     return d
 
@@ -565,6 +585,10 @@ def test_stage_writes_the_marker_for_real(tmp_path):
     assert "jarvis-0.2.0" in tags
     prod_py = tmp_path / "prod" / "jarvis_os" / "pyproject.toml"
     assert 'version = "0.2.0"' in prod_py.read_text()
+    # …and the tag is SELF-CONSISTENT: for nine releases the lock beside that pyproject
+    # said 0.1.1, so every bare `uv` command in prod re-resolved and rewrote it (#202).
+    prod_lock = (tmp_path / "prod" / "jarvis_os" / "uv.lock").read_text()
+    assert 'name = "jarvis-os"\nversion = "0.2.0"' in prod_lock
     # and the operator was told what happens next
     assert "NOT restarted" in r.stdout
 
