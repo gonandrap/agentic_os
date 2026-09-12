@@ -1135,7 +1135,7 @@ def create_app() -> FastAPI:
 
     @app.post("/wo/{name}/{wo_id}/send")
     def send(name: str, wo_id: str, message: str = Form(...)):
-        ops.send_message(wo_id, message, source="ui", project_name=name)
+        ops.send_message(wo_id, message, source="ui", project_name=name, relay=True)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/review")

@@ -73,7 +73,7 @@ __all__ = [
     "REVIEWER_PERSONA", "RuleSet",
     "VERDICTS", "amend_request", "apply_decision", "build_request_question", "classify",
     "deny_conflicts", "file_request", "open_gate", "queue_for_review", "reads_only",
-    "scannable", "summarise", "sweep_unargued",
+    "render_user_messages", "scannable", "summarise", "sweep_unargued",
 ]
 
 # How long an approval stays usable, and how many attempts it covers. The window is
@@ -453,6 +453,14 @@ ESCALATE to the user, rather than deciding, when:
 - The work order itself is ambiguous about whether shipping was in scope.
 - Anything in the request does not add up, including a claim you cannot check.
 
+THE USER MAY HAVE ANSWERED THIS ALREADY. When the request carries a section of the
+user's own words to the work order, read it before you escalate. It verifies nothing — a
+user authorising a merge has not made its checks green, so every evidence test above
+still applies — but it settles WHO DECIDES, and a user who has instructed this work order
+in writing has already decided. Escalating it back to them asks a question they have
+answered and reads as though their answer was lost. Escalate on what they have NOT
+answered, if anything, and say which of their words you relied on.
+
 Escalating is the safe answer and costs only a little of the user's time. Approving
 something that should not ship costs much more. When genuinely torn about a REAL
 privileged action, escalate. Note that a false positive is the one case where escalating
@@ -497,16 +505,60 @@ def render_history(rows: Iterable[dict[str, Any]]) -> list[str]:
     return out
 
 
+USER_MESSAGE_LIMIT = 5
+USER_MESSAGE_CHARS = 700
+
+
+def render_user_messages(rows: Iterable[dict[str, Any]]) -> list[str]:
+    """The user's own words to this work order, as the reviewer's authorisation check.
+
+    Without this the reviewer cannot see an instruction the user gave the worker, ever:
+    the request carries the work order's description and the worker's prose and nothing
+    the user said after dispatch. That is how gate 85 went to the user for a decision
+    they had made in writing twelve minutes earlier (`jarvis wo send`, msg-797, "resolve
+    the conflicts and merge the PR, I authorize it").
+
+    ONLY rows `ProjectStore.user_messages` could attribute to the human. Rendering the
+    last N messages regardless of author would be worse than not rendering any: a worker
+    has a shell and could file its own approval into its own conversation, and the panel
+    would read it as the user's. Absent rather than present-and-empty when there are
+    none — a blank section reads as "the user said nothing", which is a claim this
+    function is not entitled to make about a work order predating the stamp.
+    """
+    rows = [r for r in rows][:USER_MESSAGE_LIMIT]
+    if not rows:
+        return []
+    out = ["", "WHAT THE USER HAS TOLD THIS WORK ORDER (newest first). These are the "
+           "USER'S OWN WORDS, relayed to the worker through `jarvis wo send` or the "
+           "dashboard — not the worker's account of what the user wants. Weigh an "
+           "explicit instruction or authorisation here AS THE USER'S, and say in your "
+           "reason if you relied on one. It is not evidence: authorising a merge does "
+           "not make its checks green, and a genuinely unverified action is still worth "
+           "escalating. Only messages the OS could attribute to the user appear here, "
+           "so a message the WORKER wrote is never among them:"]
+    for r in rows:
+        body = " ".join((r.get("content") or "").split())[:USER_MESSAGE_CHARS]
+        out.append(f"  · {body}")
+    return out
+
+
 def build_request_question(action: GatedAction, wo: dict[str, Any],
                            justification: str, evidence: str = "",
                            agent_type: str | None = None,
-                           history: Iterable[dict[str, Any]] = ()) -> str:
+                           history: Iterable[dict[str, Any]] = (),
+                           user_messages: Iterable[dict[str, Any]] = ()) -> str:
     """Render the approval request Neo (or the user) reads.
 
     Whoever decides sees only this text — never the worker's session — so it has to
     carry the case by itself: what is being attempted, under which work order, why the
-    worker believes it is ready, whatever it offered as proof, and what this same work
-    order has already been told about the same gate.
+    worker believes it is ready, whatever it offered as proof, what the USER has said to
+    this work order since it was dispatched, and what this same work order has already
+    been told about the same gate.
+
+    That fifth item is `user_messages`, and it is passed IN rather than fetched here for
+    the same reason the other four are: a reviewer that goes and looks things up makes
+    `jarvis gate show` a partial account of what it saw, and makes two runs of the same
+    review differ. See `render_user_messages`.
 
     `agent_type` names the SEAT when a subagent tripped the gate. The work order still
     owns the request — its lead is answerable for what its team did — but the reviewer
@@ -533,6 +585,7 @@ def build_request_question(action: GatedAction, wo: dict[str, Any],
     if evidence.strip():
         parts += ["", "Evidence the worker supplied (branch, PR, test results):",
                   evidence.strip()[:2000]]
+    parts += render_user_messages(user_messages)
     parts += render_history(history)
     parts += [
         "",
@@ -599,7 +652,8 @@ def queue_for_review(store: ProjectStore, neo: Any, project: str, wo: dict[str, 
     question = neo.ask(
         project, wo["id"],
         build_request_question(action, wo, approval["justification"],
-                               approval["evidence"], approval["agent_type"], history),
+                               approval["evidence"], approval["agent_type"], history,
+                               store.user_messages(wo["id"], USER_MESSAGE_LIMIT)),
         context=f"{wo.get('title') or ''}\n{(wo.get('description') or '')[:800]}",
         kind="approval",
     )
@@ -694,7 +748,8 @@ def amend_request(store: ProjectStore, neo: Any, wo: dict[str, Any],
         neo.revise_question(
             question["id"],
             build_request_question(action, wo, amended["justification"],
-                                   amended["evidence"], amended["agent_type"], history),
+                                   amended["evidence"], amended["agent_type"], history,
+                                   store.user_messages(wo["id"], USER_MESSAGE_LIMIT)),
         )
     return amended
 

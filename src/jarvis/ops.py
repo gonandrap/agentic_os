@@ -882,8 +882,44 @@ def inject_session(session_id: str, project_name: str | None = None,
         store.close()
 
 
+#: The environment variable `dispatch._write_worker_settings` stamps on every dispatched
+#: worker session, inherited by every subagent and every shell it opens. Its ABSENCE is
+#: what `user_authorship` treats as proof the caller is not a worker.
+WORKER_SESSION_ENV = "JARVIS_WO_ID"
+
+
+def user_authorship(relay: bool) -> str:
+    """`MESSAGE_AUTHOR_USER` if this call can be attributed to the human, else `''`.
+
+    Two conditions, and they are load-bearing in different ways.
+
+    `relay` says the CALL SITE is a surface a human reaches — `jarvis wo send`, the
+    dashboard's message box, `jarvis neo answer`. It is a property of the code, not of
+    any argument the caller supplies, so grepping for it enumerates the trusted surfaces
+    exactly. That is deliberate: `--source` used to be the closest thing to attribution
+    and a worker could pass any value it liked.
+
+    The environment check is the enforcement. A worker reaches those same surfaces — it
+    has a shell and `jarvis` on PATH — so `relay` alone would let it write its own
+    authorisation into its own conversation and have the gate panel believe it. A
+    dispatched session cannot shed `JARVIS_WO_ID` by passing a different flag.
+
+    WHAT THIS DOES NOT CLAIM, because the boundary does not exist to claim it: worker and
+    human run as the same uid, so nothing here survives a worker that deliberately
+    scrubs its own environment, and no secret the CLI can read is one the worker cannot.
+    The property held is narrower and is the one the incident needed — no sanctioned path
+    mints a user stamp for a worker. §3 of
+    docs/superpowers/specs/2026-09-11-a-gate-request-carries-the-users-words.md.
+    """
+    from .project_store import MESSAGE_AUTHOR_USER
+
+    if not relay or os.environ.get(WORKER_SESSION_ENV, "").strip():
+        return ""
+    return MESSAGE_AUTHOR_USER
+
+
 def send_message(wo_id: str, content: str, source: str = "jarvis",
-                 project_name: str | None = None) -> dict[str, Any]:
+                 project_name: str | None = None, relay: bool = False) -> dict[str, Any]:
     name, path, wo = find_work_order(wo_id, project_name)
     if wo["status"] in ("completed", "failed", "cancelled"):
         # Still allowed — resuming a finished session is fine — but tell the user.
@@ -892,8 +928,12 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
         note = None
     store = ProjectStore(path)
     try:
-        msg_id = store.queue_message(wo_id, content, source=source)
-        store.add_event(wo_id, "message_queued", {"msg_id": msg_id, "source": source})
+        authored_by = user_authorship(relay)
+        msg_id = store.queue_message(wo_id, content, source=source,
+                                     authored_by=authored_by)
+        store.add_event(wo_id, "message_queued",
+                        {"msg_id": msg_id, "source": source,
+                         "authored_by": authored_by})
         # A reply IS the response to whatever flagged the user — drop it from the
         # attention list now, don't wait for the daemon to deliver. The message
         # stays queued for the worker; if delivery later fails the daemon re-flags.
@@ -2892,8 +2932,10 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
         neo.review(question_id, approved=True)  # user-authored ⇒ nothing to review
     finally:
         neo.close()
+    # A relay surface like `wo send`: this text IS the user's, typed at `jarvis neo
+    # answer` or the dashboard, and the prefix already tells the worker so.
     delivery = send_message(q["wo_id"], f"[Answer from the user] {answer}",
-                            project_name=q["project"])
+                            project_name=q["project"], relay=True)
     # The escalation is handled — release the work order from the attention list, AND
     # from the status that put it there. Clearing the flag alone lasted exactly one
     # reconcile tick: `true_blockers` derives the flag from `waiting_input`, so the
