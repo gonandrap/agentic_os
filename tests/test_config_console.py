@@ -162,15 +162,16 @@ def test_an_unknown_project_is_named_with_the_ones_that_exist(catalog):
 
 # --- --reason, mandatory on the safety keys and only there ---------------------------
 
-@pytest.mark.parametrize("project,path", [
-    (None, "os.validation.enabled"),
-    (None, "os.neo.enabled"),
-    ("proj_a", "worker.permission_mode"),
-    ("proj_a", "gates.enabled"),
+@pytest.mark.parametrize("project,path,value", [
+    (None, "os.validation.enabled", True),
+    # `False`, not `True`: `os.neo.enabled` ships ON, and a set to the value already in
+    # force is the write this refusal must NOT catch.
+    (None, "os.neo.enabled", False),
+    ("proj_a", "worker.permission_mode", "acceptEdits"),
+    ("proj_a", "gates.enabled", ["pr_merge"]),
 ])
-def test_a_safety_setting_refuses_to_be_changed_without_a_reason(catalog, project, path):
-    value = "acceptEdits" if path.endswith("permission_mode") else ["pr_merge"] \
-        if path.endswith("gates.enabled") else True
+def test_a_safety_setting_refuses_to_be_changed_without_a_reason(catalog, project, path,
+                                                                 value):
     with pytest.raises(ops.OpsError, match="safety setting"):
         ops.set_config(path, value, project=project)
     assert no_head()
@@ -184,6 +185,72 @@ def test_a_money_setting_needs_no_reason(catalog):
     res = ops.set_config("os.defaults.max_concurrent", 4)
     assert res["safety"] is False
     assert res["version"]["reason"] == ""
+
+
+def test_a_no_op_write_of_a_safety_setting_needs_no_reason(catalog):
+    """The premise of the refusal — "it goes on the version row" — is false here: the
+    document already says this, so `add_config_version` dedupes and there is no row."""
+    ops.set_config("validation.enabled", True, project="proj_a", reason="trying it")
+
+    again = ops.set_config("validation.enabled", True, project="proj_a")
+
+    assert again["changed"] is False
+    store = CentralStore()
+    assert len(store.config_versions()) == 1
+    store.close()
+
+
+def test_pinning_a_safety_setting_at_its_default_needs_no_reason(catalog):
+    """Writing `false` where `false` was already in force moves the PROVENANCE, not the
+    permission: the file now says what the default said. Nothing a worker may do moves,
+    so there is nothing to justify."""
+    res = ops.set_config("validation.enabled", False, project="proj_a")
+
+    assert res["change"]["kind"] == "pinned"
+    assert res["change"]["old"] == res["change"]["new"] is False
+    entry = next(p for p in document_of(catalog)["projects"] if p["name"] == "proj_a")
+    assert entry["validation"] == {"enabled": False}
+
+
+def test_a_document_only_write_is_never_reported_as_a_value_change(catalog):
+    """`~ …validation.enabled: false → false` claims a safety setting was changed when
+    only its provenance moved. Both surfaces render the honest kind."""
+    res = ops.set_config("validation.enabled", False, project="proj_a")
+
+    assert "→" not in cli._cfg_change(res["change"])
+    assert head()["changes"][0]["kind"] == "pinned"
+
+
+def test_an_unset_that_leaves_the_effective_value_alone_needs_no_reason(catalog):
+    """The same rule at the other end (§7): clearing a key whose written value equals
+    its default changes nothing either."""
+    ops.set_config("validation.enabled", False, project="proj_a")
+
+    res = ops.unset_config("validation.enabled", project="proj_a")
+
+    assert res["change"]["kind"] == "unpinned"
+    assert res["change"]["old"] == res["change"]["new"] is False
+    entry = next(p for p in document_of(catalog)["projects"] if p["name"] == "proj_a")
+    assert entry["validation"] == {}  # the leaf goes; the block it lived in stays
+
+
+def test_a_real_safety_change_still_refuses_and_names_the_retry(catalog):
+    """The gate is not weakened, and the refusal now says the whole command to type
+    rather than only the flag it wants."""
+    with pytest.raises(ops.OpsError) as e:
+        ops.set_config("validation.enabled", True, project="proj_a")
+
+    assert 'jarvis config set proj_a validation.enabled true --reason' in str(e.value)
+    assert no_head()
+
+
+def test_an_unset_that_moves_the_effective_value_still_demands_a_reason(catalog):
+    ops.set_config("validation.enabled", True, project="proj_a", reason="trying it")
+
+    with pytest.raises(ops.OpsError) as e:
+        ops.unset_config("validation.enabled", project="proj_a")
+
+    assert 'jarvis config unset proj_a validation.enabled --reason' in str(e.value)
 
 
 def test_adopt_never_demands_a_reason_because_it_changes_nothing(catalog):

@@ -3575,8 +3575,24 @@ def _document_slot(document: dict[str, Any], key: str, *,
     return node, rest[-1]
 
 
+#: A write that moved the DOCUMENT and not the effective value, so `old == new` by
+#: construction: `pinned` writes into the file a value that was already in force,
+#: `unpinned` takes one back out. Neither may be reported as `changed` — that claims a
+#: change nobody made — and neither demands a `--reason` on a safety key (§7).
+DOCUMENT_ONLY_KINDS = ("pinned", "unpinned")
+
+
+def _retry(verb: str, path: str, project: str | None, value: str = "") -> str:
+    """The exact command to re-run, spelled the way the user spelled it."""
+    words = ["jarvis", "config", verb, *([project] if project else []), path]
+    if value:
+        words.append(value)
+    return " ".join(words) + ' --reason "…"'
+
+
 def _one_change(key: str, before: dict[str, Any], after: dict[str, Any],
-                doc_before: Any, doc_after: Any, existed: bool) -> list[dict[str, Any]]:
+                doc_before: Any, doc_after: Any, existed: bool,
+                *, removed: bool = False) -> list[dict[str, Any]]:
     """The single triple a `set`/`unset` asked for, read off the RESOLVED maps.
 
     Resolved rather than raw so the history shows the default the user was actually on
@@ -3588,20 +3604,30 @@ def _one_change(key: str, before: dict[str, Any], after: dict[str, Any],
         if change["path"] == key:
             return [change]
     if key in before or key in after:
-        return [{"path": key, "kind": "changed",
+        return [{"path": key, "kind": "unpinned" if removed else "pinned",
                  "old": before.get(key), "new": after.get(key)}]
     return [{"path": key, "kind": "changed" if existed else "added",
              "old": doc_before, "new": doc_after}]
 
 
-def _require_reason(changes: list[dict[str, Any]], reason: str) -> None:
-    unsafe = [c["path"] for c in changes if safety_key(c["path"])]
+def _require_reason(changes: list[dict[str, Any]], reason: str,
+                    retry: str = "") -> None:
+    """A safety key demands a `--reason` only when its EFFECTIVE value moves (§7).
+
+    The reason exists to go on the version row, so a write that records no row — the
+    document already said this — has nowhere to put one; and a write that only pins an
+    already-effective value into the file has nothing to justify, since what a worker is
+    ALLOWED to do did not move, only where that permission is written down.
+    """
+    unsafe = [c["path"] for c in changes if safety_key(c["path"])
+              and c["kind"] not in DOCUMENT_ONLY_KINDS and c["old"] != c["new"]]
     if not unsafe or reason.strip():
         return
     more = f" (and {len(unsafe) - 3} more)" if len(unsafe) > 3 else ""
     raise OpsError(
         f"{', '.join(unsafe[:3])}{more} — a safety setting changes what a worker is "
-        f"ALLOWED to do, so `--reason` is required and goes on the version row")
+        f"ALLOWED to do, so `--reason` is required and goes on the version row"
+        + (f":\n    {retry}" if retry else ""))
 
 
 def _find_version(version_id: str) -> dict[str, Any]:
@@ -3666,7 +3692,8 @@ def set_config(path: str, value: Any, project: str | None = None, *, reason: str
 
     after = _resolved_of(document, file)
     changes = _one_change(key, before, after, doc_before, value, existed)
-    _require_reason(changes, reason)
+    _require_reason(changes, reason,
+                    _retry("set", path, project, json.dumps(value, ensure_ascii=False)))
     row = _commit_document(document, path=file, actor=actor, reason=reason,
                            changes=changes)
     return {"version": row, "changed": row["id"] != was,
@@ -3693,8 +3720,9 @@ def unset_config(path: str, project: str | None = None, *, reason: str = "",
     doc_before = container.pop(leaf)
 
     after = _resolved_of(document, file)
-    changes = _one_change(key, before, after, doc_before, after.get(key), True)
-    _require_reason(changes, reason)
+    changes = _one_change(key, before, after, doc_before, after.get(key), True,
+                          removed=True)
+    _require_reason(changes, reason, _retry("unset", path, project))
     row = _commit_document(document, path=file, actor=actor, reason=reason,
                            changes=changes)
     return {"version": row, "changed": True, "path": key, "value": after.get(key),
@@ -3824,7 +3852,8 @@ def restore_config(version_id: str, *, reason: str = "",
     except OpsError:
         before = {}
     changes = config_version.diff(before, row["resolved"])
-    _require_reason(changes, reason)
+    _require_reason(changes, reason,
+                    f'jarvis config restore {row["id"]} --reason "…"')
     applied = _commit_document(row["document"], path=file, actor=actor, reason=reason,
                                changes=changes)
     return {"version": applied, "restored": row["id"], "changes": changes,
