@@ -54,9 +54,27 @@ Two mechanisms, layered, in this order:
 
 The signature deliberately cannot express "in executable position". A match at `code`
 position is text the shell will run, and no amount of learning may clear it. Nor does a
-signature apply to any chain containing an executor (`bash`, `eval`, `xargs`, `python`):
-`git commit <<EOF … shipit … EOF` is a commit message, `cat <<EOF | bash … shipit … EOF`
-is a release, and the difference between them is exactly the executor in the chain.
+signature apply where an executor (`bash`, `eval`, `xargs`, `python`) shares a command
+with the literal: `git commit <<EOF … shipit … EOF` is a commit message, `cat <<EOF |
+bash … shipit … EOF` is a release, and the difference between them is exactly that.
+
+## The unit all of that is judged over
+
+Not the whole command string: the independent command inside it. `||`, `&&`, `;` and `&`
+join commands that share no STREAM, so an executor on one side of one usually says
+nothing about the other — `cat …/shipit/SKILL.md || find ~ -name SKILL.md` is two reads,
+and judging it whole made it a release (issue #194). A PIPE is the opposite and stays
+whole, because `cat scripts/shipit.sh | bash` really does ship; so do substitutions and
+heredoc bodies, which belong to the command that reads them. `list_segments` draws that
+line once and `read_only_mentions` and `Shape` both work over it.
+
+"Usually" is load-bearing, and getting it wrong is worse here than anywhere else in this
+module. Those segments DO share the filesystem and the environment, so a reader that
+writes — `cat scripts/shipit.sh > /tmp/s.sh && bash /tmp/s.sh` — hands its subject to
+the next command by a route no parser here follows. `_hands_off` spots the handing over
+and puts the whole chain back under the chain-wide test. The asymmetry is on purpose:
+issue #194 was a gate that fired when it should not, and the only thing worse than that
+is one that stays quiet when it should.
 """
 
 from __future__ import annotations
@@ -250,7 +268,31 @@ _SUBSTITUTION = re.compile(r"\$\(|`|<\(|>\(")
 # `2>` looking like a command name and fail every reader that redirects its stderr.
 _SEPARATORS = re.compile(r"\|\||&&|[|;\n]|(?<![<>&])&")
 
+# The subset of those that join INDEPENDENT commands — everything but the pipe. Nothing
+# flows from one side to the other, so a judgement about one says nothing about the
+# other, and a chain-wide answer over these is pure over-approximation (issue #194).
+_LIST_SEPARATORS = re.compile(r"\|\||&&|[;\n]|(?<![<>&|])&(?!&)")
+
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# What a redirection writes to. `>&2` and `2>&1` duplicate a file descriptor and
+# `>/dev/null` discards — neither leaves anything behind. Any other target is a file the
+# next command in the list can open, which is the one way a read hands its subject on.
+_REDIRECT_TARGET = re.compile(r"&\d+|[^\s<>&|;]+")
+_DISCARD = ("/dev/null",)
+
+# Every entry of `_READERS` that can write a file anyway, with no redirection to give it
+# away: `tee` takes a filename, `sort` has `-o`, `uniq` writes its SECOND positional
+# argument, `yq` has `-i`, and `sed` has the `w` command — which lives inside a quoted
+# script, so spotting it means parsing sed. Hence the blunt membership test: naming one
+# of these is a handoff whether or not it wrote anything. It costs nothing unless the
+# chain stops being all-readers, which is the only case where it matters.
+_MAY_WRITE = frozenset({"tee", "sort", "uniq", "yq", "sed"})
+
+# …and the subset of those whose write is an IN-PLACE edit of the file named. That is
+# not a handoff, it is a modification of the gated target itself, so it costs the
+# segment its reader status outright rather than merely arming `_hands_off`.
+_INPLACE = frozenset({"sed", "yq"})
 
 
 def heredoc_spans(command: str) -> list[tuple[int, int, int]]:
@@ -381,6 +423,39 @@ def command_names(command: str) -> frozenset[str]:
     return frozenset(name for _, _, name in segments(command) if name)
 
 
+def _list_inert(command: str) -> str:
+    """`_inert`, with heredoc newlines blanked too, so a body cannot split a list.
+
+    `_blank` preserves newlines because `segments` wants the line structure back. Here
+    it is the enemy: a heredoc body is one command's argument however many lines it
+    spans, and splitting it would hand half of it to the next segment.
+    """
+    out = list(_inert(command))
+    for start, end, _ in heredoc_spans(command):
+        eol = command.find("\n", end)
+        for i in range(start, len(command) if eol == -1 else eol):
+            out[i] = " "
+    return "".join(out)
+
+
+def list_segments(command: str) -> list[tuple[int, int]]:
+    """Spans of the independent commands in `command`, offsets into it.
+
+    Splits on `||`, `&&`, `;`, `&` and newlines only — NOT on the pipe, which is what
+    makes this different from `segments`. `a && b` is two commands that happen to be
+    typed together; `a | b` is one command feeding another, and every judgement this
+    module makes about a pipeline has to cover the whole of it.
+    """
+    inert = _list_inert(command)
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    for m in _LIST_SEPARATORS.finditer(inert):
+        spans.append((pos, m.start()))
+        pos = m.end()
+    spans.append((pos, len(command)))
+    return spans
+
+
 def reads_only(command: str) -> bool:
     """True when every command in `command` can read but not execute.
 
@@ -389,6 +464,10 @@ def reads_only(command: str) -> bool:
     segment anywhere is enough to lose it. So the only commands this clears are ones
     that cannot run the thing they name — which is why it is safe to apply to every
     gate rather than just `release`.
+
+    Applied to a whole chain this answers a whole-chain question, and across a list
+    separator that is the wrong question — see `read_only_mentions`, which asks it of
+    the one segment the gated literal is actually in.
 
     Structural, and therefore still in code rather than in the table: it is not a claim
     about any particular privileged action, it is a claim about what `cat` is.
@@ -414,11 +493,86 @@ def reads_only(command: str) -> bool:
         name = words[0].lstrip("\\")
         if name not in _READERS:
             return False
-        # `sed -n '1,20p' f` reads; `sed -i s/a/b/ f` rewrites the file.
-        if name == "sed" and any(w.startswith("-i") or w == "--in-place"
-                                 for w in words[1:]):
+        # `sed -n '1,20p' f` reads; `sed -i s/a/b/ f` rewrites the file. `yq -i` too.
+        if name in _INPLACE and any(w.startswith("-i") or w == "--in-place"
+                                    for w in words[1:]):
             return False
     return True
+
+
+def _hands_off(segment: str) -> bool:
+    """Whether `segment` could leave the thing it read where a later command finds it.
+
+    Commands either side of a list separator share no *stream*, but they do share the
+    filesystem and the environment, and that is how a read reaches an executor without
+    ever being piped to one: `cat scripts/shipit.sh > /tmp/s.sh && bash /tmp/s.sh` is a
+    release written in two commands. Three ways to put it there — a redirection to a
+    real file, a reader that writes one itself, and an assignment — and each test below
+    is deliberately blunt, because being wrong here means a release that never asks.
+    """
+    inert = _inert(segment)
+    if command_names(segment) & _MAY_WRITE:
+        return True
+    if any(_ASSIGNMENT.match(w.lstrip("({")) for w in inert.split()):
+        return True
+    # The operator is located in the inert form, so a `>` inside a quoted argument is not
+    # a redirection — but the TARGET is read back out of the raw segment, because
+    # `> "/tmp/s.sh"` is blanked there and an unreadable target must not read as none.
+    for m in re.finditer(r">>?", inert):
+        target = _REDIRECT_TARGET.match(segment[m.end():].lstrip())
+        if target is None:
+            return True
+        name = target.group(0).strip("\"'")
+        if not name.startswith("&") and name not in _DISCARD:
+            return True
+    return False
+
+
+def read_only_mentions(command: str, pattern: str) -> bool:
+    """True when every independent command that NAMES `pattern` can only read it.
+
+    The segment-level form of `reads_only`, and the reason it exists: a `||` fallback
+    guarding a read used to void the reader exemption for the read as well, so
+    `cat …/shipit/SKILL.md || find ~ -name SKILL.md` gated as a release while either
+    half alone did not (issue #194). `find` is genuinely an executor; it is just not in
+    the same command as the literal.
+
+    What stays chain-wide is everything the segment itself contains: a pipeline, a
+    substitution or a heredoc body inside it is judged whole by `reads_only`, because
+    there the reader's output really does reach the executor.
+
+    …and so does everything, the moment the reading segment could WRITE what it read.
+    A `_hands_off` reader puts the chain back under `reads_only`, because at that point
+    the literal can travel by a route this parser does not follow. The two halves of
+    that are the whole safety argument: `find` after a plain `cat` stays exempt, `bash`
+    after a `cat >` does not.
+
+    It has to be `reads_only` — the reader WHITELIST — and not "no known executor in the
+    chain". A blacklist is one rename away from silence: `cat scripts/shipit.sh >
+    /tmp/s.sh && chmod +x /tmp/s.sh && /tmp/s.sh` runs the release script without naming
+    a single member of `_EXECUTORS`, and `chmod` is not something anyone will remember
+    to add to it.
+
+    Fails closed twice over. A pattern that matches no single segment — it straddled a
+    separator, or only the whole string matched — clears nothing.
+    """
+    try:
+        rx = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        return False
+    handoff = False
+    named = False
+    for start, end in list_segments(command):
+        segment = command[start:end]
+        if not rx.search(scannable(segment)):
+            continue
+        named = True
+        if not reads_only(segment):
+            return False
+        handoff = handoff or _hands_off(segment)
+    if handoff:
+        return named and reads_only(command)
+    return named
 
 
 # -- the shape of a match ------------------------------------------------------------
@@ -436,7 +590,7 @@ class Shape:
 
     position: str            # code | heredoc | quoted
     owner: str               # the command that owns that position, e.g. `git commit`
-    names: frozenset[str]    # every command name in the chain
+    names: frozenset[str]    # every command name in the match's own list segment
 
     @property
     def exemptible(self) -> bool:
@@ -445,10 +599,12 @@ class Shape:
         Three conditions, each closing a different door:
         - the literal is not in executable position;
         - something owns the position (an unparseable command is not a known-safe one);
-        - nothing in the chain can execute the span the literal sits in. This is the
-          condition that keeps `cat <<EOF | bash` and `eval "…"` gated no matter what was
-          dismissed before, and it is checked against the chain rather than the owner
-          because the executor is usually downstream of it.
+        - nothing that could execute the span the literal sits in shares a segment with
+          it. This is the condition that keeps `cat <<EOF | bash` and `eval "…"` gated no
+          matter what was dismissed before, and it is checked against the segment rather
+          than the owner because the executor is usually downstream of it — but not
+          against the whole chain, where an executor past a `||` never sees the literal
+          at all (issue #194).
         """
         return (self.position in EXEMPTIBLE_POSITIONS
                 and bool(self.owner)
@@ -458,11 +614,26 @@ class Shape:
         return json.dumps({"position": self.position, "owner": self.owner},
                           sort_keys=True)
 
+    @property
+    def blockers(self) -> tuple[str, ...]:
+        """What in the literal's own segment could run it."""
+        return tuple(sorted(self.names & _EXECUTORS))
+
+    def unlearnable_reason(self) -> str:
+        """Why no dismissal of this shape could become a rule, or `""` if one could."""
+        if self.position not in EXEMPTIBLE_POSITIONS:
+            return "the literal is where the shell would run it"
+        if not self.owner:
+            return "nothing recognisable owns the position the literal sits in"
+        if self.blockers:
+            return f"its own command executes via {', '.join(self.blockers)}"
+        return ""
+
     def describe(self) -> str:
         where = {CODE: "in executable position", HEREDOC: "in a heredoc body",
                  QUOTED: "inside a quoted argument"}.get(self.position, self.position)
-        blockers = sorted(self.names & _EXECUTORS)
-        note = f"; chain executes via {', '.join(blockers)}" if blockers else ""
+        note = (f"; that command executes via {', '.join(self.blockers)}"
+                if self.blockers else "")
         return f"{where}, owned by `{self.owner or '?'}`{note}"
 
 
@@ -482,7 +653,8 @@ def shape_of(command: str, pattern: str) -> Shape | None:
     quotes = [m.span() for m in
               _QUOTED.finditer(_blank(command, [(s, e) for s, e, _ in heres]))]
     segs = segments(command)
-    names = frozenset(n for _, _, n in segs if n)
+    lists = list_segments(command)
+    all_names = frozenset(n for _, _, n in segs if n)
 
     def owner_at(offset: int) -> str:
         for s, e, name in segs:
@@ -490,21 +662,29 @@ def shape_of(command: str, pattern: str) -> Shape | None:
                 return name
         return ""
 
+    def names_at(offset: int) -> frozenset[str]:
+        """What shares a command with the match. Falls back to the whole chain when the
+        offset lands nowhere, so an unmodelled string cannot lose its executors."""
+        for s, e in lists:
+            if s <= offset < e:
+                return command_names(command[s:e])
+        return all_names
+
     best: Shape | None = None
     for m in rx.finditer(command):
         start, end = m.span()
         for s, e, opener in heres:
             if s <= start and end <= e:
-                shape = Shape(HEREDOC, owner_at(opener), names)
+                shape = Shape(HEREDOC, owner_at(opener), names_at(opener))
                 break
         else:
             for s, e in quotes:
                 if s <= start and end <= e:
-                    shape = Shape(QUOTED, owner_at(start), names)
+                    shape = Shape(QUOTED, owner_at(start), names_at(start))
                     break
             else:
                 # Executable position wins outright, and immediately.
-                return Shape(CODE, owner_at(start), names)
+                return Shape(CODE, owner_at(start), names_at(start))
         if best is None:
             best = shape
     return best
@@ -560,7 +740,7 @@ class Rule:
         p = self.payload
         return (f"a `{p.get('kind') or self.kind}` literal "
                 f"{'in a heredoc body' if p.get('position') == HEREDOC else 'inside a quoted argument'} "
-                f"owned by `{p.get('owner')}`, in a chain that executes nothing")
+                f"owned by `{p.get('owner')}`, in a command that executes nothing")
 
     def clears(self, command: str, kind: str, pattern: str) -> bool:
         """Whether this exemption clears a match of `pattern` in `command`."""
@@ -640,6 +820,17 @@ SEED_CANARIES: tuple[tuple[str, str], ...] = (
     ("release", "git push --follow-tags origin release/jarvis-1.2.3"),
     ("release", "cat <<'EOF' | bash\nscripts/shipit.sh\nEOF"),
     ("release", 'eval "bash scripts/shipit.sh"'),
+    # The pipe the reader exemption must never be loosened across, and the list
+    # separator it must be — `reader || executor` is two commands (issue #194), and
+    # these two lines are what stops the second fix reaching the first.
+    ("release", "cat scripts/shipit.sh | bash"),
+    ("release", "ls -la .claude/skills/shipit/ && ./scripts/shipit.sh"),
+    # …and the one that is neither: a reader whose output is WRITTEN somewhere the next
+    # command runs it. Nothing pipes here and no executor names the script.
+    ("release", "cat scripts/shipit.sh > /tmp/s.sh && bash /tmp/s.sh"),
+    # The same, run without naming any member of `_EXECUTORS` at all. Pins that the
+    # handoff falls back to the reader whitelist rather than to a list of bad names.
+    ("release", "cat scripts/shipit.sh > /tmp/s.sh && chmod +x /tmp/s.sh && /tmp/s.sh"),
     ("service_restart", "sudo systemctl restart jarvis-daemon"),
     ("service_restart", "systemctl --user stop jarvisd"),
     ("push_protected", "git push origin main"),
@@ -673,7 +864,7 @@ def seed_rows() -> list[dict[str, Any]]:
 
 
 # 2: the `config_write` kind, its recogniser and its canaries (the config console).
-SEED_VERSION = "2"
+SEED_VERSION = "3"
 
 
 # -- the live rule base ---------------------------------------------------------------
@@ -784,6 +975,11 @@ class RuleSet:
                     continue
             except re.error:
                 trace.append(f"rule {rule_id} does not compile: {pattern!r}")
+                continue
+            if read_only_mentions(command, pattern):
+                trace.append(
+                    f"{kind} matched {pattern!r} but only in commands that can read it "
+                    f"and nothing more")
                 continue
             exemption = self.clearance(command, kind, pattern)
             if exemption is not None:

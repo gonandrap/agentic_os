@@ -1144,6 +1144,15 @@ def test_reading_a_privileged_script_is_not_performing_it(command):
     assert gates.classify(command, ALL_GATES) is None, f"{command!r} must not be gated"
 
 
+def test_every_line_range_of_the_release_script_reads_free():
+    """Issue #87: two reads of the SAME file cost two dismissals, because a dismissal is
+    keyed to the byte-exact command and the line range differs. Nothing is learned here —
+    the exemption is structural, so the number of ranges no longer matters."""
+    for lo in range(1, 400, 120):
+        command = f"sed -n '{lo},{lo + 120}p' scripts/shipit.sh"
+        assert gates.classify(command, ALL_GATES) is None, command
+
+
 @pytest.mark.parametrize("command", [
     # The exemption covers commands that cannot execute anything. The moment one
     # segment can, it is gone — a reader piping into a shell is the classic bypass.
@@ -1158,6 +1167,79 @@ def test_reading_a_privileged_script_is_not_performing_it(command):
     "sed -i 's/0.5.3/0.5.4/' scripts/shipit.sh",  # -i writes; not a reader
 ])
 def test_the_read_only_exemption_never_covers_a_command_that_can_execute(command):
+    assert gates.classify(command, ALL_GATES) is not None, f"{command!r} must be gated"
+
+
+# -- …and one segment's executor is not another segment's (issue #194) -----------------
+#
+# The pair below is the whole fix, and they have to be read together: the same reader and
+# the same executor, joined two ways. Across a list separator they are two commands and
+# the read stays exempt; across a pipe the reader's output reaches the executor and it
+# does not. Loosening the second to make the first pass is the mistake this guards.
+
+
+@pytest.mark.parametrize("command", [
+    # Gate 91 on wo-e4be8c37, verbatim: a read with a `||` fallback. `find` is correctly
+    # an executor — it has -exec — but it is in the other command and never sees the path.
+    'cat ~/.claude/skills/shipit/SKILL.md 2>/dev/null || '
+    'find ~ -name SKILL.md -path "*shipit*" 2>/dev/null',
+    "cat scripts/shipit.sh || bash fallback.sh",
+    "make build && cat scripts/shipit.sh",
+    "head -20 scripts/shipit.sh; python3 build.py",
+    "grep -c . scripts/shipit.sh & python3 -c 'pass'",
+    # A redirection that discards, or duplicates an fd, leaves nothing behind — and
+    # `2>/dev/null` is in the gate-91 command itself, so getting this wrong un-fixes it.
+    "cat scripts/shipit.sh > /dev/null || find . -name x",
+    "cat scripts/shipit.sh 2>&1 || find . -name x",
+    # A reader that writes, with nothing in the chain able to run what it wrote.
+    "cat scripts/shipit.sh > /tmp/s.sh && diff /tmp/s.sh /tmp/o.sh",
+])
+def test_an_executor_in_another_command_does_not_void_the_read(command):
+    assert gates.classify(command, ALL_GATES) is None, f"{command!r} must not be gated"
+
+
+@pytest.mark.parametrize("command", [
+    # The same shapes with the executor put back where it can reach the literal.
+    "cat scripts/shipit.sh | bash",
+    "cat scripts/shipit.sh || bash scripts/shipit.sh",
+    "make build && ./scripts/shipit.sh",
+    "head -20 README.md; python3 scripts/shipit.sh",
+    "true || xargs -I{} bash scripts/shipit.sh",
+])
+def test_the_segment_that_names_the_literal_is_the_one_that_must_only_read(command):
+    assert gates.classify(command, ALL_GATES) is not None, f"{command!r} must be gated"
+
+
+@pytest.mark.parametrize("command", [
+    # Round 1 of review on PR #201. Segments either side of a list separator share no
+    # STREAM, which is what the exemption above rests on — but they do share the
+    # filesystem and the environment, and a reader that WRITES uses both to hand the
+    # release script to an executor that never names it. The gated literal is in a
+    # read-only segment in every one of these, and every one of them ships.
+    "cat scripts/shipit.sh > /tmp/s.sh && bash /tmp/s.sh",
+    'S=scripts/shipit.sh; bash "$S"',
+    "cp scripts/shipit.sh /tmp/s.sh && bash /tmp/s.sh",
+    "cat scripts/shipit.sh | tee /tmp/s.sh; bash /tmp/s.sh",
+    "head -200 scripts/shipit.sh >> /tmp/s.sh; sh /tmp/s.sh",
+    "grep . scripts/shipit.sh > /tmp/s.sh; find . -name x -exec bash /tmp/s.sh ;",
+    # The target is quoted, so `_inert` blanks it — an unreadable target must not read
+    # as no target at all.
+    'cat scripts/shipit.sh > "/tmp/s.sh" && bash /tmp/s.sh',
+    # Readers that write a file with no redirection to give them away: `sed` has the `w`
+    # command and `sort` has `-o`, both inside arguments this parser does not read.
+    "sed -n '1,200w /tmp/s.sh' scripts/shipit.sh; bash /tmp/s.sh",
+    "sort -o /tmp/s.sh scripts/shipit.sh && sh /tmp/s.sh",
+    "uniq scripts/shipit.sh /tmp/s.sh && sh /tmp/s.sh",
+    "yq -i '.x = 1' scripts/shipit.sh",     # -i edits the target, not a handoff at all
+    # Round 2 of review: the chain that runs it without naming anything in `_EXECUTORS`.
+    # This is why the handoff falls back to the reader WHITELIST and not to "no known
+    # executor" — `chmod` will never be on a blacklist anyone remembers to extend.
+    "cat scripts/shipit.sh > /tmp/s.sh && chmod +x /tmp/s.sh && /tmp/s.sh",
+    "head -200 scripts/shipit.sh > /tmp/s.sh; . /tmp/s.sh",
+    "cat scripts/shipit.sh > /tmp/s.sh && zsh /tmp/s.sh",
+    "cat scripts/shipit.sh > /tmp/s.sh && install -m755 /tmp/s.sh /usr/local/bin/go",
+])
+def test_a_reader_that_writes_hands_the_literal_on_and_loses_the_exemption(command):
     assert gates.classify(command, ALL_GATES) is not None, f"{command!r} must be gated"
 
 
