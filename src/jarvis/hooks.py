@@ -754,7 +754,7 @@ def _is_current_session(store: ProjectStore, wo_id: str, session_id: str) -> boo
 
 
 def _parked_on_the_delegate(store: ProjectStore, wo_id: str) -> str:
-    """What Neo is holding for this work order — "" when nothing is.
+    """What this work order is parked on instead of the user — "" when nothing is.
 
     Only ever consulted for a `waiting_input` work order, which is the state both waits
     put it in (`ops.ask_question`, `gates.request`). A `running` worker's Notification is
@@ -769,6 +769,10 @@ def _parked_on_the_delegate(store: ProjectStore, wo_id: str) -> str:
         return f"neo question {question['id']} ({question['status']})"
     if store.pending_approvals(wo_id):
         return "a privileged-action gate awaiting a verdict"
+    if store.held_approvals(wo_id):
+        # The fourth reader kn-30036661 lists — and the one it missed. A held request is
+        # with the WORKER, not the user: the OS refuses it on a timer if nobody argues it.
+        return "a privileged-action gate awaiting the worker's case"
     return ""
 
 

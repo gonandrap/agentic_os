@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import pytest
 
+from jarvis import gates
 from jarvis import neo as neo_mod
 from jarvis import ops
 from jarvis.catalog import load_catalog
@@ -260,6 +261,33 @@ def test_the_idle_prompt_is_ignored_while_a_gate_is_with_neo(project):
     )
 
     assert not store.get_work_order(wo["id"])["needs_attention"]
+
+
+def test_the_idle_prompt_is_ignored_while_a_gate_awaits_the_worker_s_case(project):
+    """GitHub issue 197, the fourth road in. A hook-filed request is HELD
+    (`gates.AWAITING_CASE`) and never reaches `pending_approvals` — kn-30036661 names the
+    readers taught about held requests, and this one was missed."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship it")
+    store.set_status(wo["id"], "running")
+    action = gates.GatedAction(kind="release", summary="cut a release",
+                               command="scripts/shipit.sh", matched="shipit")
+    approval, question = gates.file_request(store, None, "proj",
+                                            store.get_work_order(wo["id"]), action,
+                                            hold=True)
+    assert question is None and approval["status"] == gates.AWAITING_CASE
+    assert store.get_work_order(wo["id"])["status"] == "waiting_input"
+
+    handle_hook(
+        {"hook_event_name": "Notification", "session_id": "s1",
+         "cwd": str(project), "message": IDLE_NOTIFICATION},
+        {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)},
+    )
+
+    fresh = store.get_work_order(wo["id"])
+    assert not fresh["needs_attention"]
+    assert store.unrouted_notifications() == []
+    assert "notification_ignored" in [e["kind"] for e in store.list_events(wo["id"])]
 
 
 def test_a_real_permission_prompt_still_reaches_the_user(project):
