@@ -1409,7 +1409,7 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
 
     packet = evidence_mod.collect_work_order(
         project_path, wo, declared=declared, diff_chars=cfg.diff_chars,
-        spec=specs.spec_of(store, wo))
+        spec=specs.spec_of(store, wo), side_effects=side_effects_of(str(wo["id"])))
     nxt = store.counted_validation_rounds(wo_id=wo["id"]) + 1
     round_row = store.open_validation_round(
         wo_id=wo["id"], fingerprint=evidence_mod.fingerprint(packet),
@@ -1449,7 +1449,9 @@ def collect_feature_evidence(store: ProjectStore, project_path: Path,
         last = store.latest_validation_round(wo_id=child["id"])
         children.append({**child, "declared": str((last or {}).get("evidence") or "")})
     return evidence_mod.collect_feature(project_path, fo, children, declared=declared,
-                                        summary=summary, diff_chars=cfg.diff_chars)
+                                        summary=summary, diff_chars=cfg.diff_chars,
+                                        side_effects=feature_side_effects(store,
+                                                                          fo["id"]))
 
 
 def submit_feature_for_validation(store: ProjectStore, project_path: Path,
@@ -5217,6 +5219,140 @@ def _index_cost(central: CentralStore, name: str, path: Path) -> dict[str, Any]:
         "share_of_prompt": round((whole - bare) / whole, 4) if whole else 0.0,
         "body_chars": central.knowledge_body_chars(name),
     }
+
+
+#: The side-effect kinds a packet can carry, and what each one is called in the timeline
+#: event that records it. ONE dict rather than two literals so a kind cannot be added to
+#: the collector and forgotten in the recorder.
+#:
+#: Only knowledge writes are here. GitHub state, backlog items, Neo learnings, gate
+#: outcomes and configuration changes are the same class of invisible effect and are
+#: deliberately out of this release (issue #200 step 3, "decide separately") — the shape
+#: is a list of typed records precisely so adding one is a collector change and not a
+#: packet change.
+SIDE_EFFECT_EVENTS = {
+    "knowledge_added": "knowledge_added",
+    "knowledge_retracted": "knowledge_retracted",
+}
+
+
+def learn_add(content: str, *, project: str = "", topic: str = "", tags: str = "",
+              wo_id: str = "") -> dict[str, Any]:
+    """Write a knowledge entry AND record on the work order that it did.
+
+    Here rather than in `CentralStore.add_knowledge` because the two halves live in
+    different databases: the knowledge base is central and a timeline is per-project, so
+    the writer needs a `ProjectStore` the leaf store cannot reach without importing this
+    module. `find_work_order` is how the project is resolved from the id alone.
+
+    **The timeline half is best effort and the knowledge half is not.** An entry that was
+    written must not be reported as failed because its work order has since been deleted
+    — the entry is the durable thing and the event is the record of it.
+    """
+    from .central_store import headline
+
+    central = CentralStore()
+    try:
+        row = central.add_knowledge(content, project=project, topic=topic, tags=tags,
+                                    wo_id=wo_id)
+    finally:
+        central.close()
+    _record_side_effect(wo_id, "knowledge_added",
+                        {"kn_id": row["id"], "topic": topic,
+                         "project": project or "global",
+                         "headline": headline(content)})
+    return row
+
+
+def learn_retract(knowledge_id: str, reason: str, *, wo_id: str = "") -> dict[str, Any]:
+    """Retire a knowledge entry AND record on the work order that it did.
+
+    The mirror of `learn_add`, and the case that produced issue #200: wo-28405ea1
+    retracted a fleet-wide instruction every future worker reads, and nothing anywhere
+    recorded that it had.
+
+    Raises exactly what `CentralStore.retract_knowledge` raises — `KeyError` for an
+    unknown id, `ValueError` for a missing reason or an already-retired entry — so the
+    CLI's error handling is unchanged.
+    """
+    from .central_store import headline
+
+    central = CentralStore()
+    try:
+        row = central.retract_knowledge(knowledge_id, reason, wo_id=wo_id)
+    finally:
+        central.close()
+    _record_side_effect(wo_id, "knowledge_retracted",
+                        {"kn_id": row["id"], "reason": row["retired_reason"],
+                         "topic": row["topic"], "headline": headline(row["content"])})
+    return row
+
+
+def _record_side_effect(wo_id: str, kind: str, payload: dict[str, Any]) -> bool:
+    """One side-effect event on a work order's timeline. False if it could not land.
+
+    Swallows everything: this is called AFTER the durable write has already happened, so
+    an exception escaping here would report a completed change as a failure.
+    """
+    if not wo_id:
+        return False  # a person at a terminal, not a worker
+    try:
+        _name, path, _wo = find_work_order(wo_id)
+        store = ProjectStore(path)
+        try:
+            store.add_event(wo_id, SIDE_EFFECT_EVENTS[kind], payload)
+        finally:
+            store.close()
+    except Exception:  # noqa: BLE001 — see the docstring
+        return False
+    return True
+
+
+def side_effects_of(wo_id: str) -> list[dict[str, Any]]:
+    """Durable, non-file change this work order made, for its evidence packet.
+
+    Read from the knowledge base's own attribution columns rather than from the timeline
+    events `_record_side_effect` writes: the event is best effort and the row is not, so
+    an entry whose event failed to land is still judged.
+
+    `detail` carries the WHOLE entry, not a headline. A reviewer asked to judge a
+    retraction cannot do it from a summary line — the question is whether the text that
+    was retired deserved to be, and that needs the text.
+    """
+    central = CentralStore()
+    try:
+        rows = central.knowledge_by_work_order(wo_id)
+    finally:
+        central.close()
+    effects = []
+    for row in rows:
+        if row.get("retired_by_wo_id") == wo_id:
+            effects.append({
+                "kind": "knowledge_retracted", "id": row["id"],
+                "summary": f"retired {row['id']} ({row['topic'] or 'no topic'}): "
+                           f"{row['retired_reason'] or '(no reason recorded)'}",
+                "detail": row["content"]})
+        if row.get("wo_id") == wo_id:
+            effects.append({
+                "kind": "knowledge_added", "id": row["id"],
+                "summary": f"wrote {row['id']} to the {row['project'] or 'global'} "
+                           f"knowledge base ({row['topic'] or 'no topic'})",
+                "detail": row["content"]})
+    return effects
+
+
+def feature_side_effects(store: ProjectStore, fo_id: str) -> list[dict[str, Any]]:
+    """Every child's side effects, in the feature's own child order.
+
+    A feature whose children delivered only knowledge changes hits the same empty
+    guard its children would have — `daemon._validate_feature_order` escalates on
+    `not packet.files` too — so the feature packet carries the union.
+    """
+    effects: list[dict[str, Any]] = []
+    for child in store.feature_children(fo_id):
+        for effect in side_effects_of(str(child["id"])):
+            effects.append({**effect, "wo_id": str(child["id"])})
+    return effects
 
 
 def knowledge_usage_report(project: str | None = None, days: int | None = None,

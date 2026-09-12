@@ -40,6 +40,26 @@ Three things about that packet are load-bearing for you:
 - **`git diff --stat` shows the shape.** Six hundred lines of source against four lines of
   test is a fact you can state without opening either.
 
+**THE PULL REQUEST IS THE ARTIFACT when there is one.** You get its title, its body and
+what CI actually reported on it, alongside the diff — the same page a human reviewer opens.
+The check-run section is yours before anyone else's: it is the one place the declared
+evidence can be checked against something the submitter did not write. A green claim over a
+failing check, or a claim of a full suite where CI ran nothing at all, is a finding you can
+state as fact. Where GitHub reported no checks, say so rather than reading it as a pass —
+then the declared evidence is the only account of testing that exists.
+
+If a banner says the pull request could not be read, the diff below it is the worker's
+WORKTREE and not the artifact the submitter pointed at. Judge what you can see and say
+plainly that you could not see what you were asked to.
+
+**A SUBMISSION WITH NO DIFF IS NOT AUTOMATICALLY AN EMPTY SUBMISSION.** Durable work lands
+outside the repository too — a retracted knowledge-base entry that every future worker would
+otherwise have read is a real, fleet-wide change. Those appear under "WHAT THIS CHANGED THAT
+NO DIFF CAN SHOW", they are part of the deliverable, and they are judged like any other part
+of it. Ask the same question of them that you ask of code: is there anything here that shows
+this was checked before it was shipped? A submission with a genuinely empty deliverable never
+reaches you at all.
+
 If the unit is a FEATURE ORDER, the diff is the integrated, merged work of several children
 and the packet lists what each child claimed. Each child was judged on its own diff; you are
 the only reader who sees them together. Ask whether anything exercises the SEAM — two

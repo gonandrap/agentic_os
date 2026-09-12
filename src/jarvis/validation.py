@@ -43,6 +43,15 @@ for a codebase actually live.
 **THE SEATS JUDGE THE PACKET AND ONLY THE PACKET** — `cwd = $JARVIS_HOME`, `tools=""`. A
 headless call carries no settings file, so what a tooled seat could reach would depend on
 the user's global configuration rather than on anything Jarvis controls.
+
+That held when the packet was a git diff and it still holds now that the packet is a
+PULL REQUEST (docs/superpowers/specs/2026-09-12-the-pull-request-is-the-artifact.md).
+Making the pull request the artifact could have meant handing the seats a read-only `gh`;
+Neo (question 251) ruled the other way, and the seats gained NOTHING. The fetch happens in
+`evidence.collect_work_order`, through `github.py`, which can only ask GitHub questions.
+So "the judge cannot comment on the pull request it is judging" — the property the whole
+blind review rests on — is enforced by there being no write verb in the path, not by a
+mandate asking a model not to use one.
 """
 
 from __future__ import annotations
@@ -233,8 +242,17 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
         "## The testing evidence the submitter DECLARED\n"
         f"{packet.declared or '(none declared — the submitter claimed no evidence)'}",
     ]
-    if packet.pr_url:
-        parts.append(f"## Pull request\n{packet.pr_url}")
+    parts += _pull_request_sections(packet)
+    if packet.side_effects:
+        parts.append(
+            "## WHAT THIS CHANGED THAT NO DIFF CAN SHOW\n"
+            "Durable effects this submission had outside the repository. They are part "
+            "of the deliverable and are judged like any other part of it — a submission "
+            "whose diff is empty is NOT automatically an empty submission.\n\n"
+            + "\n\n".join(
+                f"### {e.get('kind') or 'effect'} — {e.get('id') or ''}\n"
+                f"{e.get('summary') or ''}\n\n{e.get('detail') or ''}".rstrip()
+                for e in packet.side_effects))
     if packet.children:
         parts.append("## What each child of this feature claimed")
         for child in packet.children:
@@ -242,7 +260,10 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
                 f"### {child.get('id') or '?'} — {child.get('title') or ''}\n"
                 f"summary: {child.get('summary') or '(none)'}\n"
                 f"declared evidence: {child.get('declared') or '(none)'}")
-    parts.append(f"## The change\n`{packet.base or '?'}` → `{packet.head or '?'}`")
+    origin = ("the pull request above" if packet.source == "pull_request"
+              else "the worker's worktree")
+    parts.append(f"## The change, as collected from {origin}\n"
+                 f"`{packet.base or '?'}` → `{packet.head or '?'}`")
     listed = "\n".join(f"- {f}" for f in packet.files) or "(no files changed)"
     parts.append(f"## Every file this change touches ({len(packet.files)}) — "
                  f"this list is NEVER truncated\n{listed}")
@@ -258,6 +279,51 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
             "rather than passing what you did not read.")
     parts.append(f"## The diff\n```diff\n{packet.diff or '(empty)'}\n```")
     return "\n\n".join(parts)
+
+
+def _pull_request_sections(packet: EvidencePacket) -> list[str]:
+    """The pull request, as the artifact under review — or why it could not be read.
+
+    Three shapes, matching `evidence.collect_work_order`'s three cases (spec §3). The
+    one that must never be silent is the middle one: when `pr_error` is set the diff
+    below came from a WORKTREE and the submitter pointed at something else, and a seat
+    told neither would judge one artifact believing it was the other.
+    """
+    if not packet.pr_url:
+        return []
+    if packet.pr is None:
+        return [f"## THE PULL REQUEST COULD NOT BE READ — {packet.pr_url}\n"
+                f"{packet.pr_error or 'no reason recorded'}\n\n"
+                f"What follows is the worker's WORKTREE, not the pull request the "
+                f"submitter pointed at. Judge it as that, and say plainly that the "
+                f"artifact you were asked to review was unavailable."]
+    pr = packet.pr
+    draft = " — DRAFT" if pr.get("draft") else ""
+    out = [f"## THE PULL REQUEST UNDER REVIEW — {packet.pr_url}\n"
+           f"**{pr.get('title') or '(no title)'}** "
+           f"[{pr.get('state') or '?'}{draft}] "
+           f"`{pr.get('head_ref') or '?'}` → `{pr.get('base_ref') or '?'}`, "
+           f"+{pr.get('additions') or 0}/-{pr.get('deletions') or 0}\n\n"
+           f"### What the pull request says for itself\n"
+           f"{pr.get('body') or '(the body is empty)'}"]
+    checks = pr.get("checks") or []
+    if checks:
+        rows = "\n".join(f"- {c.get('name') or '?'}: "
+                         f"{c.get('conclusion') or c.get('status') or '?'}"
+                         for c in checks)
+        out.append("## What CI reported on this pull request\n"
+                   "Check the DECLARED testing evidence above against this. A "
+                   "submitter claiming a green suite over a failing check is the "
+                   "cheapest defect on this page to find.\n" + rows)
+    else:
+        # Said out loud rather than omitted: a seat that sees no check section can only
+        # guess whether CI passed or whether there is no CI, and the two want opposite
+        # weight on the submitter's declared evidence.
+        out.append("## What CI reported on this pull request\n"
+                   "GitHub reported no check runs at all. That is not a failure and "
+                   "not a pass: this repository ran nothing, so the declared evidence "
+                   "above is the only account of testing there is.")
+    return out
 
 
 def build_chair_prompt(packet: EvidencePacket, opinions: Sequence[seats.Opinion]) -> str:

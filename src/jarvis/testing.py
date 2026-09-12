@@ -782,12 +782,25 @@ elif argv[:2] == ["pr", "view"]:
     # `gh pr view <url> --json <fields>`. The roster comes from the fixture; a URL
     # nobody registered gets gh's own "no pull requests found" shape, because a test
     # about an unreadable PR should exercise the same path a real deleted one does.
+    #
+    # ONLY THE REQUESTED FIELDS COME BACK, exactly as real `gh` does. That is what lets
+    # a test prove the poll loop and the evidence collector ask for different things:
+    # a fake that answered with everything it held would pass a collector that never
+    # requested `body` at all.
     prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
     pr = prs.get(argv[2] if len(argv) > 2 else "")
     if pr is None:
         sys.stderr.write("no pull requests found for this URL\n")
         sys.exit(1)
-    print(json.dumps(pr))
+    fields = argv[argv.index("--json") + 1].split(",") if "--json" in argv else []
+    print(json.dumps({k: v for k, v in pr.items() if not fields or k in fields}))
+elif argv[:2] == ["pr", "diff"]:
+    prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
+    pr = prs.get(argv[2] if len(argv) > 2 else "")
+    if pr is None:
+        sys.stderr.write("no pull requests found for this URL\n")
+        sys.exit(1)
+    sys.stdout.write(pr.get("_diff", ""))
 else:
     sys.stderr.write(f"fake gh: unhandled argv {argv}\n")
     sys.exit(2)
@@ -1006,8 +1019,37 @@ def fake_gh(tmp_path, monkeypatch):
             any other state, which is what GitHub itself answers."""
             if mergeable is None:
                 mergeable = "MERGEABLE" if state == "OPEN" else None
-            self.prs[pr_url] = {"state": state, "mergedAt": merged_at,
+            self.prs[pr_url] = {**self.prs.get(pr_url, {}),
+                                "state": state, "mergedAt": merged_at,
                                 "mergeable": mergeable, "baseRefName": base_ref}
+            monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
+
+        def set_pr_artifact(self, pr_url: str, *, diff: str = "", title: str = "",
+                    body: str = "", files: list[dict] | None = None,
+                    checks: list[dict] | None = None, state: str = "OPEN",
+                    draft: bool = False, base_ref: str = "main",
+                    head_ref: str = "feature", number: int = 1) -> None:
+            """Register what the PANEL sees of this pull request.
+
+            Separate from `set_pr` because the two readers ask for different
+            fields and a test must be able to register one without the other:
+            the poll loop asks four questions and the evidence collector asks
+            for the whole artifact. Both shapes live in one dict here, and the
+            fake returns only what each caller's `--json` asked for.
+            """
+            files = files if files is not None else []
+            self.prs[pr_url] = {
+                **self.prs.get(pr_url, {}),
+                "number": number, "title": title, "body": body, "state": state,
+                "isDraft": draft, "baseRefName": base_ref,
+                "headRefName": head_ref, "url": pr_url,
+                "additions": sum(int(f.get("additions") or 0) for f in files),
+                "deletions": sum(int(f.get("deletions") or 0) for f in files),
+                "changedFiles": len(files), "files": files,
+                "statusCheckRollup": checks or [],
+                # Underscored: not a `gh` field, it is what `gh pr diff` prints.
+                "_diff": diff,
+            }
             monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
 
     return Handle()

@@ -336,8 +336,13 @@ def test_a_validating_work_order_is_not_polled_and_keeps_its_pull_request(
 
     store = fleet.store()
     try:
+        # Measured as "no NEW gh call", not "no gh call at all": the evidence collector
+        # reads the pull request itself now (spec 2026-09-12 §3), so `finish` above has
+        # already made one and an absolute assertion here would be asserting that the
+        # panel never saw the artifact.
+        before = len(fake_gh.calls)
         fleet.daemon.poll_pull_requests(fleet.spec, store)
-        assert fake_gh.calls == [], "a validating work order was polled"
+        assert fake_gh.calls[before:] == [], "a validating work order was polled"
         fresh = store.get_work_order(wo["id"])
         assert fresh["status"] == "validating"
         assert fresh["pr_url"] == pr, "the round machine dropped the pull request"
