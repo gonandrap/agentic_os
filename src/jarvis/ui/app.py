@@ -161,6 +161,21 @@ def fmt_age(ts: float | None) -> str:
     return f"{int(d / 86400)}d"
 
 
+def fmt_left(ts: float | None) -> str:
+    """How long until a deadline — the mirror of `fmt_age`, for the one thing on these
+    pages whose next event is a clock rather than a person (`gates.sweep_unargued`).
+
+    "any moment now" rather than a negative: the sweep runs on the reconcile tick, so a
+    deadline that has passed means the refusal is due, not that it was missed.
+    """
+    if not ts:
+        return "–"
+    d = ts - time.time()
+    if d <= 0:
+        return "any moment now"
+    return f"{int(d / 60)}m" if d >= 60 else f"{int(d)}s"
+
+
 def fmt_ts(ts: float | None) -> str:
     """An absolute local date-time. `fmt_age` answers "how long ago", which is the right
     question for a running thing and the wrong one for a bill: a sealed bill's date is a
@@ -553,6 +568,7 @@ def create_app() -> FastAPI:
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         fo_status_meta=FO_STATUS_META, level_tone=LEVEL_TONE, fmt_age=fmt_age,
+        fmt_left=fmt_left,
         # Shared with `jarvis alarms` rather than spelled inline, so neither surface can
         # be the one that shows a subject-level finding as `turn -1`.
         turn_label=ops.turn_label, no_turn=NO_TURN,
@@ -1001,12 +1017,14 @@ def create_app() -> FastAPI:
         """
         rows = ops.list_gates(include_request=True)
         pending = [g for g in rows if g["status"] == "pending"]
+        held = [g for g in rows if g["status"] == "awaiting_case"]
         dismissed = [g for g in rows if g["status"] == "dismissed"]
-        decided = [g for g in rows if g["status"] not in ("pending", "dismissed")]
+        decided = [g for g in rows
+                   if g["status"] not in ("pending", "awaiting_case", "dismissed")]
         return render(request, "gates.html", active="gates",
                       escalated=[g for g in pending if g["escalated"]],
                       with_neo=[g for g in pending if not g["escalated"]],
-                      decided=decided, dismissed=dismissed,
+                      held=held, decided=decided, dismissed=dismissed,
                       false_positive_rate=_false_positive_rate(rows))
 
     @app.get("/config", response_class=HTMLResponse)

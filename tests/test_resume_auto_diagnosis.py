@@ -20,7 +20,7 @@ import json
 
 import pytest
 
-from jarvis import cli, ops
+from jarvis import cli, gates, ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.hooks import handle_hook
@@ -103,6 +103,52 @@ def test_it_declines_while_a_gate_is_with_neo(started, project):
 
     assert result["nudged"] is False
     assert result["waiting_on"] == "gate_with_neo"
+
+
+def test_it_declines_while_a_gate_waits_for_the_worker_to_argue_it(started, project):
+    """The GitHub issue 100 false diagnosis, arriving down the gate road: an
+    `awaiting_case` request has no branch of its own, so the park used to fall through to
+    "an unanswered permission prompt is what is left" — about a worker in `auto`, which
+    cannot prompt, blocked at a hook that told it to file its case."""
+    daemon = started
+    wo = ops.create_work_order("proj_a", "ship it")
+    daemon.tick()
+    store = ProjectStore(project)
+    store.set_status(wo["id"], "waiting_input")
+    approval = store.add_approval(wo["id"], kind="release",
+                                  command="./scripts/shipit.sh", matched="shipit",
+                                  justification=gates.NO_CASE_JUSTIFICATION,
+                                  status=gates.AWAITING_CASE)
+
+    wait = ops.waiting_on(store, store.get_work_order(wo["id"]))
+
+    assert wait["what"] == "gate_held"
+    assert wait["stalled"] is False
+    # The worker's move, who is holding it, and the clock that closes it if nobody moves.
+    assert f"gate {approval['id']}" in wait["detail"]
+    assert f'jarvis gate request {wo["id"]} "./scripts/shipit.sh"' in wait["detail"]
+    assert "no reviewer sees it yet" in wait["detail"]
+    assert "case_ttl_seconds" in wait["detail"]
+
+    result = ops.resume_in_auto(wo["id"])
+
+    assert result["nudged"] is False                      # no conversation re-sent
+    assert result["waiting_on"] == "gate_held"
+    assert store.queued_messages(wo["id"]) == []
+    assert "resume_auto_declined" in [e["kind"] for e in store.list_events(wo["id"])]
+
+
+def test_a_held_gate_can_still_be_nudged_with_force(started, project):
+    daemon = started
+    wo = ops.create_work_order("proj_a", "ship it")
+    daemon.tick()
+    store = ProjectStore(project)
+    store.set_status(wo["id"], "waiting_input")
+    store.add_approval(wo["id"], kind="release", command="./scripts/shipit.sh",
+                       status=gates.AWAITING_CASE)
+
+    assert ops.resume_in_auto(wo["id"], force=True)["nudged"] is True
+    assert store.queued_messages(wo["id"])
 
 
 def test_it_points_at_the_review_when_assumptions_are_pending(started, project):
