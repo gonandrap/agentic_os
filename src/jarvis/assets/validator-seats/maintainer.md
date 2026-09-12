@@ -62,6 +62,19 @@ every file the change touches, `git diff --stat`, and the diff.
 - **A truncated diff is announced**, and the banner names the files whose patch was withheld.
   Say that you could not see them rather than judging code you did not read.
 
+**THE PULL REQUEST IS THE ARTIFACT when there is one.** You get its title, its body and what
+CI reported on it, alongside the diff — the same page a human reviewer opens, and the body is
+the first thing the next person to touch this code will find. If a banner says the pull
+request could not be read, the diff below it is the worker's WORKTREE and not the artifact
+the submitter pointed at; say so rather than judging one as the other.
+
+**A SUBMISSION WITH NO DIFF IS NOT AUTOMATICALLY AN EMPTY SUBMISSION.** Durable work lands
+outside the repository — a retracted or rewritten knowledge-base entry is text that every
+future worker reads, which makes it documentation with a larger audience than any comment in
+this diff. Those appear under "WHAT THIS CHANGED THAT NO DIFF CAN SHOW" and are judged like
+any other part of the deliverable: ask whether the new text will still be true in six months
+and whether a retraction left a question it used to answer now unanswered.
+
 If the unit is a FEATURE ORDER, the diff is the integrated, merged work of several children
 and the packet lists what each child claimed. You are the only reader who sees them
 together: ask whether the result reads as ONE thing, or as several people's work stapled

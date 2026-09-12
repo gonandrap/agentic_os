@@ -355,6 +355,15 @@ the merge queue, so nothing unvalidated ever reaches the user.
 
 ## The evidence packet
 
+> **SUPERSEDED IN PART, 2026-09-12 (issue #200, Neo questions 251 and 253).** The row
+> below saying a work order's `files`/`diff` are "the worktree diff" is **no longer
+> true**: when the work order has a pull request, the packet is collected FROM THE PULL
+> REQUEST and the worktree is the fallback. The packet also grew `source`, `pr`,
+> `pr_error`, `side_effects` and `side_effects_sha`. Everything else in this section
+> still stands. Read
+> `docs/superpowers/specs/2026-09-12-the-pull-request-is-the-artifact.md` §3 and §4
+> before changing any of it.
+
 One dataclass, two collectors, distinguished by a `unit` field.
 
 | field | `unit="work_order"` | `unit="feature"` |
@@ -430,10 +439,21 @@ itself was cut short.
 
 ```
 fingerprint = sha256( packet.diff_sha
+                    + packet.side_effects_sha
                     + whitespace-normalised `declared` text )[:16]
 ```
 
 **And nothing else.** Not `head`, not `base`, not `summary`, not `pr_url`.
+
+> **CORRECTION, 2026-09-12 (Neo question 253, correcting question 133).**
+> `side_effects_sha` joined the hash and **the exclusion list above is unchanged** —
+> `head`, `base`, `summary` and `pr_url` stay out, for the reason they were excluded: a
+> submitter can move each of them without producing new evidence. Side effects are not
+> that. Two diff-less rounds retracting two different knowledge entries hashed
+> identically under the old formula, and round 2 escalated as a repeat — issue #200
+> one guard further along. `side_effects_digest(())` is `""`, not the sha of the empty
+> string, so a packet with no side effects fingerprints exactly as it did before the
+> field existed.
 
 | a submitter that… | changes | new evidence? |
 |---|---|---|
