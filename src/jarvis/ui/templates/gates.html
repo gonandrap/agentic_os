@@ -17,7 +17,12 @@
   <input type="hidden" name="next" value="/gates">
   <input type="text" name="reason"
          placeholder="reason — goes to the worker; required to deny or dismiss">
+  {# No Approve on a CONTEST. The worker argued this performs no privileged action and
+     made no case for performing one, so there is nothing here to authorise — ops.decide_gate
+     refuses it, and offering the button would only produce an error page. #}
+  {% if not g.contested %}
   <button class="accept" name="decision" value="approve">✓ Approve</button>
+  {% endif %}
   <button class="danger" name="decision" value="deny">✗ Deny</button>
   <button name="decision" value="dismiss"
           title="The command performs no privileged action — the gate matched it by
@@ -27,6 +32,11 @@
 {% endmacro %}
 
 {% macro request_detail(g) %}
+{% if g.contested %}
+<div class="sub">CONTESTED — the worker says the recogniser matched this by mistake and
+  that the command performs no privileged action. Dismiss it if that is right; deny it if
+  it is wrong. Nothing here can be approved.</div>
+{% endif %}
 {% if g.justification %}<div class="sub">Case made: {{ g.justification }}</div>{% endif %}
 {% if g.evidence %}<div class="sub">Evidence: {{ g.evidence }}</div>{% endif %}
 {% if g.neo_question %}
@@ -91,7 +101,11 @@
     <tr><th>#</th><th>project / wo</th><th>action</th><th>command</th>
         <th>verdict</th><th>by</th><th>age</th></tr>
     {% for g in decided %}
-    {% set m = gate_meta.get(g.status, {'word': g.status, 'icon': '•', 'tone': 'muted'}) %}
+    {# Keyed on the DISPLAY state, not the status: an abandoned row is `expired` in the
+       database, and "expired" reads as a grant that ran out rather than a request nobody
+       ever reviewed. #}
+    {% set m = gate_meta.get('abandoned' if g.closed_as == 'abandoned' else g.status,
+                             {'word': g.status, 'icon': '•', 'tone': 'muted'}) %}
     <tr>
       <td class="mono">{{ g.id }}</td>
       <td class="mono">{{ g.project }}<br><a href="/wo/{{ g.project }}/{{ g.wo_id }}">{{ g.wo_id }}</a></td>
@@ -119,6 +133,11 @@
     each and are listed apart from the verdicts because they measure the OS, not the fleet.
     {% if false_positive_rate %}
     <span class="counts">false-positive rate: {{ false_positive_rate }} of all gates ruled on</span>
+    {% endif %}
+    {% if abandoned %}
+    <span class="counts">{{ abandoned }} more were abandoned: a worker was blocked, made no
+      case and contested nothing, so nobody ever ruled. Those are not counted above and are
+      mostly false positives somebody routed around.</span>
     {% endif %}
   </p>
   <table>

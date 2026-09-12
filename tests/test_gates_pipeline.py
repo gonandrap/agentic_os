@@ -456,8 +456,13 @@ def test_a_request_with_no_case_is_refused_before_it_is_filed(fleet):
         store.close()
 
 
-def test_a_held_request_whose_case_never_comes_is_refused_on_a_timer(fleet):
-    """Nothing else can ever close one: no question to answer, no escalation to see."""
+def test_a_held_request_whose_case_never_comes_is_abandoned_on_a_timer(fleet):
+    """Nothing else can ever close one: no question to answer, no escalation to see.
+
+    ABANDONED, not denied — spec 2026-09-12 §4. Nobody reviewed it, so nobody can have
+    refused it, and a `denied` row asserts a verdict on a privileged action that may
+    never have been one.
+    """
     fleet.attempt("./scripts/shipit.sh")
     approval = fleet.approval()
 
@@ -466,27 +471,40 @@ def test_a_held_request_whose_case_never_comes_is_refused_on_a_timer(fleet):
         # Wind the filing back past the window rather than sleeping through it.
         store.conn.execute("UPDATE approvals SET ts = ts - 7200 WHERE id=?",
                            (approval["id"],))
-        refused = gates.sweep_unargued(store, gates.DEFAULT_CASE_TTL_SECONDS)
+        closed = gates.sweep_unargued(store, gates.DEFAULT_CASE_TTL_SECONDS)
     finally:
         store.close()
 
-    assert [r["id"] for r in refused] == [approval["id"]]
-    closed = fleet.approval()
-    assert closed["status"] == "denied"      # refused, not quietly expired
-    assert closed["decided_by"] == "os"
-    assert "no case was made" in closed["decision_reason"]
-    # The worker is told, because the worker is who has to act — and the denial routes it
-    # back to `jarvis gate request`, which is the thing it should have run.
+    assert [r["id"] for r in closed] == [approval["id"]]
+    row = fleet.approval()
+    assert row["status"] == "expired"
+    assert row["closed_as"] == "abandoned"
+    assert row["decided_by"] == "os"
+    assert "no case was made" in row["decision_reason"]
+    # Nothing was decided, so nothing may be read off this row as a verdict.
+    assert row["status"] not in gates.VERDICTS
+
+
+def test_the_abandoned_worker_is_told_and_given_both_exits(fleet):
+    """The one objection to `expired` was that nobody tells the worker. Now something
+    does — and it names the exit the worker could not find the first time."""
+    fleet.attempt("./scripts/shipit.sh")
     store = fleet.store()
     try:
+        store.conn.execute("UPDATE approvals SET ts = ts - 7200")
+        gates.sweep_unargued(store, gates.DEFAULT_CASE_TTL_SECONDS)
         body = "\n".join(m["content"] for m in store.queued_messages(fleet.wo_id))
     finally:
         store.close()
-    assert "DENIED" in body
+
+    assert "ABANDONED" in body
+    assert "DENIED" not in body          # nobody refused it
+    assert "jarvis gate explain" in body
     assert "jarvis gate request" in body
+    assert "jarvis gate contest" in body
 
 
-def test_the_daemon_is_what_refuses_it(fleet):
+def test_the_daemon_is_what_closes_it(fleet):
     """The sweep has to be wired into a tick or the hold leaks in production."""
     fleet.attempt("./scripts/shipit.sh")
     approval = fleet.approval()
@@ -500,7 +518,39 @@ def test_the_daemon_is_what_refuses_it(fleet):
     for _ in range(7):   # RECONCILE_EVERY_TICKS
         fleet.daemon.tick()
 
-    assert fleet.approval()["status"] == "denied"
+    assert fleet.approval()["closed_as"] == "abandoned"
+
+
+def test_an_abandoned_request_unparks_the_work_order(fleet):
+    """The request parked it; the close has to unpark it. Otherwise a work order nobody
+    is reviewing anything for reads as "waiting on your input" for ever."""
+    fleet.attempt("./scripts/shipit.sh")
+    store = fleet.store()
+    try:
+        assert store.get_work_order(fleet.wo_id)["status"] == "waiting_input"
+        store.conn.execute("UPDATE approvals SET ts = ts - 7200")
+        gates.sweep_unargued(store, gates.DEFAULT_CASE_TTL_SECONDS)
+        assert store.get_work_order(fleet.wo_id)["status"] != "waiting_input"
+    finally:
+        store.close()
+
+
+def test_abandonment_is_counted_where_the_false_positive_rate_is_read(fleet):
+    """The signal the OS used to throw away: a worker walks away from a block, and on
+    this evidence it is usually a false positive nobody will ever hear about."""
+    fleet.attempt("./scripts/shipit.sh")
+    store = fleet.store()
+    try:
+        store.conn.execute("UPDATE approvals SET ts = ts - 7200")
+        gates.sweep_unargued(store, gates.DEFAULT_CASE_TTL_SECONDS)
+    finally:
+        store.close()
+
+    stats = ops.list_gate_rules()["classifier"]
+    assert stats["abandoned"] == 1
+    # Evidence, not a verdict: it must never inflate the dismissal count.
+    assert stats["dismissed"] == 0
+    assert ops.os_status()["gates"]["abandoned"] == 1
 
 
 def test_a_request_still_inside_its_window_is_left_alone(fleet):
@@ -513,8 +563,8 @@ def test_a_request_still_inside_its_window_is_left_alone(fleet):
     assert fleet.approval()["status"] == gates.AWAITING_CASE
 
 
-def test_the_refusal_leaves_the_command_blocked_and_a_fresh_request_possible(fleet):
-    """A refusal authorises nothing, and the worker's route back is a real request."""
+def test_the_abandonment_leaves_the_command_blocked_and_a_fresh_request_possible(fleet):
+    """It authorises nothing, and the worker's route back is a real request."""
     fleet.attempt("./scripts/shipit.sh")
     approval = fleet.approval()
     store = fleet.store()
@@ -792,3 +842,165 @@ def test_an_older_neo_that_never_heard_of_dismissal_still_ships_a_release(fleet)
 
     assert fleet.approval()["status"] == "approved"
     assert _decision(fleet.attempt("./scripts/shipit.sh")) == "allow"
+
+
+# -- contesting a match: the other exit ------------------------------------------------
+#
+# docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md. The worker's side of a
+# false positive: a command the recogniser matched on text it is only writing ABOUT.
+
+
+#: A heredoc whose body quotes the release script — wo-5efc2de6's gate 97, the shape the
+#: block message had no honest answer for. Nothing here ships; the literal is prose.
+PROSE = ("git commit -F - <<'MSG'\n"
+         "Stop the release script ./scripts/shipit.sh clobbering the tag\n"
+         "MSG")
+
+
+def _question(fleet):
+    neo = NeoStore()
+    try:
+        return neo.get(fleet.approval()["neo_question_id"])
+    finally:
+        neo.close()
+
+
+def test_a_contest_reaches_the_reviewer_as_a_dismissal_candidate(fleet):
+    """The acceptance criterion: a contested match is never put as an authorisation.
+
+    The reviewer's page decides what can be decided. Rendered as a PRIVILEGED ACTION
+    REQUEST, the only available answers are about whether this should ship — and no true
+    one exists for a commit message.
+    """
+    assert _decision(fleet.attempt(PROSE)) == "deny"
+    out = ops.contest_gate_match(fleet.wo_id, PROSE,
+                                 why="the script name is inside the commit message body")
+
+    assert out["contested"] is True
+    approval = fleet.approval()
+    assert approval["contested"] == 1
+    assert approval["status"] == "pending"      # no hold: the contest IS the case
+
+    question = _question(fleet)["question"]
+    assert question.startswith(gates.CONTEST_HEADER)
+    assert "PRIVILEGED ACTION REQUEST" not in question
+    # The reviewer is given the OS's own reading of the command, not just the worker's.
+    assert "heredoc" in question
+    assert "the script name is inside the commit message body" in question
+
+
+def test_an_upheld_contest_teaches_the_fleet(fleet):
+    """It must reach `learn_from_dismissal` by the path a dismissal already takes —
+    otherwise the contest clears one command and the next worker is blocked again."""
+    fleet.attempt(PROSE)
+    ops.contest_gate_match(fleet.wo_id, PROSE,
+                           why="FORCE_DISMISS — this is a commit message, not a release")
+    fleet.daemon._neo_drain()
+
+    approval = fleet.approval()
+    assert approval["status"] == "dismissed"
+    assert approval["decided_by"] == "neo"
+
+    learned = [r for r in ops.list_gate_rules(role="exempt")["rules"]
+               if r["approval_id"] == approval["id"]]
+    assert len(learned) == 1, "an upheld contest must leave a standing exemption rule"
+    assert ops.list_gate_rules()["canary_failures"] == []
+    # No decision at all, which is stronger than an allow: the rule cleared the SHAPE, so
+    # the recogniser no longer fires and no second worker files a second request.
+    assert _decision(fleet.attempt(PROSE)) is None
+
+
+def test_a_contest_can_never_be_recorded_as_an_authorisation(fleet):
+    """Persona text is advice; this is the invariant. A reviewer that answers "approve"
+    to a contest has authorised an action nobody ever argued for."""
+    fleet.attempt(PROSE)
+    ops.contest_gate_match(fleet.wo_id, PROSE,
+                           why="FORCE_APPROVE — the reviewer will get this wrong")
+    fleet.daemon._neo_drain()
+
+    approval = fleet.approval()
+    assert approval["status"] == "denied"
+    assert gates.CONTEST_NOT_AN_AUTHORISATION in approval["decision_reason"]
+    # And nothing was cleared: an approval it never granted cannot open the gate.
+    assert _decision(fleet.attempt(PROSE)) == "deny"
+
+
+def test_the_user_is_told_to_dismiss_rather_than_silently_coerced(fleet):
+    """The same invariant on the path where there is a person to tell."""
+    fleet.attempt(PROSE)
+    ops.contest_gate_match(fleet.wo_id, PROSE, why="prose in a commit message")
+    with pytest.raises(ops.OpsError, match="CONTEST"):
+        ops.decide_gate(fleet.approval()["id"], verdict="approved", reason="fine by me")
+    assert fleet.approval()["status"] == "pending"
+
+    ops.decide_gate(fleet.approval()["id"], verdict="dismissed",
+                    reason="the literal is in the message body")
+    # None, not "allow": the user's dismissal teaches the same standing rule Neo's does,
+    # so the recogniser stops firing on the shape entirely.
+    assert _decision(fleet.attempt(PROSE)) is None
+
+
+def test_a_rejected_contest_routes_the_worker_to_a_real_request(fleet):
+    """The other outcome. The worker was wrong, and being wrong about which exit it
+    needed must not leave it without one."""
+    fleet.attempt("./scripts/shipit.sh")
+    ops.contest_gate_match(fleet.wo_id, "./scripts/shipit.sh",
+                           why="FORCE_DENY — I claim this is only a mention")
+    fleet.daemon._neo_drain()
+
+    assert fleet.approval()["status"] == "denied"
+    store = fleet.store()
+    try:
+        body = "\n".join(m["content"] for m in store.queued_messages(fleet.wo_id))
+    finally:
+        store.close()
+    assert "CONTEST REJECTED" in body
+    assert "jarvis gate request" in body
+
+
+def test_a_held_request_becomes_a_contest_rather_than_a_second_row(fleet):
+    """One action, one review — a contest after a block amends the standing row."""
+    fleet.attempt(PROSE)
+    held = fleet.approval()
+    assert held["status"] == gates.AWAITING_CASE
+
+    ops.contest_gate_match(fleet.wo_id, PROSE, why="the literal is in the message")
+
+    store = fleet.store()
+    try:
+        rows = store.list_approvals(fleet.wo_id)
+    finally:
+        store.close()
+    assert [r["id"] for r in rows] == [held["id"]]
+    assert rows[0]["status"] == "pending" and rows[0]["contested"] == 1
+    assert gates.NO_CASE_JUSTIFICATION not in rows[0]["justification"]
+
+
+def test_contesting_something_that_was_never_gated_says_so(fleet):
+    with pytest.raises(ops.OpsError, match="trips no gate"):
+        ops.contest_gate_match(fleet.wo_id, "ls -la", why="obviously not a release")
+
+
+def test_a_contest_needs_an_argument(fleet):
+    """Same rule as a request, for the same reason: the reviewer sees only this text."""
+    fleet.attempt(PROSE)
+    with pytest.raises(ops.OpsError, match="needs an argument"):
+        ops.contest_gate_match(fleet.wo_id, PROSE, why="   ")
+
+
+def test_an_escalated_contest_never_offers_the_user_the_approve_button(fleet):
+    """Neo escalating asks the user a question about the classifier. Offering
+    `jarvis gate approve` there would hand them the one verb that cannot answer it."""
+    fleet.attempt(PROSE)
+    ops.contest_gate_match(fleet.wo_id, PROSE, why="no force marker — Neo escalates")
+    fleet.daemon._neo_drain()
+
+    central = CentralStore()
+    try:
+        items = [i for i in central.unacked_inbox() if fleet.wo_id in (i["title"] or "")]
+    finally:
+        central.close()
+    assert len(items) == 1
+    assert "jarvis gate dismiss" in items[0]["body"]
+    assert "jarvis gate approve" not in items[0]["body"]
+    assert fleet.approval()["status"] == "pending"      # still claimable by the user

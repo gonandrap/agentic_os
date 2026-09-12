@@ -559,12 +559,16 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         # not the user's, but the rate is the one signal that says whether the
         # recognisers are getting better.
         false_positives = 0
+        # Held requests whose worker never came back — evidence about the same classifier,
+        # counted separately because an abandonment is not a verdict (spec 2026-09-12 §5).
+        abandoned = 0
         for name, path in registered_project_paths().items():
             if not path.is_dir():
                 continue
             store = ProjectStore(path)
             try:
                 false_positives += store.dismissed_count()
+                abandoned += store.abandoned_count()
                 for a in store.escalated_approvals():
                     gate_items.append({
                         "project": name, "wo_id": a["wo_id"],
@@ -607,7 +611,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             "backlog": {"open": len(backlog_open)},
             "neo": neo_counts,
             "gates": {"awaiting_you": len(gate_items),
-                      "false_positives": false_positives},
+                      "false_positives": false_positives,
+                      "abandoned": abandoned},
             "healthy": pid is not None and not attention,
         }
     finally:
@@ -3072,6 +3077,88 @@ def request_gate_approval(wo_id: str, command: str, why: str = "", evidence: str
                     "next user turn"}
 
 
+def contest_gate_match(wo_id: str, command: str, why: str,
+                       project_name: str | None = None) -> dict[str, Any]:
+    """(Workers) dispute a gate MATCH: this command performs no privileged action.
+
+    The other exit from a block, and the one the OS had no command for. A worker handed a
+    false positive and told only to argue that its command is "ready to ship" has no true
+    sentence available — it writes a false one or walks away, and walking away is what
+    three requests in a row did. See docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md.
+
+    Same reviewer, same queue, same `learn_from_dismissal` on the way out. What differs is
+    the claim on the record: a candidate DISMISSAL, never a request for permission.
+    """
+    from . import gates
+    from .neo_store import NeoStore
+
+    name, path, wo = find_work_order(wo_id, project_name)
+    if not why.strip():
+        raise OpsError(
+            "a contest needs an argument — pass --why, saying what the command actually "
+            "does and where the matched text sits (a grep pattern, a commit message, a "
+            "heredoc). The reviewer sees only what you write, and a contest with nothing "
+            "in it can only be denied."
+        )
+    config = _project_gate_config(name)
+    if not config:
+        raise OpsError(
+            f"project {name!r} has no gates enabled, so nothing could have matched this "
+            f"command — there is nothing to contest."
+        )
+    action = gates.classify(command, config)
+    if action is None:
+        # Nothing to contest is good news, and saying which command was checked matters:
+        # a grant is scoped to an exact string, so a worker contesting a RETYPED command
+        # would otherwise be told its real block does not exist.
+        raise OpsError(
+            f"that command trips no gate enabled for {name!r} "
+            f"(enabled: {sorted(config.enabled)}) — run it directly. If a gate really "
+            f"fired, the string here is not the string that was blocked: copy it exactly "
+            f"from `jarvis gate list --wo {wo_id}`."
+        )
+
+    store = ProjectStore(path)
+    try:
+        grant = store.usable_grant(wo_id, action.kind, action.command)
+        if grant is not None:
+            return {"project": name, "wo_id": wo_id, "approval_id": grant["id"],
+                    "kind": action.kind, "status": grant["status"],
+                    "note": "already cleared — run the command as written"}
+        existing = store.latest_approval_for(wo_id, action.kind, action.command)
+        neo = NeoStore()
+        try:
+            if existing and existing["status"] in (gates.AWAITING_CASE, "pending"):
+                # Onto the STANDING row, never a second one — same rule as a late case
+                # (kn-76b155a0). A request the worker now disputes becomes a contest:
+                # the claim changed, so the reviewer's page is rewritten to match it.
+                held = existing["status"] == gates.AWAITING_CASE
+                approval = gates.amend_request(store, neo, wo, action,
+                                               store.mark_contested(existing["id"]),
+                                               justification=why)
+                if held:
+                    gates.queue_for_review(store, neo, name, wo, action, approval)
+            else:
+                # No hold. The hold exists so no reviewer sees a privileged action nobody
+                # argued for; a contest argues there is no privileged action here at all,
+                # which is exactly the case the reviewer needs.
+                approval, _ = gates.file_request(store, neo, name, wo, action,
+                                                 justification=why, contested=True)
+        finally:
+            neo.close()
+    finally:
+        store.close()
+    return {
+        "project": name, "wo_id": wo_id, "approval_id": approval["id"],
+        "kind": action.kind, "command": action.command, "status": "pending",
+        "contested": True,
+        "note": ("contested — a reviewer will decide whether the recogniser was wrong. "
+                 "It cannot authorise anything, so the outcomes are DISMISSED (run the "
+                 "command as written) or DENIED (it really does perform the action). "
+                 "END YOUR TURN; the verdict arrives as your next user turn"),
+    }
+
+
 def decide_gate(approval_id: int, verdict: str, reason: str = "",
                 project_name: str | None = None) -> dict[str, Any]:
     """(User) rule on a gate directly, whatever Neo did or didn't say.
@@ -3105,6 +3192,18 @@ def decide_gate(approval_id: int, verdict: str, reason: str = "",
         raise OpsError(
             f"approval {approval_id} is already {approval['status']}"
             + (f" (by {approval['decided_by']})" if approval["decided_by"] else "")
+        )
+    # Refused here rather than coerced, because there is a person to tell. A contest
+    # argues that the command performs no privileged action; approving it would record an
+    # authorisation for an action nobody ever argued for. `gates.apply_decision` coerces
+    # on the daemon's path, where there is nobody to tell. Spec 2026-09-12 §2.
+    if approval["contested"] and verdict == "approved":
+        raise OpsError(
+            f"approval {approval_id} is a CONTEST, not a request for permission — the "
+            f"worker argued this command performs no privileged action, and made no case "
+            f"for performing one. Dismiss it if it is right (`jarvis gate dismiss "
+            f"{approval_id} --reason \"...\"`), deny it if it is wrong. To authorise the "
+            f"action itself, the worker files `jarvis gate request` with a case."
         )
     store = ProjectStore(path)
     central = CentralStore()
@@ -3241,7 +3340,35 @@ def list_gate_rules(role: str | None = None, kind: str | None = None,
     return {
         "rules": [{**r, "rendered": Rule.from_row(r).render()} for r in rows],
         "canary_failures": live.check_canaries(),
+        "classifier": classifier_stats(),
     }
+
+
+def classifier_stats() -> dict[str, int]:
+    """How often the recogniser has been wrong, and how often nobody stayed to say so.
+
+    Two numbers, reported side by side and never added together. `dismissed` is a
+    reviewer's finding that the classifier misfired. `abandoned` is a held request whose
+    worker never came back — no case, no contest — and on the evidence that is usually a
+    false positive the worker silently routed around, which makes it the classifier's
+    error rate showing up as a hole rather than as a count.
+
+    Evidence is not a verdict, so it is never folded into the false-positive rate. It is
+    printed beside it because a rate taken over only the requests somebody argued is
+    measured on the population least likely to contain the defects.
+    """
+    dismissed = abandoned = total = 0
+    for _name, path in registered_project_paths().items():
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            dismissed += store.dismissed_count()
+            abandoned += store.abandoned_count()
+            total += len(store.list_approvals())
+        finally:
+            store.close()
+    return {"dismissed": dismissed, "abandoned": abandoned, "requests": total}
 
 
 def retract_gate_rule(rule_id: str, reason: str) -> dict[str, Any]:

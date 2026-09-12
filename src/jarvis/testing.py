@@ -709,6 +709,23 @@ elif "-p" in argv and "--resume" not in argv:
     elif "FORCE_GARBAGE" in prompt:
         emit_headless("I think you should maybe do the thing?")
         sys.exit(0)
+    elif "CONTESTED GATE MATCH" in prompt:
+        # A contest speaks the same verdict shape but a narrower vocabulary: the worker
+        # disputes the MATCH, so there is nothing to approve. FORCE_APPROVE is offered
+        # anyway — the OS's refusal to record one is a property worth testing, and a fake
+        # that could not produce the input would leave it untested.
+        if "FORCE_DISMISS" in prompt:
+            verdict = {"escalate": False, "verdict": "dismiss",
+                       "reason": "test-forced dismissal: the recogniser matched prose"}
+        elif "FORCE_DENY" in prompt:
+            verdict = {"escalate": False, "verdict": "deny",
+                       "reason": "test-forced: the command really does ship"}
+        elif "FORCE_APPROVE" in prompt:
+            verdict = {"escalate": False, "verdict": "approve",
+                       "reason": "test-forced approval of a contest"}
+        else:
+            verdict = {"escalate": True, "verdict": "deny",
+                       "reason": "test default: contests escalate unless forced"}
     elif "PRIVILEGED ACTION REQUEST" in prompt:
         # A gate review, which speaks a different verdict shape: the decision lives in
         # `verdict`, not in prose. Default is to escalate, matching the real reviewer's

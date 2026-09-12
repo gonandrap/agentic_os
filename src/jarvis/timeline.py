@@ -268,7 +268,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # A held request was RECORDED, not asked: the worker ran the command and no
         # reviewer has been shown anything. "Asked permission" would credit it with a
         # review that has not started — see gates.AWAITING_CASE.
-        verb = ("Ran a gated command — request recorded, awaiting its case"
+        # A CONTEST is not a request for permission, and a record that says it is would
+        # be read later as an attempt at the action — see spec 2026-09-12 §1.
+        verb = ("Contested the `%s` gate match — says this performs no privileged action"
+                % (p.get("kind") or "gate") if p.get("contested")
+                else "Ran a gated command — request recorded, awaiting its case"
                 if p.get("held") else f"Asked permission to {p.get('kind') or 'act'}")
         return (f"{verb}{who}", p.get("command") or "")
     if kind == "gate_amended":
@@ -292,6 +296,13 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # plainly so the record cannot be read as "someone approved this quietly".
         return (f"Gate request closed unanswered — the `{p.get('kind') or 'gate'}` "
                 f"question no longer applies", p.get("reason") or "")
+    if kind == "gate_abandoned":
+        # Not a denial. Nobody reviewed it, so nobody refused it — and on the evidence
+        # this is usually the worker routing around a recogniser false positive, which
+        # is why `abandoned_count` exists. Spec 2026-09-12 §4.
+        return (f"Gate request abandoned — no case was ever made for the "
+                f"`{p.get('kind') or 'gate'}` block, and nothing was decided",
+                p.get("reason") or "")
     if kind == "gate_escalated":
         return "Gate approval escalated to you", p.get("reason") or ""
     if kind == "gate_opened":

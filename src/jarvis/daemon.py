@@ -2111,23 +2111,40 @@ class Daemon:
             return
 
         if verdict["escalate"]:
-            central.add_inbox(
-                project=q["project"], level="warning",
-                title=f"Approval needed: {approval['kind']} from {q['wo_id']}",
-                body=(f"Neo declined to decide: {verdict['reason']}\n\n"
-                      f"Command: {approval['command']}\n\n"
-                      f"Approve it with: jarvis gate approve {approval['id']} "
-                      f"--reason \"...\"\n"
-                      f"Deny it with:    jarvis gate deny {approval['id']} "
-                      f"--reason \"...\"\n"
-                      f"Full request:    jarvis gate show {approval['id']}"),
-                wo_id=q["wo_id"],
-            )
+            # A CONTEST asks a different question, so it must not arrive offering the one
+            # verb that cannot answer it. The user is being asked whether the OS's own
+            # recogniser misfired; `jarvis gate approve` would record an authorisation for
+            # an action nobody argued for, and `ops.decide_gate` refuses it anyway. Spec
+            # 2026-09-12 §2.
+            if approval["contested"]:
+                title = f"Is this a false positive? {approval['kind']} from {q['wo_id']}"
+                body = (f"The worker says this command performs no privileged action and "
+                        f"the `{approval['kind']}` gate matched it by mistake. Neo "
+                        f"declined to decide: {verdict['reason']}\n\n"
+                        f"Command: {approval['command']}\n\n"
+                        f"It is a false positive:  jarvis gate dismiss {approval['id']} "
+                        f"--reason \"...\"\n"
+                        f"The worker is wrong:     jarvis gate deny {approval['id']} "
+                        f"--reason \"...\"\n"
+                        f"The contest in full:     jarvis gate show {approval['id']}")
+            else:
+                title = f"Approval needed: {approval['kind']} from {q['wo_id']}"
+                body = (f"Neo declined to decide: {verdict['reason']}\n\n"
+                        f"Command: {approval['command']}\n\n"
+                        f"Approve it with: jarvis gate approve {approval['id']} "
+                        f"--reason \"...\"\n"
+                        f"Deny it with:    jarvis gate deny {approval['id']} "
+                        f"--reason \"...\"\n"
+                        f"Full request:    jarvis gate show {approval['id']}")
+            central.add_inbox(project=q["project"], level="warning", title=title,
+                              body=body, wo_id=q["wo_id"])
             pstore.mark_approval_escalated(approval["id"], verdict["reason"])
             pstore.flag_attention(
                 q["wo_id"],
-                f"gate approval escalated by Neo: {approval['kind']} "
-                f"(request {approval['id']})",
+                (f"contested gate match escalated by Neo: {approval['kind']} "
+                 f"(request {approval['id']})") if approval["contested"] else
+                (f"gate approval escalated by Neo: {approval['kind']} "
+                 f"(request {approval['id']})"),
             )
             pstore.add_event(q["wo_id"], "gate_escalated", {
                 "approval_id": approval["id"], "reason": verdict["reason"],
@@ -2151,10 +2168,16 @@ class Daemon:
         # instead — `jarvis gate list` and the dashboard — because what matters about
         # classifier defects is the rate, not each instance.
         if ruling != "dismissed":
+            # A rejected CONTEST stays visible, and it is the one place this feature
+            # spends the user's attention on purpose: a worker that argued a real release
+            # was not a release is worth seeing. The title has to say that is what
+            # happened, or it reads as a release the worker asked for and was refused.
             central.add_inbox(
                 project=q["project"],
                 level="info" if ruling == "approved" else "warning",
-                title=f"Neo {ruling} {approval['kind']} for {q['wo_id']}",
+                title=(f"Neo rejected a contested {approval['kind']} match from "
+                       f"{q['wo_id']}" if approval["contested"]
+                       else f"Neo {ruling} {approval['kind']} for {q['wo_id']}"),
                 body=(f"{verdict['reason']}\n\nCommand: {approval['command']}\n"
                       f"Review Neo's call with: jarvis neo review {q['id']}"),
                 wo_id=q["wo_id"],
@@ -2433,15 +2456,15 @@ class Daemon:
         if not project.gates:
             return
         try:
-            refused = gates.sweep_unargued(
-                store, project.gates.case_ttl_seconds,
-                central=self.central, project=project.name)
+            closed = gates.sweep_unargued(store, project.gates.case_ttl_seconds)
         except Exception:  # noqa: BLE001 — one project's sweep must not stop the tick
-            log.exception("project %s: refusing unargued gates failed", project.name)
+            log.exception("project %s: closing unargued gates failed", project.name)
             return
-        for approval in refused:
-            log.info("gate %s (%s) refused: no case was made for it",
-                     approval["id"], approval["kind"])
+        for approval in closed:
+            # "abandoned", never "refused": nobody reviewed it, so nobody refused it —
+            # and a log line that says otherwise is where the false record starts.
+            log.info("gate %s (%s) abandoned: no case was made and the match was never "
+                     "contested", approval["id"], approval["kind"])
 
     # -- 7. invariants (post-conditions) --------------------------------------------------
 

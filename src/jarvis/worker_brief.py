@@ -241,8 +241,11 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             f"forbidden: an attempt is blocked, filed for review, and the gate's "
             f"full instructions arrive when one fires. You make a stronger case by "
             f"asking first — `jarvis gate request {wo_id} \"<the exact command>\" "
-            f"--why \"<why this is ready>\" --evidence \"<PR, tests, checks>\"` "
-            f"(full protocol: `jarvis brief gates --wo {wo_id}`).",
+            f"--why \"<why this is ready>\" --evidence \"<PR, tests, checks>\"`. If a "
+            f"gate fires on a command that ships NOTHING, that is a classifier bug and "
+            f"the request above is the wrong move: contest it instead — `jarvis gate "
+            f"contest {wo_id} \"<the exact command>\" --why \"<why this performs no "
+            f"privileged action>\"` (full protocol: `jarvis brief gates --wo {wo_id}`).",
         ] if gate_names else []),
         f"- **A turn is one-shot and NOTHING wakes you when a background job "
         f"ends.** You are one `claude -p`, NOT an interactive session: the "
@@ -583,30 +586,39 @@ def gates_section(wo_id: str = WO_PLACEHOLDER,
         "because you have argued nothing yet — so nobody is looking at it, and "
         "retrying the command will not change that. Run the command above and it "
         "becomes the same request, now with your case; it is never a second one, "
-        "because one action gets one review. Leave it unargued and the OS refuses "
-        "it unreviewed once its window runs out.",
+        "because one action gets one review. Leave it unargued and the OS closes "
+        "it as ABANDONED once its window runs out: nobody will have reviewed it, "
+        "nothing will be decided, and the command stays blocked.",
         "",
         "Then END YOUR TURN. The verdict arrives as your next user turn. If "
         "approved, run that exact command — the approval is scoped to that one "
         "string and expires, so do not reword it. If denied, fix what the reason "
         "names; do not retry as-is.",
         "",
-        "A third verdict exists: DISMISSED. The recogniser matches text, so it "
-        "sometimes fires on a command that merely NAMES one of these actions — a "
-        "release script inside a grep pattern, a path quoted in a PR body. That is "
-        "an OS bug, not a refusal: the reviewer dismisses it, nothing is "
-        "authorised, and you may run the command as written. So if a gate fires on "
-        "something you know ships nothing, do not reword the command to get around "
-        "it — file it, say plainly why it performs no privileged action, and end "
-        "your turn.",
+        "THE OTHER EXIT — the recogniser matches TEXT, so it sometimes fires on a "
+        "command that merely NAMES one of these actions: a release script inside a "
+        "grep pattern, a path quoted in a PR body, a heredoc that writes a file. "
+        "That is an OS bug, not a refusal, and the command above is the wrong one "
+        "for it — there is no PR, no test result and nothing 'ready to ship' to "
+        "write in it. Contest the match instead:",
+        f"    jarvis gate contest {wo_id} \"<the exact command>\" "
+        f"--why \"<why this performs no privileged action>\"",
         "",
-        "Filing it is worth more than it used to be. A dismissal now TEACHES the "
+        "That reaches the same reviewer as a candidate DISMISSAL rather than a "
+        "request for permission. It authorises nothing and needs no evidence; the "
+        "two outcomes are dismissed (you were right — run the command as written) "
+        "and denied (the command really does perform the action, and your route "
+        "back is a real request). If you cannot tell which of the two exits you "
+        "need, ask the OS before you choose — it reports where the matched literal "
+        "sits and whether the shell would run it:",
+        "    jarvis gate explain \"<the exact command>\"",
+        "",
+        "Contesting is worth more than walking away. A dismissal TEACHES the "
         "recogniser: the OS derives a standing rule from the shape of what was "
         "wrongly matched, so the next worker writing something similar — in this "
-        "project or any other — is never blocked at all. Rewording to dodge the "
-        "gate teaches it nothing and leaves the defect in place for everyone else. "
-        "To see why a command was matched before you file, run `jarvis gate "
-        "explain \"<the exact command>\"`.",
+        "project or any other — is never blocked at all. Rewording the command to "
+        "dodge the gate, or abandoning it and working around the block, teaches it "
+        "nothing and leaves the defect in place for everyone else.",
         "",
         "A dismissal clears a command STRING; it does not reset the review state "
         "of the action that string talks about. So NEVER open a second request for "

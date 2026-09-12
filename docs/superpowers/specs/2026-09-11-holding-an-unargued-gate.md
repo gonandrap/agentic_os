@@ -43,11 +43,17 @@ Holding a request back from review means nothing else will ever close it: there 
 question for Neo to answer and no escalation for the user to see. A worker that wanders
 off would leave an unargued privileged action open for ever.
 
-`Daemon.refuse_unargued_gates` sweeps on each reconcile tick and **denies** — not expires —
-every held request older than `gates.case_ttl_seconds` (per project, default 600s;
-kn-67cdb54b). A denial because the worker is who has to act: the denial message says what
-was missing, and the hook's denied branch already routes the retry into a fresh, argued
-request. Nothing is authorised and nothing is lost — the command string stays blocked.
+`Daemon.refuse_unargued_gates` sweeps on each reconcile tick and closes every held request
+older than `gates.case_ttl_seconds` (per project, default 600s; kn-67cdb54b). Nothing is
+authorised and nothing is lost — the command string stays blocked.
+
+> **Superseded on 2026-09-12** — see `2026-09-12-contesting-a-gate-match.md` §4. This
+> section originally chose **denied** over **expired**, on the grounds that the worker has
+> to act and nothing tells it about an expiry. The first half held; the second was a
+> property of the code, not of the status. The sweep now writes `expired` with
+> `closed_as='abandoned'` and queues the worker a message, because a denial asserts that a
+> reviewer refused a privileged action — and on the evidence these are mostly commands
+> that were never privileged at all.
 
 ### What the user can still do
 

@@ -710,6 +710,16 @@ ADDED_COLUMNS = {
         # `PreToolUse` carries `agent_type` for a subagent's call and omits the key
         # entirely for the lead's, so the payload can always tell the two apart.
         "agent_type": "TEXT",
+        # The worker claims this command performs no privileged action — `jarvis gate
+        # contest`. A different claim from every other row in the table, and the column
+        # is what makes it enforceable rather than a matter of prompt wording: a
+        # contested row can only be dismissed or denied (`gates.apply_decision`).
+        "contested": "INTEGER NOT NULL DEFAULT 0",
+        # WHY a row landed in `expired`, which three different things produce and which
+        # only one of them is worth counting: 'lapsed' (a grant ran out of clock or
+        # uses), 'superseded' (the world moved on), 'abandoned' (a held request whose
+        # case never came). See docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §4.
+        "closed_as": "TEXT NOT NULL DEFAULT ''",
     },
     # An alarm can name a FEATURE ORDER as its subject and a health probe as its source.
     # All four are additive with defaults and no CHECK: `_migrate` runs inside
@@ -785,6 +795,35 @@ class ProjectStore:
                 if name not in have:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
         self._backfill_alarms()
+        self._backfill_abandoned_gates()
+
+    #: The reason `gates.sweep_unargued` wrote while the TTL still recorded a DENIAL.
+    #: Matched as a prefix because the minute count varies with the project's
+    #: `case_ttl_seconds`. This exact string is the discriminator, and it is what makes
+    #: the backfill below safe: nothing but the sweep ever wrote it.
+    _TTL_DENIAL_PREFIX = "no case was made for it within "
+
+    def _backfill_abandoned_gates(self) -> None:
+        """Re-file the TTL's old denials as what they were: abandonments.
+
+        Every row this touches was written by the OS itself, with nobody having reviewed
+        anything — and `denied` on a gate asserts that a reviewer refused a privileged
+        action. Gate 95 of this very fleet is a `python3 -c` that imported a module,
+        recorded for ever as a denied release. Leaving them would keep the
+        false-positive count understated by exactly the population most likely to contain
+        false positives, which is the defect spec 2026-09-12 is about.
+
+        NARROW, and that is the whole safety argument: `decided_by='os'` plus the sweep's
+        own reason prefix. A verdict any REVIEWER reached is never touched, and a row that
+        genuinely was refused by Neo or the user keeps its denial. Idempotent — after the
+        first pass the WHERE matches nothing.
+        """
+        self.conn.execute(
+            """UPDATE approvals SET status='expired', closed_as='abandoned'
+               WHERE status='denied' AND decided_by='os' AND closed_as=''
+                 AND decision_reason LIKE ?""",
+            (self._TTL_DENIAL_PREFIX + "%",),
+        )
 
     def _backfill_alarms(self) -> None:
         """Give every alarm raised before `wo_alarms` existed a row of its own.
@@ -2369,13 +2408,14 @@ class ProjectStore:
                      justification: str = "", evidence: str = "",
                      max_uses: int = 3,
                      agent_type: str | None = None,
-                     status: str = "pending") -> dict[str, Any]:
+                     status: str = "pending",
+                     contested: bool = False) -> dict[str, Any]:
         cur = self.conn.execute(
             """INSERT INTO approvals (wo_id, ts, kind, command, matched, justification,
-                                      evidence, max_uses, agent_type, status)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                                      evidence, max_uses, agent_type, status, contested)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (wo_id, db.now(), kind, command, matched, justification, evidence, max_uses,
-             agent_type, status),
+             agent_type, status, int(contested)),
         )
         approval_id = int(cur.lastrowid)  # type: ignore[arg-type]
         self.add_event(wo_id, "gate_requested", {
@@ -2384,6 +2424,9 @@ class ProjectStore:
             # "asked permission" is the wrong thing to say about a request that is still
             # waiting for the worker to argue it — see gates.AWAITING_CASE.
             "held": status == "awaiting_case",
+            # A CONTEST, not a request: the worker is disputing the match, so "asked
+            # permission to cut a release" is the wrong thing for the timeline to say.
+            **({"contested": True} if contested else {}),
             # In the payload as well as the column: the timeline is read on its own, and
             # "the planner ran this" is exactly the wrong thing for it to imply.
             **({"agent_type": agent_type} if agent_type else {}),
@@ -2512,8 +2555,9 @@ class ProjectStore:
         if approval["status"] not in ("pending", "awaiting_case"):
             return approval
         self.conn.execute(
-            """UPDATE approvals SET status='expired', decided_by='os',
-                                    decision_reason=?, decided_at=?, expires_at=NULL
+            """UPDATE approvals SET status='expired', closed_as='superseded',
+                                    decided_by='os', decision_reason=?, decided_at=?,
+                                    expires_at=NULL
                WHERE id=?""",
             (reason, db.now(), approval_id),
         )
@@ -2614,12 +2658,73 @@ class ProjectStore:
         `dismissed_count()` exists to report — the whole reason the verdict is separate.
         """
         cur = self.conn.execute(
-            """UPDATE approvals SET status='expired'
+            """UPDATE approvals SET status='expired', closed_as='lapsed'
                WHERE status='approved'
                  AND (uses >= max_uses OR (expires_at IS NOT NULL AND expires_at < ?))""",
             (db.now(),),
         )
         return cur.rowcount
+
+    def abandon_approval(self, approval_id: int, reason: str) -> dict[str, Any]:
+        """Close a held request whose case never came. NOT a verdict — see
+        `gates.sweep_unargued` and spec 2026-09-12 §4.
+
+        The worker ran a command, was blocked, and never came back to argue it or to
+        contest the match. Nobody ever reviewed it, so nobody can rule on it: writing
+        `denied` here would assert that a reviewer refused a privileged action, on
+        evidence that the OS's own recogniser is usually wrong about (`abandoned_count`).
+
+        Lands in `expired` like `supersede_approval`, for the same reason — it is the one
+        status that already means "never decided, and can no longer be" — and authorises
+        nothing: the command string stays blocked, so a retry gets a real review.
+        """
+        approval = self.get_approval(approval_id)
+        if approval is None:
+            raise KeyError(f"approval {approval_id} not found")
+        if approval["status"] != "awaiting_case":
+            return approval
+        self.conn.execute(
+            """UPDATE approvals SET status='expired', closed_as='abandoned',
+                                    decided_by='os', decision_reason=?, decided_at=?,
+                                    expires_at=NULL
+               WHERE id=?""",
+            (reason, db.now(), approval_id),
+        )
+        self.add_event(approval["wo_id"], "gate_abandoned", {
+            "approval_id": approval_id,
+            "kind": approval["kind"],
+            "command": approval["command"],
+            "matched": approval["matched"],
+            "reason": reason,
+        })
+        return self.get_approval(approval_id)  # type: ignore[return-value]
+
+    def mark_contested(self, approval_id: int) -> dict[str, Any]:
+        """Record that the worker disputes the MATCH rather than asking permission.
+
+        One-way: a row that has carried the claim "this performs no privileged action"
+        can never be turned back into a request to perform one, because the case a
+        reviewer read would no longer be the case it is ruling on.
+        """
+        self.conn.execute("UPDATE approvals SET contested=1 WHERE id=?", (approval_id,))
+        return self.get_approval(approval_id)  # type: ignore[return-value]
+
+    def abandoned_count(self, wo_id: str | None = None) -> int:
+        """How many held requests timed out with no case and no contest.
+
+        Counted beside `dismissed_count` and never folded into it: an abandonment is
+        EVIDENCE about the classifier, not a verdict on it. A worker that walks away from
+        a block is usually routing around a false positive, and until this existed that
+        signal was discarded — so the measured false-positive rate was understated by
+        every one of them.
+        """
+        q = ("SELECT COUNT(*) c FROM approvals "
+             "WHERE status='expired' AND closed_as='abandoned'")
+        params: list[Any] = []
+        if wo_id:
+            q += " AND wo_id=?"
+            params.append(wo_id)
+        return int(self.conn.execute(q, params).fetchone()["c"])
 
     def dismissed_count(self, wo_id: str | None = None) -> int:
         """How many gate requests turned out not to be gated actions at all.

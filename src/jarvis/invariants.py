@@ -606,7 +606,8 @@ def _waiting_on_neo_gate(store: ProjectStore, wo: dict[str, Any]) -> bool:
 
     A `pending` request is with Neo. An `awaiting_case` one is with the WORKER, which
     still asks the user for nothing: it is held precisely because nobody has argued it
-    yet, and the OS refuses it on a timer if nobody ever does (`gates.sweep_unargued`).
+    yet, and the OS closes it as abandoned on a timer if nobody ever does
+    (`gates.sweep_unargued`).
     Omitting the second reads the park as the generic "waiting on your input" — the
     false flag GitHub issue 100 was, arrived at down a different road.
     """

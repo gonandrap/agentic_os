@@ -108,6 +108,10 @@ GATE_META = {
     "denied":    {"word": "denied",    "icon": "✗", "tone": "bad"},
     "dismissed": {"word": "not a gate", "icon": "⊘", "tone": "muted"},
     "expired":   {"word": "expired",   "icon": "–", "tone": "muted"},
+    # Not a status but a DISPLAY state: `expired` with `closed_as='abandoned'`. Its own
+    # word because nobody reviewed it — calling that "expired" alongside a lapsed grant
+    # hides the one gate outcome that is evidence of a classifier defect (spec 2026-09-12).
+    "abandoned": {"word": "abandoned, never reviewed", "icon": "⊗", "tone": "muted"},
 }
 
 # How often the dashboard re-reads OS state. Not a page reload — the browser swaps
@@ -225,15 +229,27 @@ def _version_for_badge(version: str) -> str:
 def _false_positive_rate(rows: list) -> str | None:
     """"3 of 11 (27%)" — how often the gate fired on a command that ships nothing.
 
-    Measured over requests that were actually ruled on. Pending ones are excluded
-    because they have no answer yet, and including them would drag the rate down
-    towards zero simply by being slow to review.
+    Measured over requests a reviewer actually ruled on, and the set is named
+    POSITIVELY: `status != "pending"` also swept in `awaiting_case` rows nobody has
+    seen and `expired` ones nobody decided, both of which dilute the rate by sitting
+    in the denominator as non-dismissals. A gate state enumerated by negation gets
+    every new state wrong (kn-8d77ab41).
     """
-    ruled = [g for g in rows if g["status"] != "pending"]
+    ruled = [g for g in rows if g["status"] in ("approved", "denied", "dismissed")]
     if not ruled:
         return None
     n = sum(1 for g in ruled if g["status"] == "dismissed")
     return f"{n} of {len(ruled)} ({round(100 * n / len(ruled))}%)"
+
+
+def _abandoned(rows: list) -> int:
+    """Held requests whose worker never came back — no case, no contest.
+
+    Beside the rate, never inside it. Nobody reviewed one, so it is evidence about the
+    classifier rather than a verdict on it — and on the evidence so far, mostly false
+    positives a worker routed around. Spec 2026-09-12 §5.
+    """
+    return sum(1 for g in rows if g["closed_as"] == "abandoned")
 
 
 def gate_badge() -> int | None:
@@ -1007,7 +1023,8 @@ def create_app() -> FastAPI:
                       escalated=[g for g in pending if g["escalated"]],
                       with_neo=[g for g in pending if not g["escalated"]],
                       decided=decided, dismissed=dismissed,
-                      false_positive_rate=_false_positive_rate(rows))
+                      false_positive_rate=_false_positive_rate(rows),
+                      abandoned=_abandoned(rows))
 
     @app.get("/config", response_class=HTMLResponse)
     def config_page(request: Request, a: str = "", b: str = "", scope: str = "",

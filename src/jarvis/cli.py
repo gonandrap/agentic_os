@@ -13,7 +13,8 @@ Grouped commands:
                                           each answer came from
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
   jarvis fo create|list|show|plan|submit|approve|cancel feature orders (planned sets)
-  jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
+  jarvis gate request|contest|list|show|approve|deny|dismiss  privileged-action
+                                          approvals (contest = the match was wrong)
   jarvis gate rules|rule-retract|explain  what counts as privileged, and what the OS
                                           has LEARNED does not
   jarvis neo list|show|review|answer|learnings|learn|export
@@ -523,6 +524,17 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--why", default="", help="why this is ready to ship")
     g.add_argument("--evidence", default="",
                    help="PR number, test results, checks — the reviewer sees only this")
+    g.add_argument("--project")
+    g = ga.add_parser(
+        "contest",
+        help="(workers) dispute the MATCH: this command performs no privileged action. "
+             "Reaches the reviewer as a candidate dismissal, and authorises nothing",
+    )
+    g.add_argument("wo_id")
+    g.add_argument("command", help="the EXACT command that was blocked")
+    g.add_argument("--why", required=True,
+                   help="why this performs no privileged action — where the matched "
+                        "text sits, and what the command really does")
     g.add_argument("--project")
     g = ga.add_parser("list", help="approval requests, newest first")
     g.add_argument("--project")
@@ -1774,9 +1786,13 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # Every assumption, each with its `n` and `status` — §4.
                 "assumptions": store.all_assumptions(args.wo_id),
                 # What this work order was allowed (or refused) permission to ship.
+                # `contested` and `closed_as` ride along because `status` alone cannot say
+                # what happened: a contested row is a claim about the classifier, not a
+                # request to ship, and an `expired` one is three different outcomes.
                 "gates": [
                     {k: a[k] for k in ("id", "kind", "command", "status", "escalated",
-                                       "decided_by", "decision_reason")}
+                                       "contested", "closed_as", "decided_by",
+                                       "decision_reason")}
                     for a in store.list_approvals(args.wo_id)
                 ],
                 # Additive, and always present under `--json` even when empty: a key
@@ -1973,6 +1989,7 @@ def _print_gate_rules(data: dict) -> None:
     rules = data["rules"]
     if not rules:
         print("no gate rules")
+        _print_classifier_stats(data.get("classifier") or {})
         return
     for role in ("match", "exempt", "canary"):
         group = [r for r in rules if r["role"] == role]
@@ -2000,15 +2017,39 @@ def _print_gate_rules(data: dict) -> None:
             print(f"    {f['command'].splitlines()[0]} ({f['kind']}): {f['why']}")
     else:
         print("\n✓ every command that must gate still gates")
+    _print_classifier_stats(data.get("classifier") or {})
+
+
+def _print_classifier_stats(stats: dict) -> None:
+    """How wrong the recogniser has been, and how often nobody stayed to say so.
+
+    The exemptions above are what the OS LEARNED; these two numbers are what it cost to
+    learn them, and the second one is the part that used to be invisible. An abandoned
+    request is a worker that hit a block, was offered only "argue this is ready to ship",
+    and walked away — usually from a false positive. It is printed beside the rate and
+    never inside it: evidence is not a verdict. Spec 2026-09-12 §5.
+    """
+    if not stats or not stats.get("requests"):
+        return
+    print(f"\nthe recogniser's own record, over {stats['requests']} request(s): "
+          f"{stats['dismissed']} dismissed as false positives, "
+          f"{stats['abandoned']} abandoned unargued")
+    if stats["abandoned"]:
+        print("    an abandoned request was never reviewed by anyone — on the evidence "
+              "so far these are mostly false positives a worker routed around, so the "
+              "dismissed count understates the real error rate by roughly this much.")
 
 
 def cmd_gate(args: argparse.Namespace) -> int:
-    from . import ops
+    from . import gates, ops
 
     if args.ga_cmd == "request":
         _print(ops.request_gate_approval(
             args.wo_id, args.command, why=args.why, evidence=args.evidence,
             project_name=args.project), args.json)
+    elif args.ga_cmd == "contest":
+        _print(ops.contest_gate_match(args.wo_id, args.command, why=args.why,
+                                      project_name=args.project), args.json)
     elif args.ga_cmd == "list":
         rows = ops.list_gates(project_name=args.project, wo_id=args.wo,
                               pending_only=args.pending)
@@ -2024,17 +2065,23 @@ def cmd_gate(args: argparse.Namespace) -> int:
                     # Never "pending": nobody is holding it. It is the worker's move.
                     state = "awaiting the worker's case — no reviewer sees it yet"
                 elif r["status"] == "pending":
-                    state = f"pending (with {where})"
+                    state = (f"contested, pending (with {where})" if r["contested"]
+                             else f"pending (with {where})")
                 elif r["status"] == "dismissed":
                     state = f"dismissed by {r['decided_by'] or '?'} — not a gated action"
+                elif r["closed_as"] == "abandoned":
+                    # Not a verdict, and it must not print as one: nobody reviewed it.
+                    state = "abandoned — no case was ever made, nothing was decided"
                 else:
                     state = f"{r['status']} by {r['decided_by'] or '?'}"
                 print(f"{icon} {r['id']} [{r['project']}] {r['kind']} · {state} "
                       f"· {r['wo_id']} · {_age(r['ts'])} ago")
                 print(f"    {r['command']}")
                 if r["status"] == "awaiting_case":
-                    print(f"    ↳ jarvis gate request {r['wo_id']} \"{r['command']}\" "
-                          f"--why \"...\" --evidence \"...\"   (the worker's move)")
+                    print(f"    ↳ {gates.request_command(r['wo_id'], r['command'], '...', '...')}"
+                          f"   (the worker's move)")
+                    print(f"    ↳ {gates.contest_command(r['wo_id'], r['command'], '...')}"
+                          f"   (…or this, if the gate matched it by mistake)")
                 elif r["status"] == "pending" and r["escalated"]:
                     print(f"    ↳ Neo escalated: {r['escalation_reason']}")
                     print(f"    ↳ jarvis gate approve {r['id']} --reason \"...\"  |  "

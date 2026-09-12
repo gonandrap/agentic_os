@@ -310,7 +310,7 @@ def test_first_attempt_is_blocked_and_the_request_is_held_not_reviewed(gated):
     # ...and that nothing happens until it argues the thing, and by when.
     assert "jarvis gate request" in _reason(result)
     assert "NOBODY IS REVIEWING IT YET" in _reason(result)
-    assert "refused" in _reason(result)
+    assert "ABANDONED" in _reason(result)
 
     # No question exists, so no reviewer can read the placeholder justification.
     neo = NeoStore()
@@ -1223,3 +1223,106 @@ def test_a_dismissed_gate_asks_nothing_of_the_user(gated):
 
     wo = gated.store.get_work_order(gated.wo["id"])
     assert invariants.true_blockers(gated.store, wo) == []
+
+
+# -- both exits, wherever a worker is blocked -----------------------------------------
+#
+# The defect: the block offered one exit, and it was the wrong one for a false positive.
+# docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §3.
+
+
+def _names_both_exits(text, wo_id, command):
+    """The property every blocking surface must have, asserted in one place.
+
+    Pinned as a shared predicate rather than three copies of the literals: the rendered
+    line is the only thing each reader gets, so a flag renamed in one surface and not the
+    others is advice that no longer parses (kn-467d1ecd).
+    """
+    assert f'jarvis gate explain "{command}"' in text
+    assert gates.request_command(wo_id, command) in text
+    assert gates.contest_command(wo_id, command) in text
+
+
+def test_the_block_names_the_diagnosis_and_both_exits(gated):
+    """A worker that cannot tell which exit it needs is told to run `explain` first."""
+    reason = _reason(gated.attempt("./scripts/shipit.sh"))
+
+    _names_both_exits(reason, gated.wo["id"], "./scripts/shipit.sh")
+    assert reason.index("gate explain") < reason.index("gate request")
+
+
+def test_the_retry_message_names_them_too(gated):
+    """The second block is where the first three abandonments happened: the worker ran
+    the command again, was told only to argue for it, and gave up."""
+    gated.attempt("./scripts/shipit.sh")
+    reason = _reason(gated.attempt("./scripts/shipit.sh"))
+
+    assert "NOT under review" in reason
+    _names_both_exits(reason, gated.wo["id"], "./scripts/shipit.sh")
+
+
+def test_the_abandonment_message_names_them_as_well(gated):
+    """The last surface that reaches a worker about this command."""
+    gated.attempt("./scripts/shipit.sh")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+
+    text = gates.abandoned_message(approval, gates.DEFAULT_CASE_TTL_SECONDS)
+
+    _names_both_exits(text, gated.wo["id"], "./scripts/shipit.sh")
+
+
+def test_a_second_block_after_an_abandonment_says_so(gated):
+    """One repetition of the failure is a worker that lost a turn; two is a habit."""
+    gated.attempt("./scripts/shipit.sh")
+    gated.store.conn.execute("UPDATE approvals SET ts = ts - 7200")
+    gates.sweep_unargued(gated.store, gates.DEFAULT_CASE_TTL_SECONDS)
+
+    reason = _reason(gated.attempt("./scripts/shipit.sh"))
+    assert "ABANDONED" in reason
+    _names_both_exits(reason, gated.wo["id"], "./scripts/shipit.sh")
+
+
+def test_the_contest_question_carries_the_structural_reading(gated):
+    """The reviewer's premise check is about the command's shape, and the shape is the
+    one input to the review the worker did not write."""
+    command = "./scripts/shipit.sh"
+    action = gates.classify(command, ALL_GATES)
+    text = gates.build_contest_question(action, gated.wo, "I say this is only a mention")
+
+    assert text.startswith(gates.CONTEST_HEADER)
+    assert "in executable position" in text
+    assert "TWO verdicts" in text
+
+
+def test_the_ttls_old_denials_are_re_filed_as_abandonments(gated):
+    """The rows already on the record. Every one was written by the OS with nobody
+    having reviewed anything, and `denied` on a gate asserts that a reviewer refused a
+    privileged action — spec 2026-09-12 §4."""
+    from jarvis.project_store import ProjectStore
+
+    gated.attempt("./scripts/shipit.sh")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+    # Exactly what the old sweep wrote, reproduced rather than imported: the string is
+    # history now, and a test that read it from the code could not detect its loss.
+    gated.store.conn.execute(
+        """UPDATE approvals SET status='denied', decided_by='os', decision_reason=?,
+                                closed_as='' WHERE id=?""",
+        ("no case was made for it within 10 minutes. The command was run directly, so "
+         "nothing was ever put to a reviewer.", approval["id"]),
+    )
+    # A real denial by a reviewer, which must survive untouched.
+    gated.attempt("gh pr merge 31 --squash")
+    refused = [a for a in gated.store.list_approvals(gated.wo["id"])
+               if a["id"] != approval["id"]][0]
+    gates.apply_decision(gated.store, refused["id"], verdict="denied",
+                         reason="out of scope", decided_by="neo")
+    gated.store.close()
+
+    store = ProjectStore(gated.project)        # re-open: the migration runs on __init__
+    try:
+        assert store.get_approval(approval["id"])["status"] == "expired"
+        assert store.get_approval(approval["id"])["closed_as"] == "abandoned"
+        assert store.abandoned_count() == 1
+        assert store.get_approval(refused["id"])["status"] == "denied"
+    finally:
+        store.close()
