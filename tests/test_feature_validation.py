@@ -39,7 +39,7 @@ import pytest
 
 from jarvis import claude_cli, ops
 from jarvis.catalog import load_catalog
-from jarvis.daemon import Daemon
+from jarvis.daemon import VALIDATION_ESCALATED_TITLE, Daemon
 from jarvis.invariants import VALIDATION_STUCK_BLOCKER
 from jarvis.project_store import ProjectStore
 from jarvis.testing import FIXTURE_DESIGN_DOC, fixture_spec_section, make_git_project
@@ -923,3 +923,82 @@ def test_a_feature_with_no_manager_escalates_without_calling_the_panel(fleet):
         assert store.get_feature_order(owned)["status"] == "completed"
     finally:
         store.close()
+
+
+# -- 7. the give-up reaches the user (issue #199) -------------------------------------
+
+
+def _outbox(store: ProjectStore, unit_id: str) -> list[dict]:
+    """The outbox rows this unit's give-up wrote, routed or not.
+
+    NOT `unrouted_notifications`: `Fleet.drain` ticks twice and `route_outbox` runs on
+    every tick, so a give-up escalated on the first tick is already `routed` by the time
+    the second one returns — and a test reading only the unrouted rows would see the
+    silence it was written to rule out.
+
+    SCOPED BY UNIT, because the fixture validates work orders too: the feature's own
+    MANAGER is a work order that finishes with an empty worktree and gives up on its
+    round 1, so an unfiltered read is never empty and the rejection pairing below would
+    pass for the wrong reason."""
+    return [dict(r) for r in store.conn.execute(
+        "SELECT * FROM notifications WHERE source='validation' AND title LIKE ?"
+        " ORDER BY id", (f"{unit_id}%",)).fetchall()]
+
+
+def test_a_feature_give_up_notifies_and_a_rejection_stays_silent(fleet):
+    """PAIRED: a rejection has an addressee — the manager, over the bus — and pinging the
+    user per round would bury the one transition that actually needs them. The feature
+    id lives in the TITLE because the outbox carries no feature column, and naming the
+    manager in `wo_id` would send every sink to a session instead of to the rounds."""
+    fleet.reconfigure(max_rounds=2)
+    fleet.daemon.validator = Validator(rejected("the exporter has no empty-set test"))
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+        fleet.drain()
+
+        assert _outbox(store, fo_id) == [], "round 1 was rejected, not given up on"
+        assert store.get_feature_order(fo_id)["status"] == "executing"
+
+        fleet.merge("test_exporter.py", "def test_empty():\n    assert True\n")
+        ops.submit_feature(fo_id, "added the test", evidence="pytest")
+        fleet.drain()
+
+        rows = _outbox(store, fo_id)
+        assert len(rows) == 1
+        assert rows[0]["title"] == VALIDATION_ESCALATED_TITLE.format(unit=fo_id, n=2)
+        assert rows[0]["body"] == "the exporter has no empty-set test"
+        assert (rows[0]["level"], rows[0]["wo_id"]) == ("warning", None)
+    finally:
+        store.close()
+
+
+def test_the_feature_give_up_notification_reaches_the_central_inbox(fleet):
+    """The empty-diff give-up never calls the panel, so the notification is the only
+    thing that leaves the project at all — and `route_outbox` is what carries it."""
+    from jarvis.central_store import CentralStore
+
+    fleet.daemon.validator = Validator(passed())
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.land_children(fo_id, store)  # nothing merged: escalates on the empty diff
+        fleet.drain()
+        fleet.tick()  # `route_outbox` carries what the give-up wrote
+        rows = _outbox(store, fo_id)
+        assert len(rows) == 1 and rows[0]["status"] == "routed"
+    finally:
+        store.close()
+
+    central = CentralStore()
+    try:
+        rows = [i for i in central.unacked_inbox()
+                if i["title"].startswith(fo_id)]
+    finally:
+        central.close()
+    assert len(rows) == 1
+    assert rows[0]["title"] == VALIDATION_ESCALATED_TITLE.format(unit=fo_id, n=1)
+    assert "nothing has changed on the default branch" in rows[0]["body"]
+    assert (rows[0]["level"], rows[0]["project"]) == ("warning", "proj_a")
