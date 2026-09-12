@@ -28,6 +28,9 @@ Two invariants inherited from the knowledge base work:
 
 from __future__ import annotations
 
+#: The full protocol spells its `--evidence` placeholder out, where the one-line summary
+#: of it and every hook denial use the short form. Only the wording differs.
+EXACT_EVIDENCE = "<PR number, test results, checks>"
 WO_PLACEHOLDER = "<wo-id>"
 PROJECT_PLACEHOLDER = "<project>"
 
@@ -198,6 +201,8 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
     last-message-is-the-record rule are behaviourally load-bearing and stay in the
     opening prompt. Everything explanatory moved behind `jarvis brief`.
     """
+    from .gates import case_command
+
     lines = [
         "# Operating contract",
         "You MUST follow it. This is the compressed core; the full contract with "
@@ -240,8 +245,8 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             f"- Privileged actions ({', '.join(gate_names)}) are gated, NOT "
             f"forbidden: an attempt is blocked, filed for review, and the gate's "
             f"full instructions arrive when one fires. You make a stronger case by "
-            f"asking first — `jarvis gate request {wo_id} \"<the exact command>\" "
-            f"--why \"<why this is ready>\" --evidence \"<PR, tests, checks>\"` "
+            f"asking first — "
+            f"`{case_command(wo_id, '<the exact command>')}` "
             f"(full protocol: `jarvis brief gates --wo {wo_id}`).",
         ] if gate_names else []),
         f"- **A turn is one-shot and NOTHING wakes you when a background job "
@@ -556,7 +561,7 @@ def gates_section(wo_id: str = WO_PLACEHOLDER,
     did; without project context every kind is described, with a note, because the
     section must always render something true.
     """
-    from .gates import KINDS
+    from .gates import KINDS, case_command
 
     live = [k for k in KINDS if k.name in enabled] if enabled else list(KINDS)
     lines = [
@@ -574,9 +579,7 @@ def gates_section(wo_id: str = WO_PLACEHOLDER,
         "",
         "ASK FIRST. This is the only command that starts a review, because the "
         "reviewer sees ONLY the text you write:",
-        f"    jarvis gate request {wo_id} \"<the exact command>\" "
-        f"--why \"<why this is ready>\" --evidence \"<PR number, test results, "
-        f"checks>\"",
+        f"    {case_command(wo_id, '<the exact command>', evidence=EXACT_EVIDENCE)}",
         "",
         "Attempting one directly is safe but it is NOT a request. The attempt is "
         "blocked and the OS records it, holding it back from review precisely "

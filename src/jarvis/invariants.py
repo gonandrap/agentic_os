@@ -839,9 +839,13 @@ def check_no_orphan_gate_requests(store: ProjectStore) -> Iterator[Violation]:
 
     Repairable: close the request as superseded. It is not a verdict and authorises
     nothing (see `ProjectStore.supersede_approval`); the command string stays blocked.
+
+    Held requests count. One is further from a verdict than a pending one, not closer:
+    no question exists for Neo to answer, and the only thing that would ever have closed
+    it is a worker that is gone.
     """
     for wo in store.list_work_orders(statuses=TERMINAL_STATUSES, include_hidden=True):
-        for approval in store.pending_approvals(wo["id"]):
+        for approval in store.open_approvals(wo["id"]):
             store.supersede_approval(approval["id"], (
                 f"work order is {wo['status']} — no worker is left to run this command, "
                 f"so there is nothing to authorise or refuse"

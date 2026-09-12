@@ -2003,7 +2003,7 @@ def _print_gate_rules(data: dict) -> None:
 
 
 def cmd_gate(args: argparse.Namespace) -> int:
-    from . import ops
+    from . import gates, ops
 
     if args.ga_cmd == "request":
         _print(ops.request_gate_approval(
@@ -2033,8 +2033,9 @@ def cmd_gate(args: argparse.Namespace) -> int:
                       f"· {r['wo_id']} · {_age(r['ts'])} ago")
                 print(f"    {r['command']}")
                 if r["status"] == "awaiting_case":
-                    print(f"    ↳ jarvis gate request {r['wo_id']} \"{r['command']}\" "
-                          f"--why \"...\" --evidence \"...\"   (the worker's move)")
+                    make_case = gates.case_command(r["wo_id"], r["command"],
+                                                   why="...", evidence="...")
+                    print(f"    ↳ {make_case}   (the worker's move)")
                 elif r["status"] == "pending" and r["escalated"]:
                     print(f"    ↳ Neo escalated: {r['escalation_reason']}")
                     print(f"    ↳ jarvis gate approve {r['id']} --reason \"...\"  |  "
