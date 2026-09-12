@@ -134,12 +134,15 @@
     {% if false_positive_rate %}
     <span class="counts">false-positive rate: {{ false_positive_rate }} of all gates ruled on</span>
     {% endif %}
-    {% if abandoned %}
-    <span class="counts">{{ abandoned }} more were abandoned: a worker was blocked, made no
-      case and contested nothing, so nobody ever ruled. Those are not counted above and are
-      mostly false positives somebody routed around.</span>
-    {% endif %}
   </p>
+  {% if abandoned %}
+  <p class="kv">
+    <span class="counts">{{ abandoned }} more were abandoned</span> — a worker was blocked,
+    made no case and contested nothing, so nobody ever ruled on them. They are NOT in the
+    rate above, and on the evidence so far they are mostly false positives somebody routed
+    around rather than contested.
+  </p>
+  {% endif %}
   <table>
     <tr><th>#</th><th>project / wo</th><th>gate</th><th>command</th>
         <th>what the recogniser got wrong</th><th>by</th><th>age</th></tr>

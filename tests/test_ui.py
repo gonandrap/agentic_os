@@ -1941,3 +1941,45 @@ def test_the_feature_page_names_its_manager_order(client, project):
     plain = client.get(f"/fo/proj_a/{without['id']}")
     assert plain.status_code == 200
     assert "manager:" not in plain.text
+
+
+# -- a contested match on the page (spec 2026-09-12) ----------------------------------
+
+
+def test_a_contested_gate_offers_no_approve_button(gated):
+    """The page's verbs are the user's options. A contest argues the command performs no
+    privileged action, so there is nothing here to authorise — and `ops.decide_gate`
+    refuses an approval on one, which would make the button an error page."""
+    ops.contest_gate_match(gated.wo_id, "./scripts/shipit.sh",
+                           why="the literal is inside a message body")
+    gated.daemon._neo_drain()          # the fake escalates by default
+
+    page = gated.client.get("/gates").text
+    assert "CONTESTED" in page
+    assert "the literal is inside a message body" in page
+    assert 'value="dismiss"' in page and 'value="deny"' in page
+    assert 'value="approve"' not in page
+
+
+def test_an_abandoned_request_is_not_shown_as_expired(gated):
+    """`expired` is three different outcomes and only one of them is evidence about the
+    classifier. A row nobody ever reviewed must not read like a grant that ran out."""
+    from jarvis.hooks import preflight_decision
+
+    settings = json.loads(
+        (gated.project / ".jarvis" / "worker-settings"
+         / f"{gated.wo_id}.json").read_text())
+    preflight_decision({"tool_name": "Bash",
+                        "tool_input": {"command": "./scripts/shipit.sh"},
+                        "cwd": str(gated.project)}, settings["env"])
+    store = ProjectStore(gated.project)
+    try:
+        store.conn.execute("UPDATE approvals SET ts = ts - 7200")
+        gates.sweep_unargued(store, gates.DEFAULT_CASE_TTL_SECONDS)
+    finally:
+        store.close()
+
+    page = gated.client.get("/gates").text
+    assert "abandoned, never reviewed" in page
+    # ...and counted beside the false-positive rate rather than inside it.
+    assert "1 more were abandoned" in page
