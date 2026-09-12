@@ -572,13 +572,19 @@ def gates_section(wo_id: str = WO_PLACEHOLDER,
         ]
     lines += [
         "",
-        "Attempting one directly is safe: the attempt is blocked, a request is "
-        "filed automatically, and you are told to wait. But you make a much "
-        "stronger case by asking first, because the reviewer sees ONLY the text "
-        "you write:",
+        "ASK FIRST. This is the only command that starts a review, because the "
+        "reviewer sees ONLY the text you write:",
         f"    jarvis gate request {wo_id} \"<the exact command>\" "
         f"--why \"<why this is ready>\" --evidence \"<PR number, test results, "
         f"checks>\"",
+        "",
+        "Attempting one directly is safe but it is NOT a request. The attempt is "
+        "blocked and the OS records it, holding it back from review precisely "
+        "because you have argued nothing yet — so nobody is looking at it, and "
+        "retrying the command will not change that. Run the command above and it "
+        "becomes the same request, now with your case; it is never a second one, "
+        "because one action gets one review. Leave it unargued and the OS refuses "
+        "it unreviewed once its window runs out.",
         "",
         "Then END YOUR TURN. The verdict arrives as your next user turn. If "
         "approved, run that exact command — the approval is scoped to that one "

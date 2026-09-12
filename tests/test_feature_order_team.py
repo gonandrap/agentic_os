@@ -417,6 +417,9 @@ def test_the_reviewer_is_told_a_seat_attempted_it(gated):
     store, wo, env = gated
 
     handle_hook(gate_payload("gh pr merge 12 --squash", "jarvis-architect"), env)
+    # The hook only records it; the lead makes the case, which is what writes the
+    # reviewer's question — so the seat has to survive the hold to reach the prose.
+    ops.request_gate_approval(wo["id"], "gh pr merge 12 --squash", why="CI is green")
 
     approval = store.list_approvals(wo["id"])[0]
     question = ops.show_gate(approval["id"])["neo_question"]
@@ -444,6 +447,7 @@ def test_the_lead_still_gets_an_unqualified_line(gated):
 
     store, wo, env = gated
     handle_hook(gate_payload("gh pr merge 12 --squash"), env)
+    ops.request_gate_approval(wo["id"], "gh pr merge 12 --squash", why="CI is green")
 
     rows = timeline.build_timeline(wo, store.list_events(wo["id"]), [])
     asked = [r for r in rows if r["kind"] == "gate_requested"]

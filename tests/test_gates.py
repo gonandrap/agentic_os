@@ -270,25 +270,60 @@ def gated(jarvis_home, project):
                 {"tool_name": "Bash", "tool_input": {"command": command},
                  "cwd": str(project)}, env)
 
+        def request(self, command, why="tests are green", evidence=""):
+            """Attempt it, then argue it — a compliant worker's two moves, in one call.
+
+            The attempt alone leaves the request `awaiting_case` and in front of nobody
+            (gates.AWAITING_CASE), so every test that needs a request UNDER REVIEW has to
+            make the case too. Mirrors `ops.request_gate_approval` without a catalog.
+            """
+            self.attempt(command)
+            action = gates.classify(command, ALL_GATES)
+            approval = store.latest_approval_for(wo["id"], action.kind, action.command)
+            neo = NeoStore()
+            try:
+                gates.amend_request(store, neo, wo, action, approval,
+                                    justification=why, evidence=evidence)
+                gates.queue_for_review(store, neo, "proj_a", wo, action,
+                                       store.get_approval(approval["id"]))
+            finally:
+                neo.close()
+            return store.get_approval(approval["id"])
+
     yield Handle()
     store.close()
 
 
-def test_first_attempt_is_blocked_and_files_a_request(gated):
+def test_first_attempt_is_blocked_and_the_request_is_held_not_reviewed(gated):
+    """Running the command is not a request. The row is recorded and nobody sees it."""
     result = gated.attempt("gh pr merge 31 --squash")
 
     assert _decision(result) == "deny"
     approvals = gated.store.list_approvals(gated.wo["id"])
     assert len(approvals) == 1
     assert approvals[0]["kind"] == "pr_merge"
-    assert approvals[0]["status"] == "pending"
+    assert approvals[0]["status"] == gates.AWAITING_CASE
     assert approvals[0]["command"] == "gh pr merge 31 --squash"
+    assert approvals[0]["neo_question_id"] is None
     # The worker must be told to stop, or it burns its turn retrying.
     assert "END YOUR TURN" in _reason(result)
-    # ...and told how to make a real case next time.
+    # ...and that nothing happens until it argues the thing, and by when.
     assert "jarvis gate request" in _reason(result)
+    assert "NOBODY IS REVIEWING IT YET" in _reason(result)
+    assert "refused" in _reason(result)
 
-    # The request is queued for Neo, as an approval rather than an open question.
+    # No question exists, so no reviewer can read the placeholder justification.
+    neo = NeoStore()
+    try:
+        assert neo.list_questions() == []
+    finally:
+        neo.close()
+
+
+def test_making_the_case_is_what_puts_the_request_in_front_of_a_reviewer(gated):
+    approval = gated.request("gh pr merge 31 --squash", why="CI is green on 31")
+
+    assert approval["status"] == "pending"
     neo = NeoStore()
     try:
         questions = neo.list_questions()
@@ -296,6 +331,9 @@ def test_first_attempt_is_blocked_and_files_a_request(gated):
         assert questions[0]["kind"] == "approval"
         assert questions[0]["wo_id"] == gated.wo["id"]
         assert "gh pr merge 31 --squash" in questions[0]["question"]
+        # The first thing any reviewer reads is the case, never the placeholder.
+        assert "CI is green on 31" in questions[0]["question"]
+        assert gates.NO_CASE_JUSTIFICATION not in questions[0]["question"]
     finally:
         neo.close()
 
@@ -307,7 +345,7 @@ def test_worker_parked_on_a_gate_is_marked_waiting_not_running(gated):
 
 def test_retrying_while_under_review_does_not_file_a_second_request(gated):
     """A worker that loops on the command must not flood Neo's queue."""
-    gated.attempt("gh pr merge 31")
+    gated.request("gh pr merge 31")
     second = gated.attempt("gh pr merge 31")
 
     assert _decision(second) == "deny"
@@ -316,6 +354,23 @@ def test_retrying_while_under_review_does_not_file_a_second_request(gated):
     neo = NeoStore()
     try:
         assert len(neo.list_questions()) == 1
+    finally:
+        neo.close()
+
+
+def test_retrying_a_held_request_says_the_review_has_not_started(gated):
+    """The loop the worker must break out of is different here: it is not waiting for a
+    verdict, it is withholding the case that would produce one."""
+    gated.attempt("gh pr merge 31")
+    second = gated.attempt("gh pr merge 31")
+
+    assert _decision(second) == "deny"
+    assert "NOT under review" in _reason(second)
+    assert "jarvis gate request" in _reason(second)
+    assert len(gated.store.list_approvals(gated.wo["id"])) == 1
+    neo = NeoStore()
+    try:
+        assert neo.list_questions() == []
     finally:
         neo.close()
 
@@ -510,7 +565,7 @@ def test_a_gate_with_neo_costs_the_user_no_attention(gated):
 def test_an_escalated_gate_does_ask_for_the_user(gated):
     from jarvis.invariants import true_blockers
 
-    gated.attempt("./scripts/shipit.sh")
+    gated.request("./scripts/shipit.sh")
     approval = gated.store.list_approvals(gated.wo["id"])[0]
     gated.store.mark_approval_escalated(approval["id"], "release touches production")
 
@@ -522,7 +577,7 @@ def test_an_escalated_gate_does_ask_for_the_user(gated):
 
 def test_escalated_gate_stays_pending_so_the_user_can_still_open_it(gated):
     """Neo declining must not close the request — the user needs a row to act on."""
-    gated.attempt("./scripts/shipit.sh")
+    gated.request("./scripts/shipit.sh")
     approval = gated.store.list_approvals(gated.wo["id"])[0]
     gated.store.mark_approval_escalated(approval["id"], "nope")
 
@@ -805,7 +860,7 @@ def test_the_timeline_does_not_call_a_dismissed_run_an_approved_command(gated):
 
 
 def test_apply_decision_refuses_a_verdict_it_does_not_understand(gated):
-    gated.attempt("gh pr merge 31")
+    gated.request("gh pr merge 31")
     approval = gated.store.list_approvals(gated.wo["id"])[0]
 
     with pytest.raises(ValueError):
@@ -952,7 +1007,7 @@ def test_a_decorated_retry_does_not_leave_a_gate_open_after_the_action_ran(gated
     assert _decision(gated.attempt(WRAPPED)) == "deny"
     duplicate = [a for a in gated.store.list_approvals(gated.wo["id"])
                  if a["id"] != approval["id"]][0]
-    assert duplicate["status"] == "pending"
+    assert duplicate["status"] == gates.AWAITING_CASE
 
     # ...then it runs the command it was actually given. The release happens here.
     assert _decision(gated.attempt(STAGED)) == "allow"
@@ -964,6 +1019,7 @@ def test_a_decorated_retry_does_not_leave_a_gate_open_after_the_action_ran(gated
     assert closed["decided_by"] == "os"
     assert "approved request" in closed["decision_reason"]
     assert gated.store.pending_approvals(gated.wo["id"]) == []
+    assert gated.store.held_approvals(gated.wo["id"]) == []
 
 
 def test_closing_a_superseded_request_authorises_nothing(gated):
@@ -975,8 +1031,9 @@ def test_closing_a_superseded_request_authorises_nothing(gated):
     retry = gated.attempt(WRAPPED)
 
     assert _decision(retry) == "deny"
-    # ...and it gets a real review rather than silently vanishing.
-    assert len(gated.store.pending_approvals(gated.wo["id"])) == 1
+    # ...and it gets a real request rather than silently vanishing. Held, because the
+    # worker argued nothing — one `jarvis gate request` away from a real review.
+    assert len(gated.store.held_approvals(gated.wo["id"])) == 1
 
 
 def test_a_shorter_command_is_never_superseded_by_a_longer_approval(gated):
@@ -988,7 +1045,7 @@ def test_a_shorter_command_is_never_superseded_by_a_longer_approval(gated):
 
     assert _decision(gated.attempt(STAGED)) == "allow"
 
-    assert gated.store.get_approval(bare["id"])["status"] == "pending"
+    assert gated.store.get_approval(bare["id"])["status"] == gates.AWAITING_CASE
 
 
 def test_an_approval_does_not_supersede_a_request_at_another_gate(gated):
@@ -997,7 +1054,7 @@ def test_an_approval_does_not_supersede_a_request_at_another_gate(gated):
     _approved(gated, STAGED)
     gated.attempt(STAGED)
 
-    assert gated.store.get_approval(merge["id"])["status"] == "pending"
+    assert gated.store.get_approval(merge["id"])["status"] == gates.AWAITING_CASE
 
 
 def test_a_dismissal_opening_a_gate_supersedes_nothing(gated):
@@ -1013,12 +1070,12 @@ def test_a_dismissal_opening_a_gate_supersedes_nothing(gated):
 
     gated.attempt(DEPLOY)  # goes through on the dismissal
 
-    assert gated.store.get_approval(other["id"])["status"] == "pending"
+    assert gated.store.get_approval(other["id"])["status"] == gates.AWAITING_CASE
 
 
 def test_the_reviewer_is_shown_the_work_orders_earlier_gate_requests(gated):
     _approved(gated, STAGED, reason="three PRs, CI green")
-    gated.attempt(WRAPPED)
+    gated.request(WRAPPED)
 
     neo = NeoStore()
     try:
@@ -1034,7 +1091,7 @@ def test_the_reviewer_is_shown_the_work_orders_earlier_gate_requests(gated):
 
 
 def test_the_first_request_on_a_work_order_carries_no_history_block(gated):
-    gated.attempt(DEPLOY)
+    gated.request(DEPLOY)
 
     neo = NeoStore()
     try:

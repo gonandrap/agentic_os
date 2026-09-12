@@ -176,20 +176,37 @@ def gated(jarvis_home, project, store):
             {"tool_name": "Bash", "tool_input": {"command": command},
              "cwd": str(project)}, env)
 
-    return wo, attempt
+    def argue(command, why="tests are green"):
+        """Attempt it and then make its case — what puts a request in front of Neo.
+
+        The attempt alone leaves it `awaiting_case` with no question at all
+        (gates.AWAITING_CASE), and a question is the whole subject of this file.
+        """
+        attempt(command)
+        action = gates.classify(command, all_gates)
+        approval = store.latest_approval_for(wo["id"], action.kind, action.command)
+        n = NeoStore()
+        try:
+            gates.amend_request(store, n, wo, action, approval, justification=why)
+            gates.queue_for_review(store, n, "proj_a", wo, action,
+                                   store.get_approval(approval["id"]))
+        finally:
+            n.close()
+        return store.get_approval(approval["id"])
+
+    return wo, attempt, argue
 
 
 @pytest.fixture()
 def escalated_duplicate(gated, store, neo):
     """Production 118's exact state: the approved command has run, and a decorated
     duplicate of it is still escalated to the user."""
-    wo, attempt = gated
+    wo, attempt, argue = gated
     attempt(STAGED)
     approval = store.latest_approval_for(wo["id"], "release", STAGED)
     gates.apply_decision(store, approval["id"], verdict="approved", reason="ok",
                          decided_by="neo")
-    attempt(WRAPPED)                                  # blocked; files the duplicate
-    duplicate = store.latest_approval_for(wo["id"], "release", WRAPPED)
+    duplicate = argue(WRAPPED)                        # blocked; the duplicate is argued
     store.mark_approval_escalated(duplicate["id"], "an unjustified real release")
     neo.mark(duplicate["neo_question_id"], "escalated", reason="the user must rule")
     return wo, attempt, approval, duplicate
@@ -224,10 +241,9 @@ def test_closing_that_escalation_records_no_authorisation(escalated_duplicate, s
 
 def test_a_gate_still_pending_keeps_its_escalation(gated, store, neo):
     """The whole point of a gate: while the request is undecided the question is real."""
-    wo, attempt = gated
-    attempt(STAGED)
-    approval = store.latest_approval_for(wo["id"], "release", STAGED)
-    store.mark_approval_escalated(approval["id"], "no justification")
+    wo, attempt, argue = gated
+    approval = argue(STAGED)
+    store.mark_approval_escalated(approval["id"], "not enough evidence")
     neo.mark(approval["neo_question_id"], "escalated", reason="the user must rule")
 
     check_project(store, repair=True)

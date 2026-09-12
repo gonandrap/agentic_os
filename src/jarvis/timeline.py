@@ -265,7 +265,16 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # The seat, when a subagent tripped the gate. `add_approval` only writes the key
         # when there is one, so the unqualified line is still what a plain worker gets.
         who = f" (seat `{p['agent_type']}`)" if p.get("agent_type") else ""
-        return (f"Asked permission to {p.get('kind') or 'act'}{who}",
+        # A held request was RECORDED, not asked: the worker ran the command and no
+        # reviewer has been shown anything. "Asked permission" would credit it with a
+        # review that has not started — see gates.AWAITING_CASE.
+        verb = ("Ran a gated command — request recorded, awaiting its case"
+                if p.get("held") else f"Asked permission to {p.get('kind') or 'act'}")
+        return (f"{verb}{who}", p.get("command") or "")
+    if kind == "gate_amended":
+        # Not a second request — the same one, better argued. Said that way because a
+        # reader counting attempts at a privileged action must not count this as one.
+        return (f"Made the case for the pending `{p.get('kind') or 'gate'}` request",
                 p.get("command") or "")
     if kind == "gate_decided":
         verb = "Approved" if p.get("decision") == "approved" else "Denied"
