@@ -1304,6 +1304,13 @@ class Daemon:
         you" transition tells the user without being asked. `_reject` deliberately stays
         silent — its feedback travels to the worker over the bus — so the give-up is the
         only transition in this machine that pings.
+
+        NO NEO PRE-STEP, and it is not an oversight (Neo, question 254). By the time a
+        give-up could be reviewed the round is closed and the unit is `needs_review`, and
+        `invariants.true_blockers` re-derives VALIDATION_STUCK_BLOCKER from exactly that
+        pair on every reconcile tick — so a verdict of "do not bother the user" cannot
+        take the attention item down, and the call would buy one suppressed sink message
+        and nothing else. It becomes worth asking only if Neo may also SETTLE the unit.
         """
         from .invariants import VALIDATION_STUCK_BLOCKER
 
