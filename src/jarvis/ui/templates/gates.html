@@ -45,9 +45,42 @@
   ones it declines to decide reach this page as yours.
   <span class="counts">({{ escalated|length }} waiting on you ·
   {{ with_neo|length }} with Neo ·
+  {{ held|length }} awaiting the worker's case ·
   {{ decided|length }} decided ·
   {{ dismissed|length }} not gated actions)</span>
 </p>
+
+{# The fifth state, and the one that reads as a dead end without a sentence of its own:
+   a worker that ran the command instead of asking gets its attempt RECORDED and held,
+   in front of nobody — gates.AWAITING_CASE. Listed with the open ones rather than under
+   "Decided", which is what it used to fall into, and carrying its deadline, because the
+   next thing to happen to it is a clock. #}
+{% if held %}
+<h2>Awaiting the worker's case — no action needed</h2>
+<div class="panel">
+  <p class="kv">
+    The worker ran one of these instead of asking, so the attempt was blocked and
+    recorded — but nobody is reviewing it: there is no case to review yet. The move is the
+    worker's, with <span class="mono">jarvis gate request</span>, and if it never comes
+    the OS refuses the request itself on the
+    <span class="mono">gates.case_ttl_seconds</span> timer. Nothing was authorised, and
+    nothing here asks anything of you.
+  </p>
+  {% for g in held %}
+  <div class="msg" id="gate-{{ g.id }}">
+    <div class="who tone-warn">#{{ g.id }} · {{ g.kind }} · {{ g.project }} ·
+      <a href="/wo/{{ g.project }}/{{ g.wo_id }}" class="mono">{{ g.wo_id }}</a> ·
+      recorded {{ fmt_age(g.ts) }} ago</div>
+    <div class="mono" style="margin:6px 0">$ {{ g.command }}</div>
+    {# No decide form, deliberately: the point of the hold is that nothing has been put
+       to a reviewer, and a verdict on an unargued request is a verdict on a bare command
+       string. The deadline is what the row is for. #}
+    <div class="sub">No reviewer sees it yet — awaiting the worker's case.
+      Refused automatically in {{ fmt_left(g.case_deadline) }} if none is made.</div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
 
 {% if escalated %}
 <h2>Waiting on you — Neo escalated</h2>

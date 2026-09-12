@@ -976,6 +976,19 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
         return {"what": "gate_with_neo", "stalled": False,
                 "detail": "a privileged-action gate that is with Neo — the verdict "
                           "reaches the worker by itself"}
+    # Recorded, unargued, in front of NOBODY — `gates.AWAITING_CASE`. Without this branch
+    # the park falls all the way to the catch-all and is reported as a permission prompt,
+    # which is the false diagnosis of GitHub issue 100 arriving down the road
+    # `invariants._waiting_on_neo_gate` was written to close. Wording mirrors what
+    # `jarvis gate list` prints, the one surface that already gets it right.
+    held = store.held_approvals(wo_id)
+    if held:
+        return {"what": "gate_held", "stalled": False,
+                "detail": f"gate {held[0]['id']} is recorded but unargued — no reviewer "
+                          f"sees it yet, and the move is the WORKER's: `jarvis gate "
+                          f"request {wo_id} \"{held[0]['command'].splitlines()[0]}\" "
+                          f"--why \"…\" --evidence \"…\"`. If the case never comes the OS "
+                          f"refuses it itself on the `gates.case_ttl_seconds` timer"}
     question = awaiting_neo(wo_id)
     if question is not None:
         if question["status"] in USER_HELD_Q_STATUSES:
@@ -3207,6 +3220,16 @@ def list_gates(project_name: str | None = None, wo_id: str | None = None,
             store.close()
         out.extend({**r, "project": name} for r in rows)
     out.sort(key=lambda r: r["ts"], reverse=True)
+    # A held request is the one status whose next event is a CLOCK, so the clock travels
+    # with the row: a surface that can only say "awaiting case" leaves the reader with no
+    # way to tell a request the worker is about to argue from one nothing will ever
+    # close. See `gates.sweep_unargued`.
+    ttls = _case_ttl_seconds()
+    for row in out:
+        if row["status"] == gates.AWAITING_CASE:
+            ttl = ttls.get(row["project"], gates.DEFAULT_CASE_TTL_SECONDS)
+            row["case_ttl_seconds"] = ttl
+            row["case_deadline"] = row["ts"] + ttl
     if include_request:
         from .neo_store import NeoStore
         neo = NeoStore()
@@ -3217,6 +3240,21 @@ def list_gates(project_name: str | None = None, wo_id: str | None = None,
         finally:
             neo.close()
     return out
+
+
+def _case_ttl_seconds() -> dict[str, float]:
+    """Each project's `gates.case_ttl_seconds`, empty when the catalog is unreadable.
+
+    One catalog read for a whole listing; callers fall back to
+    `gates.DEFAULT_CASE_TTL_SECONDS`, which is what `Daemon.refuse_unargued_gates` would
+    use anyway for a project with no gate block.
+    """
+    try:
+        catalog = resolve_catalog()
+    except (OpsError, CatalogError):
+        return {}
+    return {spec.name: spec.gates.case_ttl_seconds
+            for spec in catalog.projects if spec.gates}
 
 
 def list_gate_rules(role: str | None = None, kind: str | None = None,
