@@ -332,16 +332,20 @@ def scannable(command: str) -> str:
     those are scanned whole. Erring that way is deliberate: a spurious gate costs one
     review, a missed one ships unreviewed code.
 
+    The invoker test is POSITIONAL — it runs on the blanked text, so only an invoker the
+    shell would actually reach disarms blanking. Asking the raw string instead meant a
+    payload that merely spelled one of those words turned blanking off for the whole
+    command and gated itself (issue #203).
+
     Heredoc bodies are deliberately NOT blanked here, and that is not the oversight it
     looks like. `cat <<EOF | bash` executes its body, so blanking it outright would open
     a bypass in the classifier for every gate at once. What the body needs is not a blunt
     exemption but a *learnable* one — see `Shape`, which records that a match landed in a
     body and lets a reviewed dismissal clear that shape for the chains that cannot run it.
     """
-    if _SHELL_INVOKER.search(command):
-        return command
     # Replace rather than delete, so neighbouring tokens can't fuse into a false match.
-    return _QUOTED.sub(" ", command)
+    blanked = _QUOTED.sub(" ", command)
+    return command if _SHELL_INVOKER.search(blanked) else blanked
 
 
 def _argv0(segment: str) -> str:
@@ -397,9 +401,14 @@ def reads_only(command: str) -> bool:
     is not the `cat` on PATH but something in the tree that merely shares its name, and
     an empty segment means the split found something this parser does not model.
     """
-    if _SUBSTITUTION.search(command) or _SHELL_INVOKER.search(command):
+    if _SUBSTITUTION.search(command):
         return False
-    parts = [s.strip() for s in _SEPARATORS.split(_QUOTED.sub(" ", command))]
+    blanked = _QUOTED.sub(" ", command)
+    # Positional, for the reason `scannable` gives: the word inside a reader's quoted
+    # argument is the thing being read, not a shell about to re-parse it (issue #203).
+    if _SHELL_INVOKER.search(blanked):
+        return False
+    parts = [s.strip() for s in _SEPARATORS.split(blanked)]
     if not any(parts):
         return False
     for segment in parts:
@@ -623,11 +632,11 @@ SEED_MATCHES: tuple[tuple[str, str], ...] = (
 # run against the whole set before it is allowed into the table; a proposal that would
 # clear any of these is rejected and the rejection is recorded on the work order.
 #
-# The last two of the release group are not examples of anything a worker would type.
+# The last three of the release group are not examples of anything a worker would type.
 # They are there because they are the shapes a *learned* rule would most plausibly clear
-# by accident: a heredoc body piped into a shell, and a quoted payload handed to `eval`.
-# Both are the exact spans an exemption talks about, in the one arrangement where they
-# are code after all.
+# by accident: a heredoc body piped into a shell, a quoted payload handed to `eval`, and
+# a heredoc body handed to an interpreter. All three are the exact spans an exemption
+# talks about, in the one arrangement where they are code after all.
 SEED_CANARIES: tuple[tuple[str, str], ...] = (
     ("pr_merge", "gh pr merge 31 --squash --delete-branch"),
     ("pr_merge", "gh pr merge --auto"),
@@ -640,6 +649,8 @@ SEED_CANARIES: tuple[tuple[str, str], ...] = (
     ("release", "git push --follow-tags origin release/jarvis-1.2.3"),
     ("release", "cat <<'EOF' | bash\nscripts/shipit.sh\nEOF"),
     ("release", 'eval "bash scripts/shipit.sh"'),
+    # Added with the issue #203 fix, to pin what that fix must NOT turn into a miss.
+    ("release", "python3 - <<'PY'\nscripts/shipit.sh\nPY"),
     ("service_restart", "sudo systemctl restart jarvis-daemon"),
     ("service_restart", "systemctl --user stop jarvisd"),
     ("push_protected", "git push origin main"),
@@ -673,7 +684,8 @@ def seed_rows() -> list[dict[str, Any]]:
 
 
 # 2: the `config_write` kind, its recogniser and its canaries (the config console).
-SEED_VERSION = "2"
+# 3: the `python3 - <<PY` release canary (issue #203).
+SEED_VERSION = "3"
 
 
 # -- the live rule base ---------------------------------------------------------------
