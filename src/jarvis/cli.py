@@ -2094,8 +2094,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
                 print("    a dismissal of this " + (
                     "COULD be generalised into a standing rule"
                     if data["learnable"] else
-                    "could NOT be generalised — the literal is where the shell would "
-                    "run it"))
+                    f"could NOT be generalised — {data['why_unlearnable']}"))
     elif args.ga_cmd in ("approve", "deny", "dismiss"):
         verdict = {"approve": "approved", "deny": "denied",
                    "dismiss": "dismissed"}[args.ga_cmd]

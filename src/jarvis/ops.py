@@ -3319,6 +3319,9 @@ def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any
         out["rule"] = decision.match.rule_id
         out["where"] = shape.describe() if shape else "unknown"
         out["learnable"] = bool(shape and shape.exemptible)
+        out["why_unlearnable"] = (
+            shape.unlearnable_reason() if shape
+            else "the pattern does not occur in the command as written")
     return out
 
 
