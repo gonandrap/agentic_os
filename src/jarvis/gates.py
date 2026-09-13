@@ -536,6 +536,12 @@ string and nothing else.
   message body is a family; that exact commit message is not.
 - Anchor it on literal text. A pattern with no literal in it is not a description of a
   family, it is the gate switched off, and the OS will refuse it.
+- Cover the WHOLE command, start to end. A pattern describing only the harmless prefix
+  clears whatever was chained after it — `&&`, `;`, or a second line. The OS refuses one
+  that does not match the command it was written for end to end, and refuses one that
+  reaches across a newline.
+- Do not propose one at all for a command spanning more than one line. A regex cannot say
+  which line it is about; omit the field and let the OS derive the structural rule.
 - Never write one that would match a command that really does perform the action. The OS
   tests every pattern you propose against commands that must always be gated and drops it
   if it fails, but do not rely on that: it is a backstop, not a reviewer.
