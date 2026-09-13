@@ -75,12 +75,15 @@ sha. A feature has no second half: see `collect_feature`.
 from __future__ import annotations
 
 import hashlib
+import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 from . import worker_session
+
+log = logging.getLogger("jarvis.evidence")
 
 #: The truncation limit callers get when they do not pass one. It is a plain default on
 #: `collect_work_order`, NOT a config read: this module has no opinion about the catalog,
@@ -338,8 +341,6 @@ def _pull_request(url: str,
     nobody predicted and a silent fallback to the worktree would be undiagnosable — the
     packet would say only "could not be read" and nothing anywhere would say why.
     """
-    import logging
-
     from . import github
 
     try:
@@ -347,7 +348,7 @@ def _pull_request(url: str,
     except github.GitHubError as e:  # the packet gets the vocabulary, not the stderr
         return None, "", e.reason
     except Exception:  # noqa: BLE001 — a thin packet, never a dead round
-        logging.getLogger("jarvis.evidence").warning(
+        log.warning(
             "could not read the pull request at %s; falling back to the worktree",
             url, exc_info=True)
         return None, "", "the pull request could not be read"

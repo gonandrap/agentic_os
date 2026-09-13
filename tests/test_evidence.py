@@ -356,8 +356,8 @@ def test_the_module_imports_nothing_that_could_have_seen_the_work():
     back to the submitter whose work it is gathering. Spec 2026-09-12 §2.
     """
     found = _imports(Path(evidence.__file__))
-    assert found == {"__future__", "hashlib", "subprocess", "dataclasses", "pathlib",
-                     "typing", ".worker_session", ".github"}
+    assert found == {"__future__", "hashlib", "logging", "subprocess", "dataclasses",
+                     "pathlib", "typing", ".worker_session", ".github"}
     for forbidden in (".catalog", ".daemon", ".bus", ".neo", ".panel", ".claude_cli",
                       ".neo_store", ".ops", ".project_store"):
         assert forbidden not in found
