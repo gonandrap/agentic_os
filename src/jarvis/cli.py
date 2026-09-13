@@ -541,8 +541,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--project")
     g = ga.add_parser(
         "contest",
-        help="(workers) dispute the MATCH: this command performs no privileged action. "
-             "Reaches the reviewer as a candidate dismissal, and authorises nothing",
+        help="(workers ONLY — needs JARVIS_WO_ID) dispute the MATCH: this command "
+             "performs no privileged action. Reaches the reviewer as a candidate "
+             "dismissal, and authorises nothing. To rule on one yourself, use "
+             "`jarvis gate dismiss`",
     )
     g.add_argument("wo_id", metavar="request-number | wo-id",
                    help="the request number the block printed — or a work order id, "
@@ -2073,8 +2075,10 @@ def cmd_gate(args: argparse.Namespace) -> int:
             wo_id, command, why=args.why, evidence=args.evidence,
             project_name=args.project), args.json)
     elif args.ga_cmd == "contest":
+        # `require_caller`: a contest is the worker's exit and nobody else's, so an
+        # unowned session is refused rather than merely unscoped — ops.CONTEST_NEEDS_AN_OWNER.
         wo_id, command = ops.resolve_gate_target(args.wo_id, args.command, args.project,
-                                                 caller)
+                                                 caller, require_caller=True)
         _print(ops.contest_gate_match(wo_id, command, why=args.why,
                                       project_name=args.project), args.json)
     elif args.ga_cmd == "list":

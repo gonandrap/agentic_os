@@ -229,11 +229,26 @@ another unit's pending release request as a claim that it performs no privileged
 silently, with the reviewer deciding on the result. `resolve_gate_target` therefore
 refuses a number whose work order is not the caller's own `JARVIS_WO_ID`, and says which
 work order it belongs to and how to list the caller's own. The same rule applies to the
-`<wo-id> "<cmd>"` spelling, for the same reason. A session with no `JARVIS_WO_ID` — the
-user's — is not narrowed: it can read the row before acting on it, and narrowing it would
-leave an escalated request with no way to resolve it by hand. Cross-project collisions
-were already refused rather than guessed at (`_find_approval`); this is the same posture
-one level down.
+`<wo-id> "<cmd>"` spelling, for the same reason. Cross-project collisions were already
+refused rather than guessed at (`_find_approval`); this is the same posture one level
+down.
+
+For `request`, `approve`, `deny` and `dismiss`, a session with **no** `JARVIS_WO_ID` — the
+user's own — is not narrowed: it can read the row before acting on it, and narrowing it
+would leave an escalated request with no way to resolve it by hand.
+
+**`contest` is the exception, and is refused outright without an owner.** It is the
+worker's exit and nobody else's: upheld, it does not merely clear one command string, it
+teaches a fleet-wide exemption through `learn_from_dismissal`, so an unowned session
+reaching it would rewrite the recogniser on behalf of a unit it is not. The user loses
+nothing — `jarvis gate dismiss` reaches the same outcome, reviewed, reasoned and recorded
+as theirs.
+
+A contest may amend only a row that is **still open and not already contested**.
+Re-contesting a pending contest rewrites the claim under a reviewer already reading it,
+and contesting a row a reviewer has ruled on asks the same question of a second reviewer
+(kn-76b155a0). Both are refused by name. Everything else — abandoned, lapsed, never filed
+— legitimately files a fresh one.
 
 Worth stating plainly, because it is the property the guard is protecting and the reason
 this is safe: neither exit ever *runs* the string. `gate request` and `gate contest`

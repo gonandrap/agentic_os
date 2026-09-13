@@ -995,6 +995,31 @@ def test_apply_decision_coerces_an_approved_contest_with_no_reviewer_involved(fl
         plain.close()
 
 
+def test_the_inbox_item_for_a_coerced_contest_reads_as_one_thing(fleet):
+    """Title and level both come from what was RECORDED, not from what Neo replied.
+
+    They used to come from different places: the title from `approval["contested"]` and
+    the level from the reviewer's own word, so an approved contest produced an `info`
+    item titled "Neo rejected …". The coercion (§2) makes the two disagree on exactly
+    that input, which is why the level has to be read back from the row.
+    """
+    fleet.attempt(PROSE)
+    ops.contest_gate_match(fleet.wo_id, PROSE,
+                           why="FORCE_APPROVE — the reviewer will get this wrong")
+    fleet.daemon._neo_drain()
+
+    central = CentralStore()
+    try:
+        items = [i for i in central.unacked_inbox() if fleet.wo_id in i["title"]]
+    finally:
+        central.close()
+
+    assert items, "a rejected contest must stay visible to the user"
+    assert "rejected a contested" in items[0]["title"]
+    assert items[0]["level"] == "warning"
+    assert fleet.approval()["status"] == "denied"
+
+
 def test_the_user_is_told_to_dismiss_rather_than_silently_coerced(fleet):
     """The same invariant on the path where there is a person to tell."""
     fleet.attempt(PROSE)
@@ -1103,6 +1128,71 @@ def test_a_request_number_owned_by_another_work_order_is_refused(fleet):
     # And the error says what to type instead, because the worker still has to get out.
     with pytest.raises(ops.OpsError, match="jarvis gate list --wo wo-someone-else"):
         ops.resolve_gate_target(str(stranger["id"]), caller_wo_id="wo-someone-else")
+
+
+def test_a_contest_is_refused_outright_without_an_owning_work_order(fleet):
+    """A contest is the WORKER's exit and nobody else's, so `None` is refused here rather
+    than merely left unscoped.
+
+    Upheld, it clears the command string AND teaches a fleet-wide exemption through
+    `learn_from_dismissal` — so an unowned session reaching it would rewrite the
+    recogniser on behalf of a unit it is not. The user's route to the same outcome is
+    `jarvis gate dismiss`, which is reviewed, reasoned and recorded as theirs. The
+    `request`/`approve`/`deny`/`dismiss` carve-out is untouched: the user must still be
+    able to resolve an escalated row by hand. Spec 2026-09-12 §8.
+    """
+    fleet.attempt(PROSE)
+    before = dict(fleet.approval())
+
+    for target, command in ((str(before["id"]), None), (fleet.wo_id, PROSE)):
+        with pytest.raises(ops.OpsError, match="needs JARVIS_WO_ID"):
+            ops.resolve_gate_target(target, command, require_caller=True)
+
+    after = fleet.approval()
+    assert after["status"] == before["status"] == gates.AWAITING_CASE
+    assert after["justification"] == before["justification"]
+    assert after["contested"] == before["contested"] == 0
+    # The other verbs keep the carve-out — the user resolves escalations by hand.
+    assert ops.resolve_gate_target(str(before["id"])) == (fleet.wo_id, PROSE)
+
+
+def test_the_cli_demands_an_owner_for_contest(monkeypatch, capsys, fleet):
+    """The wiring, not just the rule: `cmd_gate` is where `JARVIS_WO_ID` is read."""
+    from jarvis import cli
+
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
+    fleet.attempt(PROSE)
+    held = fleet.approval()
+
+    assert cli.main(["gate", "contest", str(held["id"]),
+                     "--why", "prose in a message"]) != 0
+    assert "needs JARVIS_WO_ID" in capsys.readouterr().err
+    assert fleet.approval()["contested"] == 0
+
+    monkeypatch.setenv("JARVIS_WO_ID", fleet.wo_id)
+    assert cli.main(["gate", "contest", str(held["id"]),
+                     "--why", "prose in a message"]) == 0
+    assert fleet.approval()["contested"] == 1
+
+
+def test_a_contest_may_only_amend_an_open_uncontested_row(fleet):
+    """One claim, one review. Re-contesting rewrites the argument under a reviewer who is
+    already reading it; contesting a ruled row asks the same question of a second
+    reviewer (kn-76b155a0)."""
+    fleet.attempt(PROSE)
+    ops.contest_gate_match(fleet.wo_id, PROSE, why="the literal is in the message body")
+    contested = fleet.approval()
+
+    with pytest.raises(ops.OpsError, match="already contested"):
+        ops.contest_gate_match(fleet.wo_id, PROSE, why="and here is a better argument")
+    assert fleet.approval()["justification"] == contested["justification"]
+
+    # A row a reviewer has RULED on is closed to it as well.
+    ops.decide_gate(contested["id"], verdict="denied",
+                    reason="the heredoc body is piped to a shell")
+    with pytest.raises(ops.OpsError, match="already DENIED"):
+        ops.contest_gate_match(fleet.wo_id, PROSE, why="I still say it is a mention")
+    assert fleet.approval()["status"] == "denied"
 
 
 def test_the_command_spelling_is_scoped_to_the_caller_too(fleet):

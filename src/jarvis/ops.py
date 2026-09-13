@@ -2981,9 +2981,26 @@ def _project_gate_config(project_name: str):
     return GateConfig()
 
 
+#: Refused when `JARVIS_WO_ID` is unset, rather than merely unscoped. A contest is the
+#: WORKER's exit and nobody else's: upheld, it clears the command string and teaches a
+#: fleet-wide exemption through `learn_from_dismissal`, so an unowned session reaching it
+#: would rewrite the recogniser on behalf of a work order it is not. The user's route to
+#: the same outcome is `jarvis gate dismiss`, which is reviewed, reasoned and recorded as
+#: theirs. Spec 2026-09-12 §8.
+CONTEST_NEEDS_AN_OWNER = (
+    "`jarvis gate contest` is a worker's exit from its own block and needs JARVIS_WO_ID, "
+    "which is set only inside a dispatched worker's session. An upheld contest clears the "
+    "command and teaches the recogniser fleet-wide, so it is not something to run on "
+    "another unit's behalf. To rule on a request yourself: `jarvis gate dismiss <id> "
+    "--reason \"...\"` if the recogniser was wrong, `jarvis gate deny <id> --reason "
+    "\"...\"` if it was not."
+)
+
+
 def resolve_gate_target(target: str, command: str | None = None,
                         project_name: str | None = None,
-                        caller_wo_id: str | None = None) -> tuple[str, str]:
+                        caller_wo_id: str | None = None,
+                        require_caller: bool = False) -> tuple[str, str]:
     """`(wo_id, command)` from either spelling of a gate exit: `<wo> "<cmd>"` or `<id>`.
 
     The id spelling exists because the command spelling is unusable for a large part of
@@ -2996,8 +3013,15 @@ def resolve_gate_target(target: str, command: str | None = None,
     another unit's pending release request as a claim that it performs no privileged
     action, and the reviewer would decide it on that. Refused rather than guessed at, for
     the same reason `_find_approval` refuses an id that two projects both hold. A session
-    with no `JARVIS_WO_ID` — the user's own — is not narrowed: it can read the row first.
+    with no `JARVIS_WO_ID` — the user's own — is not narrowed: it can read the row first,
+    and narrowing it would leave an escalated request with no way to resolve it by hand.
+
+    `require_caller` withdraws even that, for `contest` alone — see
+    `CONTEST_NEEDS_AN_OWNER`. The carve-out above is about the USER resolving a row they
+    can read; a contest is not that verb, and the user already has `gate dismiss`.
     """
+    if require_caller and not caller_wo_id:
+        raise OpsError(CONTEST_NEEDS_AN_OWNER)
     if command is not None:
         if caller_wo_id and target != caller_wo_id:
             raise OpsError(
@@ -3168,6 +3192,26 @@ def contest_gate_match(wo_id: str, command: str, why: str,
                     "kind": action.kind, "status": grant["status"],
                     "note": "already cleared — run the command as written"}
         existing = store.latest_approval_for(wo_id, action.kind, action.command)
+        # A contest amends a row that is STILL OPEN AND NOT YET CONTESTED, and nothing
+        # else. Re-contesting a pending contest rewrites the claim under a reviewer who is
+        # already reading it; contesting a row a reviewer has already ruled on is
+        # reviewer-shopping by another name (kn-76b155a0). Everything else — abandoned,
+        # lapsed, never filed — legitimately files a fresh one. Spec 2026-09-12 §8.
+        if existing and existing["status"] == "pending" and existing["contested"]:
+            raise OpsError(
+                f"request {existing['id']} is already contested and in front of a "
+                f"reviewer — one claim, one review. To add to the argument, send it to "
+                f"the reviewer rather than re-filing it; to see it as they do, "
+                f"`jarvis gate show {existing['id']}`."
+            )
+        if existing and existing["status"] == "denied":
+            raise OpsError(
+                f"request {existing['id']} was already DENIED by "
+                f"{existing['decided_by'] or 'a reviewer'}: "
+                f"{existing['decision_reason'] or 'no reason recorded'}. A reviewer has "
+                f"ruled that this command does perform the action, so contesting it again "
+                f"asks the same question of a second reviewer. Address the reason instead."
+            )
         neo = NeoStore()
         try:
             if existing and existing["status"] in (gates.AWAITING_CASE, "pending"):

@@ -2151,12 +2151,16 @@ class Daemon:
             })
             return
 
-        ruling = verdict.get("verdict") or ("approved" if verdict.get("approve")
-                                            else "denied")
-        gates.apply_decision(pstore, approval["id"], verdict=ruling,
-                             reason=verdict["reason"], decided_by="neo",
-                             central=central, project=q["project"],
-                             exempt_pattern=verdict.get("exempt_pattern", ""))
+        asked = verdict.get("verdict") or ("approved" if verdict.get("approve")
+                                           else "denied")
+        decided = gates.apply_decision(pstore, approval["id"], verdict=asked,
+                                       reason=verdict["reason"], decided_by="neo",
+                                       central=central, project=q["project"],
+                                       exempt_pattern=verdict.get("exempt_pattern", ""))
+        # WHAT WAS RECORDED, not what the reviewer said — the two differ on exactly one
+        # input: `approved` on a contested row is written as `denied` (spec §2). Reading
+        # the reply would put an `info` level under a title that says "rejected".
+        ruling = decided["status"]
         # A shipped release is something the user wants to know happened, even when they
         # did not have to authorise it — that is the trade for spending none of their
         # attention on the approval itself.
@@ -2176,7 +2180,7 @@ class Daemon:
                 project=q["project"],
                 level="info" if ruling == "approved" else "warning",
                 title=(f"Neo rejected a contested {approval['kind']} match from "
-                       f"{q['wo_id']}" if approval["contested"]
+                       f"{q['wo_id']}" if decided["contested"]
                        else f"Neo {ruling} {approval['kind']} for {q['wo_id']}"),
                 body=(f"{verdict['reason']}\n\nCommand: {approval['command']}\n"
                       f"Review Neo's call with: jarvis neo review {q['id']}"),
