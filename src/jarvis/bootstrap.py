@@ -47,7 +47,9 @@ from .paths import project_state_dir
 # 15-minute eval, signed off on the promise of a wake-up that does not exist, and the run
 # died with its process (wo-2df8828c). Prose is again the whole mechanism, and it only
 # helps the workers whose repo has it.
-TEMPLATE_VERSION = 10
+# v11 = the second exit (`jarvis gate contest`, beside `explain`) and the per-kind ask —
+# spec 2026-09-12 §3, §6. Prose is the whole mechanism, so it has to reach every repo.
+TEMPLATE_VERSION = 11
 ASSETS = Path(__file__).parent / "assets"
 
 
@@ -299,16 +301,37 @@ def _gates_section(project: ProjectSpec) -> str:
         "independent reviewer (Neo, the user's delegate) decides whether they run.",
         "",
     ]
-    lines += [f"- `{k.name}` — {k.summary}" for k in live]
+    # With the two questions each kind's own request has to answer — a reviewer sees
+    # nothing but what the worker wrote. Spec 2026-09-12 §6.
+    for k in live:
+        lines += [
+            f"- `{k.name}` — {k.summary}",
+            f"  - `--why`: {k.why_ask}",
+            f"  - `--evidence`: {k.evidence_ask}",
+        ]
     lines += [
         "",
-        "Ask before acting — the reviewer sees ONLY the text you write, so a request with",
-        "evidence is far more likely to be approved than a bare attempt:",
+        "**BEFORE you are blocked** — nothing has been filed yet, so the command string is",
+        "the only handle there is. Ask first: the reviewer sees ONLY the text you write, so",
+        "a request with evidence is far more likely to be approved than a bare attempt.",
+        "Answer the two questions listed above for the kind that fired:",
         "",
         "```bash",
         'jarvis gate request "$JARVIS_WO_ID" "<the exact command>" \\',
-        '    --why "<why this is ready to ship>" \\',
-        '    --evidence "<PR number, test results, checks>"',
+        '    --why "<the --why your kind asks for>" \\',
+        '    --evidence "<the --evidence your kind asks for>"',
+        "```",
+        "",
+        "**AFTER a block, use the REQUEST NUMBER the block printed — never the command",
+        "string.** The OS already has the string; re-typing it into an argument is how a",
+        "worker in a git worktree finds its own way out refused by the isolation guard,",
+        "which inspects arguments and rejects any text it cannot prove is not a git",
+        "operation. Every exit below takes the number, and none of them runs the command:",
+        "",
+        "```bash",
+        "jarvis gate explain <request-number>                       # which exit do you need?",
+        'jarvis gate request <request-number> --why "..." --evidence "..."',
+        'jarvis gate contest <request-number> --why "..."',
         "```",
         "",
         "Then END YOUR TURN. The verdict arrives as your next user turn. If approved, run",
@@ -316,13 +339,21 @@ def _gates_section(project: ProjectSpec) -> str:
         "not reword it. If denied, fix what the reason names; retrying unchanged will be",
         "blocked again.",
         "",
-        "There is a third verdict, **dismissed**. The gate recognises commands by matching",
-        "text, so it sometimes fires on one that merely *names* a privileged action — a",
-        "release script inside a grep pattern, a path quoted in a PR body. That is a defect",
-        "in the OS, not a refusal: the reviewer dismisses it, nothing is authorised, and the",
-        "command goes through unchanged. So when a gate fires on something you know ships",
-        "nothing, do not reword the command to slip past it. File the request, say plainly",
-        "why it performs no privileged action, and end your turn.",
+        "There is a third verdict, **dismissed**, and its own command. The gate recognises",
+        "commands by matching text, so it sometimes fires on one that merely *names* a",
+        "privileged action — a release script inside a grep pattern, a path quoted in a PR",
+        "body. That is a defect in the OS, not a refusal, and the request above is the wrong",
+        "move for it: the command does none of these things, so both answers would be false.",
+        "Contest the match instead, and nothing is authorised either way — by NUMBER, since",
+        "you are reading this after a block:",
+        "",
+        "```bash",
+        'jarvis gate contest <request-number> --why "<why this performs no privileged action>"',
+        "```",
+        "",
+        "So when a gate fires on something you know ships nothing, do not reword the command",
+        "to slip past it and do not walk away from it: contest it, and the OS learns a",
+        "standing rule that spares the next worker the same block.",
         "",
         "A dismissal clears a command *string*; it does not reset the review state of the",
         "action that string talks about. So never open a second request for a privileged",

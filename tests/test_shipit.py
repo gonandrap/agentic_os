@@ -14,10 +14,17 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 SHIPIT = Path(__file__).resolve().parents[1] / "scripts" / "shipit.sh"
+
+#: Resolved once, by absolute path: the no-uv-on-PATH test hands the script a PATH too
+#: small to find an interpreter.
+BASH = shutil.which("bash") or "/bin/bash"
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -54,8 +61,27 @@ def _make_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _stub(directory: Path, name: str) -> Path:
+    """A no-op stand-in for a tool the script only checks the presence of."""
+    directory.mkdir(parents=True, exist_ok=True)
+    p = directory / name
+    p.write_text("#!/bin/sh\nexit 0\n")
+    p.chmod(p.stat().st_mode | stat.S_IEXEC)
+    return p
+
+
 def _dry_run(repo: Path, prod: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "PRODUCTION_CODE": str(prod)}
+    """Drive the real script in --dry-run, with a STUB `uv` first on PATH.
+
+    Not a convenience: CI installs this project with pip and has no `uv` anywhere
+    (.github/workflows/ci.yml), so a test that borrows the host's would pass on a
+    developer's machine and fail on the runner — which is exactly what it did. A dry run
+    never executes `uv`, it only prints the plan, so a stub is the honest stand-in.
+    """
+    env = {**os.environ,
+           "PRODUCTION_CODE": str(prod),
+           "PATH": f"{_stub(repo.parent / 'stub-bin', 'uv').parent}"
+                   f"{os.pathsep}{os.environ['PATH']}"}
     return subprocess.run(
         ["bash", str(repo / "scripts" / "shipit.sh"), "--dry-run", *args],
         cwd=str(repo), env=env, capture_output=True, text=True)
@@ -316,3 +342,195 @@ def test_a_tag_without_the_installer_says_so_instead_of_aborting(tmp_path):
     assert "units NOT re-rendered" in r.stdout
     assert "jarvis doctor" in r.stdout
     assert "--no-restart" not in r.stdout, "claimed a re-render it could not do"
+
+
+# -- the tag's uv.lock -----------------------------------------------------------
+#
+# Issue #202: nine releases shipped a lock recording jarvis-os 0.1.1 beside a pyproject
+# recording the released version, because the bump committed pyproject ALONE. Any bare
+# `uv` command in the production checkout then re-resolved and rewrote the lock, leaving
+# prod dirty and every version string suffixed `-dirty`.
+
+
+def test_the_release_commit_carries_the_relocked_uv_lock(tmp_path):
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", "0.2.0")
+    assert r.returncode == 0, r.stderr
+    assert "uv lock" in r.stdout
+    assert "add pyproject.toml uv.lock" in r.stdout
+
+
+def test_the_relock_happens_before_the_commit(tmp_path):
+    """A lock written after the commit is a lock that does not reach the tag."""
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", "0.2.0")
+    out = r.stdout
+    assert out.index("uv lock") < out.index("commit -m 'Release jarvis-0.2.0'")
+
+
+#: Everything the script reaches for before the tool preconditions run. The sandbox PATH
+#: holds only these, so "not found" means the test withheld it and nothing else.
+_PRECONDITION_TOOLS = ("dirname", "git", "sed", "grep", "sort", "tail", "mktemp")
+
+
+def _run_with_only(tmp_path: Path, repo: Path, *, keep: tuple[str, ...],
+                   stub: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+    """Drive the script with a PATH holding only what this test planted.
+
+    `stub` rather than `keep` for `uv`: CI has none to borrow, so a test that symlinked
+    the host's would assert the wrong precondition there — it would fail on the missing
+    `uv` while claiming to be about something else.
+    """
+    sandbox = tmp_path / "bin"
+    sandbox.mkdir(exist_ok=True)
+    for tool in keep:
+        real = shutil.which(tool)
+        if real and not (sandbox / tool).exists():
+            (sandbox / tool).symlink_to(real)
+    for name in stub:
+        _stub(sandbox, name)
+    return subprocess.run(
+        [BASH, str(repo / "scripts" / "shipit.sh"), "--dry-run", "0.2.0"],
+        cwd=str(repo), capture_output=True, text=True,
+        env={"PATH": str(sandbox), "HOME": str(tmp_path / "home"),
+             "PRODUCTION_CODE": str(tmp_path / "prod")})
+
+
+def test_refuses_when_uv_is_not_on_path(tmp_path):
+    """Checked in the preconditions, not at first use: `uv sync` needs it too, and by
+    then the tag has already been pushed to origin."""
+    repo = _make_repo(tmp_path)
+    r = _run_with_only(tmp_path, repo, keep=(*_PRECONDITION_TOOLS, "diff"), stub=())
+    assert r.returncode != 0
+    assert "uv not found" in (r.stdout + r.stderr)
+
+
+# -- the guard that keeps the relock honest --------------------------------------
+#
+# `uv lock` is free to move every dependency it likes. A release commit that does so
+# silently is a worse bug than the one above, so the script asserts the relocked file is
+# what HEAD's lock looks like with the version line — and nothing else — rewritten.
+# Sliced out of the real script rather than copied: a copy keeps passing after the
+# original changes, which is the standard way a shell-script test becomes a lie.
+
+_LOCK_GUARD_START = "# >>> lock-guard"
+_LOCK_GUARD_END = "# <<< lock-guard"
+
+_LOCK = """version = 1
+requires-python = ">=3.13"
+
+[[package]]
+name = "httpx"
+version = "0.27.0"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "jarvis-os"
+version = "0.1.1"
+source = { editable = "." }
+"""
+
+
+def _lock_guard_source() -> str:
+    text = SHIPIT.read_text()
+    start, end = text.find(_LOCK_GUARD_START), text.find(_LOCK_GUARD_END)
+    assert start >= 0, f"{_LOCK_GUARD_START} missing from scripts/shipit.sh"
+    assert end > start, f"{_LOCK_GUARD_END} missing or misplaced in scripts/shipit.sh"
+    return text[start:end]
+
+
+def _run_guard(worktree: Path, version: str) -> subprocess.CompletedProcess[str]:
+    script = (
+        "set -euo pipefail\n"
+        "die() { printf '%s\\n' \"$*\" >&2; exit 1; }\n"
+        + _lock_guard_source()
+        + f"\nassert_lock_bump_only {worktree!s} {version}\n"
+    )
+    return subprocess.run([BASH, "-c", script], capture_output=True, text=True)
+
+
+@pytest.fixture()
+def locked(tmp_path: Path) -> Path:
+    """A release worktree whose HEAD carries a lock, mid-bump: the file on disk is
+    whatever `uv lock` just wrote, HEAD's copy is what main had."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / "uv.lock").write_text(_LOCK)
+    _git(wt, "init", "-q", "-b", "main")
+    _git(wt, "config", "user.email", "t@example.com")
+    _git(wt, "config", "user.name", "Test")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-q", "-m", "init")
+    return wt
+
+
+def test_guard_accepts_a_lock_that_only_moved_the_root_version(locked):
+    (locked / "uv.lock").write_text(_LOCK.replace('version = "0.1.1"', 'version = "0.2.0"'))
+    r = _run_guard(locked, "0.2.0")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_guard_refuses_a_relock_that_moved_a_dependency(locked):
+    """The failure mode worth aborting a release for: a dependency reaching production
+    inside a release commit, with no review and no record."""
+    (locked / "uv.lock").write_text(
+        _LOCK.replace('version = "0.1.1"', 'version = "0.2.0"')
+             .replace('version = "0.27.0"', 'version = "0.28.0"'))
+    r = _run_guard(locked, "0.2.0")
+    assert r.returncode != 0
+    err = r.stdout + r.stderr
+    assert "re-resolved more than the version bump" in err
+    assert "0.28.0" in err, "the offending change must be shown, not just named"
+
+
+def test_guard_refuses_a_lock_left_at_the_old_version(locked):
+    """`uv lock` not running at all is the bug this whole change fixes."""
+    r = _run_guard(locked, "0.2.0")
+    assert r.returncode != 0
+    assert "0.1.1" in (r.stdout + r.stderr)
+
+
+def test_guard_refuses_when_the_relock_wrote_no_file(locked):
+    """It must FAIL CLOSED. `diff` against a missing file produces no differing lines,
+    so a guard that only looked at the output would wave the release through."""
+    (locked / "uv.lock").unlink()
+    r = _run_guard(locked, "0.2.0")
+    assert r.returncode != 0
+    assert "left no" in (r.stdout + r.stderr)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read a 000 file")
+def test_guard_refuses_when_diff_cannot_compare_at_all(locked):
+    """diff exits >1 when it could not do the comparison. Same fail-closed rule: an
+    unmade comparison is not a passed one."""
+    (locked / "uv.lock").write_text(_LOCK.replace('version = "0.1.1"', 'version = "0.2.0"'))
+    (locked / "uv.lock").chmod(0o000)
+    try:
+        r = _run_guard(locked, "0.2.0")
+    finally:
+        (locked / "uv.lock").chmod(0o644)
+    assert r.returncode != 0
+    assert "cannot compare" in (r.stdout + r.stderr)
+
+
+def test_refuses_when_diff_is_not_on_path(tmp_path):
+    """A guard that cannot run must stop the release, not be skipped."""
+    repo = _make_repo(tmp_path)
+    r = _run_with_only(tmp_path, repo, keep=_PRECONDITION_TOOLS, stub=("uv",))
+    assert r.returncode != 0
+    assert "diff not found" in (r.stdout + r.stderr)
+
+
+def test_guard_refuses_when_head_carries_no_lock_at_all(tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / "README.md").write_text("# x\n")
+    _git(wt, "init", "-q", "-b", "main")
+    _git(wt, "config", "user.email", "t@example.com")
+    _git(wt, "config", "user.name", "Test")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-q", "-m", "init")
+    (wt / "uv.lock").write_text(_LOCK)
+    r = _run_guard(wt, "0.2.0")
+    assert r.returncode != 0
+    assert "no uv.lock at HEAD" in (r.stdout + r.stderr)

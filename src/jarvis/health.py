@@ -87,13 +87,16 @@ def fingerprint(pstore: Any, subject: dict[str, Any]) -> str:
 
 
 def due(review: dict[str, Any] | None, current: str, cfg: Any, now: float,
-        created: float) -> str | None:
+        created: float, last_attempt: float | None = None) -> str | None:
     """Which trigger says to look at this unit now, or None to leave it alone.
 
     `review` is the unit's most recent `health_reviews` row, or None. `created` is the
     unit's own `created_at`, and it is an argument rather than something read off
     `subject` because this function is the whole of the spend decision and reading state
     inside it would make that decision untestable without a store.
+
+    `last_attempt` is the ts of the most recent sweep OF ANY OUTCOME, failures included,
+    or None if never swept. `review` deliberately cannot answer that — see the floor.
 
     THE `stale` CLAUSE FIRES ONCE PER STALE WINDOW, not once for ever. §4 words it as
     "exactly one review until it moves again", and once-for-ever is unbuildable against
@@ -103,6 +106,11 @@ def due(review: dict[str, Any] | None, current: str, cfg: Any, now: float,
     """
     interval = cfg.health_min_interval_minutes * SECONDS_PER_MINUTE
     stale = cfg.health_stale_minutes * SECONDS_PER_MINUTE
+    # THE FLOOR IS ON ATTEMPTS, NOT ON JUDGEMENTS. Every branch below floors on
+    # `review`, which excludes a failure — so a sweep that always fails has no floor at
+    # all and falls back to the tick rate. §4.1 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+    if last_attempt is not None and now - last_attempt < interval:
+        return None
     if review is None:
         # A unit created moments ago has nothing to say yet, and the sweep is the
         # standing cost of watching: the floor applies to the first look too.
