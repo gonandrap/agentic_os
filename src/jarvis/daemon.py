@@ -515,7 +515,7 @@ class Daemon:
                     # Also before them: this is the only thing that ever closes a gate
                     # request no reviewer can see, so leaving it until after would let
                     # the invariants judge a hold the OS was about to refuse.
-                    self.refuse_unargued_gates(project, store)
+                    self.abandon_unargued_gates(project, store)
                     # Last: check the state everything above just produced.
                     self.check_invariants(project, store)
                 self.central.touch_project(project.name)
@@ -2453,7 +2453,7 @@ class Daemon:
         finally:
             neo_store.close()
 
-    def refuse_unargued_gates(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def abandon_unargued_gates(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Close every gate request whose case never came. See `gates.sweep_unargued`.
 
         The other half of holding an unargued request back from review: nothing else can

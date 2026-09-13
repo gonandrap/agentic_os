@@ -480,7 +480,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     -- `awaiting_case` is filed-but-unargued: the worker ran the command instead of
     -- asking, so no Neo question exists yet and nothing in the OS acts on the row until
     -- the worker makes its case. It is the ONLY status no reviewer can see, which is why
-    -- it is also the only one with a TTL that refuses it — see gates.AWAITING_CASE.
+    -- it is also the only one with a TTL that abandons it — see gates.AWAITING_CASE.
     -- `dismissed` is not a verdict on a privileged action, it is a verdict on the
     -- CLASSIFIER: the command never performed one and the gate matched it by mistake.
     -- It clears the command like an approval does but records no authorisation, and it

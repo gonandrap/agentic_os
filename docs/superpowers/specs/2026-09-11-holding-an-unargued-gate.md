@@ -43,7 +43,7 @@ Holding a request back from review means nothing else will ever close it: there 
 question for Neo to answer and no escalation for the user to see. A worker that wanders
 off would leave an unargued privileged action open for ever.
 
-`Daemon.refuse_unargued_gates` sweeps on each reconcile tick and closes every held request
+`Daemon.abandon_unargued_gates` sweeps on each reconcile tick and closes every held request
 older than `gates.case_ttl_seconds` (per project, default 600s; kn-67cdb54b). Nothing is
 authorised and nothing is lost — the command string stays blocked.
 
