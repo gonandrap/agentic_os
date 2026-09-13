@@ -1178,7 +1178,8 @@ class Daemon:
             n, max_rounds = int(round_row["round"]), int(cfg.max_rounds)
             packet = evidence_mod.collect_work_order(
                 project.path, wo, declared=str(round_row["evidence"] or ""),
-                diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo))
+                diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo),
+                side_effects=ops.side_effects_of(wo_id))
 
             validator = (self.validator if self.validator is not None
                          else self._validator(cfg))
@@ -1195,13 +1196,20 @@ class Daemon:
                          project.name, wo_id, n)
                 return
 
-            # An EMPTY DIFF never reaches the validator. A reviewer handed nothing to
-            # review will approve it, and that single silent pass would make the whole
-            # feature theatre.
-            if not packet.files:
+            # AN EMPTY SUBMISSION never reaches the validator. A reviewer handed
+            # nothing to review will approve it, and that single silent pass would make
+            # the whole feature theatre.
+            #
+            # "Empty" is no files AND no side effects. The guard's intent was always
+            # right and only its premise was wrong: "no files changed" is not the same
+            # statement as "nothing was delivered", and a work order whose whole
+            # deliverable was a knowledge-base retraction was escalated unjudged for
+            # years of fleet time on the difference (issue #200, spec 2026-09-12 §5).
+            if not packet.files and not packet.side_effects:
                 self._escalate(store, wo, round_id, n,
-                               "this submission changes no files, so there is nothing "
-                               "to review. Nobody has judged the work.")
+                               "this submission changes no files and records no other "
+                               "durable effect, so there is nothing to review. Nobody "
+                               "has judged the work.")
                 return
 
             # A REPEAT of the IMMEDIATELY PRECEDING round only. Compared against every
@@ -1478,6 +1486,10 @@ class Daemon:
                 return
             cfg = self._round_config(project, round_row)
             n, max_rounds = int(round_row["round"]), int(cfg.max_rounds)
+            # `side_effects` is NOT passed here and is not missing: `ops` fills it, the
+            # same way and for the same reason it assembles `children` — both are store
+            # reads per child, and `evidence.py` may not touch a store. Said out loud
+            # because reading this line alone makes the feature path look half-wired.
             packet = ops.collect_feature_evidence(
                 store, project.path, fo, declared=str(round_row["evidence"] or ""),
                 summary=str(round_row["summary"] or ""), cfg=cfg)
@@ -1512,6 +1524,14 @@ class Daemon:
                     "that asked for changes would have nobody to act on it. Nobody has "
                     "judged the work.")
                 return
+            # THIS GUARD DOES NOT YIELD TO SIDE EFFECTS, and the one below does. They
+            # answer different questions: this one asks "can we honestly diff what was
+            # delivered", and the next asks "was anything delivered at all". A single
+            # knowledge write is an answer to the second and says nothing about the
+            # first — so exempting a baseless feature on the strength of one retraction
+            # would send a feature whose file changes were never diffable to a panel
+            # that has just been told not to read an empty diff as nothing delivered.
+            # It could then pass on the retraction alone. Rejected in review, round 1.
             if not packet.base:
                 self._escalate_feature(
                     store, fo, round_id, n,
@@ -1519,11 +1539,12 @@ class Daemon:
                     "honest way to say what it changed. It was released before the OS "
                     "started recording one. Nobody has judged the work.")
                 return
-            if not packet.files:
+            if not packet.files and not packet.side_effects:
                 self._escalate_feature(
                     store, fo, round_id, n,
                     "nothing has changed on the default branch since this feature "
-                    "started, so there is nothing to review. Nobody has judged the work.")
+                    "started and its children record no other durable effect, so there "
+                    "is nothing to review. Nobody has judged the work.")
                 return
 
             previous = self._preceding_round(store, n, fo_id=fo_id)

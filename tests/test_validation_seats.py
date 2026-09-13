@@ -221,6 +221,81 @@ def test_a_truncated_diff_is_announced_in_the_prompt_with_the_files_it_dropped()
     assert "TRUNCATED" not in validation.build_packet_prompt(packet())
 
 
+def test_the_pull_request_is_rendered_as_the_artifact_under_review():
+    """Spec 2026-09-12 §6: the body and the checks are what a diff cannot show, and the
+    check section is the only place the declared evidence can be held against something
+    the submitter did not write."""
+    prompt = validation.build_packet_prompt(packet(
+        pr_url="https://github.com/x/y/pull/7", source="pull_request",
+        pr={"title": "[wo-1] Add the thing", "body": "## Summary\nreasoning here",
+            "state": "OPEN", "draft": False, "base_ref": "main", "head_ref": "wo-1",
+            "additions": 10, "deletions": 2,
+            "checks": [{"name": "tests", "status": "COMPLETED",
+                        "conclusion": "FAILURE"}]}))
+
+    assert "THE PULL REQUEST UNDER REVIEW" in prompt
+    assert "reasoning here" in prompt
+    assert "tests: FAILURE" in prompt
+    assert "as collected from the pull request above" in prompt
+
+
+def test_a_pull_request_that_could_not_be_read_is_announced_not_swallowed():
+    """The silent lie this whole collector refuses to tell: a seat told nothing would
+    judge the worktree believing it was the artifact the submitter pointed at."""
+    prompt = validation.build_packet_prompt(packet(
+        pr_url="https://github.com/x/y/pull/7", source="worktree", pr=None,
+        pr_error="GitHubError: HTTP 502"))
+
+    assert "COULD NOT BE READ" in prompt
+    assert "HTTP 502" in prompt
+    assert "as collected from the worker's worktree" in prompt
+
+
+def test_no_checks_is_stated_rather_than_omitted():
+    """An absent section and a green CI are indistinguishable to a seat, and the two
+    want opposite weight on the submitter's declared evidence."""
+    prompt = validation.build_packet_prompt(packet(
+        pr_url="https://github.com/x/y/pull/7", source="pull_request",
+        pr={"title": "t", "body": "b", "state": "OPEN", "draft": False,
+            "base_ref": "main", "head_ref": "wo-1", "additions": 1, "deletions": 0,
+            "checks": []}))
+
+    assert "no check runs at all" in prompt
+    assert "not a failure and not a pass" in prompt
+
+
+def test_a_work_order_with_no_pull_request_renders_no_pull_request_section():
+    """The negative control: the prompt a seat reads must not have grown a heading for
+    every work order that never opened one."""
+    prompt = validation.build_packet_prompt(packet())
+    assert "PULL REQUEST" not in prompt
+    assert "as collected from the worker's worktree" in prompt
+
+
+def test_the_side_effects_section_tells_a_seat_an_empty_diff_is_not_an_empty_submission():
+    prompt = validation.build_packet_prompt(packet(
+        files=(), diff="", side_effects=(
+            {"kind": "knowledge_retracted", "id": "kn-1",
+             "summary": "retired kn-1: it named the wrong path",
+             "detail": "always call /snap/bin/gh"},)))
+
+    assert "NO DIFF CAN SHOW" in prompt
+    assert "always call /snap/bin/gh" in prompt
+    assert "is NOT automatically an empty submission" in prompt
+
+    assert "NO DIFF CAN SHOW" not in validation.build_packet_prompt(packet())
+
+
+@pytest.mark.parametrize("seat", ["chair", "tester", "security", "architect",
+                                  "maintainer"])
+def test_every_seat_is_told_that_a_diffless_submission_is_not_an_empty_one(seat):
+    """The false escalation moved inside the panel: a seat that has only ever been shown
+    diffs reads an empty one as nothing delivered and rejects on that alone."""
+    mandate = validation.definition(seat)[1]
+    assert "NOT AUTOMATICALLY AN EMPTY SUBMISSION" in mandate
+    assert "THE PULL REQUEST IS THE ARTIFACT" in mandate
+
+
 def test_a_feature_packet_shows_what_each_child_claimed():
     prompt = validation.build_packet_prompt(packet(
         unit="feature", subject_id="fo-1",

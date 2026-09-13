@@ -5,25 +5,46 @@ reviewer that never met the worker, and this module is the only thing standing b
 the two: it assembles the packet the seats read, and it fingerprints that packet so a
 resubmission that produced nothing new can be told apart from one that did.
 
-Two collectors, one packet. `collect_work_order` reads a work order's own worktree;
-`collect_feature` reads the project root, because the question a feature-level panel
-exists to answer — do these children add up, and do they collide — is only answerable
-where the children's work has actually met.
+Two collectors, one packet. `collect_work_order` reads THE PULL REQUEST when there is
+one and the work order's own worktree when there is not; `collect_feature` reads the
+project root, because the question a feature-level panel exists to answer — do these
+children add up, and do they collide — is only answerable where the children's work has
+actually met.
+
+## The pull request is the artifact
+
+A work order that ends behind a pull request has already assembled its own evidence
+there, for exactly this purpose: the diff, the reasoning, the screenshots, what CI said.
+So that is what the panel judges, the way a human judges one — see
+docs/superpowers/specs/2026-09-12-the-pull-request-is-the-artifact.md §3 for the
+three-row table this collector implements, and §2 for why the fetch lives in a
+read-only module rather than in the seats' hands.
+
+**A pull request that cannot be read never silently becomes a worktree packet.**
+`pr_error` carries the reason and the seat prompt prints it. Presenting the worktree as
+the pull request would be the same silent lie this function already refuses to tell when
+the worktree is missing.
 
 ## Why this module imports almost nothing
 
 A seat's verdict is only worth something if the evidence under it was gathered by
 something that cannot have been influenced by the thing being judged. So this is a leaf:
-the standard library, and `worker_session` for the one pure path helper that knows where
-a work order's worktree lives. No catalog, no store writes, no bus, no Neo, no panel,
-nothing that reaches a model. `tests/test_evidence.py` asserts that import set by walking
-this file's AST — including inside function bodies, because the house style is a lazy
-import in the function that needs it, and a `sys.modules` check would miss those.
+the standard library, `worker_session` for the one pure path helper that knows where a
+work order's worktree lives, and `github` for the pull-request read — which qualifies on
+the same rule, being a module that can only ask GitHub questions and never tell it
+anything. No catalog, no store writes, no bus, no Neo, no panel, nothing that reaches a
+model. `tests/test_evidence.py` asserts that import set by walking this file's AST —
+including inside function bodies, because the house style is a lazy import in the
+function that needs it, and a `sys.modules` check would miss those.
+
+Note what that rules OUT and why it costs nothing: `side_effects` is collected by `ops`
+and passed in, exactly as `spec` and `children` are, because the durable non-file change
+a work order made lives in a DATABASE and this module may not open one.
 
 ## The three rules that are the point of the module
 
-**1. The fingerprint covers the FULL diff before truncation, and nothing but that and the
-normalised `declared` text.** See `fingerprint`.
+**1. The fingerprint covers the FULL diff before truncation, the side effects, and
+nothing but those and the normalised `declared` text.** See `fingerprint`.
 
 **2. `declared` is whitespace-normalised before hashing** — see `_normalise`. Re-running
 the same tests and describing them with different line breaks is not new evidence.
@@ -54,12 +75,15 @@ sha. A feature has no second half: see `collect_feature`.
 from __future__ import annotations
 
 import hashlib
+import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 from . import worker_session
+
+log = logging.getLogger("jarvis.evidence")
 
 #: The truncation limit callers get when they do not pass one. It is a plain default on
 #: `collect_work_order`, NOT a config read: this module has no opinion about the catalog,
@@ -83,8 +107,20 @@ class EvidencePacket:
     summary: str                    # the submitter's --summary for this round
     declared: str                   # the submitter's --evidence text, verbatim
     pr_url: str                     # "" when none
-    base: str                       # resolved merge-base ref, "" if unresolvable
-    head: str                       # HEAD sha, "" if unresolvable
+    #: WHAT THESE TWO HOLD DEPENDS ON `source`, and the two meanings are not
+    #: interchangeable. On the worktree path they are git objects — a resolved
+    #: merge-base ref and a HEAD sha. On the pull-request path they are the PR's
+    #: BRANCH NAMES (`baseRefName`/`headRefName`), because that is what GitHub reports
+    #: and what a reviewer reading the PR sees; a sha would need another round trip to
+    #: learn something nobody asked for. Both are "" when unresolvable.
+    #:
+    #: So anything that wants to RESOLVE these — `git rev-parse`, a range like
+    #: `base...head`, a sha comparison between rounds — must check `source` first. They
+    #: are rendered, never resolved: `validation.build_packet_prompt` prints them under
+    #: a heading that names which source they came from, and `fingerprint` deliberately
+    #: excludes both.
+    base: str
+    head: str
     stat: str                       # `git diff --stat` output
     files: tuple[str, ...]          # every changed path, NEVER truncated
     diff: str                       # unified diff, truncated to diff_chars
@@ -96,6 +132,28 @@ class EvidencePacket:
     #: one — defeating `diff_chars` silently. The digest is all `fingerprint` needs.
     diff_sha: str
     children: tuple[dict, ...] = ()
+    #: Where `diff`, `files` and `stat` came from: `"pull_request"` or `"worktree"`. A
+    #: seat is told which, because "this is the pull request" and "this is what was
+    #: lying in a worktree" are different claims about the same bytes.
+    source: str = "worktree"
+    #: The pull request as a human reviewer reads it — title, body, state, draft, refs,
+    #: additions/deletions, check runs — or None when there is none, or none readable.
+    #: A dict rather than the `github.PullRequestArtifact` so nothing downstream needs
+    #: that type to render a packet. THE DIFF IS NOT A KEY IN HERE AND NEVER WAS: it is
+    #: returned separately by `_pull_request`, so the rule that a packet carries no
+    #: untruncated diff (kn-c8b9c7da) holds by construction rather than by a caller
+    #: remembering to remove it.
+    pr: dict[str, Any] | None = None
+    #: Why the pull request could not be read, when `pr_url` was set and the fetch
+    #: failed. Non-empty means the diff below is the WORKTREE's and the submitter
+    #: pointed at something else.
+    pr_error: str = ""
+    #: Durable change that no diff can show, collected by `ops` and passed in. One dict
+    #: per effect: `{"kind", "id", "summary", "detail"}`. Empty is the normal case.
+    side_effects: tuple[dict, ...] = ()
+    #: sha256 over `side_effects`, computed at collection time exactly as `diff_sha` is,
+    #: and hashed into `fingerprint` for exactly the same reason — see that function.
+    side_effects_sha: str = ""
     #: The section of the feature's spec this unit was told to implement — `spec_ref` is
     #: "<path> § <section>" for citing, `spec_section` its text. Both "" for a standalone
     #: work order and for anything planned before specs existed, which is the null case
@@ -107,12 +165,15 @@ class EvidencePacket:
 
 
 def fingerprint(packet: EvidencePacket) -> str:
-    """A 16-char sha256 prefix over the FULL pre-truncation diff and the normalised
-    `declared` text — and NOTHING else.
+    """A 16-char sha256 prefix over the FULL pre-truncation diff, the side effects and
+    the normalised `declared` text — and NOTHING else.
 
-    Not `head`, not `base`, not `summary`, not `pr_url`. The fingerprint answers one
-    question, "did this submitter produce new evidence?", and every field left out is a
-    field a submitter can move without producing any:
+    Not `head`, not `base`, not `summary`, not `pr_url`. THAT EXCLUSION LIST IS
+    UNCHANGED, and saying so by name is the point: `side_effects_sha` joined the hash
+    (Neo, question 253, correcting question 133 — kn-c8b9c7da) without letting anything
+    else in. The fingerprint answers one question, "did this submitter produce new
+    evidence?", and every field left out is a field a submitter can move without
+    producing any:
 
     | a submitter that…                        | changes             | new evidence? |
     |------------------------------------------|---------------------|---------------|
@@ -123,27 +184,62 @@ def fingerprint(packet: EvidencePacket) -> str:
     | opens a PR for work already submitted    | `pr_url`            | no            |
     | adds a test file                         | the diff            | **yes**       |
     | states a result it had not stated before | `declared` content  | **yes**       |
+    | retracts a DIFFERENT knowledge entry     | `side_effects`      | **yes**       |
+
+    That last row is why the formula widened. Without it, two consecutive diff-less
+    rounds retracting two different entries hash identically, and `_preceding_round`
+    escalates round 2 as "identical to round 1" — issue #200 reappearing one guard
+    further along, with the empty-diff guard already fixed (spec §5).
 
     Hashing `packet.diff` is the obvious implementation and it is wrong: the same tree
     would fingerprint differently at two truncation limits, which makes an integrity
     check depend on a display setting. `diff_sha` is taken before the cut for exactly
-    that reason.
+    that reason, and `side_effects_sha` at the same moment for the same one.
     """
     h = hashlib.sha256()
     h.update(packet.diff_sha.encode("utf-8"))
+    h.update(b"\n")
+    h.update(packet.side_effects_sha.encode("utf-8"))
     h.update(b"\n")
     h.update(_normalise(packet.declared).encode("utf-8"))
     return h.hexdigest()[:16]
 
 
+def side_effects_digest(side_effects: Iterable[dict[str, Any]]) -> str:
+    """sha256 over a packet's side effects, stable against dict ordering.
+
+    `""` for none, NOT the sha of the empty string: every packet collected before this
+    field existed carries `""`, and a round that genuinely has no side effects must
+    fingerprint the same as one of those. Giving "nothing" a non-empty digest would
+    change every existing fingerprint and make the next round of every open work order
+    read as new evidence.
+    """
+    effects = list(side_effects)
+    if not effects:
+        return ""
+    h = hashlib.sha256()
+    for effect in effects:
+        for key in sorted(effect):
+            h.update(f"{key}={effect[key]}\n".encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
 def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
                        diff_chars: int = DEFAULT_DIFF_CHARS,
-                       spec: dict[str, str] | None = None) -> EvidencePacket:
-    """Assemble the packet for one work order from its worktree.
+                       spec: dict[str, str] | None = None,
+                       side_effects: Iterable[dict[str, Any]] = ()) -> EvidencePacket:
+    """Assemble the packet for one work order — from its PULL REQUEST when it has one.
 
-    Never raises for a repository that is missing, empty, broken or gone: a collector
-    that throws would turn "the evidence is thin" into "the round crashed", and the
-    empty packet (`files == ()`) is what the round machine escalates on.
+    The three cases are spec §3's table, and `packet.source` records which one happened.
+    A pull request that cannot be read falls back to the worktree AND says so in
+    `pr_error`: the panel must be able to tell "the submitter pointed at something
+    unreadable" from "the submitter changed nothing".
+
+    Never raises — not for a repository that is missing, empty, broken or gone, and not
+    for a GitHub that is down. A collector that throws would turn "the evidence is thin"
+    into "the round crashed", and the empty packet (`files == ()` and no side effects) is
+    what the round machine escalates on.
 
     **When the worktree is gone the packet is empty, and git is NOT run anywhere else.**
     Falling back to the project root would diff the user's own checkout — whatever they
@@ -152,29 +248,45 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
 
     `wo` is a `work_orders` row. Note what is NOT read from it: `branch`. That column is
     declared and written by nothing in the codebase, so it is always NULL; the base comes
-    from git, via the pinned ladder.
+    from git, via the pinned ladder, or from the pull request's own refs.
 
-    `spec` is `specs.spec_of`'s result, passed in rather than looked up because this
-    module reads a repository and never a database — the same separation that keeps
-    `_ProjectRef` a two-line stand-in instead of a `ProjectSpec` import.
+    `spec` is `specs.spec_of`'s result and `side_effects` is `ops.side_effects_of`'s,
+    both passed in rather than looked up because this module reads a repository and
+    never a database — the same separation that keeps `_ProjectRef` a two-line stand-in
+    instead of a `ProjectSpec` import.
     """
-    # type: ignore — `_ProjectRef` carries the one attribute that helper reads; see it.
-    worktree = worker_session.worktree_path(_ProjectRef(project_path), wo)  # type: ignore[arg-type]
+    pr_url = str(wo.get("pr_url") or "")
+    pr_data: dict[str, Any] | None = None
+    pr_error = source = ""
     base = head = stat = diff = ""
     files: tuple[str, ...] = ()
-    if worktree is not None:
-        base = _resolve_base(worktree)
-        head = _git(worktree, "rev-parse", "HEAD").strip()
-        # Committed work AND anything still uncommitted, whenever there is a base.
-        ranges = (f"{base}...HEAD", None) if base else (None,)
-        stat = "".join(_git(worktree, *_diff_args(r, "--stat")) for r in ranges)
-        diff = "".join(_git(worktree, *_diff_args(r)) for r in ranges)
-        files = _dedupe(
-            name
-            for r in ranges
-            for name in _git(worktree, *_diff_args(r, "--name-only")).split("\n")
-        )
 
+    if pr_url:
+        pr_data, pr_diff, pr_error = _pull_request(pr_url, project_path)
+        if pr_data is not None:
+            source = "pull_request"
+            base, head = str(pr_data["base_ref"]), str(pr_data["head_ref"])
+            stat, diff = str(pr_data["stat"]), pr_diff
+            files = _dedupe(pr_data["files"])
+
+    if source != "pull_request":
+        source = "worktree"
+        # type: ignore — `_ProjectRef` carries the one attribute that helper reads.
+        worktree = worker_session.worktree_path(_ProjectRef(project_path), wo)  # type: ignore[arg-type]
+        if worktree is not None:
+            base = _resolve_base(worktree)
+            head = _git(worktree, "rev-parse", "HEAD").strip()
+            # Committed work AND anything still uncommitted, whenever there is a base.
+            ranges = (f"{base}...HEAD", None) if base else (None,)
+            stat = "".join(_git(worktree, *_diff_args(r, "--stat")) for r in ranges)
+            diff = "".join(_git(worktree, *_diff_args(r)) for r in ranges)
+            files = _dedupe(
+                name
+                for r in ranges
+                for name in _git(worktree, *_diff_args(r, "--name-only")).split("\n")
+            )
+
+    effects = tuple(dict(e) for e in side_effects)
     kept, truncated, dropped = _truncate(diff, diff_chars, files)
     return EvidencePacket(
         unit="work_order",
@@ -183,7 +295,7 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
         description=str(wo.get("description") or ""),
         summary=str(wo.get("result_summary") or ""),
         declared=declared,
-        pr_url=str(wo.get("pr_url") or ""),
+        pr_url=pr_url,
         base=base,
         head=head,
         stat=stat,
@@ -192,9 +304,61 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
         diff_truncated=truncated,
         dropped_files=dropped,
         diff_sha=hashlib.sha256(diff.encode("utf-8")).hexdigest(),
+        source=source,
+        pr=pr_data,
+        pr_error=pr_error,
+        side_effects=effects,
+        side_effects_sha=side_effects_digest(effects),
         spec_ref=_spec_ref(spec),
         spec_section=(spec or {}).get("section_text", ""),
     )
+
+
+def _pull_request(url: str,
+                  project_path: Path) -> tuple[dict[str, Any] | None, str, str]:
+    """`(artifact-as-a-dict, diff, "")`, or `(None, "", why-not)`. Never raises.
+
+    **THE DIFF IS RETURNED SEPARATELY, and the dict it is absent from is the one that
+    becomes `packet.pr`.** The rule that a packet never carries the untruncated diff in
+    any field (kn-c8b9c7da, where a `full_diff` field was rejected for exactly this) is
+    enforced HERE, by the diff never being in that dict at all — not by a caller
+    remembering to remove it. A caller that forgets a `.pop` leaks silently: the limit
+    still reads as configured and every seat prompt is simply enormous. There is nothing
+    to forget now. Rejected in review, round 2.
+
+    The lazy import is the house style AND the thing the leaf rule turns on: `github`
+    can only ask GitHub questions — every command it runs is in `github.READ_ONLY_VERBS`
+    — so importing it cannot give this module, or anything downstream of it, a way to
+    talk back to the submitter it is gathering evidence about (spec §2).
+
+    **`pr_error` IS `GitHubError.reason` AND NEVER `str(e)`.** The exception text
+    carries `gh`'s stderr, and this string is rendered verbatim into five seat prompts;
+    `reason` is a short phrase `github.py` wrote itself, from a fixed vocabulary. A
+    judge's prompt is not a place to interpolate a string a remote server chose.
+
+    **BOTH branches log.** `github._run` logs the expected failures where it raises
+    them; the bare `except` below logs its own, because that branch is for the failure
+    nobody predicted and a silent fallback to the worktree would be undiagnosable — the
+    packet would say only "could not be read" and nothing anywhere would say why.
+    """
+    from . import github
+
+    try:
+        art = github.pr_artifact(url, cwd=project_path)
+    except github.GitHubError as e:  # the packet gets the vocabulary, not the stderr
+        return None, "", e.reason
+    except Exception:  # noqa: BLE001 — a thin packet, never a dead round
+        log.warning(
+            "could not read the pull request at %s; falling back to the worktree",
+            url, exc_info=True)
+        return None, "", "the pull request could not be read"
+    return {
+        "url": art.url, "number": art.number, "title": art.title, "body": art.body,
+        "state": art.state, "draft": art.draft, "base_ref": art.base_ref,
+        "head_ref": art.head_ref, "additions": art.additions,
+        "deletions": art.deletions, "files": list(art.files), "stat": art.stat,
+        "checks": [dict(c) for c in art.checks],
+    }, art.diff, ""
 
 
 def _spec_ref(spec: dict[str, str] | None) -> str:
@@ -206,7 +370,8 @@ def _spec_ref(spec: dict[str, str] | None) -> str:
 
 def collect_feature(project_path: Path, fo: dict[str, Any], children: list[dict[str, Any]],
                     *, declared: str, summary: str = "",
-                    diff_chars: int = DEFAULT_DIFF_CHARS) -> EvidencePacket:
+                    diff_chars: int = DEFAULT_DIFF_CHARS,
+                    side_effects: Iterable[dict[str, Any]] = ()) -> EvidencePacket:
     """Assemble the packet for one feature order, from the PROJECT ROOT.
 
     Every child passed its own review on its own diff, so the marginal defect a
@@ -251,6 +416,7 @@ def collect_feature(project_path: Path, fo: dict[str, Any], children: list[dict[
         diff = _git(project_path, *_diff_args(rng))
         files = _dedupe(_git(project_path, *_diff_args(rng, "--name-only")).split("\n"))
 
+    effects = tuple(dict(e) for e in side_effects)
     kept, truncated, dropped = _truncate(diff, diff_chars, files)
     return EvidencePacket(
         unit="feature",
@@ -270,6 +436,11 @@ def collect_feature(project_path: Path, fo: dict[str, Any], children: list[dict[
         diff_truncated=truncated,
         dropped_files=dropped,
         diff_sha=hashlib.sha256(diff.encode("utf-8")).hexdigest(),
+        # `source` stays "worktree": a feature's diff is read from the project root and
+        # a feature order has no pull request of its own, so there is no third value to
+        # invent. The one thing a seat must not be told is that this came from a PR.
+        side_effects=effects,
+        side_effects_sha=side_effects_digest(effects),
         children=tuple(
             {"id": str(c.get("id") or ""), "title": str(c.get("title") or ""),
              "summary": str(c.get("result_summary") or ""),
