@@ -60,6 +60,8 @@
 {% macro change_line(c) %}
 {% if c.kind == 'added' %}<span class="tone-ok">+</span> {{ c.path }} = {{ c.new|tojson }}
 {% elif c.kind == 'removed' %}<span class="tone-bad">−</span> {{ c.path }} (was {{ c.old|tojson }})
+{% elif c.kind == 'pinned' %}<span class="tone-muted">=</span> {{ c.path }} = {{ c.new|tojson }} (unchanged — the catalog now says so)
+{% elif c.kind == 'unpinned' %}<span class="tone-muted">=</span> {{ c.path }} = {{ c.new|tojson }} (unchanged — back on its default)
 {% else %}<span class="tone-warn">~</span> {{ c.path }}: {{ c.old|tojson }} → {{ c.new|tojson }}
 {% endif %}
 {% endmacro %}
