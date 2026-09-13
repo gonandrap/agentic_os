@@ -1009,6 +1009,21 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
                           f"arrives as the worker's next turn by itself"}
     queued = store.queued_messages(wo_id)
     if queued:
+        # ...unless the delivery this promises has stopped happening. Answering
+        # `queued_message` for a message the worker will never see is the sentence
+        # GitHub issue 43 measured being wrong for 62 minutes, and MESSAGE_STUCK_BLOCKER
+        # sends the user to this command to find out why — so it has to be able to say.
+        # `stalled` stays False deliberately: a nudge is another message into the same
+        # stalled queue, which is the one thing that cannot help.
+        from .invariants import stuck_message
+
+        found = stuck_message(store, wo)
+        if found is not None:
+            msg, why = found
+            return {"what": "message_stuck", "stalled": False,
+                    "detail": f"message {msg['id']} is queued undelivered because "
+                              f"{why} — read `jarvis wo show {wo_id}`, then `jarvis wo "
+                              f"done` if the work order is finished with it"}
         return {"what": "queued_message", "stalled": False,
                 "detail": f"{len(queued)} message(s) queued — jarvisd delivers them "
                           f"when the worker is idle"}
@@ -1084,6 +1099,25 @@ def resume_in_auto(wo_id: str, project_name: str | None = None,
     could_prompt = worker_stalls_on_prompts(mode) if mode else True
     out = {"project": name, "wo_id": wo_id, "permission_mode": mode,
            "waiting_on": wait["what"], "diagnosis": wait["detail"]}
+    if not force and wait["what"] == "message_stuck":
+        # THE ONE ANSWER WHERE A NUDGE IS ACTIVELY WRONG rather than merely useless, and
+        # the reason it needs a branch of its own: every other refusal below is bought by
+        # `could_prompt` being False, so a project running a mode that CAN prompt would
+        # fall through to the nudge — and the nudge is `send_message`, another row on the
+        # queue that is already not moving. `invariants.MESSAGE_STUCK_BLOCKER` sends the
+        # user here, so this is the command that has to say what is wrong instead.
+        store = ProjectStore(path)
+        try:
+            store.add_event(wo_id, "resume_auto_declined",
+                            {"permission_mode": mode, "waiting_on": wait["what"]})
+        finally:
+            store.close()
+        out.update({
+            "nudged": False, "changed": False,
+            "note": f"a nudge cannot help — it is another message on the queue that is "
+                    f"already stuck. {wait['detail']}. Send one anyway with --force.",
+        })
+        return out
     if not force and not could_prompt and not wait["stalled"]:
         # The no-op case, reported rather than performed. Recorded on the timeline too:
         # "the user asked what was wrong and the OS said nothing was" is part of this
@@ -4856,6 +4890,27 @@ def inspect_config_at(project_path: Path) -> Any:
         return catalog.os.inspect
     except (OpsError, CatalogError, OSError, ValueError):
         return InspectConfig()
+
+
+def messaging_config_at(project_path: Path) -> Any:
+    """`os.messaging` for the project rooted at `project_path`.
+
+    `inspect_config_at`'s twin, for `invariants.stuck_message` — an invariant is handed
+    a `ProjectStore` and no project name, and falls back to the OS block and then to the
+    shipped defaults for the reason that function gives: a check with no threshold is no
+    check.
+    """
+    from .catalog import MessagingConfig
+
+    try:
+        catalog = resolve_catalog()
+        target = Path(project_path).resolve()
+        for spec in catalog.projects:
+            if Path(spec.path).resolve() == target:
+                return spec.messaging
+        return catalog.os.messaging
+    except (OpsError, CatalogError, OSError, ValueError):
+        return MessagingConfig()
 
 
 def inspect_report(target: str, project: str | None = None, *,
