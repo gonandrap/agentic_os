@@ -159,6 +159,30 @@ NO_VALIDATOR_REASON = (
     "settled exactly where it settles with validation switched off"
 )
 
+#: The give-up notification, for both round machines (issue #199). ONE shape for both,
+#: because a unit that gives up says the same thing to the user whichever machine gave
+#: up on it. The body is the round's reason, CUT to `VALIDATION_REASON_CHARS`.
+VALIDATION_ESCALATED_TITLE = "{unit} — the review gave up in round {n}"
+
+#: How much of the reason the body carries. A DISPLAY choice and not a schema limit —
+#: `notifications.body` is TEXT and would take the whole of it — so raising it is safe
+#: and is a decision about what a Telegram push should be, not about the store. A panel
+#: reason runs to paragraphs; this row exists to say enough to decide whether to look,
+#: and `jarvis wo show` / `jarvis validation show` hold the untruncated text.
+VALIDATION_REASON_CHARS = 500
+
+#: Appended when the cut above actually bit, so a reader can tell a short reason from a
+#: clipped one. Without it a sentence simply stops and the truncation reads as the
+#: machine having nothing more to say.
+VALIDATION_REASON_CUT = " […]"
+
+
+def escalation_body(reason: str) -> str:
+    """The reason as a notification body — see `VALIDATION_REASON_CHARS`."""
+    if len(reason) <= VALIDATION_REASON_CHARS:
+        return reason
+    return reason[:VALIDATION_REASON_CHARS] + VALIDATION_REASON_CUT
+
 
 class Daemon:
     def __init__(self, catalog: Catalog, poll_interval: float = 5.0):
@@ -515,7 +539,7 @@ class Daemon:
                     # Also before them: this is the only thing that ever closes a gate
                     # request no reviewer can see, so leaving it until after would let
                     # the invariants judge a hold the OS was about to refuse.
-                    self.refuse_unargued_gates(project, store)
+                    self.abandon_unargued_gates(project, store)
                     # Last: check the state everything above just produced.
                     self.check_invariants(project, store)
                 self.central.touch_project(project.name)
@@ -1280,6 +1304,20 @@ class Daemon:
         INV-ATTENTION-REASON rewrites any reason `invariants.true_blockers` cannot
         re-derive — a better sentence here would simply be overwritten on the next
         reconcile tick, and the user would read the generic one.
+
+        THE NOTIFICATION IS THE HALF THE FLAG CANNOT DO (issue #199). An attention flag
+        is read by somebody already looking at `jarvis status`; the outbox is what
+        reaches the central inbox and every sink, which is how every other "this needs
+        you" transition tells the user without being asked. `_reject` deliberately stays
+        silent — its feedback travels to the worker over the bus — so the give-up is the
+        only transition in this machine that pings.
+
+        NO NEO PRE-STEP, and it is not an oversight (Neo, question 254). By the time a
+        give-up could be reviewed the round is closed and the unit is `needs_review`, and
+        `invariants.true_blockers` re-derives VALIDATION_STUCK_BLOCKER from exactly that
+        pair on every reconcile tick — so a verdict of "do not bother the user" cannot
+        take the attention item down, and the call would buy one suppressed sink message
+        and nothing else. It becomes worth asking only if Neo may also SETTLE the unit.
         """
         from .invariants import VALIDATION_STUCK_BLOCKER
 
@@ -1289,6 +1327,11 @@ class Daemon:
                         {"round": n, "round_id": round_id, "reason": reason})
         store.set_status(wo_id, "needs_review")
         store.flag_attention(wo_id, VALIDATION_STUCK_BLOCKER)
+        store.add_notification(
+            title=VALIDATION_ESCALATED_TITLE.format(unit=wo_id, n=n),
+            body=escalation_body(reason), level="warning", wo_id=wo_id,
+            source="validation",
+        )
 
     def _validation_outage(self, store: ProjectStore, wo: dict, round_id: int, n: int,
                            error: Exception) -> None:
@@ -1587,6 +1630,12 @@ class Daemon:
         `true_blockers` never sees a feature order — it answers "what does this WORK
         ORDER need from me" — so nothing rewrites this reason, but two units giving up
         for the same cause must say the same words to the user.
+
+        The notification carries NO `wo_id`, for the same reason the flag goes on the
+        feature: the id this give-up is about is the feature order, the outbox and the
+        central inbox only carry a work-order column, and naming the manager there would
+        point every sink at a session rather than at the rounds. So the feature id goes
+        in the title, where the user reads it (issue #199).
         """
         from . import ops
         from .invariants import VALIDATION_STUCK_BLOCKER
@@ -1597,6 +1646,10 @@ class Daemon:
                           {"round": n, "round_id": round_id, "reason": reason,
                            "feature_order": fo_id})
         store.flag_feature_attention(fo_id, VALIDATION_STUCK_BLOCKER)
+        store.add_notification(
+            title=VALIDATION_ESCALATED_TITLE.format(unit=fo_id, n=n),
+            body=escalation_body(reason), level="warning", source="validation",
+        )
 
     def _feature_outage(self, store: ProjectStore, fo: dict, round_id: int, n: int,
                         error: Exception) -> None:
@@ -2100,35 +2153,53 @@ class Daemon:
             return
 
         if verdict["escalate"]:
-            central.add_inbox(
-                project=q["project"], level="warning",
-                title=f"Approval needed: {approval['kind']} from {q['wo_id']}",
-                body=(f"Neo declined to decide: {verdict['reason']}\n\n"
-                      f"Command: {approval['command']}\n\n"
-                      f"Approve it with: jarvis gate approve {approval['id']} "
-                      f"--reason \"...\"\n"
-                      f"Deny it with:    jarvis gate deny {approval['id']} "
-                      f"--reason \"...\"\n"
-                      f"Full request:    jarvis gate show {approval['id']}"),
-                wo_id=q["wo_id"],
-            )
+            # A contest must not arrive offering `approve`, the one verb that cannot
+            # answer it — spec 2026-09-12 §2.
+            if approval["contested"]:
+                title = f"Is this a false positive? {approval['kind']} from {q['wo_id']}"
+                body = (f"The worker says this command performs no privileged action and "
+                        f"the `{approval['kind']}` gate matched it by mistake. Neo "
+                        f"declined to decide: {verdict['reason']}\n\n"
+                        f"Command: {approval['command']}\n\n"
+                        f"It is a false positive:  jarvis gate dismiss {approval['id']} "
+                        f"--reason \"...\"\n"
+                        f"The worker is wrong:     jarvis gate deny {approval['id']} "
+                        f"--reason \"...\"\n"
+                        f"The contest in full:     jarvis gate show {approval['id']}")
+            else:
+                title = f"Approval needed: {approval['kind']} from {q['wo_id']}"
+                body = (f"Neo declined to decide: {verdict['reason']}\n\n"
+                        f"Command: {approval['command']}\n\n"
+                        f"Approve it with: jarvis gate approve {approval['id']} "
+                        f"--reason \"...\"\n"
+                        f"Deny it with:    jarvis gate deny {approval['id']} "
+                        f"--reason \"...\"\n"
+                        f"Full request:    jarvis gate show {approval['id']}")
+            central.add_inbox(project=q["project"], level="warning", title=title,
+                              body=body, wo_id=q["wo_id"])
             pstore.mark_approval_escalated(approval["id"], verdict["reason"])
             pstore.flag_attention(
                 q["wo_id"],
-                f"gate approval escalated by Neo: {approval['kind']} "
-                f"(request {approval['id']})",
+                (f"contested gate match escalated by Neo: {approval['kind']} "
+                 f"(request {approval['id']})") if approval["contested"] else
+                (f"gate approval escalated by Neo: {approval['kind']} "
+                 f"(request {approval['id']})"),
             )
             pstore.add_event(q["wo_id"], "gate_escalated", {
                 "approval_id": approval["id"], "reason": verdict["reason"],
             })
             return
 
-        ruling = verdict.get("verdict") or ("approved" if verdict.get("approve")
-                                            else "denied")
-        gates.apply_decision(pstore, approval["id"], verdict=ruling,
-                             reason=verdict["reason"], decided_by="neo",
-                             central=central, project=q["project"],
-                             exempt_pattern=verdict.get("exempt_pattern", ""))
+        asked = verdict.get("verdict") or ("approved" if verdict.get("approve")
+                                           else "denied")
+        decided = gates.apply_decision(pstore, approval["id"], verdict=asked,
+                                       reason=verdict["reason"], decided_by="neo",
+                                       central=central, project=q["project"],
+                                       exempt_pattern=verdict.get("exempt_pattern", ""))
+        # WHAT WAS RECORDED, not what the reviewer said: the two differ on exactly one
+        # input, `approved` on a contested row — spec §2. Level, title and body all read
+        # from here for that reason.
+        ruling = decided["status"]
         # A shipped release is something the user wants to know happened, even when they
         # did not have to authorise it — that is the trade for spending none of their
         # attention on the approval itself.
@@ -2140,11 +2211,16 @@ class Daemon:
         # instead — `jarvis gate list` and the dashboard — because what matters about
         # classifier defects is the rate, not each instance.
         if ruling != "dismissed":
+            # A rejected CONTEST stays visible — the one place this feature spends the
+            # user's attention on purpose.
             central.add_inbox(
                 project=q["project"],
                 level="info" if ruling == "approved" else "warning",
-                title=f"Neo {ruling} {approval['kind']} for {q['wo_id']}",
-                body=(f"{verdict['reason']}\n\nCommand: {approval['command']}\n"
+                title=(f"Neo rejected a contested {approval['kind']} match from "
+                       f"{q['wo_id']}" if decided["contested"]
+                       else f"Neo {ruling} {approval['kind']} for {q['wo_id']}"),
+                body=(f"{decided['decision_reason']}\n\n"
+                      f"Command: {approval['command']}\n"
                       f"Review Neo's call with: jarvis neo review {q['id']}"),
                 wo_id=q["wo_id"],
             )
@@ -2380,8 +2456,14 @@ class Daemon:
         for subject in subjects:
             row = subject["row"]
             last = pstore.last_health_review(subject["kind"], row["id"])
+            # TWO READS, and they disagree precisely when the sweep is failing: `last`
+            # is the last JUDGEMENT and skips a `failed` row, `attempt` is the last CALL
+            # and counts it. `due` compares the fingerprint against the first and floors
+            # the spend on the second — see issue #216.
+            attempt = pstore.last_health_attempt_ts(subject["kind"], row["id"])
             trigger = health.due(last, health.fingerprint(pstore, subject), cfg, now,
-                                 float(row.get("created_at") or 0.0))
+                                 float(row.get("created_at") or 0.0),
+                                 last_attempt=attempt)
             if trigger:
                 out.append((float(last["ts"]) if last else 0.0, subject, trigger))
         out.sort(key=lambda c: c[0])
@@ -2410,7 +2492,7 @@ class Daemon:
         finally:
             neo_store.close()
 
-    def refuse_unargued_gates(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def abandon_unargued_gates(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Close every gate request whose case never came. See `gates.sweep_unargued`.
 
         The other half of holding an unargued request back from review: nothing else can
@@ -2422,15 +2504,14 @@ class Daemon:
         if not project.gates:
             return
         try:
-            refused = gates.sweep_unargued(
-                store, project.gates.case_ttl_seconds,
-                central=self.central, project=project.name)
+            closed = gates.sweep_unargued(store, project.gates.case_ttl_seconds)
         except Exception:  # noqa: BLE001 — one project's sweep must not stop the tick
-            log.exception("project %s: refusing unargued gates failed", project.name)
+            log.exception("project %s: closing unargued gates failed", project.name)
             return
-        for approval in refused:
-            log.info("gate %s (%s) refused: no case was made for it",
-                     approval["id"], approval["kind"])
+        for approval in closed:
+            # "abandoned", never "refused": nobody reviewed it — spec 2026-09-12 §4.
+            log.info("gate %s (%s) abandoned: no case was made and the match was never "
+                     "contested", approval["id"], approval["kind"])
 
     # -- 7. invariants (post-conditions) --------------------------------------------------
 

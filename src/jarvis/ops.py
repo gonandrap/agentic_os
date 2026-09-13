@@ -559,12 +559,16 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         # not the user's, but the rate is the one signal that says whether the
         # recognisers are getting better.
         false_positives = 0
+        # Held requests whose worker never came back — evidence about the same classifier,
+        # counted separately because an abandonment is not a verdict (spec 2026-09-12 §5).
+        abandoned = 0
         for name, path in registered_project_paths().items():
             if not path.is_dir():
                 continue
             store = ProjectStore(path)
             try:
                 false_positives += store.dismissed_count()
+                abandoned += store.abandoned_count()
                 for a in store.escalated_approvals():
                     gate_items.append({
                         "project": name, "wo_id": a["wo_id"],
@@ -607,7 +611,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             "backlog": {"open": len(backlog_open)},
             "neo": neo_counts,
             "gates": {"awaiting_you": len(gate_items),
-                      "false_positives": false_positives},
+                      "false_positives": false_positives,
+                      "abandoned": abandoned},
             "healthy": pid is not None and not attention,
         }
     finally:
@@ -976,6 +981,24 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
         return {"what": "gate_with_neo", "stalled": False,
                 "detail": "a privileged-action gate that is with Neo — the verdict "
                           "reaches the worker by itself"}
+    # Recorded, unargued, in front of NOBODY — `gates.AWAITING_CASE`. Without this branch
+    # the park falls all the way to the catch-all and is reported as a permission prompt,
+    # which is the false diagnosis of GitHub issue 100 arriving down the road
+    # `invariants._waiting_on_neo_gate` was written to close. Wording mirrors what
+    # `jarvis gate list` prints, the one surface that already gets it right.
+    held = store.held_approvals(wo_id)
+    if held:
+        # Both exits, addressed by REQUEST NUMBER: this describes what the worker must
+        # type, and a worktree-isolated worker cannot pass its own command string back
+        # (spec 2026-09-12 §8). And the TTL abandons rather than refuses — §4.
+        return {"what": "gate_held", "stalled": False,
+                "detail": f"gate {held[0]['id']} is recorded but unargued — no reviewer "
+                          f"sees it yet, and the move is the WORKER's, either "
+                          f"`jarvis gate request {held[0]['id']} --why \"…\" "
+                          f"--evidence \"…\"` or, if the gate matched it by mistake, "
+                          f"`jarvis gate contest {held[0]['id']} --why \"…\"`. If neither "
+                          f"comes the OS abandons it unreviewed on the "
+                          f"`gates.case_ttl_seconds` timer"}
     question = awaiting_neo(wo_id)
     if question is not None:
         if question["status"] in USER_HELD_Q_STATUSES:
@@ -1620,6 +1643,25 @@ def declared_evidence(store: ProjectStore, wo_id: str) -> str:
     return ""
 
 
+def gate_still_open(wo_id: str, request: dict[str, Any]) -> str:
+    """Why this work order cannot settle yet, and the one way on from where it is."""
+    from .gates import AWAITING_CASE, exits_advice
+
+    if request["status"] == AWAITING_CASE:
+        # Both exits, from the renderer every other block uses — a refusal that named
+        # only the request would push a worker whose command performs no privileged
+        # action into writing a false case (spec 2026-09-12-contesting-a-gate-match §3).
+        way_on = ("Nobody is reviewing it: it carries neither a case nor a contest.\n\n"
+                  + exits_advice(wo_id, request["command"], request["kind"],
+                                 request["id"]))
+    else:
+        way_on = ("It is under review. End your turn — the verdict arrives as your "
+                  "next user turn, and you finish from there.")
+    return (f"{wo_id} has gate request {request['id']} ({request['kind']}) still open, "
+            f"so it cannot be finished: settling it now would close the work order over "
+            f"a privileged action nobody ruled on. {way_on}")
+
+
 def finish(wo_id: str, summary: str, pr_url: str | None = None,
            evidence: str = "") -> dict[str, Any]:
     """The worker reporting its own result.
@@ -1641,6 +1683,11 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
     OPTIONAL: every worker in flight when this shipped predates the flag, so an empty
     one is an ordinary submission and not a thin one.
 
+    An open gate request outranks all of it, and this is the third enforcement point of
+    docs/superpowers/specs/2026-09-12-a-gate-that-holds.md: declaring yourself done is
+    the one route around a gate that neither the Stop hold nor the narrowed tool surface
+    can close, because the command that takes it is a `jarvis …` contract command.
+
     **`os.validation.enabled` is read at the SUBMISSION SITES ONLY** — here and in
     `review_work_order`, the other route into done — and it gates OPENING a round and
     nothing else. A flag turned off while rounds are open must still let the daemon
@@ -1652,6 +1699,17 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
     cfg = validation_config(name)
     store = ProjectStore(path)
     try:
+        open_requests = store.open_approvals(wo_id)
+        if open_requests:
+            # WHICH request the message describes is a choice, not a consequence of how
+            # `open_approvals` happens to order its two halves: the way on differs by
+            # status, and a held one is the only one the worker can act on this turn, so
+            # it leads whenever both are open.
+            from .gates import AWAITING_CASE
+
+            raise OpsError(gate_still_open(wo_id, next(
+                (a for a in open_requests if a["status"] == AWAITING_CASE),
+                open_requests[0])))
         fields: dict[str, Any] = {"result_summary": summary}
         if pr_url:
             fields["pr_url"] = pr_url
@@ -3010,6 +3068,55 @@ def _project_gate_config(project_name: str):
     return GateConfig()
 
 
+#: Refused when `JARVIS_WO_ID` is unset, rather than merely unscoped: a contest is the
+#: WORKER's exit and nobody else's. Spec 2026-09-12 §8.
+CONTEST_NEEDS_AN_OWNER = (
+    "`jarvis gate contest` is a worker's exit from its own block and needs JARVIS_WO_ID, "
+    "which is set only inside a dispatched worker's session. An upheld contest clears the "
+    "command and teaches the recogniser fleet-wide, so it is not something to run on "
+    "another unit's behalf. To rule on a request yourself: `jarvis gate dismiss <id> "
+    "--reason \"...\"` if the recogniser was wrong, `jarvis gate deny <id> --reason "
+    "\"...\"` if it was not."
+)
+
+
+def resolve_gate_target(target: str, command: str | None = None,
+                        project_name: str | None = None,
+                        caller_wo_id: str | None = None,
+                        require_caller: bool = False) -> tuple[str, str]:
+    """`(wo_id, command)` from either spelling of a gate exit: `<wo> "<cmd>"` or `<id>`.
+
+    Why a request number at all, why it is SCOPED to `caller_wo_id`, and why
+    `require_caller` withdraws the no-caller carve-out for `contest` alone: spec
+    2026-09-12 §8 and `CONTEST_NEEDS_AN_OWNER`.
+    """
+    if require_caller and not caller_wo_id:
+        raise OpsError(CONTEST_NEEDS_AN_OWNER)
+    if command is not None:
+        if caller_wo_id and target != caller_wo_id:
+            raise OpsError(
+                f"{target} is not your work order ({caller_wo_id}) — a gate exit acts on "
+                f"the unit that was blocked, and this one was not."
+            )
+        return target, command
+    if not target.strip().isdigit():
+        raise OpsError(
+            f"{target!r} is neither a request number nor a work order with a command "
+            f"after it. Either `jarvis gate <verb> <request-number> …` (the number the "
+            f"block printed) or `jarvis gate <verb> <wo-id> \"<the exact command>\" …`."
+        )
+    name, _, approval = _find_approval(int(target.strip()), project_name)
+    if caller_wo_id and approval["wo_id"] != caller_wo_id:
+        raise OpsError(
+            f"request {target.strip()} belongs to {approval['wo_id']} (project {name!r}), "
+            f"not to you ({caller_wo_id}) — refusing, because a contest amends the "
+            f"standing row and this one is not yours to re-frame. Re-read the number in "
+            f"your own block message: `jarvis gate list --wo {caller_wo_id}` lists the "
+            f"requests filed against this work order."
+        )
+    return approval["wo_id"], approval["command"]
+
+
 def request_gate_approval(wo_id: str, command: str, why: str = "", evidence: str = "",
                           project_name: str | None = None) -> dict[str, Any]:
     """(Workers) ask for permission to run a privileged command, making the case for it.
@@ -3106,6 +3213,96 @@ def request_gate_approval(wo_id: str, command: str, why: str = "", evidence: str
                     "next user turn"}
 
 
+def contest_gate_match(wo_id: str, command: str, why: str,
+                       project_name: str | None = None) -> dict[str, Any]:
+    """(Workers) dispute a gate MATCH: this command performs no privileged action.
+
+    Same reviewer, same queue, same `learn_from_dismissal` on the way out; what differs
+    is the claim on the record — a candidate DISMISSAL, never a request for permission.
+    See docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §1.
+    """
+    from . import gates
+    from .neo_store import NeoStore
+
+    name, path, wo = find_work_order(wo_id, project_name)
+    if not why.strip():
+        raise OpsError(
+            "a contest needs an argument — pass --why, saying what the command actually "
+            "does and where the matched text sits (a grep pattern, a commit message, a "
+            "heredoc). The reviewer sees only what you write, and a contest with nothing "
+            "in it can only be denied."
+        )
+    config = _project_gate_config(name)
+    if not config:
+        raise OpsError(
+            f"project {name!r} has no gates enabled, so nothing could have matched this "
+            f"command — there is nothing to contest."
+        )
+    action = gates.classify(command, config)
+    if action is None:
+        # Naming the command checked matters: a grant is scoped to an exact string.
+        raise OpsError(
+            f"that command trips no gate enabled for {name!r} "
+            f"(enabled: {sorted(config.enabled)}) — run it directly. If a gate really "
+            f"fired, the string here is not the string that was blocked: copy it exactly "
+            f"from `jarvis gate list --wo {wo_id}`."
+        )
+
+    store = ProjectStore(path)
+    try:
+        grant = store.usable_grant(wo_id, action.kind, action.command)
+        if grant is not None:
+            return {"project": name, "wo_id": wo_id, "approval_id": grant["id"],
+                    "kind": action.kind, "status": grant["status"],
+                    "note": "already cleared — run the command as written"}
+        existing = store.latest_approval_for(wo_id, action.kind, action.command)
+        # Open and not yet contested, and nothing else — reviewer-shopping otherwise
+        # (kn-76b155a0). Spec 2026-09-12 §8.
+        if existing and existing["status"] == "pending" and existing["contested"]:
+            raise OpsError(
+                f"request {existing['id']} is already contested and in front of a "
+                f"reviewer — one claim, one review. To add to the argument, send it to "
+                f"the reviewer rather than re-filing it; to see it as they do, "
+                f"`jarvis gate show {existing['id']}`."
+            )
+        if existing and existing["status"] == "denied":
+            raise OpsError(
+                f"request {existing['id']} was already DENIED by "
+                f"{existing['decided_by'] or 'a reviewer'}: "
+                f"{existing['decision_reason'] or 'no reason recorded'}. A reviewer has "
+                f"ruled that this command does perform the action, so contesting it again "
+                f"asks the same question of a second reviewer. Address the reason instead."
+            )
+        neo = NeoStore()
+        try:
+            if existing and existing["status"] in (gates.AWAITING_CASE, "pending"):
+                # Onto the STANDING row, never a second one (kn-76b155a0). The claim
+                # changed, so the reviewer's page is rewritten to match it.
+                held = existing["status"] == gates.AWAITING_CASE
+                approval = gates.amend_request(store, neo, wo, action,
+                                               store.mark_contested(existing["id"]),
+                                               justification=why)
+                if held:
+                    gates.queue_for_review(store, neo, name, wo, action, approval)
+            else:
+                # No hold: a contest IS the case the reviewer needs — spec §1.
+                approval, _ = gates.file_request(store, neo, name, wo, action,
+                                                 justification=why, contested=True)
+        finally:
+            neo.close()
+    finally:
+        store.close()
+    return {
+        "project": name, "wo_id": wo_id, "approval_id": approval["id"],
+        "kind": action.kind, "command": action.command, "status": "pending",
+        "contested": True,
+        "note": ("contested — a reviewer will decide whether the recogniser was wrong. "
+                 "It cannot authorise anything, so the outcomes are DISMISSED (run the "
+                 "command as written) or DENIED (it really does perform the action). "
+                 "END YOUR TURN; the verdict arrives as your next user turn"),
+    }
+
+
 def decide_gate(approval_id: int, verdict: str, reason: str = "",
                 project_name: str | None = None) -> dict[str, Any]:
     """(User) rule on a gate directly, whatever Neo did or didn't say.
@@ -3134,11 +3331,21 @@ def decide_gate(approval_id: int, verdict: str, reason: str = "",
     name, path, approval = _find_approval(approval_id, project_name)
     # `awaiting_case` decides too. The hold keeps NEO from ruling on a request nobody
     # argued; the user is not Neo — they can read the command, and the alternative is a
-    # dead end where the only way out is waiting for the TTL to refuse it.
+    # dead end where the only way out is waiting for the TTL to abandon it.
     if approval["status"] not in ("pending", gates.AWAITING_CASE):
         raise OpsError(
             f"approval {approval_id} is already {approval['status']}"
             + (f" (by {approval['decided_by']})" if approval["decided_by"] else "")
+        )
+    # Refused here rather than coerced, because there is a person to tell; the daemon's
+    # path coerces instead. Spec 2026-09-12 §2.
+    if approval["contested"] and verdict == "approved":
+        raise OpsError(
+            f"approval {approval_id} is a CONTEST, not a request for permission — the "
+            f"worker argued this command performs no privileged action, and made no case "
+            f"for performing one. Dismiss it if it is right (`jarvis gate dismiss "
+            f"{approval_id} --reason \"...\"`), deny it if it is wrong. To authorise the "
+            f"action itself, the worker files `jarvis gate request` with a case."
         )
     store = ProjectStore(path)
     central = CentralStore()
@@ -3241,6 +3448,16 @@ def list_gates(project_name: str | None = None, wo_id: str | None = None,
             store.close()
         out.extend({**r, "project": name} for r in rows)
     out.sort(key=lambda r: r["ts"], reverse=True)
+    # A held request is the one status whose next event is a CLOCK, so the clock travels
+    # with the row: a surface that can only say "awaiting case" leaves the reader with no
+    # way to tell a request the worker is about to argue from one nothing will ever
+    # close. See `gates.sweep_unargued`.
+    ttls = _case_ttl_seconds()
+    for row in out:
+        if row["status"] == gates.AWAITING_CASE:
+            ttl = ttls.get(row["project"], gates.DEFAULT_CASE_TTL_SECONDS)
+            row["case_ttl_seconds"] = ttl
+            row["case_deadline"] = row["ts"] + ttl
     if include_request:
         from .neo_store import NeoStore
         neo = NeoStore()
@@ -3251,6 +3468,21 @@ def list_gates(project_name: str | None = None, wo_id: str | None = None,
         finally:
             neo.close()
     return out
+
+
+def _case_ttl_seconds() -> dict[str, float]:
+    """Each project's `gates.case_ttl_seconds`, empty when the catalog is unreadable.
+
+    One catalog read for a whole listing; callers fall back to
+    `gates.DEFAULT_CASE_TTL_SECONDS`, which is what `Daemon.abandon_unargued_gates` would
+    use anyway for a project with no gate block.
+    """
+    try:
+        catalog = resolve_catalog()
+    except (OpsError, CatalogError):
+        return {}
+    return {spec.name: spec.gates.case_ttl_seconds
+            for spec in catalog.projects if spec.gates}
 
 
 def list_gate_rules(role: str | None = None, kind: str | None = None,
@@ -3275,7 +3507,27 @@ def list_gate_rules(role: str | None = None, kind: str | None = None,
     return {
         "rules": [{**r, "rendered": Rule.from_row(r).render()} for r in rows],
         "canary_failures": live.check_canaries(),
+        "classifier": classifier_stats(),
     }
+
+
+def classifier_stats() -> dict[str, int]:
+    """How often the recogniser has been wrong, and how often nobody stayed to say so.
+
+    Two numbers, reported side by side and never added together — spec 2026-09-12 §5.
+    """
+    dismissed = abandoned = total = 0
+    for _name, path in registered_project_paths().items():
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            dismissed += store.dismissed_count()
+            abandoned += store.abandoned_count()
+            total += len(store.list_approvals())
+        finally:
+            store.close()
+    return {"dismissed": dismissed, "abandoned": abandoned, "requests": total}
 
 
 def retract_gate_rule(rule_id: str, reason: str) -> dict[str, Any]:
@@ -3310,6 +3562,9 @@ def retract_gate_rule(rule_id: str, reason: str) -> dict[str, Any]:
 def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any]:
     """Why this command would, or would not, trip a gate.
 
+    `command` may be a request NUMBER instead, which is how a blocked worker can reach
+    this at all — §8.
+
     The diagnostic that a false positive used to require reading source code to get. A
     gate record holds the exact string that fired, so pasting it here is a mechanical
     two-minute answer to "why was this blocked" — which is the difference between
@@ -3319,11 +3574,15 @@ def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any
         KIND_NAMES,
         RuleSet,
         command_names,
+        gate_paperwork,
         reads_only,
         scannable,
         shape_of,
     )
 
+    if command.strip().isdigit():
+        _, _, approval = _find_approval(int(command.strip()), project_name)
+        command = approval["command"]
     # Without a project, every gate is treated as live: the question being asked is what
     # the RULES say, and answering it against an empty enabled-set would return "nothing
     # fires" for a command that fires four gates in any project that has them on.
@@ -3340,6 +3599,7 @@ def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any
         "command": command,
         "gates_enabled": sorted(enabled),
         "reads_only": reads_only(command),
+        "gate_paperwork": gate_paperwork(command),
         "commands_in_chain": sorted(command_names(command)),
         "scanned": scannable(command),
         "trace": list(decision.trace),
@@ -3353,6 +3613,9 @@ def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any
         out["rule"] = decision.match.rule_id
         out["where"] = shape.describe() if shape else "unknown"
         out["learnable"] = bool(shape and shape.exemptible)
+        out["why_unlearnable"] = (
+            shape.unlearnable_reason() if shape
+            else "the pattern does not occur in the command as written")
     return out
 
 
@@ -3609,8 +3872,24 @@ def _document_slot(document: dict[str, Any], key: str, *,
     return node, rest[-1]
 
 
+#: A write that moved the DOCUMENT and not the effective value, so `old == new` by
+#: construction: `pinned` writes into the file a value that was already in force,
+#: `unpinned` takes one back out. Neither may be reported as `changed` — that claims a
+#: change nobody made — and neither demands a `--reason` on a safety key (§7).
+DOCUMENT_ONLY_KINDS = ("pinned", "unpinned")
+
+
+def _retry(verb: str, path: str, project: str | None, value: str = "") -> str:
+    """The exact command to re-run, spelled the way the user spelled it."""
+    words = ["jarvis", "config", verb, *([project] if project else []), path]
+    if value:
+        words.append(value)
+    return " ".join(words) + ' --reason "…"'
+
+
 def _one_change(key: str, before: dict[str, Any], after: dict[str, Any],
-                doc_before: Any, doc_after: Any, existed: bool) -> list[dict[str, Any]]:
+                doc_before: Any, doc_after: Any, existed: bool,
+                *, removed: bool = False) -> list[dict[str, Any]]:
     """The single triple a `set`/`unset` asked for, read off the RESOLVED maps.
 
     Resolved rather than raw so the history shows the default the user was actually on
@@ -3622,20 +3901,30 @@ def _one_change(key: str, before: dict[str, Any], after: dict[str, Any],
         if change["path"] == key:
             return [change]
     if key in before or key in after:
-        return [{"path": key, "kind": "changed",
+        return [{"path": key, "kind": "unpinned" if removed else "pinned",
                  "old": before.get(key), "new": after.get(key)}]
     return [{"path": key, "kind": "changed" if existed else "added",
              "old": doc_before, "new": doc_after}]
 
 
-def _require_reason(changes: list[dict[str, Any]], reason: str) -> None:
-    unsafe = [c["path"] for c in changes if safety_key(c["path"])]
+def _require_reason(changes: list[dict[str, Any]], reason: str,
+                    retry: str = "") -> None:
+    """A safety key demands a `--reason` only when its EFFECTIVE value moves (§7).
+
+    The reason exists to go on the version row, so a write that records no row — the
+    document already said this — has nowhere to put one; and a write that only pins an
+    already-effective value into the file has nothing to justify, since what a worker is
+    ALLOWED to do did not move, only where that permission is written down.
+    """
+    unsafe = [c["path"] for c in changes if safety_key(c["path"])
+              and c["kind"] not in DOCUMENT_ONLY_KINDS and c["old"] != c["new"]]
     if not unsafe or reason.strip():
         return
     more = f" (and {len(unsafe) - 3} more)" if len(unsafe) > 3 else ""
     raise OpsError(
         f"{', '.join(unsafe[:3])}{more} — a safety setting changes what a worker is "
-        f"ALLOWED to do, so `--reason` is required and goes on the version row")
+        f"ALLOWED to do, so `--reason` is required and goes on the version row"
+        + (f":\n    {retry}" if retry else ""))
 
 
 def _find_version(version_id: str) -> dict[str, Any]:
@@ -3700,7 +3989,8 @@ def set_config(path: str, value: Any, project: str | None = None, *, reason: str
 
     after = _resolved_of(document, file)
     changes = _one_change(key, before, after, doc_before, value, existed)
-    _require_reason(changes, reason)
+    _require_reason(changes, reason,
+                    _retry("set", path, project, json.dumps(value, ensure_ascii=False)))
     row = _commit_document(document, path=file, actor=actor, reason=reason,
                            changes=changes)
     return {"version": row, "changed": row["id"] != was,
@@ -3727,8 +4017,9 @@ def unset_config(path: str, project: str | None = None, *, reason: str = "",
     doc_before = container.pop(leaf)
 
     after = _resolved_of(document, file)
-    changes = _one_change(key, before, after, doc_before, after.get(key), True)
-    _require_reason(changes, reason)
+    changes = _one_change(key, before, after, doc_before, after.get(key), True,
+                          removed=True)
+    _require_reason(changes, reason, _retry("unset", path, project))
     row = _commit_document(document, path=file, actor=actor, reason=reason,
                            changes=changes)
     return {"version": row, "changed": True, "path": key, "value": after.get(key),
@@ -3858,7 +4149,8 @@ def restore_config(version_id: str, *, reason: str = "",
     except OpsError:
         before = {}
     changes = config_version.diff(before, row["resolved"])
-    _require_reason(changes, reason)
+    _require_reason(changes, reason,
+                    f'jarvis config restore {row["id"]} --reason "…"')
     applied = _commit_document(row["document"], path=file, actor=actor, reason=reason,
                                changes=changes)
     return {"version": applied, "restored": row["id"], "changes": changes,
