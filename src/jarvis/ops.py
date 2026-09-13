@@ -559,12 +559,16 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         # not the user's, but the rate is the one signal that says whether the
         # recognisers are getting better.
         false_positives = 0
+        # Held requests whose worker never came back — evidence about the same classifier,
+        # counted separately because an abandonment is not a verdict (spec 2026-09-12 §5).
+        abandoned = 0
         for name, path in registered_project_paths().items():
             if not path.is_dir():
                 continue
             store = ProjectStore(path)
             try:
                 false_positives += store.dismissed_count()
+                abandoned += store.abandoned_count()
                 for a in store.escalated_approvals():
                     gate_items.append({
                         "project": name, "wo_id": a["wo_id"],
@@ -607,7 +611,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             "backlog": {"open": len(backlog_open)},
             "neo": neo_counts,
             "gates": {"awaiting_you": len(gate_items),
-                      "false_positives": false_positives},
+                      "false_positives": false_positives,
+                      "abandoned": abandoned},
             "healthy": pid is not None and not attention,
         }
     finally:
@@ -983,12 +988,17 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
     # `jarvis gate list` prints, the one surface that already gets it right.
     held = store.held_approvals(wo_id)
     if held:
+        # Both exits, addressed by REQUEST NUMBER: this describes what the worker must
+        # type, and a worktree-isolated worker cannot pass its own command string back
+        # (spec 2026-09-12 §8). And the TTL abandons rather than refuses — §4.
         return {"what": "gate_held", "stalled": False,
                 "detail": f"gate {held[0]['id']} is recorded but unargued — no reviewer "
-                          f"sees it yet, and the move is the WORKER's: `jarvis gate "
-                          f"request {wo_id} \"{held[0]['command'].splitlines()[0]}\" "
-                          f"--why \"…\" --evidence \"…\"`. If the case never comes the OS "
-                          f"refuses it itself on the `gates.case_ttl_seconds` timer"}
+                          f"sees it yet, and the move is the WORKER's, either "
+                          f"`jarvis gate request {held[0]['id']} --why \"…\" "
+                          f"--evidence \"…\"` or, if the gate matched it by mistake, "
+                          f"`jarvis gate contest {held[0]['id']} --why \"…\"`. If neither "
+                          f"comes the OS abandons it unreviewed on the "
+                          f"`gates.case_ttl_seconds` timer"}
     question = awaiting_neo(wo_id)
     if question is not None:
         if question["status"] in USER_HELD_Q_STATUSES:
@@ -2989,6 +2999,55 @@ def _project_gate_config(project_name: str):
     return GateConfig()
 
 
+#: Refused when `JARVIS_WO_ID` is unset, rather than merely unscoped: a contest is the
+#: WORKER's exit and nobody else's. Spec 2026-09-12 §8.
+CONTEST_NEEDS_AN_OWNER = (
+    "`jarvis gate contest` is a worker's exit from its own block and needs JARVIS_WO_ID, "
+    "which is set only inside a dispatched worker's session. An upheld contest clears the "
+    "command and teaches the recogniser fleet-wide, so it is not something to run on "
+    "another unit's behalf. To rule on a request yourself: `jarvis gate dismiss <id> "
+    "--reason \"...\"` if the recogniser was wrong, `jarvis gate deny <id> --reason "
+    "\"...\"` if it was not."
+)
+
+
+def resolve_gate_target(target: str, command: str | None = None,
+                        project_name: str | None = None,
+                        caller_wo_id: str | None = None,
+                        require_caller: bool = False) -> tuple[str, str]:
+    """`(wo_id, command)` from either spelling of a gate exit: `<wo> "<cmd>"` or `<id>`.
+
+    Why a request number at all, why it is SCOPED to `caller_wo_id`, and why
+    `require_caller` withdraws the no-caller carve-out for `contest` alone: spec
+    2026-09-12 §8 and `CONTEST_NEEDS_AN_OWNER`.
+    """
+    if require_caller and not caller_wo_id:
+        raise OpsError(CONTEST_NEEDS_AN_OWNER)
+    if command is not None:
+        if caller_wo_id and target != caller_wo_id:
+            raise OpsError(
+                f"{target} is not your work order ({caller_wo_id}) — a gate exit acts on "
+                f"the unit that was blocked, and this one was not."
+            )
+        return target, command
+    if not target.strip().isdigit():
+        raise OpsError(
+            f"{target!r} is neither a request number nor a work order with a command "
+            f"after it. Either `jarvis gate <verb> <request-number> …` (the number the "
+            f"block printed) or `jarvis gate <verb> <wo-id> \"<the exact command>\" …`."
+        )
+    name, _, approval = _find_approval(int(target.strip()), project_name)
+    if caller_wo_id and approval["wo_id"] != caller_wo_id:
+        raise OpsError(
+            f"request {target.strip()} belongs to {approval['wo_id']} (project {name!r}), "
+            f"not to you ({caller_wo_id}) — refusing, because a contest amends the "
+            f"standing row and this one is not yours to re-frame. Re-read the number in "
+            f"your own block message: `jarvis gate list --wo {caller_wo_id}` lists the "
+            f"requests filed against this work order."
+        )
+    return approval["wo_id"], approval["command"]
+
+
 def request_gate_approval(wo_id: str, command: str, why: str = "", evidence: str = "",
                           project_name: str | None = None) -> dict[str, Any]:
     """(Workers) ask for permission to run a privileged command, making the case for it.
@@ -3085,6 +3144,96 @@ def request_gate_approval(wo_id: str, command: str, why: str = "", evidence: str
                     "next user turn"}
 
 
+def contest_gate_match(wo_id: str, command: str, why: str,
+                       project_name: str | None = None) -> dict[str, Any]:
+    """(Workers) dispute a gate MATCH: this command performs no privileged action.
+
+    Same reviewer, same queue, same `learn_from_dismissal` on the way out; what differs
+    is the claim on the record — a candidate DISMISSAL, never a request for permission.
+    See docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §1.
+    """
+    from . import gates
+    from .neo_store import NeoStore
+
+    name, path, wo = find_work_order(wo_id, project_name)
+    if not why.strip():
+        raise OpsError(
+            "a contest needs an argument — pass --why, saying what the command actually "
+            "does and where the matched text sits (a grep pattern, a commit message, a "
+            "heredoc). The reviewer sees only what you write, and a contest with nothing "
+            "in it can only be denied."
+        )
+    config = _project_gate_config(name)
+    if not config:
+        raise OpsError(
+            f"project {name!r} has no gates enabled, so nothing could have matched this "
+            f"command — there is nothing to contest."
+        )
+    action = gates.classify(command, config)
+    if action is None:
+        # Naming the command checked matters: a grant is scoped to an exact string.
+        raise OpsError(
+            f"that command trips no gate enabled for {name!r} "
+            f"(enabled: {sorted(config.enabled)}) — run it directly. If a gate really "
+            f"fired, the string here is not the string that was blocked: copy it exactly "
+            f"from `jarvis gate list --wo {wo_id}`."
+        )
+
+    store = ProjectStore(path)
+    try:
+        grant = store.usable_grant(wo_id, action.kind, action.command)
+        if grant is not None:
+            return {"project": name, "wo_id": wo_id, "approval_id": grant["id"],
+                    "kind": action.kind, "status": grant["status"],
+                    "note": "already cleared — run the command as written"}
+        existing = store.latest_approval_for(wo_id, action.kind, action.command)
+        # Open and not yet contested, and nothing else — reviewer-shopping otherwise
+        # (kn-76b155a0). Spec 2026-09-12 §8.
+        if existing and existing["status"] == "pending" and existing["contested"]:
+            raise OpsError(
+                f"request {existing['id']} is already contested and in front of a "
+                f"reviewer — one claim, one review. To add to the argument, send it to "
+                f"the reviewer rather than re-filing it; to see it as they do, "
+                f"`jarvis gate show {existing['id']}`."
+            )
+        if existing and existing["status"] == "denied":
+            raise OpsError(
+                f"request {existing['id']} was already DENIED by "
+                f"{existing['decided_by'] or 'a reviewer'}: "
+                f"{existing['decision_reason'] or 'no reason recorded'}. A reviewer has "
+                f"ruled that this command does perform the action, so contesting it again "
+                f"asks the same question of a second reviewer. Address the reason instead."
+            )
+        neo = NeoStore()
+        try:
+            if existing and existing["status"] in (gates.AWAITING_CASE, "pending"):
+                # Onto the STANDING row, never a second one (kn-76b155a0). The claim
+                # changed, so the reviewer's page is rewritten to match it.
+                held = existing["status"] == gates.AWAITING_CASE
+                approval = gates.amend_request(store, neo, wo, action,
+                                               store.mark_contested(existing["id"]),
+                                               justification=why)
+                if held:
+                    gates.queue_for_review(store, neo, name, wo, action, approval)
+            else:
+                # No hold: a contest IS the case the reviewer needs — spec §1.
+                approval, _ = gates.file_request(store, neo, name, wo, action,
+                                                 justification=why, contested=True)
+        finally:
+            neo.close()
+    finally:
+        store.close()
+    return {
+        "project": name, "wo_id": wo_id, "approval_id": approval["id"],
+        "kind": action.kind, "command": action.command, "status": "pending",
+        "contested": True,
+        "note": ("contested — a reviewer will decide whether the recogniser was wrong. "
+                 "It cannot authorise anything, so the outcomes are DISMISSED (run the "
+                 "command as written) or DENIED (it really does perform the action). "
+                 "END YOUR TURN; the verdict arrives as your next user turn"),
+    }
+
+
 def decide_gate(approval_id: int, verdict: str, reason: str = "",
                 project_name: str | None = None) -> dict[str, Any]:
     """(User) rule on a gate directly, whatever Neo did or didn't say.
@@ -3113,11 +3262,21 @@ def decide_gate(approval_id: int, verdict: str, reason: str = "",
     name, path, approval = _find_approval(approval_id, project_name)
     # `awaiting_case` decides too. The hold keeps NEO from ruling on a request nobody
     # argued; the user is not Neo — they can read the command, and the alternative is a
-    # dead end where the only way out is waiting for the TTL to refuse it.
+    # dead end where the only way out is waiting for the TTL to abandon it.
     if approval["status"] not in ("pending", gates.AWAITING_CASE):
         raise OpsError(
             f"approval {approval_id} is already {approval['status']}"
             + (f" (by {approval['decided_by']})" if approval["decided_by"] else "")
+        )
+    # Refused here rather than coerced, because there is a person to tell; the daemon's
+    # path coerces instead. Spec 2026-09-12 §2.
+    if approval["contested"] and verdict == "approved":
+        raise OpsError(
+            f"approval {approval_id} is a CONTEST, not a request for permission — the "
+            f"worker argued this command performs no privileged action, and made no case "
+            f"for performing one. Dismiss it if it is right (`jarvis gate dismiss "
+            f"{approval_id} --reason \"...\"`), deny it if it is wrong. To authorise the "
+            f"action itself, the worker files `jarvis gate request` with a case."
         )
     store = ProjectStore(path)
     central = CentralStore()
@@ -3246,7 +3405,7 @@ def _case_ttl_seconds() -> dict[str, float]:
     """Each project's `gates.case_ttl_seconds`, empty when the catalog is unreadable.
 
     One catalog read for a whole listing; callers fall back to
-    `gates.DEFAULT_CASE_TTL_SECONDS`, which is what `Daemon.refuse_unargued_gates` would
+    `gates.DEFAULT_CASE_TTL_SECONDS`, which is what `Daemon.abandon_unargued_gates` would
     use anyway for a project with no gate block.
     """
     try:
@@ -3279,7 +3438,27 @@ def list_gate_rules(role: str | None = None, kind: str | None = None,
     return {
         "rules": [{**r, "rendered": Rule.from_row(r).render()} for r in rows],
         "canary_failures": live.check_canaries(),
+        "classifier": classifier_stats(),
     }
+
+
+def classifier_stats() -> dict[str, int]:
+    """How often the recogniser has been wrong, and how often nobody stayed to say so.
+
+    Two numbers, reported side by side and never added together — spec 2026-09-12 §5.
+    """
+    dismissed = abandoned = total = 0
+    for _name, path in registered_project_paths().items():
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            dismissed += store.dismissed_count()
+            abandoned += store.abandoned_count()
+            total += len(store.list_approvals())
+        finally:
+            store.close()
+    return {"dismissed": dismissed, "abandoned": abandoned, "requests": total}
 
 
 def retract_gate_rule(rule_id: str, reason: str) -> dict[str, Any]:
@@ -3314,6 +3493,9 @@ def retract_gate_rule(rule_id: str, reason: str) -> dict[str, Any]:
 def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any]:
     """Why this command would, or would not, trip a gate.
 
+    `command` may be a request NUMBER instead, which is how a blocked worker can reach
+    this at all — §8.
+
     The diagnostic that a false positive used to require reading source code to get. A
     gate record holds the exact string that fired, so pasting it here is a mechanical
     two-minute answer to "why was this blocked" — which is the difference between
@@ -3323,11 +3505,15 @@ def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any
         KIND_NAMES,
         RuleSet,
         command_names,
+        gate_paperwork,
         reads_only,
         scannable,
         shape_of,
     )
 
+    if command.strip().isdigit():
+        _, _, approval = _find_approval(int(command.strip()), project_name)
+        command = approval["command"]
     # Without a project, every gate is treated as live: the question being asked is what
     # the RULES say, and answering it against an empty enabled-set would return "nothing
     # fires" for a command that fires four gates in any project that has them on.
@@ -3344,6 +3530,7 @@ def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any
         "command": command,
         "gates_enabled": sorted(enabled),
         "reads_only": reads_only(command),
+        "gate_paperwork": gate_paperwork(command),
         "commands_in_chain": sorted(command_names(command)),
         "scanned": scannable(command),
         "trace": list(decision.trace),

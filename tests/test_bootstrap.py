@@ -196,7 +196,7 @@ def _evidence_prose(text: str, window: int = 900) -> str:
     return text[max(0, at - window):at + window]
 
 
-def _worker_prompt(project) -> str:
+def _worker_prompt(project, project_spec=None) -> str:
     """What a running worker actually reads — the same call the daemon makes."""
     from jarvis.dispatch import build_worker_prompt
     from jarvis.project_store import ProjectStore
@@ -206,7 +206,7 @@ def _worker_prompt(project) -> str:
         wo = store.create_work_order("ship the thing")
     finally:
         store.close()
-    return build_worker_prompt(wo, spec(project))
+    return build_worker_prompt(wo, project_spec or spec(project))
 
 
 def test_both_worker_texts_teach_the_evidence_flag(project):
@@ -248,6 +248,47 @@ def test_neither_worker_text_reveals_who_reads_the_evidence(project):
         for word in ("panel", "seat", "seats", "validator", *VALIDATOR_SEATS):
             assert not re.search(rf"\b{word}\b", para, re.I), (
                 f"{where} names {word!r} to the worker")
+
+
+def test_no_post_block_exit_asks_the_worker_to_re_type_the_command(project):
+    """The advice a blocked worker is given must be advice it can RUN.
+
+    A session in a git worktree runs under an isolation guard that inspects a command's
+    arguments and refuses any text it cannot prove is not a git operation — which is
+    most of what trips a gate (kn-dd415e5d, spec 2026-09-12 §8). Every exit reached
+    AFTER a block therefore addresses the request by number. The pre-block `request` is
+    the one exception and is marked as such in both documents: nothing has been filed
+    yet, so there is no number to use.
+
+    Asserted on the RENDERED text of both, because this is a property of what the worker
+    reads, and the two documents are written in different places by different code.
+    """
+    from jarvis.gates import GateConfig
+    from jarvis.worker_brief import render_section
+
+    gated = spec(project, gates=GateConfig(enabled=frozenset({"release"})))
+    bootstrap_project(gated)
+    texts = {
+        "OPERATION.md": (project / "OPERATION.md").read_text(),
+        "the dispatched prompt": _worker_prompt(project, gated),
+        "jarvis brief gates": render_section("gates", wo_id="wo-1",
+                                             gates_enabled=("release",)),
+    }
+    for where, text in texts.items():
+        for line in text.splitlines():
+            line = line.strip().lstrip("`")
+            if not line.startswith("jarvis gate "):
+                continue
+            verb = line.split()[2]
+            if verb in ("contest", "explain"):
+                # Neither is reachable before a block: there is nothing to contest and
+                # nothing to explain until the OS has matched something.
+                assert "<request-number>" in line, (
+                    f"{where} offers a post-block exit that re-types the command: {line}")
+            elif verb == "request":
+                assert "<request-number>" in line or "<the exact command>" in line, (
+                    f"{where} has an unrecognised request spelling: {line}")
+        assert "<request-number>" in text, f"{where} never teaches the number spelling"
 
 
 def test_the_template_version_was_bumped_for_the_new_contract(project):
