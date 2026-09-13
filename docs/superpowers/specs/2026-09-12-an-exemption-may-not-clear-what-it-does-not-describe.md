@@ -5,17 +5,15 @@ Status: implemented (wo-551f5e8c). Supersedes nothing; tightens `gate_rules.py`.
 ## 1. The incident
 
 On 2026-09-12 the release gate — the one whose summary says *this reaches the live
-production fleet* — could be walked. Probed live with `jarvis gate explain`:
+production fleet* — could be walked, and so could `pr_merge`. Five learned exemptions
+were affected. All five were authored by Neo, validated by `validate_pattern`,
+canary-tested on admission, and listed as sound by `jarvis gate rules`.
 
-```
-echo hi<newline>./scripts/shipit.sh                             NOT GATED
-jarvis wo finish wo-12345678 --summary "x" && gh pr merge 210    NOT GATED
-ls .claude/skills/shipit && ./scripts/shipit.sh                  NOT GATED
-```
-
-Five learned exemptions were walkable, across two gate kinds. All five were authored by
-Neo, validated by `validate_pattern`, canary-tested on admission, and listed as sound by
-`jarvis gate rules`.
+This repository is public, so the working probe strings are deliberately not reproduced
+here. They are on the work-order record (`jarvis wo show wo-551f5e8c`), in the retraction
+reasons (`jarvis gate rules`), and in `kn-988d1733`. The rules are retracted and the
+shapes no longer clear anything; what follows is the reasoning a reviewer needs, which
+does not require them.
 
 ## 2. The cause is not the newline
 
@@ -25,9 +23,9 @@ that excludes `;`, `&`, `|`, backtick and `$` but not `\n`, in a pattern anchore
 `re.MULTILINE` the trailing `$` still permits it, so the class swallows every following
 line.
 
-That is true of three of the five. The other two had no end anchor at all —
-`gr-f121cbe4` described `jarvis wo finish wo-XXXXXXXX` and stopped, and `gr-e4127741`
-ended on `(\s|$)`. A plain `&&` walked both, no newline involved.
+That is true of three of the five. The other two had no end anchor at all — one
+described a harmless `jarvis wo finish` prefix and stopped, the other ended on `(\s|$)`.
+A plain `&&` walked both, no newline involved.
 
 So the defect is one level up. **A learned exemption clears the WHOLE command on the
 strength of a claim about PART of it.** The newline is the most alarming way to exploit
@@ -87,3 +85,25 @@ exemption describes a family and the whole-command rule costs nothing.
 
 Not addressed here: the recogniser `('release', r'shipit')` still cannot tell the release
 script from the file that tests it. Also `bl-9f2714ad`.
+
+## 7. An unterminated heredoc body is not prose
+
+Found in review round 1, by writing the negative half of §3's carve-out. Once a regex may
+not be learned from a multi-line command, the structural signature is the **only** route
+by which one is ever cleared — so it carries the whole weight, and it had two holes:
+
+- a release chained onto the **terminator line** (`EOF && ./scripts/shipit.sh`): the
+  delimiter line is no longer a delimiter line, so the body ran to the end of the string
+  and swallowed the release;
+- a heredoc whose delimiter simply never appears.
+
+`heredoc_spans` now reports whether each body was `terminated`, and `shape_of` returns
+`CODE` for any match inside one that was not. This is the module's existing convention —
+unrecognised syntax fails the test rather than passing it, as `reads_only` already says
+of a name carrying a slash.
+
+One case looks identical and is not, so it has its own test rather than an assertion in
+the sweep: appending `&& cat <<'EOF' | bash … EOF` to a heredoc reuses the delimiter, and
+the appended block's own `EOF` closes the **outer** heredoc. Everything becomes one commit
+message. Verified against real bash — the payload never ran — so clearing it is correct,
+and a change that makes it gate is over-gating rather than a fix.

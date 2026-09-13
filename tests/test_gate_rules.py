@@ -115,7 +115,8 @@ def test_heredoc_bodies_are_found_including_the_indented_and_quoted_forms():
         command = f"git commit -F - {opener}\n{body} scripts/shipit.sh\nEOF"
         spans = gate_rules.heredoc_spans(command)
         assert len(spans) == 1, command
-        start, end, _ = spans[0]
+        start, end, _, terminated = spans[0]
+        assert terminated, command
         assert command[start:end].strip() == f"{body} scripts/shipit.sh"
 
 
@@ -124,9 +125,10 @@ def test_a_here_string_is_not_a_heredoc():
     assert gate_rules.heredoc_spans("bash <<< 'scripts/shipit.sh'") == []
 
 
-def test_an_unterminated_heredoc_body_runs_to_the_end():
+def test_an_unterminated_heredoc_body_runs_to_the_end_and_says_so():
     spans = gate_rules.heredoc_spans("git commit -F - <<EOF\nshipit\n")
     assert len(spans) == 1
+    assert spans[0][3] is False
 
 
 def test_command_names_ignore_heredoc_bodies_and_quoted_text():
@@ -334,6 +336,35 @@ def test_a_structural_exemption_still_clears_the_multi_line_shape_it_is_for():
     assert rule.clears(HEREDOC_COMMIT, "release", "shipit")
 
 
+# Refusing a regex for a multi-line command makes the signature the ONLY route by which
+# one is ever cleared, so it carries the whole weight and needs the negative half. The
+# last two of these were real: both cleared the appended release before wo-551f5e8c
+# review round 1, because the delimiter line was not a delimiter line and the body ran
+# to the end of the string.
+SIGNATURE_MUST_REFUSE = [
+    ("a release appended below the terminator", HEREDOC_COMMIT + "\n./scripts/shipit.sh"),
+    ("a blank line before it", HEREDOC_COMMIT + "\n\n./scripts/shipit.sh"),
+    ("chained onto the terminator line", HEREDOC_COMMIT + " && ./scripts/shipit.sh"),
+    ("an unterminated body, so nothing below it is prose",
+     "git commit -F - <<'EOF'\nmentions scripts/shipit.sh\n./scripts/shipit.sh"),
+    ("a second heredoc piped into a shell",
+     HEREDOC_COMMIT + "\ncat <<'EOF2' | bash\nscripts/shipit.sh\nEOF2"),
+]
+
+
+@pytest.mark.parametrize("label,command", SIGNATURE_MUST_REFUSE,
+                         ids=[c[0] for c in SIGNATURE_MUST_REFUSE])
+def test_a_structural_exemption_refuses_a_release_the_heredoc_does_not_contain(label,
+                                                                              command):
+    rule = gate_rules.Rule(
+        id="gr-y", role=gate_rules.EXEMPT, test=gate_rules.SIGNATURE, kind="release",
+        pattern='{"kind": "release", "owner": "git commit", "position": "heredoc"}')
+
+    assert not rule.clears(command, "release", "shipit"), label
+    assert gate_rules.RuleSet.from_seeds().with_rule(rule).decide(
+        command, gate_rules.KIND_NAMES).match is not None, label
+
+
 def test_no_rule_in_the_base_clears_a_multi_line_command_with_a_gated_verb_below():
     """Item 2's acceptance test, swept rather than sampled: every reader the classifier
     knows, above every command that must always gate."""
@@ -347,15 +378,51 @@ def test_no_rule_in_the_base_clears_a_multi_line_command_with_a_gated_verb_below
         base = base.with_rule(gate_rules.Rule(
             id=rule_id, role=gate_rules.EXEMPT, test=gate_rules.REGEX, pattern=pattern,
             kind="", source="neo"))
+    # The signature path belongs in the sweep too: once a regex may not be learned from a
+    # multi-line command it is the only way one is ever cleared, so it carries the weight.
+    base = base.with_rule(gate_rules.Rule(
+        id="gr-sig", role=gate_rules.EXEMPT, test=gate_rules.SIGNATURE, kind="release",
+        pattern='{"kind": "release", "owner": "git commit", "position": "heredoc"}'))
 
+    canaries = base.canaries()
+    probed = 0
     for reader in readers:
-        for canary in base.canaries():
-            if "\n" in canary.pattern:
-                continue
+        for canary in canaries:  # every canary, multi-line ones included
             for joiner in ("\n", " && ", "; "):
                 command = f"{reader}{joiner}{canary.pattern}"
                 assert base.decide(command, gate_rules.KIND_NAMES).match is not None, \
                     command
+                probed += 1
+
+    # A heredoc can only be joined with a newline: `&&` after it lands on the TERMINATOR
+    # line, which is inside the body rather than below it — see the test below.
+    for canary in canaries:
+        command = f"{HEREDOC_COMMIT}\n{canary.pattern}"
+        assert base.decide(command, gate_rules.KIND_NAMES).match is not None, command
+        probed += 1
+
+    assert probed == len(readers) * len(canaries) * 3 + len(canaries)
+    assert probed >= 12 * 24 * 3 + 24, f"the sweep shrank to {probed} probes"
+
+
+def test_delimiter_reuse_re_terminates_the_outer_heredoc_and_the_shell_agrees():
+    """The one combination the sweep above must NOT assert on, and why.
+
+    Appending `&& cat <<'EOF' | bash ... EOF` to a heredoc does not chain a second
+    command: the `&&` lands on a line that is not the delimiter, and the appended block's
+    own `EOF` closes the OUTER heredoc. Everything is one commit message. Verified
+    against real bash on 2026-09-12 — the payload never ran — so clearing it is correct,
+    and a future change that makes this gate is over-gating, not a fix.
+    """
+    command = f"{HEREDOC_COMMIT} && cat <<'EOF' | bash\nscripts/shipit.sh\nEOF"
+    shape = gate_rules.shape_of(command, "shipit")
+
+    assert shape is not None and shape.position == gate_rules.HEREDOC
+    assert shape.owner == "git commit"
+    # The `&&` with a SINGLE-line release does chain, and that one must gate: no
+    # trailing delimiter, so the body is unterminated and nothing in it is prose.
+    assert gate_rules.shape_of(f"{HEREDOC_COMMIT} && ./scripts/shipit.sh",
+                               "shipit").position == gate_rules.CODE
 
 
 def test_an_empty_reviewer_pattern_is_not_a_pattern(central):
@@ -372,11 +439,26 @@ def test_every_gate_kind_has_a_multi_line_canary():
     """Item 3. Until wo-551f5e8c every canary was one line, so `jarvis gate rules` could
     report `every command that must gate still gates` over an open release gate: the set
     could not express the shape gr-391ba702 cleared."""
-    multiline = {kind for kind, command in gate_rules.SEED_CANARIES if "\n" in command
-                 and not command.lstrip().startswith(("cat <<", "eval"))}
+    every = [(k, c) for k, c in gate_rules.SEED_CANARIES if "\n" in c]
+    executors = [(k, c) for k, c in every if c.lstrip().startswith(("cat <<", "eval"))]
+    added = [(k, c) for k, c in every if (k, c) not in executors]
+
+    # kn-e74988af: a filter that scopes by a readable string must assert it EXCLUDED
+    # something, or deleting the rows it was written for still passes on the survivors.
+    assert executors, "the pre-existing heredoc/eval canaries have gone"
+    assert len(added) == len(every) - len(executors)
     # `self_heal` is excluded throughout: its command is a rendered intent string rather
     # than a shell command, so it has no recogniser and no canary (kn-832cb8cb).
-    assert multiline == set(gates.KIND_NAMES) - {gate_rules.SELF_HEAL}
+    assert {k for k, _ in added} == set(gates.KIND_NAMES) - {gate_rules.SELF_HEAL}
+
+    # And each survivor is the shape this work order added: a reader, a newline, then a
+    # command that must gate — not merely any command that happens to contain one.
+    for kind, command in added:
+        head, _, tail = command.partition("\n")
+        assert "\n" not in tail, f"{kind}: more than two lines"
+        assert gate_rules.reads_only(head), f"{kind}: {head!r} is not a reader"
+        assert gate_rules.RuleSet.from_seeds().decide(
+            tail, gate_rules.KIND_NAMES).match is not None, f"{kind}: {tail!r}"
 
 
 def test_the_multi_line_canary_report_fails_on_the_rule_that_walked_the_gate():
@@ -399,6 +481,26 @@ def test_the_multi_line_canary_report_fails_on_the_rule_that_walked_the_gate():
     assert ["echo hi\n./scripts/shipit.sh"] == [f["command"] for f in failures]
 
     assert unguarded.check_canaries() == []
+
+
+def test_the_newline_floor_refuses_to_run_with_nothing_to_probe():
+    """A floor that tested nothing would report every pattern sound — this module's own
+    green-over-an-open-gate failure, one level down. It must fail loudly instead."""
+    with mock.patch.object(gate_rules, "SEED_CANARIES",
+                           (("release", "cat <<'EOF' | bash\nscripts/shipit.sh\nEOF"),)):
+        with pytest.raises(AssertionError, match="single-line canary"):
+            gate_rules.validate_pattern(r"^echo hi$", "echo hi")
+
+
+def test_a_trailing_newline_does_not_decide_whether_an_exemption_applies():
+    """`"\\n" in command` and `fullmatch` must read the same string, or whitespace the
+    user never typed silently voids a rule."""
+    rule = gate_rules.Rule(id="gr-z", role=gate_rules.EXEMPT, test=gate_rules.REGEX,
+                           pattern=r"^echo hi$", kind="release", source="neo")
+
+    for command in ("echo hi", "echo hi\n", "  echo hi  \n\n", "\necho hi"):
+        assert rule.clears(command, "release", "shipit"), repr(command)
+    assert gate_rules.validate_pattern(r"^echo hi$", "echo hi\n") == ""
 
 
 def test_no_seeded_pattern_can_reach_across_a_newline():
