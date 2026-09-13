@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import claude_cli, ops
+from jarvis import claude_cli, ops, validation
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import (VALIDATION_ESCALATED_TITLE, VALIDATION_REASON_CHARS,
@@ -964,10 +964,12 @@ def test_with_no_validator_wired_an_open_round_settles_unjudged(fleet, monkeypat
         store.close()
 
 
-def test_pending_assumptions_still_outrank_validation(fleet):
-    """A decision the OS is waiting on is not something a reviewer can settle. The work
-    order goes to `needs_review` exactly as it does today, and no round is opened —
-    validation is about the work, and this is about a question the user has not answered.
+def test_a_pending_assumption_no_longer_holds_the_round_back(fleet):
+    """THE POINT OF ISSUE 212: the two gates open together and are joined, not chained.
+
+    The user still owes a decision and the status still says so — but the round runs
+    underneath it, on a diff that existed from the moment the worker finished. wo-4fc128ca
+    waited 44 minutes for a human before the panel was allowed to start.
     """
     fleet.daemon.validator = Validator(passed())
     wo = fleet.dispatch()
@@ -978,13 +980,67 @@ def test_pending_assumptions_still_outrank_validation(fleet):
 
     store = fleet.store()
     try:
-        assert store.validation_rounds(wo_id=wo["id"]) == []
+        assert len(store.validation_rounds(wo_id=wo["id"])) == 1, \
+            "the round waited for the user"
         assert store.get_work_order(wo["id"])["attention_reason"] == \
             "assumptions pending review"
-        fleet.drain()
-        assert fleet.daemon.validator.calls == []
     finally:
         store.close()
+
+    fleet.drain()  # the panel judges it while the user is still deciding
+
+    store = fleet.store()
+    try:
+        assert len(fleet.daemon.validator.calls) == 1
+        assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "passed"
+        # ...and the JOIN holds it: one gate cleared is not both.
+        assert store.get_work_order(wo["id"])["status"] == "needs_review"
+    finally:
+        store.close()
+
+    assert ops.review_work_order(wo["id"], accept=True)["status"] == "completed"
+
+
+def test_the_panel_reads_the_assumptions_it_is_judging_around(fleet):
+    """An assumption is a decision embodied in the diff, and it ships in the PR like
+    everything else. The seats never saw one before issue 212."""
+    fleet.daemon.validator = Validator(passed())
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    ops.assume(wo["id"], "assumed the exporter writes UTF-8")
+    finish(fleet, wo["id"])
+    fleet.drain()
+
+    packet = fleet.daemon.validator.calls[0]["packet"]
+    assert [a["content"] for a in packet.assumptions] == \
+        ["assumed the exporter writes UTF-8"]
+    rendered = validation.build_packet_prompt(packet)
+    assert "assumed the exporter writes UTF-8" in rendered
+    assert "the user is deciding this now" in rendered
+
+
+def test_a_refused_assumption_blocks_the_landing_a_pass_would_otherwise_do(fleet):
+    """The hole parallelism opens. The user turns a call down, the worker starts
+    revising, and the round already in flight passes the code as it stood. Nothing is
+    PENDING at that moment — and landing would ship the decision the user refused."""
+    fleet.daemon.validator = Validator(passed())
+    wo = _parked_on_assumptions(fleet)
+
+    ops.review_work_order(wo["id"], accept=False, feedback="use UTF-16 here")
+    fleet.drain()
+
+    store = fleet.store()
+    try:
+        assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "passed"
+        assert store.get_work_order(wo["id"])["status"] == "needs_review"
+        assert store.pending_assumptions(wo["id"]) == []
+    finally:
+        store.close()
+
+    # The worker answers the refusal, and the work order may land again.
+    fleet.change(wo["id"], "print('utf-16')\n")
+    assert finish(fleet, wo["id"], pr="https://github.com/x/y/pull/9")["status"] == \
+        "validating"
 
 
 # -- the second route into done ------------------------------------------------------
@@ -992,6 +1048,26 @@ def test_pending_assumptions_still_outrank_validation(fleet):
 # `ops.review_work_order` reaches `waiting_pr_merge`/`completed` without ever touching
 # `ops.finish`, so a work order that filed assumptions used to arrive at the merge queue
 # with nothing having judged it.
+
+
+def test_a_cancelled_work_orders_open_round_is_never_picked_up(fleet):
+    """The bound the round-keyed query needs and the status-keyed one got for free.
+    PAIRED with the `needs_review` work order beside it, which is the whole reason the
+    status filter had to go: judge them both or judge neither is the trap."""
+    fleet.daemon.validator = Validator(passed())
+    live = _parked_on_assumptions(fleet)
+    stopped = _parked_on_assumptions(fleet, pr="https://github.com/x/y/pull/13")
+    ops.cancel(stopped["id"])
+
+    fleet.drain()
+
+    store = fleet.store()
+    try:
+        assert store.latest_validation_round(wo_id=live["id"])["outcome"] == "passed"
+        assert store.latest_validation_round(wo_id=stopped["id"])["outcome"] == "pending"
+        assert store.get_work_order(stopped["id"])["status"] == "cancelled"
+    finally:
+        store.close()
 
 
 def _parked_on_assumptions(fleet: Fleet, *, evidence: str = "ran `pytest -q`: 412 passed",
@@ -1054,6 +1130,10 @@ def test_a_work_order_already_judged_is_not_validated_a_second_time(fleet):
     that is the USER overruling the machine, and the machine does not get a second
     vote — re-submitting would hand the work order straight back to the reviewer that
     had already given up on it.
+
+    Since issue 212 the control is the one that has to be staged: `finish` opens a round
+    for every work order, so the only way to reach this route without one is a work order
+    that finished while the panel was switched off.
     """
     fleet.reconfigure(max_rounds=1)  # one rejection is the whole budget
     fleet.daemon.validator = Validator(rejected("no test covers the change"))
@@ -1077,8 +1157,15 @@ def test_a_work_order_already_judged_is_not_validated_a_second_time(fleet):
     assert ops.review_work_order(judged["id"], accept=True)["status"] == (
         "waiting_pr_merge")
 
-    # -- never judged: the same accept opens round 1
+    # -- never judged: parked while the panel was off, so the accept opens round 1
+    fleet.reconfigure(enabled=False, max_rounds=1)
     virgin = _parked_on_assumptions(fleet, pr="https://github.com/x/y/pull/11")
+    store = fleet.store()
+    try:
+        assert store.validation_rounds(wo_id=virgin["id"]) == []
+    finally:
+        store.close()
+    fleet.reconfigure(max_rounds=1)
     assert ops.review_work_order(virgin["id"], accept=True)["status"] == "validating"
 
     store = fleet.store()
@@ -1117,21 +1204,25 @@ def test_the_review_route_carries_the_evidence_the_worker_declared(fleet):
         store.close()
 
 
-def test_rejecting_assumptions_opens_no_round(fleet):
+def test_rejecting_assumptions_opens_no_round_of_its_own(fleet):
     """A rejection is not a route into done. The work order goes back to its worker with
-    the user's reasoning, and there is nothing finished for anyone to judge."""
+    the user's reasoning — and the round `finish` already opened is the only one there
+    is: this route never adds a second."""
     fleet.daemon.validator = Validator(passed())
     wo = _parked_on_assumptions(fleet)
+    store = fleet.store()
+    try:
+        before = len(store.validation_rounds(wo_id=wo["id"]))
+    finally:
+        store.close()
 
     out = ops.review_work_order(wo["id"], accept=False, feedback="use UTF-16 here")
 
     assert out["status"] == "needs_review"
     store = fleet.store()
     try:
-        assert store.validation_rounds(wo_id=wo["id"]) == []
+        assert len(store.validation_rounds(wo_id=wo["id"])) == before
         assert store.get_work_order(wo["id"])["status"] != "validating"
-        fleet.drain()
-        assert fleet.daemon.validator.calls == []
     finally:
         store.close()
 

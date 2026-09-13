@@ -22,8 +22,8 @@ import in the function that needs it, and a `sys.modules` check would miss those
 
 ## The three rules that are the point of the module
 
-**1. The fingerprint covers the FULL diff before truncation, and nothing but that and the
-normalised `declared` text.** See `fingerprint`.
+**1. The fingerprint covers the FULL diff before truncation, the normalised `declared`
+text, and the assumptions the submitter filed — nothing else.** See `fingerprint`.
 
 **2. `declared` is whitespace-normalised before hashing** — see `_normalise`. Re-running
 the same tests and describing them with different line breaks is not new evidence.
@@ -96,6 +96,11 @@ class EvidencePacket:
     #: one — defeating `diff_chars` silently. The digest is all `fingerprint` needs.
     diff_sha: str
     children: tuple[dict, ...] = ()
+    #: Every assumption the work order ever filed, `{n, content, status}`, review state
+    #: included — a decision the user accepted in round 1 is still embodied in the diff
+    #: round 2 is judging. `()` for a feature order, which files none.
+    #: See docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §4.
+    assumptions: tuple[dict, ...] = ()
     #: The section of the feature's spec this unit was told to implement — `spec_ref` is
     #: "<path> § <section>" for citing, `spec_section` its text. Both "" for a standalone
     #: work order and for anything planned before specs existed, which is the null case
@@ -123,6 +128,14 @@ def fingerprint(packet: EvidencePacket) -> str:
     | opens a PR for work already submitted    | `pr_url`            | no            |
     | adds a test file                         | the diff            | **yes**       |
     | states a result it had not stated before | `declared` content  | **yes**       |
+    | files an assumption it had not filed     | assumption text     | **yes**       |
+    | has an assumption ACCEPTED by the user   | assumption `status` | no            |
+
+    The assumptions are mixed in ONLY when there are any, so every work order that files
+    none hashes exactly as it did before this existed. Their review STATE is left out on
+    the same reasoning as the rest of the table: the user accepting an assumption is not
+    the submitter producing evidence, and hashing it would make an unchanged resubmission
+    look new (spec 2026-09-13-two-gates-not-a-chain.md §4).
 
     Hashing `packet.diff` is the obvious implementation and it is wrong: the same tree
     would fingerprint differently at two truncation limits, which makes an integrity
@@ -133,12 +146,16 @@ def fingerprint(packet: EvidencePacket) -> str:
     h.update(packet.diff_sha.encode("utf-8"))
     h.update(b"\n")
     h.update(_normalise(packet.declared).encode("utf-8"))
+    for a in packet.assumptions:
+        h.update(b"\n")
+        h.update(_normalise(str(a.get("content") or "")).encode("utf-8"))
     return h.hexdigest()[:16]
 
 
 def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
                        diff_chars: int = DEFAULT_DIFF_CHARS,
-                       spec: dict[str, str] | None = None) -> EvidencePacket:
+                       spec: dict[str, str] | None = None,
+                       assumptions: Iterable[dict[str, Any]] = ()) -> EvidencePacket:
     """Assemble the packet for one work order from its worktree.
 
     Never raises for a repository that is missing, empty, broken or gone: a collector
@@ -156,7 +173,8 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
 
     `spec` is `specs.spec_of`'s result, passed in rather than looked up because this
     module reads a repository and never a database — the same separation that keeps
-    `_ProjectRef` a two-line stand-in instead of a `ProjectSpec` import.
+    `_ProjectRef` a two-line stand-in instead of a `ProjectSpec` import. `assumptions`
+    is `ProjectStore.all_assumptions`'s, passed in for exactly the same reason.
     """
     # type: ignore — `_ProjectRef` carries the one attribute that helper reads; see it.
     worktree = worker_session.worktree_path(_ProjectRef(project_path), wo)  # type: ignore[arg-type]
@@ -194,6 +212,10 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
         diff_sha=hashlib.sha256(diff.encode("utf-8")).hexdigest(),
         spec_ref=_spec_ref(spec),
         spec_section=(spec or {}).get("section_text", ""),
+        assumptions=tuple(
+            {"n": int(a.get("n") or 0), "content": str(a.get("content") or ""),
+             "status": str(a.get("status") or "pending")}
+            for a in assumptions),
     )
 
 

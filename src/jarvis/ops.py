@@ -38,6 +38,8 @@ from .project_store import (
     FO_TERMINAL_STATUSES,
     NO_TURN,
     OPEN_STATUSES,
+    OPEN_VALIDATION_OUTCOMES,
+    RUNNABLE_VALIDATION_OUTCOMES,
     ProjectStore,
 )
 
@@ -950,6 +952,19 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
             "delivery": "jarvisd delivers when the worker is idle"}
 
 
+def _open_round_note(store: ProjectStore, wo_id: str) -> str:
+    """The clause every surface appends when a round is running beside something else.
+
+    `RUNNABLE_VALIDATION_OUTCOMES` and not the wider open set: a `rejected` round is
+    waiting on the SUBMITTER, and saying the panel is still reading would send the user
+    looking for something to wait for.
+    """
+    latest = store.latest_validation_round(wo_id=wo_id)
+    if latest and latest["outcome"] in RUNNABLE_VALIDATION_OUTCOMES:
+        return f" — review round {latest['round']} is running in parallel"
+    return ""
+
+
 def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
     """What this work order is actually waiting for, and whether a nudge could help.
 
@@ -967,11 +982,12 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
     from .neo_store import USER_HELD_Q_STATUSES
 
     wo_id = wo["id"]
+    round_note = _open_round_note(store, wo_id)
     pending = store.pending_assumptions(wo_id)
     if pending:
         return {"what": "assumptions", "stalled": False,
                 "detail": f"{len(pending)} assumption(s) await your review — "
-                          f"`jarvis wo review {wo_id}`"}
+                          f"`jarvis wo review {wo_id}`{round_note}"}
     escalated = store.escalated_approvals(wo_id)
     if escalated:
         return {"what": "gate_escalated", "stalled": False,
@@ -1041,6 +1057,13 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
             and wo["status"] != "waiting_input"):
         return {"what": "turn_running", "stalled": False,
                 "detail": "a turn is in flight — the worker is working"}
+    # Before the statuses below, because since issue 212 a round runs in PARALLEL with a
+    # `needs_review` park — and "nothing is running to nudge" is exactly the false
+    # diagnosis this command exists to stop giving.
+    if round_note:
+        return {"what": "validating", "stalled": False,
+                "detail": f"the validation panel is judging it — the verdict settles "
+                          f"the work order by itself{round_note}"}
     if wo["status"] in ("completed", "cancelled", "failed", "waiting_pr_merge",
                         "needs_review"):
         return {"what": wo["status"], "stalled": False,
@@ -1399,10 +1422,16 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     where the same work order lands with the feature switched off — `waiting_pr_merge`
     with a pull request, `completed` without one, and the backlog item closed in the
     `completed` case only.
+
+    A pull request the poll has already SETTLED is not a merge queue, which is what
+    `_awaiting_merge` adds: parking on a CLOSED one would hand it back to a poll whose
+    only move is to flag it for the user again. That rule used to live at
+    `review_work_order`'s own call site and was invisible from the other two routes.
     """
     wo_id = wo["id"]
     pr_url = pr_url or wo.get("pr_url") or None
-    status = "waiting_pr_merge" if pr_url else "completed"
+    status = "waiting_pr_merge" if _awaiting_merge({**wo, "pr_url": pr_url}) \
+        else "completed"
     store.set_status(wo_id, status)
     store.clear_attention(wo_id)
     if wo.get("backlog_id") and status == "completed":
@@ -1412,6 +1441,71 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
         finally:
             central.close()
     return status
+
+
+def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
+                      pr_url: str | None = None, *,
+                      panel_cleared: bool = False) -> str:
+    """THE JOIN: where a finished work order sits, given BOTH gates over it.
+
+    An assumption review and a validation round are two independent judgements over one
+    artifact, opened together and joined here — never chained, which is what cost
+    wo-4fc128ca 44 minutes of dead wait (GitHub issue 212, spec
+    docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §2). Every route that
+    could end a work order goes through this one function, for the reason
+    `land_finished` gives about its own two: they must not drift.
+
+    **`needs_review` wins while an assumption is pending.** It is the only status that
+    says the user owes a decision, and `validating` is deliberately silent
+    (`invariants.BLOCKED_STATUSES`). The round keeps running underneath it and
+    `invariants.status_label` says so.
+
+    `panel_cleared` is for a caller that has just settled the panel's half ITSELF and
+    must not re-read the round it wrote: the no-validator path closes its round `failed`
+    — never `passed`, because nobody judged the work — and that outcome otherwise reads
+    here as a round still in flight.
+    """
+    wo_id = wo["id"]
+    if store.pending_assumptions(wo_id):
+        store.set_status(wo_id, "needs_review")
+        store.flag_attention(wo_id, "assumptions pending review")
+        return "needs_review"
+    if not _refusal_answered(store, wo_id):
+        # The flag and the guidance are `review_work_order`'s — this is the panel's
+        # settle path arriving at a work order the user has since turned down, and all
+        # it owes is not to land it.
+        store.set_status(wo_id, "needs_review")
+        return "needs_review"
+    latest = store.latest_validation_round(wo_id=wo_id) if not panel_cleared else None
+    outcome = str((latest or {}).get("outcome") or "")
+    if outcome in OPEN_VALIDATION_OUTCOMES:
+        store.set_status(wo_id, "validating")
+        store.clear_attention(wo_id)
+        return "validating"
+    # `escalated` lands. The panel gave up and put this in front of the user, and the
+    # only caller that can reach here with one is `review_work_order` — the user saying
+    # ship it anyway, which is the whole exit from a give-up.
+    return land_finished(store, wo, pr_url)
+
+
+def _refusal_answered(store: ProjectStore, wo_id: str) -> bool:
+    """Has the worker delivered again since the user last REFUSED an assumption?
+
+    The other half of the user's gate, and the one "nothing is pending" misses: a
+    refused assumption is guidance the worker has not answered, and a panel that passes
+    the round in the meantime would land the very decision the user turned down. Only
+    reachable because the two gates now run in parallel (spec §5).
+
+    The boundary is the `finished` event, which is the same one
+    `ProjectStore.review_assumption`'s round rule is read against (kn-82d853ca) — and
+    why `finish` records it BEFORE it settles anything.
+    """
+    refusals = [e for e in store.events_of_kind(wo_id, "reviewed")
+                if not db.from_json(e["payload"], {}).get("accepted", True)]
+    if not refusals:
+        return True
+    delivered = store.events_of_kind(wo_id, "finished")
+    return bool(delivered) and float(delivered[-1]["ts"]) > float(refusals[-1]["ts"])
 
 
 def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str, Any],
@@ -1432,7 +1526,9 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
 
     packet = evidence_mod.collect_work_order(
         project_path, wo, declared=declared, diff_chars=cfg.diff_chars,
-        spec=specs.spec_of(store, wo))
+        spec=specs.spec_of(store, wo),
+        # The store read is the caller's: `evidence` may not touch a database (spec §4).
+        assumptions=store.all_assumptions(wo["id"]))
     nxt = store.counted_validation_rounds(wo_id=wo["id"]) + 1
     round_row = store.open_validation_round(
         wo_id=wo["id"], fingerprint=evidence_mod.fingerprint(packet),
@@ -1641,9 +1737,10 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
     merge.
 
     Pending assumptions still outrank it: those are a decision the OS is waiting on,
-    and a PR the user merges before deciding them accepts them by the back door. That
-    makes `review_work_order` the only route back for such a work order, and it is that
-    function's job to do the parking skipped here.
+    and a PR the user merges before deciding them accepts them by the back door. They
+    no longer outrank VALIDATION, though — the round opens here whether or not any are
+    pending, and `land_when_cleared` joins the two (GitHub issue 212, spec
+    docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §1).
 
     `evidence` is the worker's own account of how it tested the change, and it is
     OPTIONAL: every worker in flight when this shipped predates the flag, so an empty
@@ -1681,21 +1778,19 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             fields["pr_url"] = pr_url
         store.update_work_order(wo_id, **fields)
         fresh = store.get_work_order(wo_id)
-        if store.pending_assumptions(wo_id):
-            store.set_status(wo_id, "needs_review")
-            store.flag_attention(wo_id, "assumptions pending review")
-            status = "needs_review"
-        elif cfg is not None and cfg.enabled:
-            submit_for_validation(store, path, fresh, declared=evidence, cfg=cfg)
-            status = "validating"
-        else:
-            status = land_finished(store, fresh, pr_url)
+        # BEFORE anything settles, because settling reads it: `_refusal_answered` dates
+        # the delivery against the user's last refusal, and an event written afterwards
+        # would make every re-delivery look older than the refusal it answers.
         # The evidence rides in the payload so the OTHER route into done can find it —
         # `review_work_order` has no `--evidence` of its own. See `declared_evidence`.
         store.add_event(wo_id, "finished",
                         {"summary": summary,
                          **({"pr_url": pr_url} if pr_url else {}),
                          **({"evidence": evidence} if evidence else {})})
+        if cfg is not None and cfg.enabled:
+            submit_for_validation(store, path, fresh, declared=evidence, cfg=cfg)
+        # ...and the status is the JOIN's to decide, not this branch's.
+        status = land_when_cleared(store, fresh, pr_url)
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "status": status,
@@ -2118,6 +2213,13 @@ def _validates_on_review(store: ProjectStore, wo_id: str, cfg: Any) -> bool:
     Switched on, and never judged. Anything with a round on record has been through the
     loop already, so an acceptance is the user's decision on top of the machine's rather
     than an input to it.
+
+    NOW A CATCH-UP FOR THE PAST ONLY, and kept for exactly that. `finish` opens the round
+    itself whether or not assumptions are pending (spec
+    docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §1), so every work order
+    finished from that release on already has one by the time it reaches here. The ones
+    parked in `needs_review` when it shipped do not, and deleting this would send them to
+    the merge queue unjudged.
     """
     return (cfg is not None and cfg.enabled
             and store.latest_validation_round(wo_id=wo_id) is None)
@@ -2142,11 +2244,12 @@ def review_work_order(wo_id: str, accept: bool = True,
     `waiting_pr_merge` — so the merge that should have ended the work order unattended
     ends nothing.
 
-    **This is the SECOND route into done, and it must validate too.** Pending assumptions
-    outrank validation, so a work order that filed them goes finish → `needs_review` →
-    here and never passes through `finish`'s validation branch — reaching the merge queue
-    unjudged. An accepted work order that has never been validated therefore opens round
-    1 here, through the same helper `finish` uses (`_validates_on_review`).
+    **This is the SECOND route into done, and it must validate too.** It is no longer
+    the route that OPENS the round — `finish` does that for every work order now, in
+    parallel with this review — so what this owes a work order it accepts is the JOIN:
+    `land_when_cleared` lands it only if the panel has also finished with it, and leaves
+    it `validating` if a round is still in flight. `_validates_on_review` stays for the
+    work orders that were already parked here when that shipped.
     """
     name, path, wo = find_work_order(wo_id)
     cfg = validation_config(name)
@@ -2157,14 +2260,14 @@ def review_work_order(wo_id: str, accept: bool = True,
             store.review_assumption(a["id"], "accepted" if accept else "rejected")
         status = wo["status"]
         if wo["status"] == "needs_review":
-            if accept and _validates_on_review(store, wo_id, cfg):
-                submit_for_validation(store, path, store.get_work_order(wo_id),
-                                      declared=declared_evidence(store, wo_id), cfg=cfg)
-                status = "validating"
-            elif accept:
-                status = "waiting_pr_merge" if _awaiting_merge(wo) else "completed"
-                store.set_status(wo_id, status)
-                store.clear_attention(wo_id)
+            if accept:
+                if _validates_on_review(store, wo_id, cfg):
+                    submit_for_validation(store, path, store.get_work_order(wo_id),
+                                          declared=declared_evidence(store, wo_id),
+                                          cfg=cfg)
+                # The user's gate has cleared; whether the work order lands now is the
+                # panel's half of the join to answer.
+                status = land_when_cleared(store, store.get_work_order(wo_id))
             elif not feedback:
                 # With feedback the guidance is delivered below, so the work order is
                 # not waiting on the user — only a bare rejection strands it.

@@ -32,7 +32,10 @@ have nothing to judge on. Say so and reject: silence is not a pass.
 
 **REJECT when the work is not shown to be finished** — evidence that does not match the diff,
 a change nothing exercises, a finding with a concrete ask that nobody has answered, a
-standing instruction of this project contradicted.
+standing instruction of this project contradicted, an ASSUMPTION the submitter made that is
+wrong. The last is a defect like any other and a seat raising it is grounds like any other.
+What you may NOT do is decide whether the user wants an assumption: that review is theirs
+and it is running while you read this.
 
 **PASS when the seats found nothing that must change.** A pass is not a compliment and it is
 not a promise the code is perfect: it means no reviewer found a reason this should not go

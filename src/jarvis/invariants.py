@@ -43,6 +43,7 @@ from .project_store import (
     DEPENDENCY_DEAD_STATUSES,
     FO_OPEN_STATUSES,
     OPEN_STATUSES,
+    RUNNABLE_VALIDATION_OUTCOMES,
     SLOT_STATUSES,
     UNGOVERNED_ORIGINS,
 )
@@ -453,6 +454,14 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     if wo["status"] in ACTIVE_STATUSES:
         note = pause_note(store, wo) or neo_wait_note(wo)
         return f"{wo['status']} — {note}" if note else wo["status"]
+    # `needs_review` no longer means the panel is waiting for the user: since issue 212
+    # the round runs in parallel with the assumption review, and a status that said only
+    # "needs_review" would hide the half of the work that is still moving.
+    if wo["status"] == "needs_review":
+        latest = store.latest_validation_round(wo_id=wo["id"])
+        if latest and latest["outcome"] in RUNNABLE_VALIDATION_OUTCOMES:
+            return (f"{wo['status']} — review round {latest['round']} is running "
+                    f"in parallel")
     if wo["status"] != "pending":
         return wo["status"]
     blockers = store.unfinished_dependencies(wo["id"])
@@ -1403,16 +1412,24 @@ def check_no_lost_feedback(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
-    """INV-VALIDATION-STRANDED — a unit under review must not sit in `validating` for ever.
+    """INV-VALIDATION-STRANDED — a unit under review must not sit on an open round for ever.
 
-    Nothing outside the daemon moves a `validating` unit: it raises no attention flag and
-    `settle_work_order` returns early for it. Both are right while a round is in flight,
-    and together they mean a daemon that dies mid-round leaves the unit invisibly stalled
-    with nothing left in the OS that will ever look at it again.
+    Nothing outside the daemon moves a unit whose round is open: it raises no attention
+    flag and `settle_work_order` returns early for it. Both are right while a round is in
+    flight, and together they mean a daemon that dies mid-round leaves the unit invisibly
+    stalled with nothing left in the OS that will ever look at it again.
 
-    Predicate: `validating`, latest round still `pending`, opened longer than TWICE
+    Predicate: latest round still `pending`, opened longer than TWICE
     `os.validation.timeout` ago — one timeout is what a round is allowed to take, so a
     round at 1.2x its budget is late rather than abandoned.
+
+    **The work-order half looks for the ROUND, not for `status='validating'`** (GitHub
+    issue 212, spec docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §3): a
+    work order with pending assumptions holds its round while parked in `needs_review`,
+    and the status query this replaced would have let exactly that one sit for ever. It
+    is bounded to `OPEN_STATUSES` instead — a cancelled work order's abandoned round must
+    not be handed back to a machine that would judge and then land the work the user
+    stopped.
 
     Repaired by closing the round `failed`, not `escalated`: `counted_validation_rounds`
     ignores `failed`, so the interruption costs the submitter no round, and
@@ -1427,9 +1444,13 @@ def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
     threshold = 2 * per_round
     now = time.time()
     cutoff = now - threshold
+    open_marks = ",".join("?" * len(OPEN_STATUSES))
     for kind, id_col, rows in (
         ("work order", "wo_id", store.conn.execute(
-            "SELECT id FROM work_orders WHERE status='validating'").fetchall()),
+            f"""SELECT DISTINCT w.id AS id FROM work_orders w
+                  JOIN validation_rounds r ON r.wo_id = w.id
+                 WHERE r.outcome='pending' AND w.status IN ({open_marks})""",
+            OPEN_STATUSES).fetchall()),
         ("feature order", "fo_id", store.conn.execute(
             "SELECT id FROM feature_orders WHERE status='validating'").fetchall()),
     ):

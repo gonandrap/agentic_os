@@ -209,6 +209,11 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
     they are what lets a seat say "you claim tests, and no file under `tests/` appears in
     this change" — an answer the diff alone cannot support once it has been truncated.
 
+    The assumptions are here because an assumption is a decision embodied in the code
+    being judged, and it ships in the pull request like everything else (GitHub issue
+    212). The panel gets no say in whether the user WANTS one — that review runs in
+    parallel — only in whether it is wrong.
+
     When the unit carries a spec section, that section is the standard the change is held
     to and the brief is demoted to the scope boundary around it — the heading says so,
     because a seat handed two descriptions of the same work will otherwise pick whichever
@@ -233,6 +238,19 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
         "## The testing evidence the submitter DECLARED\n"
         f"{packet.declared or '(none declared — the submitter claimed no evidence)'}",
     ]
+    if packet.assumptions:
+        called = "\n".join(
+            f"- [{a.get('n')}] ({_assumption_state(str(a.get('status') or ''))}) "
+            f"{a.get('content') or ''}"
+            for a in packet.assumptions)
+        parts.append(
+            "## The calls the submitter made on its own — ASSUMPTIONS\n"
+            "Each is a decision it took without asking, and each is embodied in the diff "
+            "below. WHETHER THE USER WANTS IT is theirs to decide, in parallel with you, "
+            "and you are not being asked for that. Whether it is WRONG is yours: a bad "
+            "call is a defect like any other and you may reject over one. `accepted` "
+            "means the user agreed with the sentence, not that anyone checked the code "
+            f"against it.\n\n{called}")
     if packet.pr_url:
         parts.append(f"## Pull request\n{packet.pr_url}")
     if packet.children:
@@ -258,6 +276,19 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
             "rather than passing what you did not read.")
     parts.append(f"## The diff\n```diff\n{packet.diff or '(empty)'}\n```")
     return "\n\n".join(parts)
+
+
+def _assumption_state(status: str) -> str:
+    """How an assumption's review state reads to a seat.
+
+    `pending` is the interesting one and the raw word undersells it: the user is deciding
+    it AT THE SAME TIME the panel is reading it (spec
+    docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §1), which is why a seat
+    must not read an undecided call as one nobody stands behind.
+    """
+    return {"pending": "the user is deciding this now",
+            "accepted": "the user accepted it",
+            "rejected": "the user REFUSED it"}.get(status, status or "unreviewed")
 
 
 def build_chair_prompt(packet: EvidencePacket, opinions: Sequence[seats.Opinion]) -> str:
