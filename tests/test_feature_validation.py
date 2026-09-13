@@ -484,6 +484,39 @@ def test_a_feature_with_no_base_escalates_without_calling_the_panel(fleet):
         store.close()
 
 
+def test_a_side_effect_does_not_excuse_a_feature_from_having_a_base(fleet):
+    """The two guards answer different questions and only one of them yields.
+
+    The files guard asks "was anything delivered"; the base guard asks "can we honestly
+    diff what was delivered". A knowledge write answers the first and says nothing about
+    the second — so exempting a baseless feature on the strength of one retraction sends
+    a feature whose file changes were never diffable to a panel that has just been told
+    not to read an empty diff as nothing delivered, and it could pass on the retraction
+    alone. Rejected in review, round 1; spec 2026-09-12 §5.
+    """
+    from jarvis import ops
+
+    validator = Validator(passed())
+    fleet.daemon.validator = validator
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("no base", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+        for child in store.feature_children(fo_id):
+            ops.learn_add("something durable", wo_id=str(child["id"]))
+        store.update_feature_order(fo_id, base_sha=None)
+
+        fleet.drain()
+
+        assert validator.calls == [], "a baseless feature reached the panel"
+        rnd = store.latest_validation_round(fo_id=fo_id)
+        assert rnd["outcome"] == "escalated"
+        assert "no recorded base commit" in rnd["reason"]
+    finally:
+        store.close()
+
+
 def test_a_feature_whose_children_merged_nothing_escalates(fleet):
     """An empty diff never reaches the panel: a reviewer handed nothing to review will
     approve it, and that one silent pass would make the whole feature theatre."""

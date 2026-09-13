@@ -305,13 +305,21 @@ def _pull_request(url: str, project_path: Path) -> tuple[dict[str, Any] | None, 
     can only ask GitHub questions — every command it runs is in `github.READ_ONLY_VERBS`
     — so importing it cannot give this module, or anything downstream of it, a way to
     talk back to the submitter it is gathering evidence about (spec §2).
+
+    **`pr_error` IS `GitHubError.reason` AND NEVER `str(e)`.** The exception text
+    carries `gh`'s stderr, and this string is rendered verbatim into five seat prompts;
+    `reason` is a short phrase `github.py` wrote itself, from a fixed vocabulary. A
+    judge's prompt is not a place to interpolate a string a remote server chose. The
+    full detail is logged where `github._run` raises, for the human who has to fix it.
     """
     from . import github
 
     try:
         art = github.pr_artifact(url, cwd=project_path)
-    except Exception as e:  # noqa: BLE001 — a thin packet, never a dead round
-        return None, f"{type(e).__name__}: {e}".strip().replace("\n", " ")[:500]
+    except github.GitHubError as e:  # the packet gets the vocabulary, not the stderr
+        return None, e.reason
+    except Exception:  # noqa: BLE001 — a thin packet, never a dead round
+        return None, "the pull request could not be read"
     return {
         "url": art.url, "number": art.number, "title": art.title, "body": art.body,
         "state": art.state, "draft": art.draft, "base_ref": art.base_ref,

@@ -36,12 +36,16 @@ failure.
 from __future__ import annotations
 
 import json
+import logging
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .bugreport import gh_bin, gh_missing_message
+
+log = logging.getLogger("jarvis.github")
 
 #: `gh pr view` is a single API round trip; anything slower than this is a network
 #: problem, and the daemon must not block its tick on one.
@@ -55,9 +59,58 @@ GH_TIMEOUT = 30
 #: docstring for why the panel's blind review depends on it.
 READ_ONLY_VERBS = (("pr", "view"), ("pr", "diff"))
 
+#: The LOCAL git subcommands this module runs, held to the same standard by the same
+#: test. `origin_repo` shells out to git to learn which repository this checkout belongs
+#: to; that never touches the network and can mutate nothing, but it puts a second
+#: command family in a module whose whole claim is "everything here is a question", so
+#: it is declared rather than left for a reader to audit.
+LOCAL_GIT_READS = (("remote", "get-url", "origin"),)
+
 
 class GitHubError(RuntimeError):
-    """The state of the pull request could not be read. Nothing is known about it."""
+    """The state of the pull request could not be read. Nothing is known about it.
+
+    `reason` is a SHORT PHRASE THIS MODULE WROTE, from the fixed vocabulary below. It
+    exists because `str(e)` carries `gh`'s stderr — remote text — and
+    `evidence.collect_work_order` puts the failure into `packet.pr_error`, which is
+    rendered verbatim into five seat prompts. A judge's prompt is not a place to
+    interpolate a string a remote server chose. The full detail stays on the exception
+    and in the log, where a human reads it; the packet gets `reason` and nothing else.
+    """
+
+    #: What the packet is allowed to say. Every raise below picks one.
+    URL_REFUSED = ("the recorded pull-request URL is not one this project is allowed "
+                   "to fetch")
+    NO_GH = "the `gh` CLI is not installed where the OS can reach it"
+    TIMEOUT = "the request to GitHub timed out"
+    REFUSED = "GitHub refused the request, or the pull request does not exist"
+    UNREADABLE = "GitHub's answer could not be understood"
+
+    def __init__(self, message: str, reason: str = "") -> None:
+        super().__init__(message)
+        self.reason = reason or self.REFUSED
+
+
+class UntrustedPullRequest(GitHubError):
+    """The URL is not a pull request on this project's own repository.
+
+    `pr_url` is written by the SUBMITTER (`jarvis wo finish --pr …`) and read back here
+    into a command that runs with the operator's GitHub credentials. Two things follow,
+    and neither is hypothetical:
+
+    * A URL that does not start with `https://` can be read by `gh` as a FLAG. The
+      argument list is passed to `subprocess.run` without a shell, which stops shell
+      injection and does nothing at all about `--repo=someone/else` sitting where a URL
+      should be.
+    * A well-formed URL pointing somewhere else is a fetch of a stranger's pull request
+      with the operator's credentials, presented to the panel as this work order's
+      evidence.
+
+    So the URL is checked against a strict shape AND against the project's own `origin`
+    before it reaches an argument list. Refusing is safe: the collector records it in
+    `pr_error` and falls back to the worktree, which is the same path a deleted pull
+    request already took.
+    """
 
 
 class GhUnavailable(GitHubError):
@@ -68,6 +121,58 @@ class GhUnavailable(GitHubError):
     fails is usually credentials. Advising `GH_TOKEN` at someone whose service PATH lost
     /snap/bin is how issue #90 went undiagnosed for a release.
     """
+
+
+#: The ONLY shape a pull-request URL may have before it becomes an argument. Anchored at
+#: both ends, `https://` required — which is also what makes a leading `-` unreachable,
+#: so no argument can be read as a `gh` flag. See `UntrustedPullRequest`.
+PR_URL_RE = re.compile(
+    r"^https://([A-Za-z0-9.-]+)/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/[0-9]+$")
+
+
+def checked_pr_url(url: str, cwd: Path | None = None) -> str:
+    """`url` if this project may fetch it. Raises `UntrustedPullRequest` otherwise.
+
+    Two checks, and the second is skipped rather than failed when `origin` cannot be
+    read: a project with no resolvable remote is a broken checkout, not an attack, and
+    losing PR polling over one would be a worse failure than the one being prevented.
+    Nothing an untrusted party controls can remove a project's git remote.
+    """
+    match = PR_URL_RE.match(url or "")
+    if match is None:
+        raise UntrustedPullRequest(
+            f"{url!r} is not a pull-request URL this OS will fetch",
+            GitHubError.URL_REFUSED)
+    _host, owner, repo = match.group(1), match.group(2), match.group(3)
+    origin = origin_repo(cwd)
+    if origin is not None and origin != (owner.lower(), repo.lower()):
+        raise UntrustedPullRequest(
+            f"{url!r} is on {owner}/{repo}, but this project's origin is "
+            f"{origin[0]}/{origin[1]}", GitHubError.URL_REFUSED)
+    return url
+
+
+def origin_repo(cwd: Path | None) -> tuple[str, str] | None:
+    """`(owner, repo)` lowercased for this checkout's `origin`, or None if unreadable.
+
+    Both remote spellings, because a project cloned over ssh and one cloned over https
+    are the same repository and only one of them looks like a URL:
+    `git@host:owner/repo.git` and `https://host/owner/repo.git`.
+    """
+    if cwd is None or not Path(cwd).is_dir():
+        return None
+    try:
+        proc = subprocess.run(["git", "-C", str(cwd), "remote", "get-url", "origin"],
+                              capture_output=True, text=True, timeout=GH_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    remote = (proc.stdout or "").strip().removesuffix(".git")
+    parts = remote.replace(":", "/").rstrip("/").split("/")
+    if len(parts) < 2 or not parts[-1] or not parts[-2]:
+        return None
+    return parts[-2].lower(), parts[-1].lower()
 
 
 #: The fields of one `gh pr view --json …`. Two questions in one round trip: did this
@@ -126,27 +231,38 @@ def _run(args: list[str], *, url: str, cwd: Path | None,
         proc = subprocess.run([gh_bin(), *args], capture_output=True, text=True,
                               timeout=GH_TIMEOUT, cwd=where)
     except FileNotFoundError as e:
-        raise GhUnavailable(gh_missing_message(missing_hint)) from e
+        raise GhUnavailable(gh_missing_message(missing_hint),
+                            GitHubError.NO_GH) from e
     except subprocess.TimeoutExpired as e:
-        raise GitHubError(f"{shown} timed out after {GH_TIMEOUT}s") from e
+        raise GitHubError(f"{shown} timed out after {GH_TIMEOUT}s",
+                          GitHubError.TIMEOUT) from e
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
-        raise GitHubError(f"{shown} failed: {detail}")
+        # The remote text is LOGGED and not raised into `reason` — see `GitHubError`.
+        log.info("%s failed: %s", shown, detail)
+        raise GitHubError(f"{shown} failed: {detail}", GitHubError.REFUSED)
     return proc.stdout or ""
 
 
 def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
-    """Read the state of the pull request at `url`. Raises `GitHubError` on any doubt."""
+    """Read the state of the pull request at `url`. Raises `GitHubError` on any doubt.
+
+    The URL is checked BEFORE it becomes an argument — the poll loop reads the same
+    submitter-written column the panel does, so it carries the same exposure.
+    """
+    url = checked_pr_url(url, cwd)
     stdout = _run(["pr", "view", url, "--json", PR_FIELDS], url=url, cwd=cwd,
                   missing_hint="so Jarvis cannot see when a pull request merges")
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError as e:
         raise GitHubError(
-            f"`gh pr view {url}` returned no JSON ({stdout[:200]!r})") from e
+            f"`gh pr view {url}` returned no JSON ({stdout[:200]!r})",
+            GitHubError.UNREADABLE) from e
     state = str(payload.get("state") or "").upper()
     if not state:
-        raise GitHubError(f"`gh pr view {url}` reported no state ({payload!r})")
+        raise GitHubError(f"`gh pr view {url}` reported no state ({payload!r})",
+                          GitHubError.UNREADABLE)
     # Only `state` is required above: `mergeable` arrives as null on a merged or closed
     # pull request and on one GitHub has not computed yet, and None reads everywhere as
     # "no conflict known" — the safe direction (spec §2).
@@ -237,16 +353,22 @@ def pr_artifact(url: str, cwd: Path | None = None) -> PullRequestArtifact:
     submitter changed nothing": the first is a fetch problem and the second is a verdict.
     `evidence.collect_work_order` catches this and records the reason in
     `packet.pr_error` rather than passing the worktree off as the pull request.
+
+    The URL is checked BEFORE it becomes an argument (`checked_pr_url`): it is written
+    by the submitter and this runs with the operator's credentials.
     """
+    url = checked_pr_url(url, cwd)
     stdout = _run(["pr", "view", url, "--json", ARTIFACT_FIELDS], url=url, cwd=cwd,
                   missing_hint="so the validation panel cannot read a pull request")
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError as e:
         raise GitHubError(
-            f"`gh pr view {url}` returned no JSON ({stdout[:200]!r})") from e
+            f"`gh pr view {url}` returned no JSON ({stdout[:200]!r})",
+            GitHubError.UNREADABLE) from e
     if not payload.get("state"):
-        raise GitHubError(f"`gh pr view {url}` reported no state ({payload!r})")
+        raise GitHubError(f"`gh pr view {url}` reported no state ({payload!r})",
+                          GitHubError.UNREADABLE)
     diff = _run(["pr", "diff", url], url=url, cwd=cwd,
                 missing_hint="so the validation panel cannot read a pull request")
     files = [f for f in (payload.get("files") or []) if isinstance(f, dict)]

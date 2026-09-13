@@ -1520,10 +1520,15 @@ class Daemon:
                     "that asked for changes would have nobody to act on it. Nobody has "
                     "judged the work.")
                 return
-            # The base guard yields to side effects for the same reason the files guard
-            # below does: a feature whose children delivered only non-file change has
-            # nothing to diff and still has something to judge.
-            if not packet.base and not packet.side_effects:
+            # THIS GUARD DOES NOT YIELD TO SIDE EFFECTS, and the one below does. They
+            # answer different questions: this one asks "can we honestly diff what was
+            # delivered", and the next asks "was anything delivered at all". A single
+            # knowledge write is an answer to the second and says nothing about the
+            # first — so exempting a baseless feature on the strength of one retraction
+            # would send a feature whose file changes were never diffable to a panel
+            # that has just been told not to read an empty diff as nothing delivered.
+            # It could then pass on the retraction alone. Rejected in review, round 1.
+            if not packet.base:
                 self._escalate_feature(
                     store, fo, round_id, n,
                     "this feature order has no recorded base commit, so there is no "

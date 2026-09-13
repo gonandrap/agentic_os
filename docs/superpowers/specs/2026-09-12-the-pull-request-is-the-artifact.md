@@ -44,6 +44,26 @@ guarantee over the policy one:
 Read-only is therefore a property of the code path, not of an allowlist string a model
 is asked to respect. There is no write verb anywhere in the judging path to allow.
 
+### `pr_url` is submitter-written input
+
+It is a column a worker fills in with `jarvis wo finish --pr …`, and it is now read back
+into a command that runs with the operator's GitHub credentials. Three consequences, all
+handled in `github.checked_pr_url` and `GitHubError.reason`:
+
+| the hazard | what stops it |
+|---|---|
+| a value like `--repo=someone/else` read by `gh` as a FLAG — a list argv stops shell injection and does nothing about this | `PR_URL_RE`, anchored, `https://` required, so a leading `-` is unreachable |
+| a well-formed URL on someone else's repository — a fetch of a stranger's PR with the operator's credentials, shown to the panel as this work order's evidence | the URL's owner/repo must match the project's own `origin` |
+| `gh`'s stderr reaching a seat prompt verbatim through `pr_error` | the packet gets `GitHubError.reason`, a phrase from a fixed vocabulary in our own source; the full detail is logged, never rendered |
+
+The `origin` check is SKIPPED, not failed, when the remote cannot be read: a project with
+no resolvable remote is a broken checkout rather than an attack, and nothing an untrusted
+party controls can remove a project's git remote. The shape check always applies.
+
+Refusal is safe in every case — the collector records it in `pr_error` and falls back to
+the worktree, the same path a deleted pull request already took. Both readers are
+checked, `pr_view` as well as `pr_artifact`: the poll loop reads the same column.
+
 ## §3 What the collector does now
 
 `evidence.collect_work_order` resolves its diff in this order, and records which one
@@ -98,6 +118,17 @@ so adding one is a collector change and not a packet change.
 `not packet.files and not packet.side_effects`. The guard's intent is untouched — a
 reviewer handed nothing will rubber-stamp it — and only its premise is corrected: "no
 files changed" was never the same statement as "nothing was delivered".
+
+**THE FEATURE ORDER'S BASE GUARD DOES NOT YIELD, AND THAT IS A SEPARATE DECISION.**
+`_validate_feature_order` carries two guards that look alike and are not: `not
+packet.base` asks *can we honestly diff what was delivered*, and `not packet.files` asks
+*was anything delivered at all*. A knowledge write answers the second and says nothing
+about the first. Making the base guard conditional on `side_effects` — which the first
+draft of this change did, and review rejected — lets one retraction exempt a whole
+feature from the only check that says its file changes are diffable at all, and sends it
+to a panel that has just been told not to read an empty diff as nothing delivered. It
+could then pass on the retraction alone. Same shape as kn-988d1733: a claim about one
+part clearing the whole.
 
 The repeat-fingerprint guard needed the same correction, and it is the one that is easy
 to miss. `fingerprint` hashed `diff_sha` and the normalised `declared` text. Two
