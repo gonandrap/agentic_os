@@ -2112,9 +2112,13 @@ def cmd_gate(args: argparse.Namespace) -> int:
                     # Addressed by request number, exactly as the block told the worker —
                     # the command is printed on the line above, and re-quoting it here is
                     # what the isolation guard refuses (§8).
-                    print(f"    ↳ {gates.request_command(r['wo_id'], r['command'], r['kind'], '...', '...', approval_id=r['id'])}"
-                          f"   (the worker's move)")
-                    print(f"    ↳ {gates.contest_command(r['wo_id'], r['command'], '...', approval_id=r['id'])}"
+                    ask = gates.request_command(r["wo_id"], r["command"], r["kind"],
+                                                why="...", evidence="...",
+                                                approval_id=r["id"])
+                    contest = gates.contest_command(r["wo_id"], r["command"], why="...",
+                                                    approval_id=r["id"])
+                    print(f"    ↳ {ask}   (the worker's move)")
+                    print(f"    ↳ {contest}"
                           f"   (…or this, if the gate matched it by mistake)")
                 elif r["status"] == "pending" and r["escalated"]:
                     print(f"    ↳ Neo escalated: {r['escalation_reason']}")

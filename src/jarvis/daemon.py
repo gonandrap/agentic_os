@@ -2182,7 +2182,12 @@ class Daemon:
                 title=(f"Neo rejected a contested {approval['kind']} match from "
                        f"{q['wo_id']}" if decided["contested"]
                        else f"Neo {ruling} {approval['kind']} for {q['wo_id']}"),
-                body=(f"{verdict['reason']}\n\nCommand: {approval['command']}\n"
+                # The RECORDED reason, for the same reason as the level and the title: on
+                # a coerced contest the reply argues the command is fine and the record
+                # carries the coercion note explaining why it was written down as a
+                # refusal anyway. Rendering the reply here would contradict the title.
+                body=(f"{decided['decision_reason']}\n\n"
+                      f"Command: {approval['command']}\n"
                       f"Review Neo's call with: jarvis neo review {q['id']}"),
                 wo_id=q["wo_id"],
             )

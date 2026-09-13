@@ -297,6 +297,27 @@ The wider version of that second problem — any quoted prose in any command los
 blanking to the word "eval" — is **not fixed here**. It is recogniser classification,
 which wo-5efc2de6 owns; it is on the backlog with request 106 named as the specimen.
 
+**Which unit owns the pre-table checks, and how the two fixes compose.** `decide` already
+runs two checks ahead of the table — `_SUBSTITUTION` and `reads_only` — and this adds a
+third beside them. The two changes do not overlap: wo-5efc2de6's fix is to `scannable`,
+deciding *per segment* whether a quoted argument is data, and it makes the table's answer
+on prose correct; `gate_paperwork` never consults the table at all, because the property
+it states is about the verb, not about the text. If wo-5efc2de6's fix lands first this
+check is still needed — an exemption derived from blanking is still per-kind, and 106's
+`release` match came from a rule the `pr_merge` exemption could not reach. If this lands
+first, `scannable` is untouched by it. The one shared line is the `decide` preamble, and
+the conflict there is textual, not semantic: both are guard clauses in the same block.
+
+**`gr-7a0e659b` stays, and stays dead.** The learned rule is a regex for the one argv
+shape 106 was re-filed in. It is now redundant — the code check runs first and is strictly
+wider (every kind, not the one kind the rule was learned under), so no command reaches the
+table that the rule would have cleared. Retiring it is `jarvis gate rule-retract` and that
+verb is the **user's**, not a worker's: retracting an exemption re-arms a gate fleet-wide.
+So this spec records the state rather than changing it, and
+`test_the_code_check_covers_the_shape_the_learned_rule_was_learned_for` pins the
+redundancy — remove the code check and that case fails, rather than the regex silently
+taking the job back.
+
 **On §5's count.** Requests 99, 100, 103, 105 and 106 of this fleet were all recorded as
 denied `release` actions and not one was a release attempt. 99 the user dismissed by hand.
 The other four were the TTL's, and opening the store under this branch re-filed every one

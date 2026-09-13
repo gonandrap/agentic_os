@@ -32,7 +32,7 @@ PROSE = ("git commit -F - <<'MSG'\n"
 def seed() -> None:
     """One project with the four gate outcomes the page has to tell apart: a contested
     match waiting on the user, an abandoned request, a dismissal and a real approval."""
-    from jarvis import gates, ops
+    from jarvis import gates
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore
 
@@ -95,7 +95,6 @@ def seed() -> None:
                          reason="PR #61 is the work order's own branch, checks green",
                          decided_by="neo", project="jarvis_os")
     store.close()
-    del ops  # imported for its side-effect-free path resolution only
 
 
 def serve() -> None:

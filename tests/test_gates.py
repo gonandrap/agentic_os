@@ -1431,29 +1431,75 @@ def test_every_exit_the_block_prints_is_runnable(gated):
 
 def test_the_deciding_verbs_are_not_paperwork(gated):
     """`approve`/`deny`/`dismiss` RULE on a request. A worker clearing its own gate is the
-    one thing this subsystem exists to prevent, so the exemption stops short of them."""
+    one thing this subsystem exists to prevent, so the exemption stops short of them.
+
+    Asserted at the CLASSIFIER, not just at the predicate: the one specimen the carve-out
+    DOES clear must still trip a gate under each deciding verb, so `GATE_PAPERWORK_VERBS`
+    cannot grow one with nothing failing (kn-e74988af)."""
     from jarvis.gate_rules import GATE_PAPERWORK_VERBS, gate_paperwork
 
+    assert gates.classify(PAPERWORK, ALL_GATES) is None, "the specimen is the control"
     for verb in ("approve", "deny", "dismiss", "rule-retract"):
+        ruling = PAPERWORK.replace("jarvis gate request", f"jarvis gate {verb}", 1)
+
         assert verb not in GATE_PAPERWORK_VERBS
-        assert not gate_paperwork(f"jarvis gate {verb} 106 --reason \"fine\"")
+        assert not gate_paperwork(ruling), verb
+        # Which kind is the table's business; that SOME kind fires is this test's.
+        assert gates.classify(ruling, ALL_GATES) is not None, verb
 
 
-def test_paperwork_is_all_or_nothing_across_the_chain(gated):
+@pytest.mark.parametrize("sep", ["; ", " && ", " || ", " | ", "\n"])
+def test_paperwork_is_all_or_nothing_across_the_chain(gated, sep):
     """Same bypass `reads_only` guards, and the same answer: one non-paperwork segment
-    anywhere loses it."""
+    anywhere loses it — argv0 being `jarvis` buys the chain nothing.
+
+    Every separator, because each is a different path through the splitter, and at the
+    classifier rather than the predicate because that is what actually blocks."""
     from jarvis.gate_rules import gate_paperwork
 
-    assert gate_paperwork('jarvis gate explain 1 && jarvis gate show 1')
-    for chain in (
-        'jarvis gate explain "x"; ./scripts/shipit.sh',
-        'jarvis gate explain 1 | bash',
-        'jarvis gate explain 1 | xargs sh -c "./scripts/shipit.sh"',
-        "sh -c 'jarvis gate explain \"./scripts/shipit.sh\"'",
+    assert gate_paperwork("jarvis gate explain 1 && jarvis gate show 1")
+
+    chain = f'jarvis gate explain "x"{sep}./scripts/shipit.sh'
+    assert not gate_paperwork(chain), chain
+    action = gates.classify(chain, ALL_GATES)
+    assert action is not None and action.kind == "release", chain
+    assert _decision(gated.attempt(chain)) == "deny"
+
+
+def test_an_invoker_wrapping_the_paperwork_verb_is_refused_on_structure(gated):
+    """The concrete claim §9 makes about why the carve-out is safe WITHOUT reusing
+    `_SHELL_INVOKER`: an invoker that invokes is a segment of its own, so the argv0 test
+    refuses it — the text `jarvis gate request` appearing somewhere exempts nothing."""
+    from jarvis.gate_rules import gate_paperwork
+
+    for wrapped in (
+        "sh -c 'jarvis gate request wo-1 \"./scripts/shipit.sh\" --why \"no\"'",
+        "echo 'jarvis gate request wo-1 \"./scripts/shipit.sh\"' | xargs sh -c",
+        'bash -lc "jarvis gate request wo-1 \\"./scripts/shipit.sh\\""',
         'jarvis gate explain "$(cat /tmp/x)"',
         "eval jarvis gate explain 1",
     ):
-        assert not gate_paperwork(chain), chain
+        assert not gate_paperwork(wrapped), wrapped
+        if "$(" not in wrapped and not wrapped.startswith("eval"):
+            action = gates.classify(wrapped, ALL_GATES)
+            assert action is not None and action.kind == "release", wrapped
+
+
+def test_the_code_check_covers_the_shape_the_learned_rule_was_learned_for(gated):
+    """`gr-7a0e659b` is the live learned exemption for this shape, and it is now dead
+    weight rather than a second mechanism: the code check is consulted BEFORE the table,
+    and it is strictly wider (every kind, not the one the rule was learned under).
+
+    Pinned so that removing the code check fails here instead of silently handing the
+    job back to a regex nobody maintains. Retracting the rule itself is the user's move —
+    spec 2026-09-12 §9."""
+    from jarvis.gate_rules import gate_paperwork
+
+    learned_shape = ('jarvis gate request wo-1 "gh pr merge 210 --squash" '
+                     '--why "ship it" --evidence "x"')
+
+    assert gate_paperwork(learned_shape)
+    assert gates.classify(learned_shape, ALL_GATES) is None
 
 
 def test_the_word_eval_in_prose_does_not_make_paperwork_executable(gated):

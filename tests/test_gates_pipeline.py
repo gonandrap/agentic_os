@@ -996,12 +996,14 @@ def test_apply_decision_coerces_an_approved_contest_with_no_reviewer_involved(fl
 
 
 def test_the_inbox_item_for_a_coerced_contest_reads_as_one_thing(fleet):
-    """Title and level both come from what was RECORDED, not from what Neo replied.
+    """Title, level AND body all come from what was RECORDED, not from what Neo replied.
 
     They used to come from different places: the title from `approval["contested"]` and
     the level from the reviewer's own word, so an approved contest produced an `info`
     item titled "Neo rejected …". The coercion (§2) makes the two disagree on exactly
-    that input, which is why the level has to be read back from the row.
+    that input, which is why all three have to be read back from the row — a body
+    arguing the command is fine under a title saying "rejected" reads as a bug in the
+    title rather than as the OS overriding a verdict.
     """
     fleet.attempt(PROSE)
     ops.contest_gate_match(fleet.wo_id, PROSE,
@@ -1018,6 +1020,10 @@ def test_the_inbox_item_for_a_coerced_contest_reads_as_one_thing(fleet):
     assert "rejected a contested" in items[0]["title"]
     assert items[0]["level"] == "warning"
     assert fleet.approval()["status"] == "denied"
+    # The body explains its own title: the coercion note is on the row, so it has to be
+    # in the notification that reports the row.
+    assert gates.CONTEST_NOT_AN_AUTHORISATION in items[0]["body"]
+    assert items[0]["body"].startswith(fleet.approval()["decision_reason"])
 
 
 def test_the_user_is_told_to_dismiss_rather_than_silently_coerced(fleet):
