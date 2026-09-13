@@ -99,6 +99,22 @@ def test_command_names_ignore_heredoc_bodies_and_quoted_text():
     assert gate_rules.command_names(HEREDOC_INTO_SHELL) == {"cat", "bash"}
 
 
+def test_list_segments_split_on_lists_and_never_on_a_pipe():
+    def parts(command):
+        return [command[s:e].strip() for s, e in gate_rules.list_segments(command)]
+
+    assert parts("cat a || find b") == ["cat a", "find b"]
+    assert parts("cat a && cat b; cat c & cat d") == ["cat a", "cat b", "cat c", "cat d"]
+    assert parts("cat a | bash") == ["cat a | bash"]
+    assert parts("cat a 2>&1 | head") == ["cat a 2>&1 | head"]
+    # A separator inside a quoted argument or a heredoc body starts no new command. The
+    # body is still its own span — the opener's own newline ends the opening command —
+    # but it arrives whole, which is what stops half a commit message reading as one.
+    assert parts("git commit -m 'a && b'") == ["git commit -m 'a && b'"]
+    body = "git commit -F - <<'EOF'\nfix a && ship b\nEOF"
+    assert parts(body) == ["git commit -F - <<'EOF'", "fix a && ship b\nEOF"]
+
+
 def test_shape_reports_where_the_literal_landed():
     assert gate_rules.shape_of(HEREDOC_COMMIT, "shipit").position == gate_rules.HEREDOC
     assert gate_rules.shape_of("./scripts/shipit.sh", "shipit").position == gate_rules.CODE
@@ -200,6 +216,20 @@ def test_a_chain_containing_an_executor_is_never_exemptible():
                     'eval "bash scripts/shipit.sh"'):
         shape = gate_rules.shape_of(command, "shipit")
         assert shape is None or not shape.exemptible, command
+
+
+def test_an_executor_past_a_list_separator_leaves_the_shape_exemptible():
+    """Issue #194, in the generalisation logic rather than the match: `find` cannot reach
+    a heredoc body it is not in, so a dismissal of this shape still has something to
+    teach. Paired with the test above, which is the same sentence about a pipe."""
+    guarded = HEREDOC_COMMIT + "\n|| find . -name TODO"
+    shape = gate_rules.shape_of(guarded, "shipit")
+    assert shape.names == {"git commit"}
+    assert shape.exemptible and shape.unlearnable_reason() == ""
+
+    piped = gate_rules.shape_of(HEREDOC_INTO_SHELL, "shipit")
+    assert "bash" in piped.names
+    assert piped.unlearnable_reason() == "its own command executes via bash"
 
 
 # -- the reviewer's own generalisation ------------------------------------------------
