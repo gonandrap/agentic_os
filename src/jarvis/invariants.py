@@ -1518,6 +1518,50 @@ def _validation_timeout() -> int:
     return int(timeout) if timeout else DEFAULT_VALIDATION_TIMEOUT
 
 
+#: How many consecutive failed sweeps mean the sweep itself is broken rather than
+#: unlucky. A transport blip fails one or two; a prompt that can never satisfy its own
+#: validator fails every one, for ever. Ten is comfortably past noise and is reached in
+#: a few hours at the shipped cadence — against the 2215 that went unreported.
+HEALTH_SWEEP_FAILURE_RUN = 10
+
+
+def check_health_sweep_produces_judgements(store: ProjectStore) -> Iterator[Violation]:
+    """INV-HEALTH-SWEEP-MUTE — a sweep that never judges anything must not bill silently.
+
+    THIS CHECK IS THE POINT OF ISSUE #216, more than either line of the fix it shipped
+    with. The sweep could never satisfy its own validator and ran 2215 times anyway, for
+    $101.78 and no finding — with no error, no flag and no stuck work order to show for
+    it. A failure mode of "works, costs money, produces nothing" needs a heartbeat rather
+    than a comment, because the other two halves of the fix are exactly the kind an
+    innocent edit undoes with every test still green. §4.1 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+
+    Predicate: of the project's last `HEALTH_SWEEP_FAILURE_RUN` sweeps, every one failed.
+    `outcome='clear'` is a healthy sweep and the common one, so a working project clears
+    this on its first tick and pays a single indexed read for it.
+
+    NOT repairable, and it must not try. The rows are honest — they record what really
+    happened — and the defect is in the prompt or the transport, neither of which is
+    derivable from state. The detail carries the most recent `health_reviews.detail`,
+    which for the #216 shape is the model's reply itself and names the problem outright.
+
+    Silent on a project that has never swept: the sweep ships disabled, and no rows is
+    not a run of failures.
+    """
+    recent = store.recent_health_reviews(HEALTH_SWEEP_FAILURE_RUN)
+    if len(recent) < HEALTH_SWEEP_FAILURE_RUN:
+        return
+    if any(r["outcome"] != "failed" for r in recent):
+        return
+    yield Violation(
+        invariant="INV-HEALTH-SWEEP-MUTE",
+        detail=(f"the last {HEALTH_SWEEP_FAILURE_RUN} health sweeps all failed, so the "
+                f"sweep is spending model calls and producing no judgement. Most recent "
+                f"reason: {str(recent[0]['detail'] or '(none recorded)')[:200]}"),
+        context={"failures": HEALTH_SWEEP_FAILURE_RUN,
+                 "last_detail": str(recent[0]["detail"] or "")[:500]},
+    )
+
+
 def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
     """INV-MANAGER-SLOTS — a project manager order must not spend a concurrency slot.
 
@@ -1975,6 +2019,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_attention_has_reason,
     check_manager_slots,           # a canary, not a state check: it repairs nothing and
                                    # is unaffected by the order it runs in
+    check_health_sweep_produces_judgements,  # ditto: a pure read of the sweep ledger,
+                                   # repairing nothing and read by nothing else
     check_paused_turns_resume,     # ditto: a pure read of what the retry pass did or
                                    # did not do, with nothing to repair
     check_pause_deadline_stable,   # ...and its companion: the pass can also be failing

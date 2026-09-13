@@ -182,6 +182,24 @@ def armed(probes: Iterable[HealthProbe], subject_kind: str) -> tuple[HealthProbe
     return tuple(p for p in probes if p.enabled and subject_kind in p.subjects)
 
 
+#: The sweep's reply shape. Appended LAST so it is the final word in the system prompt,
+#: and worded to override the persona explicitly — §4.1 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+SWEEP_CONTRACT = """# Your output, which REPLACES the shape described above
+
+You are not reviewing a cost alarm. There is no `decision` to make here and no alarm to
+ack, escalate or propose against: you are checking one unit against the checklist above.
+Ignore the output shape given earlier in this prompt and answer ONLY in this one.
+
+Output STRICT JSON, nothing else:
+  {"findings": [{"probe": "<the id from a heading above>",
+                 "reason": "<one line: what is wrong, for the user>",
+                 "evidence": "<what in the packet you were given says so>"}]}
+
+`{"findings": []}` is the healthy answer and the common one — report a symptom only when
+the evidence you were given actually supports it. Name no probe that is not in the
+checklist above."""
+
+
 def render_checklist(probes: Sequence[HealthProbe]) -> str:
     """The checklist §4 puts in the supervisor's system prompt.
 
@@ -192,6 +210,11 @@ def render_checklist(probes: Sequence[HealthProbe]) -> str:
     The id is rendered beside the title because a finding names its probe by id (§4's
     output contract); the ORDER is the resolved list's, so a reader of
     `jarvis supervisor probes` sees the list in the order the model saw it.
+
+    IT ALSO CARRIES `SWEEP_CONTRACT`, because the persona this is appended to demands
+    the COST REVIEW's `{"decision": ...}` and nothing else in the sweep's prompt ever
+    said otherwise. Here rather than in the persona (whose prefix the cost review
+    shares), and last rather than first (order is the fix, not the wording) — §4.1 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
     """
     if not probes:
         return ""
@@ -204,4 +227,5 @@ def render_checklist(probes: Sequence[HealthProbe]) -> str:
     ]
     for probe in probes:
         lines += ["", f"## {probe.id} — {probe.title}", probe.prompt]
+    lines += ["", SWEEP_CONTRACT]
     return "\n".join(lines)

@@ -1372,6 +1372,71 @@ for them.
 
 ---
 
+## 4.1 — What §4 got wrong, and what it cost (issue #216, 2026-09-12)
+
+§4 above specified the sweep's output contract and then never put it in the sweep's prompt.
+The prompt is `SUPERVISOR_PERSONA` + learnings + `render_checklist`, and until this section
+none of the three mentioned `findings`. The persona — shared with the cost review — ends with
+*"Output STRICT JSON, nothing else"* followed by the three `{"decision": ...}` shapes, so the
+only contract the model was ever handed was the one `_validate_findings` rejects.
+
+**Every sweep in production failed. 2215 of 2215, over every unit, for the whole life of the
+feature.** `health_reviews` contains no other outcome at any time.
+
+§4 saw the collision coming and warned about it in the wrong place. "YOU MUST TEACH THE FAKE
+`claude` TO ANSWER A SWEEP" spends five paragraphs on `testing.py` answering `{"decision":
+"ack"}` with no `findings` key — and that warning was heeded, so the fake was taught the
+findings schema and the suite went green over a production path that could never work. The
+real model was never told anything.
+
+### Why it cost $101.78 rather than nothing
+
+A dud feature is cheap. This one was not, because of a second clause:
+
+`due` derives the spend floor from `last_health_review`, which excludes `outcome='failed'` —
+correctly, and for its own stated reason: an unreadable reply must not suppress the retry.
+But with every sweep failing, `review is None` on every call, for ever. `due` takes the
+first-look branch every time, whose only guard is `now - created >= interval` — true once,
+half an hour after the unit was created, and true for the rest of its life. Nothing else
+throttles it. What was left was `health_every_ticks`: one model call per open unit per ~100
+seconds, indefinitely, four units a tick. Every `trigger` ever recorded is `first-look`;
+`changed` and `stale` were never once reached.
+
+`health` became the largest line item in the fleet's bill — above every worker, at 54.2M
+tokens — for zero findings.
+
+### The three changes
+
+1. **The contract moves into `render_checklist`**, appended last so it is the final word in
+   the system prompt, and worded to override the persona explicitly. Not into the persona:
+   that prefix is shared with the cost review and must not move. Not into the user prompt:
+   `render_checklist` returns `""` when no probe is armed, which is what keeps
+   `build_system_prompt(probes=())` byte-identical for a project that arms none.
+   **Order is the fix, not the wording** — a contract above *"Output STRICT JSON, nothing
+   else"* is simply overruled by it, so `tests/test_probes.py` asserts the index, not the
+   presence.
+2. **`due` takes `last_attempt`** — the ts of the last sweep of ANY outcome — and floors the
+   spend on it. `last_health_review` keeps its exclusion, which answers a different question:
+   *what was the last judgement* must skip a failure, *when did we last spend a call* must
+   not. The two reads disagree exactly when the sweep is broken, which is when the difference
+   is worth money. `ProjectStore.last_health_attempt_ts` is the second read.
+3. **`INV-HEALTH-SWEEP-MUTE`** — a canary, repairing nothing: ten consecutive failed sweeps
+   means the sweep is broken rather than unlucky, and `jarvis doctor` says so. This is the
+   most important of the three. Both of the others are the kind an innocent edit undoes with
+   every test still green — reword the persona, move the checklist — and the failure mode
+   they produce is *works, costs money, produces nothing*, which no surface in this OS showed
+   for 2215 sweeps.
+
+### The rule this leaves behind
+
+**A prompt's output contract and its validator are one artifact and must be tested against
+each other, not each against a fixture.** The fake is not evidence that the contract is
+reachable; it is a second implementation of the same assumption. Where a shared persona
+carries one contract and a caller needs another, the override is a property of ORDER, and the
+test asserts the order.
+
+---
+
 ## Out of scope, and filed
 
 - **Turning any of this on.** `supervisor.enabled`, `supervisor.health_enabled` and
