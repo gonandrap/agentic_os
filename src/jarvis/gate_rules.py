@@ -115,6 +115,17 @@ class GateKind:
     # What the action does, in the terms whoever reviews it needs. Rendered into the
     # request Neo sees, so it must read as a claim about consequences.
     summary: str
+    # WHAT TO ASK THE WORKER FOR, for this kind. Every surface that tells a worker how to
+    # file a request renders these two — the hook's block, the CLI help, the standing
+    # brief — and the reviewer's page labels the evidence box with the second.
+    #
+    # They are here rather than written out at each site because the sites were all
+    # hardcoded to the RELEASE frame: "why this is ready to ship", "PR, tests, checks".
+    # A worker asked for a PR number before restarting a service supplies the wrong
+    # thing, and the reviewer then decides on the wrong thing — the request text is all
+    # it ever sees. Nothing is "ready to ship" about a `jarvis config set`.
+    why_ask: str = "why this action should proceed"
+    evidence_ask: str = "what a reviewer can check"
     # Literals that, appearing in a project's `permissions.deny` rules, mean the deny
     # will shadow this gate — the call is blocked before the hook's `allow` is even
     # consulted, so approval can never take effect. Listed explicitly rather than
@@ -127,28 +138,41 @@ KINDS: tuple[GateKind, ...] = (
     GateKind(
         name="pr_merge",
         summary="merge a pull request into the default branch",
+        why_ask="why this is ready to merge",
+        evidence_ask="the PR number, its review state, and what its checks report",
         conflict_markers=("gh pr merge", "pulls/"),
     ),
     GateKind(
         name="release",
         summary="cut a release and deploy it (this reaches the live production fleet)",
+        why_ask="why this is ready to ship",
+        evidence_ask="the merged PRs, the commits being tagged, and CI's verdict on them",
         conflict_markers=("shipit", "gh release", "npm publish", "twine publish",
                           "uv publish", "--tags", "--follow-tags"),
     ),
     GateKind(
         name="service_restart",
         summary="restart or stop a system service (this interrupts the running fleet)",
+        why_ask="why this service has to be interrupted, and why now",
+        evidence_ask="which service, what is running on it right now, and what that "
+                     "work loses when it bounces",
         conflict_markers=("systemctl",),
     ),
     GateKind(
         name="push_protected",
         summary="push directly to a protected branch, bypassing review",
+        why_ask="why this cannot go through a pull request",
+        evidence_ask="the branch, exactly what the push contains, and who agreed to "
+                     "skip review",
         conflict_markers=("git push",),
     ),
     GateKind(
         name="config_write",
         summary="change the fleet's own configuration (this can turn gates, validation "
                 "and worker permission modes off)",
+        why_ask="why this setting has to change",
+        evidence_ask="the setting, its value now, the value after, and what the change "
+                     "switches off",
         conflict_markers=("jarvis config",),
     ),
     # THE ONLY KIND NOTHING CLASSIFIES INTO, and the only one a project cannot switch
@@ -170,6 +194,12 @@ KINDS: tuple[GateKind, ...] = (
         name=SELF_HEAL,
         summary="let the supervisor act on a work order or feature order it judged "
                 "unhealthy (this reaches a running session)",
+        # No worker ever fills these in — `remedies.propose` writes the request itself —
+        # but they are the labels the reviewer's page uses, and a page headed "PR, tests,
+        # checks" over a health finding is the same defect one level along.
+        why_ask="why acting is better than leaving the symptom with the user",
+        evidence_ask="the health finding, the probe that raised it, and what the remedy "
+                     "touches",
         conflict_markers=(),
     ),
 )
@@ -419,6 +449,37 @@ def reads_only(command: str) -> bool:
                                  for w in words[1:]):
             return False
     return True
+
+
+#: The verbs that RECORD or READ a claim about a command. Why these five and not the
+#: deciding four: spec 2026-09-12 §9.
+GATE_PAPERWORK_VERBS = frozenset({"request", "contest", "explain", "show", "list"})
+
+
+def gate_paperwork(command: str) -> bool:
+    """True when every command in the chain is the OS's own gate paperwork.
+
+    All-or-nothing, and deliberately NOT guarded on `_SHELL_INVOKER` the way `reads_only`
+    is. See docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §9.
+    """
+    if _SUBSTITUTION.search(command):
+        return False
+    spans = segments(command)
+    if not spans:
+        return False
+    seen = False
+    for start, end, name in spans:
+        raw = command[start:end].strip()
+        if not raw:
+            continue
+        if name != "jarvis gate":
+            return False
+        words = [w for w in raw.lstrip("({ ").split() if not w.startswith("-")]
+        # `jarvis` `gate` `<verb>` — anything shorter is not addressed to these verbs.
+        if len(words) < 3 or words[2] not in GATE_PAPERWORK_VERBS:
+            return False
+        seen = True
+    return seen
 
 
 # -- the shape of a match ------------------------------------------------------------
@@ -765,6 +826,11 @@ class RuleSet:
             return Decision(None, trace=("no gate is enabled",))
         if reads_only(command):
             return Decision(None, trace=("every command in the chain can only read",))
+        # Before the table, because no entry in the table can state it — §9.
+        if gate_paperwork(command):
+            return Decision(None, trace=(
+                "every command in the chain is `jarvis gate` paperwork: it files or "
+                "reads a claim ABOUT a command and runs nothing",))
         haystack = scannable(command)
         trace: list[str] = []
         cleared: list[tuple[str, str, str]] = []

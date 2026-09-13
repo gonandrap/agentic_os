@@ -78,10 +78,12 @@ status: argue a held request, or end the turn and wait for a pending one. When b
 open it describes the held one, chosen explicitly rather than by list order, because that
 is the only one the worker can act on without ending the turn.
 
-The line it hands out — `jarvis gate request <wo> "<cmd>" --why … --evidence …` — is
-rendered by `gates.case_command`, which is also what the three hook denials, `jarvis gate
-list` and the briefing print. It is the only text a blocked worker gets, so a renamed flag
-has to break every copy of it at once or it breaks none of them visibly.
+What it hands out is `gates.exits_advice`, the same renderer the hook's own blocks use —
+so the Stop hold and this refusal offer BOTH exits, the request and the contest. A hold
+that named only the request would push a worker whose command performs no privileged
+action into writing a false case, which is the failure
+`2026-09-12-contesting-a-gate-match.md` exists to stop; holding the turn would make it
+harder to walk away from, not easier.
 
 Not a trap. Every open request reaches a verdict without the worker doing anything —
 Neo's drain for a pending one, `Daemon.refuse_unargued_gates` for a held one — and the

@@ -49,11 +49,21 @@ scripts/shipit.sh minor            # or patch | major
 scripts/shipit.sh 1.4.0            # explicit version
 ```
 
-shipit cuts `release/jarvis-X.Y.Z` from `main`, bumps `pyproject.toml` + commits +
-tags `jarvis-X.Y.Z` **on that release branch** (via a throwaway worktree, so `main` is
-never modified), **pushes the branch and the tag to `origin`**, deploys the tag to
-`$PRODUCTION_CODE/jarvis_os` (`git fetch` + `checkout` + `uv sync --frozen`), restarts
-the services, and notifies Telegram.
+shipit cuts `release/jarvis-X.Y.Z` from `main`, bumps **both `pyproject.toml` and
+`uv.lock`**, commits them and tags `jarvis-X.Y.Z` **on that release branch** (via a
+throwaway worktree, so `main` is never modified), **pushes the branch and the tag to
+`origin`**, deploys the tag to `$PRODUCTION_CODE/jarvis_os` (`git fetch` + `checkout` +
+`uv sync --frozen`), restarts the services, and notifies Telegram.
+
+**The tag is self-consistent, and `jarvis doctor` checks that production still is.**
+`uv.lock` records the root package's own version, so a tag shipping the bumped
+`pyproject.toml` beside main's stale lock licenses any bare `uv` command in the
+production checkout to re-resolve and rewrite it — leaving prod dirty and every version
+string suffixed `-dirty` (issue #202). shipit therefore runs `uv lock` in the release
+worktree and **aborts the release** if that relock moved anything but the version line:
+a release commit that silently re-resolves dependencies is the worse bug. If it aborts,
+relock on `main`, review the diff there, and release from the merged result.
+`INV-PROD-CLEAN` reports any tracked file modified in the production checkout.
 
 **Git is the source of truth.** shipit refuses to run unless `HEAD` is exactly
 `origin/main`, and it pushes every release ref before deploying — production's `origin`

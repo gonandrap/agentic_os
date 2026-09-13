@@ -380,16 +380,15 @@ def _classify(command: str, config: Any) -> Any:
         central.close()
 
 
-#: What the `--why` placeholder says on the one denial that fires at the moment the
-#: worker tried to ship, rather than on a retry. Only the wording differs.
-READY_TO_SHIP = "<why this is ready to ship>"
-
-
 def _case_deadline(config: Any) -> str:
-    """The sentence that turns the hold into a deadline the worker can see."""
-    return (f"If no case is made within "
-            f"{int(config.case_ttl_seconds // 60)} minutes the request is refused "
-            f"automatically, unreviewed.")
+    """The sentence that turns the hold into a deadline the worker can see.
+
+    ABANDONED, not refused — spec 2026-09-12 §4.
+    """
+    return (f"If you do neither within "
+            f"{int(config.case_ttl_seconds // 60)} minutes the request is closed as "
+            f"ABANDONED — nobody will have reviewed it, nothing will be decided, and the "
+            f"command stays blocked.")
 
 
 def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
@@ -430,9 +429,9 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
             return _deny(
                 f"Gate `{action.kind}`: request {prior['id']} for this exact command is "
                 f"recorded but NOT under review, and retrying the command will not start "
-                f"one. It is waiting for your case, and only this starts the review:\n"
-                f"    {gates.case_command(wo_id, action.command)}\n\n"
-                f"{_case_deadline(config)} Then END YOUR TURN."
+                f"one. It is waiting for you — for a case, or for a contest.\n\n"
+                f"{gates.exits_advice(wo_id, action.command, action.kind, prior['id'])}"
+                f"\n\n{_case_deadline(config)} Then END YOUR TURN."
             )
         if prior is not None and prior["status"] == "pending":
             return _deny(
@@ -468,16 +467,23 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
             )
         finally:
             neo.close()
+        # Both exits, every time, with the diagnosis first — spec 2026-09-12 §3.
+        prior_abandoned = (prior is not None and prior["status"] == "expired"
+                           and prior["closed_as"] == "abandoned")
         return _deny(
             f"Gate `{action.kind}`: {action.summary} needs approval, so this attempt was "
             f"blocked and request {approval['id']} was recorded.\n\n"
-            f"NOBODY IS REVIEWING IT YET. You ran the command rather than asking, so the "
-            f"request carries no case, and no reviewer is shown one. Make it — reviewers "
-            f"see only what you write (branch, PR, test results):\n"
-            f"    {gates.case_command(wo_id, action.command, why=READY_TO_SHIP)}\n\n"
-            f"That command starts the review. {_case_deadline(config)}\n\n"
+            f"NOBODY IS REVIEWING IT YET, and retrying the command will not change that. "
+            f"You ran it rather than asking, so the request carries no case and no "
+            f"reviewer is shown one.\n\n"
+            + ("A previous request for this exact command was ABANDONED — it timed out "
+               "with no case and no contest. Do not do that again: take one of the two "
+               "exits below.\n\n" if prior_abandoned else "")
+            + f"{gates.exits_advice(wo_id, action.command, action.kind, approval['id'])}"
+            f"\n\n"
+            f"Either one starts the review. {_case_deadline(config)}\n\n"
             f"Then END YOUR TURN — the verdict arrives as your next user turn, and the "
-            f"retry will go through if it is approved."
+            f"retry will go through if it is approved or dismissed."
         )
     finally:
         store.close()
@@ -573,11 +579,16 @@ def held_request_turn_block(store: ProjectStore, wo_id: str, payload: dict[str, 
             f"You may not end this turn: gate request {request['id']} "
             f"({request['kind']}) is recorded but NOT under review, and ending here "
             f"leaves it that way — no reviewer is shown it and nothing else can close "
-            f"it. Make the case now, in this turn:\n"
-            f"    {gates.case_command(wo_id, request['command'])}\n\n"
+            f"it. Take one of the two exits now, in this turn.\n\n"
+            # BOTH exits, from the same renderer as every other block (spec
+            # 2026-09-12-contesting-a-gate-match.md §3). A hold that named only the
+            # request would push a worker whose command performs no privileged action
+            # into writing a false case — which is the failure that spec exists to stop,
+            # and holding the turn would make it harder to walk away from.
+            f"{gates.exits_advice(wo_id, request['command'], request['kind'], request['id'])}"
             # `from_json` always returns a config, falling back to the default TTL, so
             # this reads the same clock `Daemon.refuse_unargued_gates` runs on.
-            f"{_case_deadline(config)} "
+            f"\n\n{_case_deadline(config)} "
             f"Then end the turn — the verdict arrives as your next user turn."
         ),
     }

@@ -13,7 +13,8 @@ Grouped commands:
                                           each answer came from
   jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
   jarvis fo create|list|show|plan|submit|approve|cancel feature orders (planned sets)
-  jarvis gate request|list|show|approve|deny|dismiss   privileged-action approvals
+  jarvis gate request|contest|list|show|approve|deny|dismiss  privileged-action
+                                          approvals (contest = the match was wrong)
   jarvis gate rules|rule-retract|explain  what counts as privileged, and what the OS
                                           has LEARNED does not
   jarvis neo list|show|review|answer|learnings|learn|export
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -518,11 +520,37 @@ def build_parser() -> argparse.ArgumentParser:
     ).add_subparsers(dest="ga_cmd", required=True)
     g = ga.add_parser("request",
                       help="(workers) ask permission to run a privileged command")
-    g.add_argument("wo_id")
-    g.add_argument("command", help="the EXACT command you will run if approved")
-    g.add_argument("--why", default="", help="why this is ready to ship")
+    # Two spellings; the SHORT one is the one a blocked worker can actually type — spec
+    # 2026-09-12 §8.
+    g.add_argument("wo_id", metavar="request-number | wo-id",
+                   help="the request number the block printed — or a work order id, "
+                        "followed by the command")
+    g.add_argument("command", nargs="?",
+                   help="the EXACT command you will run if approved; omit it when you "
+                        "gave a request number")
+    # Kind-neutral: the parser is built before any command is parsed — spec §6.
+    g.add_argument("--why", default="",
+                   help="why this action should proceed — each gate kind asks a "
+                        "different question; the block message states yours")
     g.add_argument("--evidence", default="",
-                   help="PR number, test results, checks — the reviewer sees only this")
+                   help="what a reviewer can check — the reviewer sees only this")
+    g.add_argument("--project")
+    g = ga.add_parser(
+        "contest",
+        help="(workers ONLY — needs JARVIS_WO_ID) dispute the MATCH: this command "
+             "performs no privileged action. Reaches the reviewer as a candidate "
+             "dismissal, and authorises nothing. To rule on one yourself, use "
+             "`jarvis gate dismiss`",
+    )
+    g.add_argument("wo_id", metavar="request-number | wo-id",
+                   help="the request number the block printed — or a work order id, "
+                        "followed by the command")
+    g.add_argument("command", nargs="?",
+                   help="the EXACT command that was blocked; omit it when you gave a "
+                        "request number")
+    g.add_argument("--why", required=True,
+                   help="why this performs no privileged action — where the matched "
+                        "text sits, and what the command really does")
     g.add_argument("--project")
     g = ga.add_parser("list", help="approval requests, newest first")
     g.add_argument("--project")
@@ -563,10 +591,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--reason", required=True)
     g = ga.add_parser(
         "explain",
-        help="why a command would or would not trip a gate — paste the exact string "
-             "from a gate record to diagnose a false positive",
+        help="why a command would or would not trip a gate — give the request number "
+             "the block printed, or paste the exact string, to diagnose a false positive",
     )
-    g.add_argument("command")
+    g.add_argument("command", metavar="request-number | command")
     g.add_argument("--project")
 
     # config (the versioned configuration console) ---------------------------------------
@@ -1774,9 +1802,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # Every assumption, each with its `n` and `status` — §4.
                 "assumptions": store.all_assumptions(args.wo_id),
                 # What this work order was allowed (or refused) permission to ship.
+                # `status` alone cannot say what happened — spec §2, §4.
                 "gates": [
                     {k: a[k] for k in ("id", "kind", "command", "status", "escalated",
-                                       "decided_by", "decision_reason")}
+                                       "contested", "closed_as", "decided_by",
+                                       "decision_reason")}
                     for a in store.list_approvals(args.wo_id)
                 ],
                 # Additive, and always present under `--json` even when empty: a key
@@ -1973,6 +2003,7 @@ def _print_gate_rules(data: dict) -> None:
     rules = data["rules"]
     if not rules:
         print("no gate rules")
+        _print_classifier_stats(data.get("classifier") or {})
         return
     for role in ("match", "exempt", "canary"):
         group = [r for r in rules if r["role"] == role]
@@ -2000,15 +2031,47 @@ def _print_gate_rules(data: dict) -> None:
             print(f"    {f['command'].splitlines()[0]} ({f['kind']}): {f['why']}")
     else:
         print("\n✓ every command that must gate still gates")
+    _print_classifier_stats(data.get("classifier") or {})
+
+
+def _print_classifier_stats(stats: dict) -> None:
+    """How wrong the recogniser has been, and how often nobody stayed to say so.
+
+    The exemptions above are what the OS LEARNED; these two numbers are what it cost to
+    learn them, and the second one is the part that used to be invisible. An abandoned
+    request is a worker that hit a block, was offered only "argue this is ready to ship",
+    and walked away — usually from a false positive. It is printed beside the rate and
+    never inside it: evidence is not a verdict. Spec 2026-09-12 §5.
+    """
+    if not stats or not stats.get("requests"):
+        return
+    print(f"\nthe recogniser's own record, over {stats['requests']} request(s): "
+          f"{stats['dismissed']} dismissed as false positives, "
+          f"{stats['abandoned']} abandoned unargued")
+    if stats["abandoned"]:
+        print("    an abandoned request was never reviewed by anyone — on the evidence "
+              "so far these are mostly false positives a worker routed around, so the "
+              "dismissed count understates the real error rate by roughly this much.")
 
 
 def cmd_gate(args: argparse.Namespace) -> int:
     from . import gates, ops
 
+    # A worker exits its OWN block; `JARVIS_WO_ID` is what says which — spec §8.
+    caller = os.environ.get("JARVIS_WO_ID") or None
+
     if args.ga_cmd == "request":
+        wo_id, command = ops.resolve_gate_target(args.wo_id, args.command, args.project,
+                                                 caller)
         _print(ops.request_gate_approval(
-            args.wo_id, args.command, why=args.why, evidence=args.evidence,
+            wo_id, command, why=args.why, evidence=args.evidence,
             project_name=args.project), args.json)
+    elif args.ga_cmd == "contest":
+        # `require_caller` — see `ops.CONTEST_NEEDS_AN_OWNER`.
+        wo_id, command = ops.resolve_gate_target(args.wo_id, args.command, args.project,
+                                                 caller, require_caller=True)
+        _print(ops.contest_gate_match(wo_id, command, why=args.why,
+                                      project_name=args.project), args.json)
     elif args.ga_cmd == "list":
         rows = ops.list_gates(project_name=args.project, wo_id=args.wo,
                               pending_only=args.pending)
@@ -2024,18 +2087,28 @@ def cmd_gate(args: argparse.Namespace) -> int:
                     # Never "pending": nobody is holding it. It is the worker's move.
                     state = "awaiting the worker's case — no reviewer sees it yet"
                 elif r["status"] == "pending":
-                    state = f"pending (with {where})"
+                    state = (f"contested, pending (with {where})" if r["contested"]
+                             else f"pending (with {where})")
                 elif r["status"] == "dismissed":
                     state = f"dismissed by {r['decided_by'] or '?'} — not a gated action"
+                elif r["closed_as"] == "abandoned":
+                    # Not a verdict, and it must not print as one: nobody reviewed it.
+                    state = "abandoned — no case was ever made, nothing was decided"
                 else:
                     state = f"{r['status']} by {r['decided_by'] or '?'}"
                 print(f"{icon} {r['id']} [{r['project']}] {r['kind']} · {state} "
                       f"· {r['wo_id']} · {_age(r['ts'])} ago")
                 print(f"    {r['command']}")
                 if r["status"] == "awaiting_case":
-                    make_case = gates.case_command(r["wo_id"], r["command"],
-                                                   why="...", evidence="...")
-                    print(f"    ↳ {make_case}   (the worker's move)")
+                    # By request number, as the block told the worker — spec §8.
+                    ask = gates.request_command(r["wo_id"], r["command"], r["kind"],
+                                                why="...", evidence="...",
+                                                approval_id=r["id"])
+                    contest = gates.contest_command(r["wo_id"], r["command"], why="...",
+                                                    approval_id=r["id"])
+                    print(f"    ↳ {ask}   (the worker's move)")
+                    print(f"    ↳ {contest}"
+                          f"   (…or this, if the gate matched it by mistake)")
                 elif r["status"] == "pending" and r["escalated"]:
                     print(f"    ↳ Neo escalated: {r['escalation_reason']}")
                     print(f"    ↳ jarvis gate approve {r['id']} --reason \"...\"  |  "
@@ -2111,6 +2184,14 @@ def _cfg_value(value: Any) -> str:
 
 
 def _cfg_change(change: dict) -> str:
+    from . import ops
+
+    # No arrow for a document-only write: there is nothing on either side of it.
+    if change["kind"] in ops.DOCUMENT_ONLY_KINDS:
+        where = ("the catalog now says so" if change["kind"] == "pinned"
+                 else "back on its default")
+        return (f"= {change['path']} = {_cfg_value(change['new'])} "
+                f"(unchanged — {where})")
     sign = {"added": "+", "removed": "-", "changed": "~"}[change["kind"]]
     if change["kind"] == "added":
         return f"{sign} {change['path']} = {_cfg_value(change['new'])}"
@@ -2121,9 +2202,11 @@ def _cfg_change(change: dict) -> str:
 
 
 def _print_config_write(data: dict) -> None:
+    from . import ops
+
     change = data["change"]
     print(f"✓ {_cfg_change(change)}")
-    if data["safety"]:
+    if data["safety"] and change["kind"] not in ops.DOCUMENT_ONLY_KINDS:
         print("  ⚠ SAFETY SETTING — this changes what a worker is allowed to do")
     print(f"  {data['apply']} — {data['note']}")
     print(f"  {data['version']['id']}"

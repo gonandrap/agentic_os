@@ -108,6 +108,10 @@ GATE_META = {
     "denied":    {"word": "denied",    "icon": "✗", "tone": "bad"},
     "dismissed": {"word": "not a gate", "icon": "⊘", "tone": "muted"},
     "expired":   {"word": "expired",   "icon": "–", "tone": "muted"},
+    # Not a status but a DISPLAY state: `expired` with `closed_as='abandoned'`. Its own
+    # word because nobody reviewed it — calling that "expired" alongside a lapsed grant
+    # hides the one gate outcome that is evidence of a classifier defect (spec 2026-09-12).
+    "abandoned": {"word": "abandoned, never reviewed", "icon": "⊗", "tone": "muted"},
 }
 
 # How often the dashboard re-reads OS state. Not a page reload — the browser swaps
@@ -159,6 +163,21 @@ def fmt_age(ts: float | None) -> str:
         if d < limit:
             return f"{int(d / div)}{unit}"
     return f"{int(d / 86400)}d"
+
+
+def fmt_left(ts: float | None) -> str:
+    """How long until a deadline — the mirror of `fmt_age`, for the one thing on these
+    pages whose next event is a clock rather than a person (`gates.sweep_unargued`).
+
+    "any moment now" rather than a negative: the sweep runs on the reconcile tick, so a
+    deadline that has passed means the sweep is due, not that it was missed.
+    """
+    if not ts:
+        return "–"
+    d = ts - time.time()
+    if d <= 0:
+        return "any moment now"
+    return f"{int(d / 60)}m" if d >= 60 else f"{int(d)}s"
 
 
 def fmt_ts(ts: float | None) -> str:
@@ -225,15 +244,27 @@ def _version_for_badge(version: str) -> str:
 def _false_positive_rate(rows: list) -> str | None:
     """"3 of 11 (27%)" — how often the gate fired on a command that ships nothing.
 
-    Measured over requests that were actually ruled on. Pending ones are excluded
-    because they have no answer yet, and including them would drag the rate down
-    towards zero simply by being slow to review.
+    Measured over requests a reviewer actually ruled on, and the set is named
+    POSITIVELY: `status != "pending"` also swept in `awaiting_case` rows nobody has
+    seen and `expired` ones nobody decided, both of which dilute the rate by sitting
+    in the denominator as non-dismissals. A gate state enumerated by negation gets
+    every new state wrong (kn-8d77ab41).
     """
-    ruled = [g for g in rows if g["status"] != "pending"]
+    ruled = [g for g in rows if g["status"] in ("approved", "denied", "dismissed")]
     if not ruled:
         return None
     n = sum(1 for g in ruled if g["status"] == "dismissed")
     return f"{n} of {len(ruled)} ({round(100 * n / len(ruled))}%)"
+
+
+def _abandoned(rows: list) -> int:
+    """Held requests whose worker never came back — no case, no contest.
+
+    Beside the rate, never inside it. Nobody reviewed one, so it is evidence about the
+    classifier rather than a verdict on it — and on the evidence so far, mostly false
+    positives a worker routed around. Spec 2026-09-12 §5.
+    """
+    return sum(1 for g in rows if g["closed_as"] == "abandoned")
 
 
 def gate_badge() -> int | None:
@@ -553,6 +584,7 @@ def create_app() -> FastAPI:
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         fo_status_meta=FO_STATUS_META, level_tone=LEVEL_TONE, fmt_age=fmt_age,
+        fmt_left=fmt_left,
         # Shared with `jarvis alarms` rather than spelled inline, so neither surface can
         # be the one that shows a subject-level finding as `turn -1`.
         turn_label=ops.turn_label, no_turn=NO_TURN,
@@ -1001,13 +1033,16 @@ def create_app() -> FastAPI:
         """
         rows = ops.list_gates(include_request=True)
         pending = [g for g in rows if g["status"] == "pending"]
+        held = [g for g in rows if g["status"] == "awaiting_case"]
         dismissed = [g for g in rows if g["status"] == "dismissed"]
-        decided = [g for g in rows if g["status"] not in ("pending", "dismissed")]
+        decided = [g for g in rows
+                   if g["status"] not in ("pending", "awaiting_case", "dismissed")]
         return render(request, "gates.html", active="gates",
                       escalated=[g for g in pending if g["escalated"]],
                       with_neo=[g for g in pending if not g["escalated"]],
-                      decided=decided, dismissed=dismissed,
-                      false_positive_rate=_false_positive_rate(rows))
+                      held=held, decided=decided, dismissed=dismissed,
+                      false_positive_rate=_false_positive_rate(rows),
+                      abandoned=_abandoned(rows))
 
     @app.get("/config", response_class=HTMLResponse)
     def config_page(request: Request, a: str = "", b: str = "", scope: str = "",

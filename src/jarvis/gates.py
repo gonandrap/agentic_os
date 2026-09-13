@@ -46,6 +46,7 @@ file keeps the lifecycle: what a gate MEANS, who reviews it, and what a verdict 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterable
@@ -65,16 +66,23 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .neo_store import NeoStore
     from .project_store import ProjectStore
 
+log = logging.getLogger(__name__)
+
 __all__ = [
-    "APPROVAL_STATUSES", "AWAITING_CASE", "DEFAULT_CASE_TTL_SECONDS", "GRANT_MAX_USES",
+    "APPROVAL_STATUSES", "AWAITING_CASE", "CASE_TTL_CEILING_SECONDS",
+    "DEFAULT_CASE_TTL_SECONDS", "GRANT_MAX_USES",
     "GRANT_TTL_SECONDS", "SELF_HEAL",
     "GateConfig",
+    "CONTEST_HEADER", "CONTEST_NOT_AN_AUTHORISATION",
     "GateKind", "GatedAction", "KINDS", "KIND_NAMES", "NO_CASE_JUSTIFICATION",
     "REVIEWER_PERSONA", "RuleSet",
-    "VERDICTS", "amend_request", "apply_decision", "build_request_question",
-    "case_command", "classify",
-    "deny_conflicts", "file_request", "open_gate", "queue_for_review", "reads_only",
-    "render_user_messages", "scannable", "summarise", "sweep_unargued",
+    "VERDICTS", "abandoned_message", "abandoned_reason", "amend_request",
+    "apply_decision",
+    "build_contest_question", "build_request_question", "classify", "contest_command",
+    "deny_conflicts", "exits_advice", "file_request", "open_gate", "queue_for_review",
+    "asks", "explain_command", "kind_of",
+    "question_text", "reads_only", "render_user_messages", "request_command", "scannable",
+    "summarise", "sweep_unargued",
 ]
 
 # How long an approval stays usable, and how many attempts it covers. The window is
@@ -99,12 +107,15 @@ APPROVAL_STATUSES = ("awaiting_case", "pending", "approved", "denied", "dismisse
 # model turn, so the reviewer reads the placeholder first nearly every time.
 AWAITING_CASE = "awaiting_case"
 
-# How long a held request waits for its case before the OS refuses it. It must expire:
-# nothing else closes a request no reviewer can see, and an unargued privileged action
-# left open for ever is a worse record than a refused one. Per-project via
-# `gates.case_ttl_seconds` in the catalog — kn-67cdb54b — because how long a worker
-# plausibly takes to come back with test results is a fact about the project, not the OS.
-DEFAULT_CASE_TTL_SECONDS = 600.0
+# How long a held request waits for its case — or its contest — before the OS abandons it.
+# Per-project via `gates.case_ttl_seconds` (kn-67cdb54b). Why it must sit UNDER the prompt
+# cache's TTL, and the measurement behind 240s: spec 2026-09-12 §7.
+DEFAULT_CASE_TTL_SECONDS = 240.0
+
+#: The clamp ceiling. Duplicates `usage.WRITE_TTL_SECONDS` rather than importing it —
+#: `gates` is on the PreToolUse hook's path and `usage` is not — so a test pins the two
+#: literals against each other. Spec §7.
+CASE_TTL_CEILING_SECONDS = 300.0
 
 # The verdicts a reviewer can reach. `dismissed` is not a softer denial and not a quieter
 # approval — it answers a different question.
@@ -133,21 +144,17 @@ VERDICTS = ("approved", "denied", "dismissed")
 NO_CASE_JUSTIFICATION = ("(none — the worker ran the command directly rather than filing "
                          "a request, so no case was made for it)")
 
+# The string every reader of a contested request keys on — the persona's carve-out and the
+# test fake's branch. Spec 2026-09-12 §1.
+CONTEST_HEADER = "CONTESTED GATE MATCH"
 
-def case_command(wo_id: str, command: str, why: str = "<why this is ready>",
-                 evidence: str = "<PR, tests, checks>") -> str:
-    """The one command that turns a recorded request into a reviewed one.
-
-    Seven call sites tell a worker to run it: the hook's three denials, `ops.finish`'s
-    refusal, `jarvis gate list`, and both halves of the briefing. In every one of them
-    the rendered line is the ONLY thing the reader gets, so spelled out per site a
-    renamed flag would leave six of them handing out a command that no longer parses,
-    and only the tested one would say so. `why` and `evidence` vary because the surfaces
-    do: a briefing shows placeholders, a listing shows ellipses, a block names what the
-    case has to argue.
-    """
-    return (f'jarvis gate request {wo_id} "{command}" '
-            f'--why "{why}" --evidence "{evidence}"')
+# Appended when a reviewer tries to APPROVE a contest. Why it is coerced to a denial: §2.
+CONTEST_NOT_AN_AUTHORISATION = (
+    "(Recorded as a REFUSAL, not an authorisation. This was a contest: the worker argued "
+    "that the command performs no privileged action, and made no case for performing one. "
+    "If the action is genuine, it needs a real request — `jarvis gate request` — with a "
+    "case a reviewer can check.)"
+)
 
 
 @dataclass(frozen=True)
@@ -238,6 +245,15 @@ class GateConfig:
         if ttl <= 0:
             raise ValueError('"gates.case_ttl_seconds" must be positive — a held request '
                              'that never expires is the leak this setting bounds')
+        if ttl >= CASE_TTL_CEILING_SECONDS:
+            # Clamped, not refused: a settings file from the previous release legally
+            # carries 600 and this runs inside the PreToolUse hook — spec §7.
+            log.warning(
+                "gates.case_ttl_seconds=%.0f is at or past the %.0fs prompt-cache TTL; "
+                "clamped to %.0f. A worker parked longer than the cache lives re-sends "
+                "its whole conversation at the cache-write rate.",
+                ttl, CASE_TTL_CEILING_SECONDS, DEFAULT_CASE_TTL_SECONDS)
+            ttl = DEFAULT_CASE_TTL_SECONDS
         return cls(enabled=frozenset(enabled), extra_patterns=extra, case_ttl_seconds=ttl)
 
 
@@ -323,6 +339,98 @@ def deny_conflicts(config: GateConfig, deny_rules: Iterable[str]
     return conflicts
 
 
+# -- what a blocked worker is told to do ----------------------------------------------
+
+
+def kind_of(name: str) -> GateKind | None:
+    """One `GateKind` by name, or None."""
+    return next((k for k in KINDS if k.name == name), None)
+
+
+def asks(kind: str) -> tuple[str, str]:
+    """What `--why` and `--evidence` should contain FOR THIS GATE — spec 2026-09-12 §6.
+
+    An unknown kind falls back to the field defaults rather than raising: this renders
+    the text a blocked worker reads, and a `KeyError` would leave it with no advice.
+    """
+    found = kind_of(kind)
+    if found is None:
+        return GateKind(name=kind, summary="").why_ask, GateKind(name=kind,
+                                                                 summary="").evidence_ask
+    return found.why_ask, found.evidence_ask
+
+
+def _handle(wo_id: str, command: str, approval_id: int | str | None) -> str:
+    """How an exit ADDRESSES the blocked command: by request id where one exists.
+
+    Why not by command string — the worktree isolation guard refuses exactly the text
+    that trips a gate: spec 2026-09-12 §8, kn-f0daada6.
+    """
+    return str(approval_id) if approval_id is not None else f"{wo_id} \"{command}\""
+
+
+def request_command(wo_id: str, command: str, kind: str = "",
+                    why: str = "", evidence: str = "",
+                    approval_id: int | str | None = None) -> str:
+    """The command that puts a case for a real privileged action in front of a reviewer.
+
+    Placeholders come from the KIND (spec 2026-09-12 §6); pass `why`/`evidence` to
+    override, as a listing does with ellipses.
+    """
+    kind_why, kind_evidence = asks(kind)
+    return (f"jarvis gate request {_handle(wo_id, command, approval_id)} "
+            f"--why \"{why or f'<{kind_why}>'}\" "
+            f"--evidence \"{evidence or f'<{kind_evidence}>'}\"")
+
+
+def contest_command(wo_id: str, command: str,
+                    why: str = "<why this performs no privileged action>",
+                    approval_id: int | str | None = None) -> str:
+    """The command that disputes the MATCH rather than arguing for the action.
+
+    No per-kind ask, deliberately: the claim is the same whichever recogniser fired — §6.
+    """
+    return (f"jarvis gate contest {_handle(wo_id, command, approval_id)} "
+            f"--why \"{why}\"")
+
+
+def explain_command(command: str, approval_id: int | str | None = None) -> str:
+    """The diagnosis step, addressed the same way — see `_handle`."""
+    handle = str(approval_id) if approval_id is not None else f"\"{command}\""
+    return f"jarvis gate explain {handle}"
+
+
+def exits_advice(wo_id: str, command: str, kind: str = "",
+                 approval_id: int | str | None = None) -> str:
+    """The two ways out of a block, and the diagnosis that picks between them.
+
+    ONE RENDERER for every surface that blocks a worker (kn-467d1ecd). Why `explain`
+    leads: docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §3.
+    """
+    return (
+        f"TWO WAYS OUT. If you cannot tell which you need, ask the OS first — it reports "
+        f"where the matched literal sits and whether the shell would run it:\n"
+        f"    {explain_command(command, approval_id)}\n\n"
+        f"If the command DOES perform the action, make the case:\n"
+        f"    {request_command(wo_id, command, kind, approval_id=approval_id)}\n\n"
+        f"If it does NOT — the recogniser matched text it is only reading or writing "
+        f"about (a name in a grep pattern, a path in a commit message, a string in a "
+        f"heredoc) — contest the match. That asks a reviewer to DISMISS it as a "
+        f"classifier false positive; it authorises nothing and it is not a request for "
+        f"permission, so it needs no PR and no test results:\n"
+        f"    {contest_command(wo_id, command, approval_id=approval_id)}\n\n"
+        + ("All three address the block by its REQUEST NUMBER, not by the command "
+           "string: the OS already has the string, and re-typing it into an argument is "
+           "how a worker in a git worktree finds its own way out refused by the "
+           "isolation guard (§8). Neither exit ever runs the command.\n\n"
+           if approval_id is not None else "")
+        + f"Do not guess between them: answering the request's two questions about a "
+        f"command that performs no privileged action means writing something false into "
+        f"the only text the reviewer sees, and walking away leaves the block on the "
+        f"record with nobody ever told the recogniser was wrong."
+    )
+
+
 # -- the request Neo reviews ---------------------------------------------------------
 
 # Neo's ordinary persona is told to escalate anything "production-impacting" or that
@@ -365,6 +473,27 @@ paying for, on the strength of its own judgement.
   against the evidence packet and the supervisor's reasoning, both quoted in full.
   Approve, deny, or escalate; deny whenever the case for acting is not made, which
   leaves the symptom with the user and costs nothing but a tick.
+
+SECOND: if the request below opens with `CONTESTED GATE MATCH`, the worker is not asking
+for permission. It asserts that the OS's recogniser misfired and that the command performs
+no privileged action at all. Everything below still applies — read it — with these
+changes:
+
+- YOU HAVE TWO VERDICTS, `dismiss` and `deny`. There is no third. A contest contains no
+  case for performing a privileged action, so there is nothing here you could approve;
+  the OS records an approval of a contest as a refusal, because that is what it is.
+- DISMISS if the worker is right, and teach the classifier with an `exempt_pattern` as
+  below. This is the whole point of the route.
+- DENY if it is wrong — if the command really does merge, release or restart. Say which
+  part of it performs the action. The worker's route back is `jarvis gate request` with a
+  real case, and your reason is what tells it to take that route.
+- The request carries the OS's own structural analysis of where the matched literal sits.
+  Weigh it above the worker's prose: it is a fact about the command, and the worker is
+  arguing its own case.
+- DO NOT ESCALATE unless the worker's claim is one you cannot check at all. A contest is
+  a factual claim about the classifier, not an authorisation, and sending it to the user
+  spends their attention on an OS bug — the exact cost this gate exists to avoid. If you
+  are torn, deny: that costs the worker one round trip and authorises nothing.
 
 Everything below is about the other kinds.
 
@@ -444,7 +573,11 @@ APPROVE when all of these hold:
   with the project's checks or tests reported passing. For a RELEASE of code that is
   already on the main branch, that evidence is CI's verdict on the exact merged commits.
   The merge is what asserts the code is ready; a green CI run on those commits IS the
-  check, and it is complete evidence on its own.
+  check, and it is complete evidence on its own. This clause is written for the kinds
+  that SHIP CODE. Some gates do not — restarting a service, writing a fleet setting —
+  and for those the same question is asked of different facts: the evidence box names
+  what was asked for, and that is what to judge. Never hold a service restart to the
+  absence of a pull request.
 - The command matches the stated intent — the PR number, tag or service named is the
   one the request is about, and nothing extra rides along.
 - Consequences are recoverable by ordinary means (revert the merge, ship the previous
@@ -600,7 +733,8 @@ def build_request_question(action: GatedAction, wo: dict[str, Any],
     parts += ["", "The worker's justification:",
               justification.strip() or "(the worker gave none — treat that as a red flag)"]
     if evidence.strip():
-        parts += ["", "Evidence the worker supplied (branch, PR, test results):",
+        # Labelled with what THIS gate asked for — §6.
+        parts += ["", f"Evidence the worker supplied ({asks(action.kind)[1]}):",
                   evidence.strip()[:2000]]
     parts += render_user_messages(user_messages)
     parts += render_history(history)
@@ -614,13 +748,75 @@ def build_request_question(action: GatedAction, wo: dict[str, Any],
     return "\n".join(parts)
 
 
+def describe_match(command: str, pattern: str) -> list[str]:
+    """Where the matched literal sits — `jarvis gate explain`'s analysis, handed to the
+    reviewer unasked. The one input to a contest the worker did not write. Spec §1."""
+    from .gate_rules import reads_only, shape_of
+
+    shape = shape_of(command, pattern)
+    lines = [f"The OS's reading of it: the matched literal is "
+             f"{shape.describe() if shape else 'in a position the OS could not parse'}."]
+    if reads_only(command):
+        lines.append("Every command in the chain is read-only.")
+    if shape and not shape.exemptible:
+        # The one thing that makes an otherwise convincing contest wrong (kn-986fc008).
+        lines.append("A dismissal of this could NOT be generalised into a standing rule "
+                     "— by this reading the shell could still run the literal.")
+    return lines
+
+
+def build_contest_question(action: GatedAction, wo: dict[str, Any], argument: str,
+                           agent_type: str | None = None,
+                           history: Iterable[dict[str, Any]] = (),
+                           user_messages: Iterable[dict[str, Any]] = ()) -> str:
+    """Render a CONTESTED match for the reviewer — a different question from
+    `build_request_question`, not a variant of it. Spec 2026-09-12 §1."""
+    actor = f"the `{agent_type}` seat of work order {wo['id']}" if agent_type \
+        else f"the worker for work order {wo['id']}"
+    parts = [
+        f"{CONTEST_HEADER} — gate `{action.kind}`",
+        "",
+        f"The OS blocked this command as `{action.kind}`, and {actor} says the "
+        f"recogniser was wrong: that it performs no privileged action at all.",
+        "",
+        "The blocked command, exactly as it was run:",
+        f"    {action.command}",
+        "",
+        f"The recogniser that fired: {action.matched}",
+    ]
+    parts += describe_match(action.command, action.matched)
+    parts += [
+        "",
+        f"Work order: {wo.get('title') or '(untitled)'}",
+    ]
+    description = (wo.get("description") or "").strip()
+    if description:
+        parts += ["Work order description:", description[:1200]]
+    parts += ["", "The worker's argument that this is a false positive:",
+              argument.strip() or "(the worker gave none — deny it; there is nothing "
+                                  "here to review)"]
+    parts += render_user_messages(user_messages)
+    parts += render_history(history)
+    parts += [
+        "",
+        "Decide, and you have TWO verdicts only. `dismiss` if the worker is right: that "
+        "clears this command, records no authorisation, and — with an `exempt_pattern` — "
+        "stops the OS asking about commands of the same shape fleet-wide. `deny` if it "
+        "is wrong, saying which part of the command performs the action; the worker's "
+        "route back is a real request with a case. There is nothing here to approve: a "
+        "contest argues that no privileged action exists, so it carries no case for "
+        "performing one.",
+    ]
+    return "\n".join(parts)
+
+
 # -- filing a request ----------------------------------------------------------------
 
 
 def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any],
                  action: GatedAction, justification: str = "", evidence: str = "",
                  max_uses: int = GRANT_MAX_USES, agent_type: str | None = None,
-                 hold: bool = False,
+                 hold: bool = False, contested: bool = False,
                  ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Record an approval request. Returns (approval, question), question None if held.
 
@@ -643,6 +839,7 @@ def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any]
         wo["id"], action.kind, action.command, matched=action.matched,
         justification=justification, evidence=evidence, max_uses=max_uses,
         agent_type=agent_type, status=AWAITING_CASE if hold else "pending",
+        contested=contested,
     )
     question = None if hold else queue_for_review(store, neo, project, wo, action,
                                                   approval)
@@ -655,6 +852,25 @@ def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any]
     return approval, question
 
 
+def question_text(store: ProjectStore, wo: dict[str, Any], action: GatedAction,
+                  approval: dict[str, Any]) -> str:
+    """The reviewer's page for this request, whichever kind of claim it carries.
+
+    The SINGLE place the two renderers are chosen between, so a contest cannot reach a
+    reviewer dressed as an authorisation request by some second path — spec §2.
+    """
+    # Read before the question, so the reviewer's history is everything BUT this request.
+    history = [a for a in store.list_approvals(wo["id"], limit=HISTORY_LIMIT)
+               if a["id"] != approval["id"]]
+    user_messages = store.user_messages(wo["id"], USER_MESSAGE_LIMIT)
+    if approval["contested"]:
+        return build_contest_question(action, wo, approval["justification"],
+                                      approval["agent_type"], history, user_messages)
+    return build_request_question(action, wo, approval["justification"],
+                                  approval["evidence"], approval["agent_type"], history,
+                                  user_messages)
+
+
 def queue_for_review(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any],
                      action: GatedAction, approval: dict[str, Any]) -> dict[str, Any]:
     """Put a recorded request in front of a reviewer. Returns the Neo question.
@@ -663,14 +879,8 @@ def queue_for_review(store: ProjectStore, neo: Any, project: str, wo: dict[str, 
     question text is first written — so "no reviewer ever reads a request nobody argued
     for" is a property of one function rather than a convention six callers must keep.
     """
-    # Read before the question, so the reviewer's history is everything BUT this request.
-    history = [a for a in store.list_approvals(wo["id"], limit=HISTORY_LIMIT)
-               if a["id"] != approval["id"]]
     question = neo.ask(
-        project, wo["id"],
-        build_request_question(action, wo, approval["justification"],
-                               approval["evidence"], approval["agent_type"], history,
-                               store.user_messages(wo["id"], USER_MESSAGE_LIMIT)),
+        project, wo["id"], question_text(store, wo, action, approval),
         context=f"{wo.get('title') or ''}\n{(wo.get('description') or '')[:800]}",
         kind="approval",
     )
@@ -678,39 +888,65 @@ def queue_for_review(store: ProjectStore, neo: Any, project: str, wo: dict[str, 
     return question
 
 
-def sweep_unargued(store: ProjectStore, ttl_seconds: float,
-                   central: CentralStore | None = None,
-                   project: str = "") -> list[dict[str, Any]]:
-    """Refuse every held request whose case never came. Returns the rows it refused.
+def abandoned_message(approval: dict[str, Any], ttl_seconds: float) -> str:
+    """What the worker is told when its held request timed out. NOT a verdict.
+
+    This message is what makes `expired` affordable where it was not before — spec §4.
+    """
+    return (
+        f"[Gate {approval['id']} ABANDONED — no case was made within "
+        f"{int(ttl_seconds // 60)} minutes]\n\n"
+        f"The command that was blocked:\n    {approval['command']}\n\n"
+        f"NOBODY REVIEWED IT AND NOBODY DECIDED IT. Nothing was authorised and nothing "
+        f"was refused: you ran a command the `{approval['kind']}` gate matched, were "
+        f"told to make the case or contest the match, and did neither. The command is "
+        f"still blocked and the request is closed unanswered.\n\n"
+        f"If you worked around the block, come back and finish this: a match nobody "
+        f"contests is a classifier defect nobody ever hears about, and the next worker "
+        f"loses the same turn you did.\n\n"
+        + exits_advice(approval["wo_id"], approval["command"], approval["kind"],
+                       approval["id"])
+    )
+
+
+def abandoned_reason(ttl_seconds: float) -> str:
+    """What the record says about a request nobody argued and nobody reviewed.
+
+    A function, not a literal: the migration keys on its prefix and the screenshot script
+    seeds a row with it, so a second copy would name a stale window — §4, §7.
+    """
+    return (f"no case was made for it within {int(ttl_seconds // 60)} minutes, and the "
+            f"match was never contested. Nobody reviewed it.")
+
+
+def sweep_unargued(store: ProjectStore, ttl_seconds: float) -> list[dict[str, Any]]:
+    """Close every held request whose case never came. Returns the rows it closed.
 
     The cost of holding a request back from review is that nothing else will ever close
     it: there is no question for Neo to answer and no escalation for the user to see, so
     without this a worker that wandered off leaves an unargued privileged action open for
     ever. The clock starts at filing, and it is the project's (`gates.case_ttl_seconds`).
 
-    A DENIAL rather than an expiry, though it is the OS refusing rather than a reviewer.
-    `expired` is a status the worker is never told about, and the worker is exactly who
-    has to act: the denial message says what was missing, and the hook's denied branch
-    then routes the retry into `jarvis gate request` with a real case. Nothing was
-    authorised and nothing is lost — the command string stays blocked and a properly
-    argued request is a fresh row.
+    ABANDONED, NOT DENIED — the reversal of the original design; spec 2026-09-12 §4 has
+    the argument. The command string stays blocked either way.
     """
     from . import db
+    from .invariants import end_wait_if_nothing_is_out
 
     cutoff = db.now() - ttl_seconds
-    refused = []
+    closed = []
     for approval in store.list_approvals(statuses=(AWAITING_CASE,)):
         if approval["ts"] > cutoff:
             continue
-        refused.append(apply_decision(
-            store, approval["id"], verdict="denied",
-            reason=(f"no case was made for it within {int(ttl_seconds // 60)} minutes. "
-                    f"The command was run directly, so nothing was ever put to a "
-                    f"reviewer — file it again with `jarvis gate request` and say why "
-                    f"it is ready."),
-            decided_by="os", central=central, project=project,
-        ))
-    return refused
+        row = store.abandon_approval(approval["id"],
+                                     reason=abandoned_reason(ttl_seconds))
+        store.queue_message(row["wo_id"], abandoned_message(row, ttl_seconds),
+                            source="gate")
+        # The request parked the work order; the close has to unpark it — same reason and
+        # same narrow guard as `apply_decision`.
+        end_wait_if_nothing_is_out(store, row["wo_id"])
+        closed.append(row)
+    return closed
 
 
 def _merge_case(existing: str, addition: str) -> str:
@@ -760,14 +996,8 @@ def amend_request(store: ProjectStore, neo: Any, wo: dict[str, Any],
     )
     question = neo.get(approval["neo_question_id"]) if approval["neo_question_id"] else None
     if question is not None and question["status"] in OPEN_Q_STATUSES:
-        history = [a for a in store.list_approvals(wo["id"], limit=HISTORY_LIMIT)
-                   if a["id"] != approval["id"]]
-        neo.revise_question(
-            question["id"],
-            build_request_question(action, wo, amended["justification"],
-                                   amended["evidence"], amended["agent_type"], history,
-                                   store.user_messages(wo["id"], USER_MESSAGE_LIMIT)),
-        )
+        neo.revise_question(question["id"],
+                            question_text(store, wo, action, amended))
     return amended
 
 
@@ -843,6 +1073,17 @@ def approved_message(approval: dict[str, Any], reason: str, by: str) -> str:
 
 
 def denied_message(approval: dict[str, Any], reason: str, by: str) -> str:
+    # A denied CONTEST refuses a different claim, so it has to say which one — §2.
+    if approval.get("contested"):
+        return (
+            f"[Gate {approval['id']} — CONTEST REJECTED by {by}] {reason}\n\n"
+            f"The command that stays blocked:\n    {approval['command']}\n\n"
+            f"You argued that this performs no privileged action and the reviewer "
+            f"disagreed, so the match stands. Do not retry it as-is. If the work is "
+            f"genuinely ready, make the real case:\n"
+            f"    {request_command(approval['wo_id'], approval['command'], approval['kind'], approval_id=approval['id'])}\n"
+            f"Otherwise leave it and finish the work order explaining what is left."
+        )
     return (
         f"[Gate {approval['id']} DENIED by {by}] {reason}\n\n"
         f"The command that was blocked:\n    {approval['command']}\n\n"
@@ -972,6 +1213,12 @@ def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
     """
     if verdict not in VERDICTS:
         raise ValueError(f"unknown verdict {verdict!r} — expected one of {list(VERDICTS)}")
+    # A CONTEST CAN NEVER BECOME AN AUTHORISATION — coerced here rather than raised,
+    # because the caller is usually the daemon and there is no human to tell. Spec §2.
+    filed = store.get_approval(approval_id)
+    if filed is not None and filed["contested"] and verdict == "approved":
+        verdict = "denied"
+        reason = f"{reason.strip()}\n\n{CONTEST_NOT_AN_AUTHORISATION}".strip()
     approval = store.decide_approval(approval_id, verdict=verdict, reason=reason,
                                      decided_by=decided_by)
     learned: dict[str, Any] = {}

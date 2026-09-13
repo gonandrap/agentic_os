@@ -106,8 +106,11 @@ def test_the_turn_cannot_end_on_a_request_nobody_is_reviewing(worker):
     assert blocked["decision"] == "block"
     approval = worker.store.held_approvals(worker.wo["id"])[0]
     assert f"request {approval['id']}" in blocked["reason"]
-    # The way out has to be in the reason: this is the only text the worker gets.
-    assert gates.case_command(worker.wo["id"], MERGE) in blocked["reason"]
+    # Both ways out have to be in the reason: this is the only text the worker gets,
+    # and a hold that named only the request would push a false case (spec
+    # 2026-09-12-contesting-a-gate-match.md §3).
+    assert gates.exits_advice(worker.wo["id"], MERGE, "pr_merge",
+                              approval["id"]) in blocked["reason"]
     # And on the record, because nobody reads the worker's transcript.
     held = [e for e in worker.store.list_events(worker.wo["id"])
             if e["kind"] == "gate_turn_held"]
@@ -251,23 +254,29 @@ def test_finish_refuses_while_a_request_is_open(worker, argue):
     if argue:
         assert "End your turn" in str(e.value)
     else:
-        assert gates.case_command(worker.wo["id"], MERGE) in str(e.value)
+        assert gates.request_command(
+            worker.wo["id"], MERGE, "pr_merge",
+            approval_id=worker.store.held_approvals(worker.wo["id"])[0]["id"],
+        ) in str(e.value)
 
 
-def test_both_refusals_hand_out_the_same_command(worker):
-    """`gates.case_command` renders it once for six surfaces. Pinned from the two that
-    fire at a blocked worker, so a renamed flag cannot break one silently while the
-    other's test keeps passing."""
+def test_both_refusals_offer_the_same_two_exits(worker):
+    """`gates.exits_advice` renders them once for every surface that blocks a worker
+    (kn-467d1ecd). Pinned from the two this work order added, so a renamed flag or a
+    third exit cannot reach one of them and not the other."""
     worker.attempt(MERGE)
     with pytest.raises(ops.OpsError) as e:
         ops.finish(worker.wo["id"], "shipped it")
-    line = gates.case_command(worker.wo["id"], MERGE)
+    approval = worker.store.held_approvals(worker.wo["id"])[0]
+    advice = gates.exits_advice(worker.wo["id"], MERGE, "pr_merge", approval["id"])
 
-    assert line in worker.stop()["reason"]
-    assert line in str(e.value)
-    # ...and the shape itself, once, so the shared renderer is not free to say anything.
-    assert line == (f'jarvis gate request {worker.wo["id"]} "{MERGE}" '
-                    f'--why "<why this is ready>" --evidence "<PR, tests, checks>"')
+    assert advice in worker.stop()["reason"]
+    assert advice in str(e.value)
+    # Both exits, not just the one that argues for the action.
+    assert gates.request_command(worker.wo["id"], MERGE, "pr_merge",
+                                 approval_id=approval["id"]) in advice
+    assert gates.contest_command(worker.wo["id"], MERGE,
+                                 approval_id=approval["id"]) in advice
 
 
 def test_a_held_request_leads_when_both_are_open(worker):
@@ -280,7 +289,9 @@ def test_a_held_request_leads_when_both_are_open(worker):
     with pytest.raises(ops.OpsError) as e:
         ops.finish(worker.wo["id"], "shipped it")
 
-    assert gates.case_command(worker.wo["id"], RELEASE) in str(e.value)
+    held = worker.store.held_approvals(worker.wo["id"])[0]
+    assert gates.request_command(worker.wo["id"], RELEASE, "release",
+                                 approval_id=held["id"]) in str(e.value)
 
 
 def test_finish_works_once_the_gate_is_decided(worker):
