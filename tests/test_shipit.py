@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -60,8 +61,27 @@ def _make_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _stub(directory: Path, name: str) -> Path:
+    """A no-op stand-in for a tool the script only checks the presence of."""
+    directory.mkdir(parents=True, exist_ok=True)
+    p = directory / name
+    p.write_text("#!/bin/sh\nexit 0\n")
+    p.chmod(p.stat().st_mode | stat.S_IEXEC)
+    return p
+
+
 def _dry_run(repo: Path, prod: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "PRODUCTION_CODE": str(prod)}
+    """Drive the real script in --dry-run, with a STUB `uv` first on PATH.
+
+    Not a convenience: CI installs this project with pip and has no `uv` anywhere
+    (.github/workflows/ci.yml), so a test that borrows the host's would pass on a
+    developer's machine and fail on the runner — which is exactly what it did. A dry run
+    never executes `uv`, it only prints the plan, so a stub is the honest stand-in.
+    """
+    env = {**os.environ,
+           "PRODUCTION_CODE": str(prod),
+           "PATH": f"{_stub(repo.parent / 'stub-bin', 'uv').parent}"
+                   f"{os.pathsep}{os.environ['PATH']}"}
     return subprocess.run(
         ["bash", str(repo / "scripts" / "shipit.sh"), "--dry-run", *args],
         cwd=str(repo), env=env, capture_output=True, text=True)
@@ -348,21 +368,39 @@ def test_the_relock_happens_before_the_commit(tmp_path):
     assert out.index("uv lock") < out.index("commit -m 'Release jarvis-0.2.0'")
 
 
+#: Everything the script reaches for before the tool preconditions run. The sandbox PATH
+#: holds only these, so "not found" means the test withheld it and nothing else.
+_PRECONDITION_TOOLS = ("dirname", "git", "sed", "grep", "sort", "tail", "mktemp")
+
+
+def _run_with_only(tmp_path: Path, repo: Path, *, keep: tuple[str, ...],
+                   stub: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+    """Drive the script with a PATH holding only what this test planted.
+
+    `stub` rather than `keep` for `uv`: CI has none to borrow, so a test that symlinked
+    the host's would assert the wrong precondition there — it would fail on the missing
+    `uv` while claiming to be about something else.
+    """
+    sandbox = tmp_path / "bin"
+    sandbox.mkdir(exist_ok=True)
+    for tool in keep:
+        real = shutil.which(tool)
+        if real and not (sandbox / tool).exists():
+            (sandbox / tool).symlink_to(real)
+    for name in stub:
+        _stub(sandbox, name)
+    return subprocess.run(
+        [BASH, str(repo / "scripts" / "shipit.sh"), "--dry-run", "0.2.0"],
+        cwd=str(repo), capture_output=True, text=True,
+        env={"PATH": str(sandbox), "HOME": str(tmp_path / "home"),
+             "PRODUCTION_CODE": str(tmp_path / "prod")})
+
+
 def test_refuses_when_uv_is_not_on_path(tmp_path):
     """Checked in the preconditions, not at first use: `uv sync` needs it too, and by
     then the tag has already been pushed to origin."""
     repo = _make_repo(tmp_path)
-    stripped = tmp_path / "bin"
-    stripped.mkdir()
-    for tool in ("git", "sed", "grep", "sort", "tail", "mktemp", "diff", "printf"):
-        real = shutil.which(tool)
-        if real:
-            (stripped / tool).symlink_to(real)
-    r = subprocess.run(
-        [BASH, str(repo / "scripts" / "shipit.sh"), "--dry-run", "0.2.0"],
-        cwd=str(repo), capture_output=True, text=True,
-        env={"PATH": str(stripped), "HOME": str(tmp_path / "home"),
-             "PRODUCTION_CODE": str(tmp_path / "prod")})
+    r = _run_with_only(tmp_path, repo, keep=(*_PRECONDITION_TOOLS, "diff"), stub=())
     assert r.returncode != 0
     assert "uv not found" in (r.stdout + r.stderr)
 
@@ -478,17 +516,7 @@ def test_guard_refuses_when_diff_cannot_compare_at_all(locked):
 def test_refuses_when_diff_is_not_on_path(tmp_path):
     """A guard that cannot run must stop the release, not be skipped."""
     repo = _make_repo(tmp_path)
-    stripped = tmp_path / "bin"
-    stripped.mkdir()
-    for tool in ("git", "sed", "grep", "sort", "tail", "mktemp", "uv"):
-        real = shutil.which(tool)
-        if real:
-            (stripped / tool).symlink_to(real)
-    r = subprocess.run(
-        [BASH, str(repo / "scripts" / "shipit.sh"), "--dry-run", "0.2.0"],
-        cwd=str(repo), capture_output=True, text=True,
-        env={"PATH": str(stripped), "HOME": str(tmp_path / "home"),
-             "PRODUCTION_CODE": str(tmp_path / "prod")})
+    r = _run_with_only(tmp_path, repo, keep=_PRECONDITION_TOOLS, stub=("uv",))
     assert r.returncode != 0
     assert "diff not found" in (r.stdout + r.stderr)
 
