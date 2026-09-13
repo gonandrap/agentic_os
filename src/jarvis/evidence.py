@@ -104,8 +104,20 @@ class EvidencePacket:
     summary: str                    # the submitter's --summary for this round
     declared: str                   # the submitter's --evidence text, verbatim
     pr_url: str                     # "" when none
-    base: str                       # resolved merge-base ref, "" if unresolvable
-    head: str                       # HEAD sha, "" if unresolvable
+    #: WHAT THESE TWO HOLD DEPENDS ON `source`, and the two meanings are not
+    #: interchangeable. On the worktree path they are git objects — a resolved
+    #: merge-base ref and a HEAD sha. On the pull-request path they are the PR's
+    #: BRANCH NAMES (`baseRefName`/`headRefName`), because that is what GitHub reports
+    #: and what a reviewer reading the PR sees; a sha would need another round trip to
+    #: learn something nobody asked for. Both are "" when unresolvable.
+    #:
+    #: So anything that wants to RESOLVE these — `git rev-parse`, a range like
+    #: `base...head`, a sha comparison between rounds — must check `source` first. They
+    #: are rendered, never resolved: `validation.build_packet_prompt` prints them under
+    #: a heading that names which source they came from, and `fingerprint` deliberately
+    #: excludes both.
+    base: str
+    head: str
     stat: str                       # `git diff --stat` output
     files: tuple[str, ...]          # every changed path, NEVER truncated
     diff: str                       # unified diff, truncated to diff_chars
@@ -319,9 +331,15 @@ def _pull_request(url: str,
     **`pr_error` IS `GitHubError.reason` AND NEVER `str(e)`.** The exception text
     carries `gh`'s stderr, and this string is rendered verbatim into five seat prompts;
     `reason` is a short phrase `github.py` wrote itself, from a fixed vocabulary. A
-    judge's prompt is not a place to interpolate a string a remote server chose. The
-    full detail is logged where `github._run` raises, for the human who has to fix it.
+    judge's prompt is not a place to interpolate a string a remote server chose.
+
+    **BOTH branches log.** `github._run` logs the expected failures where it raises
+    them; the bare `except` below logs its own, because that branch is for the failure
+    nobody predicted and a silent fallback to the worktree would be undiagnosable — the
+    packet would say only "could not be read" and nothing anywhere would say why.
     """
+    import logging
+
     from . import github
 
     try:
@@ -329,6 +347,9 @@ def _pull_request(url: str,
     except github.GitHubError as e:  # the packet gets the vocabulary, not the stderr
         return None, "", e.reason
     except Exception:  # noqa: BLE001 — a thin packet, never a dead round
+        logging.getLogger("jarvis.evidence").warning(
+            "could not read the pull request at %s; falling back to the worktree",
+            url, exc_info=True)
         return None, "", "the pull request could not be read"
     return {
         "url": art.url, "number": art.number, "title": art.title, "body": art.body,

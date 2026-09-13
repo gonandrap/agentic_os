@@ -21,12 +21,18 @@ WO = {"id": "wo-1", "title": "Title", "description": "The brief",
 PR_DIFF = "diff --git a/from_pr.py b/from_pr.py\n@@ -0,0 +1 @@\n+from the pull request\n"
 
 
+#: A pinned identity with NO user or system config in sight, so nothing here inherits a
+#: setting from whoever is running the suite. `init.defaultBranch` is the one that
+#: actually bit — see the `project` fixture.
+_ENV = {"PATH": os.environ.get("PATH", ""),
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+        "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+
+
 def _git(cwd: Path, *args: str) -> str:
-    env = {"HOME": str(cwd), "PATH": os.environ.get("PATH", ""),
-           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
-           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
-    return subprocess.run(["git", "-C", str(cwd), *args], check=True, env=env,
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True,
+                          env={**_ENV, "HOME": str(cwd)},
                           capture_output=True, text=True).stdout
 
 
@@ -37,15 +43,34 @@ def project(tmp_path) -> Path:
     The worktree's change is deliberately different from the pull request's, so every
     test below can say WHICH source a packet came from by looking at the file names
     rather than by trusting `packet.source` to be set correctly.
+
+    **NOTHING HERE MAY DEPEND ON THE AMBIENT GIT CONFIG**, and the first draft did: it
+    let `git init` pick the default branch name and relied on rung 3 of
+    `evidence._resolve_base` finding a local `main`. That is a branch name a developer
+    machine usually has (`init.defaultBranch=main`) and a bare CI runner does not — git's
+    own built-in default is still `master`. With no `main`, the ladder falls to rung 4,
+    only `git diff HEAD` runs, and a COMMITTED worktree change is invisible: `files` came
+    back empty and both worktree-fallback tests failed on all three Python versions while
+    passing locally. So the branch name is explicit and rung 1 is built by hand.
     """
-    proj = make_git_project(tmp_path, "proj")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    # `-b trunk`: explicit, and deliberately NEITHER `main` NOR `master`, so a fixture
+    # that accidentally depends on a default branch name fails here rather than on
+    # somebody else's machine.
+    subprocess.run(["git", "init", "-q", "-b", "trunk"], cwd=proj, check=True,
+                   env=_ENV)
     (proj / "app.py").write_text("app\n")
     _git(proj, "add", "-A")
     _git(proj, "commit", "-qm", "base")
-    # A real `origin`, because the collector now refuses a `pr_url` that is not on this
-    # project's own repository — a fixture with no remote would skip that check and the
-    # tests below would prove nothing. It matches `PR`.
+    # A real `origin`, because the collector refuses a `pr_url` that is not on this
+    # project's own repository — a fixture with no remote would SKIP that check and the
+    # tests below would pass vacuously. It matches `PR`.
     _git(proj, "remote", "add", "origin", "https://github.com/x/y.git")
+    # Rung 1 of the ladder, built from local refs: no bare repo, no network, no
+    # dependence on what any default branch is called.
+    _git(proj, "update-ref", "refs/remotes/origin/trunk", "HEAD")
+    _git(proj, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
     worktree = proj / ".claude" / "worktrees" / "wt"
     _git(proj, "worktree", "add", "-q", "-b", "wo-branch", str(worktree))
     (worktree / "from_worktree.py").write_text("from the worktree\n")
@@ -187,6 +212,10 @@ def test_no_pull_request_collects_the_worktree_exactly_as_before(project, fake_g
     packet = collect(project)
     assert packet.source == "worktree"
     assert packet.pr is None and packet.pr_error == ""
+    # FIRST, because it is the one that fails informatively. Without a resolved base the
+    # collector diffs only the working tree, a COMMITTED change is invisible, and the
+    # file-list assertion below reports an empty tuple with nothing to say about why.
+    assert packet.base, "the merge-base ladder found nothing — see the fixture"
     assert packet.files == ("from_worktree.py",)
 
 

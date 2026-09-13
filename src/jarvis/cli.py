@@ -2460,9 +2460,17 @@ def cmd_learn(args: argparse.Namespace) -> int:
     from .central_store import PINNED_TAG, CentralStore, has_tag, headline, split_tags
     from .ops import OpsError
 
-    # Who is reading, for the read log. The env pair is what `dispatch._worker_env` sets,
-    # so an empty wo_id means a person at a terminal rather than a worker.
-    reader_wo = os.environ.get("JARVIS_WO_ID", "")
+    # Which work order is at this terminal — attributing BOTH the reads and the WRITES
+    # below. The env pair is what `dispatch._worker_env` sets, so an empty value means a
+    # person at a terminal rather than a worker.
+    #
+    # Not just the read log any more, and the second job is the load-bearing one:
+    # `ops.learn_add` and `ops.learn_retract` take this as `wo_id`, where it becomes
+    # `knowledge.wo_id` / `knowledge.retired_by_wo_id` and from there feeds
+    # `ops.side_effects_of` — the evidence packet's side effects, the validation
+    # fingerprint and the empty-submission guard. An empty value here is a work order
+    # that will look like it delivered nothing (issue #200, kn-52bef755).
+    acting_wo = os.environ.get("JARVIS_WO_ID", "")
     reader_project = (os.environ.get("JARVIS_PROJECT", "")
                       or getattr(args, "project", "") or "")
 
@@ -2492,7 +2500,7 @@ def cmd_learn(args: argparse.Namespace) -> int:
             # Through `ops`, not the store: the write is attributed to the work order
             # that made it and lands on that work order's timeline (issue #200).
             _print(ops.learn_add(args.content, project=args.project, topic=args.topic,
-                                 tags=",".join(tags), wo_id=reader_wo), args.json)
+                                 tags=",".join(tags), wo_id=acting_wo), args.json)
         elif args.kn_cmd == "list":
             # An audit surface, so retired entries are listed too — `search_knowledge`
             # is the unfiltered read, and `digested` marks what was retracted so a
@@ -2501,7 +2509,7 @@ def cmd_learn(args: argparse.Namespace) -> int:
                                             topic=args.topic)
             central.record_knowledge_read(
                 "list", rows, term=args.topic or "", project=reader_project,
-                wo_id=reader_wo,
+                wo_id=acting_wo,
                 chars=sum(len(r["content"] if args.full else headline(r["content"]))
                           for r in rows))
             _print(rows if args.full else digested(rows), args.json)
@@ -2509,7 +2517,7 @@ def cmd_learn(args: argparse.Namespace) -> int:
             rows = central.search_knowledge(args.term, limit=args.limit,
                                             project=args.project, topic=args.topic)
             central.record_knowledge_read("search", rows, term=args.term,
-                                          project=reader_project, wo_id=reader_wo)
+                                          project=reader_project, wo_id=acting_wo)
             if not rows and not args.json:
                 print(f"no knowledge matching {args.term!r} — "
                       f"try `jarvis learn topics` for what is recorded")
@@ -2517,7 +2525,7 @@ def cmd_learn(args: argparse.Namespace) -> int:
         elif args.kn_cmd == "show":
             rows = [r for r in (central.get_knowledge(i) for i in args.ids) if r]
             central.record_knowledge_read("show", rows, term=" ".join(args.ids),
-                                          project=reader_project, wo_id=reader_wo)
+                                          project=reader_project, wo_id=acting_wo)
             missing = set(args.ids) - {r["id"] for r in rows}
             if missing:
                 raise OpsError(f"unknown knowledge id(s): {', '.join(sorted(missing))}")
@@ -2525,7 +2533,7 @@ def cmd_learn(args: argparse.Namespace) -> int:
         elif args.kn_cmd == "topics":
             topics = central.knowledge_topics(args.project)
             central.record_knowledge_read("topics", [{"topic": t} for t, _ in topics],
-                                          project=reader_project, wo_id=reader_wo)
+                                          project=reader_project, wo_id=acting_wo)
             _print([{"topic": t or "(no topic)", "entries": n} for t, n in topics],
                    args.json)
         elif args.kn_cmd == "stats":
@@ -2539,7 +2547,7 @@ def cmd_learn(args: argparse.Namespace) -> int:
         elif args.kn_cmd == "retract":
             try:
                 row = ops.learn_retract(args.knowledge_id, args.reason,
-                                        wo_id=reader_wo)
+                                        wo_id=acting_wo)
             except (KeyError, ValueError) as exc:
                 # `.args[0]`, not `str(exc)`: KeyError stringifies to its repr, so the
                 # message would reach the user wrapped in quotes.
