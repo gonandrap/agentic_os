@@ -9,11 +9,22 @@ production fleet* — could be walked, and so could `pr_merge`. Five learned exe
 were affected. All five were authored by Neo, validated by `validate_pattern`,
 canary-tested on admission, and listed as sound by `jarvis gate rules`.
 
-This repository is public, so the working probe strings are deliberately not reproduced
-here. They are on the work-order record (`jarvis wo show wo-551f5e8c`), in the retraction
-reasons (`jarvis gate rules`), and in `kn-988d1733`. The rules are retracted and the
-shapes no longer clear anything; what follows is the reasoning a reviewer needs, which
-does not require them.
+**On what this repository does and does not carry.** It is public. The five live patterns
+and the command each one cleared are *not* in this repo — not here and not in the tests,
+which stand in shape-for-shape patterns over commands nobody ever dismissed
+(`DEFECT_SHAPES` in `tests/test_gate_rules.py`, and the comment there says why). Nothing
+is lost by that: the floors in §3 are indifferent to what a pattern says, so a stand-in
+exercises the same code identically, and the mutation check confirms all five stand-ins
+go red without the fix.
+
+The real pairs live in private state — the work-order record, the retraction reasons in
+`jarvis gate rules`, and `kn-988d1733`. Publishing them is the user's decision and they
+have not made it. An earlier commit on this branch did carry them; see the work order for
+what was done about that.
+
+Retracted rule *ids* are kept, here and in the tests. An id is an opaque hash of a row in
+private state: it carries no pattern and no command, and it is the only handle by which a
+reader with access can find the real record.
 
 ## 2. The cause is not the newline
 
@@ -96,6 +107,11 @@ by which one is ever cleared — so it carries the whole weight, and it had two 
   delimiter line is no longer a delimiter line, so the body ran to the end of the string
   and swallowed the release;
 - a heredoc whose delimiter simply never appears.
+
+Both were **latent, not live**: exploiting either needs a signature exemption at
+`heredoc` position, and every signature rule in the production base is at `quoted`
+position (checked 2026-09-12). So this one was a hole in the floor rather than an open
+gate — which is also why it is safe to describe here.
 
 `heredoc_spans` now reports whether each body was `terminated`, and `shape_of` returns
 `CODE` for any match inside one that was not. This is the module's existing convention —

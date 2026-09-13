@@ -49,35 +49,42 @@ EOF"""
 # command. Single-line, so it is the only shape a regex exemption may be learned from.
 QUOTED_NOTE = 'jarvis learn add "never run scripts/shipit.sh by hand" --topic releases'
 
-# The five learned rules that were live in production on 2026-09-12, each of which let a
-# worker walk a gate it had no approval for (wo-551f5e8c). Kept verbatim: they are the
-# regression, and every one of them passed the validation and the canaries of the day.
-BYPASSES = {
-    # The negated class excludes `;` and `|` but not the newline, so it cleared every
-    # line below the reader — `echo hi\n./scripts/shipit.sh` was not gated.
-    "gr-391ba702": r"^\s*(?:git ls-files|ls|cat|head|sed -n|echo)(?:[^;&|`$]|2>&1)*"
-                   r"(?:;\s*(?:git ls-files|ls|cat|head|sed -n|echo)(?:[^;&|`$]|2>&1)*)*$",
-    # The same defect, on the trailing `[^;&|]*`.
-    "gr-6b6c2060": r"^(?:uv run )?pytest\s+tests/test_shipit\.py(?:\s+-[^\s;&|]+)*"
-                   r"(?:\s+2>&1)?(?:\s*\|\s*(?:head|tail)\b[^;&|]*)?$",
-    "gr-5bd2c18c": r"^\s*(cat|head|tail|less|find)\b[^;&|`$()]*SKILL\.md[^;&|`$()]*"
-                   r"(\s*2>/dev/null)?$",
-    # No end anchor at all: a plain `&&` walked this one, no newline needed.
-    "gr-f121cbe4": r"^\s*(cd\s+\S+\s*;\s*)?jarvis\s+wo\s+finish\s+wo-[0-9a-f]{8}\b",
-    "gr-e4127741": r"\bls\s+(-[A-Za-z-]+\s+)*\.claude/skills/shipit/?(\s|$)",
-}
-
-# What each of them actually cleared, as probed with `jarvis gate explain`.
-WALKED = [
-    ("gr-391ba702", "release", "echo hi\n./scripts/shipit.sh"),
-    ("gr-6b6c2060", "release",
-     "uv run pytest tests/test_shipit.py | tail -20\n./scripts/shipit.sh"),
-    ("gr-5bd2c18c", "release",
-     "cat .claude/skills/shipit/SKILL.md\n./scripts/shipit.sh"),
-    ("gr-f121cbe4", "pr_merge",
-     'jarvis wo finish wo-12345678 --summary "x" && gh pr merge 210 --squash'),
-    ("gr-e4127741", "release", "ls .claude/skills/shipit && ./scripts/shipit.sh"),
+# The two defect SHAPES behind the five learned rules that were walkable on 2026-09-12
+# (wo-551f5e8c) — a negated class that forgets the newline, and a pattern with no end
+# anchor — written out here as fresh patterns over commands nobody ever dismissed.
+#
+# NOT the rules themselves, and this repository being public is the whole reason. The
+# five live patterns and the commands each one cleared are on the work-order record and
+# in the retraction reasons (`jarvis gate rules`), which are private state; publishing
+# the pair "this rule cleared this command" is the user's call and they have not made it.
+# Nothing is lost by the substitution: the floors under `Rule.clears` are indifferent to
+# what a pattern says, so a shape-for-shape stand-in exercises the same code identically.
+#
+# Each entry: the defect, a pattern exhibiting it, the single-line command it was written
+# for, and a command it WOULD clear without the fix.
+DEFECT_SHAPES = [
+    ("a negated class that forgets the newline", "release",
+     r"^\s*(?:cat|echo)(?:[^;&|`$]|2>&1)*$",
+     "echo hi",
+     "echo hi\n./scripts/shipit.sh"),
+    ("the same defect on a trailing class after a pipe", "release",
+     r"^(?:uv run )?pytest\s+tests/test_x\.py(?:\s*\|\s*(?:head|tail)\b[^;&|]*)?$",
+     "uv run pytest tests/test_x.py | tail -20",
+     "uv run pytest tests/test_x.py | tail -20\n./scripts/shipit.sh"),
+    ("a class excluding parens and the newline alike", "release",
+     r"^\s*(cat|head|find)\b[^;&|`$()]*NOTES\.md[^;&|`$()]*$",
+     "cat NOTES.md",
+     "cat NOTES.md\n./scripts/shipit.sh"),
+    ("no end anchor at all, so a plain && walks it", "pr_merge",
+     r"^\s*jarvis\s+wo\s+show\s+wo-[0-9a-f]{8}\b",
+     "jarvis wo show wo-12345678 --json",
+     "jarvis wo show wo-12345678 --json && gh pr merge 210 --squash"),
+    ("a whitespace-or-end terminator, unanchored at both ends", "release",
+     r"\bls\s+(-[A-Za-z-]+\s+)*docs/notes/?(\s|$)",
+     "ls docs/notes",
+     "ls docs/notes && ./scripts/shipit.sh"),
 ]
+BYPASS_IDS = [d[0] for d in DEFECT_SHAPES]
 
 
 @pytest.fixture()
@@ -287,33 +294,37 @@ def test_a_multi_line_command_never_teaches_a_regex(central):
 
 
 def test_an_exemption_describing_only_a_prefix_is_refused():
-    """gr-f121cbe4's defect, which needed no newline: the pattern described the harmless
-    `jarvis wo finish` and said nothing about the `&& gh pr merge` chained after it."""
-    command = 'jarvis wo finish wo-12345678 --summary "x" && gh pr merge 210 --squash'
-    why = gate_rules.validate_pattern(BYPASSES["gr-f121cbe4"], command)
-    assert "whole command" in why
+    """The defect that needed no newline: the pattern described a harmless prefix and
+    said nothing about the `&& gh pr merge` chained after it."""
+    _, _, pattern, _, walked = DEFECT_SHAPES[3]
+    assert "whole command" in gate_rules.validate_pattern(pattern, walked)
 
 
-@pytest.mark.parametrize("rule_id", sorted(BYPASSES))
-def test_every_historical_bypass_is_refused_at_learn_time(rule_id):
-    """Each of the five would-be rules fails validation against the command it was
-    actually written for, so none of them can enter the base again."""
-    _, _, walked = [w for w in WALKED if w[0] == rule_id][0]
-    original = walked.split("\n")[0].split(" && ")[0]
-    assert gate_rules.validate_pattern(BYPASSES[rule_id], original) != ""
+@pytest.mark.parametrize("label,kind,pattern,original,walked", DEFECT_SHAPES,
+                         ids=BYPASS_IDS)
+def test_every_bypass_shape_is_refused_at_learn_time(label, kind, pattern, original,
+                                                     walked):
+    """Each shape fails validation against the single-line command it was written for,
+    so no pattern of that shape can enter the base again."""
+    assert gate_rules.validate_pattern(pattern, original) != "", label
 
 
-@pytest.mark.parametrize("rule_id,kind,command", WALKED, ids=[w[0] for w in WALKED])
-def test_a_live_bypass_rule_no_longer_clears_the_command_it_walked(rule_id, kind,
-                                                                  command):
-    """The regression proper, and it is deliberately blind to validation: these rules
-    were already IN the base. `Rule.clears` is the floor that holds for a stored rule
-    nobody can re-validate."""
-    rule = gate_rules.Rule(id=rule_id, role=gate_rules.EXEMPT, test=gate_rules.REGEX,
-                           pattern=BYPASSES[rule_id], kind=kind, source="neo")
+@pytest.mark.parametrize("label,kind,pattern,original,walked", DEFECT_SHAPES,
+                         ids=BYPASS_IDS)
+def test_a_stored_bypass_rule_no_longer_clears_what_it_would_have(label, kind, pattern,
+                                                                  original, walked):
+    """The regression proper, and it is deliberately blind to validation: the five real
+    rules were already IN the base, admitted before any of these checks existed.
+    `Rule.clears` is the floor that holds for a stored rule nobody can re-validate."""
+    rule = gate_rules.Rule(id="gr-stored", role=gate_rules.EXEMPT,
+                           test=gate_rules.REGEX, pattern=pattern, kind=kind,
+                           source="neo")
     base = gate_rules.RuleSet.from_seeds().with_rule(rule)
 
-    assert base.decide(command, gate_rules.KIND_NAMES).match is not None
+    # It still clears the command it legitimately describes...
+    assert base.decide(original, gate_rules.KIND_NAMES) is not None
+    # ...and no longer clears the one it had no business clearing.
+    assert base.decide(walked, gate_rules.KIND_NAMES).match is not None, label
 
 
 def test_a_regex_exemption_never_clears_a_command_it_does_not_cover_entirely():
@@ -370,14 +381,14 @@ def test_no_rule_in_the_base_clears_a_multi_line_command_with_a_gated_verb_below
     knows, above every command that must always gate."""
     readers = ["cat README.md", "ls -la", "echo hi", "head -5 README.md",
                "sed -n '1,5p' README.md", "git ls-files", "tail -3 README.md",
-               "grep -rn shipit src/", "uv run pytest tests/test_shipit.py",
-               "cat .claude/skills/shipit/SKILL.md", "ls .claude/skills/shipit",
+               "grep -rn shipit src/", "uv run pytest tests/test_x.py",
+               "cat NOTES.md", "ls docs/notes",
                'jarvis wo finish wo-12345678 --summary "x"']
     base = gate_rules.RuleSet.from_seeds()
-    for rule_id, pattern in BYPASSES.items():
+    for i, (_, _, pattern, _, _) in enumerate(DEFECT_SHAPES):
         base = base.with_rule(gate_rules.Rule(
-            id=rule_id, role=gate_rules.EXEMPT, test=gate_rules.REGEX, pattern=pattern,
-            kind="", source="neo"))
+            id=f"gr-shape{i}", role=gate_rules.EXEMPT, test=gate_rules.REGEX,
+            pattern=pattern, kind="", source="neo"))
     # The signature path belongs in the sweep too: once a regex may not be learned from a
     # multi-line command it is the only way one is ever cleared, so it carries the weight.
     base = base.with_rule(gate_rules.Rule(
@@ -461,11 +472,12 @@ def test_every_gate_kind_has_a_multi_line_canary():
             tail, gate_rules.KIND_NAMES).match is not None, f"{kind}: {tail!r}"
 
 
-def test_the_multi_line_canary_report_fails_on_the_rule_that_walked_the_gate():
-    """The canary set earns its keep only if it is falsifiable. With gr-391ba702 back in
-    the base and the `Rule.clears` floor removed, the release canary must go red."""
-    rule = gate_rules.Rule(id="gr-391ba702", role=gate_rules.EXEMPT,
-                           test=gate_rules.REGEX, pattern=BYPASSES["gr-391ba702"],
+def test_the_multi_line_canary_report_fails_on_the_shape_that_walked_the_gate():
+    """The canary set earns its keep only if it is falsifiable. With the newline-blind
+    shape back in the base and the `Rule.clears` floor removed, the release canary must
+    go red — which is what the report could not say before wo-551f5e8c."""
+    rule = gate_rules.Rule(id="gr-stored", role=gate_rules.EXEMPT,
+                           test=gate_rules.REGEX, pattern=DEFECT_SHAPES[0][2],
                            kind="release", source="neo")
     unguarded = gate_rules.RuleSet.from_seeds().with_rule(rule)
 
