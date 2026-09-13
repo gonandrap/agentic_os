@@ -1795,12 +1795,42 @@ class ProjectStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def last_health_attempt_ts(self, subject_kind: str,
+                               subject_id: str) -> float | None:
+        """When this unit was last SWEPT, whatever came of it — or None if never.
+
+        The sibling of `last_health_review` and deliberately not a widening of it: that
+        one answers "what was the last judgement", which must skip a `failed` row, and
+        this answers "when did we last spend a call", which must not. `health.due` needs
+        both and they disagree exactly when the sweep is broken — which is when the
+        difference is worth money (issue #216).
+        """
+        row = self.conn.execute(
+            """SELECT ts FROM health_reviews
+                WHERE subject_kind=? AND subject_id=?
+             ORDER BY ts DESC, id DESC LIMIT 1""",
+            (subject_kind, subject_id),
+        ).fetchone()
+        return float(row["ts"]) if row else None
+
     def health_reviews_of(self, subject_kind: str,
                           subject_id: str) -> list[dict[str, Any]]:
         """Every sweep of one unit, oldest first."""
         return db.rows_to_dicts(self.conn.execute(
             """SELECT * FROM health_reviews WHERE subject_kind=? AND subject_id=?
              ORDER BY ts, id""", (subject_kind, subject_id)).fetchall())
+
+    def recent_health_reviews(self, limit: int) -> list[dict[str, Any]]:
+        """The project's last `limit` sweeps, newest first, of every unit and outcome.
+
+        Across subjects on purpose: a sweep that cannot produce a judgement is broken
+        for the PROJECT, not for one work order, and asking per unit would need a run
+        long enough on a single order — which is exactly the unit that then settles and
+        takes the evidence with it.
+        """
+        return db.rows_to_dicts(self.conn.execute(
+            "SELECT * FROM health_reviews ORDER BY ts DESC, id DESC LIMIT ?",
+            (int(limit),)).fetchall())
 
     def probes_reported_at(self, subject_kind: str, subject_id: str,
                            fingerprint: str) -> set[str]:

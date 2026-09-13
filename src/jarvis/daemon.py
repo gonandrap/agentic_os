@@ -2414,8 +2414,14 @@ class Daemon:
         for subject in subjects:
             row = subject["row"]
             last = pstore.last_health_review(subject["kind"], row["id"])
+            # TWO READS, and they disagree precisely when the sweep is failing: `last`
+            # is the last JUDGEMENT and skips a `failed` row, `attempt` is the last CALL
+            # and counts it. `due` compares the fingerprint against the first and floors
+            # the spend on the second — see issue #216.
+            attempt = pstore.last_health_attempt_ts(subject["kind"], row["id"])
             trigger = health.due(last, health.fingerprint(pstore, subject), cfg, now,
-                                 float(row.get("created_at") or 0.0))
+                                 float(row.get("created_at") or 0.0),
+                                 last_attempt=attempt)
             if trigger:
                 out.append((float(last["ts"]) if last else 0.0, subject, trigger))
         out.sort(key=lambda c: c[0])
