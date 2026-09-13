@@ -788,3 +788,169 @@ def test_a_records_own_clock_is_what_ages_it(store, monkeypatch):
     assert last["ts"] == long_ago
     assert due(last, "frozen", CFG, db.now(),
                float(store.get_work_order(wo_id)["created_at"])) == "stale"
+
+
+# -- the floor applies to ATTEMPTS, not to judgements (issue #216) -----------------------
+
+
+def test_the_floor_applies_to_a_failed_attempt_too():
+    """THE SECOND HALF OF #216, and the half that turned a dud feature into a $101 bill.
+
+    `last_health_review` excludes a `failed` row on purpose, so a sweep nobody could
+    read does not suppress the retry. But `due` used that same read for the SPEND floor,
+    and a unit whose every sweep fails therefore has `review is None` for ever: the
+    first-look branch is taken every time, its `now - created` guard passed once when
+    the unit was half an hour old, and what is left is the tick rate — one call per unit
+    per ~100 seconds, indefinitely.
+
+    So the floor takes its own argument: the last ATTEMPT, whatever came of it.
+    """
+    cfg = catalog.SupervisorConfig(health_min_interval_minutes=30)
+    minute = 60.0
+
+    # Every sweep so far has failed: no review to compare against, but an attempt to
+    # count from.
+    assert due(None, "fp", cfg, now=100 * minute, created=0.0,
+               last_attempt=90 * minute) is None
+    assert due(None, "fp", cfg, now=121 * minute, created=0.0,
+               last_attempt=90 * minute) == "first-look"
+
+
+def test_the_floor_is_unchanged_when_nothing_has_failed():
+    """The guard must be invisible to a healthy fleet: with every attempt recorded as a
+    review, `last_attempt` is that review's own ts and every existing branch already
+    enforces the same floor. The three triggers keep their exact meanings."""
+    cfg = catalog.SupervisorConfig(health_min_interval_minutes=30,
+                                   health_stale_minutes=720)
+    minute = 60.0
+    old = {"ts": 0.0, "fingerprint": "before"}
+
+    assert due(old, "after", cfg, now=29 * minute, created=0.0, last_attempt=0.0) is None
+    assert due(old, "after", cfg, now=31 * minute, created=0.0,
+               last_attempt=0.0) == "changed"
+    assert due(old, "before", cfg, now=721 * minute, created=0.0,
+               last_attempt=0.0) == "stale"
+    # And with the argument omitted entirely, which is what every existing caller and
+    # every existing test does.
+    assert due(None, "fp", cfg, now=31 * minute, created=0.0) == "first-look"
+
+
+def test_a_run_of_failures_costs_the_floor_and_not_the_tick(
+        started, catalog_file, fake_claude, store, clock):
+    """WHAT THE BILL ACTUALLY MEASURES. Six ticks inside one floor must buy ONE call, not
+    six — the difference between a feature that is broken and a feature that is broken
+    and expensive.
+
+    `_sweep` advances the clock by `STEP_MINUTES`, so the floor is raised above that
+    here: the point is ticks that arrive EARLY, which is every tick in production. The
+    clock is pushed past the floor once first, because the same floor gates the FIRST
+    look — otherwise this passes at zero calls, which is the wrong kind of green.
+    """
+    _enable(catalog_file, health_min_interval_minutes=60)
+    wo_id = _wo(store, status="running", description="FORCE_HEALTH_NO_FINDINGS")
+    daemon = started()
+    clock.advance(minutes=61)
+
+    for _ in range(6):
+        _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 1, (
+        "a failed sweep must wait out the floor before it is retried")
+    assert [r["outcome"] for r in _reviews(store, subject_id=wo_id)] == ["failed"]
+
+    clock.advance(minutes=61)
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2, (
+        "and it must still be retried once the floor has elapsed")
+
+
+def test_the_sweep_asks_the_model_for_findings_not_for_a_decision(
+        started, catalog_file, fake_claude, store, clock):
+    """END TO END, against the prompt that really goes out. The unit tests in
+    `test_probes.py` pin the checklist; this pins that the checklist is what the sweep
+    ships, which is the seam the production defect fell through."""
+    _enable(catalog_file)
+    _wo(store, status="running")
+
+    _sweep(started(), clock)
+
+    (call,) = _health_calls(fake_claude)
+    argv = call["argv"]
+    prompt = argv[argv.index("--append-system-prompt") + 1]
+    assert '"findings"' in prompt
+    assert prompt.index('"findings"') > prompt.index('"decision"')
+
+
+# -- the canary: a sweep that judges nothing must say so (issue #216) --------------------
+
+
+def _force_failures(store, n: int) -> None:
+    for i in range(n):
+        store.record_health_review("work_order", f"wo-{i}", fingerprint="fp",
+                                   trigger="first-look", outcome="failed",
+                                   detail='unreadable health sweep output: '
+                                          '{"decision": "ack", "reason": "..."}')
+
+
+def test_a_sweep_that_never_judges_anything_is_reported(store):
+    """WHAT #216 ACTUALLY COST US: not the broken prompt, but that nothing said so for
+    2215 sweeps. No error, no flag, no stuck order — only a bill, months later, and only
+    if someone asked `jarvis cost` the right question."""
+    from jarvis.invariants import (
+        HEALTH_SWEEP_FAILURE_RUN,
+        check_health_sweep_produces_judgements,
+    )
+
+    _force_failures(store, HEALTH_SWEEP_FAILURE_RUN)
+
+    (violation,) = list(check_health_sweep_produces_judgements(store))
+    assert violation.invariant == "INV-HEALTH-SWEEP-MUTE"
+    assert not violation.repaired, "the rows are honest; the prompt is what is broken"
+    assert '"decision"' in violation.detail, (
+        "the detail must name the reply that failed, or the check sends the reader "
+        "looking with nothing to look at")
+
+
+def test_the_canary_is_silent_on_a_sweep_that_works_and_on_one_that_never_ran(store):
+    """Both quiet cases, because each is green on its own against a check that returns
+    nothing at all. A short run of failures is a transport blip, not a defect."""
+    from jarvis.invariants import (
+        HEALTH_SWEEP_FAILURE_RUN,
+        check_health_sweep_produces_judgements,
+    )
+
+    assert list(check_health_sweep_produces_judgements(store)) == []
+
+    _force_failures(store, HEALTH_SWEEP_FAILURE_RUN - 1)
+    assert list(check_health_sweep_produces_judgements(store)) == []
+
+    # One judgement anywhere in the run is what says the sweep can still work.
+    store.record_health_review("work_order", "wo-ok", fingerprint="fp",
+                               trigger="first-look", outcome="clear")
+    _force_failures(store, HEALTH_SWEEP_FAILURE_RUN - 1)
+    assert list(check_health_sweep_produces_judgements(store)) == []
+
+
+def test_the_canary_fires_through_doctor_on_the_real_sweep_path(
+        started, catalog_file, store, clock):
+    """END TO END against the defect as it really happened: the fake answers with the
+    cost review's shape, every sweep fails, and `jarvis doctor` is where that becomes
+    visible. This is the test that would have caught #216 on day one.
+    """
+    from jarvis.invariants import HEALTH_SWEEP_FAILURE_RUN, check_project
+
+    _enable(catalog_file)
+    _wo(store, status="running", description="FORCE_HEALTH_NO_FINDINGS")
+    daemon = started()
+
+    for _ in range(HEALTH_SWEEP_FAILURE_RUN):
+        _sweep(daemon, clock)
+
+    swept = store.recent_health_reviews(HEALTH_SWEEP_FAILURE_RUN)
+    assert len(swept) == HEALTH_SWEEP_FAILURE_RUN, "the sweeps must really have run"
+    assert {r["outcome"] for r in swept} == {"failed"}
+
+    found = [v for v in check_project(store, repair=False)
+             if v.invariant == "INV-HEALTH-SWEEP-MUTE"]
+    assert len(found) == 1, "a sweep that has judged nothing in ten tries must be news"

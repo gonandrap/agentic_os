@@ -539,7 +539,7 @@ class Daemon:
                     # Also before them: this is the only thing that ever closes a gate
                     # request no reviewer can see, so leaving it until after would let
                     # the invariants judge a hold the OS was about to refuse.
-                    self.refuse_unargued_gates(project, store)
+                    self.abandon_unargued_gates(project, store)
                     # Last: check the state everything above just produced.
                     self.check_invariants(project, store)
                 self.central.touch_project(project.name)
@@ -2164,35 +2164,53 @@ class Daemon:
             return
 
         if verdict["escalate"]:
-            central.add_inbox(
-                project=q["project"], level="warning",
-                title=f"Approval needed: {approval['kind']} from {q['wo_id']}",
-                body=(f"Neo declined to decide: {verdict['reason']}\n\n"
-                      f"Command: {approval['command']}\n\n"
-                      f"Approve it with: jarvis gate approve {approval['id']} "
-                      f"--reason \"...\"\n"
-                      f"Deny it with:    jarvis gate deny {approval['id']} "
-                      f"--reason \"...\"\n"
-                      f"Full request:    jarvis gate show {approval['id']}"),
-                wo_id=q["wo_id"],
-            )
+            # A contest must not arrive offering `approve`, the one verb that cannot
+            # answer it — spec 2026-09-12 §2.
+            if approval["contested"]:
+                title = f"Is this a false positive? {approval['kind']} from {q['wo_id']}"
+                body = (f"The worker says this command performs no privileged action and "
+                        f"the `{approval['kind']}` gate matched it by mistake. Neo "
+                        f"declined to decide: {verdict['reason']}\n\n"
+                        f"Command: {approval['command']}\n\n"
+                        f"It is a false positive:  jarvis gate dismiss {approval['id']} "
+                        f"--reason \"...\"\n"
+                        f"The worker is wrong:     jarvis gate deny {approval['id']} "
+                        f"--reason \"...\"\n"
+                        f"The contest in full:     jarvis gate show {approval['id']}")
+            else:
+                title = f"Approval needed: {approval['kind']} from {q['wo_id']}"
+                body = (f"Neo declined to decide: {verdict['reason']}\n\n"
+                        f"Command: {approval['command']}\n\n"
+                        f"Approve it with: jarvis gate approve {approval['id']} "
+                        f"--reason \"...\"\n"
+                        f"Deny it with:    jarvis gate deny {approval['id']} "
+                        f"--reason \"...\"\n"
+                        f"Full request:    jarvis gate show {approval['id']}")
+            central.add_inbox(project=q["project"], level="warning", title=title,
+                              body=body, wo_id=q["wo_id"])
             pstore.mark_approval_escalated(approval["id"], verdict["reason"])
             pstore.flag_attention(
                 q["wo_id"],
-                f"gate approval escalated by Neo: {approval['kind']} "
-                f"(request {approval['id']})",
+                (f"contested gate match escalated by Neo: {approval['kind']} "
+                 f"(request {approval['id']})") if approval["contested"] else
+                (f"gate approval escalated by Neo: {approval['kind']} "
+                 f"(request {approval['id']})"),
             )
             pstore.add_event(q["wo_id"], "gate_escalated", {
                 "approval_id": approval["id"], "reason": verdict["reason"],
             })
             return
 
-        ruling = verdict.get("verdict") or ("approved" if verdict.get("approve")
-                                            else "denied")
-        gates.apply_decision(pstore, approval["id"], verdict=ruling,
-                             reason=verdict["reason"], decided_by="neo",
-                             central=central, project=q["project"],
-                             exempt_pattern=verdict.get("exempt_pattern", ""))
+        asked = verdict.get("verdict") or ("approved" if verdict.get("approve")
+                                           else "denied")
+        decided = gates.apply_decision(pstore, approval["id"], verdict=asked,
+                                       reason=verdict["reason"], decided_by="neo",
+                                       central=central, project=q["project"],
+                                       exempt_pattern=verdict.get("exempt_pattern", ""))
+        # WHAT WAS RECORDED, not what the reviewer said: the two differ on exactly one
+        # input, `approved` on a contested row — spec §2. Level, title and body all read
+        # from here for that reason.
+        ruling = decided["status"]
         # A shipped release is something the user wants to know happened, even when they
         # did not have to authorise it — that is the trade for spending none of their
         # attention on the approval itself.
@@ -2204,11 +2222,16 @@ class Daemon:
         # instead — `jarvis gate list` and the dashboard — because what matters about
         # classifier defects is the rate, not each instance.
         if ruling != "dismissed":
+            # A rejected CONTEST stays visible — the one place this feature spends the
+            # user's attention on purpose.
             central.add_inbox(
                 project=q["project"],
                 level="info" if ruling == "approved" else "warning",
-                title=f"Neo {ruling} {approval['kind']} for {q['wo_id']}",
-                body=(f"{verdict['reason']}\n\nCommand: {approval['command']}\n"
+                title=(f"Neo rejected a contested {approval['kind']} match from "
+                       f"{q['wo_id']}" if decided["contested"]
+                       else f"Neo {ruling} {approval['kind']} for {q['wo_id']}"),
+                body=(f"{decided['decision_reason']}\n\n"
+                      f"Command: {approval['command']}\n"
                       f"Review Neo's call with: jarvis neo review {q['id']}"),
                 wo_id=q["wo_id"],
             )
@@ -2444,8 +2467,14 @@ class Daemon:
         for subject in subjects:
             row = subject["row"]
             last = pstore.last_health_review(subject["kind"], row["id"])
+            # TWO READS, and they disagree precisely when the sweep is failing: `last`
+            # is the last JUDGEMENT and skips a `failed` row, `attempt` is the last CALL
+            # and counts it. `due` compares the fingerprint against the first and floors
+            # the spend on the second — see issue #216.
+            attempt = pstore.last_health_attempt_ts(subject["kind"], row["id"])
             trigger = health.due(last, health.fingerprint(pstore, subject), cfg, now,
-                                 float(row.get("created_at") or 0.0))
+                                 float(row.get("created_at") or 0.0),
+                                 last_attempt=attempt)
             if trigger:
                 out.append((float(last["ts"]) if last else 0.0, subject, trigger))
         out.sort(key=lambda c: c[0])
@@ -2474,7 +2503,7 @@ class Daemon:
         finally:
             neo_store.close()
 
-    def refuse_unargued_gates(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def abandon_unargued_gates(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Close every gate request whose case never came. See `gates.sweep_unargued`.
 
         The other half of holding an unargued request back from review: nothing else can
@@ -2486,15 +2515,14 @@ class Daemon:
         if not project.gates:
             return
         try:
-            refused = gates.sweep_unargued(
-                store, project.gates.case_ttl_seconds,
-                central=self.central, project=project.name)
+            closed = gates.sweep_unargued(store, project.gates.case_ttl_seconds)
         except Exception:  # noqa: BLE001 — one project's sweep must not stop the tick
-            log.exception("project %s: refusing unargued gates failed", project.name)
+            log.exception("project %s: closing unargued gates failed", project.name)
             return
-        for approval in refused:
-            log.info("gate %s (%s) refused: no case was made for it",
-                     approval["id"], approval["kind"])
+        for approval in closed:
+            # "abandoned", never "refused": nobody reviewed it — spec 2026-09-12 §4.
+            log.info("gate %s (%s) abandoned: no case was made and the match was never "
+                     "contested", approval["id"], approval["kind"])
 
     # -- 7. invariants (post-conditions) --------------------------------------------------
 

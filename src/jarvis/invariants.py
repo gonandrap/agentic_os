@@ -606,7 +606,8 @@ def _waiting_on_neo_gate(store: ProjectStore, wo: dict[str, Any]) -> bool:
 
     A `pending` request is with Neo. An `awaiting_case` one is with the WORKER, which
     still asks the user for nothing: it is held precisely because nobody has argued it
-    yet, and the OS refuses it on a timer if nobody ever does (`gates.sweep_unargued`).
+    yet, and the OS closes it as abandoned on a timer if nobody ever does
+    (`gates.sweep_unargued`).
     Omitting the second reads the park as the generic "waiting on your input" — the
     false flag GitHub issue 100 was, arrived at down a different road.
     """
@@ -1517,6 +1518,50 @@ def _validation_timeout() -> int:
     return int(timeout) if timeout else DEFAULT_VALIDATION_TIMEOUT
 
 
+#: How many consecutive failed sweeps mean the sweep itself is broken rather than
+#: unlucky. A transport blip fails one or two; a prompt that can never satisfy its own
+#: validator fails every one, for ever. Ten is comfortably past noise and is reached in
+#: a few hours at the shipped cadence — against the 2215 that went unreported.
+HEALTH_SWEEP_FAILURE_RUN = 10
+
+
+def check_health_sweep_produces_judgements(store: ProjectStore) -> Iterator[Violation]:
+    """INV-HEALTH-SWEEP-MUTE — a sweep that never judges anything must not bill silently.
+
+    THIS CHECK IS THE POINT OF ISSUE #216, more than either line of the fix it shipped
+    with. The sweep could never satisfy its own validator and ran 2215 times anyway, for
+    $101.78 and no finding — with no error, no flag and no stuck work order to show for
+    it. A failure mode of "works, costs money, produces nothing" needs a heartbeat rather
+    than a comment, because the other two halves of the fix are exactly the kind an
+    innocent edit undoes with every test still green. §4.1 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+
+    Predicate: of the project's last `HEALTH_SWEEP_FAILURE_RUN` sweeps, every one failed.
+    `outcome='clear'` is a healthy sweep and the common one, so a working project clears
+    this on its first tick and pays a single indexed read for it.
+
+    NOT repairable, and it must not try. The rows are honest — they record what really
+    happened — and the defect is in the prompt or the transport, neither of which is
+    derivable from state. The detail carries the most recent `health_reviews.detail`,
+    which for the #216 shape is the model's reply itself and names the problem outright.
+
+    Silent on a project that has never swept: the sweep ships disabled, and no rows is
+    not a run of failures.
+    """
+    recent = store.recent_health_reviews(HEALTH_SWEEP_FAILURE_RUN)
+    if len(recent) < HEALTH_SWEEP_FAILURE_RUN:
+        return
+    if any(r["outcome"] != "failed" for r in recent):
+        return
+    yield Violation(
+        invariant="INV-HEALTH-SWEEP-MUTE",
+        detail=(f"the last {HEALTH_SWEEP_FAILURE_RUN} health sweeps all failed, so the "
+                f"sweep is spending model calls and producing no judgement. Most recent "
+                f"reason: {str(recent[0]['detail'] or '(none recorded)')[:200]}"),
+        context={"failures": HEALTH_SWEEP_FAILURE_RUN,
+                 "last_detail": str(recent[0]["detail"] or "")[:500]},
+    )
+
+
 def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
     """INV-MANAGER-SLOTS — a project manager order must not spend a concurrency slot.
 
@@ -1879,11 +1924,72 @@ def check_service_path() -> Iterator[Violation]:
     )
 
 
+def check_production_clean() -> Iterator[Violation]:
+    """INV-PROD-CLEAN — the production checkout must be byte-identical to its tag.
+
+    "Reproduce in prod, fix it in dev, ship it" is only trustworthy while prod is
+    exactly what the tag says. Drift there is invisible: nothing errors, `jarvis
+    --version` merely gains a `-dirty` suffix, and the next deploy's `git checkout -f`
+    erases the evidence. Issue #202 went unnoticed for nine releases because the only
+    symptom was a version string nobody read.
+
+    Reports tracked modifications only (`-uno`): untracked files are not drift — `.venv/`
+    and `.jarvis/` live in that checkout by design, and the deploy never removed them.
+    No exemption list, unlike `scripts/shipit.sh`'s clean-tree precondition: the OS's
+    managed-artifact writes land in the DEV checkout registered in the catalog, never in
+    the production one, so anything modified here is genuinely unexplained.
+
+    The ref the remedy names comes from git (`release.production_status`), never from the
+    checkout's `pyproject.toml` — that file is one of the things drift can touch, and a
+    remedy built from a drifted version names a tag nobody cut.
+
+    A `jarvis doctor` check only (see `check_config_drift` on why `OS_INVARIANTS` stays
+    off the reconcile tick). Not repairable: discarding files in a checkout is
+    destructive, and the drift is the one thing worth looking at before it is thrown
+    away.
+    """
+    from . import release
+    from .paths import production_code_dir
+
+    prod = production_code_dir()
+    if not (prod / ".git").exists():
+        return  # no production deployment on this machine
+    status = release.production_status(prod)
+    if status.dirty is None:
+        yield Violation(
+            invariant="INV-PROD-CLEAN",
+            detail=(f"cannot tell whether the production checkout at {prod} still "
+                    f"matches its tag — {status.error}. Unknown is not clean: this is "
+                    f"the one checkout the invariant exists to watch, so it reports "
+                    f"rather than assumes. Run `git -C {prod} status` as the user the "
+                    f"daemon runs as to see what git is objecting to."),
+            context={"checkout": str(prod), "paths": None, "error": status.error},
+        )
+        return
+    if not status.dirty:
+        return
+    dirty = status.dirty
+    yield Violation(
+        invariant="INV-PROD-CLEAN",
+        detail=(f"the production checkout at {prod} has {len(dirty)} tracked "
+                f"file(s) modified since its tag was deployed "
+                f"({', '.join(dirty[:5])}{', …' if len(dirty) > 5 else ''}) — "
+                f"production is meant to be byte-identical to the tag, and every "
+                f"version string it reports is suffixed `-dirty` until it is. Inspect "
+                f"the diff, then discard it with `git -C {prod} checkout -f "
+                f"{status.ref}` (which is what the next deploy does) — not "
+                f"`checkout -- .`, which restores from the index and so cannot clear a "
+                f"STAGED change, and staged changes are part of what is reported above."),
+        context={"checkout": str(prod), "paths": dirty, "ref": status.ref},
+    )
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
     check_gate_canaries,
     check_config_drift,
     check_service_path,
+    check_production_clean,
 )
 
 
@@ -1913,6 +2019,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_attention_has_reason,
     check_manager_slots,           # a canary, not a state check: it repairs nothing and
                                    # is unaffected by the order it runs in
+    check_health_sweep_produces_judgements,  # ditto: a pure read of the sweep ledger,
+                                   # repairing nothing and read by nothing else
     check_paused_turns_resume,     # ditto: a pure read of what the retry pass did or
                                    # did not do, with nothing to repair
     check_pause_deadline_stable,   # ...and its companion: the pass can also be failing
