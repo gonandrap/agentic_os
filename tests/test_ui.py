@@ -53,6 +53,8 @@ def gated(jarvis_home, fake_claude, gated_catalog, project):
     daemon.tick()
 
     class Handle:
+        gated_command = "./scripts/shipit.sh"
+
         def __init__(self):
             self.daemon = daemon
             self.wo_id = wo["id"]
@@ -893,6 +895,41 @@ def test_gates_tab_shows_the_request_the_reviewer_saw(gated):
     assert "PRIVILEGED ACTION REQUEST" in r.text or "cut a release" in r.text
     assert f'id="gate-{approval["id"]}"' in r.text
     assert '<span class="nav-badge">1</span>' in r.text  # escalated ⇒ the tab is badged
+
+
+def test_gates_tab_explains_a_request_held_for_the_worker_s_case(gated):
+    """`awaiting_case` used to render as a badge word under "Decided" and nothing else —
+    a status the user could neither act on nor wait out. The report was literally "it is
+    not clear what the status is and how to proceed"."""
+    from jarvis.hooks import preflight_decision
+
+    # The attempt alone is what holds it: no case, no reviewer (gates.AWAITING_CASE).
+    settings = json.loads(
+        (gated.project / ".jarvis" / "worker-settings"
+         / f"{gated.wo_id}.json").read_text())
+    preflight_decision(
+        {"tool_name": "Bash", "tool_input": {"command": gated.gated_command},
+         "cwd": str(gated.project)}, settings["env"])
+    assert gated.approval()["status"] == gates.AWAITING_CASE
+
+    page = gated.client.get("/gates").text
+
+    assert "Awaiting the worker's case" in page
+    assert "jarvis gate request" in page
+    # BOTH exits, here as everywhere a blocked worker's row is explained (spec §3) — the
+    # held row is the one place the page describes what the worker should do next.
+    assert "jarvis gate contest" in page
+    assert "No reviewer sees it yet" in page
+    assert "gates.case_ttl_seconds" in page
+    # Not "Refused": the TTL abandons, and saying refused would promise a reviewer who
+    # never looked — the same false record `dismissed` exists to prevent (spec §4).
+    assert "Abandoned automatically in" in page
+    assert "Refused automatically" not in page
+    assert f'id="gate-{gated.approval()["id"]}"' in page
+    # not filed among the verdicts, where nothing explains it and the heading is a lie
+    assert "no gate has been decided yet" in page
+    # and it asks the user for nothing
+    assert '<span class="nav-badge">' not in page
 
 
 def test_gate_pending_with_neo_costs_no_badge(gated):
@@ -1941,3 +1978,45 @@ def test_the_feature_page_names_its_manager_order(client, project):
     plain = client.get(f"/fo/proj_a/{without['id']}")
     assert plain.status_code == 200
     assert "manager:" not in plain.text
+
+
+# -- a contested match on the page (spec 2026-09-12) ----------------------------------
+
+
+def test_a_contested_gate_offers_no_approve_button(gated):
+    """The page's verbs are the user's options. A contest argues the command performs no
+    privileged action, so there is nothing here to authorise — and `ops.decide_gate`
+    refuses an approval on one, which would make the button an error page."""
+    ops.contest_gate_match(gated.wo_id, "./scripts/shipit.sh",
+                           why="the literal is inside a message body")
+    gated.daemon._neo_drain()          # the fake escalates by default
+
+    page = gated.client.get("/gates").text
+    assert "CONTESTED" in page
+    assert "the literal is inside a message body" in page
+    assert 'value="dismiss"' in page and 'value="deny"' in page
+    assert 'value="approve"' not in page
+
+
+def test_an_abandoned_request_is_not_shown_as_expired(gated):
+    """`expired` is three different outcomes and only one of them is evidence about the
+    classifier. A row nobody ever reviewed must not read like a grant that ran out."""
+    from jarvis.hooks import preflight_decision
+
+    settings = json.loads(
+        (gated.project / ".jarvis" / "worker-settings"
+         / f"{gated.wo_id}.json").read_text())
+    preflight_decision({"tool_name": "Bash",
+                        "tool_input": {"command": "./scripts/shipit.sh"},
+                        "cwd": str(gated.project)}, settings["env"])
+    store = ProjectStore(gated.project)
+    try:
+        store.conn.execute("UPDATE approvals SET ts = ts - 7200")
+        gates.sweep_unargued(store, gates.DEFAULT_CASE_TTL_SECONDS)
+    finally:
+        store.close()
+
+    page = gated.client.get("/gates").text
+    assert "abandoned, never reviewed" in page
+    # ...and counted beside the false-positive rate rather than inside it.
+    assert "1 more were abandoned" in page

@@ -310,7 +310,7 @@ def test_first_attempt_is_blocked_and_the_request_is_held_not_reviewed(gated):
     # ...and that nothing happens until it argues the thing, and by when.
     assert "jarvis gate request" in _reason(result)
     assert "NOBODY IS REVIEWING IT YET" in _reason(result)
-    assert "refused" in _reason(result)
+    assert "ABANDONED" in _reason(result)
 
     # No question exists, so no reviewer can read the placeholder justification.
     neo = NeoStore()
@@ -1144,6 +1144,15 @@ def test_reading_a_privileged_script_is_not_performing_it(command):
     assert gates.classify(command, ALL_GATES) is None, f"{command!r} must not be gated"
 
 
+def test_every_line_range_of_the_release_script_reads_free():
+    """Issue #87: two reads of the SAME file cost two dismissals, because a dismissal is
+    keyed to the byte-exact command and the line range differs. Nothing is learned here —
+    the exemption is structural, so the number of ranges no longer matters."""
+    for lo in range(1, 400, 120):
+        command = f"sed -n '{lo},{lo + 120}p' scripts/shipit.sh"
+        assert gates.classify(command, ALL_GATES) is None, command
+
+
 @pytest.mark.parametrize("command", [
     # The exemption covers commands that cannot execute anything. The moment one
     # segment can, it is gone — a reader piping into a shell is the classic bypass.
@@ -1158,6 +1167,79 @@ def test_reading_a_privileged_script_is_not_performing_it(command):
     "sed -i 's/0.5.3/0.5.4/' scripts/shipit.sh",  # -i writes; not a reader
 ])
 def test_the_read_only_exemption_never_covers_a_command_that_can_execute(command):
+    assert gates.classify(command, ALL_GATES) is not None, f"{command!r} must be gated"
+
+
+# -- …and one segment's executor is not another segment's (issue #194) -----------------
+#
+# The pair below is the whole fix, and they have to be read together: the same reader and
+# the same executor, joined two ways. Across a list separator they are two commands and
+# the read stays exempt; across a pipe the reader's output reaches the executor and it
+# does not. Loosening the second to make the first pass is the mistake this guards.
+
+
+@pytest.mark.parametrize("command", [
+    # Gate 91 on wo-e4be8c37, verbatim: a read with a `||` fallback. `find` is correctly
+    # an executor — it has -exec — but it is in the other command and never sees the path.
+    'cat ~/.claude/skills/shipit/SKILL.md 2>/dev/null || '
+    'find ~ -name SKILL.md -path "*shipit*" 2>/dev/null',
+    "cat scripts/shipit.sh || bash fallback.sh",
+    "make build && cat scripts/shipit.sh",
+    "head -20 scripts/shipit.sh; python3 build.py",
+    "grep -c . scripts/shipit.sh & python3 -c 'pass'",
+    # A redirection that discards, or duplicates an fd, leaves nothing behind — and
+    # `2>/dev/null` is in the gate-91 command itself, so getting this wrong un-fixes it.
+    "cat scripts/shipit.sh > /dev/null || find . -name x",
+    "cat scripts/shipit.sh 2>&1 || find . -name x",
+    # A reader that writes, with nothing in the chain able to run what it wrote.
+    "cat scripts/shipit.sh > /tmp/s.sh && diff /tmp/s.sh /tmp/o.sh",
+])
+def test_an_executor_in_another_command_does_not_void_the_read(command):
+    assert gates.classify(command, ALL_GATES) is None, f"{command!r} must not be gated"
+
+
+@pytest.mark.parametrize("command", [
+    # The same shapes with the executor put back where it can reach the literal.
+    "cat scripts/shipit.sh | bash",
+    "cat scripts/shipit.sh || bash scripts/shipit.sh",
+    "make build && ./scripts/shipit.sh",
+    "head -20 README.md; python3 scripts/shipit.sh",
+    "true || xargs -I{} bash scripts/shipit.sh",
+])
+def test_the_segment_that_names_the_literal_is_the_one_that_must_only_read(command):
+    assert gates.classify(command, ALL_GATES) is not None, f"{command!r} must be gated"
+
+
+@pytest.mark.parametrize("command", [
+    # Round 1 of review on PR #201. Segments either side of a list separator share no
+    # STREAM, which is what the exemption above rests on — but they do share the
+    # filesystem and the environment, and a reader that WRITES uses both to hand the
+    # release script to an executor that never names it. The gated literal is in a
+    # read-only segment in every one of these, and every one of them ships.
+    "cat scripts/shipit.sh > /tmp/s.sh && bash /tmp/s.sh",
+    'S=scripts/shipit.sh; bash "$S"',
+    "cp scripts/shipit.sh /tmp/s.sh && bash /tmp/s.sh",
+    "cat scripts/shipit.sh | tee /tmp/s.sh; bash /tmp/s.sh",
+    "head -200 scripts/shipit.sh >> /tmp/s.sh; sh /tmp/s.sh",
+    "grep . scripts/shipit.sh > /tmp/s.sh; find . -name x -exec bash /tmp/s.sh ;",
+    # The target is quoted, so `_inert` blanks it — an unreadable target must not read
+    # as no target at all.
+    'cat scripts/shipit.sh > "/tmp/s.sh" && bash /tmp/s.sh',
+    # Readers that write a file with no redirection to give them away: `sed` has the `w`
+    # command and `sort` has `-o`, both inside arguments this parser does not read.
+    "sed -n '1,200w /tmp/s.sh' scripts/shipit.sh; bash /tmp/s.sh",
+    "sort -o /tmp/s.sh scripts/shipit.sh && sh /tmp/s.sh",
+    "uniq scripts/shipit.sh /tmp/s.sh && sh /tmp/s.sh",
+    "yq -i '.x = 1' scripts/shipit.sh",     # -i edits the target, not a handoff at all
+    # Round 2 of review: the chain that runs it without naming anything in `_EXECUTORS`.
+    # This is why the handoff falls back to the reader WHITELIST and not to "no known
+    # executor" — `chmod` will never be on a blacklist anyone remembers to extend.
+    "cat scripts/shipit.sh > /tmp/s.sh && chmod +x /tmp/s.sh && /tmp/s.sh",
+    "head -200 scripts/shipit.sh > /tmp/s.sh; . /tmp/s.sh",
+    "cat scripts/shipit.sh > /tmp/s.sh && zsh /tmp/s.sh",
+    "cat scripts/shipit.sh > /tmp/s.sh && install -m755 /tmp/s.sh /usr/local/bin/go",
+])
+def test_a_reader_that_writes_hands_the_literal_on_and_loses_the_exemption(command):
     assert gates.classify(command, ALL_GATES) is not None, f"{command!r} must be gated"
 
 
@@ -1223,3 +1305,343 @@ def test_a_dismissed_gate_asks_nothing_of_the_user(gated):
 
     wo = gated.store.get_work_order(gated.wo["id"])
     assert invariants.true_blockers(gated.store, wo) == []
+
+
+# -- both exits, wherever a worker is blocked -----------------------------------------
+#
+# The defect: the block offered one exit, and it was the wrong one for a false positive.
+# docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §3.
+
+
+def _names_both_exits(text, wo_id, command, kind="release", approval_id=None):
+    """The property every blocking surface must have, asserted in one place.
+
+    Pinned as a shared predicate rather than three copies of the literals: the rendered
+    line is the only thing each reader gets, so a flag renamed in one surface and not the
+    others is advice that no longer parses (kn-467d1ecd).
+
+    `kind` is passed through because the request line's placeholders belong to the kind
+    (§6) — a surface that dropped it would still name both exits, and would still ask a
+    service restart for a PR number. `approval_id` is the stronger check still: an exit
+    that re-quotes the blocked command into its own arguments is refused by the worktree
+    isolation guard before it runs, so a surface can name both exits and offer neither
+    (§8).
+    """
+    assert gates.explain_command(command, approval_id) in text
+    assert gates.request_command(wo_id, command, kind, approval_id=approval_id) in text
+    assert gates.contest_command(wo_id, command, approval_id=approval_id) in text
+    if approval_id is not None:
+        for line in text.splitlines():
+            if line.strip().startswith("jarvis gate "):
+                assert command not in line, f"exit re-quotes the blocked command: {line}"
+
+
+def _latest_gate_id(gated):
+    return gated.store.list_approvals(gated.wo["id"])[0]["id"]
+
+
+def test_the_block_names_the_diagnosis_and_both_exits(gated):
+    """A worker that cannot tell which exit it needs is told to run `explain` first."""
+    reason = _reason(gated.attempt("./scripts/shipit.sh"))
+
+    _names_both_exits(reason, gated.wo["id"], "./scripts/shipit.sh",
+                      approval_id=_latest_gate_id(gated))
+    assert reason.index("gate explain") < reason.index("gate request")
+
+
+def test_the_retry_message_names_them_too(gated):
+    """The second block is where the first three abandonments happened: the worker ran
+    the command again, was told only to argue for it, and gave up."""
+    gated.attempt("./scripts/shipit.sh")
+    reason = _reason(gated.attempt("./scripts/shipit.sh"))
+
+    assert "NOT under review" in reason
+    _names_both_exits(reason, gated.wo["id"], "./scripts/shipit.sh",
+                      approval_id=_latest_gate_id(gated))
+
+
+def test_the_abandonment_message_names_them_as_well(gated):
+    """The last surface that reaches a worker about this command."""
+    gated.attempt("./scripts/shipit.sh")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+
+    text = gates.abandoned_message(approval, gates.DEFAULT_CASE_TTL_SECONDS)
+
+    _names_both_exits(text, gated.wo["id"], "./scripts/shipit.sh",
+                      approval_id=approval["id"])
+
+
+def test_a_second_block_after_an_abandonment_says_so(gated):
+    """One repetition of the failure is a worker that lost a turn; two is a habit."""
+    gated.attempt("./scripts/shipit.sh")
+    gated.store.conn.execute("UPDATE approvals SET ts = ts - 7200")
+    gates.sweep_unargued(gated.store, gates.DEFAULT_CASE_TTL_SECONDS)
+
+    reason = _reason(gated.attempt("./scripts/shipit.sh"))
+    assert "ABANDONED" in reason
+    _names_both_exits(reason, gated.wo["id"], "./scripts/shipit.sh",
+                      approval_id=_latest_gate_id(gated))
+
+
+def test_the_block_asks_a_service_restart_its_own_two_questions(gated):
+    """Not "why this is ready to ship". Nothing ships when a service bounces, and the
+    reviewer is shown nothing but what the worker wrote — spec 2026-09-12 §6."""
+    command = "sudo systemctl restart jarvis"
+    reason = _reason(gated.attempt(command))
+
+    _names_both_exits(reason, gated.wo["id"], command, "service_restart",
+                      _latest_gate_id(gated))
+    assert "why this service has to be interrupted, and why now" in reason
+    assert "what that work loses when it bounces" in reason
+    assert "ready to ship" not in reason
+
+
+def test_the_block_asks_a_config_write_its_own_two_questions(gated):
+    """The other kind with no PR behind it: what the setting is now, what it becomes,
+    and what the change switches off."""
+    command = "jarvis config set proj_a gates.case_ttl_seconds 120"
+    reason = _reason(gated.attempt(command))
+
+    _names_both_exits(reason, gated.wo["id"], command, "config_write",
+                      _latest_gate_id(gated))
+    assert "why this setting has to change" in reason
+    assert "the value after, and what the change switches off" in reason
+    assert "ready to ship" not in reason
+
+
+def test_every_kind_asks_for_something_a_worker_could_actually_supply():
+    """The defect was one frame hardcoded for all six. Cheap guard against the next kind
+    being added without one of its own."""
+    seen = {(k.why_ask, k.evidence_ask) for k in gates.KINDS}
+
+    assert len(seen) == len(gates.KINDS)
+    assert not [k for k in gates.KINDS if not k.why_ask or not k.evidence_ask]
+
+
+def test_a_contest_asks_no_per_kind_question(gated):
+    """A contest asserts the command performs no privileged action of ANY kind, so the
+    question is the same whichever recogniser fired."""
+    one = gates.contest_command(gated.wo["id"], "sudo systemctl restart jarvis")
+    two = gates.contest_command(gated.wo["id"], "./scripts/shipit.sh")
+
+    assert (one.replace("sudo systemctl restart jarvis", "X")
+            == two.replace("./scripts/shipit.sh", "X"))
+
+
+def test_the_block_still_tells_the_worker_to_end_its_turn(gated):
+    """"Blocked on a gate" and "idle in-turn" must never coincide: nothing wakes a worker
+    that sits spinning, and its next turn re-sends the whole conversation at the write
+    rate. The instruction has to survive the deny payload into the worker's context —
+    spec 2026-09-12 §7."""
+    for command in ("./scripts/shipit.sh", "sudo systemctl restart jarvis"):
+        assert "END YOUR TURN" in _reason(gated.attempt(command))
+
+
+def test_the_screenshot_script_seeds_the_window_the_code_uses(gated):
+    """A published PNG is evidence, so it must not outlive the number it shows.
+
+    The script seeded "within 10 minutes" while the default was already 240s (§7), which
+    is how a screenshot in a PR body came to contradict the diff it illustrated. Both now
+    render from `gates.abandoned_reason`, and this asserts the script keeps no copy.
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "scripts" / "screenshot_contested_gate.py").read_text()
+
+    assert "gates.abandoned_reason(gates.DEFAULT_CASE_TTL_SECONDS)" in src
+    assert not re.search(r"within \d+ minutes", src), (
+        "the script carries its own copy of the window again")
+    assert "4 minutes" in gates.abandoned_reason(gates.DEFAULT_CASE_TTL_SECONDS)
+
+
+def test_the_abandonment_migration_still_recognises_the_sweeps_own_reason():
+    """The re-filing migration keys on this prefix. Changing the sentence without
+    changing the key would silently strand the rows it exists to fix."""
+    prefix = ProjectStore._TTL_DENIAL_PREFIX
+
+    assert gates.abandoned_reason(600.0).startswith(prefix)
+    assert gates.abandoned_reason(gates.DEFAULT_CASE_TTL_SECONDS).startswith(prefix)
+
+
+# -- the OS's own paperwork is not a privileged action ---------------------------------
+
+#: Request 106's shape, rebuilt: a `pr_merge` request whose ARGUMENT is plainly a merge
+#: and whose prose describes release work. The live row matched `release` on the word in
+#: its own `--why`, then TTL-closed for want of a case — the case being the command that
+#: was blocked. The "eval scorecard" clause is load-bearing, not colour: it is what
+#: `test_the_word_eval_in_prose_does_not_make_paperwork_executable` reproduces.
+#:
+#: The ARGUMENT is unquoted, and that is load-bearing too. Quoted, the only thing making
+#: this specimen trip a gate under a deciding verb was `_SHELL_INVOKER` matching that same
+#: English word and disarming quote-blanking for the whole command — issue #203, which §9
+#: names and assigns to this lineage rather than fixing. With that fixed the quoted form
+#: classifies clean under EVERY verb, including the control, so the tripwire below would
+#: have gone quiet without a single assertion failing. Unquoted it trips on the merge
+#: itself. Spec 2026-09-12 §9.
+PAPERWORK = (
+    'jarvis gate request wo-4fc128ca gh pr merge 210 --squash '
+    '--why "the PR fixes issue 202 at the root — shipit now relocks uv.lock on the '
+    'release branch so production stops rewriting its own lockfile" '
+    '--evidence "PR 210, checks pass, the eval scorecard at 45 of 45. No release was '
+    'cut at any point, and nothing was deployed"'
+)
+
+
+def test_filing_a_request_is_never_itself_a_gated_action(gated):
+    """The circularity: the only way to make a case was the command that was blocked."""
+    assert gates.classify(PAPERWORK, ALL_GATES) is None
+    # `allow`, not `None`: the hook falls through the gate check to the auto-approval
+    # every `jarvis …` contract command gets. What matters is that it is not a deny.
+    assert _decision(gated.attempt(PAPERWORK)) == "allow"
+
+
+def test_contesting_a_false_positive_is_never_itself_a_false_positive(gated):
+    """Otherwise the exit this work order adds is as unreachable as the one it replaces."""
+    contest = gates.contest_command(gated.wo["id"], "./scripts/shipit.sh",
+                                    why="the release script is named in a grep pattern")
+
+    assert gates.classify(contest, ALL_GATES) is None
+    assert _decision(gated.attempt(contest)) == "allow"
+
+
+def test_every_exit_the_block_prints_is_runnable(gated):
+    """The property in one line, over the real rendered text rather than a fixture: no
+    line a blocked worker is told to run may itself be blocked."""
+    reason = _reason(gated.attempt("./scripts/shipit.sh"))
+
+    exits = [ln.strip() for ln in reason.splitlines()
+             if ln.strip().startswith("jarvis gate ")]
+    assert len(exits) == 3
+    for line in exits:
+        assert gates.classify(line, ALL_GATES) is None, f"the block prints: {line}"
+
+
+def test_the_deciding_verbs_are_not_paperwork(gated):
+    """`approve`/`deny`/`dismiss` RULE on a request. A worker clearing its own gate is the
+    one thing this subsystem exists to prevent, so the exemption stops short of them.
+
+    Asserted at the CLASSIFIER, not just at the predicate: the one specimen the carve-out
+    DOES clear must still trip a gate under each deciding verb, so `GATE_PAPERWORK_VERBS`
+    cannot grow one with nothing failing (kn-e74988af)."""
+    from jarvis.gate_rules import GATE_PAPERWORK_VERBS, gate_paperwork
+
+    assert gates.classify(PAPERWORK, ALL_GATES) is None, "the specimen is the control"
+    for verb in ("approve", "deny", "dismiss", "rule-retract"):
+        ruling = PAPERWORK.replace("jarvis gate request", f"jarvis gate {verb}", 1)
+
+        assert verb not in GATE_PAPERWORK_VERBS
+        assert not gate_paperwork(ruling), verb
+        # Which kind is the table's business; that SOME kind fires is this test's.
+        assert gates.classify(ruling, ALL_GATES) is not None, verb
+
+
+@pytest.mark.parametrize("sep", ["; ", " && ", " || ", " | ", "\n"])
+def test_paperwork_is_all_or_nothing_across_the_chain(gated, sep):
+    """Same bypass `reads_only` guards, and the same answer: one non-paperwork segment
+    anywhere loses it — argv0 being `jarvis` buys the chain nothing.
+
+    Every separator, because each is a different path through the splitter, and at the
+    classifier rather than the predicate because that is what actually blocks."""
+    from jarvis.gate_rules import gate_paperwork
+
+    assert gate_paperwork("jarvis gate explain 1 && jarvis gate show 1")
+
+    chain = f'jarvis gate explain "x"{sep}./scripts/shipit.sh'
+    assert not gate_paperwork(chain), chain
+    action = gates.classify(chain, ALL_GATES)
+    assert action is not None and action.kind == "release", chain
+    assert _decision(gated.attempt(chain)) == "deny"
+
+
+def test_an_invoker_wrapping_the_paperwork_verb_is_refused_on_structure(gated):
+    """The concrete claim §9 makes about why the carve-out is safe WITHOUT reusing
+    `_SHELL_INVOKER`: an invoker that invokes is a segment of its own, so the argv0 test
+    refuses it — the text `jarvis gate request` appearing somewhere exempts nothing."""
+    from jarvis.gate_rules import gate_paperwork
+
+    for wrapped in (
+        "sh -c 'jarvis gate request wo-1 \"./scripts/shipit.sh\" --why \"no\"'",
+        "echo 'jarvis gate request wo-1 \"./scripts/shipit.sh\"' | xargs sh -c",
+        'bash -lc "jarvis gate request wo-1 \\"./scripts/shipit.sh\\""',
+        'jarvis gate explain "$(cat /tmp/x)"',
+        "eval jarvis gate explain 1",
+    ):
+        assert not gate_paperwork(wrapped), wrapped
+        if "$(" not in wrapped and not wrapped.startswith("eval"):
+            action = gates.classify(wrapped, ALL_GATES)
+            assert action is not None and action.kind == "release", wrapped
+
+
+def test_the_code_check_covers_the_shape_the_learned_rule_was_learned_for(gated):
+    """`gr-7a0e659b` is the live learned exemption for this shape, and it is now dead
+    weight rather than a second mechanism: the code check is consulted BEFORE the table,
+    and it is strictly wider (every kind, not the one the rule was learned under).
+
+    Pinned so that removing the code check fails here instead of silently handing the
+    job back to a regex nobody maintains. Retracting the rule itself is the user's move —
+    spec 2026-09-12 §9."""
+    from jarvis.gate_rules import gate_paperwork
+
+    learned_shape = ('jarvis gate request wo-1 "gh pr merge 210 --squash" '
+                     '--why "ship it" --evidence "x"')
+
+    assert gate_paperwork(learned_shape)
+    assert gates.classify(learned_shape, ALL_GATES) is None
+
+
+def test_the_word_eval_in_prose_does_not_make_paperwork_executable(gated):
+    """`_SHELL_INVOKER` is a substring search over the whole command, so `reads_only`'s
+    guard would hand the win back to vocabulary. The structural test does not use it —
+    an invoker that invokes is a segment of its own, and the argv0 test refuses that."""
+    from jarvis.gate_rules import _SHELL_INVOKER, gate_paperwork
+
+    assert _SHELL_INVOKER.search(PAPERWORK), "fixture no longer reproduces the trigger"
+    assert gate_paperwork(PAPERWORK)
+
+
+def test_the_contest_question_carries_the_structural_reading(gated):
+    """The reviewer's premise check is about the command's shape, and the shape is the
+    one input to the review the worker did not write."""
+    command = "./scripts/shipit.sh"
+    action = gates.classify(command, ALL_GATES)
+    text = gates.build_contest_question(action, gated.wo, "I say this is only a mention")
+
+    assert text.startswith(gates.CONTEST_HEADER)
+    assert "in executable position" in text
+    assert "TWO verdicts" in text
+
+
+def test_the_ttls_old_denials_are_re_filed_as_abandonments(gated):
+    """The rows already on the record. Every one was written by the OS with nobody
+    having reviewed anything, and `denied` on a gate asserts that a reviewer refused a
+    privileged action — spec 2026-09-12 §4."""
+    from jarvis.project_store import ProjectStore
+
+    gated.attempt("./scripts/shipit.sh")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+    # Exactly what the old sweep wrote, reproduced rather than imported: the string is
+    # history now, and a test that read it from the code could not detect its loss.
+    gated.store.conn.execute(
+        """UPDATE approvals SET status='denied', decided_by='os', decision_reason=?,
+                                closed_as='' WHERE id=?""",
+        ("no case was made for it within 10 minutes. The command was run directly, so "
+         "nothing was ever put to a reviewer.", approval["id"]),
+    )
+    # A real denial by a reviewer, which must survive untouched.
+    gated.attempt("gh pr merge 31 --squash")
+    refused = [a for a in gated.store.list_approvals(gated.wo["id"])
+               if a["id"] != approval["id"]][0]
+    gates.apply_decision(gated.store, refused["id"], verdict="denied",
+                         reason="out of scope", decided_by="neo")
+    gated.store.close()
+
+    store = ProjectStore(gated.project)        # re-open: the migration runs on __init__
+    try:
+        assert store.get_approval(approval["id"])["status"] == "expired"
+        assert store.get_approval(approval["id"])["closed_as"] == "abandoned"
+        assert store.abandoned_count() == 1
+        assert store.get_approval(refused["id"])["status"] == "denied"
+    finally:
+        store.close()

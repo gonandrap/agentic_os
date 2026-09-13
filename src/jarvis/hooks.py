@@ -381,10 +381,14 @@ def _classify(command: str, config: Any) -> Any:
 
 
 def _case_deadline(config: Any) -> str:
-    """The sentence that turns the hold into a deadline the worker can see."""
-    return (f"If no case is made within "
-            f"{int(config.case_ttl_seconds // 60)} minutes the request is refused "
-            f"automatically, unreviewed.")
+    """The sentence that turns the hold into a deadline the worker can see.
+
+    ABANDONED, not refused — spec 2026-09-12 §4.
+    """
+    return (f"If you do neither within "
+            f"{int(config.case_ttl_seconds // 60)} minutes the request is closed as "
+            f"ABANDONED — nobody will have reviewed it, nothing will be decided, and the "
+            f"command stays blocked.")
 
 
 def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
@@ -425,10 +429,9 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
             return _deny(
                 f"Gate `{action.kind}`: request {prior['id']} for this exact command is "
                 f"recorded but NOT under review, and retrying the command will not start "
-                f"one. It is waiting for your case, and only this starts the review:\n"
-                f"    jarvis gate request {wo_id} \"{action.command}\" "
-                f"--why \"<why this is ready>\" --evidence \"<PR, tests, checks>\"\n\n"
-                f"{_case_deadline(config)} Then END YOUR TURN."
+                f"one. It is waiting for you — for a case, or for a contest.\n\n"
+                f"{gates.exits_advice(wo_id, action.command, action.kind, prior['id'])}"
+                f"\n\n{_case_deadline(config)} Then END YOUR TURN."
             )
         if prior is not None and prior["status"] == "pending":
             return _deny(
@@ -464,17 +467,23 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
             )
         finally:
             neo.close()
+        # Both exits, every time, with the diagnosis first — spec 2026-09-12 §3.
+        prior_abandoned = (prior is not None and prior["status"] == "expired"
+                           and prior["closed_as"] == "abandoned")
         return _deny(
             f"Gate `{action.kind}`: {action.summary} needs approval, so this attempt was "
             f"blocked and request {approval['id']} was recorded.\n\n"
-            f"NOBODY IS REVIEWING IT YET. You ran the command rather than asking, so the "
-            f"request carries no case, and no reviewer is shown one. Make it — reviewers "
-            f"see only what you write (branch, PR, test results):\n"
-            f"    jarvis gate request {wo_id} \"{action.command}\" "
-            f"--why \"<why this is ready to ship>\" --evidence \"<PR, tests, checks>\"\n\n"
-            f"That command starts the review. {_case_deadline(config)}\n\n"
+            f"NOBODY IS REVIEWING IT YET, and retrying the command will not change that. "
+            f"You ran it rather than asking, so the request carries no case and no "
+            f"reviewer is shown one.\n\n"
+            + ("A previous request for this exact command was ABANDONED — it timed out "
+               "with no case and no contest. Do not do that again: take one of the two "
+               "exits below.\n\n" if prior_abandoned else "")
+            + f"{gates.exits_advice(wo_id, action.command, action.kind, approval['id'])}"
+            f"\n\n"
+            f"Either one starts the review. {_case_deadline(config)}\n\n"
             f"Then END YOUR TURN — the verdict arrives as your next user turn, and the "
-            f"retry will go through if it is approved."
+            f"retry will go through if it is approved or dismissed."
         )
     finally:
         store.close()
@@ -754,11 +763,17 @@ def _is_current_session(store: ProjectStore, wo_id: str, session_id: str) -> boo
 
 
 def _parked_on_the_delegate(store: ProjectStore, wo_id: str) -> str:
-    """What Neo is holding for this work order — "" when nothing is.
+    """What this work order is parked on instead of the user — "" when nothing is.
 
-    Only ever consulted for a `waiting_input` work order, which is the state both waits
-    put it in (`ops.ask_question`, `gates.request`). A `running` worker's Notification is
-    a real mid-work block until proven otherwise, and swallowing that would strand it.
+    Only ever consulted for a `waiting_input` work order, which is the state every wait
+    puts it in: `ops.ask_question`, and `gates.file_request` down both its roads — the
+    argued request `jarvis gate request` files, and the held one this hook files itself
+    when a worker runs the command first. A `running` worker's Notification is a real
+    mid-work block until proven otherwise, and swallowing that would strand it.
+
+    The returned reason is recorded verbatim on the `notification_ignored` event, so it
+    must name WHICH wait: "parked" and "parked on something a reviewer is holding" are
+    different facts to whoever reads that timeline afterwards.
     """
     if store.get_work_order(wo_id)["status"] != "waiting_input":
         return ""
@@ -769,6 +784,11 @@ def _parked_on_the_delegate(store: ProjectStore, wo_id: str) -> str:
         return f"neo question {question['id']} ({question['status']})"
     if store.pending_approvals(wo_id):
         return "a privileged-action gate awaiting a verdict"
+    if store.held_approvals(wo_id):
+        # A fourth reader of the held state, beyond the three kn-30036661 lists as the
+        # complete set. Held is with the WORKER, not the user: nobody is reviewing it,
+        # and the OS refuses it on a timer if nobody ever argues it.
+        return "a privileged-action gate awaiting the worker's case"
     return ""
 
 
