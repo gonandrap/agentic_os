@@ -26,7 +26,8 @@ import pytest
 from jarvis import claude_cli, ops
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
-from jarvis.daemon import Daemon
+from jarvis.daemon import (VALIDATION_ESCALATED_TITLE, VALIDATION_REASON_CHARS,
+                          VALIDATION_REASON_CUT, Daemon)
 from jarvis.invariants import VALIDATION_STUCK_BLOCKER, true_blockers
 from jarvis.project_store import VALIDATOR_SEATS, ProjectStore
 from jarvis.testing import make_git_project
@@ -1133,3 +1134,147 @@ def test_rejecting_assumptions_opens_no_round(fleet):
         assert fleet.daemon.validator.calls == []
     finally:
         store.close()
+
+
+# -- the give-up reaches the user (issue #199) ----------------------------------------
+
+
+def _outbox(fleet):
+    """The project outbox rows the next tick will route. `unrouted_notifications` is
+    the honest read: `route_outbox` marks them `routed`, so anything still here has not
+    reached the central inbox yet."""
+    store = fleet.store()
+    try:
+        return store.unrouted_notifications()
+    finally:
+        store.close()
+
+
+def test_a_give_up_notifies_and_a_rejection_stays_silent(fleet):
+    """PAIRED, because "a notification exists" says nothing about which transition wrote
+    it. The rejection half is the contract `_reject` keeps: its feedback travels to the
+    worker over the bus, and a ping per round would train the user to ignore the sink
+    that has to carry the give-up."""
+    fleet.reconfigure(max_rounds=2)
+    fleet.daemon.validator = Validator(rejected("no test covers the change"))
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.drain()
+
+    assert _outbox(fleet) == [], "round 1 was rejected, not given up on"
+    fleet.tick()  # the round-1 rejection reaches the worker
+
+    fleet.change(wo["id"], "print('one')\nprint('two')\n")
+    finish(fleet, wo["id"], summary="another go")
+    fleet.drain()
+
+    rows = _outbox(fleet)
+    assert len(rows) == 1
+    assert rows[0]["title"] == VALIDATION_ESCALATED_TITLE.format(unit=wo["id"], n=2)
+    assert rows[0]["body"] == "no test covers the change", (
+        "the body is the round's own reason — the only text that says why")
+    assert (rows[0]["level"], rows[0]["source"], rows[0]["wo_id"]) == (
+        "warning", "validation", wo["id"])
+
+
+def test_the_give_up_notification_reaches_the_central_inbox(fleet):
+    """The outbox row is only half the path: `route_outbox` -> central inbox -> sinks is
+    what puts a give-up in front of a user who is not looking at `jarvis status`."""
+    fleet.reconfigure(max_rounds=1)
+    fleet.daemon.validator = Validator(rejected("the change is untested"))
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.drain()
+    fleet.tick()  # routes the outbox
+
+    assert _outbox(fleet) == [], "the row was routed, not left behind"
+    central = CentralStore()
+    try:
+        rows = [i for i in central.unacked_inbox() if i["wo_id"] == wo["id"]]
+    finally:
+        central.close()
+    assert len(rows) == 1
+    assert rows[0]["title"] == VALIDATION_ESCALATED_TITLE.format(unit=wo["id"], n=1)
+    assert rows[0]["body"] == "the change is untested"
+    assert (rows[0]["level"], rows[0]["project"]) == ("warning", "proj_a")
+
+
+def test_the_escalations_that_never_call_the_validator_notify_too(fleet):
+    """An empty diff gives up without a verdict to quote, so the notification carries
+    the machine's own sentence. Nothing else would tell the user the round closed."""
+    fleet.daemon.validator = Validator(passed())
+    wo = fleet.dispatch("empty")
+    fleet.worktree(wo["id"])  # a worktree, and not one byte changed in it
+    finish(fleet, wo["id"])
+    fleet.drain()
+
+    rows = _outbox(fleet)
+    assert len(rows) == 1
+    assert rows[0]["title"] == VALIDATION_ESCALATED_TITLE.format(unit=wo["id"], n=1)
+    assert "changes no files" in rows[0]["body"]
+
+
+def test_three_outages_ping_the_user_once_not_once_per_attempt(fleet):
+    """The outage path writes a `validation_failed` event per attempt and escalates on
+    the third. One give-up is one notification: a row per attempt would report a bad
+    network three times and the decision the user owes not at all."""
+    fleet.daemon.validator = Validator(claude_cli.ClaudeCliError("connection reset"))
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+
+    for _ in range(2):
+        fleet.drain()
+        assert _outbox(fleet) == [], "an outage is not a verdict and asks nothing"
+    fleet.drain()
+
+    rows = _outbox(fleet)
+    assert len(rows) == 1
+    assert "unreachable 3 times" in rows[0]["body"]
+
+
+def test_a_long_reason_is_cut_and_says_that_it_was(fleet):
+    """A panel reason runs to paragraphs and a sink renders it as one push. What the
+    user must not get is a sentence that simply stops: the cut has to be visible, or a
+    clipped reason reads as the machine having nothing more to say."""
+    long_reason = "the seats disagree about the header row. " * 40
+    assert len(long_reason) > VALIDATION_REASON_CHARS, "the fixture must exceed the cut"
+    fleet.reconfigure(max_rounds=1)
+    fleet.daemon.validator = Validator(rejected(long_reason))
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.drain()
+
+    rows = _outbox(fleet)
+    assert len(rows) == 1
+    assert rows[0]["body"] == (long_reason[:VALIDATION_REASON_CHARS]
+                              + VALIDATION_REASON_CUT)
+    assert rows[0]["body"].endswith(VALIDATION_REASON_CUT), "the cut is visible"
+
+    store = fleet.store()
+    try:
+        # The cut is the NOTIFICATION's, not the record's: the round keeps the whole
+        # reason, which is what `jarvis wo show` and `jarvis validation show` read.
+        assert store.latest_validation_round(wo_id=wo["id"])["reason"] == long_reason
+    finally:
+        store.close()
+
+
+def test_a_reason_that_fits_is_not_marked_as_cut(fleet):
+    """The pairing for the test above: without it, a marker appended unconditionally
+    would pass every assertion there and put "[…]" on every short reason the user reads.
+    """
+    fleet.reconfigure(max_rounds=1)
+    fleet.daemon.validator = Validator(rejected("no test covers the change"))
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.drain()
+
+    rows = _outbox(fleet)
+    assert len(rows) == 1
+    assert rows[0]["body"] == "no test covers the change"
+    assert VALIDATION_REASON_CUT not in rows[0]["body"]

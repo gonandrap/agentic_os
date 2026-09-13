@@ -159,6 +159,30 @@ NO_VALIDATOR_REASON = (
     "settled exactly where it settles with validation switched off"
 )
 
+#: The give-up notification, for both round machines (issue #199). ONE shape for both,
+#: because a unit that gives up says the same thing to the user whichever machine gave
+#: up on it. The body is the round's reason, CUT to `VALIDATION_REASON_CHARS`.
+VALIDATION_ESCALATED_TITLE = "{unit} — the review gave up in round {n}"
+
+#: How much of the reason the body carries. A DISPLAY choice and not a schema limit —
+#: `notifications.body` is TEXT and would take the whole of it — so raising it is safe
+#: and is a decision about what a Telegram push should be, not about the store. A panel
+#: reason runs to paragraphs; this row exists to say enough to decide whether to look,
+#: and `jarvis wo show` / `jarvis validation show` hold the untruncated text.
+VALIDATION_REASON_CHARS = 500
+
+#: Appended when the cut above actually bit, so a reader can tell a short reason from a
+#: clipped one. Without it a sentence simply stops and the truncation reads as the
+#: machine having nothing more to say.
+VALIDATION_REASON_CUT = " […]"
+
+
+def escalation_body(reason: str) -> str:
+    """The reason as a notification body — see `VALIDATION_REASON_CHARS`."""
+    if len(reason) <= VALIDATION_REASON_CHARS:
+        return reason
+    return reason[:VALIDATION_REASON_CHARS] + VALIDATION_REASON_CUT
+
 
 class Daemon:
     def __init__(self, catalog: Catalog, poll_interval: float = 5.0):
@@ -1291,6 +1315,20 @@ class Daemon:
         INV-ATTENTION-REASON rewrites any reason `invariants.true_blockers` cannot
         re-derive — a better sentence here would simply be overwritten on the next
         reconcile tick, and the user would read the generic one.
+
+        THE NOTIFICATION IS THE HALF THE FLAG CANNOT DO (issue #199). An attention flag
+        is read by somebody already looking at `jarvis status`; the outbox is what
+        reaches the central inbox and every sink, which is how every other "this needs
+        you" transition tells the user without being asked. `_reject` deliberately stays
+        silent — its feedback travels to the worker over the bus — so the give-up is the
+        only transition in this machine that pings.
+
+        NO NEO PRE-STEP, and it is not an oversight (Neo, question 254). By the time a
+        give-up could be reviewed the round is closed and the unit is `needs_review`, and
+        `invariants.true_blockers` re-derives VALIDATION_STUCK_BLOCKER from exactly that
+        pair on every reconcile tick — so a verdict of "do not bother the user" cannot
+        take the attention item down, and the call would buy one suppressed sink message
+        and nothing else. It becomes worth asking only if Neo may also SETTLE the unit.
         """
         from .invariants import VALIDATION_STUCK_BLOCKER
 
@@ -1300,6 +1338,11 @@ class Daemon:
                         {"round": n, "round_id": round_id, "reason": reason})
         store.set_status(wo_id, "needs_review")
         store.flag_attention(wo_id, VALIDATION_STUCK_BLOCKER)
+        store.add_notification(
+            title=VALIDATION_ESCALATED_TITLE.format(unit=wo_id, n=n),
+            body=escalation_body(reason), level="warning", wo_id=wo_id,
+            source="validation",
+        )
 
     def _validation_outage(self, store: ProjectStore, wo: dict, round_id: int, n: int,
                            error: Exception) -> None:
@@ -1598,6 +1641,12 @@ class Daemon:
         `true_blockers` never sees a feature order — it answers "what does this WORK
         ORDER need from me" — so nothing rewrites this reason, but two units giving up
         for the same cause must say the same words to the user.
+
+        The notification carries NO `wo_id`, for the same reason the flag goes on the
+        feature: the id this give-up is about is the feature order, the outbox and the
+        central inbox only carry a work-order column, and naming the manager there would
+        point every sink at a session rather than at the rounds. So the feature id goes
+        in the title, where the user reads it (issue #199).
         """
         from . import ops
         from .invariants import VALIDATION_STUCK_BLOCKER
@@ -1608,6 +1657,10 @@ class Daemon:
                           {"round": n, "round_id": round_id, "reason": reason,
                            "feature_order": fo_id})
         store.flag_feature_attention(fo_id, VALIDATION_STUCK_BLOCKER)
+        store.add_notification(
+            title=VALIDATION_ESCALATED_TITLE.format(unit=fo_id, n=n),
+            body=escalation_body(reason), level="warning", source="validation",
+        )
 
     def _feature_outage(self, store: ProjectStore, fo: dict, round_id: int, n: int,
                         error: Exception) -> None:
@@ -2414,8 +2467,14 @@ class Daemon:
         for subject in subjects:
             row = subject["row"]
             last = pstore.last_health_review(subject["kind"], row["id"])
+            # TWO READS, and they disagree precisely when the sweep is failing: `last`
+            # is the last JUDGEMENT and skips a `failed` row, `attempt` is the last CALL
+            # and counts it. `due` compares the fingerprint against the first and floors
+            # the spend on the second — see issue #216.
+            attempt = pstore.last_health_attempt_ts(subject["kind"], row["id"])
             trigger = health.due(last, health.fingerprint(pstore, subject), cfg, now,
-                                 float(row.get("created_at") or 0.0))
+                                 float(row.get("created_at") or 0.0),
+                                 last_attempt=attempt)
             if trigger:
                 out.append((float(last["ts"]) if last else 0.0, subject, trigger))
         out.sort(key=lambda c: c[0])

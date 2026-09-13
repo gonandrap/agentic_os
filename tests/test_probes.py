@@ -449,3 +449,60 @@ def test_configured_probes_raise_nothing_and_call_no_model(
         assert store.alarms_across(limit=50) == []
     finally:
         store.close()
+
+
+# -- the sweep's own output contract (issue #216) ---------------------------------------
+
+
+def test_the_checklist_states_the_sweeps_output_contract():
+    """THE DEFECT THIS FILE EXISTED THROUGH. The sweep's whole prompt was the persona,
+    the learnings and this checklist, and NONE of the three named `findings` — so the
+    only output contract the model ever saw was `SUPERVISOR_PERSONA`'s `{"decision":
+    ...}`, which `supervisor._validate_findings` rejects for the one key it was never
+    asked for. In production every sweep obeyed the contract it was given and was
+    recorded `failed`: 2215 of 2215, $101.78, zero findings.
+
+    The contract lives HERE rather than in the persona because the persona is shared
+    with the cost review, whose prefix must not move, and because `render_checklist`
+    renders nothing at all when no probe is armed — so a project that arms none still
+    pays nothing.
+    """
+    out = probes.render_checklist([P1, P2])
+
+    assert "findings" in out
+    for key in ("probe", "reason", "evidence"):
+        assert f'"{key}"' in out, f"the sweep's reply shape must name {key}"
+
+
+def test_the_sweeps_contract_comes_AFTER_the_personas(jarvis_home):
+    """ORDER IS THE WHOLE FIX, not the presence of the words.
+
+    `SUPERVISOR_PERSONA` says "Output STRICT JSON, nothing else" and then gives the cost
+    review's three shapes. A findings contract placed above that is simply overruled by
+    the more emphatic instruction below it. `build_system_prompt` appends the checklist
+    last, so this holds by construction — and this test is what stops someone
+    interleaving it later for tidiness.
+    """
+    from jarvis.neo_store import NeoStore
+
+    store = NeoStore()
+    try:
+        prompt = supervisor.build_system_prompt(store, "proj_a", probes=[P1, P2])
+    finally:
+        store.close()
+
+    assert prompt.index('"findings"') > prompt.index('"decision"')
+
+
+def test_the_contract_does_not_reach_a_project_that_arms_no_probe(jarvis_home):
+    """The cost review shares this prompt and its prefix is load-bearing. Empty in,
+    empty out — the same rule `PROMPT_WITHOUT_PROBES` pins, restated for the contract."""
+    assert probes.render_checklist([]) == ""
+
+    from jarvis.neo_store import NeoStore
+
+    store = NeoStore()
+    try:
+        assert "findings" not in supervisor.build_system_prompt(store, "proj_a")
+    finally:
+        store.close()
