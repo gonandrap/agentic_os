@@ -337,15 +337,21 @@ def scannable(command: str) -> str:
     payload that merely spelled one of those words turned blanking off for the whole
     command and gated itself (issue #203).
 
-    …WITH ONE KNOWN MISS, so read the paragraph above as conditional rather than a
+    Substitution is the exception, and it is tested BEFORE blanking rather than after:
+    `$(…)`, backticks and `<(…)` run inside double quotes, so a span containing one is
+    code however it is quoted. Prose that quotes a literal `$(` therefore gates — the
+    loud failure, chosen over the silent one, and the same call `reads_only` makes.
+
+    …AND WITH ONE KNOWN MISS, so read the paragraph above as conditional rather than a
     guarantee: a quoted span this blanks may still be EXECUTED, by something `_QUOTED`
-    has no vocabulary for. `ssh host "…"`, `docker exec c "…"` and `"$(…)"` all run
-    their payload, and none of them is a shell invoker by this module's definition, so
-    both the literal and any invoker naming it vanish in the same pass. The hole is
-    older than the positional test — `ssh host "scripts/shipit.sh"` never gated — but
-    the raw search used to catch the subset whose payload happened to spell one of the
-    three keywords, and this makes the miss uniform. Issue #213; the fix is a notion of
-    "wrapper that executes its quoted argument", not a retreat to the raw search.
+    has no vocabulary for. `ssh host "…"` and `docker exec c "…"` run their payload, and
+    neither is a shell invoker by this module's definition, so both the literal and any
+    invoker naming it vanish in the same pass. The hole is older than the positional
+    test — `ssh host "scripts/shipit.sh"` never gated — but the raw search used to catch
+    the subset whose payload happened to spell one of the three keywords, and this makes
+    the miss uniform. Issue #213, and it needs the one thing substitution did not: a
+    notion of "wrapper that executes its quoted argument". Not a retreat to the raw
+    search, which is issue #203.
 
     Heredoc bodies are deliberately NOT blanked here, and that is not the oversight it
     looks like. `cat <<EOF | bash` executes its body, so blanking it outright would open
@@ -353,6 +359,8 @@ def scannable(command: str) -> str:
     exemption but a *learnable* one — see `Shape`, which records that a match landed in a
     body and lets a reviewed dismissal clear that shape for the chains that cannot run it.
     """
+    if _SUBSTITUTION.search(command):
+        return command
     # Replace rather than delete, so neighbouring tokens can't fuse into a false match.
     blanked = _QUOTED.sub(" ", command)
     return command if _SHELL_INVOKER.search(blanked) else blanked
@@ -411,11 +419,12 @@ def reads_only(command: str) -> bool:
     is not the `cat` on PATH but something in the tree that merely shares its name, and
     an empty segment means the split found something this parser does not model.
     """
-    # The asymmetry below is deliberate, not a half-finished edit: `_SUBSTITUTION` stays
-    # on the RAW command because `$(…)` runs inside double quotes, so blanking first
-    # would hide the very thing it looks for. An invoker does not — quote it and the
-    # shell passes it along as an argument — so that test moved to the blanked text,
-    # where a reader's quoted argument reads as the thing being read (issue #203).
+    # The asymmetry below is deliberate, not a half-finished edit, and `scannable` now
+    # makes the same call: `_SUBSTITUTION` stays on the RAW command because `$(…)` runs
+    # inside double quotes, so blanking first would hide the very thing it looks for. An
+    # invoker does not — quote it and the shell passes it along as an argument — so that
+    # test moved to the blanked text, where a reader's quoted argument reads as the thing
+    # being read (issue #203).
     if _SUBSTITUTION.search(command):
         return False
     blanked = _QUOTED.sub(" ", command)

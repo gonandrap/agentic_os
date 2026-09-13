@@ -355,19 +355,42 @@ def test_a_wrapper_whose_payload_names_no_invoker_was_never_gated(command):
 
 
 @pytest.mark.parametrize("command", [
+    'echo "$(scripts/shipit.sh)"',
+    'echo "$(eval scripts/shipit.sh)"',
+    'git commit -m "`scripts/shipit.sh`"',
+    'diff <(scripts/shipit.sh) old.txt',
+])
+def test_a_substitution_gates_however_it_is_quoted(command):
+    """`$(…)`, backticks and `<(…)` RUN inside double quotes, so blanking the span they
+    sit in would hide code. `scannable` therefore tests `_SUBSTITUTION` before blanking,
+    the same way `reads_only` always has — the second of these regressed in review
+    round 1, when only `reads_only` made that call.
+
+    The cost is that prose quoting a literal `$(` gates. That is the loud failure and it
+    is the one to prefer: it costs a review, where the silent one ships.
+    """
+    assert classify(command, gate_rules.RuleSet.from_seeds()) is not None
+
+
+@pytest.mark.parametrize("command", [
     'ssh prod "sh -c \'scripts/shipit.sh\'"',
     'ssh prod "eval scripts/shipit.sh"',
     'docker exec c "bash -c \'scripts/shipit.sh\'"',
-    'echo "$(eval scripts/shipit.sh)"',
 ])
 def test_a_wrapper_that_executes_its_quoted_payload_is_a_known_miss(command):
     """Issue #213, asserted as the miss it is rather than left unexamined.
 
-    `ssh`, `docker exec` and `"$(…)"` all run their quoted payload, and none is a shell
-    invoker by this module's definition — so blanking deletes the gated literal and the
-    invoker naming it together. The hole predates the positional test (the same wrappers
-    with a plain payload, below, never gated either); what changed is that the raw search
-    used to catch the subset whose payload happened to spell one of the three keywords.
+    `ssh` and `docker exec` run their quoted payload, and neither is a shell invoker by
+    this module's definition — so blanking deletes the gated literal and the invoker
+    naming it together. Unlike substitution, which needed no new vocabulary and is fixed
+    above, this needs a notion of "wrapper that executes its quoted argument".
+
+    The hole predates the positional test: the same wrappers with a plain payload, below,
+    never gated either. What changed is that the raw search used to catch the subset
+    whose payload happened to spell one of the three keywords.
+
+    **When #213 lands these assertions INVERT — they do not get deleted.** Each of these
+    commands must then gate, and this test is the list of what the fix has to catch.
     """
     assert classify(command, gate_rules.RuleSet.from_seeds()) is None
 
@@ -376,12 +399,15 @@ def test_a_wrapper_that_executes_its_quoted_payload_is_a_known_miss(command):
     'ssh prod "scripts/shipit.sh"',
     'ssh prod "gh pr merge 31"',
     'docker exec c "scripts/shipit.sh"',
-    'echo "$(scripts/shipit.sh)"',
 ])
 def test_the_wrapper_miss_is_older_than_the_positional_test(command):
     """The control for the case above, and the reason it is a pre-existing hole rather
     than one this fix opened: with no keyword in the payload there was nothing for the
-    raw search to catch, and these did not gate before the change either."""
+    raw search to catch, and these did not gate before the change either.
+
+    **Inverted by #213 too, not deleted** — a remote shell handed the release script is
+    the plainest case the fix must catch, and it is the one that never gated at all.
+    """
     assert classify(command, gate_rules.RuleSet.from_seeds()) is None
 
 
