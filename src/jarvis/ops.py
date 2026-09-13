@@ -1609,6 +1609,25 @@ def declared_evidence(store: ProjectStore, wo_id: str) -> str:
     return ""
 
 
+def gate_still_open(wo_id: str, request: dict[str, Any]) -> str:
+    """Why this work order cannot settle yet, and the one way on from where it is."""
+    from .gates import AWAITING_CASE, exits_advice
+
+    if request["status"] == AWAITING_CASE:
+        # Both exits, from the renderer every other block uses — a refusal that named
+        # only the request would push a worker whose command performs no privileged
+        # action into writing a false case (spec 2026-09-12-contesting-a-gate-match §3).
+        way_on = ("Nobody is reviewing it: it carries neither a case nor a contest.\n\n"
+                  + exits_advice(wo_id, request["command"], request["kind"],
+                                 request["id"]))
+    else:
+        way_on = ("It is under review. End your turn — the verdict arrives as your "
+                  "next user turn, and you finish from there.")
+    return (f"{wo_id} has gate request {request['id']} ({request['kind']}) still open, "
+            f"so it cannot be finished: settling it now would close the work order over "
+            f"a privileged action nobody ruled on. {way_on}")
+
+
 def finish(wo_id: str, summary: str, pr_url: str | None = None,
            evidence: str = "") -> dict[str, Any]:
     """The worker reporting its own result.
@@ -1630,6 +1649,11 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
     OPTIONAL: every worker in flight when this shipped predates the flag, so an empty
     one is an ordinary submission and not a thin one.
 
+    An open gate request outranks all of it, and this is the third enforcement point of
+    docs/superpowers/specs/2026-09-12-a-gate-that-holds.md: declaring yourself done is
+    the one route around a gate that neither the Stop hold nor the narrowed tool surface
+    can close, because the command that takes it is a `jarvis …` contract command.
+
     **`os.validation.enabled` is read at the SUBMISSION SITES ONLY** — here and in
     `review_work_order`, the other route into done — and it gates OPENING a round and
     nothing else. A flag turned off while rounds are open must still let the daemon
@@ -1641,6 +1665,17 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
     cfg = validation_config(name)
     store = ProjectStore(path)
     try:
+        open_requests = store.open_approvals(wo_id)
+        if open_requests:
+            # WHICH request the message describes is a choice, not a consequence of how
+            # `open_approvals` happens to order its two halves: the way on differs by
+            # status, and a held one is the only one the worker can act on this turn, so
+            # it leads whenever both are open.
+            from .gates import AWAITING_CASE
+
+            raise OpsError(gate_still_open(wo_id, next(
+                (a for a in open_requests if a["status"] == AWAITING_CASE),
+                open_requests[0])))
         fields: dict[str, Any] = {"result_summary": summary}
         if pr_url:
             fields["pr_url"] = pr_url

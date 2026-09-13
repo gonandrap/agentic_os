@@ -489,6 +489,111 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
         store.close()
 
 
+def under_review_decision(payload: dict[str, Any],
+                          env: dict[str, str]) -> dict[str, Any] | None:
+    """Narrow the session to reading and `jarvis …` while a request is under review.
+
+    §2 of docs/superpowers/specs/2026-09-12-a-gate-that-holds.md: matching the exact
+    command string again is not a control, because the goal has other routes to it.
+
+    Only `pending`, never `awaiting_case` — a held request is one the worker still has
+    to argue, and the evidence a case is made of comes from running things.
+
+    Fails OPEN, unlike `gate_decision`. An unreadable database here would block every
+    tool call in every worker session; the privileged command itself stays blocked
+    regardless, because the gate that judges it fails closed.
+
+    It opens the store on every Bash call and every file write, and unlike
+    `_post_tool_compaction` there is no flag file to keep it to one `stat`: a request
+    goes pending in another process (Neo's drain, the user's `jarvis gate request`), so
+    anything cached in the worktree would be a stale copy of the fact that matters. The
+    cost is in line with the path it sits on — `gate_decision` above it already opens
+    `os.db` for the rule base on every Bash call.
+    """
+    ctx = _worker_context(env, Path(payload.get("cwd") or "."))
+    if ctx is None:
+        return None
+    root, wo_id = ctx
+    try:
+        store = ProjectStore(root)
+        try:
+            pending = store.pending_approvals(wo_id)
+        finally:
+            store.close()
+    except Exception:  # noqa: BLE001 — see the docstring
+        return None
+    if not pending:
+        return None
+
+    if payload.get("tool_name") == "Bash":
+        from .gate_rules import reads_only
+
+        command = (payload.get("tool_input") or {}).get("command", "")
+        if is_jarvis_command_chain(command) or reads_only(command):
+            return None
+    request = pending[0]
+    return _deny(
+        f"Gate `{request['kind']}`: approval request {request['id']} is under review, "
+        f"so this session may only read and run `jarvis …` commands until the verdict "
+        f"lands. END YOUR TURN — the verdict arrives as your next user turn, and this "
+        f"call goes through then. Retrying, or reaching the same outcome another way, "
+        f"is the thing the gate exists to stop."
+    )
+
+
+def held_request_turn_block(store: ProjectStore, wo_id: str, payload: dict[str, Any],
+                            env: dict[str, str]) -> dict[str, Any] | None:
+    """Stop: refuse to end a turn that would leave a gate request unargued.
+
+    §1 of the spec above. `awaiting_case` and NOT `pending`, and the asymmetry is the
+    whole design: a held request is cleared by one command in this turn, so the block
+    terminates, while a pending one is cleared only by a queued verdict that
+    `Daemon.deliver_messages` will not deliver into a turn still in flight.
+
+    One continuation, not a loop: `stop_hook_active` says Claude is already going again
+    because of this hook, and a worker that ignored the reason twice is better parked
+    than spun.
+    """
+    from . import gates
+    from .invariants import TERMINAL_STATUSES
+
+    if payload.get("stop_hook_active"):
+        return None
+    held = store.held_approvals(wo_id)
+    # The SAME set the sweeper reads (`check_no_orphan_gate_requests`), not a second
+    # spelling of it — kn-d4d5a967. A status that settles a work order there and not
+    # here would leave a dead one held at every turn boundary by a request already
+    # superseded.
+    if not held or store.get_work_order(wo_id)["status"] in TERMINAL_STATUSES:
+        return None
+
+    request = held[0]
+    config = gates.GateConfig.from_json(env.get("JARVIS_GATES"))
+    store.add_event(wo_id, "gate_turn_held", {
+        "session_id": payload.get("session_id", ""),
+        "approval_id": request["id"],
+    })
+    return {
+        "decision": "block",
+        "reason": (
+            f"You may not end this turn: gate request {request['id']} "
+            f"({request['kind']}) is recorded but NOT under review, and ending here "
+            f"leaves it that way — no reviewer is shown it and nothing else can close "
+            f"it. Take one of the two exits now, in this turn.\n\n"
+            # BOTH exits, from the same renderer as every other block (spec
+            # 2026-09-12-contesting-a-gate-match.md §3). A hold that named only the
+            # request would push a worker whose command performs no privileged action
+            # into writing a false case — which is the failure that spec exists to stop,
+            # and holding the turn would make it harder to walk away from.
+            f"{gates.exits_advice(wo_id, request['command'], request['kind'], request['id'])}"
+            # `from_json` always returns a config, falling back to the default TTL, so
+            # this reads the same clock `Daemon.refuse_unargued_gates` runs on.
+            f"\n\n{_case_deadline(config)} "
+            f"Then end the turn — the verdict arrives as your next user turn."
+        ),
+    }
+
+
 def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
     """PreToolUse auto-approvals that keep autonomous workers unattended:
 
@@ -503,6 +608,10 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
     a merge or a release by accident. The PR title and body rules are checked next, for
     the same reason in reverse: they must not be reachable around by an auto-approval
     below them.
+
+    `under_review_decision` sits between the two, and the position is deliberate on both
+    sides: after `gate_decision`, so a command a live grant covers still runs; before
+    everything else, so the narrowing is not reachable around either.
     """
     tool = payload.get("tool_name")
     tool_input = payload.get("tool_input") or {}
@@ -511,6 +620,9 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         gated = gate_decision(payload, env)
         if gated is not None:
             return gated
+        narrowed = under_review_decision(payload, env)
+        if narrowed is not None:
+            return narrowed
         mistitled = pr_title_decision(payload, env)
         if mistitled is not None:
             return mistitled
@@ -522,6 +634,9 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         return None
 
     if tool in ("Edit", "Write", "NotebookEdit") and env.get("JARVIS_WO_ID"):
+        narrowed = under_review_decision(payload, env)
+        if narrowed is not None:
+            return narrowed
         cwd = payload.get("cwd") or ""
         file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
         if cwd and "/.claude/worktrees/" in cwd:
@@ -687,11 +802,11 @@ def resume_after_compaction(env: dict[str, str], root: Path, store: ProjectStore
     }
 
 
-def _compaction_context(env: dict[str, str], cwd: Path) -> tuple[Path, str] | None:
+def _worker_context(env: dict[str, str], cwd: Path) -> tuple[Path, str] | None:
     """(project root, wo id) for a dispatched worker, or None for anything else."""
     wo_id = env.get("JARVIS_WO_ID")
     if not wo_id:
-        return None  # interactive session — Jarvis does not manage its context
+        return None  # interactive session — Jarvis governs dispatched workers only
     root_env = env.get("JARVIS_PROJECT_PATH")
     root = Path(root_env) if root_env else find_project_root(cwd)
     if root is None or not (root / ".jarvis").is_dir():
@@ -701,7 +816,7 @@ def _compaction_context(env: dict[str, str], cwd: Path) -> tuple[Path, str] | No
 
 def _pre_compact(payload: dict[str, Any], env: dict[str, str],
                  cwd: Path) -> dict[str, Any] | None:
-    ctx = _compaction_context(env, cwd)
+    ctx = _worker_context(env, cwd)
     if ctx is None:
         return None
     root, wo_id = ctx
@@ -719,7 +834,7 @@ def _pre_compact(payload: dict[str, Any], env: dict[str, str],
 def _post_tool_compaction(env: dict[str, str], cwd: Path) -> dict[str, Any] | None:
     """Hot path: this runs after EVERY tool call, so it costs one `stat` until a
     compaction has actually armed it. The database is not opened otherwise."""
-    ctx = _compaction_context(env, cwd)
+    ctx = _worker_context(env, cwd)
     if ctx is None:
         return None
     root, wo_id = ctx
@@ -907,8 +1022,12 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
 
         elif event == "Stop":
             # End of a turn. Recorded above (with the final assistant message); what it
-            # means for the work order is settled from the turn row, not from here.
-            pass
+            # means for the work order is settled from the turn row, not from here — with
+            # one exception, which is the only mechanism the runtime offers for holding a
+            # session at a turn boundary.
+            blocked = held_request_turn_block(store, wo_id, payload, env)
+            if blocked is not None:
+                return blocked
 
         elif event == "SessionEnd":
             # Deliberately inert. Under the headless-turn transport this fires at the
@@ -929,7 +1048,9 @@ def main_hook() -> int:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
         result = handle_hook(payload, dict(os.environ))
-        if result and "hookSpecificOutput" in result:
+        # `decision` is the Stop hook's own shape — it has no `hookSpecificOutput`, and
+        # printing nothing is what makes a block advisory.
+        if result and ("hookSpecificOutput" in result or "decision" in result):
             print(json.dumps(result))
     except Exception as e:  # noqa: BLE001 — a broken hook must not break sessions
         try:
