@@ -53,6 +53,8 @@ def gated(jarvis_home, fake_claude, gated_catalog, project):
     daemon.tick()
 
     class Handle:
+        gated_command = "./scripts/shipit.sh"
+
         def __init__(self):
             self.daemon = daemon
             self.wo_id = wo["id"]
@@ -893,6 +895,35 @@ def test_gates_tab_shows_the_request_the_reviewer_saw(gated):
     assert "PRIVILEGED ACTION REQUEST" in r.text or "cut a release" in r.text
     assert f'id="gate-{approval["id"]}"' in r.text
     assert '<span class="nav-badge">1</span>' in r.text  # escalated ⇒ the tab is badged
+
+
+def test_gates_tab_explains_a_request_held_for_the_worker_s_case(gated):
+    """`awaiting_case` used to render as a badge word under "Decided" and nothing else —
+    a status the user could neither act on nor wait out. The report was literally "it is
+    not clear what the status is and how to proceed"."""
+    from jarvis.hooks import preflight_decision
+
+    # The attempt alone is what holds it: no case, no reviewer (gates.AWAITING_CASE).
+    settings = json.loads(
+        (gated.project / ".jarvis" / "worker-settings"
+         / f"{gated.wo_id}.json").read_text())
+    preflight_decision(
+        {"tool_name": "Bash", "tool_input": {"command": gated.gated_command},
+         "cwd": str(gated.project)}, settings["env"])
+    assert gated.approval()["status"] == gates.AWAITING_CASE
+
+    page = gated.client.get("/gates").text
+
+    assert "Awaiting the worker's case" in page
+    assert "jarvis gate request" in page
+    assert "No reviewer sees it yet" in page
+    assert "gates.case_ttl_seconds" in page
+    assert "Refused automatically in" in page
+    assert f'id="gate-{gated.approval()["id"]}"' in page
+    # not filed among the verdicts, where nothing explains it and the heading is a lie
+    assert "no gate has been decided yet" in page
+    # and it asks the user for nothing
+    assert '<span class="nav-badge">' not in page
 
 
 def test_gate_pending_with_neo_costs_no_badge(gated):
