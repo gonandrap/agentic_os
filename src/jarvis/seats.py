@@ -208,6 +208,34 @@ def _run_seat(seat: str, prompt: str, system: str, model: str, timeout: int,
                    route=str(data.get("route") or "").strip().lower())
 
 
+def prime_cache(system: str, user: str, model: str, *, timeout: int, cwd: Path,
+                tools: str | None = None) -> dict[str, Any] | None:
+    """Write a shared system prefix into the prompt cache, and WAIT for it. Returns what
+    the call cost, or None if it never happened.
+
+    THE CALLER MUST AWAIT THIS BEFORE `run_blind`, and that is the whole point. The cache
+    is a prefix match, so calls sharing a system prompt share its cost — but only after
+    one of them has PAID it. `run_blind` submits every seat before reading any result,
+    which is what makes the round blind and also means that on a cold cache none of them
+    sees another's write: all N pay in full, and the sharing measures as nothing at all.
+
+    Never raises. A primer that fails costs the round nothing but its own latency — the
+    seats behind it then run exactly as they did before this function existed — so its
+    failure is a price, not an outage, and must not take a round down.
+
+    The usage comes back rather than being recorded here for the reason nothing in this
+    module touches a store: the caller owns the thread that may.
+    """
+    try:
+        result = claude_cli.run_headless_result(user, system_prompt=system, model=model,
+                                                timeout=timeout, cwd=cwd, tools=tools,
+                                                attribute=False)
+    except claude_cli.ClaudeCliError as e:
+        log.warning("prompt-cache priming failed, seats will each write: %s", e)
+        return None
+    return result.usage
+
+
 def run_blind(prompts: dict[str, tuple[str, str]], *, models: dict[str, str],
               timeout: int, cwd: Path, tools: str | None = None) -> list[Opinion]:
     """Run every seat concurrently and blind, and return one Opinion per seat, in the
@@ -224,6 +252,11 @@ def run_blind(prompts: dict[str, tuple[str, str]], *, models: dict[str, str],
     `tools` rides through to `claude_cli.run_headless_result` unchanged: `None` leaves the
     callee's tool set alone (Neo's panel, whose behaviour must not change) and `""` strips
     every tool (the validation seats, which judge the packet and only the packet).
+
+    **IF THESE PROMPTS SHARE A SYSTEM PREFIX, `prime_cache` IT FIRST.** The fan-out below
+    is simultaneous, so on a cold cache every seat writes the shared bytes in full and
+    the sharing is worth nothing. `validation.decide` does this; read it before adding a
+    second caller with a shared prefix.
     """
     if not prompts:
         return []

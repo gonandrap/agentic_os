@@ -212,8 +212,16 @@ DEFAULT_VALIDATION_TIMEOUT = 300
 # How many times a unit may be sent back before the loop gives up and asks a human.
 DEFAULT_VALIDATION_MAX_ROUNDS = 3
 
-# Truncation limit for the diff a seat is shown.
-DEFAULT_VALIDATION_DIFF_CHARS = 60000
+# Truncation limit for the diff a seat is shown. MEASURED, not chosen: at 0.384
+# tokens/char a round's shared prefix is 76,347 tokens here, which under the shared-cache
+# layout costs less than HALF what 60,000 cost when every seat wrote its own copy
+# (125,973 against 261,388 input-equivalent tokens). 300,000 is affordable too and is
+# refused on CONTEXT — 137,621 prefix tokens leaves too little of a 200k window for the
+# packet's other sections and the seat's own reasoning, and a seat that overflows
+# abstains. PR #206, the change every seat of wo-a6af01f0 complained it could not read,
+# is 150,380 chars. Spec §6:
+# docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md
+DEFAULT_VALIDATION_DIFF_CHARS = 150000
 
 
 @dataclass
