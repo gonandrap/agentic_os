@@ -57,6 +57,19 @@ half itself and must not re-read the round it wrote: the no-validator path close
 round `failed` — never `passed`, because nobody judged the work — and that outcome
 otherwise reads as "still in flight".
 
+**`land_finished` routes on the pull request URL and never on `pr_state`.** Moving the
+`_awaiting_merge` rule down into it was tried and reverted: `Daemon.poll_pull_requests`
+is the only writer of that column, it looks at `waiting_pr_merge` alone, and it never
+clears what it wrote — so a work order whose pull request was closed, that was sent back
+and that finished again behind a NEW one still carries `CLOSED`. A landing that believed
+it would drop a live pull request out of the merge queue and close the backlog item under
+it. `review_work_order` keeps the rule because it is the one landing that can know the
+column is current: the parking it is ending is what the poll was polling.
+
+One consequence of that path going through `land_finished` at all: an accepted work order
+that lands `completed` now CLOSES ITS BACKLOG ITEM, which the inline landing it replaced
+did not. That omission was the drift `land_finished` exists to prevent.
+
 ### 3. The round machine keys off the ROUND, not the status
 
 `Daemon.validation_tick` queried `statuses=("validating",)`, which can no longer find a

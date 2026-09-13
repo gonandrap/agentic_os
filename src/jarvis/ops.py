@@ -39,7 +39,6 @@ from .project_store import (
     NO_TURN,
     OPEN_STATUSES,
     OPEN_VALIDATION_OUTCOMES,
-    RUNNABLE_VALIDATION_OUTCOMES,
     ProjectStore,
 )
 
@@ -952,19 +951,6 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
             "delivery": "jarvisd delivers when the worker is idle"}
 
 
-def _open_round_note(store: ProjectStore, wo_id: str) -> str:
-    """The clause every surface appends when a round is running beside something else.
-
-    `RUNNABLE_VALIDATION_OUTCOMES` and not the wider open set: a `rejected` round is
-    waiting on the SUBMITTER, and saying the panel is still reading would send the user
-    looking for something to wait for.
-    """
-    latest = store.latest_validation_round(wo_id=wo_id)
-    if latest and latest["outcome"] in RUNNABLE_VALIDATION_OUTCOMES:
-        return f" — review round {latest['round']} is running in parallel"
-    return ""
-
-
 def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
     """What this work order is actually waiting for, and whether a nudge could help.
 
@@ -982,7 +968,7 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
     from .neo_store import USER_HELD_Q_STATUSES
 
     wo_id = wo["id"]
-    round_note = _open_round_note(store, wo_id)
+    round_note = invariants.parallel_round_note(store, wo_id)
     pending = store.pending_assumptions(wo_id)
     if pending:
         return {"what": "assumptions", "stalled": False,
@@ -1423,15 +1409,17 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     with a pull request, `completed` without one, and the backlog item closed in the
     `completed` case only.
 
-    A pull request the poll has already SETTLED is not a merge queue, which is what
-    `_awaiting_merge` adds: parking on a CLOSED one would hand it back to a poll whose
-    only move is to flag it for the user again. That rule used to live at
-    `review_work_order`'s own call site and was invisible from the other two routes.
+    **THE PULL REQUEST IS A URL HERE, NEVER A STATE.** Routing on `pr_state` instead was
+    tried and reverted: that column is written only by `Daemon.poll_pull_requests`, which
+    looks at `waiting_pr_merge` alone and never clears what it wrote — so a worker whose
+    pull request was closed, who was sent back and who finished again behind a NEW one
+    still carries `CLOSED`, and a landing that believed it would drop a live pull request
+    out of the merge queue and close the backlog item under it. The one caller that may
+    read that column is the one that can know it is current: see `review_work_order`.
     """
     wo_id = wo["id"]
     pr_url = pr_url or wo.get("pr_url") or None
-    status = "waiting_pr_merge" if _awaiting_merge({**wo, "pr_url": pr_url}) \
-        else "completed"
+    status = "waiting_pr_merge" if pr_url else "completed"
     store.set_status(wo_id, status)
     store.clear_attention(wo_id)
     if wo.get("backlog_id") and status == "completed":
@@ -2265,9 +2253,23 @@ def review_work_order(wo_id: str, accept: bool = True,
                     submit_for_validation(store, path, store.get_work_order(wo_id),
                                           declared=declared_evidence(store, wo_id),
                                           cfg=cfg)
+                fresh = store.get_work_order(wo_id)
+                # THE ONE PLACE `pr_state` MAY BE READ, and the reason is that this is
+                # the only landing the poll can have run before: a work order reaches
+                # here parked, and `_awaiting_merge` is asking about the pull request
+                # that parking was about. A settled one is not a merge queue — passing
+                # it out of the landing is what stops `jarvis wo review` putting a
+                # CLOSED pull request back in front of a poll whose only move is to
+                # flag it for the user again. Everywhere else the column can be stale;
+                # `land_finished` says why.
+                if not _awaiting_merge(fresh):
+                    fresh = {**fresh, "pr_url": ""}
                 # The user's gate has cleared; whether the work order lands now is the
-                # panel's half of the join to answer.
-                status = land_when_cleared(store, store.get_work_order(wo_id))
+                # panel's half of the join to answer. NOTE that landing through
+                # `land_finished` also CLOSES THE BACKLOG ITEM on the `completed`
+                # branch, which the inline landing this replaced did not — that
+                # omission was the drift `land_finished` exists to prevent.
+                status = land_when_cleared(store, fresh)
             elif not feedback:
                 # With feedback the guidance is delivered below, so the work order is
                 # not waiting on the user — only a bare rejection strands it.

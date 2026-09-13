@@ -305,29 +305,32 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     if wo["status"] == "pending" and dead_dependencies(store, wo):
         blockers.append(DEAD_DEPENDENCY_BLOCKER)
     if governed and wo["status"] == "needs_review":
-        # Two very different ways to arrive at `needs_review` without an assumption to
-        # decide, and they ask the user for opposite things. A closed pull request means
-        # the work WAS delivered and then refused, so there is nothing to review in the
-        # session — the question is what to do about the refusal.
+        # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for
+        # something different. The `not pending` guards are PER LINE and not on the
+        # branch head, which is the whole subtlety here: only ONE of the three can be
+        # true at the same time as an undecided assumption, and hoisting the guard back
+        # up — where it sat until issue 212 — silently drops that one.
+        #
+        # 1. A closed pull request: the work WAS delivered and then refused, so there is
+        #    nothing to review in the session — the question is what to do about the
+        #    refusal. Ranked first: a fact about the outside world supersedes whatever
+        #    the panel thought. Guarded, because `Daemon.poll_pull_requests` only ever
+        #    sees `waiting_pr_merge`, which a work order with a pending assumption has
+        #    by construction never reached.
         if not pending and wo.get("pr_state") == "CLOSED":
             blockers.append(PR_CLOSED_BLOCKER)
+        # 2. The panel ran its rounds and could not be satisfied. UNGUARDED, and that is
+        #    the thing to preserve: since issue 212 a round runs while the user decides
+        #    (`ops.land_when_cleared`), so the panel can give up on a work order whose
+        #    assumption is still outstanding. They are two independent things owed, and
+        #    dropping the give-up because a decision is also open is the silent
+        #    relabelling kn-78346a2d names — dropping it FOR GOOD, because accepting the
+        #    assumption lands the work order and nothing re-derives it afterwards.
         elif _validation_escalated(store, wo):
-            # A third way in, and a more specific one: the panel ran its rounds and
-            # could not be satisfied. Ranked below the closed pull request — that is a
-            # fact about the outside world and supersedes whatever the panel thought —
-            # and above the generic line, which would send the user off to read a
-            # session whose story is already written down in the rounds.
-            #
-            # THE ONLY ONE OF THE THREE THAT SURVIVES A PENDING ASSUMPTION, and it has
-            # to since issue 212: the panel can now give up while the user is still
-            # deciding, and those are two independent things owed. Dropping the give-up
-            # because a decision is also outstanding is the silent relabelling
-            # kn-78346a2d names — and it would drop it for good, because accepting the
-            # assumption LANDS the work order (`ops.land_when_cleared`). The other two
-            # stay behind `not pending`: a closed pull request cannot reach a work order
-            # that never entered the merge queue, and the generic line would call a
-            # `needs_review` doing exactly its job a worker that stopped.
             blockers.append(VALIDATION_STUCK_BLOCKER)
+        # 3. Nothing more specific: the worker stopped without finishing. Guarded,
+        #    because a `needs_review` holding a pending assumption is doing exactly what
+        #    that status is for, and this line would call it a worker that gave up.
         elif not pending:
             blockers.append(IDLE_NO_FINISH_BLOCKER)
     # A pull request that cannot be merged and could not be healed — the whole reason
@@ -438,6 +441,24 @@ def dead_dependencies(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str,
             if dep["status"] in DEPENDENCY_DEAD_STATUSES or dep["status"] == "missing"]
 
 
+def parallel_round_note(store: ProjectStore, wo_id: str) -> str:
+    """" — review round N is running in parallel", or "" when none is.
+
+    ONE HOME, because two surfaces say it and a reword that landed in only one of them
+    would be two surfaces disagreeing about the same work order — the drift PR 65 is the
+    standing example of. `status_label` appends it to a status; `ops.waiting_on` appends
+    it to a diagnosis, and both are read by a user asking "is anything happening".
+
+    `RUNNABLE_VALIDATION_OUTCOMES` and not the wider open set: a `rejected` round is
+    waiting on the SUBMITTER, and saying the panel is still reading would send the user
+    looking for something to wait for.
+    """
+    latest = store.latest_validation_round(wo_id=wo_id)
+    if latest and latest["outcome"] in RUNNABLE_VALIDATION_OUTCOMES:
+        return f" — review round {latest['round']} is running in parallel"
+    return ""
+
+
 def status_label(store: ProjectStore, wo: dict[str, Any],
                  fleet: Fleet | None = None) -> str:
     """How this work order's status should read to a human.
@@ -468,10 +489,9 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     # the round runs in parallel with the assumption review, and a status that said only
     # "needs_review" would hide the half of the work that is still moving.
     if wo["status"] == "needs_review":
-        latest = store.latest_validation_round(wo_id=wo["id"])
-        if latest and latest["outcome"] in RUNNABLE_VALIDATION_OUTCOMES:
-            return (f"{wo['status']} — review round {latest['round']} is running "
-                    f"in parallel")
+        note = parallel_round_note(store, wo["id"])
+        if note:
+            return f"{wo['status']}{note}"
     if wo["status"] != "pending":
         return wo["status"]
     blockers = store.unfinished_dependencies(wo["id"])
