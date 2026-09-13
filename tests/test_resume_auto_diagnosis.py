@@ -126,9 +126,15 @@ def test_it_declines_while_a_gate_waits_for_the_worker_to_argue_it(started, proj
     assert wait["stalled"] is False
     # The worker's move, who is holding it, and the clock that closes it if nobody moves.
     assert f"gate {approval['id']}" in wait["detail"]
-    assert f'jarvis gate request {wo["id"]} "./scripts/shipit.sh"' in wait["detail"]
+    # BY REQUEST NUMBER and BOTH exits (spec §3, §8): a worktree-isolated worker cannot
+    # pass its own command string back, so an exit that re-quotes it is not an exit.
+    assert f"jarvis gate request {approval['id']} " in wait["detail"]
+    assert f"jarvis gate contest {approval['id']} " in wait["detail"]
+    assert "./scripts/shipit.sh" not in wait["detail"]
     assert "no reviewer sees it yet" in wait["detail"]
     assert "case_ttl_seconds" in wait["detail"]
+    # The clock abandons it; saying "refuses" would promise a reviewer who never looked.
+    assert "abandons it unreviewed" in wait["detail"]
 
     result = ops.resume_in_auto(wo["id"])
 
