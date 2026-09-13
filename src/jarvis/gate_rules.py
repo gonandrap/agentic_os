@@ -325,8 +325,12 @@ _MAY_WRITE = frozenset({"tee", "sort", "uniq", "yq", "sed"})
 _INPLACE = frozenset({"sed", "yq"})
 
 
-def heredoc_spans(command: str) -> list[tuple[int, int, int]]:
-    """`(body_start, body_end, opener_start)` for every heredoc in `command`.
+def heredoc_spans(command: str) -> list[tuple[int, int, int, bool]]:
+    """`(body_start, body_end, opener_start, terminated)` for every heredoc in `command`.
+
+    `terminated` is False when the delimiter line never turned up, so the body ran to the
+    end of the string. Such a body is not a construct this parser understood, and
+    `shape_of` refuses to call anything inside one prose — see the spec's §7.
 
     The body of a heredoc is the one span of a command that is neither quoted nor code:
     the shell reads it verbatim and hands it to the command as data. `_QUOTED` cannot see
@@ -335,11 +339,11 @@ def heredoc_spans(command: str) -> list[tuple[int, int, int]]:
 
     Offsets are into the original string, so a caller can ask where a match landed.
     """
-    spans: list[tuple[int, int, int]] = []
+    spans: list[tuple[int, int, int, bool]] = []
     cursor = 0
     for m in _HEREDOC_OPEN.finditer(command):
         # An opener inside an earlier heredoc's body is text, not an opener.
-        if any(s <= m.start() < e for s, e, _ in spans):
+        if any(s <= m.start() < e for s, e, _, _ in spans):
             continue
         delim = m.group("sq") or m.group("dq") or m.group("bare")
         # The body starts on the line after the opener — or, when a second heredoc opens
@@ -349,17 +353,19 @@ def heredoc_spans(command: str) -> list[tuple[int, int, int]]:
             continue  # an opener with no body: nothing was ever read
         start = nl + 1
         end = len(command)
+        terminated = False
         pos = start
         while pos <= len(command):
             eol = command.find("\n", pos)
             line = command[pos:eol if eol != -1 else len(command)]
             if line.strip() == delim:
                 end = pos
+                terminated = True
                 break
             if eol == -1:
                 break
             pos = eol + 1
-        spans.append((start, end, m.start()))
+        spans.append((start, end, m.start(), terminated))
         cursor = end
     return spans
 
@@ -387,7 +393,7 @@ def _inert(command: str) -> str:
     name of something the chain runs.
     """
     spans: list[tuple[int, int]] = []
-    for start, end, _ in heredoc_spans(command):
+    for start, end, _, _ in heredoc_spans(command):
         eol = command.find("\n", end)
         spans.append((start, len(command) if eol == -1 else eol))
     return _QUOTED.sub(lambda m: " " * (m.end() - m.start()), _blank(command, spans))
@@ -483,7 +489,7 @@ def _list_inert(command: str) -> str:
     spans, and splitting it would hand half of it to the next segment.
     """
     out = list(_inert(command))
-    for start, end, _ in heredoc_spans(command):
+    for start, end, _, _ in heredoc_spans(command):
         eol = command.find("\n", end)
         for i in range(start, len(command) if eol == -1 else eol):
             out[i] = " "
@@ -743,7 +749,7 @@ def shape_of(command: str, pattern: str) -> Shape | None:
         return None
     heres = heredoc_spans(command)
     quotes = [m.span() for m in
-              _QUOTED.finditer(_blank(command, [(s, e) for s, e, _ in heres]))]
+              _QUOTED.finditer(_blank(command, [(s, e) for s, e, _, _ in heres]))]
     segs = segments(command)
     lists = list_segments(command)
     all_names = frozenset(n for _, _, n in segs if n)
@@ -765,8 +771,14 @@ def shape_of(command: str, pattern: str) -> Shape | None:
     best: Shape | None = None
     for m in rx.finditer(command):
         start, end = m.span()
-        for s, e, opener in heres:
+        for s, e, opener, terminated in heres:
             if s <= start and end <= e:
+                # An unterminated body runs to the end of the string and swallows
+                # whatever follows it, so nothing inside one can be called prose.
+                # `EOF && ./scripts/shipit.sh` is that case: the delimiter line is not
+                # a delimiter line, and the release below it was landing in the "body".
+                if not terminated:
+                    return Shape(CODE, owner_at(start), names_at(start))
                 shape = Shape(HEREDOC, owner_at(opener), names_at(opener))
                 break
         else:
@@ -777,7 +789,13 @@ def shape_of(command: str, pattern: str) -> Shape | None:
             else:
                 # Executable position wins outright, and immediately.
                 return Shape(CODE, owner_at(start), names_at(start))
-        if best is None:
+        # Among several non-code matches, report the one that can LEAST be cleared, not
+        # the one that happened to come first. Same convention as the `code` return
+        # above: ambiguity resolves toward the privileged reading. Scoping `names` to a
+        # segment made first-wins a bypass — a `git commit` heredoc followed by
+        # `cat <<EOF | bash` put the executors in the other segment, so the leading
+        # match looked like prose and cleared the trailing one (wo-551f5e8c).
+        if best is None or (best.exemptible and not shape.exemptible):
             best = shape
     return best
 
@@ -835,14 +853,30 @@ class Rule:
                 f"owned by `{p.get('owner')}`, in a command that executes nothing")
 
     def clears(self, command: str, kind: str, pattern: str) -> bool:
-        """Whether this exemption clears a match of `pattern` in `command`."""
+        """Whether this exemption clears a match of `pattern` in `command`.
+
+        The two restrictions on the REGEX arm are the floor under a reviewer-authored
+        pattern, and they hold for a rule already stored — which is the case that
+        mattered. See docs/superpowers/specs/2026-09-12-an-exemption-may-not-clear-what-
+        it-does-not-describe.md §3.
+        """
         if self.role != EXEMPT:
             return False
         if self.kind and self.kind != kind:
             return False
         if self.test == REGEX:
+            # One normalisation, then both tests read the same string — a trailing
+            # newline must not decide whether an exemption applies.
+            subject = command.strip()
+            # A regex exemption speaks about one line. It is learned from a single-line
+            # command (`propose_exemption`) and cannot say which line of a script it
+            # describes, so it clears none of them.
+            if "\n" in subject:
+                return False
             try:
-                return bool(re.search(self.pattern, command, re.IGNORECASE))
+                # `fullmatch`, not `search`: an exemption argues that a command is
+                # harmless, and a claim about part of one says nothing about the rest.
+                return bool(re.fullmatch(self.pattern, subject, re.IGNORECASE))
             except re.error:
                 return False
         if self.test == SIGNATURE:
@@ -936,6 +970,15 @@ SEED_CANARIES: tuple[tuple[str, str], ...] = (
     ("config_write", "jarvis config unset os.validation.enabled --reason \"noisy\""),
     ("config_write", "jarvis config restore cfg-0123456789abcdef --reason \"revert\""),
     ("config_write", "jarvis config adopt --reason \"hand edit\""),
+    # One per kind: a reader, a newline, and the canonical gated command. Until
+    # wo-551f5e8c every canary was a single line, so a green report was evidence about
+    # single-line commands only — the spec's §5.
+    ("release", "echo hi\n./scripts/shipit.sh"),
+    ("pr_merge", "cat README.md\ngh pr merge 31 --squash"),
+    ("service_restart", "cat README.md\nsudo systemctl restart jarvis-daemon"),
+    ("push_protected", "ls -la\ngit push origin main"),
+    ("config_write", "head -5 README.md\njarvis config set p worker.model haiku "
+                     "--reason \"cheaper\""),
 )
 
 
@@ -963,7 +1006,9 @@ def seed_rows() -> list[dict[str, Any]]:
 # 4: the `python3 - <<PY` release canary (issue #203). A separate number because 3 has
 #    already been written to live databases, and `_seed_gate_rules` returns early on a
 #    matching key — reusing it would leave that canary out of every os.db that has one.
-SEED_VERSION = "4"
+# 5: the multi-line canaries (wo-551f5e8c). Same reasoning as 4 — 3 and 4 are already
+#    written, so these need a number of their own or no live os.db ever gets them.
+SEED_VERSION = "5"
 
 
 # -- the live rule base ---------------------------------------------------------------
@@ -1138,6 +1183,24 @@ _MAX_PATTERN = 400
 _LITERAL_ANCHOR = re.compile(r"[A-Za-z0-9_]{3,}")
 
 
+def _spans_a_newline(rx: re.Pattern[str], command: str) -> bool:
+    """Whether `rx` would still clear `command` with a gated command appended below it.
+
+    Probed rather than parsed, and the spec's §4 says why. The probes are the
+    single-line `SEED_CANARIES` — the commands that must gate whatever anyone learns.
+
+    Empty that set and `any()` returns False for every pattern, which is this module's
+    own §5 failure a second time: a floor that reports sound because it tested nothing.
+    So it raises instead.
+    """
+    probes = [gated for _, gated in SEED_CANARIES if "\n" not in gated]
+    if not probes:
+        raise AssertionError(
+            "no single-line canary to probe with: the newline floor would pass "
+            "everything. SEED_CANARIES must keep at least one single-line command.")
+    return any(rx.search(f"{command}\n{gated}") for gated in probes)
+
+
 def validate_pattern(pattern: str, command: str) -> str:
     """Why `pattern` may not be used as an exemption, or `""` if it may.
 
@@ -1145,8 +1208,12 @@ def validate_pattern(pattern: str, command: str) -> str:
     `.*`, `.+` or `git.*` is not describing a family of false positives, it is switching
     the gate off; requiring three consecutive literal characters costs a genuine rule
     nothing and makes the blanket cases unrepresentable.
+
+    The whole-command and newline tests are the same two claims `Rule.clears` enforces
+    at use time. Both live in both places on purpose — the spec's §4.
     """
     pattern = pattern.strip()
+    command = command.strip()  # one normalisation; `Rule.clears` uses the same subject
     if not pattern:
         return "empty"
     if len(pattern) > _MAX_PATTERN:
@@ -1160,6 +1227,12 @@ def validate_pattern(pattern: str, command: str) -> str:
                 "has reviewed")
     if not rx.search(command):
         return "does not match the command it was written for"
+    if not rx.fullmatch(command):
+        return ("does not cover the whole command it was written for — an exemption that "
+                "describes a prefix clears whatever is chained after it")
+    if _spans_a_newline(rx, command):
+        return ("matches across a newline — it would clear every line below the command "
+                "it describes, whatever those lines run")
     return ""
 
 
@@ -1205,7 +1278,13 @@ def propose_exemption(ruleset: RuleSet, *, command: str, kind: str, pattern: str
                    and r.kind == rule.kind for r in ruleset.exemptions())
 
     if exempt_pattern.strip():
-        why = validate_pattern(exempt_pattern, command)
+        # A multi-line command generalises into a regex only by deciding which of its
+        # lines mattered, which is the decision that opened the release gate. The
+        # structural signature below reads the shape instead, and is the path a heredoc
+        # was always meant to take.
+        why = ("the command spans more than one line, and no regex may be learned from "
+               "one" if "\n" in command.strip()
+               else validate_pattern(exempt_pattern, command))
         if why:
             proposal.notes.append(
                 f"the reviewer's proposed pattern {exempt_pattern!r} was refused: {why}")
