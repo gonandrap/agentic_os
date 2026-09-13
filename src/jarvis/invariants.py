@@ -1524,6 +1524,12 @@ def _validation_timeout() -> int:
 #: a few hours at the shipped cadence — against the 2215 that went unreported.
 HEALTH_SWEEP_FAILURE_RUN = 10
 
+#: How recent the newest failure must be for the run to still be happening. The canary
+#: claims the sweep IS SPENDING model calls, which is a statement about now: a run with
+#: nothing in it for two hours has stopped — fixed, disabled, or the daemon is down —
+#: and reporting it alarms on history. Four missed sweeps at the default 30-minute floor.
+HEALTH_SWEEP_FAILURE_WINDOW_MINUTES = 120
+
 
 def check_health_sweep_produces_judgements(store: ProjectStore) -> Iterator[Violation]:
     """INV-HEALTH-SWEEP-MUTE — a sweep that never judges anything must not bill silently.
@@ -1535,9 +1541,17 @@ def check_health_sweep_produces_judgements(store: ProjectStore) -> Iterator[Viol
     than a comment, because the other two halves of the fix are exactly the kind an
     innocent edit undoes with every test still green. §4.1 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
 
-    Predicate: of the project's last `HEALTH_SWEEP_FAILURE_RUN` sweeps, every one failed.
-    `outcome='clear'` is a healthy sweep and the common one, so a working project clears
-    this on its first tick and pays a single indexed read for it.
+    Predicate: of the project's last `HEALTH_SWEEP_FAILURE_RUN` sweeps, every one failed,
+    AND the newest of them is inside `HEALTH_SWEEP_FAILURE_WINDOW_MINUTES`. `outcome=
+    'clear'` is a healthy sweep and the common one, so a working project clears this on
+    its first tick and pays a single indexed read for it.
+
+    THE WINDOW IS NOT TIDINESS. Without it this check reported the first deploy of its
+    own fix, five seconds after the daemon booted, on the history the fix was written
+    for — and a sweep that has been SWITCHED OFF would alarm for ever, because with no
+    sweeps running no new row ever arrives to push the old ones out. A run still going
+    is still reported however long ago it started; what ages out is a run with nothing
+    recent in it.
 
     NOT repairable, and it must not try. The rows are honest — they record what really
     happened — and the defect is in the prompt or the transport, neither of which is
@@ -1551,6 +1565,9 @@ def check_health_sweep_produces_judgements(store: ProjectStore) -> Iterator[Viol
     if len(recent) < HEALTH_SWEEP_FAILURE_RUN:
         return
     if any(r["outcome"] != "failed" for r in recent):
+        return
+    window = HEALTH_SWEEP_FAILURE_WINDOW_MINUTES * 60
+    if db.now() - float(recent[0]["ts"] or 0.0) > window:
         return
     yield Violation(
         invariant="INV-HEALTH-SWEEP-MUTE",
