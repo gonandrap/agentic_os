@@ -47,12 +47,8 @@ from .paths import project_state_dir
 # 15-minute eval, signed off on the promise of a wake-up that does not exist, and the run
 # died with its process (wo-2df8828c). Prose is again the whole mechanism, and it only
 # helps the workers whose repo has it.
-# v11 = the second exit. A worker handed a false positive was offered only "argue this is
-# ready to ship" and, three times running, walked away and worked around the gate instead
-# (wo-5efc2de6) — so `jarvis gate contest` is named here, beside `explain` as the way to
-# tell the two exits apart. The same bump carries the per-kind ask: the request placeholders
-# were the RELEASE question for all six kinds, and the reviewer sees nothing but what the
-# worker wrote. Prose is the whole mechanism again, so it has to reach every managed repo.
+# v11 = the second exit (`jarvis gate contest`, beside `explain`) and the per-kind ask —
+# spec 2026-09-12 §3, §6. Prose is the whole mechanism, so it has to reach every repo.
 TEMPLATE_VERSION = 11
 ASSETS = Path(__file__).parent / "assets"
 

@@ -2111,11 +2111,8 @@ class Daemon:
             return
 
         if verdict["escalate"]:
-            # A CONTEST asks a different question, so it must not arrive offering the one
-            # verb that cannot answer it. The user is being asked whether the OS's own
-            # recogniser misfired; `jarvis gate approve` would record an authorisation for
-            # an action nobody argued for, and `ops.decide_gate` refuses it anyway. Spec
-            # 2026-09-12 §2.
+            # A contest must not arrive offering `approve`, the one verb that cannot
+            # answer it — spec 2026-09-12 §2.
             if approval["contested"]:
                 title = f"Is this a false positive? {approval['kind']} from {q['wo_id']}"
                 body = (f"The worker says this command performs no privileged action and "
@@ -2157,9 +2154,9 @@ class Daemon:
                                        reason=verdict["reason"], decided_by="neo",
                                        central=central, project=q["project"],
                                        exempt_pattern=verdict.get("exempt_pattern", ""))
-        # WHAT WAS RECORDED, not what the reviewer said — the two differ on exactly one
-        # input: `approved` on a contested row is written as `denied` (spec §2). Reading
-        # the reply would put an `info` level under a title that says "rejected".
+        # WHAT WAS RECORDED, not what the reviewer said: the two differ on exactly one
+        # input, `approved` on a contested row — spec §2. Level, title and body all read
+        # from here for that reason.
         ruling = decided["status"]
         # A shipped release is something the user wants to know happened, even when they
         # did not have to authorise it — that is the trade for spending none of their
@@ -2172,20 +2169,14 @@ class Daemon:
         # instead — `jarvis gate list` and the dashboard — because what matters about
         # classifier defects is the rate, not each instance.
         if ruling != "dismissed":
-            # A rejected CONTEST stays visible, and it is the one place this feature
-            # spends the user's attention on purpose: a worker that argued a real release
-            # was not a release is worth seeing. The title has to say that is what
-            # happened, or it reads as a release the worker asked for and was refused.
+            # A rejected CONTEST stays visible — the one place this feature spends the
+            # user's attention on purpose.
             central.add_inbox(
                 project=q["project"],
                 level="info" if ruling == "approved" else "warning",
                 title=(f"Neo rejected a contested {approval['kind']} match from "
                        f"{q['wo_id']}" if decided["contested"]
                        else f"Neo {ruling} {approval['kind']} for {q['wo_id']}"),
-                # The RECORDED reason, for the same reason as the level and the title: on
-                # a coerced contest the reply argues the command is fine and the record
-                # carries the coercion note explaining why it was written down as a
-                # refusal anyway. Rendering the reply here would contradict the title.
                 body=(f"{decided['decision_reason']}\n\n"
                       f"Command: {approval['command']}\n"
                       f"Review Neo's call with: jarvis neo review {q['id']}"),
@@ -2470,8 +2461,7 @@ class Daemon:
             log.exception("project %s: closing unargued gates failed", project.name)
             return
         for approval in closed:
-            # "abandoned", never "refused": nobody reviewed it, so nobody refused it —
-            # and a log line that says otherwise is where the false record starts.
+            # "abandoned", never "refused": nobody reviewed it — spec 2026-09-12 §4.
             log.info("gate %s (%s) abandoned: no case was made and the match was never "
                      "contested", approval["id"], approval["kind"])
 

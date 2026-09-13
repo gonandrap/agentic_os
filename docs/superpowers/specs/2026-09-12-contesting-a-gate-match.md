@@ -283,7 +283,9 @@ claim about any privileged action; it is a claim about what `jarvis gate request
 file or read a claim *about* a command. Deliberately not `approve`, `deny`, `dismiss` or
 `rule-retract`: those rule on a request, and a worker clearing its own gate is the one
 thing this subsystem exists to prevent. All-or-nothing across the chain, exactly like
-`reads_only`: `jarvis gate explain "x"; ./scripts/shipit.sh` still gates.
+`reads_only`: `jarvis gate explain "x"; ./scripts/shipit.sh` still gates, on every
+separator the splitter treats differently. A command substitution anywhere fails outright
+— the shell expands it before `jarvis` is reached, and what it expands to is unknown.
 
 **And the prose was scanned as code because of one English word.** `scannable()` blanks
 quoted arguments *unless* `_SHELL_INVOKER` matches, and that test is a substring search

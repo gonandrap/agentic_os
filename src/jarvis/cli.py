@@ -520,19 +520,15 @@ def build_parser() -> argparse.ArgumentParser:
     ).add_subparsers(dest="ga_cmd", required=True)
     g = ga.add_parser("request",
                       help="(workers) ask permission to run a privileged command")
-    # Two spellings, and the SHORT one is the one a blocked worker can actually type: a
-    # session in a git worktree runs under an isolation guard that inspects arguments and
-    # refuses any it cannot prove is not a git operation, which is most of what trips a
-    # gate. Spec 2026-09-12 §8.
+    # Two spellings; the SHORT one is the one a blocked worker can actually type — spec
+    # 2026-09-12 §8.
     g.add_argument("wo_id", metavar="request-number | wo-id",
                    help="the request number the block printed — or a work order id, "
                         "followed by the command")
     g.add_argument("command", nargs="?",
                    help="the EXACT command you will run if approved; omit it when you "
                         "gave a request number")
-    # Kind-neutral, because the parser is built before any command is parsed. What each
-    # kind actually asks for is in `jarvis brief gates` and in the block message itself,
-    # both rendered from gate_rules (spec 2026-09-12 §6).
+    # Kind-neutral: the parser is built before any command is parsed — spec §6.
     g.add_argument("--why", default="",
                    help="why this action should proceed — each gate kind asks a "
                         "different question; the block message states yours")
@@ -1806,9 +1802,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # Every assumption, each with its `n` and `status` — §4.
                 "assumptions": store.all_assumptions(args.wo_id),
                 # What this work order was allowed (or refused) permission to ship.
-                # `contested` and `closed_as` ride along because `status` alone cannot say
-                # what happened: a contested row is a claim about the classifier, not a
-                # request to ship, and an `expired` one is three different outcomes.
+                # `status` alone cannot say what happened — spec §2, §4.
                 "gates": [
                     {k: a[k] for k in ("id", "kind", "command", "status", "escalated",
                                        "contested", "closed_as", "decided_by",
@@ -2063,9 +2057,7 @@ def _print_classifier_stats(stats: dict) -> None:
 def cmd_gate(args: argparse.Namespace) -> int:
     from . import gates, ops
 
-    # A worker exits its OWN block. `JARVIS_WO_ID` is what says which that is, and
-    # without it a mistyped request number lands on a stranger's row (§8). Absent for the
-    # user's own sessions, which are not narrowed — they can read the row first.
+    # A worker exits its OWN block; `JARVIS_WO_ID` is what says which — spec §8.
     caller = os.environ.get("JARVIS_WO_ID") or None
 
     if args.ga_cmd == "request":
@@ -2075,8 +2067,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
             wo_id, command, why=args.why, evidence=args.evidence,
             project_name=args.project), args.json)
     elif args.ga_cmd == "contest":
-        # `require_caller`: a contest is the worker's exit and nobody else's, so an
-        # unowned session is refused rather than merely unscoped — ops.CONTEST_NEEDS_AN_OWNER.
+        # `require_caller` — see `ops.CONTEST_NEEDS_AN_OWNER`.
         wo_id, command = ops.resolve_gate_target(args.wo_id, args.command, args.project,
                                                  caller, require_caller=True)
         _print(ops.contest_gate_match(wo_id, command, why=args.why,
@@ -2109,9 +2100,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
                       f"· {r['wo_id']} · {_age(r['ts'])} ago")
                 print(f"    {r['command']}")
                 if r["status"] == "awaiting_case":
-                    # Addressed by request number, exactly as the block told the worker —
-                    # the command is printed on the line above, and re-quoting it here is
-                    # what the isolation guard refuses (§8).
+                    # By request number, as the block told the worker — spec §8.
                     ask = gates.request_command(r["wo_id"], r["command"], r["kind"],
                                                 why="...", evidence="...",
                                                 approval_id=r["id"])

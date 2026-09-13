@@ -17,9 +17,7 @@
   <input type="hidden" name="next" value="/gates">
   <input type="text" name="reason"
          placeholder="reason — goes to the worker; required to deny or dismiss">
-  {# No Approve on a CONTEST. The worker argued this performs no privileged action and
-     made no case for performing one, so there is nothing here to authorise — ops.decide_gate
-     refuses it, and offering the button would only produce an error page. #}
+  {# No Approve on a CONTEST — `ops.decide_gate` refuses it. Spec 2026-09-12 §2. #}
   {% if not g.contested %}
   <button class="accept" name="decision" value="approve">✓ Approve</button>
   {% endif %}
@@ -136,9 +134,7 @@
     <tr><th>#</th><th>project / wo</th><th>action</th><th>command</th>
         <th>verdict</th><th>by</th><th>age</th></tr>
     {% for g in decided %}
-    {# Keyed on the DISPLAY state, not the status: an abandoned row is `expired` in the
-       database, and "expired" reads as a grant that ran out rather than a request nobody
-       ever reviewed. #}
+    {# Keyed on the DISPLAY state: an abandoned row is `expired` in the database. #}
     {% set m = gate_meta.get('abandoned' if g.closed_as == 'abandoned' else g.status,
                              {'word': g.status, 'icon': '•', 'tone': 'muted'}) %}
     <tr>

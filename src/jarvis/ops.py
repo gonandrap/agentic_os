@@ -2999,12 +2999,8 @@ def _project_gate_config(project_name: str):
     return GateConfig()
 
 
-#: Refused when `JARVIS_WO_ID` is unset, rather than merely unscoped. A contest is the
-#: WORKER's exit and nobody else's: upheld, it clears the command string and teaches a
-#: fleet-wide exemption through `learn_from_dismissal`, so an unowned session reaching it
-#: would rewrite the recogniser on behalf of a work order it is not. The user's route to
-#: the same outcome is `jarvis gate dismiss`, which is reviewed, reasoned and recorded as
-#: theirs. Spec 2026-09-12 §8.
+#: Refused when `JARVIS_WO_ID` is unset, rather than merely unscoped: a contest is the
+#: WORKER's exit and nobody else's. Spec 2026-09-12 §8.
 CONTEST_NEEDS_AN_OWNER = (
     "`jarvis gate contest` is a worker's exit from its own block and needs JARVIS_WO_ID, "
     "which is set only inside a dispatched worker's session. An upheld contest clears the "
@@ -3021,22 +3017,9 @@ def resolve_gate_target(target: str, command: str | None = None,
                         require_caller: bool = False) -> tuple[str, str]:
     """`(wo_id, command)` from either spelling of a gate exit: `<wo> "<cmd>"` or `<id>`.
 
-    The id spelling exists because the command spelling is unusable for a large part of
-    what trips a gate — see `gates._handle` and spec 2026-09-12 §8. Nothing is looked up
-    that the blocking message did not already print.
-
-    SCOPED TO THE CALLER when there is one (`caller_wo_id`, from the worker's own
-    `JARVIS_WO_ID`). A request number carries no visible owner, and a contest AMENDS the
-    standing row rather than filing a new one — so one mistyped digit would re-file
-    another unit's pending release request as a claim that it performs no privileged
-    action, and the reviewer would decide it on that. Refused rather than guessed at, for
-    the same reason `_find_approval` refuses an id that two projects both hold. A session
-    with no `JARVIS_WO_ID` — the user's own — is not narrowed: it can read the row first,
-    and narrowing it would leave an escalated request with no way to resolve it by hand.
-
-    `require_caller` withdraws even that, for `contest` alone — see
-    `CONTEST_NEEDS_AN_OWNER`. The carve-out above is about the USER resolving a row they
-    can read; a contest is not that verb, and the user already has `gate dismiss`.
+    Why a request number at all, why it is SCOPED to `caller_wo_id`, and why
+    `require_caller` withdraws the no-caller carve-out for `contest` alone: spec
+    2026-09-12 §8 and `CONTEST_NEEDS_AN_OWNER`.
     """
     if require_caller and not caller_wo_id:
         raise OpsError(CONTEST_NEEDS_AN_OWNER)
@@ -3165,13 +3148,9 @@ def contest_gate_match(wo_id: str, command: str, why: str,
                        project_name: str | None = None) -> dict[str, Any]:
     """(Workers) dispute a gate MATCH: this command performs no privileged action.
 
-    The other exit from a block, and the one the OS had no command for. A worker handed a
-    false positive and told only to argue that its command is "ready to ship" has no true
-    sentence available — it writes a false one or walks away, and walking away is what
-    three requests in a row did. See docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md.
-
-    Same reviewer, same queue, same `learn_from_dismissal` on the way out. What differs is
-    the claim on the record: a candidate DISMISSAL, never a request for permission.
+    Same reviewer, same queue, same `learn_from_dismissal` on the way out; what differs
+    is the claim on the record — a candidate DISMISSAL, never a request for permission.
+    See docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §1.
     """
     from . import gates
     from .neo_store import NeoStore
@@ -3192,9 +3171,7 @@ def contest_gate_match(wo_id: str, command: str, why: str,
         )
     action = gates.classify(command, config)
     if action is None:
-        # Nothing to contest is good news, and saying which command was checked matters:
-        # a grant is scoped to an exact string, so a worker contesting a RETYPED command
-        # would otherwise be told its real block does not exist.
+        # Naming the command checked matters: a grant is scoped to an exact string.
         raise OpsError(
             f"that command trips no gate enabled for {name!r} "
             f"(enabled: {sorted(config.enabled)}) — run it directly. If a gate really "
@@ -3210,11 +3187,8 @@ def contest_gate_match(wo_id: str, command: str, why: str,
                     "kind": action.kind, "status": grant["status"],
                     "note": "already cleared — run the command as written"}
         existing = store.latest_approval_for(wo_id, action.kind, action.command)
-        # A contest amends a row that is STILL OPEN AND NOT YET CONTESTED, and nothing
-        # else. Re-contesting a pending contest rewrites the claim under a reviewer who is
-        # already reading it; contesting a row a reviewer has already ruled on is
-        # reviewer-shopping by another name (kn-76b155a0). Everything else — abandoned,
-        # lapsed, never filed — legitimately files a fresh one. Spec 2026-09-12 §8.
+        # Open and not yet contested, and nothing else — reviewer-shopping otherwise
+        # (kn-76b155a0). Spec 2026-09-12 §8.
         if existing and existing["status"] == "pending" and existing["contested"]:
             raise OpsError(
                 f"request {existing['id']} is already contested and in front of a "
@@ -3233,9 +3207,8 @@ def contest_gate_match(wo_id: str, command: str, why: str,
         neo = NeoStore()
         try:
             if existing and existing["status"] in (gates.AWAITING_CASE, "pending"):
-                # Onto the STANDING row, never a second one — same rule as a late case
-                # (kn-76b155a0). A request the worker now disputes becomes a contest:
-                # the claim changed, so the reviewer's page is rewritten to match it.
+                # Onto the STANDING row, never a second one (kn-76b155a0). The claim
+                # changed, so the reviewer's page is rewritten to match it.
                 held = existing["status"] == gates.AWAITING_CASE
                 approval = gates.amend_request(store, neo, wo, action,
                                                store.mark_contested(existing["id"]),
@@ -3243,9 +3216,7 @@ def contest_gate_match(wo_id: str, command: str, why: str,
                 if held:
                     gates.queue_for_review(store, neo, name, wo, action, approval)
             else:
-                # No hold. The hold exists so no reviewer sees a privileged action nobody
-                # argued for; a contest argues there is no privileged action here at all,
-                # which is exactly the case the reviewer needs.
+                # No hold: a contest IS the case the reviewer needs — spec §1.
                 approval, _ = gates.file_request(store, neo, name, wo, action,
                                                  justification=why, contested=True)
         finally:
@@ -3297,10 +3268,8 @@ def decide_gate(approval_id: int, verdict: str, reason: str = "",
             f"approval {approval_id} is already {approval['status']}"
             + (f" (by {approval['decided_by']})" if approval["decided_by"] else "")
         )
-    # Refused here rather than coerced, because there is a person to tell. A contest
-    # argues that the command performs no privileged action; approving it would record an
-    # authorisation for an action nobody ever argued for. `gates.apply_decision` coerces
-    # on the daemon's path, where there is nobody to tell. Spec 2026-09-12 §2.
+    # Refused here rather than coerced, because there is a person to tell; the daemon's
+    # path coerces instead. Spec 2026-09-12 §2.
     if approval["contested"] and verdict == "approved":
         raise OpsError(
             f"approval {approval_id} is a CONTEST, not a request for permission — the "
@@ -3476,15 +3445,7 @@ def list_gate_rules(role: str | None = None, kind: str | None = None,
 def classifier_stats() -> dict[str, int]:
     """How often the recogniser has been wrong, and how often nobody stayed to say so.
 
-    Two numbers, reported side by side and never added together. `dismissed` is a
-    reviewer's finding that the classifier misfired. `abandoned` is a held request whose
-    worker never came back — no case, no contest — and on the evidence that is usually a
-    false positive the worker silently routed around, which makes it the classifier's
-    error rate showing up as a hole rather than as a count.
-
-    Evidence is not a verdict, so it is never folded into the false-positive rate. It is
-    printed beside it because a rate taken over only the requests somebody argued is
-    measured on the population least likely to contain the defects.
+    Two numbers, reported side by side and never added together — spec 2026-09-12 §5.
     """
     dismissed = abandoned = total = 0
     for _name, path in registered_project_paths().items():

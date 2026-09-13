@@ -710,15 +710,11 @@ ADDED_COLUMNS = {
         # `PreToolUse` carries `agent_type` for a subagent's call and omits the key
         # entirely for the lead's, so the payload can always tell the two apart.
         "agent_type": "TEXT",
-        # The worker claims this command performs no privileged action — `jarvis gate
-        # contest`. A different claim from every other row in the table, and the column
-        # is what makes it enforceable rather than a matter of prompt wording: a
-        # contested row can only be dismissed or denied (`gates.apply_decision`).
+        # `jarvis gate contest`: a different claim from every other row, and the column is
+        # what makes "dismissed or denied, never approved" enforceable — spec §2.
         "contested": "INTEGER NOT NULL DEFAULT 0",
-        # WHY a row landed in `expired`, which three different things produce and which
-        # only one of them is worth counting: 'lapsed' (a grant ran out of clock or
-        # uses), 'superseded' (the world moved on), 'abandoned' (a held request whose
-        # case never came). See docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §4.
+        # WHY a row landed in `expired`: 'lapsed', 'superseded' or 'abandoned' — only the
+        # last is worth counting. Spec 2026-09-12 §4, §5.
         "closed_as": "TEXT NOT NULL DEFAULT ''",
     },
     # An alarm can name a FEATURE ORDER as its subject and a health probe as its source.
@@ -798,25 +794,15 @@ class ProjectStore:
         self._backfill_abandoned_gates()
 
     #: The reason `gates.sweep_unargued` wrote while the TTL still recorded a DENIAL.
-    #: Matched as a prefix because the minute count varies with the project's
-    #: `case_ttl_seconds`. This exact string is the discriminator, and it is what makes
-    #: the backfill below safe: nothing but the sweep ever wrote it.
+    #: A prefix because the minute count varies per project; nothing else ever wrote it,
+    #: which is what makes the backfill below safe.
     _TTL_DENIAL_PREFIX = "no case was made for it within "
 
     def _backfill_abandoned_gates(self) -> None:
-        """Re-file the TTL's old denials as what they were: abandonments.
-
-        Every row this touches was written by the OS itself, with nobody having reviewed
-        anything — and `denied` on a gate asserts that a reviewer refused a privileged
-        action. Gate 95 of this very fleet is a `python3 -c` that imported a module,
-        recorded for ever as a denied release. Leaving them would keep the
-        false-positive count understated by exactly the population most likely to contain
-        false positives, which is the defect spec 2026-09-12 is about.
+        """Re-file the TTL's old denials as what they were: abandonments. Spec §4, §5.
 
         NARROW, and that is the whole safety argument: `decided_by='os'` plus the sweep's
-        own reason prefix. A verdict any REVIEWER reached is never touched, and a row that
-        genuinely was refused by Neo or the user keeps its denial. Idempotent — after the
-        first pass the WHERE matches nothing.
+        own reason prefix, so a verdict any REVIEWER reached is never touched. Idempotent.
         """
         self.conn.execute(
             """UPDATE approvals SET status='expired', closed_as='abandoned'

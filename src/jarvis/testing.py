@@ -719,10 +719,8 @@ elif "-p" in argv and "--resume" not in argv:
         emit_headless("I think you should maybe do the thing?")
         sys.exit(0)
     elif "CONTESTED GATE MATCH" in prompt:
-        # A contest speaks the same verdict shape but a narrower vocabulary: the worker
-        # disputes the MATCH, so there is nothing to approve. FORCE_APPROVE is offered
-        # anyway — the OS's refusal to record one is a property worth testing, and a fake
-        # that could not produce the input would leave it untested.
+        # FORCE_APPROVE is offered on a contest too: the OS's refusal to RECORD one is
+        # the property under test, and a fake that cannot produce the input cannot test it.
         if "FORCE_DISMISS" in prompt:
             verdict = {"escalate": False, "verdict": "dismiss",
                        "reason": "test-forced dismissal: the recogniser matched prose"}

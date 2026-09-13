@@ -451,48 +451,16 @@ def reads_only(command: str) -> bool:
     return True
 
 
-#: The `jarvis gate` verbs that RECORD or READ a claim about a command and can never
-#: perform the action the claim is about. Deliberately NOT `approve`, `deny`, `dismiss`
-#: or `rule-retract`: those rule on a request, and a worker clearing its own gate is the
-#: one thing this whole subsystem exists to prevent.
+#: The verbs that RECORD or READ a claim about a command. Why these five and not the
+#: deciding four: spec 2026-09-12 §9.
 GATE_PAPERWORK_VERBS = frozenset({"request", "contest", "explain", "show", "list"})
 
 
 def gate_paperwork(command: str) -> bool:
     """True when every command in the chain is the OS's own gate paperwork.
 
-    Structural, and therefore in code rather than in the table — the same level as
-    `reads_only`, for the same reason. It is not a claim about any particular privileged
-    action; it is a claim about what `jarvis gate request` IS. The text a worker hands
-    those verbs is the argument it is making to a reviewer, and the argument is *about*
-    a privileged action, so it names one. That is the point of it.
-
-    Left to the rule table this came out circular, and did so in production. wo-4fc128ca
-    filed a `pr_merge` request for `gh pr merge 210 --squash` whose `--why` explained that
-    the PR fixes the release script; the filing was classified `release` on the word in
-    its own prose (request 106, `matched: shipit`) and then TTL-closed for want of a case
-    — the case being the command that was blocked. The learned exemption that should have
-    cleared it, `gr-7a0e659b`, is a regex bound to one kind and one argv shape:
-
-        ^jarvis\\s+gate\\s+request\\s+\\S+\\s+"[^"]*"(\\s+--[a-z-]+\\s+"[^"]*")*\\s*$
-
-    It cleared `pr_merge` and left `release` matching, because an exemption is scoped to
-    the kind it was learned for. No per-kind rule can state this property: the property is
-    that the verb runs nothing, whatever gate the prose happens to mention.
-
-    ALL-OR-NOTHING ACROSS THE CHAIN, exactly like `reads_only` and for the same bypass:
-    `jarvis gate explain "x"; ./scripts/shipit.sh` must still gate, and one non-paperwork
-    segment anywhere is enough to lose it. A command substitution fails outright, because
-    the shell expands it before `jarvis` is reached and what it expands to is unknown.
-
-    Deliberately NOT guarded on `_SHELL_INVOKER`, unlike `reads_only`. That test is a
-    substring search over the WHOLE command, so the English word "eval" defeats it —
-    request 106's evidence said "the eval scorecard at 45 of 45", which is why its quoted
-    prose was scanned as code in the first place. An invoker that actually invokes
-    something is a segment of its own (`… | xargs sh -c '…'`, `sh -c 'jarvis gate …'`)
-    and the argv0 test below already refuses it, on structure rather than on vocabulary.
-
-    See docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §9.
+    All-or-nothing, and deliberately NOT guarded on `_SHELL_INVOKER` the way `reads_only`
+    is. See docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §9.
     """
     if _SUBSTITUTION.search(command):
         return False

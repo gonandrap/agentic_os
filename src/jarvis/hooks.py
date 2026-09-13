@@ -383,9 +383,7 @@ def _classify(command: str, config: Any) -> Any:
 def _case_deadline(config: Any) -> str:
     """The sentence that turns the hold into a deadline the worker can see.
 
-    ABANDONED, not refused: the OS stopped writing a denial nobody reached — see
-    `gates.sweep_unargued` and spec 2026-09-12 §4. The deadline still binds, and saying
-    "refused" would keep threatening the worker with a verdict that no longer exists.
+    ABANDONED, not refused — spec 2026-09-12 §4.
     """
     return (f"If you do neither within "
             f"{int(config.case_ttl_seconds // 60)} minutes the request is closed as "
@@ -469,10 +467,7 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
             )
         finally:
             neo.close()
-        # A worker told only "argue that this is ready to ship" and handed a false
-        # positive has no true sentence available, so it writes a false one or walks away
-        # — wo-5efc2de6 walked away three times. Both exits, every time, with the
-        # diagnosis first. Spec 2026-09-12 §3.
+        # Both exits, every time, with the diagnosis first — spec 2026-09-12 §3.
         prior_abandoned = (prior is not None and prior["status"] == "expired"
                            and prior["closed_as"] == "abandoned")
         return _deny(
