@@ -222,6 +222,68 @@ def test_the_delivery_pass_and_the_diagnosis_read_the_same_decision(project):
     assert stuck_message(store, held) is None
 
 
+# -- every reader of the new `waiting_on` answer ----------------------------------------
+# `message_stuck` is a new value of `waiting_on()["what"]`. These pin what each of its
+# three readers does with it, so a fourth reader arrives to a vocabulary with a
+# demonstrated meaning rather than to an unhandled case (review round 3).
+
+
+def test_resume_auto_refuses_to_nudge_even_where_a_worker_could_prompt(project,
+                                                                      jarvis_home,
+                                                                      catalog_file):
+    """The reader review round 3 named. Every other refusal in `resume_in_auto` is bought
+    by `could_prompt` being False, so under a prompting mode a stuck order would fall
+    through to the nudge — and the nudge is another row on the queue that is stuck."""
+    ops.start_os(str(catalog_file), foreground=True)
+    store = ProjectStore(project)
+    wo = _sent_and_never_delivered(store)
+    store.update_work_order(wo["id"], permission_mode="default")  # CAN prompt
+    _age_the_message(store, wo["id"])
+    before = len(store.queued_messages(wo["id"]))
+    store.close()
+
+    out = ops.resume_in_auto(wo["id"], project_name="proj_a")
+
+    assert out["waiting_on"] == "message_stuck"
+    assert out["nudged"] is False
+    assert "a nudge cannot help" in out["note"]
+    store = ProjectStore(project)
+    assert len(store.queued_messages(wo["id"])) == before  # nothing was added
+
+
+def test_the_work_order_page_says_what_is_holding_the_message(project, jarvis_home,
+                                                              catalog_file):
+    """The UI reader. It branches on `waiting.what == 'prompt'` and renders `detail`
+    otherwise, so `message_stuck` reaches the page as its diagnosis — and the
+    resume-auto button, which is offered only for `prompt`, stays hidden."""
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    ops.start_os(str(catalog_file), foreground=True)
+    store = ProjectStore(project)
+    wo = _sent_and_never_delivered(store, status="waiting_input")
+    msg_id = store.queued_messages(wo["id"])[0]["id"]
+    _age_the_message(store, wo["id"])
+    store.close()
+
+    page = TestClient(create_app(), follow_redirects=False).get(
+        f"/wo/proj_a/{wo['id']}").text
+
+    assert f"message {msg_id} is queued undelivered" in page
+    assert "Resume in auto" not in page
+
+
+def test_the_parked_check_is_the_third_reader(project):
+    """`invariants.SPOKEN_FOR_WAITS`. Covered in full by
+    `test_a_stuck_message_speaks_instead_of_the_parked_line`; this pins the membership
+    itself so a future edit to IN_FLIGHT_WAITS cannot silently drop it."""
+    from jarvis.invariants import IN_FLIGHT_WAITS, SPOKEN_FOR_WAITS
+
+    assert "message_stuck" in SPOKEN_FOR_WAITS
+    assert "message_stuck" not in IN_FLIGHT_WAITS  # nothing is in flight for it
+
+
 # -- the noise rule: every wait something else already owns -----------------------------
 
 

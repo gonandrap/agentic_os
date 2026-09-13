@@ -224,7 +224,9 @@ def busy(store: ProjectStore, wo_id: str) -> dict[str, Any] | None:
     return turn if turn and turn["state"] == "running" else None
 
 
-#: `DeliveryHold.kind`, so a caller can branch on the hold without matching its prose.
+#: `DeliveryHold.kind`, so a caller could branch on the hold without matching its prose.
+#: NOTHING DOES TODAY — both callers read `accounted` and `reason` only — so these are a
+#: label on the record, not a dispatch table, and a new kind costs no caller a branch.
 HOLD_NO_SESSION = "no_session"
 HOLD_TURN_IN_FLIGHT = "turn_in_flight"
 HOLD_RETRY_BOOKED = "retry_booked"

@@ -988,15 +988,20 @@ def check_blocked_work_is_surfaced(store: ProjectStore) -> Iterator[Violation]:
 def check_messages_are_delivered(store: ProjectStore) -> Iterator[Violation]:
     """INV-MESSAGE-STUCK — a message queued for a worker must not sit undelivered for ever.
 
-    GitHub issue 43. `Daemon.deliver_messages` holds a message on four paths and every
-    one of them is silent: the row stays `queued`, which from the outside is
-    indistinguishable from one about to go out, and `ops.waiting_on` answers
-    `queued_message` — a member of IN_FLIGHT_WAITS, so `parked_reason` reads the hold as
-    the OS being about to act and every surface reports the work order healthy. Fifteen
-    messages across four work orders were rotting when the issue was filed, including a
-    gate verdict and the user's own two follow-ups.
+    GitHub issue 43, and the paragraph below is the state of the OS BEFORE this check
+    existed — present tense would read as a description of how it still works and invite
+    the next reader to undo it (kn-88615da4).
 
-    The predicate and its three excused waits are `stuck_message`'s. What is added here
+    `Daemon.deliver_messages` held a message on four paths and every one of them WAS
+    silent: the row stayed `queued`, which from the outside is indistinguishable from one
+    about to go out, and `ops.waiting_on` answered `queued_message` for it — a member of
+    IN_FLIGHT_WAITS, so `parked_reason` read the hold as the OS being about to act and
+    every surface reported the work order healthy. Fifteen messages across four work
+    orders were rotting when the issue was filed, including a gate verdict and the user's
+    own two follow-ups. Today `waiting_on` answers `message_stuck` instead, SPOKEN_FOR_WAITS
+    catches it, and the blocker below is what the user reads.
+
+    The predicate and its four excused waits are `stuck_message`'s. What is added here
     is the DIAGNOSIS, which is the reason this is its own invariant rather than a line of
     INV-ATTENTION-MISSING: that check can only say "needs the user", and the useful fact
     is which message, for how long, and what is holding it.

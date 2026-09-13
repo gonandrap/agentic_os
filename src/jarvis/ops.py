@@ -1076,6 +1076,25 @@ def resume_in_auto(wo_id: str, project_name: str | None = None,
     could_prompt = worker_stalls_on_prompts(mode) if mode else True
     out = {"project": name, "wo_id": wo_id, "permission_mode": mode,
            "waiting_on": wait["what"], "diagnosis": wait["detail"]}
+    if not force and wait["what"] == "message_stuck":
+        # THE ONE ANSWER WHERE A NUDGE IS ACTIVELY WRONG rather than merely useless, and
+        # the reason it needs a branch of its own: every other refusal below is bought by
+        # `could_prompt` being False, so a project running a mode that CAN prompt would
+        # fall through to the nudge — and the nudge is `send_message`, another row on the
+        # queue that is already not moving. `invariants.MESSAGE_STUCK_BLOCKER` sends the
+        # user here, so this is the command that has to say what is wrong instead.
+        store = ProjectStore(path)
+        try:
+            store.add_event(wo_id, "resume_auto_declined",
+                            {"permission_mode": mode, "waiting_on": wait["what"]})
+        finally:
+            store.close()
+        out.update({
+            "nudged": False, "changed": False,
+            "note": f"a nudge cannot help — it is another message on the queue that is "
+                    f"already stuck. {wait['detail']}. Send one anyway with --force.",
+        })
+        return out
     if not force and not could_prompt and not wait["stalled"]:
         # The no-op case, reported rather than performed. Recorded on the timeline too:
         # "the user asked what was wrong and the OS said nothing was" is part of this
