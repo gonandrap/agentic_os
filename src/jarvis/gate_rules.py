@@ -337,6 +337,16 @@ def scannable(command: str) -> str:
     payload that merely spelled one of those words turned blanking off for the whole
     command and gated itself (issue #203).
 
+    …WITH ONE KNOWN MISS, so read the paragraph above as conditional rather than a
+    guarantee: a quoted span this blanks may still be EXECUTED, by something `_QUOTED`
+    has no vocabulary for. `ssh host "…"`, `docker exec c "…"` and `"$(…)"` all run
+    their payload, and none of them is a shell invoker by this module's definition, so
+    both the literal and any invoker naming it vanish in the same pass. The hole is
+    older than the positional test — `ssh host "scripts/shipit.sh"` never gated — but
+    the raw search used to catch the subset whose payload happened to spell one of the
+    three keywords, and this makes the miss uniform. Issue #213; the fix is a notion of
+    "wrapper that executes its quoted argument", not a retreat to the raw search.
+
     Heredoc bodies are deliberately NOT blanked here, and that is not the oversight it
     looks like. `cat <<EOF | bash` executes its body, so blanking it outright would open
     a bypass in the classifier for every gate at once. What the body needs is not a blunt
@@ -401,11 +411,14 @@ def reads_only(command: str) -> bool:
     is not the `cat` on PATH but something in the tree that merely shares its name, and
     an empty segment means the split found something this parser does not model.
     """
+    # The asymmetry below is deliberate, not a half-finished edit: `_SUBSTITUTION` stays
+    # on the RAW command because `$(…)` runs inside double quotes, so blanking first
+    # would hide the very thing it looks for. An invoker does not — quote it and the
+    # shell passes it along as an argument — so that test moved to the blanked text,
+    # where a reader's quoted argument reads as the thing being read (issue #203).
     if _SUBSTITUTION.search(command):
         return False
     blanked = _QUOTED.sub(" ", command)
-    # Positional, for the reason `scannable` gives: the word inside a reader's quoted
-    # argument is the thing being read, not a shell about to re-parse it (issue #203).
     if _SHELL_INVOKER.search(blanked):
         return False
     parts = [s.strip() for s in _SEPARATORS.split(blanked)]

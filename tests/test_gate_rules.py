@@ -341,6 +341,60 @@ def test_a_shell_invoker_in_executable_position_still_scans_the_command_whole():
         assert classify(command, gate_rules.RuleSet.from_seeds()) is not None, command
 
 
+@pytest.mark.parametrize("command", [
+    'ssh prod "bash scripts/shipit.sh"',
+    '"bash" -c "gh pr merge 31"',
+])
+def test_a_wrapper_whose_payload_names_no_invoker_was_never_gated(command):
+    """These two look like the positional test lost them. It did not: neither ever
+    gated. `_SHELL_INVOKER` wants `sh` then whitespace then a `-…c` flag, so bare
+    `bash <path>` never matched it, and in `"bash" -c` a quote sits where the
+    whitespace has to be. Pinned so the next reader does not re-file them as a
+    regression — the real one is below."""
+    assert classify(command, gate_rules.RuleSet.from_seeds()) is None
+
+
+@pytest.mark.parametrize("command", [
+    'ssh prod "sh -c \'scripts/shipit.sh\'"',
+    'ssh prod "eval scripts/shipit.sh"',
+    'docker exec c "bash -c \'scripts/shipit.sh\'"',
+    'echo "$(eval scripts/shipit.sh)"',
+])
+def test_a_wrapper_that_executes_its_quoted_payload_is_a_known_miss(command):
+    """Issue #213, asserted as the miss it is rather than left unexamined.
+
+    `ssh`, `docker exec` and `"$(…)"` all run their quoted payload, and none is a shell
+    invoker by this module's definition — so blanking deletes the gated literal and the
+    invoker naming it together. The hole predates the positional test (the same wrappers
+    with a plain payload, below, never gated either); what changed is that the raw search
+    used to catch the subset whose payload happened to spell one of the three keywords.
+    """
+    assert classify(command, gate_rules.RuleSet.from_seeds()) is None
+
+
+@pytest.mark.parametrize("command", [
+    'ssh prod "scripts/shipit.sh"',
+    'ssh prod "gh pr merge 31"',
+    'docker exec c "scripts/shipit.sh"',
+    'echo "$(scripts/shipit.sh)"',
+])
+def test_the_wrapper_miss_is_older_than_the_positional_test(command):
+    """The control for the case above, and the reason it is a pre-existing hole rather
+    than one this fix opened: with no keyword in the payload there was nothing for the
+    raw search to catch, and these did not gate before the change either."""
+    assert classify(command, gate_rules.RuleSet.from_seeds()) is None
+
+
+@pytest.mark.parametrize("command", [
+    'ssh prod bash scripts/shipit.sh',
+    'ssh prod sh -c scripts/shipit.sh',
+])
+def test_an_unquoted_wrapper_payload_still_gates(command):
+    """The boundary of that miss: nothing is blanked, so the literal is in plain sight
+    and the gate fires. Only the quoting hides it."""
+    assert classify(command, gate_rules.RuleSet.from_seeds()) is not None
+
+
 def test_a_reader_whose_argument_names_a_shell_invoker_still_only_reads():
     """`reads_only` ran the same raw search, so a note about a shell cost a reader its
     exemption. The exemption cannot widen: an invoker the shell reaches is never a
