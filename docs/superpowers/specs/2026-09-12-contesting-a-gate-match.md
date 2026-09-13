@@ -256,6 +256,54 @@ write a row; `gate explain` reads the rule base. Jarvis's own recogniser already
 this — a bare `jarvis gate …` invocation does not trip a gate, while
 `jarvis gate explain "…"; ./scripts/shipit.sh` still does.
 
+### 9. The OS's own paperwork is not a privileged action
+
+§8 fixed an exit a worker could not *type*. This is an exit a worker could not *file*:
+the recogniser read the whole argv of a `jarvis gate request` invocation, prose included,
+and classified the argument the worker was making to a reviewer as if it were a command.
+
+Live, on wo-4fc128ca. A `pr_merge` request for `gh pr merge 210 --squash` — plainly a
+merge — was recorded as **request 106, `kind: release`, `matched: shipit`**, because the
+`--why` explained that the PR fixes the release script. 106 then TTL-closed for want of a
+case, which is circular: the only way to make the case is the command that was blocked.
+Re-filing the identical command with neutral prose went through as 107 and was approved.
+
+Two things went wrong and both are structural.
+
+**The exemption was a learned regex, bound to one kind and one argv shape.** `gr-7a0e659b`
+is `^jarvis\s+gate\s+request\s+\S+\s+"[^"]*"(\s+--[a-z-]+\s+"[^"]*")*\s*$`. `explain`
+reports it clearing `pr_merge` on request 106 and leaving `release` matching — an
+exemption is scoped to the kind it was learned for, and no per-kind rule can state the
+property that actually holds: **the verb runs nothing, whatever gate the prose happens to
+mention.** So `gate_rules.gate_paperwork` states it in code, checked in `RuleSet.decide`
+before the table, at the same level and for the same reason as `reads_only`. It is not a
+claim about any privileged action; it is a claim about what `jarvis gate request` is.
+
+`GATE_PAPERWORK_VERBS` is `request`, `contest`, `explain`, `show`, `list` — the verbs that
+file or read a claim *about* a command. Deliberately not `approve`, `deny`, `dismiss` or
+`rule-retract`: those rule on a request, and a worker clearing its own gate is the one
+thing this subsystem exists to prevent. All-or-nothing across the chain, exactly like
+`reads_only`: `jarvis gate explain "x"; ./scripts/shipit.sh` still gates.
+
+**And the prose was scanned as code because of one English word.** `scannable()` blanks
+quoted arguments *unless* `_SHELL_INVOKER` matches, and that test is a substring search
+over the whole command. Request 106's evidence said "the eval scorecard at 45 of 45"; the
+word `eval` is what stopped its quoted prose being blanked. `gate_paperwork` therefore does
+**not** reuse that guard — an invoker that actually invokes something is a segment of its
+own (`… | xargs sh -c '…'`, `sh -c 'jarvis gate …'`) and the argv0 test refuses it on
+structure rather than on vocabulary.
+
+The wider version of that second problem — any quoted prose in any command losing its
+blanking to the word "eval" — is **not fixed here**. It is recogniser classification,
+which wo-5efc2de6 owns; it is on the backlog with request 106 named as the specimen.
+
+**On §5's count.** Requests 99, 100, 103, 105 and 106 of this fleet were all recorded as
+denied `release` actions and not one was a release attempt. 99 the user dismissed by hand.
+The other four were the TTL's, and opening the store under this branch re-filed every one
+of them as `expired`/`closed_as='abandoned'` — verified on the live record, which now
+reports `13 abandoned unargued` beside the false-positive rate instead of four more
+denials nobody ever reviewed.
+
 ## What this is not
 
 It is not a way for a worker to clear its own gate. A contest is a claim, reviewed by
