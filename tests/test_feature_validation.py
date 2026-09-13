@@ -939,10 +939,21 @@ def _outbox(store: ProjectStore, unit_id: str) -> list[dict]:
     SCOPED BY UNIT, because the fixture validates work orders too: the feature's own
     MANAGER is a work order that finishes with an empty worktree and gives up on its
     round 1, so an unfiltered read is never empty and the rejection pairing below would
-    pass for the wrong reason."""
-    return [dict(r) for r in store.conn.execute(
-        "SELECT * FROM notifications WHERE source='validation' AND title LIKE ?"
-        " ORDER BY id", (f"{unit_id}%",)).fetchall()]
+    pass for the wrong reason.
+
+    THE SCOPE IS A MATCH ON THE TITLE, which makes the title's wording load-bearing as
+    an identifier — there is no `fo_id` column to filter on instead. So the exclusion is
+    ASSERTED rather than assumed: a reworded title would otherwise make this filter
+    match nothing, and "a rejection wrote no row" would start passing because the read
+    found nothing rather than because nothing was written.
+    """
+    rows = [dict(r) for r in store.conn.execute(
+        "SELECT * FROM notifications WHERE source='validation' ORDER BY id").fetchall()]
+    assert any(r["title"].startswith("wo-") for r in rows), (
+        "the manager's own give-up row is missing: either the title no longer starts "
+        "with the unit id, or work-order validation stopped running in this fixture — "
+        "and this helper is now silently excluding nothing")
+    return [r for r in rows if r["title"].startswith(unit_id)]
 
 
 def test_a_feature_give_up_notifies_and_a_rejection_stays_silent(fleet):

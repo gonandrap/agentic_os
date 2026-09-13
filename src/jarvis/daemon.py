@@ -161,9 +161,27 @@ NO_VALIDATOR_REASON = (
 
 #: The give-up notification, for both round machines (issue #199). ONE shape for both,
 #: because a unit that gives up says the same thing to the user whichever machine gave
-#: up on it — and the body carries the round's reason verbatim, which is the only text
-#: that says WHY.
+#: up on it. The body is the round's reason, CUT to `VALIDATION_REASON_CHARS`.
 VALIDATION_ESCALATED_TITLE = "{unit} — the review gave up in round {n}"
+
+#: How much of the reason the body carries. A DISPLAY choice and not a schema limit —
+#: `notifications.body` is TEXT and would take the whole of it — so raising it is safe
+#: and is a decision about what a Telegram push should be, not about the store. A panel
+#: reason runs to paragraphs; this row exists to say enough to decide whether to look,
+#: and `jarvis wo show` / `jarvis validation show` hold the untruncated text.
+VALIDATION_REASON_CHARS = 500
+
+#: Appended when the cut above actually bit, so a reader can tell a short reason from a
+#: clipped one. Without it a sentence simply stops and the truncation reads as the
+#: machine having nothing more to say.
+VALIDATION_REASON_CUT = " […]"
+
+
+def escalation_body(reason: str) -> str:
+    """The reason as a notification body — see `VALIDATION_REASON_CHARS`."""
+    if len(reason) <= VALIDATION_REASON_CHARS:
+        return reason
+    return reason[:VALIDATION_REASON_CHARS] + VALIDATION_REASON_CUT
 
 
 class Daemon:
@@ -1322,7 +1340,8 @@ class Daemon:
         store.flag_attention(wo_id, VALIDATION_STUCK_BLOCKER)
         store.add_notification(
             title=VALIDATION_ESCALATED_TITLE.format(unit=wo_id, n=n),
-            body=reason[:500], level="warning", wo_id=wo_id, source="validation",
+            body=escalation_body(reason), level="warning", wo_id=wo_id,
+            source="validation",
         )
 
     def _validation_outage(self, store: ProjectStore, wo: dict, round_id: int, n: int,
@@ -1640,7 +1659,7 @@ class Daemon:
         store.flag_feature_attention(fo_id, VALIDATION_STUCK_BLOCKER)
         store.add_notification(
             title=VALIDATION_ESCALATED_TITLE.format(unit=fo_id, n=n),
-            body=reason[:500], level="warning", source="validation",
+            body=escalation_body(reason), level="warning", source="validation",
         )
 
     def _feature_outage(self, store: ProjectStore, fo: dict, round_id: int, n: int,

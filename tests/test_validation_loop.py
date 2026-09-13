@@ -26,7 +26,8 @@ import pytest
 from jarvis import claude_cli, ops
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
-from jarvis.daemon import VALIDATION_ESCALATED_TITLE, Daemon
+from jarvis.daemon import (VALIDATION_ESCALATED_TITLE, VALIDATION_REASON_CHARS,
+                          VALIDATION_REASON_CUT, Daemon)
 from jarvis.invariants import VALIDATION_STUCK_BLOCKER, true_blockers
 from jarvis.project_store import VALIDATOR_SEATS, ProjectStore
 from jarvis.testing import make_git_project
@@ -1232,3 +1233,48 @@ def test_three_outages_ping_the_user_once_not_once_per_attempt(fleet):
     rows = _outbox(fleet)
     assert len(rows) == 1
     assert "unreachable 3 times" in rows[0]["body"]
+
+
+def test_a_long_reason_is_cut_and_says_that_it_was(fleet):
+    """A panel reason runs to paragraphs and a sink renders it as one push. What the
+    user must not get is a sentence that simply stops: the cut has to be visible, or a
+    clipped reason reads as the machine having nothing more to say."""
+    long_reason = "the seats disagree about the header row. " * 40
+    assert len(long_reason) > VALIDATION_REASON_CHARS, "the fixture must exceed the cut"
+    fleet.reconfigure(max_rounds=1)
+    fleet.daemon.validator = Validator(rejected(long_reason))
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.drain()
+
+    rows = _outbox(fleet)
+    assert len(rows) == 1
+    assert rows[0]["body"] == (long_reason[:VALIDATION_REASON_CHARS]
+                              + VALIDATION_REASON_CUT)
+    assert rows[0]["body"].endswith(VALIDATION_REASON_CUT), "the cut is visible"
+
+    store = fleet.store()
+    try:
+        # The cut is the NOTIFICATION's, not the record's: the round keeps the whole
+        # reason, which is what `jarvis wo show` and `jarvis validation show` read.
+        assert store.latest_validation_round(wo_id=wo["id"])["reason"] == long_reason
+    finally:
+        store.close()
+
+
+def test_a_reason_that_fits_is_not_marked_as_cut(fleet):
+    """The pairing for the test above: without it, a marker appended unconditionally
+    would pass every assertion there and put "[…]" on every short reason the user reads.
+    """
+    fleet.reconfigure(max_rounds=1)
+    fleet.daemon.validator = Validator(rejected("no test covers the change"))
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.drain()
+
+    rows = _outbox(fleet)
+    assert len(rows) == 1
+    assert rows[0]["body"] == "no test covers the change"
+    assert VALIDATION_REASON_CUT not in rows[0]["body"]
