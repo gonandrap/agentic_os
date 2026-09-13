@@ -13,6 +13,9 @@ wo-f49dab38 and dismissed by Neo four times.
 
 from __future__ import annotations
 
+import re
+from unittest import mock
+
 import pytest
 
 from jarvis import db, gate_rules, gates
@@ -41,6 +44,40 @@ EOF"""
 HEREDOC_INTO_SHELL = """cat <<'EOF' | bash
 scripts/shipit.sh
 EOF"""
+
+# A one-line false positive: the release path sits in a quoted argument to a note-taking
+# command. Single-line, so it is the only shape a regex exemption may be learned from.
+QUOTED_NOTE = 'jarvis learn add "never run scripts/shipit.sh by hand" --topic releases'
+
+# The five learned rules that were live in production on 2026-09-12, each of which let a
+# worker walk a gate it had no approval for (wo-551f5e8c). Kept verbatim: they are the
+# regression, and every one of them passed the validation and the canaries of the day.
+BYPASSES = {
+    # The negated class excludes `;` and `|` but not the newline, so it cleared every
+    # line below the reader — `echo hi\n./scripts/shipit.sh` was not gated.
+    "gr-391ba702": r"^\s*(?:git ls-files|ls|cat|head|sed -n|echo)(?:[^;&|`$]|2>&1)*"
+                   r"(?:;\s*(?:git ls-files|ls|cat|head|sed -n|echo)(?:[^;&|`$]|2>&1)*)*$",
+    # The same defect, on the trailing `[^;&|]*`.
+    "gr-6b6c2060": r"^(?:uv run )?pytest\s+tests/test_shipit\.py(?:\s+-[^\s;&|]+)*"
+                   r"(?:\s+2>&1)?(?:\s*\|\s*(?:head|tail)\b[^;&|]*)?$",
+    "gr-5bd2c18c": r"^\s*(cat|head|tail|less|find)\b[^;&|`$()]*SKILL\.md[^;&|`$()]*"
+                   r"(\s*2>/dev/null)?$",
+    # No end anchor at all: a plain `&&` walked this one, no newline needed.
+    "gr-f121cbe4": r"^\s*(cd\s+\S+\s*;\s*)?jarvis\s+wo\s+finish\s+wo-[0-9a-f]{8}\b",
+    "gr-e4127741": r"\bls\s+(-[A-Za-z-]+\s+)*\.claude/skills/shipit/?(\s|$)",
+}
+
+# What each of them actually cleared, as probed with `jarvis gate explain`.
+WALKED = [
+    ("gr-391ba702", "release", "echo hi\n./scripts/shipit.sh"),
+    ("gr-6b6c2060", "release",
+     "uv run pytest tests/test_shipit.py | tail -20\n./scripts/shipit.sh"),
+    ("gr-5bd2c18c", "release",
+     "cat .claude/skills/shipit/SKILL.md\n./scripts/shipit.sh"),
+    ("gr-f121cbe4", "pr_merge",
+     'jarvis wo finish wo-12345678 --summary "x" && gh pr merge 210 --squash'),
+    ("gr-e4127741", "release", "ls .claude/skills/shipit && ./scripts/shipit.sh"),
+]
 
 
 @pytest.fixture()
@@ -206,11 +243,11 @@ def test_a_chain_containing_an_executor_is_never_exemptible():
 
 
 def test_a_sound_reviewer_pattern_is_used_in_preference_to_the_structural_one(central):
-    result = learn(central, HEREDOC_COMMIT,
-                   exempt_pattern=r"git commit -F - <<'?EOF'?[\s\S]*shipit")
+    result = learn(central, QUOTED_NOTE, kind="release", pattern="shipit",
+                   exempt_pattern=r'^jarvis learn add "[^"]*" --topic [a-z]+$')
     rule = central.get_gate_rule(result["learned"])
     assert rule["test"] == "regex"
-    assert classify(HEREDOC_COMMIT, gate_rules.RuleSet.load(central)) is None
+    assert classify(QUOTED_NOTE, gate_rules.RuleSet.load(central)) is None
 
 
 @pytest.mark.parametrize("pattern,why", [
@@ -234,6 +271,93 @@ def test_a_reviewer_pattern_that_would_clear_a_real_release_is_refused(central):
     assert classify("./scripts/shipit.sh", gate_rules.RuleSet.load(central)) is not None
 
 
+def test_a_multi_line_command_never_teaches_a_regex(central):
+    """Item 4 of wo-551f5e8c. A regex cannot say which line of a script it describes, so
+    a multi-line dismissal falls to the structural rule — the path a heredoc was always
+    meant to take — however sound the reviewer's pattern looks."""
+    result = learn(central, HEREDOC_COMMIT,
+                   exempt_pattern=r"git commit -F - <<'?EOF'?[\s\S]*shipit")
+
+    assert central.get_gate_rule(result["learned"])["test"] == "signature"
+    assert "more than one line" in " ".join(result["notes"])
+    # The dismissal still buys what it was supposed to buy.
+    assert classify(HEREDOC_COMMIT, gate_rules.RuleSet.load(central)) is None
+
+
+def test_an_exemption_describing_only_a_prefix_is_refused():
+    """gr-f121cbe4's defect, which needed no newline: the pattern described the harmless
+    `jarvis wo finish` and said nothing about the `&& gh pr merge` chained after it."""
+    command = 'jarvis wo finish wo-12345678 --summary "x" && gh pr merge 210 --squash'
+    why = gate_rules.validate_pattern(BYPASSES["gr-f121cbe4"], command)
+    assert "whole command" in why
+
+
+@pytest.mark.parametrize("rule_id", sorted(BYPASSES))
+def test_every_historical_bypass_is_refused_at_learn_time(rule_id):
+    """Each of the five would-be rules fails validation against the command it was
+    actually written for, so none of them can enter the base again."""
+    _, _, walked = [w for w in WALKED if w[0] == rule_id][0]
+    original = walked.split("\n")[0].split(" && ")[0]
+    assert gate_rules.validate_pattern(BYPASSES[rule_id], original) != ""
+
+
+@pytest.mark.parametrize("rule_id,kind,command", WALKED, ids=[w[0] for w in WALKED])
+def test_a_live_bypass_rule_no_longer_clears_the_command_it_walked(rule_id, kind,
+                                                                  command):
+    """The regression proper, and it is deliberately blind to validation: these rules
+    were already IN the base. `Rule.clears` is the floor that holds for a stored rule
+    nobody can re-validate."""
+    rule = gate_rules.Rule(id=rule_id, role=gate_rules.EXEMPT, test=gate_rules.REGEX,
+                           pattern=BYPASSES[rule_id], kind=kind, source="neo")
+    base = gate_rules.RuleSet.from_seeds().with_rule(rule)
+
+    assert base.decide(command, gate_rules.KIND_NAMES).match is not None
+
+
+def test_a_regex_exemption_never_clears_a_command_it_does_not_cover_entirely():
+    """The two floors under `Rule.clears`, stated directly."""
+    rule = gate_rules.Rule(id="gr-x", role=gate_rules.EXEMPT, test=gate_rules.REGEX,
+                           pattern=r"^echo hi$", kind="release", source="neo")
+
+    assert rule.clears("echo hi", "release", "shipit")
+    assert not rule.clears("echo hi\n./scripts/shipit.sh", "release", "shipit")
+    assert not rule.clears("echo hi && ./scripts/shipit.sh", "release", "shipit")
+
+
+def test_a_structural_exemption_still_clears_the_multi_line_shape_it_is_for():
+    """The newline rule is scoped to regex exemptions on purpose: a heredoc IS multi-line,
+    and clearing that shape is what the signature path exists for (kn-0b2fdebb)."""
+    rule = gate_rules.Rule(
+        id="gr-y", role=gate_rules.EXEMPT, test=gate_rules.SIGNATURE, kind="release",
+        pattern='{"kind": "release", "owner": "git commit", "position": "heredoc"}')
+
+    assert rule.clears(HEREDOC_COMMIT, "release", "shipit")
+
+
+def test_no_rule_in_the_base_clears_a_multi_line_command_with_a_gated_verb_below():
+    """Item 2's acceptance test, swept rather than sampled: every reader the classifier
+    knows, above every command that must always gate."""
+    readers = ["cat README.md", "ls -la", "echo hi", "head -5 README.md",
+               "sed -n '1,5p' README.md", "git ls-files", "tail -3 README.md",
+               "grep -rn shipit src/", "uv run pytest tests/test_shipit.py",
+               "cat .claude/skills/shipit/SKILL.md", "ls .claude/skills/shipit",
+               'jarvis wo finish wo-12345678 --summary "x"']
+    base = gate_rules.RuleSet.from_seeds()
+    for rule_id, pattern in BYPASSES.items():
+        base = base.with_rule(gate_rules.Rule(
+            id=rule_id, role=gate_rules.EXEMPT, test=gate_rules.REGEX, pattern=pattern,
+            kind="", source="neo"))
+
+    for reader in readers:
+        for canary in base.canaries():
+            if "\n" in canary.pattern:
+                continue
+            for joiner in ("\n", " && ", "; "):
+                command = f"{reader}{joiner}{canary.pattern}"
+                assert base.decide(command, gate_rules.KIND_NAMES).match is not None, \
+                    command
+
+
 def test_an_empty_reviewer_pattern_is_not_a_pattern(central):
     """`exempt_pattern: ""` must never reach the rule base as a regex matching
     everything."""
@@ -242,6 +366,50 @@ def test_an_empty_reviewer_pattern_is_not_a_pattern(central):
 
 
 # -- the safety net itself -------------------------------------------------------------
+
+
+def test_every_gate_kind_has_a_multi_line_canary():
+    """Item 3. Until wo-551f5e8c every canary was one line, so `jarvis gate rules` could
+    report `every command that must gate still gates` over an open release gate: the set
+    could not express the shape gr-391ba702 cleared."""
+    multiline = {kind for kind, command in gate_rules.SEED_CANARIES if "\n" in command
+                 and not command.lstrip().startswith(("cat <<", "eval"))}
+    # `self_heal` is excluded throughout: its command is a rendered intent string rather
+    # than a shell command, so it has no recogniser and no canary (kn-832cb8cb).
+    assert multiline == set(gates.KIND_NAMES) - {gate_rules.SELF_HEAL}
+
+
+def test_the_multi_line_canary_report_fails_on_the_rule_that_walked_the_gate():
+    """The canary set earns its keep only if it is falsifiable. With gr-391ba702 back in
+    the base and the `Rule.clears` floor removed, the release canary must go red."""
+    rule = gate_rules.Rule(id="gr-391ba702", role=gate_rules.EXEMPT,
+                           test=gate_rules.REGEX, pattern=BYPASSES["gr-391ba702"],
+                           kind="release", source="neo")
+    unguarded = gate_rules.RuleSet.from_seeds().with_rule(rule)
+
+    # `clears` is what the fix hardened. Restore its pre-fix body verbatim — an
+    # unanchored `search` over the raw command — to recreate the state of the day.
+    def unhardened(self, command, kind, _pattern):
+        if self.role != gate_rules.EXEMPT or (self.kind and self.kind != kind):
+            return False
+        return bool(re.search(self.pattern, command, re.IGNORECASE))
+
+    with mock.patch.object(gate_rules.Rule, "clears", unhardened):
+        failures = unguarded.check_canaries()
+    assert ["echo hi\n./scripts/shipit.sh"] == [f["command"] for f in failures]
+
+    assert unguarded.check_canaries() == []
+
+
+def test_no_seeded_pattern_can_reach_across_a_newline():
+    """The audit item 2 asks for, over the patterns the OS itself ships. A negated class
+    that forgets `\\n` is the whole defect; `[^\\n]*` is the form that does not have it."""
+    classes = re.compile(r"\[\^([^\]]*)\]")
+    for kind, pattern in gate_rules.SEED_MATCHES:
+        for body in classes.findall(pattern):
+            assert r"\n" in body, f"{kind}: {pattern}"
+        assert not pattern.startswith("^"), f"{kind}: {pattern}"
+        assert not pattern.endswith("$"), f"{kind}: {pattern}"
 
 
 def test_check_canaries_catches_a_retracted_recogniser(central):

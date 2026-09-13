@@ -563,14 +563,27 @@ class Rule:
                 f"owned by `{p.get('owner')}`, in a chain that executes nothing")
 
     def clears(self, command: str, kind: str, pattern: str) -> bool:
-        """Whether this exemption clears a match of `pattern` in `command`."""
+        """Whether this exemption clears a match of `pattern` in `command`.
+
+        The two restrictions on the REGEX arm are the floor under a reviewer-authored
+        pattern, and they hold for a rule already stored — which is the case that
+        mattered. See docs/superpowers/specs/2026-09-12-an-exemption-may-not-clear-what-
+        it-does-not-describe.md §3.
+        """
         if self.role != EXEMPT:
             return False
         if self.kind and self.kind != kind:
             return False
         if self.test == REGEX:
+            # A regex exemption speaks about one line. It is learned from a single-line
+            # command (`propose_exemption`) and cannot say which line of a script it
+            # describes, so it clears none of them.
+            if "\n" in command:
+                return False
             try:
-                return bool(re.search(self.pattern, command, re.IGNORECASE))
+                # `fullmatch`, not `search`: an exemption argues that a command is
+                # harmless, and a claim about part of one says nothing about the rest.
+                return bool(re.fullmatch(self.pattern, command.strip(), re.IGNORECASE))
             except re.error:
                 return False
         if self.test == SIGNATURE:
@@ -651,6 +664,15 @@ SEED_CANARIES: tuple[tuple[str, str], ...] = (
     ("config_write", "jarvis config unset os.validation.enabled --reason \"noisy\""),
     ("config_write", "jarvis config restore cfg-0123456789abcdef --reason \"revert\""),
     ("config_write", "jarvis config adopt --reason \"hand edit\""),
+    # One per kind: a reader, a newline, and the canonical gated command. Until
+    # wo-551f5e8c every canary was a single line, so a green report was evidence about
+    # single-line commands only — the spec's §5.
+    ("release", "echo hi\n./scripts/shipit.sh"),
+    ("pr_merge", "cat README.md\ngh pr merge 31 --squash"),
+    ("service_restart", "cat README.md\nsudo systemctl restart jarvis-daemon"),
+    ("push_protected", "ls -la\ngit push origin main"),
+    ("config_write", "head -5 README.md\njarvis config set p worker.model haiku "
+                     "--reason \"cheaper\""),
 )
 
 
@@ -673,7 +695,8 @@ def seed_rows() -> list[dict[str, Any]]:
 
 
 # 2: the `config_write` kind, its recogniser and its canaries (the config console).
-SEED_VERSION = "2"
+# 3: the multi-line canaries (wo-551f5e8c).
+SEED_VERSION = "3"
 
 
 # -- the live rule base ---------------------------------------------------------------
@@ -838,6 +861,15 @@ _MAX_PATTERN = 400
 _LITERAL_ANCHOR = re.compile(r"[A-Za-z0-9_]{3,}")
 
 
+def _spans_a_newline(rx: re.Pattern[str], command: str) -> bool:
+    """Whether `rx` would still clear `command` with a gated command appended below it.
+
+    Probed rather than parsed, and the spec's §4 says why.
+    """
+    return any(rx.search(f"{command.strip()}\n{gated}")
+               for _, gated in SEED_CANARIES if "\n" not in gated)
+
+
 def validate_pattern(pattern: str, command: str) -> str:
     """Why `pattern` may not be used as an exemption, or `""` if it may.
 
@@ -845,6 +877,9 @@ def validate_pattern(pattern: str, command: str) -> str:
     `.*`, `.+` or `git.*` is not describing a family of false positives, it is switching
     the gate off; requiring three consecutive literal characters costs a genuine rule
     nothing and makes the blanket cases unrepresentable.
+
+    The whole-command and newline tests are the same two claims `Rule.clears` enforces
+    at use time. Both live in both places on purpose — the spec's §4.
     """
     pattern = pattern.strip()
     if not pattern:
@@ -860,6 +895,12 @@ def validate_pattern(pattern: str, command: str) -> str:
                 "has reviewed")
     if not rx.search(command):
         return "does not match the command it was written for"
+    if not rx.fullmatch(command.strip()):
+        return ("does not cover the whole command it was written for — an exemption that "
+                "describes a prefix clears whatever is chained after it")
+    if _spans_a_newline(rx, command):
+        return ("matches across a newline — it would clear every line below the command "
+                "it describes, whatever those lines run")
     return ""
 
 
@@ -905,7 +946,12 @@ def propose_exemption(ruleset: RuleSet, *, command: str, kind: str, pattern: str
                    and r.kind == rule.kind for r in ruleset.exemptions())
 
     if exempt_pattern.strip():
-        why = validate_pattern(exempt_pattern, command)
+        # A multi-line command generalises into a regex only by deciding which of its
+        # lines mattered, which is the decision that opened the release gate. The
+        # structural signature below reads the shape instead, and is the path a heredoc
+        # was always meant to take.
+        why = ("the command spans more than one line, and no regex may be learned from "
+               "one" if "\n" in command else validate_pattern(exempt_pattern, command))
         if why:
             proposal.notes.append(
                 f"the reviewer's proposed pattern {exempt_pattern!r} was refused: {why}")
