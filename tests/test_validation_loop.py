@@ -1050,6 +1050,103 @@ def test_a_refused_assumption_blocks_the_landing_a_pass_would_otherwise_do(fleet
 # with nothing having judged it.
 
 
+def test_a_rejection_while_the_user_is_deciding_reaches_the_worker_and_keeps_the_park(
+        fleet):
+    """The decision the user was offered and took: full parallelism, so the feedback goes
+    to the worker IMMEDIATELY rather than waiting for them (issue 212, spec §5).
+
+    Both halves are the test. The feedback has to MOVE — a rejection the worker never
+    sees is the serialization this change removed, wearing a different hat — and the
+    user's own pending decision has to survive that movement. It nearly does not:
+    `Daemon._deliver` clears the attention flag on any work order it un-parks, which
+    erases "assumptions pending review" outright. `true_blockers` re-derives it from the
+    assumption row on the next reconcile, which is what makes the erasure a blink rather
+    than a loss.
+    """
+    fleet.reconfigure(max_rounds=3)
+    fleet.daemon.validator = Validator(rejected("no test covers the change"))
+    wo = _parked_on_assumptions(fleet)
+
+    fleet.drain()
+
+    store = fleet.store()
+    try:
+        assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "rejected"
+        fresh = store.get_work_order(wo["id"])
+        # Not settled and not un-parked by the verdict itself: the user still owes a
+        # decision, and the panel refusing the code is not that decision.
+        assert fresh["status"] == "needs_review"
+        assert len(store.pending_assumptions(wo["id"])) == 1
+        assert true_blockers(store, fresh)[0] == "1 assumption pending your review"
+        assert store.envelopes(subject_wo_id=wo["id"]), "the rejection reached nobody"
+    finally:
+        store.close()
+
+    fleet.tick()  # routes the envelope, delivers it, and reconciles behind it
+
+    store = fleet.store()
+    try:
+        delivered = [m for m in store.list_messages(wo["id"])
+                     if "round 1" in m["content"]]
+        assert delivered, "the worker was never given the feedback"
+        fresh = store.get_work_order(wo["id"])
+        assert len(store.pending_assumptions(wo["id"])) == 1
+        # The flag `_deliver` cleared, back on the record and still naming the assumption.
+        assert fresh["needs_attention"] == 1
+        assert fresh["attention_reason"] == "1 assumption pending your review"
+    finally:
+        store.close()
+
+
+def test_an_escalation_while_the_user_is_deciding_leaves_the_assumption_in_front_of_them(
+        fleet):
+    """The other concurrent verdict, and the one that writes an attention flag of its
+    own. `Daemon._escalate` stamps VALIDATION_STUCK_BLOCKER over whatever was there —
+    which, now that the two gates overlap, can be the user's pending assumption.
+
+    `true_blockers` ranks the assumption first and the give-up second, so the user is
+    told BOTH rather than the more recent one: they are two independent things owed, and
+    dropping either is the silent relabelling kn-78346a2d names. The accept then lands
+    the work order exactly where the join's table says an `escalated` round lands — the
+    user shipping it anyway, which is the only exit from a give-up.
+    """
+    fleet.reconfigure(max_rounds=1)  # one rejection exhausts the budget
+    fleet.daemon.validator = Validator(rejected("no test covers the change"))
+    wo = _parked_on_assumptions(fleet)
+
+    fleet.drain()
+
+    store = fleet.store()
+    try:
+        assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "escalated"
+        fresh = store.get_work_order(wo["id"])
+        assert fresh["status"] == "needs_review"
+        assert len(store.pending_assumptions(wo["id"])) == 1
+        assert true_blockers(store, fresh) == ["1 assumption pending your review",
+                                               VALIDATION_STUCK_BLOCKER]
+    finally:
+        store.close()
+
+    fleet.tick()  # the reconciler re-derives the reason; it must not lose the assumption
+
+    store = fleet.store()
+    try:
+        assert store.get_work_order(wo["id"])["attention_reason"] == \
+            "1 assumption pending your review"
+    finally:
+        store.close()
+
+    assert ops.review_work_order(wo["id"], accept=True)["status"] == "waiting_pr_merge"
+
+    store = fleet.store()
+    try:
+        fresh = store.get_work_order(wo["id"])
+        assert fresh["needs_attention"] == 0
+        assert len(store.validation_rounds(wo_id=wo["id"])) == 1, "a second round opened"
+    finally:
+        store.close()
+
+
 def test_a_cancelled_work_orders_open_round_is_never_picked_up(fleet):
     """The bound the round-keyed query needs and the status-keyed one got for free.
     PAIRED with the `needs_review` work order beside it, which is the whole reason the

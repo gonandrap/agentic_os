@@ -304,12 +304,12 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # edge (`jarvis wo unblock`). That is the difference between waiting and stranded.
     if wo["status"] == "pending" and dead_dependencies(store, wo):
         blockers.append(DEAD_DEPENDENCY_BLOCKER)
-    if governed and wo["status"] == "needs_review" and not pending:
+    if governed and wo["status"] == "needs_review":
         # Two very different ways to arrive at `needs_review` without an assumption to
         # decide, and they ask the user for opposite things. A closed pull request means
         # the work WAS delivered and then refused, so there is nothing to review in the
         # session — the question is what to do about the refusal.
-        if wo.get("pr_state") == "CLOSED":
+        if not pending and wo.get("pr_state") == "CLOSED":
             blockers.append(PR_CLOSED_BLOCKER)
         elif _validation_escalated(store, wo):
             # A third way in, and a more specific one: the panel ran its rounds and
@@ -317,8 +317,18 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
             # fact about the outside world and supersedes whatever the panel thought —
             # and above the generic line, which would send the user off to read a
             # session whose story is already written down in the rounds.
+            #
+            # THE ONLY ONE OF THE THREE THAT SURVIVES A PENDING ASSUMPTION, and it has
+            # to since issue 212: the panel can now give up while the user is still
+            # deciding, and those are two independent things owed. Dropping the give-up
+            # because a decision is also outstanding is the silent relabelling
+            # kn-78346a2d names — and it would drop it for good, because accepting the
+            # assumption LANDS the work order (`ops.land_when_cleared`). The other two
+            # stay behind `not pending`: a closed pull request cannot reach a work order
+            # that never entered the merge queue, and the generic line would call a
+            # `needs_review` doing exactly its job a worker that stopped.
             blockers.append(VALIDATION_STUCK_BLOCKER)
-        else:
+        elif not pending:
             blockers.append(IDLE_NO_FINISH_BLOCKER)
     # A pull request that cannot be merged and could not be healed — the whole reason
     # `waiting_pr_merge` is in BLOCKED_STATUSES at all (spec §5). The query sits behind

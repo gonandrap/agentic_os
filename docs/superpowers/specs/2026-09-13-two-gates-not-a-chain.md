@@ -96,6 +96,21 @@ starts revising while the user is still deciding. Nothing in `Daemon._reject` ne
 change — it posts to the `implementor` role over the bus and `deliver_messages` filters
 on the session, never on the status.
 
+`Daemon._reject` and `Daemon._escalate` are unchanged, and both were checked against
+the new concurrency rather than assumed safe:
+
+- A REJECTION leaves the status alone, so the `needs_review` park survives the verdict.
+  The feedback then travels to the worker and `Daemon._deliver` un-parks it — clearing
+  the attention flag, which erases "assumptions pending review" outright. `true_blockers`
+  re-derives it from the assumption row on the next reconcile, so the erasure is a blink
+  rather than a loss. INV-ATTENTION-MISSING is what puts it back.
+- An ESCALATION writes an attention flag of its OWN, and that one needed a change:
+  `invariants.true_blockers` dropped `VALIDATION_STUCK_BLOCKER` whenever an assumption
+  was pending, and it is now the one of that branch's three that survives a pending
+  assumption. Before this, a panel that gave up while the user was still deciding was
+  never mentioned to them — and never would be, because accepting the assumption lands
+  the work order and the blocker is re-derived from `needs_review`.
+
 The mirror of it is a hole parallelism opens, and `ops._refusal_answered` is what closes
 it: the USER refuses an assumption, the worker starts revising, and the round already in
 flight passes the code as it stood. "Nothing is pending" is true — a refused assumption
