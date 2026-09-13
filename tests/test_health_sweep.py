@@ -954,3 +954,48 @@ def test_the_canary_fires_through_doctor_on_the_real_sweep_path(
     found = [v for v in check_project(store, repair=False)
              if v.invariant == "INV-HEALTH-SWEEP-MUTE"]
     assert len(found) == 1, "a sweep that has judged nothing in ten tries must be news"
+
+
+def test_the_canary_ages_out_a_run_of_failures_that_is_over(store, clock):
+    """THE CANARY'S OWN DEFECT, found in production the hour it shipped.
+
+    It read the last ten rows whatever their age, so a run of failures that predates a
+    fix still reported as a live money leak — and a run that predates the sweep being
+    SWITCHED OFF reported for ever, because with the sweep disabled no new row ever
+    arrives to push the old ones out. The first deploy of the #216 fix alarmed on the
+    history the fix was written for, five seconds after the daemon booted.
+
+    What the canary claims is "the sweep IS SPENDING model calls and producing no
+    judgement" — a statement about now. A failure older than the retry floor allows
+    cannot be part of that, whatever it was at the time.
+    """
+    from jarvis.invariants import (
+        HEALTH_SWEEP_FAILURE_RUN,
+        check_health_sweep_produces_judgements,
+    )
+
+    _force_failures(store, HEALTH_SWEEP_FAILURE_RUN)
+    assert list(check_health_sweep_produces_judgements(store)), "live: it must report"
+
+    # The same rows, a day later, with nothing since — the sweep was fixed, or turned
+    # off, and either way it is not burning anything now.
+    clock.advance(minutes=60 * 24)
+    assert list(check_health_sweep_produces_judgements(store)) == [], (
+        "a run of failures that stopped is history, not an alarm")
+
+
+def test_a_sweep_still_failing_now_is_reported_however_old_the_run_started(store, clock):
+    """The other side of the bound, and the one that must not be lost: a sweep that has
+    been failing for a week is exactly what the canary is for. What ages out is a run
+    with nothing recent in it, never a run that is still going."""
+    from jarvis.invariants import (
+        HEALTH_SWEEP_FAILURE_RUN,
+        check_health_sweep_produces_judgements,
+    )
+
+    _force_failures(store, HEALTH_SWEEP_FAILURE_RUN)
+    clock.advance(minutes=60 * 24)
+    _force_failures(store, 1)          # and it failed again just now
+
+    assert list(check_health_sweep_produces_judgements(store)), (
+        "still failing is still news, however long it has been true")
