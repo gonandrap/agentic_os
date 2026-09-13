@@ -404,16 +404,38 @@ def scannable(command: str) -> str:
     those are scanned whole. Erring that way is deliberate: a spurious gate costs one
     review, a missed one ships unreviewed code.
 
+    The invoker test is POSITIONAL — it runs on the blanked text, so only an invoker the
+    shell would actually reach disarms blanking. Asking the raw string instead meant a
+    payload that merely spelled one of those words turned blanking off for the whole
+    command and gated itself (issue #203).
+
+    Substitution is the exception, and it is tested BEFORE blanking rather than after:
+    `$(…)`, backticks and `<(…)` run inside double quotes, so a span containing one is
+    code however it is quoted. Prose that quotes a literal `$(` therefore gates — the
+    loud failure, chosen over the silent one, and the same call `reads_only` makes.
+
+    …AND WITH ONE KNOWN MISS, so read the paragraph above as conditional rather than a
+    guarantee: a quoted span this blanks may still be EXECUTED, by something `_QUOTED`
+    has no vocabulary for. `ssh host "…"` and `docker exec c "…"` run their payload, and
+    neither is a shell invoker by this module's definition, so both the literal and any
+    invoker naming it vanish in the same pass. The hole is older than the positional
+    test — `ssh host "scripts/shipit.sh"` never gated — but the raw search used to catch
+    the subset whose payload happened to spell one of the three keywords, and this makes
+    the miss uniform. Issue #213, and it needs the one thing substitution did not: a
+    notion of "wrapper that executes its quoted argument". Not a retreat to the raw
+    search, which is issue #203.
+
     Heredoc bodies are deliberately NOT blanked here, and that is not the oversight it
     looks like. `cat <<EOF | bash` executes its body, so blanking it outright would open
     a bypass in the classifier for every gate at once. What the body needs is not a blunt
     exemption but a *learnable* one — see `Shape`, which records that a match landed in a
     body and lets a reviewed dismissal clear that shape for the chains that cannot run it.
     """
-    if _SHELL_INVOKER.search(command):
+    if _SUBSTITUTION.search(command):
         return command
     # Replace rather than delete, so neighbouring tokens can't fuse into a false match.
-    return _QUOTED.sub(" ", command)
+    blanked = _QUOTED.sub(" ", command)
+    return command if _SHELL_INVOKER.search(blanked) else blanked
 
 
 def _argv0(segment: str) -> str:
@@ -506,9 +528,18 @@ def reads_only(command: str) -> bool:
     is not the `cat` on PATH but something in the tree that merely shares its name, and
     an empty segment means the split found something this parser does not model.
     """
-    if _SUBSTITUTION.search(command) or _SHELL_INVOKER.search(command):
+    # The asymmetry below is deliberate, not a half-finished edit, and `scannable` now
+    # makes the same call: `_SUBSTITUTION` stays on the RAW command because `$(…)` runs
+    # inside double quotes, so blanking first would hide the very thing it looks for. An
+    # invoker does not — quote it and the shell passes it along as an argument — so that
+    # test moved to the blanked text, where a reader's quoted argument reads as the thing
+    # being read (issue #203).
+    if _SUBSTITUTION.search(command):
         return False
-    parts = [s.strip() for s in _SEPARATORS.split(_QUOTED.sub(" ", command))]
+    blanked = _QUOTED.sub(" ", command)
+    if _SHELL_INVOKER.search(blanked):
+        return False
+    parts = [s.strip() for s in _SEPARATORS.split(blanked)]
     if not any(parts):
         return False
     for segment in parts:
@@ -864,11 +895,11 @@ SEED_MATCHES: tuple[tuple[str, str], ...] = (
 # run against the whole set before it is allowed into the table; a proposal that would
 # clear any of these is rejected and the rejection is recorded on the work order.
 #
-# The last two of the release group are not examples of anything a worker would type.
+# The last three of the release group are not examples of anything a worker would type.
 # They are there because they are the shapes a *learned* rule would most plausibly clear
-# by accident: a heredoc body piped into a shell, and a quoted payload handed to `eval`.
-# Both are the exact spans an exemption talks about, in the one arrangement where they
-# are code after all.
+# by accident: a heredoc body piped into a shell, a quoted payload handed to `eval`, and
+# a heredoc body handed to an interpreter. All three are the exact spans an exemption
+# talks about, in the one arrangement where they are code after all.
 SEED_CANARIES: tuple[tuple[str, str], ...] = (
     ("pr_merge", "gh pr merge 31 --squash --delete-branch"),
     ("pr_merge", "gh pr merge --auto"),
@@ -881,6 +912,8 @@ SEED_CANARIES: tuple[tuple[str, str], ...] = (
     ("release", "git push --follow-tags origin release/jarvis-1.2.3"),
     ("release", "cat <<'EOF' | bash\nscripts/shipit.sh\nEOF"),
     ("release", 'eval "bash scripts/shipit.sh"'),
+    # Added with the issue #203 fix, to pin what that fix must NOT turn into a miss.
+    ("release", "python3 - <<'PY'\nscripts/shipit.sh\nPY"),
     # The pipe the reader exemption must never be loosened across, and the list
     # separator it must be — `reader || executor` is two commands (issue #194), and
     # these two lines are what stops the second fix reaching the first.
@@ -925,7 +958,12 @@ def seed_rows() -> list[dict[str, Any]]:
 
 
 # 2: the `config_write` kind, its recogniser and its canaries (the config console).
-SEED_VERSION = "3"
+# 3: the reader-exemption canaries — the pipe, the list separator, and the reader whose
+#    output is written somewhere the next command runs it (issue #194).
+# 4: the `python3 - <<PY` release canary (issue #203). A separate number because 3 has
+#    already been written to live databases, and `_seed_gate_rules` returns early on a
+#    matching key — reusing it would leave that canary out of every os.db that has one.
+SEED_VERSION = "4"
 
 
 # -- the live rule base ---------------------------------------------------------------

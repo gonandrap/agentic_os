@@ -1470,11 +1470,18 @@ def test_the_abandonment_migration_still_recognises_the_sweeps_own_reason():
 #: Request 106's shape, rebuilt: a `pr_merge` request whose ARGUMENT is plainly a merge
 #: and whose prose describes release work. The live row matched `release` on the word in
 #: its own `--why`, then TTL-closed for want of a case — the case being the command that
-#: was blocked. The "eval scorecard" clause is load-bearing, not colour: `_SHELL_INVOKER`
-#: is a substring search over the whole command, so that one English word is what stopped
-#: the quoted prose being blanked. Spec 2026-09-12 §9.
+#: was blocked. The "eval scorecard" clause is load-bearing, not colour: it is what
+#: `test_the_word_eval_in_prose_does_not_make_paperwork_executable` reproduces.
+#:
+#: The ARGUMENT is unquoted, and that is load-bearing too. Quoted, the only thing making
+#: this specimen trip a gate under a deciding verb was `_SHELL_INVOKER` matching that same
+#: English word and disarming quote-blanking for the whole command — issue #203, which §9
+#: names and assigns to this lineage rather than fixing. With that fixed the quoted form
+#: classifies clean under EVERY verb, including the control, so the tripwire below would
+#: have gone quiet without a single assertion failing. Unquoted it trips on the merge
+#: itself. Spec 2026-09-12 §9.
 PAPERWORK = (
-    'jarvis gate request wo-4fc128ca "gh pr merge 210 --squash" '
+    'jarvis gate request wo-4fc128ca gh pr merge 210 --squash '
     '--why "the PR fixes issue 202 at the root — shipit now relocks uv.lock on the '
     'release branch so production stops rewriting its own lockfile" '
     '--evidence "PR 210, checks pass, the eval scorecard at 45 of 45. No release was '
