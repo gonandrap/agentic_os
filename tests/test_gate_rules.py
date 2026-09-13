@@ -383,7 +383,7 @@ def test_no_rule_in_the_base_clears_a_multi_line_command_with_a_gated_verb_below
                "sed -n '1,5p' README.md", "git ls-files", "tail -3 README.md",
                "grep -rn shipit src/", "uv run pytest tests/test_x.py",
                "cat NOTES.md", "ls docs/notes",
-               'jarvis wo finish wo-12345678 --summary "x"']
+               'jarvis wo show wo-12345678 --json']
     base = gate_rules.RuleSet.from_seeds()
     for i, (_, _, pattern, _, _) in enumerate(DEFECT_SHAPES):
         base = base.with_rule(gate_rules.Rule(
