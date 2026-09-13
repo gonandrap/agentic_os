@@ -124,9 +124,10 @@ class EvidencePacket:
     #: The pull request as a human reviewer reads it — title, body, state, draft, refs,
     #: additions/deletions, check runs — or None when there is none, or none readable.
     #: A dict rather than the `github.PullRequestArtifact` so nothing downstream needs
-    #: that type to render a packet. The artifact's own `diff` is NOT in here: it went
-    #: through truncation into `diff`, and a second untruncated copy is the leak
-    #: kn-c8b9c7da rejected `full_diff` for.
+    #: that type to render a packet. THE DIFF IS NOT A KEY IN HERE AND NEVER WAS: it is
+    #: returned separately by `_pull_request`, so the rule that a packet carries no
+    #: untruncated diff (kn-c8b9c7da) holds by construction rather than by a caller
+    #: remembering to remove it.
     pr: dict[str, Any] | None = None
     #: Why the pull request could not be read, when `pr_url` was set and the fetch
     #: failed. Non-empty means the diff below is the WORKTREE's and the submitter
@@ -246,12 +247,12 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
     files: tuple[str, ...] = ()
 
     if pr_url:
-        pr_data, pr_error = _pull_request(pr_url, project_path)
-    if pr_data is not None:
-        source = "pull_request"
-        base, head = str(pr_data["base_ref"]), str(pr_data["head_ref"])
-        stat, diff = str(pr_data["stat"]), str(pr_data.pop("diff"))
-        files = _dedupe(pr_data["files"])
+        pr_data, pr_diff, pr_error = _pull_request(pr_url, project_path)
+        if pr_data is not None:
+            source = "pull_request"
+            base, head = str(pr_data["base_ref"]), str(pr_data["head_ref"])
+            stat, diff = str(pr_data["stat"]), pr_diff
+            files = _dedupe(pr_data["files"])
 
     if source != "pull_request":
         source = "worktree"
@@ -298,8 +299,17 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
     )
 
 
-def _pull_request(url: str, project_path: Path) -> tuple[dict[str, Any] | None, str]:
-    """`(artifact-as-a-dict, "")`, or `(None, why-not)`. Never raises.
+def _pull_request(url: str,
+                  project_path: Path) -> tuple[dict[str, Any] | None, str, str]:
+    """`(artifact-as-a-dict, diff, "")`, or `(None, "", why-not)`. Never raises.
+
+    **THE DIFF IS RETURNED SEPARATELY, and the dict it is absent from is the one that
+    becomes `packet.pr`.** The rule that a packet never carries the untruncated diff in
+    any field (kn-c8b9c7da, where a `full_diff` field was rejected for exactly this) is
+    enforced HERE, by the diff never being in that dict at all — not by a caller
+    remembering to remove it. A caller that forgets a `.pop` leaks silently: the limit
+    still reads as configured and every seat prompt is simply enormous. There is nothing
+    to forget now. Rejected in review, round 2.
 
     The lazy import is the house style AND the thing the leaf rule turns on: `github`
     can only ask GitHub questions — every command it runs is in `github.READ_ONLY_VERBS`
@@ -317,16 +327,16 @@ def _pull_request(url: str, project_path: Path) -> tuple[dict[str, Any] | None, 
     try:
         art = github.pr_artifact(url, cwd=project_path)
     except github.GitHubError as e:  # the packet gets the vocabulary, not the stderr
-        return None, e.reason
+        return None, "", e.reason
     except Exception:  # noqa: BLE001 — a thin packet, never a dead round
-        return None, "the pull request could not be read"
+        return None, "", "the pull request could not be read"
     return {
         "url": art.url, "number": art.number, "title": art.title, "body": art.body,
         "state": art.state, "draft": art.draft, "base_ref": art.base_ref,
         "head_ref": art.head_ref, "additions": art.additions,
         "deletions": art.deletions, "files": list(art.files), "stat": art.stat,
-        "checks": [dict(c) for c in art.checks], "diff": art.diff,
-    }, ""
+        "checks": [dict(c) for c in art.checks],
+    }, art.diff, ""
 
 
 def _spec_ref(spec: dict[str, str] | None) -> str:

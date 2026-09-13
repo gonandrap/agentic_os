@@ -1486,6 +1486,10 @@ class Daemon:
                 return
             cfg = self._round_config(project, round_row)
             n, max_rounds = int(round_row["round"]), int(cfg.max_rounds)
+            # `side_effects` is NOT passed here and is not missing: `ops` fills it, the
+            # same way and for the same reason it assembles `children` — both are store
+            # reads per child, and `evidence.py` may not touch a store. Said out loud
+            # because reading this line alone makes the feature path look half-wired.
             packet = ops.collect_feature_evidence(
                 store, project.path, fo, declared=str(round_row["evidence"] or ""),
                 summary=str(round_row["summary"] or ""), cfg=cfg)

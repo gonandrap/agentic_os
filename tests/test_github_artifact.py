@@ -60,6 +60,35 @@ def test_every_gh_command_this_module_builds_is_a_declared_read_verb():
         f"{sorted(git_verbs - set(github.LOCAL_GIT_READS))}")
 
 
+@pytest.mark.parametrize("source, allowed", [
+    ('x = ["gh-placeholder", "pr", "view", url]', False),   # not a real gh shape
+    ('x = ["git", "-C", str(p), "remote", "get-url", "origin"]', True),
+    ('x = ["git", "-C", str(p), "push", "origin", "main"]', False),
+    ('x = ["git", "-C", str(p), "remote", "add", "origin", url]', False),
+    ('x = ["git", "-C", str(p), "commit", "-m", "x"]', False),
+])
+def test_the_local_git_carve_out_excludes_everything_it_does_not_name(source, allowed):
+    """kn-67364b3a: an allowlist that has never been shown to REFUSE anything is not
+    known to be an allowlist. `LOCAL_GIT_READS` was added to let one local read through,
+    and the risk is that it lets the whole `git` family through with it — so the same
+    rule the module is held to is run here against tails that must fail.
+
+    The check is duplicated from the test above rather than shared, deliberately: a
+    helper both tests call could be broken in a way that makes both pass.
+    """
+    tails = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.List) and node.elts:
+            words = [e.value if isinstance(e, ast.Constant) else None
+                     for e in node.elts]
+            if words[0] == "git":
+                tails.add(tuple(w for w in words[2:] if isinstance(w, str)))
+    if not tails:  # the non-git row: nothing for this carve-out to admit
+        return
+    assert (tails <= set(github.LOCAL_GIT_READS)) is allowed, (
+        f"{source!r} should {'pass' if allowed else 'FAIL'} the carve-out")
+
+
 def test_fetching_an_artifact_runs_only_read_verbs(artifact):
     github.pr_artifact(PR)
     for call in artifact.calls:

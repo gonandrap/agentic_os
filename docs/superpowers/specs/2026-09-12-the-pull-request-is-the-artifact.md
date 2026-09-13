@@ -130,6 +130,16 @@ to a panel that has just been told not to read an empty diff as nothing delivere
 could then pass on the retraction alone. Same shape as kn-988d1733: a claim about one
 part clearing the whole.
 
+Feature orders ARE in scope for the files half: a feature's `side_effects` is the union
+of its children's, and `ops.collect_feature_evidence` fills it — not
+`Daemon._validate_feature_order`, which reads as though it passes nothing. The
+aggregation lives in `ops` for the same reason `children` does: both are store reads per
+child and `evidence.py` may not open a store. Two tests pin it, and both die if the
+argument is dropped: `test_a_features_side_effects_are_the_union_of_its_childrens` and
+the assertion at the head of `test_a_side_effect_does_not_excuse_a_feature_from_having_a_base`
+— without which that test cannot tell the conditional base guard from the unconditional
+one it exists to pin.
+
 The repeat-fingerprint guard needed the same correction, and it is the one that is easy
 to miss. `fingerprint` hashed `diff_sha` and the normalised `declared` text. Two
 consecutive diff-less rounds retracting two DIFFERENT knowledge entries would hash

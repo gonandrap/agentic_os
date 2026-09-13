@@ -507,12 +507,50 @@ def test_a_side_effect_does_not_excuse_a_feature_from_having_a_base(fleet):
             ops.learn_add("something durable", wo_id=str(child["id"]))
         store.update_feature_order(fo_id, base_sha=None)
 
+        # ASSERT THE SIDE EFFECTS ACTUALLY REACH A FEATURE PACKET FIRST. Without this
+        # the test cannot tell the conditional base guard from the unconditional one it
+        # exists to pin: if `side_effects` were always empty, BOTH versions of the guard
+        # would escalate and this test would pass against the code it is meant to
+        # reject. Collected through the same function the daemon calls, which is where
+        # the children are aggregated (`ops.collect_feature_evidence` — `evidence.py`
+        # may not read a store). Rejected in review, round 2.
+        packet = ops.collect_feature_evidence(
+            store, fleet.project, store.get_feature_order(fo_id),
+            declared="", summary="", cfg=fleet.daemon.catalog.os.validation)
+        assert packet.side_effects, "a feature packet never carries side effects"
+        assert not packet.base, "the fixture did not actually remove the base"
+
         fleet.drain()
 
         assert validator.calls == [], "a baseless feature reached the panel"
         rnd = store.latest_validation_round(fo_id=fo_id)
         assert rnd["outcome"] == "escalated"
         assert "no recorded base commit" in rnd["reason"]
+    finally:
+        store.close()
+
+
+def test_a_features_side_effects_are_the_union_of_its_childrens(fleet):
+    """The wiring the guard above depends on, asserted on its own so a break shows up as
+    a failure that NAMES it rather than as a base-guard test going quiet."""
+    from jarvis import ops
+
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+        children = [str(c["id"]) for c in store.feature_children(fo_id)]
+        assert children, "the fixture produced no children to aggregate"
+        for i, child in enumerate(children):
+            ops.learn_add(f"child {i} learned something", wo_id=child)
+
+        packet = ops.collect_feature_evidence(
+            store, fleet.project, store.get_feature_order(fo_id),
+            declared="", summary="", cfg=fleet.daemon.catalog.os.validation)
+
+        assert {e["wo_id"] for e in packet.side_effects} == set(children)
+        assert packet.side_effects_sha, "the digest is empty with side effects present"
     finally:
         store.close()
 
