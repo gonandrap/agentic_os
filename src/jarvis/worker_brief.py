@@ -246,8 +246,9 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             f"`jarvis brief gates` says what. If a "
             f"gate fires on a command that ships NOTHING, that is a classifier bug and "
             f"the request above is the wrong move: contest it instead — `jarvis gate "
-            f"contest {wo_id} \"<the exact command>\" --why \"<why this performs no "
-            f"privileged action>\"` (full protocol: `jarvis brief gates --wo {wo_id}`).",
+            f"contest <request-number> --why \"<why this performs no privileged "
+            f"action>\"`, by the NUMBER the block printed, never by re-typing the "
+            f"command (full protocol: `jarvis brief gates --wo {wo_id}`).",
         ] if gate_names else []),
         f"- **A turn is one-shot and NOTHING wakes you when a background job "
         f"ends.** You are one `claude -p`, NOT an interactive session: the "
@@ -586,17 +587,19 @@ def gates_section(wo_id: str = WO_PLACEHOLDER,
         ]
     lines += [
         "",
-        "ASK FIRST. This is the only command that starts a review, because the "
-        "reviewer sees ONLY the text you write:",
+        "ASK FIRST, BEFORE YOU ARE BLOCKED. Nothing has been filed yet, so the "
+        "command string is the only handle there is — and this is the only command "
+        "that starts a review, because the reviewer sees ONLY the text you write:",
         f"    jarvis gate request {wo_id} \"<the exact command>\" "
         f"--why \"<the --why your kind asks for, above>\" "
         f"--evidence \"<the --evidence your kind asks for, above>\"",
         "",
         "",
-        "ONCE YOU HAVE BEEN BLOCKED, address the request by its NUMBER instead — "
-        "the block prints it, the OS already has the command string, and re-typing "
-        "the string into an argument is how a worker in a git worktree finds its "
-        "own way out refused by the isolation guard:",
+        "AFTER A BLOCK, USE THE REQUEST NUMBER THE BLOCK PRINTED — never the command "
+        "string. The OS already has the string; re-typing it into an argument is how "
+        "a worker in a git worktree finds its own way out refused by the isolation "
+        "guard, which inspects arguments and rejects any text it cannot prove is not "
+        "a git operation. None of these runs the command:",
         f"    jarvis gate request <request-number> --why \"...\" --evidence \"...\"",
         "    jarvis gate contest <request-number> --why \"...\"",
         "    jarvis gate explain <request-number>",
@@ -621,8 +624,8 @@ def gates_section(wo_id: str = WO_PLACEHOLDER,
         "That is an OS bug, not a refusal, and the command above is the wrong one "
         "for it — the command performs none of these actions, so every answer the "
         "request asks you for would be false. Contest the match instead:",
-        f"    jarvis gate contest {wo_id} \"<the exact command>\" "
-        f"--why \"<why this performs no privileged action>\"",
+        "    jarvis gate contest <request-number> "
+        "--why \"<why this performs no privileged action>\"",
         "",
         "That reaches the same reviewer as a candidate DISMISSAL rather than a "
         "request for permission. It authorises nothing and needs no evidence; the "
@@ -631,7 +634,7 @@ def gates_section(wo_id: str = WO_PLACEHOLDER,
         "back is a real request). If you cannot tell which of the two exits you "
         "need, ask the OS before you choose — it reports where the matched literal "
         "sits and whether the shell would run it:",
-        "    jarvis gate explain \"<the exact command>\"",
+        "    jarvis gate explain <request-number>",
         "",
         "Contesting is worth more than walking away. A dismissal TEACHES the "
         "recogniser: the OS derives a standing rule from the shape of what was "

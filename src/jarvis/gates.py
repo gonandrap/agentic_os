@@ -76,7 +76,8 @@ __all__ = [
     "CONTEST_HEADER", "CONTEST_NOT_AN_AUTHORISATION",
     "GateKind", "GatedAction", "KINDS", "KIND_NAMES", "NO_CASE_JUSTIFICATION",
     "REVIEWER_PERSONA", "RuleSet",
-    "VERDICTS", "abandoned_message", "amend_request", "apply_decision",
+    "VERDICTS", "abandoned_message", "abandoned_reason", "amend_request",
+    "apply_decision",
     "build_contest_question", "build_request_question", "classify", "contest_command",
     "deny_conflicts", "exits_advice", "file_request", "open_gate", "queue_for_review",
     "asks", "explain_command", "kind_of",
@@ -980,6 +981,18 @@ def abandoned_message(approval: dict[str, Any], ttl_seconds: float) -> str:
     )
 
 
+def abandoned_reason(ttl_seconds: float) -> str:
+    """What the record says about a request nobody argued and nobody reviewed.
+
+    A function rather than a literal at its one call site because it is read back
+    verbatim elsewhere — the abandonment migration keys on its prefix, and the screenshot
+    script seeds a row with it. A copy of it that names a stale window (the default was
+    600s, and is now 240s — §7) puts a published figure at odds with the code.
+    """
+    return (f"no case was made for it within {int(ttl_seconds // 60)} minutes, and the "
+            f"match was never contested. Nobody reviewed it.")
+
+
 def sweep_unargued(store: ProjectStore, ttl_seconds: float) -> list[dict[str, Any]]:
     """Close every held request whose case never came. Returns the rows it closed.
 
@@ -1007,11 +1020,8 @@ def sweep_unargued(store: ProjectStore, ttl_seconds: float) -> list[dict[str, An
     for approval in store.list_approvals(statuses=(AWAITING_CASE,)):
         if approval["ts"] > cutoff:
             continue
-        row = store.abandon_approval(
-            approval["id"],
-            reason=(f"no case was made for it within {int(ttl_seconds // 60)} minutes, "
-                    f"and the match was never contested. Nobody reviewed it."),
-        )
+        row = store.abandon_approval(approval["id"],
+                                     reason=abandoned_reason(ttl_seconds))
         store.queue_message(row["wo_id"], abandoned_message(row, ttl_seconds),
                             source="gate")
         # The request parked the work order (`file_request`); the close has to unpark it,

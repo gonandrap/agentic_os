@@ -1355,6 +1355,34 @@ def test_the_block_still_tells_the_worker_to_end_its_turn(gated):
         assert "END YOUR TURN" in _reason(gated.attempt(command))
 
 
+def test_the_screenshot_script_seeds_the_window_the_code_uses(gated):
+    """A published PNG is evidence, so it must not outlive the number it shows.
+
+    The script seeded "within 10 minutes" while the default was already 240s (§7), which
+    is how a screenshot in a PR body came to contradict the diff it illustrated. Both now
+    render from `gates.abandoned_reason`, and this asserts the script keeps no copy.
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "scripts" / "screenshot_contested_gate.py").read_text()
+
+    assert "gates.abandoned_reason(gates.DEFAULT_CASE_TTL_SECONDS)" in src
+    assert not re.search(r"within \d+ minutes", src), (
+        "the script carries its own copy of the window again")
+    assert "4 minutes" in gates.abandoned_reason(gates.DEFAULT_CASE_TTL_SECONDS)
+
+
+def test_the_abandonment_migration_still_recognises_the_sweeps_own_reason():
+    """The re-filing migration keys on this prefix. Changing the sentence without
+    changing the key would silently strand the rows it exists to fix."""
+    prefix = ProjectStore._TTL_DENIAL_PREFIX
+
+    assert gates.abandoned_reason(600.0).startswith(prefix)
+    assert gates.abandoned_reason(gates.DEFAULT_CASE_TTL_SECONDS).startswith(prefix)
+
+
 def test_the_contest_question_carries_the_structural_reading(gated):
     """The reviewer's premise check is about the command's shape, and the shape is the
     one input to the review the worker did not write."""

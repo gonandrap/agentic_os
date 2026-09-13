@@ -212,7 +212,7 @@ def test_gates_section_is_the_full_gate_briefing():
     text = worker_brief.render_section("gates", wo_id="wo-1",
                                        gates_enabled=("release",))
     for phrase in ("gated, NOT forbidden", "jarvis gate request wo-1", "DISMISSAL",
-                   "jarvis gate contest wo-1", "jarvis gate explain",
+                   "jarvis gate contest <request-number>", "jarvis gate explain",
                    "pending or escalated", "second request",
                    "leave the original standing"):
         assert phrase in text, f"lost from the gates section: {phrase!r}"

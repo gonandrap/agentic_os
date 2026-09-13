@@ -2982,14 +2982,28 @@ def _project_gate_config(project_name: str):
 
 
 def resolve_gate_target(target: str, command: str | None = None,
-                        project_name: str | None = None) -> tuple[str, str]:
+                        project_name: str | None = None,
+                        caller_wo_id: str | None = None) -> tuple[str, str]:
     """`(wo_id, command)` from either spelling of a gate exit: `<wo> "<cmd>"` or `<id>`.
 
     The id spelling exists because the command spelling is unusable for a large part of
     what trips a gate — see `gates._handle` and spec 2026-09-12 §8. Nothing is looked up
     that the blocking message did not already print.
+
+    SCOPED TO THE CALLER when there is one (`caller_wo_id`, from the worker's own
+    `JARVIS_WO_ID`). A request number carries no visible owner, and a contest AMENDS the
+    standing row rather than filing a new one — so one mistyped digit would re-file
+    another unit's pending release request as a claim that it performs no privileged
+    action, and the reviewer would decide it on that. Refused rather than guessed at, for
+    the same reason `_find_approval` refuses an id that two projects both hold. A session
+    with no `JARVIS_WO_ID` — the user's own — is not narrowed: it can read the row first.
     """
     if command is not None:
+        if caller_wo_id and target != caller_wo_id:
+            raise OpsError(
+                f"{target} is not your work order ({caller_wo_id}) — a gate exit acts on "
+                f"the unit that was blocked, and this one was not."
+            )
         return target, command
     if not target.strip().isdigit():
         raise OpsError(
@@ -2997,7 +3011,15 @@ def resolve_gate_target(target: str, command: str | None = None,
             f"after it. Either `jarvis gate <verb> <request-number> …` (the number the "
             f"block printed) or `jarvis gate <verb> <wo-id> \"<the exact command>\" …`."
         )
-    _, _, approval = _find_approval(int(target.strip()), project_name)
+    name, _, approval = _find_approval(int(target.strip()), project_name)
+    if caller_wo_id and approval["wo_id"] != caller_wo_id:
+        raise OpsError(
+            f"request {target.strip()} belongs to {approval['wo_id']} (project {name!r}), "
+            f"not to you ({caller_wo_id}) — refusing, because a contest amends the "
+            f"standing row and this one is not yours to re-frame. Re-read the number in "
+            f"your own block message: `jarvis gate list --wo {caller_wo_id}` lists the "
+            f"requests filed against this work order."
+        )
     return approval["wo_id"], approval["command"]
 
 

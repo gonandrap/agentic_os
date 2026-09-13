@@ -957,6 +957,44 @@ def test_a_contest_can_never_be_recorded_as_an_authorisation(fleet):
     assert _decision(fleet.attempt(PROSE)) == "deny"
 
 
+def test_apply_decision_coerces_an_approved_contest_with_no_reviewer_involved(fleet):
+    """The invariant at its own level, with nothing above it that could be skipped.
+
+    `test_a_contest_can_never_be_recorded_as_an_authorisation` covers the same rule
+    end to end, but it reaches `apply_decision` through the fake reviewer. This calls the
+    function directly: whatever a reviewer says, `approved` on a contested row is written
+    as `denied`, and the reason carries the reason why. Spec 2026-09-12 §2.
+    """
+    fleet.attempt(PROSE)
+    ops.contest_gate_match(fleet.wo_id, PROSE, why="the literal is in the message body")
+    approval = fleet.approval()
+    assert approval["contested"] == 1
+
+    store = fleet.store()
+    try:
+        gates.apply_decision(store, approval["id"], verdict="approved",
+                             reason="looks fine to me", decided_by="neo")
+        row = store.get_approval(approval["id"])
+    finally:
+        store.close()
+
+    assert row["status"] == "denied"
+    assert gates.CONTEST_NOT_AN_AUTHORISATION in row["decision_reason"]
+    assert "looks fine to me" in row["decision_reason"]
+    # An uncontested row on the same path is untouched: the coercion is about the CLAIM,
+    # not about approvals in general.
+    fleet.attempt("./scripts/shipit.sh")
+    plain = fleet.store()
+    try:
+        other = [r for r in plain.list_approvals(fleet.wo_id)
+                 if r["command"] == "./scripts/shipit.sh"][0]
+        gates.apply_decision(plain, other["id"], verdict="approved",
+                             reason="ready", decided_by="neo")
+        assert plain.get_approval(other["id"])["status"] == "approved"
+    finally:
+        plain.close()
+
+
 def test_the_user_is_told_to_dismiss_rather_than_silently_coerced(fleet):
     """The same invariant on the path where there is a person to tell."""
     fleet.attempt(PROSE)
@@ -1042,6 +1080,49 @@ def test_explain_takes_a_request_number_too(fleet):
 def test_a_request_number_that_is_not_one_says_what_to_type(fleet):
     with pytest.raises(ops.OpsError, match="neither a request number nor a work order"):
         ops.resolve_gate_target("wo-nope")
+
+
+def test_a_request_number_owned_by_another_work_order_is_refused(fleet):
+    """One wrong digit must not re-frame a stranger's pending release as a false positive.
+
+    A number carries no visible owner and a contest AMENDS the standing row, so the
+    mistake is silent and it is the reviewer who decides on the result. Scoped by the
+    worker's own `JARVIS_WO_ID`, refused rather than guessed at (spec §8).
+    """
+    fleet.attempt("./scripts/shipit.sh")
+    stranger = fleet.approval()
+    before = dict(stranger)
+
+    with pytest.raises(ops.OpsError, match="not to you"):
+        ops.resolve_gate_target(str(stranger["id"]), caller_wo_id="wo-someone-else")
+
+    after = fleet.approval()
+    assert after["status"] == before["status"]
+    assert after["justification"] == before["justification"]
+    assert after["contested"] == before["contested"] == 0
+    # And the error says what to type instead, because the worker still has to get out.
+    with pytest.raises(ops.OpsError, match="jarvis gate list --wo wo-someone-else"):
+        ops.resolve_gate_target(str(stranger["id"]), caller_wo_id="wo-someone-else")
+
+
+def test_the_command_spelling_is_scoped_to_the_caller_too(fleet):
+    """Same rule, other spelling: a gate exit acts on the unit that was blocked."""
+    with pytest.raises(ops.OpsError, match="not your work order"):
+        ops.resolve_gate_target("wo-someone-else", "./scripts/shipit.sh",
+                                caller_wo_id=fleet.wo_id)
+    assert ops.resolve_gate_target(fleet.wo_id, "./scripts/shipit.sh",
+                                   caller_wo_id=fleet.wo_id) == (
+        fleet.wo_id, "./scripts/shipit.sh")
+
+
+def test_a_session_with_no_work_order_of_its_own_is_not_narrowed(fleet):
+    """The user's own session. It can read the row before acting on it, and narrowing it
+    would leave an escalated request with no way to resolve it by hand."""
+    fleet.attempt("./scripts/shipit.sh")
+    held = fleet.approval()
+
+    assert ops.resolve_gate_target(str(held["id"])) == (fleet.wo_id,
+                                                        "./scripts/shipit.sh")
 
 
 def test_a_contest_is_never_parked_behind_the_case_clock(fleet):

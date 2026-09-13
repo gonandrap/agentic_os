@@ -216,7 +216,24 @@ still works — it is the only spelling available before a block has happened �
 positional is a request number). `gates._handle` is the matching renderer, so every
 blocking surface prints the spelling the worker can actually type, and
 `tests/test_gates.py::_names_both_exits` asserts that no exit line re-quotes the blocked
-command.
+command. The two *generated documents* — the dispatched prompt and `OPERATION.md` — are
+held to the same rule by
+`tests/test_bootstrap.py::test_no_post_block_exit_asks_the_worker_to_re_type_the_command`,
+which walks their rendered text: `contest` and `explain` are unreachable before a block,
+so they must always be addressed by number; `request` may use the command spelling, and
+only where the document marks it as the pre-block case.
+
+**A number carries no visible owner, so it is scoped to the caller.** A contest *amends*
+the standing row rather than filing a new one, so one mistyped digit would re-frame
+another unit's pending release request as a claim that it performs no privileged action —
+silently, with the reviewer deciding on the result. `resolve_gate_target` therefore
+refuses a number whose work order is not the caller's own `JARVIS_WO_ID`, and says which
+work order it belongs to and how to list the caller's own. The same rule applies to the
+`<wo-id> "<cmd>"` spelling, for the same reason. A session with no `JARVIS_WO_ID` — the
+user's — is not narrowed: it can read the row before acting on it, and narrowing it would
+leave an escalated request with no way to resolve it by hand. Cross-project collisions
+were already refused rather than guessed at (`_find_approval`); this is the same posture
+one level down.
 
 Worth stating plainly, because it is the property the guard is protecting and the reason
 this is safe: neither exit ever *runs* the string. `gate request` and `gate contest`

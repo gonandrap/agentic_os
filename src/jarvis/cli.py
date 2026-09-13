@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -2060,13 +2061,20 @@ def _print_classifier_stats(stats: dict) -> None:
 def cmd_gate(args: argparse.Namespace) -> int:
     from . import gates, ops
 
+    # A worker exits its OWN block. `JARVIS_WO_ID` is what says which that is, and
+    # without it a mistyped request number lands on a stranger's row (§8). Absent for the
+    # user's own sessions, which are not narrowed — they can read the row first.
+    caller = os.environ.get("JARVIS_WO_ID") or None
+
     if args.ga_cmd == "request":
-        wo_id, command = ops.resolve_gate_target(args.wo_id, args.command, args.project)
+        wo_id, command = ops.resolve_gate_target(args.wo_id, args.command, args.project,
+                                                 caller)
         _print(ops.request_gate_approval(
             wo_id, command, why=args.why, evidence=args.evidence,
             project_name=args.project), args.json)
     elif args.ga_cmd == "contest":
-        wo_id, command = ops.resolve_gate_target(args.wo_id, args.command, args.project)
+        wo_id, command = ops.resolve_gate_target(args.wo_id, args.command, args.project,
+                                                 caller)
         _print(ops.contest_gate_match(wo_id, command, why=args.why,
                                       project_name=args.project), args.json)
     elif args.ga_cmd == "list":

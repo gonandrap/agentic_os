@@ -79,9 +79,10 @@ def seed() -> None:
                          "heredoc is never piped to a shell")
 
     abandoned = filed("Ship 0.5.4", "./scripts/shipit.sh --stage 0.5.4")
-    store.abandon_approval(abandoned["id"],
-                           "no case was made for it within 10 minutes, and the match "
-                           "was never contested. Nobody reviewed it.")
+    # From the sweep's own renderer, so the published PNG cannot outlive the window it
+    # names (the default moved 600s → 240s; spec §7).
+    store.abandon_approval(
+        abandoned["id"], gates.abandoned_reason(gates.DEFAULT_CASE_TTL_SECONDS))
 
     dismissed = filed("Run the release staging tests",
                       "uv run pytest tests/test_release_staging.py -k shipit")
