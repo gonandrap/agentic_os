@@ -108,13 +108,16 @@ def test_the_registry_is_closed_and_shipped_with_exactly_two():
     nudge = remedies.get("nudge")
     assert nudge.id == "nudge"
     assert nudge.headline and nudge.blast
-    assert tuple(remedies.REMEDIES) == remedies.SHIPPED_REMEDIES == ("nudge", "unblock")
+    assert tuple(remedies.REMEDIES) == remedies.SHIPPED_REMEDIES == (
+        "nudge", "unblock", "file_work_order")
     # Not a restatement of the line above: it is what makes the registry a REGISTRY
     # rather than one hard-coded action, and it is the property the AST pin below keys
     # its allow-list off.
-    assert len({r.apply.__name__ for r in remedies.REMEDIES.values()}) == 2
+    assert len({r.apply.__name__ for r in remedies.REMEDIES.values()}) == 3
     assert remedies.REMEDIES["unblock"].subjects == ("work_order",)
     assert set(remedies.REMEDIES["nudge"].subjects) == {"work_order", "feature_order"}
+    assert set(remedies.REMEDIES["file_work_order"].subjects) == {"work_order",
+                                                                 "feature_order"}
 
 
 def test_the_catalog_refuses_a_remedy_the_os_does_not_have(tmp_path):
@@ -363,7 +366,7 @@ def test_the_acting_calls_stay_inside_the_handlers():
     source = Path(remedies.__file__).read_text()
     tree = ast.parse(source)
     forbidden = {"send_message", "queue_message", "unblock_work_order", "cancel",
-                 "cancel_work_order", "set_status"}
+                 "cancel_work_order", "set_status", "create_work_order"}
     handlers = {r.apply.__name__ for r in remedies.REMEDIES.values()}
 
     enclosing: dict[ast.AST, str] = {}

@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import db, usage as usage_mod
+from .inspection import Alarm, REWRITE_PREFIX_ALARM, REWRITE_TTL_ALARM
 
 #: How many `agent_calls` rows one order's bill will read. Far above any real order (a
 #: heavy one runs to dozens), and counted rather than assumed: a truncated bill would
@@ -1214,3 +1215,184 @@ def _check_children(line: dict[str, Any]) -> list[str]:
         for child in children:
             problems.extend(_check_children(child))
     return problems
+
+
+# -- the re-write tax as a STANDING condition ------------------------------------------
+#
+# `inspection.alarms` reports one call re-sending one conversation, while the turn that
+# made it is still running, and it already names the cause. What nothing reported is the
+# aggregate: a PROJECT's re-write tax over a window, and which of the two causes it was.
+# Issue 164 item 1; finding 1 of
+# docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
+#
+# Read off SEALED BILLS (`ProjectStore.sealed_bills_since`) rather than transcripts,
+# which is what makes it affordable on the reconcile cadence — the objection finding 2
+# raised against doing this at all.
+
+#: The `scripts/cache_ttl_cohort.py` invocation the TTL alarm points a reader at. Named
+#: once: the whole hazard of that alarm is a reader acting on the wrong ratio, and a
+#: command spelled differently in two places is one of them going stale.
+COHORT_COMMAND = "uv run python scripts/cache_ttl_cohort.py --days 30"
+
+#: The break-even the TTL decision is actually taken against, as a sentence rather than a
+#: number this module branches on — nothing here compares anything to it. It is in the
+#: alarm's prose because the alarm's own threshold is a share of the BILL, roughly half
+#: this ratio, and a judge that read one against the other would propose switching the
+#: write TTL on evidence that says keep it (kn-1449447a (4), which is the error the
+#: findings doc's own draft made).
+TTL_DECISION_NOTE = (
+    "This is a share of the BILL and is NOT the trigger for switching the write TTL. "
+    "That decision is TTL-expiry tokens as a share of ALL cache writes, against a "
+    "break-even of 39.5% — a different ratio over a much larger denominator, running at "
+    f"about half this figure. Measure it with `{COHORT_COMMAND}` before proposing any "
+    "change to the cache TTL."
+)
+
+
+@dataclass
+class RewriteTax:
+    """One project's re-write tax over a cohort window, split by CAUSE.
+
+    `ttl_share` is the TTL's share OF THE TAX and is None when no boundary in the window
+    was classified — `usage.Usage.rewrite_ttl_share`'s rule, kept all the way up here:
+    unmeasured must never print as 0%, and with no split there is no cause to name, so no
+    alarm is raised at all.
+
+    THE SPLIT AND THE DENOMINATOR COME FROM DIFFERENT POPULATIONS ON PURPOSE.
+    `bill_usd`, `tax_usd` and `tax_tokens` are every sealed order in the window, because
+    an order that paid no tax is still spend the tax is a share OF. The ratio is taken
+    only over the orders whose boundaries were classified (`classified_tokens`) and then
+    applied to the whole — dropping the unclassified orders from the denominator instead
+    would shrink it and inflate every share printed.
+    """
+
+    days: int
+    since: float
+    orders: int
+    bill_usd: float
+    tax_usd: float
+    tax_tokens: int
+    classified_tokens: int
+    ttl_tokens: int
+    #: The biggest single contributor, which is the alarm's CARRIER and its exemplar —
+    #: never its culprit. See `Daemon.check_rewrite_tax`.
+    worst_id: str
+    worst_title: str
+    worst_tax_usd: float
+
+    @property
+    def ttl_share(self) -> float | None:
+        """Of the tax, the fraction the cache entry EXPIRING accounts for."""
+        if not self.classified_tokens:
+            return None
+        return self.ttl_tokens / self.classified_tokens
+
+    @property
+    def tax_share(self) -> float:
+        """The whole tax as a fraction of the window's bill, both at list prices."""
+        return self.tax_usd / self.bill_usd if self.bill_usd else 0.0
+
+    @property
+    def ttl_share_of_bill(self) -> float:
+        share = self.ttl_share
+        return self.tax_share * share if share is not None else 0.0
+
+    @property
+    def prefix_share_of_bill(self) -> float:
+        share = self.ttl_share
+        return self.tax_share * (1 - share) if share is not None else 0.0
+
+    @property
+    def coverage(self) -> float:
+        """How much of the tax the split actually accounts for. Stated on the alarm when
+        it is partial, because a share drawn from half the evidence is a weaker claim."""
+        return self.classified_tokens / self.tax_tokens if self.tax_tokens else 0.0
+
+
+def rewrite_tax(store: Any, *, days: int, now: float | None = None) -> RewriteTax | None:
+    """One project's re-write tax over the trailing `days`, or None if nothing settled.
+
+    A COHORT WINDOW AND NEVER ALL HISTORY (kn-1449447a (5)): the split between the two
+    causes is drifting, and an average over everything ever sealed averages the trend
+    away — which is the difference between an alarm that notices a change and one that
+    restates a constant.
+    """
+    now = now if now is not None else db.now()
+    since = now - days * 86_400
+    orders = store.sealed_bills_since(since)
+    bill_usd = tax_usd = 0.0
+    tax_tokens = classified = ttl_tokens = 0
+    counted = 0
+    worst = ("", "", 0.0)
+    for order in orders:
+        payload = db.from_json(order.get("bill_json") or "", {}) or {}
+        rewrite = payload.get("rewrite")
+        if not isinstance(rewrite, dict):
+            # A bill sealed before `_worker_extras` carried the block, or one sealed
+            # EMPTY because it could not be computed (`Daemon.seal_bills`). Neither is
+            # evidence of a small tax, so it is left out of both halves rather than
+            # counted as a zero — which would dilute every share on this record.
+            continue
+        counted += 1
+        total = payload.get("total") or {}
+        # LIST prices on both sides. `rewrite.list_usd` has no exact twin — it is derived
+        # from a rate, not billed — so pairing it with `exact_usd` would divide one
+        # currency by another and print the answer as a percentage.
+        bill_usd += float((total.get("cost") or {}).get("list_usd") or 0.0)
+        this_tax = float(rewrite.get("list_usd") or 0.0)
+        tax_usd += this_tax
+        tokens = int(rewrite.get("tokens") or 0)
+        tax_tokens += tokens
+        if rewrite.get("ttl_share") is not None:
+            classified += tokens
+            ttl_tokens += int(rewrite.get("ttl_tokens") or 0)
+        if this_tax > worst[2]:
+            worst = (str(order["id"]), str(order.get("title") or ""), this_tax)
+    if not counted or not worst[0]:
+        return None
+    return RewriteTax(days=days, since=since, orders=counted, bill_usd=bill_usd,
+                      tax_usd=tax_usd, tax_tokens=tax_tokens,
+                      classified_tokens=classified, ttl_tokens=ttl_tokens,
+                      worst_id=worst[0], worst_title=worst[1], worst_tax_usd=worst[2])
+
+
+def _coverage_note(tax: RewriteTax) -> str:
+    """Said only when the split rests on part of the tax. A claim drawn from half the
+    evidence and one drawn from all of it must not read identically."""
+    if tax.coverage >= 0.99:
+        return ""
+    return (f" The split is measured over {tax.coverage:.0%} of the tax; the rest "
+            f"crossed no boundary this OS could classify.")
+
+
+def rewrite_alarms(tax: RewriteTax, cfg: Any) -> list[Alarm]:
+    """What is standing-wrong with this project's spend, one alarm per CAUSE.
+
+    NEITHER IS RAISED WHEN THE SPLIT IS UNMEASURED. `ttl_share` is None exactly when no
+    boundary was classified, and an alarm that named a cause anyway would be inventing
+    the one fact it exists to carry.
+
+    Each reason is self-contained down to the command that checks it, because the
+    supervisor judges on the alarm and the evidence packet and can look nothing up.
+    """
+    if tax.ttl_share is None:
+        return []
+    window = f"over the last {tax.days} days, across {tax.orders} settled orders"
+    worst = (f"Biggest single contributor: {tax.worst_id} "
+             f"(${tax.worst_tax_usd:.2f}) — `jarvis inspect {tax.worst_id}` labels every "
+             f"re-write it made by cause.")
+    raised = []
+    if tax.prefix_share_of_bill >= cfg.alarm_rewrite_prefix_share:
+        raised.append(Alarm(REWRITE_PREFIX_ALARM, (
+            f"{tax.prefix_share_of_bill:.0%} of this project's ${tax.bill_usd:,.0f} bill "
+            f"{window} went on re-sending conversations whose PROMPT PREFIX had moved — "
+            f"${tax.tax_usd * (1 - tax.ttl_share):,.2f}, and no cache TTL can buy back "
+            f"any of it. The cure is whatever is changing the head of the prompt between "
+            f"calls.{_coverage_note(tax)} {worst}")))
+    if tax.ttl_share_of_bill >= cfg.alarm_rewrite_ttl_share:
+        raised.append(Alarm(REWRITE_TTL_ALARM, (
+            f"{tax.ttl_share_of_bill:.0%} of this project's ${tax.bill_usd:,.0f} bill "
+            f"{window} went on conversations re-sent because the CACHE ENTRY EXPIRED — "
+            f"${tax.tax_usd * tax.ttl_share:,.2f}, the part a longer cache TTL could have "
+            f"bought back. {TTL_DECISION_NOTE}{_coverage_note(tax)} {worst}")))
+    return raised

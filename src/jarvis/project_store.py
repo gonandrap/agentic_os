@@ -1144,6 +1144,44 @@ class ProjectStore:
             " ORDER BY updated_at LIMIT ?", (*TERMINAL_STATUSES, limit)).fetchall()
         return [dict(r) for r in rows]
 
+    def sealed_bills_since(self, since: float) -> list[dict[str, Any]]:
+        """Every work order whose bill was frozen at or after `since`, newest first.
+
+        THE CHEAP AGGREGATE, and it is what makes an alarm about a project's SPEND
+        affordable on the reconcile cadence: a bill is frozen JSON on the row already, so
+        a window's worth is one indexed read and a JSON parse per order. Walking the
+        transcripts instead is the objection finding 2 of
+        docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md raised against
+        doing this at all, and the reason nobody did.
+
+        Sealed bills only, which is also the right population: an OPEN order's cost is
+        still moving, and a share of a denominator that has not stopped changing would
+        report a different number every tick for the same facts.
+        """
+        rows = self.conn.execute(
+            "SELECT id, title, status, hidden, bill_sealed_at, bill_json"
+            " FROM work_orders WHERE bill_json IS NOT NULL AND bill_sealed_at >= ?"
+            " ORDER BY bill_sealed_at DESC", (since,)).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def last_alarm_of_kind(self, kind: str) -> dict[str, Any] | None:
+        """The newest alarm of one kind in this project, whatever became of it.
+
+        THE DEDUPE MEMORY FOR AN ALARM ABOUT A STANDING CONDITION.
+        `Daemon.check_burning_turns` matches on `(kind, seq)` because a burning turn has
+        a turn to key on; a project's re-write tax has none, is still true on the next
+        tick, and would re-raise for ever. `Daemon.check_rewrite_tax` keys on this
+        instead: one alarm per kind per cohort window.
+
+        WHATEVER BECAME OF IT is the whole point — judged, escalated, skipped or still
+        open all mean the same thing here, that this window has already been reported.
+        Filtering to the unsettled ones would re-raise the moment the supervisor acked.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM wo_alarms WHERE kind=? ORDER BY ts DESC LIMIT 1",
+            (kind,)).fetchone()
+        return dict(row) if row else None
+
     def unsealed_terminal_features(self, limit: int = 2) -> list[dict[str, Any]]:
         marks = ", ".join("?" for _ in FO_TERMINAL_STATUSES)
         rows = self.conn.execute(
