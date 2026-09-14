@@ -87,6 +87,24 @@ PR_CLOSED_BLOCKER = "pull request closed without merging — the work was not ac
 #: build, because they are different problems and `ops.PrRepair` counts them apart.
 PR_REPAIR_MAX_ATTEMPTS = 3
 
+#: The statuses in which a pull request can SIT WITH NOBODY MOVING IT — so the statuses
+#: the poll asks GitHub about (`Daemon.PR_POLL_STATUSES` is this tuple) and the only ones
+#: in which either repair blocker below may be derived. ONE home for the set, because the
+#: two have to agree: a status the poll nudges in but `true_blockers` does not derive for
+#: raises a give-up flag nothing can re-derive, and INV-ATTENTION-REASON relabels it on
+#: the next tick; a status derived for but never polled asserts a repair that cannot be
+#: happening. Issue #224 widened the poll and this is what keeps the pair honest.
+#:
+#: Every member is in BLOCKED_STATUSES, or INV-ATTENTION-MISSING would derive the give-up
+#: correctly and then never surface it.
+#:
+#: The in-flight statuses are deliberately absent — see `Daemon.PR_POLL_STATUSES` — and so
+#: are the terminal ones, which is not merely tidiness: a hand-merged RED pull request
+#: ends in `ops.complete_merged`, never in `clear_pr_repair`, so its episode stays open
+#: for ever and an ungated derivation would leave a finished work order saying "do not
+#: merge it as it stands".
+PR_REPAIR_STATUSES = ("waiting_pr_merge", "needs_review", "waiting_input", "failed")
+
 #: What a work order says when its pull request conflicts and the worker could not fix
 #: it in PR_REPAIR_MAX_ATTEMPTS attempts — one of the two things that make a
 #: `waiting_pr_merge` work order an attention item (spec §4). Re-derived below from the
@@ -349,10 +367,12 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # `blockers[0]` (kn-d4d5a967), so ranking it below would mean the user never reads
     # it. The status still says `needs_review`, which is the rest of the story.
     #
-    # Free of any status filter, unlike the conflict line below, because a pull request
-    # is red wherever its work order happens to be sitting — that IS issue #224. The
-    # query costs a work order with no pull request nothing.
-    if wo.get("pr_url") and \
+    # Gated on PR_REPAIR_STATUSES, not on `pr_url` alone: an episode is only ever closed
+    # by a poll, and a terminal work order is not polled. A hand-merged red pull request
+    # ends in `complete_merged` with its episode still open, and an ungated derivation
+    # would leave a finished work order saying "do not merge it as it stands" for ever.
+    # The status check also keeps the query off every work order that cannot be in one.
+    if wo["status"] in PR_REPAIR_STATUSES and \
             store.pr_repair_attempts(wo["id"], "checks") >= PR_REPAIR_MAX_ATTEMPTS:
         blockers.append(PR_CHECKS_BLOCKER)
     if governed and wo["status"] == "needs_review" and not pending:
@@ -374,7 +394,14 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # A pull request that cannot be merged and could not be healed — the whole reason
     # `waiting_pr_merge` is in BLOCKED_STATUSES at all (spec §5). The query sits behind
     # the status check so no other work order pays for it.
-    if wo["status"] == "waiting_pr_merge" and \
+    #
+    # THE SAME SET AS THE RED BUILD ABOVE, and it used to be `waiting_pr_merge` alone.
+    # That was correct only while the poll looked nowhere else; issue #224 widened it, so
+    # a conflict give-up in `needs_review` was a flag raised by `nudge_pr_repair` that
+    # nothing here could re-derive — INV-ATTENTION-REASON's territory, and the exact
+    # silence PR_CLOSED_BLOCKER's note warns about. Widening a poll obliges you to widen
+    # every blocker it can raise.
+    if wo["status"] in PR_REPAIR_STATUSES and \
             store.pr_repair_attempts(wo["id"], "conflict") >= PR_REPAIR_MAX_ATTEMPTS:
         blockers.append(PR_CONFLICT_BLOCKER)
     # A message the user sent that the worker will never see (GitHub issue 43). Derived

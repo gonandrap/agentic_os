@@ -182,7 +182,7 @@ def origin_repo(cwd: Path | None) -> tuple[str, str] | None:
 PR_FIELDS = "state,mergedAt,mergeable,mergeStateStatus,baseRefName,statusCheckRollup"
 
 #: A check conclusion that means THE CODE IS WRONG — as opposed to merely not green. The
-#: distinction is the whole of the red-pull-request spec's §3: a run that is PENDING,
+#: distinction is the whole of the red-pull-request spec's §2: a run that is PENDING,
 #: CANCELLED, SKIPPED, NEUTRAL or STALE tells nobody the work is broken, and a worker
 #: asked to "fix" one has nothing to edit. ERROR is a legacy commit status's FAILURE.
 RED_CONCLUSIONS = frozenset({"FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "ERROR"})

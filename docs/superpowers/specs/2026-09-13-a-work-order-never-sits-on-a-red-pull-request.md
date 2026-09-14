@@ -92,10 +92,21 @@ the process holding the context to decide what a fix looks like.
 ## 4. `needs_review`, and the trap
 
 Every status where a pull request can sit with nobody moving it is polled:
-`PR_POLL_STATUSES = waiting_pr_merge, needs_review, waiting_input, failed`. The in-flight
-statuses (`running`, `dispatching`, `validating`) are out — something already owns those,
-and `complete_merged` on one would end a work order out from under a worker still writing
-to it.
+`invariants.PR_REPAIR_STATUSES = waiting_pr_merge, needs_review, waiting_input, failed`,
+which `Daemon.PR_POLL_STATUSES` aliases. The in-flight statuses (`running`,
+`dispatching`, `validating`) are out — something already owns those, and
+`complete_merged` on one would end a work order out from under a worker still writing to
+it. The terminal ones are out for a sharper reason: **an episode is only ever closed by a
+poll**, so a user who reads the red build and merges anyway ends in `complete_merged`
+with the episode still open, and a blocker derived on `pr_url` alone would leave a
+finished work order saying "do not merge it as it stands" for ever.
+
+ONE tuple, in one place, because the two halves have to agree. A status the poll nudges
+in but `true_blockers` does not derive for raises a give-up flag nothing can re-derive,
+and INV-ATTENTION-REASON relabels it on the next tick. That is why **both** repair
+blockers moved onto this set: `PR_CONFLICT_BLOCKER` was gated on `waiting_pr_merge`, which
+was correct only while the poll looked nowhere else. Widening a poll obliges you to widen
+every blocker it can raise.
 
 **A red build on a `needs_review` work order means the USER is the one being asked to
 merge something broken.** So the nudge has to reach the worker without the item leaving
@@ -131,10 +142,31 @@ and it is the fact that changes what they do next, on the same precedent that ra
 closed pull request above the panel's verdict. The status still says `needs_review`,
 which is the rest of the story.
 
-One consequence of widening the poll: `record_pr_closed` is now guarded on
-`pr_state != 'CLOSED'`. Before, moving a work order to `needs_review` took it out of the
-polled set, so re-running was unreachable; now it stays in, and an unguarded call would
-write a `pr_closed` event every couple of minutes for ever.
+One consequence of widening the poll: `record_pr_closed` needs a guard. Before, moving a
+work order to `needs_review` took it out of the polled set, so re-running was
+unreachable; now it stays in, and an unguarded call writes a `pr_closed` event and
+re-flags the user every couple of minutes for ever.
+
+**The guard is derived from the timeline, not from `pr_state`.** That column is stale by
+construction with exactly one permitted reader (kn-dbc4971d), and nothing ever cleared
+it — so a guard reading it would latch on the first closure, and a pull request closed,
+reopened and closed again would never tell the user the second time. That is this bug's
+own silence, reintroduced by the guard against it.
+`ProjectStore.pr_closure_told` is the same episode arithmetic as the repairs: a
+`pr_closed` newer than the newest `pr_reopened`.
+
+That needs a re-arming half, so `Daemon._note_reopened` writes `pr_reopened` when the
+poll sees an open pull request the record still calls refused — closing the gap
+kn-a94cbd68 filed. It also clears `pr_state`, because `PR_CLOSED_BLOCKER` is derived from
+that column and leaving it would keep asserting a refusal that has been withdrawn; the
+poll is the column's only writer, so this is the writer finally clearing what it wrote.
+The attention reason is **relabelled from `true_blockers`, not cleared** — clearing would
+drop the flag until INV-ATTENTION-MISSING put it back, logging a violation every time the
+code worked.
+
+The STATUS is deliberately untouched. Reopening a pull request is a button press, not a
+decision: the work was refused, what to do about that is still the user's, and moving the
+order back to the merge queue would take the item off their list on GitHub's say-so.
 
 ## 5. BEHIND: reported, never rebased
 

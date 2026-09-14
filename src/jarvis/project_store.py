@@ -1883,6 +1883,26 @@ class ProjectStore:
         """
         return bool(self._this_episode(wo_id, repair, f"pr_{repair}_unresolved"))
 
+    def pr_closure_told(self, wo_id: str) -> bool:
+        """Has the user already been told about THIS closure of the pull request?
+
+        Episode arithmetic again, and for the reason `_this_episode` gives: a
+        `pr_closed` newer than the newest `pr_reopened`. NOT `pr_state == 'CLOSED'`,
+        which kn-dbc4971d records as stale by construction — nothing ever cleared it, so
+        a pull request closed, reopened and closed again still reads CLOSED and the
+        second refusal would never reach the user. That is issue #224's silence with a
+        different cause, which is a poor thing to reintroduce while fixing it.
+
+        `Daemon.poll_pull_requests` is the only writer of both events, and it now also
+        clears the column when it writes `pr_reopened`, so the stale reader this
+        replaces has one fewer way to be wrong too.
+        """
+        closed = self.events_of_kind(wo_id, "pr_closed")
+        if not closed:
+            return False
+        reopened = self.events_of_kind(wo_id, "pr_reopened")
+        return not reopened or closed[-1]["ts"] > reopened[-1]["ts"]
+
     def pr_repair_origin(self, wo_id: str, repairs: tuple[str, ...]) -> str | None:
         """The status the newest OPEN repair episode took this work order away from.
 

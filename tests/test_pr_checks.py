@@ -20,6 +20,7 @@ from jarvis.daemon import Daemon
 from jarvis.invariants import (
     IDLE_NO_FINISH_BLOCKER,
     PR_CHECKS_BLOCKER,
+    PR_CONFLICT_BLOCKER,
     PR_REPAIR_MAX_ATTEMPTS,
     check_project,
     true_blockers,
@@ -391,6 +392,48 @@ def test_clearing_the_ci_flag_never_takes_down_a_different_one(started, project,
     row = store.get_work_order(reviewing["id"])
     assert row["needs_attention"]
     assert row["attention_reason"] == IDLE_NO_FINISH_BLOCKER
+
+
+def test_a_merged_work_order_stops_saying_do_not_merge_it(started, project, fake_gh,
+                                                          reviewing):
+    """An episode is only ever closed by a poll, and a terminal work order is not polled.
+    So a user who reads the red build and merges anyway ends in `complete_merged` with
+    the episode still open — and an ungated derivation would leave a finished work order
+    telling them not to merge something they already merged, for ever."""
+    red(fake_gh)
+    store = ProjectStore(project)
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
+        poll(started, store)
+        delivered(store, reviewing["id"])
+    assert store.get_work_order(reviewing["id"])["attention_reason"] == PR_CHECKS_BLOCKER
+
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-09-13T10:00:00Z", checks=RED)
+    poll(started, store)
+
+    row = store.get_work_order(reviewing["id"])
+    assert row["status"] == "completed"
+    assert true_blockers(store, row) == []
+    assert not row["needs_attention"]
+    assert [v.invariant for v in check_project(store)] == []
+
+
+def test_a_conflict_give_up_outside_the_merge_queue_is_re_derivable(
+        started, project, fake_gh, reviewing):
+    """The conflict blocker's twin obligation. Widening the poll means conflicts are now
+    nudged in `needs_review` too, so a give-up there is a flag `true_blockers` must be
+    able to re-derive — or INV-ATTENTION-REASON relabels it on the next tick and the
+    user is sent to read a session whose story is a merge conflict."""
+    fake_gh.set_pr(PR, "OPEN", mergeable="CONFLICTING", base_ref="main", checks=GREEN)
+    store = ProjectStore(project)
+
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
+        poll(started, store)
+        delivered(store, reviewing["id"])
+
+    row = store.get_work_order(reviewing["id"])
+    assert row["status"] == "needs_review"
+    assert PR_CONFLICT_BLOCKER in true_blockers(store, row)
+    assert [v.invariant for v in check_project(store)] == []
 
 
 # -- the guards, and BEHIND ---------------------------------------------------------

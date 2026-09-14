@@ -309,6 +309,66 @@ def test_the_closed_pr_reason_survives_the_reconciler(started, project, fake_gh,
     assert store.get_work_order(parked["id"])["attention_reason"] == PR_CLOSED_BLOCKER
 
 
+def test_a_closed_pr_is_only_reported_once(started, project, fake_gh, parked):
+    """`needs_review` is polled now (issue #224), so a closed pull request stays in the
+    poll's selection instead of dropping out of it. Unguarded, `record_pr_closed` would
+    write a `pr_closed` event and re-flag the user every couple of minutes for ever."""
+    fake_gh.set_pr(PR, "CLOSED")
+    store = ProjectStore(project)
+
+    poll(started, store)
+    poll(started, store)
+    poll(started, store)
+
+    closed = [e for e in store.list_events(parked["id"]) if e["kind"] == "pr_closed"]
+    assert len(closed) == 1
+
+
+def test_a_reopened_then_reclosed_pr_tells_the_user_again(started, project, fake_gh,
+                                                          parked):
+    """The PAIR of the test above, and the reason its guard is derived from the timeline
+    rather than from `pr_state`: that column is stale by construction and nothing used to
+    clear it (kn-dbc4971d), so a guard reading it would latch on the first closure and
+    the second refusal would never reach the user — this bug's own silence, reintroduced
+    by the guard against it."""
+    store = ProjectStore(project)
+    fake_gh.set_pr(PR, "CLOSED")
+    poll(started, store)
+    assert store.get_work_order(parked["id"])["attention_reason"] == PR_CLOSED_BLOCKER
+
+    # Reopened: the refusal has been withdrawn, so the record must stop asserting it.
+    fake_gh.set_pr(PR, "OPEN", mergeable="MERGEABLE")
+    poll(started, store)
+    row = store.get_work_order(parked["id"])
+    assert row["pr_state"] is None
+    assert PR_CLOSED_BLOCKER not in true_blockers(store, row)
+    assert any(e["kind"] == "pr_reopened" for e in store.list_events(parked["id"]))
+    assert [v.invariant for v in check_project(store)] == []
+
+    fake_gh.set_pr(PR, "CLOSED")
+    poll(started, store)
+
+    row = store.get_work_order(parked["id"])
+    assert row["attention_reason"] == PR_CLOSED_BLOCKER
+    closed = [e for e in store.list_events(parked["id"]) if e["kind"] == "pr_closed"]
+    assert len(closed) == 2
+
+
+def test_a_reopen_does_not_move_the_work_order_back_to_the_merge_queue(
+        started, project, fake_gh, parked):
+    """Reopening is a button press, not a decision. The work was refused and what to do
+    about that is still the user's; putting the order back on the merge queue would take
+    the item off their list on GitHub's say-so."""
+    store = ProjectStore(project)
+    fake_gh.set_pr(PR, "CLOSED")
+    poll(started, store)
+    fake_gh.set_pr(PR, "OPEN", mergeable="MERGEABLE")
+
+    poll(started, store)
+
+    assert store.get_work_order(parked["id"])["status"] == "needs_review"
+
+
 def test_a_closed_pr_is_still_the_users_to_close(started, project, fake_gh, parked):
     """Refused work is not failed work: the ordinary exits still apply."""
     fake_gh.set_pr(PR, "CLOSED")

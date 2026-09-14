@@ -53,6 +53,8 @@ from . import bugreport, bus, claude_cli, db, fleet, worker_session
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
+from . import invariants as invariants_mod
+from .invariants import PR_REPAIR_STATUSES
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     ACTIVE_STATUSES,
@@ -86,14 +88,19 @@ PR_POLL_EVERY_TICKS = 24
 #: that escalated into `needs_review` behind a red build completely unpolled, which is
 #: precisely when the user is about to decide whether to merge it.
 #:
+#: THE SAME TUPLE `invariants.true_blockers` DERIVES THE REPAIR BLOCKERS FOR, aliased
+#: rather than repeated: a status this polls and that does not derive raises a give-up
+#: flag nothing can re-derive. See `invariants.PR_REPAIR_STATUSES` for that half.
+#:
 #: The in-flight statuses (`running`, `dispatching`, `validating`) are deliberately out.
 #: Something already owns those — a live turn, or the round machine, which
 #: `settle_work_order` refuses to touch for the same reason — and `complete_merged` on
 #: one would end a work order out from under a worker that is still writing to it. They
 #: also cannot SIT: whatever is driving them will settle them into a status that is here.
 #:
-#: `pending` is out too: an order that has not been dispatched has no pull request.
-PR_POLL_STATUSES = ("waiting_pr_merge", "needs_review", "waiting_input", "failed")
+#: `pending` is out too: an order that has not been dispatched has no pull request. So
+#: are the terminal ones — a merged or cancelled work order's pull request is over.
+PR_POLL_STATUSES = PR_REPAIR_STATUSES
 
 #: Look for a work order the transport parked — the usage limit or a broken API — every
 #: N ticks, which is ten seconds at the default 5s interval. Its own cadence rather than
@@ -2945,14 +2952,29 @@ class Daemon:
                              wo["pr_url"], wo["id"])
                     ops.complete_merged(store, wo, merged_at=pr.merged_at)
                 elif pr.closed_unmerged:
-                    # ONCE. Before the poll widened, `record_pr_closed` moved the work
-                    # order to `needs_review` and out of the polled set, so re-running
-                    # was unreachable; now the closed order stays in it and would write
-                    # a `pr_closed` event every couple of minutes for ever.
-                    if wo.get("pr_state") != "CLOSED":
+                    # ONCE PER CLOSURE. Before the poll widened, `record_pr_closed` moved
+                    # the work order to `needs_review` and out of the polled set, so
+                    # re-running was unreachable; now the closed order stays in it and
+                    # would write a `pr_closed` event every couple of minutes for ever.
+                    #
+                    # Derived from the timeline, NOT from `pr_state`: that column is
+                    # stale by construction and has one permitted reader (kn-dbc4971d),
+                    # and reading it here would mean a pull request closed, reopened and
+                    # closed again never told the user the second time — this bug's own
+                    # silence, reintroduced by the guard against it.
+                    if not store.pr_closure_told(wo["id"]):
                         log.info("[%s] %s closed unmerged — %s needs the user",
                                  project.name, wo["pr_url"], wo["id"])
                         ops.record_pr_closed(store, wo)
+                elif self._note_reopened(project, store, wo):
+                    # The pull request is OPEN and the record still says it was refused.
+                    # Nothing used to write this, so `pr_state` said CLOSED for ever
+                    # (the gap kn-a94cbd68 filed) and `PR_CLOSED_BLOCKER` went on being
+                    # derived from a fact that had stopped being true. Recorded before
+                    # any repair below, because both of those would be nudging a worker
+                    # about a pull request whose status line still called it dead.
+                    log.info("[%s] %s is open again — %s", project.name,
+                             wo["pr_url"], wo["id"])
                 elif pr.conflicting:
                     self.heal_pull_request(project, store, wo, ops.PR_CONFLICT,
                                            "conflicts",
@@ -2987,6 +3009,42 @@ class Daemon:
             except Exception:  # noqa: BLE001
                 log.exception("[%s] settling %s against its PR failed", project.name,
                               wo["id"])
+
+    def _note_reopened(self, project: ProjectSpec, store: ProjectStore,
+                       wo: dict) -> bool:
+        """This open pull request was recorded as closed: say so, once. True if it was.
+
+        The re-arming half of `ProjectStore.pr_closure_told` — without it that guard
+        would latch on the first closure and the second refusal would never reach the
+        user. It also clears `pr_state`, which is the column kn-dbc4971d describes as
+        stale BECAUSE this poll "never clears what it wrote": `PR_CLOSED_BLOCKER` is
+        derived from it, so leaving it would keep asserting a refusal that has been
+        withdrawn.
+
+        THE STATUS IS NOT TOUCHED. The work order is in `needs_review` because somebody
+        refused the work, and reopening a pull request does not decide what to do about
+        that — moving it back to the merge queue would take the decision off the user's
+        list on the strength of a button press. What the user gets is a true reason line
+        and a timeline entry; the rest is theirs.
+        """
+        if not store.pr_closure_told(wo["id"]):
+            return False
+        store.add_event(wo["id"], "pr_reopened", {"pr_url": wo.get("pr_url"),
+                                                  "status": wo["status"]})
+        store.update_work_order(wo["id"], pr_state=None)
+        if wo["attention_reason"] == invariants_mod.PR_CLOSED_BLOCKER:
+            # RELABELLED, not cleared. The order is still in `needs_review` and still
+            # owes the user a decision, so clearing would drop the flag for the tick
+            # until INV-ATTENTION-MISSING put it back — churn, and a violation logged
+            # every time this works correctly. Re-derived here rather than guessed,
+            # under the rule PR_CLOSED_BLOCKER's own note states.
+            fresh = store.get_work_order(wo["id"])
+            blockers = invariants_mod.true_blockers(store, fresh)
+            if blockers:
+                store.flag_attention(wo["id"], blockers[0])
+            else:
+                store.clear_attention(wo["id"])
+        return True
 
     def heal_pull_request(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                           repair: Any, what: str, **fields: Any) -> None:
