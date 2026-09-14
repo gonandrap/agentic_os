@@ -134,6 +134,21 @@ PR_CONFLICT_BLOCKER = ("merge conflicts the worker could not resolve — the pul
 PR_CHECKS_BLOCKER = ("the pull request's checks are failing and the worker could not fix "
                      "them — do not merge it as it stands")
 
+#: THE TWO GIVE-UPS, PAIRED AND ORDERED, because `true_blockers` derives them from this
+#: tuple at ONE site. They were derived at two — the red build above the `needs_review`
+#: triage and the conflict below it — and after issue #224 widened both onto
+#: PR_REPAIR_STATUSES that asymmetry had teeth: in the statuses it added, a conflict
+#: give-up was derived and then outranked by the panel-gave-up line, so it was computed
+#: and never read. `attention_reason` is one column fed from `blockers[0]` (kn-d4d5a967),
+#: which makes "derived below something else" and "not derived" the same thing to the
+#: user, and being derived-but-unread is the silence this whole work order exists to
+#: close. One tuple, one ranking, one comment.
+#:
+#: Conflict first: a pull request that will not merge at all is not waiting on its
+#: checks, and if a worker somehow spent both budgets that is the one to act on.
+PR_REPAIR_BLOCKERS = ((PR_CONFLICT_REPAIR, PR_CONFLICT_BLOCKER),
+                      (PR_CHECKS_REPAIR, PR_CHECKS_BLOCKER))
+
 #: What a work order says when the validation panel gave up on it: it kept resubmitting
 #: and the panel kept rejecting, until the round budget ran out. Nothing automatic is
 #: left to try, and only the user can say whether the work is good enough or the
@@ -375,12 +390,22 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # edge (`jarvis wo unblock`). That is the difference between waiting and stranded.
     if wo["status"] == "pending" and dead_dependencies(store, wo):
         blockers.append(DEAD_DEPENDENCY_BLOCKER)
-    # A red build the worker could not fix, and it is ABOVE the `needs_review` triage
-    # below on the same precedent that ranks the closed pull request first there: it is a
-    # fact about the outside world, and it changes what the user does next — they were
-    # about to merge. `attention_reason` is one column fed from `blockers[0]`
-    # (kn-d4d5a967), so ranking it below would mean the user never reads it. The status
-    # still says `needs_review`, which is the rest of the story.
+    # A PULL REQUEST THE OS TRIED TO REPAIR AND COULD NOT — conflicts, a red build, or
+    # both. Derived at ONE site from PR_REPAIR_BLOCKERS, in that tuple's order; see its
+    # note for what being derived at two sites cost.
+    #
+    # ABOVE the `needs_review` triage below, on the same precedent that ranks the closed
+    # pull request first there: each is a fact about the outside world, and each changes
+    # what the user does next — they were about to merge. The status still says
+    # `needs_review`, which is the rest of the story.
+    #
+    # BELOW PR_CLOSED_BLOCKER IS THE ONE RANKING THIS DOES NOT HAVE TO MAKE, and that is
+    # by construction rather than by luck: `ops.record_pr_closed` — the only writer of
+    # `pr_state='CLOSED'` — closes both episodes before it flags anything, so a refused
+    # pull request has no give-up left to outrank its refusal. Without that a red pull
+    # request later closed unmerged would say "do not merge it as it stands" over the
+    # news that nobody is going to, which is kn-b6977de3's shape exactly: a true line
+    # hiding a truer one.
     #
     # UNGUARDED BY `pending`, for the reason case 2 below is: a pull request can be red
     # while an assumption is still undecided, and those are two independent things owed.
@@ -389,11 +414,11 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # by a poll, and a terminal work order is not polled. A hand-merged red pull request
     # ends in `complete_merged` with its episode still open, and an ungated derivation
     # would leave a finished work order saying "do not merge it as it stands" for ever.
-    # The status check also keeps the query off every work order that cannot be in one.
-    if wo["status"] in PR_REPAIR_STATUSES and \
-            store.pr_repair_attempts(wo["id"],
-                                     PR_CHECKS_REPAIR) >= PR_REPAIR_MAX_ATTEMPTS:
-        blockers.append(PR_CHECKS_BLOCKER)
+    # The status check also keeps both queries off every work order that cannot be in one.
+    if wo["status"] in PR_REPAIR_STATUSES:
+        for repair, blocker in PR_REPAIR_BLOCKERS:
+            if store.pr_repair_attempts(wo["id"], repair) >= PR_REPAIR_MAX_ATTEMPTS:
+                blockers.append(blocker)
     if governed and wo["status"] == "needs_review":
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for
         # something different. The `not pending` guards are PER LINE and not on the
@@ -431,20 +456,6 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         #    that status is for, and this line would call it a worker that gave up.
         elif not pending:
             blockers.append(IDLE_NO_FINISH_BLOCKER)
-    # A pull request that cannot be merged and could not be healed — the whole reason
-    # `waiting_pr_merge` is in BLOCKED_STATUSES at all (spec §5). The query sits behind
-    # the status check so no other work order pays for it.
-    #
-    # THE SAME SET AS THE RED BUILD ABOVE, and it used to be `waiting_pr_merge` alone.
-    # That was correct only while the poll looked nowhere else; issue #224 widened it, so
-    # a conflict give-up in `needs_review` was a flag raised by `nudge_pr_repair` that
-    # nothing here could re-derive — INV-ATTENTION-REASON's territory, and the exact
-    # silence PR_CLOSED_BLOCKER's note warns about. Widening a poll obliges you to widen
-    # every blocker it can raise.
-    if wo["status"] in PR_REPAIR_STATUSES and \
-            store.pr_repair_attempts(wo["id"],
-                                     PR_CONFLICT_REPAIR) >= PR_REPAIR_MAX_ATTEMPTS:
-        blockers.append(PR_CONFLICT_BLOCKER)
     # A message the user sent that the worker will never see (GitHub issue 43). Derived
     # here rather than flagged at the delivery site because `deliver_messages` never runs
     # for these — the hold is the absence of an attempt, so there is no call site to

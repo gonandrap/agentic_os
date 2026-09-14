@@ -2918,8 +2918,22 @@ class Daemon:
           docs/superpowers/specs/2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md).
           A check that is merely not green is NOT this: `github.RED_CONCLUSIONS`.
         * **open, mergeable and green** — nothing to do, and nothing written unless a
-          repair episode is being closed. The overwhelmingly common case, so it costs
-          one `gh` call, one indexed read and no write.
+          repair episode is being closed.
+
+        THE LAST ONE IS THE BUDGET, because it is the overwhelmingly common case: one
+        `gh` call and THREE indexed reads per pull request, no write. The three are one
+        per question this branch has to ask the timeline — was a closure already
+        reported (`pr_closure_told`), is a conflict episode open, is a checks episode
+        open — and they are reads of `wo_events` by `(wo_id, kind)`, not scans. Nothing
+        else on the path touches the database: the work-order row itself is re-read only
+        when a clear has just run, and the step's `list_work_orders` is one query for the
+        whole project however many pull requests it has.
+
+        That sentence used to say "one indexed read" and had been false since this body
+        was rewritten. It is a claim worth keeping honest rather than deleting —
+        `tests/test_pr_checks.py` counts the statements, so a fourth read fails a test
+        instead of quietly costing the fleet a query every two minutes per open pull
+        request.
 
         EVERY STATUS THAT CARRIES A PULL REQUEST IS POLLED, not `waiting_pr_merge`
         alone. A work order that escalated into `needs_review` behind a red build was
@@ -3002,23 +3016,28 @@ class Daemon:
                         behind=(ops.PR_BEHIND_NOTE.format(base=pr.base_ref or "its base")
                                 if pr.behind else ""))
                 else:
-                    if pr.mergeable_now and ops.clear_pr_repair(store, wo,
-                                                                ops.PR_CONFLICT):
+                    healed = pr.mergeable_now and ops.clear_pr_repair(
+                        store, wo, ops.PR_CONFLICT)
+                    if healed:
                         log.info("[%s] %s merges again — %s stopped conflicting",
                                  project.name, wo["pr_url"], wo["id"])
                     # Not `elif`: a pull request can stop conflicting and go green in the
-                    # same poll, and the two episodes are separate budgets. Re-read the
-                    # row because the clear above may have taken a flag down, and
-                    # `clear_pr_repair` decides on `attention_reason`.
+                    # same poll, and the two episodes are separate budgets.
                     #
                     # `checks_green`, NOT "nothing is failing" — see the property. The
                     # tick right after a worker pushes its fix has every check QUEUED,
                     # and closing the episode there would hand a fix that does not work
                     # three fresh attempts every round.
-                    if pr.checks_green and ops.clear_pr_repair(
-                            store, store.get_work_order(wo["id"]), ops.PR_CHECKS):
-                        log.info("[%s] %s is green again — %s stopped failing",
-                                 project.name, wo["pr_url"], wo["id"])
+                    if pr.checks_green:
+                        # Re-read ONLY if the clear above ran, because that is the only
+                        # thing that can have moved `attention_reason` under us, and
+                        # `clear_pr_repair` decides on it. An unconditional re-read cost
+                        # a row lookup on every healthy pull request in the fleet, every
+                        # two minutes, to notice a change that provably had not happened.
+                        row = store.get_work_order(wo["id"]) if healed else wo
+                        if ops.clear_pr_repair(store, row, ops.PR_CHECKS):
+                            log.info("[%s] %s is green again — %s stopped failing",
+                                     project.name, wo["pr_url"], wo["id"])
             except Exception:  # noqa: BLE001
                 log.exception("[%s] settling %s against its PR failed", project.name,
                               wo["id"])

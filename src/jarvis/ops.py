@@ -1940,6 +1940,17 @@ def record_pr_closed(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
     store.add_event(wo["id"], "pr_closed", {"pr_url": wo.get("pr_url"),
                                             "was": wo["status"]})
     store.set_status(wo["id"], "needs_review")
+    # EVERY REPAIR EPISODE ENDS HERE, because there is nothing left to repair: the pull
+    # request is shut. Only the open-and-mergeable branch of the poll used to close one,
+    # so a red build that spent its three attempts and was then closed unmerged kept
+    # saying "do not merge it as it stands" — over the news that nobody is going to.
+    # That is a true line hiding a truer one, which is the shape kn-b6977de3 is about and
+    # the shape this work order exists to close. It also makes the ranking in
+    # `true_blockers` unnecessary rather than merely favourable: a refusal has no
+    # give-up left to be outranked by. Reopening starts a fresh budget, which is right —
+    # the fix the worker never landed is three attempts away again.
+    for repair in PR_REPAIRS:
+        clear_pr_repair(store, wo, repair)
     # DERIVED, not asserted. PR_CLOSED_BLOCKER is what this usually is and the fallback
     # keeps that true when nothing is derivable yet — but since issue #224 widened the
     # poll, a work order reaching here may already owe the user an assumption decision,

@@ -23,6 +23,7 @@ from jarvis.invariants import (
     PR_CLOSED_BLOCKER,
     PR_CONFLICT_BLOCKER,
     PR_REPAIR_MAX_ATTEMPTS,
+    VALIDATION_STUCK_BLOCKER,
     check_project,
     true_blockers,
 )
@@ -260,16 +261,34 @@ def test_a_pull_request_with_no_checks_is_not_red(started, project, fake_gh, rev
     assert not store.queued_messages(reviewing["id"])
 
 
-def test_a_green_pull_request_costs_one_call_one_read_and_no_write(
+def test_a_green_pull_request_costs_one_call_three_reads_and_no_write(
         started, project, fake_gh, reviewing):
-    """The overwhelmingly common case stays the cheap one."""
+    """The overwhelmingly common case stays the cheap one — and the budget is COUNTED,
+    not described.
+
+    `poll_pull_requests` states this cost in its docstring, and the sentence had already
+    drifted: it claimed one indexed read while the rewritten body performed several. A
+    prose budget nobody executes is a comment, not a guarantee, so the statements are
+    read off the connection here. The three per pull request are one question each —
+    was this closure already reported, is a conflict episode open, is a checks episode
+    open — and a fourth appearing means somebody put a query on the path every open
+    pull request in the fleet pays for every two minutes.
+    """
     red(fake_gh, GREEN)
     store = ProjectStore(project)
     before = store.list_events(reviewing["id"])
+    sql: list[str] = []
+    store.conn.set_trace_callback(sql.append)
 
     poll(started, store)
 
+    store.conn.set_trace_callback(None)
     assert len([c for c in fake_gh.calls if c["argv"][:2] == ["pr", "view"]]) == 1
+    assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
+    assert len([s for s in sql if "wo_events" in s]) == 3
+    # ...and the work-order query is the step's one, for the whole project, not one per
+    # pull request: the row is re-read only when a clear has just taken a flag down.
+    assert len([s for s in sql if "wo_events" not in s]) == 1
     assert not store.queued_messages(reviewing["id"])
     assert store.list_events(reviewing["id"]) == before
     assert store.get_work_order(reviewing["id"])["status"] == "needs_review"
@@ -455,6 +474,105 @@ def test_a_conflict_give_up_outside_the_merge_queue_is_re_derivable(
     row = store.get_work_order(reviewing["id"])
     assert row["status"] == "needs_review"
     assert PR_CONFLICT_BLOCKER in true_blockers(store, row)
+    assert [v.invariant for v in check_project(store)] == []
+
+
+def test_a_conflict_give_up_is_read_and_not_merely_derived(started, project, fake_gh,
+                                                           reviewing):
+    """DERIVED IS NOT READ. `attention_reason` is one column fed from `blockers[0]`
+    (kn-d4d5a967), so a blocker appended below another is invisible to the user — and
+    the two give-ups were derived at two different sites, the red build above the
+    `needs_review` triage and the conflict below it. In the statuses issue #224 added,
+    that put a conflict give-up under the panel's, where nobody would ever read it.
+
+    The panel half is what makes this a test rather than an ordering preference: both
+    lines are true at once here, and only one of them can be the reason."""
+    fake_gh.set_pr(PR, "OPEN", mergeable="CONFLICTING", base_ref="main", checks=GREEN)
+    store = ProjectStore(project)
+    rnd = store.open_validation_round(wo_id=reviewing["id"], fingerprint="abc")
+    store.close_validation_round(rnd["id"], "escalated", reason="three rounds, no deal")
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
+        poll(started, store)
+        delivered(store, reviewing["id"])
+
+    row = store.get_work_order(reviewing["id"])
+    blockers = true_blockers(store, row)
+    assert blockers[0] == PR_CONFLICT_BLOCKER
+    assert VALIDATION_STUCK_BLOCKER in blockers      # ...and the panel is not dropped
+    assert row["attention_reason"] == PR_CONFLICT_BLOCKER
+    assert [v.invariant for v in check_project(store)] == []
+
+
+def test_a_conflict_outranks_a_red_build_when_both_budgets_are_spent(
+        started, project, fake_gh, reviewing):
+    """`PR_REPAIR_BLOCKERS` is ORDERED, and one site deriving from it is only half the
+    answer — the order it derives in is the other half. A pull request that will not
+    merge at all is not waiting on its checks, so the conflict is the one to act on."""
+    fake_gh.set_pr(PR, "OPEN", mergeable="CONFLICTING", base_ref="main", checks=RED)
+    store = ProjectStore(project)
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
+        poll(started, store)
+        delivered(store, reviewing["id"])
+    # the conflict is gone, so the poll can finally see the red build underneath it
+    red(fake_gh)
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
+        poll(started, store)
+        delivered(store, reviewing["id"])
+
+    blockers = true_blockers(store, store.get_work_order(reviewing["id"]))
+    assert blockers[:2] == [PR_CONFLICT_BLOCKER, PR_CHECKS_BLOCKER]
+    assert [v.invariant for v in check_project(store)] == []
+
+
+def test_a_refused_pull_request_stops_saying_do_not_merge_it(started, project, fake_gh,
+                                                             reviewing):
+    """The closed-unmerged twin of the merged case above, and the one that had no
+    answer: only the open-and-mergeable branch closed an episode, so a red pull request
+    later shut without merging went on saying "do not merge it as it stands" — ABOVE
+    the news that nobody is going to. A true line hiding a truer one is the shape
+    kn-b6977de3 is about, and it is this work order's own bug wearing a different hat.
+
+    `record_pr_closed` closes both episodes, which is why the ranking in `true_blockers`
+    never has to decide between a refusal and a give-up: the co-occurrence cannot
+    happen."""
+    red(fake_gh)
+    store = ProjectStore(project)
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
+        poll(started, store)
+        delivered(store, reviewing["id"])
+    assert store.get_work_order(reviewing["id"])["attention_reason"] == PR_CHECKS_BLOCKER
+
+    fake_gh.set_pr(PR, "CLOSED", checks=RED)
+    poll(started, store)
+
+    row = store.get_work_order(reviewing["id"])
+    blockers = true_blockers(store, row)
+    assert blockers == [PR_CLOSED_BLOCKER]
+    assert row["attention_reason"] == PR_CLOSED_BLOCKER
+    assert store.pr_repair_attempts(reviewing["id"], "checks") == 0
+    assert [v.invariant for v in check_project(store)] == []
+
+
+def test_a_reopened_pull_request_gets_a_fresh_repair_budget(started, project, fake_gh,
+                                                            reviewing):
+    """The other half of closing the episode on a refusal: the fix the worker never
+    landed is three attempts away again, not zero. Reopening a pull request that was
+    shut mid-repair is somebody saying "actually, let's have this" — and a budget still
+    reading as spent would hand it straight back to the user."""
+    red(fake_gh)
+    store = ProjectStore(project)
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
+        poll(started, store)
+        delivered(store, reviewing["id"])
+    fake_gh.set_pr(PR, "CLOSED", checks=RED)
+    poll(started, store)
+
+    red(fake_gh)                       # reopened, still red
+    poll(started, store)               # ...notices the reopen
+    poll(started, store)               # ...and starts again from one
+
+    assert store.pr_repair_attempts(reviewing["id"], "checks") == 1
+    assert delivered(store, reviewing["id"])
     assert [v.invariant for v in check_project(store)] == []
 
 

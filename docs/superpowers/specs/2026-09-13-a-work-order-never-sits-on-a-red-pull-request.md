@@ -89,6 +89,40 @@ fixes, and a shared counter would silently deny one of them its tries.
 Nothing here runs git or writes to GitHub. The daemon notices and asks; the worker is
 the process holding the context to decide what a fix looks like.
 
+### 3.1 One derivation site, because derived is not read
+
+The two give-ups are derived together, from `invariants.PR_REPAIR_BLOCKERS`, in that
+tuple's order. They were not: the red build was derived above the `needs_review` triage
+and the conflict below it, which was harmless while the conflict only ever appeared in
+`waiting_pr_merge` — a status the triage does not touch. Widening both onto
+PR_REPAIR_STATUSES (§4) gave that asymmetry teeth. In the statuses it added, a conflict
+give-up was appended *after* the panel-gave-up line, and `attention_reason` is one column
+fed from `blockers[0]` (kn-d4d5a967): the blocker was computed on every reconcile tick
+and never shown to anybody.
+
+Derived-but-unread and never-derived are the same thing to the user, which makes this
+issue #224's own bug at one remove — the OS knowing something about a pull request and
+saying nothing. The general rule, and the reason it is written here rather than left to
+the code: **two blockers that can be true at once must be ranked at one site.** Ranking
+by where the `append` happens to sit distributes the decision across a function nobody
+reads top to bottom.
+
+Conflict ranks above the red build: a pull request that will not merge at all is not
+waiting on its checks.
+
+### 3.2 A refusal closes every episode
+
+`ops.record_pr_closed` clears both repair episodes. Until it did, only the
+open-and-mergeable branch of the poll ever closed one, so a red pull request that spent
+its three attempts and was then shut without merging went on saying *"do not merge it as
+it stands"* — above the news that nobody is going to. A true line hiding a truer one is
+the shape kn-b6977de3 describes, and closing the episode at the closure is what makes
+§3.1's ranking unnecessary rather than merely favourable: a refused pull request has no
+give-up left to outrank its refusal, so `true_blockers` never has to choose between them.
+
+Reopening therefore starts a fresh budget, which is the right answer: the fix the worker
+never landed is three attempts away again, not zero.
+
 ## 4. `needs_review`, and the trap
 
 Every status where a pull request can sit with nobody moving it is polled:
