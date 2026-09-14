@@ -1377,7 +1377,7 @@ def rewrite_alarms(tax: RewriteTax, cfg: Any) -> list[Alarm]:
     """
     if tax.ttl_share is None:
         return []
-    window = f"over the last {tax.days} days, across {tax.orders} settled orders"
+    window = f"over the last {tax.days} days ({tax.orders} settled orders)"
     worst = (f"Biggest single contributor: {tax.worst_id} "
              f"(${tax.worst_tax_usd:.2f}) — `jarvis inspect {tax.worst_id}` labels every "
              f"re-write it made by cause.")
