@@ -822,10 +822,17 @@ _PY_RUN_KWARGS = frozenset({"capture_output", "text", "check", "cwd", "encoding"
 #: No `ImportFrom`: `from os import system as print` rebinds a name this calls inert, and
 #: the call site cannot see that it did (review round 1). Plain `import x` only, and
 #: `_py_program` refuses `as` on that too.
+#: `UnaryOp`/`USub` is here for `r.stdout[-2500:]`, which gated the production filing this
+#: whole carve-out exists for. It is admitted on the same argument as `BinOp`/`Add`: a
+#: pure value operator reaches nothing. It cannot NAME anything either — the reference
+#: rules below run on every node whatever its position, so `-os.system` is still refused.
+#: Its siblings are deliberately absent: `USub` is what the shape needed, and `UAdd`,
+#: `Not` and `Invert` are three more arguments nobody has had to make.
 _PY_NODES = (ast.Module, ast.Import, ast.alias, ast.Assign, ast.AnnAssign,
              ast.Expr, ast.Call, ast.keyword, ast.Name, ast.Attribute, ast.Constant,
              ast.List, ast.Tuple, ast.Dict, ast.Subscript, ast.Slice, ast.Load,
-             ast.Store, ast.BinOp, ast.Add, ast.JoinedStr, ast.FormattedValue)
+             ast.Store, ast.BinOp, ast.Add, ast.UnaryOp, ast.USub,
+             ast.JoinedStr, ast.FormattedValue)
 
 
 def interpreter_paperwork(segment: str) -> bool:
