@@ -52,7 +52,12 @@ OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
 # in `Daemon._neo_drain`, the `ops._neo_attention` filter and the
 # `invariants.check_neo_escalations_are_live` filter. A kind with no `deliver()` branch
 # falls through to `queue_message` and speaks to the worker.
-Q_KINDS = ("question", "approval", "plan", "alarm")
+# `triage` is the odd one out, deliberately: it is the only kind with NO work order
+# behind it. A bug filed through `jarvis bug report` has an issue and a backlog item and
+# nothing else, and the whole point of the question is to decide whether it earns a work
+# order at all (issue #240, and the user's ruling of 2026-09-14). Everything its verdict
+# has to act on travels in `context` as JSON — see `issues.ask_triage`.
+Q_KINDS = ("question", "approval", "plan", "alarm", "triage")
 
 # The panel's seats — see docs/superpowers/specs/2026-08-02-neo-team-design.md.
 # `premise` asks whether this was even the question that was asked (and routes),

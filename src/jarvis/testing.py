@@ -859,8 +859,89 @@ fail = os.environ.get("FAKE_GH_FAIL")
 if fail:
     sys.stderr.write(fail + "\n")
     sys.exit(1)
+def issues():
+    """The tracker, as this fake keeps it: {url: {"state", "labels"}}."""
+    path = os.path.join(state_dir, "issues.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return json.loads(os.environ.get("FAKE_GH_ISSUES", "{}"))
+
+
+def save(rows):
+    with open(os.path.join(state_dir, "issues.json"), "w") as f:
+        json.dump(rows, f)
+
+
+def labels():
+    """The labels the repository has. `--add-label` refuses anything else, exactly as
+    real `gh` does — which is the whole reason `issues.ensure_label` exists."""
+    path = os.path.join(state_dir, "labels.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return json.loads(os.environ.get("FAKE_GH_LABELS", '["bug"]'))
+
+
+def save_labels(names):
+    with open(os.path.join(state_dir, "labels.json"), "w") as f:
+        json.dump(sorted(set(names)), f)
+
+
+def row(url):
+    """The issue at `url`, defaulted OPEN with no labels — the shape `gh issue create`
+    leaves behind, so a test that filed one never has to register it a second time."""
+    rows = issues()
+    return rows, rows.setdefault(url, {"state": "OPEN", "labels": []})
+
+
 if argv[:2] == ["issue", "create"]:
-    print(os.environ["FAKE_GH_ISSUE_URL"])
+    url = os.environ["FAKE_GH_ISSUE_URL"]
+    rows, r = row(url)
+    if "--label" in argv:
+        r["labels"] = sorted(set(r["labels"]) | {argv[argv.index("--label") + 1]})
+    save(rows)
+    print(url)
+elif argv[:2] == ["issue", "view"]:
+    rows, r = row(argv[2] if len(argv) > 2 else "")
+    if r.get("_missing"):
+        sys.stderr.write("could not find any issue\n")
+        sys.exit(1)
+    save(rows)
+    number = argv[2].rstrip("/").rsplit("/", 1)[-1]
+    whole = {"number": int(number) if number.isdigit() else 0,
+             "state": r["state"], "url": argv[2],
+             "labels": [{"name": n} for n in r["labels"]]}
+    fields = argv[argv.index("--json") + 1].split(",") if "--json" in argv else []
+    print(json.dumps({k: v for k, v in whole.items() if not fields or k in fields}))
+elif argv[:2] == ["issue", "edit"]:
+    rows, r = row(argv[2] if len(argv) > 2 else "")
+    if "--add-label" in argv:
+        label = argv[argv.index("--add-label") + 1]
+        if label not in labels():
+            sys.stderr.write("could not add label: '%s' not found\n" % label)
+            sys.exit(1)
+        r["labels"] = sorted(set(r["labels"]) | {label})
+    if "--remove-label" in argv:
+        label = argv[argv.index("--remove-label") + 1]
+        r["labels"] = [n for n in r["labels"] if n != label]
+    save(rows)
+elif argv[:2] == ["issue", "comment"]:
+    rows, r = row(argv[2] if len(argv) > 2 else "")
+    r.setdefault("comments", []).append(stdin)
+    save(rows)
+elif argv[:2] == ["issue", "close"]:
+    rows, r = row(argv[2] if len(argv) > 2 else "")
+    r["state"] = "CLOSED"
+    if "--comment" in argv:
+        r.setdefault("comments", []).append(argv[argv.index("--comment") + 1])
+    save(rows)
+elif argv[:2] == ["label", "create"]:
+    known = labels()
+    if argv[2] in known:
+        sys.stderr.write("label with this name already exists\n")
+        sys.exit(1)
+    save_labels([*known, argv[2]])
 elif argv[:2] == ["pr", "view"]:
     # `gh pr view <url> --json <fields>`. The roster comes from the fixture; a URL
     # nobody registered gets gh's own "no pull requests found" shape, because a test
@@ -1063,6 +1144,12 @@ def fake_systemd(tmp_path, monkeypatch):
     return Handle()
 
 
+#: The repository every fixture in this harness pretends is the OS's bug tracker. It is
+#: deliberately NOT `bugreport.DEFAULT_BUG_REPO`: see `fake_gh`.
+FIXTURE_BUG_REPO = "jarvis-fixture/no-such-tracker"
+FIXTURE_ISSUE_URL = f"https://github.com/{FIXTURE_BUG_REPO}/issues/7"
+
+
 @pytest.fixture()
 def fake_gh(tmp_path, monkeypatch):
     """Install a fake `gh` binary; returns a handle to its recorded state."""
@@ -1071,13 +1158,22 @@ def fake_gh(tmp_path, monkeypatch):
     binpath = gdir / "gh"
     binpath.write_text(FAKE_GH)
     binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
-    url = "https://github.com/example/repo/issues/7"
+    # THE TRACKER THESE TESTS WRITE TO DOES NOT EXIST (review round 2). `issues.py`
+    # refuses to write anywhere but `bugreport.bug_repo()`, so a fixture issue on some
+    # other repository could only ever exercise the refusal — but pointing the fixture at
+    # the REAL tracker leaves `BLOCKED_GH` as the only thing between a test that escapes
+    # the fake and a live label, comment or close on a public issue. So the fixture moves
+    # the ANSWER instead of the URL: `bug_repo()` becomes a repository nobody owns, the
+    # URL check still has something to enforce, and an escaped write has nowhere to land.
+    monkeypatch.setenv("JARVIS_BUG_REPO", FIXTURE_BUG_REPO)
+    url = FIXTURE_ISSUE_URL
     monkeypatch.setenv("FAKE_GH_DIR", str(gdir))
     monkeypatch.setenv("FAKE_GH_ISSUE_URL", url)
     monkeypatch.setenv("JARVIS_GH_BIN", str(binpath))
 
     class Handle:
         dir = gdir
+        repo = FIXTURE_BUG_REPO
         issue_url = url
         prs: dict[str, dict] = {}
 
@@ -1091,6 +1187,42 @@ def fake_gh(tmp_path, monkeypatch):
         def fail(self, message: str) -> None:
             """Make every subsequent `gh` call fail with `message` on stderr."""
             monkeypatch.setenv("FAKE_GH_FAIL", message)
+
+        def works(self) -> None:
+            """Undo `fail` — a test that proves the lifecycle RETRIES has to."""
+            monkeypatch.delenv("FAKE_GH_FAIL", raising=False)
+
+        @property
+        def issues(self) -> dict[str, dict]:
+            """The tracker as the fake holds it: `{url: {"state", "labels", ...}}`."""
+            path = gdir / "issues.json"
+            return json.loads(path.read_text()) if path.exists() else {}
+
+        def issue(self, issue_url: str | None = None) -> dict:
+            """One issue, defaulted OPEN and unlabelled like a freshly filed one."""
+            return self.issues.get(issue_url or url,
+                                   {"state": "OPEN", "labels": [], "comments": []})
+
+        def set_issue(self, issue_url: str, state: str = "OPEN",
+                      labels: list[str] | None = None) -> None:
+            """Put an issue where a test needs it — closed by a human, say."""
+            rows = self.issues
+            rows[issue_url] = {**rows.get(issue_url, {"comments": []}),
+                               "state": state.upper(),
+                               "labels": sorted(labels or [])}
+            (gdir / "issues.json").write_text(json.dumps(rows))
+
+        def next_issue(self, issue_url: str) -> str:
+            """Where the NEXT `gh issue create` lands. The fake files every issue at one
+            url, which is what a test wanting two distinct bugs on the rails has to
+            move."""
+            monkeypatch.setenv("FAKE_GH_ISSUE_URL", issue_url)
+            return issue_url
+
+        def set_labels(self, names: list[str]) -> None:
+            """Which labels the repository already has. `--add-label` refuses everything
+            else, exactly as real `gh` does."""
+            (gdir / "labels.json").write_text(json.dumps(sorted(set(names))))
 
         def set_pr(self, pr_url: str, state: str, merged_at: str | None = None,
                    mergeable: str | None = None, base_ref: str = "main",

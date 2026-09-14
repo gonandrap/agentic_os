@@ -186,6 +186,12 @@ class _VersionAction(argparse.Action):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # Imported HERE rather than at module scope: `jarvis --help` is the one path that
+    # needs the rubric, and `issues` pulls in `github` and `bugreport` behind it. Every
+    # other CLI import in this file is deferred for the same reason.
+    from .issues import PRIORITIES as _PRIORITIES
+    from .issues import PRIORITY_RUBRIC as _PRIORITY_RUBRIC
+
     # A leaf module with no store or CLI dependency, so importing it here costs nothing
     # and lets `--help` state the shipped defaults rather than repeating their values.
     from . import catalog
@@ -821,6 +827,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="what happened, in Jarvis OS terms")
     br.add_argument("--expected", "-e", required=True, help="what you expected")
     br.add_argument("--actual", "-a", required=True, help="what you got instead")
+    # REQUIRED, with no default and no inference: it is the only thing that decides what
+    # happens to the report, so a default would be the OS rating someone else's bug. The
+    # rubric rides on the help text because this is where an agent reads it —
+    # `issues.PRIORITY_RUBRIC` is the one definition and argparse renders it verbatim.
+    br.add_argument("--priority", "-p", required=True, choices=list(_PRIORITIES),
+                    help="how bad this is for the FLEET. " + _PRIORITY_RUBRIC)
     br.add_argument("--steps", default="", help="optional steps to reproduce")
     br.add_argument("--project", default="", help="reporting project (default: $JARVIS_PROJECT)")
     br.add_argument("--wo-id", default="", help="reporting work order (default: $JARVIS_WO_ID)")
@@ -2828,11 +2840,18 @@ def cmd_notify(args: argparse.Namespace) -> int:
 
 
 def cmd_bug(args: argparse.Namespace) -> int:
-    from .bugreport import report_bug
+    from .bugreport import pickup_note, report_bug
     result = report_bug(title=args.title, description=args.description,
                         expected=args.expected, actual=args.actual, steps=args.steps,
+                        priority=args.priority,
                         project=args.project, wo_id=args.wo_id)
-    _print(result, args.json)
+    if args.json:
+        _print(result, True)
+    else:
+        # The nested `pickup` flattened to the one line a reporting agent needs: whether
+        # anything is going to happen to this issue, or whether it is theirs to chase.
+        _print({k: v for k, v in result.items() if k != "pickup"}, False)
+        print(pickup_note(result["pickup"]))
     return 0
 
 
