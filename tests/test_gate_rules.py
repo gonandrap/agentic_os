@@ -166,12 +166,15 @@ def test_list_segments_split_on_lists_and_never_on_a_pipe():
     assert parts("cat a && cat b; cat c & cat d") == ["cat a", "cat b", "cat c", "cat d"]
     assert parts("cat a | bash") == ["cat a | bash"]
     assert parts("cat a 2>&1 | head") == ["cat a 2>&1 | head"]
-    # A separator inside a quoted argument or a heredoc body starts no new command. The
-    # body is still its own span — the opener's own newline ends the opening command —
-    # but it arrives whole, which is what stops half a commit message reading as one.
+    # A separator inside a quoted argument or a heredoc body starts no new command — and
+    # neither does the opener's own newline. The body belongs to the command that owns
+    # it, so a commit message arrives as one span WITH the `git commit` that reads it;
+    # splitting there made every line of prose a command of its own (issue #233).
     assert parts("git commit -m 'a && b'") == ["git commit -m 'a && b'"]
     body = "git commit -F - <<'EOF'\nfix a && ship b\nEOF"
-    assert parts(body) == ["git commit -F - <<'EOF'", "fix a && ship b\nEOF"]
+    assert parts(body) == [body]
+    # The command AFTER the terminator is still a command: the merge is not the message.
+    assert parts(body + "\ngh pr merge 1") == [body, "gh pr merge 1"]
 
 
 def test_shape_reports_where_the_literal_landed():

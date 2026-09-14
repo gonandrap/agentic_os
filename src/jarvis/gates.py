@@ -75,6 +75,7 @@ __all__ = [
     "GateConfig",
     "CONTEST_HEADER", "CONTEST_NOT_AN_AUTHORISATION",
     "GateKind", "GatedAction", "KINDS", "KIND_NAMES", "NO_CASE_JUSTIFICATION",
+    "NO_CASE_PREFIX", "is_no_case", "no_case_justification",
     "REVIEWER_PERSONA", "RuleSet",
     "VERDICTS", "abandoned_message", "abandoned_reason", "amend_request",
     "apply_decision",
@@ -143,6 +144,50 @@ VERDICTS = ("approved", "denied", "dismissed")
 # both writer and reader must agree on the string: see GitHub issue 185.
 NO_CASE_JUSTIFICATION = ("(none — the worker ran the command directly rather than filing "
                          "a request, so no case was made for it)")
+
+#: Every form of the placeholder opens with this, and no case a worker writes does. The
+#: readers key on the prefix rather than on `NO_CASE_JUSTIFICATION` itself, because there
+#: is now more than one of them — see `no_case_justification`.
+NO_CASE_PREFIX = "(none"
+
+
+def is_no_case(justification: str) -> bool:
+    """True when `justification` is a placeholder rather than a case someone made."""
+    return not justification.strip() or justification.strip().startswith(NO_CASE_PREFIX)
+
+
+def no_case_justification(command: str, prior_id: int | None = None) -> str:
+    """The placeholder for a request nobody argued — saying only what is established.
+
+    `NO_CASE_JUSTIFICATION` used to be the only answer, and it is an ACCUSATION: it tells
+    every later reader that the worker went round the gate. Gate 123 recorded it against
+    a worker whose blocked command WAS `jarvis gate request` — the inverse of what
+    happened, in an append-only record, about the one thing the gate exists to catch
+    (issue #233). So the placeholder now reports what the classifier can actually
+    establish, and the accusation is kept for the case where it is true: no filing
+    anywhere in the chain, no mention of one, and no request already on the record.
+
+    Note what the first branch does NOT say. A chain may both file a request and run the
+    action (`gh pr merge … && jarvis gate request …`), so the exculpation stops at "not
+    established" rather than claiming the worker asked — a record that clears a worker it
+    cannot vouch for is the same defect pointing the other way.
+    """
+    from .gate_rules import files_a_claim, list_segments
+
+    pointer = ("" if prior_id is None else
+               f" Request {prior_id} on this work order is for the same kind of action; "
+               f"the case, if one was made, is there.")
+    if any(files_a_claim(command[s:e]) for s, e in list_segments(command)):
+        return ("(none recorded. This command FILES a gate request, and the recogniser "
+                "matched inside the case it carried, so the OS has NOT established that "
+                "the worker ran the action rather than asking for it." + pointer + ")")
+    if "jarvis gate " in command:
+        return ("(none recorded. This command names `jarvis gate`, so the OS cannot tell "
+                "whether the worker was filing a case or running the action, and has "
+                "established neither." + pointer + ")")
+    if pointer:
+        return "(none recorded with this attempt." + pointer + ")"
+    return NO_CASE_JUSTIFICATION
 
 # The string every reader of a contested request keys on — the persona's carve-out and the
 # test fake's branch. Spec 2026-09-12 §1.
@@ -968,7 +1013,7 @@ def _merge_case(existing: str, addition: str) -> str:
     addition = addition.strip()
     if not addition:
         return existing
-    if not prior or prior == NO_CASE_JUSTIFICATION:
+    if is_no_case(prior):
         return addition
     if addition in prior:
         return existing

@@ -1645,3 +1645,226 @@ def test_the_ttls_old_denials_are_re_filed_as_abandonments(gated):
         assert store.get_approval(refused["id"])["status"] == "denied"
     finally:
         store.close()
+
+
+# -- paperwork assembled in pieces: issue #233 -----------------------------------------
+
+#: The reduced repro, case E: a heredoc into `python` that files a request. Correct
+#: today, and the control for the pair — the only difference between it and
+#: `FILED_VIA_FILE` is a `cat` heredoc carrying the justification prose.
+FILED_VIA_PYTHON = (
+    'python - <<PY\n'
+    'import subprocess\n'
+    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223 --squash",'
+    '"--why","w"])\n'
+    'PY'
+)
+
+#: Case F: the same filing, with the `--why` prose written to a file first. The literal
+#: the recogniser fires on is in the body owned by `cat`, which writes a file and runs
+#: nothing; the body owned by `python` holds it only as an argv element of the filing.
+FILED_VIA_FILE = (
+    'cat > /tmp/why.txt <<EOF\n'
+    'THE USER AUTHORIZED THIS MERGE. gh pr merge 223 is the command.\n'
+    'EOF\n'
+    'python - <<PY\n'
+    'import subprocess; subprocess.run(["jarvis","gate","request","wo-x",'
+    '"gh pr merge 223","--why",open("/tmp/why.txt").read()])\n'
+    'PY'
+)
+
+#: Gate 123 on wo-b304c02a, 2026-09-13, trimmed to its shape: quoted heredoc delimiters,
+#: markdown backticks in the prose (which cost the whole command its quote-blanking), and
+#: the filing itself as an argv list inside a `python -` heredoc. Neo approved it on the
+#: merits of the merge, which is why nobody noticed the classifier had held the FILING.
+GATE_123 = (
+    "cat > /tmp/gate_why.txt <<'EOF'\n"
+    'THE USER AUTHORIZED THIS MERGE IN THEIR OWN WORDS, this turn: "resolve the '
+    'conflicts and merge the PR, I authorize it".\n'
+    "EOF\n"
+    "cat > /tmp/gate_evidence.txt <<'EOF'\n"
+    "`gh pr view 223`: mergeable MERGEABLE, mergeStateStatus CLEAN.\n"
+    "`gh pr checks 223` on that exact head: all five required checks green.\n"
+    "EOF\n"
+    "python - <<'PY'\n"
+    "import pathlib, subprocess\n"
+    'why = pathlib.Path("/tmp/gate_why.txt").read_text().strip()\n'
+    'ev = pathlib.Path("/tmp/gate_evidence.txt").read_text().strip()\n'
+    'r = subprocess.run(["jarvis", "gate", "request", "wo-b304c02a",\n'
+    '                    "gh pr merge 223 --squash --delete-branch",\n'
+    '                    "--why", why, "--evidence", ev],\n'
+    "                   capture_output=True, text=True)\n"
+    "print(r.returncode)\n"
+    "PY"
+)
+
+
+def test_filing_a_request_survives_a_heredoc_chain(gated):
+    """Issue #233, the headline: writing the justification to a file first must not gate
+    the filing that reads it back."""
+    assert gates.classify(FILED_VIA_PYTHON, ALL_GATES) is None, "the control"
+    assert gates.classify(FILED_VIA_FILE, ALL_GATES) is None
+    # No opinion, not `allow`: the auto-approval every `jarvis …` contract command gets
+    # is keyed on argv0, and argv0 here is `cat`. What matters is that it is not a deny.
+    assert _decision(gated.attempt(FILED_VIA_FILE)) != "deny"
+
+
+def test_the_production_filing_shape_is_not_gated(gated):
+    """Gate 123 itself. It held the command that was making the case for gate 124."""
+    assert gates.classify(GATE_123, ALL_GATES) is None
+    assert _decision(gated.attempt(GATE_123)) != "deny"
+
+
+def test_a_heredoc_body_belongs_to_the_command_that_owns_it():
+    """The attribution under all of it, asserted directly: `cat > f <<EOF` owns its body.
+
+    The stated reason was wrong as well as the verdict — the body was charged to a
+    `python` further down the chain, which never reads it."""
+    from jarvis.gate_rules import list_segments, segments
+
+    owners = [name for _, _, name in segments(FILED_VIA_FILE) if name]
+    assert owners == ["cat", "python"], "a body is not a command of its own"
+    # One list segment per command, not one per line of prose.
+    spans = [FILED_VIA_FILE[s:e].strip() for s, e in list_segments(FILED_VIA_FILE)]
+    assert [s for s in spans if s.startswith("THE USER")] == []
+
+
+@pytest.mark.parametrize("body", [
+    # An `os.system` of the literal: python really would run it.
+    'import os; os.system("gh pr merge 223 --squash")',
+    # `shell=True` makes the first argument a command line, not an argv.
+    'import subprocess; subprocess.run("gh pr merge 223", shell=True)',
+    # The filing is there, and so is an execution beside it.
+    'import subprocess\n'
+    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223","--why","w"])\n'
+    'subprocess.run(["gh","pr","merge","223","--squash"])',
+    # An exec of text that names it.
+    'exec("import os\\nos.system(\'gh pr merge 223\')")',
+])
+def test_an_interpreter_that_would_run_the_literal_still_gates(gated, body):
+    """The half of issue #233 that could open a real hole. Argument-vs-execution is the
+    distinction; anything this cannot establish must gate."""
+    command = f"python - <<PY\n{body}\nPY"
+
+    action = gates.classify(command, ALL_GATES)
+    assert action is not None and action.kind == "pr_merge", command
+    assert _decision(gated.attempt(command)) == "deny", command
+
+
+def test_a_body_written_to_a_file_and_then_run_still_gates(gated):
+    """`_hands_off`, which the ownership fix must not cost: `cat` writing a script and
+    `bash` running it is one privileged action written in two commands (kn-67364b3a)."""
+    command = "cat > /tmp/s.sh <<EOF\ngh pr merge 223 --squash\nEOF\nbash /tmp/s.sh"
+
+    action = gates.classify(command, ALL_GATES)
+    assert action is not None and action.kind == "pr_merge"
+    assert _decision(gated.attempt(command)) == "deny"
+
+
+def test_an_unterminated_heredoc_body_is_still_code(gated):
+    """The other thing the ownership fix must not cost. A body whose delimiter never
+    turns up runs to the end of the string and swallows whatever follows it, so nothing
+    inside one may read as prose owned by a reader — kn-67364b3a, spec §7."""
+    for command in (
+        "cat <<EOF\nmerging now\nEOF && gh pr merge 223 --squash",
+        "cat <<NOPE\ngh pr merge 223 --squash",
+    ):
+        action = gates.classify(command, ALL_GATES)
+        assert action is not None and action.kind == "pr_merge", command
+        assert _decision(gated.attempt(command)) == "deny", command
+
+
+@pytest.mark.parametrize("command,gated_kind", [
+    # The negative controls: the four shapes issue #233 must leave exactly as they are.
+    ("gh pr merge 223 --squash", "pr_merge"),
+    ('jarvis gate request wo-x "gh pr merge 223" --why "the user asked for it"', None),
+    ('echo "I would like to run gh pr merge 223 later"', None),
+    ('grep -r "gh pr merge" docs/', None),
+])
+def test_the_shapes_that_were_already_right(gated, command, gated_kind):
+    """The half that rots (kn-e74988af, kn-67364b3a). A suite where `gh pr merge 223
+    --squash` stops gating is worse than the bug being fixed."""
+    action = gates.classify(command, ALL_GATES)
+
+    assert (action.kind if action else None) == gated_kind, command
+    decision = _decision(gated.attempt(command))
+    # `allow` for the paperwork (every `jarvis …` contract command gets one) and None —
+    # no opinion — for an ordinary read. What matters is which of them is a deny.
+    assert (decision == "deny") is bool(gated_kind), command
+
+
+def test_a_filing_wrapped_in_an_interpreter_is_read_as_a_program():
+    """The carve-out is over a gate that fires, not over a hole. Under Neo's ruling on
+    question 281 a heredoc body owned by an interpreter is scanned WHOLE — its string
+    literals are part of a program, not arguments the shell blanked."""
+    from jarvis.gate_rules import interpreter_paperwork, scannable
+
+    assert interpreter_paperwork(FILED_VIA_PYTHON)
+    # …and the literal really is in the haystack. Before issue #233 it was blanked, so
+    # the exemption below had nothing to exempt and `os.system` matched nothing at all.
+    assert "gh pr merge" in scannable(FILED_VIA_PYTHON)
+
+
+@pytest.mark.parametrize("segment", [
+    # Not the body it reads its program from.
+    'python -c "import subprocess; subprocess.run([\'jarvis\',\'gate\',\'request\'])"',
+    # A script path: the body is not the program.
+    "python file.py <<PY\nsubprocess.run(['jarvis','gate','request','wo-x','x'])\nPY",
+    # Output redirected somewhere a later command can run.
+    "python - <<PY > /tmp/s.sh\nsubprocess.run(['jarvis','gate','request','wo-x','x'])\nPY",
+    # A deciding verb is not paperwork, here as anywhere else.
+    "python - <<PY\nsubprocess.run(['jarvis','gate','approve','1'])\nPY",
+    # A program with control flow is one this cannot read, so it does not clear it.
+    "python - <<PY\nfor x in [1]:\n    subprocess.run(['jarvis','gate','request','w','x'])\nPY",
+    # Unparseable.
+    "python - <<PY\nthis is not python\nPY",
+    # Nothing but a name on the left of an `=`: this one decides which `jarvis` runs.
+    "python - <<PY\nimport os, subprocess\nos.environ['PATH'] = '/tmp'\n"
+    "subprocess.run(['jarvis','gate','request','wo-x','gh pr merge 223'])\nPY",
+])
+def test_interpreter_paperwork_refuses_what_it_cannot_read(segment):
+    """Every branch of the narrowing, because each one is a way in if it goes quiet."""
+    from jarvis.gate_rules import interpreter_paperwork
+
+    assert not interpreter_paperwork(segment), segment
+
+
+def test_the_record_never_says_a_worker_bypassed_a_gate_it_was_asking_about(gated):
+    """Issue #233's second half. Gate 123 recorded the inverse of what happened, in an
+    append-only record, about the one thing the gate exists to catch."""
+    filing = ('gh pr merge 223 --squash && jarvis gate request wo-x '
+              '"gh pr merge 223 --squash" --why "the user authorised it"')
+    assert _decision(gated.attempt(filing)) == "deny", "the chain does run the merge"
+
+    justification = gated.store.list_approvals(gated.wo["id"])[0]["justification"]
+    assert gates.NO_CASE_JUSTIFICATION not in justification
+    assert "FILES a gate request" in justification
+    # And it stops short of vouching for a chain that also ran the action.
+    assert "has NOT established" in justification
+    # Every form is still a placeholder, so a case REPLACES it rather than landing under
+    # it — the whole point of the constant this splits (issue 185).
+    assert gates.is_no_case(justification)
+    assert gates._merge_case(justification, "the real case") == "the real case"
+
+
+def test_the_accusation_survives_where_it_is_established(gated):
+    """The other direction, and the one that matters more: a worker that really did run
+    the command instead of asking is still recorded as having done so."""
+    assert _decision(gated.attempt("./scripts/shipit.sh")) == "deny"
+
+    filed = gated.store.list_approvals(gated.wo["id"])[0]
+    assert filed["justification"] == gates.NO_CASE_JUSTIFICATION
+
+
+def test_a_second_attempt_points_at_the_request_that_has_the_case(gated):
+    """`latest_approval_for` is keyed to the exact command string, so the case for an
+    action is routinely on a row a later attempt will not match (kn-237185ed)."""
+    gated.attempt("gh pr merge 31 --squash")
+    first = gated.store.list_approvals(gated.wo["id"])[0]["id"]
+
+    gated.attempt("gh pr merge 31 --squash --delete-branch")
+    latest = gated.store.list_approvals(gated.wo["id"])[0]
+
+    assert latest["id"] != first
+    assert f"Request {first}" in latest["justification"]
+    assert gates.NO_CASE_JUSTIFICATION not in latest["justification"]

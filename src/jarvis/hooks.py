@@ -450,6 +450,12 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
             )
 
         wo = store.get_work_order(wo_id)
+        # A request already on this work order for the same KIND, whatever string it was
+        # filed under — an approval is keyed to the exact command, so the case for this
+        # action is routinely on a row this one will not match (kn-237185ed). The
+        # placeholder says so instead of asserting the worker never made one (#233).
+        same_kind = next((a["id"] for a in store.list_approvals(wo_id)
+                          if a["kind"] == action.kind), None)
         neo = NeoStore()
         try:
             # HELD, not queued. You ran the command instead of arguing for it, so there is
@@ -457,7 +463,8 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
             # it decided before yours could arrive (GitHub issue 185).
             approval, _ = gates.file_request(
                 store, neo, env.get("JARVIS_PROJECT", ""), wo, action,
-                justification=gates.NO_CASE_JUSTIFICATION, hold=True,
+                justification=gates.no_case_justification(action.command, same_kind),
+                hold=True,
                 # Which SEAT attempted it, if a subagent did. `JARVIS_WO_ID` is
                 # per-session, so the request is filed against the work order either way;
                 # this is the only thing that keeps the record from saying the lead ran a
@@ -474,8 +481,11 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
             f"Gate `{action.kind}`: {action.summary} needs approval, so this attempt was "
             f"blocked and request {approval['id']} was recorded.\n\n"
             f"NOBODY IS REVIEWING IT YET, and retrying the command will not change that. "
-            f"You ran it rather than asking, so the request carries no case and no "
-            f"reviewer is shown one.\n\n"
+            + ("The request carries no case and no reviewer is shown one.\n\n"
+               if gates.is_no_case(approval["justification"])
+               and approval["justification"] != gates.NO_CASE_JUSTIFICATION else
+               "You ran it rather than asking, so the request carries no case and no "
+               "reviewer is shown one.\n\n")
             + ("A previous request for this exact command was ABANDONED — it timed out "
                "with no case and no contest. Do not do that again: take one of the two "
                "exits below.\n\n" if prior_abandoned else "")
