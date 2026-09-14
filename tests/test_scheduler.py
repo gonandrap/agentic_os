@@ -376,6 +376,89 @@ def test_status_says_nothing_about_a_job_that_is_ticking_along(clock, started, s
                 if p["name"] == "proj_a")["schedule_held"] == []
 
 
+# -- the upgrade: a project database that predates `scheduled_jobs` -----------------------
+
+
+def test_an_old_database_gets_the_table_back_on_open(clock, started, catalog_file):
+    """THE ONLY PATH HERE THAT REACHES EVERY EXISTING INSTALL ON DAY ONE.
+
+    Every other test in this file runs against a store the new code created, so all of
+    them would pass on a build that never shipped the `CREATE TABLE` at all. What a live
+    fleet does on upgrade is open a database written before `scheduled_jobs` existed —
+    and `os_status` reads that table for EVERY project unconditionally, with no `enabled`
+    guard, so a table that did not come back would take out `jarvis status` and the
+    dashboard for the whole fleet rather than only for a project running the scheduler.
+
+    Simulated by dropping the table rather than by checking in a fixture database: the
+    drop is verified to bite first (`no such table`), so the recreate is demonstrably
+    what saves it and not a swallowed exception somewhere downstream.
+
+    THE SCHEDULER IS ENABLED throughout. `check_schedule_progresses` returns before it
+    touches the table when it is off, so the disabled form of this test would assert
+    nothing at all about the table — exactly the empty-either-way reading that
+    `test_skip_os_drops_the_fleet_wide_checks_and_keeps_the_project_ones` was rewritten
+    to avoid.
+    """
+    import sqlite3
+
+    _enable(catalog_file)
+    started()
+    path = ops.registered_project_paths()["proj_a"]
+
+    old = ProjectStore(path)
+    try:
+        with old.conn:
+            old.conn.execute("DROP TABLE scheduled_jobs")
+        # The drop BITES: that is what makes the assertions below about the recreate.
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            old.list_schedule_states()
+    finally:
+        old.close()
+
+    # `os_status` FIRST, and deliberately: it is the fleet-wide blast radius. It opens
+    # its own store per project and has no `except` around the read, so a table that did
+    # not come back takes out `jarvis status` and the dashboard for every project, not
+    # only for one running the scheduler.
+    st = ops.os_status()
+    proj = next(p for p in st["projects"] if p["name"] == "proj_a")
+    assert proj["schedule_held"] == []
+
+    reopened = ProjectStore(path)
+    try:
+        assert reopened.list_schedule_states() == []
+        assert list(invariants.check_schedule_progresses(reopened)) == []
+    finally:
+        reopened.close()
+
+
+def test_an_old_database_still_schedules_after_the_upgrade(clock, started, catalog_file):
+    """The other half: the recreated table is a working clock, not merely a quiet one.
+
+    A `CREATE TABLE` that ran but left the job unable to seed would look identical to a
+    healthy upgrade on the test above — nothing raises, `schedule_held` is empty — and
+    would only show up as a fleet that silently stopped scheduling after a release.
+    """
+    _enable(catalog_file)
+    started()
+    path = ops.registered_project_paths()["proj_a"]
+    old = ProjectStore(path)
+    try:
+        with old.conn:
+            old.conn.execute("DROP TABLE scheduled_jobs")
+    finally:
+        old.close()
+
+    store = ProjectStore(path)
+    try:
+        _tick(started(), store)          # seeds the clock on the recreated table
+        assert _scheduled(store) == []
+        clock.advance(DAY)
+        _tick(started(), store)
+        assert len(_scheduled(store)) == 1
+    finally:
+        store.close()
+
+
 # -- the doctor rider --------------------------------------------------------------------
 
 
