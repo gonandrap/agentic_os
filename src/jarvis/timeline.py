@@ -355,6 +355,20 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "pr_conflict_unresolved":
         return ("Merge conflict the worker could not resolve — over to you",
                 f"{p.get('attempts')} attempts")
+    # The same three for the other repair (issue #224). Separate lines rather than one
+    # parameterised pair: the words a user reads about a red build are not the words
+    # they read about a conflict, and this function is a vocabulary, not a mechanism.
+    if kind == "pr_checks_nudged":
+        of = p.get("of")
+        return ("Failing checks — asked the worker to fix them",
+                ", ".join(x for x in (p.get("failing"),
+                                      f"attempt {p.get('attempt')} of {of}" if of else "")
+                          if x))
+    if kind == "pr_checks_cleared":
+        return "Checks are green again", ""
+    if kind == "pr_checks_unresolved":
+        return ("Failing checks the worker could not fix — over to you",
+                f"{p.get('attempts')} attempts")
     if kind == "deferral_submitted":
         # The worker deciding something is not its job is a scope decision, and the
         # timeline is the only place the user ever sees it: the item itself lands on the
@@ -378,10 +392,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
 
 
 #: Message sources nobody decided: no user typed them, and no delegate chose to send
-#: them on the user's behalf either. So far exactly one — the automatic merge-conflict
-#: nudge a poll writes on seeing GitHub report CONFLICTING (§6 of
-#: docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md).
-UNAUTHORED_SOURCES = frozenset({"pr-conflict"})
+#: them on the user's behalf either. Both are pull-request repairs a poll writes on
+#: seeing GitHub report CONFLICTING or a failed check (§6 of
+#: docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md, and
+#: docs/superpowers/specs/2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md).
+UNAUTHORED_SOURCES = frozenset({"pr-conflict", "pr-checks"})
 
 #: `remedies.MESSAGE_SOURCE`, spelled out here for the reason `ALARM_KINDS` is: this
 #: module is a leaf and opens nothing. A test pins the two equal. Deliberately NOT a
