@@ -131,6 +131,15 @@ claim the user did something they did not do.
 
 ## 7. What this deliberately does not do
 
+> **SUPERSEDED IN PART, 2026-09-13 (issue #224).** The first two items below were
+> reversed by
+> [2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md](2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md);
+> the last two still stand. Red CI IS healed now, through this same machinery
+> (`ops.PrRepair`), and BEHIND is reported to the worker — but still never rebased by
+> the OS, for the reason the third paragraph gives plus one the sentence below got
+> wrong. **The claim that BEHIND "does not block a merge in this fleet" is false**: the
+> `protect-main` ruleset sets `strict_required_status_checks_policy: true`.
+
 **Failing CI checks are not healed.** `UNSTABLE` — a red check on a mergeable branch —
 is left alone. Auto-fixing a failing test is a far larger autonomy step than the one
 asked for, and it is the step where an OS that is wrong writes bad code into a pull
