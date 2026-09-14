@@ -14,6 +14,7 @@ through a pull request that merged.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -26,6 +27,7 @@ from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 
 PR = "https://github.com/acme/proj/pull/7"
+OTHER_PR = "https://github.com/acme/proj/pull/8"
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -57,7 +59,11 @@ def started(jarvis_home, fake_claude, catalog_file, project):
     (project / "app.py").write_text(_feature("base", 10))
     _git(project, "add", "-A")
     _git(project, "commit", "-qm", "base")
-    origin = project.parent / "origin.git"
+    # Named `acme/proj` so `github.checked_pr_url` accepts the `PR` constant below: it
+    # refuses a pull request whose owner/repo does not match this checkout's `origin`,
+    # and the poll is part of the seam these tests exercise.
+    origin = project.parent / "acme" / "proj.git"
+    origin.parent.mkdir(parents=True, exist_ok=True)
     _git(project.parent, "init", "--bare", "-q", str(origin))
     _git(project, "remote", "add", "origin", str(origin))
     _git(project, "push", "-q", "origin", "trunk")
@@ -190,7 +196,6 @@ def test_abandon_completes_the_order_and_writes_down_what_was_dropped(started, p
 
     assert out["status"] == "completed"
     [event] = _events(project, wo["id"], "abandoned")
-    import json
     payload = json.loads(event["payload"])
     assert payload["reason"] == "the approach does not work, see the summary"
     assert payload["commits"] == 1
@@ -379,6 +384,76 @@ def test_the_sweep_reports_a_completed_order_whose_code_is_not_on_the_branch(
     assert found[0].context["verdict"] == landing.STRANDED
     assert "launcher.py" in found[0].context["missing_files"]
     assert not found[0].repaired      # what to do with it is the user's call
+
+
+def test_complete_merged_writes_the_sha_that_merged_onto_the_event(started, project):
+    """The one place that sha can live, and the sweep's only exact answer to Mode C.
+
+    `pr_state` is stale by construction with one permitted reader (kn-dbc4971d) and
+    re-asking GitHub months later is a round trip per settled work order, so
+    `landing.assess` reads `head_oid` off this payload and nowhere else. Asserted on the
+    event rather than inferred from a verdict: the producer and the consumer are joined
+    by a dict key, and a key that did not match would make the exact rung silently
+    dormant for ever — indistinguishable from a fleet with nothing stranded.
+    """
+    wo = _order(project, "launcher contract", code="launcher")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR)
+    sha = "9f1c2ab4d5e6f708192a3b4c5d6e7f8091a2b3c4"
+
+    store = ProjectStore(project)
+    try:
+        ops.complete_merged(store, store.get_work_order(wo["id"]),
+                            merged_at="2026-08-02T10:00:00Z", head_oid=sha)
+    finally:
+        store.close()
+
+    [event] = _events(project, wo["id"], "pr_merged")
+    assert json.loads(event["payload"])["head_oid"] == sha
+
+
+def test_a_tail_after_the_merged_sha_is_stranded_and_a_clean_merge_is_not(
+        started, project, fake_gh):
+    """MODE C END TO END, through every joint the sha crosses.
+
+    `gh pr view` -> `github.pr_view` -> `Daemon.poll_pull_requests` -> `complete_merged`
+    -> the `pr_merged` event -> `check_work_lands` -> `assess(pr_head_oid=...)`. Calling
+    `assess` directly with a sha proves the rung and none of that carriage, and by
+    assumption [6] the rung cannot fire for any order that merged before this shipped —
+    so this test is the only thing standing between a mistyped key and a check that is
+    permanently, invisibly quiet.
+
+    Both work orders merged. The difference is the work that came after: three of the
+    six stranded orders had a first pull request merge while the worker kept going.
+    """
+    tailed = _order(project, "launcher contract", code="launcher")
+    clean = _order(project, "the cap", code="cap")
+    for wo, pr in ((tailed, PR), (clean, OTHER_PR)):
+        ops.finish(wo["id"], "opened a PR", pr_url=pr)
+        # The sha GitHub reports as merged is the branch tip at the moment it merged.
+        merged_sha = _git(wo["worktree_path"], "rev-parse", "HEAD").strip()
+        _git(project, "merge", "--squash", "-q", f"worktree-{wo['id']}")
+        _git(project, "commit", "-qm", f"[{wo['id']}] {wo['title']} (#9)")
+        fake_gh.set_pr(pr, "MERGED", merged_at="2026-08-02T10:00:00Z",
+                       head_oid=merged_sha)
+    _git(project, "push", "-q", "origin", "trunk")
+
+    store = ProjectStore(project)
+    try:
+        started.poll_pull_requests(started.catalog.project("proj_a"), store)
+    finally:
+        store.close()
+    assert _row(project, tailed["id"])["status"] == "completed"
+
+    # ...and the worker kept going after the merge. This is the whole of Mode C.
+    (tailed["worktree_path"] / "onboarding.py").write_text(_feature("onboarding"))
+    _git(tailed["worktree_path"], "add", "-A")
+    _git(tailed["worktree_path"], "commit", "-qm", "the onboarding half")
+
+    found = _violations(project)
+
+    assert [v.wo_id for v in found] == [tailed["id"]]
+    assert found[0].context["rung"] == "merged-tail"   # the exact rung, not the heuristic
+    assert found[0].context["verdict"] == landing.STRANDED
 
 
 def test_the_sweep_is_silent_on_orders_that_produced_nothing_and_on_abandoned_ones(

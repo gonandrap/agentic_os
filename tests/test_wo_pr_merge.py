@@ -31,6 +31,7 @@ from jarvis.project_store import OPEN_STATUSES, ProjectStore
 from jarvis.timeline import build_timeline
 
 PR = "https://github.com/acme/proj/pull/7"
+OTHER_PR = "https://github.com/acme/proj/pull/8"
 
 
 @pytest.fixture()
@@ -782,6 +783,26 @@ def test_a_pr_with_no_mergeability_is_no_conflict(fake_gh):
 
     assert not pr.conflicting and not pr.mergeable_now
     assert pr.mergeable is None
+
+
+def test_pr_view_reads_the_head_sha_and_survives_its_absence(fake_gh):
+    """`headRefOid` is the one field this repository's landing sweep added to PR_FIELDS.
+
+    On a MERGED pull request it is the sha that merged, and `ops.complete_merged` writes
+    it onto the `pr_merged` event because that event is the only place it can live
+    (kn-dbc4971d: `pr_state` is stale by construction). Asserted HERE, at the parse, and
+    not only through `landing.assess(pr_head_oid=...)`: the two are joined by a payload
+    key and a JSON field name, and a typo in either would leave the exact Mode C rung
+    permanently dormant — which looks precisely like a fleet with nothing stranded.
+    """
+    sha = "9f1c2ab4d5e6f708192a3b4c5d6e7f8091a2b3c4"
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-08-02T10:00:00Z", head_oid=sha)
+
+    assert github.pr_view(PR).head_oid == sha
+
+    # And the fleet that predates the field: GitHub answers, the sha is simply absent.
+    fake_gh.set_pr(OTHER_PR, "MERGED", merged_at="2026-08-02T10:00:00Z")
+    assert github.pr_view(OTHER_PR).head_oid == ""
 
 
 def test_pr_view_raises_rather_than_guessing(fake_gh):
