@@ -72,8 +72,22 @@ cov=  0.79 .. 1.00                   <- ~90 branches that landed
 `STRANDED_COVERAGE = 0.25` and `LANDED_COVERAGE = 0.75` sit well inside that gap rather
 than on its edges, so a branch has to move a long way before its verdict changes. Between
 them is `PARTIAL`, which is a real answer rather than a shrug: it is Mode C's exact shape,
-where a first pull request merged and the work after it did not (`rescue/wo-4576667e`
-scores 0.87, `rescue/wo-0fea6edb` 0.69).
+where a first pull request merged and the work after it did not — `rescue/wo-0fea6edb`
+scores 0.69 and is `PARTIAL` on coverage alone.
+
+`rescue/wo-4576667e` is NOT, and the distinction is worth writing down because the first
+draft of this spec got it wrong. It scores 0.87, which is above `LANDED_COVERAGE`, so the
+thresholds alone call it `landed` — and that is what `assess` returns for it today,
+measured, not argued. Coverage only reaches `PARTIAL` for a branch this well landed
+through the second route into that verdict: the `dirty` clause, which demotes a `LANDED`
+branch whose worktree still holds uncommitted work. Its worktree was deleted in the same
+disk sweep that took the other 172, so there is no longer anything for that clause to
+find. The measurement this file is built on stands; the claim that all three Mode C
+orders show up as `PARTIAL` did not, and the honest version is that the coverage rung
+catches the ones whose tail is big enough to move the number. Both routes are pinned by
+tests (`tests/test_landing.py`), because a `PARTIAL` that quietly reads `LANDED` is
+CACHED and never recomputed — a permanent silent all-clear, which is the exact failure
+this whole file exists to prevent.
 
 ## 5. The negative controls are half the value
 
@@ -141,11 +155,20 @@ construction with one permitted reader.
 this — was written without one, and nothing backfills it: the sha is GitHub's answer to a
 poll that has already happened, and re-asking for 209 work orders is a network sweep this
 invariant exists to not be. So for the existing fleet the exact rung is skipped and those
-orders fall through to `coverage`, which still reports Mode C — `rescue/wo-4576667e`
-scores 0.87 and `rescue/wo-0fea6edb` 0.69, both `PARTIAL` — and to the `dirty` clause
-under it. The exact rung is for the orders that merge from now on. This is a deliberate
-asymmetry, not an oversight: a run of `unknown`s from a rung that cannot fire would be
-worse than a measurement that can.
+orders fall through to `coverage` and to the `dirty` clause under it. The exact rung is
+for the orders that merge from now on. This is a deliberate asymmetry, not an oversight:
+a run of `unknown`s from a rung that cannot fire would be worse than a measurement that
+can.
+
+**And `coverage` does not catch all three of them.** `rescue/wo-0fea6edb` scores 0.69 and
+is reported `PARTIAL`; `rescue/wo-4576667e` scores 0.87 and is reported `landed`, because
+its tail is a small enough fraction of what the branch added to sit above
+`LANDED_COVERAGE` and its worktree — the other thing that would demote it, via the `dirty`
+clause — no longer exists to be read (§4). That is the honest cost of a heuristic rung
+standing in for an exact one: for orders that merged before this shipped, a SMALL Mode C
+tail is under the floor of what content can see. It is not a cost this change can pay off
+without the network sweep it exists to avoid, and it shrinks to nothing as the fleet's
+`pr_merged` events start carrying `head_oid`, which makes the exact rung answer instead.
 
 The verdict is CACHED, and only the settled half. `landed` and `not-produced` are recorded
 as a `landing_checked` event and never recomputed: a completed order's branch has stopped

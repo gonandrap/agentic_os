@@ -468,6 +468,106 @@ def test_the_sweep_is_silent_on_orders_that_produced_nothing_and_on_abandoned_on
     assert _violations(project) == []
 
 
+def test_a_partly_landed_order_is_reported_and_its_verdict_is_never_cached(
+        started, project):
+    """THE ONLY RUNG THAT CAN SEE THE FLEET THAT ALREADY EXISTS, at the sweep's level.
+
+    `tests/test_landing.py` proves the detector returns `PARTIAL`; this proves the sweep
+    does something with it. Both halves matter and the second one more: `PARTIAL` must
+    NOT be written to `landing_checked`, because that cache is never recomputed and the
+    order's tail is exactly the thing a later merge resolves. A sweep that cached this
+    would answer "all clear" for ever on a work order that is half on the branch.
+
+    The shape is issue #232's Mode C without a `head_oid` to key on (spec §7): the first
+    pull request squash-merged, the worker kept going, and the second half never left
+    the branch.
+    """
+    wo = _order(project, "launcher contract", code="first")
+    _settle(project, wo["id"])
+    _git(project, "merge", "--squash", "-q", f"worktree-{wo['id']}")
+    _git(project, "commit", "-qm", f"[{wo['id']}] the first half (#9)")
+    _git(project, "push", "-q", "origin", "trunk")
+    (wo["worktree_path"] / "second.py").write_text(_feature("second"))
+    _git(wo["worktree_path"], "add", "-A")
+    _git(wo["worktree_path"], "commit", "-qm", "the tail nobody merged")
+
+    found = _violations(project)
+
+    assert [v.wo_id for v in found] == [wo["id"]]
+    assert found[0].context["verdict"] == landing.PARTIAL
+    assert found[0].context["rung"] == "coverage"
+    assert "second.py" in found[0].context["missing_files"]
+    # Re-derived, not remembered: the moment the tail merges, this stops being reported.
+    assert _events(project, wo["id"], "landing_checked") == []
+    assert len(_violations(project)) == 1      # ...and it is still reported until then
+
+
+def test_an_order_the_user_marked_done_is_not_reported_by_the_sweep_for_ever(
+        started, project):
+    """`jarvis wo done` is a decision, and the sweep has to read it as one.
+
+    `mark_done` is the one landing that records instead of refusing: the user closing an
+    order over a pull request that will never merge is the documented exit, and it writes
+    `work_unlanded` with `closed_by: marked_done`. But the sweep only ever excused
+    `abandoned` — so the order it just closed came straight back, flagged `stranded`,
+    with a remedy telling it to run `jarvis wo finish --abandon` on a work order that is
+    already `completed`. Every hour. For ever. That is the hourly nag spec §3 is written
+    against, and it gets the checker switched off within a day.
+
+    The pairing is the order beside it, which was NOT closed and must still be named.
+    """
+    closed = _order(project, "will never merge", code="orphaned")
+    still_open = _order(project, "launcher contract", code="launcher")
+    _settle(project, still_open["id"])
+
+    assert ops.mark_done(closed["id"])["status"] == "completed"
+    # The evidence is on the record either way — that is what issue #232 asked for.
+    assert json.loads(_events(project, closed["id"], "work_unlanded")[-1]["payload"]
+                      )["closed_by"] == "marked_done"
+
+    found = _violations(project)
+
+    assert [v.wo_id for v in found] == [still_open["id"]]
+    assert _violations(project) == found      # and it stays silent on the next sweep too
+
+
+def test_the_read_only_doctor_reports_the_same_thing_and_records_nothing(started,
+                                                                        project):
+    """What the plain `jarvis doctor` a human types actually does — which is not what
+    the daemon does, and the docstrings now say so.
+
+    `ops.run_doctor` passes `slow=True` with `repair=False`, so `check_project` hands the
+    sweep a `_ReadOnly` proxy and `add_event` — the `landing_checked` cache write — is
+    swallowed. The report is identical; the cache is simply not populated, so the run
+    pays the full per-file git walk every time.
+
+    Left that way on purpose rather than worked around: a read-only doctor that wrote to
+    a timeline would be a worse defect than a repeated git walk, and the daemon's hourly
+    repairing sweep fills the cache for both of them. Asserted because a promise about
+    caching that only holds on one of two paths is the kind of thing that rots into a
+    performance bug nobody can find.
+    """
+    stranded = _order(project, "launcher contract", code="launcher")
+    clean = _order(project, "answered it")
+    _settle(project, stranded["id"], clean["id"])
+
+    store = ProjectStore(project)
+    try:
+        found = [v for v in invariants.check_project(store, repair=False, slow=True)
+                 if v.invariant == "INV-WORK-LANDED"]
+    finally:
+        store.close()
+
+    assert [v.wo_id for v in found] == [stranded["id"]]
+    assert found[0].context["verdict"] == landing.STRANDED
+    # Nothing was written, for either verdict — the settled one included.
+    assert _events(project, clean["id"], "landing_checked") == []
+    assert _events(project, stranded["id"], "landing_checked") == []
+    # The repairing path is what fills it, and it is the daemon's.
+    _violations(project)
+    assert len(_events(project, clean["id"], "landing_checked")) == 1
+
+
 def test_a_settled_verdict_is_cached_and_an_unsettled_one_is_re_derived(started, project):
     """A landed order must not pay for git on every sweep; a stranded one must, or the
     check would go on complaining after the user merged it."""

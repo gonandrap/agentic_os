@@ -363,7 +363,11 @@ def assess(repo: Path, wo_id: str, *, worktree: Path | None = None,
     cov = present / total
     verdict = (LANDED if cov >= LANDED_COVERAGE else
                STRANDED if cov <= STRANDED_COVERAGE else PARTIAL)
-    if verdict is LANDED and dirty:
+    # `==`, never `is`: the verdicts are plain strings, and identity holds here only
+    # because `verdict` is bound to this module's own constant. The day it arrives from
+    # an event payload or any other round trip, `is` goes quietly False and this branch —
+    # the one that catches Mode C without a pull request to key on — is dead code.
+    if verdict == LANDED and dirty:
         # The branch landed and the worktree still holds work that never left it. Mode C
         # again, arrived at without a pull request to key on.
         verdict, cov_note = PARTIAL, " but its worktree still holds uncommitted work"

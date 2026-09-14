@@ -192,6 +192,66 @@ def test_a_squash_merged_branch_reads_as_landed_and_an_unmerged_one_as_stranded(
     assert bad.missing_files == ("src/strand.py",)
 
 
+def test_half_a_branch_on_trunk_is_partial_and_neither_landed_nor_stranded(repo):
+    """THE RUNG THAT REPORTS THE FLEET THAT ALREADY EXISTS.
+
+    Every `pr_merged` event written before this change carries no `head_oid`, so the
+    exact `merged-tail` rung cannot fire for the orders that prompted issue #232 and
+    they fall through to here (spec §7). `PARTIAL` is the only verdict that names them,
+    and its failure direction is permanent: a `PARTIAL` that comes out `LANDED` is
+    SETTLED, so `check_work_lands` writes it to `landing_checked` and never looks again
+    — a silent all-clear that is indistinguishable from a fleet with nothing stranded.
+
+    The shape is the real one: a first pull request squash-merges, the worker keeps
+    going, and the second half never leaves the branch. Half the lines it added are on
+    `trunk` and half are nowhere, so coverage lands squarely in the band between the two
+    thresholds — which is neither of the answers the other tests in this file assert.
+    """
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/first.py", _feature("first"))
+    repo.squash_merge(f"worktree-{WO}", f"[{WO}] the first half (#5)")
+    repo.commit(wt, "src/second.py", _feature("second"), "the tail nobody merged")
+
+    found = landing.assess(repo.path, WO, worktree=wt)
+
+    assert found.verdict == landing.PARTIAL, found.detail
+    assert found.rung == "coverage"
+    # Strictly INSIDE the band, both ends: an implementation that moved a threshold or
+    # flipped a comparison to `>=`/`<=` would land on an edge and this would catch it.
+    assert landing.STRANDED_COVERAGE < found.coverage < landing.LANDED_COVERAGE
+    assert found.missing_files == ("src/second.py",)
+
+
+def test_a_landed_branch_whose_worktree_still_holds_work_is_partial_not_landed(repo):
+    """The second route into `PARTIAL`, and the one the cache makes unforgiving.
+
+    The content DID land — coverage is 1.0, well over `LANDED_COVERAGE` — and the branch
+    would read `landed` on the thresholds alone. What is left is a file that was never
+    committed at all, which is the tail issue #232 nearly lost when 172 worktrees were
+    deleted in a disk sweep: 851 lines that existed in exactly one place on disk.
+
+    Demoting `LANDED` to `PARTIAL` here is the whole difference between a report and a
+    permanent silence, because `LANDED` is settled and cached and `PARTIAL` is not.
+    """
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("feature"))
+    repo.squash_merge(f"worktree-{WO}", f"[{WO}] the feature (#6)")
+
+    # The pairing, asserted first: with a clean worktree this exact branch is LANDED.
+    clean = landing.assess(repo.path, WO, worktree=wt)
+    assert clean.verdict == landing.LANDED, clean.detail
+
+    (wt / "src" / "never_added.py").write_text(_feature("orphan"))
+
+    found = landing.assess(repo.path, WO, worktree=wt)
+
+    assert found.verdict == landing.PARTIAL, found.detail
+    assert found.rung == "coverage"
+    assert found.coverage >= landing.LANDED_COVERAGE   # the content really did land
+    assert "src/never_added.py" in found.dirty
+    assert found.verdict not in landing.SETTLED_VERDICTS   # so it is looked at again
+
+
 def test_the_commit_subject_rung_confirms_but_never_condemns(repo):
     """Only 96 of this repository's 173 `trunk` commits carry a `[wo-…]` subject.
 

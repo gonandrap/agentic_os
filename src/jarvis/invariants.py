@@ -1897,6 +1897,25 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
     are the ones a merge or a push can resolve — and because a check that remembered its
     complaint would go on making it after the user fixed the thing.
 
+    **THE CACHE ONLY EXISTS ON THE REPAIRING PATH**, which is the daemon's. It is a
+    timeline event, and `add_event` is one of the mutators `_ReadOnly` swallows — so on
+    `check_project(repair=False)`, the default `jarvis doctor` a human types, the write
+    is a silent no-op and every completed order is measured from git again on every run.
+    That is deliberate rather than worked around: a read-only doctor that wrote to a
+    timeline would be a worse defect than a repeated git walk, and the daemon's hourly
+    sweep populates the cache for both of them. The cost is bounded by the exclusions
+    above — settled orders that the daemon has already cached still pay it here, so on a
+    project the daemon has never swept the first `jarvis doctor` is the slow one.
+
+    **AN ORDER THE USER CLOSED BY HAND IS EXCLUDED TOO.** `jarvis wo done` over unlanded
+    work is the one landing that records instead of refusing (`ops.mark_done`), and its
+    `work_unlanded` event carries `closed_by: marked_done`. That event IS the decision
+    this sweep asks for, so it excuses the order exactly as `abandoned` does — otherwise
+    the sweep names it every hour with a remedy telling the user to run a different
+    command on an order they already closed, which is how a checker gets switched off.
+    Both exclusions lapse the same way: the episode arithmetic in `work_unlanded_open`
+    and `work_abandoned` retires a decision as soon as the work is delivered again.
+
     Not repairable, and it must not try. What to do with stranded work — merge it, rescue
     it, drop it — is exactly the decision `--abandon` exists to record, and deriving one
     is not the OS's to make.
@@ -1905,7 +1924,8 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
 
     for wo in store.list_work_orders(statuses=("completed",), include_hidden=True):
         wo_id = wo["id"]
-        if store.work_abandoned(wo_id):
+        if store.work_abandoned(wo_id) or store.work_unlanded_open(
+                wo_id, closed_by="marked_done"):
             continue  # the decision was taken and written down; that is the whole ask
         if any(db.from_json(e["payload"], {}).get("verdict") in landing.SETTLED_VERDICTS
                for e in store.events_of_kind(wo_id, "landing_checked")):

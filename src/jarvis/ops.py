@@ -185,6 +185,12 @@ def run_doctor(project: str | None = None, repair: bool = False,
     INV-WORK-LANDED is the one that matters — "what has this fleet produced that is not
     on the default branch" has no other home, and the audit that first answered it
     (GitHub issue #232, six stranded work orders) was a one-off done by hand.
+
+    It also pays full price for it without `repair`. INV-WORK-LANDED caches its settled
+    verdicts as a timeline event, and a read-only run has no timeline to write to, so
+    the default `jarvis doctor` re-reads git for every completed work order every single
+    time — the cache is populated by the daemon's hourly sweep and by `--repair`, never
+    by a plain run. Read-only is worth more than the seconds: see `check_work_lands`.
     """
     from .invariants import check_catalog, check_os, check_project, check_release_marker
 

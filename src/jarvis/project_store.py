@@ -1953,7 +1953,7 @@ class ProjectStore:
         delivered = self.events_of_kind(wo_id, "finished")
         return not delivered or float(dropped[-1]["ts"]) >= float(delivered[-1]["ts"])
 
-    def work_unlanded_open(self, wo_id: str) -> bool:
+    def work_unlanded_open(self, wo_id: str, closed_by: str = "") -> bool:
         """Did a landing refuse this work order, with nothing since answering it?
 
         The episode arithmetic `work_abandoned` uses, over a wider set: the refusal
@@ -1966,8 +1966,18 @@ class ProjectStore:
         relabelled by INV-ATTENTION-REASON on the next tick — kn-eafe383a is that exact
         bug, one level over — and re-reading git for every open work order on every tick
         is the cost `landing`'s two-speed split exists to avoid.
+
+        `closed_by` narrows it to the landings written by ONE route — in practice
+        `marked_done`, which is `ops.mark_done` recording that the user closed an order
+        over work that never landed. That is a decision, exactly as `abandoned` is, and
+        `invariants.check_work_lands` has to read it as one or the sweep re-reports an
+        order the user already closed, every hour, for ever (issue #232). It shares this
+        method rather than copying the arithmetic, because "and nothing since answered
+        it" is the half that would rot in a second copy.
         """
-        parked = self.events_of_kind(wo_id, "work_unlanded")
+        parked = [e for e in self.events_of_kind(wo_id, "work_unlanded")
+                  if not closed_by
+                  or (db.from_json(e["payload"], {}) or {}).get("closed_by") == closed_by]
         if not parked:
             return False
         since = float(parked[-1]["ts"])
