@@ -753,8 +753,16 @@ def _spend_so_far(turn: Turn, now: float | None) -> str:
     while its wall clock runs, cannot look like one that is generating.
 
     Called only for a turn that HAS calls: the caller branches on `Turn.observed` first,
-    because a turn with none gets `STALL_ALARM` and no claim about money at all.
+    because a turn with none gets `STALL_ALARM` and no claim about money at all. THE
+    GUARD BELOW IS THAT PRECONDITION IN CODE, and it returns rather than raising: this
+    runs inside `Daemon.check_burning_turns`, where a `ValueError` out of `max()` would
+    take a whole project's reconcile tick with it. It is worded so that a caller which
+    lost the branch produces a sentence that is visibly self-contradicting — "still
+    being billed (NO API CALL …)" — rather than a plausible one, which is the whole
+    failure mode of issue 227.
     """
+    if not turn.calls:
+        return "NO API CALL — nothing has been billed"
     made = f"{len(turn.calls)} API call" + ("s" if len(turn.calls) > 1 else "")
     ago = (now - max(call.ts for call in turn.calls)) if now else 0.0
     when = "seconds ago" if ago < 60 else f"{int(ago // 60)}m ago"
