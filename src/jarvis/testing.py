@@ -140,6 +140,13 @@ def gate_environment(root: Path) -> dict[str, str]:
         # entire subject of that check (issue #202). Pointed at a directory inside the
         # sandbox holding no checkout: "no production deployment on this machine".
         paths.PRODUCTION_ROOT_ENV: str(root / "production"),
+        # The production units export `JARVIS_ENV=production` and it OVERRIDES the
+        # location check above, so a suite run BY A JARVIS WORKER inherits it from the
+        # daemon and every test of the dev badge fails on a machine where the OS is
+        # deployed — `tests/test_ui.py::test_version_lookup_failure_does_not_break_the_
+        # header` did, for exactly that reason. Pinned rather than deleted: this dict is
+        # merged into `os.environ`, and "no override" is a value a test can still set.
+        paths.ENV_OVERRIDE: paths.DEVELOPMENT,
     }
     if not os.environ.get(LLM_EVALS_ENV):
         env[CLAUDE_BIN_ENV] = str(_blocked_bin(root, "claude", BLOCKED_CLAUDE))
@@ -189,7 +196,7 @@ FAKE_CLAUDE = r'''#!/usr/bin/env python3
 Records every invocation to $FAKE_CLAUDE_DIR/calls.jsonl and keeps a background-session
 roster in $FAKE_CLAUDE_DIR/sessions.json that `agents --json` serves back.
 """
-import json, os, sys, time
+import atexit, json, os, sys, time
 
 state_dir = os.environ["FAKE_CLAUDE_DIR"]
 calls_dir = os.path.join(state_dir, "calls")
@@ -212,14 +219,48 @@ argv = sys.argv[1:]
 # detached processes and a worker prompt is far past the 4KB atomic-append ceiling, so
 # a single calls.jsonl loses and interleaves records under any real fan-out.
 os.makedirs(calls_dir, exist_ok=True)
-# The prompt-cache TTL is decided by the launch ENVIRONMENT and by nothing in argv, so a
-# call record of argv alone cannot test the rate Jarvis pays. Only these two keys: the
-# whole environment would spill every secret the daemon holds into a fixture on disk.
-with open(os.path.join(calls_dir, f"{time.time_ns()}-{os.getpid()}.json"), "w") as f:
-    json.dump({"argv": argv, "cwd": os.getcwd(),
-               "cache_env": {k: os.environ[k] for k in
-                             ("FORCE_PROMPT_CACHING_5M", "ENABLE_PROMPT_CACHING_1H")
-                             if k in os.environ}}, f)
+_started = time.time()
+_record_path = os.path.join(calls_dir, f"{time.time_ns()}-{os.getpid()}.json")
+
+def _write_call_record(finished=None):
+    # WRITTEN TWICE, AND BOTH TIMES MATTER. At entry, because tests observe a call while
+    # it is deliberately still running (`hold_turns`) and a record that appeared only at
+    # exit would never arrive for them. Again at exit, via `atexit` so that no `sys.exit`
+    # path below can skip it, to fill in `finished_at` — whether one call was OVER before
+    # another began is a property no argv can carry, and it is what the prompt-cache
+    # priming test (spec §3) is about.
+    #
+    # The prompt-cache TTL is decided by the launch ENVIRONMENT and by nothing in argv,
+    # so a call record of argv alone cannot test the rate Jarvis pays. Only those two
+    # keys: the whole environment would spill every secret the daemon holds into a
+    # fixture on disk.
+    # THE SYSTEM PROMPT, RESOLVED. It arrives by argv or by file depending on its size
+    # (`claude_cli.SYSTEM_PROMPT_ARGV_LIMIT`), and the file is a temporary one that is
+    # gone by the time a test reads this record — so an argv-only record would make
+    # every large prompt look like no prompt at all.
+    seen = ""
+    for flag in ("--append-system-prompt", "--system-prompt"):
+        if flag + "-file" in argv:
+            try:
+                with open(argv[argv.index(flag + "-file") + 1]) as f:
+                    seen = f.read()
+            except OSError:
+                seen = ""
+        elif flag in argv:
+            seen = argv[argv.index(flag) + 1]
+    tmp = _record_path + f".part{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump({"argv": argv, "cwd": os.getcwd(), "system_prompt_seen": seen,
+                   "started_at": _started, "finished_at": finished,
+                   "cache_env": {k: os.environ[k] for k in
+                                 ("FORCE_PROMPT_CACHING_5M", "ENABLE_PROMPT_CACHING_1H")
+                                 if k in os.environ}}, f)
+    # Renamed into place: `Handle.calls` polls this directory while processes are still
+    # running, and a half-written record it cannot parse is a call it silently drops.
+    os.replace(tmp, _record_path)
+
+_write_call_record()
+atexit.register(lambda: _write_call_record(time.time()))
 
 def opt(name, default=None):
     return argv[argv.index(name) + 1] if name in argv else default
@@ -452,21 +493,39 @@ elif "-p" in argv and "--resume" not in argv:
     # headless one-shot (`claude -p ...`) — Neo's answering path. Deterministic
     # verdict driven by the prompt so tests control escalation.
     prompt = argv[argv.index("-p") + 1]
-    system = opt("--append-system-prompt", "")
+    # THE SYSTEM PROMPT ARRIVES BY ONE OF TWO DOORS and a fake that knew only the argv
+    # one would read every large call as having no system prompt at all — silently, and
+    # in the direction that makes a seat look like a Neo question. See
+    # `claude_cli.SYSTEM_PROMPT_ARGV_LIMIT`.
+    spfile = opt("--append-system-prompt-file")
+    system = open(spfile).read() if spfile else opt("--append-system-prompt", "")
     # A VALIDATION SEAT, AND THIS BRANCH IS FIRST OF ALL. `chair` IS A LEGAL SEAT NAME IN
     # BOTH ROSTERS: a validator chair answered by the Neo seat branch below comes back a
     # perfectly well-formed Neo verdict carrying no pass and no reject at all, and a
     # lenient `validation.decide` would read that as a pass — a green suite that exercised
     # nothing. The two headers are different literals precisely so this branch can tell
     # them apart, and the per-seat failure variable is separate for the same reason.
+    #
+    # THE HEADER IS IN THE USER TURN NOW, not the system prompt: the packet took the
+    # system prompt because five seats share it and the cache is a prefix match. The
+    # test markers still ride in the packet, so both halves are searched — `said` is the
+    # whole of what this call was asked, wherever each part of it travelled.
+    said = system + "\n" + prompt
+    # THE PRIMING CALL (`validation.PRIMING_TURN`). It carries the shared prefix and no
+    # seat header, so without this arm it falls through to the Neo branch at the bottom
+    # and is answered as a verdict — a sixth call in every round's records, answered by
+    # a persona nobody asked for.
+    if prompt == "Reply with the single word ok.":
+        emit_headless("ok")
+        sys.exit(0)
     vseat = next((s for s in ("tester", "security", "architect", "maintainer", "chair")
-                  if ("# Jarvis validation seat: " + s) in system), None)
+                  if ("# Jarvis validation seat: " + s) in prompt), None)
     if vseat:
         if vseat in [s for s in
                      os.environ.get("FAKE_VALIDATION_SEAT_FAIL", "").split(",") if s]:
             sys.stderr.write(f"validation seat {vseat} failed (test-forced)\n")
             sys.exit(1)
-        if f"FORCE_VALIDATION_GARBAGE_{vseat.upper()}" in prompt:
+        if f"FORCE_VALIDATION_GARBAGE_{vseat.upper()}" in said:
             emit_headless(f"on reflection the {vseat} question is a hard one")
             sys.exit(0)
         if vseat == "chair":
@@ -474,24 +533,24 @@ elif "-p" in argv and "--resume" not in argv:
             # no `answer`. That difference from the Neo chair's reply is what a test
             # asserts to prove this branch, and not the one below, answered the call.
             reply = {"outcome": "passed", "reason": ""}
-            if "FORCE_VALIDATION_REJECT" in prompt:
+            if "FORCE_VALIDATION_REJECT" in said:
                 reply = {"outcome": "rejected",
                          "reason": "your change is not covered by the evidence you "
                                    "declared."}
-            elif "FORCE_VALIDATION_NO_OUTCOME" in prompt:
+            elif "FORCE_VALIDATION_NO_OUTCOME" in said:
                 reply = {"reason": "a reply with no outcome at all"}
         else:
             reply = {"verdict": "pass", "blocking": False,
                      "reason": f"the {vseat} question is answered by this change",
                      "asks": []}
-            if f"FORCE_BLOCK_{vseat.upper()}" in prompt:
+            if f"FORCE_BLOCK_{vseat.upper()}" in said:
                 # `blocking` true from EVERY seat, veto-holder or not. Arbitration, not
                 # the seat, decides what that forces — which is exactly the row the
                 # architect and maintainer tests need staged.
                 reply = {"verdict": "reject", "blocking": True,
                          "reason": f"test-forced {vseat} objection",
                          "asks": [f"answer the {vseat} objection"]}
-            elif f"FORCE_REJECT_{vseat.upper()}" in prompt:
+            elif f"FORCE_REJECT_{vseat.upper()}" in said:
                 reply = {"verdict": "reject", "blocking": False,
                          "reason": f"test-forced {vseat} concern that blocks nothing",
                          "asks": []}
@@ -806,12 +865,25 @@ elif argv[:2] == ["pr", "view"]:
     # `gh pr view <url> --json <fields>`. The roster comes from the fixture; a URL
     # nobody registered gets gh's own "no pull requests found" shape, because a test
     # about an unreadable PR should exercise the same path a real deleted one does.
+    #
+    # ONLY THE REQUESTED FIELDS COME BACK, exactly as real `gh` does. That is what lets
+    # a test prove the poll loop and the evidence collector ask for different things:
+    # a fake that answered with everything it held would pass a collector that never
+    # requested `body` at all.
     prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
     pr = prs.get(argv[2] if len(argv) > 2 else "")
     if pr is None:
         sys.stderr.write("no pull requests found for this URL\n")
         sys.exit(1)
-    print(json.dumps(pr))
+    fields = argv[argv.index("--json") + 1].split(",") if "--json" in argv else []
+    print(json.dumps({k: v for k, v in pr.items() if not fields or k in fields}))
+elif argv[:2] == ["pr", "diff"]:
+    prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
+    pr = prs.get(argv[2] if len(argv) > 2 else "")
+    if pr is None:
+        sys.stderr.write("no pull requests found for this URL\n")
+        sys.exit(1)
+    sys.stdout.write(pr.get("_diff", ""))
 else:
     sys.stderr.write(f"fake gh: unhandled argv {argv}\n")
     sys.exit(2)
@@ -1030,8 +1102,37 @@ def fake_gh(tmp_path, monkeypatch):
             any other state, which is what GitHub itself answers."""
             if mergeable is None:
                 mergeable = "MERGEABLE" if state == "OPEN" else None
-            self.prs[pr_url] = {"state": state, "mergedAt": merged_at,
+            self.prs[pr_url] = {**self.prs.get(pr_url, {}),
+                                "state": state, "mergedAt": merged_at,
                                 "mergeable": mergeable, "baseRefName": base_ref}
+            monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
+
+        def set_pr_artifact(self, pr_url: str, *, diff: str = "", title: str = "",
+                    body: str = "", files: list[dict] | None = None,
+                    checks: list[dict] | None = None, state: str = "OPEN",
+                    draft: bool = False, base_ref: str = "main",
+                    head_ref: str = "feature", number: int = 1) -> None:
+            """Register what the PANEL sees of this pull request.
+
+            Separate from `set_pr` because the two readers ask for different
+            fields and a test must be able to register one without the other:
+            the poll loop asks four questions and the evidence collector asks
+            for the whole artifact. Both shapes live in one dict here, and the
+            fake returns only what each caller's `--json` asked for.
+            """
+            files = files if files is not None else []
+            self.prs[pr_url] = {
+                **self.prs.get(pr_url, {}),
+                "number": number, "title": title, "body": body, "state": state,
+                "isDraft": draft, "baseRefName": base_ref,
+                "headRefName": head_ref, "url": pr_url,
+                "additions": sum(int(f.get("additions") or 0) for f in files),
+                "deletions": sum(int(f.get("deletions") or 0) for f in files),
+                "changedFiles": len(files), "files": files,
+                "statusCheckRollup": checks or [],
+                # Underscored: not a `gh` field, it is what `gh pr diff` prints.
+                "_diff": diff,
+            }
             monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
 
     return Handle()
