@@ -320,6 +320,12 @@ def _held_violations(store):
     return [v for v in invariants.check_schedule_progresses(store)]
 
 
+def _status_held(store, project="proj_a"):
+    """What `jarvis status` says about this project's scheduler."""
+    st = ops.os_status()
+    return next(p for p in st["projects"] if p["name"] == project)["schedule_held"]
+
+
 def test_a_hold_inside_tolerance_is_silent(clock, started, store, catalog_file):
     _fire_once(started, store, clock, catalog_file)
     clock.advance(DAY)
@@ -341,18 +347,51 @@ def test_a_hold_past_tolerance_is_reported_and_names_the_order(clock, started, s
     assert not found[0].repaired, "the remedy is a judgement about that work, not a write"
 
 
-def test_switching_the_scheduler_off_silences_it(clock, started, store, catalog_file):
+def _switch_off(catalog_file, **block) -> None:
+    data = json.loads(catalog_file.read_text())
+    data["os"]["schedule"] = {"enabled": False, **block}
+    catalog_file.write_text(json.dumps(data))
+    ops.start_os(str(catalog_file), foreground=True)
+
+
+def test_switching_the_scheduler_off_silences_BOTH_surfaces(clock, started, store,
+                                                            catalog_file):
     """A mechanism turned off, with rows still on disk, must not alarm for ever —
-    `check_health_sweep_produces_judgements`' lesson, one mechanism over."""
+    `check_health_sweep_produces_judgements`' lesson, one mechanism over.
+
+    BOTH surfaces, because a hold survives being switched off: `held_since` is cleared by
+    a firing and by nothing else, and a project told to stop scheduling will never reach
+    one. The invariant guarding it and `jarvis status` not guarding it is the OS
+    contradicting itself about a mechanism the user has already turned off — and the
+    status line is the one they would see every day.
+    """
+    _fire_once(started, store, clock, catalog_file)
+    clock.advance(DAY)
+    _tick(started(), store)
+    assert store.schedule_state(JOB)["held_since"], "the row must still say held"
+    clock.advance(10 * DAY)
+
+    _switch_off(catalog_file)
+    assert _held_violations(store) == []
+    assert _status_held(store) == []
+
+
+def test_dropping_a_job_from_the_roster_silences_both_surfaces_too(clock, started, store,
+                                                                   catalog_file):
+    """The other half of "still supposed to run": `enabled` may stay true while the job
+    itself leaves `jobs`. A filter that read only the switch would keep printing the held
+    line for a job the project no longer runs."""
     _fire_once(started, store, clock, catalog_file)
     clock.advance(DAY)
     _tick(started(), store)
     clock.advance(10 * DAY)
+
     data = json.loads(catalog_file.read_text())
-    data["os"]["schedule"] = {"enabled": False}
+    data["os"]["schedule"] = {"enabled": True, "jobs": []}
     catalog_file.write_text(json.dumps(data))
     ops.start_os(str(catalog_file), foreground=True)
     assert _held_violations(store) == []
+    assert _status_held(store) == []
 
 
 def test_status_surfaces_the_hold_before_the_invariant_does(clock, started, store,
@@ -362,8 +401,7 @@ def test_status_surfaces_the_hold_before_the_invariant_does(clock, started, stor
     _fire_once(started, store, clock, catalog_file)
     clock.advance(DAY)
     _tick(started(), store)
-    st = ops.os_status()
-    held = next(p for p in st["projects"] if p["name"] == "proj_a")["schedule_held"]
+    held = _status_held(store)
     assert [h["job_id"] for h in held] == [JOB]
     assert held[0]["reason"]
 
@@ -371,9 +409,7 @@ def test_status_surfaces_the_hold_before_the_invariant_does(clock, started, stor
 def test_status_says_nothing_about_a_job_that_is_ticking_along(clock, started, store,
                                                                catalog_file):
     _fire_once(started, store, clock, catalog_file)
-    st = ops.os_status()
-    assert next(p for p in st["projects"]
-                if p["name"] == "proj_a")["schedule_held"] == []
+    assert _status_held(store) == []
 
 
 # -- the upgrade: a project database that predates `scheduled_jobs` -----------------------
@@ -517,6 +553,60 @@ def test_the_run_files_work_rather_than_doing_it():
         "it runs every day: the same fault will still be there tomorrow"
 
 
+def test_only_the_owner_project_gets_a_run_that_carries_the_os_checks(clock, tmp_path,
+                                                                     jarvis_home,
+                                                                     fake_claude,
+                                                                     claude_json,
+                                                                     catalog_file):
+    """`owns_os=owner == project.name` NEEDS TWO PROJECTS TO MEAN ANYTHING.
+
+    Every other daemon test here runs the single-project fixture, where `proj_a` is the
+    owner by `os_owner`'s fallback — so `owns_os` is True on every firing and an inverted
+    flag would file `--skip-os` for the whole fleet with every one of them green. This is
+    the only test that can tell the two apart, and it asserts the TEXT the worker will
+    actually receive rather than the flag, because the text is all the worker sees.
+    """
+    from jarvis.testing import make_git_project
+
+    second = make_git_project(tmp_path, "proj_b")
+    claude_json(second)
+    data = json.loads(catalog_file.read_text())
+    data["os"]["schedule"] = {"enabled": True}
+    data["projects"].append({"name": "proj_b", "path": str(second),
+                             "description": "the one that does not own the OS"})
+    catalog_file.write_text(json.dumps(data))
+    ops.start_os(str(catalog_file), foreground=True)
+
+    # Pin WHO the owner is rather than relying on the fallback's ordering: this test is
+    # about the branch, and it must fail when the branch inverts, not when the fallback
+    # happens to pick differently.
+    monkeypatched = "proj_b"
+    original = Daemon._os_owner
+    Daemon._os_owner = lambda self: monkeypatched
+    try:
+        paths = ops.registered_project_paths()
+        filed = {}
+        for _ in range(2):          # seed, then fire one interval later
+            for name in ("proj_a", "proj_b"):
+                store = ProjectStore(paths[name])
+                try:
+                    daemon = Daemon(load_catalog(catalog_file))
+                    daemon.schedule_tick(daemon.catalog.project(name), store)
+                    filed[name] = _scheduled(store)
+                finally:
+                    store.close()
+            clock.advance(DAY)
+    finally:
+        Daemon._os_owner = original
+
+    assert len(filed["proj_a"]) == 1 and len(filed["proj_b"]) == 1
+    owner_body = filed["proj_b"][0]["description"]
+    other_body = filed["proj_a"][0]["description"]
+    assert "jarvis doctor proj_b --repair" in owner_body
+    assert "--skip-os" not in owner_body
+    assert "jarvis doctor proj_a --repair --skip-os" in other_body
+
+
 # -- run_doctor(include_os=...) -----------------------------------------------------------
 
 
@@ -627,15 +717,29 @@ def test_the_tick_actually_calls_it(clock, started, store, catalog_file, monkeyp
     assert seen == ["proj_a"]
 
 
-def test_the_cadence_gate_is_a_multiple_nobody_can_starve(clock, started, catalog_file,
-                                                          monkeypatch):
-    """The gate is `tick_count % SCHEDULE_EVERY_TICKS == 1`, so it must fire within one
-    window of any starting count — a gate that never matched would look exactly like a
-    scheduler with nothing due."""
+def test_the_cadence_reaches_the_pass_once_per_window(clock, started, catalog_file,
+                                                      monkeypatch):
+    """Driven through `Daemon.tick`, never recomputed here.
+
+    The version of this test that computed `n % SCHEDULE_EVERY_TICKS == 1` itself and
+    asserted the length of its own list passed with the gate deleted — it tested
+    arithmetic, not the daemon. This runs three whole windows of real ticks and counts
+    how many reach the pass, so deleting the gate (every tick) or breaking it (no tick)
+    both fail.
+    """
     from jarvis.daemon import SCHEDULE_EVERY_TICKS
-    fired = [n for n in range(1, SCHEDULE_EVERY_TICKS * 3 + 1)
-             if n % SCHEDULE_EVERY_TICKS == 1]
-    assert len(fired) == 3
+
+    _enable(catalog_file)
+    daemon = started()
+    seen = []
+    monkeypatch.setattr(Daemon, "schedule_tick",
+                        lambda self, project, st: seen.append(self.tick_count))
+    daemon.tick_count = 0
+    for _ in range(SCHEDULE_EVERY_TICKS * 3):
+        daemon.tick()
+    assert len(seen) == 3, f"reached the pass on ticks {seen}"
+    # ...and the spacing is the window, not three in a row at the start.
+    assert [b - a for a, b in zip(seen, seen[1:])] == [SCHEDULE_EVERY_TICKS] * 2
 
 
 def test_terminal_statuses_are_what_release_a_job():

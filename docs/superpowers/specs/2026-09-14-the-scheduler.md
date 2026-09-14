@@ -102,9 +102,17 @@ Two surfaces, at two volumes:
   settle the order in the way, which is a judgement about that work. An unrepaired
   violation raises a notification, so a dead scheduler reaches the inbox.
 
-Silent when the scheduler is off, or when the job has left `jobs` —
-`check_health_sweep_produces_judgements`' lesson, where a switched-off mechanism with
-rows still on disk alarmed for ever.
+**Both surfaces filter by the project's `ScheduleConfig`, and the reason is sharper than
+symmetry.** A hold SURVIVES being switched off: `held_since` is cleared by a firing and by
+nothing else, so a job held at the moment somebody sets `enabled: false` or drops it from
+`jobs` can never reach the event that would clear it. Guarding the invariant and not
+`jarvis status` leaves the OS printing `⏰ … held:` for ever about a mechanism the user has
+already turned off — `check_health_sweep_produces_judgements`' lesson, where a switched-off
+mechanism with rows still on disk alarmed for ever, arriving by a second route. `ops._held_jobs`
+is the status half; `invariants.check_schedule_progresses` is the other, and they read the
+same two keys. Where no catalog is resolvable both fall back to `ScheduleConfig()`, which
+ships disabled, so they go quiet together rather than one of them inventing a hold out of
+rows whose configuration nobody can read.
 
 ## 5. Labelling, and the attention budget
 

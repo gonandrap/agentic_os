@@ -383,6 +383,28 @@ def _neo_attention() -> tuple[dict[str, int], list[dict[str, Any]]]:
         neo.close()
 
 
+def _held_jobs(store: ProjectStore, cfg: Any) -> list[dict[str, Any]]:
+    """Scheduled jobs this project is STILL SUPPOSED TO RUN and cannot.
+
+    Only the held ones: a scheduler ticking along is not news, and a line per job per
+    project on every `jarvis status` would spend exactly the attention budget the
+    scheduler exists to protect.
+
+    Filtered by the config for `invariants.check_schedule_progresses`' reason — a hold
+    survives being switched off, because only a firing clears it, and a project that has
+    been told to stop scheduling will never reach one.
+    """
+    from .catalog import ScheduleConfig
+
+    cfg = cfg or ScheduleConfig()
+    if not cfg.enabled:
+        return []
+    return [{"job_id": st["job_id"], "since": st["held_since"],
+             "reason": st["held_reason"] or "", "wo_id": st["last_wo_id"]}
+            for st in store.list_schedule_states()
+            if st["held_since"] and st["job_id"] in cfg.jobs]
+
+
 def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
     central = CentralStore()
     try:
@@ -399,9 +421,23 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         try:
             _cat = catalog or resolve_catalog()
             mode_by_project = {ps.name: ps.worker.permission_mode for ps in _cat.projects}
+            # ...and each project's scheduler config, for the same best-effort reason.
+            # A HOLD IS ONLY NEWS WHILE THE JOB IS STILL SUPPOSED TO RUN: `held_since` is
+            # cleared by a firing and by nothing else, so a job held at the moment somebody
+            # disables the scheduler or drops it from `jobs` would print its held line for
+            # ever on a project that can never reach a firing again. Same rule
+            # `invariants.check_schedule_progresses` applies, and it has to be applied in
+            # both places or the OS contradicts itself about a mechanism it has been told
+            # to stop running.
+            schedule_by_project = {ps.name: ps.schedule for ps in _cat.projects}
             fleet_state = fleet.current(_cat)
         except (OpsError, CatalogError):
             mode_by_project = {}
+            # No catalog is no permission to speak for the scheduler. `ScheduleConfig()`
+            # ships disabled, which is exactly what `ops.schedule_config_at` falls back to
+            # on the invariant side, so both surfaces go quiet together rather than one of
+            # them inventing a hold out of rows whose config nobody can read.
+            schedule_by_project = {}
         # Read Neo's questions BEFORE the project loop, not after it: a question Neo sent
         # up already gets its own attention line below, carrying the text and the
         # `jarvis neo answer` command, and the work order it came from must not add a
@@ -559,11 +595,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     # INV-SCHEDULE-HELD is the louder half, once it has been held for
                     # days — this is what answers "why has there been no doctor order
                     # since Tuesday" before then.
-                    "schedule_held": [
-                        {"job_id": st["job_id"], "since": st["held_since"],
-                         "reason": st["held_reason"] or "", "wo_id": st["last_wo_id"]}
-                        for st in store.list_schedule_states() if st["held_since"]
-                    ],
+                    "schedule_held": _held_jobs(store,
+                                                schedule_by_project.get(p["name"])),
                 })
                 if drift:
                     attention.append({

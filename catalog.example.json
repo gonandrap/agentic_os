@@ -93,8 +93,8 @@
       "path": "~/workspace/my_research",
       "description": "Data analysis scripts and notebooks",
       "model": "haiku",
-      "$comment_schedule": "field-level inheritance like every other block: this project is swept daily even though the fleet default above is off, and it keeps os.schedule's interval and roster",
-      "schedule": { "enabled": true }
+      "$comment_schedule": "field-level inheritance like every other block: this project names ONE key and keeps os.schedule's answer for the rest. Deliberately NOT enabled:true — copying this file must not make the OS start filing work orders nobody asked for, which is the whole thing the scheduler ships disabled to avoid",
+      "schedule": { "interval_hours": 12 }
     }
   ]
 }
