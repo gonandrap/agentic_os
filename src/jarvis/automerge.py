@@ -197,7 +197,10 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
 
     outcome = str((round_row or {}).get("outcome") or "")
     n = int((round_row or {}).get("round") or 0)
-    head = str(getattr(pr, "head_sha", "") or "")
+    # `pr.head_oid`, not `getattr(pr, ..., "")`: a default would turn a renamed or
+    # missing field into "" — which compares unequal to every judged commit and holds
+    # this feature off for ever, silently. Let it raise.
+    head = str(pr.head_oid or "")
     round_id = int((round_row or {}).get("id") or 0)
     judged = validated_head or ""
     if not judged:

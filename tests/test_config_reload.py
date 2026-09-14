@@ -468,8 +468,12 @@ def test_turning_validation_on_reaches_a_running_fleet_without_a_restart(started
     daemon, project, _ = started
 
     before = _run_one(daemon, project, "before")
-    assert ops.finish(before["id"], "done", evidence="ran the tests")["status"] \
-        == "completed"
+    # `_run_one` COMMITS to the work order's branch, so finishing over it needs a pull
+    # request or an explicit abandonment (GitHub issue #232). Neither is what this test
+    # is about; the pull request is the cheaper scenery.
+    assert ops.finish(before["id"], "done", evidence="ran the tests",
+                      pr_url="https://github.com/x/y/pull/1")["status"] \
+        == "waiting_pr_merge"
     store = ProjectStore(project)
     try:
         assert store.validation_rounds(wo_id=before["id"]) == []
@@ -483,8 +487,8 @@ def test_turning_validation_on_reaches_a_running_fleet_without_a_restart(started
     assert daemon.catalog.project("proj_a").validation.enabled is True
 
     after = _run_one(daemon, project, "after")
-    assert ops.finish(after["id"], "done", evidence="ran the tests")["status"] \
-        == "validating"
+    assert ops.finish(after["id"], "done", evidence="ran the tests",
+                      pr_url="https://github.com/x/y/pull/2")["status"] == "validating"
 
     central = CentralStore()
     try:

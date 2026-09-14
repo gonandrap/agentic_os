@@ -46,7 +46,7 @@ def pr(**over) -> PullRequest:
     """An open, green, CLEAN pull request at the commit the panel judged."""
     return PullRequest(**{"state": "OPEN", "mergeable": "MERGEABLE",
                           "merge_state": "CLEAN", "base_ref": "main",
-                          "checks": tuple(GREEN), "head_sha": JUDGED, **over})
+                          "checks": tuple(GREEN), "head_oid": JUDGED, **over})
 
 
 def rnd(**over) -> dict:
@@ -135,14 +135,14 @@ def test_a_round_that_recorded_no_commit_never_reads_as_matching():
 def test_a_head_that_moved_after_the_pass_holds_the_merge_and_says_both_commits():
     """THE CASE THE WHOLE DESIGN EXISTS FOR. The reason line names both commits because
     it is what the user reads to decide whether to merge it themselves."""
-    decision = decide(rnd(), pull=pr(head_sha=PUSHED))
+    decision = decide(rnd(), pull=pr(head_oid=PUSHED))
     assert not decision.armed and decision.code == automerge.HELD_SHA_MOVED
     assert JUDGED[:10] in decision.reason and PUSHED[:10] in decision.reason
 
 
-def test_a_pull_request_with_no_head_sha_at_all_is_not_a_match():
-    """GitHub answering null is "unknown", and unknown is not equal to anything."""
-    assert not decide(rnd(), pull=pr(head_sha=None)).armed
+def test_a_pull_request_with_no_head_oid_at_all_is_not_a_match():
+    """GitHub not answering leaves `""`, and `""` is not equal to anything."""
+    assert not decide(rnd(), pull=pr(head_oid="")).armed
 
 
 @pytest.mark.parametrize("kw", [
@@ -412,7 +412,7 @@ def test_one_grant_buys_one_merge(granted, fake_gh):
     needs a fresh review rather than a free second go at an irreversible act."""
     store, wo, approval = granted
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_sha=JUDGED)
+                   head_oid=JUDGED)
 
     automerge.apply(store, wo, JUDGED, approval)
 
@@ -426,7 +426,7 @@ def test_github_refuses_the_merge_when_the_head_moved_under_it(granted, fake_gh)
     the flag rather than testing the fake's willingness to merge."""
     store, wo, approval = granted
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_sha=PUSHED)
+                   head_oid=PUSHED)
 
     with pytest.raises(automerge.AutoMergeRefused, match="refused the merge"):
         automerge.apply(store, wo, JUDGED, approval)
@@ -485,7 +485,7 @@ def test_a_project_that_has_not_opted_in_is_never_merged_by_the_os(
     and the work order stays where the user can merge it themselves."""
     store, wo = arm(started, project, auto_merge=False)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_sha=JUDGED)
+                   head_oid=JUDGED)
 
     poll(started, store)
 
@@ -511,7 +511,7 @@ def test_an_order_awaiting_a_person_is_not_told_the_merge_declined_it(
     """
     store, wo = arm(started, project, auto_merge=True)
     store.set_status(wo["id"], "needs_review")
-    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_sha=JUDGED)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
 
     poll(started, store)
 
@@ -583,7 +583,7 @@ def test_an_opted_in_project_asks_before_it_merges(started, project, fake_gh):
     files the request and merges nothing."""
     store, wo = arm(started, project, auto_merge=True)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_sha=JUDGED)
+                   head_oid=JUDGED)
 
     poll(started, store)
 
@@ -599,7 +599,7 @@ def test_it_asks_once_and_not_every_two_minutes(started, project, fake_gh):
     a fresh Neo review of the same decision on the queue every tick."""
     store, wo = arm(started, project, auto_merge=True)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_sha=JUDGED)
+                   head_oid=JUDGED)
 
     poll(started, store)
     poll(started, store)
@@ -612,7 +612,7 @@ def test_a_refused_request_is_not_re_asked_for_the_same_commit(started, project,
     """A denial is an answer. Asking again would make the reviewer's verdict advisory."""
     store, wo = arm(started, project, auto_merge=True)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_sha=JUDGED)
+                   head_oid=JUDGED)
     poll(started, store)
     approval = store.list_approvals(wo["id"])[0]
     store.decide_approval(approval["id"], verdict="denied", reason="no",
@@ -630,7 +630,7 @@ def test_once_approved_the_next_poll_merges_it_and_closes_the_work_order(
     sha after the approval rather than before it — a grant lives an hour."""
     store, wo = arm(started, project, auto_merge=True)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_sha=JUDGED)
+                   head_oid=JUDGED)
     poll(started, store)
     approval = store.list_approvals(wo["id"])[0]
     gates.apply_decision(store, approval["id"], "approved", "the panel read it", "neo",
@@ -649,7 +649,7 @@ def test_the_record_never_reads_as_though_a_person_merged_it(started, project, f
     a merge by the OS and a merge by the user, so the one path that knows says so."""
     store, wo = arm(started, project, auto_merge=True)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_sha=JUDGED)
+                   head_oid=JUDGED)
     poll(started, store)
     approval = store.list_approvals(wo["id"])[0]
     gates.apply_decision(store, approval["id"], "approved", "ok", "neo",
@@ -677,7 +677,7 @@ def test_a_push_after_the_approval_stops_the_merge_dead(started, project, fake_g
     """
     store, wo = arm(started, project, auto_merge=True)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_sha=JUDGED)
+                   head_oid=JUDGED)
     poll(started, store)
     approval = store.list_approvals(wo["id"])[0]
     gates.apply_decision(store, approval["id"], "approved", "ok", "neo",
@@ -685,7 +685,7 @@ def test_a_push_after_the_approval_stops_the_merge_dead(started, project, fake_g
 
     # The worker pushes. Same branch, same pull request, a commit no seat has read.
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_sha=PUSHED)
+                   head_oid=PUSHED)
     poll(started, store)
 
     assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
@@ -703,7 +703,7 @@ def test_a_held_merge_is_said_once_per_commit_and_never_flags_the_user(
     heal-loop push is normal: the user's attention list is not a place to put normal."""
     store, wo = arm(started, project, auto_merge=True, judged=JUDGED)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_sha=PUSHED)
+                   head_oid=PUSHED)
 
     poll(started, store)
     poll(started, store)
@@ -719,7 +719,7 @@ def test_a_worktree_round_binds_nothing_and_so_merges_nothing(started, project,
     has no commit behind its verdict. `''` never reads as "matches"."""
     store, wo = arm(started, project, auto_merge=True, judged="")
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_sha=JUDGED)
+                   head_oid=JUDGED)
 
     poll(started, store)
 
@@ -732,7 +732,7 @@ def test_a_panel_that_never_answered_does_not_merge(started, project, fake_gh):
     a panel that died on a usage limit must read as not validated."""
     store, wo = arm(started, project, auto_merge=True, outcome="pending")
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_sha=JUDGED)
+                   head_oid=JUDGED)
 
     poll(started, store)
 
@@ -754,7 +754,7 @@ def test_an_approved_merge_is_attempted_once_and_the_failure_is_told_once(
     """
     store, wo = arm(started, project, auto_merge=True)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_sha=JUDGED)
+                   head_oid=JUDGED)
     poll(started, store)
     approval = store.list_approvals(wo["id"])[0]
     gates.apply_decision(store, approval["id"], "approved", "ok", "neo",
@@ -792,14 +792,14 @@ def test_an_approval_does_not_go_on_claiming_a_merge_that_will_never_happen(
     "approved by neo" about a pull request whose head had since moved and which was
     therefore never going to merge. That is the exact case the line exists for."""
     store, wo = arm(started, project, auto_merge=True)
-    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_sha=JUDGED)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
     poll(started, store)
     approval = store.list_approvals(wo["id"])[0]
     gates.apply_decision(store, approval["id"], "approved", "the panel read it", "neo",
                          project="proj_a")
     assert ops.automerge_state(store, wo)["kind"] == "automerge_decided"
 
-    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_sha=PUSHED)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=PUSHED)
     poll(started, store)
 
     state = ops.automerge_state(store, store.get_work_order(wo["id"]))
@@ -813,7 +813,7 @@ def test_an_approval_does_not_outrank_the_merge_that_kept_failing(started, proje
     not read as "approved by neo", or the one surface that could say the merge is stuck
     says the opposite."""
     store, wo = arm(started, project, auto_merge=True)
-    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_sha=JUDGED)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
     poll(started, store)
     approval = store.list_approvals(wo["id"])[0]
     gates.apply_decision(store, approval["id"], "approved", "ok", "neo",
@@ -848,7 +848,7 @@ def test_a_pending_request_is_not_re_proposed_every_tick(started, project, fake_
     loop's. Re-proposing opened a NeoStore every two minutes for as long as the pull
     request stayed open, to discover each time that `propose` would refuse."""
     store, wo = arm(started, project, auto_merge=True)
-    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_sha=JUDGED)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
     poll(started, store)
     assert store.list_approvals(wo["id"])[0]["status"] == "pending"
 
@@ -874,7 +874,7 @@ def test_the_work_order_says_why_it_did_not_merge_itself(started, project, fake_
     from jarvis import cli
 
     store, wo = arm(started, project, auto_merge=True, judged=JUDGED)
-    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_sha=PUSHED)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=PUSHED)
     poll(started, store)
 
     assert cli.main(["wo", "show", wo["id"]]) == 0
@@ -897,7 +897,7 @@ def test_a_work_order_the_mechanism_never_touched_says_nothing_at_all(started, p
     from jarvis import cli
 
     store, wo = arm(started, project, auto_merge=False)
-    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_sha=JUDGED)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
     poll(started, store)
 
     assert cli.main(["wo", "show", wo["id"], "--json"]) == 0
@@ -911,9 +911,9 @@ def test_a_user_merging_by_hand_is_unaffected_and_still_completes_the_order(
     pull request at any moment and the existing poll notices, exactly as it always did."""
     store, wo = arm(started, project, auto_merge=True, judged=JUDGED)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_sha=PUSHED)
+                   head_oid=PUSHED)
     poll(started, store)                       # held: the head moved
-    fake_gh.set_pr(PR, "MERGED", merged_at="2026-09-14T10:00:00Z", head_sha=PUSHED)
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-09-14T10:00:00Z", head_oid=PUSHED)
 
     poll(started, store)
 

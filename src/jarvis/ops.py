@@ -16,7 +16,10 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from . import landing
 
 from .bootstrap import BootstrapReport, bootstrap_project, settings_drift
 from .catalog import (
@@ -32,7 +35,7 @@ from . import config_version, db, fleet, invariants
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import CentralStore
 from .daemon import daemon_running
-from .invariants import PR_CLOSED_BLOCKER, true_blockers
+from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     FO_OPEN_STATUSES,
@@ -176,6 +179,18 @@ def run_doctor(project: str | None = None, repair: bool = False,
     Read-only unless `repair` is set, so it is safe to run at any time. The daemon runs
     the same checks with repair enabled on every reconcile tick — this is the manual
     handle for "is the OS lying to me right now?".
+
+    It runs MORE than the daemon does on most ticks: `invariants.SLOW_INVARIANTS` shell
+    out to git, so the daemon rations them to its own cadence and this does not.
+    INV-WORK-LANDED is the one that matters — "what has this fleet produced that is not
+    on the default branch" has no other home, and the audit that first answered it
+    (GitHub issue #232, six stranded work orders) was a one-off done by hand.
+
+    It also pays full price for it without `repair`. INV-WORK-LANDED caches its settled
+    verdicts as a timeline event, and a read-only run has no timeline to write to, so
+    the default `jarvis doctor` re-reads git for every completed work order every single
+    time — the cache is populated by the daemon's hourly sweep and by `--repair`, never
+    by a plain run. Read-only is worth more than the seconds: see `check_work_lands`.
     """
     from .invariants import check_catalog, check_os, check_project, check_release_marker
 
@@ -221,7 +236,10 @@ def run_doctor(project: str | None = None, repair: bool = False,
             continue
         store = ProjectStore(path)
         try:
-            found = check_project(store, repair=repair)
+            # `slow=True` unconditionally: INV-WORK-LANDED is the whole reason issue
+            # #232 asked for a report, and a human who typed `jarvis doctor` is waiting
+            # for its answer. The daemon is the caller that has to ration it.
+            found = check_project(store, repair=repair, slow=True)
         finally:
             store.close()
         found = [*config_violations.pop(p["name"], []), *found]
@@ -1535,9 +1553,23 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     still carries `CLOSED`, and a landing that believed it would drop a live pull request
     out of the merge queue and close the backlog item under it. The one caller that may
     read that column is the one that can know it is current: see `review_work_order`.
+
+    **AND `completed` NOW ASSERTS THE DELIVERABLE.** A work order with no pull request
+    whose branch carries commits has produced code that is on nothing but that branch,
+    and letting it complete is GitHub issue #232 — six orders, ~3,100 lines, found by a
+    human going looking. Every route to `completed` passes through here, which is why
+    the check is here and not in each of them. It PARKS rather than raising, because two
+    of its three callers are the daemon's round machine and `review_work_order`, where
+    an exception would break a tick or a user's command and neither has anyone who could
+    act on it. `finish` has someone who can — the worker — so it refuses there instead,
+    off the same predicate: see `unlanded_work`.
     """
     wo_id = wo["id"]
     pr_url = pr_url or wo.get("pr_url") or None
+    if not pr_url and not store.work_abandoned(wo_id):
+        stranding = unlanded_work(store, wo)
+        if stranding.produced:
+            return park_unlanded(store, wo, stranding)
     status = "waiting_pr_merge" if pr_url else "completed"
     store.set_status(wo_id, status)
     store.clear_attention(wo_id)
@@ -1548,6 +1580,60 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
         finally:
             central.close()
     return status
+
+
+def unlanded_work(store: ProjectStore, wo: dict[str, Any],
+                  pr_url: str = "") -> landing.Authored:
+    """What settling this work order right now would strand. Issue #232's whole predicate.
+
+    Narrow on purpose, and the narrowness is the point (Neo question 280): commits or
+    uncommitted files in the worktree, AND no pull request. An order that produced no
+    code is invisible to it — the exclusion that keeps 60 planners, investigations and
+    knowledge-base writes out of every report built on this, DERIVED from the worktree
+    rather than listed as work-order kinds that would rot.
+
+    **IT DOES NOT READ THE ABANDONMENT, and that is not an omission.** An abandonment
+    excuses the settling it was written with, and each caller knows a different thing
+    about which settling this is: `finish` holds THIS CALL's `--abandon` and must judge a
+    second, ordinary finish afresh — the record cannot tell it apart, because the new
+    `finished` event does not exist yet when the check runs. `land_finished` and the
+    sweep run later, over a record that is complete, and read `work_abandoned`.
+
+    **THE PULL REQUEST IS READ FROM THE RECORD, NEVER FROM `wo`.** `review_work_order`
+    hands its landing a copy with `pr_url` deliberately BLANKED when the poll has already
+    settled that pull request — which for a MERGED one means the work landed. Trusting
+    the caller's dict there would refuse to complete a work order whose code is on the
+    default branch, over the very commits that put it there: the "flags everything"
+    failure this check has to avoid, arriving by the back door. `pr_url` is the argument
+    for the opposite case, `finish --pr`, where the record has not been written yet.
+
+    Deliberately NOT keyed on whether that pull request merged. The order that finished
+    behind a merged pull request and then kept working is issue #232's Mode C, and it
+    belongs to the sweep (`landing.assess`), which can afford to look at the repository
+    properly.
+    """
+    from . import landing
+
+    recorded = store.get_work_order(wo["id"])
+    if pr_url or recorded.get("pr_url"):
+        return landing.Authored()
+    return landing.authored(landing.worktree_of(store.project_path, recorded))
+
+
+def park_unlanded(store: ProjectStore, wo: dict[str, Any],
+                  work: landing.Authored) -> str:
+    """Hold a work order that would otherwise complete over unlanded code, and SAY SO.
+
+    The event is the point. Issue #232's Mode B is a user closing a work order by
+    accepting its assumptions, which completed it and wrote `result_summary` NULL and
+    `pr_url` NULL over the fact that a commit existed — so the record afterwards said
+    the order had produced nothing. This writes down what was there instead: the branch,
+    the count, and the files that were never committed at all.
+    """
+    store.add_event(wo["id"], "work_unlanded", {**work.record(), "was": wo["status"]})
+    store.set_status(wo["id"], "needs_review")
+    store.flag_attention(wo["id"], UNLANDED_BLOCKER)
+    return "needs_review"
 
 
 def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
@@ -1833,8 +1919,41 @@ def gate_still_open(wo_id: str, request: dict[str, Any]) -> str:
             f"a privileged action nobody ruled on. {way_on}")
 
 
+def unlanded_refusal(wo_id: str, summary: str, work: landing.Authored) -> str:
+    """Why this work order may not finish, and the three ways on. Issue #232.
+
+    The first branch is MODE A, and it is why the summary is read at all: four of the six
+    stranded orders finished with a summary that NAMED a draft pull request in prose and
+    passed no `--pr`, so `pr_url` stayed NULL and no poller ever watched it. The OS does
+    not adopt that URL — it has verified nothing about it — but it can stop pretending it
+    did not see it. Two of those four were recovered only because the user personally
+    noticed and filed work orders titled "circle back on this PR .../pull/33".
+    """
+    from . import landing as landing_mod
+
+    named = landing_mod.pr_urls_in(summary)
+    if named:
+        lead = (f"Your summary names {named[0]}, but you did not pass it as `--pr`. "
+                f"Finishing like this records NO pull request, so nothing would ever "
+                f"watch it merge and {work.describe()} would stay on the branch.")
+        fix = f"Finish again with `--pr {named[0]}`."
+    else:
+        lead = (f"{wo_id} has produced {work.describe()}, none of it on `{work.base}`, "
+                f"and there is no pull request to land it.")
+        fix = ("Commit and push anything outstanding, open a pull request, and finish "
+               "again with `--pr <url>`.")
+    return (
+        f"{lead}\n\n{fix}\n\n"
+        f"If this work is deliberately NOT being landed, that is a legitimate outcome "
+        f"and the OS only asks that you say so: re-run with "
+        f"`--abandon \"<why it is not being landed>\"`. What it will not accept is "
+        f"silence — six work orders reached `completed` with their code on nothing but "
+        f"a branch, and nothing noticed for seven weeks (GitHub issue #232)."
+    )
+
+
 def finish(wo_id: str, summary: str, pr_url: str | None = None,
-           evidence: str = "") -> dict[str, Any]:
+           evidence: str = "", abandon: str = "") -> dict[str, Any]:
     """The worker reporting its own result.
 
     `pr_url` is what separates "delivered" from "delivered and merged": a work order
@@ -1854,6 +1973,13 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
     `evidence` is the worker's own account of how it tested the change, and it is
     OPTIONAL: every worker in flight when this shipped predates the flag, so an empty
     one is an ordinary submission and not a thin one.
+
+    **AND IT MAY NOT FINISH OVER CODE NOBODY HAS UNDERTAKEN TO LAND.** A worktree with
+    commits and no `--pr` is GitHub issue #232, and `finish` is the moment the evidence
+    is freshest and the one person who can act on it is listening. `abandon` is the way
+    through and is meant to be cheap: an abandonment is a legitimate outcome, and the
+    thing being enforced is that the decision is WRITTEN DOWN, not that it is prevented.
+    The predicate is `unlanded_work`'s and is deliberately narrow — see Neo question 280.
 
     An open gate request outranks all of it, and this is the third enforcement point of
     docs/superpowers/specs/2026-09-12-a-gate-that-holds.md: declaring yourself done is
@@ -1882,6 +2008,15 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             raise OpsError(gate_still_open(wo_id, next(
                 (a for a in open_requests if a["status"] == AWAITING_CASE),
                 open_requests[0])))
+        # Read ONCE, before anything is written: a refused finish must leave the record
+        # exactly as it found it (a `result_summary` saved beside a refusal reads
+        # afterwards like a work order that finished), and the abandonment below records
+        # what this same read saw rather than re-running git against a tree that has
+        # moved. `unlanded_work` answers "nothing" for a work order carrying a pull
+        # request, so the `--pr` path never touches git at all.
+        stranding = unlanded_work(store, _wo, pr_url or "")
+        if stranding.produced and not abandon:
+            raise OpsError(unlanded_refusal(wo_id, summary, stranding))
         fields: dict[str, Any] = {"result_summary": summary}
         if pr_url:
             fields["pr_url"] = pr_url
@@ -1896,6 +2031,12 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
                         {"summary": summary,
                          **({"pr_url": pr_url} if pr_url else {}),
                          **({"evidence": evidence} if evidence else {})})
+        if abandon:
+            # AFTER `finished` and never before: `_abandoned` reads the newer of the two,
+            # so an abandonment written first would be superseded by the finish it
+            # belongs to and the landing would refuse the very order it just excused.
+            store.add_event(wo_id, "abandoned",
+                            {"reason": abandon, **stranding.record()})
         if cfg is not None and cfg.enabled:
             submit_for_validation(store, path, fresh, declared=evidence, cfg=cfg)
         # ...and the status is the JOIN's to decide, not this branch's.
@@ -1924,6 +2065,14 @@ def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
 
     An existing `result_summary` is left alone: whatever the worker last reported is
     still the truest thing on the record, and this is not a claim about the outcome.
+
+    **IT RECORDS UNLANDED WORK AND DOES NOT REFUSE IT**, which is the one place this
+    parts company with the other two landings (GitHub issue #232). They refuse because
+    nobody decided; this IS the decision — a user typing `jarvis wo done` over a pull
+    request that will never merge is the documented exit, and refusing it would leave
+    them with no way to close the work order at all. What issue #232 actually asks for
+    is that the evidence stop being written over in silence, so the event goes on the
+    record and the status does not change.
     """
     name, path, wo = find_work_order(wo_id, project_name)
     store = ProjectStore(path)
@@ -1934,6 +2083,11 @@ def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
                 f"marking it done would accept them silently. Use `jarvis wo review "
                 f"{wo_id}` to accept, or `--reject` to send it back."
             )
+        stranding = unlanded_work(store, wo)
+        if stranding.produced and not store.work_abandoned(wo_id):
+            store.add_event(wo_id, "work_unlanded",
+                            {**stranding.record(), "was": wo["status"],
+                             "closed_by": "marked_done"})
         stopped = close_out(store, wo, "marked_done", why="work order marked done")
     finally:
         store.close()
@@ -1984,6 +2138,7 @@ def mark_backlog_done(wo: dict[str, Any]) -> None:
 
 def complete_merged(store: ProjectStore, wo: dict[str, Any],
                     merged_at: str | None = None,
+                    head_oid: str = "",
                     automerge: dict[str, Any] | None = None) -> dict[str, Any]:
     """The pull request landed: end the work order, exactly as the user closing it does.
 
@@ -1998,15 +2153,23 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
     Records `pr_merged` rather than `marked_done`: the record must not claim the user
     did something they did not do.
 
-    `automerge` is that same rule cutting the other way. A merge the OS performed itself
-    is indistinguishable here from one the user performed — the same `gh pr view` reports
-    both — so the ONE path that knows the difference says so, in an `automerge_merged`
-    event written before the close-out. It carries the approval the merge ran under, the
-    round that accepted the diff and the commit that landed, which is the whole audit
-    trail: without it the timeline would read as though a person merged this, and the
-    only record that the OS holds merge authority at all would be in the gate ledger,
-    one lookup away from the work order it acted on.
-    `None` is the ordinary case: a human merged it.
+    `head_oid` is the sha that merged, and it goes on the event because THE EVENT IS THE
+    ONLY PLACE IT CAN LIVE. `pr_state` is stale by construction with one permitted reader
+    (kn-dbc4971d), and asking GitHub again months later is a round trip per settled work
+    order; a fact recorded when it was true is neither. It is what lets the landing sweep
+    answer issue #232's Mode C exactly — commits the branch grew AFTER the merge — rather
+    than falling back to the content heuristic. Empty for every work order that merged
+    before this shipped, which is exactly why that fallback exists.
+
+    `automerge` says WHO merged it, which `head_oid` cannot: it is the `pr_merged` rule
+    above cutting the other way. A merge the OS performed itself is indistinguishable
+    here from one the user performed — the same `gh pr view` reports both — so the ONE
+    path that knows the difference says so, in an `automerge_merged` event written before
+    the close-out. It carries the approval the merge ran under, the round that accepted
+    the diff and the commit that landed, which is the whole audit trail: without it the
+    timeline would read as though a person merged this, and the only record that the OS
+    holds merge authority at all would be in the gate ledger, one lookup away from the
+    work order it acted on. `None` is the ordinary case: a human merged it.
     docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md §8.
     """
     if automerge:
@@ -2014,7 +2177,8 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
                         {**automerge, "pr_url": wo.get("pr_url")})
     store.update_work_order(wo["id"], pr_state="MERGED")
     stopped = close_out(store, wo, "pr_merged", why="pull request merged",
-                        payload={"pr_url": wo.get("pr_url"), "merged_at": merged_at})
+                        payload={"pr_url": wo.get("pr_url"), "merged_at": merged_at,
+                                 **({"head_oid": head_oid} if head_oid else {})})
     mark_backlog_done(wo)
     return {"wo_id": wo["id"], "status": "completed", "was": wo["status"],
             "pr_url": wo.get("pr_url"), "merged_at": merged_at,

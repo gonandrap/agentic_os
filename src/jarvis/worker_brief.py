@@ -262,7 +262,7 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         f"the explanation. A PR body hints; the diff explains. Never restate what "
         f"is already on this record. Rules: `jarvis brief concision`.",
         f"- When done, ALWAYS run `jarvis wo finish {wo_id} --summary \"...\"` "
-        f"(add `--pr <url>` if you opened a pull request) and then write your "
+        f"(code you wrote needs `--pr <url>` or `--abandon`) and then write your "
         f"complete answer as the last thing you say. The work order record IS this "
         f"conversation: the last message of every turn is captured verbatim, the "
         f"user and Neo decide from that record, and neither will ever open this "
@@ -390,9 +390,11 @@ def contract_section(wo_id: str = WO_PLACEHOLDER,
         "to the backlog.",
         f"- When done, ALWAYS run: `jarvis wo finish {wo_id} --summary \"...\"` "
         f"and then write your full answer as the last thing you say. If you opened "
-        f"a pull request, pass it too: `--pr <url>`. The full finishing protocol "
-        f"and what the record demands of every turn: `jarvis brief record --wo "
-        f"{wo_id}`.",
+        f"a pull request, pass it too: `--pr <url>` — and if you wrote code, that "
+        f"is REQUIRED: finishing over commits no pull request covers is refused "
+        f"(issue #232), with `--abandon \"<why>\"` as the way through when the work "
+        f"is deliberately not being landed. The full finishing protocol and what "
+        f"the record demands of every turn: `jarvis brief record --wo {wo_id}`.",
         "",
         "Work autonomously toward a complete end-to-end solution unless this work "
         "order says otherwise. User feedback may arrive as new user turns; treat "
@@ -423,6 +425,21 @@ def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
         f"link until they merge it, instead of settling as completed work nobody "
         f"is looking at. The daemon closes it itself once the PR merges; a PR "
         f"closed unmerged sends the work order back for review.",
+        "",
+        "**If you wrote code, that is not optional.** `finish` REFUSES while your "
+        "worktree carries commits, or files you never committed, that no pull "
+        "request covers — it will tell you what it found, and name any pull-request "
+        "URL sitting in your summary that you forgot to pass as `--pr`. Six work "
+        "orders once reached `completed` with their code on nothing but a branch, "
+        "two of them carrying 3,100 lines that nobody noticed for seven weeks "
+        "(GitHub issue #232).",
+        "",
+        "Deliberately NOT landing what you wrote is a perfectly good answer, and "
+        f"the OS only asks that you say it out loud: `--abandon \"<why it is not "
+        f"being landed>\"` completes the work order and records the reason on it. "
+        f"A spike that proved an approach wrong has produced something worth "
+        f"recording and nothing worth merging. What the OS will not accept is "
+        f"silence, because silence is indistinguishable from work that was lost.",
         "",
         "# Evidence",
         f"Pass `--evidence \"<what you ran and what it showed>\"` to `jarvis wo "

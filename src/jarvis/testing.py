@@ -1137,8 +1137,7 @@ def fake_gh(tmp_path, monkeypatch):
         def set_pr(self, pr_url: str, state: str, merged_at: str | None = None,
                    mergeable: str | None = None, base_ref: str = "main",
                    checks: list[dict] | None = None,
-                   merge_state: str | None = None,
-                   head_sha: str | None = None) -> None:
+                   merge_state: str | None = None, head_oid: str = "") -> None:
             """Register what `gh pr view <pr_url>` answers. Re-calling re-states it,
             which is how a test walks a pull request from OPEN to MERGED — or from
             MERGEABLE to CONFLICTING and back.
@@ -1150,11 +1149,18 @@ def fake_gh(tmp_path, monkeypatch):
             readers ask for different field sets but they are reading one pull request,
             so a test that registers CI once has registered it for both.
 
-            `head_sha` is `headRefOid`, shared for the same reason and then some: it is
-            the commit the panel judges AND the commit the auto-merge decision compares
-            against, so a test that set it on only one reader would be testing two pull
-            requests. Moving it — `set_pr(..., head_sha="new")` — is how a test says
-            "somebody pushed", which is the case the whole SHA binding exists for."""
+            `head_oid` is `headRefOid`, shared with `set_pr_artifact` for the same
+            reason and then some: it is the commit the panel judges, the commit the
+            auto-merge decision compares against, AND the sha the landing sweep measures
+            a Mode C tail against (issue #232). A test that set it on only one reader
+            would be testing two pull requests. Moving it — `set_pr(..., head_oid="new")`
+            — is how a test says "somebody pushed", which is the case the whole SHA
+            binding exists for.
+
+            It is OMITTED rather than sent empty when unset, because GitHub never answers
+            an empty sha: a test that wants the field absent must get it absent
+            (`github.PR_FIELDS` asks for `headRefOid` on every call), and one that wants
+            it present says so."""
             if mergeable is None:
                 mergeable = "MERGEABLE" if state == "OPEN" else None
             row = {**self.prs.get(pr_url, {}),
@@ -1162,10 +1168,10 @@ def fake_gh(tmp_path, monkeypatch):
                    "mergeable": mergeable, "baseRefName": base_ref}
             if checks is not None:
                 row["statusCheckRollup"] = checks
-            if head_sha is not None:
-                row["headRefOid"] = head_sha
             if merge_state is not None:
                 row["mergeStateStatus"] = merge_state
+            if head_oid:
+                row["headRefOid"] = head_oid
             self.prs[pr_url] = row
             monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
 
@@ -1174,7 +1180,7 @@ def fake_gh(tmp_path, monkeypatch):
                     checks: list[dict] | None = None, state: str = "OPEN",
                     draft: bool = False, base_ref: str = "main",
                     head_ref: str = "feature", number: int = 1,
-                    head_sha: str | None = None) -> None:
+                    head_oid: str | None = None) -> None:
             """Register what the PANEL sees of this pull request.
 
             Separate from `set_pr` because the two readers ask for different
@@ -1192,7 +1198,7 @@ def fake_gh(tmp_path, monkeypatch):
                 # Kept when this is called after `set_pr` has already registered one:
                 # the two readers are reading ONE pull request, and a reset here would
                 # silently unbind a verdict from the commit a test just pinned.
-                "headRefOid": (head_sha if head_sha is not None
+                "headRefOid": (head_oid if head_oid is not None
                                else self.prs.get(pr_url, {}).get("headRefOid", "")),
                 "additions": sum(int(f.get("additions") or 0) for f in files),
                 "deletions": sum(int(f.get("deletions") or 0) for f in files),

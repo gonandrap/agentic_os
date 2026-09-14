@@ -175,19 +175,25 @@ def origin_repo(cwd: Path | None) -> tuple[str, str] | None:
     return parts[-2].lower(), parts[-1].lower()
 
 
-#: The fields of one `gh pr view --json …`. Three questions in one round trip: did this
-#: land, can it still land, and is what it would land green? See the spec's §2 for the
-#: second, and 2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md §2 for the
-#: third — including why this is still NOT the same list as `ARTIFACT_FIELDS` below.
+#: The fields of one `gh pr view --json …`. Four questions in one round trip: did this
+#: land, can it still land, is what it would land green, and — months later — is what
+#: landed all of it? See the spec's §2 for the second,
+#: 2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md §2 for the third, and
+#: 2026-09-13-a-finished-order-proves-its-code-landed.md §7 for the fourth — including
+#: why this is still NOT the same list as `ARTIFACT_FIELDS` below.
 #:
-#: `headRefOid` is the fourth question and the cheapest: WHICH COMMIT is at the head
-#: right now. It is what lets the auto-merge decision compare the live head against the
-#: commit the validation panel judged, instead of trusting that nothing moved
-#: (docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md §5). One scalar —
-#: it does not make this the same list as `ARTIFACT_FIELDS`, which still pays for the
-#: body, the file list and a second `gh pr diff` round trip.
-PR_FIELDS = ("state,mergedAt,mergeable,mergeStateStatus,baseRefName,headRefOid,"
-             "statusCheckRollup")
+#: `headRefOid` answers TWO questions and is the cheapest field here, which is why one
+#: scalar carries both and neither pays for the other:
+#:
+#: * WHICH COMMIT is at the head right now, so the auto-merge decision can compare it
+#:   against the commit the validation panel judged instead of trusting that nothing
+#:   moved (2026-09-14-validated-auto-merge-design.md §5);
+#: * WHICH COMMIT GitHub merged — the only exact answer to issue #232's Mode C, an order
+#:   whose pull request merged and whose branch then carried MORE commits. It is recorded
+#:   on the `pr_merged` event so the landing sweep can ask months later without a second
+#:   round trip (`landing.assess`).
+PR_FIELDS = ("state,mergedAt,mergeable,mergeStateStatus,baseRefName,"
+             "statusCheckRollup,headRefOid")
 
 #: A check conclusion that means THE CODE IS WRONG — as opposed to merely not green. The
 #: distinction is the whole of the red-pull-request spec's §2: a run that is PENDING,
@@ -255,11 +261,14 @@ class PullRequest:
     #: One entry per check, through `read_checks`. Empty is a repository that runs no
     #: checks, which is not the same as every check failing.
     checks: tuple[dict[str, str], ...] = ()
-    #: `headRefOid`: the commit at the head of the pull request AT VIEW TIME. None when
-    #: GitHub did not answer it. Read only to be COMPARED — against the commit a
-    #: validation round judged — and never resolved against a local checkout: this is a
-    #: remote sha and the worktree it came from may be long gone.
-    head_sha: str | None = None
+    #: `headRefOid`: the commit at the head of the pull request AT VIEW TIME, and `""`
+    #: when GitHub did not answer. On a MERGED pull request it is what was merged, which
+    #: is what a later tail is measured against; on an OPEN one it is what the auto-merge
+    #: decision compares against the commit the validation panel judged. ONE field for
+    #: both readers because it is one fact — read only to be COMPARED, and never resolved
+    #: against a local checkout: this is a remote sha and the worktree it came from may
+    #: be long gone.
+    head_oid: str = ""
 
     @property
     def merged(self) -> bool:
@@ -364,7 +373,7 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
         merge_state=(str(payload["mergeStateStatus"]).upper()
                      if payload.get("mergeStateStatus") else None),
         checks=read_checks(payload),
-        head_sha=str(payload["headRefOid"]) if payload.get("headRefOid") else None,
+        head_oid=str(payload.get("headRefOid") or ""),
     )
 
 
@@ -401,10 +410,11 @@ class PullRequestArtifact:
     draft: bool
     base_ref: str
     head_ref: str
-    #: `headRefOid` — the commit this artifact IS. `""` when GitHub did not answer it,
-    #: and that empty string is load-bearing: it is what a round records as "the commit
-    #: was not recorded", which never auto-merges (spec §5.2).
-    head_sha: str
+    #: `headRefOid` — the commit this artifact IS. Same name and same meaning as
+    #: `PullRequest.head_oid`. `""` when GitHub did not answer it, and that empty string
+    #: is load-bearing: it is what a round records as "the commit was not recorded",
+    #: which never auto-merges (spec §5.2).
+    head_oid: str
     additions: int
     deletions: int
     files: tuple[str, ...]
@@ -484,7 +494,7 @@ def pr_artifact(url: str, cwd: Path | None = None) -> PullRequestArtifact:
         draft=bool(payload.get("isDraft")),
         base_ref=str(payload.get("baseRefName") or ""),
         head_ref=str(payload.get("headRefName") or ""),
-        head_sha=str(payload.get("headRefOid") or ""),
+        head_oid=str(payload.get("headRefOid") or ""),
         additions=int(payload.get("additions") or 0),
         deletions=int(payload.get("deletions") or 0),
         files=tuple(str(f.get("path") or "") for f in files if f.get("path")),

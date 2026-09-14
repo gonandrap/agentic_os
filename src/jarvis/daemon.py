@@ -116,6 +116,21 @@ PR_POLL_STATUSES = PR_REPAIR_STATUSES
 #: costing a sixth of what checking every tick would.
 RETRY_EVERY_TICKS = 2
 
+#: Sweep for completed work orders whose code never reached the default branch every N
+#: ticks — an hour at the default 5s interval. Its own cadence for `PR_POLL_EVERY_TICKS`'
+#: reason one step removed: it does not leave the machine, but it is the only check that
+#: shells out, at a `git` invocation per touched file of every completed order whose
+#: verdict is not already cached. An hour is far inside the window that matters — the
+#: orders GitHub issue #232 found had been stranded for SEVEN WEEKS — and a settled
+#: verdict is recorded once and never recomputed, so a mature project's steady-state cost
+#: is the orders nobody has landed yet, which is the number this exists to drive to zero.
+#:
+#: A MULTIPLE OF `RECONCILE_EVERY_TICKS` on purpose: the sweep runs inside
+#: `check_invariants`, which only runs on the reconcile tick, so a cadence that did not
+#: line up would silently sweep at some beat frequency of the two. 720 % 6 == 0, and both
+#: fire on tick 721.
+LANDING_SWEEP_EVERY_TICKS = 720
+
 #: How many dashboard digests one batch may produce. Bounds the cost of the FIRST batch
 #: on an instance upgrading into the feature with a backlog of long questions already in
 #: `neo.db` — the rest are picked up on later ticks and render in full until then. It is
@@ -467,6 +482,7 @@ class Daemon:
         reconcile = self.tick_count % RECONCILE_EVERY_TICKS == 1
         poll_prs = self.tick_count % PR_POLL_EVERY_TICKS == 1
         retry_paused = self.tick_count % RETRY_EVERY_TICKS == 1
+        sweep_landings = self.tick_count % LANDING_SWEEP_EVERY_TICKS == 1
         # `None` means "the roster was not read this tick" — either nothing is injected
         # or the listing failed — and is NOT the same as an empty roster, which would
         # mean every injected session ended. Session tracking is skipped on None.
@@ -562,7 +578,7 @@ class Daemon:
                     # the invariants judge a hold the OS was about to refuse.
                     self.abandon_unargued_gates(project, store)
                     # Last: check the state everything above just produced.
-                    self.check_invariants(project, store)
+                    self.check_invariants(project, store, sweep_landings=sweep_landings)
                 self.central.touch_project(project.name)
             except Exception:  # noqa: BLE001
                 log.exception("project %s tick failed", project.name)
@@ -2575,7 +2591,8 @@ class Daemon:
 
     # -- 7. invariants (post-conditions) --------------------------------------------------
 
-    def check_invariants(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def check_invariants(self, project: ProjectSpec, store: ProjectStore, *,
+                         sweep_landings: bool = False) -> None:
         """Verify the OS's own state and repair what is unambiguously wrong.
 
         Runs after reconcile so it judges the state this tick actually produced. Every
@@ -2583,11 +2600,15 @@ class Daemon:
         Repairs are recorded on the work order's timeline so a self-healed inconsistency
         is visible rather than silently papered over, and each distinct violation is
         reported once per daemon run.
+
+        `sweep_landings` adds `invariants.SLOW_INVARIANTS` — the checks that shell out —
+        on `LANDING_SWEEP_EVERY_TICKS`. `jarvis doctor` runs them every time; the daemon
+        cannot, which is the whole reason the flag exists.
         """
         from .invariants import check_project
 
         try:
-            violations = check_project(store, repair=True)
+            violations = check_project(store, repair=True, slow=sweep_landings)
         except Exception:  # noqa: BLE001 — the checker must never take the daemon down
             log.exception("[%s] invariant check failed", project.name)
             return
@@ -2995,7 +3016,8 @@ class Daemon:
                     # The timeline, the status change and `jarvis status` carry it.
                     log.info("[%s] %s merged — completing %s", project.name,
                              wo["pr_url"], wo["id"])
-                    ops.complete_merged(store, wo, merged_at=pr.merged_at)
+                    ops.complete_merged(store, wo, merged_at=pr.merged_at,
+                                        head_oid=pr.head_oid)
                 elif pr.closed_unmerged:
                     # ONCE PER CLOSURE. Before the poll widened, `record_pr_closed` moved
                     # the work order to `needs_review` and out of the polled set, so
@@ -3184,7 +3206,12 @@ class Daemon:
         # asked GitHub anything since the merge. The `automerge_merged` event's own
         # timestamp is when it landed, and inventing a local clock reading for a remote
         # field would be the record claiming a fact it does not have.
-        ops.complete_merged(store, wo,
+        #
+        # `head_oid` IS known, and exactly: `--match-head-commit` means GitHub merged this
+        # commit or merged nothing. Passing it keeps an OS-merged order on the landing
+        # sweep's exact answer to issue #232's Mode C instead of dropping it to the
+        # content heuristic (`landing.assess`).
+        ops.complete_merged(store, wo, head_oid=decision.judged_sha,
                             automerge={"approval_id": merged["approval_id"],
                                        "round_id": decision.round_id,
                                        "round": decision.round_n,

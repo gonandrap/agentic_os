@@ -79,6 +79,13 @@ TERMINAL_STATUSES = ("completed", "cancelled")
 #: silently become the generic IDLE_NO_FINISH_BLOCKER below on the next reconcile tick.
 PR_CLOSED_BLOCKER = "pull request closed without merging — the work was not accepted"
 
+#: What a work order says when settling it would have stranded the code it wrote
+#: (`ops.park_unlanded`, GitHub issue #232). Phrased as the decision the user owes rather
+#: than as a fault: landing it and dropping it are both fine endings, and only silence is
+#: not. Here rather than at the call site under PR_CLOSED_BLOCKER's obligation above.
+UNLANDED_BLOCKER = ("work not landed — merge its pull request, or record that it is "
+                    "being abandoned")
+
 #: How many times the OS asks a worker to repair its own pull request before it asks the
 #: user instead. ONE cap for both repairs — the conflict and the red build — because
 #: they are the same mechanism with a different message; see §4 of
@@ -451,7 +458,16 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         #    assumption lands the work order and nothing re-derives it afterwards.
         elif _validation_escalated(store, wo):
             blockers.append(VALIDATION_STUCK_BLOCKER)
-        # 3. Nothing more specific: the worker stopped without finishing. Guarded,
+        # 3. The landing refused to complete it over code that is on nothing but its own
+        #    branch (`ops.park_unlanded`, GitHub issue #232). Above the idle line and
+        #    not merged into it, because they are opposite facts about the same status:
+        #    that one says the worker produced nothing anyone can see, this one says it
+        #    produced something nobody can see. Guarded for the reason below, and
+        #    unreachable with an assumption pending anyway — the landing that parks it
+        #    only runs once the user's gate has cleared.
+        elif not pending and store.work_unlanded_open(wo["id"]):
+            blockers.append(UNLANDED_BLOCKER)
+        # 4. Nothing more specific: the worker stopped without finishing. Guarded,
         #    because a `needs_review` holding a pending assumption is doing exactly what
         #    that status is for, and this line would call it a worker that gave up.
         elif not pending:
@@ -1854,6 +1870,96 @@ def check_health_sweep_produces_judgements(store: ProjectStore) -> Iterator[Viol
     )
 
 
+def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
+    """INV-WORK-LANDED — a completed work order's code must be on the default branch.
+
+    THE STANDING ANSWER TO "what has this fleet produced that is not on main". The audit
+    behind GitHub issue #232 was a one-off that found six stranded orders across 209, two
+    of them pull requests open for seven weeks carrying ~3,100 lines, and it should not
+    have to be repeated by hand.
+
+    Scoped to `completed`, and only that. `waiting_pr_merge` is a merge queue the poll
+    already watches; `cancelled` and `failed` never claimed the work was done. `completed`
+    is the status that makes the claim, which is the one worth checking. HIDDEN ORDERS
+    ARE INCLUDED, on `poll_pull_requests`' reasoning: hiding drops a record from listings,
+    it does not mean the record may go on saying something untrue.
+
+    **NO NETWORK, EVER.** Everything it needs about a pull request it reads off the work
+    order's own timeline — `pr_merged` and the `head_oid` that event now carries — never
+    from `pr_state`, which kn-dbc4971d records as stale by construction with one permitted
+    reader. That is what makes it cheap enough to run on the daemon's slow cadence instead
+    of only when a human types `jarvis doctor`.
+
+    **THE VERDICT IS CACHED, and only the settled half of it.** `landed` and
+    `not-produced` are recorded as a `landing_checked` event and never recomputed: a
+    completed order's branch has stopped moving and content on the default branch stays
+    there. `stranded`, `partial` and `unknown` are re-derived every sweep, because those
+    are the ones a merge or a push can resolve — and because a check that remembered its
+    complaint would go on making it after the user fixed the thing.
+
+    **THE CACHE ONLY EXISTS ON THE REPAIRING PATH**, which is the daemon's. It is a
+    timeline event, and `add_event` is one of the mutators `_ReadOnly` swallows — so on
+    `check_project(repair=False)`, the default `jarvis doctor` a human types, the write
+    is a silent no-op and every completed order is measured from git again on every run.
+    That is deliberate rather than worked around: a read-only doctor that wrote to a
+    timeline would be a worse defect than a repeated git walk, and the daemon's hourly
+    sweep populates the cache for both of them. The cost is bounded by the exclusions
+    above — settled orders that the daemon has already cached still pay it here, so on a
+    project the daemon has never swept the first `jarvis doctor` is the slow one.
+
+    **AN ORDER THE USER CLOSED BY HAND IS EXCLUDED TOO.** `jarvis wo done` over unlanded
+    work is the one landing that records instead of refusing (`ops.mark_done`), and its
+    `work_unlanded` event carries `closed_by: marked_done`. That event IS the decision
+    this sweep asks for, so it excuses the order exactly as `abandoned` does — otherwise
+    the sweep names it every hour with a remedy telling the user to run a different
+    command on an order they already closed, which is how a checker gets switched off.
+    Both exclusions lapse the same way: the episode arithmetic in `work_unlanded_open`
+    and `work_abandoned` retires a decision as soon as the work is delivered again.
+
+    Not repairable, and it must not try. What to do with stranded work — merge it, rescue
+    it, drop it — is exactly the decision `--abandon` exists to record, and deriving one
+    is not the OS's to make.
+    """
+    from . import landing
+
+    for wo in store.list_work_orders(statuses=("completed",), include_hidden=True):
+        wo_id = wo["id"]
+        if store.work_abandoned(wo_id) or store.work_unlanded_open(
+                wo_id, closed_by="marked_done"):
+            continue  # the decision was taken and written down; that is the whole ask
+        if any(db.from_json(e["payload"], {}).get("verdict") in landing.SETTLED_VERDICTS
+               for e in store.events_of_kind(wo_id, "landing_checked")):
+            continue
+        merges = store.events_of_kind(wo_id, "pr_merged")
+        merged = db.from_json(merges[-1]["payload"], {}) if merges else {}
+        found = landing.assess(
+            store.project_path, wo_id,
+            worktree=landing.worktree_of(store.project_path, wo),
+            pr_url=str(wo.get("pr_url") or ""),
+            # None, NOT False, when nothing says it merged: `assess` reads False as
+            # "GitHub says this is still open" and would flag every order in a project
+            # whose pull requests the OS has never been able to poll.
+            pr_merged=True if merges else None,
+            pr_head_oid=str(merged.get("head_oid") or ""))
+        if found.verdict in landing.SETTLED_VERDICTS:
+            store.add_event(wo_id, "landing_checked",
+                            {"verdict": found.verdict, "rung": found.rung,
+                             "ref": found.ref})
+        if not found.unsettled:
+            continue
+        yield Violation(
+            invariant="INV-WORK-LANDED",
+            wo_id=wo_id,
+            detail=(f"completed, but its code is not on `{found.base}`: {found.detail}. "
+                    f"Merge it, or record the decision to drop it with `jarvis wo "
+                    f"finish {wo_id} --summary \"...\" --abandon \"<why>\"`."),
+            context={"verdict": found.verdict, "rung": found.rung, "ref": found.ref,
+                     "pr_url": found.pr_url, "coverage": round(found.coverage, 3),
+                     "missing_files": list(found.missing_files[:10]),
+                     "dirty": len(found.dirty)},
+        )
+
+
 def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
     """INV-MANAGER-SLOTS — a project manager order must not spend a concurrency slot.
 
@@ -2335,16 +2441,31 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
 )
 
 
-def check_project(store: ProjectStore, repair: bool = True) -> list[Violation]:
+#: Invariants that shell out. They answer a question no other check can — "is this work
+#: on the default branch" needs the repository, not the database — and they cost a `git`
+#: invocation per touched file of every completed order whose verdict is not already
+#: settled. So they are OFF by default and run on their own cadence, exactly as
+#: `Daemon.PR_POLL_EVERY_TICKS` is its own cadence for being the only step that leaves
+#: the machine. `jarvis doctor` always runs them: a human who typed the command is
+#: waiting for the answer, and the answer is the point of the command.
+SLOW_INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
+    check_work_lands,
+)
+
+
+def check_project(store: ProjectStore, repair: bool = True,
+                  slow: bool = False) -> list[Violation]:
     """Run every invariant over one project. Returns the violations found.
 
     With `repair=False` the checks run against a read-only view of the store, so
     reporting never mutates state — that is what `jarvis doctor` uses before the user
     has decided whether to let it touch anything.
+
+    `slow` adds `SLOW_INVARIANTS`, which read the repository rather than the database.
     """
     target = store if repair else _ReadOnly(store)
     found: list[Violation] = []
-    for check in INVARIANTS:
+    for check in (*INVARIANTS, *(SLOW_INVARIANTS if slow else ())):
         try:
             found.extend(check(target))  # type: ignore[arg-type]
         except Exception as e:  # noqa: BLE001 — one broken check must not hide the rest
