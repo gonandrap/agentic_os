@@ -246,7 +246,7 @@ def test_validation_ships_disabled_with_every_default_spelled_out():
     assert v.chair_model == ""
     assert v.timeout == 300
     assert v.max_rounds == 3
-    assert v.diff_chars == 60000
+    assert v.diff_chars == 150000
     assert v.feature_units is True
     # and an empty block is the same thing as no block at all
     assert validation_of({}) == v

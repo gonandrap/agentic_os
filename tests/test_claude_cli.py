@@ -11,6 +11,8 @@ call site.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from jarvis import claude_cli
 
 
@@ -38,10 +40,56 @@ def test_tools_can_be_disabled_entirely(fake_claude, tmp_path) -> None:
     assert argv[argv.index("--tools") + 1] == ""
 
 
+def test_stripping_tools_also_strips_the_mcp_servers(fake_claude, tmp_path) -> None:
+    """`--tools ""` removes the BUILT-INS and leaves every configured MCP server's
+    schemas in the request — measured: a seat-shaped call on a machine with the Google
+    Drive connector listed eleven of its verbs when asked what tools it had. "Judges the
+    prompt and only the prompt" needs both flags, and neither is a caller's to remember.
+    Spec §4.
+    """
+    claude_cli.run_headless("hi", cwd=tmp_path, tools="")
+    assert "--strict-mcp-config" in _argv(fake_claude)
+
+
+def test_a_tooled_call_keeps_its_mcp_servers(fake_claude, tmp_path) -> None:
+    """The negative half: Neo and Neo's panel pass `tools=None` and must not lose
+    Serena. Without this assertion the line above would pass just as well if it stripped
+    MCP from every headless call in the OS."""
+    claude_cli.run_headless("hi", cwd=tmp_path)
+    assert "--strict-mcp-config" not in _argv(fake_claude)
+    claude_cli.run_headless("hi", cwd=tmp_path, tools="Read,Bash")
+    assert "--strict-mcp-config" not in _argv(fake_claude)
+
+
 def test_named_tools_are_passed_through(fake_claude, tmp_path) -> None:
     claude_cli.run_headless("hi", cwd=tmp_path, tools="Read,Bash")
     argv = _argv(fake_claude)
     assert argv[argv.index("--tools") + 1] == "Read,Bash"
+
+
+def test_a_small_system_prompt_rides_in_argv(fake_claude, tmp_path) -> None:
+    claude_cli.run_headless("hi", cwd=tmp_path, system_prompt="be brief")
+    argv = _argv(fake_claude)
+    assert argv[argv.index("--append-system-prompt") + 1] == "be brief"
+    assert "--append-system-prompt-file" not in argv
+
+
+def test_a_system_prompt_past_the_argv_ceiling_goes_by_file(fake_claude, tmp_path) -> None:
+    """`MAX_ARG_STRLEN` is 128 KiB PER ARGUMENT whatever `ARG_MAX` says, and crossing it
+    is an `OSError` out of `execve` that no CLI can report. The panel's packet is on the
+    wrong side of that line at `diff_chars=150000` (spec §5, §6), so this is the door it
+    goes through — and the fake proves the text arrives, not merely that a flag was
+    passed.
+    """
+    big = "x" * (claude_cli.SYSTEM_PROMPT_ARGV_LIMIT + 1) + "\nTHE_PREFIX_MARKER"
+
+    claude_cli.run_headless("hi", cwd=tmp_path, system_prompt=big)
+
+    argv = _argv(fake_claude)
+    assert "--append-system-prompt" not in argv
+    written = Path(argv[argv.index("--append-system-prompt-file") + 1])
+    assert not written.exists(), "the temporary file is cleaned up after the call"
+    assert "THE_PREFIX_MARKER" in fake_claude.calls[-1]["system_prompt_seen"]
 
 
 def test_call_runs_in_the_requested_directory(fake_claude, tmp_path) -> None:

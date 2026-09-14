@@ -87,8 +87,9 @@ log = logging.getLogger("jarvis.evidence")
 
 #: The truncation limit callers get when they do not pass one. It is a plain default on
 #: `collect_work_order`, NOT a config read: this module has no opinion about the catalog,
-#: and the round machine passes `os.validation.diff_chars` in.
-DEFAULT_DIFF_CHARS = 60000
+#: and the round machine passes `os.validation.diff_chars` in. Kept level with
+#: `catalog.DEFAULT_VALIDATION_DIFF_CHARS`, which is where the number was measured.
+DEFAULT_DIFF_CHARS = 150000
 
 
 @dataclass(frozen=True)

@@ -746,15 +746,18 @@ def _packet(case: tuple, unit: str, subject_id: str) -> evidence.EvidencePacket:
     )
 
 
-def _seat_of(system_prompt: str) -> str:
-    """Which seat this call is, read off `validation.SEAT_HEADER`.
+def _seat_of(prompt: str) -> str:
+    """Which seat this call is, read off `validation.SEAT_HEADER` in its USER TURN.
 
     That header is a DIFFERENT literal from `panel.SEAT_HEADER` precisely so that `chair`
     can be told apart between the two rosters, and keying on it is how one seat is taken
-    down without touching `validation.py`.
+    down without touching `validation.py`. It travels in the user prompt: the system
+    prompt is the packet, shared byte-for-byte by every seat of a round, so reading the
+    seat off it would name no seat at all — and a forced outage that silently stops
+    forcing grades a healthy panel while reporting a degraded one.
     """
     return next((s for s in FULL_ROSTER
-                 if validation.SEAT_HEADER.format(seat=s) in system_prompt), "")
+                 if validation.SEAT_HEADER.format(seat=s) in prompt), "")
 
 
 class Meter:
@@ -773,7 +776,7 @@ class Meter:
 
     def __call__(self, prompt: str, system_prompt: str | None = None,
                  **kwargs: Any) -> Any:
-        seat = _seat_of(system_prompt or "")
+        seat = _seat_of(prompt)
         if seat and seat == self.fail_seat:
             # Not counted: no call was made, and the cost reading must not bill for one.
             raise claude_cli.ClaudeCliError(
@@ -959,9 +962,10 @@ def runs(tmp_path_factory, request):
     """Every submission this file grades, judged once.
 
     Module-scoped and built in one pass, mirroring production: the daemon validates one
-    unit at a time through one store, so consecutive seat calls share a warm per-seat
-    prompt prefix — `build_seat_system_prompt` is byte-stable per seat for exactly that
-    reason, and a per-test fixture would throw that saving away and misreport the cost.
+    unit at a time through one store. The saving inside a round is the SHARED prefix —
+    `build_shared_prefix` is byte-identical across the seats of one submission and is
+    written once by `decide`'s priming call — so what a per-test fixture would throw away
+    is the module's own warm-up, not that.
     """
     home = tmp_path_factory.mktemp("validation-llm-home")
     os.environ["JARVIS_HOME"] = str(home)
