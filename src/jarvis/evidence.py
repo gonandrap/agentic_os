@@ -207,6 +207,13 @@ def fingerprint(packet: EvidencePacket) -> str:
     the submitter producing evidence, and hashing it would make an unchanged resubmission
     look new (spec 2026-09-13-two-gates-not-a-chain.md §4).
 
+    **Do not add `head` to this in order to answer "which commit did the panel judge".**
+    That question has its own function, `judged_head`, and its own column, because the
+    first row of the table above is the two questions disagreeing: folding `head` in here
+    would make every unchanged resubmission look like new evidence, break
+    `Daemon._preceding_round`'s repeat guard, and change the hash of every round already
+    on the record.
+
     Hashing `packet.diff` is the obvious implementation and it is wrong: the same tree
     would fingerprint differently at two truncation limits, which makes an integrity
     check depend on a display setting. `diff_sha` is taken before the cut for exactly
@@ -222,6 +229,30 @@ def fingerprint(packet: EvidencePacket) -> str:
         h.update(b"\n")
         h.update(_normalise(str(a.get("content") or "")).encode("utf-8"))
     return h.hexdigest()[:16]
+
+
+def judged_head(packet: EvidencePacket) -> str:
+    """WHICH COMMIT the panel is being shown, or `""` when nothing binds it to one.
+
+    The question `fingerprint` deliberately cannot answer, and must not be changed to —
+    see that function's exclusion table, whose first row is "adds an empty commit →
+    changes `head` → no new evidence". That is right for *did this submitter produce new
+    evidence* and exactly wrong for *which commit did the seats read*: the two have
+    opposite answers on an empty commit, so one field cannot serve both
+    (docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md §5.1).
+
+    `""` IS THE FAIL-CLOSED VALUE and it reads as "not recorded", never as "matches". A
+    worktree packet gets it because a local diff with no pull request behind it — or one
+    whose PR fetch failed and fell back (`packet.pr_error`) — binds the verdict to
+    nothing a remote can be held to.
+
+    NOT `packet.head`: on the pull-request path that field holds `headRefName`, a BRANCH
+    NAME, which is precisely the thing that keeps meaning something different as commits
+    land on it.
+    """
+    if packet.source != "pull_request" or not packet.pr:
+        return ""
+    return str(packet.pr.get("head_sha") or "")
 
 
 def side_effects_digest(side_effects: Iterable[dict[str, Any]]) -> str:
@@ -379,7 +410,8 @@ def _pull_request(url: str,
     return {
         "url": art.url, "number": art.number, "title": art.title, "body": art.body,
         "state": art.state, "draft": art.draft, "base_ref": art.base_ref,
-        "head_ref": art.head_ref, "additions": art.additions,
+        "head_ref": art.head_ref, "head_sha": art.head_sha,
+        "additions": art.additions,
         "deletions": art.deletions, "files": list(art.files), "stat": art.stat,
         "checks": [dict(c) for c in art.checks],
     }, art.diff, ""

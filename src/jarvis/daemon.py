@@ -1212,6 +1212,11 @@ class Daemon:
                 diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo),
                 side_effects=ops.side_effects_of(wo_id),
                 assumptions=store.all_assumptions(wo_id))
+            # WHICH COMMIT THIS ROUND IS JUDGING, recorded before any verdict exists and
+            # whatever the verdict turns out to be: it is a fact about the packet, and a
+            # rejection that recorded nothing could not later say what it rejected. `""`
+            # for a worktree packet, which never auto-merges — spec 2026-09-14 §5.2.
+            store.set_validation_head(round_id, evidence_mod.judged_head(packet))
 
             validator = (self.validator if self.validator is not None
                          else self._validator(cfg))
@@ -2935,6 +2940,17 @@ class Daemon:
         instead of quietly costing the fleet a query every two minutes per open pull
         request.
 
+        **The automatic merge costs that case NOTHING, and its own cost is counted too.**
+        `Daemon.auto_merge` returns on `project.validation.auto_merge` before it reads
+        anything, so a project that has not opted in — the shipped state of every project
+        — pays exactly the budget above. A project that HAS opted in pays three more
+        indexed reads per parked pull request per poll: the latest validation round, its
+        pending assumptions, and the `automerge_held` events the hold dedupes against.
+        One more (`latest_approval_for`) arrives only once a merge is armed, which is a
+        state a pull request passes through once. Both figures are counted by their own
+        test beside the one above, on the rule that a budget nobody executes is a comment
+        rather than a guarantee.
+
         EVERY STATUS THAT CARRIES A PULL REQUEST IS POLLED, not `waiting_pr_merge`
         alone. A work order that escalated into `needs_review` behind a red build was
         invisible here, which is exactly when the user is about to look at it and decide
@@ -3038,9 +3054,159 @@ class Daemon:
                         if ops.clear_pr_repair(store, row, ops.PR_CHECKS):
                             log.info("[%s] %s is green again — %s stopped failing",
                                      project.name, wo["pr_url"], wo["id"])
+                    # AFTER the repairs clear, and inside the same branch: a pull request
+                    # the OS is still nudging a worker about is not one it may merge.
+                    self.auto_merge(project, store, wo, pr)
             except Exception:  # noqa: BLE001
                 log.exception("[%s] settling %s against its PR failed", project.name,
                               wo["id"])
+
+    def auto_merge(self, project: ProjectSpec, store: ProjectStore, wo: dict,
+                   pr: Any) -> None:
+        """Merge this pull request, if six positive facts line up. Usually: do nothing.
+
+        docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md. The decision is
+        `automerge.decide` and lives there, pure; this is the half that has a database, a
+        clock and a subprocess. Three shapes come out of it — armed with a live grant
+        (merge, then complete the work order), armed with no grant (ask Neo), or held
+        (say so once, and leave the pull request for the user).
+
+        **THE CONFIG CHECK IS FIRST AND IT IS A COST GUARD, not the rule.** The rule is
+        condition 1 of `decide`, which is checked again there and unit-tested there; this
+        is what stops a fleet that has not opted in paying an indexed read per parked
+        pull request every two minutes for a feature it does not use. The redundancy is
+        deliberate and is the shape `two-gates-not-a-chain` argues for: a project's
+        permission is asserted at both the site that spends and the site that decides.
+
+        `project.validation` resolves per project — a project that names `auto_merge`
+        keeps its answer, one that does not takes the fleet's, and the shipped answer at
+        both levels is `false`. So the authority is granted one project at a time.
+
+        Never raises: the caller's `except` would catch it, but a pull request that could
+        not be merged must leave the work order exactly where it was, and "exactly where
+        it was" is the behaviour the whole feature is an optimisation over.
+        """
+        from . import automerge, ops
+
+        cfg = project.validation
+        if not (cfg.enabled and cfg.auto_merge):
+            return
+        wo_id = wo["id"]
+        decision = automerge.decide(
+            store.latest_validation_round(wo_id=wo_id), wo, pr, cfg,
+            pending_assumptions=bool(store.pending_assumptions(wo_id)))
+        if not decision.armed:
+            self._note_automerge_held(store, wo_id, decision)
+            return
+
+        approval = store.latest_approval_for(
+            wo_id, automerge.GATE_KIND,
+            automerge.merge_command(str(wo.get("pr_url") or ""), decision.judged_sha))
+        if approval is None or approval["status"] != "approved":
+            # Not yet permitted. `propose` is idempotent per command string — and the
+            # string carries the judged sha — so a pending, escalated or REFUSED request
+            # is left standing rather than re-asked every two minutes.
+            #
+            # The NeoStore is opened here and closed here: a sqlite connection belongs to
+            # the thread that made it (`_validate_work_order`'s reason), and the
+            # overwhelmingly common tick proposes nothing and must not pay for a second
+            # handle to find that out.
+            from .neo_store import NeoStore
+
+            neo_store = NeoStore()
+            try:
+                automerge.propose(store, neo_store, project.name, wo, decision,
+                                  checks=tuple(c["name"] for c in pr.checks))
+            finally:
+                neo_store.close()
+            return
+        if automerge.attempts(store, wo_id, decision.judged_sha) \
+                >= automerge.AUTO_MERGE_MAX_ATTEMPTS:
+            return
+        try:
+            merged = automerge.apply(store, wo, decision.judged_sha, approval,
+                                     cwd=project.path)
+        except Exception as exc:  # noqa: BLE001 — a failed merge is news, never a crash
+            log.warning("[%s] auto-merge of %s failed: %s", project.name, wo_id, exc)
+            store.add_event(wo_id, "automerge_failed", {
+                "head_sha": decision.judged_sha, "approval_id": approval["id"],
+                "reason": str(exc), "pr_url": wo.get("pr_url")})
+            self._warn_automerge_failed(project, store, wo, decision, str(exc))
+            return
+        log.info("[%s] auto-merged %s — completing %s", project.name, wo["pr_url"],
+                 wo_id)
+        # No `merged_at`: that column holds GITHUB's `mergedAt`, and this path has not
+        # asked GitHub anything since the merge. The `automerge_merged` event's own
+        # timestamp is when it landed, and inventing a local clock reading for a remote
+        # field would be the record claiming a fact it does not have.
+        ops.complete_merged(store, wo,
+                            automerge={"approval_id": merged["approval_id"],
+                                       "round_id": decision.round_id,
+                                       "round": decision.round_n,
+                                       "head_sha": decision.judged_sha})
+
+    def _note_automerge_held(self, store: ProjectStore, wo_id: str,
+                             decision: Any) -> None:
+        """Record ONCE, per (commit, reason), that the OS declined to merge.
+
+        Deduped because a parked pull request is polled every two minutes for as long as
+        it is open, and a timeline that accrued an event per tick would bury the events
+        that mean something. Keyed on the reason as well as the commit — the spec keys on
+        the commit alone — because the two holds a reader most needs to tell apart happen
+        at the SAME commit: "CI has not finished" is a wait, and "the panel has not
+        passed this" is not, and one of them arriving after the other is the news.
+
+        **DELIBERATELY NOT AN ATTENTION ITEM.** A held auto-merge means the user merges
+        this one by hand, which is what they did for every pull request before this
+        existed. A heal-loop push invalidating a pass is ordinary, and the attention list
+        is not a place to put ordinary.
+
+        The `disabled` hold is not recorded at all: `Daemon.auto_merge` returns before
+        ever asking, so the only way here is a project that HAS opted in, and writing
+        "the project has not opted in" on its timeline would be false.
+        """
+        from . import automerge, db
+
+        if decision.code == automerge.HELD_DISABLED:  # unreachable via the poll
+            return
+        key = (decision.head_sha, decision.code)
+        for event in store.events_of_kind(wo_id, "automerge_held"):
+            payload = db.from_json(event["payload"], {})
+            if (str(payload.get("head_sha") or ""), str(payload.get("code") or "")) == key:
+                return
+        store.add_event(wo_id, "automerge_held", {
+            "code": decision.code, "reason": decision.reason,
+            "judged_sha": decision.judged_sha, "head_sha": decision.head_sha,
+            "round": decision.round_n})
+
+    def _warn_automerge_failed(self, project: ProjectSpec, store: ProjectStore,
+                               wo: dict, decision: Any, reason: str) -> None:
+        """One inbox row once the budget for a commit is spent. Not before, and not again.
+
+        A single failure is very often transient — GitHub computing a merge, a check
+        reporting late — and telling the user about each one would make the inbox the
+        thing that costs more attention than hand-merging did. Three on one commit is a
+        standing problem, and the most likely one by far is the daemon's `gh` having read
+        credentials but no write scope (spec §9), which no amount of retrying fixes.
+
+        The work order is NOT flagged and NOT moved: it stays in `waiting_pr_merge` with
+        its link, and merging it by hand works exactly as it always has.
+        """
+        from . import automerge
+
+        if automerge.attempts(store, wo["id"], decision.judged_sha) \
+                != automerge.AUTO_MERGE_MAX_ATTEMPTS:
+            return
+        self.central.add_inbox(
+            project=project.name, level="warning",
+            title=f"The OS could not merge the pull request for {wo['id']}",
+            body=f"{wo.get('pr_url')}\n"
+                 f"The panel passed it and the merge was authorised, but "
+                 f"{automerge.AUTO_MERGE_MAX_ATTEMPTS} attempts on commit "
+                 f"{decision.judged_sha[:10]} all failed. Last reason: {reason}\n"
+                 f"Nothing was merged and nothing is stuck — merging it yourself works "
+                 f"exactly as it always has.",
+            wo_id=wo["id"])
 
     def _note_reopened(self, project: ProjectSpec, store: ProjectStore,
                        wo: dict) -> bool:

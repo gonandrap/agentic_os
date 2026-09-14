@@ -64,6 +64,22 @@ def _readable_rounds(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _readable_automerge(detail: dict[str, Any]) -> dict[str, Any]:
+    """The automatic merge collapsed to its one line, for HUMAN output.
+
+    `_readable_rounds`' trick again, including the disappearing key: `--json` keeps the
+    recorded payload because other tooling reads the SHAs and the approval id out of it,
+    while a person gets `auto-merge: held — round 2 passed on a1b2c3d, the head is now
+    e4f5a6b` and nothing else. A work order the mechanism never touched has no key here
+    at all and reads exactly as it did before this existed.
+    """
+    row = dict(detail)
+    state = row.pop("auto_merge", None)
+    if state:
+        row["auto_merge"] = state["line"]
+    return row
+
+
 def _readable_alarms(detail: dict[str, Any]) -> dict[str, Any]:
     """The `wo_alarms` rows collapsed to `ops.alarm_standing_line`, for HUMAN output.
 
@@ -1827,6 +1843,12 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # that comes and goes is one every consumer has to guard. The seats'
                 # replies are NOT here — see `jarvis validation show`.
                 "validation_rounds": ops.validation_rounds(store, wo_id=args.wo_id),
+                # Whether the OS merged this pull request, is waiting for permission to,
+                # or is holding — and why. NOT always present, unlike the keys above: a
+                # work order the mechanism never touched has no line here at all, which
+                # is every work order on a project that has not opted in (§8).
+                **({"auto_merge": state}
+                   if (state := ops.automerge_state(store, wo)) else {}),
                 # The rows themselves, on the same always-present rule: this order's own
                 # alarms, not `ops.list_cost_alarms`' fleet-wide dict, whose join columns
                 # (title, status, hidden) are already above — §4.
@@ -1834,7 +1856,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
             }
         finally:
             store.close()
-        _print(_readable_config(_readable_alarms(_readable_rounds(detail)))
+        _print(_readable_config(_readable_automerge(
+            _readable_alarms(_readable_rounds(detail))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":

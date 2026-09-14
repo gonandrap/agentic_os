@@ -179,7 +179,15 @@ def origin_repo(cwd: Path | None) -> tuple[str, str] | None:
 #: land, can it still land, and is what it would land green? See the spec's §2 for the
 #: second, and 2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md §2 for the
 #: third — including why this is still NOT the same list as `ARTIFACT_FIELDS` below.
-PR_FIELDS = "state,mergedAt,mergeable,mergeStateStatus,baseRefName,statusCheckRollup"
+#:
+#: `headRefOid` is the fourth question and the cheapest: WHICH COMMIT is at the head
+#: right now. It is what lets the auto-merge decision compare the live head against the
+#: commit the validation panel judged, instead of trusting that nothing moved
+#: (docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md §5). One scalar —
+#: it does not make this the same list as `ARTIFACT_FIELDS`, which still pays for the
+#: body, the file list and a second `gh pr diff` round trip.
+PR_FIELDS = ("state,mergedAt,mergeable,mergeStateStatus,baseRefName,headRefOid,"
+             "statusCheckRollup")
 
 #: A check conclusion that means THE CODE IS WRONG — as opposed to merely not green. The
 #: distinction is the whole of the red-pull-request spec's §2: a run that is PENDING,
@@ -247,6 +255,11 @@ class PullRequest:
     #: One entry per check, through `read_checks`. Empty is a repository that runs no
     #: checks, which is not the same as every check failing.
     checks: tuple[dict[str, str], ...] = ()
+    #: `headRefOid`: the commit at the head of the pull request AT VIEW TIME. None when
+    #: GitHub did not answer it. Read only to be COMPARED — against the commit a
+    #: validation round judged — and never resolved against a local checkout: this is a
+    #: remote sha and the worktree it came from may be long gone.
+    head_sha: str | None = None
 
     @property
     def merged(self) -> bool:
@@ -351,6 +364,7 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
         merge_state=(str(payload["mergeStateStatus"]).upper()
                      if payload.get("mergeStateStatus") else None),
         checks=read_checks(payload),
+        head_sha=str(payload["headRefOid"]) if payload.get("headRefOid") else None,
     )
 
 
@@ -362,8 +376,13 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
 #: taking the claim on the submitter's word. `body` is the second: it carries the
 #: reasoning, the screenshots and the "remaining work" section the PR template asks for,
 #: none of which appear in a diff.
-ARTIFACT_FIELDS = ("number,title,body,state,isDraft,baseRefName,headRefName,url,"
-                   "additions,deletions,changedFiles,files,statusCheckRollup")
+#:
+#: `headRefOid` is here as well as in `PR_FIELDS` because the panel's packet is what
+#: BINDS a verdict to a commit: `evidence.judged_head` reads it off the artifact and the
+#: round stores it, so "which diff did the seats read" is a recorded fact rather than an
+#: inference (spec 2026-09-14 §5.2).
+ARTIFACT_FIELDS = ("number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,"
+                   "url,additions,deletions,changedFiles,files,statusCheckRollup")
 
 
 @dataclass(frozen=True)
@@ -382,6 +401,10 @@ class PullRequestArtifact:
     draft: bool
     base_ref: str
     head_ref: str
+    #: `headRefOid` — the commit this artifact IS. `""` when GitHub did not answer it,
+    #: and that empty string is load-bearing: it is what a round records as "the commit
+    #: was not recorded", which never auto-merges (spec §5.2).
+    head_sha: str
     additions: int
     deletions: int
     files: tuple[str, ...]
@@ -461,6 +484,7 @@ def pr_artifact(url: str, cwd: Path | None = None) -> PullRequestArtifact:
         draft=bool(payload.get("isDraft")),
         base_ref=str(payload.get("baseRefName") or ""),
         head_ref=str(payload.get("headRefName") or ""),
+        head_sha=str(payload.get("headRefOid") or ""),
         additions=int(payload.get("additions") or 0),
         deletions=int(payload.get("deletions") or 0),
         files=tuple(str(f.get("path") or "") for f in files if f.get("path")),

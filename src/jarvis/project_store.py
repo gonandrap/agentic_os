@@ -442,6 +442,10 @@ CREATE TABLE IF NOT EXISTS validation_rounds (
     -- pending | passed | rejected | escalated | failed
     outcome TEXT NOT NULL DEFAULT 'pending',
     reason TEXT NOT NULL DEFAULT '',    -- what was sent back
+    -- Which COMMIT was judged (the PR's headRefOid), '' when nothing binds this verdict
+    -- to one. Also in ADDED_COLUMNS, where the reasoning is — this table already ships,
+    -- so a live database gets it only there.
+    head_sha TEXT NOT NULL DEFAULT '',
     -- Which configuration judged it (`os_config_versions.id`). Also in ADDED_COLUMNS —
     -- this table already ships, so a live database gets it only there.
     config_version TEXT,
@@ -706,6 +710,17 @@ ADDED_COLUMNS = {
         # falls back to the live catalog. `validation_rounds` already ships, so the
         # column reaches a live database only through here.
         "config_version": "TEXT",
+        # WHICH COMMIT THE PANEL JUDGED — `evidence.judged_head`, the pull request's
+        # `headRefOid` at the moment the packet was collected. A verdict is a judgement
+        # about one diff, and this is the only thing in the OS that says which one, so it
+        # is what `validated_head` hands the auto-merge decision
+        # (docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md §5.2).
+        #
+        # DEFAULT '' AND THAT IS THE FAIL-CLOSED VALUE, not a placeholder: every round
+        # written before this column existed migrates to it, as does every round judged
+        # from a worktree, and `validated_head` reads '' as "not recorded" — which never
+        # auto-merges. NOT NULL so there is one spelling of "nothing" rather than two.
+        "head_sha": "TEXT NOT NULL DEFAULT ''",
     },
     "approvals": {
         # Which SEAT attempted the command, when a subagent did. NULL means the session's
@@ -2422,6 +2437,41 @@ class ProjectStore:
             "UPDATE validation_rounds SET outcome=?, reason=? WHERE id=?",
             (outcome, reason, round_id),
         )
+
+    def set_validation_head(self, round_id: int, head_sha: str) -> None:
+        """Record which commit this round is judging. Called once per round.
+
+        WHATEVER THE OUTCOME, and before one is known: a rejection that recorded nothing
+        would leave the record unable to say what it was rejecting, and the value is a
+        fact about the packet rather than about the verdict. `''` is written for a
+        worktree packet, which is the same "not recorded" every pre-migration row carries
+        (spec 2026-09-14 §5.2).
+        """
+        self.conn.execute("UPDATE validation_rounds SET head_sha=? WHERE id=?",
+                          (head_sha, round_id))
+
+    def validated_head(self, wo_id: str) -> str | None:
+        """The commit the panel ACCEPTED for this work order, or None. THE predicate.
+
+        Non-None means all three of: the latest round has settled `passed`, that round
+        recorded which commit it judged, and therefore an automatic merge has something
+        to be bound to. Everything else — never validated, a round still pending, a round
+        that failed on transport, a pass superseded by a later rejection, a pass with no
+        commit recorded — is None.
+
+        **The LATEST round, never "some round passed".** A work order that passed round 1,
+        was sent back and is sitting on a pending round 2 is not validated, and reading
+        it as validated is how a panel that died silently on a usage limit (issue #235)
+        would come to merge code: `pending` and `failed` are not `passed`, and the
+        question this asks is "was it accepted", not "was it never refused".
+
+        One home for the rule, for `arbitrate`'s reason — a rule spread across three call
+        sites is a rule that holds by luck (spec 2026-09-14 §5.2).
+        """
+        latest = self.latest_validation_round(wo_id=wo_id)
+        if latest is None or latest["outcome"] != "passed":
+            return None
+        return str(latest["head_sha"] or "") or None
 
     def validation_rounds(self, *, wo_id: str | None = None,
                           fo_id: str | None = None) -> list[dict[str, Any]]:

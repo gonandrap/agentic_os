@@ -1225,8 +1225,15 @@ def round_line(rnd: dict[str, Any]) -> str:
     NULL stamp (config-console design §5).
     """
     reason = (rnd.get("reason") or "").strip()
+    # The COMMIT is the round's third input, beside what was judged and what judged it,
+    # and it is the one an automatic merge is bound to — so a reader asking why a pull
+    # request did not merge itself can see the answer on the round rather than having to
+    # infer it (spec 2026-09-14 §5.2). `not recorded` for a worktree packet and for every
+    # round written before the column existed, which is the honest reading of both.
+    sha = str(rnd.get("head_sha") or "")
     return (f"round {rnd['round']} · {rnd['fingerprint']} · {rnd['outcome']}"
             f" · config {rnd.get('config_version') or 'not recorded'}"
+            f" · commit {sha[:10] or 'not recorded'}"
             + (f" — {reason}" if reason else ""))
 
 
@@ -1328,8 +1335,60 @@ def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
     read to answer "how many times, and what came back", not to re-read the submission.
     """
     return [{k: r[k] for k in ("id", "round", "ts", "fingerprint", "outcome", "reason",
-                               "pr_url", "config_version")}
+                               "pr_url", "config_version", "head_sha")}
             for r in store.validation_rounds(wo_id=wo_id, fo_id=fo_id)]
+
+
+#: Every automatic-merge event, newest-wins, with how each reads to a person. Ordered by
+#: FINALITY rather than by time: `automerge_merged` is terminal and must never be hidden
+#: by a later row, and there is no later row after it.
+AUTOMERGE_EVENTS = ("automerge_merged", "automerge_decided", "automerge_proposed",
+                    "automerge_failed", "automerge_held")
+
+
+def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """What `jarvis wo show` and the dashboard say about the automatic merge, or None.
+
+    None — and therefore no line at all — for every work order the mechanism has never
+    touched, which is all of them on a project that has not opted in. A surface that said
+    "auto-merge: off" on every work order in the fleet would spend the user's attention
+    on the absence of a feature they did not ask for.
+
+    **Rendered from what the POLL RECORDED, not re-derived.** The interesting line —
+    "round 2 passed on a1b2c3d, the head is now e4f5a6b" — needs the live head, and only
+    the tick that held the merge ever knew it. Re-deriving here would mean a `gh` call
+    from a CLI command, and it would answer about a different moment than the one the
+    record is describing.
+    """
+    from . import db
+
+    latest: dict[str, Any] | None = None
+    for kind in AUTOMERGE_EVENTS:
+        rows = store.events_of_kind(wo["id"], kind)
+        if rows:
+            latest = {"kind": kind, **db.from_json(rows[-1]["payload"], {})}
+            break
+    if latest is None:
+        return None
+    return {**latest, "line": _automerge_line(latest)}
+
+
+def _automerge_line(state: dict[str, Any]) -> str:
+    """One line, in the words the spec's §5.4 chose. The verb says who acted."""
+    kind = state["kind"]
+    if kind == "automerge_merged":
+        return (f"merged by the OS at {str(state.get('head_sha') or '')[:10]}, under "
+                f"gate request {state.get('approval_id')} "
+                f"(round {state.get('round')})")
+    if kind == "automerge_decided":
+        return (f"{state.get('decision')} by {state.get('by')} — "
+                f"{state.get('reason') or 'no reason given'}")
+    if kind == "automerge_proposed":
+        return (f"waiting on gate request {state.get('approval_id')} to merge "
+                f"{str(state.get('head_sha') or '')[:10]}")
+    if kind == "automerge_failed":
+        return f"the merge failed: {state.get('reason') or 'no reason recorded'}"
+    return f"held — {state.get('reason') or 'no reason recorded'}"
 
 
 def validation_detail(store: ProjectStore, *, wo_id: str | None = None,
@@ -1899,7 +1958,8 @@ def mark_backlog_done(wo: dict[str, Any]) -> None:
 
 
 def complete_merged(store: ProjectStore, wo: dict[str, Any],
-                    merged_at: str | None = None) -> dict[str, Any]:
+                    merged_at: str | None = None,
+                    automerge: dict[str, Any] | None = None) -> dict[str, Any]:
     """The pull request landed: end the work order, exactly as the user closing it does.
 
     This is the whole point of polling GitHub. `jarvis wo finish --pr` parks a work
@@ -1912,7 +1972,21 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
 
     Records `pr_merged` rather than `marked_done`: the record must not claim the user
     did something they did not do.
+
+    `automerge` is that same rule cutting the other way. A merge the OS performed itself
+    is indistinguishable here from one the user performed — the same `gh pr view` reports
+    both — so the ONE path that knows the difference says so, in an `automerge_merged`
+    event written before the close-out. It carries the approval the merge ran under, the
+    round that accepted the diff and the commit that landed, which is the whole audit
+    trail: without it the timeline would read as though a person merged this, and the
+    only record that the OS holds merge authority at all would be in the gate ledger,
+    one lookup away from the work order it acted on.
+    `None` is the ordinary case: a human merged it.
+    docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md §8.
     """
+    if automerge:
+        store.add_event(wo["id"], "automerge_merged",
+                        {**automerge, "pr_url": wo.get("pr_url")})
     store.update_work_order(wo["id"], pr_state="MERGED")
     stopped = close_out(store, wo, "pr_merged", why="pull request merged",
                         payload={"pr_url": wo.get("pr_url"), "merged_at": merged_at})

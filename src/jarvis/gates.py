@@ -52,6 +52,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterable
 
 from .gate_rules import (  # re-exported: this is still the module callers import
+    AUTO_MERGE,
     KIND_NAMES,
     KINDS,
     SELF_HEAL,
@@ -71,7 +72,7 @@ log = logging.getLogger(__name__)
 __all__ = [
     "APPROVAL_STATUSES", "AWAITING_CASE", "CASE_TTL_CEILING_SECONDS",
     "DEFAULT_CASE_TTL_SECONDS", "GRANT_MAX_USES",
-    "GRANT_TTL_SECONDS", "SELF_HEAL",
+    "GRANT_TTL_SECONDS", "SELF_HEAL", "AUTO_MERGE",
     "GateConfig",
     "CONTEST_HEADER", "CONTEST_NOT_AN_AUTHORISATION",
     "GateKind", "GatedAction", "KINDS", "KIND_NAMES", "NO_CASE_JUSTIFICATION",
@@ -1297,12 +1298,24 @@ def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
     # `decide_approval`, the `gate_decided`/`gate_dismissed` event, dismissal learning —
     # is inherited unchanged. See
     # docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §5.
-    self_heal = approval["kind"] == SELF_HEAL
-    if self_heal:
+    #
+    # `auto_merge` joins it on both counts and for the same two reasons. The worker
+    # finished long ago and is parked in `waiting_pr_merge`, so a queued message would
+    # start a turn on a work order nobody asked to reopen; and `automerge.propose` never
+    # parked it, so there is no wait here to end. What the verdict does instead is
+    # RECORD — the next pull-request poll finds the grant and re-verifies the head SHA
+    # before merging, which is why nothing is merged from inside this function.
+    filed_by_the_os = approval["kind"] in (SELF_HEAL, AUTO_MERGE)
+    if approval["kind"] == SELF_HEAL:
         from . import remedies
 
         remedies.record_verdict(store, approval, verdict, reason, decided_by,
                                 central=central, project=project)
+    elif approval["kind"] == AUTO_MERGE:
+        from . import automerge
+
+        automerge.record_verdict(store, approval, verdict, reason, decided_by,
+                                 central=central, project=project)
     else:
         message = (dismissed_message(approval, reason, decided_by, learned)
                    if verdict == "dismissed"
@@ -1347,10 +1360,10 @@ def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
     # `pending_approvals` also returns — is still a genuine wait. `end_wait_if_nothing_is_out`
     # counts an unanswered Neo QUESTION as out too: this work order can be waiting on both.
     #
-    # A `self_heal` verdict skips it entirely, for the reason at the top of the guard:
-    # there was no wait to end, so the only thing this could do here is move a status
-    # nothing in this flow set.
-    if not self_heal:
+    # A `self_heal` or `auto_merge` verdict skips it entirely, for the reason at the top
+    # of the guard: there was no wait to end, so the only thing this could do here is
+    # move a status nothing in this flow set.
+    if not filed_by_the_os:
         from .invariants import end_wait_if_nothing_is_out
 
         end_wait_if_nothing_is_out(store, approval["wo_id"])
