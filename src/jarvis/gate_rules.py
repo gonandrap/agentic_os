@@ -886,15 +886,49 @@ def python_files_only_paperwork(program: str) -> bool:
     Reads the AST rather than the source, because the source is what the recogniser
     already failed to read. Fails closed on anything at all it does not model — an
     unparseable program, an unknown call, a grammar past `_PY_NODES`.
+
+    THE RULE THAT DOES THE WORK IS ABOUT REFERENCES, NOT CALLS, and it took three review
+    rounds to get there. Guarding the shape of an assignment's right-hand side stops
+    `print = os.system` and nothing else: `print = [os.system][0]` and
+    `print = dict(s=os.system)["s"]` bind the same callable through a container, and the
+    call site sees only a name it trusts (review round 2, kn-a3db2914's own rule turned on
+    the code that stated it). So what is refused is the REFERENCE. A module attribute that
+    is not allow-listed may not appear anywhere — not in a list, a `dict()` keyword, a
+    subscript or an argument — and nor may a bare module name outside one that is. A
+    reference that is never syntactically called is still a reference something else can
+    call.
     """
     try:
         tree = ast.parse(program)
     except SyntaxError:
         return False
+    nodes = list(ast.walk(tree))
+    # Which names are MODULES. `os.system` is a way to run a command; `r.returncode` is a
+    # value read off a local, and telling them apart is what the import list is for.
+    modules = {a.name for n in nodes if isinstance(n, ast.Import) for a in n.names}
+    # The module references a program IS allowed: the callee of a call `_py_call` accepts,
+    # and the qualified names. Held by identity — two `os.system` nodes are not the same
+    # reference, and only the one in a checked position is cleared.
+    ok_attrs = {id(n.func) for n in nodes
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and _py_call(n) is not None}
+    ok_attrs |= {id(n) for n in nodes
+                 if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                 and (n.value.id, n.attr) in _PY_INERT_QUALIFIED}
+    ok_names = {id(n.value) for n in nodes
+                if isinstance(n, ast.Attribute) and id(n) in ok_attrs}
+
     filed = False
-    for node in ast.walk(tree):
+    for node in nodes:
         if not isinstance(node, _PY_NODES):
             return False
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) \
+                and isinstance(node.value, ast.Name) and node.value.id in modules \
+                and id(node) not in ok_attrs:
+            return False
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) \
+                and node.id in modules and id(node) not in ok_names:
+            return False                      # `m = [os][0]` smuggles the module itself
         # Names only on the left of an `=`. `os.environ["PATH"] = "/tmp"` assigns no
         # command and calls nothing, and it decides which `jarvis` the filing below it
         # runs — the one thing a program this narrow could still do to the world.
@@ -902,9 +936,11 @@ def python_files_only_paperwork(program: str) -> bool:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if not all(isinstance(t, ast.Name) for t in targets):
                 return False
-            # …and nothing may be ALIASED into one. `print = os.system` binds a name this
-            # calls inert to something that runs a command, and the call site sees only
-            # the name (review round 1). A binding may hold a value, never a callable.
+            # A name this checker TRUSTS may not be shadowed at all, whatever it is being
+            # bound to: the call site reads the name, not the binding.
+            if any(t.id in _PY_INERT_FUNCS for t in targets
+                   if isinstance(t, ast.Name)):
+                return False
             if isinstance(node.value, (ast.Name, ast.Attribute)):
                 return False
         # Same hole through the import: `import os as print`, `from os import system`.

@@ -1919,6 +1919,67 @@ def test_a_filing_beside_an_execution_is_not_paperwork(gated, command):
     assert _decision(gated.attempt(command)) == "deny", command
 
 
+@pytest.mark.parametrize("program", [
+    # The two from review round 2. A container launders the reference, and the call site
+    # reads a name it trusts.
+    'import os, subprocess\nprint = [os.system][0]\n'
+    'print("gh pr merge 223 --squash")\n'
+    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223","--why","w"])',
+    'import os, subprocess\nprint = dict(s=os.system)["s"]\n'
+    'print("gh pr merge 223 --squash")\n'
+    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223","--why","w"])',
+    # The same class, reached other ways: a reference never syntactically called, the
+    # module itself smuggled through a container, and `getattr`.
+    'import os, subprocess\nrunner = (os.system,)\n'
+    'runner[0]("gh pr merge 223 --squash")\n'
+    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223","--why","w"])',
+    'import os, subprocess\nm = [os][0]\n'
+    'm.system("gh pr merge 223 --squash")\n'
+    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223","--why","w"])',
+    'import os, subprocess\ngetattr(os, "system")("gh pr merge 223 --squash")\n'
+    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223","--why","w"])',
+    # Shadowing a name the checker trusts, whatever it is bound to.
+    'import subprocess\nprint = [open][0]\n'
+    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223","--why","w"])',
+])
+def test_a_reference_to_an_executor_is_refused_wherever_it_appears(gated, program):
+    """Review round 2. Guarding the SHAPE of an assignment's right-hand side stops
+    `print = os.system` and nothing else — a list or a `dict()` binds the same callable,
+    and the call site sees only a name it trusts.
+
+    So what is refused is the REFERENCE: a module attribute that is not allow-listed may
+    not appear anywhere, and nor may a bare module name outside one that is. A reference
+    that is never syntactically called is still a reference something else can call."""
+    from jarvis.gate_rules import files_a_claim
+
+    command = f"python - <<'PY'\n{program}\nPY"
+
+    assert not files_a_claim(command), program
+    action = gates.classify(command, ALL_GATES)
+    assert action is not None and action.kind == "pr_merge", program
+    assert _decision(gated.attempt(command)) == "deny", program
+
+
+def test_the_reference_rule_still_reads_the_two_shapes_it_is_for():
+    """The negative half, which is where a rule this blunt would go wrong: refusing every
+    reference would refuse the production filing too.
+
+    `pathlib.Path` is allow-listed and `subprocess.run` is the callee of a checked call,
+    so both survive — and `r.returncode` is untouched, because `r` is a local holding a
+    value, not a module."""
+    from jarvis.gate_rules import python_files_only_paperwork
+
+    assert python_files_only_paperwork(
+        'import pathlib, subprocess\n'
+        'why = pathlib.Path("/tmp/w.txt").read_text().strip()\n'
+        'r = subprocess.run(["jarvis","gate","request","wo-b304c02a",'
+        '"gh pr merge 223 --squash","--why",why], capture_output=True, text=True)\n'
+        'print(r.returncode)\n')
+    assert python_files_only_paperwork(
+        'import subprocess\n'
+        'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223","--why","w"])')
+
+
 def test_a_quoted_delimiter_is_what_makes_an_unreadable_body_readable():
     """The other half of the fix above, so it cannot be "solved" by refusing everything.
 

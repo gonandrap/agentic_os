@@ -73,9 +73,9 @@ So it reads the AST, and answers False for every program it cannot read:
   in `_PY_INERT_QUALIFIED`, which has one entry. Matching the attribute alone made
   `pickle.loads(open("/tmp/p").read().encode())` inert — arbitrary code execution scored
   as paperwork. `loads` and `dumps` left with it;
-- no name this calls inert may be REBOUND: no `import … as`, no `from … import`, and an
-  assignment may bind a value, never a bare name or attribute. `print = os.system` and
-  `from os import system as print` both read as inert at the call site otherwise;
+- no name this calls inert may be REBOUND: no `import … as`, no `from … import`, no
+  assignment to a name in `_PY_INERT_FUNCS` at all, and — the rule that does the real work
+  — **no reference to an executor anywhere**, see §3.2;
 - the grammar itself is an allow-list (`_PY_NODES`). A loop, a function, a `with` or a
   comprehension is a program this cannot read, and a program it cannot read is not one it
   may clear.
@@ -105,6 +105,30 @@ matters; the delimiter is a proxy for it.
 both branches already do. It is the predicate `_mentions_only` consults BEFORE
 `reads_only`, so a missing guard there clears a segment outright rather than passing it to
 something stricter.
+
+### 3.2 The rule is about references, not calls
+
+Guarding the SHAPE of an assignment's right-hand side stops `print = os.system` and
+nothing else. `print = [os.system][0]` and `print = dict(s=os.system)["s"]` bind the same
+callable through a container — every node is in the grammar, the container scores inert,
+and the call site then reads a name it trusts while running a merge (review round 2).
+
+So what is refused is the REFERENCE. Which names are modules comes from the program's own
+`import` list, and a module reference is allowed in exactly two places: as the callee of a
+call `_py_call` accepts, and as a name in `_PY_INERT_QUALIFIED`. Anywhere else — inside a
+list, a `dict()` keyword, a subscript, a call argument — it refuses. A bare module name
+outside an allowed attribute refuses too, which closes `m = [os][0]`. Allowed references
+are held by node identity, so one `os.system` being in a checked position says nothing
+about another.
+
+The rule has to stop at MODULE references, and that is the negative half: `r.returncode`
+is a value read off a local, not a way to run anything, and refusing it would refuse the
+production filing shape this exists to clear.
+
+A reference that is never syntactically called is still a reference something else can
+call. That is the general form, and kn-a3db2914 — written after round 1, one round before
+round 2 found this — already stated it: wherever a check trusts a NAME, enumerate every
+way that name can come to mean something else.
 
 ### Why the gate had to widen first
 
