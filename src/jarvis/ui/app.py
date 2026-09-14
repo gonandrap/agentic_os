@@ -11,7 +11,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import invariants, ops, uilog
+from .. import bill as bill_mod, invariants, ops, uilog
 from ..central_store import CentralStore
 from ..daemon import daemon_running
 from ..paths import PRODUCTION, deployment_env
@@ -334,6 +334,11 @@ def create_app() -> FastAPI:
         active_statuses=ACTIVE_STATUSES,
         instance=instance_badge(),
         fmt_tok=fmt_tok, fmt_dur=fmt_dur, fmt_ts=fmt_ts,
+        # The bill's glossary. A global rather than per-route context because the four
+        # token classes are explained inside a macro that every page importing
+        # `_bill.html` uses, and threading it through each caller would mean a page that
+        # forgot loses its help bubbles silently.
+        bill_hints=bill_mod.HINTS,
     )
 
     def render(request: Request, template: str, active: str = "dashboard",

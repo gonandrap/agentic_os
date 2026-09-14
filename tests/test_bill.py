@@ -533,3 +533,58 @@ def test_an_unsealed_old_order_is_costed_live_and_says_what_it_lost(store, wo):
     assert b["accuracy"]["sealed_at"] is None
     assert b["accuracy"]["complete"] is False
     assert any("modelUsage" in gap for gap in b["accuracy"]["gaps"])
+
+
+# -- the help bubbles ------------------------------------------------------------------
+
+
+def test_every_line_of_the_bill_says_what_it_is(store, wo, transcripts):
+    """The "?" the user asked for is only useful if it is on EVERY line.
+
+    A tree where some rows explain themselves and some do not teaches the reader that a
+    row without a bubble is one of the obvious ones — which is exactly backwards, since
+    it is really the one nobody wrote copy for.
+    """
+    with_a_subagent(store, wo, transcripts)
+    os_call(wo["id"], "neo_answer", ts=1_010.0)
+    os_call(wo["id"], "panel_seat", label="blast", ts=1_011.0)
+    os_call(wo["id"], agent_usage.WORKER_SUBPROCESS, label="pytest", ts=1_012.0,
+            question_id=None)
+
+    b = ops.bill(wo["id"])
+
+    def check(lines, view):
+        for line in lines:
+            assert line["hint"], f"{view}: {line['label']} has no hint"
+            check(line.get("children") or [], view)
+
+    for view in ("actors", "turns", "agents"):
+        check(b[view], view)
+
+
+def test_a_hint_is_short_and_carries_an_example():
+    """Under 30 words with an example, which is what makes it readable in a bubble.
+
+    The rule the user set, held to by a test rather than by good intentions: copy grows
+    whenever nobody is measuring it, and a help bubble that needs scrolling is a
+    document.
+    """
+    for key, text in bill_mod.HINTS.items():
+        assert "Example:" in text, f"{key} gives no example"
+        assert len(text.split()) <= 30, f"{key} runs to {len(text.split())} words"
+        assert key in bill_mod.HINT_TERMS, f"{key} has no term to list it under"
+
+
+def test_the_hint_is_about_the_kind_of_line_not_the_line(store, wo, transcripts):
+    """Two turns get the same explanation; a turn and a subagent do not."""
+    with_a_subagent(store, wo, transcripts)
+
+    b = ops.bill(wo["id"])
+    worker = next(line for line in b["actors"] if line["key"] == "worker")
+    turn = worker["children"][0]
+    kinds = {child["label"]: child["hint"] for child in turn["children"]}
+
+    assert turn["hint"] == bill_mod.HINTS["turn"]
+    assert kinds["the lead agent"] == bill_mod.HINTS["lead"]
+    assert kinds["Explore · find the login bug"] == bill_mod.HINTS["subagent"]
+    assert worker["hint"] == bill_mod.HINTS[bill_mod.WORKER]

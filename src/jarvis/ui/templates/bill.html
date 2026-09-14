@@ -89,7 +89,8 @@
 {{ bill_ui.view(bill.turns, bill.total, 'total for ' ~ bill.id) }}
 
 {% if turn_rows %}
-<h2>How the context grew</h2>
+<h2 style="display:flex; gap:8px; align-items:center;">How the context grew
+  {{ bill_ui.help(bill_hints.context_peak) }}</h2>
 <div class="panel" style="overflow-x: auto;">
   <table>
     <tr><th>turn</th><th>kind</th><th>when</th><th>dur</th><th>API calls</th>
@@ -128,8 +129,10 @@
 {% endif %}
 
 {% if bill.rewrite and bill.rewrite.tokens %}
-<h2>The re-write tax — {{ bill_ui.money(bill.rewrite.list_usd) }} of the above</h2>
-<div class="panel" style="padding: 14px 16px;">
+<h2 style="display:flex; gap:8px; align-items:center;">The re-write tax —
+  {{ bill_ui.money(bill.rewrite.list_usd) }} of the above
+  {{ bill_ui.help(bill_hints.rewrite) }}</h2>
+<div class="panel" style="padding: 14px 16px; position: relative;">
   <p class="kv" style="margin: 0 0 6px;">
     <strong>Not an extra charge — a part of the cache-write line, named.</strong>
     {{ fmt_tok(bill.rewrite.tokens) }} tokens of this order's context were sent to be
@@ -172,14 +175,18 @@
 <p class="sub" style="margin-top: 10px;">⚠ {{ note }}</p>
 {% endfor %}
 
-<p class="sub" style="margin-top: 14px;">
-  Dollars are Anthropic list prices, a common unit for comparing a cache-read token with
-  an output token — not an invoice. Tokens are the figure that always reconciles; where
-  the <code>claude</code> CLI recorded its own billed figure it is shown beside them.
+<p class="sub" style="margin-top: 14px; display:flex; gap:8px; align-items:flex-start;
+                      position:relative;">
+  <span>Dollars are Anthropic list prices, a common unit for comparing a cache-read token
+  with an output token — not an invoice. Tokens are the figure that always reconciles;
+  where the <code>claude</code> CLI recorded its own billed figure it is shown beside
+  them.</span>{{ bill_ui.help(bill_hints.list_price) }}
 </p>
 
-<p class="sub" style="margin-top: 6px;">
-  Every figure on this page is {{ bill.floor_reason }}.
+<p class="sub" style="margin-top: 6px; display:flex; gap:8px; align-items:flex-start;
+                      position:relative;">
+  <span>Every figure on this page is {{ bill.floor_reason }}.</span>
+  {{ bill_ui.help(bill_hints.floor) }}
 </p>
 
 {% endblock %}

@@ -156,6 +156,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "(default: the whole fleet)")
     sp.add_argument("--limit", type=int, default=50,
                     help="work orders per project to measure (default: 50)")
+    sp.add_argument("--explain", action="store_true",
+                    help="say what each word on the bill means, with an example")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
@@ -769,6 +771,48 @@ def _print_bill_line(line: dict, depth: int = 0) -> None:
         _print_bill_line(child, depth + 1)
 
 
+def _print_glossary(bill: dict) -> None:
+    """What each word on this bill means — the page's "?" bubbles, in the terminal.
+
+    Only the words this order actually uses, in the order they appear: a glossary that
+    explains a panel to someone whose order never convened one is a wall to scroll past.
+    The text is `bill.HINTS`, the same strings the page shows, because a vocabulary
+    taught differently by two surfaces is two vocabularies.
+    """
+    from .bill import HINT_TERMS, HINTS
+
+    by_text = {text: key for key, text in HINTS.items()}
+    used: list[str] = []
+
+    def add(key: str) -> None:
+        if key and key not in used:
+            used.append(key)
+
+    def walk(lines):
+        for line in lines:
+            add(by_text.get(line.get("hint") or "", ""))
+            walk(line.get("children") or [])
+
+    for view in ("actors", "turns", "agents"):
+        walk(bill.get(view) or [])
+    for key in ("input", "cache_write", "cache_read", "output"):
+        if bill["total"]["tokens"].get(key):
+            add(key)
+    if (bill.get("rewrite") or {}).get("tokens"):
+        add("rewrite")
+    if (bill.get("accuracy") or {}).get("sealed_at"):
+        add("sealed")
+    for key in ("context_peak", "list_price", "floor"):
+        add(key)
+    print("\nwhat the words on this bill mean:")
+    width = max(len(HINT_TERMS.get(k, k)) for k in used)
+    for key in used:
+        head, _, example = HINTS[key].partition(" Example:")
+        print(f"  {HINT_TERMS.get(key, key):<{width}}  {head}")
+        if example:
+            print(f"  {'':<{width}}  e.g. {example.strip()}")
+
+
 def _print_provenance(acc: dict) -> None:
     """When this bill was worked out, and what it could not see.
 
@@ -910,6 +954,8 @@ def cmd_cost(args: argparse.Namespace) -> int:
             _print(bill, True)
             return 0
         _print_bill(bill)
+        if args.explain:
+            _print_glossary(bill)
         return 0
     res = ops.cost_report(project=None if is_id else target,
                           target=target if is_id else None, limit=args.limit)

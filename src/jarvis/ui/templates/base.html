@@ -140,6 +140,28 @@
                   word-break: break-word; }
   details > summary { cursor: pointer; }
 
+  /* The "?" beside a bill line: click it and the OS says what that line IS, in a
+     sentence and an example. A <details> rather than a tooltip because this dashboard
+     has no JavaScript and `title=` is hover-only — useless on a phone, which is where
+     half of these pages are read. It is a SIBLING of the line's own disclosure, never
+     nested inside its <summary>, so clicking the "?" does not also expand the line. */
+  .help { position: relative; flex: 0 0 auto; }
+  .help > summary { list-style: none; width: 17px; height: 17px; border-radius: 99px;
+                    border: 1px solid var(--line); background: var(--raised);
+                    color: var(--ink-3); font: 11px var(--mono); text-align: center;
+                    line-height: 15px; user-select: none; }
+  .help > summary::-webkit-details-marker { display: none; }
+  .help > summary:hover { color: var(--cyan); border-color: var(--cyan); }
+  .help[open] > summary { color: var(--cyan); border-color: var(--cyan); }
+  /* Absolute, so a hint opening does not reflow the row it belongs to — the numbers
+     beside it must not move when someone asks what a word means. */
+  .help-body { position: absolute; right: 0; top: 22px; z-index: 5; width: 330px;
+               max-width: 78vw; background: var(--surface); color: var(--ink-2);
+               border: 1px solid var(--cyan); border-radius: 8px; padding: 9px 11px;
+               font-size: 12.5px; line-height: 1.5;
+               box-shadow: 0 8px 24px rgba(0,0,0,.45); }
+  .help-body code { font-size: 11.5px; }
+
   /* A long worker question, cut down to what the user has to decide on (see
      src/jarvis/digest.py). The verbatim text is always one disclosure away, and this
      styling must never look like the whole story. */

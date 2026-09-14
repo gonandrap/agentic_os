@@ -5,6 +5,20 @@
    rather than three that drift. Every disclosure is a plain <details>: this dashboard
    has no JavaScript, and expanding a bill must not be the thing that introduces it. #}
 
+{# The help bubble: a "?" that says what a thing IS, in a sentence and an example.
+
+   Asked for on wo-4576667e after "re-write tax" turned out to be unguessable. The words
+   come from `bill.HINTS` — Python, not this file — because the terminal explains the
+   same vocabulary and a glossary kept in a template is one the CLI cannot speak.
+
+   It must never be placed INSIDE a line's <summary>: a <details> nested in the clickable
+   header of another <details> toggles both, so asking what a row means would also expand
+   it. Always a sibling on the same flex row. #}
+{% macro help(text) %}
+{%- if text %}<details class="help"><summary title="what is this?">?</summary>
+  <div class="help-body">{{ text }}</div></details>{% endif -%}
+{% endmacro %}
+
 {# A dollar figure. Never bare: `~` means it is priced at list rather than billed. #}
 {% macro money(usd, exact=false) -%}
   {%- if exact %}${{ '%.2f'|format(usd) }}{% else %}~${{ '%.2f'|format(usd) }}{% endif -%}
@@ -15,16 +29,19 @@
    total explains nothing, and the four classes are priced 20x apart. #}
 {% macro breakdown(line) %}
 {% set t = line.tokens %}{% set c = line.cost.by_class %}
+{% set hints = bill_hints %}
 <table style="margin: 4px 0 0; font-size: 13px;">
   <tr><th style="text-align:left">what</th><th style="text-align:right">tokens</th>
       <th style="text-align:right">rate</th><th style="text-align:right">at list</th>
       <th style="text-align:left"></th></tr>
-  <tr><td>fresh input</td>
+  <tr><td style="display:flex; gap:6px; align-items:flex-start;">fresh input
+        {{ help(hints.input) }}</td>
       <td class="mono" style="text-align:right">{{ fmt_tok(t.input) }}</td>
       <td class="mono sub" style="text-align:right">1×</td>
       <td class="mono" style="text-align:right">${{ '%.3f'|format(c.input) }}</td>
       <td class="sub">never cached — sent and read once</td></tr>
-  <tr><td>cache write</td>
+  <tr><td style="display:flex; gap:6px; align-items:flex-start;">cache write
+        {{ help(hints.cache_write) }}</td>
       <td class="mono" style="text-align:right">{{ fmt_tok(t.cache_write) }}</td>
       <td class="mono sub" style="text-align:right">1.25–2×</td>
       <td class="mono" style="text-align:right">${{ '%.3f'|format(c.cache_write) }}</td>
@@ -32,12 +49,14 @@
         one-hour one{% if t.cache_1h or t.cache_5m %} —
         {{ fmt_tok(t.cache_1h) }} of it 1h, {{ fmt_tok(t.cache_5m) }} 5m,
         where the CLI reported the split{% endif %}</td></tr>
-  <tr><td>cache read</td>
+  <tr><td style="display:flex; gap:6px; align-items:flex-start;">cache read
+        {{ help(hints.cache_read) }}</td>
       <td class="mono" style="text-align:right">{{ fmt_tok(t.cache_read) }}</td>
       <td class="mono sub" style="text-align:right">0.1×</td>
       <td class="mono" style="text-align:right">${{ '%.3f'|format(c.cache_read) }}</td>
       <td class="sub">served from the cache — a tenth of the price of sending it</td></tr>
-  <tr><td>output</td>
+  <tr><td style="display:flex; gap:6px; align-items:flex-start;">output
+        {{ help(hints.output) }}</td>
       <td class="mono" style="text-align:right">{{ fmt_tok(t.output) }}</td>
       <td class="mono sub" style="text-align:right">—</td>
       <td class="mono" style="text-align:right">${{ '%.3f'|format(c.output) }}</td>
@@ -69,8 +88,12 @@
    every depth, which is the point — a feature order, an order, a turn and one seat of
    a panel are all "some tokens, itemised". #}
 {% macro line(l, depth=0) %}
-<div style="border-top: 1px solid var(--line); padding: 8px 16px 8px {{ 16 + depth * 18 }}px;">
-  <details>
+{#- The row is a flex line holding TWO independent disclosures: the line's own (label,
+    tokens, dollars, and the itemisation under it) and the "?" that explains what kind of
+    line it is. Siblings, so one can be opened without the other. -#}
+<div style="border-top: 1px solid var(--line); padding: 8px 16px 8px {{ 16 + depth * 18 }}px;
+            display:flex; gap:10px; align-items:flex-start; position:relative;">
+  <details style="flex:1; min-width:0;">
     <summary>
       <span style="display:inline-flex; gap:12px; align-items:baseline; width: calc(100% - 24px);">
         <span class="grow" style="flex:1; min-width:0;">{{ l.label }}
@@ -93,6 +116,7 @@
       {{ breakdown(l) }}
     </div>
   </details>
+  {{ help(l.hint) }}
 </div>
 {% for child in l.children %}{{ line(child, depth + 1) }}{% endfor %}
 {% endmacro %}

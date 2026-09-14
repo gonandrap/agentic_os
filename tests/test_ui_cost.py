@@ -12,6 +12,7 @@ it.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -440,3 +441,34 @@ def test_every_cost_surface_says_the_figure_is_a_floor(client, project):
         page = client.get(url)
         assert page.status_code == 200
         assert "is a floor" in page.text, url
+
+
+def test_each_bill_line_carries_a_clickable_explanation(client, project):
+    """The "?" the user asked for, on the page and openable without JavaScript.
+
+    Checked as HTML rather than as payload because the failure that matters here is
+    structural: this dashboard has no JavaScript, so the bubble is a <details>, and a
+    <details> nested inside another one's <summary> toggles both — asking what a row
+    means would expand it as a side effect.
+    """
+    wo = ops.create_work_order("proj_a", "explained")
+    add_recorded_turn(project, wo["id"], 0.05, 48_000)
+    add_os_calls(wo["id"], seats=5, neo_calls=1)
+
+    page = client.get(f"/cost/proj_a/{wo['id']}")
+
+    assert page.status_code == 200
+    assert '<details class="help">' in page.text
+    # The words themselves, not just the affordance.
+    assert "One persona of a panel that deliberated" in page.text
+    assert "The agent Jarvis dispatched" in page.text
+    # ...including the four token classes inside every itemisation, which are priced
+    # 20x apart and are the reason a bill needs a glossary at all.
+    assert "Tokens stored in the prompt cache" in page.text
+    assert "at a tenth of the base rate" in page.text
+    # No help bubble may open inside a <summary>: everything between a <summary> and its
+    # </summary> is the clickable header of the line it belongs to. The stylesheet is cut
+    # out first — it explains this rule in prose and would match its own description.
+    markup = re.sub(r"<style.*?</style>", "", page.text, flags=re.S)
+    for header in re.findall(r"<summary[^>]*>.*?</summary>", markup, re.S):
+        assert "help" not in header, header[:200]

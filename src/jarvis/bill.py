@@ -78,6 +78,85 @@ ACTOR_NOTES = {
              "recorded as each call returned",
 }
 
+#: WHAT EACH WORD ON THE BILL MEANS, in one sentence and one example, under 30 words.
+#:
+#: The user asked for these after reading "re-write tax" and having no way to find out
+#: what it was (wo-4576667e). The rule the copy follows: say what the thing IS, then
+#: give a concrete instance of it — a definition alone is what the old line already had.
+#: They live here rather than in the template because the terminal renders them too, and
+#: a glossary that exists in one surface teaches a vocabulary the other does not speak.
+HINTS = {
+    WORKER: "The agent Jarvis dispatched, and everything it ran. Example: six turns of "
+            "one `claude --resume` conversation, its subagents included.",
+    JARVIS: "What the OS itself spent thinking about this order, while the worker slept."
+            " Example: one Neo answer, plus five panel seats deliberating one question.",
+    SUBPROC: "`claude` calls the worker launched itself, through Jarvis's transport. "
+             "Example: a `pytest evals/llm` run that made forty model calls of its own.",
+    "turn": "One `claude --resume` process, start to finish. Example: you send a "
+            "message, the worker works for ten minutes, the turn ends and is billed.",
+    "lead": "The session Jarvis drives, with its subagents' spend taken out and given "
+            "their own rows. Example: the agent reading your order and writing the code.",
+    "subagent": "An agent the lead spawned inside one turn — part of that turn's charge, "
+                "never on top of it. Example: an Explore agent sent to find where login "
+                "is handled.",
+    "gap": "Spend the session transcript knows about that no turn recorded. Example: a "
+           "turn running right now, or one whose result JSON has been pruned away.",
+    "no_turn": "Spend that belongs to this order but to none of its turns. Example: a "
+               "Neo answer that arrived before the first turn had started.",
+    "neo_answer": "One question a worker asked, answered by Neo. Example: \"should this "
+                  "be one work order or three?\" — one question, one call, one answer.",
+    "panel_seat": "One persona of a panel that deliberated. Example: five seats — "
+                  "premise, record, blast, taste, chair — each its own call on the same "
+                  "question.",
+    "digest": "A short summary written for the dashboard. Example: the one-line \"what "
+              "is happening\" under a work order, rewritten as the work moves.",
+    "question": "Every call that went into answering one question. Example: question "
+                "#121 — Neo's own answer, and each panel seat if the panel sat.",
+    "order": "One work order under this feature, with its own whole bill. Example: the "
+             "planner that decomposed the feature, or any child it created.",
+    # the four classes, priced 20x apart, on every breakdown table
+    "input": "Tokens sent that the cache had never seen, charged at the base rate. "
+             "Example: the first message of a brand-new conversation.",
+    "cache_write": "Tokens stored in the prompt cache for later calls to re-read, at "
+                   "1.25x the base rate (2x at the one-hour TTL). Example: a whole "
+                   "conversation re-sent after its cache expired.",
+    "cache_read": "Tokens served from the prompt cache, at a tenth of the base rate. "
+                  "Example: turn 6 re-reading the five turns that came before it.",
+    "output": "What the model wrote. Example: the code in a patch, the words in an "
+              "answer. Per token it is the dearest class on the bill, by far.",
+    # the concepts beside the tree
+    "rewrite": "The extra paid to re-send context a warm cache would have served. "
+               "Example: a 200k conversation written at 1.25x instead of read at 0.1x — "
+               "twelve times the price.",
+    "context_peak": "The biggest single API call of a turn, against the model's window. "
+                    "Not a charge. Example: 357k of a 1M window — the column that shows "
+                    "an order bloating.",
+    "sealed": "This bill was worked out when the order settled and frozen. Example: the "
+              "transcript it was built from may be pruned by now; the figure will not "
+              "move.",
+    "list_price": "Anthropic's published price for each kind of token, used so a cache "
+                  "read and an output token can be added together. Example: a rate "
+                  "card, not an invoice.",
+    "floor": "The least this order can have cost. Example: a bare `claude -p` a worker "
+             "ran from a shell leaves no record naming the order, so it cannot be "
+             "counted.",
+}
+
+#: What to CALL each hint when it is listed rather than attached to a line. On the page
+#: a "?" hangs off the row it explains and needs no headword; in a printed glossary the
+#: same sentence with no term in front of it is a riddle.
+HINT_TERMS = {
+    WORKER: "the worker's own session", JARVIS: "what Jarvis spent on this order",
+    SUBPROC: "claude processes the worker spawned itself", "turn": "a turn",
+    "lead": "the lead agent", "subagent": "a subagent", "gap": "an unrecorded turn",
+    "no_turn": "outside any turn", "neo_answer": "Neo answering",
+    "panel_seat": "a panel seat", "digest": "a dashboard digest",
+    "question": "a question", "order": "an order under a feature",
+    "input": "fresh input", "cache_write": "cache write", "cache_read": "cache read",
+    "output": "output", "rewrite": "the re-write tax", "context_peak": "context peak",
+    "sealed": "a sealed bill", "list_price": "list prices", "floor": "a floor",
+}
+
 #: The line for spend that belongs to the order but to no turn of it. Its own line
 #: rather than folded into the nearest turn (Neo, question 121): the turns view claims
 #: to be exhaustive, so anything it cannot place has to be visible, not absorbed.
@@ -135,10 +214,15 @@ def _zero_tokens() -> dict[str, int]:
     return {c: 0 for c in usage_mod.TOKEN_CLASSES}
 
 
-def _line(key: str, label: str, note: str = "") -> dict[str, Any]:
-    """An empty line item. Everything on it accumulates as items are folded in."""
+def _line(key: str, label: str, note: str = "", hint: str = "") -> dict[str, Any]:
+    """An empty line item. Everything on it accumulates as items are folded in.
+
+    `note` says something about THIS line — why it is estimated, which turn it was. The
+    `hint` says what a line of this KIND is, in a sentence and an example, and is the
+    same on every line of that kind: it is the help bubble, not the annotation.
+    """
     return {
-        "key": key, "label": label, "note": note, "_note": _UNSET,
+        "key": key, "label": label, "note": note, "hint": hint, "_note": _UNSET,
         "calls": 0,
         "tokens": {**_zero_tokens(), "cache_1h": 0, "cache_5m": 0,
                    "billed_input": 0, "cached_input": 0, "total": 0},
@@ -193,7 +277,7 @@ def _add_item(line: dict[str, Any], item: Item) -> None:
 
 
 def _fold(items: Sequence[Item], key: Any, label: Any, note: Any = None,
-          depth: int | None = None) -> list[dict[str, Any]]:
+          depth: int | None = None, hint: Any = None) -> list[dict[str, Any]]:
     """Group items into a tree of lines, one level per element of `key(item)`.
 
     `key` returns the path of an item as a tuple; every prefix of it becomes a line, and
@@ -202,6 +286,9 @@ def _fold(items: Sequence[Item], key: Any, label: Any, note: Any = None,
     """
     roots: list[dict[str, Any]] = []
     index: dict[tuple, dict[str, Any]] = {}
+    # Bound here rather than as a default, so the resolver can be defined below with the
+    # rest of the vocabulary it speaks instead of above the machinery that uses it.
+    hint = _hint_for if hint is None else hint
     for item in items:
         path = tuple(key(item))
         if depth is not None:
@@ -212,7 +299,8 @@ def _fold(items: Sequence[Item], key: Any, label: Any, note: Any = None,
             if line is None:
                 line = index[prefix] = _line(
                     "/".join(str(p) for p in prefix), label(prefix),
-                    (note(prefix) if note else "") or "")
+                    (note(prefix) if note else "") or "",
+                    (hint(prefix) if hint else "") or "")
                 if i == 0:
                     roots.append(line)
                 else:
@@ -566,11 +654,81 @@ def _agent_view(items: Sequence[Item]) -> list[dict[str, Any]]:
     """
     worker = [i for i in items if i.path and i.path[0] == WORKER]
     view = _fold(worker, key=lambda i: (i.inner[1] if len(i.inner) > 1 else LEAD,),
-                 label=lambda p: str(p[-1]))
+                 label=lambda p: str(p[-1]), hint=_agent_hint)
     # The lead first, then the subagents in the order they were spawned; a bill reads
     # top-down and the agent that ran the order belongs at the top of its own list.
     view.sort(key=lambda line: (line["label"] != LEAD,))
     return view
+
+
+def _hint_for(path: tuple) -> str:
+    """The one-sentence explanation for a line, chosen by where it hangs in the tree.
+
+    Resolved from the PATH rather than carried on each item, because a hint belongs to
+    the line and a line is the sum of many items: a turn line is charged by the lead
+    agent, its subagents and every OS call the turn caused, and "what is this line" has
+    one answer for all of them. Unknown shapes get no hint rather than a wrong one — a
+    help bubble that explains the wrong thing is worse than none.
+    """
+    from . import agent_usage
+
+    if not path:
+        return ""
+    head, depth = str(path[0]), len(path)
+    if head == WORKER:
+        if depth == 1:
+            return HINTS[WORKER]
+        second = str(path[1])
+        # A feature order puts the ORDER id in second place; a work order puts the turn.
+        if second.startswith(("wo-", "fo-")):
+            return HINTS["order"] if depth == 2 else _hint_for((WORKER, *path[2:]))
+        if depth == 2:
+            return HINTS["gap"] if _is_gap(second) else HINTS["turn"]
+        return HINTS["lead"] if str(path[2]) == LEAD else HINTS["subagent"]
+    if head == JARVIS:
+        if depth == 1:
+            return HINTS[JARVIS]
+        second = str(path[1])
+        if second.startswith(("wo-", "fo-")):
+            return HINTS["order"] if depth == 2 else _hint_for((JARVIS, *path[2:]))
+        kind = {label: k for k, label in agent_usage.KIND_LABELS.items()}.get(second, "")
+        if depth == 2:
+            return HINTS.get(kind, "")
+        # The third level is a seat, or the question a Neo answer belongs to.
+        return HINTS["question"] if str(path[2]).startswith("question #") \
+            else HINTS.get(kind, "")
+    if head == SUBPROC:
+        if depth == 2 and str(path[1]).startswith(("wo-", "fo-")):
+            return HINTS["order"]
+        return HINTS[SUBPROC]
+    if head == NO_TURN:
+        return HINTS["no_turn"] if depth == 1 else _hint_for(path[1:])
+    # A by-turn root is the turn's seq; everything under it is an actor path again.
+    if depth == 1:
+        return HINTS["turn"] if str(head).isdigit() else ""
+    return _hint_for(path[1:]) if str(head).isdigit() else ""
+
+
+def _is_gap(label: str) -> str | bool:
+    """Is this the line for spend the transcript knows about and no turn recorded?
+
+    Matched on the label because that is what the fold has: the three wordings
+    `_turn_items` chooses between all say the same thing about provenance, and a bill
+    that called one of them a turn would explain the wrong thing.
+    """
+    return label in ("the conversation, from its transcript",) or \
+        label.startswith(("turns still running", "turn still running",
+                          "turns with no result JSON left"))
+
+
+def _agent_hint(path: tuple) -> str:
+    """The agents view: one level of agent names, or an order then its agents."""
+    name = str(path[-1])
+    if name.startswith(("wo-", "fo-")):
+        return HINTS["order"]
+    if name == LEAD:
+        return HINTS["lead"]
+    return HINTS["gap"] if _is_gap(name) else HINTS["subagent"]
 
 
 def _seq_of(key: str) -> float:
@@ -768,7 +926,7 @@ def for_feature_order(project: str, path: Path, fo: dict[str, Any],
         # up unchanged: these sum to the feature's workers, and each order below has the
         # same view over its own turns.
         "agents": _fold(agent_items, key=lambda i: i.path,
-                        label=lambda p: str(p[-1])),
+                        label=lambda p: str(p[-1]), hint=_agent_hint),
         "orders": orders,
         "notes": [],
         "checks": {},
