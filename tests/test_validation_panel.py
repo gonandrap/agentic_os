@@ -55,17 +55,48 @@ def cfg(**kw) -> ValidationConfig:
 
 
 def headless(fake) -> list[dict]:
-    return [c for c in fake.calls if "-p" in c["argv"]]
+    """Every SEAT call of the round. The priming call (`priming` below) is not one: it
+    carries no mandate and casts no opinion, and folding it in here would add one to
+    every roster assertion in this file."""
+    return [c for c in fake.calls if "-p" in c["argv"] and not _is_priming(c)]
+
+
+def priming(fake) -> list[dict]:
+    return [c for c in fake.calls if "-p" in c["argv"] and _is_priming(c)]
+
+
+def _is_priming(call: dict) -> bool:
+    argv = call["argv"]
+    return argv[argv.index("-p") + 1] == validation.PRIMING_TURN
 
 
 def seat_of(call: dict) -> str | None:
+    """Which seat this call is — read from the USER prompt, where the mandate and its
+    header live now. The system prompt is the packet, shared by every seat."""
     argv = call["argv"]
-    system = argv[argv.index("--append-system-prompt") + 1]
+    prompt = argv[argv.index("-p") + 1]
     return next((s for s in VALIDATOR_SEATS
-                 if f"# Jarvis validation seat: {s}" in system), None)
+                 if f"# Jarvis validation seat: {s}" in prompt), None)
 
 
 # -- the fake answers the right roster --------------------------------------------------
+
+
+def test_the_priming_call_is_billed_to_the_round(store, round_row, jarvis_home,
+                                                 fake_claude):
+    """It is a real call on the round's behalf. The question this panel has to keep
+    answering is what it costs against the review it replaces, and a call the bill cannot
+    see is a saving nobody can check — the same rule `_record` states for the seats."""
+    from jarvis.central_store import CentralStore
+
+    validation.decide(store, dict(round_row), packet(), cfg())
+
+    central = CentralStore()
+    rows = [r for r in central.agent_calls() if r["kind"] == "validation_seat"]
+    central.close()
+    labels = sorted(r["label"] for r in rows)
+    assert "prime" in labels, f"the priming call was not recorded — {labels}"
+    assert labels.count("prime") == 1
 
 
 def test_a_validation_chair_and_a_neo_chair_get_different_replies(jarvis_home,
@@ -73,9 +104,13 @@ def test_a_validation_chair_and_a_neo_chair_get_different_replies(jarvis_home,
     """THE COLLISION, asserted in one test. Both calls are `chair`; only the header
     differs. If the Neo branch answered the validation call, the reply below would carry
     `escalate` and no `outcome`, and `decide` would have nothing to read a verdict from.
+
+    The two headers arrive by different doors now, exactly as they do in production: a
+    validation seat's is in the USER turn, because its system prompt is the packet the
+    whole round shares; a Neo seat's is still in its system prompt.
     """
     validator = claude_cli.run_headless_result(
-        "the packet", system_prompt="# Jarvis validation seat: chair")
+        "# Jarvis validation seat: chair", system_prompt="the packet")
     neo = claude_cli.run_headless_result(
         "the question", system_prompt="# Neo panel seat: chair")
 

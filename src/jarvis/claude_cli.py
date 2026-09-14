@@ -6,6 +6,7 @@ All interaction with Claude Code goes through here so tests can substitute a fak
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -14,7 +15,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
@@ -50,8 +53,34 @@ def cache_env(explicit: dict[str, str] | None = None) -> dict[str, str]:
     return {**PROMPT_CACHE_5M_ENV, **(explicit or {})}
 
 
+#: Above this many BYTES a system prompt goes to the CLI in a file rather than in argv.
+#: `MAX_ARG_STRLEN` is 32 pages — 131,072 bytes — per ARGUMENT, whatever `ARG_MAX` says,
+#: and exceeding it is an `OSError` from `execve` rather than anything the CLI can
+#: report. Half the ceiling, so a caller near the line cannot cross it by a few bytes of
+#: prose. Small callers keep the argv door: a CLI build without
+#: `--append-system-prompt-file` then still answers Neo and the digest. Spec §5:
+#: docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md
+SYSTEM_PROMPT_ARGV_LIMIT = 64 * 1024
+
+
 class ClaudeCliError(RuntimeError):
     pass
+
+
+@contextlib.contextmanager
+def _system_prompt_arg(system_prompt: str | None) -> Iterator[list[str]]:
+    """The flags that carry a system prompt, and the temporary file when it needs one."""
+    if not system_prompt:
+        yield []
+        return
+    if len(system_prompt.encode()) <= SYSTEM_PROMPT_ARGV_LIMIT:
+        yield ["--append-system-prompt", system_prompt]
+        return
+    with tempfile.NamedTemporaryFile("w", suffix=".md", prefix="jarvis-system-",
+                                     encoding="utf-8", delete=True) as fh:
+        fh.write(system_prompt)
+        fh.flush()
+        yield ["--append-system-prompt-file", fh.name]
 
 
 def claude_bin() -> str:
@@ -1181,6 +1210,13 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
     and `--disallowedTools` do not remove a tool, and under
     `permissions.defaultMode: auto` they do not stop it being used either.
 
+    `""` ALSO SENDS `--strict-mcp-config`, because `--tools ""` does not: it strips the
+    built-ins and leaves every configured MCP server's schemas in the request, so what a
+    "tool-free" callee could reach was the user's global MCP configuration (spec §4,
+    docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md). The two halves of
+    "judge the prompt and only the prompt" travel together, and neither is a caller's to
+    remember.
+
     `attribute` is the accounting for calls made from INSIDE a work order — see
     `_attribute_subprocess`. It defaults ON because the callers that need it are eval
     suites and scripts that do not know they are inside one; the OS's OWN call sites
@@ -1196,15 +1232,20 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
     and `env_extra` overriding `PATH` leaves `JARVIS_WO_ID` untouched.
     """
     args: list[str] = ["-p", prompt, "--output-format", "json"]
-    if system_prompt:
-        args += ["--append-system-prompt", system_prompt]
     if model:
         args += ["--model", model]
     if tools is not None:  # "" is meaningful: it disables every tool
         args += ["--tools", tools]
+    if tools == "":
+        # `--tools ""` strips the BUILT-IN tools and leaves every MCP server's schemas
+        # in the request, reachable. See spec §4: a seat asked to name its tools listed
+        # eleven Google Drive verbs. "Judges the prompt and only the prompt" is what
+        # `tools=""` means, so the two ship together.
+        args += ["--strict-mcp-config"]
     if permission_mode:
         args += ["--permission-mode", permission_mode]
-    out = _run(args, cwd=cwd, timeout=timeout, env_extra=env_extra)
+    with _system_prompt_arg(system_prompt) as extra:
+        out = _run(args + extra, cwd=cwd, timeout=timeout, env_extra=env_extra)
     data: Any = None
     try:
         data = json.loads(out)
