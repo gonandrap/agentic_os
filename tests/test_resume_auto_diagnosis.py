@@ -20,7 +20,7 @@ import json
 
 import pytest
 
-from jarvis import cli, gates, ops
+from jarvis import cli, gates, invariants, ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.hooks import handle_hook
@@ -170,6 +170,35 @@ def test_it_points_at_the_review_when_assumptions_are_pending(started, project):
     assert result["nudged"] is False
     assert result["waiting_on"] == "assumptions"
     assert f"jarvis wo review {wo['id']}" in result["diagnosis"]
+
+
+def test_it_says_the_panel_is_still_reading_a_work_order_parked_for_the_user(started,
+                                                                            project):
+    """Since issue 212 a round runs beside the assumption review, so `needs_review` no
+    longer means nothing is moving. PAIRED with the same work order once its round has
+    been judged, which is the half that proves the note is read off the round and not
+    off the status."""
+    daemon = started
+    wo = ops.create_work_order("proj_a", "risky change")
+    daemon.tick()
+    store = ProjectStore(project)
+    store.add_assumption(wo["id"], "chose CSV")
+    store.set_status(wo["id"], "needs_review")
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
+
+    running = ops.resume_in_auto(wo["id"])
+
+    assert running["waiting_on"] == "assumptions"
+    assert "review round 1 is running in parallel" in running["diagnosis"]
+    assert invariants.status_label(store, store.get_work_order(wo["id"])) == \
+        "needs_review — review round 1 is running in parallel"
+
+    store.close_validation_round(rnd["id"], "passed", "")
+    judged = ops.resume_in_auto(wo["id"])
+
+    assert "in parallel" not in judged["diagnosis"]
+    assert invariants.status_label(store, store.get_work_order(wo["id"])) == \
+        "needs_review"
 
 
 def test_it_declines_for_a_worker_that_is_simply_working(started, project):

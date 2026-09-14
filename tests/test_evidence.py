@@ -55,11 +55,12 @@ class Env:
     project: Path
     worktree: Path
 
-    def collect(self, *, declared: str = "ran the tests", **over) -> evidence.EvidencePacket:
+    def collect(self, *, declared: str = "ran the tests", assumptions=(),
+                **over) -> evidence.EvidencePacket:
         wo = {**WO_FIELDS, **over}
         chars = wo.pop("diff_chars", evidence.DEFAULT_DIFF_CHARS)
         return evidence.collect_work_order(self.project, wo, declared=declared,
-                                           diff_chars=chars)
+                                           diff_chars=chars, assumptions=assumptions)
 
 
 @pytest.fixture()
@@ -147,6 +148,25 @@ def test_reflowed_declared_text_fingerprints_identically_but_a_changed_word_does
 
     changed = env.collect(declared="uv run pytest -q: 412 passed, 1 failed")
     assert evidence.fingerprint(changed) != evidence.fingerprint(tidy)
+
+
+def test_an_assumption_moves_the_fingerprint_and_the_users_verdict_on_it_does_not(env):
+    """A call the submitter declared is material the judge reads, so a submission that
+    adds one is not the same submission. Its review STATE is the user acting, not the
+    submitter producing evidence — and the third leg is the work order that filed none,
+    which must hash exactly as it did before any of this existed."""
+    (env.worktree / "app.py").write_text(_body("app", 30, "edited"))
+    bare = env.collect()
+    assert evidence.fingerprint(env.collect(assumptions=())) == \
+        evidence.fingerprint(bare)
+
+    filed = env.collect(assumptions=[{"n": 1, "content": "the exporter writes UTF-8",
+                                      "status": "pending"}])
+    assert evidence.fingerprint(filed) != evidence.fingerprint(bare)
+
+    decided = env.collect(assumptions=[{"n": 1, "content": "the exporter writes UTF-8",
+                                        "status": "accepted"}])
+    assert evidence.fingerprint(decided) == evidence.fingerprint(filed)
 
 
 def test_the_same_worktree_fingerprints_identically_at_two_truncation_limits(env):

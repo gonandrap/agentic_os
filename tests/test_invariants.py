@@ -646,6 +646,26 @@ def test_doctor_without_repair_does_not_close_the_stranded_round(project, catalo
         after.close()
 
 
+def test_a_round_abandoned_under_needs_review_is_stranded_too(project):
+    """Since issue 212 a round runs beside the user's assumption review, so the work
+    order holding it is parked in `needs_review`. PAIRED with a cancelled one, which is
+    the reason the query is bounded by `OPEN_STATUSES` rather than not bounded at all:
+    reopening that round would judge — and land — work the user stopped."""
+    store = ProjectStore(project)
+    parked, parked_round = _stranded(store, age=5000)
+    store.set_status(parked, "needs_review")
+    stopped, stopped_round = _stranded(store, age=5000)
+    store.set_status(stopped, "cancelled")
+
+    found = _stranded_violations(store)
+
+    assert [v.wo_id for v in found] == [parked]
+    assert _round(store, parked_round)["outcome"] == "failed"
+    assert _round(store, stopped_round)["outcome"] == "pending"
+    # ...and the parked one keeps the status that says the user owes a decision.
+    assert store.get_work_order(parked)["status"] == "needs_review"
+
+
 def test_a_judged_round_is_never_stranded_however_old(project):
     """A round that reached a verdict is finished business. The unit sitting in
     `validating` after one is a different bug and not this one's to repair."""

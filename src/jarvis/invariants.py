@@ -43,6 +43,7 @@ from .project_store import (
     DEPENDENCY_DEAD_STATUSES,
     FO_OPEN_STATUSES,
     OPEN_STATUSES,
+    RUNNABLE_VALIDATION_OUTCOMES,
     SLOT_STATUSES,
     UNGOVERNED_ORIGINS,
 )
@@ -331,21 +332,34 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # edge (`jarvis wo unblock`). That is the difference between waiting and stranded.
     if wo["status"] == "pending" and dead_dependencies(store, wo):
         blockers.append(DEAD_DEPENDENCY_BLOCKER)
-    if governed and wo["status"] == "needs_review" and not pending:
-        # Two very different ways to arrive at `needs_review` without an assumption to
-        # decide, and they ask the user for opposite things. A closed pull request means
-        # the work WAS delivered and then refused, so there is nothing to review in the
-        # session — the question is what to do about the refusal.
-        if wo.get("pr_state") == "CLOSED":
+    if governed and wo["status"] == "needs_review":
+        # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for
+        # something different. The `not pending` guards are PER LINE and not on the
+        # branch head, which is the whole subtlety here: only ONE of the three can be
+        # true at the same time as an undecided assumption, and hoisting the guard back
+        # up — where it sat until issue 212 — silently drops that one.
+        #
+        # 1. A closed pull request: the work WAS delivered and then refused, so there is
+        #    nothing to review in the session — the question is what to do about the
+        #    refusal. Ranked first: a fact about the outside world supersedes whatever
+        #    the panel thought. Guarded, because `Daemon.poll_pull_requests` only ever
+        #    sees `waiting_pr_merge`, which a work order with a pending assumption has
+        #    by construction never reached.
+        if not pending and wo.get("pr_state") == "CLOSED":
             blockers.append(PR_CLOSED_BLOCKER)
+        # 2. The panel ran its rounds and could not be satisfied. UNGUARDED, and that is
+        #    the thing to preserve: since issue 212 a round runs while the user decides
+        #    (`ops.land_when_cleared`), so the panel can give up on a work order whose
+        #    assumption is still outstanding. They are two independent things owed, and
+        #    dropping the give-up because a decision is also open is the silent
+        #    relabelling kn-78346a2d names — dropping it FOR GOOD, because accepting the
+        #    assumption lands the work order and nothing re-derives it afterwards.
         elif _validation_escalated(store, wo):
-            # A third way in, and a more specific one: the panel ran its rounds and
-            # could not be satisfied. Ranked below the closed pull request — that is a
-            # fact about the outside world and supersedes whatever the panel thought —
-            # and above the generic line, which would send the user off to read a
-            # session whose story is already written down in the rounds.
             blockers.append(VALIDATION_STUCK_BLOCKER)
-        else:
+        # 3. Nothing more specific: the worker stopped without finishing. Guarded,
+        #    because a `needs_review` holding a pending assumption is doing exactly what
+        #    that status is for, and this line would call it a worker that gave up.
+        elif not pending:
             blockers.append(IDLE_NO_FINISH_BLOCKER)
     # A pull request that cannot be merged and could not be healed — the whole reason
     # `waiting_pr_merge` is in BLOCKED_STATUSES at all (spec §5). The query sits behind
@@ -503,6 +517,24 @@ def dead_dependencies(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str,
             if dep["status"] in DEPENDENCY_DEAD_STATUSES or dep["status"] == "missing"]
 
 
+def parallel_round_note(store: ProjectStore, wo_id: str) -> str:
+    """" — review round N is running in parallel", or "" when none is.
+
+    ONE HOME, because two surfaces say it and a reword that landed in only one of them
+    would be two surfaces disagreeing about the same work order — the drift PR 65 is the
+    standing example of. `status_label` appends it to a status; `ops.waiting_on` appends
+    it to a diagnosis, and both are read by a user asking "is anything happening".
+
+    `RUNNABLE_VALIDATION_OUTCOMES` and not the wider open set: a `rejected` round is
+    waiting on the SUBMITTER, and saying the panel is still reading would send the user
+    looking for something to wait for.
+    """
+    latest = store.latest_validation_round(wo_id=wo_id)
+    if latest and latest["outcome"] in RUNNABLE_VALIDATION_OUTCOMES:
+        return f" — review round {latest['round']} is running in parallel"
+    return ""
+
+
 def status_label(store: ProjectStore, wo: dict[str, Any],
                  fleet: Fleet | None = None) -> str:
     """How this work order's status should read to a human.
@@ -529,6 +561,13 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     if wo["status"] in ACTIVE_STATUSES:
         note = pause_note(store, wo) or neo_wait_note(wo)
         return f"{wo['status']} — {note}" if note else wo["status"]
+    # `needs_review` no longer means the panel is waiting for the user: since issue 212
+    # the round runs in parallel with the assumption review, and a status that said only
+    # "needs_review" would hide the half of the work that is still moving.
+    if wo["status"] == "needs_review":
+        note = parallel_round_note(store, wo["id"])
+        if note:
+            return f"{wo['status']}{note}"
     if wo["status"] != "pending":
         return wo["status"]
     blockers = store.unfinished_dependencies(wo["id"])
@@ -1534,16 +1573,24 @@ def check_no_lost_feedback(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
-    """INV-VALIDATION-STRANDED — a unit under review must not sit in `validating` for ever.
+    """INV-VALIDATION-STRANDED — a unit under review must not sit on an open round for ever.
 
-    Nothing outside the daemon moves a `validating` unit: it raises no attention flag and
-    `settle_work_order` returns early for it. Both are right while a round is in flight,
-    and together they mean a daemon that dies mid-round leaves the unit invisibly stalled
-    with nothing left in the OS that will ever look at it again.
+    Nothing outside the daemon moves a unit whose round is open: it raises no attention
+    flag and `settle_work_order` returns early for it. Both are right while a round is in
+    flight, and together they mean a daemon that dies mid-round leaves the unit invisibly
+    stalled with nothing left in the OS that will ever look at it again.
 
-    Predicate: `validating`, latest round still `pending`, opened longer than TWICE
+    Predicate: latest round still `pending`, opened longer than TWICE
     `os.validation.timeout` ago — one timeout is what a round is allowed to take, so a
     round at 1.2x its budget is late rather than abandoned.
+
+    **The work-order half looks for the ROUND, not for `status='validating'`** (GitHub
+    issue 212, spec docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §3): a
+    work order with pending assumptions holds its round while parked in `needs_review`,
+    and the status query this replaced would have let exactly that one sit for ever. It
+    is bounded to `OPEN_STATUSES` instead — a cancelled work order's abandoned round must
+    not be handed back to a machine that would judge and then land the work the user
+    stopped.
 
     Repaired by closing the round `failed`, not `escalated`: `counted_validation_rounds`
     ignores `failed`, so the interruption costs the submitter no round, and
@@ -1558,9 +1605,13 @@ def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
     threshold = 2 * per_round
     now = time.time()
     cutoff = now - threshold
+    open_marks = ",".join("?" * len(OPEN_STATUSES))
     for kind, id_col, rows in (
         ("work order", "wo_id", store.conn.execute(
-            "SELECT id FROM work_orders WHERE status='validating'").fetchall()),
+            f"""SELECT DISTINCT w.id AS id FROM work_orders w
+                  JOIN validation_rounds r ON r.wo_id = w.id
+                 WHERE r.outcome='pending' AND w.status IN ({open_marks})""",
+            OPEN_STATUSES).fetchall()),
         ("feature order", "fo_id", store.conn.execute(
             "SELECT id FROM feature_orders WHERE status='validating'").fetchall()),
     ):
