@@ -1793,6 +1793,51 @@ def test_the_shapes_that_were_already_right(gated, command, gated_kind):
     assert (decision == "deny") is bool(gated_kind), command
 
 
+#: Gate 129, this work order's own commit of this fix — the third disguise the bug wore
+#: tonight, after 127 and 128 held the heredoc that appended the fixtures above. A commit
+#: MESSAGE, naming the action in prose, inside backticks that cost the whole command its
+#: quote-blanking. Neo dismissed all three as classifier defects.
+COMMIT_MESSAGE = (
+    "git add -A && git commit -q -F - <<'MSG'\n"
+    "[wo-88b53882] Filing a gate request must never be gated (issue #233)\n"
+    "\n"
+    "`scannable` no longer blanks quotes inside an interpreter body — "
+    '`os.system("gh pr merge 223")` matched no recogniser at all.\n'
+    "MSG\n"
+    "git log --oneline -1"
+)
+
+
+def test_a_commit_message_belongs_to_the_commit_and_is_clearable():
+    """Gate 129's shape. The ownership fix is what makes the message a commit message:
+    the body used to split off into a segment nobody owned, sitting between the `git
+    commit` that reads it and the `git log` that follows.
+
+    Structurally CLEARABLE, not structurally cleared — `git commit` is not a reader, so
+    this is the learnable path the module is built around (kn-0b2fdebb), and one
+    dismissal settles it fleet-wide. That is what happened: gr-14f25d61."""
+    from jarvis import gate_rules
+
+    pattern = r"\bgh\s+pr\s+merge\b"
+    shape = gate_rules.shape_of(COMMIT_MESSAGE, pattern)
+
+    assert shape is not None
+    assert (shape.position, shape.owner) == (gate_rules.HEREDOC, "git commit")
+    assert not shape.handoff, "a commit message is not written out anywhere"
+    assert shape.exemptible, shape.unlearnable_reason()
+    # The whole chain, so `git add` and `git log` are not charged with the message either.
+    assert [n for _, _, n in gate_rules.segments(COMMIT_MESSAGE) if n] == [
+        "git add", "git commit", "git log"]
+    # And the dismissal Neo actually reached does clear it.
+    rule = gate_rules.Rule(
+        id="gr-14f25d61", role=gate_rules.EXEMPT, test=gate_rules.SIGNATURE,
+        kind="pr_merge",
+        pattern='{"kind": "pr_merge", "owner": "git commit", "position": "heredoc"}')
+    assert rule.clears(COMMIT_MESSAGE, "pr_merge", pattern)
+    assert gate_rules.RuleSet.from_seeds().with_rule(rule).decide(
+        COMMIT_MESSAGE, gates.KIND_NAMES).match is None
+
+
 def test_a_filing_wrapped_in_an_interpreter_is_read_as_a_program():
     """The carve-out is over a gate that fires, not over a hole. Under Neo's ruling on
     question 281 a heredoc body owned by an interpreter is scanned WHOLE — its string
