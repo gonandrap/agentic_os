@@ -1339,11 +1339,15 @@ def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
             for r in store.validation_rounds(wo_id=wo_id, fo_id=fo_id)]
 
 
-#: Every automatic-merge event, newest-wins, with how each reads to a person. Ordered by
-#: FINALITY rather than by time: `automerge_merged` is terminal and must never be hidden
-#: by a later row, and there is no later row after it.
+#: Every event the automatic merge writes. The ORDER HERE MEANS NOTHING — `automerge_state`
+#: picks by timestamp — and the list exists only so that adding an event kind is one edit
+#: rather than one edit and a forgotten renderer.
 AUTOMERGE_EVENTS = ("automerge_merged", "automerge_decided", "automerge_proposed",
                     "automerge_failed", "automerge_held")
+
+#: The one event that is TERMINAL: nothing follows a merge, so it wins over anything with
+#: a later timestamp. Everything else is a stage the work order can leave.
+AUTOMERGE_TERMINAL = "automerge_merged"
 
 
 def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
@@ -1359,18 +1363,39 @@ def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     the tick that held the merge ever knew it. Re-deriving here would mean a `gh` call
     from a CLI command, and it would answer about a different moment than the one the
     record is describing.
+
+    **THE NEWEST EVENT WINS, BY TIMESTAMP, with one exception.** Reading the kinds in a
+    fixed order and taking the first with any rows is the obvious implementation and it
+    is wrong, because `gates.apply_decision` writes `automerge_decided` on EVERY verdict:
+    an approval would then outrank every later event for ever, and a pull request whose
+    head moved after the approval — or whose merge failed three times — would go on
+    saying "approved by neo" while nothing was ever going to merge. That is precisely the
+    case this function exists to surface.
+
+    The exception is `automerge_merged`: nothing follows a merge, so it wins over
+    anything later. Nothing writes a later row today; it is asserted rather than assumed
+    because the cost of being wrong is a completed work order claiming to be held.
     """
     from . import db
 
-    latest: dict[str, Any] | None = None
+    newest: dict[str, Any] | None = None
+    terminal: dict[str, Any] | None = None
     for kind in AUTOMERGE_EVENTS:
         rows = store.events_of_kind(wo["id"], kind)
-        if rows:
-            latest = {"kind": kind, **db.from_json(rows[-1]["payload"], {})}
-            break
-    if latest is None:
+        if not rows:
+            continue
+        # The payload is spread FIRST so that `kind` and `ts` are this function's own
+        # answers and not whatever an event happened to carry under those names.
+        candidate = {**db.from_json(rows[-1]["payload"], {}),
+                     "kind": kind, "ts": float(rows[-1]["ts"])}
+        if kind == AUTOMERGE_TERMINAL:
+            terminal = candidate
+        elif newest is None or candidate["ts"] > newest["ts"]:
+            newest = candidate
+    newest = terminal or newest
+    if newest is None:
         return None
-    return {**latest, "line": _automerge_line(latest)}
+    return {**newest, "line": _automerge_line(newest)}
 
 
 def _automerge_line(state: dict[str, Any]) -> str:

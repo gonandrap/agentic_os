@@ -2943,9 +2943,11 @@ class Daemon:
         **The automatic merge costs that case NOTHING, and its own cost is counted too.**
         `Daemon.auto_merge` returns on `project.validation.auto_merge` before it reads
         anything, so a project that has not opted in — the shipped state of every project
-        — pays exactly the budget above. A project that HAS opted in pays three more
-        indexed reads per parked pull request per poll: the latest validation round, its
-        pending assumptions, and the `automerge_held` events the hold dedupes against.
+        — pays exactly the budget above. A project that HAS opted in pays FOUR more
+        indexed reads per parked pull request per poll: the latest validation round
+        twice — once through `validated_head` for the predicate and once raw for the
+        wording, see `auto_merge` — its pending assumptions, and the `automerge_held`
+        events the hold dedupes against.
         One more (`latest_approval_for`) arrives only once a merge is armed, which is a
         state a pull request passes through once. Both figures are counted by their own
         test beside the one above, on the rule that a budget nobody executes is a comment
@@ -3092,8 +3094,13 @@ class Daemon:
         if not (cfg.enabled and cfg.auto_merge):
             return
         wo_id = wo["id"]
+        # `validated_head` is the predicate and `latest_validation_round` is the wording:
+        # `decide` is handed the first and re-derives none of it. Two indexed reads of one
+        # row rather than one, deliberately — the alternative is the rule living in two
+        # places, and the copy that is not running is the copy that rots.
         decision = automerge.decide(
             store.latest_validation_round(wo_id=wo_id), wo, pr, cfg,
+            validated_head=store.validated_head(wo_id),
             pending_assumptions=bool(store.pending_assumptions(wo_id)))
         if not decision.armed:
             self._note_automerge_held(store, wo_id, decision)
@@ -3102,7 +3109,13 @@ class Daemon:
         approval = store.latest_approval_for(
             wo_id, automerge.GATE_KIND,
             automerge.merge_command(str(wo.get("pr_url") or ""), decision.judged_sha))
-        if approval is None or approval["status"] != "approved":
+        if approval is not None and approval["status"] != "approved":
+            # Filed and not granted: pending with Neo, escalated to the user, denied,
+            # expired. Every one of those is somebody's business and none of them is
+            # this loop's — and `propose` would refuse anyway, after opening a NeoStore
+            # to find that out, every two minutes for as long as the PR stays open.
+            return
+        if approval is None:
             # Not yet permitted. `propose` is idempotent per command string — and the
             # string carries the judged sha — so a pending, escalated or REFUSED request
             # is left standing rather than re-asked every two minutes.
@@ -3120,18 +3133,34 @@ class Daemon:
             finally:
                 neo_store.close()
             return
-        if automerge.attempts(store, wo_id, decision.judged_sha) \
-                >= automerge.AUTO_MERGE_MAX_ATTEMPTS:
-            return
+        # No attempt cap here: `automerge.GRANT_USES` is 1, so an approved-but-spent grant
+        # refuses inside `apply` without reaching GitHub, and that is the bound. See
+        # `automerge.attempts` for why spec §9's counter would enforce nothing.
         try:
             merged = automerge.apply(store, wo, decision.judged_sha, approval,
                                      cwd=project.path)
-        except Exception as exc:  # noqa: BLE001 — a failed merge is news, never a crash
+        except automerge.MergeFailed as exc:
+            # It reached GitHub and GitHub said no. Counted, recorded and — once per
+            # commit — reported.
             log.warning("[%s] auto-merge of %s failed: %s", project.name, wo_id, exc)
             store.add_event(wo_id, "automerge_failed", {
                 "head_sha": decision.judged_sha, "approval_id": approval["id"],
                 "reason": str(exc), "pr_url": wo.get("pr_url")})
             self._warn_automerge_failed(project, store, wo, decision, str(exc))
+            return
+        except automerge.AutoMergeRefused as exc:
+            # NOTHING WAS ATTEMPTED, so nothing is recorded and nothing is counted. This
+            # is the ordinary steady state of a commit whose one authorised attempt has
+            # been made: `automerge.GRANT_USES` is 1, so the grant is spent and every
+            # later poll lands here. Writing an `automerge_failed` event for it would
+            # claim a merge failure that never happened, three polls' worth per commit,
+            # and hand the user's inbox row "the grant is spent" as the reason a merge
+            # failed instead of the 403 that actually caused it.
+            log.debug("[%s] auto-merge of %s not attempted: %s", project.name, wo_id,
+                      exc)
+            return
+        except Exception:  # noqa: BLE001 — a merge must never kill the tick
+            log.exception("[%s] auto-merging %s failed", project.name, wo_id)
             return
         log.info("[%s] auto-merged %s — completing %s", project.name, wo["pr_url"],
                  wo_id)
@@ -3181,29 +3210,33 @@ class Daemon:
 
     def _warn_automerge_failed(self, project: ProjectSpec, store: ProjectStore,
                                wo: dict, decision: Any, reason: str) -> None:
-        """One inbox row once the budget for a commit is spent. Not before, and not again.
+        """One inbox row for the FIRST failed merge of a commit. Not again for that commit.
 
-        A single failure is very often transient — GitHub computing a merge, a check
-        reporting late — and telling the user about each one would make the inbox the
-        thing that costs more attention than hand-merging did. Three on one commit is a
-        standing problem, and the most likely one by far is the daemon's `gh` having read
-        credentials but no write scope (spec §9), which no amount of retrying fixes.
+        **This is a deliberate deviation from spec §9, which reports at the third
+        attempt.** That threshold assumed a retry budget, and there is none:
+        `automerge.GRANT_USES` is 1 and `automerge.propose` files at most one gate request
+        per judged commit, so a commit gets exactly one authorised attempt. "Report at
+        three" would therefore report never, and a merge that failed on a missing write
+        scope — the likeliest cause by far, spec §9 — would be silent for ever. Failing
+        closed means the refusal is VISIBLE, so the row goes out the first time GitHub
+        says no.
+
+        Deduped on the commit all the same, so that a future path which does authorise a
+        second attempt at the same diff cannot say the same thing twice.
 
         The work order is NOT flagged and NOT moved: it stays in `waiting_pr_merge` with
         its link, and merging it by hand works exactly as it always has.
         """
         from . import automerge
 
-        if automerge.attempts(store, wo["id"], decision.judged_sha) \
-                != automerge.AUTO_MERGE_MAX_ATTEMPTS:
-            return
+        if automerge.attempts(store, wo["id"], decision.judged_sha) != 1:
+            return          # the caller records the event first, so 1 == this one
         self.central.add_inbox(
             project=project.name, level="warning",
             title=f"The OS could not merge the pull request for {wo['id']}",
             body=f"{wo.get('pr_url')}\n"
-                 f"The panel passed it and the merge was authorised, but "
-                 f"{automerge.AUTO_MERGE_MAX_ATTEMPTS} attempts on commit "
-                 f"{decision.judged_sha[:10]} all failed. Last reason: {reason}\n"
+                 f"The panel passed it and the merge was authorised, but GitHub refused "
+                 f"it on commit {decision.judged_sha[:10]}: {reason}\n"
                  f"Nothing was merged and nothing is stuck — merging it yourself works "
                  f"exactly as it always has.",
             wo_id=wo["id"])

@@ -321,12 +321,17 @@ def test_an_opted_in_project_declares_what_the_automatic_merge_costs_it(
         started, project, fake_gh, reviewing):
     """And the other half: a project that HAS opted in pays, and the price is counted.
 
-    Three more indexed reads per parked pull request per poll — the latest validation
-    round, the pending assumptions, and the `automerge_held` events the dedupe keys on —
-    and that is the whole standing cost of holding merge authority. A fourth appearing
-    means somebody put a query on a path every open pull request of an opted-in project
-    pays every two minutes; this is the test that says so rather than a sentence in a
-    docstring nobody executes.
+    Four more indexed reads per parked pull request per poll — the latest validation
+    round TWICE, the pending assumptions, and the `automerge_held` events the dedupe keys
+    on — and that is the whole standing cost of holding merge authority. A fifth
+    appearing means somebody put a query on a path every open pull request of an opted-in
+    project pays every two minutes; this is the test that says so rather than a sentence
+    in a docstring nobody executes.
+
+    The round is read twice on purpose: `ProjectStore.validated_head` answers the
+    predicate and the raw row supplies only the wording, so the rule has one home. The
+    price of that is one repeated indexed read of one row, and it is named here so the
+    trade is visible rather than mistaken for a fifth query later.
 
     Counted on a HELD pull request (this one's round never passed) and on the SECOND
     poll, because held is the state an opted-in project spends almost all of its time in
@@ -346,7 +351,7 @@ def test_an_opted_in_project_declares_what_the_automatic_merge_costs_it(
 
     store.conn.set_trace_callback(None)
     assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
-    assert len([s for s in sql if "validation_rounds" in s]) == 1
+    assert len([s for s in sql if "validation_rounds" in s]) == 2
     assert len([s for s in sql if "assumptions" in s]) == 1
     assert len([s for s in sql if "wo_events" in s]) == 4
     assert not [s for s in sql if "approvals" in s]

@@ -62,13 +62,6 @@ GATE_KIND = "auto_merge"
 #: arrive without a commit that also edits the test.
 WRITE_VERBS = (("pr", "merge"),)
 
-#: How many times one commit is attempted before the OS stops and tells the user. Per
-#: HEAD SHA, counted off `automerge_failed` events: a new commit is a new submission and
-#: deserves its own budget, while three failures on one commit are a standing problem —
-#: most likely the daemon's `gh` having read credentials but no write scope, which is the
-#: most likely first failure of this whole feature (spec §9).
-AUTO_MERGE_MAX_ATTEMPTS = 3
-
 #: A grant covers ONE merge. Not a threshold — the shape of the permission: the reviewer
 #: authorised landing ONE commit, and a retry after a failure needs a fresh review rather
 #: than a free second attempt at an irreversible act. `remedies.GRANT_USES`' reasoning.
@@ -92,8 +85,27 @@ HELD_PR_NOT_READY = "pr_not_ready"
 
 
 class AutoMergeRefused(Exception):
-    """Nothing was merged. Raised by `apply` for every reason a merge must not run, so a
-    caller cannot mistake a refusal for a merge that quietly did nothing."""
+    """NOTHING WAS ATTEMPTED. Raised by `apply` for every reason a merge must not run, so
+    a caller cannot mistake a refusal for a merge that quietly did nothing.
+
+    Not news, and not counted: the commonest instance by far is a grant that has already
+    been spent, which is the ordinary state of every commit whose one authorised attempt
+    has been made. See `MergeFailed` for the other half — and why the two must not be one
+    exception.
+    """
+
+
+class MergeFailed(AutoMergeRefused):
+    """The merge RAN and GitHub refused it. A fact about the pull request, not about us.
+
+    Separate from its parent because the daemon counts these and reports them, and
+    folding the two together made the record lie in a way that only showed up under test:
+    `GRANT_USES` is 1, so the first failed attempt spends the grant and every later poll
+    refuses before reaching GitHub. Counting those as merge failures wrote two extra
+    `automerge_failed` events per commit whose reason was "the grant is spent" — and the
+    user's inbox row then quoted that as the reason the merge failed, instead of the 403
+    that actually caused it.
+    """
 
 
 @dataclass(frozen=True)
@@ -123,7 +135,8 @@ def _held(code: str, reason: str, **fields: Any) -> Decision:
 
 
 def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: Any,
-           *, pending_assumptions: bool = False) -> Decision:
+           *, validated_head: str | None,
+           pending_assumptions: bool = False) -> Decision:
     """May the OS merge this pull request right now? PURE — no store, no clock, no `gh`.
 
     Dicts and one `github.PullRequest` in, armed-or-held-with-a-reason out. Pure for
@@ -139,9 +152,18 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
     1. the project has opted in AND the panel is on (`cfg.auto_merge and cfg.enabled`);
     2. the work order is parked in `waiting_pr_merge`;
     3. it owes the user no assumption decision;
-    4. its LATEST round settled `passed`;
-    5. that round recorded which commit it judged, and the live head IS that commit;
+    4. `ProjectStore.validated_head` yields a commit — which is one fact, not two: the
+       latest round settled `passed` AND it recorded which commit it judged;
+    5. that commit IS the live head;
     6. GitHub says the pull request is open, mergeable, green and CLEAN.
+
+    **`validated_head` IS PASSED IN AND NEVER RE-DERIVED HERE.** Conditions 4 and 5 rest
+    on "which commit did the panel accept", and that question has exactly one home
+    (`ProjectStore.validated_head`, spec §5.2) for `arbitrate`'s reason: a rule spread
+    over two call sites is a rule that holds by luck, and the copy that is not the one
+    actually running is the copy that rots. `round_row` is still read below, but ONLY to
+    write the sentence a person reads — "round 2 is rejected" against "round 2 passed but
+    read a worktree" are the same refusal with different advice — and never to decide.
 
     Condition 3 is redundant with condition 2 — `ops.land_when_cleared` cannot reach
     `waiting_pr_merge` with an assumption pending — and it is re-checked because the
@@ -172,21 +194,24 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
 
     outcome = str((round_row or {}).get("outcome") or "")
     n = int((round_row or {}).get("round") or 0)
-    if round_row is None or outcome != "passed":
-        # `pending` and `failed` are the shapes a panel that never answered leaves
-        # behind, and both must read as NOT VALIDATED rather than as not refused.
+    head = str(getattr(pr, "head_sha", "") or "")
+    round_id = int((round_row or {}).get("id") or 0)
+    judged = validated_head or ""
+    if not judged:
+        # ONE refusal — the panel has accepted no commit — told two ways, because the two
+        # want different things from the reader. The round is read for the wording only;
+        # `validated_head` above is what decided. `pending` and `failed` are the shapes a
+        # panel that never answered leaves behind, and both must read as NOT VALIDATED
+        # rather than as not refused.
+        if round_row is not None and outcome == "passed":
+            return _held(HELD_SHA_UNRECORDED,
+                         f"round {n} passed, but which commit it judged was not "
+                         f"recorded — it read a worktree rather than the pull request",
+                         head_sha=head, round_id=round_id, round_n=n)
         return _held(HELD_NOT_PASSED,
                      f"round {n} is {outcome}" if round_row is not None
                      else "the panel has never judged this work order", round_n=n)
 
-    judged = str(round_row.get("head_sha") or "")
-    head = str(getattr(pr, "head_sha", "") or "")
-    round_id = int(round_row.get("id") or 0)
-    if not judged:
-        return _held(HELD_SHA_UNRECORDED,
-                     f"round {n} passed, but which commit it judged was not recorded — "
-                     f"it read a worktree rather than the pull request",
-                     head_sha=head, round_id=round_id, round_n=n)
     if judged != head:
         return _held(HELD_SHA_MOVED,
                      f"round {n} passed on {judged[:10]}, the head is now "
@@ -388,10 +413,17 @@ def record_verdict(store: Any, approval: dict[str, Any], verdict: str, reason: s
 def attempts(store: Any, wo_id: str, head_sha: str) -> int:
     """How many times the OS has already failed to merge THIS commit.
 
-    Per head sha rather than per work order: a new commit is a new submission and gets its
-    own budget, while three failures on one commit are a standing problem a person has to
-    look at. Counted off the timeline rather than a column, `ops.PrRepair`'s way — the
-    events are the record, and a counter would be a second one to keep in step.
+    Per head sha rather than per work order: a new commit is a new submission, judged
+    afresh and authorised afresh, so what it has to answer is "have we already told the
+    user about THIS one". Counted off the timeline rather than a column, `ops.PrRepair`'s
+    way — the events are the record, and a counter would be a second one to keep in step.
+
+    **NOT a retry budget, and spec §9's `AUTO_MERGE_MAX_ATTEMPTS = 3` is deliberately not
+    implemented.** `GRANT_USES` is 1 and `propose` files at most one gate request per
+    (work order, judged commit), so a commit gets exactly ONE authorised attempt and a cap
+    of three could never bind — it would be a constant that reads like a guarantee and
+    enforces nothing. The bound is the grant. This is the dedupe for
+    `Daemon._warn_automerge_failed`, nothing more.
     """
     from . import db
 
@@ -428,8 +460,12 @@ def apply(store: Any, wo: dict[str, Any], sha: str,
     project directory, and passing it is what makes that check include "and it is on THIS
     project's own origin" rather than merely "it is shaped like a pull-request URL".
     """
+    # `github.gh_bin`, not `bugreport.gh_bin` — the same function, reached through the
+    # module that owns talking to GitHub. `JARVIS_GH_BIN` and the PATH story are
+    # `github.py`'s contract, and a second import path is how a caller comes to resolve
+    # the binary one way while the module it is imitating resolves it another.
     from . import gates, github
-    from .bugreport import gh_bin
+    from .github import gh_bin
 
     wo_id = wo["id"]
     if not sha:
@@ -457,15 +493,21 @@ def apply(store: Any, wo: dict[str, Any], sha: str,
                               timeout=MERGE_TIMEOUT,
                               cwd=str(cwd) if cwd is not None else None)
     except FileNotFoundError as e:
-        raise AutoMergeRefused(github.GitHubError.NO_GH) from e
+        raise MergeFailed(github.GitHubError.NO_GH) from e
     except subprocess.SubprocessError as e:
-        raise AutoMergeRefused(f"the merge command did not complete: {e}") from e
+        raise MergeFailed(f"the merge command did not complete: {e}") from e
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
-        # The remote text is logged and summarised, never raised as the record's reason
-        # verbatim — `github.GitHubError`'s rule, and this string reaches the inbox.
+        # THE REMOTE'S OWN TEXT, TRUNCATED, AND THAT IS DELIBERATE — the opposite of
+        # `github.GitHubError.reason`, which substitutes a fixed vocabulary because its
+        # string is interpolated into five seat prompts and a judge's prompt is no place
+        # for text a remote server chose. This string reaches a human: the timeline, and
+        # one inbox row once the budget is spent. The likeliest failure here is a `gh`
+        # with read credentials and no write scope, and "HTTP 403: Resource not
+        # accessible" is the whole diagnosis — a fixed phrase would send the reader back
+        # to the log for the only fact that matters. Full detail is logged either way.
         log.info("auto-merge of %s failed: %s", url, detail)
-        raise AutoMergeRefused(f"GitHub refused the merge: {detail[:300]}")
+        raise MergeFailed(f"GitHub refused the merge: {detail[:300]}")
     log.info("auto-merge landed %s at %s under approval %s", url, sha[:10],
              approval["id"])
     return {"wo_id": wo_id, "pr_url": url, "head_sha": sha,

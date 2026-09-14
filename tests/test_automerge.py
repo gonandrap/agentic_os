@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import automerge, gate_rules, gates, ops
+from jarvis import automerge, db, gate_rules, gates, ops
 from jarvis.catalog import ValidationConfig, load_catalog
 from jarvis.daemon import Daemon
 from jarvis.github import PullRequest
@@ -60,11 +60,26 @@ def cfg(**over) -> ValidationConfig:
 WO = {"id": "wo-1", "status": "waiting_pr_merge", "pr_url": PR, "title": "t"}
 
 
+def decide(round_row, wo=WO, pull=None, config=None, **kw):
+    """`automerge.decide` with `validated_head` derived exactly as the store derives it.
+
+    The predicate is passed IN — that is the point of the signature — so the helper
+    mirrors `ProjectStore.validated_head` rather than reaching into the row a second way.
+    A dedicated test below pins the two against each other on a real store.
+    """
+    head = None
+    if round_row is not None and round_row.get("outcome") == "passed":
+        head = str(round_row.get("head_sha") or "") or None
+    return automerge.decide(round_row, wo, pull if pull is not None else pr(),
+                            config if config is not None else cfg(),
+                            validated_head=kw.pop("validated_head", head), **kw)
+
+
 # -- `decide`: the condition table, both directions -----------------------------------
 
 
 def test_the_panel_passed_the_commit_at_the_head_and_ci_is_green():
-    decision = automerge.decide(rnd(), WO, pr(), cfg())
+    decision = decide(rnd())
     assert decision.armed
     assert decision.judged_sha == JUDGED and decision.round_n == 2
 
@@ -76,7 +91,7 @@ def test_the_panel_passed_the_commit_at_the_head_and_ci_is_green():
 def test_neither_half_of_the_switch_arms_it_alone(kw, code):
     """`auto_merge` is read BESIDE `enabled`, never instead of it: the acceptance this
     rides on is the panel's, so turning the panel off must stop the merges with it."""
-    assert automerge.decide(rnd(), WO, pr(), ValidationConfig(
+    assert decide(rnd(), config=ValidationConfig(
         **{"enabled": True, "auto_merge": True, **kw})).code == code
 
 
@@ -86,14 +101,14 @@ def test_only_a_work_order_parked_behind_its_pull_request_merges(status):
     """`needs_review` is the one worth naming: it means a human owes a decision — a panel
     escalation, a closed pull request, a pending assumption — and the machine does not
     merge over a human's outstanding decision."""
-    decision = automerge.decide(rnd(), {**WO, "status": status}, pr(), cfg())
+    decision = decide(rnd(), wo={**WO, "status": status})
     assert not decision.armed and decision.code == automerge.HELD_STATUS
 
 
 def test_an_assumption_still_waiting_for_the_user_holds_the_merge():
     """Redundant with the status check via `ops.land_when_cleared`, and re-checked
     because the redundancy is the point — two-gates-not-a-chain."""
-    decision = automerge.decide(rnd(), WO, pr(), cfg(), pending_assumptions=True)
+    decision = decide(rnd(), pending_assumptions=True)
     assert not decision.armed and decision.code == automerge.HELD_ASSUMPTIONS
 
 
@@ -102,33 +117,33 @@ def test_only_a_passed_round_arms_it_and_a_panel_that_never_answered_does_not(ou
     """Issue #235: the panel has died silently on a Claude usage limit, leaving the round
     `pending` or `failed`. The predicate is "the latest round PASSED" and not "no round
     was rejected" precisely so that a review nobody completed reads as not validated."""
-    decision = automerge.decide(rnd(outcome=outcome), WO, pr(), cfg())
+    decision = decide(rnd(outcome=outcome))
     assert not decision.armed and decision.code == automerge.HELD_NOT_PASSED
 
 
 def test_a_work_order_the_panel_never_judged_is_not_merged():
-    decision = automerge.decide(None, WO, pr(), cfg())
+    decision = decide(None)
     assert not decision.armed and decision.code == automerge.HELD_NOT_PASSED
 
 
 def test_a_round_that_recorded_no_commit_never_reads_as_matching():
     """`''` is the fail-closed value: a worktree packet, or a round written before the
     column existed. "Not recorded" must never read as "matches"."""
-    decision = automerge.decide(rnd(head_sha=""), WO, pr(), cfg())
+    decision = decide(rnd(head_sha=""))
     assert not decision.armed and decision.code == automerge.HELD_SHA_UNRECORDED
 
 
 def test_a_head_that_moved_after_the_pass_holds_the_merge_and_says_both_commits():
     """THE CASE THE WHOLE DESIGN EXISTS FOR. The reason line names both commits because
     it is what the user reads to decide whether to merge it themselves."""
-    decision = automerge.decide(rnd(), WO, pr(head_sha=PUSHED), cfg())
+    decision = decide(rnd(), pull=pr(head_sha=PUSHED))
     assert not decision.armed and decision.code == automerge.HELD_SHA_MOVED
     assert JUDGED[:10] in decision.reason and PUSHED[:10] in decision.reason
 
 
 def test_a_pull_request_with_no_head_sha_at_all_is_not_a_match():
     """GitHub answering null is "unknown", and unknown is not equal to anything."""
-    assert not automerge.decide(rnd(), WO, pr(head_sha=None), cfg()).armed
+    assert not decide(rnd(), pull=pr(head_sha=None)).armed
 
 
 @pytest.mark.parametrize("kw", [
@@ -146,8 +161,48 @@ def test_a_pull_request_with_no_head_sha_at_all_is_not_a_match():
     {"checks": (check("unit"), check("evals", "", "QUEUED"))},
 ])
 def test_github_must_positively_say_open_mergeable_green_and_clean(kw):
-    decision = automerge.decide(rnd(), WO, pr(**kw), cfg())
+    decision = decide(rnd(), pull=pr(**kw))
     assert not decision.armed and decision.code == automerge.HELD_PR_NOT_READY
+
+
+def test_decide_takes_the_predicate_and_re_derives_none_of_it():
+    """`validated_head` IS the rule; `round_row` only supplies the wording.
+
+    Asserted the only way that cannot pass by accident: hand it a round that says
+    `passed` on the commit at the head — everything `decide` would need to conclude
+    "merge it" if it looked — while the predicate says no. If `decide` re-derived the
+    rule from the row, this arms. It must hold instead, which is what makes
+    `ProjectStore.validated_head` the single home rather than a second copy that rots.
+    """
+    decision = decide(rnd(), validated_head=None)
+    assert not decision.armed and decision.code == automerge.HELD_SHA_UNRECORDED
+    # ...and the other direction: the predicate alone is enough to arm it.
+    assert decide(rnd(outcome="passed", head_sha="ignored"),
+                  validated_head=JUDGED).armed
+
+
+def test_the_store_and_the_decision_agree_about_what_validated_means(started, project):
+    """The two halves of that split, pinned against each other on a real store, so the
+    helper above cannot drift into testing a rule the OS does not run."""
+    store = ProjectStore(project)
+    wo = ops.create_work_order("proj_a", "ship it")
+    row = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
+
+    assert store.validated_head(wo["id"]) is None          # pending
+    store.set_validation_head(row["id"], JUDGED)
+    assert store.validated_head(wo["id"]) is None          # still pending
+    store.close_validation_round(row["id"], "rejected", "")
+    assert store.validated_head(wo["id"]) is None          # judged, and refused
+    store.close_validation_round(row["id"], "passed", "")
+    assert store.validated_head(wo["id"]) == JUDGED
+
+    # A LATER round supersedes it, whatever the earlier one said.
+    later = store.open_validation_round(wo_id=wo["id"], fingerprint="fp2")
+    assert store.validated_head(wo["id"]) is None
+    store.set_validation_head(later["id"], "")
+    store.close_validation_round(later["id"], "passed", "")
+    assert store.validated_head(wo["id"]) is None          # passed, nothing recorded
+    store.close()
 
 
 def test_decide_touches_no_store_no_clock_and_no_network():
@@ -630,10 +685,19 @@ def test_a_panel_that_never_answered_does_not_merge(started, project, fake_gh):
     assert store.list_approvals(wo["id"]) == []
 
 
-def test_the_merge_stops_after_three_failures_on_one_commit(started, project, fake_gh):
-    """The likeliest first failure of this whole feature is the daemon's `gh` having read
-    credentials but no write scope, which no amount of retrying fixes. The work order is
-    not moved and not flagged: hand-merging still works."""
+def test_an_approved_merge_is_attempted_once_and_the_failure_is_told_once(
+        started, project, fake_gh):
+    """ONE APPROVAL BUYS ONE ATTEMPT, and the refusal is said out loud exactly once.
+
+    The likeliest first failure of this whole feature is the daemon's `gh` having read
+    credentials but no write scope, which no amount of retrying fixes. What bounds the
+    retries is `GRANT_USES = 1`, not a counter: every later poll refuses inside `apply`
+    before reaching GitHub, and those refusals are neither recorded nor counted — writing
+    them as `automerge_failed` made the user's inbox row quote "the grant is spent" as
+    the reason the merge failed instead of the 403 that actually caused it.
+
+    The work order is not moved and not flagged: hand-merging still works.
+    """
     store, wo = arm(started, project, auto_merge=True)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
                    head_sha=JUDGED)
@@ -641,15 +705,108 @@ def test_the_merge_stops_after_three_failures_on_one_commit(started, project, fa
     approval = store.list_approvals(wo["id"])[0]
     gates.apply_decision(store, approval["id"], "approved", "ok", "neo",
                          project="proj_a")
-    fake_gh.fail("HTTP 403: Resource not accessible by integration")
+    fake_gh.fail_merge("HTTP 403: Resource not accessible by integration")
 
     for _ in range(5):
         poll(started, store)
 
-    assert len(store.events_of_kind(wo["id"], "automerge_failed")) <= \
-        automerge.AUTO_MERGE_MAX_ATTEMPTS
+    # EXACTLY once, not "at most once": this assertion passed vacuously at zero while the
+    # fixture was failing `gh pr view` as well, so the merge was never attempted.
+    assert len([c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]) == 1
+    assert len(store.events_of_kind(wo["id"], "automerge_failed")) == 1
+    assert "403" in db.from_json(
+        store.events_of_kind(wo["id"], "automerge_failed")[0]["payload"], {})["reason"]
     row = store.get_work_order(wo["id"])
     assert row["status"] == "waiting_pr_merge" and not row["attention_reason"]
+    # One inbox row, quoting what GitHub said and not what the spent grant said.
+    from jarvis.central_store import CentralStore
+    central = CentralStore()
+    try:
+        told = [i for i in central.unacked_inbox()
+                if (i["wo_id"] or "") == wo["id"]]
+    finally:
+        central.close()
+    assert len(told) == 1
+    assert "403" in told[0]["body"] and "grant" not in told[0]["body"]
+
+
+def test_an_approval_does_not_go_on_claiming_a_merge_that_will_never_happen(
+        started, project, fake_gh):
+    """THE DEFECT A FIXED-ORDER SCAN HID. `gates.apply_decision` writes
+    `automerge_decided` on every verdict, so reading the kinds in a fixed finality order
+    let an approval outrank every later event for ever: the line went on saying
+    "approved by neo" about a pull request whose head had since moved and which was
+    therefore never going to merge. That is the exact case the line exists for."""
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_sha=JUDGED)
+    poll(started, store)
+    approval = store.list_approvals(wo["id"])[0]
+    gates.apply_decision(store, approval["id"], "approved", "the panel read it", "neo",
+                         project="proj_a")
+    assert ops.automerge_state(store, wo)["kind"] == "automerge_decided"
+
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_sha=PUSHED)
+    poll(started, store)
+
+    state = ops.automerge_state(store, store.get_work_order(wo["id"]))
+    assert state["kind"] == "automerge_held"
+    assert PUSHED[:10] in state["line"] and "approved" not in state["line"]
+
+
+def test_an_approval_does_not_outrank_the_merge_that_kept_failing(started, project,
+                                                                  fake_gh):
+    """The other half of the same defect: three failed attempts under an approval must
+    not read as "approved by neo", or the one surface that could say the merge is stuck
+    says the opposite."""
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_sha=JUDGED)
+    poll(started, store)
+    approval = store.list_approvals(wo["id"])[0]
+    gates.apply_decision(store, approval["id"], "approved", "ok", "neo",
+                         project="proj_a")
+    fake_gh.fail_merge("HTTP 403: Resource not accessible by integration")
+
+    poll(started, store)
+
+    state = ops.automerge_state(store, store.get_work_order(wo["id"]))
+    assert state["kind"] == "automerge_failed"
+    assert "403" in state["line"]
+
+
+def test_a_merge_is_terminal_and_outranks_anything_stamped_later(started, project,
+                                                                 fake_gh):
+    """The one exception to newest-wins, asserted rather than assumed: nothing follows a
+    merge, and a completed work order must never render as held."""
+    store, wo = arm(started, project, auto_merge=True)
+    store.add_event(wo["id"], "automerge_merged", {
+        "approval_id": 1, "round_id": 1, "round": 1, "head_sha": JUDGED})
+    store.add_event(wo["id"], "automerge_held", {
+        "code": "sha_moved", "reason": "later, and wrong", "judged_sha": JUDGED,
+        "head_sha": PUSHED, "round": 1})
+
+    state = ops.automerge_state(store, wo)
+
+    assert state["kind"] == "automerge_merged" and "merged by the OS" in state["line"]
+
+
+def test_a_pending_request_is_not_re_proposed_every_tick(started, project, fake_gh):
+    """A request with Neo, or escalated to the user, is somebody's business and not this
+    loop's. Re-proposing opened a NeoStore every two minutes for as long as the pull
+    request stayed open, to discover each time that `propose` would refuse."""
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_sha=JUDGED)
+    poll(started, store)
+    assert store.list_approvals(wo["id"])[0]["status"] == "pending"
+
+    sql: list[str] = []
+    store.conn.set_trace_callback(sql.append)
+    poll(started, store)
+    store.conn.set_trace_callback(None)
+
+    assert len(store.list_approvals(wo["id"])) == 1
+    # The tick reads the approval and stops there: nothing is written, and no second
+    # request, question or link is created.
+    assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
 
 
 def test_the_work_order_says_why_it_did_not_merge_itself(started, project, fake_gh,

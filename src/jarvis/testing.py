@@ -890,6 +890,14 @@ elif argv[:2] == ["pr", "merge"]:
     # when the head has moved, so the fake refuses too rather than merging whatever it
     # holds — a fake that ignored the flag would let a test pass while the real thing
     # merged an unjudged commit.
+    # Failing the WRITE alone, which `FAKE_GH_FAIL` cannot express: it fails every call,
+    # so a test using it never reaches the merge at all and any assertion about how the
+    # merge failed passes vacuously. The real first failure of auto-merge is a `gh` with
+    # read credentials and no write scope, and that is exactly this shape.
+    merge_fail = os.environ.get("FAKE_GH_FAIL_MERGE")
+    if merge_fail:
+        sys.stderr.write(merge_fail + "\n")
+        sys.exit(1)
     prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
     url = argv[2] if len(argv) > 2 else ""
     pr = prs.get(url)
@@ -1114,6 +1122,17 @@ def fake_gh(tmp_path, monkeypatch):
         def fail(self, message: str) -> None:
             """Make every subsequent `gh` call fail with `message` on stderr."""
             monkeypatch.setenv("FAKE_GH_FAIL", message)
+
+        def fail_merge(self, message: str) -> None:
+            """Fail `gh pr merge` and NOTHING else — reads keep working.
+
+            `fail()` is the wrong tool for testing a failed merge: it fails `pr view`
+            too, so the poll never gets as far as merging and every assertion about the
+            merge passes without the merge ever having been attempted. This is also the
+            shape of the likeliest real failure — credentials that can read and not
+            write.
+            """
+            monkeypatch.setenv("FAKE_GH_FAIL_MERGE", message)
 
         def set_pr(self, pr_url: str, state: str, merged_at: str | None = None,
                    mergeable: str | None = None, base_ref: str = "main",
