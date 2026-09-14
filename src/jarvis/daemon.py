@@ -2905,35 +2905,51 @@ class Daemon:
         looks outside the machine, and it exists so the user does not have to type
         `jarvis wo done` after every merge they already performed.
 
-        Five answers, from `github.pr_view`:
+        Three answers about the pull request AS A WHOLE, from `github.pr_view`, and each
+        of them ends the poll for that work order:
 
         * **merged** — the work landed; the work order ends (`ops.complete_merged`).
         * **closed, unmerged** — someone refused the work; it goes to `needs_review`
           and asks for the user (`ops.record_pr_closed`).
-        * **open and conflicting** — the worker is asked to resolve it, so the user
-          never has to (`ops.PR_CONFLICT`, and the whole of
+        * **open, and recorded as closed** — the refusal was withdrawn
+          (`_note_reopened`).
+
+        An open pull request that is none of those is then judged on TWO INDEPENDENT
+        AXES, healing before repair, because it can be well on one and broken on the
+        other:
+
+        * **merges again** / **conflicts** — the conflict episode is closed, or the
+          worker is asked to resolve it so the user never has to (`ops.PR_CONFLICT`, and
           docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md).
-        * **open with a failing check** — the same, with a different message
-          (`ops.PR_CHECKS`, and
+        * **green again** / **has a failing check** — the same for CI (`ops.PR_CHECKS`,
+          and
           docs/superpowers/specs/2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md).
-          A check that is merely not green is NOT this: `github.RED_CONCLUSIONS`.
-        * **open, mergeable and green** — nothing to do, and nothing written unless a
-          repair episode is being closed.
+          A check that is merely not green is NOT a failing one
+          (`github.RED_CONCLUSIONS`), and it is not a green one either
+          (`PullRequest.checks_green`).
 
-        THE LAST ONE IS THE BUDGET, because it is the overwhelmingly common case: one
-        `gh` call and THREE indexed reads per pull request, no write. The three are one
-        per question this branch has to ask the timeline — was a closure already
-        reported (`pr_closure_told`), is a conflict episode open, is a checks episode
-        open — and they are reads of `wo_events` by `(wo_id, kind)`, not scans. Nothing
-        else on the path touches the database: the work-order row itself is re-read only
-        when a clear has just run, and the step's `list_work_orders` is one query for the
-        whole project however many pull requests it has.
+        MERGEABLE AND GREEN IS THE BUDGET, because it is the overwhelmingly common case:
+        one `gh` call and THREE indexed reads per pull request, no write. The three are
+        one per question the timeline has to answer — was a closure already reported
+        (`pr_closure_told`), is a conflict episode open, is a checks episode open — and
+        they are reads of `wo_events` by `(wo_id, kind)`, not scans. Nothing else on that
+        path touches the database: the work-order row itself is re-read only when a clear
+        has just run, and the step's `list_work_orders` is one query for the whole project
+        however many pull requests it has.
 
-        That sentence used to say "one indexed read" and had been false since this body
-        was rewritten. It is a claim worth keeping honest rather than deleting —
-        `tests/test_pr_checks.py` counts the statements, so a fourth read fails a test
-        instead of quietly costing the fleet a query every two minutes per open pull
-        request.
+        STILL THREE AFTER THE HEALING WAS HOISTED out of the old `else`, which is worth
+        saying because the count was reviewed against a body where those two reads were
+        the fall-through: a green pull request asked both questions then and asks both
+        now. What changed is the BROKEN case, which pays one more — the axis that is
+        well is asked about even while the other is being repaired, which is exactly the
+        read that was missing. One indexed read per two minutes per broken pull request
+        is the price of never telling the user about a conflict that is over.
+
+        The sentence above has now been recounted twice: it said "one indexed read" until
+        the rewritten body made that false, and it is re-derived here rather than deleted
+        because `tests/test_pr_checks.py` counts the statements off the connection — a
+        fourth read on the common path fails a test instead of quietly costing the fleet
+        a query every two minutes per open pull request.
 
         EVERY STATUS THAT CARRIES A PULL REQUEST IS POLLED, not `waiting_pr_merge`
         alone. A work order that escalated into `needs_review` behind a red build was
@@ -3002,28 +3018,39 @@ class Daemon:
                     # about a pull request whose status line still called it dead.
                     log.info("[%s] %s is open again — %s", project.name,
                              wo["pr_url"], wo["id"])
-                elif pr.conflicting:
-                    self.heal_pull_request(project, store, wo, ops.PR_CONFLICT,
-                                           "conflicts",
-                                           base=pr.base_ref or "its base branch")
-                elif pr.failing:
-                    self.heal_pull_request(
-                        project, store, wo, ops.PR_CHECKS,
-                        f"has failing checks ({', '.join(pr.failing)})",
-                        failing=", ".join(pr.failing),
-                        # BEHIND rides along with a nudge that was going out anyway and
-                        # never causes one: spec §5.
-                        behind=(ops.PR_BEHIND_NOTE.format(base=pr.base_ref or "its base")
-                                if pr.behind else ""))
                 else:
+                    # HEALING IS JUDGED PER AXIS, AND BEFORE THE REPAIRS — never as the
+                    # fall-through of them. A pull request can be well on one axis and
+                    # broken on the other, and the two episodes are separate budgets, so
+                    # each clear runs on its OWN signal: `mergeable_now` closes the
+                    # conflict episode whatever CI says, `checks_green` closes the checks
+                    # episode whatever the merge state says.
+                    #
+                    # Both of these used to sit inside an `else` reached only when the
+                    # pull request was well on BOTH axes, which defeated the separate-
+                    # budgets claim this comment makes. A branch whose conflict the
+                    # worker had just resolved but whose build was red took the `failing`
+                    # arm below and never reached the conflict clear: the episode stayed
+                    # open, went on accruing attempts, and once they were spent
+                    # PR_CONFLICT_BLOCKER — first in `invariants.PR_REPAIR_BLOCKERS` —
+                    # took `attention_reason` and told the user about merge conflicts
+                    # that no longer existed, over the red build they actually needed.
+                    # Derived-but-outranked is the same silence as never derived
+                    # (kn-057a6dd3): this work order's own defect, one level up in the
+                    # branch chain. A stale episode is also a budget already spent when
+                    # the next real conflict arrives, and what `ops.pr_repair_origin`
+                    # reads back at settlement.
+                    #
+                    # AFTER the three arms above, never before: merged, closed-unmerged
+                    # and reopened are terminal answers about the pull request as a
+                    # whole, and the first two already end every episode themselves
+                    # (`ops.record_pr_closed`). Clearing here as well would write the
+                    # same event twice.
                     healed = pr.mergeable_now and ops.clear_pr_repair(
                         store, wo, ops.PR_CONFLICT)
                     if healed:
                         log.info("[%s] %s merges again — %s stopped conflicting",
                                  project.name, wo["pr_url"], wo["id"])
-                    # Not `elif`: a pull request can stop conflicting and go green in the
-                    # same poll, and the two episodes are separate budgets.
-                    #
                     # `checks_green`, NOT "nothing is failing" — see the property. The
                     # tick right after a worker pushes its fix has every check QUEUED,
                     # and closing the episode there would hand a fix that does not work
@@ -3038,6 +3065,24 @@ class Daemon:
                         if ops.clear_pr_repair(store, row, ops.PR_CHECKS):
                             log.info("[%s] %s is green again — %s stopped failing",
                                      project.name, wo["pr_url"], wo["id"])
+                    # ...and only now the repairs, on whichever axis is still broken.
+                    # `wo` is deliberately not re-read for them: `ops.nudge_pr_repair`
+                    # reads the row for its session, its id, its URL and its status, and
+                    # a clear touches none of those — only `attention_reason`, which is
+                    # why the re-read above is where it is and not here.
+                    if pr.conflicting:
+                        self.heal_pull_request(project, store, wo, ops.PR_CONFLICT,
+                                               "conflicts",
+                                               base=pr.base_ref or "its base branch")
+                    elif pr.failing:
+                        self.heal_pull_request(
+                            project, store, wo, ops.PR_CHECKS,
+                            f"has failing checks ({', '.join(pr.failing)})",
+                            failing=", ".join(pr.failing),
+                            # BEHIND rides along with a nudge that was going out anyway
+                            # and never causes one: spec §5.
+                            behind=(ops.PR_BEHIND_NOTE.format(
+                                base=pr.base_ref or "its base") if pr.behind else ""))
             except Exception:  # noqa: BLE001
                 log.exception("[%s] settling %s against its PR failed", project.name,
                               wo["id"])

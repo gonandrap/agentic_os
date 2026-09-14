@@ -507,14 +507,24 @@ def test_a_conflict_outranks_a_red_build_when_both_budgets_are_spent(
         started, project, fake_gh, reviewing):
     """`PR_REPAIR_BLOCKERS` is ORDERED, and one site deriving from it is only half the
     answer — the order it derives in is the other half. A pull request that will not
-    merge at all is not waiting on its checks, so the conflict is the one to act on."""
-    fake_gh.set_pr(PR, "OPEN", mergeable="CONFLICTING", base_ref="main", checks=RED)
+    merge at all is not waiting on its checks, so the conflict is the one to act on.
+
+    THE ORDER OF THE TWO PHASES IS THE WHOLE SETUP, and it used to be the other way
+    round: spend the conflict budget, then let the branch merge again and spend the
+    checks one. That reached this state only because the poll left the conflict episode
+    open after the conflict was over — the defect this file's crossed-state tests below
+    are about. Both budgets can still genuinely be spent at once, but only in this
+    order: the checks episode while the branch merged, and then the branch going stale
+    under it. A CONFLICTING pull request never spends the checks budget, because the
+    conflict repair outranks the checks one."""
+    red(fake_gh)
     store = ProjectStore(project)
     for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
         poll(started, store)
         delivered(store, reviewing["id"])
-    # the conflict is gone, so the poll can finally see the red build underneath it
-    red(fake_gh)
+    # ...and now the base moves under it. Nothing about a conflict makes a red build
+    # green, so the checks episode stays open while this one spends.
+    fake_gh.set_pr(PR, "OPEN", mergeable="CONFLICTING", base_ref="main", checks=RED)
     for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
         poll(started, store)
         delivered(store, reviewing["id"])
@@ -522,6 +532,77 @@ def test_a_conflict_outranks_a_red_build_when_both_budgets_are_spent(
     blockers = true_blockers(store, store.get_work_order(reviewing["id"]))
     assert blockers[:2] == [PR_CONFLICT_BLOCKER, PR_CHECKS_BLOCKER]
     assert [v.invariant for v in check_project(store)] == []
+
+
+# -- the two axes are separate budgets ----------------------------------------------
+#
+# A pull request can be well on one axis and broken on the other, and the poll has to
+# close the episode that is over WHILE it repairs the one that is not. Both clears used
+# to live in a fall-through `else` reached only when the pull request was clean on both,
+# so in exactly the crossed state they were unreachable — the episode stayed open, went
+# on accruing attempts, and once they were spent PR_CONFLICT_BLOCKER (first in
+# PR_REPAIR_BLOCKERS) took `attention_reason` and described a problem that no longer
+# existed, over the one that did. Derived-but-outranked is the same silence as never
+# derived: kn-057a6dd3, one level up in the branch chain.
+
+
+def test_a_resolved_conflict_clears_even_while_the_build_is_red(started, project,
+                                                                fake_gh, reviewing):
+    """THE CROSSED STATE. The worker got the merge conflict resolved and the build is
+    still red: the conflict episode is over and must say so, and the reason the user
+    reads has to be the red build — the thing they can still act on."""
+    store = ProjectStore(project)
+    # the checks budget first, then the conflict one — the only order that spends both
+    red(fake_gh)
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
+        poll(started, store)
+        delivered(store, reviewing["id"])
+    fake_gh.set_pr(PR, "OPEN", mergeable="CONFLICTING", base_ref="main", checks=RED)
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
+        poll(started, store)
+        delivered(store, reviewing["id"])
+    assert store.get_work_order(reviewing["id"])["attention_reason"] == \
+        PR_CONFLICT_BLOCKER
+    assert store.pr_repair_attempts(reviewing["id"], "conflict") == PR_REPAIR_MAX_ATTEMPTS
+
+    red(fake_gh)                       # merges again; the build is still red
+    poll(started, store)
+
+    assert store.pr_repair_attempts(reviewing["id"], "conflict") == 0
+    assert any(e["kind"] == "pr_conflict_cleared"
+               for e in store.list_events(reviewing["id"]))
+    blockers = true_blockers(store, store.get_work_order(reviewing["id"]))
+    assert blockers[0] == PR_CHECKS_BLOCKER
+    assert PR_CONFLICT_BLOCKER not in blockers
+    # ...and a conflict next week starts from one attempt, not from four
+    fake_gh.set_pr(PR, "OPEN", mergeable="CONFLICTING", base_ref="main", checks=RED)
+    poll(started, store)
+    assert store.pr_repair_attempts(reviewing["id"], "conflict") == 1
+
+
+def test_a_green_build_clears_even_while_the_branch_conflicts(started, project,
+                                                              fake_gh, reviewing):
+    """THE MIRROR, and the half that would otherwise be left to symmetry. CI went green
+    again while the branch went stale: the checks episode is over, whatever the merge
+    state says, and the worker is asked about the conflict in the same poll."""
+    red(fake_gh)
+    store = ProjectStore(project)
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
+        poll(started, store)
+        delivered(store, reviewing["id"])
+    assert store.get_work_order(reviewing["id"])["attention_reason"] == PR_CHECKS_BLOCKER
+
+    fake_gh.set_pr(PR, "OPEN", mergeable="CONFLICTING", base_ref="main", checks=GREEN)
+    poll(started, store)
+
+    assert store.pr_repair_attempts(reviewing["id"], "checks") == 0
+    assert any(e["kind"] == "pr_checks_cleared"
+               for e in store.list_events(reviewing["id"]))
+    assert PR_CHECKS_BLOCKER not in true_blockers(
+        store, store.get_work_order(reviewing["id"]))
+    # the same poll still repairs the axis that IS broken
+    assert store.pr_repair_attempts(reviewing["id"], "conflict") == 1
+    assert store.queued_messages(reviewing["id"])[0]["source"] == "pr-conflict"
 
 
 def test_a_refused_pull_request_stops_saying_do_not_merge_it(started, project, fake_gh,
