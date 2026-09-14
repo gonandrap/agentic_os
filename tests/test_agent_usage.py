@@ -18,7 +18,9 @@ Three things are worth a test here and the rest is arithmetic:
 
 from __future__ import annotations
 
+import ast
 import json
+from pathlib import Path
 
 import pytest
 
@@ -109,7 +111,7 @@ def test_the_recorder_binds_everything_but_the_usage(jarvis_home):
     sink({"output": 3})
 
     assert seen == [("digest", {"usage": {"output": 3}, "project": "proj_a",
-                                "wo_id": "wo-5", "label": "", "model": "",
+                                "wo_id": "wo-5", "fo_id": "", "label": "", "model": "",
                                 "question_id": None})]
 
 
@@ -266,6 +268,104 @@ def test_the_fleet_total_carries_the_os_spend(asked):
     assert totals["os_calls"] == 1
     assert totals["total_cost_usd"] == pytest.approx(
         round(totals["list_cost_usd"] + totals["os_cost_usd"], 2))
+
+
+# -- the next panel, and every one after it -------------------------------------------
+#
+# The validation panel (fo-e353491c) is up to three rounds of five headless calls on
+# EVERY unit in the fleet — by volume the largest thing the OS will ever spend on itself.
+# It is not written yet. These are the guards that make it, and anything like it,
+# impossible to build without the spend being recorded.
+
+
+SRC = Path(__file__).resolve().parent.parent / "src" / "jarvis"
+
+
+def _modules() -> list[tuple[str, ast.Module]]:
+    return [(p.name, ast.parse(p.read_text())) for p in sorted(SRC.glob("*.py"))]
+
+
+def _calls_to(tree: ast.Module, name: str) -> list[ast.Call]:
+    return [n for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == name]
+
+
+def test_no_os_call_site_uses_the_transport_that_discards_its_accounting():
+    """`run_headless` returns the text and drops the usage on the floor. That is exactly
+    how the OS's spend went unrecorded for so long, and it is a one-word mistake to make
+    again — the two functions differ by a suffix. Inside `src/jarvis`, every caller must
+    use `run_headless_result`."""
+    offenders = [name for name, tree in _modules()
+                 if name != "claude_cli.py" and _calls_to(tree, "run_headless")]
+
+    assert offenders == [], (
+        f"{offenders} calls claude_cli.run_headless, which discards the usage envelope. "
+        "Use run_headless_result and record what comes back (see agent_usage).")
+
+
+def test_a_module_that_calls_a_model_also_carries_an_accounting_seam():
+    """Every module that spends the OS's tokens must SAY so in its own source: either it
+    records (`agent_usage`) or it hands the envelope to a caller that does (`on_usage`).
+
+    This is the guard for the panel that does not exist yet. A new `validation.py` with
+    five seat calls and no recording turns this red on the first run, which is the only
+    moment anyone is in a position to fix it — the calls it makes leave no transcript
+    that could be attributed afterwards.
+    """
+    for name, tree in _modules():
+        if not _calls_to(tree, "run_headless_result") or name == "claude_cli.py":
+            continue
+        source = (SRC / name).read_text()
+        assert "agent_usage" in source or "on_usage" in source, (
+            f"{name} calls a model but neither records the usage (agent_usage.record) "
+            "nor passes it on (on_usage). OS spend that is not recorded as it happens "
+            "cannot be recovered later — see the module docstring of agent_usage.")
+
+
+def test_the_validator_seat_kind_is_reserved_before_its_code_exists():
+    """So the panel's implementer records against a kind the report and the dashboard
+    already have a word for, instead of inventing one the UI renders as a slug."""
+    assert agent_usage.describe("validator_seat") == "validation seat"
+
+
+def test_a_feature_orders_own_spend_is_attributed_to_the_feature(started):
+    """The validation panel's subject can be a FEATURE order, which has no work order to
+    bill. Without somewhere to put that, its dearest calls would land in the line for
+    spend nothing caused."""
+    fo = ops.create_feature_order("proj_a", "a feature to validate", "do the thing")
+    agent_usage.record("validator_seat", project="proj_a", fo_id=fo["id"],
+                       label="tester", model="claude-opus-5",
+                       usage={"total_cost_usd": 0.03, "input": 10, "cache_write": 9_000,
+                              "cache_read": 40_000, "output": 900})
+
+    report = ops.cost_report(target=fo["id"], project="proj_a")
+
+    assert report["os_own"]["os_calls"] == 1
+    assert report["totals"]["os_cost_usd"] == pytest.approx(
+        report["os_own"]["os_cost_usd"], abs=0.01)
+    assert [c["label"] for c in report["os_calls_detail"]] == ["tester"]
+    # And the fleet total counts it, on its own line: it is against no row of the table.
+    fleet = ops.cost_report()
+    assert fleet["os_on_feature_orders"]["os_calls"] == 1
+    assert fleet["totals"]["os_cost_usd"] >= fleet["os_on_feature_orders"]["os_cost_usd"]
+
+
+def test_a_childs_spend_is_not_counted_twice_in_its_feature_orders_total(started):
+    """A call naming both the feature and one of its work orders belongs to the CHILD,
+    and the feature order's report already rolls its children up. Counting it in both
+    would inflate exactly the unit the reader is trying to size."""
+    daemon = started
+    fo = ops.create_feature_order("proj_a", "a feature with a child", "do the thing")
+    wo = ops.create_work_order("proj_a", "the child")
+    daemon.tick()
+    agent_usage.record("neo_answer", project="proj_a", wo_id=wo["id"], fo_id=fo["id"],
+                       model="claude-opus-5", usage={"total_cost_usd": 0.02, "output": 50})
+
+    report = ops.cost_report(target=fo["id"], project="proj_a")
+
+    assert report["os_own"]["os_calls"] == 0
+    assert ops.cost_report(target=wo["id"], project="proj_a")["units"][0]["os_calls"] == 1
 
 
 def test_deleting_a_work_order_takes_its_os_spend_with_it(asked):

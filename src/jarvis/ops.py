@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -2413,54 +2414,84 @@ def cost_report(project: str | None = None, target: str | None = None,
         try:
             for wo in store.list_work_orders(limit=limit, include_hidden=include_hidden):
                 units.append(_unit_row(name, wo, index, _turn_rows(store, wo["id"]),
-                                       os_groups.get(wo["id"], ())))
+                                       os_groups.by_wo.get(wo["id"], ())))
         finally:
             store.close()
     # Dearest first, counting what Jarvis spent on the order as part of what it cost —
     # otherwise a work order that asked Neo twenty questions sorts as though it were cheap.
     units.sort(key=lambda u: u["total_cost_usd"], reverse=True)
+    # Spend on feature orders THEMSELVES and on nothing in particular is in the fleet
+    # total and broken out beside it. It belongs in the total because the fleet really
+    # did pay for it; it is broken out because it appears against no row in the table,
+    # and a total that exceeds the sum of what is on screen has to say why.
+    on_features = _os_spend([g for gs in os_groups.by_fo.values() for g in gs])
+    unattributed = _os_spend(os_groups.loose)
     return {"scope": project or "fleet", "units": units,
-            **_rollup(units), "os_unattributed": _os_unattributed(os_groups)}
+            **_rollup(units, extra_os=(on_features, unattributed)),
+            "os_on_feature_orders": on_features, "os_unattributed": unattributed}
 
 
-def _os_groups(project: str | None = None) -> dict[str, list[dict[str, Any]]]:
-    """Every work order's OS-side call groups, in one query. See `_os_spend`.
+@dataclass
+class _OsGroups:
+    """The fleet's OS-side spend, split by what it was spent ON.
 
-    One read of `os.db` for the whole fleet rather than one per work order: this report
-    already walks every work order there is, and the OS's calls are all in one table.
+    Three buckets, because there are three answers to "which unit paid for this" and
+    collapsing them loses the only interesting one:
+
+    * `by_wo` — a work order caused it. Nearly everything today.
+    * `by_fo` — the FEATURE ORDER itself did, with no work order in the picture. A row
+      naming both belongs to the child and is deliberately NOT here: the feature order's
+      report already rolls its children up, and counting it twice would inflate exactly
+      the unit a reader is trying to size. The validation panel (fo-e353491c) is the
+      first caller that will fill this.
+    * `loose` — neither. Overhead the fleet paid for that no unit caused.
+    """
+
+    by_wo: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    by_fo: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    loose: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _os_groups(project: str | None = None) -> _OsGroups:
+    """Every unit's OS-side call groups, in one query. See `_os_spend`.
+
+    One read of `os.db` for the whole fleet rather than one per unit: this report already
+    walks every work order there is, and the OS's calls are all in one table.
     """
     central = CentralStore()
     try:
-        groups: dict[str, list[dict[str, Any]]] = {}
+        groups = _OsGroups()
         for row in central.agent_call_totals(project):
-            groups.setdefault(row["wo_id"] or "", []).append(row)
+            wo_id, fo_id = row["wo_id"] or "", row.get("fo_id") or ""
+            if wo_id:
+                groups.by_wo.setdefault(wo_id, []).append(row)
+            elif fo_id:
+                groups.by_fo.setdefault(fo_id, []).append(row)
+            else:
+                groups.loose.append(row)
         return groups
     finally:
         central.close()
 
 
-def _os_unattributed(groups: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
-    """OS spend that no work order caused (`agent_calls.wo_id = ''`).
-
-    Reported on its own line rather than folded into a work order or dropped. There is
-    none of it today — every OS call the OS makes is made for a question, and a question
-    always names a work order — but a total that silently omitted a future kind of
-    overhead would be wrong in the direction nobody checks.
-    """
-    return _os_spend(groups.get("", []))
-
-
-def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
+def _rollup(units: list[dict[str, Any]],
+            extra_os: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
     """Totals over the units that could actually be measured.
 
     Unmeasured units are counted separately rather than summed as zero, so the report
     can say how much of the fleet its total is speaking for.
+
+    `extra_os` carries OS spend that belongs to no unit in `units` — see `_OsGroups`.
     """
     measured = [u for u in units if u["found"]]
     worker_cost = round(sum(u["list_cost_usd"] for u in measured), 2)
     # Over ALL units, not just measured ones, for the same reason `recorded_cost_usd` is:
     # `agent_calls` is the OS's own record and does not depend on a transcript surviving.
-    os_cost = round(sum(u.get("os_cost_usd") or 0 for u in units), 2)
+    # `extra_os` is spend that belongs to no row of the table — a feature order's own
+    # validation rounds, or overhead nothing caused — and it is added rather than shown
+    # alongside, because it was really paid.
+    os_cost = round(sum(u.get("os_cost_usd") or 0 for u in units)
+                    + sum(e["os_cost_usd"] for e in extra_os), 2)
     return {
         "measured": len(measured),
         "unmeasured": len(units) - len(measured),
@@ -2475,10 +2506,14 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "total_cost_usd": round(worker_cost + os_cost, 2),
             "os_cost_usd": os_cost,
             "os_recorded_cost_usd": round(
-                sum(u.get("os_recorded_cost_usd") or 0 for u in units), 2),
-            "os_calls": sum(u.get("os_calls") or 0 for u in units),
-            "os_billed_input": sum(u.get("os_billed_input") or 0 for u in units),
-            "os_output": sum(u.get("os_output") or 0 for u in units),
+                sum(u.get("os_recorded_cost_usd") or 0 for u in units)
+                + sum(e["os_recorded_cost_usd"] for e in extra_os), 2),
+            "os_calls": (sum(u.get("os_calls") or 0 for u in units)
+                         + sum(e["os_calls"] for e in extra_os)),
+            "os_billed_input": (sum(u.get("os_billed_input") or 0 for u in units)
+                                + sum(e["os_billed_input"] for e in extra_os)),
+            "os_output": (sum(u.get("os_output") or 0 for u in units)
+                          + sum(e["os_output"] for e in extra_os)),
             "rewrite_cost_usd": round(sum(u["rewrite_cost_usd"] for u in measured), 2),
             "rewrite_excess": sum(u["rewrite_excess"] for u in measured),
             "resume_boundaries": sum(u["resume_boundaries"] for u in measured),
@@ -2508,7 +2543,7 @@ def _cost_for_target(target: str, project: str | None,
         finally:
             store.close()
         os_groups = _os_groups()
-        unit = _unit_row(name, wo, index, rows, os_groups.get(wo["id"], ()))
+        unit = _unit_row(name, wo, index, rows, os_groups.by_wo.get(wo["id"], ()))
         provenance, recorded, settled, rec_totals = _turn_summary(rows)
         # The per-turn breakdown is the single-work-order payload: it is what shows
         # WHERE in a bloated work order the cost rose, turn by turn. `os_calls_detail`
@@ -2529,20 +2564,31 @@ def _cost_for_target(target: str, project: str | None,
             try:
                 units.append(_unit_row(name, store.get_work_order(planner_id), index,
                                        _turn_rows(store, planner_id),
-                                       os_groups.get(planner_id, ())))
+                                       os_groups.by_wo.get(planner_id, ())))
             except KeyError:
                 pass
         units.extend(_unit_row(name, child, index, _turn_rows(store, child["id"]),
-                               os_groups.get(child["id"], ()))
+                               os_groups.by_wo.get(child["id"], ()))
                      for child in store.feature_children(fo["id"]))
     finally:
         store.close()
+    # What the OS spent on the FEATURE itself rather than on any of its work orders — a
+    # validation round on the feature, once fo-e353491c ships. It is not in any unit
+    # above, so it is added here explicitly or it would vanish from the one report that
+    # exists to say what a planned feature cost.
+    own = _os_spend(os_groups.by_fo.get(fo["id"], []))
     return {"scope": fo["id"], "title": fo["title"], "status": fo["status"],
-            "units": units, **_rollup(units)}
+            "units": units, **_rollup(units, extra_os=(own,)),
+            "os_own": own,
+            # `wo_id=""` is the filter, not an omission: a call naming both the feature
+            # and one of its work orders is the CHILD's, and the child is already a row
+            # in the table above.
+            "os_calls_detail": _os_calls_detail(wo_id="", fo_id=fo["id"])}
 
 
-def _os_calls_detail(wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
-    """Every OS call made for one work order, newest first, priced at list.
+def _os_calls_detail(wo_id: str | None = None, fo_id: str | None = None,
+                     limit: int = 200) -> list[dict[str, Any]]:
+    """Every OS call made for one unit, newest first, priced at list.
 
     Flattened for a table the same way `_turn_row` flattens a turn, and priced in the
     report's own currency so a reader can compare a Neo answer with a worker turn without
@@ -2553,7 +2599,7 @@ def _os_calls_detail(wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
 
     central = CentralStore()
     try:
-        rows = central.agent_calls(wo_id=wo_id, limit=limit)
+        rows = central.agent_calls(wo_id=wo_id, fo_id=fo_id, limit=limit)
     finally:
         central.close()
     out = []

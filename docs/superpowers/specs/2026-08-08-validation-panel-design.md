@@ -525,6 +525,33 @@ only returns a value. The daemon is the only place any two of them are known tog
 | `bootstrap.TEMPLATE_VERSION` | bumped | without it the new contract prose never reaches an already-bootstrapped project |
 | `assets/validator-seats/` | **not** `assets/agents/` | `bootstrap._rebuild` copytrees `agents/` into every planner's `.claude/agents/`, so a seat dropped there becomes a bogus subagent |
 | `panel.definition`'s `lru_cache` | key on the roster | `chair.md` will exist in two seat directories; a name-only key means the first one loaded poisons the other |
+| every seat call | `agent_usage.record("validator_seat", …)` | see below |
+
+### Every seat call must record what it cost
+
+Added by wo-0fea6edb, which instrumented the OS's own token spend
+(`docs/superpowers/specs/2026-08-16-what-jarvis-spends-on-itself.md`). By volume this
+panel will be the largest thing Jarvis spends on itself — five calls a round, up to three
+rounds, on every unit in the fleet — so it is the feature that makes the accounting worth
+having, and the one most damaging to omit.
+
+Three concrete obligations:
+
+1. Call `claude_cli.run_headless_result`, never `run_headless`; the latter discards the
+   usage envelope, and a guard test fails the build if anything in `src/jarvis` uses it.
+2. Record one row **per seat per round**, `kind="validator_seat"`, `label=<seat>` —
+   matching what Neo's panel does, and for the same reason: whether the panel earns its
+   price is a per-seat question. The kind is already reserved in
+   `agent_usage.KIND_LABELS`, and `agent_usage.record` takes the `record=` seam that
+   `panel._record` uses, so the store never touches a pool thread.
+3. Pass `wo_id=` for a work-order round and `fo_id=` for a feature-order one.
+   `agent_calls` carries both, and `ops.cost_report` already reports a feature order's own
+   spend separately from its children's.
+
+**None of this is recoverable after the fact.** A headless call has no session id Jarvis
+chose and its transcript names no unit, so a round that does not record when it returns is
+spend nobody can ever attribute — and this feature's whole enabling argument is measuring
+what it costs before turning it on.
 
 ---
 

@@ -45,10 +45,19 @@ log = logging.getLogger(__name__)
 #: an unknown kind records fine and shows up in the report under its own name — but the
 #: ones the OS emits today are named here so a reader of the schema knows what to expect,
 #: and so the UI can put a word to each.
+#:
+#: `validator_seat` IS RESERVED AHEAD OF ITS CODE, on purpose. The validation panel
+#: (fo-e353491c, `docs/superpowers/specs/2026-08-08-validation-panel-design.md`) is up to
+#: three rounds of five headless calls on EVERY unit in the fleet — by volume it will be
+#: the largest thing the OS spends on itself, dwarfing Neo. Naming it here means the
+#: implementer records against a kind the report and the dashboard already have a word
+#: for, and `tests/test_agent_usage.py` holds the guard that the calls get recorded at
+#: all. One row per seat per round, exactly as Neo's panel does.
 KIND_LABELS = {
     "neo_answer": "Neo answering",
     "panel_seat": "panel seat",
     "digest": "dashboard digest",
+    "validator_seat": "validation seat",
 }
 
 
@@ -57,15 +66,21 @@ def describe(kind: str) -> str:
 
 
 def record(kind: str, *, usage: Any = None, project: str = "", wo_id: str = "",
-           label: str = "", model: str = "", question_id: int | None = None,
-           ok: bool = True, store: CentralStore | None = None) -> int | None:
+           fo_id: str = "", label: str = "", model: str = "",
+           question_id: int | None = None, ok: bool = True,
+           store: CentralStore | None = None) -> int | None:
     """Persist one OS-side Claude call. Returns the row id, or None if nothing was written.
 
     `usage` takes either a `claude_cli.derive_turn_usage` envelope or the
     `HeadlessResult` it came on, because both are what a call site has to hand.
 
-    A call with no work order (`wo_id=""`) is still recorded: it is OS overhead that
-    belongs in the fleet total even though no single work order caused it.
+    Name the subject as precisely as the call knows it. `wo_id` for work made about one
+    work order; `fo_id` when the subject is a feature order itself (a validation round on
+    the feature, a planner's own deliberation) and there is no work order to point at.
+    Both, when a call is about a child and the parent's rollup should see it too.
+
+    A call with neither is still recorded: it is OS overhead that belongs in the fleet
+    total even though nothing in particular caused it.
     """
     if isinstance(usage, claude_cli.HeadlessResult):
         model = model or usage.model
@@ -75,9 +90,9 @@ def record(kind: str, *, usage: Any = None, project: str = "", wo_id: str = "",
     own = store is None
     try:
         store = store or CentralStore()
-        return store.add_agent_call(kind, project=project, wo_id=wo_id, label=label,
-                                    model=model, question_id=question_id, ok=ok,
-                                    usage=usage)
+        return store.add_agent_call(kind, project=project, wo_id=wo_id, fo_id=fo_id,
+                                    label=label, model=model, question_id=question_id,
+                                    ok=ok, usage=usage)
     except Exception:  # noqa: BLE001 — see the module docstring: never raise
         log.warning("could not record %s usage for %s", kind, wo_id or "the OS",
                     exc_info=True)
@@ -90,8 +105,8 @@ def record(kind: str, *, usage: Any = None, project: str = "", wo_id: str = "",
                 pass
 
 
-def recorder(kind: str, *, project: str = "", wo_id: str = "", label: str = "",
-             model: str = "", question_id: int | None = None,
+def recorder(kind: str, *, project: str = "", wo_id: str = "", fo_id: str = "",
+             label: str = "", model: str = "", question_id: int | None = None,
              record: Callable[..., Any] = record) -> Callable[[Any], None]:
     """`record` with everything but the usage already bound.
 
@@ -100,7 +115,7 @@ def recorder(kind: str, *, project: str = "", wo_id: str = "", label: str = "",
     work order it is spending for but the transport does not.
     """
     def sink(usage: Any) -> None:
-        record(kind, usage=usage, project=project, wo_id=wo_id, label=label,
-               model=model, question_id=question_id)
+        record(kind, usage=usage, project=project, wo_id=wo_id, fo_id=fo_id,
+               label=label, model=model, question_id=question_id)
 
     return sink

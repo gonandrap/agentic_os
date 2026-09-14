@@ -44,9 +44,17 @@
     the digest are one-shot calls with no session Jarvis owns, so they are recorded as
     they happen ({{ fmt_tok(totals.os_billed_input) }} in ·
     {{ fmt_tok(totals.os_output) }} out) and survive transcript pruning.
+    {#- Both are inside the jarvis figure already. They are named because they appear
+        against no row of the table below, and a total bigger than what is on screen has
+        to account for itself. -#}
+    {%- if report.os_on_feature_orders and report.os_on_feature_orders.os_calls %}
+      {{ report.os_on_feature_orders.os_calls }} of them
+      (~${{ '%.2f'|format(report.os_on_feature_orders.os_cost_usd) }}) were spent on
+      feature orders themselves rather than on any one work order.
+    {%- endif %}
     {%- if report.os_unattributed and report.os_unattributed.os_calls %}
       {{ report.os_unattributed.os_calls }} of them
-      (~${{ '%.2f'|format(report.os_unattributed.os_cost_usd) }}) belong to no work order.
+      (~${{ '%.2f'|format(report.os_unattributed.os_cost_usd) }}) belong to no unit at all.
     {%- endif %}
   </p>
   {% endif %}

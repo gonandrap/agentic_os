@@ -75,6 +75,24 @@ not stop answering, because a row could not be written — so every failure in
 `agent_usage.record` is logged and swallowed. The cost is a missing row, and the number
 the report gives is therefore a floor.
 
+## The next consumer, and why it is provided for here
+
+The validation panel (`fo-e353491c`,
+`docs/superpowers/specs/2026-08-08-validation-panel-design.md`) is not written yet, and
+when it is it will be **by volume the largest thing the OS spends on itself**: up to three
+rounds of five headless calls, on every unit in the fleet. Three things here exist for it:
+
+* `agent_calls.fo_id`, because its subject can be a FEATURE order with no work order to
+  bill. A row naming both ids is the child's — the feature order's report already rolls
+  its children up — and `_OsGroups` is where that rule lives.
+* the `validator_seat` kind, reserved in `agent_usage.KIND_LABELS` ahead of its code, so
+  the implementer records against a name the report and the dashboard already render.
+* two guards in `tests/test_agent_usage.py`: nothing in `src/jarvis` may call the
+  accounting-discarding `run_headless`, and any module that calls a model must carry an
+  accounting seam (`agent_usage` or `on_usage`). A new `validation.py` with five seat
+  calls and no recording turns those red on its first run — which is the only moment
+  anyone can fix it, because the calls leave no transcript to attribute afterwards.
+
 ## What it does not do
 
 It does not backfill. Spend before this shipped is not recoverable — the transcripts are

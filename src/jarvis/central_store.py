@@ -136,6 +136,14 @@ CREATE TABLE IF NOT EXISTS agent_calls (
     ts REAL NOT NULL,
     project TEXT NOT NULL DEFAULT '',
     wo_id TEXT NOT NULL DEFAULT '',         -- '' = OS work no work order caused
+    -- The FEATURE order a call was made for, when the subject is the feature itself
+    -- rather than one of its work orders. Both may be set (a call about a child work
+    -- order, which is also spend on its parent feature); `wo_id` wins for attribution
+    -- and `fo_id` is what a feature order's own spend is found by. The validation panel
+    -- (fo-e353491c) is the first caller with a feature order as a subject — up to three
+    -- rounds of five seats on a unit that has no work order at all — and a table with
+    -- nowhere to put that would send its dearest calls to the unattributed line.
+    fo_id TEXT NOT NULL DEFAULT '',
     kind TEXT NOT NULL,                     -- neo_answer | panel_seat | digest | ...
     label TEXT NOT NULL DEFAULT '',         -- the seat name, or whatever names the call
     model TEXT NOT NULL DEFAULT '',
@@ -586,8 +594,8 @@ class CentralStore:
     # -- the OS's own Claude spend -----------------------------------------------------
 
     def add_agent_call(self, kind: str, *, project: str = "", wo_id: str = "",
-                       label: str = "", model: str = "", question_id: int | None = None,
-                       ok: bool = True,
+                       fo_id: str = "", label: str = "", model: str = "",
+                       question_id: int | None = None, ok: bool = True,
                        usage: dict[str, Any] | None = None) -> int:
         """Record one Claude call the OS made itself. See the `agent_calls` schema.
 
@@ -599,11 +607,12 @@ class CentralStore:
         """
         u = usage or {}
         cur = self.conn.execute(
-            """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model,
+            """INSERT INTO agent_calls (ts, project, wo_id, fo_id, kind, label, model,
                                         question_id, ok, cost_usd, input, cache_write,
                                         cache_read, output, usage_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (db.now(), project, wo_id, kind, label, model, question_id, 1 if ok else 0,
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (db.now(), project, wo_id, fo_id, kind, label, model, question_id,
+             1 if ok else 0,
              u.get("total_cost_usd"), u.get("input") or 0, u.get("cache_write") or 0,
              u.get("cache_read") or 0, u.get("output") or 0,
              db.to_json(usage) if usage else None),
@@ -611,12 +620,17 @@ class CentralStore:
         return int(cur.lastrowid or 0)
 
     def agent_calls(self, wo_id: str | None = None, project: str | None = None,
+                    fo_id: str | None = None,
                     limit: int = 500) -> list[dict[str, Any]]:
-        """The OS's calls, newest first — for one work order, one project, or all."""
+        """The OS's calls, newest first — for one work order, feature order, project, or
+        all."""
         where, params = [], []
         if wo_id is not None:
             where.append("wo_id=?")
             params.append(wo_id)
+        if fo_id is not None:
+            where.append("fo_id=?")
+            params.append(fo_id)
         if project is not None:
             where.append("project=?")
             params.append(project)
@@ -626,7 +640,7 @@ class CentralStore:
             (*params, limit)).fetchall())
 
     def agent_call_totals(self, project: str | None = None) -> list[dict[str, Any]]:
-        """Every work order's OS spend, summed in SQL, grouped by kind and model.
+        """Every unit's OS spend, summed in SQL, grouped by subject, kind and model.
 
         Grouped rather than flat because both consumers need the grouping: the report
         prices each group at its own model's list rate (a digest on Haiku is not Opus
@@ -635,16 +649,21 @@ class CentralStore:
 
         One query for the whole fleet: the alternative is a query per work order, and
         the cost report walks every work order there is.
+
+        `fo_id` rides along so a feature order's OWN spend — a validation round on the
+        feature rather than on any of its work orders — is groupable without a second
+        query. A row carrying both is the child's spend, and the caller decides: the
+        work order's own report counts it, the feature order's rollup would double it.
         """
         clause = "WHERE project=?" if project else ""
         params = (project,) if project else ()
         return db.rows_to_dicts(self.conn.execute(
-            f"""SELECT wo_id, kind, model, COUNT(*) AS calls,
+            f"""SELECT wo_id, fo_id, kind, model, COUNT(*) AS calls,
                        SUM(cost_usd) AS cost_usd, SUM(input) AS input,
                        SUM(cache_write) AS cache_write, SUM(cache_read) AS cache_read,
                        SUM(output) AS output, SUM(1 - ok) AS failed
                 FROM agent_calls {clause}
-                GROUP BY wo_id, kind, model""", params).fetchall())
+                GROUP BY wo_id, fo_id, kind, model""", params).fetchall())
 
     # -- os state ----------------------------------------------------------------------
 

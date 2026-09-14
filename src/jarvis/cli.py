@@ -706,15 +706,18 @@ def _print_os_calls(res: dict) -> None:
     rows = res.get("os_calls_detail") or []
     if not rows:
         return
-    unit = (res.get("units") or [{}])[0]
-    print(f"\njarvis's own calls for this work order — ~${unit.get('os_cost_usd', 0):.2f} "
-          f"of the total, recorded as they happened:")
+    # On a feature order the calls are the FEATURE's own (its validation rounds); on a
+    # work order they are the unit's. `os_own` is present only in the first case.
+    spend = res.get("os_own") or (res.get("units") or [{}])[0]
+    subject = "feature order" if res.get("os_own") is not None else "work order"
+    print(f"\njarvis's own calls for this {subject} — "
+          f"~${spend.get('os_cost_usd', 0):.2f} of the total, recorded as they happened:")
     print(f"{'kind':>12} {'what':>10} {'$':>7} {'in':>8} {'out':>7}  model")
     for r in rows:
         print(f"{r['kind']:>12} {r['label'][:10]:>10} {r['list_cost_usd']:>7.2f} "
               f"{_tok(r['billed_input']):>8} {_tok(r['output']):>7}  {r['model'][:28]}"
               f"{'' if r['ok'] else '  (failed)'}")
-    for kind in unit.get("os_by_kind") or []:
+    for kind in spend.get("os_by_kind") or []:
         print(f"  {kind['label']}: {kind['calls']} call"
               f"{'s' if kind['calls'] != 1 else ''}, ~${kind['cost_usd']:.2f}")
 
@@ -771,11 +774,18 @@ def cmd_cost(args: argparse.Namespace) -> int:
               f"{totals['resume_boundaries']} turn boundaries")
     if totals["subagent_cost_usd"]:
         print(f"  subagents     ~${totals['subagent_cost_usd']:.2f}")
+    # Both of these are already inside `os_cost_usd` above; they are named here because
+    # they appear against no row of the table, and a total larger than what is on screen
+    # has to account for itself.
+    on_features = res.get("os_on_feature_orders") or {}
+    if on_features.get("os_calls"):
+        print(f"    of which on feature orders themselves "
+              f"~${on_features['os_cost_usd']:.2f} — {on_features['os_calls']} calls "
+              f"(validation rounds), against no single work order")
     unattributed = res.get("os_unattributed") or {}
     if unattributed.get("os_calls"):
-        print(f"  OS overhead   ~${unattributed['os_cost_usd']:.2f} — "
-              f"{unattributed['os_calls']} calls no work order caused "
-              f"(already in the total above)")
+        print(f"    of which unattributed ~${unattributed['os_cost_usd']:.2f} — "
+              f"{unattributed['os_calls']} calls no unit caused")
     # Said every time, not in the help text: the figure is the only number on screen,
     # and a subscription user reading it as an invoice is the likeliest misreading.
     print("\nList prices, as a common unit for comparing token kinds — not a bill.")
