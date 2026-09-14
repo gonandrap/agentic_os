@@ -332,6 +332,33 @@ def test_it_is_one_alarm_per_kind_per_window_however_often_the_tick_runs(started
     assert len(_raise(started, store)) == 2
 
 
+def test_an_alarm_older_than_the_window_does_not_suppress_the_next_one(started, store):
+    """THE OTHER HALF OF THE DEDUPE, and without it the suppression above is satisfied by
+    "has this kind EVER been raised" — which is once per project for ever.
+
+    The mutation this kills: delete `float(last["ts"]) >= tax.since` from
+    `Daemon.check_rewrite_tax` and every other test in this module still passes, because
+    they all re-raise inside one window. Here the previous alarm is backdated past the
+    window's start, which is precisely the state a project is in on the first tick of its
+    second cohort window — the tax is still crossing and nobody has been told this week.
+    """
+    from jarvis import db
+
+    _mixed_window(store, prefix_heavy=True)
+    raised = _raise(started, store)
+    assert len(raised) == 2
+
+    # Backdate BOTH rows to before the window, exactly as the clock would have.
+    old = db.now() - 30 * DAY
+    for row in raised:
+        store.conn.execute("UPDATE wo_alarms SET ts=? WHERE id=?", (old, row["id"]))
+
+    fresh = [r for r in _raise(started, store) if float(r["ts"]) > old]
+    assert {r["kind"] for r in fresh} == {inspection.REWRITE_PREFIX_ALARM,
+                                          inspection.REWRITE_TTL_ALARM}
+    assert len(store.alarms_across()) == 4
+
+
 def test_both_floors_hold_and_neither_covers_for_the_other(started, store):
     """Two floors answering two questions: too few orders is one order's shape wearing
     the project's name, too little money is a percentage of nothing. Measured against
@@ -361,6 +388,193 @@ def test_the_off_switch_covers_it(started, store):
     turn one thing off is a second way to be surprised by it."""
     _mixed_window(store, prefix_heavy=True)
     assert _raise(started, store, enabled=False) == []
+
+
+# -- 3b. the supervisor is actually engaged ---------------------------------------------
+#
+# THE SECTION REVIEW ROUND 1 ASKED FOR, and its point is that everything above proves a
+# `wo_alarms` row exists. That is not the deliverable: the brief asked for an alarm that
+# REACHES the supervisor's review loop, and every path between the raise and the judge
+# has a filter on it — the drain excludes by age and by a missing work order, the evidence
+# builder branches on the subject kind and on the turn, and the remedy checks the subject
+# kind before it will propose. An aggregate alarm is unlike every alarm those paths were
+# written for: `seq` is NO_TURN, the carrier has COMPLETED, and nothing is flagged. Each
+# test below drives the real function rather than asserting around it.
+
+
+def _raised_alarm(started, store, kind=inspection.REWRITE_PREFIX_ALARM):
+    _mixed_window(store, prefix_heavy=True)
+    rows = _raise(started, store)
+    return next(r for r in rows if r["kind"] == kind)
+
+
+def test_the_supervisors_own_queue_returns_it_and_the_drain_judges_it(started, store):
+    """THE ENGAGEMENT PIN. Two things, because either alone would pass while the
+    supervisor was never reached: the alarm is in the read `Daemon.supervisor_tick`
+    counts before it kicks a drain, and `_drain_project_alarms` — the real one, with a
+    stub judge standing in for the model call — claims it and hands the judge the
+    COMPLETED carrier.
+
+    `_drain_project_alarms` moves an alarm it will not judge OUT of the queue with a
+    reason, so the `skipped` assertion is what discriminates: if either exclusion fired
+    on a settled carrier, the row would be `skipped` and `seen` empty, and a test that
+    only checked `alarms_across` would still be green.
+    """
+    from jarvis.neo_store import NeoStore
+
+    alarm = _raised_alarm(started, store)
+    project = started.catalog.projects[0]
+
+    # What `supervisor_tick` counts to decide whether to kick the drain at all.
+    waiting = store.alarms_across(statuses=("raised",))
+    assert alarm["id"] in {r["id"] for r in waiting}
+
+    seen: list[tuple] = []
+
+    class _Judge:
+        @staticmethod
+        def review(pstore, neo_store, project_name, wo, row, cfg, **kw):
+            seen.append((row["id"], row["kind"], wo["id"], wo["status"]))
+            return {"decision": "ack", "reason": "explicable", "note": "ok",
+                    "failed": False}
+
+    neo_store, central = NeoStore(), started.central
+    try:
+        started._drain_project_alarms(project, store, neo_store, central, _Judge)
+    finally:
+        neo_store.close()
+
+    judged = {row[0]: row for row in seen}
+    assert alarm["id"] in judged, "the drain never handed this alarm to the judge"
+    _, kind, wo_id, wo_status = judged[alarm["id"]]
+    assert kind == inspection.REWRITE_PREFIX_ALARM
+    assert (wo_id, wo_status) == (alarm["wo_id"], "completed")
+    # Nothing was excluded: `skipped` is how the drain declines one.
+    assert not [r for r in store.alarms_across() if r["alarm_status"] == "skipped"]
+
+
+def test_an_acked_aggregate_alarm_reaches_the_users_review_queue(started, store):
+    """The far end of the loop. `ops.alarm_review_queue` is `acked` + `unreviewed` by
+    design (kn-a066e10c), so a freshly raised alarm is correctly absent from it — both
+    halves asserted, because "absent" and "never arrives" look identical with one."""
+    from jarvis import db
+
+    alarm = _raised_alarm(started, store)
+    assert alarm["id"] not in {r["id"] for r in ops.alarm_review_queue("proj_a")}
+
+    store.update_alarm(alarm["id"], status="acked", verdict="ack",
+                       verdict_reason="the shape of the work accounts for it",
+                       note="a big refactor week", decided_at=db.now())
+    queued = {r["id"]: r for r in ops.alarm_review_queue("proj_a")}
+
+    assert alarm["id"] in queued
+    row = queued[alarm["id"]]
+    assert row["kind"] == inspection.REWRITE_PREFIX_ALARM
+    assert row["seq"] == NO_TURN
+    assert row["subject_kind"] == "work_order"
+    assert row["title"] == "the expensive one"   # the exemplar, named on the surface
+    # `live` is the CARRIER's attention flag, which this alarm deliberately never set.
+    assert not row["live"]
+
+
+def test_an_evidence_packet_builds_for_a_turnless_alarm_on_a_settled_order(started,
+                                                                          store):
+    """The judge is given a packet, not the alarm row, and this one is built from an
+    alarm with no turn hanging off an order that has stopped.
+
+    THE ASSERTION THAT MATTERS IS `turn -1`. `build_evidence` renders `seq` and the
+    sentinel is `-1`; "raised on turn -1" is nonsense the judge would have to interpret,
+    which is the failure `project_store.NO_TURN` is named after. The reason has to be in
+    there too — it is the only place the number, the cause and the exemplar appear.
+    """
+    from jarvis import supervisor
+    from jarvis.catalog import SupervisorConfig
+
+    alarm = _raised_alarm(started, store)
+    carrier = store.get_work_order(alarm["wo_id"])
+    assert carrier["status"] == "completed"
+
+    packet = supervisor.build_evidence(
+        store, {"kind": "work_order", "row": carrier}, alarm,
+        SupervisorConfig(), InspectConfig())
+
+    assert "raised on no particular turn" in packet
+    assert "turn -1" not in packet
+    assert inspection.REWRITE_PREFIX_ALARM in packet
+    assert "PROMPT PREFIX" in packet          # the cause, which is the point of the split
+    assert carrier["id"] in packet
+
+
+def test_the_remedy_goes_through_propose_and_apply_on_a_settled_carrier(started, store):
+    """THE REMEDY THROUGH ITS REAL PATH, not by calling the handler.
+
+    Round 1 landed because the handler was only ever called directly, which skips the
+    two checks that decide whether the supervisor can use it at all: `_refusal`'s
+    subject-kind test (`subject_kind(alarm)` against `Remedy.subjects`) and
+    `Daemon._alarm_subject`'s resolution of the subject from the alarm row. Both are
+    exercised here, on the shape this alarm actually has — a work-order subject whose
+    order has COMPLETED.
+    """
+    from jarvis.catalog import RemedyConfig
+    from jarvis.neo_store import NeoStore
+
+    alarm = _raised_alarm(started, store)
+    carrier = store.get_work_order(alarm["wo_id"])
+    argument = "Find what moves the prompt prefix between calls in proj_a."
+    cfg = RemedyConfig(enabled=True, allowed=("file_work_order",))
+
+    neo_store = NeoStore()
+    try:
+        outcome = remedies.propose(store, neo_store, "proj_a", carrier,
+                                   store.get_alarm(alarm["id"]), "file_work_order",
+                                   argument, cfg, reason=alarm["reason"])
+    finally:
+        neo_store.close()
+    assert outcome["proposed"], outcome["reason"]
+    approval_id = outcome["approval"]["id"]
+    assert store.get_alarm(alarm["id"])["status"] == "proposed"
+
+    # The reviewer says yes, and only then may anything be filed.
+    store.decide_approval(approval_id, "approved", "go on", "test")
+    subject = started._alarm_subject(store, store.get_alarm(alarm["id"]), remedies)
+    assert subject["id"] == carrier["id"], "the subject did not resolve to the carrier"
+
+    result = remedies.apply(store, started.central, "proj_a",
+                            store.get_approval(approval_id),
+                            store.get_alarm(alarm["id"]), subject)
+
+    filed = [w for w in store.list_work_orders()
+             if w["title"] == argument or w["title"].startswith("Ship the fix")]
+    assert len(filed) == 2, result
+    fix = next(w for w in filed if not w["title"].startswith("Ship the fix"))
+    ship = next(w for w in filed if w["title"].startswith("Ship the fix"))
+    assert store.dependencies(ship) == [fix["id"]]
+    assert store.get_alarm(alarm["id"])["status"] == "acked"
+
+
+def test_the_remedy_is_refused_when_the_project_has_not_armed_it(started, store):
+    """The mirror of the test above, and it is what stops that one grading "propose
+    always proposes". A refusal writes the reason on the alarm and files NOTHING."""
+    from jarvis.catalog import RemedyConfig
+    from jarvis.neo_store import NeoStore
+
+    alarm = _raised_alarm(started, store)
+    carrier = store.get_work_order(alarm["wo_id"])
+    before = len(store.list_work_orders())
+
+    neo_store = NeoStore()
+    try:
+        outcome = remedies.propose(store, neo_store, "proj_a", carrier,
+                                   store.get_alarm(alarm["id"]), "file_work_order",
+                                   "do the thing",
+                                   RemedyConfig(enabled=True, allowed=("nudge",)))
+    finally:
+        neo_store.close()
+
+    assert not outcome["proposed"]
+    assert "supervisor.remedies.allowed" in outcome["reason"]
+    assert store.get_alarm(alarm["id"])["status"] == "escalated"
+    assert len(store.list_work_orders()) == before
 
 
 # -- 4. the record renders it as what it is ---------------------------------------------
