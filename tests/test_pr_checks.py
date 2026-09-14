@@ -295,7 +295,7 @@ def test_a_green_pull_request_costs_one_call_three_reads_and_no_write(
 
 
 def test_the_automatic_merge_costs_a_project_that_has_not_opted_in_nothing(
-        started, project, fake_gh, reviewing):
+        started, project, fake_gh, parked):
     """The budget above is the SHIPPED one, and it must stay shipped.
 
     `validation.auto_merge` is false on every project until someone names it true, so the
@@ -303,6 +303,9 @@ def test_the_automatic_merge_costs_a_project_that_has_not_opted_in_nothing(
     `wo_events` reads and the same one work-order query as before the feature existed.
     That is what `Daemon.auto_merge` returning on the config check buys, and asserting it
     here is what stops a later refactor moving the check below the query.
+
+    Counted on a PARKED work order, which passes every other guard, so the config check is
+    the only thing that can be producing the zero.
     """
     red(fake_gh, GREEN)
     store = ProjectStore(project)
@@ -318,24 +321,24 @@ def test_the_automatic_merge_costs_a_project_that_has_not_opted_in_nothing(
 
 
 def test_an_opted_in_project_declares_what_the_automatic_merge_costs_it(
-        started, project, fake_gh, reviewing):
+        started, project, fake_gh, parked):
     """And the other half: a project that HAS opted in pays, and the price is counted.
 
-    Four more indexed reads per parked pull request per poll — the latest validation
-    round TWICE, the pending assumptions, and the `automerge_held` events the dedupe keys
-    on — and that is the whole standing cost of holding merge authority. A fifth
-    appearing means somebody put a query on a path every open pull request of an opted-in
-    project pays every two minutes; this is the test that says so rather than a sentence
-    in a docstring nobody executes.
+    THREE more indexed reads per parked pull request per poll — the latest validation
+    round, the pending assumptions, and the `automerge_held` events the dedupe keys on —
+    and that is the whole standing cost of holding merge authority. A fourth appearing
+    means somebody put a query on a path every open pull request of an opted-in project
+    pays every two minutes; this is the test that says so rather than a sentence in a
+    docstring nobody executes.
 
-    The round is read twice on purpose: `ProjectStore.validated_head` answers the
-    predicate and the raw row supplies only the wording, so the rule has one home. The
-    price of that is one repeated indexed read of one row, and it is named here so the
-    trade is visible rather than mistaken for a fifth query later.
+    The round is read ONCE and both answers come off that row —
+    `ProjectStore.validated_head` for the predicate, the row itself for the wording. It
+    is not a saving but a correctness rule: two reads can straddle a round the validator
+    opens on its own thread. `test_automerge.py` pins that; this pins the count.
 
-    Counted on a HELD pull request (this one's round never passed) and on the SECOND
-    poll, because held is the state an opted-in project spends almost all of its time in
-    and the first poll of any hold writes its one event. That write not repeating is the
+    Counted on a HELD pull request (this one was never validated) and on the SECOND poll,
+    because held is the state an opted-in project spends almost all of its time in and
+    the first poll of any hold writes its one event. That write not repeating is the
     other half of what is asserted here.
     """
     red(fake_gh, GREEN)
@@ -351,10 +354,35 @@ def test_an_opted_in_project_declares_what_the_automatic_merge_costs_it(
 
     store.conn.set_trace_callback(None)
     assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
-    assert len([s for s in sql if "validation_rounds" in s]) == 2
+    assert len([s for s in sql if "validation_rounds" in s]) == 1
     assert len([s for s in sql if "assumptions" in s]) == 1
     assert len([s for s in sql if "wo_events" in s]) == 4
     assert not [s for s in sql if "approvals" in s]
+
+
+def test_an_opted_in_project_pays_nothing_for_an_order_awaiting_a_person(
+        started, project, fake_gh, reviewing):
+    """The status guard is a cost guard too, and on the commonest non-parked status.
+
+    Every status in `PR_POLL_STATUSES` reaches `Daemon.auto_merge`, and only
+    `waiting_pr_merge` can ever merge. An order in `needs_review` — the one the user is
+    about to look at — must therefore pay exactly the base budget, whatever the project
+    has opted into. What it must ALSO not do is record a hold; that half is asserted in
+    `test_automerge.py`, which owns the user-visible consequence.
+    """
+    red(fake_gh, GREEN)
+    spec = started.catalog.project("proj_a")
+    spec.validation.enabled = True
+    spec.validation.auto_merge = True
+    store = ProjectStore(project)
+    sql: list[str] = []
+    store.conn.set_trace_callback(sql.append)
+
+    poll(started, store)
+
+    store.conn.set_trace_callback(None)
+    assert len([s for s in sql if "wo_events" in s]) == 3
+    assert not [s for s in sql if "validation_rounds" in s or "assumptions" in s]
 
 
 def test_a_work_order_with_no_pr_url_is_never_polled(started, project, fake_gh):

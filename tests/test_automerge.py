@@ -61,18 +61,17 @@ WO = {"id": "wo-1", "status": "waiting_pr_merge", "pr_url": PR, "title": "t"}
 
 
 def decide(round_row, wo=WO, pull=None, config=None, **kw):
-    """`automerge.decide` with `validated_head` derived exactly as the store derives it.
+    """`automerge.decide` with `validated_head` taken from the SAME row, as the poll does.
 
-    The predicate is passed IN — that is the point of the signature — so the helper
-    mirrors `ProjectStore.validated_head` rather than reaching into the row a second way.
-    A dedicated test below pins the two against each other on a real store.
+    The predicate is passed in — that is the point of the signature — and it comes from
+    `ProjectStore.validated_head` itself rather than a second copy of the rule written
+    here, so a change to the rule that this file did not follow fails these rows too.
     """
-    head = None
-    if round_row is not None and round_row.get("outcome") == "passed":
-        head = str(round_row.get("head_sha") or "") or None
     return automerge.decide(round_row, wo, pull if pull is not None else pr(),
                             config if config is not None else cfg(),
-                            validated_head=kw.pop("validated_head", head), **kw)
+                            validated_head=kw.pop("validated_head",
+                                                  ProjectStore.validated_head(round_row)),
+                            **kw)
 
 
 # -- `decide`: the condition table, both directions -----------------------------------
@@ -188,21 +187,45 @@ def test_the_store_and_the_decision_agree_about_what_validated_means(started, pr
     wo = ops.create_work_order("proj_a", "ship it")
     row = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
 
-    assert store.validated_head(wo["id"]) is None          # pending
+    def head():
+        return store.validated_head(store.latest_validation_round(wo_id=wo["id"]))
+
+    assert head() is None                                  # pending
     store.set_validation_head(row["id"], JUDGED)
-    assert store.validated_head(wo["id"]) is None          # still pending
+    assert head() is None                                  # still pending
     store.close_validation_round(row["id"], "rejected", "")
-    assert store.validated_head(wo["id"]) is None          # judged, and refused
+    assert head() is None                                  # judged, and refused
     store.close_validation_round(row["id"], "passed", "")
-    assert store.validated_head(wo["id"]) == JUDGED
+    assert head() == JUDGED
 
     # A LATER round supersedes it, whatever the earlier one said.
     later = store.open_validation_round(wo_id=wo["id"], fingerprint="fp2")
-    assert store.validated_head(wo["id"]) is None
+    assert head() is None
     store.set_validation_head(later["id"], "")
     store.close_validation_round(later["id"], "passed", "")
-    assert store.validated_head(wo["id"]) is None          # passed, nothing recorded
+    assert head() is None                                  # passed, nothing recorded
     store.close()
+
+
+def test_the_predicate_is_read_off_the_row_it_was_handed_and_never_re_fetched():
+    """THE RACE. The validation panel runs on another thread and opens rounds while this
+    poll is reading, so a predicate that fetched the round FOR ITSELF could be answering
+    about a different round from the one supplying the wording. The pair that produces —
+    a `passed` row beside "no accepted head" — is exactly `HELD_SHA_UNRECORDED`, whose
+    hold is deduped for ever: the user would keep being told that a round which in fact
+    passed on a known commit "read a worktree".
+
+    Pinned by construction rather than by threading: the function is static and takes the
+    row, so there is no store for it to re-read from.
+    """
+    import inspect
+
+    assert isinstance(
+        inspect.getattr_static(ProjectStore, "validated_head"), staticmethod)
+    assert list(inspect.signature(ProjectStore.validated_head).parameters) == ["round_row"]
+    assert ProjectStore.validated_head({"outcome": "passed", "head_sha": JUDGED}) == JUDGED
+    assert ProjectStore.validated_head({"outcome": "pending", "head_sha": JUDGED}) is None
+    assert ProjectStore.validated_head(None) is None
 
 
 def test_decide_touches_no_store_no_clock_and_no_network():
@@ -470,6 +493,37 @@ def test_a_project_that_has_not_opted_in_is_never_merged_by_the_os(
     assert store.list_approvals(wo["id"]) == []
     assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
     # ...and it did not even cost the read: the config guard is above the query.
+    assert store.events_of_kind(wo["id"], "automerge_held") == []
+
+
+def test_an_order_awaiting_a_person_is_not_told_the_merge_declined_it(
+        started, project, fake_gh):
+    """AN ORDER THE MECHANISM NEVER APPLIES TO MUST NOT BE ANNOTATED BY IT.
+
+    `PR_POLL_STATUSES` is deliberately wider than `waiting_pr_merge` — a `needs_review`
+    order behind a red build has to be polled, issue #224 — so every such order reaches
+    this code. Letting it reach `decide` produced a `HELD_STATUS` hold, which
+    `ops.automerge_state` renders on the work order as "auto-merge: held — the work order
+    is needs_review": the user told that the automatic merge declined a pull request it
+    was never a candidate for, on the one surface that exists to report what it did.
+
+    Everything else here lines up, so only the status is holding it.
+    """
+    store, wo = arm(started, project, auto_merge=True)
+    store.set_status(wo["id"], "needs_review")
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_sha=JUDGED)
+
+    poll(started, store)
+
+    row = store.get_work_order(wo["id"])
+    assert store.events_of_kind(wo["id"], "automerge_held") == []
+    assert ops.automerge_state(store, row) is None
+    assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
+    assert store.list_approvals(wo["id"]) == []
+    # And `_note_automerge_held` refuses it from the other side, so a second caller
+    # cannot reintroduce the line by skipping the guard in `Daemon.auto_merge`.
+    started._note_automerge_held(
+        store, wo["id"], automerge.decide(None, row, pr(), cfg(), validated_head=None))
     assert store.events_of_kind(wo["id"], "automerge_held") == []
 
 

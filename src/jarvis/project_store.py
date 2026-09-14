@@ -2450,8 +2450,9 @@ class ProjectStore:
         self.conn.execute("UPDATE validation_rounds SET head_sha=? WHERE id=?",
                           (head_sha, round_id))
 
-    def validated_head(self, wo_id: str) -> str | None:
-        """The commit the panel ACCEPTED for this work order, or None. THE predicate.
+    @staticmethod
+    def validated_head(round_row: dict[str, Any] | None) -> str | None:
+        """The commit the panel ACCEPTED, given its LATEST round, or None. THE predicate.
 
         Non-None means all three of: the latest round has settled `passed`, that round
         recorded which commit it judged, and therefore an automatic merge has something
@@ -2467,11 +2468,19 @@ class ProjectStore:
 
         One home for the rule, for `arbitrate`'s reason — a rule spread across three call
         sites is a rule that holds by luck (spec 2026-09-14 §5.2).
+
+        **TAKES THE ROW, DOES NOT FETCH IT — that is why it is static.** The validator
+        runs on another thread and opens rounds while the pull-request poll is reading:
+        a caller that fetched `latest_validation_round` for the wording and let this
+        fetch it again for the predicate could be handed two DIFFERENT rounds a
+        microsecond apart. The failure is not a missed merge, which the next tick
+        repairs, but a permanent one — the pair (passed round N, no accepted head) is
+        the `HELD_SHA_UNRECORDED` wording, and that hold is deduped for ever on a reason
+        that was never true. One read, one row, both answers off it.
         """
-        latest = self.latest_validation_round(wo_id=wo_id)
-        if latest is None or latest["outcome"] != "passed":
+        if round_row is None or round_row["outcome"] != "passed":
             return None
-        return str(latest["head_sha"] or "") or None
+        return str(round_row["head_sha"] or "") or None
 
     def validation_rounds(self, *, wo_id: str | None = None,
                           fo_id: str | None = None) -> list[dict[str, Any]]:

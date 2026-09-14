@@ -1,6 +1,10 @@
 # A pull request merges itself only if the panel read the commit that merges
 
-*Design proposal, 2026-09-14. Nothing here is built. No code, no PR.*
+*Design proposal, 2026-09-14. **Built in wo-bf5d03ce (PR #241).** The recommendation was
+implemented as written; three statements in it were not, and each is annotated in place
+below with an "Implemented differently" note — §7's and §8's retry cap, and §8's read
+budget. Nothing else here is stale. Where a note and the surrounding text disagree, the
+note is what the code does.*
 
 *Reading order: `mem:work-order-lifecycle` (`waiting_pr_merge` and `poll_pull_requests`),
 `mem:privileged-action-gates` (the `self_heal` precedent this design copies),
@@ -356,6 +360,16 @@ selling point over option 2:
 | the work order is in `needs_review` | not polled for merging. `needs_review` means a human owes a decision — a panel escalation, a closed pull request, a pending assumption — and the machine does not merge over a human's outstanding decision. |
 | a pull request was closed and reopened | `pr_state` is stale by construction; the branch keys on the live `pr.state` from this tick's view, as the rest of the poll already does. |
 
+> **Implemented differently — the two rows naming "3 attempts".** There is no retry
+> budget, so those rows read: *the merge attempt fails; `automerge_failed` on the timeline
+> with the reason, and one inbox row for that commit straight away.* A grant covers ONE
+> merge (`automerge.GRANT_USES = 1`) and `automerge.propose` files at most one gate request
+> per (work order, judged commit), so a commit gets exactly one authorised attempt and a
+> cap of three could never bind. Reporting therefore moved to the FIRST failure per commit:
+> at three it would have reported never, and the write-scope failure this table calls the
+> most likely first failure of the whole feature would have been silent for ever. Both rows
+> still end in "nothing merged", which is what §7 is for. See `Daemon._warn_automerge_failed`.
+
 Every row is "nothing merged". There is no row where a failure produces a merge. That is
 the required direction, and it falls out of the structure — the merge needs six positive
 facts, so any missing fact is a hold — rather than out of an exception handler someone
@@ -450,7 +464,12 @@ acting on something nobody asked it to touch.
   precedent for a `gh` write living outside `github.py`; keeping it out is what lets
   `github.py` go on claiming that everything in it is a question, which the panel's blind
   review rests on.
-* `AUTO_MERGE_MAX_ATTEMPTS = 3`, counted per head SHA from `automerge_failed` events.
+* ~~`AUTO_MERGE_MAX_ATTEMPTS = 3`, counted per head SHA from `automerge_failed` events.~~
+  **Implemented differently: the constant does not exist.** `GRANT_USES = 1` is the bound,
+  and a cap of three could never bind — see the note under §7's table. `automerge.attempts`
+  survives, counting the same events, but as the dedupe for the inbox row rather than as a
+  budget. An unreachable cap would be a constant that reads like a guarantee and enforces
+  nothing, which is worse than no constant.
 
 **`src/jarvis/daemon.py`** (~50 lines)
 * `poll_pull_requests`: in the final `else` (open, not conflicting, not failing), after the
@@ -462,6 +481,26 @@ acting on something nobody asked it to touch.
   statement count raised, deliberately.** The `else` branch gains one indexed read
   (`validated_head`) always, and one more (`usable_grant`) only when armed. That test
   counting statements is a feature — this design should be forced to declare its cost.
+
+  > **Implemented differently: not "always".** `Daemon.auto_merge` returns on two guards
+  > before it reads anything — the project's `validation.auto_merge`, and the work order
+  > being parked in `waiting_pr_merge`. So an opted-out project (the shipped state of every
+  > project) and any order in another status pay **nothing**, and an opted-in parked order
+  > pays **three** indexed reads: the latest validation round, its pending assumptions, and
+  > the `automerge_held` events the hold dedupes against. `usable_grant` is as described,
+  > only when armed.
+  >
+  > The status guard is not only a cost guard. `PR_POLL_STATUSES` is wider than
+  > `waiting_pr_merge` on purpose (issue #224), so without it an order in `needs_review`
+  > behind a green pull request reached `decide`, held on `HELD_STATUS`, and had that hold
+  > rendered to the user as "auto-merge: held — the work order is needs_review" — the
+  > mechanism reporting that it declined a pull request it was never a candidate for. §7's
+  > own table row says such an order "is not polled for merging"; this is what makes that
+  > row true.
+  >
+  > The cost-declaration intent is kept and widened: **three** statement-counting tests,
+  > not one — the opted-out path, the opted-in parked path, and the opted-in `needs_review`
+  > path, each pinned at its exact figure.
 
 **`src/jarvis/ops.py`** (~35 lines)
 * `complete_merged`: an `automerge_merged` event first, carrying the approval id, the round

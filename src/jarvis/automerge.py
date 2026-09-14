@@ -164,6 +164,9 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
     actually running is the copy that rots. `round_row` is still read below, but ONLY to
     write the sentence a person reads — "round 2 is rejected" against "round 2 passed but
     read a worktree" are the same refusal with different advice — and never to decide.
+    The two must be the SAME row: `Daemon.auto_merge` reads it once and derives both, so
+    that the validator opening a round on its own thread cannot hand this function a
+    predicate and a wording taken a microsecond apart.
 
     Condition 3 is redundant with condition 2 — `ops.land_when_cleared` cannot reach
     `waiting_pr_merge` with an assumption pending — and it is re-checked because the
@@ -418,7 +421,7 @@ def attempts(store: Any, wo_id: str, head_sha: str) -> int:
     user about THIS one". Counted off the timeline rather than a column, `ops.PrRepair`'s
     way — the events are the record, and a counter would be a second one to keep in step.
 
-    **NOT a retry budget, and spec §9's `AUTO_MERGE_MAX_ATTEMPTS = 3` is deliberately not
+    **NOT a retry budget, and spec §8's `AUTO_MERGE_MAX_ATTEMPTS = 3` is deliberately not
     implemented.** `GRANT_USES` is 1 and `propose` files at most one gate request per
     (work order, judged commit), so a commit gets exactly ONE authorised attempt and a cap
     of three could never bind — it would be a constant that reads like a guarantee and

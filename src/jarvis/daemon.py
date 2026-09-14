@@ -2943,11 +2943,11 @@ class Daemon:
         **The automatic merge costs that case NOTHING, and its own cost is counted too.**
         `Daemon.auto_merge` returns on `project.validation.auto_merge` before it reads
         anything, so a project that has not opted in — the shipped state of every project
-        — pays exactly the budget above. A project that HAS opted in pays FOUR more
-        indexed reads per parked pull request per poll: the latest validation round
-        twice — once through `validated_head` for the predicate and once raw for the
-        wording, see `auto_merge` — its pending assumptions, and the `automerge_held`
-        events the hold dedupes against.
+        — pays exactly the budget above. A project that HAS opted in pays THREE more
+        indexed reads, and only on a work order actually PARKED behind its pull request:
+        the latest validation round (read once and used for both the predicate and the
+        wording), its pending assumptions, and the `automerge_held` events the hold
+        dedupes against. A `needs_review` order with a pull request pays none of them.
         One more (`latest_approval_for`) arrives only once a merge is armed, which is a
         state a pull request passes through once. Both figures are counted by their own
         test beside the one above, on the rule that a budget nobody executes is a comment
@@ -3073,12 +3073,24 @@ class Daemon:
         (merge, then complete the work order), armed with no grant (ask Neo), or held
         (say so once, and leave the pull request for the user).
 
-        **THE CONFIG CHECK IS FIRST AND IT IS A COST GUARD, not the rule.** The rule is
-        condition 1 of `decide`, which is checked again there and unit-tested there; this
-        is what stops a fleet that has not opted in paying an indexed read per parked
-        pull request every two minutes for a feature it does not use. The redundancy is
-        deliberate and is the shape `two-gates-not-a-chain` argues for: a project's
-        permission is asserted at both the site that spends and the site that decides.
+        **THE CONFIG AND STATUS CHECKS ARE FIRST AND THEY ARE NOT THE RULE.** The rule is
+        conditions 1 and 2 of `decide`, checked again there and unit-tested there. The
+        redundancy is deliberate and is the shape `two-gates-not-a-chain` argues for: a
+        project's permission is asserted at both the site that spends and the site that
+        decides. What they buy HERE is that a work order the mechanism has no business
+        touching is never touched at all —
+
+        * config: a fleet that has not opted in pays no indexed read per parked pull
+          request every two minutes for a feature it does not use;
+        * status: `PR_POLL_STATUSES` is wider than `waiting_pr_merge` on purpose (issue
+          #224 — a `needs_review` order behind a red build must still be polled), so
+          without this an order sitting in `needs_review` behind a GREEN pull request
+          would reach `decide`, hold on `HELD_STATUS`, and have that hold rendered by
+          `ops.automerge_state` as "auto-merge: held — the work order is needs_review".
+          The user would be told the automatic merge declined a pull request it was never
+          a candidate for, on the one surface that exists to say what the mechanism did.
+          `_note_automerge_held` drops `HELD_STATUS` as well, for the same reason from
+          the other side.
 
         `project.validation` resolves per project — a project that names `auto_merge`
         keeps its answer, one that does not takes the fleet's, and the shipped answer at
@@ -3093,14 +3105,18 @@ class Daemon:
         cfg = project.validation
         if not (cfg.enabled and cfg.auto_merge):
             return
+        if wo["status"] != "waiting_pr_merge":
+            return
         wo_id = wo["id"]
-        # `validated_head` is the predicate and `latest_validation_round` is the wording:
-        # `decide` is handed the first and re-derives none of it. Two indexed reads of one
-        # row rather than one, deliberately — the alternative is the rule living in two
-        # places, and the copy that is not running is the copy that rots.
+        # ONE read of the round, used twice: `ProjectStore.validated_head` turns it into
+        # the predicate and `decide` reads it again only for the wording. Reading it twice
+        # would let the validator — another thread, opening rounds while this poll runs —
+        # slip a new round between the two and produce the pair (passed, no head), whose
+        # hold is deduped for ever on a reason that was never true.
+        round_row = store.latest_validation_round(wo_id=wo_id)
         decision = automerge.decide(
-            store.latest_validation_round(wo_id=wo_id), wo, pr, cfg,
-            validated_head=store.validated_head(wo_id),
+            round_row, wo, pr, cfg,
+            validated_head=store.validated_head(round_row),
             pending_assumptions=bool(store.pending_assumptions(wo_id)))
         if not decision.armed:
             self._note_automerge_held(store, wo_id, decision)
@@ -3135,7 +3151,7 @@ class Daemon:
             return
         # No attempt cap here: `automerge.GRANT_USES` is 1, so an approved-but-spent grant
         # refuses inside `apply` without reaching GitHub, and that is the bound. See
-        # `automerge.attempts` for why spec §9's counter would enforce nothing.
+        # `automerge.attempts` for why spec §8's counter would enforce nothing.
         try:
             merged = automerge.apply(store, wo, decision.judged_sha, approval,
                                      cwd=project.path)
@@ -3190,13 +3206,23 @@ class Daemon:
         existed. A heal-loop push invalidating a pass is ordinary, and the attention list
         is not a place to put ordinary.
 
-        The `disabled` hold is not recorded at all: `Daemon.auto_merge` returns before
-        ever asking, so the only way here is a project that HAS opted in, and writing
-        "the project has not opted in" on its timeline would be false.
+        **TWO HOLDS ARE NOT RECORDED**, and they are the two `Daemon.auto_merge` already
+        returned on, so neither is reachable from the poll. They are dropped here as well
+        because the cost of being wrong is asymmetric and permanent: a missing hold event
+        says nothing, while a spurious one is deduped for ever and is rendered to the user
+        by `ops.automerge_state`.
+
+        * `disabled` — the project has not opted in, so its timeline must not carry a
+          line about a mechanism it never enabled;
+        * `status` — the work order is not parked behind its pull request. Everything
+          from `PR_POLL_STATUSES` reaches the poll (issue #224), so this would otherwise
+          fire on every `needs_review` order with a green pull request and tell the user
+          the automatic merge declined something it was never asked about.
         """
         from . import automerge, db
 
-        if decision.code == automerge.HELD_DISABLED:  # unreachable via the poll
+        if decision.code in (automerge.HELD_DISABLED,   # both unreachable via the poll:
+                             automerge.HELD_STATUS):    # `auto_merge` returns before here
             return
         key = (decision.head_sha, decision.code)
         for event in store.events_of_kind(wo_id, "automerge_held"):
@@ -3212,14 +3238,14 @@ class Daemon:
                                wo: dict, decision: Any, reason: str) -> None:
         """One inbox row for the FIRST failed merge of a commit. Not again for that commit.
 
-        **This is a deliberate deviation from spec §9, which reports at the third
+        **This is a deliberate deviation from spec §7, which reports at the third
         attempt.** That threshold assumed a retry budget, and there is none:
         `automerge.GRANT_USES` is 1 and `automerge.propose` files at most one gate request
         per judged commit, so a commit gets exactly one authorised attempt. "Report at
         three" would therefore report never, and a merge that failed on a missing write
-        scope — the likeliest cause by far, spec §9 — would be silent for ever. Failing
-        closed means the refusal is VISIBLE, so the row goes out the first time GitHub
-        says no.
+        scope — the likeliest cause by far, spec §7's own table — would be silent for
+        ever. Failing closed means the refusal is VISIBLE, so the row goes out the first
+        time GitHub says no.
 
         Deduped on the commit all the same, so that a future path which does authorise a
         second attempt at the same diff cannot say the same thing twice.
