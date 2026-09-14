@@ -78,17 +78,28 @@ TERMINAL_STATUSES = ("completed", "cancelled")
 #: silently become the generic IDLE_NO_FINISH_BLOCKER below on the next reconcile tick.
 PR_CLOSED_BLOCKER = "pull request closed without merging — the work was not accepted"
 
-#: How many times the OS asks a worker to resolve the same merge conflict before it
-#: asks the user instead. See §4 of
-#: docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md.
-PR_CONFLICT_MAX_ATTEMPTS = 3
+#: How many times the OS asks a worker to repair its own pull request before it asks the
+#: user instead. ONE cap for both repairs — the conflict and the red build — because
+#: they are the same mechanism with a different message; see §4 of
+#: docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md and §3
+#: of 2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md. Shared VALUE, separate
+#: BUDGETS: a branch that conflicted twice last week still gets three tries at a red
+#: build, because they are different problems and `ops.PrRepair` counts them apart.
+PR_REPAIR_MAX_ATTEMPTS = 3
 
 #: What a work order says when its pull request conflicts and the worker could not fix
-#: it in PR_CONFLICT_MAX_ATTEMPTS attempts — the ONE thing that makes a
+#: it in PR_REPAIR_MAX_ATTEMPTS attempts — one of the two things that make a
 #: `waiting_pr_merge` work order an attention item (spec §4). Re-derived below from the
 #: work order's own timeline, under the same obligation as PR_CLOSED_BLOCKER (spec §5).
 PR_CONFLICT_BLOCKER = ("merge conflicts the worker could not resolve — the pull request "
                        "needs you")
+
+#: The other one: CI is red on the pull request and the worker could not get it green.
+#: Under exactly the same obligation, and it reaches a work order in ANY status that
+#: carries a pull request — a red build in `needs_review` is the user being asked to
+#: merge something broken, which is the case issue #224 was filed about.
+PR_CHECKS_BLOCKER = ("the pull request's checks are failing and the worker could not fix "
+                     "them — do not merge it as it stands")
 
 #: What a work order says when the validation panel gave up on it: it kept resubmitting
 #: and the panel kept rejecting, until the round budget ran out. Nothing automatic is
@@ -331,6 +342,19 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # edge (`jarvis wo unblock`). That is the difference between waiting and stranded.
     if wo["status"] == "pending" and dead_dependencies(store, wo):
         blockers.append(DEAD_DEPENDENCY_BLOCKER)
+    # A red build the worker could not fix, and it is ABOVE the `needs_review` triage
+    # below on the same precedent that ranks the closed pull request above the panel's
+    # verdict: it is a fact about the outside world, and it changes what the user does
+    # next — they were about to merge. `attention_reason` is one column fed from
+    # `blockers[0]` (kn-d4d5a967), so ranking it below would mean the user never reads
+    # it. The status still says `needs_review`, which is the rest of the story.
+    #
+    # Free of any status filter, unlike the conflict line below, because a pull request
+    # is red wherever its work order happens to be sitting — that IS issue #224. The
+    # query costs a work order with no pull request nothing.
+    if wo.get("pr_url") and \
+            store.pr_repair_attempts(wo["id"], "checks") >= PR_REPAIR_MAX_ATTEMPTS:
+        blockers.append(PR_CHECKS_BLOCKER)
     if governed and wo["status"] == "needs_review" and not pending:
         # Two very different ways to arrive at `needs_review` without an assumption to
         # decide, and they ask the user for opposite things. A closed pull request means
@@ -351,7 +375,7 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # `waiting_pr_merge` is in BLOCKED_STATUSES at all (spec §5). The query sits behind
     # the status check so no other work order pays for it.
     if wo["status"] == "waiting_pr_merge" and \
-            store.pr_conflict_attempts(wo["id"]) >= PR_CONFLICT_MAX_ATTEMPTS:
+            store.pr_repair_attempts(wo["id"], "conflict") >= PR_REPAIR_MAX_ATTEMPTS:
         blockers.append(PR_CONFLICT_BLOCKER)
     # A message the user sent that the worker will never see (GitHub issue 43). Derived
     # here rather than flagged at the delivery site because `deliver_messages` never runs

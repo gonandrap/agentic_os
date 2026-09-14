@@ -23,7 +23,7 @@ from jarvis.daemon import PR_POLL_EVERY_TICKS, Daemon
 from jarvis.invariants import (
     PR_CLOSED_BLOCKER,
     PR_CONFLICT_BLOCKER,
-    PR_CONFLICT_MAX_ATTEMPTS,
+    PR_REPAIR_MAX_ATTEMPTS,
     check_project,
     true_blockers,
 )
@@ -474,7 +474,7 @@ def test_a_conflicting_pr_asks_the_worker_to_resolve_it(started, project, fake_g
     # the two things the loop depends on the worker NOT doing (spec §3)
     assert "do NOT call `jarvis wo finish` again" in msgs[0]["content"]
     assert "Do NOT rebase or force-push" in msgs[0]["content"]
-    assert store.pr_conflict_attempts(parked_worker["id"]) == 1
+    assert store.pr_repair_attempts(parked_worker["id"], "conflict") == 1
 
 
 def test_the_conflict_nudge_asks_the_user_for_nothing(started, project, fake_gh,
@@ -504,7 +504,7 @@ def test_a_second_poll_does_not_nudge_twice(started, project, fake_gh, parked_wo
     poll(started, store)
 
     assert len(store.queued_messages(parked_worker["id"])) == 1
-    assert store.pr_conflict_attempts(parked_worker["id"]) == 1
+    assert store.pr_repair_attempts(parked_worker["id"], "conflict") == 1
 
 
 def test_a_work_order_with_no_session_is_left_alone(started, project, fake_gh, parked):
@@ -517,7 +517,7 @@ def test_a_work_order_with_no_session_is_left_alone(started, project, fake_gh, p
     poll(started, store)
 
     assert not store.queued_messages(parked["id"])
-    assert store.pr_conflict_attempts(parked["id"]) == 0
+    assert store.pr_repair_attempts(parked["id"], "conflict") == 0
     assert not store.get_work_order(parked["id"])["needs_attention"]
 
 
@@ -554,7 +554,7 @@ def test_three_attempts_and_then_it_is_the_users_problem(started, project, fake_
     conflicting(fake_gh)
     store = ProjectStore(project)
 
-    for _ in range(PR_CONFLICT_MAX_ATTEMPTS):
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS):
         poll(started, store)
         assert delivered(store, parked_worker["id"])
     assert not store.get_work_order(parked_worker["id"])["needs_attention"]  # still trying
@@ -567,14 +567,14 @@ def test_three_attempts_and_then_it_is_the_users_problem(started, project, fake_
     assert row["attention_reason"] == PR_CONFLICT_BLOCKER
     assert true_blockers(store, row) == [PR_CONFLICT_BLOCKER]
     assert not store.queued_messages(parked_worker["id"])   # it stopped asking
-    assert store.pr_conflict_attempts(parked_worker["id"]) == PR_CONFLICT_MAX_ATTEMPTS
+    assert store.pr_repair_attempts(parked_worker["id"], "conflict") == PR_REPAIR_MAX_ATTEMPTS
 
 
 def test_giving_up_is_recorded_once_however_long_it_stays_broken(started, project,
                                                                  fake_gh, parked_worker):
     conflicting(fake_gh)
     store = ProjectStore(project)
-    for _ in range(PR_CONFLICT_MAX_ATTEMPTS):
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS):
         poll(started, store)
         delivered(store, parked_worker["id"])
 
@@ -590,7 +590,7 @@ def test_the_give_up_reason_survives_the_reconciler(started, project, fake_gh, p
     from BLOCKED_STATUSES has its blockers derived and then never surfaced (spec §5)."""
     conflicting(fake_gh)
     store = ProjectStore(project)
-    for _ in range(PR_CONFLICT_MAX_ATTEMPTS + 1):
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
         poll(started, store)
         delivered(store, parked_worker["id"])
     store.clear_attention(parked_worker["id"])   # as a delivered nudge would have
@@ -622,7 +622,7 @@ def test_resolving_the_conflict_clears_it_and_restores_the_budget(started, proje
     fresh attempts, not attempt four (spec §4)."""
     conflicting(fake_gh)
     store = ProjectStore(project)
-    for _ in range(PR_CONFLICT_MAX_ATTEMPTS + 1):
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
         poll(started, store)
         delivered(store, parked_worker["id"])
     assert store.get_work_order(parked_worker["id"])["needs_attention"]
@@ -633,13 +633,13 @@ def test_resolving_the_conflict_clears_it_and_restores_the_budget(started, proje
     row = store.get_work_order(parked_worker["id"])
     assert not row["needs_attention"]
     assert true_blockers(store, row) == []
-    assert store.pr_conflict_attempts(parked_worker["id"]) == 0
+    assert store.pr_repair_attempts(parked_worker["id"], "conflict") == 0
     assert any(e["kind"] == "pr_conflict_cleared"
                for e in store.list_events(parked_worker["id"]))
 
     conflicting(fake_gh)                  # and it may conflict all over again
     poll(started, store)
-    assert store.pr_conflict_attempts(parked_worker["id"]) == 1
+    assert store.pr_repair_attempts(parked_worker["id"], "conflict") == 1
 
 
 def test_clearing_a_conflict_leaves_an_unrelated_flag_alone(started, project, fake_gh,
@@ -683,7 +683,7 @@ def test_unknown_mergeability_is_not_a_conflict(started, project, fake_gh, parke
     poll(started, store)
 
     assert not store.queued_messages(parked_worker["id"])
-    assert store.pr_conflict_attempts(parked_worker["id"]) == 0
+    assert store.pr_repair_attempts(parked_worker["id"], "conflict") == 0
 
 
 def test_unknown_mergeability_does_not_clear_a_conflict_either(started, project,
@@ -697,7 +697,7 @@ def test_unknown_mergeability_does_not_clear_a_conflict_either(started, project,
     fake_gh.set_pr(PR, "OPEN", mergeable="UNKNOWN")
     poll(started, store)
 
-    assert store.pr_conflict_attempts(parked_worker["id"]) == 1
+    assert store.pr_repair_attempts(parked_worker["id"], "conflict") == 1
 
 
 def test_the_timeline_shows_the_attempts_and_credits_nobody_with_them(
@@ -706,7 +706,7 @@ def test_the_timeline_shows_the_attempts_and_credits_nobody_with_them(
     asking — and must not read a message they never wrote as their own (spec §6)."""
     conflicting(fake_gh)
     store = ProjectStore(project)
-    for _ in range(PR_CONFLICT_MAX_ATTEMPTS + 1):
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
         poll(started, store)
         delivered(store, parked_worker["id"])
 

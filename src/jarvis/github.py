@@ -175,9 +175,54 @@ def origin_repo(cwd: Path | None) -> tuple[str, str] | None:
     return parts[-2].lower(), parts[-1].lower()
 
 
-#: The fields of one `gh pr view --json …`. Two questions in one round trip: did this
-#: land, and can it still land? See the spec's §2 for the second half.
-PR_FIELDS = "state,mergedAt,mergeable,baseRefName"
+#: The fields of one `gh pr view --json …`. Three questions in one round trip: did this
+#: land, can it still land, and is what it would land green? See the spec's §2 for the
+#: second, and 2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md §2 for the
+#: third — including why this is still NOT the same list as `ARTIFACT_FIELDS` below.
+PR_FIELDS = "state,mergedAt,mergeable,mergeStateStatus,baseRefName,statusCheckRollup"
+
+#: A check conclusion that means THE CODE IS WRONG — as opposed to merely not green. The
+#: distinction is the whole of the red-pull-request spec's §3: a run that is PENDING,
+#: CANCELLED, SKIPPED, NEUTRAL or STALE tells nobody the work is broken, and a worker
+#: asked to "fix" one has nothing to edit. ERROR is a legacy commit status's FAILURE.
+RED_CONCLUSIONS = frozenset({"FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "ERROR"})
+
+#: A check that has not finished. `status` on a check run, `state` on a legacy commit
+#: status — `read_checks` normalises both into the same keys, so one set covers both.
+UNFINISHED_STATUSES = frozenset({"QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED",
+                                 "PENDING", "EXPECTED"})
+
+
+def read_checks(payload: dict[str, Any]) -> tuple[dict[str, str], ...]:
+    """`statusCheckRollup`, normalised. THE ONLY READER OF A CHECK RUN IN THIS OS.
+
+    GitHub answers a check run and a legacy commit status with different keys —
+    `status`/`conclusion` on the first, `state` on the second — and a repository can
+    carry both at once. Reading either shape keeps a green CI from rendering as an empty
+    conclusion, which a seat would have to read as "not known to pass".
+
+    Shared by both readers below on purpose. The FIELD SETS stay separate (the poll must
+    not pay for the body, the file list and the diff on every tick), but "what does this
+    check say" has one answer, or the OS judges a submission by a standard it does not
+    police while it waits for the merge — which is exactly issue #224.
+    """
+    return tuple(
+        {"name": str(c.get("name") or c.get("context") or ""),
+         "status": str(c.get("status") or c.get("state") or ""),
+         "conclusion": str(c.get("conclusion") or c.get("state") or "")}
+        for c in (payload.get("statusCheckRollup") or [])
+        if isinstance(c, dict))
+
+
+def failing_checks(checks: tuple[dict[str, str], ...]) -> tuple[str, ...]:
+    """The names of the checks that say the code is wrong. Empty is the green answer.
+
+    Empty also covers the two states that are neither green nor red: nothing has run
+    yet, and nothing runs on this repository at all. Both must nudge nobody, which is
+    why this returns what IS failing rather than a "not passing" verdict.
+    """
+    return tuple(c["name"] or "(unnamed check)" for c in checks
+                 if c["conclusion"].upper() in RED_CONCLUSIONS)
 
 
 @dataclass(frozen=True)
@@ -196,6 +241,12 @@ class PullRequest:
     #: when the field was not asked for or not answered.
     mergeable: str | None = None
     base_ref: str | None = None
+    #: `mergeStateStatus`: BEHIND, BLOCKED, CLEAN, DIRTY, DRAFT, HAS_HOOKS, UNKNOWN or
+    #: UNSTABLE. Only BEHIND is read, and only to SAY so — never to act (spec §5).
+    merge_state: str | None = None
+    #: One entry per check, through `read_checks`. Empty is a repository that runs no
+    #: checks, which is not the same as every check failing.
+    checks: tuple[dict[str, str], ...] = ()
 
     @property
     def merged(self) -> bool:
@@ -214,6 +265,32 @@ class PullRequest:
     def mergeable_now(self) -> bool:
         """GitHub positively says it merges — as opposed to "not known to conflict"."""
         return self.mergeable == "MERGEABLE"
+
+    @property
+    def failing(self) -> tuple[str, ...]:
+        """The checks that say the code is wrong, by name. Empty is the green answer."""
+        return failing_checks(self.checks)
+
+    @property
+    def checks_green(self) -> bool:
+        """CI positively passed — as opposed to "nothing is currently failing".
+
+        The same distinction `mergeable_now` draws, and it exists for the same reason.
+        A worker that has just pushed a fix leaves every check QUEUED, and "not failing"
+        would read that as success and close the repair episode — resetting the attempt
+        budget, so a fix that does not work buys three fresh attempts every round and
+        the cap stops capping anything. Only a finished, unanimous pass clears it.
+
+        A pull request with no checks at all is not green either. It cannot have had a
+        red episode to close, so this never has to answer for one.
+        """
+        return bool(self.checks) and not self.failing and not any(
+            c["status"].upper() in UNFINISHED_STATUSES for c in self.checks)
+
+    @property
+    def behind(self) -> bool:
+        """The branch is behind its base. REPORTED, NEVER ACTED ON — spec §5."""
+        return self.merge_state == "BEHIND"
 
 
 def _run(args: list[str], *, url: str, cwd: Path | None,
@@ -271,6 +348,9 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
         merged_at=payload.get("mergedAt") or None,
         mergeable=str(payload["mergeable"]).upper() if payload.get("mergeable") else None,
         base_ref=payload.get("baseRefName") or None,
+        merge_state=(str(payload["mergeStateStatus"]).upper()
+                     if payload.get("mergeStateStatus") else None),
+        checks=read_checks(payload),
     )
 
 
@@ -310,9 +390,9 @@ class PullRequestArtifact:
     #: stat block; rebuilding it here keeps that section identical in shape whichever
     #: source the diff came from.
     stat: str
-    #: One entry per check run: `{"name", "status", "conclusion"}`. Empty when the
-    #: repository runs no checks, which is NOT the same as every check failing and must
-    #: not be rendered as though it were.
+    #: One entry per check run: `{"name", "status", "conclusion"}`, through the same
+    #: `read_checks` the poll loop uses. Empty when the repository runs no checks, which
+    #: is NOT the same as every check failing and must not be rendered as though it were.
     checks: tuple[dict[str, str], ...]
     #: The unified diff, exactly as `gh pr diff` prints it. UNTRUNCATED here: truncation
     #: is the evidence collector's job and its limit is a config value this module has
@@ -385,15 +465,6 @@ def pr_artifact(url: str, cwd: Path | None = None) -> PullRequestArtifact:
         deletions=int(payload.get("deletions") or 0),
         files=tuple(str(f.get("path") or "") for f in files if f.get("path")),
         stat=_stat_block(files),
-        # GitHub answers a check run and a legacy commit status with different keys —
-        # `conclusion`/`status` on the first, `state` on the second — and a repository
-        # can carry both at once. Reading either shape keeps a green CI from rendering
-        # as an empty conclusion, which a seat would have to read as "not known to pass".
-        checks=tuple(
-            {"name": str(c.get("name") or c.get("context") or ""),
-             "status": str(c.get("status") or c.get("state") or ""),
-             "conclusion": str(c.get("conclusion") or c.get("state") or "")}
-            for c in (payload.get("statusCheckRollup") or [])
-            if isinstance(c, dict)),
+        checks=read_checks(payload),
         diff=diff,
     )

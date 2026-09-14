@@ -81,6 +81,20 @@ SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: only ever gets set wrong.
 PR_POLL_EVERY_TICKS = 24
 
+#: Which work orders' pull requests get asked about. EVERY STATUS WHERE A PULL REQUEST
+#: CAN SIT WITH NOBODY MOVING IT — issue #224: `waiting_pr_merge` alone left a work order
+#: that escalated into `needs_review` behind a red build completely unpolled, which is
+#: precisely when the user is about to decide whether to merge it.
+#:
+#: The in-flight statuses (`running`, `dispatching`, `validating`) are deliberately out.
+#: Something already owns those — a live turn, or the round machine, which
+#: `settle_work_order` refuses to touch for the same reason — and `complete_merged` on
+#: one would end a work order out from under a worker that is still writing to it. They
+#: also cannot SIT: whatever is driving them will settle them into a status that is here.
+#:
+#: `pending` is out too: an order that has not been dispatched has no pull request.
+PR_POLL_STATUSES = ("waiting_pr_merge", "needs_review", "waiting_input", "failed")
+
 #: Look for a work order the transport parked — the usage limit or a broken API — every
 #: N ticks, which is ten seconds at the default 5s interval. Its own cadence rather than
 #: the reconcile one, and a cheap one to run: the moment it may go again is already
@@ -2761,9 +2775,23 @@ class Daemon:
                 # Finished behind a pull request: it is the user's merge that ends this
                 # work order, not the worker's last turn. Settling it to `completed`
                 # here would take it off the open list before anyone had merged it.
-                if fresh["status"] != "waiting_pr_merge":
-                    store.set_status(wo["id"], "waiting_pr_merge")
-                    store.clear_attention(wo["id"])
+                #
+                # UNLESS THE OS IS THE ONE THAT WOKE IT. A repair turn — a conflict or a
+                # red build — returns the work order where it CAME FROM, which is not
+                # always the merge queue. A `needs_review` order nudged about failing CI
+                # still needs review, and parking it here would end the repair by
+                # silently taking the item off the user's list: the OS would look like it
+                # had handled something it had only half handled (issue #224, Neo
+                # question 275). The flag comes back on its own once the status does —
+                # INV-ATTENTION-MISSING re-derives it — so nothing has to be remembered
+                # beyond the status itself.
+                from . import ops as ops_mod
+
+                back = ops_mod.pr_repair_origin(store, wo["id"]) or "waiting_pr_merge"
+                if fresh["status"] != back:
+                    store.set_status(wo["id"], back)
+                    if back == "waiting_pr_merge":
+                        store.clear_attention(wo["id"])
             else:
                 store.set_status(wo["id"], "completed")
                 store.clear_attention(wo["id"])
@@ -2857,17 +2885,27 @@ class Daemon:
         looks outside the machine, and it exists so the user does not have to type
         `jarvis wo done` after every merge they already performed.
 
-        Four answers, from `github.pr_view`:
+        Five answers, from `github.pr_view`:
 
         * **merged** — the work landed; the work order ends (`ops.complete_merged`).
         * **closed, unmerged** — someone refused the work; it goes to `needs_review`
           and asks for the user (`ops.record_pr_closed`).
         * **open and conflicting** — the worker is asked to resolve it, so the user
-          never has to (`ops.nudge_pr_conflict`, and the whole of
+          never has to (`ops.PR_CONFLICT`, and the whole of
           docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md).
-        * **open and mergeable** — nothing to do, and nothing written unless a conflict
-          episode is being closed. The overwhelmingly common case, so it costs one `gh`
-          call, one indexed read and no write.
+        * **open with a failing check** — the same, with a different message
+          (`ops.PR_CHECKS`, and
+          docs/superpowers/specs/2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md).
+          A check that is merely not green is NOT this: `github.RED_CONCLUSIONS`.
+        * **open, mergeable and green** — nothing to do, and nothing written unless a
+          repair episode is being closed. The overwhelmingly common case, so it costs
+          one `gh` call, one indexed read and no write.
+
+        EVERY STATUS THAT CARRIES A PULL REQUEST IS POLLED, not `waiting_pr_merge`
+        alone. A work order that escalated into `needs_review` behind a red build was
+        invisible here, which is exactly when the user is about to look at it and decide
+        whether to merge (issue #224). `PR_POLL_STATUSES` says which, and why the
+        in-flight ones are left out.
 
         Hidden work orders are polled too. Hiding drops a record from listings and the
         attention list; it does not mean the record may go on saying something untrue.
@@ -2875,7 +2913,7 @@ class Daemon:
         The step is skipped whole when nothing is parked — one indexed query — so a
         fleet with no open pull requests never spawns a subprocess for this.
         """
-        parked = [wo for wo in store.list_work_orders(statuses=("waiting_pr_merge",),
+        parked = [wo for wo in store.list_work_orders(statuses=PR_POLL_STATUSES,
                                                       include_hidden=True)
                   if wo.get("pr_url")]
         if not parked:
@@ -2907,25 +2945,57 @@ class Daemon:
                              wo["pr_url"], wo["id"])
                     ops.complete_merged(store, wo, merged_at=pr.merged_at)
                 elif pr.closed_unmerged:
-                    log.info("[%s] %s closed unmerged — %s needs the user",
-                             project.name, wo["pr_url"], wo["id"])
-                    ops.record_pr_closed(store, wo)
+                    # ONCE. Before the poll widened, `record_pr_closed` moved the work
+                    # order to `needs_review` and out of the polled set, so re-running
+                    # was unreachable; now the closed order stays in it and would write
+                    # a `pr_closed` event every couple of minutes for ever.
+                    if wo.get("pr_state") != "CLOSED":
+                        log.info("[%s] %s closed unmerged — %s needs the user",
+                                 project.name, wo["pr_url"], wo["id"])
+                        ops.record_pr_closed(store, wo)
                 elif pr.conflicting:
-                    self.heal_pr_conflict(project, store, wo, pr)
-                elif pr.mergeable_now and ops.clear_pr_conflict(store, wo):
-                    log.info("[%s] %s merges again — %s stopped conflicting",
-                             project.name, wo["pr_url"], wo["id"])
+                    self.heal_pull_request(project, store, wo, ops.PR_CONFLICT,
+                                           "conflicts",
+                                           base=pr.base_ref or "its base branch")
+                elif pr.failing:
+                    self.heal_pull_request(
+                        project, store, wo, ops.PR_CHECKS,
+                        f"has failing checks ({', '.join(pr.failing)})",
+                        failing=", ".join(pr.failing),
+                        # BEHIND rides along with a nudge that was going out anyway and
+                        # never causes one: spec §5.
+                        behind=(ops.PR_BEHIND_NOTE.format(base=pr.base_ref or "its base")
+                                if pr.behind else ""))
+                else:
+                    if pr.mergeable_now and ops.clear_pr_repair(store, wo,
+                                                                ops.PR_CONFLICT):
+                        log.info("[%s] %s merges again — %s stopped conflicting",
+                                 project.name, wo["pr_url"], wo["id"])
+                    # Not `elif`: a pull request can stop conflicting and go green in the
+                    # same poll, and the two episodes are separate budgets. Re-read the
+                    # row because the clear above may have taken a flag down, and
+                    # `clear_pr_repair` decides on `attention_reason`.
+                    #
+                    # `checks_green`, NOT "nothing is failing" — see the property. The
+                    # tick right after a worker pushes its fix has every check QUEUED,
+                    # and closing the episode there would hand a fix that does not work
+                    # three fresh attempts every round.
+                    if pr.checks_green and ops.clear_pr_repair(
+                            store, store.get_work_order(wo["id"]), ops.PR_CHECKS):
+                        log.info("[%s] %s is green again — %s stopped failing",
+                                 project.name, wo["pr_url"], wo["id"])
             except Exception:  # noqa: BLE001
                 log.exception("[%s] settling %s against its PR failed", project.name,
                               wo["id"])
 
-    def heal_pr_conflict(self, project: ProjectSpec, store: ProjectStore, wo: dict,
-                         pr: Any) -> None:
-        """A parked pull request that conflicts: ask its worker to resolve it.
+    def heal_pull_request(self, project: ProjectSpec, store: ProjectStore, wo: dict,
+                          repair: Any, what: str, **fields: Any) -> None:
+        """A pull request the OS can ask its own worker to fix: conflicts, or a red build.
 
-        The three guards are all this adds over `ops.nudge_pr_conflict`: no session to
-        resume, a nudge already queued, a turn already in flight. Spec §3 for why each
-        of them would otherwise cost a duplicated turn or silently spend the budget.
+        ONE function for both, because they are one mechanism — see `ops.PrRepair`. The
+        three guards are all this adds over `ops.nudge_pr_repair`: no session to resume,
+        a nudge already queued, a turn already in flight. Spec §3 for why each of them
+        would otherwise cost a duplicated turn or silently spend the budget.
         """
         from . import ops
 
@@ -2933,13 +3003,13 @@ class Daemon:
             return
         if store.queued_messages(wo["id"]) or worker_session.busy(store, wo["id"]):
             return
-        out = ops.nudge_pr_conflict(store, wo, base=pr.base_ref)
+        out = ops.nudge_pr_repair(store, wo, repair, **fields)
         if out["gave_up"]:
-            log.info("[%s] %s still conflicts after %s attempts — %s needs the user",
-                     project.name, wo["pr_url"], out["attempts"], wo["id"])
+            log.info("[%s] %s still %s after %s attempts — %s needs the user",
+                     project.name, wo["pr_url"], what, out["attempts"], wo["id"])
         else:
-            log.info("[%s] %s conflicts — asking %s to resolve (attempt %s)",
-                     project.name, wo["pr_url"], wo["id"], out["attempts"])
+            log.info("[%s] %s %s — asking %s to fix it (attempt %s)",
+                     project.name, wo["pr_url"], what, wo["id"], out["attempts"])
 
     def _warn_pr_poll_broken(self, project: ProjectSpec, store: ProjectStore,
                              error: Exception) -> None:

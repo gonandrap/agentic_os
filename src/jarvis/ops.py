@@ -14,6 +14,7 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -1876,57 +1877,139 @@ against has itself been merged), say so plainly in your final message rather tha
 fighting it: that is a call for the user.
 
 When the push is done, simply END YOUR TURN. This work order already finished and \
-already has its summary — do NOT call `jarvis wo finish` again. Jarvis parks it back \
-behind the pull request by itself and re-checks the merge.
+already has its summary — do NOT call `jarvis wo finish` again. Jarvis puts it back \
+where it was by itself and re-checks the merge.
 
 This is attempt {attempt} of {max_attempts}. After {max_attempts} the work order stops \
 trying and asks the user."""
 
 
-def nudge_pr_conflict(store: ProjectStore, wo: dict[str, Any],
-                      base: str | None = None) -> dict[str, Any]:
-    """GitHub says this pull request conflicts: ask the worker to fix it, or give up.
+#: The same message for a red build. Same four things the conflict nudge says — what is
+#: wrong, what to do, what NOT to do, how many attempts are left — plus the names of the
+#: checks, because "CI is red" without them costs the worker a `gh` call to find out.
+#: docs/superpowers/specs/2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md §3.
+PR_CHECKS_NUDGE = """\
+Your pull request {url} has failing checks and must not be merged as it stands. GitHub \
+reports these as failed: {failing}. Nobody typed this message — Jarvis noticed while \
+polling the pull request.
+
+Fix them: in your worktree, reproduce each failure locally, fix the cause, run this \
+project's tests, and push. If a check fails for a reason that is not yours to fix (an \
+infrastructure outage, a flake, a required check this branch cannot satisfy), say so \
+plainly in your final message rather than fighting it: that is a call for the user. Do \
+NOT rebase or force-push — a forced branch update is refused by the permission \
+classifier.{behind}
+
+When the push is done, simply END YOUR TURN. This work order already finished and \
+already has its summary — do NOT call `jarvis wo finish` again. Jarvis puts it back \
+where it was by itself and re-checks the build.
+
+This is attempt {attempt} of {max_attempts}. After {max_attempts} the work order stops \
+trying and asks the user."""
+
+#: Appended to the nudge above when the branch is also BEHIND its base. SAID, NEVER DONE
+#: — spec §5 for why the OS reports this rather than running the update itself, and why
+#: BEHIND on its own nudges nobody.
+PR_BEHIND_NOTE = """ The branch is also behind `{base}`, which this repository's ruleset \
+requires it not to be before a merge; while you are in there, merge `origin/{base}` in \
+(do not rebase) so the checks re-run against what would actually land."""
+
+
+@dataclass(frozen=True)
+class PrRepair:
+    """One thing a poll can ask a worker to fix on its own pull request.
+
+    Two of them, and everything else is shared: the same attempt cap, the same three
+    guards in `Daemon.heal_pull_request`, the same episode arithmetic, the same
+    unauthored message source. They differ only in what is wrong and what to say about
+    it, which is the whole reason this is a descriptor and not a second copy of the
+    functions below (issue #224: the CI half was missing because it looked like new
+    machinery).
+    """
+
+    #: Names the event kinds (`pr_<name>_nudged`/`_cleared`/`_unresolved`), the message
+    #: source (`pr-<name>`, which `timeline.UNAUTHORED_SOURCES` renders as Jarvis rather
+    #: than as the user) and the episode `ProjectStore.pr_repair_attempts` counts.
+    name: str
+    template: str
+    blocker: str
+
+    @property
+    def source(self) -> str:
+        return f"pr-{self.name}"
+
+    def event(self, suffix: str) -> str:
+        return f"pr_{self.name}_{suffix}"
+
+
+PR_CONFLICT = PrRepair("conflict", PR_CONFLICT_NUDGE, invariants.PR_CONFLICT_BLOCKER)
+PR_CHECKS = PrRepair("checks", PR_CHECKS_NUDGE, invariants.PR_CHECKS_BLOCKER)
+
+#: Newest episode first is not a thing here — `pr_repair_origin` compares timestamps —
+#: but every repair that can hold a work order out of its status has to be in this
+#: tuple, or `Daemon.settle_work_order` will park its repair turn in the merge queue.
+PR_REPAIRS = (PR_CONFLICT, PR_CHECKS)
+
+
+def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
+                    **fields: Any) -> dict[str, Any]:
+    """GitHub says this pull request is broken: ask the worker to fix it, or give up.
 
     Queues the message and records the attempt — delivery, the resume and the return to
-    `waiting_pr_merge` are all existing machinery, and nothing here runs git (spec §3).
-    Past PR_CONFLICT_MAX_ATTEMPTS it stops and flags the user instead, once (spec §4).
+    wherever the work order came from are all existing machinery, and nothing here runs
+    git (spec §3). Past PR_REPAIR_MAX_ATTEMPTS it stops and flags the user instead, once
+    (spec §4).
+
+    `was` is the status the repair is taking the work order OUT of, recorded so that
+    settlement can put it back: a `needs_review` order nudged about a red build still
+    needs review, and parking it in the merge queue would take the item off the user's
+    list (Neo question 275, red-PR spec §4).
     """
-    attempts = store.pr_conflict_attempts(wo["id"])
-    if attempts >= invariants.PR_CONFLICT_MAX_ATTEMPTS:
-        if not store.pr_conflict_gave_up(wo["id"]):
-            store.add_event(wo["id"], "pr_conflict_unresolved",
+    attempts = store.pr_repair_attempts(wo["id"], repair.name)
+    if attempts >= invariants.PR_REPAIR_MAX_ATTEMPTS:
+        if not store.pr_repair_gave_up(wo["id"], repair.name):
+            store.add_event(wo["id"], repair.event("unresolved"),
                             {"pr_url": wo.get("pr_url"), "attempts": attempts})
-            store.flag_attention(wo["id"], invariants.PR_CONFLICT_BLOCKER)
+            store.flag_attention(wo["id"], repair.blocker)
         return {"wo_id": wo["id"], "nudged": False, "attempts": attempts,
                 "gave_up": True}
     attempt = attempts + 1
     msg_id = store.queue_message(
         wo["id"],
-        PR_CONFLICT_NUDGE.format(
-            url=wo.get("pr_url") or "your pull request", base=base or "its base branch",
-            attempt=attempt, max_attempts=invariants.PR_CONFLICT_MAX_ATTEMPTS),
+        repair.template.format(
+            url=wo.get("pr_url") or "your pull request",
+            attempt=attempt, max_attempts=invariants.PR_REPAIR_MAX_ATTEMPTS, **fields),
         # Not "jarvis" and not "user": this message had no author, a poll wrote it, and
         # the timeline says so (spec §6).
-        source="pr-conflict",
+        source=repair.source,
     )
-    store.add_event(wo["id"], "pr_conflict_nudged",
-                    {"pr_url": wo.get("pr_url"), "base": base, "attempt": attempt,
-                     "of": invariants.PR_CONFLICT_MAX_ATTEMPTS, "msg_id": msg_id})
+    store.add_event(wo["id"], repair.event("nudged"),
+                    {"pr_url": wo.get("pr_url"), "attempt": attempt,
+                     "of": invariants.PR_REPAIR_MAX_ATTEMPTS, "msg_id": msg_id,
+                     "was": wo["status"],
+                     **{k: v for k, v in fields.items() if k != "behind"}})
     return {"wo_id": wo["id"], "nudged": True, "attempts": attempt, "gave_up": False}
 
 
-def clear_pr_conflict(store: ProjectStore, wo: dict[str, Any]) -> bool:
-    """The pull request merges again: close the conflict episode. True if there was one.
+def clear_pr_repair(store: ProjectStore, wo: dict[str, Any],
+                    repair: PrRepair) -> bool:
+    """The pull request is well again: close the episode. True if there was one.
 
     Resets the attempt budget (spec §4) and takes down the give-up flag — but only that
-    one, never a flag raised for something else.
+    one, never a flag raised for something else. That last clause is what keeps a green
+    build from clearing the review the user still owes.
     """
-    if not store.pr_conflict_attempts(wo["id"]):
+    if not store.pr_repair_attempts(wo["id"], repair.name):
         return False
-    store.add_event(wo["id"], "pr_conflict_cleared", {"pr_url": wo.get("pr_url")})
-    if wo["attention_reason"] == invariants.PR_CONFLICT_BLOCKER:
+    store.add_event(wo["id"], repair.event("cleared"), {"pr_url": wo.get("pr_url")})
+    if wo["attention_reason"] == repair.blocker:
         store.clear_attention(wo["id"])
     return True
+
+
+def pr_repair_origin(store: ProjectStore, wo_id: str) -> str | None:
+    """The status an OPEN repair episode took this work order out of, if any."""
+    return store.pr_repair_origin(wo_id, tuple(r.name for r in PR_REPAIRS))
 
 
 def _awaiting_merge(wo: dict[str, Any]) -> bool:
