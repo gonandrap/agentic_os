@@ -703,6 +703,52 @@ def test_the_packet_carries_the_alarm_the_order_and_what_the_worker_last_said(
     assert "still drafting section four" in packet
 
 
+def _synthetic_row(at: float, mid: str) -> dict:
+    """The zero-token assistant message Claude Code writes ITSELF. It ends a turn without
+    ever having been an API call, which is how a turn comes to have none."""
+    return {"type": "assistant", "timestamp": _stamp(at),
+            "message": {"id": mid, "model": usage.SYNTHETIC_MODEL,
+                        "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+                                  "cache_read_input_tokens": 0, "output_tokens": 0},
+                        "content": [{"type": "text", "text": "…"}]}}
+
+
+def test_the_packet_says_a_turn_cost_nothing_rather_than_leaving_it_to_be_inferred(
+        started, monkeypatch, tmp_path):
+    """ISSUE 227, THE LAYER THAT REACHED THE USER. wo-f1ce0f24 turn 3 made no API call in
+    65 minutes; the supervisor escalated it as "a silent hung turn BILLED IN FULL" in the
+    same sentence as "zero context peak", and the user got a Telegram saying an hour of
+    generation had been billed. The judge never read the per-turn cost, so the packet now
+    hands it over — and leads with the fact that there was none."""
+    daemon = started()
+    root = tmp_path / "projects"
+    (root / "-proj").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    wo = ops.create_work_order("proj_a", "the dead turn")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        (root / "-proj" / f"{wo['id']}.jsonl").write_text("".join(
+            json.dumps(r) + "\n" for r in [
+                _prompt_row(FIXED_TURN_AT, "You are the worker agent for wo-1"),
+                _synthetic_row(FIXED_TURN_AT + 10, "s1"),
+                _prompt_row(FIXED_TURN_AT + 3900, "the same message again"),
+                _assistant_row(FIXED_TURN_AT + 4031, "m1"),
+            ]))
+        store.update_work_order(wo["id"], status="running", session_id=wo["id"])
+        packet = supervisor.build_evidence(store, _wo_subject(store, wo["id"]), None,
+                                           CFG, daemon.catalog.projects[0].inspect)
+    finally:
+        store.close()
+
+    stalled = next(l for l in packet.splitlines() if l.startswith("- turn 1:"))
+    assert "NO API CALL WAS EVER MADE — it cost nothing." in stalled
+    assert stalled.index("NO API CALL") < stalled.index("3900s wall")
+    assert "0 API calls costing 0 tokens / $0.00" in stalled
+    assert "3900s unaccounted" in stalled and "0s generating" in stalled
+    # The turn that answered the re-delivered message in 131 seconds is not swallowed.
+    assert "1 API call costing" in packet
+
+
 #: A clock and a transcript that do not move, so the packet below is a literal rather
 #: than a description of one. `build_evidence`'s first section renders "N minute(s) ago"
 #: off `db.now`, which is why it is pinned rather than merely started from.
@@ -724,6 +770,9 @@ def _fixed_transcript(path: Path) -> None:
 #: THE WORK-ORDER PACKET, COMMITTED. It is the cached prompt prefix of every review the
 #: OS runs: a packet that changes shape reprices them all, silently. Only `{wo_id}` is
 #: substituted, because the id is generated — everything else is bytes.
+#:
+#: Moved once, deliberately, for issue 227: every turn now carries what it ACTUALLY cost,
+#: because the judge was asserting spend it had never read.
 EXPECTED_WORK_ORDER_PACKET = """\
 # The alarm
 kind: long-turn
@@ -737,9 +786,9 @@ title: write the design doc
 brief: a long brief about the console
 
 # The session, turn by turn
-- turn 1: 120s wall (30s generating, 0s blocked, 0s tools, 90s idle), context peak 0
+- turn 1: 120s wall (30s generating, 0s blocked, 0s tools, 90s idle, 0s unaccounted), 1 API call costing 1 tokens / $0.00, context peak 0
     started by [dispatch] You are the worker agent for wo-1
-- turn 2: 30s wall (30s generating, 0s blocked, 0s tools, 0s idle), context peak 0
+- turn 2: 30s wall (30s generating, 0s blocked, 0s tools, 0s idle, 0s unaccounted), 1 API call costing 1 tokens / $0.00, context peak 0
     started by [a message] carry on
 
 # What was last said about this order

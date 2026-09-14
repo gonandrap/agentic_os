@@ -33,6 +33,12 @@ has to go and look. Your job is to look instead, and to decide whether it needed
 
 You are shown evidence, never the worker's transcript. Judge on what you are given.
 
+READ WHAT A TURN COST BEFORE YOU CALL IT EXPENSIVE. Every turn in the packet carries its
+API call count and the tokens and dollars it actually bought. A turn that made NO API call
+has spent nothing however long its wall clock is: it STALLED, and it is the work never
+starting rather than effort being re-spent. Saying it was billed, burned or wasted puts a
+false claim about money in front of the user, which is worse than the silence it describes.
+
 ACK when the spend is EXPLICABLE — the shape of the work accounts for it. A long turn on a
 design document, a planning session, a large refactor or a test suite that takes an hour is
 the work costing what the work costs. A single large cache write at the start of a session
@@ -85,6 +91,11 @@ The OS raised an alarm on a session whose turn was still running — too long, b
 subagent too long, or re-sending too much of its conversation. A supervisor agent looked
 first and could not settle it, so it is yours. You are the second reader and the last one
 before the user is interrupted.
+
+READ WHAT THE TURN COST, NEVER INFER IT FROM THE CLOCK. The packet gives every turn its
+API call count and its actual tokens and dollars. A turn with no API call bought nothing
+however long it ran — it stalled, and an answer or escalation that describes it as billed
+is a false claim about money reaching the user.
 
 READ THE PACKET'S "this session is" LINE BEFORE YOU JUDGE THE NUMBERS. The alarm is
 always raised against a work order, but a work order is not always a worker: it may be a
@@ -289,10 +300,18 @@ def _session_lines(wo: dict[str, Any], inspect_cfg: Any) -> list[str]:
 
     lines = []
     for turn in anatomy.turns:
+        # THE COST IS AN INPUT, NOT AN INFERENCE FROM THE DURATION (issue 227). The
+        # per-turn record already existed and no layer read it, so a 65-minute turn that
+        # made no call at all was escalated as "BILLED IN FULL" in the same sentence as
+        # "zero context peak". A turn that bought nothing says so before its clock.
+        spend = turn.usage
+        split = ", ".join(f"{getattr(turn, part):.0f}s {part}"
+                          for part in inspection.PARTS)
+        stalled = "" if turn.observed else "NO API CALL WAS EVER MADE — it cost nothing. "
         lines.append(
-            f"- turn {turn.seq}: {turn.wall:.0f}s wall "
-            f"({turn.generating:.0f}s generating, {turn.blocked:.0f}s blocked, "
-            f"{turn.tools:.0f}s tools, {turn.idle:.0f}s idle), "
+            f"- turn {turn.seq}: {stalled}{turn.wall:.0f}s wall ({split}), "
+            f"{len(turn.calls)} API call{'' if len(turn.calls) == 1 else 's'} costing "
+            f"{spend.total_tokens:,} tokens / ${spend.list_cost_usd:.2f}, "
             f"context peak {turn.context_peak:,}")
         for trigger in turn.triggers:
             lines.append(f"    started by [{trigger.kind}] {trigger.quote}")
