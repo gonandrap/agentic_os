@@ -394,9 +394,16 @@ def test_only_the_round_machine_collects_evidence():
     that has started forming its own opinion about what a work order changed — which is
     the coupling this leaf exists to avoid — so the list is asserted whole rather than
     "nothing imports it".
+
+    `landing` is the one entry that is NOT a collector, and it is allowed for the reason
+    the list exists: it imports `base_ref` and `ProjectRef` precisely so that there is
+    one pinned merge-base ladder and one worktree stand-in rather than two. It never
+    calls `collect_work_order`, which the assertion below pins separately — a `landing`
+    that started collecting packets would be exactly the drift this guard is for.
     """
     src = Path(evidence.__file__).parent
     names = {".evidence", "jarvis.evidence"}
     importers = [p.name for p in sorted(src.glob("*.py"))
                  if p.name != "evidence.py" and _imports(p) & names]
-    assert importers == ["daemon.py", "ops.py", "validation.py"]
+    assert importers == ["daemon.py", "landing.py", "ops.py", "validation.py"]
+    assert "collect_work_order" not in (src / "landing.py").read_text()

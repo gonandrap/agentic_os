@@ -175,11 +175,19 @@ def origin_repo(cwd: Path | None) -> tuple[str, str] | None:
     return parts[-2].lower(), parts[-1].lower()
 
 
-#: The fields of one `gh pr view --json …`. Three questions in one round trip: did this
-#: land, can it still land, and is what it would land green? See the spec's §2 for the
-#: second, and 2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md §2 for the
-#: third — including why this is still NOT the same list as `ARTIFACT_FIELDS` below.
-PR_FIELDS = "state,mergedAt,mergeable,mergeStateStatus,baseRefName,statusCheckRollup"
+#: The fields of one `gh pr view --json …`. Four questions in one round trip: did this
+#: land, can it still land, is what it would land green, and — months later — is what
+#: landed all of it? See the spec's §2 for the second,
+#: 2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md §2 for the third, and
+#: 2026-09-13-a-finished-order-proves-its-code-landed.md §7 for the fourth — including
+#: why this is still NOT the same list as `ARTIFACT_FIELDS` below.
+#:
+#: `headRefOid` is the sha GitHub merged, and it is the only exact answer to issue
+#: #232's Mode C: an order whose pull request merged and whose branch then carried
+#: MORE commits. It is recorded on the `pr_merged` event so the landing sweep can ask
+#: that question months later without a second round trip (`landing.assess`).
+PR_FIELDS = ("state,mergedAt,mergeable,mergeStateStatus,baseRefName,"
+             "statusCheckRollup,headRefOid")
 
 #: A check conclusion that means THE CODE IS WRONG — as opposed to merely not green. The
 #: distinction is the whole of the red-pull-request spec's §2: a run that is PENDING,
@@ -247,6 +255,9 @@ class PullRequest:
     #: One entry per check, through `read_checks`. Empty is a repository that runs no
     #: checks, which is not the same as every check failing.
     checks: tuple[dict[str, str], ...] = ()
+    #: The sha at the head of the pull request's branch. On a MERGED pull request
+    #: this is what was merged, which is what a later tail is measured against.
+    head_oid: str = ""
 
     @property
     def merged(self) -> bool:
@@ -351,6 +362,7 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
         merge_state=(str(payload["mergeStateStatus"]).upper()
                      if payload.get("mergeStateStatus") else None),
         checks=read_checks(payload),
+        head_oid=str(payload.get("headRefOid") or ""),
     )
 
 
