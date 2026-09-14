@@ -213,6 +213,33 @@ def test_a_review_after_the_pr_was_closed_does_not_re_park_it(
     assert store.get_work_order(parked["id"])["status"] == "completed"
 
 
+def test_a_second_pull_request_is_not_judged_by_the_first_ones_closure(
+        started, project, fake_gh, parked):
+    """PAIRED with the test above, and the pairing is the point: the same `CLOSED` in
+    `pr_state` means opposite things at the two landings, so only one of them may read
+    it.
+
+    `Daemon.poll_pull_requests` writes that column and never clears it. A worker whose
+    pull request was closed, who was sent back and who opened a NEW one still carries
+    the old verdict — so a landing that believed it would drop a live pull request
+    straight out of the merge queue and close the backlog item under it. The review
+    above is the one caller that can know the column is current, because the parking it
+    is ending is what the poll was polling.
+    """
+    second = "https://github.com/acme/proj/pull/8"
+    fake_gh.set_pr(PR, "CLOSED")
+    store = ProjectStore(project)
+    poll(started, store)
+    assert store.get_work_order(parked["id"])["pr_state"] == "CLOSED"
+
+    out = ops.finish(parked["id"], "opened another one", pr_url=second)
+
+    assert out["status"] == "waiting_pr_merge"
+    row = store.get_work_order(parked["id"])
+    assert row["status"] == "waiting_pr_merge", "a live pull request left the queue"
+    assert row["pr_url"] == second
+
+
 def test_rejecting_leaves_the_work_order_where_it_was(started, project, reviewable_pr):
     """A rejection is not an ending: the worker gets guidance and the PR is still its
     problem, so nothing about the merge queue changes."""

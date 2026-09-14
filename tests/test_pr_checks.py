@@ -20,6 +20,7 @@ from jarvis.daemon import Daemon
 from jarvis.invariants import (
     IDLE_NO_FINISH_BLOCKER,
     PR_CHECKS_BLOCKER,
+    PR_CLOSED_BLOCKER,
     PR_CONFLICT_BLOCKER,
     PR_REPAIR_MAX_ATTEMPTS,
     check_project,
@@ -414,6 +415,27 @@ def test_a_merged_work_order_stops_saying_do_not_merge_it(started, project, fake
     assert row["status"] == "completed"
     assert true_blockers(store, row) == []
     assert not row["needs_attention"]
+    assert [v.invariant for v in check_project(store)] == []
+
+
+def test_a_refusal_is_not_hidden_behind_a_pending_assumption(started, project,
+                                                             fake_gh):
+    """Widening the poll made a co-occurrence reachable that `true_blockers` had a guard
+    against precisely because it could not happen: a work order holding an undecided
+    assumption sits in `needs_review`, which is polled now, so its pull request CAN be
+    closed under it. The refusal must still be said — under the assumptions line, never
+    instead of it."""
+    wo = ops.create_work_order("proj_a", "add feature X")
+    ops.assume(wo["id"], "used tabs, not spaces")
+    assert ops.finish(wo["id"], "opened a PR", pr_url=PR)["status"] == "needs_review"
+    fake_gh.set_pr(PR, "CLOSED")
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    blockers = true_blockers(store, store.get_work_order(wo["id"]))
+    assert "assumption" in blockers[0]        # the decision still ranks first
+    assert PR_CLOSED_BLOCKER in blockers      # ... and the refusal is not lost
     assert [v.invariant for v in check_project(store)] == []
 
 

@@ -298,8 +298,8 @@ def test_the_eval_does_not_assemble_the_seats_itself(tree) -> None:
     opinion, applies the veto table, and only then runs the chair. An eval that called
     `run_blind` and `arbitrate` itself would grade the seats' prose while leaving the order
     of those steps — where the safety rule lives — completely unmeasured."""
-    for forbidden in ("run_blind", "arbitrate", "_run_chair", "build_seat_system_prompt",
-                      "build_chair_prompt"):
+    for forbidden in ("run_blind", "arbitrate", "_run_chair", "build_shared_prefix",
+                      "build_seat_prompt", "build_chair_prompt"):
         assert not _calls(tree, forbidden), (
             f"the eval calls {forbidden} itself, so it is assembling the panel rather "
             "than grading validation.decide")

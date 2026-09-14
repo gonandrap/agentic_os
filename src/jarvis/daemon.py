@@ -1141,7 +1141,7 @@ class Daemon:
     # -- 3b. the validation round machine (see the validation-panel design) -----------
 
     def validation_tick(self, project: ProjectSpec, store: ProjectStore) -> None:
-        """Judge every work order parked in `validating`, off this thread.
+        """Judge every work order with an open round, off this thread.
 
         THE KILL SWITCH IS NOT CHECKED HERE, and that is the point of the whole design:
         `os.validation.enabled` gates OPENING a round (`ops.finish`) and never settling
@@ -1151,27 +1151,37 @@ class Daemon:
         exactly where the OS settles it with the feature switched off.
 
         Everything expensive — collecting the diff, calling the seats — happens on the
-        pool thread. What is left here is one indexed query, so a fleet with nothing in
-        `validating` pays a lookup that finds nothing.
+        pool thread. What is left here is two indexed queries, so a fleet with nothing
+        in `validating` pays lookups that find nothing.
+
+        **THE QUERY IS OVER ROUNDS, NOT STATUSES** (GitHub issue 212, spec
+        docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §3). A work order with
+        pending assumptions parks in `needs_review` with its round open beside it, and
+        `statuses=("validating",)` — what this used to ask for — could not see one, which
+        is the whole of why validation waited on the user.
         """
-        for wo in store.list_work_orders(statuses=("validating",), include_hidden=True):
+        for wo in store.work_orders_awaiting_validation():
             wo_id = wo["id"]
             if wo_id in self.validating:
                 continue  # its round is in flight; a second tick must not start another
             round_row = store.latest_validation_round(wo_id=wo_id)
-            if round_row is None:
-                # In `validating` with no round at all: nothing this machine can judge.
-                # INV-VALIDATION-STRANDED (a later work order) is what finds these.
-                log.warning("[%s] %s is validating with no round on record",
-                            project.name, wo_id)
+            if round_row is None:  # pragma: no cover - the query selected on this round
                 continue
-            if round_row["outcome"] not in ("pending", "failed"):
-                continue  # already judged — settlement is what moves it, not a re-run
             self.validating.add(wo_id)
             future = self.validate_pool.submit(
                 self._validate_work_order, project, wo_id, int(round_row["id"]))
             future.add_done_callback(
                 lambda f, k=wo_id: self.validating.discard(k))
+        # A `validating` row with NO round is the one shape the query above cannot
+        # select on, and it is the shape nothing else in the OS looks at either: it
+        # raises no attention flag, `settle_work_order` returns early for it, and
+        # INV-VALIDATION-STRANDED needs a round to find it by. The warning is all there
+        # has ever been, and dropping the status loop would have dropped that too.
+        for orphan in store.list_work_orders(statuses=("validating",),
+                                             include_hidden=True):
+            if store.latest_validation_round(wo_id=orphan["id"]) is None:
+                log.warning("[%s] %s is validating with no round on record",
+                            project.name, orphan["id"])
 
     def _validate_work_order(self, project: ProjectSpec, wo_id: str,
                              round_id: int) -> None:
@@ -1200,7 +1210,8 @@ class Daemon:
             packet = evidence_mod.collect_work_order(
                 project.path, wo, declared=str(round_row["evidence"] or ""),
                 diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo),
-                side_effects=ops.side_effects_of(wo_id))
+                side_effects=ops.side_effects_of(wo_id),
+                assumptions=store.all_assumptions(wo_id))
 
             validator = (self.validator if self.validator is not None
                          else self._validator(cfg))
@@ -1212,7 +1223,9 @@ class Daemon:
                 store.add_event(wo_id, "validation_failed",
                                 {"round": n, "cause": "no_validator",
                                  "reason": NO_VALIDATOR_REASON})
-                ops.land_finished(store, wo)
+                # `panel_cleared`: the round this just closed is `failed`, and that
+                # outcome reads as "in flight" to anything that re-reads it.
+                ops.land_when_cleared(store, wo, panel_cleared=True)
                 log.info("[%s] %s: round %d settled unjudged (no validator)",
                          project.name, wo_id, n)
                 return
@@ -1266,7 +1279,7 @@ class Daemon:
                 store.close_validation_round(round_id, "passed", reason)
                 store.add_event(wo_id, "validation_passed",
                                 {"round": n, "round_id": round_id})
-                status = ops.land_finished(store, wo)
+                status = ops.land_when_cleared(store, wo)
                 log.info("[%s] %s passed review in round %d -> %s",
                          project.name, wo_id, n, status)
             elif outcome == "rejected" and n < max_rounds:

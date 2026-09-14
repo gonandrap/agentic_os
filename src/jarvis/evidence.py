@@ -43,8 +43,9 @@ a work order made lives in a DATABASE and this module may not open one.
 
 ## The three rules that are the point of the module
 
-**1. The fingerprint covers the FULL diff before truncation, the side effects, and
-nothing but those and the normalised `declared` text.** See `fingerprint`.
+**1. The fingerprint covers the FULL diff before truncation, the side effects, the
+assumptions the submitter filed, and nothing but those and the normalised `declared`
+text.** See `fingerprint`.
 
 **2. `declared` is whitespace-normalised before hashing** — see `_normalise`. Re-running
 the same tests and describing them with different line breaks is not new evidence.
@@ -87,8 +88,9 @@ log = logging.getLogger("jarvis.evidence")
 
 #: The truncation limit callers get when they do not pass one. It is a plain default on
 #: `collect_work_order`, NOT a config read: this module has no opinion about the catalog,
-#: and the round machine passes `os.validation.diff_chars` in.
-DEFAULT_DIFF_CHARS = 60000
+#: and the round machine passes `os.validation.diff_chars` in. Kept level with
+#: `catalog.DEFAULT_VALIDATION_DIFF_CHARS`, which is where the number was measured.
+DEFAULT_DIFF_CHARS = 150000
 
 
 @dataclass(frozen=True)
@@ -132,6 +134,11 @@ class EvidencePacket:
     #: one — defeating `diff_chars` silently. The digest is all `fingerprint` needs.
     diff_sha: str
     children: tuple[dict, ...] = ()
+    #: Every assumption the work order ever filed, `{n, content, status}`, review state
+    #: included — a decision the user accepted in round 1 is still embodied in the diff
+    #: round 2 is judging. `()` for a feature order, which files none.
+    #: See docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §4.
+    assumptions: tuple[dict, ...] = ()
     #: Where `diff`, `files` and `stat` came from: `"pull_request"` or `"worktree"`. A
     #: seat is told which, because "this is the pull request" and "this is what was
     #: lying in a worktree" are different claims about the same bytes.
@@ -185,11 +192,20 @@ def fingerprint(packet: EvidencePacket) -> str:
     | adds a test file                         | the diff            | **yes**       |
     | states a result it had not stated before | `declared` content  | **yes**       |
     | retracts a DIFFERENT knowledge entry     | `side_effects`      | **yes**       |
+    | files an assumption it had not filed     | assumption text     | **yes**       |
+    | has an assumption ACCEPTED by the user   | assumption `status` | no            |
 
-    That last row is why the formula widened. Without it, two consecutive diff-less
-    rounds retracting two different entries hash identically, and `_preceding_round`
-    escalates round 2 as "identical to round 1" — issue #200 reappearing one guard
-    further along, with the empty-diff guard already fixed (spec §5).
+    The side-effects row is why the formula widened once. Without it, two consecutive
+    diff-less rounds retracting two different entries hash identically, and
+    `_preceding_round` escalates round 2 as "identical to round 1" — issue #200
+    reappearing one guard further along, with the empty-diff guard already fixed
+    (spec 2026-09-12-the-pull-request-is-the-artifact.md §5).
+
+    The assumptions are mixed in ONLY when there are any, so every work order that files
+    none hashes exactly as it did before that existed. Their review STATE is left out on
+    the same reasoning as the rest of the table: the user accepting an assumption is not
+    the submitter producing evidence, and hashing it would make an unchanged resubmission
+    look new (spec 2026-09-13-two-gates-not-a-chain.md §4).
 
     Hashing `packet.diff` is the obvious implementation and it is wrong: the same tree
     would fingerprint differently at two truncation limits, which makes an integrity
@@ -202,6 +218,9 @@ def fingerprint(packet: EvidencePacket) -> str:
     h.update(packet.side_effects_sha.encode("utf-8"))
     h.update(b"\n")
     h.update(_normalise(packet.declared).encode("utf-8"))
+    for a in packet.assumptions:
+        h.update(b"\n")
+        h.update(_normalise(str(a.get("content") or "")).encode("utf-8"))
     return h.hexdigest()[:16]
 
 
@@ -228,7 +247,8 @@ def side_effects_digest(side_effects: Iterable[dict[str, Any]]) -> str:
 def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
                        diff_chars: int = DEFAULT_DIFF_CHARS,
                        spec: dict[str, str] | None = None,
-                       side_effects: Iterable[dict[str, Any]] = ()) -> EvidencePacket:
+                       side_effects: Iterable[dict[str, Any]] = (),
+                       assumptions: Iterable[dict[str, Any]] = ()) -> EvidencePacket:
     """Assemble the packet for one work order — from its PULL REQUEST when it has one.
 
     The three cases are spec §3's table, and `packet.source` records which one happened.
@@ -250,10 +270,10 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
     declared and written by nothing in the codebase, so it is always NULL; the base comes
     from git, via the pinned ladder, or from the pull request's own refs.
 
-    `spec` is `specs.spec_of`'s result and `side_effects` is `ops.side_effects_of`'s,
-    both passed in rather than looked up because this module reads a repository and
-    never a database — the same separation that keeps `_ProjectRef` a two-line stand-in
-    instead of a `ProjectSpec` import.
+    `spec` is `specs.spec_of`'s result, `side_effects` is `ops.side_effects_of`'s and
+    `assumptions` is `ProjectStore.all_assumptions`'s — all passed in rather than looked
+    up because this module reads a repository and never a database, the same separation
+    that keeps `_ProjectRef` a two-line stand-in instead of a `ProjectSpec` import.
     """
     pr_url = str(wo.get("pr_url") or "")
     pr_data: dict[str, Any] | None = None
@@ -311,6 +331,10 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
         side_effects_sha=side_effects_digest(effects),
         spec_ref=_spec_ref(spec),
         spec_section=(spec or {}).get("section_text", ""),
+        assumptions=tuple(
+            {"n": int(a.get("n") or 0), "content": str(a.get("content") or ""),
+             "status": str(a.get("status") or "pending")}
+            for a in assumptions),
     )
 
 

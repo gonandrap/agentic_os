@@ -60,6 +60,14 @@ VALIDATION_OUTCOMES = ("pending", "passed", "rejected", "escalated", "failed")
 # `max_rounds`. `pending` and `failed` are deliberately absent: see
 # `counted_validation_rounds`, which is the only thing that may count a round.
 COUNTED_VALIDATION_OUTCOMES = ("passed", "rejected", "escalated")
+# The outcomes the ROUND MACHINE still owns: `pending` is in flight, `failed` is an
+# outage it retries. What `work_orders_awaiting_validation` looks for.
+RUNNABLE_VALIDATION_OUTCOMES = ("pending", "failed")
+# ...and the wider set that means the panel has not finished with this unit: `rejected`
+# adds the wait for the submitter to come back. `escalated` is absent — the panel gave
+# up and the USER holds it — and so is `passed`, which is the one that clears.
+# See docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §2.
+OPEN_VALIDATION_OUTCOMES = ("pending", "failed", "rejected")
 # What one seat proposed. "" is a seat that offered none — it ran, but said nothing the
 # arbiter can count.
 VALIDATION_VERDICTS = ("pass", "reject", "")
@@ -2423,6 +2431,33 @@ class ProjectStore:
             f"SELECT * FROM validation_rounds WHERE {col}=? ORDER BY round",
             (subject_id,),
         ).fetchall())
+
+    def work_orders_awaiting_validation(self) -> list[dict[str, Any]]:
+        """Every OPEN work order whose latest round is the round machine's to run.
+
+        Keyed off the ROUND, never off `status='validating'`: a work order with pending
+        assumptions parks in `needs_review` with its round open beside it, and the query
+        this replaced could not see one (spec
+        docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §3).
+
+        `OPEN_STATUSES` is the bound that matters. A cancelled work order can hold a
+        round nobody closed, and handing that to the machine would judge — and then land
+        — work the user stopped. Hidden ones ARE included: hiding is "stop showing me
+        this", not "stop this".
+        """
+        marks = ",".join("?" * len(RUNNABLE_VALIDATION_OUTCOMES))
+        statuses = ",".join("?" * len(OPEN_STATUSES))
+        rows = self.conn.execute(
+            f"""SELECT w.* FROM work_orders w
+                  JOIN validation_rounds r ON r.wo_id = w.id
+                 WHERE r.outcome IN ({marks})
+                   AND w.status IN ({statuses})
+                   AND r.round = (SELECT MAX(round) FROM validation_rounds
+                                   WHERE wo_id = w.id)
+                 ORDER BY w.created_at""",
+            (*RUNNABLE_VALIDATION_OUTCOMES, *OPEN_STATUSES),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
 
     def latest_validation_round(self, *, wo_id: str | None = None,
                                 fo_id: str | None = None) -> dict[str, Any] | None:

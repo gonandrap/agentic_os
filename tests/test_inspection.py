@@ -323,6 +323,56 @@ def test_an_unfinished_tool_call_is_counted_but_not_timed(write_transcript):
     assert (row["calls"], row["unfinished"], row["mean"]) == (1, 1, 0.0)
 
 
+# -- a turn nothing was ever observed doing --------------------------------------------
+
+
+def api_call(at: float, output: int = 1) -> usage.Call:
+    """One real, billed API call — what the fifth bucket exists to require."""
+    return usage.Call(ts=at, model="claude-opus-5", output=output)
+
+
+def test_a_turn_with_no_api_call_is_not_reported_as_generating():
+    """THE REGRESSION (issue 227). `generating` was the remainder of a four-way
+    partition, so a turn that made no call and ran no tool had every second of its wall
+    clock charged to it — rendering identically to a turn that really did generate for
+    an hour. wo-f1ce0f24 turn 3: 65.3 minutes, `gen 100%`, 0 calls, peak 0, $0.00."""
+    turn = inspection.Turn(seq=1, started=0.0, ended=65 * 60)
+
+    assert turn.generating == 0.0
+    assert turn.unaccounted == 65 * 60
+    assert turn.share()["unaccounted"] == 1.0
+    assert sum(turn.share().values()) == pytest.approx(1.0)
+
+
+def test_a_long_turn_that_really_generated_still_says_generating():
+    """THE NEGATIVE CONTROL, and the half that rots (kn-67364b3a): the new bucket must
+    not be passing by swallowing every long turn. Same wall clock as the case above,
+    with calls to vouch for it."""
+    turn = inspection.Turn(seq=1, started=0.0, ended=65 * 60)
+    turn.calls = [api_call(60.0), api_call(64 * 60)]
+    turn.active_ended = 64 * 60
+
+    assert turn.unaccounted == 0.0
+    assert turn.generating == pytest.approx(64 * 60)
+    assert turn.idle == pytest.approx(60)
+    assert turn.share()["generating"] > 0.98
+
+
+def test_the_partition_still_sums_to_the_wall_clock_with_five_buckets():
+    """A percentage table that no longer adds to 100 is worse than the bug it replaced,
+    and the fifth bucket is exactly the kind of addition that breaks one."""
+    stalled = inspection.Turn(seq=1, started=0.0, ended=600.0)
+    worked = inspection.Turn(seq=2, started=600.0, ended=1_200.0)
+    worked.calls = [api_call(900.0)]
+    worked.active_ended = 900.0
+    anatomy = inspection.Anatomy(session_id="s", found=True, turns=[stalled, worked])
+
+    part = anatomy.partition()
+
+    assert sum(part[k] for k in inspection.PARTS) == pytest.approx(part["wall"])
+    assert part["unaccounted"] == pytest.approx(600.0)
+
+
 # -- classifying a cache write ---------------------------------------------------------
 
 
@@ -357,9 +407,15 @@ def test_a_one_hour_write_is_not_called_a_defect_for_surviving_ten_minutes():
 # -- the live alarm --------------------------------------------------------------------
 
 
-def burning(*, wall: float = 0.0, write: int = 0, join: float = 0.0) -> tuple:
-    """A one-turn anatomy that trips exactly the condition asked for."""
+def burning(*, wall: float = 0.0, write: int = 0, join: float = 0.0,
+            calls: int = 1) -> tuple:
+    """A one-turn anatomy that trips exactly the condition asked for.
+
+    IT MAKES AN API CALL BY DEFAULT, because every alarm below it is about SPEND and a
+    turn with no call has not spent anything (issue 227). `calls=0` is the stalled turn.
+    """
     turn = inspection.Turn(seq=1, started=0.0, ended=wall)
+    turn.calls = [api_call(1.0 + n) for n in range(calls)]
     if join:
         turn.spans.append(inspection.ToolSpan(name="TaskOutput", tool_id="t1",
                                               started=0.0, detail="a subagent"))
@@ -383,6 +439,51 @@ def test_each_threshold_raises_its_own_alarm():
                                               dispatched=0.0)] == [inspection.WRITE_ALARM]
     assert [a.kind for a in inspection.alarms(blocked, cfg, now=when,
                                               dispatched=0.0)] == [inspection.JOIN_ALARM]
+
+
+def test_a_stalled_turn_is_alarmed_as_stalled_and_never_as_billed():
+    """THE DETECTOR THAT SHOULD HAVE FIRED on wo-f1ce0f24 turn 3. `going-in-circles`
+    said effort was being re-spent and the escalation said it was BILLED IN FULL; the
+    turn had made no API call at all, so nothing had started and nothing was billed."""
+    cfg = InspectConfig()
+    stalled, now = burning(wall=cfg.alarm_stalled_minutes * 60 + 1, calls=0)
+
+    raised = inspection.alarms(stalled, cfg, now=now, dispatched=0.0)
+
+    assert [a.kind for a in raised] == [inspection.STALL_ALARM]
+    assert "no API call" in raised[0].reason
+    assert "billed" not in raised[0].reason
+
+
+def test_a_stalled_turn_never_raises_the_long_turn_alarm():
+    """The two are the same wall clock read two ways, and only one of them is true. The
+    long-turn alarm's whole claim is that money is being spent."""
+    cfg = InspectConfig()
+    stalled, now = burning(wall=cfg.alarm_turn_minutes * 60 + 1, calls=0)
+
+    kinds = [a.kind for a in inspection.alarms(stalled, cfg, now=now, dispatched=0.0)]
+
+    assert kinds == [inspection.STALL_ALARM]
+
+
+def test_the_stall_is_named_before_the_long_turn_alarm_could_call_it_spend():
+    """A stall must be diagnosable while it is still a stall. Fifteen minutes of silence
+    is already fifteen times the p99 time-to-first-call; the hour the long-turn alarm
+    waits is another forty-five minutes of the user being told nothing."""
+    assert InspectConfig().alarm_stalled_minutes < InspectConfig().alarm_turn_minutes
+
+
+def test_the_long_turn_alarm_states_what_the_turn_actually_cost():
+    """NO ALARM MAY ASSERT SPEND IT DID NOT READ. The per-turn cost record already
+    existed and no layer consulted it — the supervisor asserted "BILLED IN FULL" in the
+    same sentence as "zero context peak"."""
+    cfg = InspectConfig()
+    anatomy, now = burning(wall=cfg.alarm_turn_minutes * 60 + 1, calls=3)
+
+    reason = inspection.alarms(anatomy, cfg, now=now, dispatched=0.0)[0].reason
+
+    assert "3 API calls" in reason
+    assert "$" in reason, "the claim is about money, so it carries the money"
 
 
 def test_the_alarm_measures_the_running_turn_against_the_wall_clock():
@@ -550,6 +651,9 @@ def test_the_defaults_are_the_measured_ones():
 
     assert (cfg.alarm_turn_minutes, cfg.alarm_join_seconds,
             cfg.alarm_write_tokens) == (60, 300, 300_000)
+    # p99 of time-to-first-API-call over the fleet's 4,543 turns is 61 seconds, so this
+    # is fifteen times a slow start and fires on 0.26% of them.
+    assert cfg.alarm_stalled_minutes == 15
     assert cfg.alarm_join_seconds == inspection.TTL_5M
     # The report is deliberately far more talkative than the alarm: the same blocking
     # join is worth a line at 30s and worth interrupting someone at 300s.
@@ -624,7 +728,8 @@ def test_a_project_overrides_one_threshold_and_inherits_the_rest(tmp_path):
 
 
 @pytest.mark.parametrize("key", ["alarm_write_tokens", "report_write_floor",
-                                 "quote_chars", "alarm_turn_minutes"])
+                                 "quote_chars", "alarm_turn_minutes",
+                                 "alarm_stalled_minutes"])
 def test_a_threshold_of_zero_is_refused_rather_than_flagging_everything(key):
     """Zero would report every write a session makes and flag every work order the fleet
     runs — and it arrives by a typo in a `jarvis config set`, so it is caught where the
@@ -659,6 +764,33 @@ def test_inspect_reports_a_work_order_by_its_session(started, monkeypatch):
     assert [w["cause"] for w in unit["writes"]] == [inspection.COLD_START,
                                                     inspection.PREFIX_MISS,
                                                     inspection.TTL_EXPIRY]
+
+
+def test_every_bucket_of_the_partition_has_a_label_on_the_page():
+    """The renderers walk `PARTS` through these, so a bucket missing from either dict
+    renders as silently absent and the percentages stop summing to 100 — the failure the
+    fifth bucket was most likely to introduce (issue 227)."""
+    from jarvis import cli
+
+    assert tuple(cli.PART_LABELS) == inspection.PARTS
+    assert tuple(cli.PART_SHORT) == inspection.PARTS
+
+
+def test_the_turn_line_says_no_api_call_before_it_says_anything_about_duration(
+        capsys):
+    """Part 2 of issue 227. `0 calls` and `peak 0` were already printed BESIDE a number
+    that contradicted them and nothing reconciled the three."""
+    from jarvis import cli
+
+    stalled = inspection.Turn(seq=3, started=0.0, ended=65 * 60)
+    anatomy = inspection.Anatomy(session_id="s", found=True, turns=[stalled])
+    unit = {"wo_id": "wo-1", "title": "t", **anatomy.as_dict()}
+
+    cli._print_anatomy(unit, InspectConfig().report_write_floor)
+    line = next(l for l in capsys.readouterr().out.splitlines() if "turn  3" in l)
+
+    assert line.index(cli.NO_CALL_FLAG) < line.index("gen")
+    assert "unacc 100%" in line and "gen   0%" in line
 
 
 def test_a_work_order_with_no_session_reports_no_transcript(started):
@@ -724,6 +856,39 @@ def test_a_burning_turn_reaches_the_user_the_way_everything_else_does(
         # The half a single-tick test cannot see, and the one that costs a model call
         # per tick per alarm once the supervisor reads this table.
         assert len(store.alarms_of(wo["id"])) == 1
+    finally:
+        store.close()
+
+
+def test_a_stalled_turn_reaches_the_user_as_a_stall_and_not_as_a_bill(
+        started, monkeypatch, tmp_path):
+    """END TO END, the case that was reported backwards (issue 227). The attention line
+    is what became a Telegram saying an hour of generation had been billed."""
+    from jarvis.project_store import ProjectStore
+
+    root = tmp_path / "projects"
+    (root / "-proj").mkdir(parents=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    daemon = started
+    wo = ops.create_work_order("proj_a", "the dead one")
+
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        turn = store.create_turn(wo["id"], "dispatch", "go")
+        at = turn["started_at"]
+        # A prompt and nothing else: the turn opened and no API call was ever made.
+        (root / "-proj" / "dead.jsonl").write_text(
+            json.dumps(prompt_row(at + 1, "You are the worker agent for wo-1")) + "\n")
+        store.update_work_order(wo["id"], status="running", session_id="dead")
+        monkeypatch.setattr("jarvis.daemon.time.time", lambda: at + 2 * 3600)
+        daemon.check_burning_turns(daemon.catalog.projects[0], store)
+
+        flagged = store.get_work_order(wo["id"])
+        (alarm,) = store.alarms_of(wo["id"])
+        assert alarm["kind"] == inspection.STALL_ALARM
+        assert "no API call at all" in flagged["attention_reason"]
+        assert "billed" not in flagged["attention_reason"]
+        assert "still being billed" not in flagged["attention_reason"]
     finally:
         store.close()
 

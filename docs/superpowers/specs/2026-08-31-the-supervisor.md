@@ -7,7 +7,8 @@ Feature order `fo-a10521d8`. Extends the live cost alarm shipped by PR 159
 
 PR 159 gave the OS an alarm that fires WHILE a turn is still costing money — a turn past
 `alarm_turn_minutes`, a subagent join open past the cache TTL, a re-write over
-`alarm_write_tokens`. It reaches the user the only way anything reaches the user: the
+`alarm_write_tokens`. (A fourth kind, `stalled-turn`, was added by issue 227 and is the
+odd one out: its finding is that NOTHING was spent.) It reaches the user the only way anything reaches the user: the
 attention list. That was the right first move and it is also the whole problem. An alarm
 is a *symptom*, and the user is the one who has to open the work order, read
 `jarvis inspect`, and decide whether 74 minutes on a design document is normal or whether
