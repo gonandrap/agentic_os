@@ -294,8 +294,11 @@ def _validation_escalated(store: ProjectStore, wo: dict[str, Any]) -> bool:
 #:   retried on the next tick with the unit still parked. INV-VALIDATION-STRANDED owns
 #:   the case where that never resolves.
 #:
-#: Firing on either would put a permanent flag on healthy work orders — permanent because
-#: nothing clears an attention reason it cannot re-derive away, and violations dedupe on
+#: `Daemon.validation_tick` is the authority on both, and this tuple is its complement:
+#: that loop re-submits any round whose outcome is in `("pending", "failed")` and stands
+#: back from anything else, so a `failed` round is live work and flagging it would raise a
+#: permanent alarm on every transport hiccup in the fleet. Permanent, because nothing
+#: clears an attention reason it cannot re-derive away and violations dedupe on
 #: `Violation.key` for the life of the daemon. Decided with the user on wo-69a06ff4.
 #:
 #: THE GAP THIS LEAVES, named rather than hidden: a `rejected` round whose feedback
@@ -989,7 +992,9 @@ def check_validation_orphaned(store: ProjectStore) -> Iterator[Violation]:
     nothing will ever move again, and because that status deliberately raises no
     attention, it looks exactly like one the panel is still thinking about — on the
     dashboard, in `jarvis status` and in the attention list alike. Nothing else in the OS
-    can tell the two apart.
+    can tell the two apart. `Daemon.validation_tick` already knows: handed a `validating`
+    work order with no round it logs a warning and moves on, because a daemon log is not a
+    surface anybody reads. This is what turns that warning into something a human sees.
 
     Predicate: status `validating`, and `latest_validation_round` returns either nothing
     at all or a round that already reached a verdict the unit should have acted on — see
@@ -997,6 +1002,12 @@ def check_validation_orphaned(store: ProjectStore) -> Iterator[Violation]:
     deliberately: a work order and a feature order park in the same status by the same
     mechanism, and an invariant that covered one of them would leave the other silently
     stalled with the checker's name on the box saying it was covered.
+
+    There is no transient to confuse it with, which is why the no-round half needs no
+    staleness threshold: `ops.submit_for_validation` opens the round BEFORE it sets the
+    status, so a unit is never legitimately `validating` with nothing on record — not even
+    for a moment. Reversing those two lines would make this invariant fire on healthy
+    submissions, which is a good reason not to.
 
     REPORTED, never repaired, and that is a rule rather than an omission. Un-parking the
     unit correctly needs the status it came FROM — `running` for a worker mid-rejection,
