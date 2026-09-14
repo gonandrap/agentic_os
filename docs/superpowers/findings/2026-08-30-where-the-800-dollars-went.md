@@ -172,6 +172,11 @@ though the evidence sits in every transcript and `jarvis cost` already parses th
    · Pro: removes both the mid-turn tool-set change and the schemas every prompt carries.
    · Con: narrows what every worker can reach — a fleet capability decision, not a free
    arithmetic win.
+   · **Answered by `2026-09-14-which-mcp-server-moves-the-prefix.md` (wo-8778138e).** The
+   server is Serena, the schemas are not in the prefix at all, and the 61% left
+   unexplained above is mostly this document's boundary definition rather than a second
+   cause — 90.0% of the tax is attributable once only conversation-sized writes are
+   counted. `--strict-mcp-config` does not remove the top mover.
 
 ---
 
