@@ -280,6 +280,7 @@ class Daemon:
         # credentials, an unreachable host). Same idea: say it once, not every 2 minutes
         # forever. Reset by restarting the daemon, which is also what fixes it.
         self.pr_poll_warned: set[str] = set()
+        self.issue_sync_warned: set[str] = set()
         # The systemd seam for staged releases (src/jarvis/release.py). None means the
         # real thing; tests inject a fake so no test can ever touch real systemctl.
         self.release_runner: Any = None
@@ -555,6 +556,11 @@ class Daemon:
                 self.dispatch_pending(project, store, state)
                 if poll_prs:
                     self.poll_pull_requests(project, store)
+                    # AFTER the poll, in the same tick: a merge that just completed a
+                    # work order is what closes its issue, and making the tracker wait
+                    # a second poll interval for news the OS already has is the gap
+                    # issue #240 is about, one step smaller.
+                    self.sync_issues(project, store)
                 # After the pull-request poll, so the merge that completes a feature's
                 # last child settles the feature in the same tick rather than the next
                 # one — but outside the `if`, because a child can also finish without
@@ -3367,6 +3373,77 @@ class Daemon:
         else:
             log.info("[%s] %s %s — asking %s to fix it (attempt %s)",
                      project.name, wo["pr_url"], what, wo["id"], out["attempts"])
+
+    def sync_issues(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Keep the tracker saying what the OS is actually doing. Issue #240.
+
+        The counterpart to `poll_pull_requests`, pointed the other way: that step asks
+        GitHub what happened, this one tells GitHub what happened here. A bug the OS
+        filed itself carries `issue_url`, and its issue must be labelled while a work
+        order is on it and closed when that work lands — without which the tracker is a
+        thing only a human maintains, which is the whole of the issue.
+
+        **A COMPARISON, NOT A SCHEDULE OF POKES.** `issues.desired_state` derives where
+        the issue belongs from the work order, `issue_state` records where the OS last
+        put it, and nothing is sent while the two agree. So the common case — every
+        tracked work order already reconciled — costs ONE indexed query for the whole
+        project and no subprocess at all, and a project that has never filed a bug does
+        not even pay that (the query returns nothing).
+
+        It is also the retry. `issues.record_applied` writes the column only after
+        GitHub accepted the change, so a tick that could not reach `gh` leaves the two
+        disagreeing and the next sweep tries again — which is what lets the filing path
+        label optimistically without owning a failure (#240 E).
+        """
+        tracked = store.work_orders_tracking_issues()
+        if not tracked:
+            return
+        from . import github, issues
+
+        for wo in tracked:
+            want = issues.desired_state(store, wo)
+            if want == (wo.get("issue_state") or ""):
+                continue
+            try:
+                applied = issues.record_applied(store, wo, project.bugs.label)
+            except github.GitHubError as e:
+                # Same shape as the pull-request poll: one unreachable tracker must not
+                # hide the rest, and the user hears once per daemon run.
+                log.debug("[%s] could not sync %s for %s: %s", project.name,
+                          wo.get("issue_url"), wo["id"], e)
+                self._warn_issue_sync_broken(project, store, e)
+                continue
+            except Exception:  # noqa: BLE001 — never let one work order stall the rest
+                log.exception("[%s] syncing the issue for %s failed", project.name,
+                              wo["id"])
+                continue
+            log.info("[%s] %s is now %s (%s)", project.name, wo.get("issue_url"),
+                     applied, wo["id"])
+
+    def _warn_issue_sync_broken(self, project: ProjectSpec, store: ProjectStore,
+                                error: Exception) -> None:
+        """Tell the user once per daemon run that the tracker is not being kept up.
+
+        `_warn_pr_poll_broken`'s twin, and it says a different thing on purpose: that
+        one warns that merges will not register, this one that issues the OS filed will
+        sit labelled and open until somebody closes them by hand. Both are the state the
+        OS reverts to, said plainly, rather than a stack trace.
+        """
+        from . import github
+
+        if project.name in self.issue_sync_warned:
+            return
+        self.issue_sync_warned.add(project.name)
+        log.warning("[%s] issue lifecycle unavailable: %s", project.name, error)
+        hint = ("" if isinstance(error, github.GhUnavailable) else
+                " If this is the daemon, `gh`'s keyring credentials may be out of "
+                "reach — set GH_TOKEN in the service environment.")
+        store.add_notification(
+            title=f"the bug tracker is not being kept up to date for {project.name}",
+            body=(f"{error}\n\nIssues Jarvis filed will stay as they are — labelled and "
+                  f"open — until you close them yourself.{hint}"),
+            level="warning", source="issue-sync",
+        )
 
     def _warn_pr_poll_broken(self, project: ProjectSpec, store: ProjectStore,
                              error: Exception) -> None:

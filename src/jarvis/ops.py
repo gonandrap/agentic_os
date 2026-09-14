@@ -669,7 +669,8 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       append_system_prompt: str | None = None,
                       backlog_id: str | None = None,
                       depends_on: list[str] | None = None,
-                      parent_id: str | None = None) -> dict[str, Any]:
+                      parent_id: str | None = None,
+                      issue_url: str | None = None) -> dict[str, Any]:
     """File a work order. `parent_id` files it UNDER a feature order.
 
     Until now the only way a work order acquired a parent was a plan release, because the
@@ -703,7 +704,7 @@ def create_work_order(project_name: str, title: str, description: str = "",
             title=title, description=description, origin=origin, model=model,
             effort=effort, permission_mode=permission_mode,
             append_system_prompt=append_system_prompt, backlog_id=backlog_id,
-            depends_on=depends_on, parent_id=parent_id,
+            depends_on=depends_on, parent_id=parent_id, issue_url=issue_url,
         )
     except (KeyError, ValueError) as e:
         # A dependency on a work order in another project cannot be honoured — the edge

@@ -2890,11 +2890,17 @@ def cmd_notify(args: argparse.Namespace) -> int:
 
 
 def cmd_bug(args: argparse.Namespace) -> int:
-    from .bugreport import report_bug
+    from .bugreport import pickup_note, report_bug
     result = report_bug(title=args.title, description=args.description,
                         expected=args.expected, actual=args.actual, steps=args.steps,
                         project=args.project, wo_id=args.wo_id)
-    _print(result, args.json)
+    if args.json:
+        _print(result, True)
+    else:
+        # The nested `pickup` flattened to the one line a reporting agent needs: whether
+        # anything is going to happen to this issue, or whether it is theirs to chase.
+        _print({k: v for k, v in result.items() if k != "pickup"}, False)
+        print(pickup_note(result["pickup"]))
     return 0
 
 
