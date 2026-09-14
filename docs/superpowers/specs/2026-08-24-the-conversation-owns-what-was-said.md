@@ -101,7 +101,7 @@ A message entry becomes what happened, with `detail = ""` and a ref:
 | `source` / direction | label |
 |---|---|
 | `neo` | `Neo answered the worker` |
-| `pr-conflict` (`UNAUTHORED_SOURCES`) | `Jarvis messaged the worker` |
+| `pr-conflict`, `pr-checks` (`UNAUTHORED_SOURCES`) | `Jarvis messaged the worker` |
 | anything else inbound | `You messaged the worker` |
 | outbound | `Worker replied` |
 

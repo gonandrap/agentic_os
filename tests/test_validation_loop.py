@@ -1412,7 +1412,12 @@ def test_the_give_up_notification_reaches_the_central_inbox(fleet):
     fleet.drain()
     fleet.tick()  # routes the outbox
 
-    assert _outbox(fleet) == [], "the row was routed, not left behind"
+    # Filtered to this row's own source, not the whole outbox: the tick also polls the
+    # pull request `finish` now opens, this fixture has no `fake_gh`, and the daemon
+    # files one project-level `pr-poll` warning about it. That is a fact about the
+    # fixture, not about whether a give-up reaches the user.
+    assert [r for r in _outbox(fleet) if r["source"] == "validation"] == [], \
+        "the row was routed, not left behind"
     central = CentralStore()
     try:
         rows = [i for i in central.unacked_inbox() if i["wo_id"] == wo["id"]]

@@ -134,7 +134,7 @@ def _apply_nudge(pstore: Any, central: Any, project: str, subject: dict[str, Any
     NOT `ops.send_message`, and this is not a style choice: that function ends with
     `clear_attention`, which sets `acknowledged_blockers` to NULL and so discards the
     user's own earlier dismissals — before `apply` ever reaches `ops.ack_attention`.
-    `ops.nudge_pr_conflict` is the precedent for an OS-authored message and does the two
+    `ops.nudge_pr_repair` is the precedent for an OS-authored message and does the two
     right things; the event half of it is written by `apply`, once, for every remedy.
     """
     wo_id = _carrier_id(pstore, alarm)

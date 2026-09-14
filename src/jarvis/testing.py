@@ -1094,7 +1094,8 @@ def fake_gh(tmp_path, monkeypatch):
 
         def set_pr(self, pr_url: str, state: str, merged_at: str | None = None,
                    mergeable: str | None = None, base_ref: str = "main",
-                   head_oid: str = "") -> None:
+                   checks: list[dict] | None = None,
+                   merge_state: str | None = None, head_oid: str = "") -> None:
             """Register what `gh pr view <pr_url>` answers. Re-calling re-states it,
             which is how a test walks a pull request from OPEN to MERGED — or from
             MERGEABLE to CONFLICTING and back.
@@ -1102,17 +1103,27 @@ def fake_gh(tmp_path, monkeypatch):
             `mergeable` defaults to MERGEABLE for an open pull request and to null for
             any other state, which is what GitHub itself answers.
 
-            `head_oid` defaults to "" and is then OMITTED rather than sent empty, because
-            GitHub never answers an empty sha: a test that wants the field absent must
-            get it absent (`github.PR_FIELDS` asks for `headRefOid` on every call), and
-            one that wants it present says so. It is the sha the landing sweep measures a
-            Mode C tail against — issue #232."""
+            `checks` is `statusCheckRollup`, shared with `set_pr_artifact`: the two
+            readers ask for different field sets but they are reading one pull request,
+            so a test that registers CI once has registered it for both.
+
+            `head_oid` is OMITTED rather than sent empty when unset, because GitHub never
+            answers an empty sha: a test that wants the field absent must get it absent
+            (`github.PR_FIELDS` asks for `headRefOid` on every call), and one that wants
+            it present says so. It is the sha the landing sweep measures a Mode C tail
+            against — issue #232."""
             if mergeable is None:
                 mergeable = "MERGEABLE" if state == "OPEN" else None
-            self.prs[pr_url] = {**self.prs.get(pr_url, {}),
-                                "state": state, "mergedAt": merged_at,
-                                "mergeable": mergeable, "baseRefName": base_ref,
-                                **({"headRefOid": head_oid} if head_oid else {})}
+            row = {**self.prs.get(pr_url, {}),
+                   "state": state, "mergedAt": merged_at,
+                   "mergeable": mergeable, "baseRefName": base_ref}
+            if checks is not None:
+                row["statusCheckRollup"] = checks
+            if merge_state is not None:
+                row["mergeStateStatus"] = merge_state
+            if head_oid:
+                row["headRefOid"] = head_oid
+            self.prs[pr_url] = row
             monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
 
         def set_pr_artifact(self, pr_url: str, *, diff: str = "", title: str = "",

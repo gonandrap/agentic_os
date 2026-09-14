@@ -1860,31 +1860,79 @@ class ProjectStore:
             found.update(p for p in str(row["detail"] or "").split(",") if p)
         return found
 
-    def _this_conflict(self, wo_id: str, kind: str) -> int:
-        """Events of `kind` since the last `pr_conflict_cleared` — this EPISODE's.
+    def _this_episode(self, wo_id: str, repair: str, kind: str) -> list[dict[str, Any]]:
+        """Events of `kind` since the last `pr_<repair>_cleared` — this EPISODE's.
 
-        Conflict state is derived from the timeline rather than kept in columns; the
-        clear is the budget reset. See §4 of
+        Repair state is derived from the timeline rather than kept in columns; the clear
+        is the budget reset. See §4 of
         docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md.
+
+        `repair` is `ops.PrRepair.name` — "conflict" or "checks" — passed as a string
+        because a store may not import `ops`. The two episodes are counted APART on
+        purpose: a branch that conflicted twice last week has spent nothing of the red
+        build's budget, and they are different problems with different fixes.
         """
         rows = self.events_of_kind(wo_id, kind)
         if not rows:
-            return 0
-        cleared = self.events_of_kind(wo_id, "pr_conflict_cleared")
+            return []
+        cleared = self.events_of_kind(wo_id, f"pr_{repair}_cleared")
         since = cleared[-1]["ts"] if cleared else 0.0
-        return sum(1 for r in rows if r["ts"] > since)
+        return [r for r in rows if r["ts"] > since]
 
-    def pr_conflict_attempts(self, wo_id: str) -> int:
-        """How many times the OS has asked this worker to resolve the SAME conflict."""
-        return self._this_conflict(wo_id, "pr_conflict_nudged")
+    def pr_repair_attempts(self, wo_id: str, repair: str) -> int:
+        """How many times the OS has asked this worker to fix the SAME thing."""
+        return len(self._this_episode(wo_id, repair, f"pr_{repair}_nudged"))
 
-    def pr_conflict_gave_up(self, wo_id: str) -> bool:
-        """Has the OS already stopped trying on this conflict and said so?
+    def pr_repair_gave_up(self, wo_id: str, repair: str) -> bool:
+        """Has the OS already stopped trying on this episode and said so?
 
         Not "are the attempts spent": this is what keeps the give-up event to one per
         episode on a work order that may be flagged for something else entirely.
         """
-        return bool(self._this_conflict(wo_id, "pr_conflict_unresolved"))
+        return bool(self._this_episode(wo_id, repair, f"pr_{repair}_unresolved"))
+
+    def pr_closure_told(self, wo_id: str) -> bool:
+        """Has the user already been told about THIS closure of the pull request?
+
+        Episode arithmetic again, and for the reason `_this_episode` gives: a
+        `pr_closed` newer than the newest `pr_reopened`. NOT `pr_state == 'CLOSED'`,
+        which kn-dbc4971d records as stale by construction — nothing ever cleared it, so
+        a pull request closed, reopened and closed again still reads CLOSED and the
+        second refusal would never reach the user. That is issue #224's silence with a
+        different cause, which is a poor thing to reintroduce while fixing it.
+
+        `Daemon.poll_pull_requests` is the only writer of both events, and it now also
+        clears the column when it writes `pr_reopened`, so the stale reader this
+        replaces has one fewer way to be wrong too.
+        """
+        closed = self.events_of_kind(wo_id, "pr_closed")
+        if not closed:
+            return False
+        reopened = self.events_of_kind(wo_id, "pr_reopened")
+        return not reopened or closed[-1]["ts"] > reopened[-1]["ts"]
+
+    def pr_repair_origin(self, wo_id: str, repairs: tuple[str, ...]) -> str | None:
+        """The status the newest OPEN repair episode took this work order away from.
+
+        `Daemon.settle_work_order` parks any done turn carrying a summary and a pull
+        request into `waiting_pr_merge`. That is right for a work order that WAS parked,
+        and wrong for one the OS pulled out of `needs_review` to fix a red build: the
+        repair would end by silently downgrading a review item into a merge-queue entry
+        (Neo question 275, spec §4).
+
+        Only an OPEN episode answers — a cleared one is a problem that is over, and its
+        origin must not outlive it. Derived from the timeline for the reason the attempt
+        count is: there is no column to drift from what the user reads.
+        """
+        newest: dict[str, Any] | None = None
+        for repair in repairs:
+            rows = self._this_episode(wo_id, repair, f"pr_{repair}_nudged")
+            if rows and (newest is None or rows[-1]["ts"] > newest["ts"]):
+                newest = rows[-1]
+        if newest is None:
+            return None
+        return (db.from_json(newest["payload"], {}) or {}).get("was") or None
+
 
     def work_abandoned(self, wo_id: str) -> bool:
         """Has the worker declared this work deliberately dropped, and not since landed?
@@ -2452,6 +2500,35 @@ class ProjectStore:
             (*RUNNABLE_VALIDATION_OUTCOMES, *OPEN_STATUSES),
         ).fetchall()
         return db.rows_to_dicts(rows)
+
+    def validation_round_open(self, wo_id: str) -> bool:
+        """Is the round machine going to act on this work order?
+
+        `work_orders_awaiting_validation` asked about ONE work order, off the same
+        `RUNNABLE_VALIDATION_OUTCOMES` and the same latest-round rule, because the two
+        must answer alike: this is the question "does something else own this worker's
+        session right now", and the round machine is the thing that would be lying to.
+        The status bound is left to the caller, which has its own (`Daemon.heal_pull_request`
+        only ever asks about a work order the pull-request poll selected).
+
+        `rejected` is deliberately NOT runnable here, which means this says False while
+        the panel waits for the submitter to come back. That window belongs to
+        `heal_pull_request`'s other guards — a turn in flight, or a nudge already
+        queued — and a red build the worker is about to push over is worth telling it
+        about. See §4.1 of
+        docs/superpowers/specs/2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md.
+        """
+        marks = ",".join("?" * len(RUNNABLE_VALIDATION_OUTCOMES))
+        row = self.conn.execute(
+            f"""SELECT 1 FROM validation_rounds r
+                 WHERE r.wo_id = ?
+                   AND r.outcome IN ({marks})
+                   AND r.round = (SELECT MAX(round) FROM validation_rounds
+                                   WHERE wo_id = r.wo_id)
+                 LIMIT 1""",
+            (wo_id, *RUNNABLE_VALIDATION_OUTCOMES),
+        ).fetchone()
+        return row is not None
 
     def latest_validation_round(self, *, wo_id: str | None = None,
                                 fo_id: str | None = None) -> dict[str, Any] | None:
