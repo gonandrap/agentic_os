@@ -380,6 +380,10 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--evidence", default="", metavar="TEXT",
                    help="how you tested this: what you ran and what it said. An "
                         "independent reviewer reads it beside your diff")
+    f.add_argument("--abandon", default="", metavar="WHY",
+                   help="this work order wrote code that is deliberately NOT being "
+                        "landed, and this is why. Without it, finishing over commits "
+                        "that no pull request covers is refused (GitHub issue #232)")
 
     r = wo.add_parser("review", help="accept/reject a work order's pending assumptions")
     r.add_argument("wo_id")
@@ -1855,7 +1859,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
                          project_name=args.project), args.json)
     elif args.wo_cmd == "finish":
         _print(ops.finish(args.wo_id, args.summary, pr_url=args.pr or None,
-                          evidence=args.evidence), args.json)
+                          evidence=args.evidence, abandon=args.abandon), args.json)
     elif args.wo_cmd == "review":
         _print(ops.review_work_order(args.wo_id, accept=not args.reject,
                                      feedback=args.feedback), args.json)

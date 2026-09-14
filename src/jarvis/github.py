@@ -177,7 +177,11 @@ def origin_repo(cwd: Path | None) -> tuple[str, str] | None:
 
 #: The fields of one `gh pr view --json …`. Two questions in one round trip: did this
 #: land, and can it still land? See the spec's §2 for the second half.
-PR_FIELDS = "state,mergedAt,mergeable,baseRefName"
+#: `headRefOid` is the sha GitHub merged, and it is the only exact answer to issue
+#: #232's Mode C: an order whose pull request merged and whose branch then carried
+#: MORE commits. It is recorded on the `pr_merged` event so the landing sweep can ask
+#: that question months later without a second round trip (`landing.assess`).
+PR_FIELDS = "state,mergedAt,mergeable,baseRefName,headRefOid"
 
 
 @dataclass(frozen=True)
@@ -196,6 +200,9 @@ class PullRequest:
     #: when the field was not asked for or not answered.
     mergeable: str | None = None
     base_ref: str | None = None
+    #: The sha at the head of the pull request's branch. On a MERGED pull request
+    #: this is what was merged, which is what a later tail is measured against.
+    head_oid: str = ""
 
     @property
     def merged(self) -> bool:
@@ -271,6 +278,7 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
         merged_at=payload.get("mergedAt") or None,
         mergeable=str(payload["mergeable"]).upper() if payload.get("mergeable") else None,
         base_ref=payload.get("baseRefName") or None,
+        head_oid=str(payload.get("headRefOid") or ""),
     )
 
 

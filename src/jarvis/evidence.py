@@ -59,7 +59,7 @@ limit that kept none of the patch.
 ## The merge-base ladder is pinned, not inferred
 
 "Which branch is the default" has no obvious answer, and left to each collector it would
-be guessed per project. The order is fixed in `_resolve_base` and the diff is the sum of
+be guessed per project. The order is fixed in `base_ref` and the diff is the sum of
 two commands, never one:
 
     with a base:  git diff <base>...HEAD   +   git diff HEAD
@@ -273,7 +273,7 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
     `spec` is `specs.spec_of`'s result, `side_effects` is `ops.side_effects_of`'s and
     `assumptions` is `ProjectStore.all_assumptions`'s — all passed in rather than looked
     up because this module reads a repository and never a database, the same separation
-    that keeps `_ProjectRef` a two-line stand-in instead of a `ProjectSpec` import.
+    that keeps `ProjectRef` a two-line stand-in instead of a `ProjectSpec` import.
     """
     pr_url = str(wo.get("pr_url") or "")
     pr_data: dict[str, Any] | None = None
@@ -291,10 +291,10 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
 
     if source != "pull_request":
         source = "worktree"
-        # type: ignore — `_ProjectRef` carries the one attribute that helper reads.
-        worktree = worker_session.worktree_path(_ProjectRef(project_path), wo)  # type: ignore[arg-type]
+        # type: ignore — `ProjectRef` carries the one attribute that helper reads.
+        worktree = worker_session.worktree_path(ProjectRef(project_path), wo)  # type: ignore[arg-type]
         if worktree is not None:
-            base = _resolve_base(worktree)
+            base = base_ref(worktree)
             head = _git(worktree, "rev-parse", "HEAD").strip()
             # Committed work AND anything still uncommitted, whenever there is a base.
             ranges = (f"{base}...HEAD", None) if base else (None,)
@@ -477,7 +477,7 @@ def default_branch_head(repo: Path) -> str:
     """The sha the default branch points at right now, or "" if there is no answer.
 
     The SAME pinned ladder `collect_work_order` resolves a merge base with
-    (`_resolve_base`), resolved one step further to a sha. Two uses, one ladder: a
+    (`base_ref`), resolved one step further to a sha. Two uses, one ladder: a
     feature whose `base_sha` was recorded against `origin/main` and whose head was later
     read off `main` would diff two different branches and blame the difference on the
     feature.
@@ -487,23 +487,52 @@ def default_branch_head(repo: Path) -> str:
     the user last checked out — which is exactly the confidently-wrong base this module
     refuses to invent.
     """
-    ref = _resolve_base(repo)
+    ref = base_ref(repo)
     return _git(repo, "rev-parse", ref).strip() if ref else ""
 
 
-# --------------------------------------------------------------------------- internals
+def base_ref(worktree: Path) -> str:
+    """The pinned merge-base ladder. "" means rung 4: diff the working tree against HEAD.
+
+    Rung 1 is the repository's own answer, which is why it comes first: `origin/HEAD` is
+    what the remote says its default branch is, so a project on `master`, `trunk` or
+    anything else is right without configuring Jarvis. The two guesses below it exist
+    for the common case of a repo cloned without `--single-branch`, or one with no
+    remote at all.
+
+    PUBLIC because `landing` asks the same question and must not answer it differently —
+    "which branch is the default" is the module docstring's example of a question that
+    gets guessed per caller the moment each caller owns a copy. It is the THIRD use of
+    one ladder now, and rung 4 means something different to each: a diff against HEAD
+    here, and "ahead of the default branch has no meaning" there.
+    """
+    ref = _git(worktree, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD").strip()
+    if ref:
+        prefix = "refs/remotes/"
+        return ref[len(prefix):] if ref.startswith(prefix) else ref
+    for candidate in ("origin/main", "main"):
+        if _git(worktree, "rev-parse", "--verify", "--quiet", candidate).strip():
+            return candidate
+    return ""
 
 
 @dataclass(frozen=True)
-class _ProjectRef:
+class ProjectRef:
     """The `.path` that `worker_session.worktree_path` reads, and nothing else.
 
     That helper is typed for a `catalog.ProjectSpec`, but it touches exactly one
     attribute, and importing the catalog here would drag config loading into a module
     whose whole value is that it depends on nothing. Collectors take a plain path.
+
+    PUBLIC because `ops.unlanded_work` needs the same stand-in and a second copy of a
+    one-attribute shim is how two callers end up disagreeing about where a worktree
+    lives.
     """
 
     path: Path
+
+
+# --------------------------------------------------------------------------- internals
 
 
 def _normalise(text: str) -> str:
@@ -536,23 +565,6 @@ def _diff_args(rev_range: str | None, *extra: str) -> tuple[str, ...]:
     return ("diff", *extra, rev_range or "HEAD")
 
 
-def _resolve_base(worktree: Path) -> str:
-    """The pinned merge-base ladder. "" means rung 4: diff the working tree against HEAD.
-
-    Rung 1 is the repository's own answer, which is why it comes first: `origin/HEAD` is
-    what the remote says its default branch is, so a project on `master`, `trunk` or
-    anything else is right without configuring Jarvis. The two guesses below it exist
-    for the common case of a repo cloned without `--single-branch`, or one with no
-    remote at all.
-    """
-    ref = _git(worktree, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD").strip()
-    if ref:
-        prefix = "refs/remotes/"
-        return ref[len(prefix):] if ref.startswith(prefix) else ref
-    for candidate in ("origin/main", "main"):
-        if _git(worktree, "rev-parse", "--verify", "--quiet", candidate).strip():
-            return candidate
-    return ""
 
 
 def _dedupe(names: Iterable[str]) -> tuple[str, ...]:

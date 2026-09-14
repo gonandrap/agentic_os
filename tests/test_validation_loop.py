@@ -220,8 +220,24 @@ def fleet(tmp_path, jarvis_home, fake_claude, claude_json):
     return Fleet(tmp_path, project, catalog_path)
 
 
-def finish(fleet: Fleet, wo_id: str, summary: str = "done", pr: str | None = None,
+#: "give this work order a pull request of its own", as distinct from `None`, which is
+#: the tests that are ABOUT finishing without one.
+AUTO_PR = "<auto>"
+
+
+def finish(fleet: Fleet, wo_id: str, summary: str = "done", pr: str | None = AUTO_PR,
            evidence: str = "ran `pytest -q`: 412 passed") -> dict:
+    """Finish the way a worker that produced code now has to: behind a pull request.
+
+    The default became a URL when GitHub issue #232 shipped. `Fleet.change` COMMITS to
+    the work order's branch — that is the whole point, the panel needs a diff to judge —
+    and a work order that settles over commits no pull request covers is the defect that
+    issue is about, so `ops.finish` refuses it. That refusal is not what any test in this
+    file is about; every one of them is about the round machine, and the pull request is
+    scenery. `pr=None` is still there for the tests that ARE about the two endings.
+    """
+    if pr == AUTO_PR:
+        pr = f"https://github.com/x/y/pull/{int(wo_id[-4:], 16) % 900 + 100}"
     return ops.finish(wo_id, summary, pr_url=pr, evidence=evidence)
 
 
@@ -260,7 +276,8 @@ def test_a_worker_that_omits_evidence_still_finishes(fleet):
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
 
-    assert ops.finish(wo["id"], "done")["status"] == "validating"
+    assert ops.finish(wo["id"], "done",
+                      pr_url="https://github.com/x/y/pull/8")["status"] == "validating"
 
     store = fleet.store()
     try:
@@ -269,7 +286,7 @@ def test_a_worker_that_omits_evidence_still_finishes(fleet):
         assert round_row["fingerprint"]
         fleet.daemon.validator = Validator(passed())
         fleet.drain()
-        assert store.get_work_order(wo["id"])["status"] == "completed"
+        assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
     finally:
         store.close()
 
@@ -457,7 +474,12 @@ def test_the_round_row_exists_before_the_validator_starts(fleet):
 def test_a_pass_settles_exactly_where_finish_would(fleet):
     """`waiting_pr_merge` with a pull request, `completed` without one — the same two
     endings `ops.finish` reaches with validation switched off, reached by the same
-    function so they cannot drift."""
+    function so they cannot drift.
+
+    The no-pull-request arm ABANDONS, and that is the point rather than a workaround: a
+    work order that produced a diff and completes without a pull request is GitHub issue
+    #232's whole finding, and the only honest route to that ending is now saying so. The
+    ending itself is unchanged, which is what this test is for."""
     fleet.daemon.validator = Validator(passed())
 
     with_pr = fleet.dispatch("with pr")
@@ -466,7 +488,8 @@ def test_a_pass_settles_exactly_where_finish_would(fleet):
 
     without = fleet.dispatch("without pr")
     fleet.change(without["id"], "print('no pr')\n")
-    finish(fleet, without["id"])
+    ops.finish(without["id"], "done", evidence="ran the tests",
+               abandon="spiked; the approach does not work")
 
     fleet.drain()
     fleet.drain()
@@ -503,7 +526,13 @@ def test_a_backlog_backed_work_order_closes_its_item_once_validation_passes(flee
     fleet.change(wo["id"], "print('one')\n")
     fleet.daemon.validator = Validator(passed())
 
-    finish(fleet, wo["id"])
+    # Abandoned rather than behind a pull request, because the backlog item closes on
+    # the `completed` branch of `land_finished` and nowhere else — a work order parked
+    # in `waiting_pr_merge` closes its item when the merge lands, which is a different
+    # test. See `test_a_pass_settles_exactly_where_finish_would` for why that ending now
+    # has to be asked for out loud (GitHub issue #232).
+    ops.finish(wo["id"], "done", evidence="ran the tests",
+               abandon="spiked; the approach does not work")
     central = CentralStore()
     try:
         assert central.get_backlog(item["id"])["status"] == "open", (
@@ -737,7 +766,7 @@ def test_a_project_switch_decides_whether_finish_opens_a_round_at_all(fleet):
     fleet.reconfigure(enabled=True, project_validation={"enabled": False})
     other = fleet.dispatch("second")
     fleet.change(other["id"], "print('two')\n")
-    assert finish(fleet, other["id"])["status"] == "completed"
+    assert finish(fleet, other["id"])["status"] == "waiting_pr_merge"
 
 
 def test_the_daemon_prices_a_round_from_the_projects_settings_not_the_os_block(fleet):
@@ -814,7 +843,7 @@ def test_an_empty_diff_escalates_and_a_real_one_does_not(fleet):
         assert empty_fresh["status"] == "needs_review"
         assert empty_fresh["attention_reason"] == VALIDATION_STUCK_BLOCKER
         assert store.latest_validation_round(wo_id=empty["id"])["outcome"] == "escalated"
-        assert store.get_work_order(real["id"])["status"] == "completed"
+        assert store.get_work_order(real["id"])["status"] == "waiting_pr_merge"
         assert [c["round"] for c in validator.calls] == [1], (
             "the validator was handed an empty diff")
     finally:
@@ -915,7 +944,7 @@ def test_the_kill_switch_drains_open_rounds_instead_of_stranding_them(fleet):
 
     after = fleet.dispatch("after the switch")
     fleet.change(after["id"], "print('after')\n")
-    assert finish(fleet, after["id"])["status"] == "completed", (
+    assert finish(fleet, after["id"])["status"] == "waiting_pr_merge", (
         "a fresh finish under the disabled flag did not take today's path")
 
     held.release.set()
@@ -926,7 +955,7 @@ def test_the_kill_switch_drains_open_rounds_instead_of_stranding_them(fleet):
     try:
         assert store.validation_rounds(wo_id=after["id"]) == [], (
             "the disabled flag still opened a round")
-        assert store.get_work_order(open_round["id"])["status"] == "completed", (
+        assert store.get_work_order(open_round["id"])["status"] == "waiting_pr_merge", (
             "turning the feature off stranded a unit already in validating")
         assert store.latest_validation_round(wo_id=open_round["id"])["outcome"] \
             == "passed"
@@ -1003,7 +1032,8 @@ def test_a_pending_assumption_no_longer_holds_the_round_back(fleet):
     finally:
         store.close()
 
-    assert ops.review_work_order(wo["id"], accept=True)["status"] == "completed"
+    assert ops.review_work_order(wo["id"],
+                                 accept=True)["status"] == "waiting_pr_merge"
 
 
 def test_the_panel_reads_the_assumptions_it_is_judging_around(fleet):

@@ -1886,6 +1886,48 @@ class ProjectStore:
         """
         return bool(self._this_conflict(wo_id, "pr_conflict_unresolved"))
 
+    def work_abandoned(self, wo_id: str) -> bool:
+        """Has the worker declared this work deliberately dropped, and not since landed?
+
+        THE NEWEST OF THE TWO EVENTS WINS, which is the whole rule. `ops.finish` writes
+        `finished` on every route and `abandoned` only when asked, in that order — so an
+        abandonment stands until an ordinary finish supersedes it, and a work order that
+        was abandoned and later delivered properly is judged again. Same episode
+        arithmetic as `pr_conflict_gave_up` above and the same reason: a decision is
+        current only until the thing it was about happens again.
+
+        On the store because `ops` (which excuses a finish) and `invariants` (which
+        excuses a sweep) both need it and `invariants` cannot import `ops`. Issue #232.
+        """
+        dropped = self.events_of_kind(wo_id, "abandoned")
+        if not dropped:
+            return False
+        delivered = self.events_of_kind(wo_id, "finished")
+        return not delivered or float(dropped[-1]["ts"]) >= float(delivered[-1]["ts"])
+
+    def work_unlanded_open(self, wo_id: str) -> bool:
+        """Did a landing refuse this work order, with nothing since answering it?
+
+        The episode arithmetic `work_abandoned` uses, over a wider set: the refusal
+        stands until the work order is DELIVERED again (`finished`, which every route
+        through `ops.finish` writes), dropped on purpose (`abandoned`) or landed by a
+        merge (`pr_merged`).
+
+        `invariants.true_blockers` needs this, and needs it derived from the record
+        rather than from the repository. A flag that function cannot re-derive is
+        relabelled by INV-ATTENTION-REASON on the next tick — kn-eafe383a is that exact
+        bug, one level over — and re-reading git for every open work order on every tick
+        is the cost `landing`'s two-speed split exists to avoid.
+        """
+        parked = self.events_of_kind(wo_id, "work_unlanded")
+        if not parked:
+            return False
+        since = float(parked[-1]["ts"])
+        return not any(
+            float(e["ts"]) > since
+            for kind in ("finished", "abandoned", "pr_merged")
+            for e in self.events_of_kind(wo_id, kind))
+
     def count_events(self, wo_id: str, exclude: tuple[str, ...] = ()) -> int:
         """How many events this work order has, unbounded, minus the kinds named.
 
