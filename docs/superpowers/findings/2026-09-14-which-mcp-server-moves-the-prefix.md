@@ -34,6 +34,16 @@ boundary at which exactly one server moved in the window and no other did.
 | **Serena alone moved** | **28** | **808,889** |
 | any other single server alone | 0 | 0 |
 
+**That zero is a property of the test, not an acquittal, and the exception is measured
+in finding 4.** A server that never moves on its own cannot be a sole mover however
+expensive it is. The known instance is the claude.ai block — Gmail, Google Calendar,
+Crypto.com, PubMed, Mermaid Chart and WordPress — which moves as **one 49-event unit** in
+this corpus and therefore scores 0 here by construction, while preceding a
+conversation-sized write **83.7%** of the time, the worst rate of any cohort measured.
+The sole-mover test says Serena is *a* culprit and is the only one that can be isolated;
+it does not say the others are innocent. Read the two tests together: sole-mover names
+Serena, the per-cohort base rate names the block.
+
 Two independent checks agree. The **base rate** — how often a delta event is followed by
 a conversation-sized write at all — separates the shapes rather than the servers:
 
@@ -217,7 +227,8 @@ demand via `ToolSearch`. In 108,470 tool entries across the corpus, `addedLines`
 byte-identical to `addedNames` **108,325 times (99.87%)** — the "line" rendered into the
 prompt *is* the name.
 
-Everything all 23 servers put in the prefix, added up:
+Everything the 22 MCP servers and Claude Code's own deferred-tool bucket put in the
+prefix, added up:
 
 | | |
 |---|---:|
@@ -227,9 +238,21 @@ Everything all 23 servers put in the prefix, added up:
 | **≈ tokens** | **~3,900** |
 
 The two largest contributors are Notion (46 tools, 2,119 chars) and Serena (30 tools,
-1,307 chars). Cutting the fleet to Serena only would save roughly **2,700 tokens per
-prompt** of standing cost. Against a median worker context of tens of thousands, that is
-noise.
+1,307 chars). What a Serena-only cut actually removes, taken straight off that table:
+
+| | tools | name chars | instr. chars | total chars | ≈ tokens |
+|---|---:|---:|---:|---:|---:|
+| everything in the prefix today | 276 | 11,501 | 4,171 | 15,672 | 3,918 |
+| — Serena, which stays | 30 | 1,307 | 154 | 1,461 | 365 |
+| — `(builtin-deferred)`, which is **not MCP** | 27 | 335 | 0 | 335 | 84 |
+| **removed: the other 21 MCP servers** | **219** | **9,859** | **4,017** | **13,876** | **3,469** |
+
+So the saving is **~3,469 tokens**, and **~449 survive** — not zero, because the
+`(builtin-deferred)` bucket is `CronCreate`, `WebFetch`, `TaskOutput` and the rest of
+Claude Code's own deferred tools. They are advertised through the same mechanism and show
+up in the same delta rows, which is why they appear in the table at all, but they are not
+MCP servers and `--strict-mcp-config` does not touch them. Against a median worker context
+of tens of thousands, 3,469 tokens is still noise.
 
 **Root cause.** The mental model came from the API, where a tool definition is its full
 schema. Claude Code defers them precisely to keep the prefix small — and having done so,
@@ -252,13 +275,17 @@ conversation behind it.
    attributions, and a Serena-only fleet keeps every one of them. This buys the tail, not
    the head — and it is a fleet capability decision, which this order is told to leave
    to the user and to the sibling `/config` order.
-2. **Retract or amend `kn-f94abf34` (3)'s size claim.** `jarvis learn retract` exists for
-   a superseded entry.
+2. *(done, not deferred — `kn-506436c6`)* **Amend `kn-f94abf34` (3) rather than retract
+   it.** The back-pointer is landed: a short entry whose headline names the superseded
+   clause and points at `kn-1cd2b85a`. `jarvis learn search "strict-mcp-config"` now
+   returns it **above** `kn-f94abf34`, so the sibling `/config` order reaches the
+   correction before the stale premise.
    · Pro: the entry is read by every worker that searches this area, and its arithmetic
-   premise is measurably false.
-   · Con: clauses (0), (1), (2), (4) and (5) of that entry are correct and load-bearing;
-   retracting the whole thing to fix one clause loses far more than it fixes. An amending
-   entry that links back is the smaller move.
+   premise is measurably false, so leaving it unmarked was the live risk.
+   · Con: clauses (0), (1), (2), (4) and (5) of that entry are correct and load-bearing —
+   retracting the whole thing to fix one clause would lose the TTL multiplier, the 5m/1h
+   decision, the double-cold-write mechanism and the `PostCompact` finding. The cost of
+   the smaller move is a second entry to read, and no way to edit the first.
 
 ---
 
@@ -275,8 +302,11 @@ There is a shape in the timing worth naming. The three instructions-only example
 finding 2 are **three different worker sessions** re-adding Serena within four minutes of
 each other on 2026-08-24 — consistent with one Serena process restarting underneath every
 worker attached to it, and not with per-session flakiness. This session reproduced the
-same thing live: Serena and Notion both finished connecting mid-turn during this order
-and during its parent, `wo-9722bb7b`.
+same thing live **three times**: Serena and Notion finished connecting mid-turn during
+this order and during its parent `wo-9722bb7b`, and both dropped and came back again
+during this order's first review round — Serena's 30 tools and Notion's 43 withdrawn
+together and restored together, minutes apart, in a session doing nothing but editing
+markdown.
 
 **Root cause.** MCP transport health is Claude Code's business and it logs none of it to
 the transcript. Jarvis reads only what the transcript holds, so the cause of the single
@@ -306,6 +336,11 @@ explained part of a thing and implied it had explained all of it:
 
 - **10.0% of the prefix-miss tax by volume (15 boundaries, 1.32M tokens) has no MCP delta
   anywhere near it** and remains unexplained. See finding 3 action 2.
+- **No server but Serena was cleared.** The sole-mover test can only isolate a server
+  that sometimes moves alone; the claude.ai block of six never does in this corpus, so
+  its 0 in finding 1's table means "not separable", not "not guilty" — and its 83.7%
+  big-write rate is the worst measured. Isolating the members of that block needs a
+  corpus where they move independently, which this one does not contain.
 - **Why any server disconnects** is not in the transcripts. See finding 5.
 - **Whether removing a server would actually help** is a prediction, not a measurement.
   Every number here is observational; nothing was A/B'd. The two controlled runs in
