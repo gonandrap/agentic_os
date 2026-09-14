@@ -226,22 +226,28 @@ jarvis learn retract <id> --reason "…"     # same for the knowledge base: reti
                                            # workers — it leaves the index too, not
                                            # just the payload — without erasing that
                                            # it was true
-jarvis bug report "title" -d "..." -e "expected" -a "actual" [--steps "..."]
+jarvis bug report "title" -d "..." -e "expected" -a "actual" -p <priority>
                                            # a bug in the OS itself -> GitHub issue on
                                            # the (PUBLIC) tracker + Telegram ping.
                                            # Every agent has the report-jarvis-bug skill.
-                                           # On a project with `bugs.auto_work_order` on
-                                           # the issue is ALSO picked up: a work order is
-                                           # created, the issue is labelled `in progress`,
-                                           # and it closes ITSELF — with the work order
-                                           # and the PR on it — once the code lands. Off
-                                           # by default, because every agent can file a
-                                           # bug and none of them should be able to
-                                           # commit the fleet to work on its own:
-                                           # `jarvis config set <project>
-                                           # bugs.auto_work_order true`. Never close an
-                                           # issue the OS filed by hand once it is on:
-                                           # you would be racing the daemon.
+                                           # --priority is REQUIRED and is the ONLY thing
+                                           # that routes the bug: low/medium/high queue
+                                           # in the backlog for the user to promote;
+                                           # critical/blocker are RE-ASSESSED BY NEO
+                                           # against the rubric in `--help`, and only if
+                                           # Neo confirms does a work order get created
+                                           # and a release ship once that fix LANDS. The
+                                           # filing agent states a claim, not a verdict —
+                                           # the level it claimed stays in the issue body,
+                                           # the level after Neo is the `priority:` label,
+                                           # and Neo's reasoning is a comment. Neo
+                                           # unreachable = it stays queued, unconfirmed:
+                                           # nothing is dispatched off an unconfirmed
+                                           # blocker. A picked-up issue is labelled
+                                           # `in progress` and closes ITSELF — with the
+                                           # work order and the PR on it — once the code
+                                           # lands, so never close one by hand: you would
+                                           # be racing the daemon.
 jarvis doctor [project] [--repair]         # check the OS's own post-conditions;
                                            # read-only unless --repair. The daemon runs
                                            # the same checks every reconcile tick.

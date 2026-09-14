@@ -36,11 +36,6 @@ SAFETY_KEYS = (
     # for `*.validation.*`'s reason: the per-project form is the same switch with a
     # smaller blast radius, and both halves — the flag and the allow-list — widen it.
     "*.supervisor.remedies.*",
-    # Money by the letter of the rule above, safety by its spirit: turning this on gives
-    # EVERY agent in the fleet the power to create work orders in this project, because
-    # every agent carries the `report-jarvis-bug` skill (issue #240 A). What a worker is
-    # allowed to do is exactly what changes.
-    "*.bugs.auto_work_order",
 )
 
 # Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
@@ -380,18 +375,22 @@ DEFAULT_BUGS_LABEL = "in progress"
 
 @dataclass
 class BugsConfig:
-    """Whether a bug the OS files becomes work the OS does.
+    """How the tracker is labelled while the OS works on a bug it filed.
 
-    `auto_work_order` SHIPS OFF, and that is a safety property rather than caution: any
-    worker in the fleet carries the `report-jarvis-bug` skill, so an unconditional yes
-    would let one worker commit the fleet to unbounded new work and unbounded spend
-    without anyone deciding. Turning it on is a catalog edit — one project, deliberately.
+    WHAT IS NOT HERE IS THE POINT. There is no `auto_work_order` switch: routing is by
+    priority and only by priority (the user's ruling of 2026-09-14 settling issue #240's
+    decision A), and what stops a filing committing the fleet to work is the rubric
+    (`issues.PRIORITY_RUBRIC`) plus Neo re-assessing every `critical`/`blocker` claim —
+    not a catalog key. A key that shipped off would have made that ruling's own
+    "critical and blocker automatically get a work order" unreachable.
 
     `label` is the whole of the in-progress signal: nothing derives it, and an issue
-    carries it exactly while a live work order is on it (`issues.desired_state`).
+    carries it exactly while a live work order is on it (`issues.desired_state`). The
+    priority labels beside it are not configurable — they are the vocabulary itself
+    (`issues.PRIORITY_LABELS`), and a fleet that renamed them would have a tracker its
+    own rubric no longer describes.
     """
 
-    auto_work_order: bool = False
     label: str = DEFAULT_BUGS_LABEL
 
 
@@ -862,10 +861,14 @@ def _parse_bugs(raw: Any, base: BugsConfig | None = None,
     label = str(raw.get("label", base.label) or "").strip()
     if not label:
         raise _err(f"{where}.label must not be empty")
-    return BugsConfig(
-        auto_work_order=bool(raw.get("auto_work_order", base.auto_work_order)),
-        label=label,
-    )
+    # SHAPE, not just non-emptiness (review round 1). This string becomes a `gh` argument
+    # (`issues.checked_label` is the layer that cannot be skipped); catching it here is
+    # what lets the message name the key the typo is in.
+    from .issues import LABEL_RE
+    if not LABEL_RE.match(label):
+        raise _err(f"{where}.label must start with a letter or digit and use only "
+                   f"letters, digits, spaces and ._:/- (got {label!r})")
+    return BugsConfig(label=label)
 
 
 def _parse_messaging(raw: Any, base: MessagingConfig | None = None,

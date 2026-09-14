@@ -667,6 +667,12 @@ ADDED_COLUMNS = {
         # which is nearly all of them, and the reason `Daemon.sync_issues` is a single
         # indexed query that usually returns nothing.
         "issue_url": "TEXT",
+        # The priority the bug was settled at — one of `issues.PRIORITIES`. Only ever
+        # `critical` or `blocker` on a work order, because those are the only two that
+        # become one. Here rather than re-read from the tracker because the thing that
+        # needs it is the release trigger, which runs offline and must not depend on a
+        # label a human may have edited.
+        "issue_priority": "TEXT",
         # The tracker state the OS last SUCCESSFULLY applied to `issue_url` — one of
         # `issues.IN_PROGRESS`, `issues.RELEASED`, `issues.CLOSED`. The pair is
         # `pr_url`/`pr_state`'s shape with the arrow reversed: `pr_state` caches what
@@ -895,6 +901,7 @@ class ProjectStore:
         kind: str = "worker",
         spec_section: str | None = None,
         issue_url: str | None = None,
+        issue_priority: str | None = None,
     ) -> dict[str, Any]:
         """Create a work order. `status` and `session_id` are set in the same INSERT
         rather than afterwards, because the row is visible to the daemon the instant it
@@ -924,13 +931,14 @@ class ProjectStore:
             """INSERT INTO work_orders (id, title, description, status, origin,
                    created_at, updated_at, model, effort, permission_mode,
                    append_system_prompt, backlog_id, metadata, session_id, depends_on,
-                   parent_id, kind, spec_section, issue_url)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   parent_id, kind, spec_section, issue_url, issue_priority)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 wo_id, title, description, status, origin, ts, ts, model, effort,
                 permission_mode, append_system_prompt, backlog_id,
                 db.to_json(metadata or {}), session_id, db.to_json(deps),
                 parent_id, kind, spec_section or None, issue_url or None,
+                issue_priority or None,
             ),
         )
         self.add_event(wo_id, "created", {"origin": origin, "depends_on": deps,
