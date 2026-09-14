@@ -1243,6 +1243,13 @@ def fake_gh(tmp_path, monkeypatch):
                                "labels": sorted(labels or [])}
             (gdir / "issues.json").write_text(json.dumps(rows))
 
+        def next_issue(self, issue_url: str) -> str:
+            """Where the NEXT `gh issue create` lands. The fake files every issue at one
+            url, which is what a test wanting two distinct bugs on the rails has to
+            move."""
+            monkeypatch.setenv("FAKE_GH_ISSUE_URL", issue_url)
+            return issue_url
+
         def set_labels(self, names: list[str]) -> None:
             """Which labels the repository already has. `--add-label` refuses everything
             else, exactly as real `gh` does."""
