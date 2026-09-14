@@ -3175,24 +3175,32 @@ class Daemon:
         log.info("[%s] triage %s: %s -> %s%s", q.get("project"), out.get("outcome"),
                  out.get("claimed"), out.get("settled"),
                  f" ({out['wo_id']})" if out.get("wo_id") else "")
+        # The head of the reasoning, and a pointer to the rest. Every inbox row reaches
+        # every sink, Telegram included, so the full text stays one `jarvis neo show`
+        # away — the rule the escalation row above already follows. This is also the ONLY
+        # place it goes now: the tracker comment carries the two levels and nothing else
+        # (`issues.TRIAGE_COMMENT`, review round 2).
+        why = (out.get("reason") or "").strip()
+        head = (why[:300] + ("…" if len(why) > 300 else "")) or "no reason given"
+        full = f"Neo's reasoning in full: jarvis neo show {q.get('id')}"
         if out["outcome"] == "unconfirmed":
             central.add_inbox(
                 project=q.get("project") or "jarvis-os", level="warning",
                 title=f"a `{out['claimed']}` bug report is UNCONFIRMED",
                 body=(f"{out['issue_url']}\nNeo could not settle the priority "
-                      f"({out.get('reason') or 'no reason given'}), so NOTHING was "
-                      f"dispatched and no release was cut. It is queued at "
-                      f"{out.get('backlog_id') or '(no backlog item)'} — promote it "
-                      f"with `jarvis backlog promote {out.get('backlog_id') or '<id>'}` "
-                      f"if you agree with the rating."))
+                      f"({head}), so NOTHING was dispatched and no release was cut. It "
+                      f"is queued at {out.get('backlog_id') or '(no backlog item)'} — "
+                      f"promote it with `jarvis backlog promote "
+                      f"{out.get('backlog_id') or '<id>'}` if you agree with the "
+                      f"rating.\n{full}"))
         elif out["outcome"] == "downgraded":
             central.add_inbox(
                 project=q.get("project") or "jarvis-os", level="info",
                 title=f"Neo downgraded a `{out['claimed']}` bug to "
                       f"`{out['settled']}`",
-                body=(f"{out['issue_url']}\n{(verdict.get('reason') or '')[:300]}\n"
+                body=(f"{out['issue_url']}\n{head}\n"
                       f"Queued at {out.get('backlog_id') or '(no backlog item)'} rather "
-                      f"than dispatched."))
+                      f"than dispatched.\n{full}"))
 
     def sync_issues(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Keep the tracker saying what the OS is actually doing. Issue #240.

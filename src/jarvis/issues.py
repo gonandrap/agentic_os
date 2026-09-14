@@ -706,22 +706,30 @@ def triage_payload(q: dict[str, Any]) -> dict[str, Any]:
 #: What the tracker records about the re-assessment. BOTH FACTS, ALWAYS — the claim and
 #: the verdict — because their disagreement is the signal that says whether the rubric is
 #: working, and a comment that only showed the surviving level would delete it.
+#: What the TRACKER is told about a re-assessment: the two levels and where the bug went.
+#:
+#: **NEO'S REASONING IS DELIBERATELY NOT HERE** (review round 2), for the same reason
+#: `closing_comment` carries no `result_summary`. It is model prose written for the
+#: internal record by a model that does not know it will be published, and Neo answers
+#: with fleet context behind it — learnings, other work orders, project names, paths. A
+#: GitHub comment is indexed and cached whether or not it is later deleted, and nobody
+#: reads this one before it leaves the machine.
+#:
+#: The reasoning still travels with both levels, on the RECORD the user asked for it on:
+#: the Neo question row holds it verbatim (`jarvis neo show <id>`), and the inbox row
+#: `daemon._deliver_triage_verdict` writes carries the head of it. Neither is public.
 TRIAGE_COMMENT = """\
 **Priority re-assessed by Neo:** filed as `{claimed}` → **`{settled}`**.
-
-{reason}
 
 {tail}
 
 <!-- Jarvis bug lifecycle (issue #240): the filing agent's rating is a claim; Neo
      re-assesses `critical` and `blocker` against the OS's rubric before any work is
-     dispatched. -->"""
+     dispatched. The reasoning is on the work-order record, not here. -->"""
 
 
-def triage_comment(claimed: str, settled: str, reason: str, tail: str) -> str:
-    return TRIAGE_COMMENT.format(
-        claimed=claimed, settled=settled,
-        reason=(reason or "").strip() or "_(Neo gave no reasoning.)_", tail=tail)
+def triage_comment(claimed: str, settled: str, tail: str) -> str:
+    return TRIAGE_COMMENT.format(claimed=claimed, settled=settled, tail=tail)
 
 
 def record_applied(store: Any, wo: dict[str, Any], label: str) -> str:
@@ -758,9 +766,11 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
       refusal direction is the point: an unconfirmed `blocker` that quietly became a
       release is the worse failure.
 
-    The tracker gets a comment carrying BOTH levels and Neo's reasoning in every case
-    where a verdict was reached, because the disagreement between the claim and the
-    verdict is what tells the user whether the rubric is working.
+    The tracker gets a comment carrying BOTH levels in every case where a verdict was
+    reached, because the disagreement between the claim and the verdict is what tells the
+    user whether the rubric is working. NEO'S REASONING IS NOT ON IT — see
+    `TRIAGE_COMMENT`; it rides the internal record instead, where `out["reason"]` carries
+    it in full for the caller to put in front of the user.
     """
     from .central_store import CentralStore
 
@@ -773,9 +783,12 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
                            "issue_url": url, "wo_id": "",
                            "backlog_id": payload.get("backlog_id") or ""}
 
+    # In full and on every outcome: this is the private half of the record, and the two
+    # places it goes (the inbox row, `jarvis neo show`) are the ones that may hold it.
+    out["reason"] = verdict.get("reason") or ""
+
     if verdict.get("escalate") or verdict.get("failed"):
         out["outcome"] = "unconfirmed"
-        out["reason"] = (verdict.get("reason") or "")[:200]
         return out
 
     if verdict.get("approve"):
@@ -810,7 +823,7 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
     try:
         set_priority_label(url, out["settled"])
         comment(url, triage_comment(
-            claimed, out["settled"], verdict.get("reason") or "",
+            claimed, out["settled"],
             f"A work order is on it: `{out['wo_id']}`." if out["wo_id"] else
             "Queued in the Jarvis backlog; no work order was created."))
     except GitHubError as e:

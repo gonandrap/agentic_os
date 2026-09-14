@@ -224,7 +224,9 @@ def test_report_files_a_github_issue_labelled_bug(reporting):
                          expected="e", actual="a", priority="low")
     call = reporting.calls[-1]
     assert call["argv"][:3] == ["issue", "create", "--repo"]
-    assert call["argv"][3] == bugreport.DEFAULT_BUG_REPO
+    # The fixture's tracker, which nobody owns — `fake_gh` moves `bug_repo()` so that a
+    # test escaping the fake `gh` cannot write to the live one.
+    assert call["argv"][3] == reporting.repo
     assert "--label" in call["argv"]
     assert call["argv"][call["argv"].index("--label") + 1] == "bug"
 

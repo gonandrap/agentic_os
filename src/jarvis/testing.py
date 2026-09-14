@@ -1144,6 +1144,12 @@ def fake_systemd(tmp_path, monkeypatch):
     return Handle()
 
 
+#: The repository every fixture in this harness pretends is the OS's bug tracker. It is
+#: deliberately NOT `bugreport.DEFAULT_BUG_REPO`: see `fake_gh`.
+FIXTURE_BUG_REPO = "jarvis-fixture/no-such-tracker"
+FIXTURE_ISSUE_URL = f"https://github.com/{FIXTURE_BUG_REPO}/issues/7"
+
+
 @pytest.fixture()
 def fake_gh(tmp_path, monkeypatch):
     """Install a fake `gh` binary; returns a handle to its recorded state."""
@@ -1152,17 +1158,22 @@ def fake_gh(tmp_path, monkeypatch):
     binpath = gdir / "gh"
     binpath.write_text(FAKE_GH)
     binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
-    # ON `bugreport.DEFAULT_BUG_REPO`, not a stand-in repository: `issues.py` refuses to
-    # write anywhere but the OS's own tracker, so a fixture issue somewhere else could
-    # only ever exercise the refusal. Nothing reaches the network — the fake is the only
-    # `gh` these tests can run (`testing.BLOCKED_GH`).
-    url = "https://github.com/gonandrap/agentic_os/issues/7"
+    # THE TRACKER THESE TESTS WRITE TO DOES NOT EXIST (review round 2). `issues.py`
+    # refuses to write anywhere but `bugreport.bug_repo()`, so a fixture issue on some
+    # other repository could only ever exercise the refusal — but pointing the fixture at
+    # the REAL tracker leaves `BLOCKED_GH` as the only thing between a test that escapes
+    # the fake and a live label, comment or close on a public issue. So the fixture moves
+    # the ANSWER instead of the URL: `bug_repo()` becomes a repository nobody owns, the
+    # URL check still has something to enforce, and an escaped write has nowhere to land.
+    monkeypatch.setenv("JARVIS_BUG_REPO", FIXTURE_BUG_REPO)
+    url = FIXTURE_ISSUE_URL
     monkeypatch.setenv("FAKE_GH_DIR", str(gdir))
     monkeypatch.setenv("FAKE_GH_ISSUE_URL", url)
     monkeypatch.setenv("JARVIS_GH_BIN", str(binpath))
 
     class Handle:
         dir = gdir
+        repo = FIXTURE_BUG_REPO
         issue_url = url
         prs: dict[str, dict] = {}
 

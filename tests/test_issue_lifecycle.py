@@ -20,14 +20,19 @@ import pytest
 
 from jarvis import bugreport, cli, issues
 from jarvis.project_store import ProjectStore
+from jarvis.testing import FIXTURE_BUG_REPO
 
-PR = "https://github.com/gonandrap/agentic_os/pull/9"
+#: Everything here happens on the repository `fake_gh` makes `bug_repo()` answer, which
+#: NOBODY OWNS (review round 2) — so a test that got past the fake `gh` would write to a
+#: repository that does not exist rather than to the live public tracker.
+PR = f"https://github.com/{FIXTURE_BUG_REPO}/pull/9"
+PR_2 = f"https://github.com/{FIXTURE_BUG_REPO}/pull/10"
 
 
 # -- fixtures -------------------------------------------------------------------------
 
 
-def _origin(path, repo="gonandrap/agentic_os"):
+def _origin(path, repo=FIXTURE_BUG_REPO):
     """Give a fixture checkout the `origin` that makes it the tracker's project."""
     subprocess.run(["git", "remote", "add", "origin",
                     f"https://github.com/{repo}.git"], cwd=path, check=True)
@@ -403,16 +408,45 @@ def test_a_downgrade_that_names_a_higher_level_is_not_a_confirmation(fleet):
 def test_the_tracker_records_both_the_claim_and_the_verdict(fleet):
     """The user's instruction: the disagreement is the signal that says whether the
     rubric is working, so neither half may be overwritten silently."""
+    from jarvis.central_store import CentralStore
+
     result = fleet.file_bug(priority="blocker")
     fleet.triage(approve=False, answer="medium", reason="bounded to one surface")
 
+    # PUBLIC: both levels, so the disagreement is visible on the tracker itself.
     body = "\n".join(fleet.gh.issue()["comments"])
     assert "blocker" in body and "medium" in body
-    assert "bounded to one surface" in body, "the reasoning travels with the two levels"
     # And the ORIGINAL claim is in the issue body, where no re-assessment can move it.
     filed = [c for c in fleet.gh.calls if c["argv"][:2] == ["issue", "create"]][0]
     assert "blocker" in filed["stdin"]
     assert result["url"]
+    # PRIVATE: the reasoning, on the record the user reads, and NOT on the tracker.
+    central = CentralStore()
+    try:
+        inbox = "\n".join((i["body"] or "") for i in central.unacked_inbox())
+    finally:
+        central.close()
+    assert "bounded to one surface" in inbox
+    assert "jarvis neo show" in inbox, "and a pointer to the rest of it"
+
+
+def test_neos_reasoning_never_reaches_the_public_tracker(fleet):
+    """Review round 2, and `closing_comment`'s rule on the other comment this OS writes.
+
+    Neo answers with fleet context behind it — learnings, other work orders, project
+    names, absolute paths — and a GitHub comment is indexed and cached whether or not it
+    is later deleted. Nobody reads this one before it leaves the machine, so the tracker
+    gets the two levels and the work order, and nothing a model wrote in prose.
+    """
+    leak = ("promoted over /home/gonzalo/workspace/secret_client per kn-deadbeef; "
+            "wo-000000 hit the same thing")
+    fleet.file_bug(priority="blocker")
+    fleet.triage(approve=False, answer="medium", reason=leak)
+
+    body = "\n".join(fleet.gh.issue()["comments"])
+    assert "/home/gonzalo" not in body and "secret_client" not in body
+    assert "kn-deadbeef" not in body and "wo-000000" not in body
+    assert "blocker" in body and "medium" in body, "the levels still are public"
 
 
 def test_neo_escalating_dispatches_nothing_and_says_so(fleet):
@@ -760,7 +794,7 @@ def test_a_human_closing_an_issue_under_a_live_work_order_is_not_undone(fleet):
 # -- a confirmed fix that LANDS ships a release ---------------------------------------
 
 
-ISSUE_2 = "https://github.com/gonandrap/agentic_os/issues/8"
+ISSUE_2 = f"https://github.com/{FIXTURE_BUG_REPO}/issues/8"
 
 
 def test_a_landed_confirmed_blocker_files_a_release_through_the_ordinary_path(fleet):
@@ -785,7 +819,7 @@ def test_a_second_landed_blocker_joins_the_pending_release(fleet):
     first = fleet.releases()[0]["id"]
 
     second = fleet.blocker_wo(ISSUE_2, title="daemon drops a tick")
-    fleet.land(second, pr_url="https://github.com/gonandrap/agentic_os/pull/10")
+    fleet.land(second, pr_url=PR_2)
 
     releases = fleet.releases()
     assert len(releases) == 1 and releases[0]["id"] == first, \
@@ -806,7 +840,7 @@ def test_a_settled_release_does_not_hold_the_next_fix_back(fleet):
         store.close()
 
     fleet.land(fleet.blocker_wo(ISSUE_2, title="daemon drops a tick"),
-               pr_url="https://github.com/gonandrap/agentic_os/pull/10")
+               pr_url=PR_2)
     assert len(fleet.releases()) == 1, "the settled one is no longer open"
     assert fleet.releases()[0]["id"] != first
 

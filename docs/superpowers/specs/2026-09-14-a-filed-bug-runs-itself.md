@@ -93,9 +93,18 @@ nothing.
 **The claim and the verdict are both kept.** The moving `priority:` label carries the
 level the bug ACTUALLY has after Neo — one label, never two. The ORIGINAL claim is
 written into the issue body at filing time (`Priority claimed by the reporter`), where
-no re-assessment can move it, and `issues.triage_comment` posts both levels and Neo's
-reasoning on the issue. That disagreement is the signal that says whether the rubric is
-working, so nothing may overwrite it silently.
+no re-assessment can move it, and `issues.triage_comment` posts both levels on the issue.
+That disagreement is the signal that says whether the rubric is working, so nothing may
+overwrite it silently.
+
+**Neo's reasoning is not published** (review round 2). It is model prose written for the
+internal record by a model that does not know it will be published, and Neo answers with
+fleet context behind it — learnings, other work orders, project names, paths. It rides
+the private half of the record instead: the Neo question row holds it verbatim
+(`jarvis neo show <id>`), and the inbox row `Daemon._deliver_triage_verdict` writes
+carries its head plus a pointer to the rest. Same rule as `closing_comment` (§9), for the
+same reason: a GitHub comment is indexed and cached whether or not it is later deleted,
+and nobody reads this one before it leaves the machine.
 
 The Neo question row IS the pending-triage record (`context` carries the issue URL, the
 title, the claim and the backlog id). There is no second table and no orphan state: a
@@ -217,7 +226,15 @@ reach the tracker and the OS will retry.
   on each would be pure cost for a decision nobody acts on until the user promotes it.
 * **No assignee, no milestone, no project board.** One label is the whole of the
   in-progress signal, and every additional field is a second thing that can go stale.
-* **The closing comment carries no `result_summary`.** The work order id, the title and
-  the pull request link, and nothing else: worker prose is written for the internal
-  record by a worker that does not know it will be published, and this tracker is
-  public.
+* **NO MODEL PROSE IS EVER PUBLISHED.** One rule, two comments. The closing comment
+  carries the work order id, the title and the pull request link; the triage comment
+  carries the two levels and where the bug went. Neither carries `result_summary` or
+  Neo's reasoning. Both are written by a model that does not know it will be published,
+  to a tracker that is public and that indexes and caches a comment whether or not it is
+  later deleted, with nobody reading it in between. Anything a person needs beyond those
+  fields is on the work-order record, one command away.
+* **The test harness does not point at the real tracker.** `testing.fake_gh` makes
+  `bug_repo()` answer `jarvis-fixture/no-such-tracker`, so `checked_issue_url` still has
+  a repository to enforce, and a test that got past the fake `gh` would write to a
+  repository nobody owns rather than to live public issues. `BLOCKED_GH` is then the
+  second line of defence, not the only one.
