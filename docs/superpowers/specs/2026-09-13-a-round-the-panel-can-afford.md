@@ -204,26 +204,53 @@ ask by ask, whether it was met.
 
 **Its own, and no other seat's.** Blindness is the property the whole panel rests on, and
 a seat that could read another's prior round would be reading a round-delayed copy of the
-opinion it is not allowed to see. `tests/test_validation_seats.py` asserts both halves:
-a round-2 prompt contains that seat's round-1 asks, and contains no other seat's text.
+opinion it is not allowed to see. `tests/test_validation_seats.py` asserts both halves in
+the same test: a round-2 prompt contains that seat's round-1 asks, and contains no other
+seat's text. Either alone is satisfied by a prompt carrying no memory at all.
 
-It rides in `-p` beside the mandate, never in the shared prefix (§2).
+**THE LAST ROUND IT SPOKE IN, not the numerically preceding one.** A round can close
+`failed` as a transport outage with no opinions in it, and a seat whose memory went blank
+because the round before it timed out is the amnesia this section exists to end.
+`previous_opinion` walks back to the most recent round in which this seat actually
+replied, and the heading names that round number so the seat knows how old its own words
+are.
+
+An unparseable prior reply is shown RAW rather than dropped: a seat told nothing cannot
+tell "I said nothing last round" from "my reply did not survive", and those want opposite
+weight on what the submitter has since changed.
+
+The chair gets the same treatment — it is a seat, and its prior `outcome`/`reason` is its
+own.
+
+It rides in `-p` beside the mandate, never in the shared prefix (§2), and it is read on
+`decide`'s own thread with every other prompt: `run_blind` takes no store precisely so a
+seat on a pool thread cannot reach one.
 
 ## §8 Later rounds and the delta
 
 Round n re-sends the whole packet. A human reviewer would be shown "changes since your
 last review".
 
-Not shipped, and the reasoning is §1's: the delta's saving is the prefix, and §2 already
-took 74% of the prefix while §6 spent the rest of it on coverage. What a delta-only round
-buys is therefore small, and what it risks is a regression outside the delta going unseen
-by a panel that believes it has reviewed the change — which is the same failure mode as
-the truncation §6 exists to end. The panel would be reading less again, for less reason.
+**NOT SHIPPED**, and the arithmetic is why rather than the risk alone.
 
-§7 delivers the half of this that the record actually asked for: a seat that can check
-its own asks. Reopen §8 only with a measurement showing round 2+ prefix cost is worth the
-coverage, and only with the fallback-to-full-packet path that this note declines to build
-speculatively.
+The only thing a delta saves is the prefix, and §2 already took 74% of it. At
+`diff_chars=150000` a later round's prefix is 76,347 tokens: paid cold, once per round,
+that is 95,434 input-equivalent tokens — under 2% of what wo-a6af01f0 cost in total, and a
+twentieth of what one round of the worker's own rework costs. A delta that cut the diff to
+a tenth would save perhaps 85,000 input-equivalent tokens per later round.
+
+Against that: a delta-only round cannot see a regression outside the delta, while
+believing it has reviewed the change. That is the same failure mode as the truncation §6
+exists to end — the panel reading less than it thinks it has — bought back for a saving
+two orders of magnitude below the one the work order is about.
+
+§7 delivers the half of this the record actually asked for. What the seats complained of
+in wo-a6af01f0 was not re-reading the diff; it was not knowing what they had already
+demanded, and a seat that carries its own asks can say "this ask is met" without the
+packet shrinking at all.
+
+Reopen §8 only with a measurement showing a later round's prefix is the expensive thing,
+and only with the fallback-to-full-packet path this note declines to build speculatively.
 
 ## §9 What a later change will be tempted to undo
 
@@ -246,6 +273,14 @@ system prompt is a prompt-prose change: every structural test stays green while 
 behaviour shifts underneath. `evals/llm/test_validation_judgment.py` (`JARVIS_EVALS_LLM=1`)
 is the only instrument that can see it, and a change to §2, §4 or §7 that does not report
 it has measured half of what it did.
+
+**AND IT DOES NOT COVER §7.** Every case in that eval runs ONE round, so the memory block
+is never rendered into a graded prompt: its 11/11 says adding an optional section did not
+disturb round-1 behaviour, and says nothing about whether a seat that has its own asks
+uses them. The A/B that would answer it — arm WITHOUT built by cutting
+`render_prior_opinion`'s block by marker, two rounds per case over
+`untested-new-function` then `new-function-with-its-own-test` — is filed as `bl-86b70464`
+with the reason the outcome cannot be the signal.
 
 What it reported for this change, `model=sonnet`, before = `git archive HEAD` in a clean
 tree, after = this branch: **11/11 both arms**. One after-run scored `must-pass` 2/3 and a

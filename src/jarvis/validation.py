@@ -48,6 +48,13 @@ server's schemas in the request, so a seat on a machine with Google Drive connec
 share the diff it was judging. `claude_cli.run_headless_result` now sends
 `--strict-mcp-config` with `tools=""`, and this paragraph is true.
 
+**A SEAT REMEMBERS ITS OWN LAST ROUND AND NO OTHER SEAT'S.** `previous_opinion` carries
+the seat's own verdict, reason and asks into its next-round prompt so it can say whether
+what it demanded was delivered, instead of re-deriving the finding from a diff. Reading a
+neighbour's prior round would hand it a round-delayed copy of the opinion blindness exists
+to withhold — so the read is scoped to one seat, and a test asserts the absence as well as
+the presence. Spec §7.
+
 **THE PACKET IS THE SHARED SYSTEM PREFIX; THE MANDATE IS THE USER TURN.** Five calls
 seconds apart share the packet and nothing else, and the prompt cache is a prefix match,
 so that is the only layout in which a round pays for the packet once. Anything per-seat
@@ -269,16 +276,88 @@ def build_shared_prefix(packet: EvidencePacket, project: str,
     return "\n".join(parts)
 
 
-def build_seat_prompt(seat: str) -> str:
-    """One seat's own half of its prompt: who it is and what its mandate is.
+def build_seat_prompt(seat: str, prior: Mapping[str, Any] | None = None) -> str:
+    """One seat's own half of its prompt: who it is, what its mandate is, and what IT
+    said last time.
 
     The header is the machine-readable first line it has always been — it is what lets a
     reader of the record, and the test fake, tell this roster's `chair` from Neo's. It
     moved here from the system prompt with the mandate, because a per-seat line in the
     shared prefix is the one thing `build_shared_prefix` cannot carry.
+
+    `prior` is `{"round": n, "reply": raw}` from `previous_opinion` — THIS SEAT'S OWN and
+    no other's. It rides here rather than in the shared prefix for the same reason the
+    mandate does: per-seat bytes in the prefix un-share it (spec §2).
     """
     _, mandate = definition(seat)
-    return "\n".join([SEAT_HEADER.format(seat=seat), "", mandate])
+    return "\n".join([SEAT_HEADER.format(seat=seat), "", mandate,
+                      *render_prior_opinion(prior)])
+
+
+def previous_opinion(store: ProjectStore, round_row: Mapping[str, Any],
+                     seat: str) -> dict[str, Any] | None:
+    """What this seat itself said the last time it spoke about this submission.
+
+    THE LAST ROUND IT SPOKE IN, not the numerically preceding one. A round can fail as a
+    transport outage with no opinions in it at all, and a seat whose memory went blank
+    because the round before it timed out is the amnesia this exists to end.
+
+    Only this seat's row is ever read. Blindness is the property the whole panel rests
+    on, and another seat's prior round is a round-delayed copy of the opinion this one is
+    not allowed to see.
+    """
+    key = ({"wo_id": str(round_row["wo_id"])} if round_row.get("wo_id")
+           else {"fo_id": str(round_row["fo_id"])})
+    earlier = [r for r in store.validation_rounds(**key)  # type: ignore[arg-type]
+               if int(r["round"]) < int(round_row["round"])]
+    for row in reversed(earlier):
+        mine = next((o for o in store.validation_opinions(int(row["id"]))
+                     if o["seat"] == seat and o["status"] == "ok" and o["reply"]), None)
+        if mine is not None:
+            return {"round": int(row["round"]), "reply": str(mine["reply"])}
+    return None
+
+
+def render_prior_opinion(prior: Mapping[str, Any] | None) -> list[str]:
+    """This seat's own last reply, and the extra job it creates for this round.
+
+    Rendered from the stored reply rather than summarised: the asks are the concrete
+    thing the submitter was told to do, and anything between them and the seat that wrote
+    them is somewhere they can be softened.
+
+    An unparseable prior is shown RAW rather than dropped. A seat told nothing cannot
+    tell "I said nothing last round" from "my reply did not survive", and those want
+    opposite weight on what the submitter has since changed.
+    """
+    if not prior:
+        return []
+    data = structured.parse_json_object(str(prior.get("reply") or ""))
+    out = [
+        "",
+        f"# WHAT YOU YOURSELF SAID IN ROUND {prior['round']}",
+        "Your own previous opinion on this same submission, and nobody else's — you have "
+        "not been shown another seat's, and you did not see one then either. The "
+        "submitter has answered it; the change in front of you is what came back.",
+        "",
+        "**Part of your job this round is to say, ASK BY ASK, whether it was met.** Do "
+        "not re-derive the finding from scratch and do not repeat an ask that has been "
+        "answered: say which of these the change now satisfies, which it does not, and "
+        "why. An ask you cannot check because the diff was truncated is one you say you "
+        "cannot check.",
+    ]
+    if not isinstance(data, dict):
+        return out + ["", "```", str(prior.get("reply") or "").strip(), "```"]
+    verdict = str(data.get("outcome") or data.get("verdict") or "").strip() or "(none)"
+    blocking = " (blocking)" if _raised(data, "blocking") else ""
+    out += ["", f"## Your verdict was: {verdict}{blocking}",
+            str(data.get("reason") or "").strip() or "(you gave no reason)"]
+    asks = _asks(data)
+    if asks:
+        out += ["", "## What you asked for"] + [f"- {a}" for a in asks]
+    else:
+        out += ["", "## What you asked for", "(you listed no concrete asks; your reason "
+                                             "above was the whole of it)"]
+    return out
 
 
 def build_packet_prompt(packet: EvidencePacket) -> str:
@@ -405,7 +484,8 @@ def _pull_request_sections(packet: EvidencePacket) -> list[str]:
     return out
 
 
-def build_chair_prompt(opinions: Sequence[seats.Opinion]) -> str:
+def build_chair_prompt(opinions: Sequence[seats.Opinion],
+                       prior: Mapping[str, Any] | None = None) -> str:
     """The chair's mandate, then every seat's reply verbatim.
 
     Verbatim rather than summarised: a summariser between the seats and the chair is one
@@ -415,7 +495,7 @@ def build_chair_prompt(opinions: Sequence[seats.Opinion]) -> str:
     system prompt, the same bytes the four seats read minutes earlier, which is what lets
     the chair's call cache-read rather than write (spec §2).
     """
-    parts = [build_seat_prompt("chair"), "", "# The panel's opinions",
+    parts = [build_seat_prompt("chair", prior), "", "# The panel's opinions",
              "Each seat answered blind — none of them saw another's reply, and none of "
              "them saw yours. A seat with no opinion errored or timed out; it abstained, "
              "and silence is never agreement."]
@@ -556,7 +636,11 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
         if seat == "chair":
             continue
         try:
-            prompts[seat] = (prefix, build_seat_prompt(seat))
+            # READ ON THIS THREAD, with every other prompt. `run_blind` takes no store
+            # precisely so a seat on a pool thread cannot reach one.
+            prompts[seat] = (prefix,
+                             build_seat_prompt(seat, previous_opinion(store, round_row,
+                                                                     seat)))
         except seats.SeatError as e:
             # Not an outage: this build ships no such seat. The panel proceeds without it
             # rather than stalling the round, and the row says `failed` rather than
@@ -606,7 +690,8 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
         return _out("escalated", "this panel has no chair, so nothing could turn the "
                                  "seats' opinions into a verdict.", opinions)
 
-    chair = _run_chair(store, round_id, packet, opinions, cfg, project, prefix)
+    chair = _run_chair(store, round_id, packet, opinions, cfg, project, prefix,
+                       previous_opinion(store, round_row, "chair"))
     opinions = [*opinions, chair]
     data = chair.data or {}
     outcome = str(data.get("outcome") or "").strip().lower()
@@ -689,7 +774,8 @@ def _record_usage(usage: dict[str, Any] | None, project: str, packet: EvidencePa
 
 def _run_chair(store: ProjectStore, round_id: int, packet: EvidencePacket,
                opinions: Sequence[seats.Opinion], cfg: ValidationConfig, project: str,
-               prefix: str) -> seats.Opinion:
+               prefix: str,
+               prior: Mapping[str, Any] | None = None) -> seats.Opinion:
     """Synthesise. The chair is the one seat that is not blind — that is its whole job.
 
     A chair that cannot be reached is TOTAL FAILURE, not a seat abstaining: there is no
@@ -705,7 +791,7 @@ def _run_chair(store: ProjectStore, round_id: int, packet: EvidencePacket,
 
     model = seat_model("chair", cfg)
     system = prefix
-    prompt = build_chair_prompt(opinions)
+    prompt = build_chair_prompt(opinions, prior)
     started = time.monotonic()
     try:
         result = claude_cli.run_headless_result(prompt, system_prompt=system, model=model,

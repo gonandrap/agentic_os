@@ -543,3 +543,120 @@ def test_the_shared_prefix_carries_the_packet_and_no_seats_mandate(store, jarvis
     for seat in VALIDATOR_SEATS:
         assert f"# Jarvis validation seat: {seat}" not in prefix
         assert validation.definition(seat)[1] not in prefix
+
+
+# -- a seat's own memory (spec §7) ---------------------------------------------------------
+
+
+def _round_two(store, fake_claude):
+    """Run round 1 through `decide`, then round 2, and return round 2's calls.
+
+    Round 1 is really run rather than staged by hand: what a seat is shown in round 2 has
+    to be what the store kept from round 1, and a fixture row written beside the renderer
+    would test it against itself.
+    """
+    wo = store.create_work_order("t")
+    first = store.open_validation_round(wo_id=wo["id"], fingerprint="f1")
+    validation.decide(store, first, packet(summary="FORCE_BLOCK_TESTER"),
+                      ValidationConfig(enabled=True))
+    before = len(fake_claude.calls)
+    second = store.open_validation_round(wo_id=wo["id"], fingerprint="f2")
+    validation.decide(store, second, packet(summary="round two"),
+                      ValidationConfig(enabled=True))
+    return [c for c in fake_claude.calls[before:] if "-p" in c["argv"]]
+
+
+def _user_prompt(call) -> str:
+    argv = call["argv"]
+    return argv[argv.index("-p") + 1]
+
+
+def _prompt_for(calls, seat: str) -> str:
+    return next(_user_prompt(c) for c in calls
+                if f"# Jarvis validation seat: {seat}" in _user_prompt(c))
+
+
+def test_a_seat_sees_its_own_round_one_asks_in_round_two(store, jarvis_home, fake_claude):
+    """THE CORRECTNESS GAP, asserted end to end. In round 2 of wo-a6af01f0 the tester
+    wrote "you did not name a test that asserts it" with no awareness that it had raised
+    that ask itself in round 1. A seat that cannot see what it demanded can only
+    re-derive the finding — from a diff that was truncated anyway."""
+    prompt = _prompt_for(_round_two(store, fake_claude), "tester")
+
+    assert "WHAT YOU YOURSELF SAID IN ROUND 1" in prompt
+    assert "test-forced tester objection" in prompt, "its own reason"
+    assert "answer the tester objection" in prompt, "its own ask"
+    assert "ASK BY ASK" in prompt, "the extra job the memory creates"
+
+
+def test_a_seats_round_two_prompt_carries_no_other_seats_text(store, jarvis_home,
+                                                              fake_claude):
+    """BLINDNESS, AND IT IS THE PROPERTY THE WHOLE PANEL RESTS ON. A neighbour's prior
+    round is a round-delayed copy of the opinion a seat is not allowed to see, so the
+    presence assertion above is only safe paired with this one."""
+    calls = _round_two(store, fake_claude)
+
+    for seat in ("tester", "security", "architect", "maintainer"):
+        prompt = _prompt_for(calls, seat)
+        # Paired, or "no other seat's text is here" is satisfied by a prompt carrying no
+        # memory at all — which is the bug, passing as the fix.
+        assert "WHAT YOU YOURSELF SAID IN ROUND 1" in prompt
+        for other in VALIDATOR_SEATS:
+            if other == seat:
+                continue
+            assert f"the {other} question is answered" not in prompt, (
+                f"{seat} was shown what {other} said")
+            assert f"test-forced {other} objection" not in prompt, (
+                f"{seat} was shown what {other} said")
+
+
+def test_the_memory_rides_in_the_user_turn_and_never_in_the_shared_prefix(
+        store, jarvis_home, fake_claude):
+    """It is PER SEAT, so putting it in the system prompt would un-share the prefix and
+    silently undo the whole cost change — with every test still green (spec §2)."""
+    calls = _round_two(store, fake_claude)
+
+    systems = {c["system_prompt_seen"] for c in calls}
+    assert len(systems) == 1, "the round no longer shares one prefix"
+    assert "WHAT YOU YOURSELF SAID" not in systems.pop()
+
+
+def test_a_first_round_seat_is_told_nothing_it_never_said(store, jarvis_home,
+                                                          fake_claude):
+    """The negative control. A heading promising a previous opinion, with nothing under
+    it, is a prompt inviting a seat to invent one."""
+    wo = store.create_work_order("t")
+    round_row = store.open_validation_round(wo_id=wo["id"], fingerprint="f")
+
+    validation.decide(store, round_row, packet(), ValidationConfig(enabled=True))
+
+    for call in (c for c in fake_claude.calls if "-p" in c["argv"]):
+        assert "WHAT YOU YOURSELF SAID" not in _user_prompt(call)
+
+
+def test_a_round_that_failed_as_an_outage_does_not_blank_a_seats_memory(store,
+                                                                        jarvis_home):
+    """THE LAST ROUND IT SPOKE IN, not the numerically preceding one. A transport outage
+    closes a round with no opinions in it, and a seat whose memory went blank because the
+    round before it timed out is the amnesia this feature exists to end."""
+    wo = store.create_work_order("t")
+    first = store.open_validation_round(wo_id=wo["id"], fingerprint="f1")
+    store.record_validation_opinion(int(first["id"]), "tester", verdict="reject",
+                                    reply=json.dumps({"verdict": "reject",
+                                                      "asks": ["ROUND_ONE_ASK"]}))
+    store.open_validation_round(wo_id=wo["id"], fingerprint="f2")  # outage, no opinions
+    third = store.open_validation_round(wo_id=wo["id"], fingerprint="f3")
+
+    prior = validation.previous_opinion(store, third, "tester")
+
+    assert prior is not None and prior["round"] == 1
+    assert "ROUND_ONE_ASK" in validation.build_seat_prompt("tester", prior)
+
+
+def test_an_unparseable_previous_reply_is_shown_raw_rather_than_dropped():
+    """A seat told nothing cannot tell "I said nothing" from "my reply did not survive",
+    and those want opposite weight on what the submitter has since changed."""
+    prompt = validation.build_seat_prompt(
+        "tester", {"round": 1, "reply": "on reflection the tester question is hard"})
+
+    assert "on reflection the tester question is hard" in prompt
