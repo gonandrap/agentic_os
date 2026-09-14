@@ -3795,7 +3795,9 @@ def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any
         KIND_NAMES,
         RuleSet,
         command_names,
+        files_a_claim,
         gate_paperwork,
+        list_segments,
         reads_only,
         scannable,
         shape_of,
@@ -3821,6 +3823,11 @@ def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any
         "gates_enabled": sorted(enabled),
         "reads_only": reads_only(command),
         "gate_paperwork": gate_paperwork(command),
+        # Per SEGMENT, so a filing reached through an interpreter or written in more than
+        # one command shows up as what it is — issue #233.
+        "files_a_claim": sorted({command[s:e].strip().splitlines()[0]
+                                 for s, e in list_segments(command)
+                                 if command[s:e].strip() and files_a_claim(command[s:e])}),
         "commands_in_chain": sorted(command_names(command)),
         "scanned": scannable(command),
         "trace": list(decision.trace),

@@ -68,6 +68,14 @@ whole, because `cat scripts/shipit.sh | bash` really does ship; so do substituti
 heredoc bodies, which belong to the command that reads them. `list_segments` draws that
 line once and `read_only_mentions` and `Shape` both work over it.
 
+"Belong to" is load-bearing and was not true until issue #233. A heredoc body sits on its
+own lines, and a newline is a list separator, so every body used to split off into a
+segment of its own that no command owned: `cat > /tmp/why.txt <<EOF` owned nothing, the
+prose inside it was judged as if someone had typed it at a prompt, and the gated literal
+it merely quoted was charged to whatever ran next. `owned_spans` is where that is fixed —
+one span per heredoc, from the newline ending its opener line to the end of its
+terminator line, blanked with the body so the whole thing stays with its owner.
+
 "Usually" is load-bearing, and getting it wrong is worse here than anywhere else in this
 module. Those segments DO share the filesystem and the environment, so a reader that
 writes — `cat scripts/shipit.sh > /tmp/s.sh && bash /tmp/s.sh` — hands its subject to
@@ -79,6 +87,7 @@ is one that stays quiet when it should.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -384,19 +393,41 @@ def _blank(text: str, spans: Iterable[tuple[int, int]]) -> str:
     return "".join(out)
 
 
-def _inert(command: str) -> str:
-    """`command` with every span the shell will not execute blanked, length preserved.
+def owned_spans(command: str) -> list[tuple[int, int]]:
+    """The span each heredoc occupies in `command`, as text belonging to its OWNER.
 
-    The heredoc's TERMINATOR line goes too, which `heredoc_spans` deliberately does not
-    include: it is not part of the body (a gated literal there is the delimiter, not
-    prose), but it is not a command either, and leaving it in makes `EOF` look like the
-    name of something the chain runs.
+    Wider than `heredoc_spans` at both ends, and each end closes a different way of
+    charging a body to the wrong command (issue #233).
+
+    It starts at the newline ENDING the opener line, not at the body: that newline is a
+    list separator everywhere else in this module, so leaving it made every body a
+    command of its own — `cat > f <<EOF` owned nothing, and the prose inside it was
+    judged as if someone had typed it at a prompt.
+
+    It ends after the TERMINATOR line, which `heredoc_spans` deliberately excludes: a
+    gated literal there is the delimiter, not prose, but it is not a command either, and
+    leaving it in makes `EOF` look like the name of something the chain runs.
     """
     spans: list[tuple[int, int]] = []
     for start, end, _, _ in heredoc_spans(command):
         eol = command.find("\n", end)
-        spans.append((start, len(command) if eol == -1 else eol))
-    return _QUOTED.sub(lambda m: " " * (m.end() - m.start()), _blank(command, spans))
+        spans.append((start - 1, len(command) if eol == -1 else eol))
+    return spans
+
+
+def _inert(command: str) -> str:
+    """`command` with every span the shell will not execute blanked, length preserved.
+
+    Newlines inside a heredoc go with it. `_blank` keeps them because a caller may want
+    the line structure back; here they are the enemy, and were the whole of issue #233's
+    misattribution — see `owned_spans`.
+    """
+    out = list(_QUOTED.sub(lambda m: " " * (m.end() - m.start()),
+                           _blank(command, owned_spans(command))))
+    for start, end in owned_spans(command):
+        for i in range(max(0, start), min(len(out), end)):
+            out[i] = " "
+    return "".join(out)
 
 
 def scannable(command: str) -> str:
@@ -436,12 +467,41 @@ def scannable(command: str) -> str:
     a bypass in the classifier for every gate at once. What the body needs is not a blunt
     exemption but a *learnable* one — see `Shape`, which records that a match landed in a
     body and lets a reviewed dismissal clear that shape for the chains that cannot run it.
+
+    …and inside a body owned by an INTERPRETER, quotes are not blanked either, because
+    the shell never sees them: `python - <<PY` hands the body to python, and a string
+    literal in a python program is part of the program. Blanking them made
+    `os.system("gh pr merge 223 --squash")` inside a heredoc match no recogniser at all
+    (issue #233). The carve-out that clears such a body has to be `gate_paperwork` —
+    which establishes that the literal is an ARGUMENT — rather than the accident of
+    quoting, which establishes nothing.
     """
     if _SUBSTITUTION.search(command):
         return command
+    programs = program_spans(command)
     # Replace rather than delete, so neighbouring tokens can't fuse into a false match.
-    blanked = _QUOTED.sub(" ", command)
+    blanked = _QUOTED.sub(
+        lambda m: m.group(0) if any(s <= m.start() and m.end() <= e for s, e in programs)
+        else " ", command)
     return command if _SHELL_INVOKER.search(blanked) else blanked
+
+
+def program_spans(command: str) -> list[tuple[int, int]]:
+    """The heredoc bodies that are PROGRAMS rather than data: those owned by an executor.
+
+    `git commit -F - <<EOF` is handed a commit message; `python - <<PY` is handed a
+    program. Same syntax, and the difference is exactly the `_EXECUTORS` membership test.
+    """
+    heres = heredoc_spans(command)
+    if not heres:
+        return []
+    segs = segments(command)
+    spans: list[tuple[int, int]] = []
+    for start, end, opener, _ in heres:
+        owner = next((n for s, e, n in segs if s <= opener < e and n), "")
+        if owner and owner.split()[0] in _EXECUTORS:
+            spans.append((start, end))
+    return spans
 
 
 def _argv0(segment: str) -> str:
@@ -481,21 +541,6 @@ def command_names(command: str) -> frozenset[str]:
     return frozenset(name for _, _, name in segments(command) if name)
 
 
-def _list_inert(command: str) -> str:
-    """`_inert`, with heredoc newlines blanked too, so a body cannot split a list.
-
-    `_blank` preserves newlines because `segments` wants the line structure back. Here
-    it is the enemy: a heredoc body is one command's argument however many lines it
-    spans, and splitting it would hand half of it to the next segment.
-    """
-    out = list(_inert(command))
-    for start, end, _, _ in heredoc_spans(command):
-        eol = command.find("\n", end)
-        for i in range(start, len(command) if eol == -1 else eol):
-            out[i] = " "
-    return "".join(out)
-
-
 def list_segments(command: str) -> list[tuple[int, int]]:
     """Spans of the independent commands in `command`, offsets into it.
 
@@ -504,7 +549,7 @@ def list_segments(command: str) -> list[tuple[int, int]]:
     typed together; `a | b` is one command feeding another, and every judgement this
     module makes about a pipeline has to cover the whole of it.
     """
-    inert = _list_inert(command)
+    inert = _inert(command)
     spans: list[tuple[int, int]] = []
     pos = 0
     for m in _LIST_SEPARATORS.finditer(inert):
@@ -531,8 +576,12 @@ def reads_only(command: str) -> bool:
     about any particular privileged action, it is a claim about what `cat` is.
 
     Unrecognised syntax fails the test rather than passing it: a name carrying a slash
-    is not the `cat` on PATH but something in the tree that merely shares its name, and
-    an empty segment means the split found something this parser does not model.
+    is not the `cat` on PATH but something in the tree that merely shares its name, an
+    empty segment means the split found something this parser does not model, and an
+    UNTERMINATED heredoc is a body that swallowed the rest of the string — the reader
+    owning it now owns whatever came after the delimiter that never arrived, so it is
+    not a reader (kn-67364b3a, and the guard that keeps `owned_spans` from paying for
+    that ownership with a bypass).
     """
     # The asymmetry below is deliberate, not a half-finished edit, and `scannable` now
     # makes the same call: `_SUBSTITUTION` stays on the RAW command because `$(…)` runs
@@ -542,10 +591,13 @@ def reads_only(command: str) -> bool:
     # being read (issue #203).
     if _SUBSTITUTION.search(command):
         return False
-    blanked = _QUOTED.sub(" ", command)
-    if _SHELL_INVOKER.search(blanked):
+    if any(not terminated for *_, terminated in heredoc_spans(command)):
         return False
-    parts = [s.strip() for s in _SEPARATORS.split(blanked)]
+    if _SHELL_INVOKER.search(_QUOTED.sub(" ", command)):
+        return False
+    # The INERT form, so a heredoc body stays with the command that owns it rather than
+    # splitting into a line of prose that reads as a command nobody can name (#233).
+    parts = [s.strip() for s in _SEPARATORS.split(_inert(command))]
     if not any(parts):
         return False
     for segment in parts:
@@ -623,23 +675,62 @@ def read_only_mentions(command: str, pattern: str) -> bool:
     Fails closed twice over. A pattern that matches no single segment — it straddled a
     separator, or only the whole string matched — clears nothing.
     """
+    return bool(_mentions_only(command, pattern, paperwork=False))
+
+
+def mentions_only(command: str, pattern: str) -> str:
+    """WHY nothing that names `pattern` could run it, or `""` if something could.
+
+    `read_only_mentions` widened by one segment kind: a segment that only hands the
+    literal to `jarvis gate` paperwork runs it no more than `cat` does. Filing a case
+    about an action is the OS's own sanctioned remedy, and it must survive being written
+    in more than one command — issue #233, where a justification written to a file by
+    `cat` and read back by the filing was held as the merge it was asking for.
+
+    The reason is returned rather than a bool because it is recorded: a gate that says
+    the wrong thing about why it fired is the other half of that issue.
+    """
+    return _mentions_only(command, pattern, paperwork=True)
+
+
+#: How each kind of segment fails to run what it names. Ordered as the reason is read.
+_CLEARANCES = ("can read it and nothing more", "hand it to `jarvis gate` paperwork, "
+               "which files a claim about it and runs nothing")
+
+
+def _mentions_only(command: str, pattern: str, *, paperwork: bool) -> str:
+    """The loop both carve-outs share. One function so the safety argument is one place."""
     try:
         rx = re.compile(pattern, re.IGNORECASE)
     except re.error:
-        return False
+        return ""
     handoff = False
-    named = False
+    grounds: set[int] = set()
     for start, end in list_segments(command):
         segment = command[start:end]
         if not rx.search(scannable(segment)):
             continue
-        named = True
+        if paperwork and files_a_claim(segment):
+            grounds.add(1)
+            continue
         if not reads_only(segment):
-            return False
+            return ""
+        grounds.add(0)
         handoff = handoff or _hands_off(segment)
-    if handoff:
-        return named and reads_only(command)
-    return named
+    if not grounds:
+        return ""
+    # A reader that WRITES what it read hands the literal on by a route no parser here
+    # follows, so the whole chain has to be unable to run it — not just the segment the
+    # literal is in. Paperwork counts there too, and for the same reason it counts above.
+    if handoff and not (reads_only(command) or (paperwork and all(
+            reads_only(command[s:e]) or files_a_claim(command[s:e])
+            for s, e in list_segments(command)))):
+        return ""
+    if grounds == {0}:
+        return f"only in commands that {_CLEARANCES[0]}"
+    if grounds == {1}:
+        return f"only in commands that {_CLEARANCES[1]}"
+    return f"only in commands that {_CLEARANCES[0]}, or that {_CLEARANCES[1]}"
 
 
 #: The verbs that RECORD or READ a claim about a command. Why these five and not the
@@ -673,6 +764,228 @@ def gate_paperwork(command: str) -> bool:
     return seen
 
 
+def files_a_claim(segment: str) -> bool:
+    """True when `segment` does nothing but RECORD or READ a claim about a command.
+
+    Two routes to the same property, and the second is the one issue #233 adds: the
+    paperwork may be typed at the shell, or passed to an interpreter as an argument. A
+    worker whose justification runs to several paragraphs writes it with a heredoc and
+    files it from python, and that is still paperwork — the OS's own advice, blocked.
+
+    The `_SUBSTITUTION` guard on the RAW text is stated here as well as in both branches,
+    and the repetition is deliberate: this is the predicate `_mentions_only` consults
+    BEFORE `reads_only`, so it is the one place where a missing guard clears a segment
+    outright rather than passing it to something stricter (review round 1).
+    """
+    if _SUBSTITUTION.search(segment):
+        return False
+    return gate_paperwork(segment) or interpreter_paperwork(segment)
+
+
+#: The `subprocess` entry points. A paperwork call is one of these, given an argv LIST
+#: whose first three elements are literally `jarvis gate <verb>`.
+_PY_RUNNERS = frozenset({"run", "call", "check_call", "check_output", "Popen"})
+
+#: Everything else a filing script is allowed to call. Both lists are what the call CAN
+#: do, the same membership test `_READERS` and `_EXECUTORS` are built on: `read_text`
+#: reads a file, `system` runs a command, and no argument about intent enters into it.
+_PY_INERT_FUNCS = frozenset({"open", "print", "str", "repr", "len", "int", "sorted",
+                             "list", "tuple", "dict"})
+#: …and these are methods on a VALUE — the result of a call, a literal, a subscript.
+#: Never on a bare name, because a bare name is usually a module: matching the attribute
+#: name alone made `pickle.loads(open("/tmp/p").read().encode())` inert, which is
+#: arbitrary code execution scored as paperwork (review round 1). `loads` and `dumps`
+#: left with it — nothing a filing does requires deserialising anything.
+_PY_INERT_METHODS = frozenset({"read", "read_text", "readlines", "strip",
+                               "rstrip", "lstrip", "splitlines", "split", "join",
+                               "format", "decode", "encode"})
+
+#: The module-qualified calls that ARE allowed, named in full rather than by attribute.
+#: One entry, because one is what the shape needs: `pathlib.Path(p).read_text()`.
+_PY_INERT_QUALIFIED = frozenset({("pathlib", "Path")})
+
+#: What the shell rewrites inside an UNQUOTED heredoc body: parameter expansion, command
+#: substitution, arithmetic expansion, and the backslash that escapes them. A body with
+#: none of these reaches python exactly as written, which is the property the AST
+#: analysis rests on and could not previously state — `python - <<PY` with
+#: `"$(gh pr merge 223)"` in the body had already merged before python parsed a line.
+_EXPANDS = re.compile(r"[$`\\]")
+
+#: `shell=True` turns argv into a command line and `executable=` replaces the program, so
+#: an allow-list is the only safe direction here.
+_PY_RUN_KWARGS = frozenset({"capture_output", "text", "check", "cwd", "encoding",
+                            "timeout", "stdout", "stderr", "stdin", "input"})
+
+#: The whole grammar a filing script may be written in. Anything else — a loop, a
+#: function, a `with`, a comprehension, an `import *` — is a program this cannot read,
+#: and a program this cannot read is not one it may clear.
+#: No `ImportFrom`: `from os import system as print` rebinds a name this calls inert, and
+#: the call site cannot see that it did (review round 1). Plain `import x` only, and
+#: `_py_program` refuses `as` on that too.
+_PY_NODES = (ast.Module, ast.Import, ast.alias, ast.Assign, ast.AnnAssign,
+             ast.Expr, ast.Call, ast.keyword, ast.Name, ast.Attribute, ast.Constant,
+             ast.List, ast.Tuple, ast.Dict, ast.Subscript, ast.Slice, ast.Load,
+             ast.Store, ast.BinOp, ast.Add, ast.JoinedStr, ast.FormattedValue)
+
+
+def interpreter_paperwork(segment: str) -> bool:
+    """True when `segment` is an interpreter whose whole program only files paperwork.
+
+    The distinction this has to establish is ARGUMENT versus EXECUTION, and it is the
+    half of issue #233 that could open a real hole: `subprocess.run(["jarvis", "gate",
+    "request", …, "gh pr merge 223"])` passes the merge to a filing, while
+    `os.system("gh pr merge 223")` runs it, and the two differ by nothing a regex can
+    see. So this reads the program rather than the text — and answers False for every
+    program it cannot read, which is most of them.
+
+    Deliberately narrow. Python only, the program from the heredoc body and nowhere else
+    (`-c` and a script path are both refused), one heredoc, no redirection, nothing else
+    in the pipeline. Widening it is a change to a security boundary, not a convenience.
+
+    AND THE BODY MUST REACH PYTHON AS WRITTEN, which the first version did not check and
+    which the whole AST argument rests on (review round 1). The shell rewrites an
+    UNQUOTED heredoc body before python sees a line of it, so `python - <<PY` carrying
+    `"$(gh pr merge 223 --squash)"` had already merged by the time this read a program
+    that merely quoted a string. Two ways to be sure, and either will do: the delimiter is
+    QUOTED (`<<'PY'`), so the shell passes the body through untouched — or the body
+    contains none of `$`, a backtick or `\\`, which is everything the shell would rewrite.
+
+    Keeping the second is not a softening of the first. The reduced repro in issue #233
+    is written `python - <<PY`, and refusing an unquoted delimiter outright would re-gate
+    the exact command this work order exists to clear, for a body the shell demonstrably
+    does not touch. `_EXPANDS` states the property; the delimiter is a proxy for it.
+    """
+    if _SUBSTITUTION.search(segment):
+        return False
+    inert = _inert(segment).strip()
+    words = inert.split()
+    if not words or words[0] not in ("python", "python3"):
+        return False
+    # `-` is stdin, `<<PY` is the body it comes from. A script path, a `-c`, a `-m` or a
+    # redirection all mean the program is not the one being read below.
+    if any(w != "-" and not w.startswith("<<") for w in words[1:]):
+        return False
+    spans = heredoc_spans(segment)
+    if len(spans) != 1 or not spans[0][3]:
+        return False
+    start, end, opener, _ = spans[0]
+    opened = _HEREDOC_OPEN.match(segment, opener)
+    if opened is None:
+        return False
+    # `<<-` strips leading tabs, so the body python receives is not the one read here.
+    if segment[opener:opened.end()].startswith("<<-"):
+        return False
+    if opened.group("bare") is not None and _EXPANDS.search(segment[start:end]):
+        return False
+    return python_files_only_paperwork(segment[start:end])
+
+
+def python_files_only_paperwork(program: str) -> bool:
+    """True when every call in `program` is inert, and at least one files gate paperwork.
+
+    Reads the AST rather than the source, because the source is what the recogniser
+    already failed to read. Fails closed on anything at all it does not model — an
+    unparseable program, an unknown call, a grammar past `_PY_NODES`.
+
+    THE RULE THAT DOES THE WORK IS ABOUT REFERENCES, NOT CALLS, and it took three review
+    rounds to get there. Guarding the shape of an assignment's right-hand side stops
+    `print = os.system` and nothing else: `print = [os.system][0]` and
+    `print = dict(s=os.system)["s"]` bind the same callable through a container, and the
+    call site sees only a name it trusts (review round 2, kn-a3db2914's own rule turned on
+    the code that stated it). So what is refused is the REFERENCE. A module attribute that
+    is not allow-listed may not appear anywhere — not in a list, a `dict()` keyword, a
+    subscript or an argument — and nor may a bare module name outside one that is. A
+    reference that is never syntactically called is still a reference something else can
+    call.
+    """
+    try:
+        tree = ast.parse(program)
+    except SyntaxError:
+        return False
+    nodes = list(ast.walk(tree))
+    # Which names are MODULES. `os.system` is a way to run a command; `r.returncode` is a
+    # value read off a local, and telling them apart is what the import list is for.
+    modules = {a.name for n in nodes if isinstance(n, ast.Import) for a in n.names}
+    # The module references a program IS allowed: the callee of a call `_py_call` accepts,
+    # and the qualified names. Held by identity — two `os.system` nodes are not the same
+    # reference, and only the one in a checked position is cleared.
+    ok_attrs = {id(n.func) for n in nodes
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and _py_call(n) is not None}
+    ok_attrs |= {id(n) for n in nodes
+                 if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                 and (n.value.id, n.attr) in _PY_INERT_QUALIFIED}
+    ok_names = {id(n.value) for n in nodes
+                if isinstance(n, ast.Attribute) and id(n) in ok_attrs}
+
+    filed = False
+    for node in nodes:
+        if not isinstance(node, _PY_NODES):
+            return False
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) \
+                and isinstance(node.value, ast.Name) and node.value.id in modules \
+                and id(node) not in ok_attrs:
+            return False
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) \
+                and node.id in modules and id(node) not in ok_names:
+            return False                      # `m = [os][0]` smuggles the module itself
+        # Names only on the left of an `=`. `os.environ["PATH"] = "/tmp"` assigns no
+        # command and calls nothing, and it decides which `jarvis` the filing below it
+        # runs — the one thing a program this narrow could still do to the world.
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if not all(isinstance(t, ast.Name) for t in targets):
+                return False
+            # A name this checker TRUSTS may not be shadowed at all, whatever it is being
+            # bound to: the call site reads the name, not the binding.
+            if any(t.id in _PY_INERT_FUNCS for t in targets
+                   if isinstance(t, ast.Name)):
+                return False
+            if isinstance(node.value, (ast.Name, ast.Attribute)):
+                return False
+        # Same hole through the import: `import os as print`, `from os import system`.
+        if isinstance(node, ast.Import) and any(a.asname for a in node.names):
+            return False
+        if isinstance(node, ast.Call):
+            verdict = _py_call(node)
+            if verdict is None:
+                return False
+            filed = filed or verdict
+    return filed
+
+
+def _py_call(node: ast.Call) -> bool | None:
+    """`True` a filing, `False` inert, `None` anything this cannot place — which gates."""
+    func = node.func
+    if isinstance(func, ast.Attribute) and func.attr in _PY_RUNNERS:
+        if not (isinstance(func.value, ast.Name) and func.value.id == "subprocess"):
+            return None
+        if not node.args or not isinstance(node.args[0], (ast.List, ast.Tuple)):
+            return None                       # a string first argument is a command line
+        argv = [e.value for e in node.args[0].elts[:3]
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        if argv[:2] != ["jarvis", "gate"] or argv[2:3] == [] \
+                or argv[2] not in GATE_PAPERWORK_VERBS:
+            return None
+        if any(kw.arg is None or kw.arg not in _PY_RUN_KWARGS for kw in node.keywords):
+            return None                       # `shell=True`, `executable=`, `**kwargs`
+        return True
+    if isinstance(func, ast.Name) and func.id in _PY_INERT_FUNCS:
+        # `open(p)` reads; `open(p, "w")` is a file the next command in the chain runs.
+        if func.id == "open" and (len(node.args) > 1 or node.keywords):
+            return None
+        return False
+    if isinstance(func, ast.Attribute):
+        # A bare name on the left is a MODULE, and `pickle.loads` is not `"x".strip` —
+        # matching the attribute alone made deserialisation read as inert (review round
+        # 1). Module-qualified calls are named in full; everything else must be a method
+        # on a value the program built.
+        if isinstance(func.value, ast.Name):
+            return False if (func.value.id, func.attr) in _PY_INERT_QUALIFIED else None
+        return False if func.attr in _PY_INERT_METHODS else None
+    return None
+
+
 # -- the shape of a match ------------------------------------------------------------
 
 
@@ -689,12 +1002,14 @@ class Shape:
     position: str            # code | heredoc | quoted
     owner: str               # the command that owns that position, e.g. `git commit`
     names: frozenset[str]    # every command name in the match's own list segment
+    handoff: bool = False    # the owner could leave the literal where a later command
+                             # finds it — `_hands_off`
 
     @property
     def exemptible(self) -> bool:
         """Whether a shape like this may ever be cleared by a learned rule.
 
-        Three conditions, each closing a different door:
+        Four conditions, each closing a different door:
         - the literal is not in executable position;
         - something owns the position (an unparseable command is not a known-safe one);
         - nothing that could execute the span the literal sits in shares a segment with
@@ -702,10 +1017,16 @@ class Shape:
           matter what was dismissed before, and it is checked against the segment rather
           than the owner because the executor is usually downstream of it — but not
           against the whole chain, where an executor past a `||` never sees the literal
-          at all (issue #194).
+          at all (issue #194);
+        - the owner does not WRITE the literal somewhere. A signature is `{position,
+          owner}` and nothing else, so a rule learned from `cat > /tmp/s.sh <<EOF` would
+          read as "a heredoc body owned by `cat` is prose" and clear the same body in a
+          chain that then runs the file. `_hands_off` is already why such a chain gates;
+          without this it would gate once and be dismissed into a standing exemption.
         """
         return (self.position in EXEMPTIBLE_POSITIONS
                 and bool(self.owner)
+                and not self.handoff
                 and not (self.names & _EXECUTORS))
 
     def signature(self) -> str:
@@ -725,13 +1046,17 @@ class Shape:
             return "nothing recognisable owns the position the literal sits in"
         if self.blockers:
             return f"its own command executes via {', '.join(self.blockers)}"
+        if self.handoff:
+            return f"`{self.owner}` writes what it was given, so a later command may run it"
         return ""
 
     def describe(self) -> str:
         where = {CODE: "in executable position", HEREDOC: "in a heredoc body",
                  QUOTED: "inside a quoted argument"}.get(self.position, self.position)
         note = (f"; that command executes via {', '.join(self.blockers)}"
-                if self.blockers else "")
+                if self.blockers else
+                "; that command writes it out, where a later one may run it"
+                if self.handoff else "")
         return f"{where}, owned by `{self.owner or '?'}`{note}"
 
 
@@ -768,6 +1093,13 @@ def shape_of(command: str, pattern: str) -> Shape | None:
                 return command_names(command[s:e])
         return all_names
 
+    def handoff_at(offset: int) -> bool:
+        """Whether the command holding the match writes what it was handed."""
+        for s, e in lists:
+            if s <= offset < e:
+                return _hands_off(command[s:e])
+        return True
+
     best: Shape | None = None
     for m in rx.finditer(command):
         start, end = m.span()
@@ -778,17 +1110,21 @@ def shape_of(command: str, pattern: str) -> Shape | None:
                 # `EOF && ./scripts/shipit.sh` is that case: the delimiter line is not
                 # a delimiter line, and the release below it was landing in the "body".
                 if not terminated:
-                    return Shape(CODE, owner_at(start), names_at(start))
-                shape = Shape(HEREDOC, owner_at(opener), names_at(opener))
+                    return Shape(CODE, owner_at(start), names_at(start),
+                                 handoff_at(start))
+                shape = Shape(HEREDOC, owner_at(opener), names_at(opener),
+                              handoff_at(opener))
                 break
         else:
             for s, e in quotes:
                 if s <= start and end <= e:
-                    shape = Shape(QUOTED, owner_at(start), names_at(start))
+                    shape = Shape(QUOTED, owner_at(start), names_at(start),
+                                  handoff_at(start))
                     break
             else:
                 # Executable position wins outright, and immediately.
-                return Shape(CODE, owner_at(start), names_at(start))
+                return Shape(CODE, owner_at(start), names_at(start),
+                             handoff_at(start))
         # Among several non-code matches, report the one that can LEAST be cleared, not
         # the one that happened to come first. Same convention as the `code` return
         # above: ambiguity resolves toward the privileged reading. Scoping `names` to a
@@ -1125,10 +1461,9 @@ class RuleSet:
             except re.error:
                 trace.append(f"rule {rule_id} does not compile: {pattern!r}")
                 continue
-            if read_only_mentions(command, pattern):
-                trace.append(
-                    f"{kind} matched {pattern!r} but only in commands that can read it "
-                    f"and nothing more")
+            why = mentions_only(command, pattern)
+            if why:
+                trace.append(f"{kind} matched {pattern!r} but {why}")
                 continue
             exemption = self.clearance(command, kind, pattern)
             if exemption is not None:
