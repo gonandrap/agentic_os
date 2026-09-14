@@ -173,7 +173,8 @@ def stop_os() -> dict[str, Any]:
 # -- status ------------------------------------------------------------------------------
 
 def run_doctor(project: str | None = None, repair: bool = False,
-               catalog_path: str | None = None) -> dict[str, Any]:
+               catalog_path: str | None = None,
+               include_os: bool = True) -> dict[str, Any]:
     """Run the OS's post-condition checks over one project or the whole fleet.
 
     Read-only unless `repair` is set, so it is safe to run at any time. The daemon runs
@@ -191,6 +192,13 @@ def run_doctor(project: str | None = None, repair: bool = False,
     the default `jarvis doctor` re-reads git for every completed work order every single
     time — the cache is populated by the daemon's hourly sweep and by `--repair`, never
     by a plain run. Read-only is worth more than the seconds: see `check_work_lands`.
+
+    `include_os=False` drops the OS-LEVEL checks — `check_os` and the release marker —
+    and keeps the per-project ones. The scheduler's daily run passes it for every project
+    but the one that owns the install: those checks are about the OS, not about any
+    project, so a fleet of six would otherwise report one broken dashboard six times
+    every morning. Interactive `jarvis doctor` leaves it on, which is why the default is
+    True: a human who typed the command is asking about everything they can see.
     """
     from .invariants import check_catalog, check_os, check_project, check_release_marker
 
@@ -224,7 +232,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
     # OS-level checks first: they are about the OS itself (is the dashboard alive?),
     # not about any one project, and `--project` must not filter them out — a fleet
     # scoped to one project still wants to know its web UI is broken.
-    os_found = check_os()
+    os_found = check_os() if include_os else []
     results, total = [], len(os_found)
     for p in rows:
         if p["status"] != "active":
@@ -267,7 +275,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
     # OS-level state under $JARVIS_HOME, owned by no project: a pending-release marker
     # stuck in flight. Reported under its own heading; never repaired (which half of
     # the hand-off died is not derivable from the file).
-    os_violations = check_release_marker()
+    os_violations = check_release_marker() if include_os else []
     if os_violations:
         total += len(os_violations)
         results.append({
@@ -280,6 +288,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
         })
     out = {
         "repair": repair,
+        "include_os": include_os,
         "violations": total,
         "os": [{"invariant": v.invariant, "detail": v.detail, "repaired": v.repaired,
                 "repair": v.repair, "context": v.context} for v in os_found],
@@ -542,6 +551,19 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         for wo in open_wos
                     ],
                     "settings_drift": drift,
+                    # ONLY THE HELD ONES. A scheduler that is ticking along is not news
+                    # and adding a line per job per project to every `jarvis status`
+                    # would spend exactly the attention budget the scheduler is designed
+                    # to protect; a job that has wanted to fire and could not is the one
+                    # state where silence and death look the same from outside.
+                    # INV-SCHEDULE-HELD is the louder half, once it has been held for
+                    # days — this is what answers "why has there been no doctor order
+                    # since Tuesday" before then.
+                    "schedule_held": [
+                        {"job_id": st["job_id"], "since": st["held_since"],
+                         "reason": st["held_reason"] or "", "wo_id": st["last_wo_id"]}
+                        for st in store.list_schedule_states() if st["held_since"]
+                    ],
                 })
                 if drift:
                     attention.append({
@@ -5282,6 +5304,26 @@ def inspect_config_at(project_path: Path) -> Any:
         return catalog.os.inspect
     except (OpsError, CatalogError, OSError, ValueError):
         return InspectConfig()
+
+
+def schedule_config_at(project_path: Path) -> Any:
+    """`os.schedule` for the project rooted at `project_path`.
+
+    `inspect_config_at`'s twin, for `invariants.check_schedule_progresses` — which is
+    handed a store and no project name, and has to know the interval it is judging
+    lateness against.
+    """
+    from .catalog import ScheduleConfig
+
+    try:
+        catalog = resolve_catalog()
+        target = Path(project_path).resolve()
+        for spec in catalog.projects:
+            if Path(spec.path).resolve() == target:
+                return spec.schedule
+        return catalog.os.schedule
+    except (OpsError, CatalogError, OSError, ValueError):
+        return ScheduleConfig()
 
 
 def messaging_config_at(project_path: Path) -> Any:
