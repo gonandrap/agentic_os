@@ -134,6 +134,19 @@ order's own timeline — `pr_merged`, and the `head_oid` that event now carries,
 what answers Mode C exactly. Never `pr_state`, which kn-dbc4971d records as stale by
 construction with one permitted reader.
 
+### The `merged-tail` rung is blind to the fleet that already exists
+
+`head_oid` starts being written by `ops.complete_merged` from this change onwards. Every
+`pr_merged` event already on a timeline — including the three Mode C orders that prompted
+this — was written without one, and nothing backfills it: the sha is GitHub's answer to a
+poll that has already happened, and re-asking for 209 work orders is a network sweep this
+invariant exists to not be. So for the existing fleet the exact rung is skipped and those
+orders fall through to `coverage`, which still reports Mode C — `rescue/wo-4576667e`
+scores 0.87 and `rescue/wo-0fea6edb` 0.69, both `PARTIAL` — and to the `dirty` clause
+under it. The exact rung is for the orders that merge from now on. This is a deliberate
+asymmetry, not an oversight: a run of `unknown`s from a rung that cannot fire would be
+worse than a measurement that can.
+
 The verdict is CACHED, and only the settled half. `landed` and `not-produced` are recorded
 as a `landing_checked` event and never recomputed: a completed order's branch has stopped
 moving. `stranded`, `partial` and `unknown` are re-derived every sweep, because those are

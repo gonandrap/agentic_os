@@ -197,6 +197,26 @@ def test_abandon_completes_the_order_and_writes_down_what_was_dropped(started, p
     assert payload["branch"] == f"worktree-{wo['id']}"
 
 
+def test_the_remedy_the_sweep_prints_works_on_an_order_already_completed(started,
+                                                                          project):
+    """INV-WORK-LANDED tells the user to run `wo finish --abandon` on a COMPLETED order.
+
+    Every order the sweep names is already settled — that is what the sweep looks at — so
+    the remedy it prints is only a remedy if `finish` accepts one. A violation whose fix
+    is refused by the command it names is a report that cannot be answered, and it would
+    go on naming the same order every hour until somebody switched the check off.
+    """
+    wo = _order(project, "launcher contract", code="launcher")
+    _settle(project, wo["id"])
+    [violation] = _violations(project)
+    assert f"finish {wo['id']}" in violation.detail and "--abandon" in violation.detail
+
+    ops.finish(wo["id"], "dropping it", abandon="superseded by the rewrite")
+
+    assert _row(project, wo["id"])["status"] == "completed"
+    assert _violations(project) == []
+
+
 def test_an_abandonment_is_superseded_by_a_later_ordinary_finish(started, project):
     """The newest of the two events wins, or an order excused once is excused for ever."""
     wo = _order(project, code="spike")

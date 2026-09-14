@@ -290,3 +290,78 @@ def test_a_pr_url_is_recognised_in_prose_and_ordinary_prose_yields_none():
     assert found == ("https://github.com/acme/proj/pull/33",)   # deduped, no issue URL
     assert landing.pr_urls_in("Answered the question; no code was needed.") == ()
     assert landing.pr_urls_in("") == ()
+
+
+# -- the ref that is read, and what happens when git cannot answer ---------------------
+
+
+def _drop_object(repo: Repo, sha: str) -> None:
+    """Delete one loose object, which is what a half-fetched or damaged clone looks like.
+
+    Still not faking git (module docstring): the object store is git's own, and every
+    command below really does exit non-zero. There is no other portable way to make a
+    `git` that exists and works fail on one repository, and "what does this module do
+    with a non-zero exit" is exactly the question.
+    """
+    (repo.path / ".git" / "objects" / sha[:2] / sha[2:]).unlink()
+
+
+def test_the_pushed_branch_is_read_and_not_a_local_one_left_behind(repo):
+    """`refs/heads/` sorts BEFORE `refs/remotes/`, so a single sorted list picks wrong.
+
+    The audit reads branches months later, in a clone whose local copy may be anything.
+    What was PUSHED is the work; a local branch rewound by a rebase, a reset or a
+    `worktree remove` is not, and scoring it would under-report a strand — the failure
+    direction that hides issue #232 rather than the one that cries wolf.
+    """
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/early.py", _feature("early"))
+    early = _git(wt, "rev-parse", "HEAD").strip()
+    repo.commit(wt, "src/late.py", _feature("late"))
+    _git(repo.path, "push", "-q", "origin", f"worktree-{WO}")
+    _git(repo.path, "worktree", "remove", "--force", str(wt))
+    _git(repo.path, "branch", "-f", f"worktree-{WO}", early)   # local now behind origin
+
+    found = landing.assess(repo.path, WO)
+
+    assert found.ref == f"origin/worktree-{WO}"
+    # The proof it is not the stale one: `src/late.py` exists only on what was pushed.
+    assert "src/late.py" in found.missing_files
+    assert found.verdict == landing.STRANDED
+
+
+def test_a_failed_content_read_is_unknown_and_never_stranded(repo):
+    """A `git` error must not score 0, because 0 is `stranded` — "flags everything"."""
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("feature"))
+    blob = _git(wt, "rev-parse", f"HEAD:src/feature.py").strip()
+    _git(repo.path, "worktree", "remove", "--force", str(wt))
+    _drop_object(repo, blob)
+
+    found = landing.assess(repo.path, WO)
+
+    assert found.verdict == landing.UNKNOWN
+    assert found.rung == "unreadable"
+
+
+def test_a_failed_commit_count_is_unknown_and_never_a_cached_not_produced(repo):
+    """`not-produced` is SETTLED and cached, so arriving there by error is permanent.
+
+    `invariants.check_work_lands` writes a settled verdict to `landing_checked` and never
+    recomputes it: a `rev-list` that errored once would drop this work order out of the
+    audit for good. `unknown` is re-derived every sweep, which is what an error deserves.
+    """
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("feature"))
+    tip = _git(wt, "rev-parse", "HEAD").strip()
+    _drop_object(repo, tip)
+
+    # And the settle-time predicate, which is what a refusal is built on, stays silent.
+    work = landing.authored(wt)
+    assert work.unreadable and not work.produced
+
+    _git(repo.path, "worktree", "remove", "--force", str(wt))
+    found = landing.assess(repo.path, WO)
+
+    assert found.verdict == landing.UNKNOWN
+    assert found.verdict not in landing.SETTLED_VERDICTS

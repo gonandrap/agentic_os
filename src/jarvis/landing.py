@@ -205,10 +205,12 @@ def worktree_of(project_path: Path, wo: dict[str, object]) -> Path | None:
 def authored(worktree: Path | None) -> Authored:
     """Has this worktree produced anything? Exact, local, and cheap enough to always run.
 
-    Two `git` invocations and no network. Every failure — no worktree, no git, no base
-    to compare against — comes back as `unreadable` with `produced` False, because this
-    is the predicate a refusal is built on: a work order must never be unable to finish
-    because the OS could not run `git`.
+    Three `git` invocations and no network. Every failure — no worktree, no git, no base
+    to compare against, a command that errored — comes back as `unreadable` with
+    `produced` False, because this is the predicate a refusal is built on: a work order
+    must never be unable to finish because the OS could not run `git`. The failure still
+    goes in the log (`_git`), and an `unreadable` settling is not silent either — it is
+    the one shape `assess` will look at again later.
     """
     if worktree is None or not worktree.is_dir():
         return Authored(unreadable="no worktree on disk")
@@ -218,18 +220,20 @@ def authored(worktree: Path | None) -> Authored:
         # which is the right answer for a diff and the wrong one here: with no default
         # branch to compare against, "ahead of the default branch" has no meaning.
         return Authored(unreadable="no default branch to compare against")
-    branch = _git(worktree, "rev-parse", "--abbrev-ref", "HEAD").strip()
-    count = _git(worktree, "rev-list", "--count", f"{base}..HEAD").strip()
+    branch = _git(worktree, "rev-parse", "--abbrev-ref", "HEAD")
+    count = _git(worktree, "rev-list", "--count", f"{base}..HEAD")
     # `--porcelain` lists untracked files too, and it must: a worker that wrote a new
     # module and never `git add`ed it has produced exactly the thing this exists to
     # catch. `--untracked-files=all` because the default COLLAPSES an untracked
     # directory to one entry — a worker that wrote a whole new package would report as
     # `src/`, and the refusal would say "1 uncommitted file" about forty.
-    dirty = tuple(line[3:] for line in
-                  _git(worktree, "status", "--porcelain",
-                       "--untracked-files=all").splitlines() if line[3:])
-    return Authored(branch=branch, base=base,
-                    commits=int(count) if count.isdigit() else 0, dirty=dirty)
+    status = _git(worktree, "status", "--porcelain", "--untracked-files=all")
+    if branch is None or count is None or status is None:
+        return Authored(unreadable="git could not read the worktree")
+    dirty = tuple(line[3:] for line in status.splitlines() if line[3:])
+    return Authored(branch=branch.strip(), base=base,
+                    commits=int(count.strip()) if count.strip().isdigit() else 0,
+                    dirty=dirty)
 
 
 @dataclass(frozen=True)
@@ -281,11 +285,18 @@ def assess(repo: Path, wo_id: str, *, worktree: Path | None = None,
     3. `merged-tail` — the pull request merged, and the branch carries commits AFTER the
        sha GitHub merged, or files never committed at all. Issue #232's Mode C, which is
        invisible to any audit keyed on `pr_url` because these orders HAVE one and it
-       points at a pull request that DID merge.
+       points at a pull request that DID merge. Skipped for every `pr_merged` event
+       written before this change, which carries no `head_oid` and is not backfilled —
+       those fall through to `coverage`, which still reports Mode C. Spec §7.
     4. `coverage` — the content test. See the module docstring.
     5. `subject` — the corroborating rung, reached only when the branch added no
        significant lines at all (a pure deletion, a rename, a config tweak). Absence of
        a `[<wo-id>]` commit is NOT evidence here, so a miss ends at `unknown`.
+
+    A sixth rung, `unreadable`, is not part of that sequence: it is what a `git` command
+    that ERRORED produces, at whichever rung it errored on. `_git` keeps that distinct
+    from an empty result precisely so it can arrive here as `unknown` — which is
+    re-derived every sweep — instead of as `stranded` or as a cached `not-produced`.
     """
     ref = _ref_for(repo, wo_id, worktree)
     base = base_ref(repo)
@@ -296,6 +307,13 @@ def assess(repo: Path, wo_id: str, *, worktree: Path | None = None,
 
     dirty = authored(worktree).dirty
     commits = _count(repo, f"{base}..{ref}")
+    if commits is None:
+        # NOT `NOT_PRODUCED`. That verdict is settled and cached, so a `rev-list` that
+        # errored would drop this work order out of the audit for ever; `unknown` is
+        # re-derived every sweep, which is what a transient failure deserves.
+        return Landing(wo_id, UNKNOWN, "unreadable", ref=ref, base=base, pr_url=pr_url,
+                       detail=f"could not count what `{ref}` carries over `{base}` — "
+                              f"see the jarvis.landing log")
     if not commits and not dirty:
         return Landing(wo_id, NOT_PRODUCED, "no-commits", ref=ref, base=base,
                        pr_url=pr_url,
@@ -309,7 +327,12 @@ def assess(repo: Path, wo_id: str, *, worktree: Path | None = None,
                               f"that has not merged: {pr_url}")
 
     if pr_merged and pr_head_oid:
-        tail = _count(repo, f"{pr_head_oid}..{ref}")
+        # A failed count here is usually a KNOWN shape — the merged sha was never fetched
+        # into this clone — and it only costs the exact rung, so it falls through to
+        # `coverage` rather than answering `unknown`. Coverage still catches Mode C from
+        # the other side, through `dirty`, and an `unknown` would be a worse answer than
+        # a measured one.
+        tail = _count(repo, f"{pr_head_oid}..{ref}") or 0
         if tail or dirty:
             return Landing(wo_id, STRANDED, "merged-tail", ref=ref, base=base,
                            pr_url=pr_url, tail_commits=tail, dirty=dirty,
@@ -317,7 +340,15 @@ def assess(repo: Path, wo_id: str, *, worktree: Path | None = None,
                                   f"commit(s) and {len(dirty)} uncommitted file(s) "
                                   f"after the sha that merged")
 
-    present, total, missing = _coverage(repo, base, ref)
+    measured = _coverage(repo, base, ref)
+    if measured is None:
+        # The one that would otherwise "flag everything": a failed `ls-tree`, `diff` or
+        # `show` scores 0, and 0 is `STRANDED`.
+        return Landing(wo_id, UNKNOWN, "unreadable", ref=ref, base=base, pr_url=pr_url,
+                       dirty=dirty,
+                       detail=f"could not read what `{ref}` added or what `{base}` "
+                              f"holds — see the jarvis.landing log")
+    present, total, missing = measured
     if not total:
         # Nothing significant was added, so there is nothing to look for. The subject
         # rung is all that is left, and it may only CONFIRM.
@@ -354,23 +385,40 @@ def _ref_for(repo: Path, wo_id: str, worktree: Path | None) -> str:
     The worktree's own HEAD first, because it is the only answer that cannot be wrong.
     Failing that — and the worktree is usually gone by the time anyone audits — every
     branch name containing the work-order id, which covers all three shapes this fleet
-    has produced: `worktree-wo-x`, `wo-x-some-slug` and `rescue/wo-x`. A REMOTE ref is
-    preferred over a local one of the same name, since a local branch can be behind
-    what was actually pushed.
+    has produced: `worktree-wo-x`, `wo-x-some-slug` and `rescue/wo-x`.
+
+    A REMOTE ref beats a local one, because a local branch can be behind what was
+    actually pushed and it is the PUSHED work this module is asked about. That ordering
+    is two separate queries and not one sorted list: `git for-each-ref` sorts by FULL
+    refname, so `refs/heads/...` comes out ahead of `refs/remotes/...` and taking the
+    first match would pick the local branch every time both exist — the stale one this
+    paragraph exists to avoid. kn-47004b56: a rule written down is not a rule applied.
     """
     if worktree is not None and worktree.is_dir():
-        head = _git(worktree, "rev-parse", "--abbrev-ref", "HEAD").strip()
-        if head and head != "HEAD":
-            return head
-    names = _git(repo, "for-each-ref", "--format=%(refname:short)",
-                 "refs/remotes/", "refs/heads/").split()
-    matches = [n for n in names if wo_id in n]
-    return matches[0] if matches else ""
+        head = _git(worktree, "rev-parse", "--abbrev-ref", "HEAD") or ""
+        if head.strip() and head.strip() != "HEAD":
+            return head.strip()
+    for pattern in ("refs/remotes/", "refs/heads/"):
+        names = (_git(repo, "for-each-ref", "--format=%(refname:short)", pattern)
+                 or "").split()
+        matches = [n for n in names if wo_id in n]
+        if matches:
+            return matches[0]
+    return ""
 
 
-def _count(repo: Path, rev_range: str) -> int:
-    out = _git(repo, "rev-list", "--count", rev_range).strip()
-    return int(out) if out.isdigit() else 0
+def _count(repo: Path, rev_range: str) -> int | None:
+    """Commits in `rev_range`, or None if git could not answer.
+
+    None is NOT zero. Zero means "this branch carries nothing", which `assess` reads as
+    `NOT_PRODUCED` — a settled verdict that `invariants.check_work_lands` caches and never
+    recomputes. Letting a failed `rev-list` arrive there would drop a work order out of the
+    audit permanently on the strength of a command that errored.
+    """
+    out = _git(repo, "rev-list", "--count", rev_range)
+    if out is None:
+        return None
+    return int(out.strip()) if out.strip().isdigit() else 0
 
 
 def _significant(line: str) -> bool:
@@ -379,8 +427,12 @@ def _significant(line: str) -> bool:
     return len(text) >= SIGNIFICANT_CHARS and any(c.isalnum() for c in text)
 
 
-def _coverage(repo: Path, base: str, ref: str) -> tuple[int, int, tuple[str, ...]]:
+def _coverage(repo: Path, base: str, ref: str
+              ) -> tuple[int, int, tuple[str, ...]] | None:
     """(lines found on `base`, lines looked for, files added that `base` lacks entirely).
+
+    None if any `git` call failed — see `_git`. Scoring 0 off a command that errored is
+    the single most damaging thing this module could do, since 0 reads as `STRANDED`.
 
     Per FILE, never across the tree: a line is "present" only in the default branch's
     copy of the file the branch put it in. Searching the whole tree instead would score
@@ -389,23 +441,38 @@ def _coverage(repo: Path, base: str, ref: str) -> tuple[int, int, tuple[str, ...
     The diff is `base...ref` — three dots, the MERGE BASE — so a branch cut months ago
     is measured against what it changed, not against everything `base` has done since.
     """
-    names = _git(repo, "diff", "--name-only", f"{base}...{ref}").split()
+    changed = _git(repo, "diff", "--name-only", f"{base}...{ref}")
+    tree = _git(repo, "ls-tree", "-r", "--name-only", base)
+    if changed is None or tree is None:
+        return None
+    names = changed.split()
     if not names:
         return 0, 0, ()
-    on_base = set(_git(repo, "ls-tree", "-r", "--name-only", base).split())
+    on_base = set(tree.split())
     present = total = 0
     missing: list[str] = []
     for name in names:
-        added = [line[1:] for line in
-                 _git(repo, "diff", f"{base}...{ref}", "--", name).splitlines()
+        diff = _git(repo, "diff", f"{base}...{ref}", "--", name)
+        if diff is None:
+            return None
+        added = [line[1:] for line in diff.splitlines()
                  if line.startswith("+") and not line.startswith("+++")
                  and _significant(line[1:])]
-        if name not in on_base:
+        absent = name not in on_base
+        if absent:
             missing.append(name)
         if not added:
             continue
-        blob = _git(repo, "show", f"{base}:{name}")
         total += len(added)
+        if absent:
+            # `ls-tree` already said this file is not on `base`, so `git show base:name`
+            # would fail for a KNOWN reason and none of these lines can be found. That is
+            # the distinction `_git` exists to keep: an absence proved by another command,
+            # not a failure read as one.
+            continue
+        blob = _git(repo, "show", f"{base}:{name}")
+        if blob is None:
+            return None
         present += sum(1 for line in added if line.strip() in blob)
     return present, total, tuple(missing)
 
@@ -415,22 +482,38 @@ def _subject_landed(repo: Path, base: str, wo_id: str) -> bool:
 
     The convention every worker's pull-request title is held to, which a squash merge
     carries onto the default branch verbatim. CONFIRMS ONLY — see the module docstring
-    on why its absence proves nothing.
+    on why its absence proves nothing, which is also why a failed `git log` may be False
+    here and nowhere else: the rung's only outputs are `LANDED` and `UNKNOWN`, so losing
+    it costs a confirmation and cannot manufacture a complaint.
     """
     return any(line.startswith(f"[{wo_id}]")
-               for line in _git(repo, "log", "--format=%s", base).splitlines())
+               for line in (_git(repo, "log", "--format=%s", base) or "").splitlines())
 
 
-def _git(repo: Path, *args: str) -> str:
-    """One read-only git command in `repo`. Any failure is "".
+def _git(repo: Path, *args: str) -> str | None:
+    """One read-only git command in `repo`. Its stdout, or None if it FAILED.
 
-    Silent for `evidence._git`'s reason and one of its own: this module's caller is
+    Never raises, for `evidence._git`'s reason and one of its own: this module's caller is
     often a worker trying to finish, and a repository with no `origin`, no commits or no
     git at all must produce a thin answer rather than an exception that strands it.
+
+    But it does not return "" for a failure either, because every caller here reads the
+    output as DATA and "" is a meaningful datum: no commits ahead, no files changed, the
+    lines are nowhere on the default branch. A transient failure smuggled in as "" makes
+    `_coverage` score 0 and report `STRANDED` — "flags everything" (module docstring)
+    arriving by the back door — and makes `_count` report `NOT_PRODUCED`, which is cached
+    for ever. So the failure is a separate value the callers have to handle, and it is
+    logged: this module is otherwise silent by design, and a fleet-wide audit that quietly
+    stopped working would look exactly like a fleet with nothing stranded.
     """
     try:
         proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
                               text=True, errors="replace", check=False)
-    except OSError:
-        return ""
-    return proc.stdout if proc.returncode == 0 else ""
+    except OSError as exc:
+        log.warning("git %s in %s could not run: %s", " ".join(args), repo, exc)
+        return None
+    if proc.returncode != 0:
+        log.warning("git %s in %s exited %d: %s", " ".join(args), repo,
+                    proc.returncode, proc.stderr.strip()[:200])
+        return None
+    return proc.stdout
