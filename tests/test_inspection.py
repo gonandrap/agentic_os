@@ -776,6 +776,49 @@ def test_every_bucket_of_the_partition_has_a_label_on_the_page():
     assert tuple(cli.PART_SHORT) == inspection.PARTS
 
 
+def test_the_dashboard_renders_no_partition_at_all():
+    """THE THIRD SURFACE THE BRIEF NAMES, and the answer is that it does not exist: the
+    dashboard reads alarms, never an `Anatomy`, so there is no four-way split under
+    `src/jarvis/ui/` for a fifth bucket to go missing from.
+
+    Pinned STRUCTURALLY rather than stated in a PR, because the claim is what rots: a
+    later page that renders a turn's clock has to import something from `inspection`
+    beyond the alarm labels, and that is the moment to key it off `PARTS` and add it to
+    the pin above.
+    """
+    import ast
+    from pathlib import Path
+
+    imported: set[str] = set()
+    ui = Path(inspection.__file__).parent / "ui"
+    for path in sorted(ui.rglob("*.py")):
+        source = path.read_text()
+        assert "inspect_report" not in source, f"{path.name} reads an anatomy"
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").endswith(
+                    "inspection"):
+                imported |= {a.name for a in node.names}
+            if isinstance(node, ast.ImportFrom) and node.module in (None, "", "."):
+                imported |= {a.name for a in node.names if a.name == "inspection"}
+
+    assert imported == {"ALARM_KINDS"}, (
+        "the dashboard now reaches into `inspection` for more than the alarm labels — "
+        "if it renders the partition, key it off `PARTS` and pin it like `PART_LABELS`")
+
+
+def test_the_spend_line_refuses_to_claim_money_for_a_turn_with_no_calls():
+    """The precondition in code, not only in the docstring. `alarms` branches on
+    `Turn.observed` before it gets here, so this is for the SECOND caller: it must fail
+    visibly rather than raise `ValueError` out of `max()` inside a reconcile tick."""
+    empty = inspection.Turn(seq=1, started=0.0, ended=3_900.0)
+
+    said = inspection._spend_so_far(empty, now=3_900.0)
+
+    assert "NO API CALL" in said
+    # And it names no figure, so nothing downstream can quote it as spend.
+    assert "$" not in said and "token" not in said
+
+
 def test_the_turn_line_says_no_api_call_before_it_says_anything_about_duration(
         capsys):
     """Part 2 of issue 227. `0 calls` and `peak 0` were already printed BESIDE a number
