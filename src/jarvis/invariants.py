@@ -105,6 +105,20 @@ PR_REPAIR_MAX_ATTEMPTS = 3
 #: merge it as it stands".
 PR_REPAIR_STATUSES = ("waiting_pr_merge", "needs_review", "waiting_input", "failed")
 
+#: The NAME of each repair, which is also the name of its timeline events
+#: (`pr_<name>_nudged`/`_cleared`/`_unresolved`), its message source (`pr-<name>`) and
+#: the episode `ProjectStore.pr_repair_attempts` counts. They live here, beside the
+#: status set, for exactly the reason that set does: `ops.PrRepair` is constructed FROM
+#: these, and `true_blockers` below derives FROM these, so the two cannot be renamed
+#: apart. Spelling one as a literal at either site is the poll/derivation disagreement
+#: PR_REPAIR_STATUSES exists to prevent, one level down — a rename would silently stop
+#: the blocker deriving, and nothing would fail loudly.
+#:
+#: Here rather than in `ops` because `ops` imports this module; the direction cannot be
+#: reversed without a cycle.
+PR_CONFLICT_REPAIR = "conflict"
+PR_CHECKS_REPAIR = "checks"
+
 #: What a work order says when its pull request conflicts and the worker could not fix
 #: it in PR_REPAIR_MAX_ATTEMPTS attempts — one of the two things that make a
 #: `waiting_pr_merge` work order an attention item (spec §4). Re-derived below from the
@@ -373,7 +387,8 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # would leave a finished work order saying "do not merge it as it stands" for ever.
     # The status check also keeps the query off every work order that cannot be in one.
     if wo["status"] in PR_REPAIR_STATUSES and \
-            store.pr_repair_attempts(wo["id"], "checks") >= PR_REPAIR_MAX_ATTEMPTS:
+            store.pr_repair_attempts(wo["id"],
+                                     PR_CHECKS_REPAIR) >= PR_REPAIR_MAX_ATTEMPTS:
         blockers.append(PR_CHECKS_BLOCKER)
     if governed and wo["status"] == "needs_review" and not pending:
         # Two very different ways to arrive at `needs_review` without an assumption to
@@ -402,7 +417,8 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # silence PR_CLOSED_BLOCKER's note warns about. Widening a poll obliges you to widen
     # every blocker it can raise.
     if wo["status"] in PR_REPAIR_STATUSES and \
-            store.pr_repair_attempts(wo["id"], "conflict") >= PR_REPAIR_MAX_ATTEMPTS:
+            store.pr_repair_attempts(wo["id"],
+                                     PR_CONFLICT_REPAIR) >= PR_REPAIR_MAX_ATTEMPTS:
         blockers.append(PR_CONFLICT_BLOCKER)
     # A message the user sent that the worker will never see (GitHub issue 43). Derived
     # here rather than flagged at the delivery site because `deliver_messages` never runs

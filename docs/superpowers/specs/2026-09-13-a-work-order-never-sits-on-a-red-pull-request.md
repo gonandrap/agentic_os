@@ -184,13 +184,25 @@ Three reasons, and the first is the one that matters:
 
 So BEHIND never causes a nudge. It rides along in one that was going out anyway
 (`PR_BEHIND_NOTE`), where it costs nothing: the worker is already in its worktree with a
-push to make.
+push to make, so the re-run happens against what would actually land.
 
-That spec's §7 claimed BEHIND "does not block a merge in this fleet". **That is now
-wrong** and was worth checking rather than inheriting: the `protect-main` ruleset sets
-`strict_required_status_checks_policy: true`, so a behind branch cannot merge. Reporting
-it is therefore not cosmetic — it is the difference between the user pressing merge and
-the user being told why they cannot.
+**Say plainly what that does and does not cover.** `PR_BEHIND_NOTE` is only ever
+formatted into the failing-checks nudge. The conflict branch does not pass it — a
+conflicting branch is about to be merged with its base anyway, which is the cure for
+BEHIND as well — and the green branch nudges nobody at all. **So a pull request that is
+green, non-conflicting and merely behind is reported to no one by Jarvis.** The user
+learns it from GitHub, on the merge page, where the "Update branch" button is already
+sitting next to the refusal. That is the cheapest possible remedy and it is in front of
+them at the exact moment it matters; a second telling in `jarvis status` would be a
+notification per movement of `main` about something one click already fixes, and an
+attention item per movement of `main` is how the attention strip stops being read.
+
+That is a decision rather than an omission, and it is the one place this spec is content
+to leave a user uninformed — so the fact that made it worth re-checking belongs here too.
+§7 of the 2026-08-22 spec claimed BEHIND "does not block a merge in this fleet". **That
+is wrong**: the `protect-main` ruleset sets `strict_required_status_checks_policy: true`,
+so a behind branch genuinely cannot merge. The old spec reached the same conclusion from
+a false premise; this one reaches it from GitHub already owning the report.
 
 ## 6. What the record shows
 

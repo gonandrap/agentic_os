@@ -1908,8 +1908,16 @@ This is attempt {attempt} of {max_attempts}. After {max_attempts} the work order
 trying and asks the user."""
 
 #: Appended to the nudge above when the branch is also BEHIND its base. SAID, NEVER DONE
-#: — spec §5 for why the OS reports this rather than running the update itself, and why
-#: BEHIND on its own nudges nobody.
+#: — spec §5 for why the OS reports this rather than running the update itself.
+#:
+#: THE ONLY PLACE BEHIND IS EVER MENTIONED, and it is a rider rather than a report: the
+#: conflict nudge does not carry it (that worker is merging its base in anyway, which
+#: cures BEHIND too) and a green branch is nudged about nothing. So a pull request that
+#: is green, non-conflicting and merely behind is reported to NOBODY by Jarvis, even
+#: though this repository's ruleset will refuse to merge it. Deliberate: GitHub already
+#: says so on the merge page with the "Update branch" button beside it, and `main` moves
+#: under every open pull request in the fleet — a second telling would be an attention
+#: item per movement about something one click fixes. Spec §5 states this in full.
 PR_BEHIND_NOTE = """ The branch is also behind `{base}`, which this repository's ruleset \
 requires it not to be before a merge; while you are in there, merge `origin/{base}` in \
 (do not rebase) so the checks re-run against what would actually land."""
@@ -1930,6 +1938,8 @@ class PrRepair:
     #: Names the event kinds (`pr_<name>_nudged`/`_cleared`/`_unresolved`), the message
     #: source (`pr-<name>`, which `timeline.UNAUTHORED_SOURCES` renders as Jarvis rather
     #: than as the user) and the episode `ProjectStore.pr_repair_attempts` counts.
+    #: ALWAYS one of `invariants.PR_*_REPAIR`, never a literal written here — see the
+    #: note beside those constants for why the name cannot live in this module.
     name: str
     template: str
     blocker: str
@@ -1942,8 +1952,10 @@ class PrRepair:
         return f"pr_{self.name}_{suffix}"
 
 
-PR_CONFLICT = PrRepair("conflict", PR_CONFLICT_NUDGE, invariants.PR_CONFLICT_BLOCKER)
-PR_CHECKS = PrRepair("checks", PR_CHECKS_NUDGE, invariants.PR_CHECKS_BLOCKER)
+PR_CONFLICT = PrRepair(invariants.PR_CONFLICT_REPAIR, PR_CONFLICT_NUDGE,
+                       invariants.PR_CONFLICT_BLOCKER)
+PR_CHECKS = PrRepair(invariants.PR_CHECKS_REPAIR, PR_CHECKS_NUDGE,
+                     invariants.PR_CHECKS_BLOCKER)
 
 #: Newest episode first is not a thing here — `pr_repair_origin` compares timestamps —
 #: but every repair that can hold a work order out of its status has to be in this

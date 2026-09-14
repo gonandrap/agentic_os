@@ -479,16 +479,42 @@ def test_a_behind_branch_is_reported_and_never_rebased(started, project, fake_gh
     assert [c["argv"][:2] for c in fake_gh.calls] == [["pr", "view"]]
 
 
-def test_behind_on_its_own_nudges_nobody(started, project, fake_gh, reviewing):
-    """`main` moves under every open pull request in the fleet. A nudge per movement is
-    a whole worker turn — the conversation re-sent at the cache-write rate — for
-    something the merge button does itself (spec §5)."""
+def test_a_merely_behind_pull_request_is_reported_to_nobody(started, project, fake_gh,
+                                                            reviewing):
+    """THE DOCUMENTED SILENCE, pinned so nobody has to take spec §5's word for it.
+
+    A green, non-conflicting, behind pull request cannot merge under this repository's
+    strict ruleset, and Jarvis says nothing at all about it: no message, no event, no
+    attention. GitHub already says so on the merge page with the "Update branch" button
+    beside it, `main` moves under every open pull request in the fleet, and an attention
+    item per movement is how the attention strip stops being read.
+    """
     red(fake_gh, GREEN, merge_state="BEHIND")
     store = ProjectStore(project)
+    before = store.list_events(reviewing["id"])
 
     poll(started, store)
 
     assert not store.queued_messages(reviewing["id"])
+    assert store.list_events(reviewing["id"]) == before
+    assert store.get_work_order(reviewing["id"])["attention_reason"] == \
+        IDLE_NO_FINISH_BLOCKER          # what it already said, and nothing added
+
+
+def test_the_conflict_nudge_carries_no_behind_note(started, project, fake_gh,
+                                                   reviewing):
+    """The other half of §5's scope: only the checks nudge carries it. A conflicting
+    branch is about to have its base merged in anyway, which cures BEHIND too, so
+    repeating it there would be an instruction the worker is already following."""
+    fake_gh.set_pr(PR, "OPEN", mergeable="CONFLICTING", base_ref="main", checks=GREEN,
+                   merge_state="BEHIND")
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    msg = store.queued_messages(reviewing["id"])[0]
+    assert msg["source"] == "pr-conflict"
+    assert "behind" not in msg["content"].lower()
 
 
 # -- one reader, two field sets -----------------------------------------------------
