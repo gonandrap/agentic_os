@@ -1874,6 +1874,73 @@ def test_interpreter_paperwork_refuses_what_it_cannot_read(segment):
     assert not interpreter_paperwork(segment), segment
 
 
+@pytest.mark.parametrize("command", [
+    # -- the body the AST reads is not the body python runs (review round 1) ------------
+    # A substitution in an UNQUOTED body: the merge has already happened by the time
+    # python parses a program that merely quotes a string.
+    'python - <<PY\nimport subprocess\n'
+    'subprocess.run(["jarvis","gate","request","wo-x","$(gh pr merge 223 --squash)"])\nPY',
+    # A variable expands the same way, and can close the argv and open a statement.
+    'python - <<PY\nimport subprocess\n'
+    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223","--why","$W"])\nPY',
+    # A backslash is consumed by the shell, so the text analysed is not the text run.
+    'python - <<PY\nimport subprocess\n'
+    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223","--why","a\\\\b"])\nPY',
+    # `<<-` strips leading tabs — again, a body this did not read.
+    'python - <<-PY\n\timport subprocess\n'
+    '\tsubprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223"])\n\tPY',
+    # -- a call scored inert on its attribute NAME, with no idea what it is called on ---
+    'python - <<PY\nimport pickle, subprocess\n'
+    'pickle.loads(open("/tmp/p").read().encode())\n'
+    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223"])\nPY',
+    'python - <<PY\nimport json, subprocess\n'
+    'json.loads(open("/tmp/p").read())\n'
+    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223"])\nPY',
+    # -- a name this calls inert, rebound to something that runs a command --------------
+    'python - <<PY\nfrom os import system as print\nimport subprocess\n'
+    'print("gh pr merge 223 --squash")\n'
+    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223"])\nPY',
+    'python - <<PY\nimport os, subprocess\nprint = os.system\n'
+    'print("gh pr merge 223 --squash")\n'
+    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223"])\nPY',
+])
+def test_a_filing_beside_an_execution_is_not_paperwork(gated, command):
+    """Review round 1: every one of these cleared, and each fails in the direction the
+    brief named — a false negative merges something nobody authorised.
+
+    Two causes. The AST argument assumes the body it reads is the body python runs, which
+    an unquoted heredoc does not give it; and an attribute matched by name alone says
+    nothing about the receiver, so `pickle.loads` read as inert as `"x".strip`."""
+    from jarvis.gate_rules import files_a_claim
+
+    assert not files_a_claim(command), command
+    action = gates.classify(command, ALL_GATES)
+    assert action is not None and action.kind == "pr_merge", command
+    assert _decision(gated.attempt(command)) == "deny", command
+
+
+def test_a_quoted_delimiter_is_what_makes_an_unreadable_body_readable():
+    """The other half of the fix above, so it cannot be "solved" by refusing everything.
+
+    The shell rewrites an unquoted body and leaves a quoted one alone — verified against
+    real bash rather than from memory (kn-67364b3a): with `<<PY`, `$W` expanded and
+    `$(echo IT-RAN)` RAN; with `<<'PY'` both arrived verbatim; a body carrying none of
+    ``$ ` \\`` was passed through untouched. `_EXPANDS` is that character class, which is
+    why the repro in issue #233 — written `python - <<PY` — is still cleared."""
+    from jarvis.gate_rules import _EXPANDS, interpreter_paperwork
+
+    filing = ('import subprocess\n'
+              'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223",'
+              '"--why","$W"])\n')
+
+    assert _EXPANDS.search(filing), "the fixture no longer reproduces the trigger"
+    assert not interpreter_paperwork(f"python - <<PY\n{filing}PY")
+    assert interpreter_paperwork(f"python - <<'PY'\n{filing}PY")
+    # And the issue's own repro, whose body the shell demonstrably does not touch.
+    assert interpreter_paperwork(FILED_VIA_PYTHON)
+    assert not _EXPANDS.search(FILED_VIA_PYTHON)
+
+
 def test_the_record_never_says_a_worker_bypassed_a_gate_it_was_asking_about(gated):
     """Issue #233's second half. Gate 123 recorded the inverse of what happened, in an
     append-only record, about the one thing the gate exists to catch."""

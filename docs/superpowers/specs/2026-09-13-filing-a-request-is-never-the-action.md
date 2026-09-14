@@ -63,15 +63,48 @@ So it reads the AST, and answers False for every program it cannot read:
 - python only, the program from the heredoc body and nowhere else — `-c`, `-m` and a
   script path are all refused, and so is a redirection;
 - one heredoc, terminated, nothing else in the pipeline;
+- **the body must reach python as written** — see §3.1, which is what review round 1 found
+  missing and is the premise everything below rests on;
 - every call either a `subprocess` entry point given an argv LIST whose first three
-  elements are literally `jarvis gate <paperwork verb>`, or a member of a small inert
-  allow-list. `shell=True`, `executable=`, `**kwargs`, `os.system`, `exec`, an `open` with
-  a mode: all refused;
+  elements are literally `jarvis gate <paperwork verb>`, or an inert call. `shell=True`,
+  `executable=`, `**kwargs`, `os.system`, `exec`, an `open` with a mode: all refused;
+- "inert" is judged on the RECEIVER as well as the name. A method on a value the program
+  built (`open(p).read().strip()`) is inert; a module-qualified call must be named in full
+  in `_PY_INERT_QUALIFIED`, which has one entry. Matching the attribute alone made
+  `pickle.loads(open("/tmp/p").read().encode())` inert — arbitrary code execution scored
+  as paperwork. `loads` and `dumps` left with it;
+- no name this calls inert may be REBOUND: no `import … as`, no `from … import`, and an
+  assignment may bind a value, never a bare name or attribute. `print = os.system` and
+  `from os import system as print` both read as inert at the call site otherwise;
 - the grammar itself is an allow-list (`_PY_NODES`). A loop, a function, a `with` or a
   comprehension is a program this cannot read, and a program it cannot read is not one it
   may clear.
 
 Widening any of that is a change to a security boundary, not a convenience.
+
+### 3.1 The body the AST reads must be the body python runs
+
+The shell rewrites an UNQUOTED heredoc body before python sees a line of it, so
+`python - <<PY` carrying `"$(gh pr merge 223 --squash)"` had already merged by the time
+the first version read a program that merely quoted a string. Verified against real bash
+rather than from memory (kn-67364b3a): with `<<PY`, `$W` expanded and `$(echo IT-RAN)`
+ran; with `<<'PY'` both arrived verbatim; a body carrying none of `` $ ` \ `` was passed
+through untouched; `<<-` stripped leading tabs.
+
+So the body may be read as a program on either of two grounds: the delimiter is QUOTED, or
+the body contains none of `_EXPANDS` — `` $ ``, a backtick, a backslash. `<<-` is refused
+outright.
+
+The second ground is not a softening of the first, and the review asked for the first
+alone. Issue #233's reduced repro is written `python - <<PY`: refusing an unquoted
+delimiter outright would re-gate the exact command this work order exists to clear, for a
+body the shell demonstrably does not touch. `_EXPANDS` states the property that actually
+matters; the delimiter is a proxy for it.
+
+`files_a_claim` also applies the raw-string `_SUBSTITUTION` guard itself, repeating what
+both branches already do. It is the predicate `_mentions_only` consults BEFORE
+`reads_only`, so a missing guard there clears a segment outright rather than passing it to
+something stricter.
 
 ### Why the gate had to widen first
 

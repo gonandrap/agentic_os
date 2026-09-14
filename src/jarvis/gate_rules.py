@@ -771,7 +771,14 @@ def files_a_claim(segment: str) -> bool:
     paperwork may be typed at the shell, or passed to an interpreter as an argument. A
     worker whose justification runs to several paragraphs writes it with a heredoc and
     files it from python, and that is still paperwork — the OS's own advice, blocked.
+
+    The `_SUBSTITUTION` guard on the RAW text is stated here as well as in both branches,
+    and the repetition is deliberate: this is the predicate `_mentions_only` consults
+    BEFORE `reads_only`, so it is the one place where a missing guard clears a segment
+    outright rather than passing it to something stricter (review round 1).
     """
+    if _SUBSTITUTION.search(segment):
+        return False
     return gate_paperwork(segment) or interpreter_paperwork(segment)
 
 
@@ -784,9 +791,25 @@ _PY_RUNNERS = frozenset({"run", "call", "check_call", "check_output", "Popen"})
 #: reads a file, `system` runs a command, and no argument about intent enters into it.
 _PY_INERT_FUNCS = frozenset({"open", "print", "str", "repr", "len", "int", "sorted",
                              "list", "tuple", "dict"})
-_PY_INERT_METHODS = frozenset({"Path", "read", "read_text", "readlines", "strip",
+#: …and these are methods on a VALUE — the result of a call, a literal, a subscript.
+#: Never on a bare name, because a bare name is usually a module: matching the attribute
+#: name alone made `pickle.loads(open("/tmp/p").read().encode())` inert, which is
+#: arbitrary code execution scored as paperwork (review round 1). `loads` and `dumps`
+#: left with it — nothing a filing does requires deserialising anything.
+_PY_INERT_METHODS = frozenset({"read", "read_text", "readlines", "strip",
                                "rstrip", "lstrip", "splitlines", "split", "join",
-                               "format", "decode", "encode", "dumps", "loads"})
+                               "format", "decode", "encode"})
+
+#: The module-qualified calls that ARE allowed, named in full rather than by attribute.
+#: One entry, because one is what the shape needs: `pathlib.Path(p).read_text()`.
+_PY_INERT_QUALIFIED = frozenset({("pathlib", "Path")})
+
+#: What the shell rewrites inside an UNQUOTED heredoc body: parameter expansion, command
+#: substitution, arithmetic expansion, and the backslash that escapes them. A body with
+#: none of these reaches python exactly as written, which is the property the AST
+#: analysis rests on and could not previously state — `python - <<PY` with
+#: `"$(gh pr merge 223)"` in the body had already merged before python parsed a line.
+_EXPANDS = re.compile(r"[$`\\]")
 
 #: `shell=True` turns argv into a command line and `executable=` replaces the program, so
 #: an allow-list is the only safe direction here.
@@ -796,7 +819,10 @@ _PY_RUN_KWARGS = frozenset({"capture_output", "text", "check", "cwd", "encoding"
 #: The whole grammar a filing script may be written in. Anything else — a loop, a
 #: function, a `with`, a comprehension, an `import *` — is a program this cannot read,
 #: and a program this cannot read is not one it may clear.
-_PY_NODES = (ast.Module, ast.Import, ast.ImportFrom, ast.alias, ast.Assign, ast.AnnAssign,
+#: No `ImportFrom`: `from os import system as print` rebinds a name this calls inert, and
+#: the call site cannot see that it did (review round 1). Plain `import x` only, and
+#: `_py_program` refuses `as` on that too.
+_PY_NODES = (ast.Module, ast.Import, ast.alias, ast.Assign, ast.AnnAssign,
              ast.Expr, ast.Call, ast.keyword, ast.Name, ast.Attribute, ast.Constant,
              ast.List, ast.Tuple, ast.Dict, ast.Subscript, ast.Slice, ast.Load,
              ast.Store, ast.BinOp, ast.Add, ast.JoinedStr, ast.FormattedValue)
@@ -815,7 +841,22 @@ def interpreter_paperwork(segment: str) -> bool:
     Deliberately narrow. Python only, the program from the heredoc body and nowhere else
     (`-c` and a script path are both refused), one heredoc, no redirection, nothing else
     in the pipeline. Widening it is a change to a security boundary, not a convenience.
+
+    AND THE BODY MUST REACH PYTHON AS WRITTEN, which the first version did not check and
+    which the whole AST argument rests on (review round 1). The shell rewrites an
+    UNQUOTED heredoc body before python sees a line of it, so `python - <<PY` carrying
+    `"$(gh pr merge 223 --squash)"` had already merged by the time this read a program
+    that merely quoted a string. Two ways to be sure, and either will do: the delimiter is
+    QUOTED (`<<'PY'`), so the shell passes the body through untouched — or the body
+    contains none of `$`, a backtick or `\\`, which is everything the shell would rewrite.
+
+    Keeping the second is not a softening of the first. The reduced repro in issue #233
+    is written `python - <<PY`, and refusing an unquoted delimiter outright would re-gate
+    the exact command this work order exists to clear, for a body the shell demonstrably
+    does not touch. `_EXPANDS` states the property; the delimiter is a proxy for it.
     """
+    if _SUBSTITUTION.search(segment):
+        return False
     inert = _inert(segment).strip()
     words = inert.split()
     if not words or words[0] not in ("python", "python3"):
@@ -827,7 +868,16 @@ def interpreter_paperwork(segment: str) -> bool:
     spans = heredoc_spans(segment)
     if len(spans) != 1 or not spans[0][3]:
         return False
-    return python_files_only_paperwork(segment[spans[0][0]:spans[0][1]])
+    start, end, opener, _ = spans[0]
+    opened = _HEREDOC_OPEN.match(segment, opener)
+    if opened is None:
+        return False
+    # `<<-` strips leading tabs, so the body python receives is not the one read here.
+    if segment[opener:opened.end()].startswith("<<-"):
+        return False
+    if opened.group("bare") is not None and _EXPANDS.search(segment[start:end]):
+        return False
+    return python_files_only_paperwork(segment[start:end])
 
 
 def python_files_only_paperwork(program: str) -> bool:
@@ -852,6 +902,14 @@ def python_files_only_paperwork(program: str) -> bool:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if not all(isinstance(t, ast.Name) for t in targets):
                 return False
+            # …and nothing may be ALIASED into one. `print = os.system` binds a name this
+            # calls inert to something that runs a command, and the call site sees only
+            # the name (review round 1). A binding may hold a value, never a callable.
+            if isinstance(node.value, (ast.Name, ast.Attribute)):
+                return False
+        # Same hole through the import: `import os as print`, `from os import system`.
+        if isinstance(node, ast.Import) and any(a.asname for a in node.names):
+            return False
         if isinstance(node, ast.Call):
             verdict = _py_call(node)
             if verdict is None:
@@ -881,8 +939,14 @@ def _py_call(node: ast.Call) -> bool | None:
         if func.id == "open" and (len(node.args) > 1 or node.keywords):
             return None
         return False
-    if isinstance(func, ast.Attribute) and func.attr in _PY_INERT_METHODS:
-        return False
+    if isinstance(func, ast.Attribute):
+        # A bare name on the left is a MODULE, and `pickle.loads` is not `"x".strip` —
+        # matching the attribute alone made deserialisation read as inert (review round
+        # 1). Module-qualified calls are named in full; everything else must be a method
+        # on a value the program built.
+        if isinstance(func.value, ast.Name):
+            return False if (func.value.id, func.attr) in _PY_INERT_QUALIFIED else None
+        return False if func.attr in _PY_INERT_METHODS else None
     return None
 
 
