@@ -66,8 +66,15 @@ jarvis bug report "wo send silently drops messages when the worker is idle" \
   --steps "1. Create a work order and let the worker go idle. 2. Run jarvis wo send <id> \"hello\". 3. Run jarvis wo show <id>."
 ```
 
-The command prints the issue URL. Mention that URL in your final answer so the user can
-follow it, then get back to your work order.
+The command prints the issue URL, and under it one line saying what happened to the
+issue next: a work order id if the OS picked it up, or the reason it did not. Mention
+both in your final answer, then get back to your work order.
+
+**Do not touch the issue afterwards.** If a work order was created, the OS owns that
+issue from then on — it labels it `in progress` and closes it itself, with the work
+order and the pull request on it, once the code lands. Closing it by hand, labelling it,
+or filing a second issue for the same fault all race the OS and leave the tracker
+saying something untrue.
 
 ## If reporting fails
 

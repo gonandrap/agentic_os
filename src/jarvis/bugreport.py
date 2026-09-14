@@ -1,9 +1,11 @@
 """Bug reporting: one command turns a fleet agent's observation into a tracked issue.
 
 Any agent working under the OS — a worker in its worktree, Jarvis in the terminal —
-runs `jarvis bug report` when Jarvis OS itself misbehaves. That does two things and
-neither is optional: it files a GitHub issue on the OS repo from a fixed template, and
-it puts the issue link in front of the user through the normal notification pipeline.
+runs `jarvis bug report` when Jarvis OS itself misbehaves. That files a GitHub issue on
+the OS repo from a fixed template, hands it to `issues` to be picked up as work, and puts
+the link in front of the user through the normal notification pipeline. The first and the
+last are not optional; the middle one is a project's own choice
+(`catalog.BugsConfig`, and `issues` for the lifecycle that follows).
 
 The template is fixed on purpose. Bugs found by agents are read later by an agent
 fixing them, and "what I expected vs what I got" plus the exact running version is what
@@ -302,7 +304,41 @@ def create_issue(title: str, body: str, repo: str, label: str = BUG_LABEL) -> st
     return url
 
 
-def _notify(project: str, title: str, url: str, version: str, wo_id: str) -> None:
+def _pick_up(url: str, title: str, body: str) -> dict[str, Any]:
+    """Put the freshly filed issue on the OS's rails, if any project will have it.
+
+    Deliberately cannot fail the filing. The issue exists by the time this runs, so an
+    exception here would report "the bug was not filed" about a bug that was — the
+    inverse of the half-success `report_bug` refuses to produce, and just as misleading.
+    Whatever went wrong comes back as `reason` and reaches the user with everything else.
+    """
+    from .issues import work_order_for
+    try:
+        return work_order_for(url, title, body)
+    except Exception as e:  # noqa: BLE001 — see the docstring: the issue is already filed
+        return {"wo_id": "", "project": "", "created": False,
+                "reason": f"the work order could not be created ({e})"}
+
+
+def pickup_note(pickup: dict[str, Any]) -> str:
+    """The one line the user reads about what happened after the issue was created.
+
+    Says only what actually reached the tracker. `report_bug`'s rule — never ping about a
+    state that was not reached — applies to the lifecycle exactly as it does to the
+    filing, so a label that failed says so rather than being rounded up to "in progress".
+    """
+    if not pickup.get("wo_id"):
+        return f"No work order: {pickup.get('reason') or 'not picked up'}"
+    verb = "Work order" if pickup.get("created") else "Already being worked on by"
+    line = f"{verb} {pickup['wo_id']} in {pickup.get('project') or '?'}"
+    if pickup.get("label_error"):
+        return (f"{line} — but the issue is NOT labelled yet "
+                f"({pickup['label_error']}); Jarvis retries on its next tick")
+    return line
+
+
+def _notify(project: str, title: str, url: str, version: str, wo_id: str,
+            pickup: dict[str, Any] | None = None) -> None:
     """Put the issue link in front of the user via the normal inbox -> sinks path.
 
     The daemon routes the inbox on each tick; when it is not running (a bug reported
@@ -313,6 +349,8 @@ def _notify(project: str, title: str, url: str, version: str, wo_id: str) -> Non
     from .daemon import daemon_running
 
     body = f"{url}\nJarvis OS {version}" + (f" · {wo_id}" if wo_id else "")
+    if pickup is not None:
+        body += f"\n{pickup_note(pickup)}"
     central = CentralStore()
     try:
         central.add_inbox(project or "jarvis-os", f"Bug filed: {title}",
@@ -330,8 +368,13 @@ def _notify(project: str, title: str, url: str, version: str, wo_id: str) -> Non
 
 def report_bug(*, title: str, description: str, expected: str, actual: str,
                steps: str = "", project: str = "", wo_id: str = "") -> dict[str, Any]:
-    """File a Jarvis OS bug and tell the user about it. Raises BugReportError if the
-    issue could not be created — in which case nobody is notified."""
+    """File a Jarvis OS bug, put it on the OS's rails, and tell the user about it.
+
+    Raises BugReportError if the ISSUE could not be created — in which case nobody is
+    notified. Nothing after that raises: by then the issue exists, and failing the call
+    would report "not filed" about a bug that was filed. What did and did not happen to
+    it comes back in `pickup` and goes out with the notification (`pickup_note`).
+    """
     if not title.strip():
         raise BugReportError("a bug report needs a title")
     project = project or os.environ.get("JARVIS_PROJECT", "")
@@ -341,6 +384,9 @@ def report_bug(*, title: str, description: str, expected: str, actual: str,
     body = render_body(description=description, expected=expected, actual=actual,
                        version=version, project=project, wo_id=wo_id, steps=steps)
     url = create_issue(title, body, repo)
-    _notify(project, title, url, version, wo_id)
+    # Between creating the issue and telling anyone about it, so the ping says what the
+    # tracker actually shows rather than what it was about to show (issue #240).
+    pickup = _pick_up(url, title, body)
+    _notify(project, title, url, version, wo_id, pickup)
     return {"url": url, "title": title, "repo": repo, "version": version,
-            "project": project, "wo_id": wo_id}
+            "project": project, "wo_id": wo_id, "pickup": pickup}

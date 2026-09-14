@@ -230,6 +230,18 @@ jarvis bug report "title" -d "..." -e "expected" -a "actual" [--steps "..."]
                                            # a bug in the OS itself -> GitHub issue on
                                            # the (PUBLIC) tracker + Telegram ping.
                                            # Every agent has the report-jarvis-bug skill.
+                                           # On a project with `bugs.auto_work_order` on
+                                           # the issue is ALSO picked up: a work order is
+                                           # created, the issue is labelled `in progress`,
+                                           # and it closes ITSELF — with the work order
+                                           # and the PR on it — once the code lands. Off
+                                           # by default, because every agent can file a
+                                           # bug and none of them should be able to
+                                           # commit the fleet to work on its own:
+                                           # `jarvis config set <project>
+                                           # bugs.auto_work_order true`. Never close an
+                                           # issue the OS filed by hand once it is on:
+                                           # you would be racing the daemon.
 jarvis doctor [project] [--repair]         # check the OS's own post-conditions;
                                            # read-only unless --repair. The daemon runs
                                            # the same checks every reconcile tick.

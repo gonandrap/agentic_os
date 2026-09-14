@@ -36,6 +36,11 @@ SAFETY_KEYS = (
     # for `*.validation.*`'s reason: the per-project form is the same switch with a
     # smaller blast radius, and both halves — the flag and the allow-list — widen it.
     "*.supervisor.remedies.*",
+    # Money by the letter of the rule above, safety by its spirit: turning this on gives
+    # EVERY agent in the fleet the power to create work orders in this project, because
+    # every agent carries the `report-jarvis-bug` skill (issue #240 A). What a worker is
+    # allowed to do is exactly what changes.
+    "*.bugs.auto_work_order",
 )
 
 # Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
@@ -362,6 +367,34 @@ class InspectConfig:
 DEFAULT_MESSAGING_STUCK_MINUTES = 60
 
 
+# -- the bug lifecycle: what happens to a GitHub issue `jarvis bug report` files. Issue
+# #240, and `docs/superpowers/specs/2026-09-14-a-filed-bug-runs-itself.md`. Per project
+# with a fleet fallback, on `_parse_inspect`'s shape, and the project it is read from is
+# THE ONE THAT WOULD DO THE WORK — never the one that noticed the bug. Any agent in the
+# fleet can run `jarvis bug report`, so the project that pays for the work is the only
+# one whose consent means anything.
+
+#: The label that says the OS has picked an issue up. Wording from issue #240 itself.
+DEFAULT_BUGS_LABEL = "in progress"
+
+
+@dataclass
+class BugsConfig:
+    """Whether a bug the OS files becomes work the OS does.
+
+    `auto_work_order` SHIPS OFF, and that is a safety property rather than caution: any
+    worker in the fleet carries the `report-jarvis-bug` skill, so an unconditional yes
+    would let one worker commit the fleet to unbounded new work and unbounded spend
+    without anyone deciding. Turning it on is a catalog edit — one project, deliberately.
+
+    `label` is the whole of the in-progress signal: nothing derives it, and an issue
+    carries it exactly while a live work order is on it (`issues.desired_state`).
+    """
+
+    auto_work_order: bool = False
+    label: str = DEFAULT_BUGS_LABEL
+
+
 @dataclass
 class MessagingConfig:
     """When a message queued for a worker stops being in flight and becomes a defect.
@@ -515,6 +548,7 @@ class ProjectSpec:
     inspect: InspectConfig = field(default_factory=InspectConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
+    bugs: BugsConfig = field(default_factory=BugsConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -607,6 +641,7 @@ class OsConfig:
     inspect: InspectConfig = field(default_factory=InspectConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
+    bugs: BugsConfig = field(default_factory=BugsConfig)
 
 
 @dataclass
@@ -810,6 +845,27 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
         if name != "enabled" and value < 1:
             raise _err(f"{where}.{name} must be >= 1")
     return cfg
+
+
+def _parse_bugs(raw: Any, base: BugsConfig | None = None,
+                where: str = "os.bugs") -> BugsConfig:
+    """`os.bugs`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    An empty label is refused rather than silently disabling the in-progress signal:
+    `jarvis config set <p> bugs.label ""` is a plausible typo, and a tracker that
+    quietly stopped saying which issues are being worked is the failure issue #240 is
+    about.
+    """
+    base = base or BugsConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    label = str(raw.get("label", base.label) or "").strip()
+    if not label:
+        raise _err(f"{where}.label must not be empty")
+    return BugsConfig(
+        auto_work_order=bool(raw.get("auto_work_order", base.auto_work_order)),
+        label=label,
+    )
 
 
 def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
@@ -1018,6 +1074,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         inspect=_parse_inspect(os_raw.get("inspect", {})),
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
+        bugs=_parse_bugs(os_raw.get("bugs", {})),
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")
@@ -1081,6 +1138,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         messaging_cfg = _parse_messaging(
             p.get("messaging", {}), base=os_cfg.messaging,
             where=f"projects[{i}] ({name}).messaging")
+        bugs_cfg = _parse_bugs(
+            p.get("bugs", {}), base=os_cfg.bugs,
+            where=f"projects[{i}] ({name}).bugs")
         projects.append(
             ProjectSpec(
                 name=name,
@@ -1095,6 +1155,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 inspect=inspect_cfg,
                 supervisor=supervisor_cfg,
                 messaging=messaging_cfg,
+                bugs=bugs_cfg,
                 raw=p,
             )
         )

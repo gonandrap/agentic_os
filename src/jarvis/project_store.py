@@ -662,6 +662,18 @@ ADDED_COLUMNS = {
         # `pr_state`: "ran before the console existed", never version 1. See
         # docs/superpowers/specs/2026-08-27-the-config-console.md §5.
         "config_version": "TEXT",
+        # The tracker issue this work order exists to fix, when the OS filed it itself
+        # (`jarvis bug report`). NULL for every work order a human or a planner created,
+        # which is nearly all of them, and the reason `Daemon.sync_issues` is a single
+        # indexed query that usually returns nothing.
+        "issue_url": "TEXT",
+        # The tracker state the OS last SUCCESSFULLY applied to `issue_url` — one of
+        # `issues.IN_PROGRESS`, `issues.RELEASED`, `issues.CLOSED`. The pair is
+        # `pr_url`/`pr_state`'s shape with the arrow reversed: `pr_state` caches what
+        # GitHub told us, this caches what we told GitHub. Comparing it against
+        # `issues.desired_state` is what makes the sweep free while they agree and a
+        # retry when `gh` was unreachable — see the `issues` module docstring.
+        "issue_state": "TEXT",
     },
     "feature_orders": {
         # Same, one level up: a feature's bill is its children's, and children can be
@@ -882,6 +894,7 @@ class ProjectStore:
         parent_id: str | None = None,
         kind: str = "worker",
         spec_section: str | None = None,
+        issue_url: str | None = None,
     ) -> dict[str, Any]:
         """Create a work order. `status` and `session_id` are set in the same INSERT
         rather than afterwards, because the row is visible to the daemon the instant it
@@ -911,13 +924,13 @@ class ProjectStore:
             """INSERT INTO work_orders (id, title, description, status, origin,
                    created_at, updated_at, model, effort, permission_mode,
                    append_system_prompt, backlog_id, metadata, session_id, depends_on,
-                   parent_id, kind, spec_section)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   parent_id, kind, spec_section, issue_url)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 wo_id, title, description, status, origin, ts, ts, model, effort,
                 permission_mode, append_system_prompt, backlog_id,
                 db.to_json(metadata or {}), session_id, db.to_json(deps),
-                parent_id, kind, spec_section or None,
+                parent_id, kind, spec_section or None, issue_url or None,
             ),
         )
         self.add_event(wo_id, "created", {"origin": origin, "depends_on": deps,
@@ -930,6 +943,32 @@ class ProjectStore:
         if row is None:
             raise KeyError(f"work order {wo_id!r} not found in {self.db_path}")
         return dict(row)
+
+    def work_orders_for_issue(self, issue_url: str) -> list[dict[str, Any]]:
+        """Every work order filed against this tracker issue, newest first.
+
+        The idempotency question in one query (issue #240 D): a second `jarvis bug
+        report` for an issue that already has an OPEN work order must not file another,
+        and a REOPENED issue whose old work order is terminal must be free to get one.
+        Hidden rows are included — hiding stops a record being listed, it does not stop
+        it being the work order that already exists.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM work_orders WHERE issue_url=? ORDER BY created_at DESC",
+            (issue_url,)).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def work_orders_tracking_issues(self) -> list[dict[str, Any]]:
+        """Every work order that owns a tracker issue. The sweep's whole input.
+
+        Usually empty, and always small: only `jarvis bug report` writes `issue_url`.
+        Hidden rows included for `record_pr_closed`'s reason — a hidden work order's
+        issue may not go on saying something untrue.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM work_orders WHERE issue_url IS NOT NULL AND issue_url != ''"
+        ).fetchall()
+        return db.rows_to_dicts(rows)
 
     def find_by_session(self, session_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
