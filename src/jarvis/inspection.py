@@ -11,13 +11,25 @@ Design and worked example: `docs/superpowers/specs/2026-08-30-the-anatomy-of-a-t
 
 ## The partition
 
-The method is `docs/findings/anatomy-of-an-expensive-turn.md` §1 step 4, with one
-bucket added:
+The method is `docs/findings/anatomy-of-an-expensive-turn.md` §1 step 4, with two
+buckets added:
 
     executing tools   `tool_use` timestamp to the matching `tool_result` timestamp
     blocked           the subset of those where the tool is a BLOCKING JOIN
     idle              after the turn's last API call, before the next turn's prompt
-    generating        the wall clock left over
+    generating        the wall clock left over, ON A TURN THAT MADE AN API CALL
+    unaccounted       the same remainder on a turn that made NONE
+
+UNACCOUNTED IS THE SECOND ADDITION TO THE METHOD, and it is there because `generating`
+is not measured — it is what nothing else explains, and on a turn with no API call and
+no tool there is nothing to subtract. wo-f1ce0f24 turn 3 therefore rendered as 65
+minutes of pure generation beside its own `0 calls` and `peak 0`, and four layers read
+that number as measurement (issue 227). A span with no API call in it was never OBSERVED
+generating; naming the gap is honest where charging it to the model is not. It is
+`unaccounted` rather than `stalled` because the name states the evidence and not a
+diagnosis: a transcript Claude Code has pruned produces the same silence as a turn that
+hung. The DIAGNOSIS is `STALL_ALARM` below, which is a judgement about how long the
+silence has run.
 
 Blocked is carved out of tool time rather than added beside it because the two are
 opposite facts about the same seconds: 45 seconds of `Bash` is work being done, and 450
@@ -95,8 +107,10 @@ JOIN_TOOLS = ("TaskOutput",)
 COLD_START, TTL_EXPIRY, PREFIX_MISS = "cold-start", "ttl-expiry", "prefix-miss"
 
 #: The buckets a wall clock divides into, in the order they are rendered. Walked rather
-#: than spelled out at each site, so a bucket cannot exist in one renderer and not another.
-PARTS = ("generating", "blocked", "tools", "idle")
+#: than spelled out at each site, so a bucket cannot exist in one renderer and not another
+#: — `cli.PART_LABELS` is keyed by these and `tests/test_inspection.py` pins the two equal,
+#: because a fifth bucket missing from one renderer is a table that no longer sums to 100.
+PARTS = ("generating", "blocked", "tools", "idle", "unaccounted")
 
 WRITE_CAUSE_NOTES = {
     COLD_START: "the first call of the session — unavoidable",
@@ -246,14 +260,35 @@ class Turn:
         return max(0.0, self.ended - self.active_ended)
 
     @property
-    def generating(self) -> float:
-        """The wall clock nothing else accounts for.
+    def _remainder(self) -> float:
+        """The wall clock nothing else accounts for — `generating` or `unaccounted`.
 
         Clamped at zero rather than allowed to go negative: tool spans are read from a
         file Jarvis does not write, and a clock skew or an overlapping pair of spans
         must not produce a partition that reads as nonsense.
         """
         return max(0.0, self.wall - self.blocked - self.tools - self.idle)
+
+    @property
+    def observed(self) -> bool:
+        """Did anything in this turn actually reach the API? See `unaccounted`."""
+        return bool(self.calls)
+
+    @property
+    def generating(self) -> float:
+        """The remainder, but only where an API call vouches for it.
+
+        A call's timestamp is when its response FINISHED, so every second up to it was
+        the model producing that response and the remainder before the last call is
+        honestly generating. A turn with no call at all has nothing for the clock to
+        lead up to, and charging it anyway is issue 227.
+        """
+        return self._remainder if self.observed else 0.0
+
+    @property
+    def unaccounted(self) -> float:
+        """The remainder of a turn that never reached the API — see the module docstring."""
+        return 0.0 if self.observed else self._remainder
 
     @property
     def context_peak(self) -> int:
@@ -283,10 +318,7 @@ class Turn:
         """The partition as fractions of the wall clock, or all zero for an empty turn."""
         if self.wall <= 0:
             return {k: 0.0 for k in PARTS}
-        return {"generating": self.generating / self.wall,
-                "blocked": self.blocked / self.wall,
-                "tools": self.tools / self.wall,
-                "idle": self.idle / self.wall}
+        return {k: getattr(self, k) / self.wall for k in PARTS}
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -294,6 +326,11 @@ class Turn:
             "wall": round(self.wall, 2), "generating": round(self.generating, 2),
             "blocked": round(self.blocked, 2), "tools": round(self.tools, 2),
             "idle": round(self.idle, 2),
+            "unaccounted": round(self.unaccounted, 2),
+            # THE HEADLINE FACT ABOUT A TURN, carried beside the clock rather than left
+            # to be inferred from `api_calls == 0`: every renderer has to say it first
+            # and loudest, and an inference is what four layers got wrong (issue 227).
+            "observed": self.observed,
             "share": {k: round(v, 4) for k, v in self.share().items()},
             "context_peak": self.context_peak,
             "api_calls": len(self.calls), "tool_calls": len(self.spans),
@@ -673,12 +710,18 @@ def _name_joins(turns: Sequence[Turn], labels: dict[str, str]) -> None:
 
 
 TURN_ALARM, JOIN_ALARM, WRITE_ALARM = "long-turn", "long-join", "big-rewrite"
+#: The one alarm here whose finding is that NOTHING was spent — see `ALARM_KINDS`.
+STALL_ALARM = "stalled-turn"
 
 #: What each kind IS, for a surface listing alarms rather than raising one. An `Alarm`'s
 #: own `reason` is about one turn and carries its numbers; this is the standing meaning,
 #: and it lives beside the constants so a dashboard and the CLI cannot drift on it.
 ALARM_KINDS = {
     TURN_ALARM: "a turn still running, still being billed",
+    # THE ODD ONE OUT, deliberately: the other three say money is going out and this one
+    # says none is. It is the opposite finding to the `going-in-circles` health probe,
+    # which says effort is being RE-spent — here the work never started (issue 227).
+    STALL_ALARM: "a turn open with no API call ever made — nothing is being billed",
     JOIN_ALARM: "a join open past the cache TTL — the wait is paid for twice",
     WRITE_ALARM: "the conversation sent again, at the cache-write rate",
 }
@@ -703,18 +746,21 @@ class Alarm:
 def _spend_so_far(turn: Turn, now: float | None) -> str:
     """What the turn has actually bought, so "still being billed" can be checked.
 
-    The claim the alarm makes is about money, and a turn wedged on a permission prompt
-    makes no API call while its wall clock runs. Naming the last call is what tells the
-    two apart at a glance, and it is the half of "still being billed" that the wall
-    clock alone could never show.
+    THE COST IS READ, NEVER INFERRED FROM THE CLOCK (issue 227, and the standing rule
+    recorded against al-abf99387). `turn.usage` is the same per-turn accounting `jarvis
+    cost` prints, so an alarm that says a turn is expensive is quoting the record rather
+    than the duration — and a turn wedged on a permission prompt, which makes no API call
+    while its wall clock runs, cannot look like one that is generating.
+
+    Called only for a turn that HAS calls: the caller branches on `Turn.observed` first,
+    because a turn with none gets `STALL_ALARM` and no claim about money at all.
     """
-    if not turn.calls:
-        return "no API call yet"
     made = f"{len(turn.calls)} API call" + ("s" if len(turn.calls) > 1 else "")
     ago = (now - max(call.ts for call in turn.calls)) if now else 0.0
-    if ago < 60:
-        return f"{made}, the last one seconds ago"
-    return f"{made}, the last one {int(ago // 60)}m ago"
+    when = "seconds ago" if ago < 60 else f"{int(ago // 60)}m ago"
+    spend = turn.usage
+    return (f"{made}, the last one {when}, {spend.total_tokens:,} tokens for "
+            f"${spend.list_cost_usd:.2f} so far")
 
 
 def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
@@ -748,7 +794,17 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
     raised: list[Alarm] = []
     hint = f" — `jarvis inspect {wo_id}`" if wo_id else ""
 
-    if wall >= cfg.alarm_turn_minutes * 60:
+    # THE TWO DURATION ALARMS ARE EXCLUSIVE, and which one applies is decided by the
+    # cost record rather than by the clock. A turn that has made no API call has bought
+    # nothing, so `long-turn`'s claim — that it is still being billed — would be false;
+    # the finding is the silence itself, and it is raised sooner.
+    if not turn.observed:
+        if wall >= cfg.alarm_stalled_minutes * 60:
+            raised.append(Alarm(STALL_ALARM, (
+                f"this turn has been open {int(wall // 60)} minutes and has made no API "
+                f"call at all — the work never started, and nothing has been spent on "
+                f"it{hint}")))
+    elif wall >= cfg.alarm_turn_minutes * 60:
         raised.append(Alarm(TURN_ALARM, (
             f"this turn has been running {int(wall // 60)} minutes and is still being "
             f"billed ({_spend_so_far(turn, now)}){hint}")))

@@ -20,14 +20,15 @@ reads it.
 
 ## 2. The partition
 
-The method's §1 step 4, with one bucket added:
+The method's §1 step 4, with two buckets added:
 
 | part | how it is measured |
 |---|---|
 | executing tools | `tool_use` timestamp to the matching `tool_result` timestamp |
 | blocked | the subset of those spans whose tool is a BLOCKING JOIN (`TaskOutput`) |
 | idle | after the turn's last API call, before the next turn's prompt |
-| generating | the wall clock left over |
+| generating | the wall clock left over, on a turn that made an API call |
+| unaccounted | the same remainder, on a turn that made none (§7.4) |
 
 Blocked is carved OUT of tool time rather than counted beside it, because they are
 opposite facts about the same seconds: 45 seconds of `Bash` is work being done, and 450
@@ -153,6 +154,7 @@ at a point where it fires on a small minority:
 | setting | default | why |
 |---|---|---|
 | `alarm_turn_minutes` | 60 | p95 of a turn's ACTIVE time is 59 minutes; fires on 16% of orders, and sits well below the 6-hour `is_stalled` flag, which is a different fact (hung, not expensive) |
+| `alarm_stalled_minutes` | 15 | a turn open this long having made NO API call. Not a spend threshold — its finding is that nothing was spent. p99 of time-to-first-call is 61s and exactly one turn in 3,811 took over ten minutes, so 15 is far outside a slow start; fires on 0.26% of turns (§7.4) |
 | `alarm_join_seconds` | 300 | the 5-minute cache TTL itself: past it the prefix is cold, so the wait converts into a re-write. Fires on 2% |
 | `alarm_write_tokens` | 300,000 | p95 of the largest re-write per order (median 130,519). ~$1.88 at Opus list in one event. Fires on 5% |
 
@@ -364,6 +366,32 @@ moment a skill loaded.
 §4 requirement 3 names two labels, `TTL-expiry` and `prefix-miss`. The first write of a
 session is neither — §3.5 discusses it separately and it is not a defect — so it gets its
 own label rather than being mislabelled a prefix-miss for having no predecessor.
+
+### 7.4 `unaccounted` is split out of `generating`, and a stall is its own alarm
+
+`generating` is not measured — it is what nothing else explains — so a turn that makes no
+API call and runs no tool has its entire wall clock charged to it. wo-f1ce0f24 turn 3
+rendered as `65.3m  gen 100%` beside its own `0 calls  peak 0`, and `jarvis cost` put the
+turn at $0.00 and zero tokens. Four layers then read that percentage as measurement: the
+alarm fired `going-in-circles`, the supervisor escalated "a silent hung turn BILLED IN
+FULL", Neo declined to decide, and the user got a Telegram saying an hour of generation
+had been billed (issue 227).
+
+A span with no API call in it was never OBSERVED generating. It is `unaccounted` rather
+than `stalled` because the name states the evidence and not a diagnosis — a pruned
+transcript produces the same silence as a hung turn. The DIAGNOSIS is the
+`stalled-turn` alarm, which is a judgement about how long that silence has run, and it
+is the inverse of the finding that misfired: `going-in-circles` says the work ran twice,
+and here it never started at all.
+
+Two rules fall out of it, and they are what stops the misreading recurring somewhere else:
+
+- the two duration alarms are exclusive, and the cost record decides which applies. A turn
+  that bought nothing cannot raise `long-turn`, whose whole claim is that it is being
+  billed;
+- nothing may assert spend it has not read. Every alarm text and every judge's packet now
+  carries the turn's own API call count, tokens and dollars, which already existed per
+  turn and which no layer had consulted.
 
 ## 8. What it costs to run
 
