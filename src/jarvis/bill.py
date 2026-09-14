@@ -1279,6 +1279,11 @@ class RewriteTax:
     worst_id: str
     worst_title: str
     worst_tax_usd: float
+    #: Sealed orders in the window carrying NO re-write block at all, so absent from
+    #: `orders` and from `bill_usd` alike. Said on the alarm, because a denominator
+    #: introduced as "this project's bill" while some of that bill was never looked at
+    #: is a claim wider than the number behind it (kn-6c0bef4c (2)).
+    unmeasured_orders: int = 0
 
     @property
     def ttl_share(self) -> float | None:
@@ -1293,14 +1298,19 @@ class RewriteTax:
         return self.tax_usd / self.bill_usd if self.bill_usd else 0.0
 
     @property
-    def ttl_share_of_bill(self) -> float:
+    def ttl_share_of_bill(self) -> float | None:
+        """None, never 0.0, when nothing was classified — the rule this class's own
+        docstring states, and the one a dashboard reading these would otherwise break:
+        a window no boundary could be classified in has no TTL half to print, and 0%
+        reads as "measured, and it is nothing"."""
         share = self.ttl_share
-        return self.tax_share * share if share is not None else 0.0
+        return self.tax_share * share if share is not None else None
 
     @property
-    def prefix_share_of_bill(self) -> float:
+    def prefix_share_of_bill(self) -> float | None:
+        """None when unmeasured — see `ttl_share_of_bill`."""
         share = self.ttl_share
-        return self.tax_share * (1 - share) if share is not None else 0.0
+        return self.tax_share * (1 - share) if share is not None else None
 
     @property
     def coverage(self) -> float:
@@ -1322,7 +1332,7 @@ def rewrite_tax(store: Any, *, days: int, now: float | None = None) -> RewriteTa
     orders = store.sealed_bills_since(since)
     bill_usd = tax_usd = 0.0
     tax_tokens = classified = ttl_tokens = 0
-    counted = 0
+    counted = unmeasured = 0
     worst = ("", "", 0.0)
     for order in orders:
         payload = db.from_json(order.get("bill_json") or "", {}) or {}
@@ -1331,7 +1341,9 @@ def rewrite_tax(store: Any, *, days: int, now: float | None = None) -> RewriteTa
             # A bill sealed before `_worker_extras` carried the block, or one sealed
             # EMPTY because it could not be computed (`Daemon.seal_bills`). Neither is
             # evidence of a small tax, so it is left out of both halves rather than
-            # counted as a zero — which would dilute every share on this record.
+            # counted as a zero — which would dilute every share on this record. The
+            # count is kept so the alarm can say the denominator is not the whole bill.
+            unmeasured += 1
             continue
         counted += 1
         total = payload.get("total") or {}
@@ -1353,7 +1365,8 @@ def rewrite_tax(store: Any, *, days: int, now: float | None = None) -> RewriteTa
     return RewriteTax(days=days, since=since, orders=counted, bill_usd=bill_usd,
                       tax_usd=tax_usd, tax_tokens=tax_tokens,
                       classified_tokens=classified, ttl_tokens=ttl_tokens,
-                      worst_id=worst[0], worst_title=worst[1], worst_tax_usd=worst[2])
+                      worst_id=worst[0], worst_title=worst[1], worst_tax_usd=worst[2],
+                      unmeasured_orders=unmeasured)
 
 
 def _coverage_note(tax: RewriteTax) -> str:
@@ -1363,6 +1376,16 @@ def _coverage_note(tax: RewriteTax) -> str:
         return ""
     return (f" The split is measured over {tax.coverage:.0%} of the tax; the rest "
             f"crossed no boundary this OS could classify.")
+
+
+def _denominator_note(tax: RewriteTax) -> str:
+    """The OTHER coverage, which `_coverage_note` does not cover: the split's evidence is
+    part of the tax, and the tax's own denominator is part of the project's spend."""
+    if not tax.unmeasured_orders:
+        return ""
+    return (f" That bill is the {tax.orders} settled orders carrying a re-write "
+            f"measurement; {tax.unmeasured_orders} more settled in the window with no "
+            f"re-write block to read, and their spend is in neither half.")
 
 
 def rewrite_alarms(tax: RewriteTax, cfg: Any) -> list[Alarm]:
@@ -1375,24 +1398,28 @@ def rewrite_alarms(tax: RewriteTax, cfg: Any) -> list[Alarm]:
     Each reason is self-contained down to the command that checks it, because the
     supervisor judges on the alarm and the evidence packet and can look nothing up.
     """
-    if tax.ttl_share is None:
+    ttl_share = tax.ttl_share
+    if ttl_share is None:
         return []
+    prefix_of_bill, ttl_of_bill = tax.prefix_share_of_bill, tax.ttl_share_of_bill
+    assert prefix_of_bill is not None and ttl_of_bill is not None  # measured, see above
     window = f"over the last {tax.days} days ({tax.orders} settled orders)"
     worst = (f"Biggest single contributor: {tax.worst_id} "
              f"(${tax.worst_tax_usd:.2f}) — `jarvis inspect {tax.worst_id}` labels every "
              f"re-write it made by cause.")
     raised = []
-    if tax.prefix_share_of_bill >= cfg.alarm_rewrite_prefix_share:
+    if prefix_of_bill >= cfg.alarm_rewrite_prefix_share:
         raised.append(Alarm(REWRITE_PREFIX_ALARM, (
-            f"{tax.prefix_share_of_bill:.0%} of this project's ${tax.bill_usd:,.0f} bill "
+            f"{prefix_of_bill:.0%} of this project's ${tax.bill_usd:,.0f} bill "
             f"{window} went on re-sending conversations whose PROMPT PREFIX had moved — "
-            f"${tax.tax_usd * (1 - tax.ttl_share):,.2f}, and no cache TTL can buy back "
+            f"${tax.tax_usd * (1 - ttl_share):,.2f}, and no cache TTL can buy back "
             f"any of it. The cure is whatever is changing the head of the prompt between "
-            f"calls.{_coverage_note(tax)} {worst}")))
-    if tax.ttl_share_of_bill >= cfg.alarm_rewrite_ttl_share:
+            f"calls.{_coverage_note(tax)}{_denominator_note(tax)} {worst}")))
+    if ttl_of_bill >= cfg.alarm_rewrite_ttl_share:
         raised.append(Alarm(REWRITE_TTL_ALARM, (
-            f"{tax.ttl_share_of_bill:.0%} of this project's ${tax.bill_usd:,.0f} bill "
+            f"{ttl_of_bill:.0%} of this project's ${tax.bill_usd:,.0f} bill "
             f"{window} went on conversations re-sent because the CACHE ENTRY EXPIRED — "
-            f"${tax.tax_usd * tax.ttl_share:,.2f}, the part a longer cache TTL could have "
-            f"bought back. {TTL_DECISION_NOTE}{_coverage_note(tax)} {worst}")))
+            f"${tax.tax_usd * ttl_share:,.2f}, the part a longer cache TTL could have "
+            f"bought back. {TTL_DECISION_NOTE}{_coverage_note(tax)}"
+            f"{_denominator_note(tax)} {worst}")))
     return raised

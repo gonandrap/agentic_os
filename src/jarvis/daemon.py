@@ -49,7 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import bugreport, bus, claude_cli, db, fleet, worker_session
+from . import bugreport, bus, claude_cli, db, fleet, inspection, worker_session
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
@@ -216,7 +216,15 @@ VALIDATION_REASON_CUT = " […]"
 #: What the inbox row for an aggregate re-write-tax alarm says. Up here rather than at
 #: its call site because every inbox row reaches every sink, Telegram included, and
 #: `remedies`' and `supervisor`'s titles live at the top of their modules for that reason.
-REWRITE_INBOX_TITLE = "{project}'s re-write tax crossed a threshold"
+#: ONE PER CAUSE, because the inbox is the durable half of this alarm and two rows
+#: reading identically merge exactly the two failures this whole change exists to keep
+#: apart — a title that says only "the tax" sends the reader to the wrong cure.
+REWRITE_INBOX_TITLE = {
+    inspection.REWRITE_PREFIX_ALARM:
+        "{project} is paying to re-send conversations whose prompt PREFIX moved",
+    inspection.REWRITE_TTL_ALARM:
+        "{project} is paying to re-send conversations whose cache entry EXPIRED",
+}
 
 
 def escalation_body(reason: str) -> str:
@@ -2656,7 +2664,6 @@ class Daemon:
         Read-only and free of the model: one transcript read per running work order, on
         the reconcile cadence rather than every tick.
         """
-        from . import inspection
         from . import usage as usage_mod
 
         # The PROJECT's thresholds, already resolved against the OS block by
@@ -2763,7 +2770,7 @@ class Daemon:
                              "reason": alarm.reason, "alarm_id": row["id"]})
             self.central.add_inbox(
                 project=project.name, level="warning",
-                title=REWRITE_INBOX_TITLE.format(project=project.name),
+                title=REWRITE_INBOX_TITLE[alarm.kind].format(project=project.name),
                 body=f"{alarm.reason}\n"
                      f"The supervisor will look before you have to. "
                      f"Read it with: jarvis alarms show {row['id']}",

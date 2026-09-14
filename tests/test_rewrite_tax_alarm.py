@@ -72,6 +72,18 @@ def _seal(store, *, title, bill_usd, tax_usd, tax_tokens, ttl_tokens, age_days=1
     return wo["id"]
 
 
+def _seal_without_rewrite(store, *, title, bill_usd, age_days=1.0):
+    """A bill sealed before `_worker_extras` carried the re-write block, or one sealed
+    EMPTY because it could not be computed. It billed real money that no half of this
+    arithmetic can see."""
+    from jarvis import db
+
+    wo = store.create_work_order(title, status="completed")
+    payload = {"total": {"cost": {"list_usd": bill_usd, "exact_usd": 0.0}}}
+    store.seal_bill(wo["id"], json.dumps(payload), at=db.now() - age_days * DAY)
+    return wo["id"]
+
+
 def _mixed_window(store, *, prefix_heavy=True):
     """Five sealed orders: four classified, one not, and the two causes disagree.
 
@@ -118,12 +130,13 @@ def test_the_split_is_a_ratio_over_the_classified_orders_applied_to_the_whole(st
     assert tax.tax_share == pytest.approx(0.30)
     # 200,000 of the 1,000,000 classified tax tokens were the entry expiring.
     assert tax.ttl_share == pytest.approx(0.20)
-    assert tax.prefix_share_of_bill == pytest.approx(0.24)
-    assert tax.ttl_share_of_bill == pytest.approx(0.06)
+    prefix_of_bill, ttl_of_bill = tax.prefix_share_of_bill, tax.ttl_share_of_bill
+    assert prefix_of_bill == pytest.approx(0.24)
+    assert ttl_of_bill == pytest.approx(0.06)
     # …and the two halves are a PARTITION of the whole, which is the property
     # kn-7a2180ba asks of every finer accounting in this area.
-    assert tax.prefix_share_of_bill + tax.ttl_share_of_bill == pytest.approx(
-        tax.tax_share)
+    assert prefix_of_bill is not None and ttl_of_bill is not None
+    assert prefix_of_bill + ttl_of_bill == pytest.approx(tax.tax_share)
 
 
 def test_the_carrier_is_the_biggest_single_contributor(store):
@@ -187,6 +200,11 @@ def test_an_unmeasured_split_raises_neither_alarm(store):
     assert tax.tax_share > 0.9        # an enormous tax…
     assert tax.ttl_share is None      # …with no cause anyone can name
     assert bill.rewrite_alarms(tax, InspectConfig()) == []
+    # AND THE TWO DERIVED SHARES SAY None TOO, not 0.0. Only the early return above
+    # protects them today; the next caller to put them on a dashboard would otherwise
+    # print "0% prefix, 0% TTL" for a window where the truth is that nobody knows.
+    assert tax.prefix_share_of_bill is None
+    assert tax.ttl_share_of_bill is None
 
 
 def test_each_cause_raises_its_own_kind_and_only_when_it_crosses(store):
@@ -261,6 +279,31 @@ def test_a_partial_split_says_so_and_a_complete_one_does_not(store):
     assert "The split is measured over 50%" in bill.rewrite_alarms(partial, low)[0].reason
 
 
+def test_the_alarm_says_when_its_denominator_is_not_the_whole_bill(store):
+    """THE OTHER COVERAGE, and `_coverage_note` does not cover it. `rewrite_tax` drops a
+    sealed order with no re-write block from BOTH halves, so "this project's $100 bill"
+    can be a claim wider than the number behind it (kn-6c0bef4c (2)). The alarm says so
+    rather than the docstring saying it."""
+    _seal(store, title="measured", bill_usd=100.0, tax_usd=30.0,
+          tax_tokens=100_000, ttl_tokens=100_000)
+    clean = bill.rewrite_tax(store, days=7)
+    _seal_without_rewrite(store, title="sealed before the block existed", bill_usd=900.0)
+    thin = bill.rewrite_tax(store, days=7)
+
+    assert clean is not None and thin is not None
+    # The $900 moves neither the bill nor the tax — which is right, a missing block is
+    # not evidence of a small tax — so the share printed stays 30% and only the sentence
+    # under it changes.
+    assert (thin.orders, thin.unmeasured_orders) == (1, 1)
+    assert thin.bill_usd == pytest.approx(100.0)
+    assert thin.tax_share == pytest.approx(0.30)
+    low = InspectConfig(alarm_rewrite_ttl_share=0.01, alarm_rewrite_prefix_share=0.99)
+    assert "settled in the window with no" not in bill.rewrite_alarms(clean, low)[0].reason
+    reason = bill.rewrite_alarms(thin, low)[0].reason
+    assert "That bill is the 1 settled orders carrying a re-write measurement" in reason
+    assert "1 more settled in the window with no re-write block to read" in reason
+
+
 def test_both_new_kinds_have_a_standing_meaning_a_surface_can_render(store):
     """`ui.app` hands `inspection.ALARM_KINDS` to /alarms as the legend, so a kind
     missing from it renders as a bare id — the same failure kn-376c88eb (4) records for
@@ -307,10 +350,21 @@ def test_the_carrier_is_not_flagged_for_attention(started, store):
 
     carrier = store.get_work_order(rows[0]["wo_id"])
     assert not carrier["needs_attention"]
+    titles = {k: t.format(project="proj_a")
+              for k, t in daemon_mod.REWRITE_INBOX_TITLE.items()}
     inbox = [r for r in started.central.unacked_inbox()
-             if r["title"] == daemon_mod.REWRITE_INBOX_TITLE.format(project="proj_a")]
+             if r["title"] in titles.values()]
     assert len(inbox) == 2
     assert all(r["wo_id"] == carrier["id"] for r in inbox)
+    # THE TWO ROWS DO NOT READ THE SAME. The inbox is the durable half of this alarm and
+    # it is where the user meets it first; two rows saying "the re-write tax crossed a
+    # threshold" merge the two causes the whole change exists to keep apart, and send
+    # the reader to a cure that cannot work.
+    assert len({r["title"] for r in inbox}) == 2
+    assert set(titles.values()) == {r["title"] for r in inbox}
+    prefix_row = next(r for r in inbox
+                      if r["title"] == titles[inspection.REWRITE_PREFIX_ALARM])
+    assert "PREFIX" in prefix_row["title"] and "EXPIRED" not in prefix_row["title"]
 
 
 def test_it_is_one_alarm_per_kind_per_window_however_often_the_tick_runs(started, store):

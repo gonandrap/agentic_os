@@ -96,7 +96,7 @@ def _proposed(started, catalog_file, monkeypatch, tmp_path, token, *allowed):
 # -- 1. the registry is closed ---------------------------------------------------------
 
 
-def test_the_registry_is_closed_and_shipped_with_exactly_two():
+def test_the_registry_is_closed_and_shipped_with_exactly_three():
     """Adding a remedy must be a test-breaking, reviewed act rather than a prompt edit.
 
     Both directions in one test: an id that is not there raises, an id that is returns
