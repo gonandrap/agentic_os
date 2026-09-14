@@ -3083,15 +3083,30 @@ class Daemon:
         """A pull request the OS can ask its own worker to fix: conflicts, or a red build.
 
         ONE function for both, because they are one mechanism — see `ops.PrRepair`. The
-        three guards are all this adds over `ops.nudge_pr_repair`: no session to resume,
-        a nudge already queued, a turn already in flight. Spec §3 for why each of them
-        would otherwise cost a duplicated turn or silently spend the budget.
+        four guards are all this adds over `ops.nudge_pr_repair`: no session to resume,
+        a nudge already queued, a turn already in flight, and a validation round that
+        owns the work order. Spec §3 for why each of the first three would otherwise
+        cost a duplicated turn or silently spend the budget, and §4.1 for the fourth.
         """
         from . import ops
 
         if not wo.get("session_id"):
             return
         if store.queued_messages(wo["id"]) or worker_session.busy(store, wo["id"]):
+            return
+        # THE ROUND MACHINE OWNS THIS SESSION. Keyed off the ROUND, not the status, and
+        # that distinction is the whole guard: since issue 212 a round runs while the
+        # user decides, so `ops.land_when_cleared` parks a work order in `needs_review`
+        # with its round still open — a status this poll now selects. Both loops would
+        # then claim the same work order in the same moment, the round runner sending
+        # the panel's feedback while this sends a repair nudge, and the branch head
+        # moving under the seats mid-round. `busy` cannot see it: the worker's session
+        # is idle while the panel deliberates. Deferred, never dropped — the work order
+        # re-enters this poll on the tick after the round settles, and the pull request
+        # is still red. Neo question 283.
+        if store.validation_round_open(wo["id"]):
+            log.debug("[%s] %s has a validation round open — repair deferred",
+                      project.name, wo["id"])
             return
         out = ops.nudge_pr_repair(store, wo, repair, **fields)
         if out["gave_up"]:

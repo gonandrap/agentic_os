@@ -135,6 +135,40 @@ poll**, so a user who reads the red build and merges anyway ends in `complete_me
 with the episode still open, and a blocker derived on `pr_url` alone would leave a
 finished work order saying "do not merge it as it stands" for ever.
 
+### 4.1 A status set is not enough: the round owns the session
+
+Excluding `validating` from the polled set was the whole of this guard until issue 212
+landed, and issue 212 is precisely what made "the round machine owns this work order" and
+"the status says `validating`" stop being the same sentence. `ops.land_when_cleared`
+parks a work order in `needs_review` with its round running underneath, and
+`Daemon.run_validation_rounds` selects over ROUNDS for exactly that reason — its own
+docstring calls the status query "the whole of why validation waited on the user".
+
+This poll selects over statuses, and `needs_review` is one of them. So both loops can
+claim the same work order in the same moment: the round runner sending the panel's
+feedback and re-running the turn while `heal_pull_request` sends a repair nudge. Two
+writers to one worker session, and the branch head moving under the seats mid-round.
+None of the first three guards can see it — the worker's session is idle while the panel
+deliberates, so `worker_session.busy` says False.
+
+So there is a fourth guard, and it is keyed off the round: `ProjectStore.validation_round_open`
+is `work_orders_awaiting_validation` asked about one work order, off the same
+`RUNNABLE_VALIDATION_OUTCOMES` and the same latest-round rule, so the two cannot answer
+differently. **Deferred, never dropped** — nothing is written, no attempt is spent, and
+the work order re-enters the poll on the tick after the round settles with the pull
+request still red.
+
+`rejected` is deliberately outside that set. It means the panel is waiting for the
+SUBMITTER rather than deliberating: the worker is the one who acts next, and a red build
+it is about to push over is exactly what it needs told. That window belongs to the
+turn-in-flight and nudge-already-queued guards.
+
+The general shape, and the third time this work order met it: **widening a selection
+invalidates guards justified by the old narrowness, including guards in code you never
+touched** (kn-b6977de3). Here the old narrowness was somebody else's — issue 212 widened
+what a round could sit under, and this branch widened what the poll looks at, and neither
+change is wrong alone.
+
 ONE tuple, in one place, because the two halves have to agree. A status the poll nudges
 in but `true_blockers` does not derive for raises a give-up flag nothing can re-derive,
 and INV-ATTENTION-REASON relabels it on the next tick. That is why **both** repair

@@ -593,6 +593,51 @@ def test_a_work_order_with_no_session_is_left_alone(started, project, fake_gh):
     assert store.pr_repair_attempts(wo["id"], "checks") == 0
 
 
+def test_an_open_validation_round_owns_the_worker(started, project, fake_gh, reviewing):
+    """THE FOURTH GUARD (Neo question 283). Since issue 212 a round runs while the user
+    decides, so a work order can sit in `needs_review` — a status this poll now selects
+    — with its round still open. Both loops would then claim the same worker in the same
+    moment, and `busy` cannot see it because the session is idle while the panel thinks.
+
+    The pairing is the test: asserting only the silence would pass against an
+    implementation that had simply stopped nudging. The nudge has to arrive once the
+    round settles, because the pull request is still red."""
+    red(fake_gh)
+    store = ProjectStore(project)
+    rnd = store.open_validation_round(wo_id=reviewing["id"], fingerprint="abc")
+    assert store.validation_round_open(reviewing["id"])
+
+    poll(started, store)
+
+    assert not store.queued_messages(reviewing["id"])
+    assert store.pr_repair_attempts(reviewing["id"], "checks") == 0   # not spent either
+
+    store.close_validation_round(rnd["id"], "escalated", reason="three rounds, no deal")
+    poll(started, store)
+
+    assert store.queued_messages(reviewing["id"])
+    assert store.pr_repair_attempts(reviewing["id"], "checks") == 1
+
+
+def test_a_rejected_round_does_not_defer_the_repair(started, project, fake_gh,
+                                                    reviewing):
+    """The boundary of that guard, written down rather than left to the constant.
+    `rejected` means the panel is waiting for the SUBMITTER, not deliberating — the
+    worker is the one who acts next, and a red build it is about to push over is
+    exactly what it needs told. That window belongs to the turn-in-flight and
+    nudge-queued guards above, which is why `RUNNABLE_VALIDATION_OUTCOMES` and not the
+    wider `OPEN_VALIDATION_OUTCOMES` is the set this keys off."""
+    red(fake_gh)
+    store = ProjectStore(project)
+    rnd = store.open_validation_round(wo_id=reviewing["id"], fingerprint="abc")
+    store.close_validation_round(rnd["id"], "rejected", reason="needs a test")
+
+    poll(started, store)
+
+    assert not store.validation_round_open(reviewing["id"])
+    assert store.queued_messages(reviewing["id"])
+
+
 def test_a_second_poll_does_not_nudge_twice(started, project, fake_gh, reviewing):
     red(fake_gh)
     store = ProjectStore(project)

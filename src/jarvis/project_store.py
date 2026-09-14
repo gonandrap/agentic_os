@@ -2459,6 +2459,35 @@ class ProjectStore:
         ).fetchall()
         return db.rows_to_dicts(rows)
 
+    def validation_round_open(self, wo_id: str) -> bool:
+        """Is the round machine going to act on this work order?
+
+        `work_orders_awaiting_validation` asked about ONE work order, off the same
+        `RUNNABLE_VALIDATION_OUTCOMES` and the same latest-round rule, because the two
+        must answer alike: this is the question "does something else own this worker's
+        session right now", and the round machine is the thing that would be lying to.
+        The status bound is left to the caller, which has its own (`Daemon.heal_pull_request`
+        only ever asks about a work order the pull-request poll selected).
+
+        `rejected` is deliberately NOT runnable here, which means this says False while
+        the panel waits for the submitter to come back. That window belongs to
+        `heal_pull_request`'s other guards — a turn in flight, or a nudge already
+        queued — and a red build the worker is about to push over is worth telling it
+        about. See §4.1 of
+        docs/superpowers/specs/2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md.
+        """
+        marks = ",".join("?" * len(RUNNABLE_VALIDATION_OUTCOMES))
+        row = self.conn.execute(
+            f"""SELECT 1 FROM validation_rounds r
+                 WHERE r.wo_id = ?
+                   AND r.outcome IN ({marks})
+                   AND r.round = (SELECT MAX(round) FROM validation_rounds
+                                   WHERE wo_id = r.wo_id)
+                 LIMIT 1""",
+            (wo_id, *RUNNABLE_VALIDATION_OUTCOMES),
+        ).fetchone()
+        return row is not None
+
     def latest_validation_round(self, *, wo_id: str | None = None,
                                 fo_id: str | None = None) -> dict[str, Any] | None:
         """The most recent round on one subject, or None if it has never been judged."""
