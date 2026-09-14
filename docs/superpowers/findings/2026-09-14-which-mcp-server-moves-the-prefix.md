@@ -257,29 +257,51 @@ of tens of thousands, 3,469 tokens is still noise.
 **Root cause.** The mental model came from the API, where a tool definition is its full
 schema. Claude Code defers them precisely to keep the prefix small — and having done so,
 the residual cost is not what the servers weigh but **where they sit**: a name list at
-position 0 that can change at any moment. Twenty-three servers is twenty-three things
-that can move the first token of the prompt, and the price of each move is the whole
+position 0 that can change at any moment, and the price of each move is the whole
 conversation behind it.
+
+**So how many movers are there, and how many can `--strict-mcp-config` remove? Not the
+same number.** Both come off the table above, which has 23 rows:
+
+| | count | prefix-miss boundaries it moved at | tokens |
+|---|---:|---:|---:|
+| MCP servers | 22 | — | — |
+| `(builtin-deferred)` | 1 | 70 of 164 | 1,464,767 |
+| **things that can move token 0** | **23** | | |
+| **removable by `--strict-mcp-config` (Serena kept)** | **21** | | |
+
+**`(builtin-deferred)` is a mover, and it is not removable.** It is Claude Code's own
+deferred tools — `CronCreate`, `WebFetch`, `TaskOutput` — advertised through the same
+`deferred_tools_delta` rows, and it churns: 83 disconnect/reconnect cycles, 2,416 delta
+events at a 14.8% big-write rate, and a presence at **70 of the 164** prefix-miss
+boundaries. `--strict-mcp-config` governs MCP servers and does not touch it. So the
+honest form of the churn argument is **21 fewer movers out of 23, not 22**, and the two
+that remain are the two with the largest measured churn of all.
 
 **Follow-up actions.**
 
 1. **Re-file `--strict-mcp-config --mcp-config` on the churn argument, not the size one.**
    `kn-f94abf34` (3) justifies it with "every server contributes schemas"; that premise is
-   wrong and the proposal survives it anyway — 22 fewer things that can move.
+   wrong and the proposal survives it anyway — **21 fewer movers out of 23**, per the
+   table above.
    · Pro: the proposal is already written and its cost is now honestly stated; Gmail,
    Google Calendar, Crypto.com, PubMed, Mermaid Chart and WordPress move as one 49-event
    block that precedes a big write **83.7%** of the time — the worst rate of any cohort
    measured — and `kn-f94abf34` (3)'s census recorded **zero** calls to any of them in
    13,061 tool calls.
-   · Con: **it does not remove the top mover.** Serena is the sole mover in all 28 clean
-   attributions, and a Serena-only fleet keeps every one of them. This buys the tail, not
+   · Con: **it removes neither mover that matters.** Serena is the sole mover in all 28
+   clean attributions and a Serena-only fleet keeps every one of them; `(builtin-deferred)`
+   moved at 70 of the 164 boundaries and is not removable at all. This buys the tail, not
    the head — and it is a fleet capability decision, which this order is told to leave
    to the user and to the sibling `/config` order.
 2. *(done, not deferred — `kn-506436c6`)* **Amend `kn-f94abf34` (3) rather than retract
    it.** The back-pointer is landed: a short entry whose headline names the superseded
-   clause and points at `kn-1cd2b85a`. `jarvis learn search "strict-mcp-config"` now
-   returns it **above** `kn-f94abf34`, so the sibling `/config` order reaches the
-   correction before the stale premise.
+   clause and points at `kn-809104fc`, the measurement entry. `jarvis learn search
+   "strict-mcp-config"` returns those two **first and second** and `kn-f94abf34` last, so
+   the sibling `/config` order reaches the correction before the stale premise. The index
+   shows headlines only, which is the whole mechanism: an entry whose headline points at
+   the clause it corrects sends the reader the wrong way, and one earlier draft of
+   `kn-809104fc` did exactly that.
    · Pro: the entry is read by every worker that searches this area, and its arithmetic
    premise is measurably false, so leaving it unmarked was the live risk.
    · Con: clauses (0), (1), (2), (4) and (5) of that entry are correct and load-bearing —

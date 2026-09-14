@@ -172,11 +172,19 @@ though the evidence sits in every transcript and `jarvis cost` already parses th
    · Pro: removes both the mid-turn tool-set change and the schemas every prompt carries.
    · Con: narrows what every worker can reach — a fleet capability decision, not a free
    arithmetic win.
-   · **Answered by `2026-09-14-which-mcp-server-moves-the-prefix.md` (wo-8778138e).** The
-   server is Serena, the schemas are not in the prefix at all, and the 61% left
-   unexplained above is mostly this document's boundary definition rather than a second
-   cause — 90.0% of the tax is attributable once only conversation-sized writes are
-   counted. `--strict-mcp-config` does not remove the top mover.
+   · **Answered by `2026-09-14-which-mcp-server-moves-the-prefix.md` (wo-8778138e).**
+   Serena is the only server that could be **isolated** as a cause — 28 boundaries where
+   it moved alone — and **no other server was cleared**. The test cannot clear one: a
+   server that only ever moves inside a block scores zero by construction, and the
+   claude.ai block of six (Gmail, Calendar, Crypto.com, PubMed, Mermaid Chart, WordPress)
+   does exactly that. It is the **worst cohort measured — 83.7%** of its events precede a
+   conversation-sized write — and is **not separable in this corpus**. Also: the schemas
+   are not in the prefix at all (they are deferred; the prefix carries names), so the size
+   argument for this action is void and only the churn argument survives — and
+   `--strict-mcp-config` does not remove the top mover. Finally, the 61% left unexplained
+   above is mostly this document's own boundary definition rather than a second cause:
+   90.0% of the tax is attributable once only conversation-sized writes are counted, with
+   10.0% still genuinely unexplained.
 
 ---
 
