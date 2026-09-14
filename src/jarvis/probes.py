@@ -25,11 +25,11 @@ SUBJECTS = ("work_order", "feature_order")
 #: spelled one way only.
 ID_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
-#: `inspection`'s three alarm kinds, which a probe id may NOT take: the two would read
-#: as one thing on `/alarms`, in `jarvis alarms` and in `alarms_across`. Duplicated as
-#: literals rather than imported — `inspection` imports `catalog`, which imports this
-#: module, so the import would be a cycle. `tests/test_probes.py` pins the two equal.
-RESERVED_IDS = ("long-turn", "long-join", "big-rewrite")
+#: `inspection`'s alarm kinds, which a probe id may NOT take: the two would read as one
+#: thing on `/alarms`, in `jarvis alarms` and in `alarms_across`. Duplicated as literals
+#: rather than imported — `inspection` imports `catalog`, which imports this module, so
+#: the import would be a cycle. `tests/test_probes.py` pins the two equal.
+RESERVED_IDS = ("long-turn", "stalled-turn", "long-join", "big-rewrite")
 
 
 @dataclass(frozen=True)
@@ -79,15 +79,16 @@ DEFAULT_PROBES: tuple[HealthProbe, ...] = (
         prompt=(
             "The same tool, file, test or error recurs across turns without the state "
             "changing. Look for the same test failing in consecutive turns, the same "
-            "file edited and re-edited, the same command re-run, the same error text "
-            "quoted in a later turn as in an earlier one. Effort is being re-spent "
-            "rather than advancing.\n"
+            "file edited and re-edited, the same command re-run, the same error quoted "
+            "twice. Effort is being re-spent rather than advancing.\n"
             "What innocently looks like this: an edit-run-fix loop that is converging, "
             "where the error changes each time or the work visibly grows, and a "
-            "refactor that touches one file repeatedly for good reason. Repetition is "
-            "only a symptom when nothing about it moves.\n"
+            "refactor legitimately touching one file repeatedly. Repetition is only a "
+            "symptom when nothing about it moves.\n"
+            "A turn that made NO API call is not this symptom: the work never started "
+            "rather than ran twice. The OS raises that one itself.\n"
             "Report what recurred and across which turns. If you cannot tell whether it "
-            "was converging, say so rather than asserting that it was not."
+            "was converging, say so rather than assert it was not."
         ),
         subjects=("work_order",),
     ),

@@ -370,7 +370,7 @@ prompt produces a detector that fires on everything.
 | id | subjects | the symptom, in substance |
 |---|---|---|
 | `no-progress` | both | Nothing has changed on the record for a long time: no new turn, no message, no event. The instrument is nominally open and is not moving. |
-| `going-in-circles` | work_order | The same tool, file, test or error recurs across turns without the state changing. Effort is being re-spent rather than advancing. |
+| `going-in-circles` | work_order | The same tool, file, test or error recurs across turns without the state changing. Effort is being re-spent rather than advancing. NOT a turn that made no API call: the work never started, and `inspection`'s `stalled-turn` alarm owns that (issue 227). |
 | `waiting-on-nobody` | both | Blocked on something nobody is going to resolve: a queued message nothing consumes, a decision already made, a dependency that can never clear. |
 | `failing-children` | feature_order | Children failing, being superseded or re-filed repeatedly. The feature is not converging. |
 | `brief-mismatch` | both | What the instrument is doing has drifted from what it was asked to do. |

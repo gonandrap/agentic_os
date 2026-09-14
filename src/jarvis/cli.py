@@ -1338,9 +1338,22 @@ def _mins(seconds: float) -> str:
 
 #: What each bucket of the partition is called on the page. `idle` says what it is
 #: rather than naming itself: "idle" alone reads as a judgement about the worker, and
-#: what happened is that no process existed to be busy.
+#: what happened is that no process existed to be busy. KEYED BY `inspection.PARTS` and
+#: pinned equal to it by a test: a bucket missing from here renders as nothing at all and
+#: the percentages stop summing to 100, which is worse than the bug it would hide.
 PART_LABELS = {"generating": "generating", "blocked": "blocked on a subagent",
-               "tools": "running tools", "idle": "between turns, nothing running"}
+               "tools": "running tools", "idle": "between turns, nothing running",
+               "unaccounted": "unaccounted — no API call was ever made"}
+
+#: The same buckets on the per-TURN line, where a full label does not fit. Same keys,
+#: same order, same pin.
+PART_SHORT = {"generating": "gen", "blocked": "blocked", "tools": "tools",
+              "idle": "idle", "unaccounted": "unacc"}
+
+#: What a turn with no API call says, ahead of any duration breakdown. A fixed width so
+#: the split below it stays a column, and stated rather than left to be inferred from
+#: `0 calls`: the inference is what four layers got wrong (issue 227).
+NO_CALL_FLAG = "NO API CALL"
 
 
 def _print_partition(unit: dict[str, Any]) -> None:
@@ -1380,9 +1393,10 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
     for turn in unit["turns"]:
         reasons = ", ".join(t["kind"] for t in turn["triggers"]) or "no prompt recorded"
         s = turn["share"]
+        split = "  ".join(f"{PART_SHORT[k]} {s[k] * 100:>3.0f}%" for k in PART_SHORT)
+        flag = "" if turn["observed"] else NO_CALL_FLAG
         print(f"  turn {turn['seq']:>2}  {_mins(turn['wall']):>7}  "
-              f"gen {s['generating'] * 100:>3.0f}%  blocked {s['blocked'] * 100:>3.0f}%  "
-              f"tools {s['tools'] * 100:>3.0f}%  idle {s['idle'] * 100:>3.0f}%  "
+              f"{flag:<{len(NO_CALL_FLAG)}}  {split}  "
               f"{turn['api_calls']:>3} calls  peak {_tok(turn['context_peak']):>5}  "
               f"{reasons}")
         for trigger in turn["triggers"]:

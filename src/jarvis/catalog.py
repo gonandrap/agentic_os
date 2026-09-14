@@ -288,6 +288,17 @@ DEFAULT_INSPECT_QUOTE_CHARS = 140
 #: expensive.
 DEFAULT_INSPECT_ALARM_TURN_MINUTES = 60
 
+#: A turn that has been open this long WITHOUT MAKING A SINGLE API CALL. Not a spend
+#: threshold at all — its finding is that nothing was spent, and it is the detector issue
+#: 227 asked for after a 65-minute dead turn was reported as 65 minutes of generation.
+#: MEASURED over the 4,543 worker turns on this machine: the p99 time from a turn opening
+#: to its first API call is 61 seconds and exactly ONE turn in 3,811 took longer than ten
+#: minutes, so fifteen is far outside a slow start; it fires on 12 turns, 0.26%. Below
+#: `DEFAULT_INSPECT_ALARM_TURN_MINUTES` on purpose — a stall must be named a stall before
+#: the long-turn alarm's hour is up, or the first thing the user hears about it is a claim
+#: about money.
+DEFAULT_INSPECT_ALARM_STALLED_MINUTES = 15
+
 #: A blocking join still open after this long. THE ONLY THRESHOLD HERE THAT IS PRINCIPLED
 #: RATHER THAN EMPIRICAL: it is the 5-minute cache TTL itself, past which the prefix is
 #: certainly cold and the wait will be paid for a second time as a re-write. Fires on 2%.
@@ -330,6 +341,7 @@ class InspectConfig:
     report_join_floor: int = DEFAULT_INSPECT_REPORT_JOIN_FLOOR
     quote_chars: int = DEFAULT_INSPECT_QUOTE_CHARS
     alarm_turn_minutes: int = DEFAULT_INSPECT_ALARM_TURN_MINUTES
+    alarm_stalled_minutes: int = DEFAULT_INSPECT_ALARM_STALLED_MINUTES
     alarm_join_seconds: int = DEFAULT_INSPECT_ALARM_JOIN_SECONDS
     alarm_write_tokens: int = DEFAULT_INSPECT_ALARM_WRITE_TOKENS
     alarm_parked_minutes: int = DEFAULT_INSPECT_ALARM_PARKED_MINUTES
@@ -785,6 +797,8 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
         quote_chars=int(raw.get("quote_chars", base.quote_chars)),
         alarm_turn_minutes=int(raw.get("alarm_turn_minutes",
                                        base.alarm_turn_minutes)),
+        alarm_stalled_minutes=int(raw.get("alarm_stalled_minutes",
+                                          base.alarm_stalled_minutes)),
         alarm_join_seconds=int(raw.get("alarm_join_seconds",
                                        base.alarm_join_seconds)),
         alarm_write_tokens=int(raw.get("alarm_write_tokens",
