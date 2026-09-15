@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import gates
+from jarvis import gate_rules, gates
 from jarvis.bootstrap import _gates_section
 from jarvis.catalog import ProjectSpec
 from jarvis.dispatch import _gate_briefing
@@ -1673,10 +1673,11 @@ FILED_VIA_FILE = (
     'PY'
 )
 
-#: Gate 123 on wo-b304c02a, 2026-09-13, trimmed to its shape: quoted heredoc delimiters,
-#: markdown backticks in the prose (which cost the whole command its quote-blanking), and
-#: the filing itself as an argv list inside a `python -` heredoc. Neo approved it on the
-#: merits of the merge, which is why nobody noticed the classifier had held the FILING.
+#: Gate 123 on wo-b304c02a, 2026-09-13, VERBATIM to its last line: quoted heredoc
+#: delimiters, markdown backticks in the prose (which cost the whole command its
+#: quote-blanking), the filing itself as an argv list inside a `python -` heredoc — and
+#: the two negative slices that print the tail of the output. An earlier version of this
+#: fixture stopped at `print(r.returncode)`, so it passed while the real command gated.
 GATE_123 = (
     "cat > /tmp/gate_why.txt <<'EOF'\n"
     'THE USER AUTHORIZED THIS MERGE IN THEIR OWN WORDS, this turn: "resolve the '
@@ -1695,6 +1696,8 @@ GATE_123 = (
     '                    "--why", why, "--evidence", ev],\n'
     "                   capture_output=True, text=True)\n"
     "print(r.returncode)\n"
+    "print(r.stdout[-2500:])\n"
+    "print(r.stderr[-2000:])\n"
     "PY"
 )
 
@@ -1713,6 +1716,80 @@ def test_the_production_filing_shape_is_not_gated(gated):
     """Gate 123 itself. It held the command that was making the case for gate 124."""
     assert gates.classify(GATE_123, ALL_GATES) is None
     assert _decision(gated.attempt(GATE_123)) != "deny"
+
+
+def test_a_negative_slice_in_a_filing_script_is_not_a_privileged_action(gated):
+    """The node that re-gated gate 123: `r.stdout[-2500:]`.
+
+    `python_files_only_paperwork` fails closed on any node outside its grammar, so one
+    unary minus in a `print` refused the whole filing — `classify` gated, the match was
+    not even exemptible, and the record accused the worker of going round the gate."""
+    command = (
+        "python - <<'PY'\n"
+        "import subprocess\n"
+        'r = subprocess.run(["jarvis", "gate", "request", "wo-x",\n'
+        '                    "gh pr merge 223 --squash"],\n'
+        "                   capture_output=True, text=True)\n"
+        "print(r.stdout[-2500:])\n"
+        "PY"
+    )
+
+    assert gates.classify(command, ALL_GATES) is None
+    assert _decision(gated.attempt(command)) != "deny"
+
+
+@pytest.mark.parametrize("expr", [
+    "print(-1)",                      # not a slice at all: the operator, anywhere
+    "print(r.stdout.split()[-1])",    # a negative INDEX, the other everyday form
+])
+def test_a_unary_minus_anywhere_in_a_filing_script_is_inert(expr):
+    """`USub` computes a value and cannot reach the world; position is not the argument.
+
+    Scoping the carve-out to slices would refuse `[-1]`, which is the same operator doing
+    the same nothing one node higher."""
+    program = ('import subprocess\n'
+               'r = subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223"])\n'
+               + expr)
+
+    assert gate_rules.python_files_only_paperwork(program), expr
+
+
+@pytest.mark.parametrize("expr", [
+    "print(not r.returncode)",        # `Not`
+    "print(~r.returncode)",           # `Invert`
+    "print(+r.returncode)",           # `UAdd`
+])
+def test_the_other_unary_operators_are_still_refused(expr):
+    """The grammar stayed closed around the one operator the shape needed.
+
+    Each of these is a separate argument nobody has made; a filing that wants one files a
+    bug, it does not get it by association with `-2500`."""
+    program = ('import subprocess\n'
+               'r = subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223"])\n'
+               + expr)
+
+    assert not gate_rules.python_files_only_paperwork(program), expr
+
+
+def test_a_unary_minus_does_not_launder_a_module_reference():
+    """kn-47004b56's rule, applied to the new node before it ships: a container that
+    scores inert must not be a way to HOLD a callable the checker refuses."""
+    for program in ('import os\nimport subprocess\n'
+                    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223"])\n'
+                    'f = [-1, os.system][1]\n'
+                    'f("gh pr merge 223 --squash")',
+                    'import os\nimport subprocess\n'
+                    'subprocess.run(["jarvis","gate","request","wo-x","gh pr merge 223"])\n'
+                    'print(-os.getpid())'):
+        assert not gate_rules.python_files_only_paperwork(program), program
+
+
+def test_the_record_stops_accusing_a_worker_who_filed(gated):
+    """The append-only half of the defect. Gate 123's justification said the worker "ran
+    the command directly rather than filing a request"; the blocked command WAS a filing.
+    """
+    assert gates.no_case_justification(GATE_123).startswith(
+        "(none recorded. This command FILES a gate request")
 
 
 def test_a_heredoc_body_belongs_to_the_command_that_owns_it():
