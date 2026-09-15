@@ -268,9 +268,17 @@ def _merge_args(pr_url: str, sha: str) -> list[str]:
     so GitHub refuses at the server if the head moved after this tick looked. The
     comparison in `decide` exists so the OS can SAY why it is holding; this is what makes
     it true (spec §5.3).
+
+    **NO `--delete-branch`, and spec §10.1's answer is REVERSED** (issue #253). That flag
+    deletes the remote branch AND then the local one — the spec proposed it believing it
+    did the first only — and the local delete fails whenever a worktree still has the
+    branch checked out, which on this path is every time: nothing removes a worker's
+    worktree, and the work order completes only after the merge. So it turned every OS
+    merge into a command that half-failed. Deleting a developer's local branches was
+    never this mechanism's business; the remote half belongs to the repository's own
+    `delete_branch_on_merge` setting, which is one click and the owner's to make.
     """
-    return ["pr", "merge", pr_url, "--squash", "--delete-branch",
-            "--match-head-commit", sha]
+    return ["pr", "merge", pr_url, "--squash", "--match-head-commit", sha]
 
 
 # -- proposing -------------------------------------------------------------------------
@@ -301,8 +309,9 @@ def _request_question(project: str, wo: dict[str, Any], decision: Decision,
         f"CI on that commit: {', '.join(checks) or 'no checks reported'}.\n"
         f"Read the deliberation with: jarvis validation show {wo['id']}",
         "# What it cannot undo\n"
-        "The squash lands on the default branch and the remote branch is deleted. The "
-        "work order completes. Nothing here weakens branch protection: the five required "
+        "The squash lands on the default branch. No branch is deleted, here or on the "
+        "remote. The work order completes. Nothing here weakens branch protection: the "
+        "five required "
         "checks still apply and GitHub refuses the merge on its own if they do not pass.",
         "Approve it to let the OS merge, or deny it with a reason. Denying leaves the "
         "pull request open and with the user, which is today's behaviour and the safe "
@@ -499,11 +508,13 @@ def apply(store: Any, wo: dict[str, Any], sha: str,
                               timeout=MERGE_TIMEOUT,
                               cwd=str(cwd) if cwd is not None else None)
     except FileNotFoundError as e:
+        # NOT `_outcome`: `gh` was never on this machine, so nothing reached GitHub and
+        # there is no pull-request state that could have changed. The one failure whose
+        # outcome is knowable without asking.
         raise MergeFailed(github.GitHubError.NO_GH) from e
     except subprocess.SubprocessError as e:
-        raise MergeFailed(f"the merge command did not complete: {e}") from e
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+        failure = f"the merge command did not complete: {e}"
+    else:
         # THE REMOTE'S OWN TEXT, TRUNCATED, AND THAT IS DELIBERATE — the opposite of
         # `github.GitHubError.reason`, which substitutes a fixed vocabulary because its
         # string is interpolated into five seat prompts and a judge's prompt is no place
@@ -512,9 +523,59 @@ def apply(store: Any, wo: dict[str, Any], sha: str,
         # with read credentials and no write scope, and "HTTP 403: Resource not
         # accessible" is the whole diagnosis — a fixed phrase would send the reader back
         # to the log for the only fact that matters. Full detail is logged either way.
-        log.info("auto-merge of %s failed: %s", url, detail)
-        raise MergeFailed(f"GitHub refused the merge: {detail[:300]}")
-    log.info("auto-merge landed %s at %s under approval %s", url, sha[:10],
-             approval["id"])
+        failure = ("" if proc.returncode == 0 else
+                   (proc.stderr or proc.stdout or "").strip()
+                   or f"exit {proc.returncode}")
+    cleanup = ""
+    if failure:
+        log.info("the merge command for %s did not succeed: %s", url, failure)
+        cleanup = _outcome(url, cwd, failure)
+    log.info("auto-merge landed %s at %s under approval %s%s", url, sha[:10],
+             approval["id"], " — the cleanup after it failed" if cleanup else "")
     return {"wo_id": wo_id, "pr_url": url, "head_sha": sha,
-            "approval_id": approval["id"], "use": spent["uses"]}
+            "approval_id": approval["id"], "use": spent["uses"],
+            # "" on the ordinary path. Non-empty means the pull request MERGED and
+            # something AFTER the merge failed — `_outcome`.
+            "cleanup_error": cleanup}
+
+
+def _outcome(url: str, cwd: Any, failure: str) -> str:
+    """The merge command did not succeed. Did the PULL REQUEST merge? Returns, or raises.
+
+    THE EXIT CODE IS NOT THE OUTCOME (issue #253). The command merges REMOTELY and then
+    tidies up locally, so one process reports two acts through one status, and the local
+    half can fail over something the remote never saw. Both live merges of 0.10.0 landed
+    on `main` and then exited non-zero because `--delete-branch` could not delete a local
+    branch a worker's worktree still had checked out. The OS said "GitHub refused the
+    merge" about a merge GitHub had accepted, wrote `automerge_failed` and an inbox row
+    for it, and spent the one attempt `GRANT_USES` allows on an operation that had
+    succeeded. Both work orders were rescued only by the separate pull-request poll,
+    which made this mechanism correct by accident.
+
+    So the merge is judged by the only authority on it — GitHub's own `state`, read
+    through the module that owns reading it. Three answers, and the middle one is the
+    point:
+
+    * MERGED — it landed. The failure text comes back as a CLEANUP note for the
+      timeline. Not a `MergeFailed`: no `automerge_failed` event, no inbox row, and the
+      work order completes. Nothing about a local tidy-up needs a person.
+    * anything else — GitHub really did refuse, which is the 403-shaped case `apply`'s
+      comment above is written for.
+    * unreadable — two `gh` calls failed and the OS does not know what happened, so it
+      says that rather than choose. Claiming a merge that did not happen would complete
+      a work order whose pull request is still open, which is the worse of the two
+      errors, and the pull-request poll settles the case either way within a tick.
+    """
+    from . import github
+
+    try:
+        pr = github.pr_view(url, cwd=cwd)
+    except github.GitHubError as e:
+        raise MergeFailed(
+            f"the merge command failed and the pull request could then not be read, so "
+            f"whether it landed is unknown — check it: {failure[:200]} ({e})") from e
+    if not pr.merged:
+        raise MergeFailed(f"GitHub refused the merge: {failure[:300]}")
+    log.info("the merge of %s landed; only the cleanup after it failed: %s", url,
+             failure)
+    return failure[:300]

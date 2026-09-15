@@ -859,6 +859,27 @@ fail = os.environ.get("FAKE_GH_FAIL")
 if fail:
     sys.stderr.write(fail + "\n")
     sys.exit(1)
+
+# The roster the fixture registered, with anything a MERGE in this test has since done
+# to it laid over the top. A merge really does change what `pr view` answers, and until
+# issue #253 this fake could not say so: every state it held came from an env var the
+# test set, so a merge was invisible to the very read that judges whether it landed.
+merged_path = os.path.join(state_dir, "merged.json")
+
+
+def roster():
+    prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
+    try:
+        with open(merged_path) as f:
+            landed = json.load(f)
+    except (OSError, ValueError):
+        landed = {}
+    for u, patch in landed.items():
+        if u in prs:
+            prs[u] = {**prs[u], **patch}
+    return prs
+
+
 if argv[:2] == ["issue", "create"]:
     print(os.environ["FAKE_GH_ISSUE_URL"])
 elif argv[:2] == ["pr", "view"]:
@@ -870,7 +891,7 @@ elif argv[:2] == ["pr", "view"]:
     # a test prove the poll loop and the evidence collector ask for different things:
     # a fake that answered with everything it held would pass a collector that never
     # requested `body` at all.
-    prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
+    prs = roster()
     pr = prs.get(argv[2] if len(argv) > 2 else "")
     if pr is None:
         sys.stderr.write("no pull requests found for this URL\n")
@@ -878,7 +899,7 @@ elif argv[:2] == ["pr", "view"]:
     fields = argv[argv.index("--json") + 1].split(",") if "--json" in argv else []
     print(json.dumps({k: v for k, v in pr.items() if not fields or k in fields}))
 elif argv[:2] == ["pr", "diff"]:
-    prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
+    prs = roster()
     pr = prs.get(argv[2] if len(argv) > 2 else "")
     if pr is None:
         sys.stderr.write("no pull requests found for this URL\n")
@@ -898,7 +919,7 @@ elif argv[:2] == ["pr", "merge"]:
     if merge_fail:
         sys.stderr.write(merge_fail + "\n")
         sys.exit(1)
-    prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
+    prs = roster()
     url = argv[2] if len(argv) > 2 else ""
     pr = prs.get(url)
     if pr is None:
@@ -913,6 +934,23 @@ elif argv[:2] == ["pr", "merge"]:
         sys.exit(1)
     if pr.get("state") != "OPEN":
         sys.stderr.write(f"pull request is {pr.get('state')}\n")
+        sys.exit(1)
+    # MERGED FIRST, AND THEN WHATEVER FOLLOWS IT MAY FAIL. That ordering is the whole
+    # of issue #253: the real CLI merges remotely and then tidies up locally, and one
+    # exit status reports both. Recording the merge before the cleanup can fail is what
+    # lets a test say "GitHub accepted it AND gh exited non-zero".
+    try:
+        with open(merged_path) as f:
+            landed = json.load(f)
+    except (OSError, ValueError):
+        landed = {}
+    landed[url] = {"state": "MERGED", "mergedAt": "2026-09-15T10:00:00Z",
+                   "mergeable": None}
+    with open(merged_path, "w") as f:
+        json.dump(landed, f)
+    cleanup_fail = os.environ.get("FAKE_GH_FAIL_MERGE_CLEANUP")
+    if cleanup_fail:
+        sys.stderr.write(cleanup_fail + "\n")
         sys.exit(1)
     print(f"Merged pull request {url}")
 else:
@@ -1134,6 +1172,17 @@ def fake_gh(tmp_path, monkeypatch):
             """
             monkeypatch.setenv("FAKE_GH_FAIL_MERGE", message)
 
+        def fail_merge_cleanup(self, message: str) -> None:
+            """Land the merge, then fail — THE SEAM OF ISSUE #253.
+
+            Distinct from `fail_merge`, and the difference is the entire bug: there,
+            nothing merged; here, GitHub accepted the merge and the command still exits
+            non-zero, because the local tidy-up after it failed. Both live merges of
+            0.10.0 came out this way and were reported to the user as refused by GitHub.
+            A test that only drives `fail_merge` cannot see it.
+            """
+            monkeypatch.setenv("FAKE_GH_FAIL_MERGE_CLEANUP", message)
+
         def set_pr(self, pr_url: str, state: str, merged_at: str | None = None,
                    mergeable: str | None = None, base_ref: str = "main",
                    checks: list[dict] | None = None,
@@ -1174,6 +1223,14 @@ def fake_gh(tmp_path, monkeypatch):
                 row["headRefOid"] = head_oid
             self.prs[pr_url] = row
             monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
+            # "Re-calling re-states it" includes un-doing a merge the fake performed:
+            # this is the authoritative statement of what the pull request is now, so
+            # it outranks the overlay rather than being silently overridden by it.
+            landed = gdir / "merged.json"
+            if landed.exists():
+                held = json.loads(landed.read_text())
+                if held.pop(pr_url, None) is not None:
+                    landed.write_text(json.dumps(held))
 
         def set_pr_artifact(self, pr_url: str, *, diff: str = "", title: str = "",
                     body: str = "", files: list[dict] | None = None,

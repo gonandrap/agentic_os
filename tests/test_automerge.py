@@ -277,7 +277,20 @@ def test_the_merge_is_pinned_to_the_judged_commit():
     SAY why it is holding; this is what makes it true."""
     command = automerge.merge_command(PR, JUDGED)
     assert f"--match-head-commit {JUDGED}" in command
-    assert "--squash" in command and "--delete-branch" in command
+    assert "--squash" in command
+
+
+def test_the_merge_deletes_no_branch_anywhere():
+    """ISSUE #253's CAUSE, refused at source, and spec §10.1's answer reversed.
+
+    `--delete-branch` deletes the remote branch and then the LOCAL one, and the local
+    delete fails whenever a worktree still has that branch checked out — which on this
+    path is always, since nothing removes a worker's worktree and the work order
+    completes only after the merge. So the flag made every OS merge a command that
+    half-failed. Deleting a developer's local branches was never this mechanism's
+    business, and the remote half belongs to the repository's own setting.
+    """
+    assert "--delete-branch" not in automerge.merge_command(PR, JUDGED)
 
 
 # -- the gate: a kind nothing classifies into, sharing no authority with `pr_merge` ----
@@ -429,6 +442,51 @@ def test_github_refuses_the_merge_when_the_head_moved_under_it(granted, fake_gh)
                    head_oid=PUSHED)
 
     with pytest.raises(automerge.AutoMergeRefused, match="refused the merge"):
+        automerge.apply(store, wo, JUDGED, approval)
+
+
+def test_a_merge_that_landed_is_not_a_failure_however_gh_exited(granted, fake_gh):
+    """**ISSUE #253, AT THE SEAM THAT BROKE.** `gh` exits non-zero AND the merge landed —
+    that exact combination, which no test drove before and both live merges of 0.10.0
+    produced. The command merges remotely and then tidies up locally; one exit status
+    reports two acts, and the local half failed on a branch a worktree still held.
+
+    The outcome is the PULL REQUEST's, not the exit code's. `apply` returns rather than
+    raising, and the failure text comes back as a cleanup note for the timeline.
+    """
+    store, wo, approval = granted
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    fake_gh.fail_merge_cleanup(
+        "failed to delete local branch worktree-wo-1: cannot delete branch "
+        "'worktree-wo-1' used by worktree at '/repo/.claude/worktrees/wo-1'")
+
+    merged = automerge.apply(store, wo, JUDGED, approval)
+
+    assert merged["head_sha"] == JUDGED
+    assert "cannot delete branch" in merged["cleanup_error"]
+
+
+def test_a_merge_github_really_refused_is_still_a_failure(granted, fake_gh):
+    """The other direction of the same read, and the reason it is a read rather than a
+    shrug: the likeliest real failure is a `gh` with no write scope. The pull request is
+    still OPEN afterwards, so this must raise exactly as it always did."""
+    store, wo, approval = granted
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    fake_gh.fail_merge("HTTP 403: Resource not accessible by integration")
+
+    with pytest.raises(automerge.MergeFailed, match="403"):
+        automerge.apply(store, wo, JUDGED, approval)
+
+
+def test_an_outcome_the_os_cannot_read_is_never_guessed_as_merged(granted, fake_gh):
+    """`gh` failed twice and nothing knows what happened. Claiming the merge landed would
+    complete a work order whose pull request is still open, which is the worse of the two
+    errors — so it says the outcome is unknown, in those words, and the pull-request poll
+    settles it either way within a tick."""
+    store, wo, approval = granted
+    fake_gh.fail_merge("HTTP 502: upstream timed out")   # ...and `pr view` finds no PR
+
+    with pytest.raises(automerge.MergeFailed, match="unknown"):
         automerge.apply(store, wo, JUDGED, approval)
 
 
@@ -782,6 +840,48 @@ def test_an_approved_merge_is_attempted_once_and_the_failure_is_told_once(
         central.close()
     assert len(told) == 1
     assert "403" in told[0]["body"] and "grant" not in told[0]["body"]
+
+
+def test_a_landed_merge_is_never_reported_as_failed(started, project, fake_gh):
+    """**ISSUE #253 THROUGH THE WHOLE LOOP.** GitHub accepted the merge and `gh` exited
+    non-zero over the local tidy-up after it. Before this, the OS told the user "GitHub
+    refused the merge: failed to delete local branch …" — false twice over — wrote
+    `automerge_failed` and an inbox row about a merge that had landed, and spent the one
+    attempt `GRANT_USES` allows on an operation that had succeeded. The work orders were
+    rescued only by the separate pull-request poll, which made this mechanism correct by
+    accident: remove that poll and the order parks for ever behind a merge that landed.
+
+    The four things the record must now say, and the existing suite asserted none of
+    them because nothing drove this combination.
+    """
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    poll(started, store)
+    gates.apply_decision(store, store.list_approvals(wo["id"])[0]["id"], "approved",
+                         "ok", "neo", project="proj_a")
+    fake_gh.fail_merge_cleanup(
+        "failed to delete local branch worktree-wo-1: failed to run git: error: cannot "
+        "delete branch 'worktree-wo-1' used by worktree at '/repo/.claude/worktrees'")
+
+    poll(started, store)
+
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "completed"
+    assert store.events_of_kind(wo["id"], "automerge_failed") == []
+    assert ops.automerge_state(store, row)["kind"] == "automerge_merged"
+    # The cleanup IS on the record — a warning, and nothing that needs a person.
+    cleanup = store.events_of_kind(wo["id"], "automerge_cleanup_failed")
+    assert len(cleanup) == 1
+    assert "cannot delete branch" in db.from_json(cleanup[0]["payload"], {})["reason"]
+    assert not row["attention_reason"]
+
+    from jarvis.central_store import CentralStore
+    central = CentralStore()
+    try:
+        told = [i for i in central.unacked_inbox() if (i["wo_id"] or "") == wo["id"]]
+    finally:
+        central.close()
+    assert told == [], [i["title"] for i in told]
 
 
 def test_an_approval_does_not_go_on_claiming_a_merge_that_will_never_happen(

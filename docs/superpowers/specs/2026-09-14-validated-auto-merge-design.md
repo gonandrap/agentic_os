@@ -284,7 +284,7 @@ milliseconds between the `view` and the `merge`.
 GitHub closes that window for us:
 
 ```
-gh pr merge <url> --squash --delete-branch --match-head-commit <the judged SHA>
+gh pr merge <url> --squash --match-head-commit <the judged SHA>
 ```
 
 `--match-head-commit SHA` is the API's `sha` parameter: *"Commit SHA that the pull request
@@ -296,6 +296,41 @@ OS can *say* why it is holding; `--match-head-commit` is what makes it true.
 Three independent things must all agree before a single byte lands on `main`: Jarvis's
 stored SHA, GitHub's head at view time, and GitHub's head at merge time. Any disagreement
 merges nothing.
+
+### 5.4 The exit code is not the outcome (issue #253)
+
+Added after the first two live merges, both of which landed on `main` and were reported to
+the user as *"GitHub refused the merge"*.
+
+`gh pr merge` merges **remotely first** and then tidies up locally, so one process performs
+two acts and reports them through one exit status. With `--delete-branch` on (§10.1), the
+local half failed every time — a worker's worktree still had the branch checked out — and
+`apply` mapped the non-zero exit to `MergeFailed`. Four consequences, and only the first is
+cosmetic:
+
+1. the sentence was false twice over: GitHub accepted the merge, and what failed was local
+   housekeeping the remote never saw;
+2. an `automerge_failed` event and an inbox row recorded a failure for a merge that
+   succeeded — the durable record of the OS's most consequential action, wrong;
+3. `GRANT_USES` is 1, so the single authorised attempt was spent by an operation that had
+   in fact succeeded;
+4. both work orders completed only because the *separate* pull-request poll later saw the
+   PR as MERGED. A mechanism that is correct only because a different mechanism cleans up
+   after it is not correct.
+
+**So the merge is judged by GitHub's own `state`.** Any failure that could have reached
+GitHub goes through `automerge._outcome`, which reads the pull request back through
+`github.pr_view`:
+
+| `gh` | the pull request | the OS says |
+|---|---|---|
+| non-zero | MERGED | **merged.** The failure text becomes an `automerge_cleanup_failed` event — a warning on the timeline. No `MergeFailed`, no `automerge_failed`, no inbox row, and the work order completes. |
+| non-zero | OPEN / CLOSED | `MergeFailed`, as before. This is the 403-shaped case: a `gh` with read credentials and no write scope. |
+| non-zero | unreadable | `MergeFailed` saying *the outcome is unknown*, in those words. Claiming a merge that did not happen would complete a work order whose pull request is still open, which is the worse of the two errors; the pull-request poll settles the case either way within a tick. |
+| `gh` missing | — | `MergeFailed`. Nothing reached GitHub, so there is no state to read.
+
+The grant is still spent before the attempt, and on this path that is correct: the
+authorised act *happened*. Nothing needs retrying.
 
 ### 5.4 What happens after a push that invalidates a pass
 
@@ -457,7 +492,9 @@ acting on something nobody asked it to touch.
 * `apply(store, wo, sha)` — refuses unless `usable_grant` yields a live grant, spends it
   through `gates.open_gate` (never by hand — `remedies.apply`'s note), then performs **the
   one write**:
-  `gh pr merge <url> --squash --delete-branch --match-head-commit <sha>`.
+  `gh pr merge <url> --squash --match-head-commit <sha>` — see §10.1, whose answer is
+  reversed — and then judges the outcome by **whether the pull request merged**, never by
+  the exit code (§5.4).
 * `WRITE_VERBS = (("pr", "merge"),)` declared at module top, with an AST test asserting
   this module builds no other `gh` command — the same mechanism `github.READ_ONLY_VERBS`
   uses, applied to the one module that is allowed to write. `bugreport.create_issue` is the
@@ -612,8 +649,17 @@ requires handing the human a permanent override of every check in the repository
 
 ## 10. Open questions for the user
 
-1. **`--delete-branch`?** Proposed on, matching what a hand merge usually does. It deletes
-   the remote branch only; the worker's local worktree is untouched.
+1. ~~**`--delete-branch`?** Proposed on, matching what a hand merge usually does. It deletes
+   the remote branch only; the worker's local worktree is untouched.~~
+   **ANSWERED NO, and the premise was wrong** (issue #253). It deletes the remote branch
+   **and then the local one**, and the local delete fails whenever a worktree still has
+   that branch checked out — which on this path is always: nothing removes a worker's
+   worktree, and the work order completes only after the merge. So the flag made every OS
+   merge a command that half-failed, which is what §5.4 exists to answer. Deleting a
+   developer's local branches was never this mechanism's business; remote-branch hygiene
+   belongs to the repository's own `delete_branch_on_merge` setting, which is one click
+   and the owner's to make. **It is currently OFF on `agentic_os`, so merged branches
+   accumulate on the remote until someone turns it on.**
 2. **Should Neo review every merge?** The design says yes (§8), for the audit trail and the
    escalation path, at a cost of one headless call and ~30s per merged PR. The alternative
    — the panel's pass *is* the authorisation, and the approval row is filed decided —

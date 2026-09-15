@@ -3202,6 +3202,14 @@ class Daemon:
             return
         log.info("[%s] auto-merged %s — completing %s", project.name, wo["pr_url"],
                  wo_id)
+        if merged["cleanup_error"]:
+            # THE MERGE LANDED AND SOMETHING AFTER IT DID NOT (issue #253, `_outcome`).
+            # A note on the timeline and nothing else: not `automerge_failed`, which is
+            # a claim about the pull request, and no inbox row, because local tidy-up is
+            # not the user's problem and the work order completes below either way.
+            store.add_event(wo_id, "automerge_cleanup_failed", {
+                "head_sha": decision.judged_sha, "approval_id": approval["id"],
+                "reason": merged["cleanup_error"], "pr_url": wo.get("pr_url")})
         # No `merged_at`: that column holds GITHUB's `mergedAt`, and this path has not
         # asked GitHub anything since the merge. The `automerge_merged` event's own
         # timestamp is when it landed, and inventing a local clock reading for a remote
