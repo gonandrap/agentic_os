@@ -420,6 +420,9 @@ CREATE TABLE IF NOT EXISTS assumptions (
     ts REAL NOT NULL,
     content TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' -- pending | accepted | rejected
+    -- WHO settled it, why, under which model and configuration, and the Neo question
+    -- that ruled. All in ADDED_COLUMNS, where the reasoning is — this table already
+    -- ships, so a live database gets them only there.
 );
 -- One judging round over one working unit — a work order or a feature order — by the
 -- validation panel. ONE table for both, not two: the two loops record identical facts,
@@ -770,7 +773,43 @@ ADDED_COLUMNS = {
     "wo_messages": {
         "authored_by": "TEXT NOT NULL DEFAULT ''",
     },
+    # WHO DECIDED AN ASSUMPTION, AND ON WHAT BASIS. Until auto-review shipped there was
+    # exactly one answer — the user, through `jarvis wo review` — so a row said only
+    # `accepted` and every surface read that as the user's act. Now the OS can settle one
+    # itself (docs/superpowers/specs/2026-09-15-neo-decides-an-assumption.md §4), and a
+    # record that cannot tell the two apart is a record that credits a machine decision
+    # to a person.
+    #
+    # EMPTY IS "THE USER", not "unknown", and that reads correctly on every row written
+    # before this existed: the user was the only thing that could have written a verdict
+    # into them. `ops.review_work_order` stamps `ASSUMPTION_DECIDER_USER` explicitly all
+    # the same, so the claim is asserted going forward rather than inferred from a
+    # default.
+    "assumptions": {
+        "decided_by": "TEXT NOT NULL DEFAULT ''",        # '' | user | neo
+        "decided_reason": "TEXT NOT NULL DEFAULT ''",    # the reviewer's one line
+        # The MODEL that ruled, and the configuration it ruled under — the two facts that
+        # let a reader judge a machine verdict months later, when both have moved on.
+        # Empty on every user verdict, which is the honest answer: a person is not a
+        # model, and a config version stamped on a human decision would say nothing.
+        "decided_model": "TEXT NOT NULL DEFAULT ''",
+        "decided_config_version": "TEXT",
+        # The Neo question that ruled on this one assumption. One question per assumption
+        # — never a batch verdict over a list (§3) — and the back-link `NeoStore` cannot
+        # hold, since it is OS-wide and knows nothing about a project's tables. Read by
+        # `invariants.check_neo_escalations_are_live` to tell a live escalation from a
+        # moot one.
+        "neo_question_id": "INTEGER",
+    },
 }
+
+#: `assumptions.decided_by` when the person reviewed it. See the migration note above:
+#: `''` means the same thing on a historical row, and this is what says so on a new one.
+ASSUMPTION_DECIDER_USER = "user"
+
+#: `assumptions.decided_by` when the OS did — `autoreview`. The one value that must never
+#: be mistaken for the user's, which is the whole reason the column exists.
+ASSUMPTION_DECIDER_OS = "neo"
 
 #: `wo_messages.authored_by` when the OS could prove the human typed it. The ONLY value
 #: this column ever takes: everything else is unattributed (`''`), because a stamp that
@@ -2391,9 +2430,40 @@ class ProjectStore:
         ).fetchall()
         return [{**a, "n": i} for i, a in enumerate(db.rows_to_dicts(rows), start=1)]
 
-    def review_assumption(self, assumption_id: int, status: str) -> None:
+    def review_assumption(self, assumption_id: int, status: str, *,
+                          decided_by: str = "", reason: str = "", model: str = "",
+                          config_version: str | None = None) -> None:
+        """Settle one assumption, recording WHO settled it and on what basis.
+
+        The attribution is keyword-only and defaults to `''` — "the user", the only
+        decider that existed before auto-review — so no caller is silently re-attributed
+        by this signature growing. `ops` passes it explicitly on both routes.
+        """
         assert status in ("accepted", "rejected"), status
-        self.conn.execute("UPDATE assumptions SET status=? WHERE id=?", (status, assumption_id))
+        self.conn.execute(
+            """UPDATE assumptions SET status=?, decided_by=?, decided_reason=?,
+                   decided_model=?, decided_config_version=? WHERE id=?""",
+            (status, decided_by, reason, model, config_version, assumption_id))
+
+    def get_assumption(self, assumption_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM assumptions WHERE id=?",
+                                (assumption_id,)).fetchone()
+        return dict(row) if row else None
+
+    def link_assumption_question(self, assumption_id: int, question_id: int) -> None:
+        self.conn.execute("UPDATE assumptions SET neo_question_id=? WHERE id=?",
+                          (question_id, assumption_id))
+
+    def assumption_for_question(self, question_id: int) -> dict[str, Any] | None:
+        """The assumption this Neo question is ruling on, if any.
+
+        The mirror of `approval_for_question` and `feature_order_for_question`, and it
+        exists for their reason: Neo's database is OS-wide and knows nothing about a
+        project's tables, so the back-link is resolved from this side.
+        """
+        row = self.conn.execute("SELECT * FROM assumptions WHERE neo_question_id=?",
+                                (question_id,)).fetchone()
+        return dict(row) if row else None
 
     # -- validation rounds (see the validation-panel design) ----------------------
     #

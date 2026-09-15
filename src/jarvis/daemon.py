@@ -577,6 +577,11 @@ class Daemon:
                     # request no reviewer can see, so leaving it until after would let
                     # the invariants judge a hold the OS was about to refuse.
                     self.abandon_unargued_gates(project, store)
+                    # On the reconcile cadence rather than every tick, and that is the
+                    # right one: this asks a model about a work order that is waiting on
+                    # a person, so the thing it saves is measured in the user's hours.
+                    # It only ASKS — the ruling lands through the Neo drain below.
+                    self.auto_review(project, store)
                     # Last: check the state everything above just produced.
                     self.check_invariants(project, store, sweep_landings=sweep_landings)
                 self.central.touch_project(project.name)
@@ -1846,6 +1851,13 @@ class Daemon:
                     # and the branch below it messages the WORKER, which no alarm may
                     # ever do (§3).
                     self._deliver_alarm_verdict(central, pstore, q, verdict)
+                elif q.get("kind") == "assumption":
+                    # Above it for the alarm's reason, and one more of its own: the
+                    # worker this question is about finished long before it was asked,
+                    # so a queued message would start a turn on an order nobody asked to
+                    # reopen — `gates.apply_decision`'s `auto_merge` guard, one authority
+                    # along.
+                    self._deliver_assumption_verdict(central, store, pstore, q, verdict)
                 elif verdict["escalate"]:
                     # A headline, never the verbatim question: this row's job is to get
                     # the user's attention, and every inbox row reaches every sink
@@ -1887,7 +1899,8 @@ class Daemon:
                 # work order dispatched off a COST OBSERVATION is a work order nobody
                 # asked for, and it would spend a worker session to fix the record about
                 # a turn that was only ever being watched.
-                if pstore and q.get("kind") not in ("approval", "plan", "alarm"):
+                if pstore and q.get("kind") not in ("approval", "plan", "alarm",
+                                                    "assumption"):
                     self._dispatch_neo_cleanup(pstore, q, verdict)
             finally:
                 if pstore:
@@ -3216,6 +3229,219 @@ class Daemon:
                                        "round_id": decision.round_id,
                                        "round": decision.round_n,
                                        "head_sha": decision.judged_sha})
+
+    def auto_review(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Put this project's pending assumptions to Neo, one question each. Usually: none.
+
+        docs/superpowers/specs/2026-09-15-neo-decides-an-assumption.md. `Daemon.auto_merge`'s
+        shape one authority along: the decision is `autoreview.decide` and lives there,
+        pure; this is the half that has a database and a model queue. It ASKS and nothing
+        more — the ruling arrives asynchronously through the Neo drain and is applied by
+        `_deliver_assumption_verdict`, so nothing here can settle anything.
+
+        **THE CONFIG GUARD IS FIRST AND IT IS NOT THE RULE.** Condition 1 of `decide` is
+        the rule, checked and unit-tested there; this is `two-gates-not-a-chain`'s
+        redundancy, and what it buys is that a fleet which has not opted in pays two
+        attribute reads per project per reconcile tick for a feature it does not use,
+        rather than a listing and a read per order on it.
+
+        **NEO'S OWN SWITCH IS READ TOO.** Neo is the reviewer here, so a fleet with
+        `os.neo.enabled` off would file questions nothing will ever drain — assumptions
+        parked behind a queue that does not run, which is worse than not asking.
+
+        Never raises past one work order: an assumption the OS could not ask about stays
+        pending and its order stays where it is, which is the behaviour this whole
+        feature is an optimisation over — and one bad order must not cost the rest of the
+        project its pass.
+        """
+        cfg = project.validation
+        if not (cfg.enabled and cfg.auto_review):
+            return
+        if not self.catalog.os.neo.enabled:
+            return
+        from .neo_store import NeoStore
+
+        # Hidden orders are excluded by the default, and deliberately: the rule
+        # `ProjectStore.pending_assumptions`' fleet-wide query already applies — a hidden
+        # order's assumptions are not asking for the user, so there is nothing here to
+        # take off them and no reason to spend a call finding out.
+        #
+        # `all_assumptions` once per candidate, reused for the decision, the numbering
+        # and the siblings the question carries.
+        candidates = []
+        for wo in store.list_work_orders(statuses=("needs_review",)):
+            rows = store.all_assumptions(wo["id"])
+            if any(a["status"] == "pending" for a in rows):
+                candidates.append((wo, rows))
+        if not candidates:
+            return
+        # A sqlite connection belongs to the thread that made it
+        # (`_validate_work_order`'s reason), so it is opened and closed here.
+        neo_store = NeoStore()
+        try:
+            for wo, assumptions in candidates:
+                try:
+                    self._review_assumptions_of(project, store, neo_store, wo, cfg,
+                                                assumptions)
+                except Exception:  # noqa: BLE001 — one order must never stop the rest
+                    log.exception("[%s] auto-review of %s failed", project.name,
+                                  wo["id"])
+        finally:
+            neo_store.close()
+
+    def _review_assumptions_of(self, project: ProjectSpec, store: ProjectStore,
+                               neo_store: Any, wo: dict, cfg: Any,
+                               assumptions: list[dict]) -> None:
+        """One work order's assumptions, each decided on its own. See `auto_review`."""
+        from . import autoreview, ops
+
+        # ONE read of the round and one of the refusal history for the whole list: both
+        # are facts about the ORDER rather than about an assumption, and re-reading them
+        # per row would let the validator — running on another thread — change the answer
+        # half way down a list that is meant to be judged against one state.
+        latest = store.latest_validation_round(wo_id=wo["id"])
+        outcome = str((latest or {}).get("outcome") or "")
+        answered = ops.refusal_answered(store, wo["id"])
+        for a in assumptions:
+            decision = autoreview.decide(a, wo, cfg, round_outcome=outcome,
+                                         refusal_answered=answered)
+            if not decision.armed:
+                self._note_autoreview_held(store, wo["id"], decision)
+                continue
+            autoreview.propose(store, neo_store, project.name, wo, a, assumptions)
+
+    def _note_autoreview_held(self, store: ProjectStore, wo_id: str,
+                              decision: Any) -> None:
+        """Record ONCE, per (assumption, reason), that the OS declined to decide.
+
+        `_note_automerge_held`'s reasoning verbatim: the pass runs every reconcile tick
+        for as long as the work order sits there, and a timeline that accrued an event
+        per tick would bury the events that mean something. Keyed on the reason as well
+        as the assumption, because the hold that matters most — "this mentions
+        production" — can follow one that does not.
+
+        **DELIBERATELY NOT AN ATTENTION ITEM.** A held assumption is one the user decides
+        themselves, which is what they did for every assumption before this existed, and
+        the work order is already on their list carrying `assumptions pending review`.
+
+        THREE HOLDS ARE NOT RECORDED, and all three are things the reader would be told
+        about a mechanism that was never a candidate — the asymmetry `_note_automerge_held`
+        names, where a missing hold event says nothing and a spurious one is deduped for
+        ever and then rendered:
+
+        * `disabled` — the project never opted in, so its timeline must not carry a line
+          about a mechanism it does not have;
+        * `status` — unreachable from this pass, which lists `needs_review` only;
+        * `settled` — the assumption is decided, and saying the OS declined to decide a
+          decided thing is noise on every work order the user has ever reviewed.
+        """
+        from . import autoreview, db
+
+        if decision.code in (autoreview.HELD_DISABLED, autoreview.HELD_STATUS,
+                             autoreview.HELD_SETTLED, autoreview.HELD_ASKED):
+            return
+        key = (decision.assumption_id, decision.code)
+        for event in store.events_of_kind(wo_id, "autoreview_held"):
+            payload = db.from_json(event["payload"], {})
+            if (int(payload.get("assumption_id") or 0),
+                    str(payload.get("code") or "")) == key:
+                return
+        store.add_event(wo_id, "autoreview_held", {
+            "code": decision.code, "reason": decision.reason,
+            "assumption_id": decision.assumption_id, "n": decision.n})
+
+    def _deliver_assumption_verdict(self, central: CentralStore, neo_store: Any,
+                                    pstore: ProjectStore | None, q: dict,
+                                    verdict: dict) -> None:
+        """Apply Neo's ruling on ONE assumption: accept it, or leave it with the user.
+
+        `_deliver_plan_verdict`'s shape — resolve the subject from the question, check it
+        is still open, apply through the same `ops` the user's own command goes through —
+        and its one hard rule: **the code can override Neo toward the user and never away
+        from it.** `autoreview.read_ruling` is where that override lives.
+
+        A ruling that does not accept is NOT an inbox row. The work order is already on
+        the user's attention list carrying "assumptions pending review" — the state it was
+        in before the OS asked and the state it stays in — and a second announcement of an
+        unchanged fact is the attention cost this feature exists to reduce.
+
+        An ACCEPTANCE that clears the LAST pending assumption IS one row, at `info`. That
+        is the moment a decision the user used to make stops being theirs and the work
+        order leaves their list, and it is the only trace they would otherwise get: the
+        order simply completes. One row per work order rather than per assumption, because
+        what changed for the user is the work order.
+        """
+        from . import autoreview, ops
+
+        if pstore is None:
+            log.error("assumption verdict for question %s has no project store", q["id"])
+            return
+        assumption = pstore.assumption_for_question(q["id"])
+        if assumption is None:
+            log.warning("assumption question %s rules on nothing (deleted?)", q["id"])
+            return
+        if assumption["status"] != "pending":
+            # The user got there first through `jarvis wo review`. Their decision stands;
+            # `invariants.check_neo_escalations_are_live` closes the question behind them.
+            log.info("assumption question %s: assumption %s is already %s, dropping "
+                     "Neo's ruling", q["id"], assumption["id"], assumption["status"])
+            return
+        try:
+            wo = pstore.get_work_order(q["wo_id"])
+        except KeyError:
+            return
+        # `n` is a position in the work order's list and is derived, never stored
+        # (`all_assumptions`), so the row fetched by question id does not carry one.
+        numbered = next((a for a in pstore.all_assumptions(wo["id"])
+                         if a["id"] == assumption["id"]), assumption)
+        ruling = autoreview.read_ruling(verdict,
+                                        default_model=self.catalog.os.neo.model)
+        if not ruling.accept:
+            if not verdict.get("escalate"):
+                # NEO ANSWERED AND THE ANSWER IS NOT WHAT HAPPENS, so `drain_queue` has
+                # already recorded it as `answered`. Re-marking keeps `jarvis neo list`,
+                # `jarvis status` and the work order's record telling one story: this is
+                # the user's to decide — `_deliver_plan_verdict`'s over-cap branch, for
+                # the same reason. Both shapes reach here: a `deny` (there is no machine
+                # rejection, so it becomes an escalation) and an acceptance this module
+                # overrode on stakes.
+                neo_store.mark(q["id"], "escalated", reason=ruling.reason)
+            pstore.add_event(wo["id"], "autoreview_escalated", {
+                "assumption_id": assumption["id"], "n": numbered.get("n"),
+                "reason": ruling.reason, "stakes": ruling.stakes,
+                "model": ruling.model, "neo_question_id": q["id"],
+                "overridden": ruling.overridden})
+            log.info("auto-review left assumption #%s of %s with the user: %s",
+                     numbered.get("n"), wo["id"], ruling.reason)
+            return
+
+        project = next((p for p in self.catalog.projects if p.name == q["project"]), None)
+        if project is None:
+            return
+        try:
+            out = ops.accept_assumption(
+                pstore, project.path, wo, numbered, reason=ruling.reason,
+                model=ruling.model, question_id=int(q["id"]),
+                cfg=project.validation)
+        except Exception:  # noqa: BLE001 — one ruling must never kill the drain
+            log.exception("accepting assumption %s of %s failed", assumption["id"],
+                          wo["id"])
+            return
+        log.info("auto-review accepted assumption #%s of %s (%s left) — %s",
+                 numbered.get("n"), wo["id"], out["pending"], out["status"])
+        if not out["settled"]:
+            return
+        decided = [a for a in pstore.all_assumptions(wo["id"])
+                   if a.get("decided_by") == autoreview.DECIDER]
+        central.add_inbox(
+            project=q["project"], level="info",
+            title=f"The OS decided {len(decided)} assumption(s) for you on {wo['id']}",
+            body=f"{wo.get('title') or ''}\n"
+                 f"{wo['id']} is now {out['status']} — it is off your review list.\n"
+                 f"What it accepted, and why: jarvis wo show {wo['id']}\n"
+                 f"If any of it was wrong: jarvis neo review {q['id']} "
+                 f"--correct \"…\" teaches Neo not to do it again.",
+            wo_id=wo["id"])
 
     def _note_automerge_held(self, store: ProjectStore, wo_id: str,
                              decision: Any) -> None:

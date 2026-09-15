@@ -1351,11 +1351,12 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
     neo = NeoStore()
     try:
         held = [q for q in neo.list_questions(statuses=USER_HELD_Q_STATUSES)
-                if q["kind"] in ("approval", "plan", "alarm")]
+                if q["kind"] in ("approval", "plan", "alarm", "assumption")]
         for q in held:
             moot = {"approval": _stale_approval_question,
                     "plan": _stale_plan_question,
-                    "alarm": _stale_alarm_question}[q["kind"]](store, q)
+                    "alarm": _stale_alarm_question,
+                    "assumption": _stale_assumption_question}[q["kind"]](store, q)
             if moot is None:
                 continue
             answer, why = moot
@@ -1431,6 +1432,26 @@ def _stale_alarm_question(store: ProjectStore,
         return None
     return (f"SUPERSEDED — alarm {alarm['id']} is {alarm['status']}",
             f"alarm {alarm['id']} was already {alarm['status']}")
+
+
+def _stale_assumption_question(store: ProjectStore,
+                               q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) if this assumption question is moot, else None.
+
+    An assumption question Neo escalated is held by the user, and the way they answer it
+    is `jarvis wo review` — which settles the assumption and never touches the question.
+    So the row would go on asking for a ruling that has already been given, which is
+    exactly the shape this invariant exists to catch.
+
+    A MISSING ROW IS LEFT ALONE, as in all three siblings: the checks run per project
+    against an OS-wide `neo.db`, so "no such assumption here" is how another project's
+    rows are skipped and cannot be told apart from a subject that has gone.
+    """
+    assumption = store.assumption_for_question(q["id"])
+    if assumption is None or assumption["status"] == "pending":
+        return None
+    return (f"SUPERSEDED — assumption {assumption['id']} is {assumption['status']}",
+            f"assumption {assumption['id']} was already {assumption['status']}")
 
 
 def check_proposed_remedies_are_live(store: ProjectStore) -> Iterator[Violation]:

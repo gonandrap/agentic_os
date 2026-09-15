@@ -52,7 +52,7 @@ OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
 # in `Daemon._neo_drain`, the `ops._neo_attention` filter and the
 # `invariants.check_neo_escalations_are_live` filter. A kind with no `deliver()` branch
 # falls through to `queue_message` and speaks to the worker.
-Q_KINDS = ("question", "approval", "plan", "alarm")
+Q_KINDS = ("question", "approval", "plan", "alarm", "assumption")
 
 # The panel's seats — see docs/superpowers/specs/2026-08-02-neo-team-design.md.
 # `premise` asks whether this was even the question that was asked (and routes),

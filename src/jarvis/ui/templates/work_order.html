@@ -67,6 +67,9 @@
        mechanism has touched this order — which is every order on a project that has not
        opted in — and NEVER a warning tone: a held auto-merge means the user merges this
        one by hand, which is what they did for every pull request before this existed. #}
+    {% if auto_review %}
+      <p class="sub">⚙ auto-review: {{ auto_review.line }}</p>
+    {% endif %}
     {% if auto_merge %}
       <p class="sub">⚙ auto-merge: {{ auto_merge.line }}</p>
     {% endif %}
@@ -187,8 +190,14 @@
   <div class="row"><span class="mono sub" style="min-width: 2.5em;">#{{ a.n }}</span>
     <div class="grow">{{ a.content }}</div>
     {% if a.status != 'pending' %}
-    <span class="st tone-{{ 'ok' if a.status == 'accepted' else 'bad' }}">
-      <span class="i">{{ '✓' if a.status == 'accepted' else '✗' }}</span>{{ a.status }}</span>
+    {# WHO decided it, never just THAT it was decided: the OS can settle one itself now,
+       and a badge that says only "accepted" credits a machine verdict to the reader.
+       Empty means the user — every row predating the column was theirs. #}
+    <span class="st tone-{{ 'ok' if a.status == 'accepted' else 'bad' }}"
+          title="{{ a.decided_reason }}">
+      <span class="i">{{ '✓' if a.status == 'accepted' else '✗' }}</span>{{ a.status }}
+      by {{ 'you' if not a.decided_by or a.decided_by == 'user'
+            else 'the OS (' ~ a.decided_by ~ ', ' ~ (a.decided_model or '?') ~ ')' }}</span>
     {% endif %}
     <span class="sub mono">{{ fmt_age(a.ts) }} ago</span></div>
   {% endfor %}
