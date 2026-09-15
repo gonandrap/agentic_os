@@ -195,12 +195,14 @@
     {% if a.status != 'pending' %}
     {# WHO decided it, never just THAT it was decided: the OS can settle one itself now,
        and a badge that says only "accepted" credits a machine verdict to the reader.
-       Empty means the user — every row predating the column was theirs. #}
+       The phrase comes from `ops.assumption_decider`, the same function behind
+       `jarvis wo show` — spelling it inline here would be a second renderer of the one
+       attribution that must never be dropped, and the page is the surface somebody
+       actually reads. #}
     <span class="st tone-{{ 'ok' if a.status == 'accepted' else 'bad' }}"
           title="{{ a.decided_reason }}">
       <span class="i">{{ '✓' if a.status == 'accepted' else '✗' }}</span>{{ a.status }}
-      by {{ 'you' if not a.decided_by or a.decided_by == 'user'
-            else 'the OS (' ~ a.decided_by ~ ', ' ~ (a.decided_model or '?') ~ ')' }}</span>
+      by {{ assumption_decider(a) }}</span>
     {% endif %}
     <span class="sub mono">{{ fmt_age(a.ts) }} ago</span></div>
   {% endfor %}

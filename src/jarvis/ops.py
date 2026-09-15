@@ -1462,26 +1462,33 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
     return {**newest, "line": _autoreview_line(newest)}
 
 
-def assumption_line(a: dict[str, Any]) -> str:
-    """One assumption, rendered so that WHO decided it is unmissable. One renderer.
+def assumption_decider(a: dict[str, Any]) -> str:
+    """WHO decided this assumption, in words, for whoever is about to read the verdict.
 
     THE POST-CONDITION THIS EXISTS FOR: a machine decision must never read as the user's.
-    Shared by `jarvis wo show` and the work-order page rather than written twice, because
-    two renderers of an attribution are two chances for one of them to drop it — and the
-    one that drops it is the one somebody reads.
+    This is the ONE place that phrase is built. `jarvis wo show` reaches it through
+    `assumption_line`; the work-order page calls it directly, because the page wants the
+    attribution inside a badge and the rest of the row in its own cells. The LAYOUTS
+    differ and that is fine — the attribution must not, because two spellings of it are
+    two chances for one to drop the "the OS" and credit a machine verdict to the reader.
 
     `''` means the user (`ASSUMPTION_DECIDER_USER`'s note): every row written before the
     column existed was, by construction, the user's.
     """
+    by = str(a.get("decided_by") or "") or ASSUMPTION_DECIDER_USER
+    if by == ASSUMPTION_DECIDER_USER:
+        return "you"
+    return f"the OS ({by}, {a.get('decided_model') or 'model not recorded'})"
+
+
+def assumption_line(a: dict[str, Any]) -> str:
+    """One assumption on one line, for `jarvis wo show`. Attribution from one renderer."""
     n, status = a.get("n"), str(a.get("status") or "")
     content = str(a.get("content") or "")
     if status == "pending":
         return f"#{n} pending your review: {content}"
-    by = str(a.get("decided_by") or "") or ASSUMPTION_DECIDER_USER
-    who = ("you" if by == ASSUMPTION_DECIDER_USER
-           else f"the OS ({by}, {a.get('decided_model') or 'model not recorded'})")
     reason = str(a.get("decided_reason") or "").strip()
-    return (f"#{n} {status} by {who}"
+    return (f"#{n} {status} by {assumption_decider(a)}"
             f"{' — ' + reason if reason else ''}: {content}")
 
 

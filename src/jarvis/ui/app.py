@@ -588,6 +588,9 @@ def create_app() -> FastAPI:
         # Shared with `jarvis alarms` rather than spelled inline, so neither surface can
         # be the one that shows a subject-level finding as `turn -1`.
         turn_label=ops.turn_label, no_turn=NO_TURN,
+        # Same reason, for the assumption badge: `jarvis wo show` and this page must
+        # not be able to disagree about whether the OS or the user decided one.
+        assumption_decider=ops.assumption_decider,
         # "a worker turn may be in flight right now", so the page can withhold the
         # `claude --resume` invitation rather than put a second driver on one session.
         active_statuses=ACTIVE_STATUSES,
