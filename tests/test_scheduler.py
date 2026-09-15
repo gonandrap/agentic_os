@@ -412,6 +412,86 @@ def test_status_says_nothing_about_a_job_that_is_ticking_along(clock, started, s
     assert _status_held(store) == []
 
 
+def _drop_from_catalog(catalog_file, name="proj_a", **os_block) -> None:
+    """Leave the project REGISTERED in the central store but absent from the catalog.
+
+    The real shape: a project onboarded once and later removed from the catalog file.
+    `ops.registered_project_paths()` still knows it — `jarvis start` never unregisters —
+    so `os_status` still opens its store and reads its rows.
+    """
+    data = json.loads(catalog_file.read_text())
+    data["os"]["schedule"] = {"enabled": True, **os_block}
+    data["projects"] = [p for p in data["projects"] if p["name"] != name]
+    catalog_file.write_text(json.dumps(data))
+    ops.start_os(str(catalog_file), foreground=True)
+
+
+def test_a_project_the_catalog_no_longer_lists_is_silent_on_BOTH_surfaces(clock, started,
+                                                                          store,
+                                                                          catalog_file):
+    """THE TWO SURFACES MUST RESOLVE CONFIG THE SAME WAY, OR THEY CONTRADICT EACH OTHER.
+
+    They used to resolve separately: `os_status` by project NAME with a disabled fallback,
+    `check_schedule_progresses` by resolved PATH with `catalog.os.schedule`'s. A project
+    in the central store but absent from the catalog therefore got OPPOSITE answers —
+    silent on one surface, and on the other a hold that can never clear, because
+    `Daemon.tick` iterates `catalog.projects` and will never fire this project's jobs
+    again.
+
+    `os.schedule.enabled` is left TRUE here on purpose: that is the only setting under
+    which the old inherit-the-fleet-default fallback speaks at all, so a test with it off
+    would pass on the unfixed code.
+    """
+    _fire_once(started, store, clock, catalog_file)
+    clock.advance(DAY)
+    _tick(started(), store)
+    assert store.schedule_state(JOB)["held_since"], "the row must still say held"
+    clock.advance(10 * DAY)
+
+    _drop_from_catalog(catalog_file)
+    assert _held_violations(store) == []
+    assert _status_held(store) == []
+
+
+def test_both_surfaces_go_through_one_resolver(clock, started, store, catalog_file):
+    """Structural, and it is the only assertion that survives someone re-splitting them.
+
+    The behaviour above can be made to pass twice over by writing the same rule in two
+    places — which is what the code did before, and it drifted. This pins that there is
+    ONE call: monkeypatching `ops.schedule_config_at` to claim the scheduler is off must
+    silence both surfaces, because neither has its own way of asking.
+    """
+    import jarvis.ops as ops_mod
+
+    _fire_once(started, store, clock, catalog_file)
+    clock.advance(DAY)
+    _tick(started(), store)
+    clock.advance(10 * DAY)
+    assert _held_violations(store) and _status_held(store), "both must speak first"
+
+    real = ops_mod.schedule_config_at
+    ops_mod.schedule_config_at = lambda path, catalog=None: ScheduleConfig()
+    try:
+        assert _held_violations(store) == []
+        assert _status_held(store) == []
+    finally:
+        ops_mod.schedule_config_at = real
+
+
+def test_the_resolver_matches_by_path_not_by_name(clock, started, store, catalog_file):
+    """A project registered under one name and catalogued under another is the SAME
+    project — the store is opened by path and the invariant only ever holds a path, so
+    name is not a key both surfaces can use."""
+    data = json.loads(catalog_file.read_text())
+    data["os"]["schedule"] = {"enabled": True}
+    data["projects"][0]["name"] = "renamed_in_the_catalog"
+    catalog_file.write_text(json.dumps(data))
+
+    path = ops.registered_project_paths()["proj_a"]
+    cfg = ops.schedule_config_at(path, load_catalog(catalog_file))
+    assert cfg.enabled, "matched by path, so the rename is invisible to the resolver"
+
+
 # -- the upgrade: a project database that predates `scheduled_jobs` -----------------------
 
 

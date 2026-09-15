@@ -108,11 +108,24 @@ nothing else, so a job held at the moment somebody sets `enabled: false` or drop
 `jobs` can never reach the event that would clear it. Guarding the invariant and not
 `jarvis status` leaves the OS printing `⏰ … held:` for ever about a mechanism the user has
 already turned off — `check_health_sweep_produces_judgements`' lesson, where a switched-off
-mechanism with rows still on disk alarmed for ever, arriving by a second route. `ops._held_jobs`
-is the status half; `invariants.check_schedule_progresses` is the other, and they read the
-same two keys. Where no catalog is resolvable both fall back to `ScheduleConfig()`, which
-ships disabled, so they go quiet together rather than one of them inventing a hold out of
-rows whose configuration nobody can read.
+mechanism with rows still on disk alarmed for ever, arriving by a second route. **And they filter through ONE resolver, `ops.schedule_config_at`.** Writing the same rule
+in two places is what let them drift the first time: `_held_jobs` resolved by project NAME
+with a disabled fallback while the invariant resolved by resolved PATH and fell back to
+`catalog.os.schedule`, so a project in the central store but absent from the catalog — or
+registered under a different name — got opposite answers from the two surfaces.
+
+Resolution is **by path**, because that is the only key both callers hold: an invariant is
+handed a store and no name. A caller that has already loaded a catalog may pass it, which
+saves a file read per project and is not a second code path.
+
+**A project the catalog does not list resolves to `ScheduleConfig()` — disabled — and
+deliberately not to `catalog.os.schedule`,** where `inspect_config_at` and
+`messaging_config_at` go. Those answer "by what threshold shall I judge this work", which a
+fleet-wide default answers perfectly well for an unconfigured project. This answers "is this
+mechanism supposed to be running here", and for a project absent from the catalog the
+daemon's answer is no: `Daemon.tick` iterates `catalog.projects`, so its jobs can never fire
+and its holds can never clear. Inheriting an enabled `os.schedule` would report a permanent
+hold for a project the OS does not drive — this section's failure, reached by a third route.
 
 ## 5. Labelling, and the attention budget
 
