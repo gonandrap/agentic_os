@@ -56,10 +56,27 @@ database gets it only there. `''` means "a submission opened this", which is the
 reading of every round written before the column existed.
 
 It is a column and not only an event because the round is what every surface already
-reads: `ops.round_line` renders `· forced: <reason>` on the same line `wo show`, `fo show`
-and both dashboard pages print, so a forced round can never be mistaken afterwards for a
-worker re-delivering. A `validation_forced` timeline event is written beside it, carrying
-the reason and the status the work order was in.
+reads. **There are three renderings, not one, and they are separate code with separate
+tests** — the first draft of this section claimed a single formatter covered all of them,
+which was a claim wider than the code:
+
+| Surface | What renders it | Reads |
+|---|---|---|
+| `wo show`, `fo show`, `validation show` | `ops.round_line` | `ops.validation_rounds` |
+| the work-order and feature pages | `_validation.html`'s own markup — a `⟳ forced` badge and a `forced by hand — …` line | `ops.validation_detail` |
+| the timeline tab | `timeline.describe`'s `validation_forced` case | `wo_events` |
+
+The dashboard's guard is `{% if r.forced_reason %}`, which is **silently falsy**: drop the
+column from `validation_detail`'s projection and the marker simply vanishes, leaving a
+forced round reading exactly like a worker re-delivering. Nothing but a rendering
+assertion catches that, so `tests/test_forced_validation.py` fetches the page and asserts
+the marker, the count (so a template marking *every* round fails) and the judged commit.
+
+The timeline case is a genuine sixth event kind rather than decoration:
+`timeline.event_level` returns `"signal"` for anything it does not know, so a
+`validation_forced` with no case would have looked fine on the timeline while rendering as
+the bare kind beside a JSON blob — which is the comment already written above that
+function's validation block, arriving by a new door.
 
 ## 4. `max_rounds`: the budget is left alone
 
@@ -137,3 +154,29 @@ insertion order**, both directions, where latest-by-`id` and `MAX(round)` disagr
 `ops.land_when_cleared` re-parks it in `waiting_pr_merge` behind the still-open pull
 request, and `Daemon.poll_pull_requests` can now arm the automatic merge because condition
 4 finally has a commit to compare. On an escalation, `needs_review` with the flag.
+
+### 6.1 The attention flag an escalation raised
+
+A work order reaches `needs_review` through `Daemon._escalate`, which calls
+`flag_attention` with `VALIDATION_STUCK_BLOCKER`. Forcing a round is the operator saying
+"I have dealt with it", so the flag must not survive into a `waiting_pr_merge` the machine
+has just re-parked — the user would be left looking at a question that has been answered
+(kn-7e57d410).
+
+**It does not, and exactly one thing is responsible**: `ops.submit_for_validation` calls
+`clear_attention`, on the principle that a unit under review is the system working. The
+flag therefore drops when the round OPENS. No change was needed in `force_validation`, and
+adding a second `clear_attention` there would be a write that never fires.
+
+**The reconciler is NOT a second mechanism**, and it is worth being exact because the
+obvious reading of `true_blockers` says otherwise. `check_attention_reason_is_true` starts
+with `if not wo["needs_attention"]: continue` — it only ever rewrites the *reason* on a
+work order still flagged, and never re-raises one already cleared. So "the tick does not
+put it back" is a property of the invariant's guard, not of `_validation_escalated`
+keying on the latest round. The test asserts it as a non-event, which is cheap and still
+worth keeping: a flag cleared by a write and restored three minutes later by a tick is
+indistinguishable from one never cleared.
+
+The boundary has its own test: a forced round that escalates *again* flags the user
+afresh. The flag comes down because the machine took the question back, not because
+forcing a round is a way to silence it.

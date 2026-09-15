@@ -42,6 +42,13 @@ def _repo(path: Path) -> None:
 def order(store) -> str:
     """One work order parked behind a pull request, with the pair of rounds.
 
+    **ROUND 2 IS OPENED BY `ops.force_validation` ITSELF**, not written here. The shot is
+    evidence of the path the operator actually takes — the `forced_reason` on the round
+    and the `validation_forced` event are whatever that function really produces, so a
+    change that stopped writing either shows up in the picture instead of being papered
+    over by hand-inserted rows. Only the panel's VERDICT is faked, because a real one
+    would need five model calls.
+
     Round 1 is settled the way the pre-0.10.0 daemon settled every round: a verdict, and
     NO commit beside it. That is the state the whole feature exists to get out of, so
     seeding it with a commit would make the shot a picture of something else.
@@ -59,10 +66,16 @@ def order(store) -> str:
     store.record_validation_opinion(first["id"], "tester", verdict="pass",
                                     reply="The recogniser's boundary is pinned.",
                                     model="claude-opus-5", latency_ms=19200)
+    # `force_validation` only accepts FORCEABLE_STATUSES, so the work order has to be
+    # parked exactly as the real one is before the command will touch it.
+    store.set_status(wo["id"], "waiting_pr_merge")
 
-    forced = store.open_validation_round(
-        wo_id=wo["id"], fingerprint="b3e5d1907f4c", round=2, pr_url=PR,
-        forced_reason=REASON)
+    ops.force_validation(wo["id"], reason=REASON, project_name="jarvis_os")
+
+    forced = store.latest_validation_round(wo_id=wo["id"])
+    assert forced is not None and forced["forced_reason"] == REASON
+    # The panel's half, faked: `Daemon._validate_work_order` would record the head from
+    # the evidence packet and close the round, and neither needs a model to be a picture.
     store.set_validation_head(forced["id"], JUDGED)
     store.close_validation_round(forced["id"], "passed", "")
     store.record_validation_opinion(forced["id"], "tester", verdict="pass",
@@ -71,9 +84,6 @@ def order(store) -> str:
     store.record_validation_opinion(forced["id"], "security", verdict="pass",
                                     reply="No new authority reaches a worker.",
                                     model="claude-opus-5", latency_ms=15100)
-    store.add_event(wo["id"], "validation_forced",
-                    {"round": 2, "round_id": forced["id"], "reason": REASON,
-                     "was": "waiting_pr_merge"})
     store.add_event(wo["id"], "automerge_proposed",
                     {"approval_id": 44, "neo_question_id": 91, "round_id": forced["id"],
                      "round": 2, "head_sha": JUDGED, "pr_url": PR})
@@ -127,6 +137,14 @@ def shoot(wo_id: str) -> None:
         page.locator("h2", has_text="Validation").first.scroll_into_view_if_needed()
         page.wait_for_timeout(200)
         page.screenshot(path=SHOTS / "forced-round.png")
+        # The TIMELINE is the other rendered surface this touches, and the one the whole
+        # command is about: it is where a forced re-judgement would otherwise read like a
+        # worker re-delivering. Behind a tab, so it has to be clicked.
+        page.get_by_role("tab", name="Timeline").click()
+        page.wait_for_timeout(200)
+        page.locator("#tab-timeline").scroll_into_view_if_needed()
+        page.wait_for_timeout(200)
+        page.screenshot(path=SHOTS / "forced-round-timeline.png")
         browser.close()
 
 
@@ -138,7 +156,7 @@ def main() -> int:
     threading.Thread(target=serve, daemon=True).start()
     time.sleep(2)
     shoot(wo_id)
-    print(SHOTS / "forced-round.png")
+    print("\n".join(str(q) for q in sorted(SHOTS.glob("forced-round*.png"))))
     return 0
 
 

@@ -257,9 +257,10 @@ def test_the_reason_is_recoverable_afterwards_from_the_round_and_the_timeline(
     assert payload["round"] == 2 and payload["was"] == "waiting_pr_merge"
 
 
-def test_every_surface_that_prints_a_round_says_it_was_forced(fleet, project, fake_gh):
-    """One formatter, so `wo show`, `fo show` and both dashboard pages cannot word it
-    differently — and the projection they read has to carry the column at all."""
+def test_the_terminal_line_for_a_round_says_it_was_forced(fleet, project, fake_gh):
+    """`ops.round_line` — the ONE formatter behind `jarvis wo show`, `jarvis fo show` and
+    `jarvis validation show`, so those three cannot word it differently. It is NOT what
+    the dashboard renders: that surface has its own markup, and its own test below."""
     store, wo = parked(fleet, project)
     artifact(fake_gh)
     ops.force_validation(wo["id"], reason="round 1 predates head_sha")
@@ -269,6 +270,45 @@ def test_every_surface_that_prints_a_round_says_it_was_forced(fleet, project, fa
     # ...and an ordinary round says nothing: a line announcing "not forced" on every
     # round in the fleet would spend attention on the absence of an event.
     assert "forced" not in ops.round_line(rounds[0])
+
+
+def test_the_work_order_page_marks_the_forced_round_and_leaves_the_other_alone(
+        fleet, project, fake_gh):
+    """THE DASHBOARD RENDERS ITS OWN WORDING, and a `round_line` assertion never reaches
+    it. `_validation.html` hand-rolls the ⟳ badge and the `forced by hand — …` line off
+    `{% if r.forced_reason %}`, which is SILENTLY FALSY: drop the column from the
+    projection `validation_detail` builds and the marker simply disappears, leaving a
+    forced round reading exactly like a worker re-delivering — the defect this command
+    exists to remove. Only a rendering assertion catches that.
+
+    Both rounds are checked, because "the forced one is marked" and "the ordinary one is
+    not" are different claims and a template that marked every round satisfies the first.
+    """
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    store, wo = parked(fleet, project)
+    artifact(fake_gh)
+    ops.force_validation(wo["id"], reason="round 1 predates head_sha")
+    judge(fleet, store, Panel("passed"))
+
+    page = TestClient(create_app(), follow_redirects=False).get(
+        f"/wo/proj_a/{wo['id']}").text
+
+    assert "forced by hand — round 1 predates head_sha" in page
+    # THREE and no more, each one accounted for: the badge and the reason on round 2, and
+    # the timeline's own sentence for the `validation_forced` event. Round 1 is rendered
+    # on the same page and carries none of them. A bare count would pass on a template
+    # that marked every round, so the total is pinned rather than the presence.
+    assert page.count("forced") == 3, page.count("forced")
+    assert "Validation forced by hand — round 2" in page
+    # ...and the raw event kind never reaches a reader: an unlabelled kind renders as the
+    # kind itself beside a JSON blob, which is what the label above exists to prevent.
+    assert "validation_forced" not in page
+    # The commit the forced round bound the verdict to, on that same row — this page is
+    # where a person asks why the pull request did not merge itself.
+    assert f"@{LIVE_HEAD[:10]}" in page
 
 
 def test_the_round_is_numbered_and_counted_like_any_other(fleet, project, fake_gh):
@@ -438,19 +478,94 @@ def test_the_allowlist_is_what_the_refusal_names_so_the_two_cannot_drift(fleet, 
         assert allowed in str(caught.value)
 
 
+def escalated(fleet, store, project, fake_gh) -> dict:
+    """A work order in `needs_review` because THE PANEL GAVE UP on it — the real path.
+
+    Through `Daemon._escalate` and not `set_status("needs_review")`, because the two
+    differ in exactly the fact these tests are about: the real one flags the user
+    (`flag_attention`, `VALIDATION_STUCK_BLOCKER`) and a bare status write does not. A
+    fixture that skipped it could not tell a flag left standing from a flag taken down.
+    """
+    store_, wo = parked(fleet, project, outcome="pending")
+    assert store_ is not None
+    artifact(fake_gh)
+    judge(fleet, store, Panel("escalated"))
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "needs_review", fresh["status"]
+    assert fresh["needs_attention"] == 1 and fresh["attention_reason"]
+    return fresh
+
+
 def test_a_delivered_order_awaiting_a_person_is_allowed(fleet, project, fake_gh):
     """`needs_review` is the OTHER half of the allowlist and not an afterthought: a panel
-    escalation that recorded no commit lands exactly here, and it is a work order that has
-    delivered with nobody typing — which is the whole predicate."""
-    store, wo = parked(fleet, project, outcome="escalated")
-    store.set_status(wo["id"], "needs_review")
-    artifact(fake_gh)
+    escalation is exactly how a work order with an unrecorded commit ends up there, and it
+    is a work order that has delivered with nobody typing — the whole predicate."""
+    store = ProjectStore(project)
+    wo = escalated(fleet, store, project, fake_gh)
 
     ops.force_validation(wo["id"], reason="re-judge the escalation on the live head")
     judge(fleet, store, Panel("passed"))
 
     rounds = store.validation_rounds(wo_id=wo["id"])
-    assert len(rounds) == 2 and rounds[-1]["head_sha"] == LIVE_HEAD
+    assert [r["outcome"] for r in rounds] == ["escalated", "passed"]
+    assert rounds[-1]["head_sha"] == LIVE_HEAD
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+
+
+def test_forcing_takes_down_the_flag_the_escalation_raised(fleet, project, fake_gh):
+    """THE USER IS NOT LEFT LOOKING AT A QUESTION THE MACHINE HAS ANSWERED (kn-7e57d410).
+
+    `Daemon._escalate` sets `needs_attention` and `VALIDATION_STUCK_BLOCKER`, and forcing a
+    round is the operator saying "I have dealt with it".
+
+    ONE mechanism takes it down, and it is worth being exact about which: the
+    `clear_attention` inside `ops.submit_for_validation` — "a unit under review is the
+    system working" — so the flag drops when the round OPENS, not when it settles. Pinned
+    by the first assertion, which runs before any tick, and mutation-verified: delete that
+    call and this fails on `assert (1 == 0)`.
+
+    **The reconcile tick is asserted as a NON-event, not as a second mechanism.**
+    `check_attention_reason_is_true` skips a work order whose flag is already down (`if
+    not wo["needs_attention"]: continue`) and only ever rewrites the REASON on one still
+    flagged — so nothing in the reconciler re-derives a cleared flag back up. That makes
+    the post-tick assertion cheap, and still worth keeping: a flag cleared by a write and
+    restored three minutes later by a tick is indistinguishable from one never cleared,
+    and this is the test that would notice if that ever changed.
+    """
+    store = ProjectStore(project)
+    wo = escalated(fleet, store, project, fake_gh)
+    spec = fleet.catalog.project("proj_a")
+
+    ops.force_validation(wo["id"], reason="re-judge the escalation on the live head")
+    opened = store.get_work_order(wo["id"])
+    assert opened["needs_attention"] == 0 and not opened["attention_reason"]
+
+    judge(fleet, store, Panel("passed"))
+    fleet.check_invariants(spec, store)
+
+    settled = store.get_work_order(wo["id"])
+    assert settled["status"] == "waiting_pr_merge"
+    assert settled["needs_attention"] == 0, settled["attention_reason"]
+    assert not settled["attention_reason"]
+
+
+def test_a_forced_round_that_gives_up_again_flags_the_user_afresh(fleet, project,
+                                                                  fake_gh):
+    """The boundary on the test above, and it is the half that keeps the clearing honest:
+    the flag comes DOWN because the machine took the question back, not because forcing a
+    round is a way to silence it. A forced round that escalates again owes the user the
+    same flag, and the reconcile tick must agree rather than clear it."""
+    store = ProjectStore(project)
+    wo = escalated(fleet, store, project, fake_gh)
+    spec = fleet.catalog.project("proj_a")
+
+    ops.force_validation(wo["id"], reason="try the live head")
+    judge(fleet, store, Panel("escalated"))
+    fleet.check_invariants(spec, store)
+
+    again = store.get_work_order(wo["id"])
+    assert again["status"] == "needs_review"
+    assert again["needs_attention"] == 1 and again["attention_reason"]
 
 
 # -- the command, driven the way the operator drives it -------------------------------

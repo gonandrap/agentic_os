@@ -315,8 +315,8 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                     f"by mistake", "no privileged action was authorised")
         return (f"Ran the approved {p.get('kind') or 'command'}",
                 f"use {p.get('use')} of {p.get('of')}")
-    # The validation loop. Five kinds rather than one with an outcome in the payload,
-    # because the four are the whole story a reader wants at a glance — and each gets a
+    # The validation loop. Six kinds rather than one with an outcome in the payload,
+    # because each is the whole story a reader wants at a glance — and each gets a
     # LABEL of its own here. `event_level` returns "signal" for anything it does not
     # know, so these arriving unclassified would look fine on the timeline while
     # rendering as a bare kind and a JSON blob.
@@ -324,6 +324,18 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         rnd = p.get("round")
         return ("Submitted for validation",
                 f"round {rnd}" if rnd else "")
+    if kind == "validation_forced":
+        # A SIXTH kind, and the only one no worker produced — `jarvis validation force`,
+        # a person re-opening the round. It says so in the LABEL rather than only in the
+        # detail: the whole point of the command is that a forced re-judgement must not
+        # read afterwards like a worker re-delivering, and the timeline is where that
+        # reading happens. The reason is the ask the operator answered, so like
+        # `validation_rejected` it is shown rather than folded away.
+        rnd, was = p.get("round"), p.get("was")
+        return (f"Validation forced by hand — round {rnd}" if rnd
+                else "Validation forced by hand",
+                f"{p.get('reason') or ''}"
+                + (f" (was {was})" if was else ""))
     if kind == "validation_passed":
         return "Validation passed", p.get("reason") or ""
     if kind == "validation_rejected":
