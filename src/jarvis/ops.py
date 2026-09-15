@@ -42,6 +42,7 @@ from .project_store import (
     FO_TERMINAL_STATUSES,
     NO_TURN,
     OPEN_STATUSES,
+    FORCEABLE_STATUSES,
     OPEN_VALIDATION_OUTCOMES,
     ProjectStore,
 )
@@ -1249,9 +1250,15 @@ def round_line(rnd: dict[str, Any]) -> str:
     # infer it (spec 2026-09-14 §5.2). `not recorded` for a worktree packet and for every
     # round written before the column existed, which is the honest reading of both.
     sha = str(rnd.get("head_sha") or "")
+    # WHO OPENED IT, and only when the answer is not "a submission did". A round a person
+    # forced must never read afterwards like a worker re-delivering — that
+    # indistinguishability is the whole defect `jarvis validation force` removes — and the
+    # place it has to say so is the line every surface already prints.
+    forced = (rnd.get("forced_reason") or "").strip()
     return (f"round {rnd['round']} · {rnd['fingerprint']} · {rnd['outcome']}"
             f" · config {rnd.get('config_version') or 'not recorded'}"
             f" · commit {sha[:10] or 'not recorded'}"
+            + (f" · forced: {forced}" if forced else "")
             + (f" — {reason}" if reason else ""))
 
 
@@ -1353,7 +1360,7 @@ def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
     read to answer "how many times, and what came back", not to re-read the submission.
     """
     return [{k: r[k] for k in ("id", "round", "ts", "fingerprint", "outcome", "reason",
-                               "pr_url", "config_version", "head_sha")}
+                               "pr_url", "config_version", "head_sha", "forced_reason")}
             for r in store.validation_rounds(wo_id=wo_id, fo_id=fo_id)]
 
 
@@ -1702,7 +1709,8 @@ def _refusal_answered(store: ProjectStore, wo_id: str) -> bool:
 
 
 def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str, Any],
-                          *, declared: str, cfg: Any) -> dict[str, Any]:
+                          *, declared: str, cfg: Any,
+                          forced_reason: str = "") -> dict[str, Any]:
     """Open a validation round over what this work order has produced.
 
     Collects the evidence, fingerprints it, opens the round and parks the work order in
@@ -1713,6 +1721,12 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     is retried while its round is still open, or one that follows a transport outage,
     reuses the number it already has. The insert is idempotent per (work order, round),
     so two callers racing here produce one round rather than two.
+
+    `forced_reason` is `force_validation`'s and nobody else's: it is stamped on the round
+    and changes NOTHING about how the round is numbered, judged or settled. A forced
+    round spends a number exactly like a submitted one, which is why the budget question
+    has the answer it has — spec
+    docs/superpowers/specs/2026-09-15-forcing-a-validation-round.md §4.
     """
     from . import evidence as evidence_mod
     from . import specs
@@ -1727,7 +1741,7 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
         wo_id=wo["id"], fingerprint=evidence_mod.fingerprint(packet),
         summary=str(wo.get("result_summary") or ""), evidence=declared,
         pr_url=wo.get("pr_url"), round=nxt,
-        config_version=current_config_version())
+        config_version=current_config_version(), forced_reason=forced_reason)
     store.set_status(wo["id"], "validating")
     # No attention flag: a unit under review is the system working. Only the give-up
     # transition flags anyone.
@@ -1737,6 +1751,108 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
                      "fingerprint": round_row["fingerprint"],
                      "files": len(packet.files)})
     return round_row
+
+
+def force_validation(wo_id: str, *, reason: str,
+                     project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis validation force` — a PERSON opening a fresh round, with no worker.
+
+    Why it exists: jarvis-0.10.0 introduced `validation_rounds.head_sha`, so every round
+    judged before it carries `''` and `automerge.decide`'s condition 4 holds those work
+    orders on `sha_unrecorded` for ever. The only route to a fresh round was `jarvis wo
+    finish`, which writes a `finished` event and demands a `--summary` — so re-judging a
+    work order meant forging a worker's account of work no worker had done. This reaches
+    `submit_for_validation` directly and writes NO `finished` event; the packet is
+    re-collected from scratch, which is how the new round comes to read the CURRENT pull
+    request and record the CURRENT head.
+
+    **`--reason` is REQUIRED and stored on the round**, following `jarvis config set` and
+    `jarvis gate approve`. A forced round that looked organic afterwards is the defect
+    this command exists to remove, so the reason is on `validation_rounds.forced_reason`
+    — beside the verdict it caused, where `round_line` renders it — and on a
+    `validation_forced` timeline event.
+
+    **IT SPENDS A ROUND NUMBER LIKE ANY OTHER, AND `max_rounds` DOES NOT HOLD IT OFF**
+    (Neo, question 300). Nothing about opening a round consults `cfg.max_rounds`: it is a
+    settle-time branch in `Daemon._validate_work_order`, where `rejected` below the budget
+    sends the worker feedback and `rejected` at or past it escalates to the user. That is
+    the right landing for a round a person forced — the motivating population is parked
+    work orders with no worker left to send feedback to — so the budget is left alone
+    rather than exempted. It cannot be exempted cheaply either: `counted_validation_rounds`
+    both counts rounds AND numbers them, so a round excluded from the count would have its
+    number reused, hit the idempotent insert in `open_validation_round` and hand the
+    caller an already-closed round while the work order parked in `validating` for ever.
+
+    **WHAT IT ALLOWS is `FORCEABLE_STATUSES`, and that is a narrower claim than "what it
+    does not refuse".** Only `waiting_pr_merge` and `needs_review`: a work order that has
+    DELIVERED and whose worker is not typing. A `running` one would be judged while its
+    worker is still writing to the branch, and — worse — an open round OWNS that worker's
+    session (kn-01a4ab27), so `Daemon._reject` would post the panel's feedback into a
+    session mid-task. The allowlist is the guard rather than a `running`-shaped refusal,
+    so a status added to `WO_STATUSES` tomorrow is refused until somebody decides it is
+    safe rather than allowed until somebody remembers it is not.
+
+    The work order lands in `validating` and goes back to where the panel's verdict puts
+    it: `waiting_pr_merge` on a pass (`land_when_cleared` re-parks it behind the still-open
+    pull request, and the automatic merge can then arm on the head this round recorded),
+    `needs_review` on an escalation.
+    """
+    reason = reason.strip()
+    if not reason:
+        raise OpsError("`--reason` cannot be blank: it is what makes this round legible "
+                       "afterwards as one a person forced, and why")
+    name, path, _wo = find_work_order(wo_id, project_name)
+    cfg = validation_config(name)
+    if cfg is None or not cfg.enabled:
+        raise OpsError(
+            f"the validation panel is off for {name}, so there is nothing to force a "
+            f"round with — turn it on (`jarvis config set {name} validation.enabled "
+            f"true`) before forcing a round")
+    store = ProjectStore(path)
+    try:
+        wo = store.get_work_order(wo_id)
+        status = str(wo["status"] or "")
+        if status not in FORCEABLE_STATUSES:
+            raise OpsError(
+                f"{wo_id} is {status}, and a round can only be forced on a work order "
+                f"that has DELIVERED and whose worker is not typing — "
+                f"{' or '.join(FORCEABLE_STATUSES)}. A settled order would be reopened "
+                f"by a verdict that could change nothing; a live one would have its "
+                f"session claimed by the round machine while its worker is still "
+                f"writing to it")
+        if not str(wo.get("pr_url") or ""):
+            raise OpsError(
+                f"{wo_id} carries no pull request, so a fresh round would read its "
+                f"worktree and record no commit — which is the state this command "
+                f"exists to get out of. Give it its pull request first "
+                f"(`jarvis wo finish {wo_id} --pr <url>`)")
+        # ONE READ, predicate and wording derived from it (kn-08f2ff9b): the panel opens
+        # rounds on its own thread, and two reads can straddle one — refusing while
+        # naming a round that has since settled, or allowing over a round that has since
+        # opened. `round_machine_owns` is the round machine's own definition of "this is
+        # mine", and a round it still owns is one about to run or be retried: a second
+        # round underneath would take the MAX-round slot out from under it.
+        latest = store.latest_validation_round(wo_id=wo_id)
+        if ProjectStore.round_machine_owns(latest):
+            assert latest is not None  # `round_machine_owns` is False for None
+            raise OpsError(
+                f"round {latest['round']} on {wo_id} is {latest['outcome']} — the panel "
+                f"has not finished with it. Wait for the verdict; forcing a round now "
+                f"would judge the same pull request twice")
+        round_row = submit_for_validation(store, path, wo,
+                                          declared=declared_evidence(store, wo_id),
+                                          cfg=cfg, forced_reason=reason)
+        # AFTER the round exists, so the event can name it. A person reading the timeline
+        # sees who reopened this and why, next to the `validation_submitted` that a
+        # submission would have written alone.
+        store.add_event(wo_id, "validation_forced",
+                        {"round": round_row["round"], "round_id": round_row["id"],
+                         "reason": reason, "was": status})
+        return {"project": name, "wo_id": wo_id, "round": round_row["round"],
+                "round_id": round_row["id"], "reason": reason, "was": status,
+                "status": store.get_work_order(wo_id)["status"]}
+    finally:
+        store.close()
 
 
 def collect_feature_evidence(store: ProjectStore, project_path: Path,
