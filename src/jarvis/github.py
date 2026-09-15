@@ -182,10 +182,16 @@ def origin_repo(cwd: Path | None) -> tuple[str, str] | None:
 #: 2026-09-13-a-finished-order-proves-its-code-landed.md §7 for the fourth — including
 #: why this is still NOT the same list as `ARTIFACT_FIELDS` below.
 #:
-#: `headRefOid` is the sha GitHub merged, and it is the only exact answer to issue
-#: #232's Mode C: an order whose pull request merged and whose branch then carried
-#: MORE commits. It is recorded on the `pr_merged` event so the landing sweep can ask
-#: that question months later without a second round trip (`landing.assess`).
+#: `headRefOid` answers TWO questions and is the cheapest field here, which is why one
+#: scalar carries both and neither pays for the other:
+#:
+#: * WHICH COMMIT is at the head right now, so the auto-merge decision can compare it
+#:   against the commit the validation panel judged instead of trusting that nothing
+#:   moved (2026-09-14-validated-auto-merge-design.md §5);
+#: * WHICH COMMIT GitHub merged — the only exact answer to issue #232's Mode C, an order
+#:   whose pull request merged and whose branch then carried MORE commits. It is recorded
+#:   on the `pr_merged` event so the landing sweep can ask months later without a second
+#:   round trip (`landing.assess`).
 PR_FIELDS = ("state,mergedAt,mergeable,mergeStateStatus,baseRefName,"
              "statusCheckRollup,headRefOid")
 
@@ -255,8 +261,13 @@ class PullRequest:
     #: One entry per check, through `read_checks`. Empty is a repository that runs no
     #: checks, which is not the same as every check failing.
     checks: tuple[dict[str, str], ...] = ()
-    #: The sha at the head of the pull request's branch. On a MERGED pull request
-    #: this is what was merged, which is what a later tail is measured against.
+    #: `headRefOid`: the commit at the head of the pull request AT VIEW TIME, and `""`
+    #: when GitHub did not answer. On a MERGED pull request it is what was merged, which
+    #: is what a later tail is measured against; on an OPEN one it is what the auto-merge
+    #: decision compares against the commit the validation panel judged. ONE field for
+    #: both readers because it is one fact — read only to be COMPARED, and never resolved
+    #: against a local checkout: this is a remote sha and the worktree it came from may
+    #: be long gone.
     head_oid: str = ""
 
     @property
@@ -374,8 +385,13 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
 #: taking the claim on the submitter's word. `body` is the second: it carries the
 #: reasoning, the screenshots and the "remaining work" section the PR template asks for,
 #: none of which appear in a diff.
-ARTIFACT_FIELDS = ("number,title,body,state,isDraft,baseRefName,headRefName,url,"
-                   "additions,deletions,changedFiles,files,statusCheckRollup")
+#:
+#: `headRefOid` is here as well as in `PR_FIELDS` because the panel's packet is what
+#: BINDS a verdict to a commit: `evidence.judged_head` reads it off the artifact and the
+#: round stores it, so "which diff did the seats read" is a recorded fact rather than an
+#: inference (spec 2026-09-14 §5.2).
+ARTIFACT_FIELDS = ("number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,"
+                   "url,additions,deletions,changedFiles,files,statusCheckRollup")
 
 
 @dataclass(frozen=True)
@@ -394,6 +410,11 @@ class PullRequestArtifact:
     draft: bool
     base_ref: str
     head_ref: str
+    #: `headRefOid` — the commit this artifact IS. Same name and same meaning as
+    #: `PullRequest.head_oid`. `""` when GitHub did not answer it, and that empty string
+    #: is load-bearing: it is what a round records as "the commit was not recorded",
+    #: which never auto-merges (spec §5.2).
+    head_oid: str
     additions: int
     deletions: int
     files: tuple[str, ...]
@@ -473,6 +494,7 @@ def pr_artifact(url: str, cwd: Path | None = None) -> PullRequestArtifact:
         draft=bool(payload.get("isDraft")),
         base_ref=str(payload.get("baseRefName") or ""),
         head_ref=str(payload.get("headRefName") or ""),
+        head_oid=str(payload.get("headRefOid") or ""),
         additions=int(payload.get("additions") or 0),
         deletions=int(payload.get("deletions") or 0),
         files=tuple(str(f.get("path") or "") for f in files if f.get("path")),

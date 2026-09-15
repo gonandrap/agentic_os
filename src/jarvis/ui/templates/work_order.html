@@ -63,6 +63,13 @@
     <p class="kv">⑃ pull request:
       <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a>
       {%- if wo.status == 'waiting_pr_merge' %} — merge it, then "Mark done".{% endif %}</p>
+    {# What the OS did, or declined to do, about merging it. Absent entirely unless the
+       mechanism has touched this order — which is every order on a project that has not
+       opted in — and NEVER a warning tone: a held auto-merge means the user merges this
+       one by hand, which is what they did for every pull request before this existed. #}
+    {% if auto_merge %}
+      <p class="sub">⚙ auto-merge: {{ auto_merge.line }}</p>
+    {% endif %}
   {% endif %}
   {# True for BOTH pause reasons, which the old copy ("refused before it ran") was not:
      a usage-limit refusal never reached the model, but an API error can land halfway

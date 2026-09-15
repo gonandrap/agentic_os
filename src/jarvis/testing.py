@@ -884,6 +884,37 @@ elif argv[:2] == ["pr", "diff"]:
         sys.stderr.write("no pull requests found for this URL\n")
         sys.exit(1)
     sys.stdout.write(pr.get("_diff", ""))
+elif argv[:2] == ["pr", "merge"]:
+    # THE ONE WRITE THE OS EVER MAKES. It is modelled on the property the whole
+    # auto-merge design rests on: `--match-head-commit <sha>` is refused by the SERVER
+    # when the head has moved, so the fake refuses too rather than merging whatever it
+    # holds — a fake that ignored the flag would let a test pass while the real thing
+    # merged an unjudged commit.
+    # Failing the WRITE alone, which `FAKE_GH_FAIL` cannot express: it fails every call,
+    # so a test using it never reaches the merge at all and any assertion about how the
+    # merge failed passes vacuously. The real first failure of auto-merge is a `gh` with
+    # read credentials and no write scope, and that is exactly this shape.
+    merge_fail = os.environ.get("FAKE_GH_FAIL_MERGE")
+    if merge_fail:
+        sys.stderr.write(merge_fail + "\n")
+        sys.exit(1)
+    prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
+    url = argv[2] if len(argv) > 2 else ""
+    pr = prs.get(url)
+    if pr is None:
+        sys.stderr.write("no pull requests found for this URL\n")
+        sys.exit(1)
+    want = argv[argv.index("--match-head-commit") + 1] \
+        if "--match-head-commit" in argv else None
+    if want is not None and want != pr.get("headRefOid"):
+        sys.stderr.write(
+            "failed to merge pull request: Head branch was modified. "
+            "Review and try the merge again.\n")
+        sys.exit(1)
+    if pr.get("state") != "OPEN":
+        sys.stderr.write(f"pull request is {pr.get('state')}\n")
+        sys.exit(1)
+    print(f"Merged pull request {url}")
 else:
     sys.stderr.write(f"fake gh: unhandled argv {argv}\n")
     sys.exit(2)
@@ -1092,6 +1123,17 @@ def fake_gh(tmp_path, monkeypatch):
             """Make every subsequent `gh` call fail with `message` on stderr."""
             monkeypatch.setenv("FAKE_GH_FAIL", message)
 
+        def fail_merge(self, message: str) -> None:
+            """Fail `gh pr merge` and NOTHING else — reads keep working.
+
+            `fail()` is the wrong tool for testing a failed merge: it fails `pr view`
+            too, so the poll never gets as far as merging and every assertion about the
+            merge passes without the merge ever having been attempted. This is also the
+            shape of the likeliest real failure — credentials that can read and not
+            write.
+            """
+            monkeypatch.setenv("FAKE_GH_FAIL_MERGE", message)
+
         def set_pr(self, pr_url: str, state: str, merged_at: str | None = None,
                    mergeable: str | None = None, base_ref: str = "main",
                    checks: list[dict] | None = None,
@@ -1107,11 +1149,18 @@ def fake_gh(tmp_path, monkeypatch):
             readers ask for different field sets but they are reading one pull request,
             so a test that registers CI once has registered it for both.
 
-            `head_oid` is OMITTED rather than sent empty when unset, because GitHub never
-            answers an empty sha: a test that wants the field absent must get it absent
+            `head_oid` is `headRefOid`, shared with `set_pr_artifact` for the same
+            reason and then some: it is the commit the panel judges, the commit the
+            auto-merge decision compares against, AND the sha the landing sweep measures
+            a Mode C tail against (issue #232). A test that set it on only one reader
+            would be testing two pull requests. Moving it — `set_pr(..., head_oid="new")`
+            — is how a test says "somebody pushed", which is the case the whole SHA
+            binding exists for.
+
+            It is OMITTED rather than sent empty when unset, because GitHub never answers
+            an empty sha: a test that wants the field absent must get it absent
             (`github.PR_FIELDS` asks for `headRefOid` on every call), and one that wants
-            it present says so. It is the sha the landing sweep measures a Mode C tail
-            against — issue #232."""
+            it present says so."""
             if mergeable is None:
                 mergeable = "MERGEABLE" if state == "OPEN" else None
             row = {**self.prs.get(pr_url, {}),
@@ -1130,7 +1179,8 @@ def fake_gh(tmp_path, monkeypatch):
                     body: str = "", files: list[dict] | None = None,
                     checks: list[dict] | None = None, state: str = "OPEN",
                     draft: bool = False, base_ref: str = "main",
-                    head_ref: str = "feature", number: int = 1) -> None:
+                    head_ref: str = "feature", number: int = 1,
+                    head_oid: str | None = None) -> None:
             """Register what the PANEL sees of this pull request.
 
             Separate from `set_pr` because the two readers ask for different
@@ -1145,6 +1195,11 @@ def fake_gh(tmp_path, monkeypatch):
                 "number": number, "title": title, "body": body, "state": state,
                 "isDraft": draft, "baseRefName": base_ref,
                 "headRefName": head_ref, "url": pr_url,
+                # Kept when this is called after `set_pr` has already registered one:
+                # the two readers are reading ONE pull request, and a reset here would
+                # silently unbind a verdict from the commit a test just pinned.
+                "headRefOid": (head_oid if head_oid is not None
+                               else self.prs.get(pr_url, {}).get("headRefOid", "")),
                 "additions": sum(int(f.get("additions") or 0) for f in files),
                 "deletions": sum(int(f.get("deletions") or 0) for f in files),
                 "changedFiles": len(files), "files": files,

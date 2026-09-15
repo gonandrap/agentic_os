@@ -23,6 +23,11 @@
     <div class="grow">
       <strong>Round {{ r.round }}</strong>
       <span class="mono sub">{{ r.fingerprint }}</span>
+      {# WHICH COMMIT the seats read. Silent when nothing recorded one — a worktree
+         packet, or a round from before the column existed — because "not recorded" on
+         every historical round would be noise, and the auto-merge line below says so
+         in words when it matters. #}
+      {% if r.head_sha %}<span class="mono sub">@{{ r.head_sha[:10] }}</span>{% endif %}
       {% if r.outcome == 'passed' %}<span class="st tone-ok"><span class="i">✓</span>passed</span>
       {% elif r.outcome == 'rejected' %}<span class="st tone-warn"><span class="i">◭</span>rejected</span>
       {% elif r.outcome == 'escalated' %}<span class="st tone-warn"><span class="i">🙋</span>escalated</span>
