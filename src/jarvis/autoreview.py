@@ -157,8 +157,9 @@ def _held(code: str, reason: str, **fields: Any) -> Decision:
 
 
 def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
-           round_outcome: str = "", refusal_answered: bool = True) -> Decision:
-    """May the OS put this assumption to Neo right now? PURE — no store, no clock, no model.
+           round_outcome: str = "", refusal_answered: bool = True,
+           asked_question_id: int = 0) -> Decision:
+    """May the OS decide this assumption right now? PURE — no store, no clock, no model.
 
     Dicts in, armed-or-held-with-a-reason out, for `automerge.decide`'s reason: the whole
     condition table is then unit-testable without a network, and the safety rule lives in
@@ -180,12 +181,28 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
     5. no refusal of the user's is outstanding (`ops.refusal_answered`). A refused
        assumption is guidance the worker has not answered, and settling its siblings
        would land the very decision the user turned down;
-    6. it has not been asked already — one question per assumption, ever;
+    6. it is not already with Neo on some OTHER question — one question per assumption,
+       ever (see `asked_question_id` below);
     7. `high_stakes_marker` finds nothing in its text.
 
     Condition 1's redundancy with `Daemon.auto_review`'s own guard is deliberate and is
     `two-gates-not-a-chain`'s shape: a project's permission is asserted at the site that
     decides as well as the site that spends.
+
+    **ASKED AT THE ASK SITE, ASKED AGAIN AT THE SETTLE SITE.** Everything above is a fact
+    about state the ask does not freeze: a model call takes seconds to minutes, and in
+    that window the panel can escalate, the user can cancel the order or refuse a
+    sibling. Every one of those turns an armed assumption into one the OS must not touch,
+    and the SETTLE is the act that cannot be taken back — it clears the assumption and
+    `ops.land_when_cleared` lands the order behind it. So `Daemon._deliver_assumption_
+    verdict` re-runs this against freshly read state immediately before accepting, and
+    drops Neo's ruling when it no longer arms.
+
+    `asked_question_id` is what makes that second call meaningful. Condition 6 exists to
+    stop a SECOND question being filed; at the settle site the assumption is linked to
+    the very question being delivered, so passing its id excludes it — while a link to a
+    DIFFERENT question still holds, because two rulings on one assumption is a state
+    nobody designed and not one to settle under.
     """
     if not (getattr(cfg, "enabled", False) and getattr(cfg, "auto_review", False)):
         return _held(HELD_DISABLED,
@@ -212,10 +229,10 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
         return _held(HELD_REFUSAL_UNANSWERED,
                      "you refused an assumption on this work order and the worker has "
                      "not delivered again since", **fields)
-    if assumption.get("neo_question_id"):
+    asked = int(assumption.get("neo_question_id") or 0)
+    if asked and asked != int(asked_question_id or 0):
         return _held(HELD_ASKED,
-                     f"assumption #{n} is already with Neo "
-                     f"(question {assumption['neo_question_id']})", **fields)
+                     f"assumption #{n} is already with Neo (question {asked})", **fields)
     marker = high_stakes_marker(str(assumption.get("content") or ""))
     if marker:
         return _held(HELD_HIGH_STAKES,

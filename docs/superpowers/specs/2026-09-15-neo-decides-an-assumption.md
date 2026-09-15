@@ -161,6 +161,33 @@ unparseable reply, a transport failure, a missing field or a model answering som
 question all land with the user by structure rather than by an exception handler someone
 remembered to write.
 
+### 5.1 `decide` is asked twice, and only the second call guards anything
+
+Every condition above is a fact about state **the ask does not freeze**. A model call is
+seconds to minutes wide, and in that window the panel can go `pending` → `escalated`, the
+user can cancel the work order, revoke `validation.auto_review`, or refuse a sibling
+assumption. Asking is cheap and reversible; **settling is neither** — it clears the
+assumption and `ops.land_when_cleared` lands the order behind it, and with auto-merge on
+that runs to merged.
+
+So `Daemon._deliver_assumption_verdict` re-runs the whole table against state read at
+that moment — the work order re-fetched, `latest_validation_round`, `ops.refusal_answered`
+— immediately before `ops.accept_assumption`, and drops Neo's ruling when it no longer
+arms. A dropped ruling is recorded twice over: an `autoreview_held` event carrying the
+code, and the question re-marked `escalated` so `/neo` says the assumption is the user's
+again.
+
+Condition 6 is the one that needs help here, because by the settle site the assumption is
+linked to the very question being delivered. `asked_question_id` excludes exactly that
+one; a link to a *different* question still holds, because two rulings on one assumption
+is a state nobody designed and not one to settle under.
+
+This is also why `_note_autoreview_held`'s four exclusions are suspended when settling.
+They all rest on "this order was never a candidate", which is true of the ask pass — it
+lists `needs_review` and nothing else. At the settle site `status` means the user
+**cancelled** the order and `disabled` means they **revoked the permission**, and those
+are the two the record most needs.
+
 ## 6. Failure directions — every one ends in "the user decides it, as they do today"
 
 | what breaks | what happens |

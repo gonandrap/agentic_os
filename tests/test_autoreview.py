@@ -480,6 +480,123 @@ def test_the_users_own_verdict_wins_a_race_with_neos(started):
     assert events(store, wo["id"], "autoreview_accepted") == []
 
 
+# -- the settle site: everything that can change while Neo is thinking -----------------
+#
+# The ask FREEZES NOTHING. A model call is seconds to minutes wide, and `decide` runs
+# before it — so every condition it checked is a fact that can be false by the time the
+# ruling comes back. The settle is the step that cannot be taken back: it clears the
+# assumption and `ops.land_when_cleared` lands the order behind it. So the table is run
+# again against state read at that moment, and these are the rows that reach it.
+
+
+def test_a_panel_that_gives_up_while_neo_is_thinking_stops_the_settle(started):
+    """THE ONE THAT MATTERS MOST, and it is reachable rather than theoretical: arming on
+    a `pending` round is explicitly allowed (`test_every_other_round_outcome_leaves_the
+    _assumption_reviewable`), so pending -> escalated is the ordinary way a panel gives
+    up on an order the OS has already asked about.
+
+    Without the re-check the OS clears the assumptions and lands — with auto-merge on,
+    merges — a work order the panel deliberately put in front of the user, silently and
+    with nothing on the record saying so (kn-fcbfd42b).
+    """
+    store, wo = park(started, auto_review=True, outcome="pending",
+                     assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    ask(started, store)
+    (q,) = questions()
+    # The panel reaches its verdict while the question is in flight, and gives up.
+    store.close_validation_round(
+        store.latest_validation_round(wo_id=wo["id"])["id"], "escalated",
+        "the seats could not agree")
+
+    drain(started)
+
+    (row,) = store.all_assumptions(wo["id"])
+    assert row["status"] == "pending" and not row["decided_by"]
+    assert events(store, wo["id"], "autoreview_accepted") == []
+    # The order did NOT land behind it — the thing the panel's give-up was protecting.
+    assert store.get_work_order(wo["id"])["status"] == "needs_review"
+    # ...and the OS said why, in both places: the work order's record and Neo's own list.
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["code"] == autoreview.HELD_PANEL_GAVE_UP
+    assert "gave up" in held["reason"]
+    (escalated,) = events(store, wo["id"], "autoreview_escalated")
+    assert escalated["dropped"] == autoreview.HELD_PANEL_GAVE_UP
+    assert questions()[0]["status"] == "escalated"
+    assert q["id"] == questions()[0]["id"]
+    # The one line the user reads on `jarvis wo show` says it is theirs again.
+    assert "left with you" in ops.autoreview_state(
+        store, store.get_work_order(wo["id"]))["line"]
+
+
+def test_a_work_order_cancelled_while_neo_is_thinking_is_not_settled_and_re_landed(
+        started):
+    """The same gap by another door. `decide` condition 2 is checked against the work
+    order's status at ASK time; the order can be cancelled before the ruling lands, and
+    settling it would clear the assumptions of an order nobody is waiting on and push it
+    back through `ops.land_when_cleared`."""
+    store, wo = park(started, auto_review=True,
+                     assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    ask(started, store)
+    ops.cancel(wo["id"])
+
+    drain(started)
+
+    (row,) = store.all_assumptions(wo["id"])
+    assert row["status"] == "pending" and not row["decided_by"]
+    assert store.get_work_order(wo["id"])["status"] == "cancelled"
+    assert events(store, wo["id"], "autoreview_accepted") == []
+    # `_note_autoreview_held` drops `status` at the ASK site, where it is unreachable.
+    # Here it is the whole reason, and suppressing it would leave the OS's decision not
+    # to act as the one thing it never wrote down.
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["code"] == autoreview.HELD_STATUS and "cancelled" in held["reason"]
+
+
+def test_permission_revoked_while_neo_is_thinking_stops_the_settle(started):
+    """The switch is read at the settle as well as at the ask. A user who turns
+    `validation.auto_review` off has withdrawn the authority the ruling was spending, and
+    a ruling already paid for is not a reason to spend it anyway."""
+    store, wo = park(started, auto_review=True,
+                     assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    ask(started, store)
+    started.catalog.project("proj_a").validation.auto_review = False
+
+    drain(started)
+
+    (row,) = store.all_assumptions(wo["id"])
+    assert row["status"] == "pending" and not row["decided_by"]
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["code"] == autoreview.HELD_DISABLED
+
+
+def test_nothing_having_changed_the_second_check_lets_the_ruling_through(started):
+    """The control. A guard that held everything would pass all four tests above and
+    break the feature, so the arming path is asserted from the same fixture — one
+    `park`, one `ask`, one `drain`, nothing touched in between."""
+    store, wo = park(started, auto_review=True,
+                     assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    ask(started, store)
+
+    drain(started)
+
+    (row,) = store.all_assumptions(wo["id"])
+    assert row["status"] == "accepted" and row["decided_by"] == "neo"
+    assert events(store, wo["id"], "autoreview_held") == []
+
+
+def test_the_question_being_delivered_does_not_block_its_own_settle():
+    """`asked_question_id` at the unit level, and it is the reason the second `decide`
+    call says anything at all. Condition 6 exists to stop a SECOND question being filed;
+    at the settle site the assumption is linked to the very question being delivered, so
+    that link must not read as "already with Neo" — while a link to a DIFFERENT question
+    still holds, because two rulings on one assumption is a state nobody designed."""
+    linked = assumption(neo_question_id=41)
+
+    assert decide(assumption=linked).code == autoreview.HELD_ASKED
+    assert decide(assumption=linked, asked_question_id=41).armed
+    assert decide(assumption=linked, asked_question_id=42).code == autoreview.HELD_ASKED
+
+
 # -- the refusals that were already there, left honest ---------------------------------
 
 

@@ -3311,7 +3311,7 @@ class Daemon:
             autoreview.propose(store, neo_store, project.name, wo, a, assumptions)
 
     def _note_autoreview_held(self, store: ProjectStore, wo_id: str,
-                              decision: Any) -> None:
+                              decision: Any, *, settling: bool = False) -> None:
         """Record ONCE, per (assumption, reason), that the OS declined to decide.
 
         `_note_automerge_held`'s reasoning verbatim: the pass runs every reconcile tick
@@ -3333,12 +3333,23 @@ class Daemon:
           about a mechanism it does not have;
         * `status` — unreachable from this pass, which lists `needs_review` only;
         * `settled` — the assumption is decided, and saying the OS declined to decide a
-          decided thing is noise on every work order the user has ever reviewed.
+          decided thing is noise on every work order the user has ever reviewed;
+        * `asked` — the question is already filed, which is the pass working.
+
+        **`settling=True` SUSPENDS ALL FOUR, and the difference is not cosmetic.** Every
+        exclusion above rests on "this order was never a candidate" — true of the ask
+        pass, which lists `needs_review` and nothing else. The settle site re-runs the
+        same table against state read after the model call, and there `status` means the
+        user CANCELLED the order between the ask and the ruling and `disabled` means they
+        revoked the permission. Those are the two the record most needs, and dropping
+        them would leave the OS's decision not to act as the one thing it never wrote
+        down.
         """
         from . import autoreview, db
 
-        if decision.code in (autoreview.HELD_DISABLED, autoreview.HELD_STATUS,
-                             autoreview.HELD_SETTLED, autoreview.HELD_ASKED):
+        if not settling and decision.code in (
+                autoreview.HELD_DISABLED, autoreview.HELD_STATUS,
+                autoreview.HELD_SETTLED, autoreview.HELD_ASKED):
             return
         key = (decision.assumption_id, decision.code)
         for event in store.events_of_kind(wo_id, "autoreview_held"):
@@ -3359,6 +3370,11 @@ class Daemon:
         is still open, apply through the same `ops` the user's own command goes through —
         and its one hard rule: **the code can override Neo toward the user and never away
         from it.** `autoreview.read_ruling` is where that override lives.
+
+        **THE WHOLE CONDITION TABLE IS RE-RUN BEFORE ACCEPTING, NOT JUST "IS IT STILL
+        PENDING".** `autoreview.decide` is asked twice: once to justify spending a model
+        call, and once, against freshly read state, to justify the settle it came back
+        to do. Only the second one is guarding anything irreversible.
 
         A ruling that does not accept is NOT an inbox row. The work order is already on
         the user's attention list carrying "assumptions pending review" — the state it was
@@ -3417,6 +3433,39 @@ class Daemon:
 
         project = next((p for p in self.catalog.projects if p.name == q["project"]), None)
         if project is None:
+            return
+
+        # THE ASK DID NOT FREEZE ANYTHING, and accepting is the step that cannot be taken
+        # back: it clears the assumption, and `ops.land_when_cleared` lands the order
+        # behind it — with auto-merge on, all the way to merged. A model call is seconds
+        # to minutes wide, and in that window the panel can go `pending` -> `escalated`
+        # (arming on `pending` is explicitly allowed, so this is reachable, not
+        # theoretical), the user can cancel the order, or a refusal can arrive on a
+        # sibling. So the whole condition table is re-run against state read NOW —
+        # `wo` came from `get_work_order` above, the round and the refusal from these two
+        # reads — and Neo's ruling is dropped if it no longer arms. `asked_question_id`
+        # excludes the question being delivered from condition 6; see `autoreview.decide`.
+        latest = pstore.latest_validation_round(wo_id=wo["id"])
+        still = autoreview.decide(
+            numbered, wo, project.validation,
+            round_outcome=str((latest or {}).get("outcome") or ""),
+            refusal_answered=ops.refusal_answered(pstore, wo["id"]),
+            asked_question_id=int(q["id"]))
+        if not still.armed:
+            # Escalated rather than left `answered`: the assumption is the user's again,
+            # and `/neo` and `jarvis neo list` have to say so — the same re-mark the
+            # non-acceptance branch above does, for the same reason. The hold event is
+            # what puts the WHY on the work order, where `ops.autoreview_state` renders
+            # it as the one `⚙ auto-review:` line.
+            neo_store.mark(q["id"], "escalated", reason=still.reason)
+            self._note_autoreview_held(pstore, wo["id"], still, settling=True)
+            pstore.add_event(wo["id"], "autoreview_escalated", {
+                "assumption_id": assumption["id"], "n": numbered.get("n"),
+                "reason": still.reason, "stakes": ruling.stakes,
+                "model": ruling.model, "neo_question_id": q["id"],
+                "overridden": False, "dropped": still.code})
+            log.info("auto-review dropped its ruling on assumption #%s of %s: %s",
+                     numbered.get("n"), wo["id"], still.reason)
             return
         try:
             out = ops.accept_assumption(
