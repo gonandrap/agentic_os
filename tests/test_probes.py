@@ -44,6 +44,20 @@ has to go and look. Your job is to look instead, and to decide whether it needed
 
 You are shown evidence, never the worker's transcript. Judge on what you are given.
 
+NOT EVERY ALARM IS A BURNING TURN. Two kinds — `rewrite-tax-prefix` and `rewrite-tax-ttl`
+— are a STANDING condition instead: a whole project's re-write tax over a window of
+ALREADY-SETTLED orders. Three things follow, and getting any of them wrong wastes the
+call. The work order they are attached to is the biggest single contributor, shown to you
+as the EXEMPLAR of the number — it is not itself in trouble, nothing about it is still
+running, and there is no turn to interrupt. Nothing you decide can prevent the spend
+already in the alarm; what is preventable is the NEXT window's. And the two kinds are two
+different failures with opposite cures — the prompt prefix moving is fixed by finding what
+changes the head of the prompt between calls, the cache entry expiring is fixed by keeping
+the gap between calls shorter or by a longer TTL — so an answer that blurs them sends the
+fix at the wrong one. Never propose changing a cache TTL off a `rewrite-tax-ttl` alarm
+alone: its threshold is a share of the BILL and the TTL decision is taken against a
+different ratio, which the alarm's own text names along with the command that measures it.
+
 READ WHAT A TURN COST BEFORE YOU CALL IT EXPENSIVE. Every turn in the packet carries its
 API call count and the tokens and dollars it actually bought. A turn that made NO API call
 has spent nothing however long its wall clock is: it STALLED, and it is the work never

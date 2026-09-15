@@ -49,7 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import bugreport, bus, claude_cli, db, fleet, worker_session
+from . import bugreport, bus, claude_cli, db, fleet, inspection, worker_session
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
@@ -211,6 +211,20 @@ VALIDATION_REASON_CHARS = 500
 #: clipped one. Without it a sentence simply stops and the truncation reads as the
 #: machine having nothing more to say.
 VALIDATION_REASON_CUT = " […]"
+
+
+#: What the inbox row for an aggregate re-write-tax alarm says. Up here rather than at
+#: its call site because every inbox row reaches every sink, Telegram included, and
+#: `remedies`' and `supervisor`'s titles live at the top of their modules for that reason.
+#: ONE PER CAUSE, because the inbox is the durable half of this alarm and two rows
+#: reading identically merge exactly the two failures this whole change exists to keep
+#: apart — a title that says only "the tax" sends the reader to the wrong cure.
+REWRITE_INBOX_TITLE = {
+    inspection.REWRITE_PREFIX_ALARM:
+        "{project} is paying to re-send conversations whose prompt PREFIX moved",
+    inspection.REWRITE_TTL_ALARM:
+        "{project} is paying to re-send conversations whose cache entry EXPIRED",
+}
 
 
 def escalation_body(reason: str) -> str:
@@ -573,6 +587,10 @@ class Daemon:
                     # Before the invariants, because it is a fact about work that is
                     # still RUNNING rather than about state that has settled.
                     self.check_burning_turns(project, store)
+                    # AFTER `seal_bills`, never before: it reads the sealed bills, so an
+                    # order that settled on this tick is in this tick's window rather
+                    # than a reconcile interval late.
+                    self.check_rewrite_tax(project, store)
                     # Also before them: this is the only thing that ever closes a gate
                     # request no reviewer can see, so leaving it until after would let
                     # the invariants judge a hold the OS was about to refuse.
@@ -2651,7 +2669,6 @@ class Daemon:
         Read-only and free of the model: one transcript read per running work order, on
         the reconcile cadence rather than every tick.
         """
-        from . import inspection
         from . import usage as usage_mod
 
         # The PROJECT's thresholds, already resolved against the OS block by
@@ -2695,6 +2712,77 @@ class Daemon:
             # carry one sentence.
             if fresh and not wo["needs_attention"]:
                 store.flag_attention(wo["id"], fresh[0].reason)
+
+    def check_rewrite_tax(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Raise a project's STANDING re-write tax, split by the cause that produced it.
+
+        THE AGGREGATE HALF OF `check_burning_turns`. That one reports a single call
+        re-sending a single conversation while the turn is still running and already
+        names its cause; this one reports the condition ACROSS settled orders, which no
+        surface raised and which the user asked for in issue 164 item 1.
+
+        Read off sealed bills, so it costs an indexed query and a JSON parse per order in
+        the window — no transcript walk, and no model call.
+
+        THREE THINGS HERE ARE DELIBERATE AND EACH WOULD LOOK LIKE AN OMISSION.
+
+        * NO ATTENTION FLAG. The carrier is a settled order, and
+          `invariants.check_no_phantom_attention` clears the flag on every terminal order
+          on the next tick — so a flag here would evaporate and the OS would be raising a
+          finding it then hides. The INBOX ROW is the durable half, which is
+          `remedies._flag_and_tell`'s own reasoning arrived at from the other side. The
+          supervisor's queue is what carries it onward: it claims the alarm, judges it,
+          and may propose `file_work_order`. The cost of that, stated rather than
+          discovered: on a project running the supervisor the user hears twice, once here
+          and once at the verdict. It is paid deliberately, because the supervisor SHIPS
+          OFF and a finding whose only reader is a disabled subsystem reaches nobody at
+          all (Neo question 291).
+        * THE CARRIER IS AN EXEMPLAR, NOT A CULPRIT. `wo_alarms.wo_id` is a real foreign
+          key and an aggregate finding is about a project, so something must carry it;
+          the biggest single contributor is the one order whose evidence packet is
+          actually about the number being judged. `SUPERVISOR_PERSONA` says so in as many
+          words, because a judge shown a settled order would otherwise look for what is
+          wrong with THAT order.
+        * THE DEDUPE IS ONE ALARM PER KIND PER WINDOW. The condition is still true on the
+          next tick — that is what makes it standing rather than burning — so matching on
+          `(kind, seq)` the way `check_burning_turns` does would re-raise it every
+          reconcile for ever. `last_alarm_of_kind` is the memory, and the window is the
+          same cohort window the arithmetic used.
+        """
+        from . import bill as bill_mod
+        from .project_store import NO_TURN
+
+        cfg = project.inspect
+        if not cfg.enabled:
+            return
+        tax = bill_mod.rewrite_tax(store, days=cfg.alarm_rewrite_window_days)
+        if tax is None:
+            return
+        # BOTH floors, and they answer different questions: too few orders is one
+        # order's shape wearing the project's name, too little money is a percentage of
+        # nothing. Either alone lets the other case through.
+        if tax.orders < cfg.alarm_rewrite_min_orders \
+                or tax.bill_usd < cfg.alarm_rewrite_min_usd:
+            return
+        # `(kind, reason)` and not an `inspection.Alarm`: `bill` is accounting and does
+        # not import the config layer to name a string — see `bill.REWRITE_PREFIX_ALARM`.
+        for kind, reason in bill_mod.rewrite_alarms(tax, cfg):
+            last = store.last_alarm_of_kind(kind)
+            if last is not None and float(last["ts"] or 0.0) >= tax.since:
+                continue
+            row = store.add_finding(tax.worst_id, kind=kind, reason=reason,
+                                    seq=NO_TURN, source="cost")
+            store.add_event(tax.worst_id, "cost_alarm",
+                            {"kind": kind, "seq": NO_TURN,
+                             "reason": reason, "alarm_id": row["id"]})
+            self.central.add_inbox(
+                project=project.name, level="warning",
+                title=REWRITE_INBOX_TITLE[kind].format(project=project.name),
+                body=f"{reason}\n"
+                     f"The supervisor will look before you have to. "
+                     f"Read it with: jarvis alarms show {row['id']}",
+                wo_id=tax.worst_id)
+            log.info("[%s] %s: %s", project.name, kind, reason)
 
     def settle_turns(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Reap finished turns, then move each work order to where its turn says it is.
