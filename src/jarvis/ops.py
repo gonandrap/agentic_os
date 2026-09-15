@@ -38,6 +38,8 @@ from .daemon import daemon_running
 from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
+    ASSUMPTION_DECIDER_OS,
+    ASSUMPTION_DECIDER_USER,
     FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
     NO_TURN,
@@ -357,11 +359,12 @@ def ui_health() -> dict[str, Any]:
 def _neo_attention() -> tuple[dict[str, int], list[dict[str, Any]]]:
     """`(counts, questions Neo handed back to the user)` — one open of Neo's DB.
 
-    `approval`, `plan` and `alarm` questions are dropped here rather than at the display:
-    each is reported by the thing that actually carries the decision (the gate item, the
-    feature order, the alarm), and telling the user to `jarvis neo answer` a question
-    whose real resolution is `jarvis gate approve` — or `jarvis alarms review` — sends
-    them to the wrong command.
+    `approval`, `plan`, `alarm` and `assumption` questions are dropped here rather than at
+    the display: each is reported by the thing that actually carries the decision (the
+    gate item, the feature order, the alarm, the work order's own "assumptions pending
+    review" flag), and telling the user to `jarvis neo answer` a question whose real
+    resolution is `jarvis gate approve` — or `jarvis wo review` — sends them to the wrong
+    command.
     """
     from .neo_store import NeoStore
 
@@ -369,7 +372,7 @@ def _neo_attention() -> tuple[dict[str, int], list[dict[str, Any]]]:
     try:
         return (neo.counts(),
                 [q for q in neo.list_questions(statuses=("escalated", "failed"))
-                 if q.get("kind") not in ("approval", "plan", "alarm")])
+                 if q.get("kind") not in ("approval", "plan", "alarm", "assumption")])
     finally:
         neo.close()
 
@@ -1416,6 +1419,95 @@ def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     return {**newest, "line": _automerge_line(newest)}
 
 
+#: Every event the automatic assumption review writes. `AUTOMERGE_EVENTS`' note applies
+#: verbatim: the order means nothing, and the list exists so that adding a kind is one
+#: edit rather than one edit and a forgotten renderer.
+AUTOREVIEW_EVENTS = ("autoreview_accepted", "autoreview_escalated", "autoreview_asked",
+                     "autoreview_held")
+
+
+def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """What `jarvis wo show` and the dashboard say about the automatic review, or None.
+
+    `automerge_state`'s shape and its reasons, one authority along — None on every work
+    order the mechanism never touched, and the NEWEST EVENT WINS BY TIMESTAMP rather than
+    by a fixed kind order, because a work order can accrue several of these: three
+    assumptions can be asked about, two accepted and one escalated, and the line must say
+    where that left things rather than which kind was checked first.
+
+    NO TERMINAL KIND, unlike its sibling. An `autoreview_accepted` is terminal for ONE
+    assumption and says nothing about the next, so a work order whose last event is an
+    escalation is held even though an acceptance came earlier — which is exactly what the
+    timestamp already says.
+
+    **This is the SUMMARY line, and it is not where the attribution lives.** Who decided
+    each assumption is on the assumption row itself (`assumptions.decided_by`), which is
+    what every surface listing them reads; this says what the mechanism did last.
+    """
+    from . import db
+
+    newest: dict[str, Any] | None = None
+    for kind in AUTOREVIEW_EVENTS:
+        rows = store.events_of_kind(wo["id"], kind)
+        if not rows:
+            continue
+        # Payload first, so `kind` and `ts` are this function's answers and not whatever
+        # an event happened to carry under those names (`automerge_state`'s note).
+        candidate = {**db.from_json(rows[-1]["payload"], {}),
+                     "kind": kind, "ts": float(rows[-1]["ts"])}
+        if newest is None or candidate["ts"] > newest["ts"]:
+            newest = candidate
+    if newest is None:
+        return None
+    return {**newest, "line": _autoreview_line(newest)}
+
+
+def assumption_decider(a: dict[str, Any]) -> str:
+    """WHO decided this assumption, in words, for whoever is about to read the verdict.
+
+    THE POST-CONDITION THIS EXISTS FOR: a machine decision must never read as the user's.
+    This is the ONE place that phrase is built. `jarvis wo show` reaches it through
+    `assumption_line`; the work-order page calls it directly, because the page wants the
+    attribution inside a badge and the rest of the row in its own cells. The LAYOUTS
+    differ and that is fine — the attribution must not, because two spellings of it are
+    two chances for one to drop the "the OS" and credit a machine verdict to the reader.
+
+    `''` means the user (`ASSUMPTION_DECIDER_USER`'s note): every row written before the
+    column existed was, by construction, the user's.
+    """
+    by = str(a.get("decided_by") or "") or ASSUMPTION_DECIDER_USER
+    if by == ASSUMPTION_DECIDER_USER:
+        return "you"
+    return f"the OS ({by}, {a.get('decided_model') or 'model not recorded'})"
+
+
+def assumption_line(a: dict[str, Any]) -> str:
+    """One assumption on one line, for `jarvis wo show`. Attribution from one renderer."""
+    n, status = a.get("n"), str(a.get("status") or "")
+    content = str(a.get("content") or "")
+    if status == "pending":
+        return f"#{n} pending your review: {content}"
+    reason = str(a.get("decided_reason") or "").strip()
+    return (f"#{n} {status} by {assumption_decider(a)}"
+            f"{' — ' + reason if reason else ''}: {content}")
+
+
+def _autoreview_line(state: dict[str, Any]) -> str:
+    """One line. The verb says WHO acted, which is the whole point of the record."""
+    kind = state["kind"]
+    n = state.get("n")
+    if kind == "autoreview_accepted":
+        return (f"assumption #{n} accepted by the OS (Neo, "
+                f"{state.get('model') or 'model not recorded'}) — "
+                f"{state.get('reason') or 'no reason recorded'}")
+    if kind == "autoreview_escalated":
+        return (f"assumption #{n} left with you — "
+                f"{state.get('reason') or 'no reason recorded'}")
+    if kind == "autoreview_asked":
+        return f"assumption #{n} is with Neo (question {state.get('neo_question_id')})"
+    return f"held — {state.get('reason') or 'no reason recorded'}"
+
+
 def _automerge_line(state: dict[str, Any]) -> str:
     """One line, in the words the spec's §5.4 chose. The verb says who acted."""
     kind = state["kind"]
@@ -1663,7 +1755,7 @@ def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
         store.set_status(wo_id, "needs_review")
         store.flag_attention(wo_id, "assumptions pending review")
         return "needs_review"
-    if not _refusal_answered(store, wo_id):
+    if not refusal_answered(store, wo_id):
         # The flag and the guidance are `review_work_order`'s — this is the panel's
         # settle path arriving at a work order the user has since turned down, and all
         # it owes is not to land it.
@@ -1681,7 +1773,7 @@ def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
     return land_finished(store, wo, pr_url)
 
 
-def _refusal_answered(store: ProjectStore, wo_id: str) -> bool:
+def refusal_answered(store: ProjectStore, wo_id: str) -> bool:
     """Has the worker delivered again since the user last REFUSED an assumption?
 
     The other half of the user's gate, and the one "nothing is pending" misses: a
@@ -2022,7 +2114,7 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             fields["pr_url"] = pr_url
         store.update_work_order(wo_id, **fields)
         fresh = store.get_work_order(wo_id)
-        # BEFORE anything settles, because settling reads it: `_refusal_answered` dates
+        # BEFORE anything settles, because settling reads it: `refusal_answered` dates
         # the delivery against the user's last refusal, and an event written afterwards
         # would make every re-delivery look older than the refusal it answers.
         # The evidence rides in the payload so the OTHER route into done can find it —
@@ -2626,6 +2718,82 @@ def _validates_on_review(store: ProjectStore, wo_id: str, cfg: Any) -> bool:
             and store.latest_validation_round(wo_id=wo_id) is None)
 
 
+def _land_after_acceptance(store: ProjectStore, path: Path, wo_id: str,
+                           cfg: Any) -> str:
+    """Where a work order goes once its assumptions are all accepted. Returns the status.
+
+    ONE function for both routes into that state — the user's `jarvis wo review` and the
+    OS's `accept_assumption` — because the OS accepting an assumption must be
+    indistinguishable IN EFFECT from the user accepting it. Two copies of this would be
+    two answers to "does a closed pull request go back into the merge queue", and the one
+    that is not the route actually running is the copy that rots (`arbitrate`'s lesson,
+    and `land_finished`'s own note about its two callers).
+    """
+    if _validates_on_review(store, wo_id, cfg):
+        submit_for_validation(store, path, store.get_work_order(wo_id),
+                              declared=declared_evidence(store, wo_id), cfg=cfg)
+    fresh = store.get_work_order(wo_id)
+    # THE ONE PLACE `pr_state` MAY BE READ, and the reason is that this is the only
+    # landing the poll can have run before: a work order reaches here parked, and
+    # `_awaiting_merge` is asking about the pull request that parking was about. A
+    # settled one is not a merge queue — passing it out of the landing is what stops a
+    # review putting a CLOSED pull request back in front of a poll whose only move is to
+    # flag it for the user again. Everywhere else the column can be stale; `land_finished`
+    # says why.
+    if not _awaiting_merge(fresh):
+        fresh = {**fresh, "pr_url": ""}
+    # The assumption gate has cleared; whether the work order lands now is the panel's
+    # half of the join to answer. NOTE that landing through `land_finished` also CLOSES
+    # THE BACKLOG ITEM on the `completed` branch, which the inline landing this replaced
+    # did not — that omission was the drift `land_finished` exists to prevent.
+    return land_when_cleared(store, fresh)
+
+
+def accept_assumption(store: ProjectStore, project_path: Path, wo: dict[str, Any],
+                      assumption: dict[str, Any], *, reason: str, model: str,
+                      question_id: int, cfg: Any,
+                      config_version_id: str | None = None) -> dict[str, Any]:
+    """THE OS settling ONE assumption on the user's behalf. Never the user's route.
+
+    docs/superpowers/specs/2026-09-15-neo-decides-an-assumption.md §4. Takes an open
+    store, `complete_merged`'s way, because the only caller is the daemon thread that
+    already has one.
+
+    **EVERY FACT THAT MAKES THIS AUDITABLE IS WRITTEN HERE, and that is the single most
+    important post-condition of the feature**: who decided (never the user), the reason,
+    the model that reached it and the configuration in force. The row carries them so
+    that every surface listing assumptions inherits the attribution without each having
+    to remember; the event carries them so the timeline reads as one fact.
+
+    **NO LEARNING IS RECORDED.** `review_work_order` distils the USER's reasoning into a
+    Neo learning, which is the point of asking them for it. Doing the same here would be
+    Neo teaching itself out of its own output, and a ledger that cites itself is how a
+    single early mistake becomes a standing rule. The teachable half is the other
+    direction and it already exists: `jarvis neo review <qid> --correct "…"` on the
+    question this settled, and `jarvis neo retract` on anything it produced.
+
+    Lands the work order only when this was the LAST pending assumption — through the
+    same `_land_after_acceptance` the user's route uses, so the two cannot drift.
+    """
+    wo_id = wo["id"]
+    store.review_assumption(
+        assumption["id"], "accepted",
+        decided_by=ASSUMPTION_DECIDER_OS, reason=reason, model=model,
+        config_version=(config_version_id if config_version_id is not None
+                        else current_config_version()))
+    store.add_event(wo_id, "autoreview_accepted", {
+        "assumption_id": assumption["id"], "n": assumption.get("n"),
+        "reason": reason, "model": model, "neo_question_id": question_id,
+        "decided_by": ASSUMPTION_DECIDER_OS})
+    pending = store.pending_assumptions(wo_id)
+    status = str(wo.get("status") or "")
+    if not pending:
+        status = _land_after_acceptance(store, project_path, wo_id, cfg)
+    return {"wo_id": wo_id, "assumption_id": assumption["id"],
+            "n": assumption.get("n"), "status": status, "pending": len(pending),
+            "settled": not pending}
+
+
 def review_work_order(wo_id: str, accept: bool = True,
                       feedback: str = "") -> dict[str, Any]:
     """Accept (or reject) all pending assumptions and settle the work order.
@@ -2658,31 +2826,15 @@ def review_work_order(wo_id: str, accept: bool = True,
     try:
         pending = store.pending_assumptions(wo_id)
         for a in pending:
-            store.review_assumption(a["id"], "accepted" if accept else "rejected")
+            # STAMPED `user` RATHER THAN LEFT EMPTY. Empty already reads as the user on
+            # every historical row, but this is the route a person takes and the claim is
+            # worth asserting: it is what makes "not the user" provable on the other one.
+            store.review_assumption(a["id"], "accepted" if accept else "rejected",
+                                    decided_by=ASSUMPTION_DECIDER_USER, reason=feedback)
         status = wo["status"]
         if wo["status"] == "needs_review":
             if accept:
-                if _validates_on_review(store, wo_id, cfg):
-                    submit_for_validation(store, path, store.get_work_order(wo_id),
-                                          declared=declared_evidence(store, wo_id),
-                                          cfg=cfg)
-                fresh = store.get_work_order(wo_id)
-                # THE ONE PLACE `pr_state` MAY BE READ, and the reason is that this is
-                # the only landing the poll can have run before: a work order reaches
-                # here parked, and `_awaiting_merge` is asking about the pull request
-                # that parking was about. A settled one is not a merge queue — passing
-                # it out of the landing is what stops `jarvis wo review` putting a
-                # CLOSED pull request back in front of a poll whose only move is to
-                # flag it for the user again. Everywhere else the column can be stale;
-                # `land_finished` says why.
-                if not _awaiting_merge(fresh):
-                    fresh = {**fresh, "pr_url": ""}
-                # The user's gate has cleared; whether the work order lands now is the
-                # panel's half of the join to answer. NOTE that landing through
-                # `land_finished` also CLOSES THE BACKLOG ITEM on the `completed`
-                # branch, which the inline landing this replaced did not — that
-                # omission was the drift `land_finished` exists to prevent.
-                status = land_when_cleared(store, fresh)
+                status = _land_after_acceptance(store, path, wo_id, cfg)
             elif not feedback:
                 # With feedback the guidance is delivered below, so the work order is
                 # not waiting on the user — only a bare rejection strands it.
@@ -3441,7 +3593,14 @@ def neo_review(question_id: int, approved: bool, feedback: str = "",
     finally:
         neo.close()
     forwarded = False
-    if not approved:
+    # AN ASSUMPTION REVIEW HAS NO WORKER TO FORWARD TO, and correcting one is the path
+    # the user is actually told to take (`Daemon._deliver_assumption_verdict`'s inbox
+    # row), so this is not a corner. The worker finished before the question was even
+    # filed, and the work order is typically `waiting_pr_merge` or `validating` — not
+    # terminal — so without this guard the correction would start a turn on an order
+    # nobody asked to reopen, which is the one act the whole mechanism is fenced against.
+    # The LEARNING above still lands, which is the entire point of the correction.
+    if not approved and q.get("kind") != "assumption":
         try:
             _, _, wo = find_work_order(q["wo_id"], q["project"])
             if wo["status"] not in ("completed", "failed", "cancelled"):
@@ -3504,6 +3663,18 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
             raise OpsError(f"neo question {question_id} is a cost alarm, and answering "
                            f"it would message the worker mid-turn — "
                            f"{_alarm_review_hint(q)}")
+        # AN ASSUMPTION QUESTION HAS NO WORKER TO ANSWER EITHER, and for the mirror
+        # reason: nobody asked it, and the worker finished long before it was filed. A
+        # reply here would start a turn on a work order nobody asked to reopen. The
+        # answer the user actually means is a verdict on the assumption, and that has its
+        # own command. Refused here as well as in the template, because `jarvis neo
+        # answer` reaches this too.
+        if q.get("kind") == "assumption":
+            raise OpsError(
+                f"neo question {question_id} is an assumption review, and the worker "
+                f"that recorded it has finished — answering here would reopen it. "
+                f"Decide the assumption instead: jarvis wo review {q['wo_id']} "
+                f"[--reject] --feedback \"...\"")
         neo.record_answer(question_id, answer, answered_by="user")
         neo.review(question_id, approved=True)  # user-authored ⇒ nothing to review
     finally:

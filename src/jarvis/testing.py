@@ -815,6 +815,27 @@ elif "-p" in argv and "--resume" not in argv:
         else:
             verdict = {"escalate": True, "verdict": "deny",
                        "reason": "test default: gate reviews escalate unless forced"}
+    elif "ASSUMPTION REVIEW" in prompt:
+        # The fourth reviewer kind, and the same defaulting rule as the two above for
+        # the same reason: a fake that ACCEPTED by default would let every auto-review
+        # test pass while asserting nothing about the ruling. `stakes` is on every reply
+        # because the real persona demands it on every reply.
+        #
+        # HIGH before ACCEPT: the one contains the other, and the override it exercises
+        # is the net that has to hold when Neo says yes.
+        if "FORCE_ACCEPT_HIGH" in prompt:
+            verdict = {"escalate": False, "verdict": "approve", "stakes": "high",
+                       "reason": "test-forced: accepted, and high-stakes"}
+        elif "FORCE_ACCEPT" in prompt:
+            verdict = {"escalate": False, "verdict": "approve", "stakes": "routine",
+                       "reason": "test-forced acceptance: a naming convention"}
+        elif "FORCE_DENY" in prompt:
+            verdict = {"escalate": False, "verdict": "deny", "stakes": "routine",
+                       "reason": "test-forced: the worker chose wrongly"}
+        else:
+            verdict = {"escalate": True, "verdict": "deny", "stakes": "routine",
+                       "reason": "test default: assumption reviews escalate unless "
+                                 "forced"}
     elif "Release this plan?" in prompt:
         # A feature order's plan review — the third question kind, and the third verdict
         # shape. Same defaulting rule as the gate above and for the same reason: a fake

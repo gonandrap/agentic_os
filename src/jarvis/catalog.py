@@ -267,6 +267,19 @@ class ValidationConfig:
     # it: turning the panel off stops auto-merge with it, because the acceptance this
     # rides on is the panel's.
     auto_merge: bool = False
+    # WHETHER THE OS MAY DECIDE THIS PROJECT'S PENDING ASSUMPTIONS ITSELF, instead of
+    # holding the work order until the user rules on each one
+    # (docs/superpowers/specs/2026-09-15-neo-decides-an-assumption.md).
+    #
+    # The same shape as `auto_merge` above in every respect — per project, ordinary
+    # field-level fallback, `*.validation.*` so `jarvis config set` demands a reason and
+    # stamps a config version, ships FALSE at both levels — and for the same reason: it
+    # is an authority the user held, handed to the OS one project at a time.
+    #
+    # Read BESIDE `enabled`, never instead of it. The reviewer this rides on is Neo, but
+    # what makes an accepted assumption safe to land is that the panel judged the work it
+    # was part of; turning the panel off must stop this with it.
+    auto_review: bool = False
 
 
 # -- `jarvis inspect`: what counts as worth reporting, and what as worth interrupting for
@@ -790,6 +803,8 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         # shipped `False` when the fleet names nothing either — the field-level fallback
         # that makes this per-project rather than global. A project opts in by naming it.
         auto_merge=bool(raw.get("auto_merge", base.auto_merge)),
+        # Same fallback, same reason — see `ValidationConfig.auto_review`.
+        auto_review=bool(raw.get("auto_review", base.auto_review)),
     )
 
 

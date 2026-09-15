@@ -866,7 +866,12 @@ def test_parse_verdict_tolerates_fences():
                  # An answer that proposes no gate exemption proposes none: the empty
                  # string must never reach the rule base as a pattern that matches
                  # everything.
-                 "exempt_pattern": ""}
+                 "exempt_pattern": "",
+                 # And an answer that classifies no stakes classifies none. Only the
+                 # `assumption` kind reads this, and `autoreview.read_ruling` treats an
+                 # empty string as `routine` — which is safe ONLY because accepting
+                 # needs an explicit `approve` as well, never the absence of a warning.
+                 "stakes": ""}
     v = neo_mod.parse_verdict("total nonsense")
     assert v["escalate"] is True
 

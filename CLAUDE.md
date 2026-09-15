@@ -104,7 +104,18 @@ jarvis fo resume <id> [--fix "what still needs doing"]  # a FAILED feature back 
 jarvis backlog promote <id> --as feature   # intake -> feature order, not a work order
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
 jarvis wo review <id> [--reject] [--feedback "why"]   # feedback teaches Neo; on
-                                           # --reject it also goes to the worker
+                                           # --reject it also goes to the worker.
+                                           # A project may hand the ROUTINE ones to Neo:
+                                           # `jarvis config set <project>
+                                           # validation.auto_review true --reason "…"`.
+                                           # Ships OFF everywhere, and it only ever
+                                           # ACCEPTS — anything Neo cannot defend, and
+                                           # anything high-stakes, still waits for the
+                                           # user, with Neo's reading attached. What it
+                                           # decided, and why, is on `jarvis wo show`
+                                           # against each assumption, saying the OS
+                                           # decided it and never you. Correct one with
+                                           # `jarvis neo review <qid> --correct "…"`.
 jarvis wo ack <id> / --all                 # "seen it" — puts the attention flag down for
                                            # good (the reconciler re-derives attention
                                            # every tick, so nothing else makes it stick).

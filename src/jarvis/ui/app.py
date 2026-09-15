@@ -588,6 +588,9 @@ def create_app() -> FastAPI:
         # Shared with `jarvis alarms` rather than spelled inline, so neither surface can
         # be the one that shows a subject-level finding as `turn -1`.
         turn_label=ops.turn_label, no_turn=NO_TURN,
+        # Same reason, for the assumption badge: `jarvis wo show` and this page must
+        # not be able to disagree about whether the OS or the user decided one.
+        assumption_decider=ops.assumption_decider,
         # "a worker turn may be in flight right now", so the page can withhold the
         # `claude --resume` invitation rather than put a second driver on one session.
         active_statuses=ACTIVE_STATUSES,
@@ -842,6 +845,10 @@ def create_app() -> FastAPI:
             # None for every order the automatic merge has never touched, which is what
             # keeps the line off the page entirely rather than rendering "off" forever.
             auto_merge = ops.automerge_state(store, wo)
+            # And the same for the assumption review, on the same rule — and for the
+            # same reason one authority along: None keeps the line off the page for
+            # every order the mechanism never looked at.
+            auto_review = ops.autoreview_state(store, wo)
             # WHERE THE REST OF THIS ORDER IS. The brief is deliberately only the margin
             # around a section of the feature's spec now, so a page that showed the brief
             # alone would be a page missing most of the work. `section_text` is NOT passed
@@ -855,6 +862,7 @@ def create_app() -> FastAPI:
         return render(request, "work_order.html", project=pname, wo=wo, parked=parked,
                       pause=pause, waiting=waiting, status_label=label,
                       validation=validation, spec=spec, auto_merge=auto_merge,
+                      auto_review=auto_review,
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug),
                       debug=show_debug, debug_count=count_debug(events),

@@ -432,6 +432,34 @@ def test_the_question_page_sends_a_gate_request_to_the_gates_tab(gated):
     assert "decide it on the gates tab" in page
 
 
+def test_an_escalated_assumption_sends_the_user_to_the_work_order_not_the_worker(
+        client, daemon, project):
+    """Auto-review's half of the same rule. Nobody ASKED this question — the OS filed it
+    against an assumption a worker that has long since finished recorded, so the reply
+    box would deliver the user's words into a work order nobody asked to reopen.
+    `ops.neo_answer_escalated` refuses it; this is the half that stops them typing into
+    a box that then errors."""
+    from jarvis.neo_store import NeoStore
+
+    wo = ops.create_work_order("proj_a", "export the schedule")
+    store = ProjectStore(project)
+    a = store.add_assumption(wo["id"], "dropped the `--since` flag from the exporter")
+    store.set_status(wo["id"], "needs_review")
+    neo = NeoStore()
+    q = neo.ask("proj_a", wo["id"],
+                f"ASSUMPTION REVIEW — rule on assumption #1 of {wo['id']} in proj_a, "
+                f"and on nothing else.", kind="assumption")
+    neo.mark(q["id"], "escalated",
+             reason="dropping a flag changes the CLI surface, which is yours to decide")
+    store.link_assumption_question(a, q["id"])
+
+    for page in (client.get("/neo").text,
+                 client.get(f"/neo/question/{q['id']}").text):
+        assert f'action="/neo/{q["id"]}/answer"' not in page
+        assert "would reopen its work order" in page
+        assert f'href="/wo/proj_a/{wo["id"]}#pending"' in page
+
+
 def test_assumptions_are_numbered_to_match_the_timeline(client, daemon, project):
     """The timeline says "Assumption #2 recorded" and never the text, so the number is
     the only thing tying an entry to the paragraph it is about."""
@@ -465,6 +493,104 @@ def test_a_reviewed_assumption_is_still_readable_by_its_number(client, daemon, p
     # ...and the decision is no longer being asked for.
     assert "Accept all" not in page
     assert "Assumptions the worker recorded" in page
+
+
+def test_the_page_says_which_assumptions_the_os_decided_and_which_you_did(client,
+                                                                          project):
+    """THE post-condition of auto-review, on the surface somebody actually reads.
+
+    The OS can settle an assumption itself now. A badge saying only "accepted" would
+    credit a machine verdict to the reader, and the reader has no other way to tell:
+    both rows look identical once the pending panel is gone. So the page must name the
+    decider on each one, separately — the two must not be able to read the same.
+    """
+    from jarvis.project_store import ASSUMPTION_DECIDER_OS, ASSUMPTION_DECIDER_USER
+
+    wo = ops.create_work_order("proj_a", "task with two judgement calls")
+    store = ProjectStore(project)
+    mine = store.add_assumption(wo["id"], "picked postgres over sqlite")
+    theirs = store.add_assumption(wo["id"], "named the helper `_render_row`")
+    store.review_assumption(theirs, "accepted", decided_by=ASSUMPTION_DECIDER_OS,
+                            reason="a naming convention, not a decision",
+                            model="claude-opus-5", config_version="cfg-0007")
+    store.review_assumption(mine, "accepted", decided_by=ASSUMPTION_DECIDER_USER,
+                            reason="fine")
+    store.set_status(wo["id"], "needs_review")
+
+    # Whitespace-normalised: the claim is about the WORDS on the badge, and a reviewer
+    # reindenting the template must not have to come and fix this test.
+    page = " ".join(client.get(f"/wo/proj_a/{wo['id']}").text.split())
+    assert "accepted by the OS (neo, claude-opus-5)" in page
+    assert "accepted by you" in page
+    # Not just "both phrases appear somewhere": the model is named on the OS's row, and
+    # the user's row does not borrow it.
+    assert page.count("the OS (neo, claude-opus-5)") == 1
+    assert page.count("claude-opus-5") == 1
+    # ...and the reason the OS gave is on the row it decided, for the hover.
+    assert "a naming convention, not a decision" in page
+
+
+def test_the_page_and_jarvis_wo_show_cannot_disagree_about_who_decided(client, project):
+    """One renderer, asserted as one renderer. `ops.assumption_decider` is what the CLI
+    prints and what the badge prints; a second spelling on either side is the failure
+    this pins, because the one that drops the "the OS" is the one somebody reads."""
+    from jarvis.project_store import ASSUMPTION_DECIDER_OS
+
+    wo = ops.create_work_order("proj_a", "task with a judgement call")
+    store = ProjectStore(project)
+    a = store.add_assumption(wo["id"], "reused the existing exporter")
+    store.review_assumption(a, "accepted", decided_by=ASSUMPTION_DECIDER_OS,
+                            reason="no new surface", model="claude-opus-5")
+    store.set_status(wo["id"], "needs_review")
+
+    row = store.all_assumptions(wo["id"])[0]
+    phrase = ops.assumption_decider(row)
+    assert phrase == "the OS (neo, claude-opus-5)"
+    assert phrase in client.get(f"/wo/proj_a/{wo['id']}").text
+    assert phrase in ops.assumption_line(row)
+
+
+def test_a_model_the_os_did_not_record_is_said_so_rather_than_left_blank(client,
+                                                                        project):
+    """A row written by an older OS, or by a path that forgot to pass the model. "the OS
+    (neo, )" reads as a rendering bug and invites the reader to ignore it; the honest
+    phrase says the attribution is real and the model is what is missing.
+
+    This is also the assertion that DISCRIMINATES: the badge used to spell the
+    attribution inline and rendered `?` here, where `jarvis wo show` said "model not
+    recorded". Two spellings of the same fact; this test fails if a second one returns.
+    """
+    from jarvis.project_store import ASSUMPTION_DECIDER_OS
+
+    wo = ops.create_work_order("proj_a", "task with a judgement call")
+    store = ProjectStore(project)
+    a = store.add_assumption(wo["id"], "kept the default timeout")
+    store.review_assumption(a, "accepted", decided_by=ASSUMPTION_DECIDER_OS,
+                            reason="unchanged behaviour")
+    store.set_status(wo["id"], "needs_review")
+
+    assert "the OS (neo, model not recorded)" in client.get(
+        f"/wo/proj_a/{wo['id']}").text
+
+
+def test_the_auto_review_line_shows_before_there_is_a_pull_request(client, project):
+    """Auto-review is not a fact about a pull request: it fires on `needs_review`, which
+    is normally reached before one exists, and a HOLD is exactly what the user needs to
+    see at that moment. This line once rendered only inside the `pr_url` block, and 109
+    UI tests passed with it visible to nobody."""
+    wo = ops.create_work_order("proj_a", "task with a risky judgement call")
+    store = ProjectStore(project)
+    store.add_assumption(wo["id"], "reused the production API key")
+    store.set_status(wo["id"], "needs_review")
+    store.add_event(wo["id"], "autoreview_held",
+                    {"assumption_id": 1, "n": 1, "code": "high_stakes",
+                     "reason": "assumption #1 mentions 'production API key' — the OS "
+                               "does not decide those for you"})
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert not store.get_work_order(wo["id"])["pr_url"]
+    assert "auto-review" in page
+    assert "does not decide those for you" in page
 
 
 def test_wo_show_carries_every_assumption_with_its_number(jarvis_home, fake_claude,
