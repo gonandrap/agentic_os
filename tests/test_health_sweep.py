@@ -18,7 +18,7 @@ import time
 
 import pytest
 
-from jarvis import catalog, db, ops, probes as probes_mod, supervisor
+from jarvis import catalog, db, health as health_mod, ops, probes as probes_mod, supervisor
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.health import due, fingerprint
@@ -192,6 +192,67 @@ def test_the_stale_clause_is_what_earns_the_feature():
     three_days = 3 * 24 * 60 * 60.0
     assert due({"ts": 0.0, "fingerprint": "frozen"}, "frozen", cfg,
                now=three_days, created=0.0) == "stale"
+
+
+# -- a parked unit's stale window is its own (issue #220) ------------------------------
+
+
+_PARKED_CFG = catalog.SupervisorConfig(health_min_interval_minutes=30,
+                                       health_stale_minutes=720,
+                                       health_parked_stale_minutes=2880)
+MINUTE = 60.0
+
+
+def test_a_parked_unit_waits_the_long_window_and_a_live_one_does_not():
+    """§4.2: a unit waiting on a human cannot move its own fingerprint, so the stale
+    window IS its steady-state bill — and re-deriving "parked, correctly" is worth far
+    less per look than watching something that is executing."""
+    still = {"ts": 0.0, "fingerprint": "frozen"}
+
+    assert due(still, "frozen", _PARKED_CFG, now=721 * MINUTE, created=0.0,
+               status="needs_review") is None
+    assert due(still, "frozen", _PARKED_CFG, now=2881 * MINUTE, created=0.0,
+               status="needs_review") == "stale"
+    # The partner: the same row, the same clock, a unit that is actually executing.
+    assert due(still, "frozen", _PARKED_CFG, now=721 * MINUTE, created=0.0,
+               status="running") == "stale"
+
+
+def test_every_parked_status_gets_the_long_window_and_nothing_else_does():
+    """The vocabulary, asserted as a whole: a status added to `OPEN_STATUSES` later must
+    be classified deliberately, not inherit a window by accident. `status=""` is the
+    caller that names none — a feature order — and it keeps the ordinary window."""
+    from jarvis.project_store import OPEN_STATUSES
+
+    still = {"ts": 0.0, "fingerprint": "frozen"}
+
+    def trigger(status: str) -> str | None:
+        return due(still, "frozen", _PARKED_CFG, now=721 * MINUTE, created=0.0,
+                   status=status)
+
+    assert set(health_mod.PARKED_STATUSES) <= set(OPEN_STATUSES)
+    for status in health_mod.PARKED_STATUSES:
+        assert trigger(status) is None, status
+    for status in set(OPEN_STATUSES) - set(health_mod.PARKED_STATUSES):
+        assert trigger(status) == "stale", status
+    assert trigger("") == "stale"
+
+
+def test_a_parked_unit_that_moves_is_still_swept_on_the_ordinary_floor():
+    """THE REASON THIS IS A LONGER WINDOW AND NOT AN EXCLUSION. `waiting-on-nobody` is
+    the probe that is MOST valuable on a parked unit — an order waiting on a message
+    nobody will send looks exactly like one waiting on a merge — so the sweep after a
+    parked unit's state actually moves is the one worth paying for, and it is still
+    floored at `health_min_interval_minutes` and nothing longer."""
+    old = {"ts": 0.0, "fingerprint": "before"}
+
+    assert due(old, "after", _PARKED_CFG, now=29 * MINUTE, created=0.0,
+               status="waiting_pr_merge") is None
+    assert due(old, "after", _PARKED_CFG, now=31 * MINUTE, created=0.0,
+               status="waiting_pr_merge") == "changed"
+    # And a parked unit is still looked at once to begin with.
+    assert due(None, "fp", _PARKED_CFG, now=31 * MINUTE, created=0.0,
+               status="needs_review") == "first-look"
 
 
 # -- `fingerprint`: cheap, deterministic, and it moves when the unit does ---------------
@@ -602,6 +663,33 @@ def test_the_cadence_is_a_setting_and_a_tick_off_it_sweeps_nothing(
 
     _sweep(daemon, clock)   # tick 1 of 20
     assert len(_health_calls(fake_claude)) == 1
+
+
+def test_the_parked_window_governs_a_real_sweep_and_the_project_may_shorten_it(
+        started, catalog_file, fake_claude, store, clock):
+    """END TO END, because `due` cannot know a status nobody hands it: this is the only
+    test that fails if `_health_candidates` stops passing one through.
+
+    `health_stale_minutes` is at the legal floor here, so a live unit would be swept on
+    every tick — the parked one is not, and then is, when the project says so.
+    """
+    _enable(catalog_file, health_parked_stale_minutes=1000)
+    _wo(store, status="needs_review")
+
+    _sweep(started(), clock)
+    assert len(_health_calls(fake_claude)) == 1, "a parked unit is still looked at once"
+
+    _sweep(started(), clock)
+    assert len(_health_calls(fake_claude)) == 1, (
+        "and then waits out the parked window, not the ordinary one")
+
+    data = json.loads(catalog_file.read_text())
+    data["projects"][0]["supervisor"] = {"health_parked_stale_minutes": FLOOR_MINUTES}
+    catalog_file.write_text(json.dumps(data))
+
+    _sweep(started(), clock)
+    assert len(_health_calls(fake_claude)) == 2, (
+        "the cadence is the project's to set, like every other threshold")
 
 
 # -- the ledger's own housekeeping -------------------------------------------------------

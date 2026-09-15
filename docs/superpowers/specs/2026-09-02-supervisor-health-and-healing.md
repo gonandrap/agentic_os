@@ -1437,6 +1437,58 @@ test asserts the order.
 
 ---
 
+## 4.2 — What the sweep actually costs, and the parked window (issue #220, 2026-09-13)
+
+Issue #220 was filed one hour after §4.1 made the sweep work, and it projected the bill as
+`open units × 2 sweeps/hour × $0.108 ≈ $47/day`, of which ~$41/day on units parked waiting on
+a human. **That model is wrong by about 25×, and the error is the interesting part.**
+
+### The cadence is fingerprint-driven and stale-bounded, not interval-driven
+
+`health_min_interval_minutes` (30) is a FLOOR, never a period. After the first look, `due`
+fires again only when the fingerprint has MOVED — floored at 30 minutes — or when it has not
+moved for `health_stale_minutes` (720). A unit nobody is touching is therefore swept **twice
+a day**, not 48 times.
+
+The live ledger says exactly that. Of every non-`failed` row on 0.9.4: eight `first-look`
+sweeps inside three minutes of the sweep being re-enabled, one `changed`, and then **nothing
+for the next hour and a quarter** — with the sweep on, the daemon healthy and eight open
+units. Steady state for the eight parked units is ~`8 × 2/day × $0.108 ≈ $1.7/day`.
+
+#220's own option 4 predicted this ("make the fingerprint do the work… this may partly solve
+itself") and said to check it before tuning anything. The check came out in its favour.
+
+### The residual, and the proportionate fix
+
+Two sweeps a day to re-derive "this is parked, correctly" is still the wrong bill, because
+every probe on a parked unit is either inapplicable or has to be talked out of firing by
+prompt prose. So: `PARKED_STATUSES` (`waiting_input`, `needs_review`, `waiting_pr_merge`) get
+their own stale window, `health_parked_stale_minutes`, default 2880 (48h) — one setting, a
+`SupervisorConfig` field like every other threshold, per-project overridable.
+
+Nothing else moves. The `changed` floor is untouched: when a parked unit's status finally
+moves, so does its fingerprint, and that sweep is the one worth paying for.
+
+**A longer window, never an exclusion.** `waiting-on-nobody` is the probe that is MOST
+valuable on a parked unit — an order waiting on a message nobody will send looks exactly like
+one waiting on a merge, and no cost heuristic can tell them apart. #220's option 1 (drop
+parked statuses from `_health_candidates`) would have blinded the one probe that earns its
+keep there. This keeps the catch at a quarter of the looks.
+
+`due` gains `status` as an ARGUMENT, not a read: §4's rule that this function is the whole of
+the spend decision and must stay testable without a store is why it is not parsed out of the
+fingerprint and why no store reaches it.
+
+### The rule this leaves behind
+
+**A cost projection taken from a cold-start window measures the cold start, not the steady
+state.** Eight `first-look` sweeps in three minutes is a backlog draining, and multiplying it
+by 24 hours measures nothing that will ever happen. Where a trigger is event-driven, the only
+honest projection is one taken after the events stop — which is why #220 was filed with a
+revisit date, and why the fix shipped is a twenty-fifth of the one filed.
+
+---
+
 ## Out of scope, and filed
 
 - **Turning any of this on.** `supervisor.enabled`, `supervisor.health_enabled` and
