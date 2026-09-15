@@ -174,7 +174,8 @@ def stop_os() -> dict[str, Any]:
 # -- status ------------------------------------------------------------------------------
 
 def run_doctor(project: str | None = None, repair: bool = False,
-               catalog_path: str | None = None) -> dict[str, Any]:
+               catalog_path: str | None = None,
+               include_os: bool = True) -> dict[str, Any]:
     """Run the OS's post-condition checks over one project or the whole fleet.
 
     Read-only unless `repair` is set, so it is safe to run at any time. The daemon runs
@@ -192,6 +193,13 @@ def run_doctor(project: str | None = None, repair: bool = False,
     the default `jarvis doctor` re-reads git for every completed work order every single
     time — the cache is populated by the daemon's hourly sweep and by `--repair`, never
     by a plain run. Read-only is worth more than the seconds: see `check_work_lands`.
+
+    `include_os=False` drops the OS-LEVEL checks — `check_os` and the release marker —
+    and keeps the per-project ones. The scheduler's daily run passes it for every project
+    but the one that owns the install: those checks are about the OS, not about any
+    project, so a fleet of six would otherwise report one broken dashboard six times
+    every morning. Interactive `jarvis doctor` leaves it on, which is why the default is
+    True: a human who typed the command is asking about everything they can see.
     """
     from .invariants import check_catalog, check_os, check_project, check_release_marker
 
@@ -225,7 +233,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
     # OS-level checks first: they are about the OS itself (is the dashboard alive?),
     # not about any one project, and `--project` must not filter them out — a fleet
     # scoped to one project still wants to know its web UI is broken.
-    os_found = check_os()
+    os_found = check_os() if include_os else []
     results, total = [], len(os_found)
     for p in rows:
         if p["status"] != "active":
@@ -268,7 +276,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
     # OS-level state under $JARVIS_HOME, owned by no project: a pending-release marker
     # stuck in flight. Reported under its own heading; never repaired (which half of
     # the hand-off died is not derivable from the file).
-    os_violations = check_release_marker()
+    os_violations = check_release_marker() if include_os else []
     if os_violations:
         total += len(os_violations)
         results.append({
@@ -281,6 +289,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
         })
     out = {
         "repair": repair,
+        "include_os": include_os,
         "violations": total,
         "os": [{"invariant": v.invariant, "detail": v.detail, "repaired": v.repaired,
                 "repair": v.repair, "context": v.context} for v in os_found],
@@ -375,6 +384,28 @@ def _neo_attention() -> tuple[dict[str, int], list[dict[str, Any]]]:
         neo.close()
 
 
+def _held_jobs(store: ProjectStore, catalog: Catalog | None = None) -> list[dict[str, Any]]:
+    """Scheduled jobs this project is STILL SUPPOSED TO RUN and cannot.
+
+    Only the held ones: a scheduler ticking along is not news, and a line per job per
+    project on every `jarvis status` would spend exactly the attention budget the
+    scheduler exists to protect.
+
+    Filtered by the config for `invariants.check_schedule_progresses`' reason — a hold
+    survives being switched off, because only a firing clears it, and a project that has
+    been told to stop scheduling will never reach one. Resolved through
+    `schedule_config_at`, the SAME call that invariant makes, so the two cannot answer
+    differently for one project.
+    """
+    cfg = schedule_config_at(store.project_path, catalog)
+    if not cfg.enabled:
+        return []
+    return [{"job_id": st["job_id"], "since": st["held_since"],
+             "reason": st["held_reason"] or "", "wo_id": st["last_wo_id"]}
+            for st in store.list_schedule_states()
+            if st["held_since"] and st["job_id"] in cfg.jobs]
+
+
 def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
     central = CentralStore()
     try:
@@ -394,6 +425,11 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             fleet_state = fleet.current(_cat)
         except (OpsError, CatalogError):
             mode_by_project = {}
+            # `_cat` stays None and `_held_jobs` resolves the catalog itself, landing on
+            # `schedule_config_at`'s single fallback. Deliberately NOT a second map here:
+            # a name-keyed one beside the invariant's path-keyed lookup is how the two
+            # surfaces came to disagree about the same project in the first place.
+            _cat = None
         # Read Neo's questions BEFORE the project loop, not after it: a question Neo sent
         # up already gets its own attention line below, carrying the text and the
         # `jarvis neo answer` command, and the work order it came from must not add a
@@ -543,6 +579,15 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         for wo in open_wos
                     ],
                     "settings_drift": drift,
+                    # ONLY THE HELD ONES. A scheduler that is ticking along is not news
+                    # and adding a line per job per project to every `jarvis status`
+                    # would spend exactly the attention budget the scheduler is designed
+                    # to protect; a job that has wanted to fire and could not is the one
+                    # state where silence and death look the same from outside.
+                    # INV-SCHEDULE-HELD is the louder half, once it has been held for
+                    # days — this is what answers "why has there been no doctor order
+                    # since Tuesday" before then.
+                    "schedule_held": _held_jobs(store, _cat),
                 })
                 if drift:
                     attention.append({
@@ -5497,6 +5542,44 @@ def inspect_config_at(project_path: Path) -> Any:
         return catalog.os.inspect
     except (OpsError, CatalogError, OSError, ValueError):
         return InspectConfig()
+
+
+def schedule_config_at(project_path: Path, catalog: Catalog | None = None) -> Any:
+    """THE ONLY WAY ANYTHING LEARNS WHETHER THIS PROJECT SCHEDULES ANYTHING.
+
+    One resolver with one fallback, called by both surfaces that read a hold
+    (`_held_jobs` for `jarvis status`, `invariants.check_schedule_progresses` for
+    `jarvis doctor`). They used to resolve separately — one by NAME with a disabled
+    fallback, one by PATH with `os.schedule`'s — which meant they could give opposite
+    answers about the same project and the OS would contradict itself about a mechanism
+    it had been told to stop running.
+
+    BY PATH, because that is the only key both callers hold: an invariant is handed a
+    store and no name. `catalog` may be passed by a caller that has already loaded one,
+    which is a saved file read per project and not a second code path — the resolution
+    and the fallback below are the same either way.
+
+    A PROJECT THE CATALOG DOES NOT LIST FALLS BACK TO `ScheduleConfig()` — DISABLED — and
+    deliberately NOT to `catalog.os.schedule`, where `inspect_config_at` and
+    `messaging_config_at` go. Those answer "by what threshold shall I judge this work",
+    which a fleet-wide default answers perfectly well for a project nobody has configured.
+    This answers "is this mechanism supposed to be running here", and for a project absent
+    from the catalog the daemon's answer is no: `Daemon.tick` iterates `catalog.projects`,
+    so such a project's jobs can never fire and its holds can never clear. Inheriting an
+    enabled `os.schedule` would make both surfaces report a permanent hold for a project
+    the OS does not drive — §4's failure, reached by a third route.
+    """
+    from .catalog import ScheduleConfig
+
+    try:
+        cat = catalog if catalog is not None else resolve_catalog()
+        target = Path(project_path).resolve()
+        for spec in cat.projects:
+            if Path(spec.path).resolve() == target:
+                return spec.schedule
+    except (OpsError, CatalogError, OSError, ValueError):
+        pass
+    return ScheduleConfig()
 
 
 def messaging_config_at(project_path: Path) -> Any:

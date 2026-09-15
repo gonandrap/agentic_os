@@ -62,6 +62,7 @@ from .project_store import (
     FO_TERMINAL_STATUSES,
     OPEN_STATUSES,
     PRE_APPROVED_KEY,
+    TERMINAL_STATUSES,
     UNGOVERNED_ORIGINS,
     ProjectStore,
     resume_spends_slot,
@@ -130,6 +131,15 @@ RETRY_EVERY_TICKS = 2
 #: line up would silently sweep at some beat frequency of the two. 720 % 6 == 0, and both
 #: fire on tick 721.
 LANDING_SWEEP_EVERY_TICKS = 720
+
+#: Look at the scheduler's clock every N ticks — a minute at the default 5s interval. Its
+#: own cadence because it is the cheapest pass in the daemon and the one whose lateness
+#: matters least: the shortest interval a job can declare is an hour, so a minute of slop
+#: is noise, and running it every tick would be 12x the reads for no difference anybody
+#: could observe. One indexed `scheduled_jobs` read per enabled job per pass, and NOTHING
+#: AT ALL for a project that has not switched the scheduler on, which is every project by
+#: default (`catalog.ScheduleConfig`).
+SCHEDULE_EVERY_TICKS = 12
 
 #: How many dashboard digests one batch may produce. Bounds the cost of the FIRST batch
 #: on an instance upgrading into the feature with a backlog of long questions already in
@@ -483,6 +493,7 @@ class Daemon:
         poll_prs = self.tick_count % PR_POLL_EVERY_TICKS == 1
         retry_paused = self.tick_count % RETRY_EVERY_TICKS == 1
         sweep_landings = self.tick_count % LANDING_SWEEP_EVERY_TICKS == 1
+        run_schedule = self.tick_count % SCHEDULE_EVERY_TICKS == 1
         # `None` means "the roster was not read this tick" — either nothing is injected
         # or the listing failed — and is NOT the same as an empty roster, which would
         # mean every injected session ended. Session tracking is skipped on None.
@@ -552,6 +563,11 @@ class Daemon:
                 # pending work order, so it is claimed by the same pass rather than
                 # waiting a whole poll interval to start.
                 self.plan_features(project, store)
+                # Before dispatch for the planner's reason one step removed: an order the
+                # scheduler files this tick is an ordinary pending work order, so the
+                # same pass claims it instead of leaving it a whole poll interval late.
+                if run_schedule:
+                    self.schedule_tick(project, store)
                 self.dispatch_pending(project, store, state)
                 if poll_prs:
                     self.poll_pull_requests(project, store)
@@ -2567,6 +2583,101 @@ class Daemon:
                     pstore.close()
         finally:
             neo_store.close()
+
+    # -- 6b. the scheduler: work orders nobody typed ---------------------------------------
+
+    def _os_owner(self) -> str | None:
+        """Which project runs the fleet-wide OS checks — `schedule.os_owner`, per tick."""
+        from . import schedule
+
+        return schedule.os_owner((p.name, p.path) for p in self.catalog.projects)
+
+    @staticmethod
+    def _schedule_blocker(store: ProjectStore, state: dict[str, Any]) -> dict[str, Any] | None:
+        """The job's own previous order, if it has not settled yet.
+
+        A DELETED previous order is not a blocker: the clock outlives the work order it
+        filed (`scheduled_jobs` carries no foreign key), and a job that could never fire
+        again because somebody tidied up its last receipt would be a scheduler killed by
+        housekeeping.
+        """
+        prev = state.get("last_wo_id")
+        if not prev:
+            return None
+        try:
+            wo = store.get_work_order(str(prev))
+        except KeyError:
+            return None
+        return None if wo["status"] in TERMINAL_STATUSES else wo
+
+    @staticmethod
+    def _retire_previous(store: ProjectStore, state: dict[str, Any]) -> None:
+        """Hide yesterday's receipt as today's is filed — the attention-budget rule.
+
+        A daily job left alone fills the listing with a year of identical rows, which is
+        the alarm nobody reads that this whole design is written against. So exactly one
+        scheduled order per job stays visible: the newest.
+
+        HIDING IS EARNED, NOT AUTOMATIC. A previous order that ended badly — flagged, or
+        holding an assumption the user has not ruled on — is left where it is, because
+        those are the two states in which it is still asking for something. What a run
+        FOUND does not live here either way: findings leave as their own work orders,
+        filed under their own origin, and nothing hides those.
+        """
+        prev = state.get("last_wo_id")
+        if not prev:
+            return
+        try:
+            wo = store.get_work_order(str(prev))
+        except KeyError:
+            return
+        if (wo["status"] in TERMINAL_STATUSES and not wo["needs_attention"]
+                and not wo["hidden"] and not store.pending_assumptions(wo["id"])):
+            store.set_hidden(wo["id"])
+
+    def schedule_tick(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """File the work orders this project's clock says are due.
+
+        THE ONLY PLACE IN THE OS THAT CREATES WORK NOBODY ASKED FOR, and every guard rail
+        it leans on is somewhere else on purpose: the cadence is `schedule.decide` (pure,
+        so it is tested without a daemon), the roster and the master switch are
+        `catalog.ScheduleConfig` (so `jarvis config show` answers "what will this spend"),
+        and the clock is `scheduled_jobs` (so a restart cannot re-fire one). What is left
+        here is the wiring. Spec: docs/superpowers/specs/2026-09-14-the-scheduler.md.
+        """
+        from . import schedule
+
+        cfg = project.schedule
+        if not cfg.enabled or not cfg.jobs:
+            return
+        owner = self._os_owner()
+        now = db.now()
+        for job_id in cfg.jobs:
+            try:
+                spec = schedule.job(job_id)
+            except KeyError:
+                # `_parse_schedule` refuses an unknown id at boot, so this is only
+                # reachable on a DOWNGRADE — a catalog naming a job the running build no
+                # longer ships. Skipping beats refusing the whole tick.
+                log.warning("project %s: no scheduled job %r in this build",
+                            project.name, job_id)
+                continue
+            state = store.seed_schedule(job_id, now)
+            decision = schedule.decide(
+                state, interval_seconds=cfg.interval_seconds, now=now,
+                blocker=self._schedule_blocker(store, state))
+            if decision.action == schedule.WAIT:
+                continue
+            if decision.action == schedule.HOLD:
+                store.record_schedule_hold(job_id, decision.reason, now)
+                continue
+            ctx = schedule.JobContext(project=project.name,
+                                      owns_os=owner == project.name)
+            wo = store.create_work_order(title=spec.title, description=spec.describe(ctx),
+                                         origin=schedule.ORIGIN)
+            self._retire_previous(store, state)
+            store.record_schedule_fire(job_id, wo["id"], now)
+            log.info("scheduled job %s filed %s in %s", job_id, wo["id"], project.name)
 
     def abandon_unargued_gates(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Close every gate request whose case never came. See `gates.sweep_unargued`.

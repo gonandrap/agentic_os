@@ -189,7 +189,8 @@ STATUS_ICON = {
 # The dashboard groups by the same rule (see ui/app.py FEATURED_STATUSES).
 LIST_PRIORITY = {"running": 0, "waiting_pr_merge": 1}
 ORIGIN_BADGE = {"jarvis": "🤖 jarvis", "ui": "🖥 ui", "manual": "⚠ manual",
-                "adhoc": "⚠ ad-hoc", "injected": "🔗 injected", "neo": "🧠 neo"}
+                "adhoc": "⚠ ad-hoc", "injected": "🔗 injected", "neo": "🧠 neo",
+                "schedule": "⏰ scheduled"}
 
 
 class _VersionAction(argparse.Action):
@@ -232,6 +233,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("project", nargs="?", help="one project (default: the whole fleet)")
     sp.add_argument("--repair", action="store_true",
                     help="apply the repairs instead of only reporting them")
+    sp.add_argument("--skip-os", action="store_true", dest="skip_os",
+                    help="check the project(s) only, not the OS itself — what the "
+                         "scheduled daily run passes in every project but the one that "
+                         "owns the install, so one broken dashboard is reported once")
     sp.add_argument("--catalog", help="catalog to read the fleet from")
     sp.add_argument("--json", action="store_true")
 
@@ -951,6 +956,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         counts = ", ".join(f"{k}:{v}" for k, v in p.get("summary", {}).get("by_status", {}).items())
         drift = " ⚠ settings drift" if p.get("settings_drift") else ""
         print(f"• {p['name']} — {counts or 'no work orders'}{drift}")
+        # A scheduled job that has wanted to fire and could not. Printed here rather
+        # than on the attention strip: nothing is being asked of the user yet, and the
+        # answer is usually "settle that work order" — which is already on the strip.
+        for held in p.get("schedule_held", []):
+            print(f"    ⏰ {held['job_id']} held: {held['reason']}")
         for wo in p.get("open_work_orders", []):
             icon = STATUS_ICON.get(wo["status"], "•")
             badge = ORIGIN_BADGE.get(wo["origin"], wo["origin"])
@@ -968,7 +978,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_doctor(args: argparse.Namespace) -> int:
     from . import ops
     res = ops.run_doctor(project=args.project, repair=args.repair,
-                         catalog_path=args.catalog)
+                         catalog_path=args.catalog, include_os=not args.skip_os)
     if args.json:
         _print(res, True)
         return 1 if res["violations"] else 0

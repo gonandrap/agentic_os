@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from . import probes as probes_mod
+from . import schedule as schedule_mod
 from .gates import GateConfig
 from .neo_store import Q_KINDS, SEATS
 from .project_store import VALIDATOR_SEATS
@@ -36,6 +37,11 @@ SAFETY_KEYS = (
     # for `*.validation.*`'s reason: the per-project form is the same switch with a
     # smaller blast radius, and both halves — the flag and the allow-list — widen it.
     "*.supervisor.remedies.*",
+    # The whole scheduler block, not just its switch. It is the only thing in the OS
+    # that files work with nobody asking, so enabling it and shortening its interval are
+    # the same act at two magnitudes — and a change here is invisible until the morning
+    # it starts spending. docs/superpowers/specs/2026-09-14-the-scheduler.md §2.
+    "*.schedule.*",
 )
 
 # Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
@@ -392,6 +398,54 @@ class MessagingConfig:
     stuck_minutes: int = DEFAULT_MESSAGING_STUCK_MINUTES
 
 
+# -- the scheduler: the OS filing a work order nobody typed. ABOVE `ProjectSpec` for the
+# `field(default_factory=…)` reason kn-6ca2bcd9 gives, and a catalog setting rather than a
+# module constant for kn-67cdb54b's: "how often, and which jobs" is policy the user holds
+# an opinion about. Reasoning: docs/superpowers/specs/2026-09-14-the-scheduler.md §2.
+
+#: Daily, which is the cadence the ask named. Hours rather than a cron expression on
+#: purpose: a cron string can express "every minute", and the first mechanism that spends
+#: money on its own should not be one typo away from doing so.
+DEFAULT_SCHEDULE_INTERVAL_HOURS = 24
+
+#: How many whole intervals a job may sit HELD — wanting to fire, blocked behind its own
+#: unsettled previous order — before `invariants.check_schedule_progresses` reports it.
+#: Three rather than one: a doctor order the user has not got round to reviewing is a
+#: normal Tuesday, and flagging that would put the scheduler itself on the attention list
+#: for the crime of working. Three days of silence is a scheduler that has stopped.
+DEFAULT_SCHEDULE_HELD_ALARM_INTERVALS = 3
+
+
+@dataclass
+class ScheduleConfig:
+    """Recurring work orders: whether, how often, and which.
+
+    TWO SWITCHES RATHER THAN ONE, `RemedyConfig`'s pattern and for a sharper reason: this
+    is the only thing in the OS that files work — and therefore spends the user's money —
+    with nobody asking. `enabled` ships FALSE, so a fleet that upgrades into this feature
+    schedules nothing until somebody says so, while `jobs` still carries a meaningful
+    default roster so turning it on is one setting and not two.
+
+    `jobs` names ids of `schedule.JOBS`; an unknown one is a `CatalogError` naming the
+    known ids (`GateConfig.parse`'s rule — a typo must not silently leave a job unset).
+    It REPLACES rather than merges when a project overrides it, for the reason
+    `seat_models` does (kn-6ca2bcd9): inheritance is field-level and this is one field.
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance:
+    "should this project be swept daily" is exactly the kind of claim that differs by
+    project — an OS checkout wants it, an archived repo does not.
+    """
+
+    enabled: bool = False
+    interval_hours: int = DEFAULT_SCHEDULE_INTERVAL_HOURS
+    jobs: tuple[str, ...] = schedule_mod.JOB_IDS
+    held_alarm_intervals: int = DEFAULT_SCHEDULE_HELD_ALARM_INTERVALS
+
+    @property
+    def interval_seconds(self) -> float:
+        return self.interval_hours * schedule_mod.SECONDS_PER_HOUR
+
+
 # -- the supervisor: it JUDGES a cost alarm, so every number it judges by is a setting
 # rather than a module constant (kn-67cdb54b). Reasoning, and why none of it belongs in
 # `InspectConfig`: docs/superpowers/specs/2026-08-31-the-supervisor.md §2.
@@ -532,6 +586,7 @@ class ProjectSpec:
     inspect: InspectConfig = field(default_factory=InspectConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
+    schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -624,6 +679,7 @@ class OsConfig:
     inspect: InspectConfig = field(default_factory=InspectConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
+    schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
 
 
 @dataclass
@@ -853,6 +909,39 @@ def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
     return cfg
 
 
+def _parse_schedule(raw: Any, base: ScheduleConfig | None = None,
+                   where: str = "os.schedule") -> ScheduleConfig:
+    """`os.schedule`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    `jobs` is validated against `schedule.JOBS` rather than accepted as written: an id
+    that names no job would otherwise be a job that silently never runs, and the whole
+    point of this block is that the user can tell what the OS is about to do on its own.
+    """
+    base = base or ScheduleConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    jobs_raw = raw.get("jobs", base.jobs)
+    if isinstance(jobs_raw, str) or not isinstance(jobs_raw, (list, tuple)):
+        raise _err(f"{where}.jobs must be a list of job ids "
+                   f"(known: {list(schedule_mod.JOB_IDS)})")
+    jobs = tuple(str(j) for j in jobs_raw)
+    unknown = [j for j in jobs if j not in schedule_mod.JOB_IDS]
+    if unknown:
+        raise _err(f"{where}.jobs names unknown job(s) {unknown} "
+                   f"(known: {list(schedule_mod.JOB_IDS)})")
+    cfg = ScheduleConfig(
+        enabled=bool(raw.get("enabled", base.enabled)),
+        interval_hours=int(raw.get("interval_hours", base.interval_hours)),
+        jobs=jobs,
+        held_alarm_intervals=int(raw.get("held_alarm_intervals",
+                                         base.held_alarm_intervals)),
+    )
+    for name in ("interval_hours", "held_alarm_intervals"):
+        if getattr(cfg, name) < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    return cfg
+
+
 #: Fields of `SupervisorConfig` that are NOT whole numbers. The reflective parse below
 #: casts everything else with `int()`, so a non-numeric field missing from this set is a
 #: `TypeError` on every catalog load — or, for a bool, a silent `int(False) == 0` that
@@ -1039,6 +1128,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         inspect=_parse_inspect(os_raw.get("inspect", {})),
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
+        schedule=_parse_schedule(os_raw.get("schedule", {})),
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")
@@ -1102,6 +1192,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         messaging_cfg = _parse_messaging(
             p.get("messaging", {}), base=os_cfg.messaging,
             where=f"projects[{i}] ({name}).messaging")
+        schedule_cfg = _parse_schedule(
+            p.get("schedule", {}), base=os_cfg.schedule,
+            where=f"projects[{i}] ({name}).schedule")
         projects.append(
             ProjectSpec(
                 name=name,
@@ -1116,6 +1209,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 inspect=inspect_cfg,
                 supervisor=supervisor_cfg,
                 messaging=messaging_cfg,
+                schedule=schedule_cfg,
                 raw=p,
             )
         )
