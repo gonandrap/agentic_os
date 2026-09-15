@@ -162,6 +162,25 @@ jarvis validation show <wo-id|fo-id>       # HOW a unit was judged. `wo show` an
                                            # nothing pushes it at the user; reach for it
                                            # when they ask WHY a unit was rejected, not to
                                            # report that it was. Takes either id.
+jarvis validation force <wo-id> --reason "…"    # judge this work order AGAIN, now. The
+                                           # panel's verdict is about a COMMIT, and every
+                                           # round judged before 0.10.0 recorded none — so
+                                           # those orders can never auto-merge, however
+                                           # green. This opens a fresh round that reads
+                                           # the CURRENT pull request and records the
+                                           # commit, with no worker and no `finished`
+                                           # event on the timeline. --reason is required
+                                           # and is stored on the round, so a forced
+                                           # re-judgement never reads afterwards like a
+                                           # worker's own re-delivery. Works on a
+                                           # `waiting_pr_merge` order — that is the case
+                                           # it exists for — and leaves it `validating`
+                                           # until the verdict, back to `waiting_pr_merge`
+                                           # if it passes. It spends a round number like
+                                           # any other, so a REJECTION at or past
+                                           # `max_rounds` comes to you rather than to a
+                                           # worker. Refuses with no pull request, with a
+                                           # round already open, or on a settled order.
 jarvis gate list [--pending]               # privileged-action approvals (merge a PR, ship
                                            # a release). Workers attempt these and get
                                            # blocked; Neo reviews and decides, so most

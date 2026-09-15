@@ -449,6 +449,10 @@ CREATE TABLE IF NOT EXISTS validation_rounds (
     -- Which configuration judged it (`os_config_versions.id`). Also in ADDED_COLUMNS —
     -- this table already ships, so a live database gets it only there.
     config_version TEXT,
+    -- Why a PERSON opened this round by hand (`jarvis validation force`). '' is the
+    -- ordinary round, opened by a submission. Also in ADDED_COLUMNS, where the
+    -- reasoning is.
+    forced_reason TEXT NOT NULL DEFAULT '',
     CHECK ((wo_id IS NULL) <> (fo_id IS NULL))
 );
 -- PARTIAL unique indexes, NOT `UNIQUE (wo_id, fo_id, round)`. SQLite treats NULLs as
@@ -721,6 +725,17 @@ ADDED_COLUMNS = {
         # from a worktree, and `validated_head` reads '' as "not recorded" — which never
         # auto-merges. NOT NULL so there is one spelling of "nothing" rather than two.
         "head_sha": "TEXT NOT NULL DEFAULT ''",
+        # WHY A PERSON FORCED THIS ROUND — `jarvis validation force --reason`, verbatim.
+        # The population this exists for is every round judged before `head_sha` shipped:
+        # they all carry '' and can never auto-merge, so an operator has to open a fresh
+        # round by hand, and a re-judgement that looked organic afterwards would be
+        # indistinguishable from a worker re-delivering (spec
+        # docs/superpowers/specs/2026-09-15-forcing-a-validation-round.md §3).
+        #
+        # DEFAULT '' MEANS "NOT FORCED", which is the honest reading of every round
+        # written by a submission and of every round written before this column existed.
+        # NOT NULL so there is one spelling of "nobody forced this" rather than two.
+        "forced_reason": "TEXT NOT NULL DEFAULT ''",
     },
     "approvals": {
         # Which SEAT attempted the command, when a subagent did. NULL means the session's
@@ -2416,7 +2431,8 @@ class ProjectStore:
                               summary: str = "", evidence: str = "",
                               pr_url: str | None = None,
                               round: int | None = None,
-                              config_version: str | None = None) -> dict[str, Any]:
+                              config_version: str | None = None,
+                              forced_reason: str = "") -> dict[str, Any]:
         """Start a round on one subject, or return the one that already holds its number.
 
         1-based and per subject. Left to itself the number is derived from what is
@@ -2432,6 +2448,9 @@ class ProjectStore:
 
         `config_version` stamps the round with the configuration it is being judged
         under; None means the ledger holds nothing yet, and reads as "not recorded".
+
+        `forced_reason` is set only by `ops.force_validation`, and its emptiness is what
+        every other surface reads as "a submission opened this".
         """
         col, subject_id = self._subject(wo_id, fo_id)
         if round is None:
@@ -2443,10 +2462,10 @@ class ProjectStore:
             cur = self.conn.execute(
                 f"""INSERT INTO validation_rounds ({col}, round, ts, fingerprint,
                                                    summary, evidence, pr_url,
-                                                   config_version)
-                    VALUES (?,?,?,?,?,?,?,?)""",
+                                                   config_version, forced_reason)
+                    VALUES (?,?,?,?,?,?,?,?,?)""",
                 (subject_id, round, db.now(), fingerprint, summary, evidence, pr_url,
-                 config_version),
+                 config_version, forced_reason),
             )
         except sqlite3.IntegrityError:
             existing = self.conn.execute(
@@ -2570,6 +2589,21 @@ class ProjectStore:
         ).fetchall()
         return db.rows_to_dicts(rows)
 
+    @staticmethod
+    def round_machine_owns(round_row: dict[str, Any] | None) -> bool:
+        """Does the round machine still own the work order this row is the latest round
+        of? THE ONE DEFINITION, and it takes the ROW for `validated_head`'s reason.
+
+        A caller that needs the predicate AND the wording — "round 2 is pending, wait for
+        it" — must derive both from ONE read, or the panel opening a round on its own
+        thread between the two hands it a predicate and a sentence taken a microsecond
+        apart (kn-08f2ff9b, the `HELD_SHA_UNRECORDED` bug). A staticmethod over the row
+        cannot re-fetch, which is what makes that impossible rather than merely unlikely.
+
+        None — the unit has never been judged — is False: nothing owns it.
+        """
+        return str((round_row or {}).get("outcome") or "") in RUNNABLE_VALIDATION_OUTCOMES
+
     def validation_round_open(self, wo_id: str) -> bool:
         """Is the round machine going to act on this work order?
 
@@ -2586,18 +2620,14 @@ class ProjectStore:
         queued — and a red build the worker is about to push over is worth telling it
         about. See §4.1 of
         docs/superpowers/specs/2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md.
+
+        It fetches the latest round and hands it to `round_machine_owns` rather than
+        asking SQL the same question a second way: a caller that needs the predicate AND
+        the round it is about (`ops.force_validation`) can then take one read and derive
+        both, which is the only shape that cannot straddle a round opening on the panel's
+        thread.
         """
-        marks = ",".join("?" * len(RUNNABLE_VALIDATION_OUTCOMES))
-        row = self.conn.execute(
-            f"""SELECT 1 FROM validation_rounds r
-                 WHERE r.wo_id = ?
-                   AND r.outcome IN ({marks})
-                   AND r.round = (SELECT MAX(round) FROM validation_rounds
-                                   WHERE wo_id = r.wo_id)
-                 LIMIT 1""",
-            (wo_id, *RUNNABLE_VALIDATION_OUTCOMES),
-        ).fetchone()
-        return row is not None
+        return self.round_machine_owns(self.latest_validation_round(wo_id=wo_id))
 
     def latest_validation_round(self, *, wo_id: str | None = None,
                                 fo_id: str | None = None) -> dict[str, Any] | None:
