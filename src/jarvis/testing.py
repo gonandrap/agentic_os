@@ -847,7 +847,7 @@ else:
 
 FAKE_GH = r'''#!/usr/bin/env python3
 """Fake `gh` CLI for tests: records invocations, files issues, serves PR states."""
-import json, os, sys
+import json, os, sys, time
 
 state_dir = os.environ["FAKE_GH_DIR"]
 argv = sys.argv[1:]
@@ -952,6 +952,11 @@ elif argv[:2] == ["pr", "merge"]:
     if cleanup_fail:
         sys.stderr.write(cleanup_fail + "\n")
         sys.exit(1)
+    if os.environ.get("FAKE_GH_HANG_MERGE"):
+        # Merged, then never returns: the caller's timeout is what ends this. The other
+        # half of issue #253 — a command that did not FINISH is not a command that
+        # cleaned up badly, and the record must not say it was.
+        time.sleep(3600)
     print(f"Merged pull request {url}")
 else:
     sys.stderr.write(f"fake gh: unhandled argv {argv}\n")
@@ -1182,6 +1187,19 @@ def fake_gh(tmp_path, monkeypatch):
             A test that only drives `fail_merge` cannot see it.
             """
             monkeypatch.setenv("FAKE_GH_FAIL_MERGE_CLEANUP", message)
+
+        def hang_merge_after_landing(self, timeout: float = 1.0) -> None:
+            """Land the merge, then never return — the caller's timeout ends it.
+
+            The second landed shape of issue #253, and NOT the same fact as
+            `fail_merge_cleanup`: this command attempted no branch deletion, so a record
+            that calls it a cleanup failure sends the reader hunting one. Shortens
+            `automerge.MERGE_TIMEOUT` so the test costs a second rather than a minute.
+            """
+            from . import automerge
+
+            monkeypatch.setattr(automerge, "MERGE_TIMEOUT", timeout)
+            monkeypatch.setenv("FAKE_GH_HANG_MERGE", "1")
 
         def set_pr(self, pr_url: str, state: str, merged_at: str | None = None,
                    mergeable: str | None = None, base_ref: str = "main",

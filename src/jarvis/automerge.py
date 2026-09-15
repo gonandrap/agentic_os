@@ -83,6 +83,19 @@ HELD_SHA_UNRECORDED = "sha_unrecorded"
 HELD_SHA_MOVED = "sha_moved"
 HELD_PR_NOT_READY = "pr_not_ready"
 
+#: WHY the merge command did not succeed on a pull request that merged anyway (§5.5).
+#: Two causes, never folded into one: a command that RAN and exited non-zero is a local
+#: tidy-up that failed, and a command that NEVER FINISHED is a timeout that may have
+#: expired after GitHub had already merged. Calling the second one a cleanup failure
+#: sends a reader hunting a branch deletion that was never attempted.
+CLEANUP = "cleanup"
+UNFINISHED = "unfinished"
+
+#: The event each cause writes. Separate kinds rather than one kind with a field,
+#: because `timeline._describe` keys on the kind and the two want different sentences.
+AFTER_MERGE_EVENT = {CLEANUP: "automerge_cleanup_failed",
+                     UNFINISHED: "automerge_command_unfinished"}
+
 
 class AutoMergeRefused(Exception):
     """NOTHING WAS ATTEMPTED. Raised by `apply` for every reason a merge must not run, so
@@ -513,7 +526,10 @@ def apply(store: Any, wo: dict[str, Any], sha: str,
         # outcome is knowable without asking.
         raise MergeFailed(github.GitHubError.NO_GH) from e
     except subprocess.SubprocessError as e:
-        failure = f"the merge command did not complete: {e}"
+        # The process never finished — the 60s timeout, overwhelmingly. GitHub may well
+        # have merged before it expired, so this goes through `_outcome` like any other
+        # failure; what it must NOT do is arrive there as the same fact as an exit code.
+        cause, failure = UNFINISHED, f"the merge command did not complete: {e}"
     else:
         # THE REMOTE'S OWN TEXT, TRUNCATED, AND THAT IS DELIBERATE — the opposite of
         # `github.GitHubError.reason`, which substitutes a fixed vocabulary because its
@@ -523,23 +539,27 @@ def apply(store: Any, wo: dict[str, Any], sha: str,
         # with read credentials and no write scope, and "HTTP 403: Resource not
         # accessible" is the whole diagnosis — a fixed phrase would send the reader back
         # to the log for the only fact that matters. Full detail is logged either way.
+        cause = CLEANUP
         failure = ("" if proc.returncode == 0 else
                    (proc.stderr or proc.stdout or "").strip()
                    or f"exit {proc.returncode}")
-    cleanup = ""
+    after = ""
     if failure:
         log.info("the merge command for %s did not succeed: %s", url, failure)
-        cleanup = _outcome(url, cwd, failure)
+        after = _outcome(url, cwd, failure, cause)
     log.info("auto-merge landed %s at %s under approval %s%s", url, sha[:10],
-             approval["id"], " — the cleanup after it failed" if cleanup else "")
+             approval["id"], f" — {cause} failure after it" if after else "")
     return {"wo_id": wo_id, "pr_url": url, "head_sha": sha,
             "approval_id": approval["id"], "use": spent["uses"],
-            # "" on the ordinary path. Non-empty means the pull request MERGED and
-            # something AFTER the merge failed — `_outcome`.
-            "cleanup_error": cleanup}
+            # Both "" on the ordinary path. Non-empty means the pull request MERGED and
+            # the command that merged it did not succeed — `_outcome`. The CAUSE is
+            # carried separately from the text because it picks the event kind and the
+            # sentence, and the two causes are not the same fact.
+            "after_merge_cause": cause if after else "",
+            "after_merge_error": after}
 
 
-def _outcome(url: str, cwd: Any, failure: str) -> str:
+def _outcome(url: str, cwd: Any, failure: str, cause: str) -> str:
     """The merge command did not succeed. Did the PULL REQUEST merge? Returns, or raises.
 
     THE EXIT CODE IS NOT THE OUTCOME (issue #253, spec §5.5). The command merges REMOTELY
@@ -557,15 +577,22 @@ def _outcome(url: str, cwd: Any, failure: str) -> str:
     through the module that owns reading it. Three answers, and the middle one is the
     point:
 
-    * MERGED — it landed. The failure text comes back as a CLEANUP note for the
-      timeline. Not a `MergeFailed`: no `automerge_failed` event, no inbox row, and the
-      work order completes. Nothing about a local tidy-up needs a person.
+    * MERGED — it landed. The failure text comes back for the timeline, under `cause`.
+      Not a `MergeFailed`: no `automerge_failed` event, no inbox row, and the work order
+      completes. Neither cause needs a person.
     * anything else — GitHub really did refuse, which is the 403-shaped case `apply`'s
       comment above is written for.
     * unreadable — two `gh` calls failed and the OS does not know what happened, so it
       says that rather than choose. Claiming a merge that did not happen would complete
       a work order whose pull request is still open, which is the worse of the two
       errors, and the pull-request poll settles the case either way within a tick.
+
+    **`cause` IS CARRIED THROUGH AND NEVER ASSUMED.** This function is reached by two
+    roads and only one of them is a cleanup: a command that ran and exited non-zero
+    (`CLEANUP`), and a command that never finished at all (`UNFINISHED` — the timeout).
+    Labelling a timed-out merge "the cleanup after it failed" sends a reader hunting a
+    branch deletion that was never attempted, so the two keep separate event kinds and
+    separate sentences all the way to the timeline (`AFTER_MERGE_EVENT`).
     """
     from . import github
 
@@ -577,6 +604,5 @@ def _outcome(url: str, cwd: Any, failure: str) -> str:
             f"whether it landed is unknown — check it: {failure[:200]} ({e})") from e
     if not pr.merged:
         raise MergeFailed(f"GitHub refused the merge: {failure[:300]}")
-    log.info("the merge of %s landed; only the cleanup after it failed: %s", url,
-             failure)
+    log.info("the merge of %s landed; the %s after it did not: %s", url, cause, failure)
     return failure[:300]

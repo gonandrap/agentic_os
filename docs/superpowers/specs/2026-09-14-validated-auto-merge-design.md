@@ -344,13 +344,23 @@ GitHub goes through `automerge._outcome`, which reads the pull request back thro
 
 | `gh` | the pull request | the OS says |
 |---|---|---|
-| non-zero | MERGED | **merged.** The failure text becomes an `automerge_cleanup_failed` event — a warning on the timeline. No `MergeFailed`, no `automerge_failed`, no inbox row, and the work order completes. |
-| non-zero | OPEN / CLOSED | `MergeFailed`, as before. This is the 403-shaped case: a `gh` with read credentials and no write scope. |
-| non-zero | unreadable | `MergeFailed` saying *the outcome is unknown*, in those words. Claiming a merge that did not happen would complete a work order whose pull request is still open, which is the worse of the two errors; the pull-request poll settles the case either way within a tick. |
-| `gh` missing | — | `MergeFailed`. Nothing reached GitHub, so there is no state to read. |
+| ran, non-zero | MERGED | **merged.** The failure text becomes an `automerge_cleanup_failed` event — a warning on the timeline, reading *"The merge landed; the cleanup after it did not"*. No `MergeFailed`, no `automerge_failed`, no inbox row, and the work order completes. |
+| **never finished** (timed out at `MERGE_TIMEOUT`) | MERGED | **merged**, and *not* a cleanup failure — see below. `automerge_command_unfinished`, reading *"The merge command never finished — GitHub says the merge landed"*. Otherwise identical: no `MergeFailed`, no inbox row, the work order completes. |
+| ran or timed out | OPEN / CLOSED | `MergeFailed`, as before. This is the 403-shaped case: a `gh` with read credentials and no write scope. |
+| ran or timed out | unreadable | `MergeFailed` saying *the outcome is unknown*, in those words. Claiming a merge that did not happen would complete a work order whose pull request is still open, which is the worse of the two errors; the pull-request poll settles the case either way within a tick. |
+| missing binary | — | `MergeFailed`. Nothing reached GitHub, so there is no state to read. |
 
-The grant is still spent before the attempt, and on this path that is correct: the
-authorised act *happened*. Nothing needs retrying.
+**The two landed rows are separate kinds, and folding them into one would be a lie in the
+record.** A merge that timed out attempted no branch deletion, so calling it a cleanup
+failure sends the reader hunting a failure that never happened. `automerge.CLEANUP` and
+`automerge.UNFINISHED` are carried from the exception handler that knows which it was,
+through `_outcome`, to `AFTER_MERGE_EVENT` and two sentences in `timeline._describe`.
+A timeout is the more likely of the two now that `--delete-branch` is gone: GitHub
+computes the squash on the way, which is why `MERGE_TIMEOUT` is longer than
+`github.GH_TIMEOUT` in the first place.
+
+The grant is still spent before the attempt, and on both landed paths that is correct:
+the authorised act *happened*. Nothing needs retrying.
 
 ---
 

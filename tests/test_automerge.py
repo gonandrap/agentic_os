@@ -463,7 +463,30 @@ def test_a_merge_that_landed_is_not_a_failure_however_gh_exited(granted, fake_gh
     merged = automerge.apply(store, wo, JUDGED, approval)
 
     assert merged["head_sha"] == JUDGED
-    assert "cannot delete branch" in merged["cleanup_error"]
+    assert merged["after_merge_cause"] == automerge.CLEANUP
+    assert "cannot delete branch" in merged["after_merge_error"]
+
+
+def test_a_merge_that_timed_out_is_not_called_a_cleanup_failure(granted, fake_gh):
+    """THE OTHER LANDED SHAPE, and the reason the cause is carried rather than assumed.
+
+    The command never FINISHED — GitHub computes the squash on the way, which is why
+    `MERGE_TIMEOUT` is longer than `github.GH_TIMEOUT` in the first place — and it may
+    well have merged before the timeout expired. That is still a landed merge, and it is
+    still not a cleanup failure: no branch deletion was attempted, so a record saying
+    one failed sends the reader hunting something that never happened. With
+    `--delete-branch` gone this is now the likelier of the two.
+    """
+    store, wo, approval = granted
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    fake_gh.hang_merge_after_landing()
+
+    merged = automerge.apply(store, wo, JUDGED, approval)
+
+    assert merged["head_sha"] == JUDGED
+    assert merged["after_merge_cause"] == automerge.UNFINISHED
+    assert "did not complete" in merged["after_merge_error"]
+    assert "cleanup" not in merged["after_merge_error"]
 
 
 def test_a_merge_github_really_refused_is_still_a_failure(granted, fake_gh):
@@ -873,6 +896,42 @@ def test_a_landed_merge_is_never_reported_as_failed(started, project, fake_gh):
     cleanup = store.events_of_kind(wo["id"], "automerge_cleanup_failed")
     assert len(cleanup) == 1
     assert "cannot delete branch" in db.from_json(cleanup[0]["payload"], {})["reason"]
+    assert not row["attention_reason"]
+    # ...and the OTHER landed shape is not claimed alongside it.
+    assert store.events_of_kind(wo["id"], "automerge_command_unfinished") == []
+
+    from jarvis.central_store import CentralStore
+    central = CentralStore()
+    try:
+        told = [i for i in central.unacked_inbox() if (i["wo_id"] or "") == wo["id"]]
+    finally:
+        central.close()
+    assert told == [], [i["title"] for i in told]
+
+
+def test_a_timed_out_merge_that_landed_says_so_and_does_not_blame_the_cleanup(
+        started, project, fake_gh):
+    """Same four guarantees as the test above, through the whole poll, for the OTHER
+    landed shape — and one more: the record must not describe a timeout as a tidy-up
+    that failed. Nothing drove this path when the cause was assumed rather than carried,
+    which is how a timed-out merge came to read as a branch deletion nobody attempted."""
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    poll(started, store)
+    gates.apply_decision(store, store.list_approvals(wo["id"])[0]["id"], "approved",
+                         "ok", "neo", project="proj_a")
+    fake_gh.hang_merge_after_landing()
+
+    poll(started, store)
+
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "completed"
+    assert store.events_of_kind(wo["id"], "automerge_failed") == []
+    assert store.events_of_kind(wo["id"], "automerge_cleanup_failed") == []
+    assert ops.automerge_state(store, row)["kind"] == "automerge_merged"
+    unfinished = store.events_of_kind(wo["id"], "automerge_command_unfinished")
+    assert len(unfinished) == 1
+    assert "did not complete" in db.from_json(unfinished[0]["payload"], {})["reason"]
     assert not row["attention_reason"]
 
     from jarvis.central_store import CentralStore
