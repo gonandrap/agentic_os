@@ -18,6 +18,7 @@ over the classified orders from one taken over all of them.
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 
@@ -222,9 +223,9 @@ def test_each_cause_raises_its_own_kind_and_only_when_it_crosses(store):
     neither = bill.rewrite_alarms(tax, InspectConfig(alarm_rewrite_prefix_share=0.90,
                                                      alarm_rewrite_ttl_share=0.90))
 
-    assert [a.kind for a in both_low] == [inspection.REWRITE_PREFIX_ALARM,
+    assert [kind for kind, _ in both_low] == [inspection.REWRITE_PREFIX_ALARM,
                                           inspection.REWRITE_TTL_ALARM]
-    assert [a.kind for a in only_prefix] == [inspection.REWRITE_PREFIX_ALARM]
+    assert [kind for kind, _ in only_prefix] == [inspection.REWRITE_PREFIX_ALARM]
     assert neither == []
 
 
@@ -245,8 +246,8 @@ def test_the_ttl_alarm_says_it_is_not_the_ttl_switching_trigger(store):
     alarms = bill.rewrite_alarms(tax, InspectConfig(alarm_rewrite_ttl_share=0.05,
                                                     alarm_rewrite_prefix_share=0.90))
 
-    assert [a.kind for a in alarms] == [inspection.REWRITE_TTL_ALARM]
-    reason = alarms[0].reason
+    assert [kind for kind, _ in alarms] == [inspection.REWRITE_TTL_ALARM]
+    reason = alarms[0][1]
     assert "39.5%" in reason
     assert bill.COHORT_COMMAND in reason
     # Not a restatement: this is the half that says WHICH denominator this number used,
@@ -257,8 +258,8 @@ def test_the_ttl_alarm_says_it_is_not_the_ttl_switching_trigger(store):
     # no TTL can touch, and repeating it there teaches the judge the two are one topic.
     prefix = bill.rewrite_alarms(tax, InspectConfig(alarm_rewrite_prefix_share=0.01,
                                                     alarm_rewrite_ttl_share=0.90))
-    assert [a.kind for a in prefix] == [inspection.REWRITE_PREFIX_ALARM]
-    assert "39.5%" not in prefix[0].reason
+    assert [kind for kind, _ in prefix] == [inspection.REWRITE_PREFIX_ALARM]
+    assert "39.5%" not in prefix[0][1]
 
 
 def test_a_partial_split_says_so_and_a_complete_one_does_not(store):
@@ -275,8 +276,8 @@ def test_a_partial_split_says_so_and_a_complete_one_does_not(store):
     assert complete.coverage == pytest.approx(1.0)
     assert partial.coverage == pytest.approx(0.5)
     low = InspectConfig(alarm_rewrite_ttl_share=0.01, alarm_rewrite_prefix_share=0.99)
-    assert "The split is measured over" not in bill.rewrite_alarms(complete, low)[0].reason
-    assert "The split is measured over 50%" in bill.rewrite_alarms(partial, low)[0].reason
+    assert "The split is measured over" not in bill.rewrite_alarms(complete, low)[0][1]
+    assert "The split is measured over 50%" in bill.rewrite_alarms(partial, low)[0][1]
 
 
 def test_the_alarm_says_when_its_denominator_is_not_the_whole_bill(store):
@@ -298,10 +299,25 @@ def test_the_alarm_says_when_its_denominator_is_not_the_whole_bill(store):
     assert thin.bill_usd == pytest.approx(100.0)
     assert thin.tax_share == pytest.approx(0.30)
     low = InspectConfig(alarm_rewrite_ttl_share=0.01, alarm_rewrite_prefix_share=0.99)
-    assert "settled in the window with no" not in bill.rewrite_alarms(clean, low)[0].reason
-    reason = bill.rewrite_alarms(thin, low)[0].reason
+    assert "settled in the window with no" not in bill.rewrite_alarms(clean, low)[0][1]
+    reason = bill.rewrite_alarms(thin, low)[0][1]
     assert "That bill is the 1 settled orders carrying a re-write measurement" in reason
     assert "1 more settled in the window with no re-write block to read" in reason
+
+
+def test_bills_copy_of_the_two_kinds_is_the_same_string_inspection_publishes():
+    """`bill` spells the two kinds as LITERALS rather than importing them, because
+    `inspection` imports `catalog` and `bill` is accounting over sealed rows that knows
+    only `db` and `usage` — an import there would put the whole config layer behind
+    `jarvis cost`. That is `probes.RESERVED_IDS`' answer one level over, and this is the
+    test that keeps the copy honest, the same job `test_probes.py` does for that one.
+    """
+    assert bill.REWRITE_PREFIX_ALARM == inspection.REWRITE_PREFIX_ALARM
+    assert bill.REWRITE_TTL_ALARM == inspection.REWRITE_TTL_ALARM
+    # And the edge stays absent: a later import would make the duplication pointless
+    # while leaving both assertions above green.
+    src = (pathlib.Path(bill.__file__).read_text())
+    assert "import inspection" not in src and "from .inspection" not in src
 
 
 def test_both_new_kinds_have_a_standing_meaning_a_surface_can_render(store):

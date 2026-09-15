@@ -2759,23 +2759,25 @@ class Daemon:
         if tax.orders < cfg.alarm_rewrite_min_orders \
                 or tax.bill_usd < cfg.alarm_rewrite_min_usd:
             return
-        for alarm in bill_mod.rewrite_alarms(tax, cfg):
-            last = store.last_alarm_of_kind(alarm.kind)
+        # `(kind, reason)` and not an `inspection.Alarm`: `bill` is accounting and does
+        # not import the config layer to name a string — see `bill.REWRITE_PREFIX_ALARM`.
+        for kind, reason in bill_mod.rewrite_alarms(tax, cfg):
+            last = store.last_alarm_of_kind(kind)
             if last is not None and float(last["ts"] or 0.0) >= tax.since:
                 continue
-            row = store.add_finding(tax.worst_id, kind=alarm.kind, reason=alarm.reason,
+            row = store.add_finding(tax.worst_id, kind=kind, reason=reason,
                                     seq=NO_TURN, source="cost")
             store.add_event(tax.worst_id, "cost_alarm",
-                            {"kind": alarm.kind, "seq": NO_TURN,
-                             "reason": alarm.reason, "alarm_id": row["id"]})
+                            {"kind": kind, "seq": NO_TURN,
+                             "reason": reason, "alarm_id": row["id"]})
             self.central.add_inbox(
                 project=project.name, level="warning",
-                title=REWRITE_INBOX_TITLE[alarm.kind].format(project=project.name),
-                body=f"{alarm.reason}\n"
+                title=REWRITE_INBOX_TITLE[kind].format(project=project.name),
+                body=f"{reason}\n"
                      f"The supervisor will look before you have to. "
                      f"Read it with: jarvis alarms show {row['id']}",
                 wo_id=tax.worst_id)
-            log.info("[%s] %s: %s", project.name, alarm.kind, alarm.reason)
+            log.info("[%s] %s: %s", project.name, kind, reason)
 
     def settle_turns(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Reap finished turns, then move each work order to where its turn says it is.

@@ -52,7 +52,6 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import db, usage as usage_mod
-from .inspection import Alarm, REWRITE_PREFIX_ALARM, REWRITE_TTL_ALARM
 
 #: How many `agent_calls` rows one order's bill will read. Far above any real order (a
 #: heavy one runs to dozens), and counted rather than assumed: a truncated bill would
@@ -1229,6 +1228,14 @@ def _check_children(line: dict[str, Any]) -> list[str]:
 # which is what makes it affordable on the reconcile cadence — the objection finding 2
 # raised against doing this at all.
 
+#: `inspection`'s two aggregate alarm kinds, duplicated as literals rather than imported
+#: — the same answer `probes.RESERVED_IDS` gives, and for the same reason one level over:
+#: `inspection` imports `catalog`, and this module is accounting that knows `db` and
+#: `usage` and must not learn the config layer to name a string. `cfg` below stays
+#: duck-typed for that reason too. `tests/test_rewrite_tax_alarm.py` pins both equal.
+REWRITE_PREFIX_ALARM = "rewrite-tax-prefix"
+REWRITE_TTL_ALARM = "rewrite-tax-ttl"
+
 #: The `scripts/cache_ttl_cohort.py` invocation the TTL alarm points a reader at. Named
 #: once: the whole hazard of that alarm is a reader acting on the wrong ratio, and a
 #: command spelled differently in two places is one of them going stale.
@@ -1388,8 +1395,11 @@ def _denominator_note(tax: RewriteTax) -> str:
             f"re-write block to read, and their spend is in neither half.")
 
 
-def rewrite_alarms(tax: RewriteTax, cfg: Any) -> list[Alarm]:
+def rewrite_alarms(tax: RewriteTax, cfg: Any) -> list[tuple[str, str]]:
     """What is standing-wrong with this project's spend, one alarm per CAUSE.
+
+    A `(kind, reason)` pair and NOT an `inspection.Alarm`: that class lives behind the
+    config layer, and the caller who raises these already holds it.
 
     NEITHER IS RAISED WHEN THE SPLIT IS UNMEASURED. `ttl_share` is None exactly when no
     boundary was classified, and an alarm that named a cause anyway would be inventing
@@ -1407,16 +1417,16 @@ def rewrite_alarms(tax: RewriteTax, cfg: Any) -> list[Alarm]:
     worst = (f"Biggest single contributor: {tax.worst_id} "
              f"(${tax.worst_tax_usd:.2f}) — `jarvis inspect {tax.worst_id}` labels every "
              f"re-write it made by cause.")
-    raised = []
+    raised: list[tuple[str, str]] = []
     if prefix_of_bill >= cfg.alarm_rewrite_prefix_share:
-        raised.append(Alarm(REWRITE_PREFIX_ALARM, (
+        raised.append((REWRITE_PREFIX_ALARM, (
             f"{prefix_of_bill:.0%} of this project's ${tax.bill_usd:,.0f} bill "
             f"{window} went on re-sending conversations whose PROMPT PREFIX had moved — "
             f"${tax.tax_usd * (1 - ttl_share):,.2f}, and no cache TTL can buy back "
             f"any of it. The cure is whatever is changing the head of the prompt between "
             f"calls.{_coverage_note(tax)}{_denominator_note(tax)} {worst}")))
     if ttl_of_bill >= cfg.alarm_rewrite_ttl_share:
-        raised.append(Alarm(REWRITE_TTL_ALARM, (
+        raised.append((REWRITE_TTL_ALARM, (
             f"{ttl_of_bill:.0%} of this project's ${tax.bill_usd:,.0f} bill "
             f"{window} went on conversations re-sent because the CACHE ENTRY EXPIRED — "
             f"${tax.tax_usd * ttl_share:,.2f}, the part a longer cache TTL could have "
