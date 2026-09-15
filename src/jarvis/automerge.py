@@ -542,9 +542,10 @@ def apply(store: Any, wo: dict[str, Any], sha: str,
 def _outcome(url: str, cwd: Any, failure: str) -> str:
     """The merge command did not succeed. Did the PULL REQUEST merge? Returns, or raises.
 
-    THE EXIT CODE IS NOT THE OUTCOME (issue #253). The command merges REMOTELY and then
-    tidies up locally, so one process reports two acts through one status, and the local
-    half can fail over something the remote never saw. Both live merges of 0.10.0 landed
+    THE EXIT CODE IS NOT THE OUTCOME (issue #253, spec §5.5). The command merges REMOTELY
+    and then tidies up locally, so one process reports two acts through one status, and
+    the local half can fail over something the remote never saw. Both live merges of
+    0.10.0 landed
     on `main` and then exited non-zero because `--delete-branch` could not delete a local
     branch a worker's worktree still had checked out. The OS said "GitHub refused the
     merge" about a merge GitHub had accepted, wrote `automerge_failed` and an inbox row

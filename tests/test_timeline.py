@@ -94,6 +94,21 @@ def test_signal_entries_read_as_prose_not_json():
     ]
 
 
+def test_a_cleanup_failure_reads_as_a_sentence_and_not_a_json_dump():
+    """THE TIMELINE IS THIS KIND'S ONLY SURFACE. Every other `automerge_*` event is
+    rendered by `ops.automerge_state` as the mechanism's state line on the work order;
+    this one is deliberately not in `ops.AUTOMERGE_EVENTS`, because the state after it
+    is "merged". Unregistered it still appeared — unknown kinds are signal — as the bare
+    kind plus its payload as JSON, which is written and not seen (issue #253)."""
+    entry = build_timeline({}, [ev("automerge_cleanup_failed", 1.0,
+                                   reason="cannot delete branch 'worktree-wo-1'",
+                                   head_sha="a1b2c3d")], [])[0]
+    assert entry["level"] == "signal"
+    assert entry["label"] == "The merge landed; the cleanup after it did not"
+    assert entry["detail"] == "cannot delete branch 'worktree-wo-1'"
+    assert "{" not in entry["label"] + entry["detail"]
+
+
 def test_messages_appear_as_prompt_and_reply():
     """Both directions are moments on the timeline; the words are the conversation's."""
     messages = [

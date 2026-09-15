@@ -297,7 +297,27 @@ Three independent things must all agree before a single byte lands on `main`: Ja
 stored SHA, GitHub's head at view time, and GitHub's head at merge time. Any disagreement
 merges nothing.
 
-### 5.4 The exit code is not the outcome (issue #253)
+### 5.4 What happens after a push that invalidates a pass
+
+Nothing dramatic, and deliberately no attention flag. The poll sees `pr.head_sha !=
+validated_head(wo_id)`, writes one `automerge_held` event carrying both SHAs (deduped per
+head SHA, so a parked pull request does not accrue an event every two minutes), and
+declines. `jarvis wo show` says so:
+
+```
+auto-merge: held — round 2 passed on a1b2c3d, the head is now e4f5a6b
+```
+
+It does **not** re-open validation. The way to a new verdict is the way that already
+exists: the worker resubmits with `jarvis wo finish`, which opens round 3. If the worker
+pushes without resubmitting — the ordinary outcome of a heal-loop nudge — the pull request
+simply never auto-merges and the user merges it by hand, which is today's behaviour. Fail
+closed, quietly, visibly.
+
+A held auto-merge is not an attention item, because a heal-loop push is normal and the
+user's list is not a place to put normal.
+
+### 5.5 The exit code is not the outcome (issue #253)
 
 Added after the first two live merges, both of which landed on `main` and were reported to
 the user as *"GitHub refused the merge"*.
@@ -327,30 +347,10 @@ GitHub goes through `automerge._outcome`, which reads the pull request back thro
 | non-zero | MERGED | **merged.** The failure text becomes an `automerge_cleanup_failed` event — a warning on the timeline. No `MergeFailed`, no `automerge_failed`, no inbox row, and the work order completes. |
 | non-zero | OPEN / CLOSED | `MergeFailed`, as before. This is the 403-shaped case: a `gh` with read credentials and no write scope. |
 | non-zero | unreadable | `MergeFailed` saying *the outcome is unknown*, in those words. Claiming a merge that did not happen would complete a work order whose pull request is still open, which is the worse of the two errors; the pull-request poll settles the case either way within a tick. |
-| `gh` missing | — | `MergeFailed`. Nothing reached GitHub, so there is no state to read.
+| `gh` missing | — | `MergeFailed`. Nothing reached GitHub, so there is no state to read. |
 
 The grant is still spent before the attempt, and on this path that is correct: the
 authorised act *happened*. Nothing needs retrying.
-
-### 5.4 What happens after a push that invalidates a pass
-
-Nothing dramatic, and deliberately no attention flag. The poll sees `pr.head_sha !=
-validated_head(wo_id)`, writes one `automerge_held` event carrying both SHAs (deduped per
-head SHA, so a parked pull request does not accrue an event every two minutes), and
-declines. `jarvis wo show` says so:
-
-```
-auto-merge: held — round 2 passed on a1b2c3d, the head is now e4f5a6b
-```
-
-It does **not** re-open validation. The way to a new verdict is the way that already
-exists: the worker resubmits with `jarvis wo finish`, which opens round 3. If the worker
-pushes without resubmitting — the ordinary outcome of a heal-loop nudge — the pull request
-simply never auto-merges and the user merges it by hand, which is today's behaviour. Fail
-closed, quietly, visibly.
-
-A held auto-merge is not an attention item, because a heal-loop push is normal and the
-user's list is not a place to put normal.
 
 ---
 
@@ -494,7 +494,7 @@ acting on something nobody asked it to touch.
   one write**:
   `gh pr merge <url> --squash --match-head-commit <sha>` — see §10.1, whose answer is
   reversed — and then judges the outcome by **whether the pull request merged**, never by
-  the exit code (§5.4).
+  the exit code (§5.5).
 * `WRITE_VERBS = (("pr", "merge"),)` declared at module top, with an AST test asserting
   this module builds no other `gh` command — the same mechanism `github.READ_ONLY_VERBS`
   uses, applied to the one module that is allowed to write. `bugreport.create_issue` is the
@@ -655,7 +655,7 @@ requires handing the human a permanent override of every check in the repository
    **and then the local one**, and the local delete fails whenever a worktree still has
    that branch checked out — which on this path is always: nothing removes a worker's
    worktree, and the work order completes only after the merge. So the flag made every OS
-   merge a command that half-failed, which is what §5.4 exists to answer. Deleting a
+   merge a command that half-failed, which is what §5.5 exists to answer. Deleting a
    developer's local branches was never this mechanism's business; remote-branch hygiene
    belongs to the repository's own `delete_branch_on_merge` setting, which is one click
    and the owner's to make. **It is currently OFF on `agentic_os`, so merged branches

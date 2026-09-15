@@ -381,6 +381,14 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "pr_checks_unresolved":
         return ("Failing checks the worker could not fix — over to you",
                 f"{p.get('attempts')} attempts")
+    if kind == "automerge_cleanup_failed":
+        # THE ONLY `automerge_*` KIND WITH A LABEL HERE, and deliberately: every other
+        # one is rendered by `ops.automerge_state` as the mechanism's one-line state on
+        # the work order. This one is excluded from `ops.AUTOMERGE_EVENTS` — the state
+        # after it is "merged" — so the timeline is the only surface it has, and without
+        # a label it falls through to the kind plus a raw JSON payload (issue #253).
+        return ("The merge landed; the cleanup after it did not",
+                (p.get("reason") or "")[:200])
     if kind == "deferral_submitted":
         # The worker deciding something is not its job is a scope decision, and the
         # timeline is the only place the user ever sees it: the item itself lands on the
