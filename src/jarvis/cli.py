@@ -817,10 +817,13 @@ def build_parser() -> argparse.ArgumentParser:
     # beside the command that shows the rounds.
     f = va.add_parser(
         "force", help="open a fresh validation round on a work order by hand, with no "
-                      "worker and no `finished` event — the order goes to `validating` "
-                      "and back to `waiting_pr_merge` if the round passes. It spends a "
-                      "round number like any other, so a rejection at or past "
-                      "`max_rounds` is escalated to you rather than sent to a worker")
+                      "worker and no `finished` event. ONLY on an order that has "
+                      "delivered and whose worker is not typing — `waiting_pr_merge` "
+                      "(the case it exists for) or `needs_review`; a live or settled "
+                      "one is refused. It goes to `validating`, and back to "
+                      "`waiting_pr_merge` if the round passes. It spends a round number "
+                      "like any other, so a rejection at or past `max_rounds` is "
+                      "escalated to you rather than sent to a worker")
     f.add_argument("wo_id", metavar="WO_ID")
     f.add_argument("--reason", required=True,
                    help="why you are forcing it — recorded on the round, so the "

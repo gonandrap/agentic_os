@@ -87,20 +87,49 @@ insert in `open_validation_round`, and hand the caller an already-CLOSED round �
 it. Exempting the budget honestly needs round-number and round-count decoupled first, and
 that is a different change. There is no `--max-rounds` override.
 
-## 5. What it refuses
+## 5. What it ALLOWS, and what it refuses
 
-Each refusal is a case where re-judging could only produce a worse record.
+**`FORCEABLE_STATUSES = ("waiting_pr_merge", "needs_review")` — an allowlist.** The
+question is not "has this work order settled" but "has it DELIVERED, and is nobody
+typing". Two different failures sit either side of it:
+
+- a **settled** order (`completed`, `cancelled`, `failed`) would be *reopened* into
+  `validating` by a verdict that could change nothing;
+- a **live** one (`running`, `dispatching`, `waiting_input`) has a worker still writing to
+  the branch — and an open round OWNS that worker's session (kn-01a4ab27), so
+  `Daemon._reject` would post the panel's feedback into a session mid-task. That is the
+  two-writers bug that knowledge entry exists to prevent, arriving by a new door.
+  `pending` has not begun and has nothing to judge.
+
+An allowlist rather than a `running`-shaped refusal, so a status added to `WO_STATUSES`
+tomorrow is refused until somebody decides it is safe — not allowed until somebody
+remembers it is not. `validating` is absent for its own reason: its round is open by
+definition, which is the next row's refusal with its own sentence.
+
+The rest:
 
 | Refused | Why |
 |---|---|
 | blank `--reason` | the reason is what makes the round legible as forced; a blank one gives back the defect |
 | the work order does not exist | `find_work_order` — covers a deleted order |
-| `completed`, `cancelled` or `failed` | re-judging settled work would reopen it, and a verdict could change nothing |
 | no `pr_url` | a fresh round would read the worktree and record `''` — exactly the state this exists to escape |
-| a round the machine still owns | `ProjectStore.validation_round_open`, the round machine's own predicate (`pending`/`failed`): a second round underneath takes the MAX-round slot from the one about to run |
+| a round the machine still owns | `ProjectStore.round_machine_owns` off the latest round (`pending`/`failed`): a second round underneath takes the MAX-round slot from the one about to run |
 | `validation.enabled` off for the project | the submission sites are the only place that switch is read (`ops.finish`), and this is a new submission site |
 
-`waiting_pr_merge` is explicitly ALLOWED — it is the case the command was built for.
+### 5.1 `round_machine_owns` and the latest-round rule
+
+The refusal above names the round it refuses over, so it needs the predicate AND the row.
+Reading twice is the kn-08f2ff9b shape — the panel opens rounds on another thread, and two
+reads can straddle one. So `ProjectStore.round_machine_owns(round_row)` is a staticmethod
+over the row (it *cannot* re-fetch), and `validation_round_open` — which
+`Daemon.heal_pull_request` depends on — is reimplemented on top of it.
+
+**The rewrite's risk is the latest-round rule**, not the outcome set. The old SQL keyed on
+`round = (SELECT MAX(round) …)`; the new path takes `latest_validation_round`, which orders
+`BY round DESC LIMIT 1`. Those agree, and an implementation that reached for "most recently
+inserted" instead would agree too on every work order whose rounds were inserted in order —
+which is every work order the ordinary path produces. So the test builds rounds **out of
+insertion order**, both directions, where latest-by-`id` and `MAX(round)` disagree.
 
 ## 6. Where the work order lands
 

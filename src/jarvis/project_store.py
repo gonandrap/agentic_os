@@ -43,6 +43,19 @@ OPEN_STATUSES = ("pending", "dispatching", "running", "waiting_input", "validati
 # Settled: nothing more will happen to these on their own. They are the bulk of an old
 # project's history, so listings collapse them behind a count rather than printing them.
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
+# Where a PERSON may force a fresh validation round (`ops.force_validation`). AN
+# ALLOWLIST, not a blocklist, and the two are not the same statement here: the question is
+# not "has this settled" but "has this work order DELIVERED, and is nobody typing". An
+# open round OWNS the worker's session (kn-01a4ab27) — `Daemon._reject` posts the panel's
+# feedback to whatever fills the `implementor` role — so a round opened over a live worker
+# gives that session two writers and moves the branch head under the seats mid-round.
+# `running`, `dispatching` and `waiting_input` are live sessions; `pending` has not begun.
+# Neither has anything to re-judge, and both are refused by NOT being here rather than by
+# a rule that has to be kept in step with `WO_STATUSES` as it grows.
+#
+# `validating` is absent for a different reason and is not a silent omission: its round is
+# open by definition, which is its own refusal with its own sentence.
+FORCEABLE_STATUSES = ("waiting_pr_merge", "needs_review")
 
 # The seat names a validation panel may be rostered with. This is the VOCABULARY, not
 # the set whose markdown ships in a given build: a catalog may name a seat whose

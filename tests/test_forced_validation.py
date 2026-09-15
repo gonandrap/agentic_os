@@ -24,10 +24,10 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import ops
+from jarvis import cli, ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
-from jarvis.project_store import ProjectStore
+from jarvis.project_store import FORCEABLE_STATUSES, ProjectStore
 from jarvis.testing import make_git_project
 
 PR = "https://github.com/acme/proj/pull/7"
@@ -336,23 +336,63 @@ def test_a_round_the_machine_still_owns_is_refused(fleet, project, fake_gh, outc
     assert len(store.validation_rounds(wo_id=wo["id"])) == 1
 
 
-@pytest.mark.parametrize("outcome", ["pending", "failed", "passed", "rejected",
-                                     "escalated"])
-def test_the_predicate_and_the_sentence_come_from_one_read(fleet, project, outcome):
-    """kn-08f2ff9b: the panel opens rounds on another thread, so a refusal that asked SQL
-    for the predicate and then re-fetched the row for the wording could refuse while
-    naming a round that had since settled. `round_machine_owns` takes the ROW — it
-    cannot re-fetch — and `validation_round_open` is derived from it, so the two can
-    never answer differently."""
-    store, _ = parked(fleet, project, outcome=outcome)
-    wo = ops.create_work_order("proj_a", "another")
-    round_row = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
-    if outcome != "pending":
-        store.close_validation_round(round_row["id"], outcome, "")
+def out_of_order(store, *, high: str, low: str) -> dict:
+    """A work order whose rounds were INSERTED in the wrong order.
 
-    row = store.latest_validation_round(wo_id=wo["id"])
-    assert ProjectStore.round_machine_owns(row) == store.validation_round_open(wo["id"])
-    # ...and a work order with no round at all is owned by nobody, both ways.
+    Round 2 is written first and round 1 second, so latest-by-`id` and `MAX(round)` name
+    DIFFERENT rows. That is the only shape that can tell the two apart, and no ordinary
+    path produces it — which is exactly why the guard needs it (see spec §5.1).
+    """
+    wo = ops.create_work_order("proj_a", f"two rounds: {high} over {low}")
+    second = store.open_validation_round(wo_id=wo["id"], fingerprint="fp2", round=2)
+    store.close_validation_round(second["id"], high, "")
+    first = store.open_validation_round(wo_id=wo["id"], fingerprint="fp1", round=1)
+    store.close_validation_round(first["id"], low, "")
+    assert first["id"] > second["id"], "the fixture must insert round 1 last"
+    return wo
+
+
+def test_the_open_round_predicate_keys_on_the_highest_round_not_the_newest_row(
+        fleet, project):
+    """THE RISK THE REWRITE INTRODUCED, both directions. `validation_round_open` used to
+    key on `round = (SELECT MAX(round) …)`; it now reads `latest_validation_round`, which
+    orders `BY round DESC`. An implementation that reached for the most recently INSERTED
+    row instead would agree on every work order the ordinary path produces, because that
+    path never inserts out of order. Here it cannot hide.
+
+    `Daemon.heal_pull_request` is the caller that depends on this, and getting it backwards
+    would nudge a worker whose round is still in flight — two writers to one session
+    (kn-01a4ab27)."""
+    store = ProjectStore(project)
+    # Round 2 is PENDING and round 1 (inserted last) is settled: the machine still owns it.
+    still_open = out_of_order(store, high="pending", low="passed")
+    assert store.validation_round_open(still_open["id"]) is True
+
+    # ...and the reverse: round 2 settled, round 1 (inserted last) left pending. The newest
+    # ROW is runnable and the highest ROUND is not, so a newest-row rule says True here.
+    done = out_of_order(store, high="passed", low="pending")
+    assert store.validation_round_open(done["id"]) is False
+
+
+def test_forcing_reads_the_same_highest_round_the_predicate_does(fleet, project,
+                                                                 fake_gh):
+    """The refusal and the round it names come from ONE read of the HIGHEST round — so
+    the sentence a person gets cannot describe a different round from the one that
+    decided (kn-08f2ff9b)."""
+    store = ProjectStore(project)
+    wo = out_of_order(store, high="pending", low="passed")
+    store.update_work_order(wo["id"], pr_url=PR)
+    store.set_status(wo["id"], "waiting_pr_merge")
+    artifact(fake_gh)
+
+    with pytest.raises(ops.OpsError, match="round 2 .* is pending"):
+        ops.force_validation(wo["id"], reason="impatient")
+    assert len(store.validation_rounds(wo_id=wo["id"])) == 2
+
+
+def test_a_work_order_nothing_has_ever_judged_is_owned_by_nobody(fleet, project):
+    """None is the shape `latest_validation_round` returns for it, and False is the only
+    answer that lets the first round ever be opened."""
     assert ProjectStore.round_machine_owns(None) is False
 
 
@@ -365,6 +405,101 @@ def test_a_settled_work_order_is_refused(fleet, project, fake_gh, status):
     with pytest.raises(ops.OpsError, match=status):
         ops.force_validation(wo["id"], reason="re-judge it")
     assert store.get_work_order(wo["id"])["status"] == status
+
+
+@pytest.mark.parametrize("status", ["running", "dispatching", "waiting_input",
+                                    "pending"])
+def test_a_work_order_whose_worker_is_still_typing_is_refused(fleet, project, fake_gh,
+                                                              status):
+    """THE CASE AN ALLOWLIST CATCHES AND A SETTLED-ONLY BLOCKLIST DOES NOT. An open round
+    OWNS the worker's session (kn-01a4ab27) — `Daemon._reject` posts the panel's feedback
+    to whatever fills the `implementor` role — so a round forced over a live worker gives
+    that session two writers and moves the branch head under the seats mid-round.
+
+    `pending` is here for the other reason: it has not begun, so there is nothing to
+    re-judge. Both are refused by NOT being in `FORCEABLE_STATUSES`."""
+    store, wo = parked(fleet, project)
+    store.set_status(wo["id"], status)
+    with pytest.raises(ops.OpsError, match=f"is {status}, and a round can only be"):
+        ops.force_validation(wo["id"], reason="re-judge it")
+    assert len(store.validation_rounds(wo_id=wo["id"])) == 1
+    assert store.get_work_order(wo["id"])["status"] == status
+
+
+def test_the_allowlist_is_what_the_refusal_names_so_the_two_cannot_drift(fleet, project,
+                                                                        fake_gh):
+    """The message quotes `FORCEABLE_STATUSES`, so a status added to the tuple cannot
+    leave the user reading a list that no longer matches what the code accepts."""
+    store, wo = parked(fleet, project)
+    store.set_status(wo["id"], "running")
+    with pytest.raises(ops.OpsError) as caught:
+        ops.force_validation(wo["id"], reason="re-judge it")
+    for allowed in FORCEABLE_STATUSES:
+        assert allowed in str(caught.value)
+
+
+def test_a_delivered_order_awaiting_a_person_is_allowed(fleet, project, fake_gh):
+    """`needs_review` is the OTHER half of the allowlist and not an afterthought: a panel
+    escalation that recorded no commit lands exactly here, and it is a work order that has
+    delivered with nobody typing — which is the whole predicate."""
+    store, wo = parked(fleet, project, outcome="escalated")
+    store.set_status(wo["id"], "needs_review")
+    artifact(fake_gh)
+
+    ops.force_validation(wo["id"], reason="re-judge the escalation on the live head")
+    judge(fleet, store, Panel("passed"))
+
+    rounds = store.validation_rounds(wo_id=wo["id"])
+    assert len(rounds) == 2 and rounds[-1]["head_sha"] == LIVE_HEAD
+
+
+# -- the command, driven the way the operator drives it -------------------------------
+
+
+def test_the_cli_opens_the_round_and_reports_where_the_order_went(fleet, project,
+                                                                  fake_gh, capsys):
+    """`args.validation_cmd` dispatch, end to end. `cmd_validation` serves `show` and
+    would happily swallow `force` — a missing branch here is a command that parses,
+    prints somebody else's output and opens no round at all."""
+    store, wo = parked(fleet, project)
+    artifact(fake_gh)
+
+    assert cli.main(["validation", "force", wo["id"],
+                     "--reason", "round 1 predates head_sha"]) == 0
+
+    out = capsys.readouterr().out
+    assert "round 2 opened by hand — round 1 predates head_sha" in out
+    assert "was waiting_pr_merge, now validating" in out
+    forced = store.latest_validation_round(wo_id=wo["id"])
+    assert forced is not None and forced["round"] == 2
+    assert forced["forced_reason"] == "round 1 predates head_sha"
+
+
+def test_the_cli_refuses_without_a_reason_and_opens_nothing(fleet, project, fake_gh):
+    """`--reason` is `required=True`, so argparse exits 2 before `ops` is reached — the
+    same shape as `jarvis config set` and `jarvis gate approve`."""
+    store, wo = parked(fleet, project)
+    with pytest.raises(SystemExit) as caught:
+        cli.main(["validation", "force", wo["id"]])
+    assert caught.value.code == 2
+    assert len(store.validation_rounds(wo_id=wo["id"])) == 1
+
+
+def test_the_cli_hands_back_the_round_as_json(fleet, project, fake_gh, capsys):
+    """The machine-readable half, because a forced round is a thing a script may want to
+    follow — and `round_id` is what `jarvis validation show` is then read against."""
+    store, wo = parked(fleet, project)
+    artifact(fake_gh)
+
+    assert cli.main(["--json", "validation", "force", wo["id"],
+                     "--reason", "round 1 predates head_sha"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    forced = store.latest_validation_round(wo_id=wo["id"])
+    assert forced is not None
+    assert payload["round_id"] == forced["id"] and payload["round"] == 2
+    assert payload["was"] == "waiting_pr_merge" and payload["status"] == "validating"
+    assert payload["reason"] == "round 1 predates head_sha"
 
 
 def test_a_work_order_that_does_not_exist_is_refused(fleet, project):

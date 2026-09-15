@@ -42,8 +42,8 @@ from .project_store import (
     FO_TERMINAL_STATUSES,
     NO_TURN,
     OPEN_STATUSES,
+    FORCEABLE_STATUSES,
     OPEN_VALIDATION_OUTCOMES,
-    TERMINAL_STATUSES,
     ProjectStore,
 )
 
@@ -1783,6 +1783,15 @@ def force_validation(wo_id: str, *, reason: str,
     number reused, hit the idempotent insert in `open_validation_round` and hand the
     caller an already-closed round while the work order parked in `validating` for ever.
 
+    **WHAT IT ALLOWS is `FORCEABLE_STATUSES`, and that is a narrower claim than "what it
+    does not refuse".** Only `waiting_pr_merge` and `needs_review`: a work order that has
+    DELIVERED and whose worker is not typing. A `running` one would be judged while its
+    worker is still writing to the branch, and — worse — an open round OWNS that worker's
+    session (kn-01a4ab27), so `Daemon._reject` would post the panel's feedback into a
+    session mid-task. The allowlist is the guard rather than a `running`-shaped refusal,
+    so a status added to `WO_STATUSES` tomorrow is refused until somebody decides it is
+    safe rather than allowed until somebody remembers it is not.
+
     The work order lands in `validating` and goes back to where the panel's verdict puts
     it: `waiting_pr_merge` on a pass (`land_when_cleared` re-parks it behind the still-open
     pull request, and the automatic merge can then arm on the head this round recorded),
@@ -1803,9 +1812,14 @@ def force_validation(wo_id: str, *, reason: str,
     try:
         wo = store.get_work_order(wo_id)
         status = str(wo["status"] or "")
-        if status in TERMINAL_STATUSES:
-            raise OpsError(f"{wo_id} is {status}: re-judging settled work would reopen "
-                           f"it, and a verdict on it could change nothing")
+        if status not in FORCEABLE_STATUSES:
+            raise OpsError(
+                f"{wo_id} is {status}, and a round can only be forced on a work order "
+                f"that has DELIVERED and whose worker is not typing — "
+                f"{' or '.join(FORCEABLE_STATUSES)}. A settled order would be reopened "
+                f"by a verdict that could change nothing; a live one would have its "
+                f"session claimed by the round machine while its worker is still "
+                f"writing to it")
         if not str(wo.get("pr_url") or ""):
             raise OpsError(
                 f"{wo_id} carries no pull request, so a fresh round would read its "

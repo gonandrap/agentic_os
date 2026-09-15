@@ -172,15 +172,20 @@ jarvis validation force <wo-id> --reason "…"    # judge this work order AGAIN,
                                            # event on the timeline. --reason is required
                                            # and is stored on the round, so a forced
                                            # re-judgement never reads afterwards like a
-                                           # worker's own re-delivery. Works on a
-                                           # `waiting_pr_merge` order — that is the case
-                                           # it exists for — and leaves it `validating`
-                                           # until the verdict, back to `waiting_pr_merge`
-                                           # if it passes. It spends a round number like
-                                           # any other, so a REJECTION at or past
-                                           # `max_rounds` comes to you rather than to a
-                                           # worker. Refuses with no pull request, with a
-                                           # round already open, or on a settled order.
+                                           # worker's own re-delivery. ONLY on an order
+                                           # that has DELIVERED and whose worker is not
+                                           # typing: `waiting_pr_merge` (the case it
+                                           # exists for) or `needs_review`. A running one
+                                           # is refused — an open round owns the worker's
+                                           # session, so forcing there would put the
+                                           # panel's feedback into a session mid-task —
+                                           # and so is a settled one. It leaves the order
+                                           # `validating` until the verdict, back to
+                                           # `waiting_pr_merge` if it passes. It spends a
+                                           # round number like any other, so a REJECTION
+                                           # at or past `max_rounds` comes to you rather
+                                           # than to a worker. Also refuses with no pull
+                                           # request or with a round already open.
 jarvis gate list [--pending]               # privileged-action approvals (merge a PR, ship
                                            # a release). Workers attempt these and get
                                            # blocked; Neo reviews and decides, so most
