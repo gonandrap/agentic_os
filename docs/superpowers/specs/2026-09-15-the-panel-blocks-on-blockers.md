@@ -174,10 +174,42 @@ A non-chair seat's reply gains one key, beside the four it already has (§2.2):
   direction: this is the mirror of `validation._raised`'s permissive `bool()` and it points
   the *opposite* way, because this flag points *away* from a rejection. A malformed severity
   must fail toward filing, never toward rejecting — the failure this feature exists to remove.
-  A `findings` key that is absent, not a list, or unparseable is `[]`.
 * `title` becomes a backlog item's title: under ~100 characters, naming the file or symbol.
 * `detail` becomes that item's description, and on a blocker it is what the chair reads.
-* `reason` and `asks` are unchanged and stay the veto seat's own words to the submitter.
+
+**`asks` AND `reason` NARROW TO THE BLOCKERS, AND THAT IS NOT A DETAIL — IT IS THE OTHER HALF
+OF §3.5.** `asks` is where a non-blocking reviewer's nits live *today*. If it kept meaning
+"everything this reviewer wants changed", a seat could answer `verdict: reject`, `asks:
+["rename X", "share this helper"]` and two `follow_up` findings, and the chair would still read
+two concrete actionable asks — mechanism 1.1, untouched, arriving through a second door. So:
+
+* **`asks` carries the concrete changes required by this seat's `blocker` findings, and
+  nothing else.** A follow-up's text lives in `findings` and only there. One remark is never
+  represented twice at two severities.
+* **`reason` is about the blockers** for the same reason. A seat with nothing blocking says so
+  in one line and puts its remarks in `findings`.
+* **`verdict` is `reject` if and only if the seat raised at least one `blocker`.** A seat whose
+  every finding is a follow-up answers `pass`; its remarks are not discarded, they are filed.
+* On the veto path this changes nothing, which is the point: a blocking seat's `blocker`
+  findings are exactly what its `reason` and `asks` describe, so `arbitrate._message(reason,
+  asks)` renders the same text to the submitter it renders today (§2.2).
+
+**THE THREE CASES `validation.findings()` MUST HANDLE**, and the middle one is the one a reader
+will get wrong:
+
+| the reply | what `findings()` returns |
+|---|---|
+| `findings` present and usable | it, with every non-`"blocker"` severity read as `follow_up` |
+| `findings` absent, unusable, or not a list, **and `verdict` is `reject`** | **ONE synthesised `blocker`**, title and detail from `reason` + `asks` |
+| `findings` absent or unusable, and `verdict` is `pass` | `[]` |
+
+**The synthesis row is a fail-safe and it is not the same question as a malformed severity.** A
+seat that wrote `severity: "nit"` classified its finding and we merely do not know its word —
+read it as `follow_up`. A seat that emitted **no `findings` key at all** has not classified
+anything, so reading its rejection as minor would be the rubber stamp this feature is most at
+risk of. Without this row, §3.5's severity filter would make an un-upgraded rejecting seat
+*invisible to the chair*, which is a hole the field filter did not have. It is also what makes
+§2.2's additivity promise literally true: an un-upgraded seat behaves exactly as it does today.
 
 ### 3.2 What each seat is told, and where
 
@@ -197,12 +229,24 @@ next to the output format, and that the same fix stated elsewhere in the file di
 **Stating the default is load-bearing.** An LLM asked to classify with no stated default
 classifies toward the graver label — which is the production defect in a new costume.
 
+**Every non-chair mandate also states where a follow-up's text goes**, in the same words and in
+the same place, because §3.1's narrowing of `asks` is a change to what a seat was previously
+told to write and a schema table alone will not carry it:
+
+> `reason` and `asks` are about your BLOCKERS. `asks` lists the concrete changes your `blocker`
+> findings require and nothing else; a follow-up's text belongs in its own finding and nowhere
+> else. Do not write a remark in both places — one remark, one severity. If nothing you found
+> blocks, answer `"verdict": "pass"`, say so in one line, and put your remarks in `findings`:
+> they are filed, not discarded.
+
 Per seat:
 
 * **`tester.md` / `security.md`** (veto holders). Their existing "you may reject WITHOUT
   blocking" paragraph becomes: a concern you would not stop the work over is a `follow_up`
   finding, filed rather than argued. Set `blocking` when and only when you have written at
-  least one `blocker` finding. Their veto itself is untouched (§7).
+  least one `blocker` finding. Their veto itself is untouched (§7), and on it their `reason`
+  and `asks` still reach the submitter verbatim — which the narrowing above preserves, because
+  a blocking seat's `asks` are its blockers' asks.
 * **`architect.md` / `maintainer.md`** (no veto). These two are where the treadmill lives.
   They gain the counterpart of the rule the chair is losing: you may write a `blocker` and the
   chair will weigh it, but yours is the seat whose failure mode is an expensive rejection loop,
@@ -248,9 +292,25 @@ wrong turn.
 That is what feeds mechanism 1.1: the chair reads twelve nits and is told a concrete one is
 reason enough.
 
-It changes to render, per seat: `verdict`, `reason`, `asks`, and **only that seat's `blocker`
-findings** — each quoted unchanged, because a summariser between the seats and the chair is
-one more place a concrete ask gets softened. In place of the follow-ups, one line:
+**IT IS FILTERED BY SEVERITY, NOT BY FIELD.** That distinction is the whole of this section.
+Withholding the `follow_up` entries of `findings` while still rendering `reason` and `asks`
+verbatim would leave the nits arriving through a second door, and this design's own claim is
+that *absence* is the only enforcement there is — a rule that withholds one channel and not
+the other is not that claim, it is a hopeful version of it. `findings()` (§3.1) is the one
+place severity is decided, and the chair prompt is built from its output.
+
+So, per seat:
+
+* **A seat that raised at least one `blocker`** contributes: its blocker findings, each quoted
+  unchanged — a summariser between the seats and the chair is one more place a concrete ask
+  gets softened — plus its `reason` and its `asks`, which §3.1 has narrowed to those blockers.
+* **A seat that raised no blocker** contributes one neutral line saying it raised nothing that
+  blocks. **Not its `verdict` word, not its `reason`, not its `asks`, not a follow-up's title.**
+  §3.1 says such a seat should answer `pass`; the chair prompt does not depend on it having
+  done so, because normalising here is code and the mandate is prose.
+* An abstaining or failed seat is reported exactly as it is today: silence, never agreement.
+
+In place of the follow-ups, one line:
 
 > `N` further findings across this panel were classified as follow-ups by the seats that raised
 > them. They have been filed as tickets against this project and are not before you. You may
@@ -311,10 +371,18 @@ until §4 lands. **That is what makes this work order shippable on its own.**
 
 * **The fake `claude` needs its branch before any assertion about it.** `src/jarvis/testing.py`
   claims a validation call by the literal `# Jarvis validation seat: <seat>` and its branch is
-  placed FIRST on purpose. Add `FORCE_FOLLOWUP_<SEAT>` beside `FORCE_BLOCK_<SEAT>` and
-  `FORCE_REJECT_<SEAT>`, and give the default unforced reply an explicit `"findings": []` —
-  otherwise the whole suite exercises the absent-key fallback and nothing exercises the new
-  path.
+  placed FIRST on purpose. Three changes, and the third is the one that is easy to miss:
+  * Add `FORCE_FOLLOWUP_<SEAT>`, emitting `verdict: pass` with a `follow_up` finding and an
+    **empty `asks`** — a fake that puts the nit in `asks` as well makes §3.5's filter untestable
+    by making the two channels agree.
+  * Give the default unforced reply an explicit `"findings": []`, or the whole suite exercises
+    the absent-key path and nothing exercises the new one.
+  * **Keep one hook that emits the OLD shape deliberately** — `verdict: reject` with `reason`,
+    `asks` and no `findings` key at all — because that is the only way §3.1's synthesis row gets
+    covered, and it is the row that stops an un-upgraded seat's rejection vanishing from the
+    chair's prompt. The existing `FORCE_REJECT_<SEAT>` is the natural home for it; if you
+    upgrade that hook to the new shape instead, add a separate old-shape one and say which is
+    which.
 * **`project_store.VALIDATION_VERDICTS` is unchanged.** `record_validation_opinion` asserts
   `verdict in ("pass", "reject", "")` and `validation._verdict` narrows to it in two places.
   Severity is a property of a FINDING, never of a verdict.
