@@ -568,6 +568,32 @@ class CentralStore:
             out.append(d)
         return out
 
+    def backlog_from(self, *, origin_wo_id: str | None = None,
+                     origin_fo_id: str | None = None) -> list[dict[str, Any]]:
+        """Every item filed against one unit, WHATEVER ITS STATUS, oldest first.
+
+        `list_backlog` cannot answer this: it filters on project and status, and its
+        status DEFAULTS TO `open`. A caller asking "has this already been filed" through
+        that default stops seeing an item the user has since closed, dropped or promoted,
+        and re-files it on every subsequent round — for ever. Spec §4.4:
+        docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
+
+        Exactly one origin, for the reason `ProjectStore._subject` refuses either: a
+        query that silently accepted both would answer about the wrong unit on the day a
+        caller passed both.
+        """
+        assert bool(origin_wo_id) != bool(origin_fo_id), "exactly one origin"
+        col = "origin_wo_id" if origin_wo_id else "origin_fo_id"
+        rows = self.conn.execute(
+            f"SELECT * FROM backlog WHERE {col}=? ORDER BY created_at",
+            (origin_wo_id or origin_fo_id,)).fetchall()
+        out = []
+        for row in rows:
+            d = dict(row)
+            d["depends_on"] = db.from_json(d["depends_on"], [])
+            out.append(d)
+        return out
+
     def unfinished_dependencies(self, item_id: str) -> list[dict[str, Any]]:
         """Dependencies of item that are not yet done (blockers for promotion)."""
         item = self.get_backlog(item_id)

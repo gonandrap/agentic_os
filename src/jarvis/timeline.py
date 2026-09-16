@@ -346,7 +346,7 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                     f"by mistake", "no privileged action was authorised")
         return (f"Ran the approved {p.get('kind') or 'command'}",
                 f"use {p.get('use')} of {p.get('of')}")
-    # The validation loop. Six kinds rather than one with an outcome in the payload,
+    # The validation loop. Seven kinds rather than one with an outcome in the payload,
     # because each is the whole story a reader wants at a glance — and each gets a
     # LABEL of its own here. `event_level` returns "signal" for anything it does not
     # know, so these arriving unclassified would look fine on the timeline while
@@ -367,6 +367,19 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 else "Validation forced by hand",
                 f"{p.get('reason') or ''}"
                 + (f" (was {was})" if was else ""))
+    if kind == "validation_follow_ups_filed":
+        # A SEVENTH kind, and the only one that is not a verdict: the round's
+        # non-blocking remarks, filed as project backlog items instead of sent back.
+        # NO SEAT IS NAMED — the payload carries them, and the timeline is read by the
+        # submitter; which reviewer said it belongs on the backlog row and on
+        # `jarvis validation show` (spec §4.7).
+        ids = p.get("ids") or []
+        dropped = int(p.get("dropped") or 0)
+        detail = ", ".join(str(i) for i in ids)
+        if dropped:
+            detail += f"{'; ' if detail else ''}{dropped} more over the per-round cap"
+        return (f"Review filed {len(ids)} follow-up{'' if len(ids) == 1 else 's'} "
+                f"on the backlog", detail)
     if kind == "validation_passed":
         return "Validation passed", p.get("reason") or ""
     if kind == "validation_rejected":

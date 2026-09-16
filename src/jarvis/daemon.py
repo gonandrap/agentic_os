@@ -1326,6 +1326,12 @@ class Daemon:
                     status=str(seat.get("status") or "ok"),
                     model=str(seat.get("model") or ""),
                     latency_ms=int(seat.get("latency_ms") or 0))
+            # BEFORE THE OUTCOME BRANCH, not inside it: a follow-up is filed whether the
+            # round passed or was rejected. `.get(...) or ()` because `self.validator` is
+            # injectable and fakes returning only the three older keys are legitimate.
+            self._file_follow_ups(store, project, round_row,
+                                  verdict.get("follow_ups") or (), cfg,
+                                  unit=wo_id, wo_id=wo_id)
             outcome = str(verdict.get("outcome") or "")
             reason = str(verdict.get("reason") or "")
 
@@ -1354,6 +1360,33 @@ class Daemon:
             log.exception("[%s] validating %s failed", project.name, wo_id)
         finally:
             store.close()
+
+    @staticmethod
+    def _file_follow_ups(store: ProjectStore, project: ProjectSpec,
+                         round_row: Any, follow_ups: Any, cfg: Any, *, unit: str,
+                         wo_id: str | None = None, fo_id: str | None = None) -> None:
+        """File this round's non-blocking findings, and say so in the log.
+
+        The filing itself is `ops.file_validation_follow_ups` — business logic the CLI
+        can reach, not daemon-private. What is here is the log line §4.4 asks for, in ONE
+        place so the two loops cannot word it differently, and the refusal to let a
+        backlog write take a round down: the verdict has been paid for and the seats are
+        already recorded, so a `CentralStore` that will not open must cost the follow-ups
+        and nothing else.
+        """
+        from . import ops
+
+        try:
+            filed = ops.file_validation_follow_ups(
+                store, project.name, round_row, follow_ups, cfg,
+                wo_id=wo_id, fo_id=fo_id)
+        except Exception:  # noqa: BLE001 — see the docstring
+            log.exception("[%s] %s: filing follow-ups failed", project.name, unit)
+            return
+        if filed["ids"] or filed["dropped"]:
+            log.info("[%s] %s: round %d filed %d follow-up(s), dropped %d over the cap",
+                     project.name, unit, filed["round"], len(filed["ids"]),
+                     filed["dropped"])
 
     @staticmethod
     def _preceding_round(store: ProjectStore, n: int, *, wo_id: str | None = None,
@@ -1658,6 +1691,10 @@ class Daemon:
                     status=str(seat.get("status") or "ok"),
                     model=str(seat.get("model") or ""),
                     latency_ms=int(seat.get("latency_ms") or 0))
+            # `_validate_work_order`'s line, in the same place and for the same reason.
+            self._file_follow_ups(store, project, round_row,
+                                  verdict.get("follow_ups") or (), cfg,
+                                  unit=fo_id, fo_id=fo_id)
             outcome = str(verdict.get("outcome") or "")
             reason = str(verdict.get("reason") or "")
 

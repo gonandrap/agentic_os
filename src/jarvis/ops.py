@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -23,6 +23,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 from .bootstrap import BootstrapReport, bootstrap_project, settings_drift
 from .catalog import (
+    DEFAULT_VALIDATION_FOLLOW_UP_CAP,
     SAFETY_KEYS,
     Catalog,
     CatalogError,
@@ -1278,9 +1279,22 @@ def round_line(rnd: dict[str, Any]) -> str:
     # indistinguishability is the whole defect `jarvis validation force` removes — and the
     # place it has to say so is the line every surface already prints.
     forced = (rnd.get("forced_reason") or "").strip()
+    # WHAT THE ROUND FILED RATHER THAN BLOCKED ON. A count only: the items themselves are
+    # deliberation and live behind `jarvis validation show`, and naming the seat that
+    # raised one here would put a seat's name on a surface the submitter reads. Silent at
+    # zero — a line saying "0 follow-ups" on every round in the fleet would spend
+    # attention on an absence, the way `automerge_state` returns None rather than "off".
+    filed = rnd.get("follow_ups") or NO_FOLLOW_UPS
+    n_filed, dropped = len(filed.get("filed") or ()), int(filed.get("dropped") or 0)
+    note = ""
+    if n_filed:
+        note = f" · {n_filed} follow-up{'' if n_filed == 1 else 's'} filed"
+    if dropped:
+        note += f",{' ' if note else ' · '}{dropped} over the cap"
     return (f"round {rnd['round']} · {rnd['fingerprint']} · {rnd['outcome']}"
             f" · config {rnd.get('config_version') or 'not recorded'}"
             f" · commit {sha[:10] or 'not recorded'}"
+            + note
             + (f" · forced: {forced}" if forced else "")
             + (f" — {reason}" if reason else ""))
 
@@ -1373,6 +1387,189 @@ def alarm_standing_line(alarms: list[dict[str, Any]]) -> str:
     return f"{len(alarms)} ({standing}) — " + ", ".join(a["id"] for a in alarms)
 
 
+#: The event one filing writes, and the only link between a round and the backlog rows
+#: it produced. Spec §4.6:
+#: docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
+FOLLOW_UPS_EVENT = "validation_follow_ups_filed"
+
+#: What a round with nothing filed projects. PRESENT ON EVERY ROUND, which is the rule
+#: `validation_rounds`, `assumptions` and `alarms` already follow: a key that comes and
+#: goes is a key every consumer has to guard, and a Jinja template guards it by
+#: rendering nothing at all (`kn-99e37a4b`).
+NO_FOLLOW_UPS: dict[str, Any] = {"filed": [], "dropped": 0}
+
+
+def follow_up_key(title: Any) -> str:
+    """The dedupe key for one finding's title: stripped, whitespace collapsed.
+
+    The house normalisation, the one `evidence._normalise` applies for the same reason.
+    NOT hashed, though §4.4 calls it a digest: the comparison is a set lookup in memory,
+    a hash buys nothing there, and the key is worth being able to read in a log line.
+    """
+    return " ".join(str(title or "").split())
+
+
+def file_validation_follow_ups(store: ProjectStore, project: str,
+                               round_row: Mapping[str, Any],
+                               follow_ups: Sequence[Mapping[str, Any]],
+                               cfg: Any, *, wo_id: str | None = None,
+                               fo_id: str | None = None) -> dict[str, Any]:
+    """File this round's non-blocking findings against the project's backlog.
+
+    Called by BOTH daemon validation loops immediately after the opinions are recorded
+    and BEFORE the outcome branch: a follow-up is filed whether the round passed or was
+    rejected. Making it conditional on an outcome the seat could not see when it wrote
+    would reintroduce, in miniature, the treadmill this feature exists to end.
+
+    **Not in `validation.py`.** That module's contract is "it is called; it is never
+    messaged, and it messages nobody" — a panel that writes backlog rows has a side
+    effect the round machine cannot roll back when the round later fails on transport.
+    `central_store` is not on its AST ban list, so this is a contract boundary rather
+    than a mechanical one, which is why it is written down here.
+
+    **Not in `daemon.py` either.** One function, two callers, for the reason
+    `side_effects_of` and `collect_feature_evidence` are already here: the collector may
+    not read a store, so `ops` does — and two inline copies of a filing rule is the shape
+    that drifts, when `_round_config`'s docstring records Neo's ruling (question 176)
+    that the two loops are held identical.
+
+    **NOT OVER THE BUS, though `bus.DeferralRequest` is exactly this shape** and
+    `reviewer` is already a legal sender. When the subject is under a feature order,
+    `bus.resolve` finds the manager and the deferral is DELIVERED AS A MESSAGE telling it
+    to run `jarvis backlog add` — a manager turn per nit, and the same fact recorded two
+    different ways depending on parentage: backlog rows for standalone work orders,
+    manager instructions for feature children. That is the failure `bus._unfilled`'s own
+    comment warns about. A direct `add_backlog` has one behaviour.
+
+    **THE SUBMITTER IS TOLD NOTHING.** These are the user's backlog, not the worker's
+    homework, and `validation.REASON_LIMIT` is 1500 characters that
+    `daemon.REVIEW_FEEDBACK` and then `bus.render` each re-frame — every sentence added
+    there pushes the instructions that matter off the bottom.
+
+    Returns the event payload whether or not anything was written, so a caller can log
+    the drop count without reading the timeline back.
+    """
+    n, round_id = int(round_row["round"]), int(round_row["id"])
+    payload: dict[str, Any] = {"round": n, "round_id": round_id,
+                               "ids": [], "seats": [], "dropped": 0}
+    # `follow_ups` is read defensively by the CALLER too (`verdict.get(...) or ()`):
+    # `Daemon.validator` is injectable and several suites inject fakes that return only
+    # the three keys that predate this.
+    if not getattr(cfg, "follow_ups", True) or not follow_ups:
+        return payload
+
+    unit_id = wo_id or fo_id or ""
+    pr_url = str(round_row.get("pr_url") or "")
+    cap = int(getattr(cfg, "max_follow_ups", DEFAULT_VALIDATION_FOLLOW_UP_CAP))
+    central = CentralStore()
+    try:
+        # THE BACKLOG IS THE SOURCE OF TRUTH FOR "has this already been filed", never
+        # the timeline event — and `backlog_from` reads EVERY status, because an item
+        # the user closed or promoted has still been filed. Every row filed against this
+        # unit counts, not only the panel's own: a worker's deferral and a seat's
+        # follow-up with the same title are the same ticket twice.
+        seen = {follow_up_key(r["title"])
+                for r in central.backlog_from(origin_wo_id=wo_id, origin_fo_id=fo_id)}
+        for finding in follow_ups:
+            title = follow_up_key(finding.get("title"))
+            if not title or title in seen:
+                continue
+            seen.add(title)  # never the same title twice within one round either
+            # DEDUPE FIRST, CAP SECOND. The other order looks stricter and stalls: a
+            # unit with six findings of which five are already filed would spend the
+            # whole cap on duplicates and never reach the sixth, on every round, for
+            # ever. This way a round always makes progress, and the only cost is that a
+            # round retried after a transport failure may file what the first attempt
+            # dropped — distinct findings, not duplicate rows, which is what §4.4's
+            # idempotence asks for.
+            if len(payload["ids"]) >= cap:
+                payload["dropped"] += 1
+                continue
+            seat = str(finding.get("seat") or "")
+            row = central.add_backlog(
+                project, title,
+                description=_follow_up_description(finding, unit_id=unit_id,
+                                                   round_no=n, pr_url=pr_url),
+                origin_wo_id=wo_id, origin_fo_id=fo_id,
+                # `bus.origin_note`'s SHAPE, so the two filing paths read alike on one
+                # backlog listing. THE SEAT IS NAMED HERE — and only here and on the
+                # deliberation surface. Deliberation never reaches the submitter, but
+                # the backlog is the project's own record, read later by a person
+                # deciding whether to act, and which reviewer said this is exactly what
+                # they need. This door is deliberate; do not close it (§4.2).
+                origin_note=f"validation follow-up · {seat or 'panel'} seat · round {n}")
+            payload["ids"].append(row["id"])
+            payload["seats"].append(seat)
+    finally:
+        central.close()
+
+    if payload["ids"] or payload["dropped"]:
+        if wo_id:
+            store.add_event(wo_id, FOLLOW_UPS_EVENT, payload)
+        else:
+            feature_event(store, str(fo_id), FOLLOW_UPS_EVENT,
+                          {**payload, "feature_order": fo_id})
+    return payload
+
+
+def _follow_up_description(finding: Mapping[str, Any], *, unit_id: str,
+                           round_no: int, pr_url: str) -> str:
+    """The finding's own detail, plus where it came from.
+
+    The footer is the only context the person who picks this ticket up will have: the
+    seat's sentence alone does not say which change it was written about.
+    """
+    detail = str(finding.get("detail") or "").strip()
+    footer = (f"Raised by the validation panel in round {round_no} of {unit_id}, "
+              f"as a follow-up rather than a blocker.")
+    if pr_url:
+        footer += f"\nPull request: {pr_url}"
+    return f"{detail}\n\n{footer}" if detail else footer
+
+
+def filed_follow_ups(store: ProjectStore, *, wo_id: str | None = None,
+                     fo_id: str | None = None) -> dict[int, dict[str, Any]]:
+    """What the panel filed, per round id, for the surfaces that print a round.
+
+    ONE resolver, because `validation_rounds` and `validation_detail` are two different
+    projections read by four surfaces between them, and two of them computing this
+    separately is how they come to show different things (`kn-4ea33fe6`, `kn-99e37a4b`).
+
+    Titles come from the BACKLOG ROWS rather than from the event, which carries only
+    ids: the row is what the ticket actually says now, so an item the user has since
+    retitled, dropped or promoted reads here as what it is. An id with no row — the user
+    deleted it — is simply absent.
+
+    Free on a fleet that has never filed one: no event, no `CentralStore` opened.
+    """
+    rows = (store.events_of_kind(wo_id, FOLLOW_UPS_EVENT) if wo_id
+            else feature_events_of_kind(store, str(fo_id), FOLLOW_UPS_EVENT))
+    if not rows:
+        return {}
+    central = CentralStore()
+    try:
+        items = {r["id"]: r for r in central.backlog_from(origin_wo_id=wo_id,
+                                                          origin_fo_id=fo_id)}
+    finally:
+        central.close()
+    out: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        p = db.from_json(row["payload"], {})
+        # A round RETRIED after a transport failure files again and writes a second
+        # event. The rows are deduped, so the two events are a partition of one round's
+        # filing: ids accumulate, and `dropped` is the LAST attempt's — the attempt that
+        # decided what is still missing.
+        rnd = out.setdefault(int(p.get("round_id") or 0), {"filed": [], "dropped": 0})
+        for item_id, seat in zip(p.get("ids") or [], p.get("seats") or []):
+            item = items.get(item_id)
+            if item is None:
+                continue
+            rnd["filed"].append({"id": item_id, "seat": seat,
+                                 "title": item["title"], "status": item["status"]})
+        rnd["dropped"] = int(p.get("dropped") or 0)
+    return out
+
+
 def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
                       fo_id: str | None = None) -> list[dict[str, Any]]:
     """One unit's rounds, oldest first, WITHOUT the seats' opinions.
@@ -1382,8 +1579,15 @@ def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
     they are a copy of what the unit already says about itself, and a round listing is
     read to answer "how many times, and what came back", not to re-read the submission.
     """
-    return [{k: r[k] for k in ("id", "round", "ts", "fingerprint", "outcome", "reason",
-                               "pr_url", "config_version", "head_sha", "forced_reason")}
+    filed = filed_follow_ups(store, wo_id=wo_id, fo_id=fo_id)
+    return [{**{k: r[k] for k in ("id", "round", "ts", "fingerprint", "outcome",
+                                  "reason", "pr_url", "config_version", "head_sha",
+                                  "forced_reason")},
+             # ALWAYS PRESENT, even empty — the rule this key list, `assumptions` and
+             # `alarms` already follow. `jarvis wo show`, `jarvis fo show` and both
+             # dashboard pages read THIS projection, so a key that came and went would
+             # be one every consumer had to guard (spec §4.7).
+             "follow_ups": filed.get(int(r["id"]), NO_FOLLOW_UPS)}
             for r in store.validation_rounds(wo_id=wo_id, fo_id=fo_id)]
 
 
@@ -1566,7 +1770,13 @@ def validation_detail(store: ProjectStore, *, wo_id: str | None = None,
     an open store so the pages that already have one do not open a second, and so the
     CLI and the dashboard cannot drift about what a deliberation contains.
     """
-    rounds = [{**rnd, "opinions": store.validation_opinions(rnd["id"])}
+    # `validation_rounds` is a DIFFERENT projection, and this one is what the dashboard
+    # macro and `jarvis validation show` are fed — so the key is added in both, off the
+    # same resolver, because two surfaces computing it separately is how they come to
+    # show different things (`kn-99e37a4b`).
+    filed = filed_follow_ups(store, wo_id=wo_id, fo_id=fo_id)
+    rounds = [{**rnd, "opinions": store.validation_opinions(rnd["id"]),
+               "follow_ups": filed.get(int(rnd["id"]), NO_FOLLOW_UPS)}
               for rnd in store.validation_rounds(wo_id=wo_id, fo_id=fo_id)]
     envelopes = store.envelopes(subject_wo_id=wo_id, subject_fo_id=fo_id)
     return {"rounds": rounds, "envelopes": envelopes,
