@@ -542,7 +542,8 @@ def parse_stamp(stamp: Any) -> float:
         return 0.0
 
 
-def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
+def _assistant_messages(path: Path | str,
+                        needle: str = '"usage"') -> list[dict[str, Any]]:
     """The assistant messages in one transcript, deduped by message id.
 
     THE TRAP: a single assistant message is written to the transcript several times —
@@ -552,12 +553,20 @@ def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
     measurement of wo-cd73c537 read 2.7M cache-write tokens where the true figure is
     1.03M. Keep one entry per message id, and take the MAX of each field rather than
     the first — the first copy of a message reports `output_tokens: 1`.
+
+    `needle` NARROWS the pre-filter below for a caller that wants one class of message
+    rather than the bill. `one_hour_writes` passes the 1h key: over the fleet's 842MB of
+    transcripts that reads 25k lines where `"usage"` reads most of them, and the counts
+    it keeps are the same ones. THE COST OF NARROWING is that `ts` and `entrypoint`
+    become the first copy carrying the NEEDLE rather than the first copy of the message —
+    accurate for placing a write in a window, wrong for `inspection._close_turns`, which
+    is why the default stays what every other caller reads.
     """
     by_id: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     # The pre-filter: a row with no `usage` key cannot carry token counts, and most
     # rows in a transcript are tool results or UI state.
-    for row in rows(path, '"usage"'):
+    for row in rows(path, needle):
         if row.get("type") != "assistant":
             continue
         message = row.get("message") or {}
@@ -570,7 +579,12 @@ def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
             # First occurrence, not max: a message is rewritten as its text grows,
             # and when the call LANDED is when its first row was written.
             entry = by_id[mid] = {"model": message.get("model") or "",
-                                  "ts": parse_stamp(row.get("timestamp"))}
+                                  "ts": parse_stamp(row.get("timestamp")),
+                                  # WHO STARTED THE PROCESS — see `SDK_ENTRYPOINT`. Read
+                                  # per message and not per file because one transcript
+                                  # holds both: wo-2df8828c's own dispatched session was
+                                  # later reopened by hand in its worktree.
+                                  "entrypoint": row.get("entrypoint") or ""}
             order.append(mid)
         for key, value in usage.items():
             if isinstance(value, int):
@@ -618,6 +632,108 @@ def _is_api_call(message: dict[str, Any]) -> bool:
 #: API — an auth refusal, a usage-limit notice, a cancellation. `price_for` already
 #: knows it costs nothing; `said_in_session` is the caller that reads what it SAYS.
 SYNTHETIC_MODEL = "<synthetic>"
+
+#: The `entrypoint` Claude Code stamps on every row of a process the SDK started. Every
+#: Jarvis turn is a `claude -p` and so carries this; a `claude` a person typed carries
+#: `cli`. It is the ONLY discriminator that survives the case that matters, and that case
+#: is real: wo-2df8828c's transcript is one file holding 259 `sdk-cli` rows and 990 `cli`
+#: ones, because its worktree was reopened by hand after the order completed. Keyed on
+#: the work order's `session_id` that session reads as Jarvis's; keyed on this field,
+#: every one of its 2,512,088 one-hour tokens lands on `cli` and none on `sdk-cli`.
+#: `one_hour_writes` is the reader. Finding 3 of
+#: docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
+SDK_ENTRYPOINT = "sdk-cli"
+
+
+@dataclass
+class HourWrites:
+    """One session's ONE-HOUR cache writes, split by who started the process.
+
+    The 1h write costs 2.0x base input where the 5m write costs 1.25x (`write_rate`), and
+    Jarvis forces the cheap one on every process it starts (`claude_cli.cache_env`). So a
+    non-zero `dispatched` here is a BREACH of that guarantee and a non-zero `foreign` is
+    a person's own `claude` paying the premium — the same tokens, two unrelated faults,
+    which is why they are never added up.
+    """
+
+    session_id: str
+    #: The transcript directory, which is the slugified cwd the session was created in —
+    #: what tells a reader WHERE the session was opened, and the only thing that
+    #: distinguishes a hand-opened session in a Jarvis worktree from one in the user's
+    #: own tree. Kept as the raw slug rather than a path: it is an identifier here, and
+    #: reconstructing a path from it guesses at every `-` that was once a `/`.
+    directory: str = ""
+    dispatched: int = 0
+    foreign: int = 0
+    first_ts: float = 0.0
+    last_ts: float = 0.0
+
+    @property
+    def total(self) -> int:
+        return self.dispatched + self.foreign
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"session_id": self.session_id, "directory": self.directory,
+                "dispatched": self.dispatched, "foreign": self.foreign,
+                "total": self.total, "first_ts": self.first_ts,
+                "last_ts": self.last_ts}
+
+
+def _session_of(path: Path) -> str:
+    """Which SESSION a transcript file belongs to, parent or subagent alike.
+
+    A subagent writes `<dir>/<parent-session-id>/subagents/agent-*.jsonl`, and its spend
+    belongs to the session that spawned it — `read_session` charges it there too. The
+    answer a reader of this needs is the session to go and look at, and a subagent is not
+    one: it has no id anyone can resume.
+    """
+    return path.parent.parent.name if path.parent.name == "subagents" else path.stem
+
+
+def one_hour_writes(since: float, *, root: Path | None = None) -> list[HourWrites]:
+    """Every session that bought the ONE-HOUR cache write since `since`, biggest first.
+
+    A TRANSCRIPT WALK AND IT HAS TO BE. `bill.rewrite_tax` reads sealed bills precisely
+    to avoid one, but the sessions this exists to find are the ones Jarvis never
+    dispatched — they have no work order, no bill and no row anywhere in the OS. The
+    transcript is the only place they exist at all.
+
+    Affordable because the pre-filter is the 1h key itself: measured over this machine's
+    4,584 transcripts, 843MB, one pass is 3.1s and parses 25k lines. That is cheap for a
+    daily leak detector and far too dear for the 30-second reconcile — see the caller.
+
+    Subagent transcripts are walked with the rest and attributed to the session that
+    spawned them (`_session_of`). They carry their own `entrypoint`, so a hand-opened
+    session's subagents are classed as foreign like their parent rather than by
+    inheritance. Fleet-wide they hold zero 1h tokens today; a class of file a leak
+    detector skips is a leak it cannot see.
+    """
+    root = root or transcript_root()
+    if not root.is_dir():
+        return []
+    found: dict[str, HourWrites] = {}
+    for path in sorted(root.glob("*/*.jsonl")) + sorted(root.glob("*/*/subagents/*.jsonl")):
+        for message in _assistant_messages(path, '"ephemeral_1h_input_tokens"'):
+            hour = message.get("ephemeral_1h_input_tokens", 0)
+            ts = message.get("ts") or 0.0
+            if not hour or ts < since:
+                continue
+            session = _session_of(path)
+            entry = found.get(session)
+            if entry is None:
+                # The directory of the PARENT transcript either way: a subagent file
+                # sits one level deeper, under a directory named for the session.
+                directory = path.parent.name if path.parent.name != "subagents" \
+                    else path.parent.parent.parent.name
+                entry = found[session] = HourWrites(session_id=session,
+                                                    directory=directory)
+            if message.get("entrypoint") == SDK_ENTRYPOINT:
+                entry.dispatched += hour
+            else:
+                entry.foreign += hour
+            entry.first_ts = min(entry.first_ts, ts) if entry.first_ts else ts
+            entry.last_ts = max(entry.last_ts, ts)
+    return sorted(found.values(), key=lambda e: (-e.total, e.session_id))
 
 
 def said_in_session(session_id: str, *, since: float = 0.0, until: float | None = None,
