@@ -234,6 +234,18 @@ class ValidationConfig:
     five headless calls over a diff of up to `diff_chars`, up to `max_rounds` times, on
     every unit in the fleet, so enabling it is a catalog edit gated on a measurement.
 
+    THAT RULE HAS ONE RULED CARVE-OUT (Neo, question 309 on wo-38e26be0, 2026-09-15;
+    kn-a88a56b6). It governs a field that ADDS panel behaviour, where the default decides
+    whether the behaviour happens at all. It does not govern a field whose behaviour change
+    is already unconditional elsewhere in the same feature: where the panel's rejection
+    semantics have already changed with no knob, a field that only chooses between
+    preserving the finding as a ticket and discarding it silently is not gated on a
+    measurement, because the measurement — do the seats classify blocking vs non-blocking
+    correctly — is taken by the eval regardless of the field's value. Such a field may ship
+    default True. Named instance: the follow-up-filing field from the 2026-09-15
+    panel-blocks-on-blockers feature
+    (docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md §5.4).
+
     `seat_models` and `chair_model` are empty by default, meaning "use the project's
     model"; the fallback is resolved where it is used, not here, for the same reason
     `PanelConfig` does it — a nested dataclass cannot see its parent's fields.
