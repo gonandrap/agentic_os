@@ -1,9 +1,11 @@
 """Bug reporting: one command turns a fleet agent's observation into a tracked issue.
 
 Any agent working under the OS — a worker in its worktree, Jarvis in the terminal —
-runs `jarvis bug report` when Jarvis OS itself misbehaves. That does two things and
-neither is optional: it files a GitHub issue on the OS repo from a fixed template, and
-it puts the issue link in front of the user through the normal notification pipeline.
+runs `jarvis bug report` when Jarvis OS itself misbehaves. That files a GitHub issue on
+the OS repo from a fixed template, hands it to `issues` to be picked up as work, and puts
+the link in front of the user through the normal notification pipeline. The first and the
+last are not optional; the middle one is a project's own choice
+(`catalog.BugsConfig`, and `issues` for the lifecycle that follows).
 
 The template is fixed on purpose. Bugs found by agents are read later by an agent
 fixing them, and "what I expected vs what I got" plus the exact running version is what
@@ -237,7 +239,8 @@ def gh_missing_message(consequence: str) -> str:
 
 
 def render_body(*, description: str, expected: str, actual: str, version: str,
-                project: str = "", wo_id: str = "", steps: str = "") -> str:
+                project: str = "", wo_id: str = "", steps: str = "",
+                priority: str = "") -> str:
     """The bug template. Every report on the tracker has this shape."""
     parts = [
         "### Description",
@@ -265,6 +268,10 @@ def render_body(*, description: str, expected: str, actual: str, version: str,
     parts += [
         "---",
         "",
+        # The CLAIM, permanently. The `priority:` LABEL carries what the bug is settled
+        # at and moves when Neo re-assesses it; this line does not move, so the two
+        # together are the disagreement the user reads the rubric off.
+        *([f"- **Priority claimed by the reporter:** `{priority}`"] if priority else []),
         f"- **Jarvis OS version:** `{version}`",
         f"- **Reported by:** {reporter}",
         f"- **Reported at:** {time.strftime('%Y-%m-%d %H:%M:%S %Z')}",
@@ -302,7 +309,58 @@ def create_issue(title: str, body: str, repo: str, label: str = BUG_LABEL) -> st
     return url
 
 
-def _notify(project: str, title: str, url: str, version: str, wo_id: str) -> None:
+def _rubric() -> str:
+    """`issues.PRIORITY_RUBRIC`, imported late.
+
+    `issues` imports this module (for `gh_bin` and `bug_repo`), so the dependency only
+    goes one way at import time. One text, one definition of the levels — see that
+    constant for why it must not be restated here.
+    """
+    from .issues import PRIORITY_RUBRIC
+    return PRIORITY_RUBRIC
+
+
+def _route(url: str, title: str, body: str, priority: str) -> dict[str, Any]:
+    """Put the freshly filed issue on the OS's rails.
+
+    Deliberately cannot fail the filing. The issue exists by the time this runs, so an
+    exception here would report "the bug was not filed" about a bug that was — the
+    inverse of the half-success `report_bug` refuses to produce, and just as misleading.
+    Whatever went wrong comes back as `reason` and reaches the user with everything else.
+    """
+    from .issues import route_filing
+    try:
+        return route_filing(url, title, body, priority)
+    except Exception as e:  # noqa: BLE001 — see the docstring: the issue is already filed
+        return {"wo_id": "", "backlog_id": "", "project": "", "priority": priority,
+                "reason": f"the OS could not route it ({e}) — it is filed and untracked"}
+
+
+def pickup_note(pickup: dict[str, Any]) -> str:
+    """The one line the user reads about what happened after the issue was created.
+
+    Says only what actually reached the tracker, and NEVER rounds a claim up to a
+    decision: a `critical` filing whose re-assessment is still queued says exactly that,
+    because between the filing and Neo's verdict the honest answer is "nothing has been
+    decided yet" (`report_bug`'s rule — never ping about a state that was not reached).
+    """
+    level = pickup.get("priority") or "?"
+    if pickup.get("wo_id"):
+        head = (f"`{level}` confirmed — work order {pickup['wo_id']} in "
+                f"{pickup.get('project') or '?'}")
+    elif pickup.get("backlog_id"):
+        head = f"`{level}` — {pickup['backlog_id']}"
+    else:
+        head = f"`{level}` — not tracked"
+    line = f"{head}: {pickup.get('reason') or ''}".rstrip(": ")
+    if pickup.get("label_error"):
+        line += (f" (the priority label did NOT reach the issue: "
+                 f"{pickup['label_error']}; Jarvis retries on its next tick)")
+    return line
+
+
+def _notify(project: str, title: str, url: str, version: str, wo_id: str,
+            pickup: dict[str, Any] | None = None) -> None:
     """Put the issue link in front of the user via the normal inbox -> sinks path.
 
     The daemon routes the inbox on each tick; when it is not running (a bug reported
@@ -313,6 +371,8 @@ def _notify(project: str, title: str, url: str, version: str, wo_id: str) -> Non
     from .daemon import daemon_running
 
     body = f"{url}\nJarvis OS {version}" + (f" · {wo_id}" if wo_id else "")
+    if pickup is not None:
+        body += f"\n{pickup_note(pickup)}"
     central = CentralStore()
     try:
         central.add_inbox(project or "jarvis-os", f"Bug filed: {title}",
@@ -329,18 +389,47 @@ def _notify(project: str, title: str, url: str, version: str, wo_id: str) -> Non
 
 
 def report_bug(*, title: str, description: str, expected: str, actual: str,
-               steps: str = "", project: str = "", wo_id: str = "") -> dict[str, Any]:
-    """File a Jarvis OS bug and tell the user about it. Raises BugReportError if the
-    issue could not be created — in which case nobody is notified."""
+               priority: str = "", steps: str = "", project: str = "",
+               wo_id: str = "") -> dict[str, Any]:
+    """File a Jarvis OS bug, put it on the OS's rails, and tell the user about it.
+
+    **`priority` IS REQUIRED AND IS NEVER INFERRED** (the user's ruling of 2026-09-14).
+    It is the only thing that routes the report, so a default would be the OS deciding
+    how serious someone else's bug is — and the only defaults available are wrong in one
+    direction or the other: `critical` lets a typo commit the fleet to a release, and
+    `low` silently buries a report the filer knew was urgent. Refusing costs the caller
+    one word and `issues.PRIORITY_RUBRIC` tells them which.
+
+    Raises BugReportError if the priority is missing or unknown, or if the ISSUE could
+    not be created — in which case nobody is notified. Nothing after that raises: by then
+    the issue exists, and failing the call would report "not filed" about a bug that was
+    filed. What did and did not happen to it comes back in `pickup` and goes out with the
+    notification (`pickup_note`).
+    """
+    from .issues import checked_priority
+
     if not title.strip():
         raise BugReportError("a bug report needs a title")
+    if not (priority or "").strip():
+        raise BugReportError(
+            "a bug report needs a priority — there is no default, because the priority "
+            "is the only thing that decides what happens to the report.\n\n"
+            + _rubric())
+    try:
+        priority = checked_priority(priority)
+    except ValueError as e:
+        raise BugReportError(str(e)) from e
     project = project or os.environ.get("JARVIS_PROJECT", "")
     wo_id = wo_id or os.environ.get("JARVIS_WO_ID", "")
     version = jarvis_version()
     repo = bug_repo()
     body = render_body(description=description, expected=expected, actual=actual,
-                       version=version, project=project, wo_id=wo_id, steps=steps)
+                       version=version, project=project, wo_id=wo_id, steps=steps,
+                       priority=priority)
     url = create_issue(title, body, repo)
-    _notify(project, title, url, version, wo_id)
+    # Between creating the issue and telling anyone about it, so the ping says what the
+    # tracker actually shows rather than what it was about to show (issue #240).
+    pickup = _route(url, title, body, priority)
+    _notify(project, title, url, version, wo_id, pickup)
     return {"url": url, "title": title, "repo": repo, "version": version,
-            "project": project, "wo_id": wo_id}
+            "project": project, "wo_id": wo_id, "pickup": pickup}

@@ -221,17 +221,19 @@ def test_version_never_raises_even_when_git_explodes(monkeypatch):
 
 def test_report_files_a_github_issue_labelled_bug(reporting):
     bugreport.report_bug(title="wo send is lost", description="d",
-                         expected="e", actual="a")
+                         expected="e", actual="a", priority="low")
     call = reporting.calls[-1]
     assert call["argv"][:3] == ["issue", "create", "--repo"]
-    assert call["argv"][3] == bugreport.DEFAULT_BUG_REPO
+    # The fixture's tracker, which nobody owns — `fake_gh` moves `bug_repo()` so that a
+    # test escaping the fake `gh` cannot write to the live one.
+    assert call["argv"][3] == reporting.repo
     assert "--label" in call["argv"]
     assert call["argv"][call["argv"].index("--label") + 1] == "bug"
 
 
 def test_report_sends_the_body_over_stdin_not_argv(reporting):
     """Bodies carry stack traces and logs; argv has a length limit, stdin does not."""
-    bugreport.report_bug(title="t", description="d" * 5000, expected="e", actual="a")
+    bugreport.report_bug(title="t", description="d" * 5000, expected="e", actual="a", priority="low")
     call = reporting.calls[-1]
     assert "--body-file" in call["argv"]
     assert call["argv"][call["argv"].index("--body-file") + 1] == "-"
@@ -239,14 +241,14 @@ def test_report_sends_the_body_over_stdin_not_argv(reporting):
 
 
 def test_report_returns_the_issue_url(reporting):
-    result = bugreport.report_bug(title="t", description="d", expected="e", actual="a")
+    result = bugreport.report_bug(title="t", description="d", expected="e", actual="a", priority="low")
     assert result["url"] == reporting.issue_url
     assert result["title"] == "t"
 
 
 def test_report_targets_an_overridable_repo(reporting, monkeypatch):
     monkeypatch.setenv(bugreport.BUG_REPO_ENV, "someone/elsewhere")
-    bugreport.report_bug(title="t", description="d", expected="e", actual="a")
+    bugreport.report_bug(title="t", description="d", expected="e", actual="a", priority="low")
     assert reporting.calls[-1]["argv"][3] == "someone/elsewhere"
 
 
@@ -256,7 +258,7 @@ def test_report_targets_an_overridable_repo(reporting, monkeypatch):
 def test_report_notifies_the_user_with_the_issue_link(reporting):
     from jarvis.central_store import CentralStore
     result = bugreport.report_bug(title="wo send is lost", description="d",
-                                  expected="e", actual="a", project="proj_a")
+                                  expected="e", actual="a", priority="low", project="proj_a")
     central = CentralStore()
     try:
         items = central.unacked_inbox()
@@ -273,7 +275,7 @@ def test_report_notifies_the_user_with_the_issue_link(reporting):
 def test_a_failed_filing_raises_rather_than_reporting_success(reporting):
     reporting.fail("gh: could not authenticate")
     with pytest.raises(bugreport.BugReportError) as e:
-        bugreport.report_bug(title="t", description="d", expected="e", actual="a")
+        bugreport.report_bug(title="t", description="d", expected="e", actual="a", priority="low")
     assert "authenticate" in str(e.value)
 
 
@@ -282,7 +284,7 @@ def test_a_failed_filing_does_not_notify(reporting):
     from jarvis.central_store import CentralStore
     reporting.fail("boom")
     with pytest.raises(bugreport.BugReportError):
-        bugreport.report_bug(title="t", description="d", expected="e", actual="a")
+        bugreport.report_bug(title="t", description="d", expected="e", actual="a", priority="low")
     central = CentralStore()
     try:
         assert central.unacked_inbox() == []
@@ -298,7 +300,7 @@ def test_a_missing_gh_blames_path_not_the_user_s_installation(reporting, monkeyp
     monkeypatch.setenv("PATH", "/opt/only-this-dir")
 
     with pytest.raises(bugreport.BugReportError) as e:
-        bugreport.report_bug(title="t", description="d", expected="e", actual="a")
+        bugreport.report_bug(title="t", description="d", expected="e", actual="a", priority="low")
 
     msg = str(e.value)
     assert "PATH" in msg, "the message must name PATH as the cause"
@@ -469,7 +471,7 @@ def test_cli_reports_a_bug_and_prints_the_url(reporting, capsys):
     rc = cli.main(["bug", "report", "wo send is lost",
                    "--description", "messages never arrive",
                    "--expected", "worker receives it",
-                   "--actual", "stays queued", "--json"])
+                   "--actual", "stays queued", "--priority", "low", "--json"])
     assert rc == 0
     out = _json.loads(capsys.readouterr().out)
     assert out["url"] == reporting.issue_url
@@ -485,7 +487,7 @@ def test_cli_requires_expected_and_actual(reporting):
 def test_cli_reports_the_failure_instead_of_exiting_zero(reporting, capsys):
     reporting.fail("gh exploded")
     rc = cli.main(["bug", "report", "t", "--description", "d",
-                   "--expected", "e", "--actual", "a"])
+                   "--expected", "e", "--actual", "a", "--priority", "low"])
     assert rc == 1
     assert "gh exploded" in capsys.readouterr().err
 
