@@ -25,7 +25,7 @@ WO_STATUSES = (
     # `waiting_input` — which every surface renders "Waiting on you" and which
     # `ops.waiting_on` could only explain as an unanswered permission prompt. GitHub
     # issue #264: the user cleared it twice, each nudge bought another turn saying
-    # nothing was needed. A status that lies is the defect; the six `kind != 'manager'`
+    # nothing was needed. A status that lies is the defect; the two `kind == 'manager'`
     # carve-outs that were paying for it are gone. See
     # docs/superpowers/specs/2026-09-16-an-idle-manager-is-not-waiting-on-you.md.
     "idle",
