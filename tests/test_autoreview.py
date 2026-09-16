@@ -145,6 +145,38 @@ def test_ordinary_mechanical_calls_pass_the_net(text):
     assert decide(assumption=assumption(content=text)).armed
 
 
+SECRET = "reused the production api key rather than minting a second one"
+
+
+def test_a_held_assumption_is_not_quoted_as_some_other_assumptions_context():
+    """THE NET IS ABOUT TEXT REACHING A MODEL, NOT ABOUT WHOSE ROW IT IS.
+
+    Condition 7 stops a high-stakes assumption being RULED on. The question about the
+    routine assumption beside it lists the siblings for context, so without the same
+    filter there the feature ships the exact sentence it exists to withhold — and one
+    high-stakes row beside one routine row is the ORDINARY shape of a work order, so this
+    was the common path rather than a corner.
+    """
+    line = autoreview.sibling_line({"id": 9, "n": 3, "status": "pending",
+                                    "content": SECRET})
+
+    assert "production" not in line and "key" not in line
+    assert SECRET not in line
+    # Withheld, not dropped: silence would tell the reviewer this work order had only
+    # routine assumptions. The number, the status and the withholding are a
+    # classification; the content is the secret.
+    assert "#3" in line and "[pending]" in line and "withheld" in line
+
+
+def test_a_routine_sibling_is_still_quoted_in_full():
+    """The control. A filter that withheld everything would pass the test above and make
+    the sibling list — the reason an assumption is sometimes defensible at all — empty."""
+    line = autoreview.sibling_line({"id": 9, "n": 3, "status": "accepted",
+                                    "content": ROUTINE})
+
+    assert ROUTINE in line and "withheld" not in line
+
+
 # -- the second net: what a reply MEANS ------------------------------------------------
 
 
@@ -314,6 +346,31 @@ def test_each_assumption_gets_its_own_question_never_one_verdict_over_a_list(sta
         q = next(x for x in asked if x["id"] == row["neo_question_id"])
         assert f"# The assumption\n{row['content']}" in q["question"]
         assert "do not rule on these" in q["question"]
+
+
+def test_no_question_the_os_files_carries_a_high_stakes_assumptions_text(started):
+    """THE SAME GUARANTEE THROUGH THE DAEMON, asserted over EVERY question filed rather
+    than over the one the test happens to look at. The unit test pins `sibling_line`; this
+    pins that nothing routes around it — the question body, the `context` field the
+    dashboard renders, and any question of any kind this pass produces."""
+    store, wo = park(started, auto_review=True,
+                     assumptions=(ROUTINE, SECRET, "used tabs in the fixture"))
+
+    ask(started, store)
+
+    filed = questions()
+    # Two routine assumptions are asked about; the high-stakes one is not.
+    assert len(filed) == 2
+    for q in filed:
+        assert SECRET not in q["question"]
+        assert "production" not in q["question"] and "api key" not in q["question"]
+        assert SECRET not in (q.get("context") or "")
+    # ...and it is named as withheld rather than silently absent, so the reviewer knows
+    # the order has an assumption it is not being shown.
+    assert all("withheld" in q["question"] for q in filed)
+    # The held one is on the record with its reason, exactly as before.
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["code"] == autoreview.HELD_HIGH_STAKES
 
 
 def test_asking_twice_asks_once(started):

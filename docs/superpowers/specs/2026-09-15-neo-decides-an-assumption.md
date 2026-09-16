@@ -77,6 +77,20 @@ is a model that cannot be relied on to volunteer its own doubt.
    a reviewer can wave through is not one — the same argument that makes the child cap
    override Neo on a plan (`Daemon._deliver_plan_verdict`).
 
+**"Before any model call" is a claim about the TEXT, and it has to hold on every path the
+text can take.** Net 1 stops a high-stakes assumption being *ruled on*; it must also stop
+it being *quoted*. A question about one assumption lists its siblings for context, and one
+high-stakes row beside one routine row is the ordinary shape of a work order, not a
+corner — so without the same filter on that list the feature would ship the exact sentence
+it exists to withhold, on the common path, as soon as anything else on the order was
+routine. `autoreview.sibling_line` applies `high_stakes_marker` to every sibling and
+replaces the content with `(withheld — high-stakes, and the user's alone to decide)`.
+
+Withheld rather than dropped: silence would tell the reviewer the work order had only
+routine assumptions, and "is this one defensible on its own?" is a different question when
+the answer is no because of a row it cannot see. The number, the status and the fact of
+the withholding are a classification; the content is the secret.
+
 ### 2.3 One question per assumption, ever.
 
 Never a batch verdict over a list; a list invites one judgement over its easiest member.

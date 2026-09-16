@@ -31,7 +31,10 @@ line, and each fails toward the user:
   production or live credentials, spending money, deleting or publishing, legal and people
   matters), applied before a call is even made; `read_ruling` then force-escalates anything
   Neo ITSELF marked `stakes: high`, whatever verdict it reached. A regex cannot read
-  meaning and a model cannot be relied on to volunteer its own doubt.
+  meaning and a model cannot be relied on to volunteer its own doubt. "Before any call" is
+  a claim about the TEXT, so `sibling_line` applies the same net to the context list: an
+  assumption held back for naming a credential must not arrive in the prompt for the
+  routine one beside it.
 * **ONE QUESTION PER ASSUMPTION**, never a batch verdict over a list. A list invites one
   judgement over the easiest member of it.
 * **THE RECORD SAYS THE OS DECIDED IT**, with the reason, the model and the config version
@@ -312,6 +315,11 @@ deletes or publishes anything, carries legal or personal-data weight, or would b
 to undo — even if you are also accepting it. High stakes goes to the user whatever you
 ruled, and marking one honestly is how you stay trusted on the rest.
 
+A SIBLING MARKED `(withheld — high-stakes …)` IS NOT A BLANK TO FILL IN. The OS holds
+those assumptions for the user and does not show you their text, deliberately. Do not
+guess at what one says, and do not treat its absence as permission: if your ruling would
+turn on what it contains, that is precisely a case to ESCALATE.
+
 WHEN IN ANY DOUBT, ESCALATE. The cost of escalating wrongly is one review action the user
 was going to make anyway. The cost of accepting wrongly is a decision they never made,
 shipped in their name.
@@ -322,18 +330,41 @@ worker — the worker has finished and nothing you say here reaches it.
 """
 
 
+def sibling_line(s: dict[str, Any]) -> str:
+    """One sibling assumption as CONTEXT, with the high-stakes net applied to it too.
+
+    **THE NET IS ABOUT TEXT REACHING A MODEL, NOT ABOUT WHOSE ROW IT IS.** Condition 7
+    holds an assumption that names a credential, production, a deletion or a migration —
+    and the guarantee that buys (spec §2.2: caught "before any model call") is worth
+    nothing if the same sentence is then pasted into the prompt for the routine
+    assumption beside it. One high-stakes row and one routine row on one work order is
+    the ordinary case, not a corner, so the leak would have been the common path.
+
+    Withheld rather than DROPPED. Silence would tell the reviewer this work order had
+    only routine assumptions, and "is this one defensible on its own?" is a different
+    question when the answer is no because of a row it cannot see. The number, the status
+    and the fact that something is being withheld are a classification, not the secret.
+    """
+    content = str(s.get("content") or "")
+    if high_stakes_marker(content):
+        return (f"  #{s['n']} [{s['status']}] (withheld — high-stakes, and the user's "
+                f"alone to decide)")
+    return f"  #{s['n']} [{s['status']}] {content[:200]}"
+
+
 def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
                      siblings: list[dict[str, Any]]) -> str:
     """What the reviewer reads. One assumption, quoted; the rest listed, not ruled on.
 
     The siblings are here because an assumption is sometimes only defensible given
     another one, and NOT as a list to rule over — the instruction says so twice, and the
-    code applies the ruling to exactly one row whatever comes back.
+    code applies the ruling to exactly one row whatever comes back. Each one goes through
+    `sibling_line`, which applies the same high-stakes rule that decided whether it could
+    be ruled on at all.
     """
     n = assumption.get("n")
-    others = "\n".join(
-        f"  #{s['n']} [{s['status']}] {str(s['content'])[:200]}"
-        for s in siblings if s["id"] != assumption["id"]) or "  (none)"
+    others = "\n".join(sibling_line(s) for s in siblings
+                       if s["id"] != assumption["id"]) or "  (none)"
     return "\n\n".join([
         f"ASSUMPTION REVIEW — rule on assumption #{n} of {wo['id']} in {project}, and on "
         f"nothing else.",
