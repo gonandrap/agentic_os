@@ -96,6 +96,15 @@
   <div class="sub" style="margin-top:8px">This is a cost alarm — the worker was never
     asked, and a reply here would interrupt a turn that is still running.
     <a href="/alarms">review it on the alarms tab →</a></div>
+  {% elif q.kind == 'assumption' %}
+  {# The mirror of the alarm above: nobody asked this, and the worker finished long
+     before it was filed, so a reply would reopen a work order nobody asked to reopen.
+     What the user means is a verdict on the assumption, which lives on its own page.
+     `ops.neo_answer_escalated` refuses it too; this is the half that stops the user
+     typing into a box that then errors. #}
+  <div class="sub" style="margin-top:8px">This is an assumption the OS would not decide
+    for you — the worker has finished, so a reply here would reopen its work order.
+    <a href="/wo/{{ q.project }}/{{ q.wo_id }}#pending">decide it on the work order →</a></div>
   {% elif q.kind == 'triage' %}
   {# No worker exists to answer: this question is about a bug report that has NOT been
      turned into a work order, and its `wo_id` is empty (issue #240). What the reader is

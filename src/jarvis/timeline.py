@@ -259,6 +259,37 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         verb = "accepted" if p.get("accepted") else "rejected"
         count = p.get("count")
         return f"Assumptions {verb}", f"{count} assumption(s)" if count else ""
+    # Auto-review's four, and they belong directly under `reviewed` because they are the
+    # same act by a different hand. THE VERB SAYS WHO: "accepted" above is the user, so
+    # every line here names the OS, on the surface that narrates what happened to a work
+    # order. `ops.autoreview_state` renders only the NEWEST of these as its one-line
+    # summary, so an order where the OS decided two assumptions and left a third is
+    # readable nowhere else — and a kind with no branch here falls through to the generic
+    # renderer, which `event_level` labels "signal": it looks fine on the page and tells
+    # the reader nothing (kn-3f133363).
+    if kind == "autoreview_asked":
+        return (f"Asked Neo to rule on assumption #{p.get('n')}",
+                f"question {p['neo_question_id']}" if p.get("neo_question_id") else "")
+    if kind == "autoreview_accepted":
+        # The model is in the label, not the detail: "the OS accepted it" and "THIS model
+        # accepted it" are different claims, and the record must never make the weaker one
+        # look like the user's. Same words as `ops.assumption_decider` for one reason.
+        model = p.get("model") or "model not recorded"
+        return (f"Assumption #{p.get('n')} accepted by the OS "
+                f"(Neo, {model}) — not by you",
+                p.get("reason") or "no reason recorded")
+    if kind == "autoreview_escalated":
+        # `dropped` means the OS had a ruling and threw it away because the state moved
+        # under it (spec §5.1). Worth saying: "left with you" alone would read as Neo
+        # declining, and a reader deciding whether to trust the feature needs the two
+        # apart.
+        why = " — the OS dropped its ruling when the work order changed" if p.get(
+            "dropped") else ""
+        return (f"Assumption #{p.get('n')} left with you{why}",
+                p.get("reason") or "no reason recorded")
+    if kind == "autoreview_held":
+        return (f"The OS would not decide assumption #{p.get('n')}",
+                p.get("reason") or "no reason recorded")
     if kind == "learning_captured":
         return "Learning captured", p.get("topic") or ""
     if kind == "gate_requested":

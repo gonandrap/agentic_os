@@ -57,6 +57,8 @@ OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
 # macro in `ui/templates/_question.html`. A kind that skips any of them speaks to a
 # worker that is not waiting — or, for `triage`, to one that does not exist.
 #
+# `alarm` still has the `--correct` tail open; `assumption` closed all three.
+#
 # `triage` is the odd one out, deliberately: it is the only kind with NO work order
 # behind it, so its `wo_id` is EMPTY. A bug filed through `jarvis bug report` has an
 # issue and a backlog item and nothing else, and the whole point of the question is to
@@ -64,7 +66,11 @@ OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
 # 2026-09-14). Everything its verdict has to act on travels in `context` as JSON — see
 # `issues.ask_triage`. Its real resolution is `jarvis backlog promote`, which is what all
 # seven sites above are told.
-Q_KINDS = ("question", "approval", "plan", "alarm", "triage")
+#
+# `assumption` is the one the OS files ITSELF, against a work order parked in
+# `needs_review` — see `autoreview.py`. Like `triage` and `alarm` nobody asked it, so its
+# answer must never reach the worker: the worker finished before the question existed.
+Q_KINDS = ("question", "approval", "plan", "alarm", "triage", "assumption")
 
 # The panel's seats — see docs/superpowers/specs/2026-08-02-neo-team-design.md.
 # `premise` asks whether this was even the question that was asked (and routes),

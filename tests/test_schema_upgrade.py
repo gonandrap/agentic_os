@@ -405,3 +405,44 @@ def test_legacy_cost_alarms_are_backfilled_exactly_once_however_often_the_store_
     # SKIPPED, not RAISED: `raised` is the supervisor's work queue, and history landing
     # in it would spend one model call per legacy alarm on turns that ended weeks ago.
     assert {r["status"] for r in rows} == {"skipped"}
+
+
+def test_assumptions_that_predate_the_new_columns_still_read_as_the_users(tmp_path):
+    """The schema tests above compare SHAPES. This one has a ROW in the stale database.
+
+    Auto-review added five columns to `assumptions`, and the one that matters is
+    `decided_by`: `''` means the user, because every row written before the column
+    existed was, by construction, theirs. That is an assumption about what `ALTER TABLE
+    … DEFAULT ''` does to existing rows, and it is load-bearing — `ops.assumption_decider`
+    reads a blank as "you", so a NULL arriving instead would make an old row render as
+    the OS's decision. A shape comparison cannot see that; only a row can.
+    """
+    from jarvis import ops
+    from jarvis.project_store import ProjectStore as PS
+
+    proj = tmp_path / "legacy-rows"
+    (proj / ".jarvis").mkdir(parents=True)
+    old = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
+    old.executescript(SHIPPED_SCHEMA.read_text())
+    old.execute("INSERT INTO work_orders (id, title, description, status, "
+                "created_at, updated_at) VALUES "
+                "('wo-old', 't', 'd', 'needs_review', 1.0, 1.0)")
+    old.execute("INSERT INTO assumptions (wo_id, ts, content, status) VALUES "
+                "('wo-old', 1.0, 'picked postgres over sqlite', 'accepted')")
+    old.commit()
+    old.close()
+
+    store = PS(proj)
+    try:
+        (row,) = store.all_assumptions("wo-old")
+    finally:
+        store.close()
+
+    assert row["content"] == "picked postgres over sqlite"
+    assert row["status"] == "accepted"
+    # The five new columns arrived with their defaults, and the blank reads as the user.
+    assert row["decided_by"] == ""
+    assert row["decided_reason"] == "" and row["decided_model"] == ""
+    assert row["decided_config_version"] is None and row["neo_question_id"] is None
+    assert ops.assumption_decider(row) == "you"
+    assert "by you" in ops.assumption_line(row)

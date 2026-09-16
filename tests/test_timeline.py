@@ -633,3 +633,91 @@ def test_cli_wo_show_says_where_the_alarms_stand(jarvis_home, fake_claude,
     assert rows[0]["note"] == "it is re-running the suite"
     assert rows[0]["seq"] == 3 and rows[0]["kind"] == "turn_minutes"
     assert "title" not in rows[0] and "alarm_status" not in rows[0]
+
+
+# -- auto-review's four ----------------------------------------------------------------
+#
+# docs/superpowers/specs/2026-09-15-neo-decides-an-assumption.md §4. `ops.autoreview_state`
+# renders the NEWEST of these as one summary line, which is the right thing for the header
+# and not a substitute for the timeline: an order where the OS decided two assumptions and
+# left a third has the other two readable nowhere else.
+
+
+def test_the_four_auto_review_events_read_as_four_different_things():
+    """Same trap the alarm kinds and the validation kinds paid for: `event_level` calls
+    an unknown kind "signal", so a kind with NO branch in `_describe` renders as its own
+    name beside a JSON blob and looks fine on the page. Asserting they are signal is
+    therefore vacuous — what has to be true is that a reader can tell the ask from the
+    acceptance from the escalation from the hold."""
+    events = [
+        ev("autoreview_asked", 1.0, assumption_id=1, n=1, neo_question_id=41),
+        ev("autoreview_accepted", 2.0, assumption_id=1, n=1, decided_by="neo",
+           model="claude-opus-5", neo_question_id=41,
+           reason="a naming convention, not a decision"),
+        ev("autoreview_escalated", 3.0, assumption_id=2, n=2, neo_question_id=42,
+           reason="dropping a flag changes the CLI surface"),
+        ev("autoreview_held", 4.0, assumption_id=3, n=3, code="high_stakes",
+           reason="assumption #3 mentions 'production' — the OS does not decide those"),
+    ]
+
+    entries = build_timeline({}, events, [])
+
+    labels = [e["label"] for e in entries]
+    assert len(set(labels)) == 4, labels
+    assert all(label and label != entries[i]["kind"]
+               for i, label in enumerate(labels)), labels
+
+
+def test_an_accepted_assumption_says_the_os_decided_it_and_names_the_model():
+    """THE RECORD POST-CONDITION, on the surface that narrates the order. A label saying
+    only "Assumption #1 accepted" would sit beside `reviewed`'s "Assumptions accepted" —
+    the USER's row — and nothing on the page would tell them apart."""
+    entries = build_timeline({}, [
+        ev("autoreview_accepted", 1.0, assumption_id=1, n=1, decided_by="neo",
+           model="claude-opus-5", reason="a naming convention, not a decision"),
+    ], [])
+
+    (entry,) = entries
+    assert "the OS" in entry["label"] and "not by you" in entry["label"]
+    assert "claude-opus-5" in entry["label"]
+    assert entry["detail"] == "a naming convention, not a decision"
+
+
+def test_a_model_the_record_does_not_have_is_said_so_on_the_timeline_too():
+    """`ops.assumption_decider`'s words, because a row rendered "(Neo, )" reads as a
+    rendering bug and invites the reader to discount the attribution with it."""
+    entries = build_timeline({}, [
+        ev("autoreview_accepted", 1.0, assumption_id=1, n=1, decided_by="neo",
+           reason="unchanged behaviour"),
+    ], [])
+
+    assert "model not recorded" in entries[0]["label"]
+
+
+def test_a_dropped_ruling_is_not_narrated_as_neo_declining():
+    """Spec §5.1's escalation carries `dropped` when the OS HAD a ruling and threw it
+    away because the state moved under it. "Left with you" alone would read as Neo
+    declining, and a reader deciding whether to trust the feature needs the two apart."""
+    plain, dropped = build_timeline({}, [
+        ev("autoreview_escalated", 1.0, assumption_id=1, n=1,
+           reason="Neo would have turned this down"),
+        ev("autoreview_escalated", 2.0, assumption_id=2, n=2, dropped="panel_gave_up",
+           reason="the validation panel gave up and put this in front of you"),
+    ], [])
+
+    assert "dropped its ruling" not in plain["label"]
+    assert "dropped its ruling" in dropped["label"]
+    assert plain["label"] != dropped["label"]
+
+
+def test_an_auto_review_event_with_no_reason_still_says_something():
+    """Every one of these rows exists to carry a WHY, so an empty payload is the one
+    shape that must not render a blank cell — it would read as "no reason" rather than
+    as a record that lost one."""
+    entries = build_timeline({}, [
+        ev("autoreview_accepted", 1.0, n=1),
+        ev("autoreview_escalated", 2.0, n=2),
+        ev("autoreview_held", 3.0, n=3),
+    ], [])
+
+    assert all(e["detail"] == "no reason recorded" for e in entries), entries

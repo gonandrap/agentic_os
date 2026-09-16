@@ -80,6 +80,27 @@ def _readable_automerge(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _readable_autoreview(detail: dict[str, Any]) -> dict[str, Any]:
+    """The automatic assumption review collapsed to its one line, and each assumption to
+    `ops.assumption_line`, for HUMAN output.
+
+    `_readable_automerge`'s trick, and its disappearing key: `--json` keeps the rows,
+    which is where `decided_by`, `decided_model` and `decided_config_version` are read
+    from by anything else, while a person gets "#2 accepted by the OS (neo, opus) — the
+    branch name is a convention, not a decision" — WHO DECIDED IT, first, every time.
+    """
+    from . import ops
+
+    row = dict(detail)
+    state = row.pop("auto_review", None)
+    if state:
+        row["auto_review"] = state["line"]
+    rows = row.get("assumptions") or []
+    if rows:
+        row["assumptions"] = [ops.assumption_line(a) for a in rows]
+    return row
+
+
 def _readable_alarms(detail: dict[str, Any]) -> dict[str, Any]:
     """The `wo_alarms` rows collapsed to `ops.alarm_standing_line`, for HUMAN output.
 
@@ -1882,6 +1903,10 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # is every work order on a project that has not opted in (§8).
                 **({"auto_merge": state}
                    if (state := ops.automerge_state(store, wo)) else {}),
+                # And the same for the assumption review, on the same never-always rule:
+                # a work order whose assumptions the OS never looked at has no line here.
+                **({"auto_review": review}
+                   if (review := ops.autoreview_state(store, wo)) else {}),
                 # The rows themselves, on the same always-present rule: this order's own
                 # alarms, not `ops.list_cost_alarms`' fleet-wide dict, whose join columns
                 # (title, status, hidden) are already above — §4.
@@ -1889,8 +1914,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
             }
         finally:
             store.close()
-        _print(_readable_config(_readable_automerge(
-            _readable_alarms(_readable_rounds(detail))))
+        _print(_readable_config(_readable_autoreview(_readable_automerge(
+            _readable_alarms(_readable_rounds(detail)))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":

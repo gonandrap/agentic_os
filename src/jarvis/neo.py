@@ -169,12 +169,14 @@ def build_system_prompt(store: NeoStore, project: str, learnings_limit: int = 50
     Each persona lives in the module that OWNS the kind, never here: the prose is judged
     beside the code that files the question.
     """
+    from .autoreview import ASSUMPTION_REVIEWER_PERSONA
     from .gates import REVIEWER_PERSONA
     from .plans import PLAN_REVIEWER_PERSONA
     from .supervisor import ALARM_REVIEWER_PERSONA
 
     persona = {"approval": REVIEWER_PERSONA, "plan": PLAN_REVIEWER_PERSONA,
-               "alarm": ALARM_REVIEWER_PERSONA}.get(kind, PERSONA)
+               "alarm": ALARM_REVIEWER_PERSONA,
+               "assumption": ASSUMPTION_REVIEWER_PERSONA}.get(kind, PERSONA)
     parts = [persona, "", "# Learnings (from the user's reviews of your past answers)"]
     parts += render_learnings(store.learnings(project, limit=learnings_limit),
                               budget=learnings_chars)
@@ -263,6 +265,11 @@ def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
         # knows nothing about. Truncating it is the only judgement made here, and that is
         # about the size of a database column, not the content of a rule.
         "exempt_pattern": str(data.get("exempt_pattern") or "")[:400],
+        # `exempt_pattern`'s treatment, for the same reason one kind along: what counts
+        # as a high-stakes assumption is `autoreview`'s judgement, and this layer must not
+        # acquire an opinion about a vocabulary it does not own. Absent on every other
+        # kind, which reads as `routine` there and is never consulted.
+        "stakes": str(data.get("stakes") or "")[:20].strip().lower(),
     }
 
 
@@ -346,7 +353,12 @@ def answer_question(store: NeoStore, q: dict[str, Any], model: str,
         log.warning("neo question %s: reply could not be parsed (%d chars) — full raw "
                     "reply follows:\n%s", q.get("id"), len(result.text or ""),
                     result.text or "")
-    return verdict
+    # THE MODEL THAT ACTUALLY ANSWERED, as the transport reported it — not the `model`
+    # argument, which is what was asked for. Additive, so every existing consumer reads
+    # by key and is untouched (`panel.decide`'s note). `autoreview` records it against
+    # the assumption it settles: a machine verdict a person reads back in six months is
+    # only judgeable if the record says which model reached it.
+    return {**verdict, "model": result.model or model}
 
 
 def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
