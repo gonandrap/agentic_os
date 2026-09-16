@@ -23,13 +23,24 @@
     <div class="grow">
       <strong>Round {{ r.round }}</strong>
       <span class="mono sub">{{ r.fingerprint }}</span>
+      {# WHICH COMMIT the seats read. Silent when nothing recorded one — a worktree
+         packet, or a round from before the column existed — because "not recorded" on
+         every historical round would be noise, and the auto-merge line below says so
+         in words when it matters. #}
+      {% if r.head_sha %}<span class="mono sub">@{{ r.head_sha[:10] }}</span>{% endif %}
       {% if r.outcome == 'passed' %}<span class="st tone-ok"><span class="i">✓</span>passed</span>
       {% elif r.outcome == 'rejected' %}<span class="st tone-warn"><span class="i">◭</span>rejected</span>
       {% elif r.outcome == 'escalated' %}<span class="st tone-warn"><span class="i">🙋</span>escalated</span>
       {% elif r.outcome == 'failed' %}<span class="st tone-bad"><span class="i">✗</span>failed</span>
       {% else %}<span class="st tone-active"><span class="i">◑</span>{{ r.outcome }}</span>{% endif %}
       <span class="sub">{{ fmt_age(r.ts) }} ago</span>
+      {# WHO OPENED IT, and only when the answer is not "a submission did". A round a
+         person forced (`jarvis validation force`) must never read afterwards like a
+         worker re-delivering — that indistinguishability is the defect the command
+         exists to remove, so the marker belongs wherever a round is printed. #}
+      {% if r.forced_reason %}<span class="st tone-active"><span class="i">⟳</span>forced</span>{% endif %}
       {% if r.reason %}<div class="sub" style="white-space: pre-wrap;">{{ r.reason }}</div>{% endif %}
+      {% if r.forced_reason %}<div class="sub">forced by hand — {{ r.forced_reason }}</div>{% endif %}
       {{ deliberation(r.opinions) }}
     </div>
   </div>

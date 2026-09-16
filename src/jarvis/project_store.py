@@ -43,6 +43,19 @@ OPEN_STATUSES = ("pending", "dispatching", "running", "waiting_input", "validati
 # Settled: nothing more will happen to these on their own. They are the bulk of an old
 # project's history, so listings collapse them behind a count rather than printing them.
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
+# Where a PERSON may force a fresh validation round (`ops.force_validation`). AN
+# ALLOWLIST, not a blocklist, and the two are not the same statement here: the question is
+# not "has this settled" but "has this work order DELIVERED, and is nobody typing". An
+# open round OWNS the worker's session (kn-01a4ab27) — `Daemon._reject` posts the panel's
+# feedback to whatever fills the `implementor` role — so a round opened over a live worker
+# gives that session two writers and moves the branch head under the seats mid-round.
+# `running`, `dispatching` and `waiting_input` are live sessions; `pending` has not begun.
+# Neither has anything to re-judge, and both are refused by NOT being here rather than by
+# a rule that has to be kept in step with `WO_STATUSES` as it grows.
+#
+# `validating` is absent for a different reason and is not a silent omission: its round is
+# open by definition, which is its own refusal with its own sentence.
+FORCEABLE_STATUSES = ("waiting_pr_merge", "needs_review")
 
 # The seat names a validation panel may be rostered with. This is the VOCABULARY, not
 # the set whose markdown ships in a given build: a catalog may name a seat whose
@@ -110,14 +123,43 @@ WO_KINDS = ("worker", "planner", "manager")
 
 # A work order with a LIVE SESSION: dispatched, running, or parked mid-conversation on
 # somebody else. The per-feature cap (`claim_next_pending`, spent by
-# `feature_orders.max_parallel`), the retry sweep and every "a turn may be in flight"
-# reader mean this.
+# `feature_orders.max_parallel`) and every "a turn may be in flight" reader mean this.
 #
 # NOT what the project-wide `max_concurrent` counts any more — see `SLOT_STATUSES` below
 # and issue #134. The two were one constant until then, on the reasoning that its readers
 # must agree; they are two because the readers turned out to be asking different
 # questions, and the split is deliberate rather than drift.
+#
+# NOT what the retry sweep walks either, since issue #259 — see `RETRY_SWEEP_STATUSES`.
 ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
+
+# Where a paused turn may be relaunched: every status a work order can be sitting in when
+# `worker_session.turn_pause` says a retry is booked (`Daemon.retry_paused_turns`, and the
+# two invariants that watch it).
+#
+# WIDER THAN `ACTIVE_STATUSES`, and issue #259 is why. A work order that finishes behind
+# a pull request, takes a message, and has that turn refused for the usage limit lands in
+# `waiting_pr_merge` HOLDING A RESUMABLE, DUE PAUSE — and the sweep, scoped to the active
+# set, could never see it. `invariants.MESSAGE_STUCK_STATUSES` already called that a
+# defect, so the OS diagnosed the stall perfectly (`jarvis wo resume-auto`: "its retry
+# came due and has not happened") and then had no loop that would ever run it. Measured
+# on wo-f35e603e: three messages queued behind one lost turn, none delivered, and the
+# only remedy on offer was `jarvis wo done` — abandoning the work.
+#
+# The two tuples below PARTITION `WO_STATUSES`, asserted by a test rather than derived
+# from each other: a status added to `WO_STATUSES` fails that test until somebody decides
+# which side it belongs on. That is the opposite shape from kn-32434cef's allowlist rule
+# because the failure direction is inverted — there, a status silently allowed through is
+# the danger; here, a status silently left OUT is a work order nothing will ever resume.
+RETRY_SWEEP_STATUSES = ("dispatching", "running", "waiting_input", "validating",
+                        "needs_review", "failed", "waiting_pr_merge")
+
+# The rest of `WO_STATUSES`, and why a due retry is not run there. `pending` has no turn
+# to relaunch (it has never been dispatched, so `turn_pause` reads nothing); `completed`
+# and `cancelled` were ENDED BY A PERSON, and relaunching a turn under one would reopen
+# work its owner closed. `failed` is not with them: the OS failed that one, the user did
+# not, and recovering it is the point.
+NOT_RETRIED = ("pending", "completed", "cancelled")
 
 # What spends one of a project's `max_concurrent` slots: a work order whose turn is
 # actually executing, plus the claim that is about to launch one (issue #134).
@@ -467,9 +509,17 @@ CREATE TABLE IF NOT EXISTS validation_rounds (
     -- pending | passed | rejected | escalated | failed
     outcome TEXT NOT NULL DEFAULT 'pending',
     reason TEXT NOT NULL DEFAULT '',    -- what was sent back
+    -- Which COMMIT was judged (the PR's headRefOid), '' when nothing binds this verdict
+    -- to one. Also in ADDED_COLUMNS, where the reasoning is — this table already ships,
+    -- so a live database gets it only there.
+    head_sha TEXT NOT NULL DEFAULT '',
     -- Which configuration judged it (`os_config_versions.id`). Also in ADDED_COLUMNS —
     -- this table already ships, so a live database gets it only there.
     config_version TEXT,
+    -- Why a PERSON opened this round by hand (`jarvis validation force`). '' is the
+    -- ordinary round, opened by a submission. Also in ADDED_COLUMNS, where the
+    -- reasoning is.
+    forced_reason TEXT NOT NULL DEFAULT '',
     CHECK ((wo_id IS NULL) <> (fo_id IS NULL))
 );
 -- PARTIAL unique indexes, NOT `UNIQUE (wo_id, fo_id, round)`. SQLite treats NULLs as
@@ -731,6 +781,28 @@ ADDED_COLUMNS = {
         # falls back to the live catalog. `validation_rounds` already ships, so the
         # column reaches a live database only through here.
         "config_version": "TEXT",
+        # WHICH COMMIT THE PANEL JUDGED — `evidence.judged_head`, the pull request's
+        # `headRefOid` at the moment the packet was collected. A verdict is a judgement
+        # about one diff, and this is the only thing in the OS that says which one, so it
+        # is what `validated_head` hands the auto-merge decision
+        # (docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md §5.2).
+        #
+        # DEFAULT '' AND THAT IS THE FAIL-CLOSED VALUE, not a placeholder: every round
+        # written before this column existed migrates to it, as does every round judged
+        # from a worktree, and `validated_head` reads '' as "not recorded" — which never
+        # auto-merges. NOT NULL so there is one spelling of "nothing" rather than two.
+        "head_sha": "TEXT NOT NULL DEFAULT ''",
+        # WHY A PERSON FORCED THIS ROUND — `jarvis validation force --reason`, verbatim.
+        # The population this exists for is every round judged before `head_sha` shipped:
+        # they all carry '' and can never auto-merge, so an operator has to open a fresh
+        # round by hand, and a re-judgement that looked organic afterwards would be
+        # indistinguishable from a worker re-delivering (spec
+        # docs/superpowers/specs/2026-09-15-forcing-a-validation-round.md §3).
+        #
+        # DEFAULT '' MEANS "NOT FORCED", which is the honest reading of every round
+        # written by a submission and of every round written before this column existed.
+        # NOT NULL so there is one spelling of "nobody forced this" rather than two.
+        "forced_reason": "TEXT NOT NULL DEFAULT ''",
     },
     "approvals": {
         # Which SEAT attempted the command, when a subagent did. NULL means the session's
@@ -2484,7 +2556,8 @@ class ProjectStore:
                               summary: str = "", evidence: str = "",
                               pr_url: str | None = None,
                               round: int | None = None,
-                              config_version: str | None = None) -> dict[str, Any]:
+                              config_version: str | None = None,
+                              forced_reason: str = "") -> dict[str, Any]:
         """Start a round on one subject, or return the one that already holds its number.
 
         1-based and per subject. Left to itself the number is derived from what is
@@ -2500,6 +2573,9 @@ class ProjectStore:
 
         `config_version` stamps the round with the configuration it is being judged
         under; None means the ledger holds nothing yet, and reads as "not recorded".
+
+        `forced_reason` is set only by `ops.force_validation`, and its emptiness is what
+        every other surface reads as "a submission opened this".
         """
         col, subject_id = self._subject(wo_id, fo_id)
         if round is None:
@@ -2511,10 +2587,10 @@ class ProjectStore:
             cur = self.conn.execute(
                 f"""INSERT INTO validation_rounds ({col}, round, ts, fingerprint,
                                                    summary, evidence, pr_url,
-                                                   config_version)
-                    VALUES (?,?,?,?,?,?,?,?)""",
+                                                   config_version, forced_reason)
+                    VALUES (?,?,?,?,?,?,?,?,?)""",
                 (subject_id, round, db.now(), fingerprint, summary, evidence, pr_url,
-                 config_version),
+                 config_version, forced_reason),
             )
         except sqlite3.IntegrityError:
             existing = self.conn.execute(
@@ -2558,6 +2634,50 @@ class ProjectStore:
             (outcome, reason, round_id),
         )
 
+    def set_validation_head(self, round_id: int, head_sha: str) -> None:
+        """Record which commit this round is judging. Called once per round.
+
+        WHATEVER THE OUTCOME, and before one is known: a rejection that recorded nothing
+        would leave the record unable to say what it was rejecting, and the value is a
+        fact about the packet rather than about the verdict. `''` is written for a
+        worktree packet, which is the same "not recorded" every pre-migration row carries
+        (spec 2026-09-14 §5.2).
+        """
+        self.conn.execute("UPDATE validation_rounds SET head_sha=? WHERE id=?",
+                          (head_sha, round_id))
+
+    @staticmethod
+    def validated_head(round_row: dict[str, Any] | None) -> str | None:
+        """The commit the panel ACCEPTED, given its LATEST round, or None. THE predicate.
+
+        Non-None means all three of: the latest round has settled `passed`, that round
+        recorded which commit it judged, and therefore an automatic merge has something
+        to be bound to. Everything else — never validated, a round still pending, a round
+        that failed on transport, a pass superseded by a later rejection, a pass with no
+        commit recorded — is None.
+
+        **The LATEST round, never "some round passed".** A work order that passed round 1,
+        was sent back and is sitting on a pending round 2 is not validated, and reading
+        it as validated is how a panel that died silently on a usage limit (issue #235)
+        would come to merge code: `pending` and `failed` are not `passed`, and the
+        question this asks is "was it accepted", not "was it never refused".
+
+        One home for the rule, for `arbitrate`'s reason — a rule spread across three call
+        sites is a rule that holds by luck (spec 2026-09-14 §5.2).
+
+        **TAKES THE ROW, DOES NOT FETCH IT — that is why it is static.** The validator
+        runs on another thread and opens rounds while the pull-request poll is reading:
+        a caller that fetched `latest_validation_round` for the wording and let this
+        fetch it again for the predicate could be handed two DIFFERENT rounds a
+        microsecond apart. The failure is not a missed merge, which the next tick
+        repairs, but a permanent one — the pair (passed round N, no accepted head) is
+        the `HELD_SHA_UNRECORDED` wording, and that hold is deduped for ever on a reason
+        that was never true. One read, one row, both answers off it.
+        """
+        if round_row is None or round_row["outcome"] != "passed":
+            return None
+        return str(round_row["head_sha"] or "") or None
+
     def validation_rounds(self, *, wo_id: str | None = None,
                           fo_id: str | None = None) -> list[dict[str, Any]]:
         """Every round on one subject, oldest first — the order they were judged in."""
@@ -2594,6 +2714,21 @@ class ProjectStore:
         ).fetchall()
         return db.rows_to_dicts(rows)
 
+    @staticmethod
+    def round_machine_owns(round_row: dict[str, Any] | None) -> bool:
+        """Does the round machine still own the work order this row is the latest round
+        of? THE ONE DEFINITION, and it takes the ROW for `validated_head`'s reason.
+
+        A caller that needs the predicate AND the wording — "round 2 is pending, wait for
+        it" — must derive both from ONE read, or the panel opening a round on its own
+        thread between the two hands it a predicate and a sentence taken a microsecond
+        apart (kn-08f2ff9b, the `HELD_SHA_UNRECORDED` bug). A staticmethod over the row
+        cannot re-fetch, which is what makes that impossible rather than merely unlikely.
+
+        None — the unit has never been judged — is False: nothing owns it.
+        """
+        return str((round_row or {}).get("outcome") or "") in RUNNABLE_VALIDATION_OUTCOMES
+
     def validation_round_open(self, wo_id: str) -> bool:
         """Is the round machine going to act on this work order?
 
@@ -2610,18 +2745,14 @@ class ProjectStore:
         queued — and a red build the worker is about to push over is worth telling it
         about. See §4.1 of
         docs/superpowers/specs/2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md.
+
+        It fetches the latest round and hands it to `round_machine_owns` rather than
+        asking SQL the same question a second way: a caller that needs the predicate AND
+        the round it is about (`ops.force_validation`) can then take one read and derive
+        both, which is the only shape that cannot straddle a round opening on the panel's
+        thread.
         """
-        marks = ",".join("?" * len(RUNNABLE_VALIDATION_OUTCOMES))
-        row = self.conn.execute(
-            f"""SELECT 1 FROM validation_rounds r
-                 WHERE r.wo_id = ?
-                   AND r.outcome IN ({marks})
-                   AND r.round = (SELECT MAX(round) FROM validation_rounds
-                                   WHERE wo_id = r.wo_id)
-                 LIMIT 1""",
-            (wo_id, *RUNNABLE_VALIDATION_OUTCOMES),
-        ).fetchone()
-        return row is not None
+        return self.round_machine_owns(self.latest_validation_round(wo_id=wo_id))
 
     def latest_validation_round(self, *, wo_id: str | None = None,
                                 fo_id: str | None = None) -> dict[str, Any] | None:

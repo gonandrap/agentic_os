@@ -256,6 +256,23 @@ class ValidationConfig:
     # a separate question from whether its children each validated: the feature is the
     # only level at which "does this add up to what was asked" can be judged.
     feature_units: bool = True
+    # WHETHER THE OS MAY MERGE THIS PROJECT'S PULL REQUESTS ITSELF, once the panel has
+    # accepted the exact commit at the head and CI is green
+    # (docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md).
+    #
+    # PER PROJECT, and the inheritance is this block's ordinary field-level fallback: a
+    # project that names a value keeps it, a project that does not takes the OS answer —
+    # the same shape as every `inspect.alarm_*` threshold. So authority is granted one
+    # project at a time, and a project that has never opted in is never merged by the OS
+    # however the fleet is configured.
+    #
+    # SHIPS FALSE at both levels. This is not caution about a setting, it is the only
+    # thing in the catalog that decides whether the OS holds merge authority at all, and
+    # `*.validation.*` already puts it behind `jarvis config set`'s mandatory `--reason`
+    # and a recorded config version. It is ALSO read beside `enabled`, never instead of
+    # it: turning the panel off stops auto-merge with it, because the acceptance this
+    # rides on is the panel's.
+    auto_merge: bool = False
 
 
 # -- `jarvis inspect`: what counts as worth reporting, and what as worth interrupting for
@@ -825,6 +842,10 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         max_rounds=max_rounds,
         diff_chars=diff_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
+        # `base.auto_merge` is the fleet answer when this project names nothing, and the
+        # shipped `False` when the fleet names nothing either — the field-level fallback
+        # that makes this per-project rather than global. A project opts in by naming it.
+        auto_merge=bool(raw.get("auto_merge", base.auto_merge)),
     )
 
 

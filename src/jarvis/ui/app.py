@@ -839,6 +839,9 @@ def create_app() -> FastAPI:
             # disagree about the same work order once before (PR 65).
             label = invariants.status_label(store, wo, _fleet_if_pending(wo))
             validation = ops.validation_detail(store, wo_id=wo_id)
+            # None for every order the automatic merge has never touched, which is what
+            # keeps the line off the page entirely rather than rendering "off" forever.
+            auto_merge = ops.automerge_state(store, wo)
             # WHERE THE REST OF THIS ORDER IS. The brief is deliberately only the margin
             # around a section of the feature's spec now, so a page that showed the brief
             # alone would be a page missing most of the work. `section_text` is NOT passed
@@ -851,7 +854,7 @@ def create_app() -> FastAPI:
         bill = wo_bill(wo_id, pname)
         return render(request, "work_order.html", project=pname, wo=wo, parked=parked,
                       pause=pause, waiting=waiting, status_label=label,
-                      validation=validation, spec=spec,
+                      validation=validation, spec=spec, auto_merge=auto_merge,
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug),
                       debug=show_debug, debug_count=count_debug(events),

@@ -64,6 +64,22 @@ def _readable_rounds(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _readable_automerge(detail: dict[str, Any]) -> dict[str, Any]:
+    """The automatic merge collapsed to its one line, for HUMAN output.
+
+    `_readable_rounds`' trick again, including the disappearing key: `--json` keeps the
+    recorded payload because other tooling reads the SHAs and the approval id out of it,
+    while a person gets `auto-merge: held — round 2 passed on a1b2c3d, the head is now
+    e4f5a6b` and nothing else. A work order the mechanism never touched has no key here
+    at all and reads exactly as it did before this existed.
+    """
+    row = dict(detail)
+    state = row.pop("auto_merge", None)
+    if state:
+        row["auto_merge"] = state["line"]
+    return row
+
+
 def _readable_alarms(detail: dict[str, Any]) -> dict[str, Any]:
     """The `wo_alarms` rows collapsed to `ops.alarm_standing_line`, for HUMAN output.
 
@@ -801,6 +817,23 @@ def build_parser() -> argparse.ArgumentParser:
     # which one it is (`fo-…` is a feature order, anything else a work order).
     v.add_argument("unit_id", metavar="WO_ID|FO_ID")
     v.add_argument("--project")
+    # ...and the one write verb on the same noun. `validation force` rather than `wo
+    # validate --force`: the subject is the ROUND, not the work order, and it belongs
+    # beside the command that shows the rounds.
+    f = va.add_parser(
+        "force", help="open a fresh validation round on a work order by hand, with no "
+                      "worker and no `finished` event. ONLY on an order that has "
+                      "delivered and whose worker is not typing — `waiting_pr_merge` "
+                      "(the case it exists for) or `needs_review`; a live or settled "
+                      "one is refused. It goes to `validating`, and back to "
+                      "`waiting_pr_merge` if the round passes. It spends a round number "
+                      "like any other, so a rejection at or past `max_rounds` is "
+                      "escalated to you rather than sent to a worker")
+    f.add_argument("wo_id", metavar="WO_ID")
+    f.add_argument("--reason", required=True,
+                   help="why you are forcing it — recorded on the round, so the "
+                        "re-judgement never reads afterwards like a worker's own")
+    f.add_argument("--project")
 
     # notifications ----------------------------------------------------------------------------
     n = sub.add_parser("notify", help="emit a notification into the OS pipeline")
@@ -1841,6 +1874,12 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # that comes and goes is one every consumer has to guard. The seats'
                 # replies are NOT here — see `jarvis validation show`.
                 "validation_rounds": ops.validation_rounds(store, wo_id=args.wo_id),
+                # Whether the OS merged this pull request, is waiting for permission to,
+                # or is holding — and why. NOT always present, unlike the keys above: a
+                # work order the mechanism never touched has no line here at all, which
+                # is every work order on a project that has not opted in (§8).
+                **({"auto_merge": state}
+                   if (state := ops.automerge_state(store, wo)) else {}),
                 # The rows themselves, on the same always-present rule: this order's own
                 # alarms, not `ops.list_cost_alarms`' fleet-wide dict, whose join columns
                 # (title, status, hidden) are already above — §4.
@@ -1848,7 +1887,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
             }
         finally:
             store.close()
-        _print(_readable_config(_readable_alarms(_readable_rounds(detail)))
+        _print(_readable_config(_readable_automerge(
+            _readable_alarms(_readable_rounds(detail))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
@@ -2749,6 +2789,28 @@ def cmd_neo(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_validation_force(args: argparse.Namespace) -> int:
+    """`jarvis validation force <wo-id> --reason` — a person opening a fresh round.
+
+    Prints where the work order went and what it is waiting for, because "it is
+    `validating`" is only half an answer: nothing else in the terminal will say when the
+    panel has finished.
+    """
+    from . import ops
+
+    result = ops.force_validation(args.wo_id, reason=args.reason,
+                                  project_name=args.project)
+    if args.json:
+        _print(result, True)
+        return 0
+    print(f"{result['wo_id']} [{result['project']}]: round {result['round']} opened by "
+          f"hand — {result['reason']}")
+    print(f"  was {result['was']}, now {result['status']}; the panel judges it on the "
+          f"daemon's next tick. `jarvis validation show {result['wo_id']}` for the "
+          f"verdict")
+    return 0
+
+
 def cmd_validation(args: argparse.Namespace) -> int:
     """`jarvis validation show <id>` — the panel's whole deliberation on one unit.
 
@@ -2935,6 +2997,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "neo":
             return cmd_neo(args)
         if args.cmd == "validation":
+            if args.validation_cmd == "force":
+                return cmd_validation_force(args)
             return cmd_validation(args)
         if args.cmd == "notify":
             return cmd_notify(args)

@@ -514,7 +514,15 @@ def test_every_gate_kind_has_a_multi_line_canary():
     assert len(added) < len(every), "the other multi-line canaries have gone"
     # `self_heal` is excluded throughout: its command is a rendered intent string rather
     # than a shell command, so it has no recogniser and no canary (kn-832cb8cb).
-    assert {k for k, _ in added} == set(gates.KIND_NAMES) - {gate_rules.SELF_HEAL}
+    #
+    # `auto_merge` is excluded for the neighbouring reason and NOT the same one, which is
+    # worth spelling out because its command IS a real shell command: the OS builds and
+    # runs it. What it is not is a command any WORKER can type — nothing classifies into
+    # the kind, by design, so there is no attempt for a recogniser to catch and a canary
+    # would be asserting that a string gates into a kind it must never gate into.
+    # docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md §8.
+    assert {k for k, _ in added} == set(gates.KIND_NAMES) - {gate_rules.SELF_HEAL,
+                                                             gate_rules.AUTO_MERGE}
 
 
 def test_the_multi_line_canary_report_fails_on_the_shape_that_walked_the_gate():

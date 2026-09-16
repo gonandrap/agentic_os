@@ -124,6 +124,14 @@ SOURCES = ("builtin", "neo", "user")
 #: worker-messaging path this kind exists to switch off (§5).
 SELF_HEAL = "self_heal"
 
+#: The second kind nothing classifies into: the OS asking permission to merge a pull
+#: request the validation panel has already accepted. Named here for `SELF_HEAL`'s
+#: reason, and kept DISTINCT from `pr_merge` deliberately — a grant is scoped to
+#: (work order, kind, exact command), so a worker's own merge command can never be
+#: cleared by an approval filed for this one, and vice versa.
+#: docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md §8.
+AUTO_MERGE = "auto_merge"
+
 
 # -- what a gate IS (metadata; the patterns live in the table) ------------------------
 
@@ -227,6 +235,30 @@ KINDS: tuple[GateKind, ...] = (
         why_ask="why acting is better than leaving the symptom with the user",
         evidence_ask="the health finding, the probe that raised it, and what the remedy "
                      "touches",
+        conflict_markers=(),
+    ),
+    # THE SECOND KIND NOTHING CLASSIFIES INTO, and it shares a command spelling with
+    # `pr_merge` without sharing any authority: `classify` returns `pr_merge` for that
+    # spelling and never this one, and a grant is scoped to (wo, kind, command), so
+    # neither kind's approval can ever open the other's gate. `automerge.propose` files
+    # this one programmatically, once the panel has passed a round bound to the pull
+    # request's current head commit.
+    #
+    # It does not ride `GateConfig.enabled`, for `self_heal`'s reason: it is the only
+    # thing between a verdict and an irreversible act. What a PROJECT controls instead is
+    # `validation.auto_merge`, which ships false and is per-project —
+    # docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md §8.
+    #
+    # No `conflict_markers`: `deny_conflicts` asks whether a project's `permissions.deny`
+    # rules would shadow a gate on a WORKER's command line, and nothing here is ever run
+    # by a worker's shell.
+    GateKind(
+        name=AUTO_MERGE,
+        summary="merge a pull request the validation panel has accepted, on the exact "
+                "commit it judged (the OS performs this merge itself)",
+        why_ask="why this diff is the one the panel passed, and why it may land now",
+        evidence_ask="the round and its outcome, the commit the seats judged, and what "
+                     "CI reports on that commit",
         conflict_markers=(),
     ),
 )
@@ -822,10 +854,17 @@ _PY_RUN_KWARGS = frozenset({"capture_output", "text", "check", "cwd", "encoding"
 #: No `ImportFrom`: `from os import system as print` rebinds a name this calls inert, and
 #: the call site cannot see that it did (review round 1). Plain `import x` only, and
 #: `_py_program` refuses `as` on that too.
+#: `UnaryOp`/`USub` is here for `r.stdout[-2500:]`, which gated the production filing this
+#: whole carve-out exists for. It is admitted on the same argument as `BinOp`/`Add`: a
+#: pure value operator reaches nothing. It cannot NAME anything either — the reference
+#: rules below run on every node whatever its position, so `-os.system` is still refused.
+#: Its siblings are deliberately absent: `USub` is what the shape needed, and `UAdd`,
+#: `Not` and `Invert` are three more arguments nobody has had to make.
 _PY_NODES = (ast.Module, ast.Import, ast.alias, ast.Assign, ast.AnnAssign,
              ast.Expr, ast.Call, ast.keyword, ast.Name, ast.Attribute, ast.Constant,
              ast.List, ast.Tuple, ast.Dict, ast.Subscript, ast.Slice, ast.Load,
-             ast.Store, ast.BinOp, ast.Add, ast.JoinedStr, ast.FormattedValue)
+             ast.Store, ast.BinOp, ast.Add, ast.UnaryOp, ast.USub,
+             ast.JoinedStr, ast.FormattedValue)
 
 
 def interpreter_paperwork(segment: str) -> bool:
