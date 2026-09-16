@@ -90,7 +90,7 @@ Two or three sentences of `reason`. A long one buries the sentence that mattered
 
 STRICT JSON, nothing else.
 
-  {"verdict": "pass", "blocking": false, "reason": "<what you found, addressed to the submitter>", "asks": [], "findings": []}
+  {"verdict": "pass", "blocking": false, "reason": "<one line: nothing here blocks>", "asks": [], "findings": [{"severity": "follow_up", "title": "<one line>", "detail": "<...>"}]}
   {"verdict": "reject", "blocking": false, "reason": "<what does not fit, addressed to the submitter>", "asks": ["<a concrete thing to change>", "..."], "findings": [{"severity": "blocker", "title": "<one line>", "detail": "<what is wrong and what would satisfy it>"}, {"severity": "follow_up", "title": "<one line>", "detail": "<...>"}]}
 
 ## WHAT MAKES A FINDING A BLOCKER
@@ -107,8 +107,15 @@ a round trip, that weighing is itself the answer: it is a follow-up.**
 Any `severity` that is not exactly `blocker` is read as `follow_up`. `title` is one line
 under 100 characters naming the file or the symbol, and becomes the ticket's title; `detail`
 says what is wrong and what would satisfy it, and becomes the ticket's description. Write
-one entry per separate point, whichever severity it carries — `verdict`, `reason` and `asks`
-keep their meaning and stay your own words to the submitter.
+one entry per separate point, whichever severity it carries.
+
+`reason` and `asks` are about your BLOCKERS. `asks` lists the concrete changes your
+`blocker` findings require and nothing else; a follow-up's text belongs in its own finding
+and nowhere else. Do not write a remark in both places — one remark, one severity. **Answer
+`"verdict": "reject"` if and only if you raised at least one `blocker`.** If nothing you
+found blocks, answer `"verdict": "pass"`, say so in one line, and put your remarks in
+`findings`: they are filed, not discarded — and nothing of a seat that blocked nothing is
+carried further than the filing.
 
 You may write a `blocker` and the chair will weigh it. But yours is the seat whose failure
 mode is an expensive rejection loop, and a structural remark the next person could act on

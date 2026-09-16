@@ -557,25 +557,45 @@ elif "-p" in argv and "--resume" not in argv:
                                        "title": f"the {vseat} blocker",
                                        "detail": f"what the {vseat} seat would stop "
                                                  f"this over"}]}
-            elif f"FORCE_REJECT_{vseat.upper()}" in said:
-                reply = {"verdict": "reject", "blocking": False,
-                         "reason": f"test-forced {vseat} concern that blocks nothing",
-                         "asks": [],
-                         "findings": [{"severity": "blocker",
-                                       "title": f"the {vseat} blocker",
-                                       "detail": f"what the {vseat} seat would stop "
-                                                 f"this over"}]}
             elif f"FORCE_FOLLOWUP_{vseat.upper()}" in said:
-                # THE ONE THE CHAIR MUST NEVER SEE. A reject carrying nothing but a
-                # follow-up: the seat had something to say and said the work ships
-                # anyway.
-                reply = {"verdict": "reject", "blocking": False,
-                         "reason": f"test-forced {vseat} remark worth filing",
+                # THE ONE THE CHAIR MUST NEVER SEE, AND ITS `asks` IS EMPTY ON PURPOSE.
+                # A fake that put the same nit in `asks` as well would make the severity
+                # filter untestable by making the two channels agree — and `asks` is the
+                # second door the filter exists to shut.
+                reply = {"verdict": "pass", "blocking": False,
+                         "reason": f"nothing the {vseat} seat found blocks this",
                          "asks": [],
                          "findings": [{"severity": "follow_up",
                                        "title": f"the {vseat} follow-up",
                                        "detail": f"what the {vseat} seat would file "
                                                  f"rather than argue"}]}
+            # THE THREE INPUTS TO THE BLOCKER FAIL-SAFE, staged separately because each
+            # is missed on its own. All three are a seat REJECTING while classifying no
+            # blocker, and all three must reach the chair as a blocker or the seat's
+            # rejection disappears behind the severity filter.
+            elif f"FORCE_REJECT_{vseat.upper()}" in said:
+                # (1) THE UN-UPGRADED SEAT: no `findings` key at all. Deliberately left
+                # in the pre-feature shape — every row already in `validation_opinions`
+                # looks like this, and a fixture where nothing does covers none of them.
+                reply = {"verdict": "reject", "blocking": False,
+                         "reason": f"test-forced {vseat} concern that blocks nothing",
+                         "asks": [f"answer the {vseat} concern"]}
+            elif f"FORCE_EMPTY_FINDINGS_{vseat.upper()}" in said:
+                # (2) An explicit EMPTY list: well-formed, parses, classifies nothing.
+                reply = {"verdict": "reject", "blocking": False,
+                         "reason": f"test-forced {vseat} rejection with an empty list",
+                         "asks": [f"answer the empty-list {vseat} concern"],
+                         "findings": []}
+            elif f"FORCE_ODD_SEVERITY_{vseat.upper()}" in said:
+                # (3) A severity nobody defined: read as `follow_up`, so step 1 yields no
+                # blocker even though the reply is complete and confident.
+                reply = {"verdict": "reject", "blocking": False,
+                         "reason": f"test-forced {vseat} rejection at an unknown severity",
+                         "asks": [f"answer the unknown-severity {vseat} concern"],
+                         "findings": [{"severity": "critical",
+                                       "title": f"the {vseat} unreadable severity",
+                                       "detail": f"what the {vseat} seat could not "
+                                                 f"classify"}]}
         emit_headless(json.dumps(reply))
         sys.exit(0)
     # A SUPERVISOR REVIEW, AND IT IS IDENTIFIED BY THE SYSTEM PROMPT FOR THE REASON THE

@@ -52,10 +52,17 @@ Reject on what a SEAT raised.
 
 # WHAT YOU ARE READING
 
-You get the same submission the seats did, and then, per seat, its verdict, the message it
-wrote to the submitter, its asks, and the findings it marked as BLOCKERS — quoted unchanged.
+You get the same submission the seats did, and then their opinions, FILTERED BY SEVERITY.
 The submission carries the brief, the submitter's summary, the testing evidence it declared,
 every file the change touches, `git diff --stat`, and the diff.
+
+- **A seat that raised a blocker** appears in full: each blocker quoted unchanged, plus its
+  message to the submitter and the concrete changes those blockers require.
+- **A seat that raised none** appears as one line saying so, and nothing else — no verdict
+  word, no message, no asks, no remark of any kind. There is nothing more of it to read, and
+  its absence is not something to wonder about: it means that seat found nothing this work
+  is unfit to ship without.
+- **A seat with no opinion** errored or timed out. It abstained.
 
 **The findings the seats classified as follow-ups are not in front of you.** A line at the
 end of their opinions says how many there were. They have been filed as tickets against this
