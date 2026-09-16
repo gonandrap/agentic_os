@@ -248,3 +248,51 @@ Directly, since it is the shape most orders have:
 
 Subagents (~$7.28) and Jarvis's own Neo/panel/digest calls (~$8.67) — together ~2% of the
 08-27 run, as the work order stated. Confirmed, not pursued.
+
+---
+
+## Appendix, 2026-09-16 — re-measured, and finding 2's headline is stale (wo-1d5cefc8)
+
+Everything above is the reading of 2026-08-30 and is left as it was written. This is the
+re-measurement, appended rather than merged, because one number in finding 2 has moved
+far enough to change what a reader would do.
+
+**The deciding ratio is 34.2% over the trailing 7 days, not ~20%.** Over all 4,642
+transcripts on this machine: 30.5% (30 days), 34.2% (7 days), against the same 39.5%
+break-even. Restricted to Jarvis-dispatched worker sessions — the population the fleet's
+cache settings actually reach — it is 30.8% (30 days) and **36.1% (7 days)**. Finding 2's
+"still about half the trigger, so not marginal" no longer holds: the drift it predicted
+happened, and the fleet is now within a few points of the crossing. The answer is still
+*keep the 5-minute write*, but it is now a close call rather than a settled one.
+
+A single-day cohort (2026-09-15 to 09-16, 515 sessions, 87 boundaries) reads **39.3%** —
+level with the break-even, and thin enough that it is a weathervane rather than a
+decision. It is quoted here because the same run prints the TTL's share of the *tax* at
+67.1%: anyone comparing *that* to 39.5% would switch the fleet's write TTL today, on a
+day when the honest arithmetic says the switch would still lose money
+(13.5M bought back against 13.6M spent).
+
+Prefix invalidation over the same worker-session population: **34.6% of all cache writes
+(7 days), 35.2% (30 days)**.
+
+**Two of the follow-up actions landed as `jarvis doctor` post-conditions** (issue #164
+item 4), both in `src/jarvis/invariants.py` and both OS-level rather than per-project:
+
+- Finding 2, action 3 → `check_cache_ttl_trigger` (INV-CACHE-TTL-TRIGGER).
+- Finding 4, action 2 → `check_prefix_stable` (INV-PREFIX-DRIFT), which is the
+  authoritative measurement of prefix stability; any hook or eval that infers drift some
+  other way is a proxy and defers to it.
+
+The con finding 2 raised against action 3 — "a scan of every transcript on each tick" —
+is answered by not scanning: both checks read the cause split off SEALED BILLS
+(`bill.cache_writes_since`), which is an indexed query per project. A full transcript
+walk was measured at ~5 minutes over those 4,642 transcripts, which is why the checks do
+not do one. The cost of that choice is that they see only bills sealed at
+`bill.PAYLOAD_VERSION` 3 or later, and each violation says how many orders it could not
+read.
+
+The con finding 4 raised against action 2 — "needs a threshold that will not cry wolf on
+a quiet day" — is answered by two floors, `os.cache_health_min_orders` (20) and
+`os.cache_health_min_boundaries` (50), below which **both checks report nothing at all**
+rather than reporting a hedged number. Measured against 51 sealed orders and 294
+boundaries in a normal week.

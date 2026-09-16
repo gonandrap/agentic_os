@@ -161,6 +161,46 @@ DEFAULT_COLD_PREFIX_FLOOR = 5_000
 #: without a release.
 DEFAULT_COLD_PREFIX_FLOOR_MAX = 100_000
 
+# -- CACHE HEALTH: the window and the floors `invariants.check_cache_ttl_trigger` and
+# `invariants.check_prefix_stable` judge the FLEET's cache configuration over.
+#
+# At `os.` and not at `os.defaults.` for the reason above, and here the reason is even
+# less arguable: both checks decide something there is only one of — the write TTL every
+# worker is launched with, and the `includeGitInstructions` line in
+# `dispatch._write_worker_settings`. A per-project value would be a per-project answer to
+# a fleet-wide question, and the check would report one decision once per project.
+
+#: The cohort window both checks measure over. NEVER all history: the split between the
+#: two causes is drifting, and an average over everything averages the trend away
+#: (kn-1449447a (5)). Thirty days because that is what `bill.COHORT_COMMAND` tells the
+#: reader to run — the doctor and the script differ on population, and they should not
+#: also differ on window.
+DEFAULT_CACHE_HEALTH_WINDOW_DAYS = 30
+
+#: Below this many MEASURED orders in the window, both checks report nothing at all. THE
+#: ANSWER TO "a quiet day gives a wild ratio": a fleet that settled three work orders has
+#: a ratio, and it is one order's shape wearing the fleet's name. Measured on this
+#: machine 2026-09-16: 51 sealed orders in the trailing 7 days and 226 in 30, so an
+#: ordinary week clears this twice over while a genuinely quiet window does not.
+DEFAULT_CACHE_HEALTH_MIN_ORDERS = 20
+
+#: …and the floor that actually bounds the noise, because the ratios are token-weighted
+#: and a single boundary can carry a 300k write. Below this many observed boundaries the
+#: window is a handful of events, not a rate. Measured on the same run: 294 boundaries in
+#: 7 days, 752 in 30 — so this is about a sixth of a normal week, and each boundary is at
+#: most 2% of the count at the floor itself. Both floors are needed: too few orders is
+#: one order's shape, too few boundaries is one boundary's.
+DEFAULT_CACHE_HEALTH_MIN_BOUNDARIES = 50
+
+#: Prefix-invalidation writes as a share of ALL cache writes, above which the prefix fix
+#: is reported as drifting. Measured over the sealed-bill population on 2026-09-16:
+#: 34.6% over 7 days, 35.2% over 30. Set above that deliberately — the same choice
+#: `DEFAULT_INSPECT_ALARM_REWRITE_PREFIX_SHARE` makes — so the check reports the prefix
+#: GETTING WORSE rather than restating the standing figure the findings doc already
+#: recorded. There is no principled break-even for this one, unlike the TTL's: it is an
+#: empirical "is this still the number it was".
+DEFAULT_CACHE_HEALTH_PREFIX_SHARE = 0.45
+
 
 _MISSING = object()
 
@@ -773,6 +813,12 @@ class OsConfig:
     #: Read by the cost surfaces, not by a worker launch — see DEFAULT_COLD_PREFIX_FLOOR.
     cold_prefix_floor: int = DEFAULT_COLD_PREFIX_FLOOR
     cold_prefix_floor_max: int = DEFAULT_COLD_PREFIX_FLOOR_MAX
+    #: Read by the two `jarvis doctor` cache-health post-conditions, which judge the
+    #: fleet and not a project — see DEFAULT_CACHE_HEALTH_WINDOW_DAYS.
+    cache_health_window_days: int = DEFAULT_CACHE_HEALTH_WINDOW_DAYS
+    cache_health_min_orders: int = DEFAULT_CACHE_HEALTH_MIN_ORDERS
+    cache_health_min_boundaries: int = DEFAULT_CACHE_HEALTH_MIN_BOUNDARIES
+    cache_health_prefix_share: float = DEFAULT_CACHE_HEALTH_PREFIX_SHARE
     notification_sinks: list[str] = field(default_factory=lambda: ["log"])
     telegram_token_env: str = "JARVIS_TELEGRAM_TOKEN"
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
@@ -835,6 +881,34 @@ def _cold_prefix_floor_or_err(os_raw: dict[str, Any]) -> tuple[int, int]:
         raise _err(f"os.cold_prefix_floor {floor} out of range 0-{ceiling} "
                    f"(os.cold_prefix_floor_max)")
     return floor, ceiling
+
+
+def _cache_health_or_err(os_raw: dict[str, Any]) -> tuple[int, int, int, float]:
+    """The cache-health window and its three floors, validated at boot.
+
+    Rejected here rather than at report time for `_cold_prefix_floor_or_err`'s reason:
+    a bad value would surface as a post-condition that never fires, or one that fires on
+    three orders — a config error wearing a finding's clothes.
+    """
+    days = _positive_int_or_err(os_raw, "cache_health_window_days",
+                                DEFAULT_CACHE_HEALTH_WINDOW_DAYS)
+    if days < 1:
+        raise _err(f"os.cache_health_window_days {days} must be >= 1")
+    min_orders = _positive_int_or_err(os_raw, "cache_health_min_orders",
+                                      DEFAULT_CACHE_HEALTH_MIN_ORDERS)
+    if min_orders < 1:
+        raise _err(f"os.cache_health_min_orders {min_orders} must be >= 1")
+    min_boundaries = _positive_int_or_err(os_raw, "cache_health_min_boundaries",
+                                          DEFAULT_CACHE_HEALTH_MIN_BOUNDARIES)
+    if min_boundaries < 1:
+        raise _err(f"os.cache_health_min_boundaries {min_boundaries} must be >= 1")
+    share = os_raw.get("cache_health_prefix_share", DEFAULT_CACHE_HEALTH_PREFIX_SHARE)
+    if isinstance(share, bool) or not isinstance(share, (int, float)):
+        raise _err("os.cache_health_prefix_share must be a number")
+    if not 0.0 < float(share) <= 1.0:
+        raise _err(f"os.cache_health_prefix_share {share} out of range 0-1 "
+                   f"(a share of all cache writes, not a percentage)")
+    return days, min_orders, min_boundaries, float(share)
 
 
 def _autocompact_or_err(raw: dict[str, Any], key: str, where: str,
@@ -1267,6 +1341,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     )
 
     cold_floor, cold_floor_max = _cold_prefix_floor_or_err(os_raw)
+    health_days, health_orders, health_bounds, health_prefix = _cache_health_or_err(os_raw)
     os_cfg = OsConfig(
         default_model=defaults.get("model", DEFAULT_MODEL),
         default_effort=defaults.get("effort"),
@@ -1283,6 +1358,10 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         ui_base_url=str(ui.get("base_url", "") or "").rstrip("/"),
         cold_prefix_floor=cold_floor,
         cold_prefix_floor_max=cold_floor_max,
+        cache_health_window_days=health_days,
+        cache_health_min_orders=health_orders,
+        cache_health_min_boundaries=health_bounds,
+        cache_health_prefix_share=health_prefix,
         knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
         knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 40)),
         knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 4000)),

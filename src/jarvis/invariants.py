@@ -24,6 +24,13 @@ Three rules for this module:
 Adding an invariant: write a `_check_*` generator yielding `Violation`s and register it
 in `INVARIANTS`. Give it a stable id — ids appear in work order timelines and in
 `jarvis doctor` output, so renaming one rewrites history.
+
+REGISTER IT IN `OS_INVARIANTS` INSTEAD when what it checks is a fact about the OS rather
+than about one project — the dashboard, the production checkout, the fleet's cache
+configuration. Those take no store, run once per `jarvis doctor` rather than once per
+project, and never run on the daemon's reconcile tick. Putting a fleet-wide check in
+`INVARIANTS` is not a smaller mistake than the reverse: it reports one decision once per
+project, which is how a finding becomes noise.
 """
 
 from __future__ import annotations
@@ -2475,12 +2482,212 @@ def check_production_clean() -> Iterator[Violation]:
     )
 
 
+# -- cache health ----------------------------------------------------------------------
+#
+# Two post-conditions on the fleet's cache configuration, from findings 2 and 4 of
+# docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md. Both are OS-level
+# and not per-project: each decides something there is exactly one of, and a per-project
+# copy would report one fleet decision once per project.
+#
+# NEITHER WALKS A TRANSCRIPT. They read `bill.cache_writes_since`, which is an indexed
+# query and a JSON parse per sealed order — the objection finding 2 raised against doing
+# this at all was the cost of the scan, and on this machine a full walk is ~5 minutes
+# over 4,642 transcripts. The price is that both see only bills sealed at
+# `bill.PAYLOAD_VERSION` 3 or later, which each violation says out loud.
+
+
+def _cache_health() -> tuple[Any, Any] | None:
+    """The fleet's cache-write cohort, and the config that judges it. None if no catalog.
+
+    Summed across every active project, because both readers are asking about the fleet.
+    A project whose path has gone is skipped rather than reported: that is
+    `ops.run_doctor`'s own finding to make, and it makes it per project.
+
+    Recomputed by each check rather than shared between them. Two indexed queries per
+    project per `jarvis doctor` run is not worth a memo that outlives the run it was
+    taken in — the whole point of a post-condition is that it reads the state as it
+    currently is.
+    """
+    from . import bill
+    from .central_store import CentralStore
+    from .ops import resolve_catalog
+    from .project_store import ProjectStore as Store
+
+    try:
+        cfg = resolve_catalog().os
+    except Exception:  # noqa: BLE001 — no catalog is not a cache-health finding
+        return None
+    central = CentralStore()
+    try:
+        rows = central.list_projects()
+    finally:
+        central.close()
+    since = db.now() - cfg.cache_health_window_days * 86_400
+    found = bill.CacheWrites()
+    for row in rows:
+        if row["status"] != "active" or not Path(row["path"]).is_dir():
+            continue
+        store = Store(Path(row["path"]))
+        try:
+            found = found + bill.cache_writes_since(store, since)
+        finally:
+            store.close()
+    return cfg, found
+
+
+def _thin_cohort(cfg: Any, writes: Any) -> bool:
+    """THE ANSWER TO "it cries wolf on a quiet day", and it is a silence, not a caveat.
+
+    Below either floor both checks yield nothing at all rather than a hedged finding: a
+    fleet that settled three orders yesterday HAS a ratio, and reporting it with a note
+    about the volume still puts a number in front of a reader who will act on it. The
+    two floors answer different questions — too few orders is one order's shape wearing
+    the fleet's name, too few boundaries is one 300k write's — so either alone lets the
+    other case through (`catalog.DEFAULT_CACHE_HEALTH_MIN_ORDERS`).
+    """
+    return (writes.orders < cfg.cache_health_min_orders
+            or writes.boundaries < cfg.cache_health_min_boundaries)
+
+
+def _cohort_note(cfg: Any, writes: Any) -> str:
+    """What was actually measured. Said on both violations, because the number they
+    report is over Jarvis's own worker sessions and the command they send the reader to
+    is over every transcript on the machine — two populations, one decision."""
+    from . import bill
+
+    skipped = ""
+    if writes.unmeasured_orders:
+        skipped = (f", and {writes.unmeasured_orders} more whose bill was sealed before "
+                   f"the OS recorded the split and cannot be re-read")
+    return (f"Measured over {writes.orders} settled work orders in the last "
+            f"{cfg.cache_health_window_days} days ({writes.boundaries} boundaries, "
+            f"{writes.cache_write:,} cache-write tokens){skipped}. That population is "
+            f"Jarvis's OWN dispatched workers, which is the population the fleet's cache "
+            f"settings reach; `{bill.cohort_command(cfg.cache_health_window_days)}` "
+            f"measures every transcript on this machine, including sessions opened by "
+            f"hand, so the two figures differ by design.")
+
+
+def check_cache_ttl_trigger() -> Iterator[Violation]:
+    """INV-CACHE-TTL-TRIGGER — the 1-hour cache write has started paying, and nobody
+    would have noticed.
+
+    Finding 2 kept the 5-minute write and its action was "re-measure monthly"; its own
+    stated con was that the trigger needs a person to remember, and for two weeks nobody
+    did. This is the reminder, and it is a post-condition rather than a reminder because
+    the crossing is a fact about the fleet's own bill.
+
+    THE COMPARISON IS THE ENTIRE HAZARD OF THIS CHECK. `usage.TTL_BREAK_EVEN` is a share
+    of ALL CACHE WRITES, because the 1-hour premium is charged on every written token.
+    The TTL's share of the RE-WRITE TAX is a different ratio over a much smaller
+    denominator, it runs at about double, and comparing THAT against 39.5% says "switch
+    now" when the answer is "keep the 5-minute write" — the error PR #160's own draft
+    made (kn-1449447a (4)). `bill.CacheWrites.ttl_share_of_tax` exists only to be printed
+    beside the deciding ratio here, never to be compared with anything, and
+    `tests/test_cache_health.py` pins that a cohort straddling the two stays quiet.
+
+    Reports rather than decides: switching the TTL is a fleet-wide config change and
+    `scripts/cache_ttl_cohort.py` is what prices it against the wider population.
+    """
+    from . import usage as usage_mod
+
+    health = _cache_health()
+    if health is None:
+        return
+    cfg, writes = health
+    if _thin_cohort(cfg, writes):
+        return
+    deciding = writes.ttl_share_of_writes
+    if deciding is None or deciding <= usage_mod.TTL_BREAK_EVEN:
+        return
+    of_tax = writes.ttl_share_of_tax
+    yield Violation(
+        invariant="INV-CACHE-TTL-TRIGGER",
+        detail=(
+            f"{deciding:.1%} of the fleet's cache writes are now re-writes the cache "
+            f"entry EXPIRING caused, against the {usage_mod.TTL_BREAK_EVEN:.1%} "
+            f"break-even where buying the 1-hour cache write starts paying — so the "
+            f"fleet's 5-minute write (`claude_cli.PROMPT_CACHE_5M_ENV`) is now costing "
+            f"money rather than saving it. Price it over the wider population before "
+            f"changing anything. For contrast and NOT for comparison, TTL expiry is "
+            f"{of_tax:.1%} of the re-write tax — a larger figure, because its "
+            f"denominator is only the writes seen at a boundary rather than every "
+            f"written token. The break-even does not apply to it, and reading it "
+            f"against {usage_mod.TTL_BREAK_EVEN:.1%} is how a fleet talks itself into "
+            f"switching when the arithmetic says do not. "
+            f"{_cohort_note(cfg, writes)}"),
+        context={"ttl_share_of_writes": deciding, "break_even": usage_mod.TTL_BREAK_EVEN,
+                 "ttl_share_of_tax": of_tax, "orders": writes.orders,
+                 "boundaries": writes.boundaries, "days": cfg.cache_health_window_days},
+    )
+
+
+def check_prefix_stable() -> Iterator[Violation]:
+    """INV-PREFIX-DRIFT — the prompt prefix has started moving again.
+
+    The fix is one line (`includeGitInstructions: false` in
+    `dispatch._write_worker_settings`, plus `worker_brief.git_briefing`), it was verified
+    once in a clean room and then trusted, and prefix invalidation is still the larger
+    half of the re-write tax. A CLI upgrade, a new MCP server or an edit to the briefing
+    would re-break it and nothing would say so — it would surface months later as a
+    bigger bill (finding 4).
+
+    THIS IS THE AUTHORITATIVE MEASUREMENT OF PREFIX STABILITY IN THIS TREE, because of
+    where its number comes from: the cache accounting the API ITSELF reported, read back
+    through the boundary classification in `usage._usage_of` and frozen onto each order's
+    bill. Any other prefix-drift signal here is a proxy and defers to this one — whether
+    it works by hashing the rendered system prompt at session start, or by comparing
+    against a recorded baseline. Both of those infer that the prefix moved; this reads
+    what the cache actually did. When they disagree, this is right.
+
+    THE RATIO IS OVER ALL CACHE WRITES, not over the tax and not over the boundaries.
+    Prefix writes as a share of the tax FALLS when TTL expiry rises, so it would report
+    the prefix improving on a day when only the cache got colder. The honest caveat,
+    stated rather than engineered around: this ratio does move with the fleet's turn
+    shape, since a fleet of shorter, choppier sessions crosses more boundaries per token.
+    That is why the threshold is empirical and set above a measured normal rather than
+    derived — `catalog.DEFAULT_CACHE_HEALTH_PREFIX_SHARE`.
+    """
+    health = _cache_health()
+    if health is None:
+        return
+    cfg, writes = health
+    if _thin_cohort(cfg, writes):
+        return
+    share = writes.prefix_share_of_writes
+    if share is None or share < cfg.cache_health_prefix_share:
+        return
+    yield Violation(
+        invariant="INV-PREFIX-DRIFT",
+        detail=(
+            f"{share:.1%} of the fleet's cache writes are being spent re-sending "
+            f"conversations whose PROMPT PREFIX had moved, over the "
+            f"{cfg.cache_health_prefix_share:.1%} ceiling this fleet is held to — a "
+            f"ceiling set above the figure measured while the `includeGitInstructions` "
+            f"fix was known to be working, so crossing it means the prefix has got "
+            f"WORSE and not merely that it costs something. No cache TTL buys any of it "
+            f"back: the cure is whatever is now changing the head of the prompt between "
+            f"calls. The usual suspects, in the order they are worth "
+            f"checking: a Claude CLI upgrade, an MCP server added or changed mid-session, "
+            f"and an edit to `worker_brief.git_briefing` or to a project's CLAUDE.md. "
+            f"`jarvis inspect <wo-id>` labels every re-write of one order by cause. "
+            f"{_cohort_note(cfg, writes)}"),
+        context={"prefix_share_of_writes": share,
+                 "threshold": cfg.cache_health_prefix_share,
+                 "prefix_boundaries": writes.prefix_boundaries,
+                 "orders": writes.orders, "boundaries": writes.boundaries,
+                 "days": cfg.cache_health_window_days},
+    )
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
     check_gate_canaries,
     check_config_drift,
     check_service_path,
     check_production_clean,
+    check_cache_ttl_trigger,
+    check_prefix_stable,
 )
 
 
