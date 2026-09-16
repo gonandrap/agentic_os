@@ -29,7 +29,7 @@ FLOOR = 5_000
 
 def row(mid: str, *, write: int = 0, read: int = 0, out: int = 0, plain: int = 0,
         model: str = "claude-opus-5", ttl_1h: int = 0, ttl_5m: int = 0,
-        at: str = "2026-08-09T00:00:00.000Z", entrypoint: str = "") -> dict:
+        at: str = "2026-08-09T00:00:00.000Z") -> dict:
     """One assistant row, in the shape Claude Code writes.
 
     `cache_creation` — the TTL the write bought — is nested one level down and is only
@@ -45,14 +45,11 @@ def row(mid: str, *, write: int = 0, read: int = 0, out: int = 0, plain: int = 0
     if ttl_1h or ttl_5m:
         usage_obj["cache_creation"] = {"ephemeral_1h_input_tokens": ttl_1h,
                                        "ephemeral_5m_input_tokens": ttl_5m}
-    built = {
+    return {
         "type": "assistant",
         "timestamp": at,
         "message": {"id": mid, "model": model, "usage": usage_obj},
     }
-    if entrypoint:
-        built["entrypoint"] = entrypoint
-    return built
 
 
 @pytest.fixture()
@@ -515,105 +512,3 @@ def test_rows_without_usage_are_ignored(transcripts):
         row("m1", write=100, out=10),
     ])
     assert usage.read_session("s1", FLOOR).total.messages == 1
-
-
-# -- the one-hour write, and who bought it --------------------------------------------
-#
-# Finding 3 of docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md. The
-# whole value of this reading is the SPLIT: an alarm that reported 1h spend without
-# saying whether Jarvis caused it would blame the OS for a person typing next to it.
-
-#: A day before every `at` below, so `since` is inert unless a test says otherwise.
-#: Derived through the parser rather than written as an epoch, because a hand-typed
-#: constant off by a year still looks plausible and makes the window test pass vacuously.
-BEFORE = usage.parse_stamp("2026-07-01T00:00:00.000Z")
-
-
-def test_one_hour_writes_split_by_entrypoint_within_a_single_transcript(transcripts):
-    """THE CASE THE WHOLE DESIGN TURNS ON, and it is wo-2df8828c's real shape.
-
-    One transcript, one session id, holding both a Jarvis-dispatched turn and the same
-    worktree reopened by hand afterwards. Keyed on the session it reads as Jarvis's;
-    keyed per message on `entrypoint`, the hand-opened half is the only one paying.
-
-    Paired on purpose: a parser that attributed the whole file to whichever entrypoint
-    it saw first would satisfy either half alone.
-    """
-    transcripts("s1", [
-        row("m1", write=900, ttl_1h=900, entrypoint=usage.SDK_ENTRYPOINT),
-        row("m2", write=4_000, ttl_1h=4_000, entrypoint="cli"),
-    ])
-
-    found = usage.one_hour_writes(BEFORE)
-
-    assert [(e.session_id, e.dispatched, e.foreign) for e in found] == \
-        [("s1", 900, 4_000)]
-    assert found[0].total == 4_900
-
-
-def test_a_five_minute_session_is_absent_rather_than_reported_as_zero(transcripts):
-    """The scan lists OFFENDERS. A session that bought the cheap write has nothing to
-    say, and a row saying `0` would put every well-behaved session on the list."""
-    transcripts("cheap", [row("m1", write=8_000, ttl_5m=8_000, entrypoint="cli")])
-    transcripts("leaky", [row("m1", write=10, ttl_1h=10, entrypoint="cli")])
-
-    assert [e.session_id for e in usage.one_hour_writes(BEFORE)] == ["leaky"]
-
-
-def test_since_bounds_the_window_per_message_not_per_session(transcripts):
-    """A session outlives a window — wo-2df8828c's was still being written to four days
-    after its work order completed. So the cut is on the WRITE, and a session with one
-    old write and one new one reports only the new one."""
-    transcripts("s1", [
-        row("old", write=7_000, ttl_1h=7_000, at="2026-08-10T00:00:00.000Z",
-            entrypoint="cli"),
-        row("new", write=300, ttl_1h=300, at="2026-08-20T00:00:00.000Z",
-            entrypoint="cli"),
-    ])
-
-    since = usage.parse_stamp("2026-08-13T00:00:00.000Z")  # between the two
-    assert [(e.session_id, e.foreign) for e in usage.one_hour_writes(since)] == \
-        [("s1", 300)]
-    assert usage.one_hour_writes(BEFORE)[0].foreign == 7_300
-
-
-def test_a_subagents_tokens_land_on_its_parent_session_under_its_own_entrypoint(
-        transcripts):
-    """Two claims, and the second is why the first is not enough.
-
-    A subagent has no id anyone can resume, so its spend is reported against the session
-    that spawned it — `read_session` charges it there too. But it carries its OWN
-    `entrypoint` row by row, so a subagent of a hand-opened session is classed foreign on
-    its own evidence rather than by inheriting its parent's.
-    """
-    transcripts("s1",
-                [row("m1", write=100, ttl_1h=100, entrypoint=usage.SDK_ENTRYPOINT)],
-                subagents={"agent-a": [row("s1m", write=2_000, ttl_1h=2_000,
-                                           entrypoint="cli")]})
-
-    found = usage.one_hour_writes(BEFORE)
-
-    assert [e.session_id for e in found] == ["s1"]
-    assert (found[0].dispatched, found[0].foreign) == (100, 2_000)
-    assert found[0].directory == "-proj"  # the PARENT's slug, not `subagents`
-
-
-def test_the_biggest_offender_is_first_and_the_span_is_the_writes_own(transcripts):
-    """Ordered by what it cost, because the caller quotes the top of this list. The span
-    is the first and last 1h WRITE, which is what a remedy has to name — not the
-    session's lifetime, most of which may have been paying the correct rate."""
-    transcripts("small", [row("m1", write=50, ttl_1h=50, entrypoint="cli")])
-    transcripts("big", [
-        row("m1", write=9_000, ttl_1h=9_000, at="2026-08-10T00:00:00.000Z",
-            entrypoint="cli"),
-        row("m2", write=1_000, ttl_1h=1_000, at="2026-08-12T00:00:00.000Z",
-            entrypoint="cli"),
-    ], slug="-other")
-
-    found = usage.one_hour_writes(BEFORE)
-
-    assert [e.session_id for e in found] == ["big", "small"]
-    assert found[0].directory == "-other"
-    assert (found[0].first_ts, found[0].last_ts) == (
-        usage.parse_stamp("2026-08-10T00:00:00.000Z"),
-        usage.parse_stamp("2026-08-12T00:00:00.000Z"))

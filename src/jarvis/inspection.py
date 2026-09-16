@@ -871,3 +871,137 @@ def live_alarms(session_id: str, cfg: InspectConfig, *, wo_id: str = "",
     reading = replace(cfg, report_write_floor=cfg.alarm_write_tokens)
     anatomy = read_session(session_id, reading, root=root, index=index)
     return alarms(anatomy, cfg, wo_id=wo_id, now=now, dispatched=dispatched)
+
+
+# -- the fleet's cache-TTL hygiene: who is still buying the one-hour write --------------
+#
+# Finding 3 of docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md. A 1h
+# cache write costs 2.0x base input where a 5m write costs 1.25x, and `claude_cli.
+# cache_env` forces the cheap one on every process Jarvis starts — so any 1h write left
+# in the fleet is either a BREACH of that guarantee or a `claude` a person typed, and
+# those are unrelated faults with unrelated fixes.
+#
+# THIS IS THE ONE COST READING THAT CANNOT COME OFF A BILL. `bill.rewrite_tax` reads
+# sealed bills precisely to avoid a transcript walk; the sessions this exists to find
+# were never dispatched, so they have no work order, no bill and no row anywhere in the
+# OS. The transcript is the only place they exist.
+
+#: The `cache_creation` key that says a write bought the hour. Also this module's cheap
+#: pre-filter: a file that never mentions it has nothing to say here, which is 98% of
+#: them, and skipping those is what makes the walk affordable at all.
+ONE_HOUR_KEY = '"ephemeral_1h_input_tokens"'
+
+
+@dataclass
+class HourWrites:
+    """One session's ONE-HOUR cache writes, split by who sent the prompt.
+
+    NEVER ADDED UP, and that is the whole design. `dispatched` means Jarvis's own
+    transport bought the expensive write, which is a defect in this OS; `foreign` means a
+    person's own session did, which the OS can only report. Finding 3 established that
+    an alarm merging the two blames the OS for a human sitting next to it.
+    """
+
+    session_id: str
+    #: The transcript directory: the slugified cwd the session was created in. Kept as
+    #: the raw slug rather than a path, because reconstructing one guesses at every `-`
+    #: that was once a `/` — it is an identifier here, not a location.
+    directory: str = ""
+    dispatched: int = 0
+    foreign: int = 0
+    #: First and last 1h WRITE, not the session's lifetime. A session mostly paying the
+    #: correct rate must not report its whole span as the leak.
+    first_ts: float = 0.0
+    last_ts: float = 0.0
+
+    @property
+    def total(self) -> int:
+        return self.dispatched + self.foreign
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"session_id": self.session_id, "directory": self.directory,
+                "dispatched": self.dispatched, "foreign": self.foreign,
+                "total": self.total, "first_ts": self.first_ts,
+                "last_ts": self.last_ts}
+
+
+def _mentions(path: Path, needle: str) -> bool:
+    """Whether a file contains `needle` at all, without parsing a line of it."""
+    try:
+        with path.open(errors="replace") as handle:
+            return any(needle in line for line in handle)
+    except OSError:
+        return False
+
+
+def _subagent_transcripts(path: Path) -> list[Path]:
+    """The subagent transcripts written beside one session file — `read_session`'s rule.
+
+    Their spend is charged to the session that SPAWNED them, here as there: a subagent
+    has no id anyone can resume, so it is not an answer to "which session do I go and
+    look at".
+    """
+    directory = path.with_suffix("") / "subagents"
+    return sorted(directory.glob("*.jsonl")) if directory.is_dir() else []
+
+
+def one_hour_writes(since: float, *, root: Path | None = None,
+                    cfg: InspectConfig | None = None) -> list[HourWrites]:
+    """Every session that bought the one-hour cache write since `since`, biggest first.
+
+    ATTRIBUTION IS `_prompt_of`'s, NOT A SECOND POLICY. A turn is Jarvis's when the
+    prompt that started it carries `promptSource: "sdk"` — the same discriminator
+    `Prompt.source` has always used and the one finding 3 established by hand. Keying on
+    `work_orders.session_id` instead gets it WRONG on the largest offender the fleet has:
+    wo-2df8828c's transcript is ONE file holding both a dispatched turn and the same
+    worktree reopened by hand afterwards, and all 2,512,088 of its 1h tokens are the
+    hand-opened half's.
+
+    A TURN IS JARVIS'S ONLY IF EVERY TRIGGER IS. `Daemon.deliver_messages` coalesces
+    what it queues, so a turn has several, and one prompt a person typed among them means
+    a person was at the keyboard — the claim `dispatched` makes is about the process, and
+    a wrong one there accuses the OS of a defect it does not have.
+
+    SUBAGENTS INHERIT THEIR PARENT'S CLASSIFICATION, because their transcripts carry no
+    `promptSource` at all (measured: 1,002 user rows, none with the field). Classified on
+    their own evidence every one of them would read as a person's, which would hide
+    exactly the breach this exists to catch. `_attach_calls` does the inheriting — their
+    calls land in the parent turn that was running, by the rule the bill already uses.
+
+    AN UNKNOWN TTL IS NOT A 1h TTL. Only `ephemeral_1h_input_tokens` itself counts, so a
+    row written before Claude Code reported the split contributes nothing — the floor
+    `usage`'s module note sets out. An alarm that read absence as the expensive write
+    would fire on every old transcript in the fleet.
+    """
+    root = root or usage_mod.transcript_root()
+    if not root.is_dir():
+        return []
+    cfg = cfg or InspectConfig()
+    found: dict[str, HourWrites] = {}
+    for path in sorted(root.glob("*/*.jsonl")):
+        subagents = _subagent_transcripts(path)
+        if not any(_mentions(p, ONE_HOUR_KEY) for p in (path, *subagents)):
+            continue
+        turns, _ = read_transcript(path, cfg)
+        calls = usage_mod.calls_of(path)
+        for sub in subagents:
+            calls.extend(usage_mod.calls_of(sub))
+        calls.sort(key=lambda c: c.ts)
+        _attach_calls(turns, calls)
+        for turn in turns:
+            dispatched = bool(turn.triggers) and all(
+                p.source == "sdk" for p in turn.triggers)
+            for call in turn.calls:
+                if not call.cache_1h or call.ts < since:
+                    continue
+                entry = found.get(path.stem)
+                if entry is None:
+                    entry = found[path.stem] = HourWrites(session_id=path.stem,
+                                                          directory=path.parent.name)
+                if dispatched:
+                    entry.dispatched += call.cache_1h
+                else:
+                    entry.foreign += call.cache_1h
+                entry.first_ts = min(entry.first_ts, call.ts) or call.ts
+                entry.last_ts = max(entry.last_ts, call.ts)
+    return sorted(found.values(), key=lambda e: (-e.total, e.session_id))
