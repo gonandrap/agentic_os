@@ -322,39 +322,60 @@ def test_a_write_outside_the_window_is_not_in_it(started, store, transcripts):
         [inspection.CACHE_1H_FOREIGN_ALARM]
 
 
-def test_the_scan_is_not_on_the_daemons_first_tick(started, store, transcripts):
-    """THE ONLY CADENCE IN THE DAEMON THAT IS NOT `== 1`, and the reason is measurable: a
-    20-second disk walk on tick 1 sits in front of every dispatch the OS is starting, and
-    a daemon restarted more often than the six-hour period would pay it on every boot and
-    never reach a later tick to do the scan it skipped.
+def test_the_real_loop_raises_these_on_the_offset_tick(started, store, transcripts):
+    """THE WIRE, and the only test that fails if `Daemon.tick` stops calling this at all.
 
-    Asserted on the arithmetic rather than by ticking, because reaching tick 60 takes 60
-    ticks. Paired: "not on tick 1" alone is satisfied by a cadence that never fires.
+    Every other test here calls `check_cache_ttl` directly, which grades the method and
+    says nothing about whether the daemon ever reaches it — and because this feature
+    ships firing on NOTHING (the trailing windows are zero), a dead wire would not show
+    up in production either. So this drives `tick` itself, one tick short of the offset,
+    and asserts the alarms and the inbox rows come out the far end.
+
+    The thresholds are the SHIPPED defaults rather than a fixture's: `tick` reloads the
+    catalog first, so a config set on the in-memory object would not survive the call —
+    and grading the wire against what actually ships is the stronger claim anyway.
     """
-    from jarvis import daemon as daemon_mod
+    from jarvis import daemon as daemon_mod, db
 
-    period, offset = (daemon_mod.CACHE_TTL_EVERY_TICKS,
-                      daemon_mod.CACHE_TTL_TICK_OFFSET)
-    fires = [t for t in range(1, 2 * period + 1) if t % period == offset]
+    carrier = store.create_work_order("carrier", status="completed")
+    _both_halves(transcripts, db.now(), dispatched=9_000_000, foreign=9_000_000)
+    started.tick_count = daemon_mod.CACHE_TTL_TICK_OFFSET - 1
 
-    assert 1 not in fires
-    assert fires == [offset, offset + period], "once per period, and it does fire"
+    started.tick()
+
+    assert started.tick_count == daemon_mod.CACHE_TTL_TICK_OFFSET
+    rows = store.alarms_across()
+    assert {r["kind"] for r in rows} == {inspection.CACHE_1H_DISPATCHED_ALARM,
+                                         inspection.CACHE_1H_FOREIGN_ALARM}
+    assert all(r["wo_id"] == carrier["id"] for r in rows)
+    titles = {r["title"] for r in started.central.unacked_inbox()}
+    assert set(daemon_mod.CACHE_1H_INBOX_TITLE.values()) <= titles
 
 
 def test_one_tick_of_the_real_loop_does_not_scan(started, store, transcripts):
-    """The other half of the offset, through `tick` itself rather than its arithmetic:
-    `Daemon.tick` is what a `jarvis start` runs, and tick 1 must not raise one of these
-    even with a transcript tree full of offending writes."""
+    """The negative half of the pair above, and the reason the offset exists: tick 1 is
+    the daemon's FIRST, where a 20-second disk walk sits in front of every dispatch the
+    OS is starting. Same tree, same carrier, same defaults — only the tick differs."""
     from jarvis import db
 
     store.create_work_order("carrier", status="completed")
     _both_halves(transcripts, db.now(), dispatched=9_000_000, foreign=9_000_000)
-    started.catalog.projects[0].inspect = InspectConfig()
 
     started.tick()
 
     assert started.tick_count == 1
     assert store.alarms_across() == []
+
+
+def test_the_offset_is_a_real_offset(started):
+    """The constant the pair above rests on, checked directly rather than by restating
+    `% period == offset` — an arithmetic identity cannot fail. What CAN fail is somebody
+    setting the offset back to 1, which silently returns the walk to the daemon's first
+    tick while both loop tests above keep passing on their own terms."""
+    from jarvis import daemon as daemon_mod
+
+    assert daemon_mod.CACHE_TTL_TICK_OFFSET != 1
+    assert 0 < daemon_mod.CACHE_TTL_TICK_OFFSET < daemon_mod.CACHE_TTL_EVERY_TICKS
 
 
 # -- 3. the alarm actually reaches the supervisor --------------------------------------
