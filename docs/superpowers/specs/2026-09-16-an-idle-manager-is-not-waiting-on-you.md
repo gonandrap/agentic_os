@@ -61,6 +61,34 @@ the user, Neo handing that question back.
 `message_stuck`: the two answers where a nudge is *actively wrong* rather than merely
 useless, refused regardless of permission mode.
 
+### Waking up is the behaviour the manager exists for
+
+Review round 2. Adding `idle` to `MESSAGE_STUCK_STATUSES` lets the OS report the delivery
+path *failing*; it says nothing about it succeeding. If any delivery or dispatch path
+keyed off a tuple holding `waiting_input` and not `idle`, this change would silently
+strand every feature order in the fleet — issue #264 one level worse.
+
+Audited, and none does. `Daemon.deliver_messages` has **no status filter at all**: it
+walks `queued_messages()` and asks `worker_session.delivery_hold`, which reads the
+session, the turn row and the pause, never the status. The cap it applies goes through
+`resume_spends_slot`, which exempts a manager by *kind*. On the envelope road,
+`bus.resolve` calls `ProjectStore.manager_work_order` — unfiltered by design — and checks
+only `TERMINAL_STATUSES`, which `idle` is not.
+
+Pinned rather than argued:
+`test_an_envelope_wakes_an_idle_manager_and_it_settles_back_to_idle` settles a manager to
+`idle`, posts the envelope the validation loop posts, runs a real `daemon.tick` (one tick
+routes *and* delivers — see the ordering comment in `Daemon.tick`) and asserts a new turn
+exists, the order reads `running`, and it settles back to `idle`.
+`test_a_user_message_wakes_an_idle_manager_too` does the same down `ops.send_message`, the
+road `jarvis wo send` and the dashboard use. The full cycle is the assertion, not just the
+wake: a manager that woke and then stuck in `running` would be the same silent stranding
+one status along.
+
+§5's `test_an_envelope_to_the_manager_role_is_delivered_to_the_manager` does **not** cover
+this and now says so in its own docstring: it stops at `queued_messages` and its manager
+is still `running`, never settled.
+
 ## Migration
 
 No schema change — a status is a `TEXT` column plus a tuple and an `assert`. Managers

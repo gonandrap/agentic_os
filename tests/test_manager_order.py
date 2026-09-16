@@ -536,6 +536,12 @@ def test_an_envelope_to_the_manager_role_is_delivered_to_the_manager(boot, store
 
     The envelope is about a CHILD work order, which is the shape the validation loop
     posts: the sender names a role and a subject and never learns who read it.
+
+    STOPS AT THE QUEUE, deliberately: what is under test here is `bus.resolve` finding
+    the manager, and the manager is left `running` because no settle pass is run. So this
+    proves nothing about waking one that is `idle` — see
+    `test_an_envelope_wakes_an_idle_manager_and_it_settles_back_to_idle` in §7, which
+    carries the same envelope the rest of the way through a real `daemon.tick`.
     """
     daemon = boot(validation=True)
     spec = daemon.catalog.project("proj_a")
@@ -749,6 +755,85 @@ def _manager_with_a_finished_turn(boot, store, settle_turns):
     daemon.tick()
     assert settle_turns(store), "the turns never ended"
     return daemon, spec, manager
+
+
+def _settled_idle(boot, store, settle_turns):
+    """A manager that has actually reached `idle` through the real settler."""
+    daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
+    daemon.settle_turns(spec, store)
+    assert store.get_work_order(manager["id"])["status"] == "idle", "the precondition"
+    return daemon, spec, store.get_work_order(manager["id"])
+
+
+def test_an_envelope_wakes_an_idle_manager_and_it_settles_back_to_idle(boot, store,
+                                                                      settle_turns):
+    """THE BEHAVIOUR THE MANAGER EXISTS FOR, end to end through a real `daemon.tick`.
+
+    Review round 2, and the gap it names is real: §5's
+    `test_an_envelope_to_the_manager_role_is_delivered_to_the_manager` stops at
+    `queued_messages` and never runs a delivery pass, and its manager is never settled,
+    so it is still `running` — it could not have caught a delivery path that keys off a
+    status tuple holding `waiting_input` and not `idle`. Nothing else did either: every
+    other test here poses a manager that is idle or that asked, and
+    `test_a_relaunched_manager_settles_back_to_idle` hand-builds its turn with
+    `store.create_turn`, which is the retry sweep's path and not delivery's.
+
+    Adding `idle` to MESSAGE_STUCK_STATUSES lets the OS report this path FAILING. This is
+    the other half: it succeeding. One tick routes the envelope AND delivers it — see the
+    ordering comment in `Daemon.tick` — so the assertions below are about the real
+    `deliver_envelopes` -> `deliver_messages` -> `worker_session.send` chain, with no
+    status filter anywhere in it that a manager could fall out of.
+
+    The FULL CYCLE is the point, not just the wake: idle -> message -> running -> idle. A
+    manager that woke once and then stuck in `running` would be the same silent stranding
+    one status further along.
+    """
+    daemon, spec, manager = _settled_idle(boot, store, settle_turns)
+    before = store.latest_turn(manager["id"])["seq"]
+    child = store.feature_children(manager["parent_id"])[0]
+
+    bus.post(
+        store,
+        subject=bus.Subject(wo_id=child["id"]),
+        from_role="reviewer",
+        to_role="manager",
+        payload=bus.ReviewFeedback(
+            round=1, outcome="rejected",
+            reason="the tests do not exercise the change",
+            asks=("cover the empty result set",)),
+    )
+    daemon.tick()
+
+    woken = store.get_work_order(manager["id"])
+    assert store.latest_turn(manager["id"])["seq"] > before, \
+        "no turn was created: the envelope reached an idle manager and died there"
+    assert woken["status"] == "running", "a turn is out; the record must say so"
+    assert not store.queued_messages(manager["id"]), "the message was consumed"
+
+    assert settle_turns(store), "the woken turn never ran"
+    daemon.settle_turns(spec, store)
+
+    assert store.get_work_order(manager["id"])["status"] == "idle", \
+        "it must go back to sleep, not stick in `running`"
+
+
+def test_a_user_message_wakes_an_idle_manager_too(boot, store, settle_turns):
+    """The other road in, and it is a different call: `ops.send_message` is what
+    `jarvis wo send` and the dashboard's box use, where the envelope above is what the
+    validation loop posts. Paired with it because they converge on `deliver_messages`
+    only if nothing between them filters on status."""
+    daemon, spec, manager = _settled_idle(boot, store, settle_turns)
+    before = store.latest_turn(manager["id"])["seq"]
+
+    ops.send_message(manager["id"], "the second child is blocked on the first",
+                     project_name="proj_a")
+    daemon.tick()
+
+    assert store.latest_turn(manager["id"])["seq"] > before
+    assert settle_turns(store), "the woken turn never ran"
+    daemon.settle_turns(spec, store)
+
+    assert store.get_work_order(manager["id"])["status"] == "idle"
 
 
 def test_a_manager_parked_on_an_escalated_question_is_not_migrated(boot, store,
