@@ -47,6 +47,18 @@ fix at the wrong one. Never propose changing a cache TTL off a `rewrite-tax-ttl`
 alone: its threshold is a share of the BILL and the TTL decision is taken against a
 different ratio, which the alarm's own text names along with the command that measures it.
 
+AND TWO MORE ARE NOT ABOUT THIS PROJECT AT ALL. `cache-1h-dispatched` and
+`cache-1h-foreign` are the FLEET's remaining one-hour cache writes — every transcript on
+the machine, including sessions no project owns. The work order they hang off carries the
+foreign key and NOTHING else: it is not the exemplar of the number, it did not cause it,
+and it may have nothing to do with it. The two are opposite findings. `cache-1h-dispatched`
+says Jarvis's own transport bought the expensive write, which is a DEFECT IN THIS
+CODEBASE and a work order anyone can act on. `cache-1h-foreign` says a person's own
+`claude` did — the remedy is one line in THEIR `~/.claude/settings.json`, which Jarvis
+must never write, so the only honest outcome is a work order asking a PERSON to add it.
+Never propose a remedy that has the OS edit a user's personal configuration, and never
+answer a `cache-1h-foreign` alarm as though the OS were at fault.
+
 READ WHAT A TURN COST BEFORE YOU CALL IT EXPENSIVE. Every turn in the packet carries its
 API call count and the tokens and dollars it actually bought. A turn that made NO API call
 has spent nothing however long its wall clock is: it STALLED, and it is the work never
@@ -116,7 +128,12 @@ whole project's re-write tax over a window of already-settled orders; the work o
 hang off is the biggest single contributor, shown as the EXEMPLAR and not as the culprit.
 Judge the project's figure, not that order's, and keep the two causes apart — the prefix
 moving and the entry expiring have opposite cures, and one answer covering both is the
-misreading these two kinds were split to prevent.
+misreading these two kinds were split to prevent. `cache-1h-dispatched` and
+`cache-1h-foreign` go further still: they are about the whole FLEET's one-hour cache
+writes, the order under them carries only the foreign key, and the second of the two
+reports a condition the OS cannot fix — the remedy is a line in a person's own
+`~/.claude/settings.json`, which Jarvis must never write. Never escalate a
+`cache-1h-foreign` alarm as an OS fault, and never propose a remedy that edits that file.
 
 READ THE PACKET'S "this session is" LINE BEFORE YOU JUDGE THE NUMBERS. The alarm is
 always raised against a work order, but a work order is not always a worker: it may be a

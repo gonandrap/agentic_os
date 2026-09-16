@@ -30,7 +30,8 @@ ID_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 #: rather than imported — `inspection` imports `catalog`, which imports this module, so
 #: the import would be a cycle. `tests/test_probes.py` pins the two equal.
 RESERVED_IDS = ("long-turn", "stalled-turn", "long-join", "big-rewrite",
-                "rewrite-tax-prefix", "rewrite-tax-ttl")
+                "rewrite-tax-prefix", "rewrite-tax-ttl",
+                "cache-1h-dispatched", "cache-1h-foreign")
 
 
 @dataclass(frozen=True)

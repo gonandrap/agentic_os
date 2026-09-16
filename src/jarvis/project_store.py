@@ -1365,6 +1365,27 @@ class ProjectStore:
             (kind,)).fetchone()
         return dict(row) if row else None
 
+    def latest_settled_order(self) -> dict[str, Any] | None:
+        """The most recently settled work order, as a CARRIER and nothing more.
+
+        `wo_alarms.wo_id` is a real foreign key, so a finding about something that is not
+        a work order still needs one. `Daemon.check_rewrite_tax` can use the biggest
+        contributor, because its subject IS a work order; `Daemon.check_cache_ttl`'s
+        subject is a session the OS never dispatched, and no order is the number's
+        exemplar — so this picks the one a reader following the link will find least
+        confusing to be shown, and the alarm's own text says it stands for nothing.
+
+        SETTLED and not merely existing: a running order's page is about a turn in
+        flight, and hanging a standing finding there would put a fleet-wide claim beside
+        live work it has nothing to do with.
+        """
+        row = self.conn.execute(
+            f"""SELECT * FROM work_orders
+                WHERE status IN ({','.join('?' * len(TERMINAL_STATUSES))})
+                ORDER BY updated_at DESC LIMIT 1""",
+            TERMINAL_STATUSES).fetchone()
+        return dict(row) if row else None
+
     def unsealed_terminal_features(self, limit: int = 2) -> list[dict[str, Any]]:
         marks = ", ".join("?" for _ in FO_TERMINAL_STATUSES)
         rows = self.conn.execute(
