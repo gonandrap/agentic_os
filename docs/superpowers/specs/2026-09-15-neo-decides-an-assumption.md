@@ -72,10 +72,26 @@ is a model that cannot be relied on to volunteer its own doubt.
    earlier and **not a second vocabulary for it**. A match HOLDS: the assumption stays
    pending and the work order stays exactly where it is today, so a false positive costs
    the user precisely what every assumption costs them now.
-2. **`stakes: high`**, which Neo must classify on every answer *separately from its
-   verdict*, and which `autoreview.read_ruling` honours **over an acceptance**. A backstop
-   a reviewer can wave through is not one — the same argument that makes the child cap
-   override Neo on a plan (`Daemon._deliver_plan_verdict`).
+2. **`stakes`**, which Neo must classify on every answer *separately from its verdict*, and
+   which `autoreview.read_ruling` honours **over an acceptance**. A backstop a reviewer can
+   wave through is not one — the same argument that makes the child cap override Neo on a
+   plan (`Daemon._deliver_plan_verdict`).
+
+   **It is read as an ALLOWLIST** (`autoreview.ROUTINE_STAKES`, kn-32434cef's shape), and
+   that is not a detail. Written as `stakes == "high"` the net FAILED OPEN: the likeliest
+   malformed reply a model produces is one that simply omits the key, and
+   `neo._validate_verdict` turns a missing key into `""` and truncates to 20 characters, so
+   `{"escalate": false, "verdict": "approve", "reason": "…"}` parsed cleanly, read as
+   routine and was accepted **with the second net silently off**. So did `"high-stakes"`,
+   `"elevated"`, and anything the 20-char cap cut in half. A net whose default is "no
+   danger here" is not a net.
+
+   Accepting therefore needs **three** positive facts, not two: Neo did not escalate, it
+   ruled `approve`, and it said a word the OS recognises as routine. Anything else
+   escalates and the record says which — the field was absent, or it carried a value the OS
+   could not read — so a model that spells it differently produces a visible escalation
+   the user can act on, not a quiet acceptance. The set has exactly one entry, the word the
+   persona asks for; widening it is a decision someone has to make on purpose.
 
 **"Before any model call" is a claim about the TEXT, and it has to hold on every path the
 text can take.** Net 1 stops a high-stakes assumption being *ruled on*; it must also stop
@@ -215,12 +231,24 @@ are the two the record most needs.
 | Neo answers `deny` without escalating | escalates, carrying Neo's reason. |
 | the user reviews it first | the delivery arm sees a non-pending assumption and drops the ruling; `invariants.check_neo_escalations_are_live` closes the question behind them. |
 | the work order is deleted | `NeoStore.purge_work_order` takes its questions with it. |
+| Neo answers `approve` and **omits `stakes` entirely** | `read_ruling` reads the allowlist, not `== "high"`, so `""` is not routine: it escalates and the record says the stakes were never classified. Written as a blocklist this was the row that produced an acceptance. |
+| Neo answers `approve` with `stakes: "high-stakes"`, `"elevated"`, or a value the 20-char cap truncated | same row. Anything the OS cannot read as routine is treated as high. |
 | the panel gave up on the work order | condition 4 holds, every tick, with a reason on the record. |
+| the panel gives up **after** the question was asked | the settle site re-runs the whole table (§5.1) and drops the ruling, with an `autoreview_held` event and the question re-marked `escalated`. |
+| the work order is cancelled while Neo is thinking | same path: condition 2 is re-read against the current status, not the one the ask saw. |
+| the project revokes `validation.auto_review` while Neo is thinking | same path, condition 1. |
 | the user rejected an earlier assumption and the worker has not delivered again | condition 5 holds. |
 
 There is no row where a failure produces an acceptance. That falls out of the structure —
-an acceptance needs seven positive facts and then two more — rather than out of a rescue
-clause.
+an acceptance needs seven positive facts, then three more, and then the seven again against
+freshly read state — rather than out of a rescue clause.
+
+**Two rows in this table were written before they were true**, and both were found in
+review rather than by a test. The `stakes` row assumed the classification would arrive;
+the settle rows assumed the ask's reading of the state still held minutes later. A table
+of failure directions is a claim, and a claim in a spec is worth exactly as much as the
+test under it — see `tests/test_autoreview.py`, where each row above now has one, and each
+was verified by disabling the guard and watching it fail.
 
 ## 7. Telling the user afterwards
 

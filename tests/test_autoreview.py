@@ -197,6 +197,70 @@ def test_neo_marking_its_own_acceptance_high_stakes_overrides_the_acceptance():
     assert not r.accept and r.overridden and "high-stakes" in r.reason
 
 
+@pytest.mark.parametrize("stakes, why", [
+    pytest.param(None, "the field is absent — the likeliest malformed reply of all, and "
+                       "`neo._validate_verdict` turns it into `''` rather than an error",
+                 id="absent"),
+    pytest.param("", "the field is there and empty", id="empty"),
+    pytest.param("   ", "whitespace only, which `.strip()` makes empty", id="blank"),
+    pytest.param("high-stakes", "a plausible misspelling of the word we asked for",
+                 id="misspelled"),
+    pytest.param("elevated", "a synonym nobody anticipated", id="synonym"),
+    pytest.param("HIGH", "the right word in the wrong case — escalates either way, but "
+                         "through the allowlist rather than the `== 'high'` compare",
+                 id="uppercase"),
+    pytest.param("routine, because the helper is intern", "truncated at "
+                 "`_validate_verdict`'s 20-char cap, so the value that arrives is not "
+                 "the value Neo wrote", id="truncated"),
+    pytest.param("high", "the one it was always meant to catch", id="high"),
+])
+def test_a_stakes_the_os_cannot_read_as_routine_escalates_rather_than_accepting(stakes,
+                                                                                why):
+    """THE SECOND NET MUST NOT FAIL OPEN, and written as `== "high"` it did.
+
+    An allowlist rather than a blocklist (kn-32434cef's shape): every row here is a reply
+    that parses cleanly, says `approve`, and carries a `stakes` the OS has no reason to
+    trust. Under the old compare each one read as ROUTINE and was accepted with the
+    backstop silently off — and the first row, the field simply missing, is the likeliest
+    malformed reply a model produces.
+
+    The cost of getting this wrong in this direction is one review action the user was
+    going to make anyway. The cost of the other direction is a decision made in their
+    name with no backstop at all.
+    """
+    reply = accepted()
+    if stakes is None:
+        reply.pop("stakes")
+    else:
+        reply["stakes"] = stakes
+
+    r = autoreview.read_ruling(reply)
+
+    assert not r.accept, why
+    assert r.overridden, "the OS overrode an acceptance — the record must say so"
+    assert "would have accepted it" in r.reason
+
+
+def test_an_unclassified_acceptance_is_not_recorded_as_routine():
+    """The absence of a warning is not a warning's absence. Writing `routine` into the
+    row would put a judgement in Neo's mouth that it never made, and that row is what
+    `jarvis wo show` and the escalation event carry."""
+    reply = accepted()
+    reply.pop("stakes")
+
+    r = autoreview.read_ruling(reply)
+
+    assert r.stakes == autoreview.STAKES_UNCLASSIFIED != autoreview.STAKES_ROUTINE
+    assert "did not classify the stakes at all" in r.reason
+
+
+def test_the_allowlist_is_exactly_the_word_the_persona_asks_for():
+    """Pinned as a set rather than read off the implementation: every entry added here is
+    a value a future reader has to trust, and the persona names one."""
+    assert autoreview.ROUTINE_STAKES == frozenset({"routine"})
+    assert '"stakes": "routine"' in autoreview.ASSUMPTION_REVIEWER_PERSONA
+
+
 def test_neo_declining_the_assumption_escalates_and_carries_its_reading():
     """There is no machine rejection (Neo, question 301), so a `deny` reaches the user —
     WITH Neo's reason, which is strictly more than they get today."""

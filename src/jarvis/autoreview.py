@@ -30,8 +30,11 @@ line, and each fails toward the user:
   `HIGH_STAKES` below is the code form of Neo's own escalation clause (`neo.PERSONA`:
   production or live credentials, spending money, deleting or publishing, legal and people
   matters), applied before a call is even made; `read_ruling` then force-escalates anything
-  Neo ITSELF marked `stakes: high`, whatever verdict it reached. A regex cannot read
-  meaning and a model cannot be relied on to volunteer its own doubt. "Before any call" is
+  Neo ITSELF did not classify as `stakes: routine`, whatever verdict it reached — an
+  ALLOWLIST (`ROUTINE_STAKES`), because a missing, empty or misspelled `stakes` read as a
+  blocklist means "no danger here" and switches the backstop off on the quietest possible
+  failure. A regex cannot read meaning and a model cannot be relied on to volunteer its own
+  doubt, or even to answer in the shape it was asked for. "Before any call" is
   a claim about the TEXT, so `sibling_line` applies the same net to the context list: an
   assumption held back for naming a credential must not arrive in the prompt for the
   routine one beside it.
@@ -69,6 +72,28 @@ DECIDER = "neo"
 
 STAKES_ROUTINE = "routine"
 STAKES_HIGH = "high"
+#: What the record calls a `stakes` the reviewer never gave. Not `routine`: the absence of
+#: a warning is not a warning's absence, and writing `routine` into the row would put a
+#: judgement in Neo's mouth that it did not make.
+STAKES_UNCLASSIFIED = "unclassified"
+
+#: **AN ALLOWLIST, NOT A BLOCKLIST, AND THAT IS THE WHOLE POINT** (kn-32434cef's shape).
+#: The one `stakes` value that leaves an acceptance standing. Everything else — the field
+#: absent, empty, misspelled, truncated by `neo._validate_verdict`'s 20-char cap, or a
+#: word nobody anticipated — is treated as high and escalates.
+#:
+#: Written as a blocklist (`== "high"`) the second net FAILED OPEN: the single most likely
+#: malformed reply is one that simply omits the key, and that parsed cleanly, read as
+#: routine and was accepted with the backstop silently off. A net whose default is "no
+#: danger here" is not a net. The cost of the allowlist is an escalation the user was
+#: going to handle anyway; the cost of the blocklist is a decision made in their name with
+#: no backstop at all — the asymmetry the module docstring's "every row fails toward the
+#: user" rests on.
+#:
+#: Exactly one entry, deliberately: `routine` is the word `ASSUMPTION_REVIEWER_PERSONA`
+#: asks for. If a model spells it otherwise the escalation reason SAYS so, so the fix is a
+#: visible persona edit rather than a quiet widening of this set.
+ROUTINE_STAKES = frozenset({STAKES_ROUTINE})
 
 #: WHY THE OS DID NOT DECIDE THIS ASSUMPTION, as a stable token. The dedupe in
 #: `Daemon.auto_review` keys on (assumption, this), so one work order records each
@@ -258,19 +283,32 @@ def read_ruling(verdict: dict[str, Any], default_model: str = "") -> Ruling:
     reason. There is no machine rejection (module docstring), and the user reading "Neo
     would have turned this down: …" is strictly better informed than they are today.
 
-    `stakes: high` OVERRIDES AN ACCEPTANCE. The reviewer is asked to classify the stakes
-    separately from ruling on them, and the classification wins, for the reason the plan
-    path's child cap wins over Neo (`Daemon._deliver_plan_verdict`): a backstop a reviewer
-    can wave through is not one.
+    `stakes` OVERRIDES AN ACCEPTANCE, AND IT IS READ AS AN ALLOWLIST. The reviewer is asked
+    to classify the stakes separately from ruling on them, and the classification wins, for
+    the reason the plan path's child cap wins over Neo (`Daemon._deliver_plan_verdict`): a
+    backstop a reviewer can wave through is not one. `ROUTINE_STAKES` holds the only value
+    that leaves an acceptance standing — so a missing, empty, misspelled or truncated
+    `stakes` escalates, instead of reading as "no danger here" and switching the second net
+    off on the quietest possible failure. Three positive facts are therefore needed to
+    accept, not two.
     """
-    stakes = str(verdict.get("stakes") or STAKES_ROUTINE).strip().lower() or STAKES_ROUTINE
+    stakes = str(verdict.get("stakes") or "").strip().lower() or STAKES_UNCLASSIFIED
     reason = str(verdict.get("reason") or "").strip() or "no reason given"
     model = str(verdict.get("model") or default_model or "")
     accept = (not verdict.get("escalate")) and verdict.get("verdict") == "approved"
-    if accept and stakes == STAKES_HIGH:
+    if accept and stakes not in ROUTINE_STAKES:
+        # Two spellings of one override, because the user reads this line and the two
+        # facts are different: Neo warned and the OS obeyed, or Neo said nothing readable
+        # and the OS would not take the silence for an answer.
+        said = (f"marked it high-stakes, and those are yours"
+                if stakes == STAKES_HIGH else
+                "did not classify the stakes at all, and the OS does not read silence "
+                "as routine"
+                if stakes == STAKES_UNCLASSIFIED else
+                f"classified the stakes as {stakes!r}, which the OS cannot read as "
+                f"routine")
         return Ruling(accept=False, stakes=stakes, model=model, overridden=True,
-                      reason=f"Neo would have accepted it but marked it high-stakes, "
-                             f"and those are yours: {reason}")
+                      reason=f"Neo would have accepted it but {said}: {reason}")
     if not accept and not verdict.get("escalate"):
         return Ruling(accept=False, stakes=stakes, model=model,
                       reason=f"Neo would have turned this down: {reason}")
