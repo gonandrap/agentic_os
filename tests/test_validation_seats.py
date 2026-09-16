@@ -278,6 +278,85 @@ def test_the_packet_prompt_carries_what_a_seat_needs_to_catch_an_unsupported_cla
     assert "NEVER truncated" in prompt
 
 
+#: One prior round, in the shape `evidence._history` normalises to. The strings are
+#: chosen so that nothing in them could be matched by accident: the seat-name assertion
+#: below is only worth something if the fixture's own prose names no seat (kn-dd0b015a).
+PRIOR = {"round": 1, "outcome": "rejected",
+         "reason": "the exporter is not covered by the evidence you declared",
+         "head_sha": "",
+         "blockers": ({"title": "TRIED-AND-REFUSED",
+                       "detail": "the retry loop swallows the second failure"},)}
+
+
+def test_round_one_carries_no_history_section_at_all():
+    """Absent, never present-and-empty: an empty heading is a thing a model reasons
+    about. Paired with the round that HAS one, or "the renderer emits nothing" passes."""
+    assert validation.HISTORY_HEADING not in validation.build_packet_prompt(packet())
+    assert validation.HISTORY_HEADING in validation.build_packet_prompt(
+        packet(history=(PRIOR,)))
+
+
+def test_the_history_carries_the_round_its_outcome_its_reason_and_its_blockers():
+    prompt = validation.build_packet_prompt(packet(history=(PRIOR,)))
+
+    assert "Round 1 — rejected" in prompt
+    assert "the exporter is not covered by the evidence you declared" in prompt
+    assert "TRIED-AND-REFUSED" in prompt
+    assert "the retry loop swallows the second failure" in prompt
+    assert "so you do not raise them again" in prompt, (
+        "a list of old remarks with no frame reads as a list of things still outstanding")
+    assert "INSTRUCTION FOLLOWED" in prompt
+
+    # Either half of a finding may be empty — `_parsed_findings` asks only that one of
+    # them says something — and an empty bold run reads as a title that was lost.
+    half = validation.build_packet_prompt(packet(history=(
+        {**PRIOR, "blockers": ({"title": "", "detail": "ONLY-A-DETAIL"},)},)))
+    assert "- ONLY-A-DETAIL" in half and "****" not in half
+
+
+def test_the_history_names_no_seat():
+    """The panel is never narrated to anyone, and a round's history is the one place a
+    seat's name could get in by accident. What the packet carries has no `seat` key at
+    all, so the only way one could appear is this renderer writing it."""
+    prompt = validation.build_packet_prompt(packet(history=(PRIOR,)))
+    section = prompt[prompt.index(validation.HISTORY_HEADING):]
+    section = section[:section.index("## The change")]
+
+    for seat in VALIDATOR_SEATS:
+        assert seat not in section
+
+
+def test_the_orientation_line_needs_both_shas_and_is_otherwise_omitted():
+    """§5.4: the previous round's sha is a column this prompt cannot read and the
+    current one is `""` on every worktree packet, so the line is said only when both ends
+    of the comparison are recorded — and never guessed from `packet.head`, which is a
+    BRANCH NAME on the pull-request path."""
+    pr = dict(pr_url="https://github.com/o/r/pull/1", source="pull_request",
+              pr={"title": "t", "body": "b", "state": "OPEN", "draft": False,
+                  "base_ref": "main", "head_ref": "wo-1", "head_sha": "d" * 40,
+                  "additions": 1, "deletions": 0})
+    both = validation.build_packet_prompt(
+        packet(history=({**PRIOR, "head_sha": "a" * 40},), **pr))
+    assert f"Round 1 judged commit `{'a' * 40}`; you are judging `{'d' * 40}`." in both
+
+    # The same packet with the prior sha unrecorded — a worktree round, or one judged
+    # before the column existed. Nothing is said rather than something guessed.
+    assert "you are judging" not in validation.build_packet_prompt(
+        packet(history=(PRIOR,), **pr))
+    # ...and the mirror: a worktree packet binds the CURRENT round to no commit either.
+    assert "you are judging" not in validation.build_packet_prompt(
+        packet(history=({**PRIOR, "head_sha": "a" * 40},)))
+
+
+def test_the_shared_prefix_is_byte_identical_across_two_calls_on_one_packet():
+    """Five seats and the chair share one prefix and the cache is a prefix match, so a
+    renderer that varied by a byte between calls would cost the round six writes."""
+    p = packet(history=(PRIOR,))
+
+    assert validation.build_shared_prefix(p, "proj_a") == \
+        validation.build_shared_prefix(p, "proj_a")
+
+
 def test_a_truncated_diff_is_announced_in_the_prompt_with_the_files_it_dropped():
     """A silently truncated diff read as complete is how a security seat passes the file
     it never opened."""

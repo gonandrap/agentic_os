@@ -648,6 +648,160 @@ def test_a_resubmission_opens_round_two(fleet):
         store.close()
 
 
+def test_round_two_reads_round_one_and_round_one_reads_nothing(fleet):
+    """THE OLD REPLY SHAPE, which is most of production: every opinion stored before this
+    feature is prose, and an injected validator writes prose too. `validation.findings`
+    parses no finding out of one, so the entry falls back to the ROUND ROW's own outcome
+    and reason — which is what the submitter was actually told, and the whole of what a
+    later seat needs in order not to re-litigate it.
+
+    Every positive is paired with the same string being absent from round 1, or "round 2
+    has history" and "the renderer always emits history" are one observation."""
+    wo, validator = _reject_one(fleet)
+    fleet.tick()  # deliver the feedback, so the work order is running again
+
+    fleet.change(wo["id"], "print('one')\nprint('and a test')\n")
+    finish(fleet, wo["id"], summary="fixed")
+    fleet.drain()
+
+    store = fleet.store()
+    try:
+        # FIRST, so that a failure here names its cause: an identical resubmission is
+        # escalated on its fingerprint before the validator is ever called, and the
+        # assertions below would then fail as an IndexError about nothing.
+        assert [r["round"] for r in store.validation_rounds(wo_id=wo["id"])] == [1, 2]
+    finally:
+        store.close()
+    assert [c["round"] for c in validator.calls] == [1, 2]
+
+    first = validation.build_packet_prompt(validator.calls[0]["packet"])
+    second = validation.build_packet_prompt(validator.calls[1]["packet"])
+
+    assert validation.HISTORY_HEADING not in first
+    assert "the tests do not touch the change" not in first
+    assert "Round 1" not in first
+
+    assert validation.HISTORY_HEADING in second
+    assert "Round 1 — rejected" in second
+    assert "the tests do not touch the change" in second, (
+        "round 1's reason, verbatim — the fallback when no opinion parses to a finding")
+    assert "so you do not raise them again" in second
+    assert "What that round said had to change" not in second, (
+        "a prose opinion classifies nothing, and a blocker invented for it would be this "
+        "renderer putting words in a seat's mouth")
+
+
+#: What the fake `claude` answers to each token, so an assertion can name the string it
+#: is about. Read off `testing.FAKE_CLAUDE`'s validation branch rather than restated: a
+#: fixture that drifted from it would make the follow-up assertions below vacuous.
+BLOCKER_DETAIL = "what the tester seat would stop this over"
+FOLLOW_UP_TITLE = "the architect follow-up"
+FOLLOW_UP_DETAIL = "what the architect seat would file rather than argue"
+
+
+def _panel_round(fleet, wo_id: str, code: str, summary: str) -> None:
+    """One round judged by the REAL panel over the fake `claude` — no injected validator,
+    because this test is about what the seats and the chair were actually handed.
+
+    The FORCE tokens ride in `summary`, never in the work order's description: a
+    description is carried into every later round's packet and would re-fire in round 2.
+    """
+    fleet.change(wo_id, code)
+    finish(fleet, wo_id, summary=summary)
+    fleet.drain()
+
+
+def test_a_prior_blocker_reaches_round_two_and_a_prior_follow_up_reaches_nobody(
+        fleet, fake_claude):
+    """THE PIN §5.2.1 EXISTS FOR. `_run_chair` hands the chair the same shared prefix the
+    four seats read, so a follow-up rendered into the packet is a follow-up in front of
+    the chair — sitting directly above the line telling it those remarks are not before
+    it, in exactly the rounds where the failure this feature fixes lives.
+
+    So the assertions below sweep EVERY seat call of round 2, the chair's among them, and
+    read the prefix each was actually handed — `system_prompt_seen`, resolved through the
+    file `claude_cli` writes it to. Checking only the chair's own USER prompt would report
+    green on exactly the leak this is about, because the leak is in the system half.
+    """
+    wo = fleet.dispatch()
+    # TWO SEATS RATHER THAN ONE raising both, because the fake's FORCE branches are
+    # mutually exclusive per seat and that file is not this work order's to edit. The
+    # property is unaffected: the packet has no seat dimension — `history` carries no
+    # seat at all — so which seat a finding came from cannot change what is rendered.
+    _panel_round(fleet, wo["id"], "print('one')\n",
+                 "FORCE_BLOCK_TESTER FORCE_FOLLOWUP_ARCHITECT")
+    fleet.tick()  # deliver the rejection
+    judged_round_one = len(fake_claude.calls)
+
+    _panel_round(fleet, wo["id"], "print('one')\nprint('and a test')\n", "fixed")
+
+    store = fleet.store()
+    try:
+        rounds = store.validation_rounds(wo_id=wo["id"])
+        assert [r["round"] for r in rounds] == [1, 2]
+        assert rounds[0]["outcome"] == "rejected"
+        # Vacuous unless round 1 really raised one of each: the two assertions
+        # below are about strings, and a round that raised nothing has none.
+        replies = "".join(str(o["reply"])
+                          for o in store.validation_opinions(int(rounds[0]["id"])))
+        assert BLOCKER_DETAIL in replies and FOLLOW_UP_DETAIL in replies
+    finally:
+        store.close()
+
+    seat_calls = [c for c in fake_claude.calls[judged_round_one:]
+                  if "# Jarvis validation seat: " in c["argv"][c["argv"].index("-p") + 1]]
+    chair = [c for c in seat_calls
+             if "# Jarvis validation seat: chair" in c["argv"][c["argv"].index("-p") + 1]]
+    assert len(chair) == 1, "no chair call, so the assertions below are about nothing"
+
+    for call in seat_calls:
+        prefix = call["system_prompt_seen"]
+        assert BLOCKER_DETAIL in prefix
+        assert FOLLOW_UP_TITLE not in prefix
+        assert FOLLOW_UP_DETAIL not in prefix
+    chair_prompt = chair[0]["argv"][chair[0]["argv"].index("-p") + 1]
+    assert FOLLOW_UP_TITLE not in chair_prompt
+    assert FOLLOW_UP_DETAIL not in chair_prompt
+
+
+def test_history_lists_only_the_rounds_the_budget_counted(tmp_path):
+    """A `failed` round is an outage or a panel that was never wired in, so its stored
+    reason is about the OS and not about the code, and a `pending` one has no outcome at
+    all. Either rendered under "these points were raised in earlier rounds" would tell
+    five seats something false about the submission.
+
+    Paired with the counted round beside it, or "the builder returns nothing" passes.
+    """
+    store = ProjectStore(tmp_path / "proj")
+    try:
+        wo_id = store.create_work_order("task")["id"]
+        judged = store.open_validation_round(wo_id=wo_id, fingerprint="f1", round=1)
+        store.record_validation_opinion(
+            int(judged["id"]), "tester", status="ok", verdict="reject",
+            reply=json.dumps({"verdict": "reject", "blocking": True, "reason": "r",
+                              "asks": [], "findings": [
+                                  {"severity": "blocker", "title": "MUST-CHANGE",
+                                   "detail": "d"},
+                                  {"severity": "follow_up", "title": "NICE-TO-HAVE",
+                                   "detail": "d"}]}))
+        store.close_validation_round(int(judged["id"]), "rejected", "go again")
+        outage = store.open_validation_round(wo_id=wo_id, fingerprint="f2", round=2)
+        store.close_validation_round(int(outage["id"]), "failed",
+                                     "the reviewer could not be reached")
+        store.open_validation_round(wo_id=wo_id, fingerprint="f3", round=3)
+
+        history = ops.prior_round_history(store, wo_id=wo_id, before=4)
+
+        assert [e["round"] for e in history] == [1]
+        assert history[0]["reason"] == "go again"
+        assert [b["title"] for b in history[0]["blockers"]] == ["MUST-CHANGE"], (
+            "a follow-up in here is a follow-up in front of the chair")
+        # ...and the round being judged is never its own history.
+        assert ops.prior_round_history(store, wo_id=wo_id, before=1) == []
+    finally:
+        store.close()
+
+
 # -- round accounting -----------------------------------------------------------------
 
 

@@ -169,6 +169,20 @@ class EvidencePacket:
     #: hashing it would only make an unchanged submission look new after a spec edit.
     spec_ref: str = ""
     spec_section: str = ""
+    #: WHAT EARLIER ROUNDS OF THIS SAME REVIEW ALREADY ASKED FOR — BLOCKERS ONLY, which
+    #: is what the key inside each entry is called. One entry per prior round:
+    #: `{"round", "outcome", "reason", "head_sha", "blockers"}`, oldest first.
+    #:
+    #: **A FOLLOW-UP MAY NOT ENTER THIS FIELD.** `validation._run_chair` hands the chair
+    #: the SAME shared prefix the four seats read, so anything in here is in front of the
+    #: chair — and a prior round's follow-ups are exactly what the chair is deliberately
+    #: not shown. Spec 2026-09-15-the-panel-blocks-on-blockers.md §5.2.1, which also says
+    #: what that gives up and why the alternative (a prefix of the chair's own) is worse.
+    #:
+    #: Passed in like `side_effects`, never looked up: the entries come from
+    #: `validation_rounds` and `validation_opinions` and this module may not open a store.
+    #: DELIBERATELY NOT in `fingerprint` — §5.5, and that function's exclusion table.
+    history: tuple[dict, ...] = ()
 
 
 def fingerprint(packet: EvidencePacket) -> str:
@@ -194,6 +208,7 @@ def fingerprint(packet: EvidencePacket) -> str:
     | retracts a DIFFERENT knowledge entry     | `side_effects`      | **yes**       |
     | files an assumption it had not filed     | assumption text     | **yes**       |
     | has an assumption ACCEPTED by the user   | assumption `status` | no            |
+    | is judged after an earlier round         | `history`           | no            |
 
     The side-effects row is why the formula widened once. Without it, two consecutive
     diff-less rounds retracting two different entries hash identically, and
@@ -206,6 +221,13 @@ def fingerprint(packet: EvidencePacket) -> str:
     the same reasoning as the rest of the table: the user accepting an assumption is not
     the submitter producing evidence, and hashing it would make an unchanged resubmission
     look new (spec 2026-09-13-two-gates-not-a-chain.md §4).
+
+    The history row is the same rule from the other end: `history` is written by the OS,
+    not by the submitter, and it differs every round BY CONSTRUCTION. Hashing it would
+    make every unchanged resubmission look like new evidence — silently disabling
+    `Daemon._preceding_round`'s repeat guard, which is the one thing here that catches a
+    submitter that changed nothing — and would change the hash of every round already
+    stored (spec 2026-09-15-the-panel-blocks-on-blockers.md §5.5).
 
     **Do not add `head` to this in order to answer "which commit did the panel judge".**
     That question has its own function, `judged_head`, and its own column, because the
@@ -275,11 +297,32 @@ def side_effects_digest(side_effects: Iterable[dict[str, Any]]) -> str:
     return h.hexdigest()
 
 
+def _history(rounds: Iterable[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    """Prior rounds as a packet carries them, normalised HERE so that no caller decides
+    the shape and every packet reads the same whichever collector built it.
+
+    **`severity` is dropped and the key is `blockers`.** The caller has already filtered
+    with `validation.blockers()`; keeping a severity word would invite a later reader to
+    filter again, and the second filter is the one that disagrees with the first —
+    which, for this field, means follow-up text in front of the chair (§5.2.1).
+    """
+    return tuple({
+        "round": int(r.get("round") or 0),
+        "outcome": str(r.get("outcome") or ""),
+        "reason": str(r.get("reason") or ""),
+        "head_sha": str(r.get("head_sha") or ""),
+        "blockers": tuple(
+            {"title": str(b.get("title") or ""), "detail": str(b.get("detail") or "")}
+            for b in (r.get("blockers") or ())),
+    } for r in rounds)
+
+
 def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
                        diff_chars: int = DEFAULT_DIFF_CHARS,
                        spec: dict[str, str] | None = None,
                        side_effects: Iterable[dict[str, Any]] = (),
-                       assumptions: Iterable[dict[str, Any]] = ()) -> EvidencePacket:
+                       assumptions: Iterable[dict[str, Any]] = (),
+                       history: Iterable[dict[str, Any]] = ()) -> EvidencePacket:
     """Assemble the packet for one work order — from its PULL REQUEST when it has one.
 
     The three cases are spec §3's table, and `packet.source` records which one happened.
@@ -301,10 +344,15 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
     declared and written by nothing in the codebase, so it is always NULL; the base comes
     from git, via the pinned ladder, or from the pull request's own refs.
 
-    `spec` is `specs.spec_of`'s result, `side_effects` is `ops.side_effects_of`'s and
-    `assumptions` is `ProjectStore.all_assumptions`'s — all passed in rather than looked
-    up because this module reads a repository and never a database, the same separation
-    that keeps `ProjectRef` a two-line stand-in instead of a `ProjectSpec` import.
+    `spec` is `specs.spec_of`'s result, `side_effects` is `ops.side_effects_of`'s,
+    `assumptions` is `ProjectStore.all_assumptions`'s and `history` is
+    `ops.prior_round_history`'s — all passed in rather than looked up because this module
+    reads a repository and never a database, the same separation that keeps `ProjectRef`
+    a two-line stand-in instead of a `ProjectSpec` import.
+
+    **`history` is empty on the round-opening call and filled on the judging one.**
+    `ops.submit_for_validation` builds a packet only to fingerprint it, and `history` is
+    excluded from that hash, so the two packets differing costs nothing (spec §5.1).
     """
     pr_url = str(wo.get("pr_url") or "")
     pr_data: dict[str, Any] | None = None
@@ -366,6 +414,7 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
             {"n": int(a.get("n") or 0), "content": str(a.get("content") or ""),
              "status": str(a.get("status") or "pending")}
             for a in assumptions),
+        history=_history(history),
     )
 
 
@@ -430,7 +479,8 @@ def _spec_ref(spec: dict[str, str] | None) -> str:
 def collect_feature(project_path: Path, fo: dict[str, Any], children: list[dict[str, Any]],
                     *, declared: str, summary: str = "",
                     diff_chars: int = DEFAULT_DIFF_CHARS,
-                    side_effects: Iterable[dict[str, Any]] = ()) -> EvidencePacket:
+                    side_effects: Iterable[dict[str, Any]] = (),
+                    history: Iterable[dict[str, Any]] = ()) -> EvidencePacket:
     """Assemble the packet for one feature order, from the PROJECT ROOT.
 
     Every child passed its own review on its own diff, so the marginal defect a
@@ -505,6 +555,7 @@ def collect_feature(project_path: Path, fo: dict[str, Any], children: list[dict[
              "summary": str(c.get("result_summary") or ""),
              "declared": str(c.get("declared") or "")}
             for c in children),
+        history=_history(history),
     )
 
 
