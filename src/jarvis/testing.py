@@ -1567,12 +1567,20 @@ def fake_claude(tmp_path, monkeypatch):
 
         @property
         def calls(self) -> list[dict]:
-            """Every invocation, oldest first (one file each; the name is a timestamp)."""
+            """Every invocation, oldest first (one file each; the name is a timestamp).
+
+            `.json` ONLY, and it is load-bearing rather than tidy. Each record is
+            written twice to the same name (see `_write_call_record`), and the second
+            write lands as a COMPLETE `<name>.json.part<pid>` beside the first one's
+            already-renamed `<name>.json` for the instant before `os.replace` runs. A
+            directory listing taken in that instant parses both and reports one
+            invocation as two — which is what a poller does for a living.
+            """
             cdir = fdir / "calls"
             if not cdir.is_dir():
                 return []
             out = []
-            for path in sorted(cdir.iterdir()):
+            for path in sorted(p for p in cdir.iterdir() if p.name.endswith(".json")):
                 try:
                     out.append(json.loads(path.read_text()))
                 except (OSError, json.JSONDecodeError):
