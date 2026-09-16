@@ -201,7 +201,8 @@ def _stamp(ts: float | None) -> str:
 
 
 STATUS_ICON = {
-    "pending": "⏳", "dispatching": "🚀", "running": "🟢", "waiting_input": "🙋",
+    "pending": "⏳", "dispatching": "🚀", "running": "🟢",
+    "idle": "💤", "waiting_input": "🙋",
     "needs_review": "👀", "waiting_pr_merge": "🔀", "completed": "✅", "failed": "❌",
     "cancelled": "🚫",
 }

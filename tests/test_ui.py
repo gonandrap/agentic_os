@@ -1960,6 +1960,22 @@ def test_a_validating_work_order_renders_everywhere_it_appears(client, project):
     assert "under review" in client.get(f"/wo/proj_a/{wo['id']}").text
 
 
+def test_an_idle_manager_renders_everywhere_it_appears(client, project):
+    """The third status added to the vocabulary, under the rule above. It also carries
+    the point of issue #264 onto the page: an idle manager must not read "waiting on
+    you" anywhere, and the work-order page says what it IS waiting for instead."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("coordinate the exporter", kind="manager")
+    store.set_status(wo["id"], "idle")
+
+    for url in ("/", "/project/proj_a", f"/wo/proj_a/{wo['id']}"):
+        res = client.get(url)
+        assert res.status_code == 200, (url, res.status_code)
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert "waiting on you" not in page.lower()
+    assert "idle until its feature sends it something" in page
+
+
 def test_a_validating_feature_order_renders_everywhere_it_appears(client, project):
     store = ProjectStore(project)
     fo = store.create_feature_order("CSV export", description="the whole ask")

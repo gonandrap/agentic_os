@@ -69,7 +69,14 @@ BLOCKED_STATUSES = ("waiting_input", "needs_review", "failed", "pending",
                     # state THEY have: a turn that ended without finishing the work and
                     # nothing in flight behind it (`parked_reason`). Silent otherwise —
                     # a running worker is still not blocked on anything the user can see.
-                    "running", "dispatching")
+                    "running", "dispatching",
+                    # `idle` is here for exactly one blocker and derives no other: a
+                    # message the user or the bus sent a manager that it will never see
+                    # (MESSAGE_STUCK_BLOCKER). Being idle asks nothing of anyone — that
+                    # is the whole of issue #264 — but a feature routes everything
+                    # through its manager, so a message rotting there strands the
+                    # feature silently, which is issue 43 one level up.
+                    "idle")
 # Statuses where nothing can possibly be pending: the work order is over.
 TERMINAL_STATUSES = ("completed", "cancelled")
 
@@ -220,6 +227,11 @@ STALE_FINISH_BLOCKER = ("the worker went back to work after finishing and stoppe
 #: round machine owns that work order and INV-VALIDATION-STRANDED already watches it;
 #: `pending` has no turn to be parked after; `waiting_pr_merge` is waiting on
 #: `Daemon.poll_pull_requests`, which is in flight by definition.
+#:
+#: `idle` is absent because "nothing is in flight" is the DEFINITION of that status
+#: rather than news about it. That absence is what replaced `parked_reason`'s
+#: `kind == "manager"` carve-out: the status now carries the fact the carve-out was
+#: asserting, so a manager in any OTHER status is judged like anything else.
 PARKABLE_STATUSES = ("dispatching", "running", "waiting_input", "needs_review")
 
 #: What a work order says when something the user sent it is still sitting in the queue
@@ -241,8 +253,13 @@ MESSAGE_STUCK_BLOCKER = ("a message you sent is still queued and the worker has 
 #: unrecoverable case is DEAD_DEPENDENCY_BLOCKER's); `validating` for the reason it is
 #: absent from BLOCKED_STATUSES; the terminal pair because INV-ATTENTION-PHANTOM clears
 #: any flag raised there, so the two checks would fight every tick.
-MESSAGE_STUCK_STATUSES = ("dispatching", "running", "waiting_input", "needs_review",
-                          "failed", "waiting_pr_merge")
+#:
+#: `idle` IS here, and it is the one thing an idle manager can still owe the user. It
+#: inherited the coverage rather than gaining it — a manager used to sit in
+#: `waiting_input` — and dropping it while moving the status would have made every stuck
+#: message to a feature's only addressee invisible.
+MESSAGE_STUCK_STATUSES = ("dispatching", "running", "idle", "waiting_input",
+                          "needs_review", "failed", "waiting_pr_merge")
 
 #: The `ops.waiting_on` answers that mean the OS itself will do the next thing, with
 #: nobody typing. A list of what IS coming rather than a second guess at what is not:
@@ -369,15 +386,12 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # steering the user at `jarvis wo resume-auto`, which cannot help. Three of five
     # sampled `jarvis_os` work orders had it.
     #
-    # A MANAGER is the second exception, and it is a stronger one: a project manager
-    # order sits in `waiting_input` for its feature's entire life, because acting on a
-    # message and then going idle is the whole of what it does. Nobody is waiting on the
-    # user for it — there is nothing to type into it — so without this every feature order
-    # in the fleet would carry a permanent false flag, put back by INV-ATTENTION-MISSING
-    # on the tick after `Daemon.settle_work_order` parked it. Narrow on purpose: a manager
-    # in any OTHER status is judged exactly like any other work order, so a failed one
-    # still reaches the user.
-    if wo["status"] == "waiting_input" and wo.get("kind") != "manager" and not auth_parked:
+    # A MANAGER used to be the second exception, on the grounds that it sits in
+    # `waiting_input` for its feature's entire life. It has its own status now (`idle`,
+    # issue #264) and the exception is gone — which fixes a bug the exception was
+    # hiding. A manager reaches `waiting_input` only by asking, so the one case it USED
+    # to suppress was the case that most needed the user: Neo handing its question back.
+    if wo["status"] == "waiting_input" and not auth_parked:
         question = awaiting_neo(wo["id"])
         if question is not None and question["status"] in USER_HELD_Q_STATUSES:
             # Neo handed the decision back. That IS the user's, and it gets a reason
@@ -573,11 +587,11 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
     the catalog read and `waiting_on`'s cross-database question about Neo both sit behind
     the two free row checks. No model, no transcript.
     """
-    if wo.get("origin") in UNGOVERNED_ORIGINS or wo.get("kind") == "manager":
-        # A manager is idle BY DESIGN between its feature's messages, and an injected
-        # session was never briefed on `jarvis wo finish`. `true_blockers` excuses both
-        # above for those reasons; excusing them in one place and not the other would
-        # give every feature order in the fleet a permanent second flag.
+    if wo.get("origin") in UNGOVERNED_ORIGINS:
+        # An injected session was never briefed on `jarvis wo finish`, so a turn of its
+        # that ends without one is not a worker parking mid-task. A manager used to be
+        # excused here too; `idle` is not in PARKABLE_STATUSES, so the status says it
+        # now and the kind does not have to (issue #264).
         return None
     if wo["status"] not in PARKABLE_STATUSES:
         return None
@@ -674,6 +688,10 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     parked = pause_note(store, wo)
     if parked:
         return f"{wo['status']} — {parked}"
+    # Below the pause note above, which names a moment this one cannot: a manager whose
+    # turn was refused IS coming back, and "idle" alone would read as the steady state.
+    if wo["status"] == "idle":
+        return "idle — waiting for a message from its feature"
     # `needs_review` no longer means the panel is waiting for the user: since issue 212
     # the round runs in parallel with the assumption review, and a status that said only
     # "needs_review" would hide the half of the work that is still moving.

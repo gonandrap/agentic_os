@@ -328,8 +328,8 @@ def test_fo_cancel_cancels_the_manager(boot, store):
 # -- 4. settlement ---------------------------------------------------------------------
 
 
-def test_an_idle_manager_settles_to_waiting_input_without_attention(boot, store,
-                                                                    settle_turns):
+def test_an_idle_manager_settles_to_idle_without_attention(boot, store,
+                                                           settle_turns):
     """Idle by design on one side, idle by abandonment on the other, in one settlement
     pass over one feature. Without the manager branch every feature order in the fleet
     would carry a permanent false flag."""
@@ -345,7 +345,7 @@ def test_an_idle_manager_settles_to_waiting_input_without_attention(boot, store,
     daemon.settle_turns(spec, store)
 
     parked = store.get_work_order(manager["id"])
-    assert parked["status"] == "waiting_input"
+    assert parked["status"] == "idle"
     assert not parked["needs_attention"]
 
     idle = store.get_work_order(child["id"])
@@ -357,12 +357,12 @@ def test_an_idle_manager_stays_unflagged_across_a_reconcile_tick(boot, store,
                                                                  settle_turns):
     """Settling it quietly is only half the job: `true_blockers` derives
     "worker is waiting on your input" from the status alone, and INV-ATTENTION-MISSING
-    repairs any unflagged blocked work order — so before the `kind='manager'` exemption
-    the flag came straight back on the very next tick, which is where the user would
+    repairs any unflagged blocked work order — so before the manager had a status of its
+    own the flag came straight back on the very next tick, which is where the user would
     actually have seen it.
 
-    Paired in the same test with an ordinary worker parked in the SAME status, which must
-    still be flagged: the exemption has to buy accuracy, not silence.
+    Paired in the same test with an ordinary worker parked in `waiting_input`, which must
+    still be flagged: `idle` has to buy accuracy, not silence.
     """
     from jarvis.invariants import true_blockers
 
@@ -374,7 +374,7 @@ def test_an_idle_manager_stays_unflagged_across_a_reconcile_tick(boot, store,
     daemon.tick()
     assert settle_turns(store), "the turns never ended"
     daemon.settle_turns(spec, store)
-    assert store.get_work_order(manager["id"])["status"] == "waiting_input"
+    assert store.get_work_order(manager["id"])["status"] == "idle"
 
     parked = ops.create_work_order("proj_a", "an ordinary worker",
                                    description="something")
@@ -389,8 +389,9 @@ def test_an_idle_manager_stays_unflagged_across_a_reconcile_tick(boot, store,
 
 
 def test_a_manager_in_any_other_status_still_reaches_the_user(boot, store):
-    """The exemption is on `waiting_input`, not on the kind. A manager that FAILED is a
-    feature with no addressee left, which is exactly the thing the user has to know."""
+    """The silence is bought by the `idle` status, not by the kind. A manager that FAILED
+    is a feature with no addressee left, which is exactly the thing the user has to
+    know."""
     from jarvis.invariants import true_blockers
 
     daemon = boot(validation=True)
@@ -561,3 +562,167 @@ def test_an_envelope_to_the_manager_role_is_delivered_to_the_manager(boot, store
     delivered = next(e for e in store.envelopes() if e["id"] == envelope_id)
     assert delivered["state"] == "delivered"
     assert delivered["delivered_wo_id"] == manager["id"]
+
+
+# -- 6. `idle`: the status that says so (GitHub issue #264) ----------------------------
+#
+# docs/superpowers/specs/2026-09-16-an-idle-manager-is-not-waiting-on-you.md. Suppressing
+# the attention FLAG was never enough — six surfaces re-derive meaning from the status
+# alone — so these tests are about what each of them now says, not about the flag.
+
+
+def test_an_idle_manager_does_not_read_as_waiting_on_the_user(boot, store, settle_turns):
+    """The eleven hours in the issue were spent reading "Waiting on you" off a status,
+    with the flag already down. Paired with an ordinary `waiting_input` worker, which
+    must still read that way: `idle` has to buy accuracy, not silence."""
+    from jarvis.timeline import STATUS_LABEL
+    from jarvis.ui.app import FEATURED_STATUSES, STATUS_META
+
+    daemon = boot(validation=True)
+    spec = daemon.catalog.project("proj_a")
+    fo_id = release(daemon, "CSV export", "one")
+    manager = store.manager_work_order(fo_id)
+    assert manager is not None
+    daemon.tick()
+    assert settle_turns(store), "the turns never ended"
+    daemon.settle_turns(spec, store)
+
+    fresh = store.get_work_order(manager["id"])
+    assert fresh["status"] == "idle"
+    assert "Waiting on you" not in STATUS_LABEL["idle"]
+    assert "waiting on you" not in STATUS_META["idle"]["word"]
+    assert STATUS_META["idle"]["tone"] != "warn"
+    assert "idle" not in FEATURED_STATUSES, (
+        "the dashboard's needs-me strip is for decisions somebody owes")
+    assert "waiting on you" not in invariants.status_label(store, fresh).lower()
+    # The control, in the same test.
+    assert STATUS_LABEL["waiting_input"] == "Waiting on you"
+
+
+def test_resume_auto_names_the_idle_manager_instead_of_a_permission_prompt(
+        boot, store, settle_turns):
+    """`waiting_on`'s fall-through called it an unanswered permission prompt — impossible
+    under `auto`, where nothing can prompt. And the nudge it offered bought one turn of
+    the manager saying nothing was needed, which is the loop the issue measured at 0.37
+    USD a lap: it must be refused, and no message may be queued."""
+    daemon = boot(validation=True)
+    spec = daemon.catalog.project("proj_a")
+    fo_id = release(daemon, "CSV export", "one")
+    manager = store.manager_work_order(fo_id)
+    assert manager is not None
+    daemon.tick()
+    assert settle_turns(store), "the turns never ended"
+    daemon.settle_turns(spec, store)
+
+    wait = ops.waiting_on(store, store.get_work_order(manager["id"]))
+    assert wait["what"] == "manager_idle"
+    assert not wait["stalled"]
+    assert "permission prompt" not in wait["detail"]
+
+    out = ops.resume_in_auto(manager["id"], project_name="proj_a")
+    assert out["nudged"] is False
+    assert out["waiting_on"] == "manager_idle"
+    assert not store.queued_messages(manager["id"]), "the lap must not be re-run"
+    assert "resume_auto_declined" in [e["kind"] for e in store.list_events(manager["id"])]
+
+
+def test_a_manager_carried_over_in_waiting_input_is_migrated_on_the_first_tick(
+        boot, store, settle_turns):
+    """Every manager alive when this release lands is parked in `waiting_input`, some of
+    them flagged. `settle_turns` is what migrates them, which is why `idle` is in its
+    sweep — and it must take the flag down itself: INV-ATTENTION-PHANTOM clears only
+    terminal rows, so a flag raised under the old status would outlive it for ever."""
+    daemon = boot(validation=True)
+    spec = daemon.catalog.project("proj_a")
+    fo_id = release(daemon, "CSV export", "one")
+    manager = store.manager_work_order(fo_id)
+    assert manager is not None
+    daemon.tick()
+    assert settle_turns(store), "the turns never ended"
+    # Exactly where 0.10.3 left it.
+    store.set_status(manager["id"], "waiting_input")
+    store.flag_attention(manager["id"], "worker is waiting on your input")
+
+    daemon.settle_turns(spec, store)
+
+    fresh = store.get_work_order(manager["id"])
+    assert fresh["status"] == "idle"
+    assert not fresh["needs_attention"]
+
+
+def test_a_manager_whose_question_neo_hands_back_still_reaches_the_user(boot, store):
+    """The bug the old `kind != 'manager'` carve-out was HIDING. A manager reaches
+    `waiting_input` only by asking, so the one case that exemption suppressed was the one
+    that most needed the user: Neo giving the question back."""
+    from jarvis.neo_store import NeoStore
+
+    daemon = boot(validation=True)
+    fo_id = release(daemon, "CSV export", "one")
+    manager = store.manager_work_order(fo_id)
+    assert manager is not None
+    store.set_status(manager["id"], "waiting_input")
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", manager["id"], "Two children conflict — which wins?")
+        neo.mark(q["id"], "escalated")
+    finally:
+        neo.close()
+
+    blockers = invariants.true_blockers(store, store.get_work_order(manager["id"]))
+
+    assert blockers and str(q["id"]) in blockers[0]
+
+
+def test_a_relaunched_manager_settles_back_to_idle(boot, store, settle_turns,
+                                                   fake_claude, monkeypatch):
+    """`idle` is in RETRY_SWEEP_STATUSES because a manager's turn can be refused for the
+    usage limit, and a sweep that skipped it would strand the one work order a feature
+    routes everything through. The relaunch reads `running` while the turn is out — and
+    lands back in `idle`, not in `needs_review`."""
+    from jarvis import worker_session
+
+    monkeypatch.setattr(worker_session, "RATE_LIMIT_MIN_DELAY", 0)
+    daemon = boot(validation=True)
+    spec = daemon.catalog.project("proj_a")
+    fo_id = release(daemon, "CSV export", "one")
+    manager = store.manager_work_order(fo_id)
+    assert manager is not None
+    daemon.tick()
+    assert settle_turns(store), "the turns never ended"
+    daemon.settle_turns(spec, store)
+    assert store.get_work_order(manager["id"])["status"] == "idle"
+    turn = store.create_turn(manager["id"], kind="message", prompt="a child reported")
+    store.finish_turn(turn["id"], "failed",
+                      error="Claude AI usage limit reached|1000000000")
+
+    daemon.retry_paused_turns(spec, store)
+    assert store.get_work_order(manager["id"])["status"] == "running", (
+        "a live turn must not read as 'nothing to act on'")
+    assert settle_turns(store), "the relaunched turn never ran"
+    daemon.settle_work_order(spec, store, store.get_work_order(manager["id"]))
+
+    assert store.get_work_order(manager["id"])["status"] == "idle"
+
+
+def test_a_message_rotting_on_an_idle_manager_still_reaches_the_user(project,
+                                                                    monkeypatch):
+    """The one blocker `idle` may still derive, and the reason it is in BLOCKED_STATUSES
+    and MESSAGE_STUCK_STATUSES at all. A feature routes everything through its manager,
+    so a message the manager will never see strands the feature silently — issue 43 one
+    level up. It inherited this coverage from `waiting_input`; moving the status without
+    moving the coverage would have dropped it."""
+    from jarvis.invariants import MESSAGE_STUCK_BLOCKER, true_blockers
+
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("manage the feature", kind="manager")
+        store.set_status(wo["id"], "idle")  # no session_id: HOLD_NO_SESSION, unaccounted
+        store.queue_message(wo["id"], "a child deferred something to you")
+        # Aged in the ROW, because `stuck_message` reads the clock itself.
+        store.conn.execute("UPDATE wo_messages SET ts=ts-? WHERE wo_id=?",
+                           (90 * 60, wo["id"]))
+
+        assert MESSAGE_STUCK_BLOCKER in true_blockers(store,
+                                                      store.get_work_order(wo["id"]))
+    finally:
+        store.close()

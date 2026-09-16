@@ -1161,9 +1161,38 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
     if wo["status"] == "pending":
         return {"what": "pending", "stalled": False,
                 "detail": "not dispatched yet — no worker exists to nudge"}
+    # THE FALL-THROUGH BELOW USED TO ANSWER FOR THIS ONE, and it was the OS giving a
+    # confident wrong explanation for a state it had created itself: a manager parked
+    # between its feature's messages reached here as `waiting_input` with nothing
+    # running and nothing queued, which is exactly the shape the last line calls a
+    # permission prompt — impossible under `auto` (GitHub issue #264).
+    if wo["status"] == "idle":
+        return {"what": "manager_idle", "stalled": False,
+                "detail": "it is the feature's manager and has nothing to act on — "
+                          "idle until its feature sends it something, which is what "
+                          "this work order is for"}
     return {"what": "prompt", "stalled": True,
             "detail": "nothing else accounts for it: an unanswered permission prompt "
                       "is what is left"}
+
+
+#: The `waiting_on` answers where a nudge is ACTIVELY WRONG rather than merely useless,
+#: mapped to the sentence that says why. They need their own refusal because every other
+#: one below is bought by `could_prompt` being False — so a project running a mode that
+#: CAN prompt would fall through and send the message anyway.
+#:
+#: `message_stuck`: the nudge is `send_message`, another row on the queue that is already
+#: not moving, and `invariants.MESSAGE_STUCK_BLOCKER` sends the user to this command.
+#:
+#: `manager_idle`: the nudge buys a turn whose whole content is the worker saying nothing
+#: was needed, and then the OS parks it back where it was — the loop GitHub issue #264
+#: measured at 0.37 USD a lap.
+NUDGE_IS_WRONG = {
+    "message_stuck": "a nudge cannot help — it is another message on the queue that is "
+                     "already stuck.",
+    "manager_idle": "a nudge cannot help — it buys one turn of the manager saying "
+                    "nothing was needed, and it ends up back here.",
+}
 
 
 def resume_in_auto(wo_id: str, project_name: str | None = None,
@@ -1196,13 +1225,7 @@ def resume_in_auto(wo_id: str, project_name: str | None = None,
     could_prompt = worker_stalls_on_prompts(mode) if mode else True
     out = {"project": name, "wo_id": wo_id, "permission_mode": mode,
            "waiting_on": wait["what"], "diagnosis": wait["detail"]}
-    if not force and wait["what"] == "message_stuck":
-        # THE ONE ANSWER WHERE A NUDGE IS ACTIVELY WRONG rather than merely useless, and
-        # the reason it needs a branch of its own: every other refusal below is bought by
-        # `could_prompt` being False, so a project running a mode that CAN prompt would
-        # fall through to the nudge — and the nudge is `send_message`, another row on the
-        # queue that is already not moving. `invariants.MESSAGE_STUCK_BLOCKER` sends the
-        # user here, so this is the command that has to say what is wrong instead.
+    if not force and wait["what"] in NUDGE_IS_WRONG:
         store = ProjectStore(path)
         try:
             store.add_event(wo_id, "resume_auto_declined",
@@ -1211,8 +1234,8 @@ def resume_in_auto(wo_id: str, project_name: str | None = None,
             store.close()
         out.update({
             "nudged": False, "changed": False,
-            "note": f"a nudge cannot help — it is another message on the queue that is "
-                    f"already stuck. {wait['detail']}. Send one anyway with --force.",
+            "note": f"{NUDGE_IS_WRONG[wait['what']]} {wait['detail']}. Send one anyway "
+                    f"with --force.",
         })
         return out
     if not force and not could_prompt and not wait["stalled"]:

@@ -20,6 +20,15 @@ WO_STATUSES = (
     "pending",       # created, waiting for the project orchestrator to pick it up
     "dispatching",   # claimed by the daemon, worker being spawned
     "running",       # worker session active
+    # A `kind='manager'` order between its feature's messages. Idle-until-messaged is
+    # its designed steady state, not a question, and it used to be parked in
+    # `waiting_input` — which every surface renders "Waiting on you" and which
+    # `ops.waiting_on` could only explain as an unanswered permission prompt. GitHub
+    # issue #264: the user cleared it twice, each nudge bought another turn saying
+    # nothing was needed. A status that lies is the defect; the six `kind != 'manager'`
+    # carve-outs that were paying for it are gone. See
+    # docs/superpowers/specs/2026-09-16-an-idle-manager-is-not-waiting-on-you.md.
+    "idle",
     "waiting_input", # worker asked something / is blocked on the user
     # The worker has claimed the job done and an independent panel is judging the
     # claim (see the validation-panel design). Ordered here rather than appended
@@ -38,8 +47,8 @@ WO_STATUSES = (
     "failed",
     "cancelled",
 )
-OPEN_STATUSES = ("pending", "dispatching", "running", "waiting_input", "validating",
-                 "needs_review", "waiting_pr_merge")
+OPEN_STATUSES = ("pending", "dispatching", "running", "idle", "waiting_input",
+                 "validating", "needs_review", "waiting_pr_merge")
 # Settled: nothing more will happen to these on their own. They are the bulk of an old
 # project's history, so listings collapse them behind a count rather than printing them.
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
@@ -131,6 +140,11 @@ WO_KINDS = ("worker", "planner", "manager")
 # questions, and the split is deliberate rather than drift.
 #
 # NOT what the retry sweep walks either, since issue #259 — see `RETRY_SWEEP_STATUSES`.
+#
+# `idle` is absent on the same reading that keeps `waiting_input` out of `SLOT_STATUSES`:
+# a manager between messages has no turn in flight and draws nothing. It is in
+# RETRY_SWEEP_STATUSES below regardless, because those two tuples answer different
+# questions and issue #259 is the standing example of assuming they do not.
 ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
 
 # Where a paused turn may be relaunched: every status a work order can be sitting in when
@@ -151,7 +165,7 @@ ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
 # which side it belongs on. That is the opposite shape from kn-32434cef's allowlist rule
 # because the failure direction is inverted — there, a status silently allowed through is
 # the danger; here, a status silently left OUT is a work order nothing will ever resume.
-RETRY_SWEEP_STATUSES = ("dispatching", "running", "waiting_input", "validating",
+RETRY_SWEEP_STATUSES = ("dispatching", "running", "idle", "waiting_input", "validating",
                         "needs_review", "failed", "waiting_pr_merge")
 
 # The rest of `WO_STATUSES`, and why a due retry is not run there. `pending` has no turn
@@ -159,12 +173,17 @@ RETRY_SWEEP_STATUSES = ("dispatching", "running", "waiting_input", "validating",
 # and `cancelled` were ENDED BY A PERSON, and relaunching a turn under one would reopen
 # work its owner closed. `failed` is not with them: the OS failed that one, the user did
 # not, and recovering it is the point.
+#
+# `idle` is NOT here, and the direction of the mistake is why: a manager whose turn was
+# refused for the usage limit settles back to `idle` HOLDING A RESUMABLE, DUE PAUSE
+# (`Daemon.settle_work_order` leaves a paused turn's status alone), so a sweep that
+# skipped it would strand the one work order a feature routes all its messages through.
 NOT_RETRIED = ("pending", "completed", "cancelled")
 
 # What spends one of a project's `max_concurrent` slots: a work order whose turn is
 # actually executing, plus the claim that is about to launch one (issue #134).
 #
-# `waiting_input` and `validating` are OUT. Both park a work order on somebody else — a
+# `idle`, `waiting_input` and `validating` are OUT. All three park a work order — a
 # Neo question, a gate, the panel — with no turn in flight and no tokens moving, and
 # counting them meant a project capped at 5 could have one turn running and refuse to
 # claim a sixth order. `dispatching` is IN even though it is transient
