@@ -13,7 +13,12 @@ round machine to act on. It is called; it is never messaged, and it messages nob
         "reason":  str,     # <= 1500 chars, second person, addressed to the submitter,
                             # empty ONLY when the outcome is "passed"
         "seats":   [{"seat", "status", "verdict", "reply", "model", "latency_ms"}, ...],
+        "follow_ups": [{"seat", "title", "detail", "round"}, ...],
     }
+
+`follow_ups` is what the seats raised and judged the work SHIPPABLE WITHOUT. This module
+still messages nobody and writes nothing: `ops` files them against the project's backlog
+(spec §4), and a reader that predates that key must drop it rather than fail on it.
 
 Raising `claude_cli.ClaudeCliError` means total failure: `Daemon._validate_work_order`
 catches it, marks the round `failed` — which `counted_validation_rounds` ignores — and
@@ -31,6 +36,22 @@ exists to save — the mirror of the `taste` seat in Neo's panel. The mandates s
 many words, and `tests/test_validation_seats.py` asserts the prose against the shipped
 markdown: a seat told it can block, by a table that says it cannot, is the exact failure
 this design lineage exists to prevent.
+
+**A FINDING BLOCKS ONLY IF A SEAT SAID IT DOES, AND THE CHAIR SEES NOTHING ELSE OF THE
+SEAT THAT RAISED IT.** `build_chair_prompt` FILTERS BY SEVERITY, NOT BY FIELD: a seat with
+no blocker contributes one neutral line, because `asks` is where a non-blocking reviewer's
+nits live and withholding one channel while rendering the other is not this design.
+Absence is the only enforcement there is — nothing in code can stop a chair rejecting over
+something it can read. The schema is ADDITIVE, and `findings` is the one place severity is
+decided: it reads an unrecognised severity as `follow_up` and then, UNLESS THE REPLY SAID
+`pass` AND NOTHING BLOCKED, synthesises a blocker from `reason` and `asks`. That second step
+keys on the RESULT — and on the ABSENCE OF AGREEMENT rather than the presence of a
+rejection, because `blocked` and `needs changes` are objections `_verdict` cannot read. A
+reply nothing could be read from at all is reported to the chair as SILENCE, never as a seat
+that blocked nothing: that line is a claim, and made about an unread reply it is the one
+claim this module may never make. Every row already in `validation_opinions` is the old
+shape and a model will sometimes answer in it anyway. Spec §3:
+docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
 
 **THIS MODULE IMPORTS NEITHER `neo`, `neo_store`, `panel` NOR `bus`**, function bodies
 included, and a test walks the AST to keep it that way. The two panels share `seats.py` and
@@ -436,25 +457,107 @@ def _pull_request_sections(packet: EvidencePacket) -> list[str]:
     return out
 
 
+#: What the chair is told INSTEAD of the follow-ups. Spec §3.5.
+#:
+#: ABSENCE IS THE ONLY ENFORCEMENT THERE IS. The chair emits `{"outcome": "rejected"}`
+#: freely and no code stops it rejecting over something it can see, so showing it the
+#: follow-up TITLES would not be a weaker version of this design — it would be no design.
+#: That is `arbitrate`'s own argument about itself: a safety rule that lives in prose is a
+#: rule that holds by prompt luck.
+CHAIR_FOLLOW_UP_NOTE = (
+    "# {n} further finding(s) across this panel were classified as follow-ups by the "
+    "seats that raised them\n"
+    "They have been filed as tickets against this project and are not before you. You "
+    "may not reject over them, and you are not being shown them.")
+
+
+#: What a seat that blocked nothing contributes. NOT its verdict word, NOT its `reason`,
+#: NOT its `asks`, NOT a follow-up's title — see `build_chair_prompt`.
+#:
+#: **IT IS A CLAIM, NOT A REDACTION**, which is why `build_chair_prompt` prints it only for
+#: a reply it actually read. Printed over a reply nothing could be read from, it tells the
+#: chair that seat cleared the work — the one direction this module may never fail in.
+NO_BLOCKER_LINE = "(raised nothing that blocks this submission)"
+
+#: And what a seat nothing could be read from contributes instead. `_reply` already calls
+#: an unparseable reply SILENCE, the same reading `arbitrate` has always taken; this says it
+#: out loud rather than inventing a third category the chair's mandate does not cover.
+UNREADABLE_LINE = "(no opinion — the seat replied and nothing in it could be read)"
+
+
+def _chair_section(data: Mapping[str, Any], raised: Sequence[Mapping[str, str]]) -> str:
+    """A BLOCKING seat's opinion as the chair reads it: its blockers, its words to the
+    submitter, and its asks — which the mandates have narrowed to those blockers (§3.1).
+
+    Each part is quoted unchanged. A summariser between the seats and the chair is one
+    more place for the concrete ask a seat wrote to be silently softened — which is why
+    the follow-ups are dropped whole rather than condensed.
+
+    The verdict WORD is not rendered: presence of a blocker is the signal now, and a seat
+    that wrote `pass` beside one would otherwise read as agreement next to its own
+    objection.
+    """
+    lines = [str(data.get("reason") or "(no reason given)").strip()]
+    asks = _asks(data)
+    if asks:
+        lines += ["", "asks:"] + [f"- {a}" for a in asks]
+    lines += ["", f"what it says must change before this ships ({len(raised)}):"]
+    for f in raised:
+        lines += [f"- **{f['title'] or '(untitled)'}**", f"  {f['detail']}"]
+    return "\n".join(lines)
+
+
 def build_chair_prompt(opinions: Sequence[seats.Opinion]) -> str:
-    """The chair's mandate, then every seat's reply verbatim.
+    """The chair's mandate, then what each seat said that it may act on.
 
-    Verbatim rather than summarised: a summariser between the seats and the chair is one
-    more place for the concrete ask a seat wrote to be silently softened.
+    IT USED TO BE `op.raw.strip()` — every seat's whole reply, verbatim — and that is
+    mechanism 1.1 of the spec: the chair read twelve nits and was told a concrete one was
+    reason enough to reject. Spec §3.5:
+    docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
 
-    The submission is NOT in here — it is the shared prefix the chair receives as its
-    system prompt, the same bytes the four seats read minutes earlier, which is what lets
-    the chair's call cache-read rather than write (spec §2).
+    **IT FILTERS BY SEVERITY, NOT BY FIELD, AND THAT DISTINCTION IS THE WHOLE OF IT.**
+    `asks` is where a non-blocking reviewer's nits live today, so withholding the
+    `follow_up` entries of `findings` while still rendering `reason` and `asks` verbatim
+    would leave mechanism 1.1 arriving through a second door — a hopeful version of this
+    design rather than this design. So a seat that raised no blocker contributes ONE
+    NEUTRAL LINE: not its verdict word, not its reason, not its asks, not a follow-up's
+    title. `findings` is the one place severity is decided and this is built from its
+    output; §3.1's fail-safe is what keeps a rejection from vanishing through the filter.
+
+    Normalising here rather than trusting the mandate is deliberate: §3.1 tells a seat
+    with nothing blocking to answer `pass`, and this does not depend on it having done so.
+
+    **THIS GOVERNS THE CHAIR'S USER TURN AND IS NOT THE WHOLE GUARANTEE.** `_run_chair`
+    hands the chair the shared prefix — the packet — as its SYSTEM prompt, the same object
+    the four seats read, so anything that ever puts a follow-up into the packet puts it in
+    front of the chair under a line saying it is not. Nothing here does; §5 is where that
+    pressure arrives and §5.2.1 is the rule that holds it.
     """
     parts = [build_seat_prompt("chair"), "", "# The panel's opinions",
              "Each seat answered blind — none of them saw another's reply, and none of "
              "them saw yours. A seat with no opinion errored or timed out; it abstained, "
              "and silence is never agreement."]
+    filed = 0
     for op in opinions:
-        if op.status == "ok":
-            parts += [f"\n## Seat: {op.seat}", op.raw.strip()]
-        else:
+        if op.status != "ok":
             parts.append(f"\n## Seat: {op.seat}\n(no opinion — the seat {op.status})")
+            continue
+        row = {"seat": op.seat, "status": op.status, "reply": op.raw}
+        data = _reply(row)
+        if not data:
+            # NEVER `NO_BLOCKER_LINE` HERE. A stored `ok` row whose reply will not parse
+            # has said nothing we can characterise, and that line would characterise it —
+            # as having cleared the work. (`seats._run_seat` records such a reply `failed`,
+            # so this arm is the defensive one, reached by a replay over the record.)
+            parts.append(f"\n## Seat: {op.seat}\n{UNREADABLE_LINE}")
+            continue
+        found = findings(row)
+        filed += len(follow_ups(found))
+        raised = blockers(found)
+        parts += [f"\n## Seat: {op.seat}",
+                  _chair_section(data, raised) if raised else NO_BLOCKER_LINE]
+    if filed:
+        parts += ["", CHAIR_FOLLOW_UP_NOTE.format(n=filed)]
     return "\n".join(parts)
 
 
@@ -511,6 +614,115 @@ def _message(reason: str, asks: Sequence[str]) -> str:
         text += "\n\nWhat this needs before it can pass:\n" + "\n".join(
             f"- {a}" for a in asks)
     return text[:REASON_LIMIT]
+
+
+#: The two severities a finding can carry, and the only one that may cost a round.
+#: Spec §3.1: docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
+BLOCKER = "blocker"
+FOLLOW_UP = "follow_up"
+
+#: How long a synthesised blocker's title may be. A finding's title is a backlog item's
+#: title (§4), and the mandates ask the seats for one line under about this.
+TITLE_LIMIT = 100
+
+
+def findings(opinion: Mapping[str, Any]) -> list[dict[str, str]]:
+    """One seat's findings, normalised — and its rejection, however it expressed it.
+
+    Takes the `{"seat", "status", "reply"}` row `arbitrate` takes — a stored
+    `validation_opinions` row — rather than the parsed reply, so the same split replays
+    over the record (spec §3.3). The parameter the spec sketches is named `reply`; the
+    shape it describes in the same paragraph is the row, and `_reply` is what turns one
+    into the other while reading silence as silence.
+
+    TWO STEPS, AND THE SECOND KEYS ON THE RESULT, NEVER ON THE SHAPE OF THE REPLY:
+
+    1. Parse. `findings` usable → normalise it, reading every `severity` that is not
+       exactly `blocker` as `follow_up`. Absent, unusable, or not a list → start from `[]`.
+    2. **If the reply is not readable as an affirmative `pass` and step 1 produced no
+       blocker, synthesise one** from `reason` and `asks`.
+
+    **STEP 2'S CONDITION IS THE ABSENCE OF A PASS, NOT THE PRESENCE OF A REJECTION**, and
+    that is round 2's correction. `_verdict` narrows by prefix, so `rejected` is read — but
+    `blocked`, `needs changes`, `no`, `refuse` and a missing `verdict` key are not, and each
+    is a well-formed JSON objection that would yield no blocker. `build_chair_prompt` would
+    then print `NO_BLOCKER_LINE` over it, telling the chair that seat cleared the work:
+    an objection not merely lost but CONTRADICTED. Asking for a pass instead makes the
+    unreadable word fail toward the round, which is the direction everything else here
+    fails in.
+
+    A reply nothing could be read from at all gets NO synthesis — `{}` in, `[]` out. There
+    is no `reason` to synthesise from, and a blocker invented for a seat that may have
+    passed is a fabrication in the other direction. That case is SILENCE, and
+    `build_chair_prompt` says so rather than claiming the seat blocked nothing.
+
+    **Step 2 IS PHRASED ABOUT THE RESULT BECAUSE EVERY SHAPE-BASED PHRASING OF IT LEAKS,
+    and the shapes that leak are well-formed.** `reject` with an explicit `"findings": []`,
+    and `reject` with `"severity": "critical"` (off-vocabulary, so read as `follow_up`),
+    both parse cleanly and both yield no blocker. Keyed on "the key was missing" they slip
+    through `build_chair_prompt`'s filter and are rendered to the chair as a seat that
+    raised nothing — a rejection, disappeared. Spec §3.1.
+
+    **THE ASYMMETRY BETWEEN THE TWO STEPS IS THE WHOLE DESIGN.** An unreadable `severity`
+    means the seat DID classify and we merely cannot read its word, so its finding is filed
+    — the mirror of `_raised`'s permissive `bool()` pointing the other way, because this
+    flag points AWAY from a rejection. An unreadable `verdict` is the opposite: the seat is
+    not agreeing, and only agreement may let something through. What this feature suppresses
+    is the classification of FINDINGS, never of verdicts.
+
+    One consequence to expect rather than be surprised by: a seat that rejects over a
+    finding whose severity word we could not read produces BOTH a filed follow-up and a
+    synthesised blocker. That is bounded to this case and it errs toward one extra round,
+    which is the direction this design fails in everywhere else.
+    """
+    data = _reply(opinion)
+    out = _parsed_findings(data)
+    if data and _verdict(str(data.get("verdict") or "")) != "pass" and not blockers(out):
+        out.append(_synthesised(str(data.get("reason") or ""), _asks(data)))
+    return out
+
+
+def _parsed_findings(data: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Step 1: what the seat actually classified, or `[]` if it classified nothing we can
+    read. An entry with neither a title nor a detail says nothing and is not a finding."""
+    raw = data.get("findings")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        title = str(item.get("title") or "").strip()
+        detail = str(item.get("detail") or "").strip()
+        if not title and not detail:
+            continue
+        severity = BLOCKER if item.get("severity") == BLOCKER else FOLLOW_UP
+        out.append({"severity": severity, "title": title, "detail": detail})
+    return out
+
+
+def _synthesised(reason: str, asks: Sequence[str]) -> dict[str, str]:
+    """Step 2's blocker: the seat's rejection, in the seat's own words.
+
+    `_message` is reused rather than reassembled so that what the chair reads here is the
+    same text `arbitrate` would have delivered to the submitter — one rendering of a
+    rejection, not two that can drift.
+    """
+    line = " ".join(reason.split()) or UNSTATED_REJECTION
+    if len(line) > TITLE_LIMIT:
+        line = line[:TITLE_LIMIT - 1].rsplit(" ", 1)[0] + "…"
+    return {"severity": BLOCKER, "title": line, "detail": _message(reason, asks)}
+
+
+def blockers(found: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """The findings that may cost the submitter a round."""
+    return [dict(f) for f in found if f.get("severity") == BLOCKER]
+
+
+def follow_ups(found: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """The findings that may not. PARTITIONS with `blockers` — total and disjoint over
+    any input, normalised or not, so a finding can never be both and never neither."""
+    return [dict(f) for f in found if f.get("severity") != BLOCKER]
 
 
 def arbitrate(opinions: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
@@ -573,6 +785,7 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
     from .paths import ensure_home
 
     round_id = int(round_row["id"])
+    round_no = int(round_row["round"])
     central = CentralStore()
     try:
         project = central.project_name_for_path(store.project_path)
@@ -622,7 +835,8 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
         # produce. Not a transport failure either — the calls happened and the round is a
         # real one — so a human is asked instead.
         return _out("escalated", "nobody could be reached to review this submission, so "
-                                 "the work has not been judged.", opinions)
+                                 "the work has not been judged.", opinions,
+                    round_no=round_no)
 
     forced = arbitrate([{"seat": op.seat, "status": op.status, "reply": op.raw}
                         for op in opinions])
@@ -631,11 +845,12 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
         # saves a call AND buys a rule no prompt can talk itself out of.
         log.info("validation: a veto seat rejected round %s; the chair was not run",
                  round_id)
-        return _out("rejected", forced["reason"], opinions)
+        return _out("rejected", forced["reason"], opinions, round_no=round_no)
 
     if "chair" not in cfg.roster:
         return _out("escalated", "this panel has no chair, so nothing could turn the "
-                                 "seats' opinions into a verdict.", opinions)
+                                 "seats' opinions into a verdict.", opinions,
+                    round_no=round_no)
 
     chair = _run_chair(store, round_id, packet, opinions, cfg, project, prefix)
     opinions = [*opinions, chair]
@@ -645,26 +860,53 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
     if outcome == "passed":
         # `reason` is emptied rather than trusted: the contract says a pass carries none,
         # and a passing round's reason is read as feedback wherever it is rendered.
-        return _out("passed", "", opinions)
+        return _out("passed", "", opinions, round_no=round_no)
     if outcome == "rejected":
-        return _out("rejected", reason or UNSTATED_REJECTION, opinions)
+        return _out("rejected", reason or UNSTATED_REJECTION, opinions,
+                    round_no=round_no)
     # No verdict this machine knows — an unparseable reply, or a word nobody defined.
     # FAILS TOWARD THE USER, never toward a pass.
     return _out("escalated", reason or "the review could not reach a verdict on this "
-                                       "submission.", opinions)
+                                       "submission.", opinions, round_no=round_no)
 
 
-def _out(outcome: str, reason: str, opinions: Sequence[seats.Opinion]) -> dict[str, Any]:
-    """The contract's three keys, and the reason capped where the contract caps it.
+def _out(outcome: str, reason: str, opinions: Sequence[seats.Opinion], *,
+         round_no: int) -> dict[str, Any]:
+    """The contract's keys, and the reason capped where the contract caps it.
 
     The verdict is narrowed HERE as well as in `_record`, and that is not belt-and-braces:
     the round machine re-records every seat from this list, and it asserts the store's
     vocabulary. A word this module accepted but the store refuses would raise in the
     daemon, after the judgement had been paid for.
+
+    `follow_ups` is the fourth key and NOTHING READS IT YET — the daemon takes `outcome`,
+    `reason` and `seats` and drops the rest, which is what makes the severity split
+    shippable before the filing that consumes it (spec §3.7). The panel still messages
+    nobody and writes no backlog row: it returns the list and `ops` files it.
     """
     return {"outcome": outcome, "reason": reason[:REASON_LIMIT],
             "seats": [{**op.summary(), "verdict": _verdict(op.verdict), "reply": op.raw}
-                      for op in opinions]}
+                      for op in opinions],
+            "follow_ups": _follow_ups(opinions, round_no)}
+
+
+def _follow_ups(opinions: Sequence[seats.Opinion], round_no: int) -> list[dict[str, Any]]:
+    """Every seat's follow-ups, flattened, each carrying the seat and round that raised it.
+
+    THE CHAIR IS EXCLUDED, and not because it has no `findings` key to read. A chair
+    finding would be a chair-originated judgement, which its own mandate forbids it in as
+    many words — filing one as a ticket would let in by the back door exactly what "A
+    CONCERN OF YOUR OWN IS NOT A FINDING" keeps out of the verdict.
+    """
+    out: list[dict[str, Any]] = []
+    for op in opinions:
+        if op.seat == "chair":
+            continue
+        row = {"seat": op.seat, "status": op.status, "reply": op.raw}
+        out += [{"seat": op.seat, "title": f["title"], "detail": f["detail"],
+                 "round": round_no}
+                for f in follow_ups(findings(row))]
+    return out
 
 
 def _verdict(word: str) -> str:

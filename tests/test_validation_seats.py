@@ -33,6 +33,17 @@ def text(seat: str) -> str:
     return (SEAT_DIR / f"{seat}.md").read_text()
 
 
+def flat(seat: str) -> str:
+    """One mandate with its line wrapping collapsed, for asserting on a SENTENCE.
+
+    A mandate is hard-wrapped prose, so a sentence's line break moves whenever a word
+    before it changes. An assertion written against one wrapping fails on an edit that
+    changed nothing it was about — and the cheapest way out of that failure is to weaken
+    the assertion to a fragment that no longer says what it meant.
+    """
+    return " ".join(text(seat).split())
+
+
 def packet(**kw) -> EvidencePacket:
     base = dict(
         unit="work_order", subject_id="wo-1", title="Add the thing",
@@ -117,7 +128,7 @@ def test_the_prose_and_the_table_name_the_same_two_seats():
 def test_every_non_chair_seat_states_its_strict_json_shape(seat):
     body = text(seat)
 
-    for key in ('"verdict"', '"blocking"', '"reason"', '"asks"'):
+    for key in ('"verdict"', '"blocking"', '"reason"', '"asks"', '"findings"'):
         assert key in body
     assert "STRICT JSON" in body
 
@@ -543,3 +554,690 @@ def test_the_shared_prefix_carries_the_packet_and_no_seats_mandate(store, jarvis
     for seat in VALIDATOR_SEATS:
         assert f"# Jarvis validation seat: {seat}" not in prefix
         assert validation.definition(seat)[1] not in prefix
+
+
+# -- the severity split: the prose ------------------------------------------------------------
+
+#: The three pieces of the severity rules, sliced out of each SHIPPED mandate rather than
+#: retyped here, so the tests compare the four files with each other. The definition and the
+#: where-a-follow-up-goes paragraph are shared by all four; THE TIEBREAKER IS NOT — see
+#: `test_the_tiebreaker_ships_to_exactly_the_two_seats_whose_uncertainty_costs_a_round`.
+BLOCKER_BLOCK_START = "## WHAT MAKES A FINDING A BLOCKER"
+DEFINITION_END = "project, in your words, and the work lands."
+NARROWING_START = "`reason` and `asks` are about your BLOCKERS."
+NARROWING_END = "carried further than the filing."
+TIEBREAKER = ("If you are weighing whether something is worth a round trip, that weighing "
+              "is itself the answer: it is a follow-up.")
+
+
+def _slice(seat: str, start: str, end: str) -> str:
+    body = flat(seat)
+    assert start in body, f"{seat} is missing {start!r}"
+    at = body.index(start)
+    return body[at:body.index(end, at) + len(end)]
+
+
+def blocker_definition(seat: str) -> str:
+    return _slice(seat, BLOCKER_BLOCK_START, DEFINITION_END)
+
+
+def narrowing_rule(seat: str) -> str:
+    return _slice(seat, NARROWING_START, NARROWING_END)
+
+
+def test_the_blocker_definition_ships_in_the_same_words_in_every_non_chair_mandate():
+    """Four seats classifying by four different definitions is four bars, and the one that
+    decides whether the submitter pays a round would be whichever seat spoke."""
+    blocks = {s: blocker_definition(s) for s in NON_CHAIR}
+
+    assert len(set(blocks.values())) == 1, (
+        "the mandates disagree about what a blocker is: " + ", ".join(sorted(blocks)))
+
+
+def test_the_narrowing_of_reason_and_asks_ships_in_the_same_words_too():
+    blocks = {s: narrowing_rule(s) for s in NON_CHAIR}
+
+    assert len(set(blocks.values())) == 1
+
+
+def test_the_tiebreaker_ships_to_exactly_the_two_seats_whose_uncertainty_costs_a_round():
+    """A SAFETY RULE, not a nit (spec §3.2.1). The two veto seats are told the OPPOSITE:
+    when torn about an exposure, BLOCK. `validation.auto_merge` is ON for this project, so a
+    concern classified `follow_up` is filed to the backlog, withheld from the chair entirely
+    — not its text, not its title — and the commit merges UNATTENDED. One sentence copied
+    into four files instead of two is the whole of what a silent fail-open would take here.
+
+    Asserted as a SET rather than per seat, so a fifth copy fails this too: "the tiebreaker
+    is in the architect's mandate" is satisfied by a build where it is in all of them.
+    """
+    carrying = {s for s in NON_CHAIR if TIEBREAKER in flat(s)}
+
+    assert carrying == {"architect", "maintainer"}
+    assert set(validation.VETO_SEATS) & carrying == set(), (
+        "the seat that is told to block when it is torn has been handed the sentence that "
+        "tells it to file instead")
+
+
+def test_the_security_seat_still_blocks_when_it_is_torn_about_an_exposure():
+    """VERBATIM, out of the shipped markdown. This sentence predates the feature and nothing
+    the feature adds may soften or displace it. It is the one rule standing between an
+    uncertain security seat and an unattended merge."""
+    assert ("When you are genuinely torn about something that could expose data or widen "
+            "access, block — being wrong about a rejection costs a round, and being wrong "
+            "about a leak costs the leak.") in flat("security")
+
+
+def test_the_tester_seat_still_states_the_cost_asymmetry_that_makes_it_block():
+    """The tester's equivalent of the rule above: uncertainty resolves toward the rejection,
+    because the two errors do not cost the same."""
+    body = flat("tester")
+
+    assert ("A rejection costs the submitter a round and costs the user nothing; a pass on "
+            "untested work costs whatever the untested path costs when it runs.") in body
+    assert "Block on absence of evidence, not on absence of your preference." in body
+
+
+def test_the_blocker_definition_states_the_default_and_where_a_remark_goes():
+    """STATING THE DEFAULT IS LOAD-BEARING (spec §3.2): a model asked to classify with no
+    stated default classifies toward the graver label, which is the production defect in a
+    new costume."""
+    block = blocker_definition("architect")
+
+    assert "only if the work is not fit to ship without it" in block
+    assert "Everything else is a `follow_up`" in block
+    assert "including everything you would merely have written differently" in block
+    assert "filed as a ticket against this project" in block, (
+        "a seat told its remark is discarded will argue for it instead")
+    assert "not exactly `blocker` is read as `follow_up`" in flat("architect")
+
+
+def test_every_seat_is_told_that_reason_and_asks_NARROW_to_its_blockers():
+    """THE SECOND DOOR, shut in prose as well as in code (spec §3.1). `asks` is where a
+    non-blocking reviewer's nits live today: a seat could answer reject with two follow-ups
+    and two concrete asks, and mechanism 1.1 would arrive intact through a field the
+    severity filter does not read. A schema table alone will not carry that, because it is
+    a change to what the seat was previously told to WRITE."""
+    block = narrowing_rule("architect")
+
+    assert "`reason` and `asks` are about your BLOCKERS" in block
+    assert "lists the concrete changes your `blocker` findings require and nothing else" \
+        in block
+    assert "a follow-up's text belongs in its own finding and nowhere else" in block
+    assert "one remark, one severity" in block
+    assert 'Answer `"verdict": "reject"` if and only if you raised at least one `blocker`' \
+        in block
+    assert 'If nothing you found blocks, answer `"verdict": "pass"`' in block
+
+
+@pytest.mark.parametrize("seat", NON_CHAIR)
+def test_the_severity_rules_sit_next_to_the_output_section(seat):
+    """kn-abb7356b, measured on this very panel: the chair's narration leak was fixed only
+    once the rule was ALSO stated beside the JSON shape. A model attends to what is adjacent
+    to the output format, and the same fix stated elsewhere in the file did not take."""
+    body = flat(seat)
+
+    assert body.index(BLOCKER_BLOCK_START) > body.index("# OUTPUT"), (
+        "the rules drifted above the OUTPUT section, where they were measured not to take")
+
+
+@pytest.mark.parametrize("seat", validation.VETO_SEATS)
+def test_a_veto_seat_needs_a_blocker_to_block_but_may_blocker_without_blocking(seat):
+    """THE IMPLICATION RUNS ONE WAY, and an earlier draft of this work wrote it as an
+    "if and only if" — which deletes row 2 of §3.4's table: a veto seat raising a real
+    blocker it would NOT stop the work over, for the chair to weigh. That path is how these
+    two say something real without spending their veto, and it has always been theirs.
+
+    Their veto itself is untouched (spec §7). What changes is that a concern they would not
+    argue at all stops being an argument and becomes a ticket.
+    """
+    body = flat(seat)
+
+    assert "`blocking` REQUIRES at least one `blocker` finding; a `blocker` does NOT " \
+           "require `blocking`" in body
+    assert "Do not set `blocking` without naming a `blocker`" in body
+    assert 'You may also reject WITHOUT blocking (`"verdict": "reject", "blocking": ' \
+           'false`)' in body, "row 2 of the table the mandate must still offer"
+    assert "a `follow_up` finding — filed rather than argued" in body
+    assert "YOU HOLD A VETO" in body, "the veto is not weakened by this"
+
+
+@pytest.mark.parametrize("seat", ["architect", "maintainer"])
+def test_a_non_veto_seat_is_told_its_own_failure_mode_is_the_rejection_loop(seat):
+    """These two are where the treadmill lives: they may write a blocker and the chair will
+    weigh it, but a remark the next person could act on next week is a follow-up."""
+    body = flat(seat)
+
+    assert "You may write a `blocker` and the chair will weigh it." in body
+    assert "next week is a `follow_up` — it is filed, it survives, and this work does " \
+           "not wait for it." in body
+    assert "YOU HOLD NO VETO" in body
+
+
+def test_the_chair_no_longer_treats_any_concrete_finding_as_reason_to_reject():
+    """THE SENTENCE THIS FEATURE EXISTS TO DELETE. An LLM reviewer can always produce one
+    more concrete, actionable finding — that is how a turn ends, not a signal about the
+    code — so under that rule rejection is the fixed point and approval is unreachable."""
+    body = flat("chair")
+
+    assert "reason enough to reject" not in body
+    assert "judged the work unfit to ship without it" in body
+    assert "PASS WHEN NO SEAT RAISED A BLOCKER" in body
+    assert "Small findings that nobody would act on do not justify a round trip" in body
+
+
+def test_the_chair_is_told_what_a_seat_that_blocked_nothing_looks_like():
+    """It reads ONE LINE where a seat used to have a reply, and a chair that has not been
+    told why will treat the gap as something to resolve — most likely by asking itself what
+    the seat must have meant, which is a concern of its own wearing a seat's clothes."""
+    body = flat("chair")
+
+    assert "FILTERED BY SEVERITY" in body
+    assert "appears as one line saying so, and nothing else — no verdict word, no " \
+           "message, no asks, no remark of any kind" in body
+    assert "its absence is not something to wonder about" in body
+    assert "errored, timed out, or answered something nothing could be read in" in body
+
+
+def test_the_chair_is_told_what_the_ABSENCE_of_the_follow_up_line_means():
+    """The mandate used to promise "a line at the end says how many there were", and
+    `build_chair_prompt` omits that line entirely at zero. A chair told to expect a line and
+    shown none cannot tell "none were filed" from "the line was dropped", and the whole
+    design rests on it trusting that what it sees is complete.
+
+    Fixed in the mandate rather than by printing a zero line, because the mandate can state
+    BOTH cases and a zero line can only state one — and "they have been filed as tickets"
+    is false prose when nothing was.
+    """
+    body = flat("chair")
+
+    assert "When any were filed, a line at the END of the opinions says how many; when " \
+           "that line is absent, none were filed and there is nothing you have not been " \
+           "shown." in body
+
+
+def test_the_chair_is_told_next_to_its_output_shape_that_follow_ups_are_not_before_it():
+    body = flat("chair")
+
+    assert "REJECT ONLY ON A BLOCKER A SEAT RAISED" in body
+    assert body.index("REJECT ONLY ON A BLOCKER A SEAT RAISED") > body.index("# OUTPUT")
+    assert "Remarks the seats filed as follow-ups are not before you" in body
+
+
+def test_the_chair_keeps_every_rule_this_change_must_not_touch():
+    """Spec §3.6's keep-list, asserted as one block: a rewrite of the chair's reject/pass
+    paragraphs is exactly the edit that drops a neighbouring rule by accident."""
+    body = flat("chair")
+
+    for kept in (
+            "A CONCERN OF YOUR OWN IS NOT A FINDING",
+            "never read silence as agreement",
+            "Never name a seat, never narrate a panel, never report a vote",
+            "NAMES NO REVIEWER AND NO COUNT",
+            # BOTH HALVES of the never-name rule (kn-abb7356b): the seat's name, and the
+            # bare name used as an actor, which is the half the eval's own leak test missed.
+            'Not "the maintainer", not "three of them"',
+            '"three seats found nothing wrong, but the maintainer caught',
+            "under about 200 words, and never over 1500 characters",
+            "If you cannot tell, reject",
+            "ASSUMPTION the submitter made that is wrong",
+            "that review is theirs",
+    ):
+        assert kept in body, kept
+
+
+# -- the severity split: the pure helpers -------------------------------------------------
+
+
+def opinion(seat: str = "architect", *, status: str = "ok", raw: str | None = None,
+            **reply) -> dict:
+    """One stored `validation_opinions` row, as `arbitrate` and `findings` both take it."""
+    return {"seat": seat, "status": status,
+            "reply": raw if raw is not None else json.dumps(reply)}
+
+
+def test_findings_normalises_a_seats_reply_into_titles_and_details():
+    found = validation.findings(opinion(
+        verdict="pass", blocking=False, reason="r", asks=[],
+        findings=[{"severity": "blocker", "title": " ops.py files twice ", "detail": "d1"},
+                  {"severity": "follow_up", "title": "t2", "detail": "d2"}]))
+
+    assert found == [{"severity": "blocker", "title": "ops.py files twice",
+                      "detail": "d1"},
+                     {"severity": "follow_up", "title": "t2", "detail": "d2"}]
+
+
+def test_a_severity_nobody_defined_is_filed_and_never_blocks():
+    """THE DIRECTION IS THE WHOLE POINT, and it is the mirror of `_raised`'s permissive
+    `bool()` pointing the opposite way. `blocking` points AT a rejection, so reading it
+    loosely costs one round; `severity` points AWAY from one, so reading it loosely costs
+    the treadmill this feature exists to remove.
+
+    The verdict here is `pass`, so step 2 does not fire and this measures step 1 alone.
+    """
+    found = validation.findings(opinion(verdict="pass", findings=[
+        {"severity": "BLOCKER", "title": "shouting", "detail": "d"},
+        {"severity": "blocker ", "title": "trailing space", "detail": "d"},
+        {"severity": "critical", "title": "a word nobody defined", "detail": "d"},
+        {"severity": None, "title": "no severity at all", "detail": "d"},
+        {"title": "no severity key at all", "detail": "d"},
+    ]))
+
+    assert [f["severity"] for f in found] == ["follow_up"] * 5
+    assert validation.blockers(found) == []
+    assert len(validation.follow_ups(found)) == 5
+
+
+def test_only_the_exact_word_blocker_may_cost_the_submitter_a_round():
+    """The negative control of the row above: a test that only proves malformed severities
+    file would be satisfied by a helper that never returns a blocker at all."""
+    found = validation.findings(opinion(verdict="pass", findings=[
+        {"severity": "blocker", "title": "t", "detail": "d"}]))
+
+    assert validation.blockers(found) == [{"severity": "blocker", "title": "t",
+                                           "detail": "d"}]
+    assert validation.follow_ups(found) == []
+
+
+@pytest.mark.parametrize("reply", [
+    {"verdict": "pass", "reason": "nothing here blocks"},
+    {"verdict": "pass", "findings": "not a list"},
+    {"verdict": "pass", "findings": ["a bare string, not a finding"]},
+    {"verdict": "pass", "findings": [{"severity": "blocker"}]},
+])
+def test_a_passing_reply_without_usable_findings_yields_none_rather_than_raising(reply):
+    """Step 1 alone, on a seat that did not reject. An entry with neither a title nor a
+    detail says nothing and is not a finding; none of these shapes raises."""
+    assert validation.findings(opinion(**reply)) == []
+
+
+@pytest.mark.parametrize("row", [
+    {"status": "abstained", "raw": ""},
+    {"status": "failed", "raw": "the seat timed out"},
+    {"status": "ok", "raw": "on reflection this is a hard one"},
+])
+def test_a_seat_that_said_nothing_usable_raises_no_findings(row):
+    """Silence is not a finding, and neither is prose that will not parse. `_reply` already
+    draws that line for `arbitrate`; this reads it through the same door. Note it also
+    stops step 2 firing: there is no verdict to read, so nothing is synthesised either."""
+    assert validation.findings(opinion(**row)) == []
+
+
+def test_blockers_and_follow_ups_partition_every_finding():
+    """TOTAL AND DISJOINT, asserted over the mixed case rather than over each half alone: a
+    finding that fell into both would be argued AND filed, and one that fell into neither
+    would vanish between the chair and the backlog with nothing looking wrong."""
+    found = validation.findings(opinion(verdict="pass", findings=[
+        {"severity": "blocker", "title": "b1", "detail": "d"},
+        {"severity": "follow_up", "title": "f1", "detail": "d"},
+        {"severity": "nonsense", "title": "f2", "detail": "d"}]))
+
+    blocking = validation.blockers(found)
+    filed = validation.follow_ups(found)
+
+    assert len(blocking) + len(filed) == len(found) == 3
+    assert [f["title"] for f in blocking] == ["b1"]
+    assert [f["title"] for f in filed] == ["f1", "f2"]
+
+
+# -- the severity split: the fail-safe, one test per input it has ---------------------------
+#
+# Spec §3.1 step 2: IF the verdict is `reject` AND step 1 produced no blocker, synthesise
+# one. Three inputs reach that rule and each is missed on its own, so each gets its own
+# named case — a guard asking whether SOME rejection synthesised a blocker is satisfied by
+# the easiest of them.
+
+
+def test_a_rejection_with_no_findings_key_at_all_still_reaches_the_chair_as_a_blocker():
+    """THE UN-UPGRADED SEAT. Every row already in `validation_opinions` is this shape, and
+    a model will sometimes answer in it anyway. This is what makes §2.2's additivity
+    promise literally true rather than nearly true."""
+    found = validation.findings(opinion(
+        verdict="reject", blocking=False,
+        reason="your change is not covered by the evidence you declared",
+        asks=["add a case for the empty packet"]))
+
+    assert [f["severity"] for f in found] == ["blocker"]
+    assert found[0]["title"] == "your change is not covered by the evidence you declared"
+    assert "add a case for the empty packet" in found[0]["detail"]
+
+
+def test_a_rejection_with_an_explicit_empty_findings_list_still_reaches_the_chair():
+    """WELL-FORMED AND IT PARSES. A rule keyed on "the `findings` key was missing" lets
+    this through, the severity filter then renders the seat as having raised nothing, and
+    its rejection disappears. That is why step 2 is a statement about the RESULT."""
+    found = validation.findings(opinion(
+        verdict="reject", reason="this should not land as written", asks=["fix it"],
+        findings=[]))
+
+    assert [f["severity"] for f in found] == ["blocker"]
+    assert found[0]["title"] == "this should not land as written"
+
+
+def test_a_rejection_whose_only_finding_has_an_unreadable_severity_still_reaches_the_chair():
+    """THE THIRD INPUT, and the one where the two steps pull apart on purpose: the
+    off-vocabulary finding is FILED, because the seat did classify and we merely cannot read
+    its word — and the rejection is ALSO heard, because `verdict` is a different field with
+    an unambiguous value. One extra round, never a lost defect."""
+    found = validation.findings(opinion(
+        verdict="reject", reason="I could not classify this but it must not land",
+        asks=["resolve it"],
+        findings=[{"severity": "critical", "title": "unreadable", "detail": "d"}]))
+
+    assert [f["severity"] for f in found] == ["follow_up", "blocker"]
+    assert validation.follow_ups(found)[0]["title"] == "unreadable"
+    assert validation.blockers(found)[0]["title"] == \
+        "I could not classify this but it must not land"
+
+
+@pytest.mark.parametrize("word", ["reject", "rejected", "REJECTED", "Rejected",
+                                 "blocked", "needs changes", "no", "refuse", ""])
+def test_any_verdict_that_is_not_an_affirmative_pass_still_reaches_the_chair(word):
+    """ROUND 2's FINDING, AT ITS FULL WIDTH. The review named `"rejected"`; that one was
+    already safe, because `_verdict` narrows by PREFIX. The words that were not are
+    `blocked`, `needs changes`, `no`, `refuse` and a missing `verdict` key — each a
+    well-formed JSON objection that produced no blocker and was then printed to the chair
+    under `NO_BLOCKER_LINE`, which says that seat cleared the work.
+
+    So step 2 asks for the ABSENCE OF A PASS rather than the presence of a rejection. Both
+    halves are parametrised here: the four spellings that always worked are pinned so a
+    future tightening of `_verdict` cannot quietly drop them, and the five that did not are
+    the regression.
+    """
+    found = validation.findings(opinion(
+        verdict=word, reason="this must not land as written", asks=["fix it"]))
+
+    assert [f["severity"] for f in found] == ["blocker"], (
+        f"a seat answering {word!r} was read as raising nothing")
+    assert found[0]["title"] == "this must not land as written"
+
+
+@pytest.mark.parametrize("word", ["pass", "passed", "PASS", "Passed"])
+def test_an_affirmative_pass_is_the_one_answer_that_synthesises_nothing(word):
+    """The negative control of the row above, and the reason step 2's condition is an
+    absence rather than a catch-all: a helper that synthesised for EVERY verdict would
+    satisfy every case there and would block every passing submission in the fleet."""
+    assert validation.findings(opinion(verdict=word, reason="all fine", asks=[])) == []
+
+
+def test_a_reply_nothing_can_be_read_in_synthesises_nothing_either():
+    """The other boundary of the same condition. There is no `reason` to synthesise from,
+    and a blocker invented for a seat that may well have passed is a fabrication pointing
+    the other way. That case is silence, and `build_chair_prompt` reports it as silence."""
+    assert validation.findings(opinion(status="ok", raw="not json at all")) == []
+    assert validation.findings(opinion(status="ok", raw="{}")) == []
+
+
+def test_a_rejection_that_already_carries_a_blocker_synthesises_nothing():
+    """THE NEGATIVE CONTROL of the three above. A fail-safe that fired on every rejection
+    would satisfy all of them and would double every honest seat's blocker."""
+    found = validation.findings(opinion(
+        verdict="reject", reason="r", asks=["a"],
+        findings=[{"severity": "blocker", "title": "the real one", "detail": "d"},
+                  {"severity": "follow_up", "title": "filed", "detail": "d"}]))
+
+    assert [f["title"] for f in validation.blockers(found)] == ["the real one"]
+
+
+def test_a_passing_seat_never_has_a_blocker_synthesised_for_it():
+    """The other negative control: step 2 keys on the verdict, so a seat that did not
+    reject must come back with exactly what it classified and nothing added."""
+    found = validation.findings(opinion(
+        verdict="pass", reason="nothing here blocks", asks=[],
+        findings=[{"severity": "follow_up", "title": "filed", "detail": "d"}]))
+
+    assert validation.blockers(found) == []
+    assert [f["title"] for f in found] == ["filed"]
+
+
+def test_a_synthesised_title_is_one_line_a_backlog_could_carry():
+    """`title` is a backlog item's title (§4). A rejection reason runs to two or three
+    sentences, so the untrimmed one would be a paragraph in a title column."""
+    found = validation.findings(opinion(
+        verdict="reject", reason="word " * 80, asks=[]))
+
+    assert len(found[0]["title"]) <= validation.TITLE_LIMIT
+    assert "\n" not in found[0]["title"]
+    assert found[0]["title"].endswith("…")
+
+
+def test_a_rejection_with_no_words_at_all_still_synthesises_a_blocker():
+    """The fail-safe's own fail-safe: a seat that rejected and wrote nothing must still be
+    heard as a rejection, not read as one that raised nothing."""
+    found = validation.findings(opinion(verdict="reject"))
+
+    assert [f["severity"] for f in found] == ["blocker"]
+    assert found[0]["title"] == validation.UNSTATED_REJECTION
+
+
+# -- the severity split: what the chair is shown -------------------------------------------
+
+
+def said(seat: str, **reply) -> seats.Opinion:
+    return seats.Opinion(seat=seat, raw=json.dumps(reply), status="ok")
+
+
+def test_the_chair_reads_a_seats_blockers_and_never_its_follow_ups():
+    """MECHANISM 1.1 OF THE SPEC, closed. `build_chair_prompt` used to interpolate
+    `op.raw.strip()` — the whole reply — so the chair read every nit and was told a concrete
+    one was reason enough to reject.
+
+    ABSENCE IS THE ONLY ENFORCEMENT THERE IS (spec §3.5): nothing in code stops the chair
+    rejecting over something it can see, so showing it the follow-up titles would not be a
+    weaker version of this design, it would be no design.
+    """
+    prompt = validation.build_chair_prompt([said(
+        "maintainer", verdict="reject", blocking=False,
+        reason="your change leaves the next reader guessing", asks=["name the case"],
+        findings=[{"severity": "blocker", "title": "BLOCKER_TITLE",
+                   "detail": "BLOCKER_DETAIL"},
+                  {"severity": "follow_up", "title": "FOLLOWUP_TITLE",
+                   "detail": "FOLLOWUP_DETAIL"}])])
+
+    assert "BLOCKER_TITLE" in prompt and "BLOCKER_DETAIL" in prompt
+    assert "your change leaves the next reader guessing" in prompt
+    assert "name the case" in prompt
+    assert "FOLLOWUP_TITLE" not in prompt and "FOLLOWUP_DETAIL" not in prompt
+
+
+def test_a_seat_that_blocked_nothing_contributes_one_line_and_not_its_asks():
+    """THE FILTER IS BY SEVERITY, NOT BY FIELD — the correction this section turns on.
+    `asks` is where a non-blocking reviewer's nits live today, so a prompt that withheld the
+    follow-up ENTRIES while still rendering `reason` and `asks` verbatim would hand the
+    chair the same two concrete actionable asks and leave mechanism 1.1 fully intact,
+    arriving through a second door.
+
+    Every channel of that seat is asserted absent. The seat still FILLED `asks` here — that
+    is the point: a seat writing its nits there anyway is the shape the filter must survive,
+    and a fixture with an empty `asks` would prove nothing about the second door.
+    """
+    prompt = validation.build_chair_prompt([said(
+        "architect", verdict="pass", blocking=False,
+        reason="REASON_TEXT nothing here is unsafe",
+        asks=["ASKS_TEXT rename the helper", "ASKS_TEXT share it with ops"],
+        findings=[{"severity": "follow_up", "title": "FOLLOWUP_TITLE",
+                   "detail": "FOLLOWUP_DETAIL"}])])
+
+    assert "## Seat: architect\n" + validation.NO_BLOCKER_LINE in prompt
+    assert "ASKS_TEXT" not in prompt, "the second door: a follow-up seat's asks"
+    assert "REASON_TEXT" not in prompt
+    assert "FOLLOWUP_TITLE" not in prompt and "FOLLOWUP_DETAIL" not in prompt
+    section = prompt.split("## Seat: architect\n")[1].split("\n#")[0].strip()
+    assert section == validation.NO_BLOCKER_LINE, (
+        "one line and NOTHING else — not the verdict word either: a seat that blocked "
+        f"nothing has nothing before the chair at all, and this one has {section!r}")
+
+
+def test_the_chair_is_told_how_many_follow_ups_it_is_not_being_shown():
+    """Counted across the whole panel, and PAIRED with its negative: a prompt that always
+    carried the line would satisfy "the chair is told", and the sentence would stop meaning
+    anything the round it mattered."""
+    filed = validation.build_chair_prompt([
+        said("architect", verdict="pass", findings=[
+            {"severity": "follow_up", "title": "t1", "detail": "d"}]),
+        said("maintainer", verdict="pass", findings=[
+            {"severity": "follow_up", "title": "t2", "detail": "d"},
+            {"severity": "blocker", "title": "t3", "detail": "d"}])])
+    none = validation.build_chair_prompt([
+        said("architect", verdict="pass", findings=[
+            {"severity": "blocker", "title": "t3", "detail": "d"}])])
+
+    assert "2 further finding(s)" in filed
+    assert "You may not reject over them" in filed
+    assert "further finding(s)" not in none, (
+        "an empty heading is a thing a model reasons about")
+
+
+def test_an_un_upgraded_seats_rejection_still_reaches_the_chair_in_full():
+    """§3.1's fail-safe, seen from the chair's end: an old-shape reject arrives as a blocker
+    carrying its reason and its asks. Without step 2 the severity filter would render this
+    seat as having raised nothing — a rejection made invisible by the fix for a different
+    problem."""
+    prompt = validation.build_chair_prompt([said(
+        "tester", verdict="reject", blocking=False,
+        reason="you declared a suite this diff does not contain",
+        asks=["add a case for the empty packet"])])
+
+    assert validation.NO_BLOCKER_LINE not in prompt
+    assert "you declared a suite this diff does not contain" in prompt
+    assert "add a case for the empty packet" in prompt
+
+
+def test_an_unreadable_reply_is_reported_as_silence_and_never_as_having_blocked_nothing():
+    """ROUND 2's FINDING. `NO_BLOCKER_LINE` is a CLAIM, not a redaction: printed over a
+    reply nothing could be read from, it tells the chair that seat cleared the work. Before
+    this feature such a reply reached the chair as its raw text; losing the text is the
+    design, but stating the opposite of it is a fail-open.
+
+    `seats._run_seat` records an unparseable reply `failed`, so the second row here is the
+    defensive one — reached by a replay over a stored `ok` row. Both must read as silence,
+    which is what `_reply` and `arbitrate` have always called it, and neither may read as
+    its own prose: that would reopen the channel this filter closes, for exactly the replies
+    least likely to be well behaved.
+    """
+    prompt = validation.build_chair_prompt([
+        seats.Opinion(seat="tester", raw="", status="failed", replied=True),
+        seats.Opinion(seat="security", raw="PROSE_MARKER I could not read the diff",
+                      status="ok")])
+
+    assert "## Seat: tester\n(no opinion — the seat failed)" in prompt
+    assert "## Seat: security\n" + validation.UNREADABLE_LINE in prompt
+    assert "PROSE_MARKER" not in prompt
+    assert validation.NO_BLOCKER_LINE not in prompt, (
+        "a reply nobody could read was reported as a seat that found nothing blocking")
+
+
+# -- the severity split: what `decide` returns ---------------------------------------------
+
+
+def chair_prompt_of(fake) -> str:
+    """The user turn the chair was actually sent this round."""
+    return next(c["argv"][c["argv"].index("-p") + 1] for c in fake.calls
+                if "-p" in c["argv"]
+                and "# Jarvis validation seat: chair"
+                in c["argv"][c["argv"].index("-p") + 1])
+
+
+def test_decide_returns_the_follow_ups_the_seats_raised_and_the_chair_never_saw(
+        store, jarvis_home, fake_claude):
+    """END TO END through the real panel: the key §4 consumes, and the absence §3.5 rests
+    on, proved on the same round rather than on two hand-built dicts."""
+    wo = store.create_work_order("t")
+    round_row = store.open_validation_round(wo_id=wo["id"], fingerprint="f")
+
+    result = validation.decide(store, round_row,
+                               packet(declared="FORCE_FOLLOWUP_ARCHITECT"),
+                               ValidationConfig(enabled=True))
+
+    assert result["outcome"] == "passed", "a follow-up costs the submitter nothing"
+    assert result["follow_ups"] == [{
+        "seat": "architect", "title": "the architect follow-up",
+        "detail": "what the architect seat would file rather than argue",
+        "round": round_row["round"]}]
+
+    chair = chair_prompt_of(fake_claude)
+    assert "what the architect seat would file rather than argue" not in chair
+    assert "## Seat: architect\n" + validation.NO_BLOCKER_LINE in chair
+    assert "1 further finding(s)" in chair
+
+
+@pytest.mark.parametrize("hook, detail", [
+    ("FORCE_REJECT_ARCHITECT", "test-forced architect concern that blocks nothing"),
+    ("FORCE_EMPTY_FINDINGS_ARCHITECT",
+     "test-forced architect rejection with an empty list"),
+    ("FORCE_ODD_SEVERITY_ARCHITECT",
+     "test-forced architect rejection at an unknown severity"),
+    ("FORCE_ODD_VERDICT_ARCHITECT",
+     "test-forced architect objection worded off-vocabulary"),
+])
+def test_every_shape_of_rejection_reaches_the_chair_through_the_whole_panel(
+        hook, detail, store, jarvis_home, fake_claude):
+    """The four inputs to §3.1's fail-safe, each named, each driven through `decide` rather
+    than through the helper alone — the helper being right does not prove the chair prompt
+    is built from it. The last is round 2's: a verdict word `_verdict` cannot read.
+
+    The second assertion is the one that matters most and it is not about the finding being
+    present: it is that the seat is not described to the chair as having blocked nothing.
+    Losing an objection is bad; telling the chair the objector cleared the work is worse,
+    and only the second assertion can tell those two apart.
+    """
+    wo = store.create_work_order("t")
+    round_row = store.open_validation_round(wo_id=wo["id"], fingerprint="f")
+
+    validation.decide(store, round_row, packet(declared=hook),
+                      ValidationConfig(enabled=True))
+
+    chair = chair_prompt_of(fake_claude)
+    assert detail in chair, f"{hook}: the seat's rejection never reached the chair"
+    assert "## Seat: architect\n" + validation.NO_BLOCKER_LINE not in chair
+
+
+def test_a_rejection_at_an_unreadable_severity_is_both_filed_and_heard(
+        store, jarvis_home, fake_claude):
+    """The duplication §3.1 says to expect rather than be surprised by, pinned end to end so
+    that a later "tidy-up" of it has to be a deliberate act."""
+    wo = store.create_work_order("t")
+    round_row = store.open_validation_round(wo_id=wo["id"], fingerprint="f")
+
+    result = validation.decide(store, round_row,
+                               packet(declared="FORCE_ODD_SEVERITY_ARCHITECT"),
+                               ValidationConfig(enabled=True))
+
+    assert [f["title"] for f in result["follow_ups"]] == \
+        ["the architect unreadable severity"]
+    assert "test-forced architect rejection at an unknown severity" in \
+        chair_prompt_of(fake_claude)
+
+
+def test_a_blocker_is_weighed_by_the_chair_and_filed_against_nothing(
+        store, jarvis_home, fake_claude):
+    """A seat's blocker is the chair's business and NOT the backlog's. A `follow_ups` list
+    that were merely "every finding" would pass the test above and file the blockers too."""
+    wo = store.create_work_order("t")
+    round_row = store.open_validation_round(wo_id=wo["id"], fingerprint="f")
+
+    result = validation.decide(store, round_row,
+                               packet(declared="FORCE_BLOCK_ARCHITECT"),
+                               ValidationConfig(enabled=True))
+
+    assert result["follow_ups"] == []
+    assert "what the architect seat would stop this over" in chair_prompt_of(fake_claude)
+
+
+def test_a_chair_finding_is_never_filed_as_a_follow_up():
+    """A CONCERN OF YOUR OWN IS NOT A FINDING — the chair's own mandate, applied to the
+    backlog too. Paired with a seat in the same list, because an empty result is satisfied
+    just as well by a helper that files nothing at all.
+
+    Reaches the private function on purpose: the shipped chair emits no `findings` key, so
+    the only way to prove the exclusion is a rule rather than an accident of the schema is
+    to hand it one.
+    """
+    findings = [{"severity": "follow_up", "title": "t", "detail": "d"}]
+
+    filed = validation._follow_ups([
+        seats.Opinion(seat="chair", status="ok",
+                      raw=json.dumps({"outcome": "passed", "findings": findings})),
+        seats.Opinion(seat="maintainer", status="ok",
+                      raw=json.dumps({"verdict": "pass", "findings": findings}))], 4)
+
+    assert filed == [{"seat": "maintainer", "title": "t", "detail": "d", "round": 4}]

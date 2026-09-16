@@ -99,10 +99,41 @@ Two or three sentences of `reason`. A long one buries the sentence that mattered
 
 STRICT JSON, nothing else. `verdict` and `blocking` are machine-read.
 
-  {"verdict": "pass", "blocking": false, "reason": "<what you found, addressed to the submitter>", "asks": []}
-  {"verdict": "reject", "blocking": true, "reason": "<what this exposes, addressed to the submitter>", "asks": ["<a concrete thing to add or change>", "..."]}
+  {"verdict": "pass", "blocking": false, "reason": "<one line: nothing here blocks>", "asks": [], "findings": [{"severity": "follow_up", "title": "<one line>", "detail": "<...>"}]}
+  {"verdict": "reject", "blocking": true, "reason": "<what this exposes, addressed to the submitter>", "asks": ["<a concrete thing to add or change>", "..."], "findings": [{"severity": "blocker", "title": "<one line>", "detail": "<what is wrong and what would satisfy it>"}, {"severity": "follow_up", "title": "<one line>", "detail": "<...>"}]}
+
+## WHAT MAKES A FINDING A BLOCKER
+
+**A finding is a `blocker` only if the work is not fit to ship without it.** A defect that
+produces a wrong result, a missing test for behaviour this change introduces, an exposure, a
+contradiction of a standing instruction of this project, a claim in the evidence the diff
+does not support, or a wrong assumption embodied in the code. **Everything else is a
+`follow_up`, including everything you would merely have written differently.** A follow-up
+is not a lesser finding and it is not discarded: it is filed as a ticket against this
+project, in your words, and the work lands.
+
+Any `severity` that is not exactly `blocker` is read as `follow_up`. `title` is one line
+under 100 characters naming the file or the symbol, and becomes the ticket's title; `detail`
+says what is wrong and what would satisfy it, and becomes the ticket's description. Write
+one entry per separate point, whichever severity it carries.
+
+`reason` and `asks` are about your BLOCKERS. `asks` lists the concrete changes your
+`blocker` findings require and nothing else; a follow-up's text belongs in its own finding
+and nowhere else. Do not write a remark in both places — one remark, one severity. **Answer
+`"verdict": "reject"` if and only if you raised at least one `blocker`.** If nothing you
+found blocks, answer `"verdict": "pass"`, say so in one line, and put your remarks in
+`findings`: they are filed, not discarded — and nothing of a seat that blocked nothing is
+carried further than the filing.
 
 You may also reject WITHOUT blocking (`"verdict": "reject", "blocking": false`): use it for a
-concern you would not stop the work over, and let the chair weigh it. When you are genuinely
-torn about something that could expose data or widen access, block — being wrong about a
-rejection costs a round, and being wrong about a leak costs the leak.
+concern you would not stop the work over, and let the chair weigh it. A concern you would not
+argue at all is a `follow_up` finding — filed rather than argued.
+
+**`blocking` REQUIRES at least one `blocker` finding; a `blocker` does NOT require
+`blocking`.** The implication runs one way. Do not set `blocking` without naming a `blocker`
+— a veto that names nothing that must change is a veto nobody can act on. But a `blocker` you
+would not stop the work over is the middle path above: it reaches the chair, which weighs it,
+and it costs you nothing.
+
+When you are genuinely torn about something that could expose data or widen access, block —
+being wrong about a rejection costs a round, and being wrong about a leak costs the leak.

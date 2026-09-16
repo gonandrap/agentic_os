@@ -159,7 +159,7 @@ def test_decide_records_one_opinion_per_seat_and_returns_the_contract_keys(
     assert all(r["reply"] for r in rows), "the raw reply is stored verbatim"
     assert all(r["latency_ms"] >= 0 for r in rows)
 
-    assert set(result) == {"outcome", "reason", "seats"}
+    assert set(result) == {"outcome", "reason", "seats", "follow_ups"}
     assert result["outcome"] == "passed"
     assert result["reason"] == "", "a pass carries no feedback"
     assert {s["seat"] for s in result["seats"]} == set(VALIDATOR_SEATS)

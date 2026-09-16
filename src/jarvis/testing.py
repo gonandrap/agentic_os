@@ -540,20 +540,71 @@ elif "-p" in argv and "--resume" not in argv:
             elif "FORCE_VALIDATION_NO_OUTCOME" in said:
                 reply = {"reason": "a reply with no outcome at all"}
         else:
+            # `findings` IS EXPLICIT AND EMPTY ON THE UNFORCED REPLY, not omitted. Left
+            # out, every test in the suite would exercise the absent-key fallback and
+            # nothing would ever exercise the severity split itself.
             reply = {"verdict": "pass", "blocking": False,
                      "reason": f"the {vseat} question is answered by this change",
-                     "asks": []}
+                     "asks": [], "findings": []}
             if f"FORCE_BLOCK_{vseat.upper()}" in said:
                 # `blocking` true from EVERY seat, veto-holder or not. Arbitration, not
                 # the seat, decides what that forces — which is exactly the row the
                 # architect and maintainer tests need staged.
                 reply = {"verdict": "reject", "blocking": True,
                          "reason": f"test-forced {vseat} objection",
-                         "asks": [f"answer the {vseat} objection"]}
+                         "asks": [f"answer the {vseat} objection"],
+                         "findings": [{"severity": "blocker",
+                                       "title": f"the {vseat} blocker",
+                                       "detail": f"what the {vseat} seat would stop "
+                                                 f"this over"}]}
+            elif f"FORCE_FOLLOWUP_{vseat.upper()}" in said:
+                # THE ONE THE CHAIR MUST NEVER SEE, AND ITS `asks` IS EMPTY ON PURPOSE.
+                # A fake that put the same nit in `asks` as well would make the severity
+                # filter untestable by making the two channels agree — and `asks` is the
+                # second door the filter exists to shut.
+                reply = {"verdict": "pass", "blocking": False,
+                         "reason": f"nothing the {vseat} seat found blocks this",
+                         "asks": [],
+                         "findings": [{"severity": "follow_up",
+                                       "title": f"the {vseat} follow-up",
+                                       "detail": f"what the {vseat} seat would file "
+                                                 f"rather than argue"}]}
+            # THE FOUR INPUTS TO THE BLOCKER FAIL-SAFE, staged separately because each is
+            # missed on its own. All four are a seat NOT AGREEING while classifying no
+            # blocker, and all four must reach the chair as a blocker or the seat's
+            # objection disappears behind the severity filter — worse, the chair is told
+            # that seat cleared the work.
             elif f"FORCE_REJECT_{vseat.upper()}" in said:
+                # (1) THE UN-UPGRADED SEAT: no `findings` key at all. Deliberately left
+                # in the pre-feature shape — every row already in `validation_opinions`
+                # looks like this, and a fixture where nothing does covers none of them.
                 reply = {"verdict": "reject", "blocking": False,
                          "reason": f"test-forced {vseat} concern that blocks nothing",
-                         "asks": []}
+                         "asks": [f"answer the {vseat} concern"]}
+            elif f"FORCE_EMPTY_FINDINGS_{vseat.upper()}" in said:
+                # (2) An explicit EMPTY list: well-formed, parses, classifies nothing.
+                reply = {"verdict": "reject", "blocking": False,
+                         "reason": f"test-forced {vseat} rejection with an empty list",
+                         "asks": [f"answer the empty-list {vseat} concern"],
+                         "findings": []}
+            elif f"FORCE_ODD_SEVERITY_{vseat.upper()}" in said:
+                # (3) A severity nobody defined: read as `follow_up`, so step 1 yields no
+                # blocker even though the reply is complete and confident.
+                reply = {"verdict": "reject", "blocking": False,
+                         "reason": f"test-forced {vseat} rejection at an unknown severity",
+                         "asks": [f"answer the unknown-severity {vseat} concern"],
+                         "findings": [{"severity": "critical",
+                                       "title": f"the {vseat} unreadable severity",
+                                       "detail": f"what the {vseat} seat could not "
+                                                 f"classify"}]}
+            elif f"FORCE_ODD_VERDICT_{vseat.upper()}" in said:
+                # (4) A VERDICT WORD `_verdict` CANNOT READ. It narrows by prefix, so
+                # `rejected` is fine and `blocked` is not — and a rule keyed on "the
+                # verdict is reject" reads this well-formed objection as no objection.
+                reply = {"verdict": "blocked", "blocking": False,
+                         "reason": f"test-forced {vseat} objection worded off-vocabulary",
+                         "asks": [f"answer the off-vocabulary {vseat} objection"],
+                         "findings": []}
         emit_headless(json.dumps(reply))
         sys.exit(0)
     # A SUPERVISOR REVIEW, AND IT IS IDENTIFIED BY THE SYSTEM PROMPT FOR THE REASON THE
