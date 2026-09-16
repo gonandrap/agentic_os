@@ -145,23 +145,38 @@ def test_a_pull_request_with_no_head_oid_at_all_is_not_a_match():
     assert not decide(rnd(), pull=pr(head_oid="")).armed
 
 
-@pytest.mark.parametrize("kw", [
-    {"state": "CLOSED"},
-    {"state": "MERGED"},
-    {"mergeable": "CONFLICTING"},
-    {"mergeable": None},                                   # not computed yet
-    {"merge_state": "UNKNOWN"},
-    {"merge_state": "BLOCKED"},                            # a requirement outstanding
-    {"merge_state": "UNSTABLE"},                           # a non-required check red
-    {"merge_state": "BEHIND"},
-    {"checks": ()},                                        # no checks is not green
-    {"checks": (check("unit", "FAILURE"),)},
-    {"checks": (check("unit", "", "IN_PROGRESS"),)},       # queued is not passed
-    {"checks": (check("unit"), check("evals", "", "QUEUED"))},
+@pytest.mark.parametrize("kw,code", [
+    ({"state": "CLOSED"}, automerge.HELD_PR_CLOSED),
+    ({"state": "MERGED"}, automerge.HELD_PR_CLOSED),
+    ({"mergeable": "CONFLICTING"}, automerge.HELD_NOT_MERGEABLE),
+    ({"mergeable": None}, automerge.HELD_NOT_MERGEABLE),   # not computed yet
+    ({"merge_state": "UNKNOWN"}, automerge.HELD_MERGE_STATE_UNCLEAN),
+    ({"merge_state": "BLOCKED"}, automerge.HELD_MERGE_STATE_UNCLEAN),   # a requirement out
+    ({"merge_state": "UNSTABLE"}, automerge.HELD_MERGE_STATE_UNCLEAN),  # non-required red
+    ({"merge_state": "BEHIND"}, automerge.HELD_MERGE_STATE_UNCLEAN),
+    ({"checks": ()}, automerge.HELD_CHECKS_NOT_GREEN),     # no checks is not green
+    ({"checks": (check("unit", "FAILURE"),)}, automerge.HELD_CHECKS_NOT_GREEN),
+    ({"checks": (check("unit", "", "IN_PROGRESS"),)},      # queued is not passed
+     automerge.HELD_CHECKS_NOT_GREEN),
+    ({"checks": (check("unit"), check("evals", "", "QUEUED"))},
+     automerge.HELD_CHECKS_NOT_GREEN),
 ])
-def test_github_must_positively_say_open_mergeable_green_and_clean(kw):
+def test_github_must_positively_say_open_mergeable_green_and_clean(kw, code):
+    """Each condition holds, and each holds under ITS OWN code (issue #263).
+
+    The code is what `Daemon._note_automerge_held` dedupes on, so one code shared by
+    several conditions means the second condition to hold a commit is filed as a repeat
+    of the first and never reaches the user.
+    """
     decision = decide(rnd(), pull=pr(**kw))
-    assert not decision.armed and decision.code == automerge.HELD_PR_NOT_READY
+    assert not decision.armed and decision.code == code
+
+
+def test_no_two_conditions_share_a_hold_code():
+    """The property behind the row above, asserted where a new condition would break it:
+    `decide`'s tokens are distinct, so the dedupe key can tell any two of them apart."""
+    codes = [v for k, v in vars(automerge).items() if k.startswith("HELD_")]
+    assert len(codes) == len(set(codes))
 
 
 def test_decide_takes_the_predicate_and_re_derives_none_of_it():
@@ -792,6 +807,91 @@ def test_a_held_merge_is_said_once_per_commit_and_never_flags_the_user(
 
     assert len(store.events_of_kind(wo["id"], "automerge_held")) == 1
     assert not store.get_work_order(wo["id"])["attention_reason"]
+
+
+def test_the_hold_the_user_reads_is_the_one_blocking_the_merge_now(started, project,
+                                                                   fake_gh):
+    """ISSUE #263. A hold that CHANGES at one commit is news, and the user reads the
+    newest one: CI was still running, then main moved and the branch stopped merging.
+    Keyed on the code alone, the second hold was filed as a repeat of the first and the
+    user was sent to look at a CI run that had since gone green."""
+    store, wo = arm(started, project, auto_merge=True, judged=JUDGED)
+    fake_gh.set_pr(PR, "OPEN", head_oid=JUDGED, merge_state="CLEAN",
+                   checks=[check("unit (3.13)", "", "IN_PROGRESS")])
+    poll(started, store)
+    assert "CI" in ops.automerge_state(store, store.get_work_order(wo["id"]))["line"]
+
+    # Same commit, CI now green — and main has moved underneath the branch.
+    fake_gh.set_pr(PR, "OPEN", head_oid=JUDGED, checks=GREEN,
+                   mergeable="CONFLICTING", merge_state="DIRTY")
+    poll(started, store)
+
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    assert [db.from_json(e["payload"], {})["code"] for e in held] == [
+        automerge.HELD_CHECKS_NOT_GREEN, automerge.HELD_NOT_MERGEABLE]
+    line = ops.automerge_state(store, store.get_work_order(wo["id"]))["line"]
+    assert "merges cleanly" in line and "CI" not in line
+    # The repair still ran: the hold is a sentence about the pull request, not a claim
+    # on it, and nothing was merged or proposed while the worker was being nudged.
+    assert store.list_approvals(wo["id"]) == []
+    assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
+
+
+def test_a_red_build_refreshes_the_hold_too(started, project, fake_gh):
+    """THE FAILING-CHECKS TWIN, and it is driven rather than reasoned about.
+
+    `poll_pull_requests` repairs on two branches and the poll body runs inside a bare
+    `except Exception: log.exception(...)` — so a mistake on either recording call is
+    swallowed in production and in this suite alike, and the defect being fixed here is
+    exactly a branch that never wrote the record. One branch proven is not two.
+    """
+    store, wo = arm(started, project, auto_merge=True, judged=JUDGED)
+    fake_gh.set_pr(PR, "OPEN", head_oid=JUDGED, checks=GREEN, merge_state="BEHIND")
+    poll(started, store)
+    assert "BEHIND" in ops.automerge_state(store, store.get_work_order(wo["id"]))["line"]
+
+    # Same commit, and now a check has gone red: `elif pr.failing:` owns this tick.
+    fake_gh.set_pr(PR, "OPEN", head_oid=JUDGED, merge_state="BEHIND",
+                   checks=[check("unit (3.13)", "FAILURE"), check("evals")])
+    poll(started, store)
+
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    assert [db.from_json(e["payload"], {})["code"] for e in held] == [
+        automerge.HELD_MERGE_STATE_UNCLEAN, automerge.HELD_CHECKS_NOT_GREEN]
+    line = ops.automerge_state(store, store.get_work_order(wo["id"]))["line"]
+    assert "CI has not finished" in line and "BEHIND" not in line
+    # The nudge went out and the merge did not: recording a hold claims nothing.
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+    assert store.list_approvals(wo["id"]) == []
+    assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
+
+
+@pytest.mark.parametrize("pull", [
+    pr(mergeable="CONFLICTING", merge_state="DIRTY"),
+    pr(checks=(check("unit", "FAILURE"),)),
+])
+def test_a_pull_request_being_repaired_can_never_arm(pull):
+    """What makes `record_only` safe, pinned where a change to either property breaks it:
+    the two shapes `poll_pull_requests` repairs are shapes `decide` refuses. `conflicting`
+    means `mergeable_now` is false and a failing check means `checks_green` is false, so
+    the recording call cannot reach a grant even before the flag stops it."""
+    assert not decide(rnd(), pull=pull).armed
+
+
+def test_a_changed_wording_under_one_code_is_still_a_changed_hold(started, project,
+                                                                  fake_gh):
+    """The half a code cannot carry: one condition, two values, two different things for
+    the user to do. `BEHIND` is a branch to update and `DIRTY` is a conflict to resolve,
+    so the dedupe keys on the sentence as well as the token."""
+    store, wo = arm(started, project, auto_merge=True, judged=JUDGED)
+    for state in ("BEHIND", "DIRTY", "BEHIND"):        # and back: already said, so no row
+        fake_gh.set_pr(PR, "OPEN", head_oid=JUDGED, checks=GREEN, merge_state=state)
+        poll(started, store)
+
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    assert [db.from_json(e["payload"], {})["reason"] for e in held] == [
+        "GitHub reports the merge state as BEHIND, not CLEAN",
+        "GitHub reports the merge state as DIRTY, not CLEAN"]
 
 
 def test_a_worktree_round_binds_nothing_and_so_merges_nothing(started, project,
