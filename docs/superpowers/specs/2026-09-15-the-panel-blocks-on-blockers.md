@@ -194,22 +194,43 @@ two concrete actionable asks — mechanism 1.1, untouched, arriving through a se
   findings are exactly what its `reason` and `asks` describe, so `arbitrate._message(reason,
   asks)` renders the same text to the submitter it renders today (§2.2).
 
-**THE THREE CASES `validation.findings()` MUST HANDLE**, and the middle one is the one a reader
-will get wrong:
+**`validation.findings()` IS TWO STEPS, AND THE SECOND KEYS ON THE OUTCOME, NEVER ON THE SHAPE
+OF THE REPLY.** Getting this wrong is how a rejecting seat disappears.
 
-| the reply | what `findings()` returns |
-|---|---|
-| `findings` present and usable | it, with every non-`"blocker"` severity read as `follow_up` |
-| `findings` absent, unusable, or not a list, **and `verdict` is `reject`** | **ONE synthesised `blocker`**, title and detail from `reason` + `asks` |
-| `findings` absent or unusable, and `verdict` is `pass` | `[]` |
+1. **Parse.** `findings` present and usable → use it, with every `severity` that is not exactly
+   `"blocker"` read as `follow_up`. `findings` absent, unusable, or not a list → start from `[]`.
+2. **Fail safe.** **If `verdict` is `reject` and step 1 produced NO `blocker`, synthesise one**,
+   its title and detail from `reason` + `asks`.
 
-**The synthesis row is a fail-safe and it is not the same question as a malformed severity.** A
-seat that wrote `severity: "nit"` classified its finding and we merely do not know its word —
-read it as `follow_up`. A seat that emitted **no `findings` key at all** has not classified
-anything, so reading its rejection as minor would be the rubber stamp this feature is most at
-risk of. Without this row, §3.5's severity filter would make an un-upgraded rejecting seat
-*invisible to the chair*, which is a hole the field filter did not have. It is also what makes
-§2.2's additivity promise literally true: an un-upgraded seat behaves exactly as it does today.
+Step 2 is written as a statement about the RESULT because every shape-based phrasing of it
+leaks. `verdict: reject` with an explicit `"findings": []`, and `verdict: reject` with
+`severity: "critical"` (off-vocabulary, so read as `follow_up`), are both well-formed replies
+that parse fine and yield no blocker — and under a rule keyed on "the key was missing" they
+would slip through §3.5's filter and be rendered to the chair as *raised nothing that blocks*.
+A seat's rejection would vanish. §3.5 says in as many words that the code must not depend on the
+mandate; this is that rule applied to its own input.
+
+**The asymmetry between the two steps is deliberate.** An unrecognised `severity` word means the
+seat DID classify and we merely cannot read its word, so the finding is filed rather than argued.
+`verdict: reject` is a different field with an unambiguous value: the seat has stated that this
+should not land as written. The classification this feature suppresses is of FINDINGS, not of
+verdicts — so the finding is still filed, and the rejection is still heard.
+
+**Say the cost out loud.** This is the one remaining way a non-veto seat can put something in
+front of the chair without writing a `blocker`: keep answering `reject`. Two things hold it down
+and neither is code — §3.2's mandate telling every seat to answer `pass` when nothing blocks,
+and the fact that what the chair then weighs is *was this seat right to reject*, not *is there
+anything to say*. §6 is what tells us whether that holds. If the eval shows the architect and
+maintainer seats still reflexively answering `reject`, the lever is their mandate, **not** this
+fail-safe — removing it would trade a measurable annoyance for a silently lost defect.
+
+One consequence to expect rather than be surprised by: a seat that rejects over a finding whose
+severity word we could not read produces both a filed follow-up and a synthesised blocker. That
+duplication is bounded to exactly this case and it errs toward one extra round, which is the
+direction this design fails in everywhere else.
+
+Step 2 is also what makes §2.2's additivity promise literally true: an un-upgraded seat — no
+`findings` key at all — behaves exactly as it does today.
 
 ### 3.2 What each seat is told, and where
 
@@ -310,6 +331,13 @@ So, per seat:
   done so, because normalising here is code and the mandate is prose.
 * An abstaining or failed seat is reported exactly as it is today: silence, never agreement.
 
+**THIS FILTER GOVERNS THE CHAIR'S USER TURN, AND IT IS NOT THE ONLY THING THE CHAIR READS.**
+`_run_chair` hands it the shared prefix — the packet — as its SYSTEM prompt, the same object the
+four seats read, so that its call cache-reads rather than writes. Anything that ever puts a
+follow-up into the packet therefore puts it in front of the chair, under a line saying it is
+not. Nothing in this section does; §5 is where that pressure arrives, and §5.2.1 is the rule
+that holds it. If you are extending the packet, that is the constraint you are working under.
+
 In place of the follow-ups, one line:
 
 > `N` further findings across this panel were classified as follow-ups by the seats that raised
@@ -377,12 +405,14 @@ until §4 lands. **That is what makes this work order shippable on its own.**
     by making the two channels agree.
   * Give the default unforced reply an explicit `"findings": []`, or the whole suite exercises
     the absent-key path and nothing exercises the new one.
-  * **Keep one hook that emits the OLD shape deliberately** — `verdict: reject` with `reason`,
-    `asks` and no `findings` key at all — because that is the only way §3.1's synthesis row gets
-    covered, and it is the row that stops an un-upgraded seat's rejection vanishing from the
-    chair's prompt. The existing `FORCE_REJECT_<SEAT>` is the natural home for it; if you
-    upgrade that hook to the new shape instead, add a separate old-shape one and say which is
-    which.
+  * **Three hooks are needed for §3.1 step 2, not one**, because it has three distinct inputs
+    that must all produce a synthesised blocker and each would be missed on its own:
+    `verdict: reject` with **no `findings` key** (the un-upgraded seat); `verdict: reject` with
+    an explicit **empty** `findings` list; and `verdict: reject` with a finding carrying an
+    **off-vocabulary severity** such as `critical`. The existing `FORCE_REJECT_<SEAT>` is the
+    natural home for the first. Whichever way you name them, the test that covers step 2 must
+    name the case it is about — a guard asking whether *some* forced rejection synthesised a
+    blocker is satisfied by the easy one.
 * **`project_store.VALIDATION_VERDICTS` is unchanged.** `record_validation_opinion` asserts
   `verdict in ("pass", "reject", "")` and `validation._verdict` narrows to it in two places.
   Severity is a property of a FINDING, never of a verdict.
@@ -576,20 +606,22 @@ edge is a **merge order, not a behaviour dependency**.
 Everything this renders is already on the record today: `validation_rounds.reason`,
 `validation_rounds.outcome`, `validation_rounds.head_sha` and `validation_opinions.reply`,
 which stores the raw seat JSON verbatim. So the *behaviour* needs nothing from §3. The edge
-exists because this section renders history **per finding** — the blockers raised, the
-follow-ups marked as already raised — and that split is `validation.blockers()` /
-`validation.follow_ups()`, which §3 writes. Writing a second reader here instead would be two
-surfaces rendering the same thing separately, which is how they come to show different things.
+exists because this section renders **only the prior BLOCKERS** (§5.2.1), and telling a blocker
+from a follow-up in a stored reply is `validation.blockers()`, which §3 writes. Writing a second
+reader here instead would be two surfaces rendering the same thing separately — and given what
+§5.2.1 turns on, a second reader that classified even slightly differently would put follow-up
+text into the chair's prompt.
 
-**The renderer reads BOTH shapes — `findings` when present, else the round's `reason` and the
-seat's `asks`** (§2.2). Every opinion already on the record is the old shape, a model will
-sometimes answer in the old shape anyway, and the tests that stage a rejected round with an
-injected validator write prose replies rather than JSON — so the fallback is not a corner, it
-is the path most of the suite takes.
+**Do not write the old-shape fallback yourself.** `validation.findings()` already handles every
+reply shape, including the step-2 fail-safe that synthesises a blocker from `reason` + `asks`
+when a seat rejected without producing one. That case is easy to get wrong in the direction that
+loses a rejection, and it matters here: every opinion already on the record is the old shape, a
+model will sometimes answer in the old shape anyway, and the tests that stage a rejected round
+with an injected validator write prose replies rather than JSON — so it is not a corner, it is
+the path most of the suite takes.
 
-**Backlog ids are out of scope here.** A follow-up is marked as already raised from its own
-`severity`; it does not carry the id of the row §4 filed for it. Joining the two is a
-cross-child read for no gain to a seat.
+**Follow-ups and their backlog ids are both out of scope here**, for the same reason and not two
+— see §5.2.1. Nothing about a prior follow-up enters this packet.
 
 ### 5.1 The field
 
@@ -598,7 +630,9 @@ cross-child read for no gain to a seat.
 
 ```python
 #: What earlier rounds raised and how it was settled. One entry per prior round:
-#: {"round": int, "outcome": str, "reason": str, "head_sha": str, "findings": [...]}
+#: {"round": int, "outcome": str, "reason": str, "head_sha": str, "blockers": [...]}
+#: BLOCKERS ONLY, and the key is named for it: this packet is the shared prefix and the
+#: CHAIR reads it, so a follow-up in here is a follow-up in front of the chair. See §5.2.1.
 history: tuple[dict, ...] = ()
 ```
 
@@ -630,7 +664,36 @@ It must say what it is for, in as many words:
 > of it.
 
 Each entry carries the round number, the outcome, the `reason` the submitter was actually told,
-the blockers raised, and the follow-ups marked as **already filed** so no seat re-raises one.
+and **the blockers raised — and NOTHING about the follow-ups. Not their text, not their titles,
+not a count.**
+
+### 5.2.1 Why history is blockers-only: the chair reads this prefix too
+
+**`_run_chair` passes the shared prefix as the chair's own system prompt** — the same object the
+four seats read, deliberately, so the chair's call cache-*reads* rather than writes
+(`docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md` §2). So the packet is not
+"what the seats see"; it is what **everyone** sees, the chair included.
+
+That makes the obvious version of this section a hole straight through §3.5. If history carried
+prior rounds' follow-ups, then from round 2 onward the chair would read verbatim the remarks
+§3.5 withholds — sitting directly above a line telling it they are not before it. And rounds 2+
+are exactly where the failure measured in §1 lives, so the leak would open precisely where it
+does the most damage, and only §6's paid run would ever find it.
+
+The two ways out are not equal. Giving the chair a different prefix un-shares it and costs the
+round a full extra cache write — the thing
+`2026-09-13-a-round-the-panel-can-afford.md` exists to prevent, and a per-seat exception in
+`build_shared_prefix` is the one edit that silently undoes that spec (§7). Filtering the history
+instead costs nothing and needs no exception: **the follow-ups are simply never in the packet.**
+
+**What is given up, honestly.** A seat can now re-raise a nit that an earlier round already
+produced, because it cannot see that it was raised. That is real, and it is bounded rather than
+open-ended: the re-raised remark is classified `follow_up` again, it does not reject, and §4.4's
+dedupe means it files no second ticket. So the cost is a wasted sentence in one seat's reply,
+paid to keep the chair's prompt honest. Prior **blockers** — the ones that actually cost rounds —
+are still carried, which is the whole of mechanism 1.3's value.
+
+`validation.blockers()` is therefore the only §3 helper this section needs.
 
 ### 5.3 The diff does NOT narrow to a delta
 
@@ -674,13 +737,27 @@ stored. Read that function's exclusion table before going near it, and add a row
 
 ### 5.6 The multi-round property is proved here, free
 
-"Round 2's shared prefix contains round 1's findings" is **structural, not a judgement**: it is
+"Round 2's shared prefix contains round 1's blockers" is **structural, not a judgement**: it is
 provable against the fake `claude` without spending a token, and it belongs in this work order
 rather than in §6's paid battery, whose harness runs exactly one round per case. Stage two
-rounds, assert that the second round's packet prompt contains the first round's finding text and
+rounds, assert that the second round's packet prompt contains the first round's blocker text and
 that the first round's packet prompt contains no history section at all. The negative half is
 what makes it measure anything: "round 2 has history" and "the renderer emits history
 unconditionally" are the same observation without it.
+
+**AND THE PIN §5.2.1 EXISTS FOR, which is the one that must not be left out.** Stage round 1 so
+that a seat raises BOTH a blocker and a follow-up, with distinct greppable text. Then assert, on
+round 2:
+
+* the blocker's text IS in `build_packet_prompt(round_2_packet)`;
+* the follow-up's text is **NOT** in it — not its detail, not its title;
+* the follow-up's text is **NOT** in `build_chair_prompt(...)` for round 2 either, **nor in the
+  shared prefix that call is given as its system prompt**.
+
+The third assertion is the one that catches a regression the first two miss, because the chair
+is handed the same prefix object the seats read. Written as one test with the blocker's presence
+beside the follow-up's absence, so it cannot pass against an empty prompt or a round that never
+ran.
 
 Three things about staging it in `tests/test_validation_loop.py`, which already has every piece:
 
@@ -689,10 +766,11 @@ Three things about staging it in `tests/test_validation_loop.py`, which already 
   the same bytes give you one recorded call and an `IndexError`. Assert the round list first so
   the failure names its cause.
 * **An injected validator never runs `decide`, so a staged round 1's stored opinions are PROSE,
-  not JSON.** That is useful rather than a problem: it exercises the old-shape fallback for
-  free, and proves the renderer falls back to the round row's own `outcome` and `reason`. Do not
-  "fix" the shared helper into emitting JSON — around twenty tests in that file use it. Add a
-  separate local helper for the new-shape test.
+  not JSON.** That is useful rather than a problem: it exercises `findings()`'s fail-safe for
+  free — a prose reply parses to no findings, and a rejecting round must still surface its
+  blocker. Do not "fix" the shared helper into emitting JSON; around twenty tests in that file
+  use it. Add a separate local helper for the new-shape test, which is also the only way to
+  stage the mixed blocker-and-follow-up round the pin above needs.
 * Both shapes need covering, because they are the two that occur in production.
 
 ---
@@ -805,7 +883,10 @@ is allowed to do.
 * **`validation.py` imports neither `neo`, `neo_store`, `panel` nor `bus`**, function bodies
   included.
 * **The shared prefix stays shared.** Anything per-seat added to `build_shared_prefix` un-shares
-  it silently: the tests stay green and the bill quadruples.
+  it silently: the tests stay green and the bill quadruples. Its corollary is a safety rule as
+  well as a cost one — **the chair reads that prefix too**, so the packet can never carry
+  anything §3.5 withholds, and "give the chair its own prefix" is not available as a way out
+  (§5.2.1).
 
 ### 7.1 Calls taken without asking
 
