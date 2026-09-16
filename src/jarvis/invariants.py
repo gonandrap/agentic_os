@@ -1359,16 +1359,27 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
     overwrites no verdict (`NeoStore.supersede` is guarded on the open statuses).
     """
     from .neo_store import USER_HELD_Q_STATUSES, NeoStore
+    from .ops import registered_project_paths
 
     readonly = getattr(store, "readonly", False)
     neo = NeoStore()
     try:
         held = [q for q in neo.list_questions(statuses=USER_HELD_Q_STATUSES)
-                if q["kind"] in ("approval", "plan", "alarm")]
+                if q["kind"] in ("approval", "plan", "alarm", "triage")]
+        # `triage` is the one kind whose subject is not a row in THIS database — it is a
+        # central backlog item, and the question carries no work order at all (issue
+        # #240). So ownership cannot be read off the project store the way the other
+        # three read it, and without this the same question would be reported by every
+        # project on the same tick. Resolved once, and only when there is one to resolve.
+        mine = (registered_project_paths()
+                if any(q["kind"] == "triage" for q in held) else {})
         for q in held:
+            if q["kind"] == "triage" and mine.get(q["project"]) != store.project_path:
+                continue
             moot = {"approval": _stale_approval_question,
                     "plan": _stale_plan_question,
-                    "alarm": _stale_alarm_question}[q["kind"]](store, q)
+                    "alarm": _stale_alarm_question,
+                    "triage": _stale_triage_question}[q["kind"]](store, q)
             if moot is None:
                 continue
             answer, why = moot
@@ -1444,6 +1455,45 @@ def _stale_alarm_question(store: ProjectStore,
         return None
     return (f"SUPERSEDED — alarm {alarm['id']} is {alarm['status']}",
             f"alarm {alarm['id']} was already {alarm['status']}")
+
+
+def _stale_triage_question(store: ProjectStore,
+                           q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) if this priority re-assessment is moot, else None. Issue #240.
+
+    The subject of a `triage` question is the BACKLOG ITEM the filing left behind, not a
+    work order — this is the only kind with no work order behind it at all. So "still
+    live" means that item is still waiting: once the user has promoted it, or dismissed
+    it, or it has gone, nobody can act on the rating any more and the escalation is
+    asking for a ruling that would change nothing.
+
+    A missing item is decisive here, unlike `_stale_alarm_question`, and for the reason
+    that check spells out: the backlog is CENTRAL, so absence means gone rather than
+    "belongs to another project" — the caller has already established this project owns
+    the question before calling.
+    """
+    from . import issues
+    from .central_store import CentralStore
+
+    payload = issues.triage_payload(q)
+    item_id = (payload or {}).get("backlog_id") or ""
+    if not item_id:
+        # A question whose context nobody can parse. `settle_triage` already refuses to
+        # act on one, and closing it here would guess at what it was about.
+        return None
+    central = CentralStore()
+    try:
+        item = central.get_backlog(item_id)
+    finally:
+        central.close()
+    if item is None:
+        return ("SUPERSEDED — the backlog item this was about is gone",
+                f"backlog item {item_id} no longer exists")
+    if item["status"] == "open":
+        return None
+    return (f"SUPERSEDED — backlog item {item_id} is {item['status']}",
+            f"backlog item {item_id} was already {item['status']}, so the rating "
+            f"changes nothing")
 
 
 def check_proposed_remedies_are_live(store: ProjectStore) -> Iterator[Violation]:

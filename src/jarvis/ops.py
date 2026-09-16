@@ -564,13 +564,30 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         inbox = central.unacked_inbox()
         backlog_open = central.list_backlog(status="open")
         for q in escalated_questions:
+            # A `triage` question is the one kind with NO WORKER BEHIND IT (issue #240):
+            # nothing is blocked on the answer, the bug is sitting in the backlog, and
+            # `jarvis neo answer` would try to message a work order that does not exist.
+            # Still listed — an unconfirmed `blocker` the user never hears about is the
+            # failure this whole path exists to avoid — but pointed at the command that
+            # actually resolves it.
+            triage = q.get("kind") == "triage"
+            item_id = ""
+            if triage:
+                from . import issues
+                item_id = (issues.triage_payload(q) or {}).get("backlog_id") or ""
             attention.append({
                 "project": q["project"], "wo_id": q["wo_id"],
-                "title": f"Neo escalated: {q['question'][:80]}",
+                "title": (f"Neo could not confirm a bug's priority: {q['question'][:60]}"
+                          if triage else f"Neo escalated: {q['question'][:80]}"),
                 "status": "neo_escalated",
-                "reason": q.get("answer_reason") or "Neo declined to answer for you",
+                "reason": q.get("answer_reason") or (
+                    "the rating is UNCONFIRMED, so nothing was dispatched and no "
+                    "release was cut" if triage
+                    else "Neo declined to answer for you"),
                 "neo_question_id": q["id"],
-                "decide": f"jarvis neo answer {q['id']} \"…\"",
+                "decide": (f"jarvis backlog promote {item_id}" if item_id else
+                           f"jarvis neo show {q['id']}") if triage else
+                          f"jarvis neo answer {q['id']} \"…\"",
             })
         # Gates Neo sent up. These are the only approval requests that cost the user
         # anything: the rest were decided without them, which is the point.
@@ -669,7 +686,9 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       append_system_prompt: str | None = None,
                       backlog_id: str | None = None,
                       depends_on: list[str] | None = None,
-                      parent_id: str | None = None) -> dict[str, Any]:
+                      parent_id: str | None = None,
+                      issue_url: str | None = None,
+                      issue_priority: str | None = None) -> dict[str, Any]:
     """File a work order. `parent_id` files it UNDER a feature order.
 
     Until now the only way a work order acquired a parent was a plan release, because the
@@ -703,7 +722,8 @@ def create_work_order(project_name: str, title: str, description: str = "",
             title=title, description=description, origin=origin, model=model,
             effort=effort, permission_mode=permission_mode,
             append_system_prompt=append_system_prompt, backlog_id=backlog_id,
-            depends_on=depends_on, parent_id=parent_id,
+            depends_on=depends_on, parent_id=parent_id, issue_url=issue_url,
+            issue_priority=issue_priority,
         )
     except (KeyError, ValueError) as e:
         # A dependency on a work order in another project cannot be honoured — the edge
@@ -3588,6 +3608,16 @@ def neo_review(question_id: int, approved: bool, feedback: str = "",
     finally:
         neo.close()
     forwarded = False
+    # `triage` carries no work order at all (issue #240), so there is nobody to forward a
+    # correction to. Stated rather than left to the lookup below failing: relying on an
+    # accidental `OpsError` is exactly the shape kn-4edb0eb7 warns gets missed, and this
+    # is the command the OS itself tells the user to run. The learning is still recorded
+    # — that is what teaches the rubric.
+    if not approved and q.get("kind") == "triage":
+        return {"question_id": question_id, "review": "corrected",
+                "learning_recorded": learning is not None,
+                "learning_seat": seat or "all seats",
+                "forwarded_to_worker": False}
     if not approved:
         try:
             _, _, wo = find_work_order(q["wo_id"], q["project"])
@@ -3628,6 +3658,16 @@ def _alarm_review_hint(q: dict[str, Any]) -> str:
             else "review it with: jarvis alarms review <al-id>")
 
 
+def _triage_promote_hint(q: dict[str, Any]) -> str:
+    """The command that really decides a bug-priority question. `_alarm_review_hint`'s
+    twin, and best-effort for the same reason: it only ever builds a refusal's tail."""
+    from . import issues
+
+    item_id = (issues.triage_payload(q) or {}).get("backlog_id") or "<bl-id>"
+    return (f"it is queued in the backlog, so promote it with: "
+            f"jarvis backlog promote {item_id}")
+
+
 def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
     """The user answers a question Neo escalated; the answer flows to the worker
     through the same delivery path Neo's answers use."""
@@ -3651,6 +3691,16 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
             raise OpsError(f"neo question {question_id} is a cost alarm, and answering "
                            f"it would message the worker mid-turn — "
                            f"{_alarm_review_hint(q)}")
+        # A TRIAGE QUESTION HAS NO WORKER TO ANSWER EITHER, and for a sharper reason
+        # than the alarm's: its `wo_id` is EMPTY (issue #240), so the delivery below
+        # would look up a work order that was never created. What the user is really
+        # deciding is whether the bug is worth a work order, and that decision is
+        # `jarvis backlog promote`. Refused HERE as well as in the template, because
+        # `jarvis neo answer` reaches this too (kn-4edb0eb7).
+        if q.get("kind") == "triage":
+            raise OpsError(f"neo question {question_id} is a bug-priority "
+                           f"re-assessment, and no work order is waiting on it — "
+                           f"{_triage_promote_hint(q)}")
         neo.record_answer(question_id, answer, answered_by="user")
         neo.review(question_id, approved=True)  # user-authored ⇒ nothing to review
     finally:

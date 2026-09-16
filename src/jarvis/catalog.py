@@ -391,6 +391,38 @@ class InspectConfig:
 DEFAULT_MESSAGING_STUCK_MINUTES = 60
 
 
+# -- the bug lifecycle: what happens to a GitHub issue `jarvis bug report` files. Issue
+# #240, and `docs/superpowers/specs/2026-09-14-a-filed-bug-runs-itself.md`. Per project
+# with a fleet fallback, on `_parse_inspect`'s shape, and the project it is read from is
+# THE ONE THAT WOULD DO THE WORK — never the one that noticed the bug. Any agent in the
+# fleet can run `jarvis bug report`, so the project that pays for the work is the only
+# one whose consent means anything.
+
+#: The label that says the OS has picked an issue up. Wording from issue #240 itself.
+DEFAULT_BUGS_LABEL = "in progress"
+
+
+@dataclass
+class BugsConfig:
+    """How the tracker is labelled while the OS works on a bug it filed.
+
+    WHAT IS NOT HERE IS THE POINT. There is no `auto_work_order` switch: routing is by
+    priority and only by priority (the user's ruling of 2026-09-14 settling issue #240's
+    decision A), and what stops a filing committing the fleet to work is the rubric
+    (`issues.PRIORITY_RUBRIC`) plus Neo re-assessing every `critical`/`blocker` claim —
+    not a catalog key. A key that shipped off would have made that ruling's own
+    "critical and blocker automatically get a work order" unreachable.
+
+    `label` is the whole of the in-progress signal: nothing derives it, and an issue
+    carries it exactly while a live work order is on it (`issues.desired_state`). The
+    priority labels beside it are not configurable — they are the vocabulary itself
+    (`issues.PRIORITY_LABELS`), and a fleet that renamed them would have a tracker its
+    own rubric no longer describes.
+    """
+
+    label: str = DEFAULT_BUGS_LABEL
+
+
 @dataclass
 class MessagingConfig:
     """When a message queued for a worker stops being in flight and becomes a defect.
@@ -544,6 +576,7 @@ class ProjectSpec:
     inspect: InspectConfig = field(default_factory=InspectConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
+    bugs: BugsConfig = field(default_factory=BugsConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -636,6 +669,7 @@ class OsConfig:
     inspect: InspectConfig = field(default_factory=InspectConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
+    bugs: BugsConfig = field(default_factory=BugsConfig)
 
 
 @dataclass
@@ -845,6 +879,31 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
     return cfg
 
 
+def _parse_bugs(raw: Any, base: BugsConfig | None = None,
+                where: str = "os.bugs") -> BugsConfig:
+    """`os.bugs`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    An empty label is refused rather than silently disabling the in-progress signal:
+    `jarvis config set <p> bugs.label ""` is a plausible typo, and a tracker that
+    quietly stopped saying which issues are being worked is the failure issue #240 is
+    about.
+    """
+    base = base or BugsConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    label = str(raw.get("label", base.label) or "").strip()
+    if not label:
+        raise _err(f"{where}.label must not be empty")
+    # SHAPE, not just non-emptiness (review round 1). This string becomes a `gh` argument
+    # (`issues.checked_label` is the layer that cannot be skipped); catching it here is
+    # what lets the message name the key the typo is in.
+    from .issues import LABEL_RE
+    if not LABEL_RE.match(label):
+        raise _err(f"{where}.label must start with a letter or digit and use only "
+                   f"letters, digits, spaces and ._:/- (got {label!r})")
+    return BugsConfig(label=label)
+
+
 def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
                      where: str = "os.messaging") -> MessagingConfig:
     """`os.messaging`, or a project's override of it — field-level, like `_parse_inspect`.
@@ -1051,6 +1110,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         inspect=_parse_inspect(os_raw.get("inspect", {})),
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
+        bugs=_parse_bugs(os_raw.get("bugs", {})),
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")
@@ -1114,6 +1174,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         messaging_cfg = _parse_messaging(
             p.get("messaging", {}), base=os_cfg.messaging,
             where=f"projects[{i}] ({name}).messaging")
+        bugs_cfg = _parse_bugs(
+            p.get("bugs", {}), base=os_cfg.bugs,
+            where=f"projects[{i}] ({name}).bugs")
         projects.append(
             ProjectSpec(
                 name=name,
@@ -1128,6 +1191,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 inspect=inspect_cfg,
                 supervisor=supervisor_cfg,
                 messaging=messaging_cfg,
+                bugs=bugs_cfg,
                 raw=p,
             )
         )
