@@ -1527,7 +1527,12 @@ def jarvis_home(tmp_path, monkeypatch):
     # from 6s to 26s here before this line existed. A test that wants transcripts still
     # sets the variable itself; setting it here only makes the DEFAULT empty rather than
     # whatever the machine is carrying.
-    transcripts = tmp_path / "transcripts"
+    # `claude-projects` and not `transcripts`: four existing fixtures already build their
+    # own tree at `tmp_path / "transcripts"` with a bare `mkdir()`, and a default sharing
+    # that path turns every one of them into a FileExistsError. A test that wants
+    # transcripts still overrides the variable; this only decides where it points when
+    # nobody sets it.
+    transcripts = tmp_path / "claude-projects"
     transcripts.mkdir(exist_ok=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(transcripts))
     return home

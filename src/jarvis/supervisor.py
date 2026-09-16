@@ -51,7 +51,7 @@ AND TWO MORE ARE NOT ABOUT THIS PROJECT AT ALL. `cache-1h-dispatched` and
 `cache-1h-foreign` are the FLEET's remaining one-hour cache writes — every transcript on
 the machine, including sessions no project owns. The work order they hang off carries the
 foreign key and NOTHING else: it is not the exemplar of the number, it did not cause it,
-and it may have nothing to do with it. The two are opposite findings. `cache-1h-dispatched`
+and it may have nothing to do with it. The two are opposite faults. `cache-1h-dispatched`
 says Jarvis's own transport bought the expensive write, which is a DEFECT IN THIS
 CODEBASE and a work order anyone can act on. `cache-1h-foreign` says a person's own
 `claude` did — the remedy is one line in THEIR `~/.claude/settings.json`, which Jarvis

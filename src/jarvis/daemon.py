@@ -257,12 +257,18 @@ REWRITE_INBOX_TITLE = {
         "{project} is paying to re-send conversations whose prompt PREFIX moved",
     inspection.REWRITE_TTL_ALARM:
         "{project} is paying to re-send conversations whose cache entry EXPIRED",
-    # The 1h pair, here rather than in a second dict: both are aggregate cost alarms
-    # raised the same way onto the same queue, and a reader looking for "what does the
-    # inbox say about an alarm" should find one list. ONE PER CAUSE for the reason above,
-    # and here the two titles name different CULPRITS rather than different cures — a row
-    # saying only "the fleet is buying the one-hour cache" sends the reader to the OS when
-    # the answer is their own settings file, or the reverse.
+}
+
+#: The same, for the ONE-HOUR CACHE pair. ITS OWN DICT AND NOT A THIRD AND FOURTH ENTRY
+#: ABOVE: a dict named for one alarm family is a thing a test reads WHOLE — the sibling's
+#: does, asserting its two titles are exactly the two inbox rows a raise produced — so
+#: adding to it silently changes what an existing assertion means. One family, one dict.
+#:
+#: ONE PER CAUSE for `REWRITE_INBOX_TITLE`'s reason, though here the two name different
+#: CULPRITS rather than different cures. A row saying only "the fleet is buying the
+#: one-hour cache" sends the reader to the OS when the answer is their own settings file,
+#: or to their settings file when the answer is a bug in here.
+CACHE_1H_INBOX_TITLE = {
     inspection.CACHE_1H_DISPATCHED_ALARM:
         "Jarvis's OWN turns are buying the one-hour cache write — a transport defect",
     inspection.CACHE_1H_FOREIGN_ALARM:
@@ -3049,7 +3055,7 @@ class Daemon:
                              "reason": alarm.reason, "alarm_id": row["id"]})
             self.central.add_inbox(
                 project=project.name, level="warning",
-                title=REWRITE_INBOX_TITLE[alarm.kind].format(project=project.name),
+                title=CACHE_1H_INBOX_TITLE[alarm.kind],
                 body=f"{alarm.reason}\n"
                      f"The supervisor will look before you have to. "
                      f"Read it with: jarvis alarms show {row['id']}",

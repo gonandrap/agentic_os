@@ -681,14 +681,21 @@ def test_nothing_in_the_module_hard_codes_a_threshold():
     thresholds are policy and they belong in the catalog, so a later change that reaches
     for a literal instead of a setting fails here rather than in review.
 
-    `TTL_5M`/`TTL_1H` are exempt and are the only exemption: they are the two durations
-    Anthropic's cache actually offers, not a number anyone gets to choose.
+    WHAT IS EXEMPT IS EVERYTHING THAT IS NOT A CHOICE. `TTL_5M`/`TTL_1H` are the two
+    durations Anthropic's cache actually offers; `1e6` is the unit its prices are quoted
+    in. Neither is a number anyone gets to set, so neither belongs in a catalog — and
+    listing them here rather than widening the rule is what keeps the rule meaning
+    something. `NAMED_SESSIONS` is the one judgement call in the list: it bounds how much
+    of a list an alarm's prose carries, which is a display decision like
+    `DEFAULT_INSPECT_QUOTE_CHARS` and not a condition anything fires on.
     """
     import ast
     import inspect as stdlib_inspect
 
     tree = ast.parse(stdlib_inspect.getsource(inspection))
-    allowed = {0, 1, 2, 4, 60, 300.0, 3600.0}  # indices, seconds-per-minute, the TTLs
+    allowed = {0, 1, 2, 4, 60, 300.0, 3600.0,   # indices, seconds-per-minute, the TTLs
+               1e6,                             # tokens per million: the price unit
+               inspection.NAMED_SESSIONS}       # a display bound, see the docstring
     literals = {node.value for node in ast.walk(tree)
                 if isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
                 and not isinstance(node.value, bool)}

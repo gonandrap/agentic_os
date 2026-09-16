@@ -48,14 +48,9 @@ def store(started):
 
 @pytest.fixture()
 def transcripts(tmp_path, monkeypatch):
-    """A fake `~/.claude/projects` tree — the only place a foreign session exists.
-
-    The SAME directory `jarvis_home` already points the whole suite at, filled in rather
-    than replaced: a second root here would be one this test set and the daemon did not
-    read, which is the failure mode that makes an isolation fixture worth having.
-    """
+    """A fake `~/.claude/projects` tree — the only place a foreign session exists."""
     root = tmp_path / "transcripts"
-    root.mkdir(exist_ok=True)
+    root.mkdir()
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
 
     def write(session_id: str, rows: list[dict], *, slug: str = "-somewhere") -> None:
@@ -219,10 +214,11 @@ def test_the_inbox_says_which_of_the_two_faults_it_is(started, store, transcript
     store.create_work_order("carrier", status="completed")
     _raise(started, store, transcripts, dispatched=90_000, foreign=900_000)
 
-    titles = [r["title"] for r in started.central.unacked_inbox()]
+    from jarvis import daemon as daemon_mod
 
-    assert any("Jarvis's OWN turns" in t for t in titles)
-    assert any("Hand-opened" in t for t in titles)
+    titles = {r["title"] for r in started.central.unacked_inbox()}
+
+    assert set(daemon_mod.CACHE_1H_INBOX_TITLE.values()) <= titles
     assert len({t for t in titles if "one-hour cache" in t}) == 2
 
 
@@ -437,6 +433,20 @@ def test_the_supervisor_is_told_these_two_are_not_this_projects_fault(started):
 
 
 # -- 4. the guards around the two new kinds --------------------------------------------
+
+
+def test_each_alarm_family_owns_its_own_inbox_titles():
+    """WHY THERE ARE TWO DICTS. A dict named for one family is a thing a test reads
+    WHOLE — `test_rewrite_tax_alarm.test_the_carrier_is_not_flagged_for_attention`
+    asserts its two titles are exactly the two rows a raise produced — so a third entry
+    there silently changes what an existing assertion means. It did, and this pins the
+    separation rather than the accident."""
+    from jarvis import daemon as daemon_mod
+
+    assert set(daemon_mod.CACHE_1H_INBOX_TITLE) == {
+        inspection.CACHE_1H_DISPATCHED_ALARM, inspection.CACHE_1H_FOREIGN_ALARM}
+    assert not (set(daemon_mod.CACHE_1H_INBOX_TITLE)
+                & set(daemon_mod.REWRITE_INBOX_TITLE))
 
 
 def test_a_probe_cannot_be_named_after_one_of_these_alarms():
