@@ -837,6 +837,35 @@ def test_the_hold_the_user_reads_is_the_one_blocking_the_merge_now(started, proj
     assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
 
 
+def test_a_red_build_refreshes_the_hold_too(started, project, fake_gh):
+    """THE FAILING-CHECKS TWIN, and it is driven rather than reasoned about.
+
+    `poll_pull_requests` repairs on two branches and the poll body runs inside a bare
+    `except Exception: log.exception(...)` — so a mistake on either recording call is
+    swallowed in production and in this suite alike, and the defect being fixed here is
+    exactly a branch that never wrote the record. One branch proven is not two.
+    """
+    store, wo = arm(started, project, auto_merge=True, judged=JUDGED)
+    fake_gh.set_pr(PR, "OPEN", head_oid=JUDGED, checks=GREEN, merge_state="BEHIND")
+    poll(started, store)
+    assert "BEHIND" in ops.automerge_state(store, store.get_work_order(wo["id"]))["line"]
+
+    # Same commit, and now a check has gone red: `elif pr.failing:` owns this tick.
+    fake_gh.set_pr(PR, "OPEN", head_oid=JUDGED, merge_state="BEHIND",
+                   checks=[check("unit (3.13)", "FAILURE"), check("evals")])
+    poll(started, store)
+
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    assert [db.from_json(e["payload"], {})["code"] for e in held] == [
+        automerge.HELD_MERGE_STATE_UNCLEAN, automerge.HELD_CHECKS_NOT_GREEN]
+    line = ops.automerge_state(store, store.get_work_order(wo["id"]))["line"]
+    assert "CI has not finished" in line and "BEHIND" not in line
+    # The nudge went out and the merge did not: recording a hold claims nothing.
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+    assert store.list_approvals(wo["id"]) == []
+    assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
+
+
 @pytest.mark.parametrize("pull", [
     pr(mergeable="CONFLICTING", merge_state="DIRTY"),
     pr(checks=(check("unit", "FAILURE"),)),
