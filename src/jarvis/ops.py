@@ -2505,6 +2505,37 @@ def pr_repair_origin(store: ProjectStore, wo_id: str) -> str | None:
     return store.pr_repair_origin(wo_id, tuple(r.name for r in PR_REPAIRS))
 
 
+#: What a relaunched turn may put a work order back into, and the only status that needs
+#: it. `needs_review` is a decision the USER owes — pending assumptions are handled a
+#: branch earlier, so what is left is a red build, a refused panel round, a pull request
+#: closed unmerged — and a usage window reopening answers none of them; parking that in
+#: the merge queue is the silent downgrade Neo question 275 already outlawed for repair
+#: turns. Every other origin is deliberately absent: `waiting_pr_merge` is where the
+#: fallback lands anyway, `failed` and `waiting_input` are the states the relaunch was
+#: meant to LIFT, and returning a work order to one would undo its own recovery.
+RESUMABLE_ORIGINS = ("needs_review",)
+
+
+def resumed_from(store: ProjectStore, wo_id: str, seq: int) -> str | None:
+    """The status `Daemon.retry_paused_turns` took this work order out of for THIS turn.
+
+    The other way the OS moves a work order without being asked, and the counterpart to
+    `pr_repair_origin` above (issue #259). Not episode arithmetic: a resume is one turn,
+    so the origin is spent by the turn that settles and matching on `seq` says so
+    exactly. A `turn_resumed` event from an earlier turn describes a move the OS has
+    already finished with, and reading it here would park a work order in a status it
+    left two turns ago.
+    """
+    events = store.events_of_kind(wo_id, "turn_resumed")
+    if not events:
+        return None
+    payload = db.from_json(events[-1].get("payload"), {}) or {}
+    if payload.get("seq") != seq:
+        return None
+    was = payload.get("was")
+    return was if was in RESUMABLE_ORIGINS else None
+
+
 def _awaiting_merge(wo: dict[str, Any]) -> bool:
     """True when this work order's ending is still a pull request nobody has merged.
 

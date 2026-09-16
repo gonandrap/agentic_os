@@ -1065,19 +1065,30 @@ class Daemon:
                 "seq": turn["seq"], "retried_seq": pause.turn["seq"],
                 "attempt": pause.attempts, "of": pause.max_attempts,
                 "reason": pause.reason,
+                # WHERE THIS TURN CAME FROM, read back by `ops.resumed_from` when it
+                # settles. Recorded here because this is the only moment that knows it.
+                "was": wo["status"],
             })
-            # The turn is out, so the record must stop saying somebody else has it —
-            # the same two lines `_deliver` uses when a message wakes a settled work
-            # order, for the same reason. Two shapes reach this: the auth pause, parked
-            # out of `running` by `_park_on_signin`, and since issue #259 an order that
-            # was already settled when its turn was refused. Running is also the only
-            # honest status for the second: `PR_POLL_STATUSES` deliberately excludes the
-            # in-flight ones so `complete_merged` can never end a work order out from
-            # under a live worker, and `settle_work_order` puts it back on the merge
-            # queue when this turn is done.
+            # The turn is out, so the record must stop saying somebody else has it.
+            # Two shapes reach this: the auth pause, parked out of `running` by
+            # `_park_on_signin`, and since issue #259 an order that was already settled
+            # when its turn was refused.
+            #
+            # `running` IS REQUIRED FOR THE SECOND, not merely tidier. All three statuses
+            # issue #259 added are in `PR_POLL_STATUSES`, which excludes the in-flight
+            # ones precisely so `complete_merged` cannot end a work order out from under
+            # a worker that is still writing to it — so leaving a relaunched order where
+            # it was would put a live turn back in front of that poll.
             if wo["status"] != "running":
                 store.set_status(wo["id"], "running")
-                store.clear_attention(wo["id"])
+                # ONLY THE PAUSE'S OWN FLAG. `_park_on_signin` is the one that raises an
+                # item this relaunch answers; every other reason on a newly-swept row —
+                # assumptions pending review, a red build — is asking for the USER, and
+                # the usage window reopening did not answer it (kn-b6977de3). The
+                # sign-in item has to go, though: `true_blockers` re-derives it from
+                # `waiting_input`, and nothing re-derives it once this row is `running`.
+                if wo["attention_reason"] == invariants_mod.AUTH_BLOCKER:
+                    store.clear_attention(wo["id"])
 
     # -- 3. message delivery ----------------------------------------------------------
 
@@ -2844,7 +2855,13 @@ class Daemon:
                 # beyond the status itself.
                 from . import ops as ops_mod
 
-                back = ops_mod.pr_repair_origin(store, wo["id"]) or "waiting_pr_merge"
+                # `resumed_from` is the same rule as `pr_repair_origin` for the other
+                # way the OS takes a work order out of its status (issue #259): a
+                # relaunched turn must not end by filing the review somebody still owes
+                # as a merge-queue entry. It answers for `needs_review` alone — see it.
+                back = (ops_mod.pr_repair_origin(store, wo["id"])
+                        or ops_mod.resumed_from(store, wo["id"], turn["seq"])
+                        or "waiting_pr_merge")
                 if fresh["status"] != back:
                     store.set_status(wo["id"], back)
                     if back == "waiting_pr_merge":
