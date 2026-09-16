@@ -3230,6 +3230,16 @@ class Daemon:
             return
         log.info("[%s] auto-merged %s — completing %s", project.name, wo["pr_url"],
                  wo_id)
+        if merged["after_merge_cause"]:
+            # THE MERGE LANDED AND THE COMMAND THAT MADE IT DID NOT SUCCEED (issue #253,
+            # spec §5.5). A note on the timeline and nothing else: not `automerge_failed`,
+            # which is a claim about the PULL REQUEST, and no inbox row, because neither
+            # cause needs a person and the work order completes below either way. The
+            # kind comes from the cause — `automerge.AFTER_MERGE_EVENT`'s reason.
+            store.add_event(wo_id,
+                            automerge.AFTER_MERGE_EVENT[merged["after_merge_cause"]], {
+                "head_sha": decision.judged_sha, "approval_id": approval["id"],
+                "reason": merged["after_merge_error"], "pr_url": wo.get("pr_url")})
         # No `merged_at`: that column holds GITHUB's `mergedAt`, and this path has not
         # asked GitHub anything since the merge. The `automerge_merged` event's own
         # timestamp is when it landed, and inventing a local clock reading for a remote
