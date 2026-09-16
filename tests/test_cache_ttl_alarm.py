@@ -48,9 +48,14 @@ def store(started):
 
 @pytest.fixture()
 def transcripts(tmp_path, monkeypatch):
-    """A fake `~/.claude/projects` tree — the only place a foreign session exists."""
+    """A fake `~/.claude/projects` tree — the only place a foreign session exists.
+
+    The SAME directory `jarvis_home` already points the whole suite at, filled in rather
+    than replaced: a second root here would be one this test set and the daemon did not
+    read, which is the failure mode that makes an isolation fixture worth having.
+    """
     root = tmp_path / "transcripts"
-    root.mkdir()
+    root.mkdir(exist_ok=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
 
     def write(session_id: str, rows: list[dict], *, slug: str = "-somewhere") -> None:
@@ -319,6 +324,41 @@ def test_a_write_outside_the_window_is_not_in_it(started, store, transcripts):
     started.check_cache_ttl(project, store)
     assert [r["kind"] for r in store.alarms_across()] == \
         [inspection.CACHE_1H_FOREIGN_ALARM]
+
+
+def test_the_scan_is_not_on_the_daemons_first_tick(started, store, transcripts):
+    """THE ONLY CADENCE IN THE DAEMON THAT IS NOT `== 1`, and the reason is measurable: a
+    20-second disk walk on tick 1 sits in front of every dispatch the OS is starting, and
+    a daemon restarted more often than the six-hour period would pay it on every boot and
+    never reach a later tick to do the scan it skipped.
+
+    Asserted on the arithmetic rather than by ticking, because reaching tick 60 takes 60
+    ticks. Paired: "not on tick 1" alone is satisfied by a cadence that never fires.
+    """
+    from jarvis import daemon as daemon_mod
+
+    period, offset = (daemon_mod.CACHE_TTL_EVERY_TICKS,
+                      daemon_mod.CACHE_TTL_TICK_OFFSET)
+    fires = [t for t in range(1, 2 * period + 1) if t % period == offset]
+
+    assert 1 not in fires
+    assert fires == [offset, offset + period], "once per period, and it does fire"
+
+
+def test_one_tick_of_the_real_loop_does_not_scan(started, store, transcripts):
+    """The other half of the offset, through `tick` itself rather than its arithmetic:
+    `Daemon.tick` is what a `jarvis start` runs, and tick 1 must not raise one of these
+    even with a transcript tree full of offending writes."""
+    from jarvis import db
+
+    store.create_work_order("carrier", status="completed")
+    _both_halves(transcripts, db.now(), dispatched=9_000_000, foreign=9_000_000)
+    started.catalog.projects[0].inspect = InspectConfig()
+
+    started.tick()
+
+    assert started.tick_count == 1
+    assert store.alarms_across() == []
 
 
 # -- 3. the alarm actually reaches the supervisor --------------------------------------

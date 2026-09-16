@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from . import agent_usage, paths, release, systemd_units
+from . import agent_usage, paths, release, systemd_units, usage
 from .bugreport import GH_BIN_ENV
 from .claude_cli import CLAUDE_BIN_ENV, CREDENTIALS_ENV
 from .notify import DISABLE_EXTERNAL_SINKS_ENV
@@ -1519,6 +1519,17 @@ def jarvis_home(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_HOME", str(home))
     if not _bills_real_tokens():
         monkeypatch.setenv(agent_usage.SPEND_HOME_ENV, str(home))
+    # CLAUDE CODE'S TRANSCRIPTS FOLLOW THE HOME, for the same reason and one of their
+    # own. A test that does not point this somewhere reads the DEVELOPER'S real
+    # `~/.claude/projects` — every session on the machine, whatever they happen to have
+    # run — so its result depends on a tree no test wrote and CI does not have. It is
+    # also slow: `Daemon.check_cache_ttl` walks that tree, which took a ticking test file
+    # from 6s to 26s here before this line existed. A test that wants transcripts still
+    # sets the variable itself; setting it here only makes the DEFAULT empty rather than
+    # whatever the machine is carrying.
+    transcripts = tmp_path / "transcripts"
+    transcripts.mkdir(exist_ok=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(transcripts))
     return home
 
 

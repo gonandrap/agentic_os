@@ -157,6 +157,13 @@ SCHEDULE_EVERY_TICKS = 12
 #: reads its own disk is not a decision anyone has information to make.
 CACHE_TTL_EVERY_TICKS = 4320
 
+#: WHICH tick of each period, and the only cadence here that is not `== 1`. Tick 1 is the
+#: daemon's FIRST, when it is starting the fleet: a 20-second disk walk there delays every
+#: dispatch behind it, and a daemon restarted more often than the period would pay that
+#: cost on every boot and never reach a later tick to do the scan it skipped. Five minutes
+#: in is past the start-up burst and still inside any session anybody is watching.
+CACHE_TTL_TICK_OFFSET = 60
+
 #: How many dashboard digests one batch may produce. Bounds the cost of the FIRST batch
 #: on an instance upgrading into the feature with a backlog of long questions already in
 #: `neo.db` — the rest are picked up on later ticks and render in full until then. It is
@@ -535,7 +542,8 @@ class Daemon:
         retry_paused = self.tick_count % RETRY_EVERY_TICKS == 1
         sweep_landings = self.tick_count % LANDING_SWEEP_EVERY_TICKS == 1
         run_schedule = self.tick_count % SCHEDULE_EVERY_TICKS == 1
-        scan_cache_ttl = self.tick_count % CACHE_TTL_EVERY_TICKS == 1
+        scan_cache_ttl = \
+            self.tick_count % CACHE_TTL_EVERY_TICKS == CACHE_TTL_TICK_OFFSET
         # `None` means "the roster was not read this tick" — either nothing is injected
         # or the listing failed — and is NOT the same as an empty roster, which would
         # mean every injected session ended. Session tracking is skipped on None.
