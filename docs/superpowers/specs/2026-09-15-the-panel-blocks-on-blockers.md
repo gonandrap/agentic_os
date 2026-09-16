@@ -244,11 +244,36 @@ next to the output format, and that the same fix stated elsewhere in the file di
 > does not support, or a wrong assumption embodied in the code. **Everything else is a
 > `follow_up`, including everything you would merely have written differently.** A follow-up
 > is not a lesser finding and it is not discarded: it is filed as a ticket against this
-> project, in your words, and the work lands. **If you are weighing whether something is worth
-> a round trip, that weighing is itself the answer: it is a follow-up.**
+> project, in your words, and the work lands.
 
 **Stating the default is load-bearing.** An LLM asked to classify with no stated default
 classifies toward the graver label — which is the production defect in a new costume.
+
+#### 3.2.1 THE TIEBREAKER IS NOT FLEET-WIDE, AND THIS IS A SAFETY RULE
+
+The two seats split on what to do when a reviewer is **uncertain**, and the split already
+exists in the shipped mandates. It must survive this feature intact.
+
+* **`architect.md` / `maintainer.md` — and ONLY these two — get the tiebreaker:** *if you are
+  weighing whether something is worth a round trip, that weighing is itself the answer: it is a
+  follow-up.* These are the seats whose failure mode is an expensive rejection loop, and this is
+  the sentence that ends it.
+* **`tester.md` and `security.md` KEEP THE OPPOSITE RULE, VERBATIM.** `security.md` says today:
+  *"When you are genuinely torn about something that could expose data or widen access, block —
+  being wrong about a rejection costs a round, and being wrong about a leak costs the leak."*
+  That sentence, and `tester.md`'s equivalent, **are not edited, softened, or displaced by
+  anything this feature adds.** An uncertain exposure blocks.
+
+**Shipping the tiebreaker into the veto mandates would be a silent fail-open, not a nit.** With
+`validation.auto_merge` ON for this project, a concern classified `follow_up` is filed to the
+backlog, withheld from the chair by §3.5 — not its text, not its title, not a count — and the
+commit merges **unattended**. So for the two veto seats the classification decision is
+load-bearing in a way it is not for the other two: for the architect it costs a round, for
+security it can cost the leak. One sentence copied into five files instead of three is all it
+would take, which is exactly why it is written down here rather than left to whoever edits the
+mandates.
+
+The blocker definition above IS shared by all four. Only the tiebreaker is not.
 
 **Every non-chair mandate also states where a follow-up's text goes**, in the same words and in
 the same place, because §3.1's narrowing of `asks` is a change to what a seat was previously
@@ -263,11 +288,22 @@ told to write and a schema table alone will not carry it:
 Per seat:
 
 * **`tester.md` / `security.md`** (veto holders). Their existing "you may reject WITHOUT
-  blocking" paragraph becomes: a concern you would not stop the work over is a `follow_up`
-  finding, filed rather than argued. Set `blocking` when and only when you have written at
-  least one `blocker` finding. Their veto itself is untouched (§7), and on it their `reason`
-  and `asks` still reach the submitter verbatim — which the narrowing above preserves, because
-  a blocking seat's `asks` are its blockers' asks.
+  blocking" paragraph gains one clause — *a concern you would not stop the work over is a
+  `follow_up` finding, filed rather than argued* — and **keeps everything else it says**,
+  including its uncertainty rule (§3.2.1) and the middle path below. Their veto itself is
+  untouched (§7), and on it their `reason` and `asks` still reach the submitter verbatim, which
+  the narrowing above preserves because a blocking seat's `asks` are its blockers' asks.
+
+  **`blocking` REQUIRES a `blocker`; a `blocker` does NOT require `blocking`.** The implication
+  runs one way only, and writing it as "set `blocking` when and only when you raised a blocker"
+  — as an earlier draft of this section did — deletes the middle path that §3.4's table still
+  lists, and that these two seats' mandates have always offered. Both directions, in the
+  mandate:
+  * Do not set `blocking` without at least one `blocker` finding. (A veto that names nothing
+    that must change is a veto nobody can act on.)
+  * **A `blocker` you would not stop the work over is `verdict: "reject", "blocking": false`.**
+    It goes to the chair, which weighs it — §3.4, row 2. That path is how a veto seat raises
+    something real without spending its veto, and it must remain available and be described.
 * **`architect.md` / `maintainer.md`** (no veto). These two are where the treadmill lives.
   They gain the counterpart of the rule the chair is losing: you may write a `blocker` and the
   chair will weigh it, but yours is the seat whose failure mode is an expensive rejection loop,
@@ -540,10 +576,22 @@ escape hatch if filing proves noisy."* The house rule exists so that a behaviour
 measured before the fleet runs it; this knob gates no behaviour change, only whether the record
 survives. **Say so in the field's own comment**, or the next reader will read it as a mistake.
 
-**The `ValidationConfig` DOCSTRING paragraph recording that carve-out is not this feature's
-work.** Neo filed `wo-42f028d1` for it while answering question 309, and it is running
-independently. Write the comment on your field; do not also rewrite the class docstring, and
-expect a small rebase in `catalog.py`.
+**The carve-out is recorded on the code side too, and that record is not this feature's work.**
+Neo filed `wo-42f028d1` while answering question 309; it lands the paragraph in
+`ValidationConfig`'s own docstring in `src/jarvis/catalog.py` and holds it in full as
+**`kn-a88a56b6`**, whose discriminator is the part worth reading before touching any default in
+that block: *ask what the field's `False` value buys.* If `False` means the fleet behaves exactly
+as it does today, the house rule governs and the field ships `False`; if `False` means the new
+behaviour happens anyway and its output is thrown away, the cost was already committed by a
+sibling change and `True` is the defensible default.
+
+So: write the comment on your field, do **not** also rewrite the class docstring, cite
+`kn-a88a56b6` rather than restating it, and expect a small rebase in `catalog.py`. The docstring
+names the field by role rather than by name, so the field's name is yours to choose.
+
+*(`kn-a88a56b6` and the docstring both cite "section 5.4" of this document. That was this
+section's number in the six-child draft the question was asked against; it is §4.5 now. The
+reference is to this paragraph.)*
 
 ### 4.6 The timeline, and what must not be widened
 
@@ -813,6 +861,11 @@ a rubber stamp:
   claims, and nothing else in the suite measures it.
 * The tester and security veto keep their own case: `blocking: true` still rejects with the
   chair never called.
+* **The uncertain-exposure case gets a case of its own**, and it is the one a rubber stamp
+  would pass: a submission whose security implication is genuinely ambiguous — the kind
+  `security.md`'s own rule says to block on *because* you are torn — must still be rejected.
+  Nothing else in the batteries measures §3.2.1, and with `auto_merge` ON this is the failure
+  that lands unattended rather than merely costing a round.
 
 **The money is authorised and the hand-edit is not.** Adding a case fails the FREE suite until
 the baseline is regenerated — deliberate (`kn-abb7356b`): a case no paid run has seen has no
@@ -866,7 +919,13 @@ This feature changes **when a non-blocking finding rejects**, and nothing else a
 is allowed to do.
 
 * **`tester` and `security` block.** `validation.VETO_SEATS`, `blocking: true`, `arbitrate`'s
-  forced rejection, and the chair being skipped entirely when a veto fires.
+  forced rejection, and the chair being skipped entirely when a veto fires. **And their MANDATE
+  TEXT is part of that claim, not separate from it** — §3.2.1: their uncertainty rule ("when
+  genuinely torn about something that could expose data or widen access, block") survives
+  verbatim, the §3.2 tiebreaker is never shipped into those two files, and the middle path
+  (`reject` without `blocking`) stays. A change that leaves `arbitrate` untouched while telling
+  the security seat to classify an uncertain exposure as a follow-up has weakened the veto just
+  as surely, and — with `auto_merge` ON — silently.
 * **Nothing forces a pass.** `arbitrate` keeps exactly one non-`None` `return` and its outcome is
   `"rejected"`, pinned by an AST walk. `tests/test_validation_arbitrate.py` stays green with zero
   edits.
