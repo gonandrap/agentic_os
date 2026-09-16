@@ -726,3 +726,124 @@ def test_a_message_rotting_on_an_idle_manager_still_reaches_the_user(project,
                                                       store.get_work_order(wo["id"]))
     finally:
         store.close()
+
+
+# -- 7. what the migration must NOT touch ----------------------------------------------
+#
+# Review round 1. Since issue #264 the manager branch of `Daemon.settle_work_order` is a
+# REWRITE (`waiting_input` -> `idle`) plus an unflag, where it used to be a no-op for a
+# manager already parked. `waiting_input` is the only carrier of the fact that a manager
+# ASKED, so every test below poses a manager that asked, drives a REAL settle pass, and
+# asserts the status, the flag and the derived blocker all survive it. Hand-setting a
+# status and calling `true_blockers` directly — which §6's Neo test does — cannot catch a
+# settler that would have overwritten the status first, which is the point of these.
+
+
+def _manager_with_a_finished_turn(boot, store, settle_turns):
+    """A manager whose turn is DONE — the shape that reaches the branch under test."""
+    daemon = boot(validation=True)
+    spec = daemon.catalog.project("proj_a")
+    fo_id = release(daemon, "CSV export", "one")
+    manager = store.manager_work_order(fo_id)
+    assert manager is not None
+    daemon.tick()
+    assert settle_turns(store), "the turns never ended"
+    return daemon, spec, manager
+
+
+def test_a_manager_parked_on_an_escalated_question_is_not_migrated(boot, store,
+                                                                   settle_turns):
+    """Neo handed the question BACK, so the user owes an answer. A settle pass must not
+    relabel that "nothing to act on".
+
+    `neo_store.OPEN_Q_STATUSES` includes `escalated`, so `awaiting_neo` still answers for
+    it — asserted here rather than assumed, because that membership is the only thing
+    that makes this case reachable by the guard at all.
+    """
+    from jarvis.neo_store import NeoStore
+
+    daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
+    store.set_status(manager["id"], "waiting_input")
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", manager["id"], "Two children conflict — which wins?")
+        neo.mark(q["id"], "escalated")
+    finally:
+        neo.close()
+    store.flag_attention(manager["id"], invariants.neo_question_blocker(
+        {"id": q["id"], "status": "escalated"}))
+    assert invariants.something_is_out(store, manager["id"])
+
+    daemon.settle_turns(spec, store)
+
+    fresh = store.get_work_order(manager["id"])
+    assert fresh["status"] == "waiting_input", "it asked; the status must say so"
+    assert fresh["needs_attention"]
+    blockers = invariants.true_blockers(store, fresh)
+    assert blockers and str(q["id"]) in blockers[0]
+
+
+def test_a_manager_parked_on_a_held_gate_is_not_migrated(boot, store, settle_turns):
+    """The case the branch order genuinely did NOT cover, and the reason the guard is a
+    predicate rather than a fall-through.
+
+    `gates.file_request` parks a work order in `waiting_input` down both its roads, but
+    the `elif` above the manager branch reads `pending_approvals`, which excludes
+    `awaiting_case` — a request the worker filed by running the command before arguing
+    it. Under the old code missing it cost nothing, because this branch's write was
+    `waiting_input` either way. `invariants.something_is_out` is the whole predicate.
+    """
+    daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
+    store.set_status(manager["id"], "waiting_input")
+    store.add_approval(manager["id"], "pr_merge", "gh " + "pr merge 42",
+                       status="awaiting_case")
+    assert not store.pending_approvals(manager["id"]), "the premise: HELD, not pending"
+    assert invariants.something_is_out(store, manager["id"])
+
+    daemon.settle_turns(spec, store)
+
+    assert store.get_work_order(manager["id"])["status"] == "waiting_input"
+
+
+def test_a_manager_parked_on_a_sign_in_keeps_its_status_and_its_flag(boot, store,
+                                                                     settle_turns,
+                                                                     signin):
+    """`_park_on_signin` raises AUTH_BLOCKER on a manager whose turn died on auth. The
+    settler must leave both alone — and, since the `kind != 'manager'` carve-out went,
+    `true_blockers` re-derives that blocker for a manager too, which it never did before.
+
+    The protection is `settle_work_order`'s early return on a FAILED turn, one branch
+    above everything §6 tests. Pinned here because nothing else pins it for a manager.
+    """
+    daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
+    turn = store.create_turn(manager["id"], kind="message", prompt="a child reported")
+    row = store.finish_turn(
+        turn["id"], "failed",
+        error="Failed to authenticate: OAuth session expired and could not be refreshed")
+    store.conn.execute("UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
+                       (row["started_at"] - 3600, row["ended_at"] - 3600, turn["id"]))
+
+    daemon.settle_turns(spec, store)
+
+    fresh = store.get_work_order(manager["id"])
+    assert fresh["status"] == "waiting_input", "a sign-in is the user's to do"
+    assert fresh["attention_reason"] == invariants.AUTH_BLOCKER
+    assert invariants.true_blockers(store, fresh) == [invariants.AUTH_BLOCKER]
+
+
+def test_the_migration_keeps_a_flag_that_survives_the_move(boot, store, settle_turns):
+    """The unflag is narrowed, not unconditional: it re-derives `true_blockers` against
+    the row AS IT NOW IS. A pending assumption is owed whatever the status, so it stays —
+    paired with §6's carried-over case, where the only blocker was the status itself and
+    the flag correctly goes down."""
+    daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
+    store.set_status(manager["id"], "waiting_input")
+    store.add_assumption(manager["id"], "filed the third child as its own work order")
+    store.flag_attention(manager["id"], "1 assumption pending your review")
+
+    daemon.settle_turns(spec, store)
+
+    fresh = store.get_work_order(manager["id"])
+    assert fresh["status"] == "idle", "nothing was OUT, so the migration still runs"
+    assert fresh["needs_attention"], "a decision the user owes outlives the status move"
+    assert fresh["attention_reason"] == "1 assumption pending your review"

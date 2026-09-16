@@ -906,6 +906,27 @@ def awaiting_neo(wo_id: str) -> dict[str, Any] | None:
     return open_questions[0] if open_questions else None
 
 
+def something_is_out(store: ProjectStore, wo_id: str) -> bool:
+    """Is this work order parked on somebody, rather than merely having nothing to do?
+
+    ONE RESOLVER, and kn-4ea33fe6 is why it is a function rather than a rule written
+    twice: `end_wait_if_nothing_is_out` asks it to decide whether a wait has ENDED, and
+    `Daemon.settle_work_order`'s manager branch asks it to decide whether a manager is
+    free to be re-statused `idle`. Those two disagreeing means a manager parked on a gate
+    is quietly relabelled "nothing to act on" — muted, out of the dashboard's needs-me
+    strip, and refused a nudge — which is the bug issue #264 exists to remove, recreated.
+
+    `held_approvals` counts as out, and it is the clause a caller inheriting this from
+    `settle_work_order`'s `pending_approvals` check would drop. Nobody is REVIEWING a
+    held request, so it is not "with a reviewer" — but the work order is not free either:
+    `gates.file_request` parks it in `waiting_input` down BOTH its roads, the OS refuses
+    it on the `gates.case_ttl_seconds` timer, and until then the worker is waiting for a
+    verdict exactly as it would be for an argued one.
+    """
+    return bool(store.pending_approvals(wo_id) or store.held_approvals(wo_id)
+                or awaiting_neo(wo_id))
+
+
 def end_wait_if_nothing_is_out(store: ProjectStore, wo_id: str) -> bool:
     """Take a work order out of `waiting_input` once nothing is holding it there.
 
@@ -925,12 +946,7 @@ def end_wait_if_nothing_is_out(store: ProjectStore, wo_id: str) -> bool:
     """
     if store.get_work_order(wo_id)["status"] != "waiting_input":
         return False
-    # `held_approvals` counts as out. Nobody is reviewing one, but the work order is not
-    # free either: the OS will refuse it on a timer and message the worker (see
-    # `gates.sweep_unargued`), and ending the wait now would say the turn has somewhere
-    # to go when it does not.
-    if (store.pending_approvals(wo_id) or store.held_approvals(wo_id)
-            or awaiting_neo(wo_id)):
+    if something_is_out(store, wo_id):
         return False
     store.set_status(wo_id, "running")
     return True

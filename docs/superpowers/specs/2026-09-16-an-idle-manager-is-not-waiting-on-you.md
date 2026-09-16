@@ -67,6 +67,31 @@ No schema change — a status is a `TEXT` column plus a tuple and an `assert`. M
 already parked in `waiting_input` are re-statused by `Daemon.settle_work_order` on the
 first tick, which is why `idle` is in `settle_turns`'s sweep. That pass runs **before**
 `check_invariants` in the same tick, so no carried-over manager is flagged in the window
-between the two. The re-status also clears attention explicitly: INV-ATTENTION-PHANTOM
-only clears terminal rows, so a flag raised under the old status would otherwise outlive
-the status it was derived from for ever.
+between the two.
+
+### What the migration must not touch
+
+That branch used to be a no-op for a manager already parked; it is now a **rewrite plus
+an unflag**, and `waiting_input` is the only carrier of the fact that a manager *asked*.
+Two guards, both added in review round 1:
+
+**The predicate, not the branch order.** The `elif` above the manager branch reads
+`store.pending_approvals`, which is two thirds of the question and looks like all of it:
+it excludes `awaiting_case`, the gate request a worker files by *running* the command
+before arguing it — and `gates.file_request` parks a work order in `waiting_input` down
+that road too. Missing it used to cost nothing, because the branch wrote `waiting_input`
+either way. So the manager branch guards on `invariants.something_is_out`, which is
+`pending_approvals or held_approvals or awaiting_neo`, shared with
+`end_wait_if_nothing_is_out` so the two cannot drift (kn-4ea33fe6). An escalated *question*
+is already covered without the guard — `neo_store.OPEN_Q_STATUSES` includes `escalated`,
+so `awaiting_neo` still answers for it — and a turn that died on auth never reaches this
+branch at all, because `settle_work_order` returns early on a `failed` turn. Both are
+pinned anyway: nothing pinned them before, and both are one edit away from breaking.
+
+**The unflag is re-derived, not assumed.** Clearing attention unconditionally would drop a
+blocker that survives the move — a pending assumption is owed whatever the status. So it
+reads `true_blockers` on the row **as it now is**, after the `set_status`, and clears only
+when that is empty. Reading the pre-move row instead would re-derive the old status's
+"worker is waiting on your input" and never clear at all. The clear itself cannot simply
+be deleted: INV-ATTENTION-PHANTOM clears flags only on *terminal* rows, so a flag raised
+under the old status would outlive the status it was derived from for ever.

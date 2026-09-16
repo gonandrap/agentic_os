@@ -2975,7 +2975,7 @@ class Daemon:
 
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
                           wo: dict) -> None:
-        from .invariants import awaiting_neo
+        from .invariants import awaiting_neo, something_is_out, true_blockers
 
         if wo["status"] == "validating":
             # THE ROUND MACHINE OWNS THIS WORK ORDER. Everything below re-derives the
@@ -3132,8 +3132,8 @@ class Daemon:
             # unanswered permission prompt — impossible under the `auto` mode the fleet
             # runs. Suppressing the FLAG was never enough: six other surfaces re-derive
             # meaning from the status alone, which is kn-cffc8905's trap paid a third
-            # time. The gate/question branch above still sends a manager that genuinely
-            # ASKED for something to `waiting_input`, which is where it belongs.
+            # time. A manager that genuinely ASKED for something stays in
+            # `waiting_input`, which is where it belongs — see the guard below.
             #
             # UNLESS ITS FEATURE IS ALREADY OVER, and that ordering is one the feature
             # round machine makes reachable. A manager is created `pending` and claimed
@@ -3148,13 +3148,36 @@ class Daemon:
             feature = store.get_feature_order(parent) if parent else None
             if feature and feature["status"] in FO_TERMINAL_STATUSES:
                 self._close_feature_manager(store, str(parent))
+            elif something_is_out(store, wo["id"]):
+                # HOLD IT WHERE IT IS. `waiting_input` is the only carrier of the fact
+                # that this manager ASKED for something, and re-statusing it `idle` would
+                # say the opposite — nothing to act on — about an order waiting for a
+                # verdict: muted, out of FEATURED_STATUSES, and refused a nudge.
+                #
+                # NOT LEFT TO THE BRANCH ORDER ABOVE, which is two thirds of the same
+                # question and looks like all of it. That `elif` reads `pending_approvals`
+                # and misses `awaiting_case` — a gate request the worker filed by running
+                # the command before arguing it, which `gates.file_request` parks here
+                # just the same. Under the old code missing it cost nothing, because this
+                # branch's write was `waiting_input` either way; since issue #264 it is a
+                # rewrite, so the predicate has to be the whole one. `something_is_out` is
+                # that predicate, shared with `invariants.end_wait_if_nothing_is_out` so
+                # the two cannot drift (kn-4ea33fe6).
+                pass
             elif fresh["status"] != "idle":
                 store.set_status(wo["id"], "idle")
-                # The one write the re-status cannot do on its own. A manager carried
+                # The one write the re-status cannot do on its own: a manager carried
                 # over from before issue #264 may have been flagged while it was in
-                # `waiting_input`, and INV-ATTENTION-PHANTOM only clears terminal rows —
-                # so the flag would outlive the status it was derived from for ever.
-                store.clear_attention(wo["id"])
+                # `waiting_input`, and INV-ATTENTION-PHANTOM only clears terminal rows,
+                # so that flag would outlive the status it was derived from for ever.
+                #
+                # RE-DERIVED AGAINST THE NEW STATUS, never assumed. `true_blockers` is
+                # read on the row AS IT NOW IS — an unconditional clear would drop a
+                # blocker that survives the move, and reading `fresh` would re-derive the
+                # old status's "worker is waiting on your input" and never clear at all.
+                moved = store.get_work_order(wo["id"])
+                if moved["needs_attention"] and not true_blockers(store, moved):
+                    store.clear_attention(wo["id"])
         else:
             from .invariants import IDLE_NO_FINISH_BLOCKER
 
