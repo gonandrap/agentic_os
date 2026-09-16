@@ -120,14 +120,43 @@ WO_KINDS = ("worker", "planner", "manager")
 
 # A work order with a LIVE SESSION: dispatched, running, or parked mid-conversation on
 # somebody else. The per-feature cap (`claim_next_pending`, spent by
-# `feature_orders.max_parallel`), the retry sweep and every "a turn may be in flight"
-# reader mean this.
+# `feature_orders.max_parallel`) and every "a turn may be in flight" reader mean this.
 #
 # NOT what the project-wide `max_concurrent` counts any more — see `SLOT_STATUSES` below
 # and issue #134. The two were one constant until then, on the reasoning that its readers
 # must agree; they are two because the readers turned out to be asking different
 # questions, and the split is deliberate rather than drift.
+#
+# NOT what the retry sweep walks either, since issue #259 — see `RETRY_SWEEP_STATUSES`.
 ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
+
+# Where a paused turn may be relaunched: every status a work order can be sitting in when
+# `worker_session.turn_pause` says a retry is booked (`Daemon.retry_paused_turns`, and the
+# two invariants that watch it).
+#
+# WIDER THAN `ACTIVE_STATUSES`, and issue #259 is why. A work order that finishes behind
+# a pull request, takes a message, and has that turn refused for the usage limit lands in
+# `waiting_pr_merge` HOLDING A RESUMABLE, DUE PAUSE — and the sweep, scoped to the active
+# set, could never see it. `invariants.MESSAGE_STUCK_STATUSES` already called that a
+# defect, so the OS diagnosed the stall perfectly (`jarvis wo resume-auto`: "its retry
+# came due and has not happened") and then had no loop that would ever run it. Measured
+# on wo-f35e603e: three messages queued behind one lost turn, none delivered, and the
+# only remedy on offer was `jarvis wo done` — abandoning the work.
+#
+# The two tuples below PARTITION `WO_STATUSES`, asserted by a test rather than derived
+# from each other: a status added to `WO_STATUSES` fails that test until somebody decides
+# which side it belongs on. That is the opposite shape from kn-32434cef's allowlist rule
+# because the failure direction is inverted — there, a status silently allowed through is
+# the danger; here, a status silently left OUT is a work order nothing will ever resume.
+RETRY_SWEEP_STATUSES = ("dispatching", "running", "waiting_input", "validating",
+                        "needs_review", "failed", "waiting_pr_merge")
+
+# The rest of `WO_STATUSES`, and why a due retry is not run there. `pending` has no turn
+# to relaunch (it has never been dispatched, so `turn_pause` reads nothing); `completed`
+# and `cancelled` were ENDED BY A PERSON, and relaunching a turn under one would reopen
+# work its owner closed. `failed` is not with them: the OS failed that one, the user did
+# not, and recovering it is the point.
+NOT_RETRIED = ("pending", "completed", "cancelled")
 
 # What spends one of a project's `max_concurrent` slots: a work order whose turn is
 # actually executing, plus the claim that is about to launch one (issue #134).

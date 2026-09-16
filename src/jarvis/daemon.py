@@ -57,11 +57,11 @@ from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
-    ACTIVE_STATUSES,
     FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
     OPEN_STATUSES,
     PRE_APPROVED_KEY,
+    RETRY_SWEEP_STATUSES,
     UNGOVERNED_ORIGINS,
     ProjectStore,
     resume_spends_slot,
@@ -1000,8 +1000,14 @@ class Daemon:
         and `tick` decides `retry_paused` once, outside the project loop, so every
         project's parked orders are swept on the same tick.
 
-        Every work order this touches is in an ACTIVE status, because the settler
-        deliberately did not fail it (see `settle_work_order` and `_park_on_signin`).
+        WHEREVER THE WORK ORDER IS PARKED (`RETRY_SWEEP_STATUSES`, issue #259). The
+        settler leaves a paused order's status alone, so most of what this touches is
+        active — but a turn can be refused on a work order that had already SETTLED into
+        `waiting_pr_merge`, `needs_review` or `failed`, and those three were unreachable
+        here while the sweep asked for `ACTIVE_STATUSES`. `invariants.stuck_message` has
+        always called an undelivered message in exactly those statuses a defect, so the
+        OS diagnosed the stall and had nothing that would ever repair it.
+
         What the relaunch SENDS is `worker_session.retry`'s business, and it is not the
         same for all: a refused turn was never sent, so the prompt goes again verbatim; a
         turn that died in flight already reached the model, so the worker is nudged to
@@ -1022,7 +1028,7 @@ class Daemon:
         `_park_on_signin`. Held means the pause stays parked with nothing written.
         """
         budget = project.max_concurrent - store.count_active()
-        for wo in store.list_work_orders(statuses=ACTIVE_STATUSES):
+        for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
             if state is not None and state.blocked():
                 return
             if wo["origin"] in UNGOVERNED_ORIGINS:
@@ -1060,10 +1066,15 @@ class Daemon:
                 "attempt": pause.attempts, "of": pause.max_attempts,
                 "reason": pause.reason,
             })
-            # Only an auth pause is ever parked out of `running` (`_park_on_signin`), so
-            # this is where that gets put back — the same two lines `_deliver` uses, for
-            # the same reason: the turn is out, and a record still saying "waiting on
-            # you" about a worker that is working would be a lie.
+            # The turn is out, so the record must stop saying somebody else has it —
+            # the same two lines `_deliver` uses when a message wakes a settled work
+            # order, for the same reason. Two shapes reach this: the auth pause, parked
+            # out of `running` by `_park_on_signin`, and since issue #259 an order that
+            # was already settled when its turn was refused. Running is also the only
+            # honest status for the second: `PR_POLL_STATUSES` deliberately excludes the
+            # in-flight ones so `complete_merged` can never end a work order out from
+            # under a live worker, and `settle_work_order` puts it back on the merge
+            # queue when this turn is done.
             if wo["status"] != "running":
                 store.set_status(wo["id"], "running")
                 store.clear_attention(wo["id"])
