@@ -3099,6 +3099,11 @@ class Daemon:
                     self.heal_pull_request(project, store, wo, ops.PR_CONFLICT,
                                            "conflicts",
                                            base=pr.base_ref or "its base branch")
+                    # ...and say what is holding the merge NOW. Issue #263: repairing
+                    # used to skip `auto_merge` entirely, so the auto-merge line kept
+                    # naming whatever held last — CI, while the real blocker was this
+                    # conflict. `record_only` cannot merge or propose.
+                    self.auto_merge(project, store, wo, pr, record_only=True)
                 elif pr.failing:
                     self.heal_pull_request(
                         project, store, wo, ops.PR_CHECKS,
@@ -3108,6 +3113,7 @@ class Daemon:
                         # never causes one: spec §5.
                         behind=(ops.PR_BEHIND_NOTE.format(base=pr.base_ref or "its base")
                                 if pr.behind else ""))
+                    self.auto_merge(project, store, wo, pr, record_only=True)
                 else:
                     healed = pr.mergeable_now and ops.clear_pr_repair(
                         store, wo, ops.PR_CONFLICT)
@@ -3133,13 +3139,15 @@ class Daemon:
                                      project.name, wo["pr_url"], wo["id"])
                     # AFTER the repairs clear, and inside the same branch: a pull request
                     # the OS is still nudging a worker about is not one it may merge.
+                    # The repair branches above call this too, `record_only` — which
+                    # writes the hold and merges nothing, so that rule is untouched.
                     self.auto_merge(project, store, wo, pr)
             except Exception:  # noqa: BLE001
                 log.exception("[%s] settling %s against its PR failed", project.name,
                               wo["id"])
 
     def auto_merge(self, project: ProjectSpec, store: ProjectStore, wo: dict,
-                   pr: Any) -> None:
+                   pr: Any, *, record_only: bool = False) -> None:
         """Merge this pull request, if six positive facts line up. Usually: do nothing.
 
         docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md. The decision is
@@ -3166,6 +3174,20 @@ class Daemon:
           a candidate for, on the one surface that exists to say what the mechanism did.
           `_note_automerge_held` drops `HELD_STATUS` as well, for the same reason from
           the other side.
+
+        **`record_only=True` DECIDES AND RECORDS THE HOLD, AND STOPS THERE.** It is how
+        the two repair branches of `poll_pull_requests` keep the auto-merge line honest
+        while a worker is being nudged, and issue #263 is why they have to: the hold
+        `ops.automerge_state` renders is the last one WRITTEN, so a pull request that
+        holds on CI and then stops merging cleanly went on naming CI — the branch that
+        saw the conflict never called this at all. A hold is a sentence about a pull
+        request, not permission to touch it, so recording one costs the repair nothing.
+
+        Nothing arms under it, and nothing could: `github.PullRequest.conflicting` means
+        `mergeable` is not `MERGEABLE`, and a failing check means `checks_green` is false,
+        so `decide` holds on conditions 6b and 6c respectively before a grant is ever
+        looked up. The flag is belt to that braces — a caller that is repairing must not
+        be able to merge even if that implication is one day broken.
 
         `project.validation` resolves per project — a project that names `auto_merge`
         keeps its answer, one that does not takes the fleet's, and the shipped answer at
@@ -3196,6 +3218,8 @@ class Daemon:
         if not decision.armed:
             self._note_automerge_held(store, wo_id, decision)
             return
+        if record_only:
+            return          # unreachable: a repairing pull request cannot arm, see above
 
         approval = store.latest_approval_for(
             wo_id, automerge.GATE_KIND,
@@ -3553,6 +3577,15 @@ class Daemon:
         at the SAME commit: "CI has not finished" is a wait, and "the panel has not
         passed this" is not, and one of them arriving after the other is the news.
 
+        THE REASON'S TEXT IS IN THE KEY, not just its code, and issue #263 is why: a code
+        is coarser than the sentence it names. `ops.automerge_state` renders the NEWEST
+        hold, so a changed reason this function drops is a user reading a hold that has
+        stopped being true — sent to look at CI for a merge conflict. `automerge`'s codes
+        are one per condition for the same reason; the text catches what a code cannot,
+        which is a condition whose wording carries the value (`BEHIND` against `DIRTY`,
+        round 2 rejected against round 3). A reason is built from a bounded vocabulary
+        plus the commit already in the key, so this stays a handful of rows per commit.
+
         **DELIBERATELY NOT AN ATTENTION ITEM.** A held auto-merge means the user merges
         this one by hand, which is what they did for every pull request before this
         existed. A heal-loop push invalidating a pass is ordinary, and the attention list
@@ -3576,10 +3609,11 @@ class Daemon:
         if decision.code in (automerge.HELD_DISABLED,   # both unreachable via the poll:
                              automerge.HELD_STATUS):    # `auto_merge` returns before here
             return
-        key = (decision.head_sha, decision.code)
+        key = (decision.head_sha, decision.code, decision.reason)
         for event in store.events_of_kind(wo_id, "automerge_held"):
             payload = db.from_json(event["payload"], {})
-            if (str(payload.get("head_sha") or ""), str(payload.get("code") or "")) == key:
+            if (str(payload.get("head_sha") or ""), str(payload.get("code") or ""),
+                    str(payload.get("reason") or "")) == key:
                 return
         store.add_event(wo_id, "automerge_held", {
             "code": decision.code, "reason": decision.reason,

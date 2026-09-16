@@ -71,17 +71,27 @@ GRANT_USES = 1
 #: the squash on the way, and the daemon must still never block its tick on one.
 MERGE_TIMEOUT = 60
 
-#: Why a hold was recorded, as a stable token. The dedupe in `Daemon.auto_merge` keys on
-#: (head sha, this), so one pull request records each distinct reason once per commit
-#: instead of every two minutes — and a hold that CHANGES (checks were still running,
-#: then the head moved) is still recorded, which keying on the sha alone would lose.
+#: Why a hold was recorded, as a stable token. The dedupe in `Daemon._note_automerge_held`
+#: keys on (head sha, this, the reason's text), so one pull request records each distinct
+#: reason once per commit instead of every two minutes — and a hold that CHANGES (checks
+#: were still running, then the branch stopped merging cleanly) is still recorded.
+#:
+#: ONE CODE PER CONDITION, never one shared by several: kn-0aba30f0's rule, and issue #263
+#: is what breaks without it. Four conditions used to return `pr_not_ready`, so the second
+#: one to hold a commit was deduped away as a repeat of the first and the user was sent to
+#: look at CI for a merge conflict. The reason's text is in the key as well because a code
+#: is coarser than a sentence — `BEHIND` and `DIRTY` are one code and two different things
+#: to do about it.
 HELD_DISABLED = "disabled"
 HELD_STATUS = "status"
 HELD_ASSUMPTIONS = "assumptions"
 HELD_NOT_PASSED = "not_passed"
 HELD_SHA_UNRECORDED = "sha_unrecorded"
 HELD_SHA_MOVED = "sha_moved"
-HELD_PR_NOT_READY = "pr_not_ready"
+HELD_PR_CLOSED = "pr_closed"
+HELD_NOT_MERGEABLE = "not_mergeable"
+HELD_CHECKS_NOT_GREEN = "checks_not_green"
+HELD_MERGE_STATE_UNCLEAN = "merge_state_unclean"
 
 #: WHY the merge command did not succeed on a pull request that merged anyway (§5.5).
 #: Two causes, never folded into one: a command that RAN and exited non-zero is a local
@@ -240,17 +250,17 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
     fields = {"judged_sha": judged, "head_sha": head, "round_id": round_id,
               "round_n": n}
     if str(getattr(pr, "state", "") or "").upper() != "OPEN":
-        return _held(HELD_PR_NOT_READY,
+        return _held(HELD_PR_CLOSED,
                      f"the pull request is {getattr(pr, 'state', '') or 'unreadable'}",
                      **fields)
     if not pr.mergeable_now:
-        return _held(HELD_PR_NOT_READY,
+        return _held(HELD_NOT_MERGEABLE,
                      "GitHub does not (yet) say the branch merges cleanly", **fields)
     if not pr.checks_green:
-        return _held(HELD_PR_NOT_READY,
+        return _held(HELD_CHECKS_NOT_GREEN,
                      "CI has not finished a unanimous pass on this commit", **fields)
     if str(getattr(pr, "merge_state", "") or "").upper() != "CLEAN":
-        return _held(HELD_PR_NOT_READY,
+        return _held(HELD_MERGE_STATE_UNCLEAN,
                      f"GitHub reports the merge state as "
                      f"{getattr(pr, 'merge_state', '') or 'unknown'}, not CLEAN",
                      **fields)
