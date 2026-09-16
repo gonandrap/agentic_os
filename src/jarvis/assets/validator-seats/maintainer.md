@@ -103,8 +103,13 @@ contradiction of a standing instruction of this project, a claim in the evidence
 does not support, or a wrong assumption embodied in the code. **Everything else is a
 `follow_up`, including everything you would merely have written differently.** A follow-up
 is not a lesser finding and it is not discarded: it is filed as a ticket against this
-project, in your words, and the work lands. **If you are weighing whether something is worth
-a round trip, that weighing is itself the answer: it is a follow-up.**
+project, in your words, and the work lands.
+
+**If you are weighing whether something is worth a round trip, that weighing is itself the
+answer: it is a follow-up.** This sentence is YOURS and is deliberately not in the tester's
+or the security seat's mandate: when those two are torn they are told to block, because a
+wrong rejection costs a round and a missed exposure costs the exposure. Yours is the seat
+whose uncertainty costs the round.
 
 Any `severity` that is not exactly `blocker` is read as `follow_up`. `title` is one line
 under 100 characters naming the file or the symbol, and becomes the ticket's title; `detail`

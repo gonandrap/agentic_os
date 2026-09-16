@@ -558,43 +558,97 @@ def test_the_shared_prefix_carries_the_packet_and_no_seats_mandate(store, jarvis
 
 # -- the severity split: the prose ------------------------------------------------------------
 
-#: Where the shared severity rules start and end in every non-chair mandate. Sliced rather
-#: than retyped, so the test compares the four SHIPPED blocks with each other instead of
-#: comparing each of them with a constant in this file.
+#: The three pieces of the severity rules, sliced out of each SHIPPED mandate rather than
+#: retyped here, so the tests compare the four files with each other. The definition and the
+#: where-a-follow-up-goes paragraph are shared by all four; THE TIEBREAKER IS NOT — see
+#: `test_the_tiebreaker_ships_to_exactly_the_two_seats_whose_uncertainty_costs_a_round`.
 BLOCKER_BLOCK_START = "## WHAT MAKES A FINDING A BLOCKER"
-BLOCKER_BLOCK_END = "carried further than the filing."
+DEFINITION_END = "project, in your words, and the work lands."
+NARROWING_START = "`reason` and `asks` are about your BLOCKERS."
+NARROWING_END = "carried further than the filing."
+TIEBREAKER = ("If you are weighing whether something is worth a round trip, that weighing "
+              "is itself the answer: it is a follow-up.")
 
 
-def blocker_block(seat: str) -> str:
+def _slice(seat: str, start: str, end: str) -> str:
     body = flat(seat)
-    assert BLOCKER_BLOCK_START in body, f"{seat} was never told what a blocker is"
-    start = body.index(BLOCKER_BLOCK_START)
-    end = body.index(BLOCKER_BLOCK_END, start) + len(BLOCKER_BLOCK_END)
-    return body[start:end]
+    assert start in body, f"{seat} is missing {start!r}"
+    at = body.index(start)
+    return body[at:body.index(end, at) + len(end)]
 
 
-def test_the_severity_rules_ship_in_the_same_words_in_every_non_chair_mandate():
+def blocker_definition(seat: str) -> str:
+    return _slice(seat, BLOCKER_BLOCK_START, DEFINITION_END)
+
+
+def narrowing_rule(seat: str) -> str:
+    return _slice(seat, NARROWING_START, NARROWING_END)
+
+
+def test_the_blocker_definition_ships_in_the_same_words_in_every_non_chair_mandate():
     """Four seats classifying by four different definitions is four bars, and the one that
     decides whether the submitter pays a round would be whichever seat spoke."""
-    blocks = {s: blocker_block(s) for s in NON_CHAIR}
+    blocks = {s: blocker_definition(s) for s in NON_CHAIR}
 
     assert len(set(blocks.values())) == 1, (
         "the mandates disagree about what a blocker is: " + ", ".join(sorted(blocks)))
 
 
-def test_the_blocker_definition_states_the_default_and_which_way_a_doubt_falls():
+def test_the_narrowing_of_reason_and_asks_ships_in_the_same_words_too():
+    blocks = {s: narrowing_rule(s) for s in NON_CHAIR}
+
+    assert len(set(blocks.values())) == 1
+
+
+def test_the_tiebreaker_ships_to_exactly_the_two_seats_whose_uncertainty_costs_a_round():
+    """A SAFETY RULE, not a nit (spec §3.2.1). The two veto seats are told the OPPOSITE:
+    when torn about an exposure, BLOCK. `validation.auto_merge` is ON for this project, so a
+    concern classified `follow_up` is filed to the backlog, withheld from the chair entirely
+    — not its text, not its title — and the commit merges UNATTENDED. One sentence copied
+    into four files instead of two is the whole of what a silent fail-open would take here.
+
+    Asserted as a SET rather than per seat, so a fifth copy fails this too: "the tiebreaker
+    is in the architect's mandate" is satisfied by a build where it is in all of them.
+    """
+    carrying = {s for s in NON_CHAIR if TIEBREAKER in flat(s)}
+
+    assert carrying == {"architect", "maintainer"}
+    assert set(validation.VETO_SEATS) & carrying == set(), (
+        "the seat that is told to block when it is torn has been handed the sentence that "
+        "tells it to file instead")
+
+
+def test_the_security_seat_still_blocks_when_it_is_torn_about_an_exposure():
+    """VERBATIM, out of the shipped markdown. This sentence predates the feature and nothing
+    the feature adds may soften or displace it. It is the one rule standing between an
+    uncertain security seat and an unattended merge."""
+    assert ("When you are genuinely torn about something that could expose data or widen "
+            "access, block — being wrong about a rejection costs a round, and being wrong "
+            "about a leak costs the leak.") in flat("security")
+
+
+def test_the_tester_seat_still_states_the_cost_asymmetry_that_makes_it_block():
+    """The tester's equivalent of the rule above: uncertainty resolves toward the rejection,
+    because the two errors do not cost the same."""
+    body = flat("tester")
+
+    assert ("A rejection costs the submitter a round and costs the user nothing; a pass on "
+            "untested work costs whatever the untested path costs when it runs.") in body
+    assert "Block on absence of evidence, not on absence of your preference." in body
+
+
+def test_the_blocker_definition_states_the_default_and_where_a_remark_goes():
     """STATING THE DEFAULT IS LOAD-BEARING (spec §3.2): a model asked to classify with no
     stated default classifies toward the graver label, which is the production defect in a
     new costume."""
-    block = blocker_block("architect")
+    block = blocker_definition("architect")
 
     assert "only if the work is not fit to ship without it" in block
     assert "Everything else is a `follow_up`" in block
     assert "including everything you would merely have written differently" in block
-    assert "that weighing is itself the answer: it is a follow-up" in block
-    assert "not exactly `blocker` is read as `follow_up`" in block
     assert "filed as a ticket against this project" in block, (
         "a seat told its remark is discarded will argue for it instead")
+    assert "not exactly `blocker` is read as `follow_up`" in flat("architect")
 
 
 def test_every_seat_is_told_that_reason_and_asks_NARROW_to_its_blockers():
@@ -603,7 +657,7 @@ def test_every_seat_is_told_that_reason_and_asks_NARROW_to_its_blockers():
     and two concrete asks, and mechanism 1.1 would arrive intact through a field the
     severity filter does not read. A schema table alone will not carry that, because it is
     a change to what the seat was previously told to WRITE."""
-    block = blocker_block("architect")
+    block = narrowing_rule("architect")
 
     assert "`reason` and `asks` are about your BLOCKERS" in block
     assert "lists the concrete changes your `blocker` findings require and nothing else" \
@@ -627,13 +681,22 @@ def test_the_severity_rules_sit_next_to_the_output_section(seat):
 
 
 @pytest.mark.parametrize("seat", validation.VETO_SEATS)
-def test_a_veto_seat_blocks_only_when_it_wrote_a_blocker(seat):
-    """Their veto itself is untouched (spec §7). What changes is that a concern they would
-    not stop the work over stops being an argument and becomes a ticket."""
+def test_a_veto_seat_needs_a_blocker_to_block_but_may_blocker_without_blocking(seat):
+    """THE IMPLICATION RUNS ONE WAY, and an earlier draft of this work wrote it as an
+    "if and only if" — which deletes row 2 of §3.4's table: a veto seat raising a real
+    blocker it would NOT stop the work over, for the chair to weigh. That path is how these
+    two say something real without spending their veto, and it has always been theirs.
+
+    Their veto itself is untouched (spec §7). What changes is that a concern they would not
+    argue at all stops being an argument and becomes a ticket.
+    """
     body = flat(seat)
 
-    assert "Set `blocking` when, and only when, you have written at least one `blocker` " \
-           "finding." in body
+    assert "`blocking` REQUIRES at least one `blocker` finding; a `blocker` does NOT " \
+           "require `blocking`" in body
+    assert "Do not set `blocking` without naming a `blocker`" in body
+    assert 'You may also reject WITHOUT blocking (`"verdict": "reject", "blocking": ' \
+           'false`)' in body, "row 2 of the table the mandate must still offer"
     assert "a `follow_up` finding — filed rather than argued" in body
     assert "YOU HOLD A VETO" in body, "the veto is not weakened by this"
 

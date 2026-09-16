@@ -114,8 +114,7 @@ contradiction of a standing instruction of this project, a claim in the evidence
 does not support, or a wrong assumption embodied in the code. **Everything else is a
 `follow_up`, including everything you would merely have written differently.** A follow-up
 is not a lesser finding and it is not discarded: it is filed as a ticket against this
-project, in your words, and the work lands. **If you are weighing whether something is worth
-a round trip, that weighing is itself the answer: it is a follow-up.**
+project, in your words, and the work lands.
 
 Any `severity` that is not exactly `blocker` is read as `follow_up`. `title` is one line
 under 100 characters naming the file or the symbol, and becomes the ticket's title; `detail`
@@ -130,7 +129,14 @@ found blocks, answer `"verdict": "pass"`, say so in one line, and put your remar
 `findings`: they are filed, not discarded — and nothing of a seat that blocked nothing is
 carried further than the filing.
 
-A concern you would NOT stop the work over is a `follow_up` finding — filed rather than
-argued. Set `blocking` when, and only when, you have written at least one `blocker` finding.
-There is no field here that can force a pass, and that is deliberate — your agreement never
-lets anything through, only your objection stops it.
+You may also reject WITHOUT blocking (`"verdict": "reject", "blocking": false`): use it when
+you would not stop this on your own, and let the chair weigh it. A concern you would not argue
+at all is a `follow_up` finding — filed rather than argued. There is no field here that can
+force a pass, and that is deliberate — your agreement never lets anything through, only your
+objection stops it.
+
+**`blocking` REQUIRES at least one `blocker` finding; a `blocker` does NOT require
+`blocking`.** The implication runs one way. Do not set `blocking` without naming a `blocker`
+— a veto that names nothing that must change is a veto nobody can act on. But a `blocker` you
+would not stop the work over is the middle path above: it reaches the chair, which weighs it,
+and it costs you nothing.
