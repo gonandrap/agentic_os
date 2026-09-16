@@ -44,6 +44,7 @@ from .project_store import (
     FO_TERMINAL_STATUSES,
     NO_TURN,
     OPEN_STATUSES,
+    FORCEABLE_STATUSES,
     OPEN_VALIDATION_OUTCOMES,
     ProjectStore,
 )
@@ -566,13 +567,30 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         inbox = central.unacked_inbox()
         backlog_open = central.list_backlog(status="open")
         for q in escalated_questions:
+            # A `triage` question is the one kind with NO WORKER BEHIND IT (issue #240):
+            # nothing is blocked on the answer, the bug is sitting in the backlog, and
+            # `jarvis neo answer` would try to message a work order that does not exist.
+            # Still listed — an unconfirmed `blocker` the user never hears about is the
+            # failure this whole path exists to avoid — but pointed at the command that
+            # actually resolves it.
+            triage = q.get("kind") == "triage"
+            item_id = ""
+            if triage:
+                from . import issues
+                item_id = (issues.triage_payload(q) or {}).get("backlog_id") or ""
             attention.append({
                 "project": q["project"], "wo_id": q["wo_id"],
-                "title": f"Neo escalated: {q['question'][:80]}",
+                "title": (f"Neo could not confirm a bug's priority: {q['question'][:60]}"
+                          if triage else f"Neo escalated: {q['question'][:80]}"),
                 "status": "neo_escalated",
-                "reason": q.get("answer_reason") or "Neo declined to answer for you",
+                "reason": q.get("answer_reason") or (
+                    "the rating is UNCONFIRMED, so nothing was dispatched and no "
+                    "release was cut" if triage
+                    else "Neo declined to answer for you"),
                 "neo_question_id": q["id"],
-                "decide": f"jarvis neo answer {q['id']} \"…\"",
+                "decide": (f"jarvis backlog promote {item_id}" if item_id else
+                           f"jarvis neo show {q['id']}") if triage else
+                          f"jarvis neo answer {q['id']} \"…\"",
             })
         # Gates Neo sent up. These are the only approval requests that cost the user
         # anything: the rest were decided without them, which is the point.
@@ -671,7 +689,9 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       append_system_prompt: str | None = None,
                       backlog_id: str | None = None,
                       depends_on: list[str] | None = None,
-                      parent_id: str | None = None) -> dict[str, Any]:
+                      parent_id: str | None = None,
+                      issue_url: str | None = None,
+                      issue_priority: str | None = None) -> dict[str, Any]:
     """File a work order. `parent_id` files it UNDER a feature order.
 
     Until now the only way a work order acquired a parent was a plan release, because the
@@ -705,7 +725,8 @@ def create_work_order(project_name: str, title: str, description: str = "",
             title=title, description=description, origin=origin, model=model,
             effort=effort, permission_mode=permission_mode,
             append_system_prompt=append_system_prompt, backlog_id=backlog_id,
-            depends_on=depends_on, parent_id=parent_id,
+            depends_on=depends_on, parent_id=parent_id, issue_url=issue_url,
+            issue_priority=issue_priority,
         )
     except (KeyError, ValueError) as e:
         # A dependency on a work order in another project cannot be honoured — the edge
@@ -1252,9 +1273,15 @@ def round_line(rnd: dict[str, Any]) -> str:
     # infer it (spec 2026-09-14 §5.2). `not recorded` for a worktree packet and for every
     # round written before the column existed, which is the honest reading of both.
     sha = str(rnd.get("head_sha") or "")
+    # WHO OPENED IT, and only when the answer is not "a submission did". A round a person
+    # forced must never read afterwards like a worker re-delivering — that
+    # indistinguishability is the whole defect `jarvis validation force` removes — and the
+    # place it has to say so is the line every surface already prints.
+    forced = (rnd.get("forced_reason") or "").strip()
     return (f"round {rnd['round']} · {rnd['fingerprint']} · {rnd['outcome']}"
             f" · config {rnd.get('config_version') or 'not recorded'}"
             f" · commit {sha[:10] or 'not recorded'}"
+            + (f" · forced: {forced}" if forced else "")
             + (f" — {reason}" if reason else ""))
 
 
@@ -1356,7 +1383,7 @@ def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
     read to answer "how many times, and what came back", not to re-read the submission.
     """
     return [{k: r[k] for k in ("id", "round", "ts", "fingerprint", "outcome", "reason",
-                               "pr_url", "config_version", "head_sha")}
+                               "pr_url", "config_version", "head_sha", "forced_reason")}
             for r in store.validation_rounds(wo_id=wo_id, fo_id=fo_id)]
 
 
@@ -1794,7 +1821,8 @@ def refusal_answered(store: ProjectStore, wo_id: str) -> bool:
 
 
 def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str, Any],
-                          *, declared: str, cfg: Any) -> dict[str, Any]:
+                          *, declared: str, cfg: Any,
+                          forced_reason: str = "") -> dict[str, Any]:
     """Open a validation round over what this work order has produced.
 
     Collects the evidence, fingerprints it, opens the round and parks the work order in
@@ -1805,6 +1833,12 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     is retried while its round is still open, or one that follows a transport outage,
     reuses the number it already has. The insert is idempotent per (work order, round),
     so two callers racing here produce one round rather than two.
+
+    `forced_reason` is `force_validation`'s and nobody else's: it is stamped on the round
+    and changes NOTHING about how the round is numbered, judged or settled. A forced
+    round spends a number exactly like a submitted one, which is why the budget question
+    has the answer it has — spec
+    docs/superpowers/specs/2026-09-15-forcing-a-validation-round.md §4.
     """
     from . import evidence as evidence_mod
     from . import specs
@@ -1819,7 +1853,7 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
         wo_id=wo["id"], fingerprint=evidence_mod.fingerprint(packet),
         summary=str(wo.get("result_summary") or ""), evidence=declared,
         pr_url=wo.get("pr_url"), round=nxt,
-        config_version=current_config_version())
+        config_version=current_config_version(), forced_reason=forced_reason)
     store.set_status(wo["id"], "validating")
     # No attention flag: a unit under review is the system working. Only the give-up
     # transition flags anyone.
@@ -1829,6 +1863,108 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
                      "fingerprint": round_row["fingerprint"],
                      "files": len(packet.files)})
     return round_row
+
+
+def force_validation(wo_id: str, *, reason: str,
+                     project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis validation force` — a PERSON opening a fresh round, with no worker.
+
+    Why it exists: jarvis-0.10.0 introduced `validation_rounds.head_sha`, so every round
+    judged before it carries `''` and `automerge.decide`'s condition 4 holds those work
+    orders on `sha_unrecorded` for ever. The only route to a fresh round was `jarvis wo
+    finish`, which writes a `finished` event and demands a `--summary` — so re-judging a
+    work order meant forging a worker's account of work no worker had done. This reaches
+    `submit_for_validation` directly and writes NO `finished` event; the packet is
+    re-collected from scratch, which is how the new round comes to read the CURRENT pull
+    request and record the CURRENT head.
+
+    **`--reason` is REQUIRED and stored on the round**, following `jarvis config set` and
+    `jarvis gate approve`. A forced round that looked organic afterwards is the defect
+    this command exists to remove, so the reason is on `validation_rounds.forced_reason`
+    — beside the verdict it caused, where `round_line` renders it — and on a
+    `validation_forced` timeline event.
+
+    **IT SPENDS A ROUND NUMBER LIKE ANY OTHER, AND `max_rounds` DOES NOT HOLD IT OFF**
+    (Neo, question 300). Nothing about opening a round consults `cfg.max_rounds`: it is a
+    settle-time branch in `Daemon._validate_work_order`, where `rejected` below the budget
+    sends the worker feedback and `rejected` at or past it escalates to the user. That is
+    the right landing for a round a person forced — the motivating population is parked
+    work orders with no worker left to send feedback to — so the budget is left alone
+    rather than exempted. It cannot be exempted cheaply either: `counted_validation_rounds`
+    both counts rounds AND numbers them, so a round excluded from the count would have its
+    number reused, hit the idempotent insert in `open_validation_round` and hand the
+    caller an already-closed round while the work order parked in `validating` for ever.
+
+    **WHAT IT ALLOWS is `FORCEABLE_STATUSES`, and that is a narrower claim than "what it
+    does not refuse".** Only `waiting_pr_merge` and `needs_review`: a work order that has
+    DELIVERED and whose worker is not typing. A `running` one would be judged while its
+    worker is still writing to the branch, and — worse — an open round OWNS that worker's
+    session (kn-01a4ab27), so `Daemon._reject` would post the panel's feedback into a
+    session mid-task. The allowlist is the guard rather than a `running`-shaped refusal,
+    so a status added to `WO_STATUSES` tomorrow is refused until somebody decides it is
+    safe rather than allowed until somebody remembers it is not.
+
+    The work order lands in `validating` and goes back to where the panel's verdict puts
+    it: `waiting_pr_merge` on a pass (`land_when_cleared` re-parks it behind the still-open
+    pull request, and the automatic merge can then arm on the head this round recorded),
+    `needs_review` on an escalation.
+    """
+    reason = reason.strip()
+    if not reason:
+        raise OpsError("`--reason` cannot be blank: it is what makes this round legible "
+                       "afterwards as one a person forced, and why")
+    name, path, _wo = find_work_order(wo_id, project_name)
+    cfg = validation_config(name)
+    if cfg is None or not cfg.enabled:
+        raise OpsError(
+            f"the validation panel is off for {name}, so there is nothing to force a "
+            f"round with — turn it on (`jarvis config set {name} validation.enabled "
+            f"true`) before forcing a round")
+    store = ProjectStore(path)
+    try:
+        wo = store.get_work_order(wo_id)
+        status = str(wo["status"] or "")
+        if status not in FORCEABLE_STATUSES:
+            raise OpsError(
+                f"{wo_id} is {status}, and a round can only be forced on a work order "
+                f"that has DELIVERED and whose worker is not typing — "
+                f"{' or '.join(FORCEABLE_STATUSES)}. A settled order would be reopened "
+                f"by a verdict that could change nothing; a live one would have its "
+                f"session claimed by the round machine while its worker is still "
+                f"writing to it")
+        if not str(wo.get("pr_url") or ""):
+            raise OpsError(
+                f"{wo_id} carries no pull request, so a fresh round would read its "
+                f"worktree and record no commit — which is the state this command "
+                f"exists to get out of. Give it its pull request first "
+                f"(`jarvis wo finish {wo_id} --pr <url>`)")
+        # ONE READ, predicate and wording derived from it (kn-08f2ff9b): the panel opens
+        # rounds on its own thread, and two reads can straddle one — refusing while
+        # naming a round that has since settled, or allowing over a round that has since
+        # opened. `round_machine_owns` is the round machine's own definition of "this is
+        # mine", and a round it still owns is one about to run or be retried: a second
+        # round underneath would take the MAX-round slot out from under it.
+        latest = store.latest_validation_round(wo_id=wo_id)
+        if ProjectStore.round_machine_owns(latest):
+            assert latest is not None  # `round_machine_owns` is False for None
+            raise OpsError(
+                f"round {latest['round']} on {wo_id} is {latest['outcome']} — the panel "
+                f"has not finished with it. Wait for the verdict; forcing a round now "
+                f"would judge the same pull request twice")
+        round_row = submit_for_validation(store, path, wo,
+                                          declared=declared_evidence(store, wo_id),
+                                          cfg=cfg, forced_reason=reason)
+        # AFTER the round exists, so the event can name it. A person reading the timeline
+        # sees who reopened this and why, next to the `validation_submitted` that a
+        # submission would have written alone.
+        store.add_event(wo_id, "validation_forced",
+                        {"round": round_row["round"], "round_id": round_row["id"],
+                         "reason": reason, "was": status})
+        return {"project": name, "wo_id": wo_id, "round": round_row["round"],
+                "round_id": round_row["id"], "reason": reason, "was": status,
+                "status": store.get_work_order(wo_id)["status"]}
+    finally:
+        store.close()
 
 
 def collect_feature_evidence(store: ProjectStore, project_path: Path,
@@ -2479,6 +2615,37 @@ def clear_pr_repair(store: ProjectStore, wo: dict[str, Any],
 def pr_repair_origin(store: ProjectStore, wo_id: str) -> str | None:
     """The status an OPEN repair episode took this work order out of, if any."""
     return store.pr_repair_origin(wo_id, tuple(r.name for r in PR_REPAIRS))
+
+
+#: What a relaunched turn may put a work order back into, and the only status that needs
+#: it. `needs_review` is a decision the USER owes — pending assumptions are handled a
+#: branch earlier, so what is left is a red build, a refused panel round, a pull request
+#: closed unmerged — and a usage window reopening answers none of them; parking that in
+#: the merge queue is the silent downgrade Neo question 275 already outlawed for repair
+#: turns. Every other origin is deliberately absent: `waiting_pr_merge` is where the
+#: fallback lands anyway, `failed` and `waiting_input` are the states the relaunch was
+#: meant to LIFT, and returning a work order to one would undo its own recovery.
+RESUMABLE_ORIGINS = ("needs_review",)
+
+
+def resumed_from(store: ProjectStore, wo_id: str, seq: int) -> str | None:
+    """The status `Daemon.retry_paused_turns` took this work order out of for THIS turn.
+
+    The other way the OS moves a work order without being asked, and the counterpart to
+    `pr_repair_origin` above (issue #259). Not episode arithmetic: a resume is one turn,
+    so the origin is spent by the turn that settles and matching on `seq` says so
+    exactly. A `turn_resumed` event from an earlier turn describes a move the OS has
+    already finished with, and reading it here would park a work order in a status it
+    left two turns ago.
+    """
+    events = store.events_of_kind(wo_id, "turn_resumed")
+    if not events:
+        return None
+    payload = db.from_json(events[-1].get("payload"), {}) or {}
+    if payload.get("seq") != seq:
+        return None
+    was = payload.get("was")
+    return was if was in RESUMABLE_ORIGINS else None
 
 
 def _awaiting_merge(wo: dict[str, Any]) -> bool:
@@ -3593,14 +3760,24 @@ def neo_review(question_id: int, approved: bool, feedback: str = "",
     finally:
         neo.close()
     forwarded = False
-    # AN ASSUMPTION REVIEW HAS NO WORKER TO FORWARD TO, and correcting one is the path
-    # the user is actually told to take (`Daemon._deliver_assumption_verdict`'s inbox
-    # row), so this is not a corner. The worker finished before the question was even
-    # filed, and the work order is typically `waiting_pr_merge` or `validating` — not
-    # terminal — so without this guard the correction would start a turn on an order
-    # nobody asked to reopen, which is the one act the whole mechanism is fenced against.
-    # The LEARNING above still lands, which is the entire point of the correction.
-    if not approved and q.get("kind") != "assumption":
+    # TWO KINDS HAVE NO WORKER TO FORWARD A CORRECTION TO, for different reasons, and
+    # both are commands the OS itself tells the user to run. Stated rather than left to
+    # the lookup below failing: relying on an accidental `OpsError` is exactly the shape
+    # kn-4edb0eb7 warns gets missed. The learning above still lands either way — that is
+    # the entire point of the correction.
+    #
+    # `triage` carries no work order at all (issue #240): there is nobody to send to.
+    # `assumption` has one, and that is worse. The worker finished before the question
+    # was even filed, and the order is typically `waiting_pr_merge` or `validating` — NOT
+    # terminal — so without this the correction would start a turn on an order nobody
+    # asked to reopen, the one act this whole mechanism is fenced against
+    # (`Daemon._deliver_assumption_verdict`'s inbox row is what sends them here).
+    if not approved and q.get("kind") in ("triage", "assumption"):
+        return {"question_id": question_id, "review": "corrected",
+                "learning_recorded": learning is not None,
+                "learning_seat": seat or "all seats",
+                "forwarded_to_worker": False}
+    if not approved:
         try:
             _, _, wo = find_work_order(q["wo_id"], q["project"])
             if wo["status"] not in ("completed", "failed", "cancelled"):
@@ -3640,6 +3817,16 @@ def _alarm_review_hint(q: dict[str, Any]) -> str:
             else "review it with: jarvis alarms review <al-id>")
 
 
+def _triage_promote_hint(q: dict[str, Any]) -> str:
+    """The command that really decides a bug-priority question. `_alarm_review_hint`'s
+    twin, and best-effort for the same reason: it only ever builds a refusal's tail."""
+    from . import issues
+
+    item_id = (issues.triage_payload(q) or {}).get("backlog_id") or "<bl-id>"
+    return (f"it is queued in the backlog, so promote it with: "
+            f"jarvis backlog promote {item_id}")
+
+
 def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
     """The user answers a question Neo escalated; the answer flows to the worker
     through the same delivery path Neo's answers use."""
@@ -3675,6 +3862,16 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
                 f"that recorded it has finished — answering here would reopen it. "
                 f"Decide the assumption instead: jarvis wo review {q['wo_id']} "
                 f"[--reject] --feedback \"...\"")
+        # A TRIAGE QUESTION HAS NO WORKER TO ANSWER EITHER, and for a sharper reason
+        # than the alarm's: its `wo_id` is EMPTY (issue #240), so the delivery below
+        # would look up a work order that was never created. What the user is really
+        # deciding is whether the bug is worth a work order, and that decision is
+        # `jarvis backlog promote`. Refused HERE as well as in the template, because
+        # `jarvis neo answer` reaches this too (kn-4edb0eb7).
+        if q.get("kind") == "triage":
+            raise OpsError(f"neo question {question_id} is a bug-priority "
+                           f"re-assessment, and no work order is waiting on it — "
+                           f"{_triage_promote_hint(q)}")
         neo.record_answer(question_id, answer, answered_by="user")
         neo.review(question_id, approved=True)  # user-authored ⇒ nothing to review
     finally:

@@ -57,11 +57,11 @@ from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
-    ACTIVE_STATUSES,
     FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
     OPEN_STATUSES,
     PRE_APPROVED_KEY,
+    RETRY_SWEEP_STATUSES,
     UNGOVERNED_ORIGINS,
     ProjectStore,
     resume_spends_slot,
@@ -280,6 +280,7 @@ class Daemon:
         # credentials, an unreachable host). Same idea: say it once, not every 2 minutes
         # forever. Reset by restarting the daemon, which is also what fixes it.
         self.pr_poll_warned: set[str] = set()
+        self.issue_sync_warned: set[str] = set()
         # The systemd seam for staged releases (src/jarvis/release.py). None means the
         # real thing; tests inject a fake so no test can ever touch real systemctl.
         self.release_runner: Any = None
@@ -555,6 +556,11 @@ class Daemon:
                 self.dispatch_pending(project, store, state)
                 if poll_prs:
                     self.poll_pull_requests(project, store)
+                    # AFTER the poll, in the same tick: a merge that just completed a
+                    # work order is what closes its issue, and making the tracker wait
+                    # a second poll interval for news the OS already has is the gap
+                    # issue #240 is about, one step smaller.
+                    self.sync_issues(project, store)
                 # After the pull-request poll, so the merge that completes a feature's
                 # last child settles the feature in the same tick rather than the next
                 # one — but outside the `if`, because a child can also finish without
@@ -1005,8 +1011,14 @@ class Daemon:
         and `tick` decides `retry_paused` once, outside the project loop, so every
         project's parked orders are swept on the same tick.
 
-        Every work order this touches is in an ACTIVE status, because the settler
-        deliberately did not fail it (see `settle_work_order` and `_park_on_signin`).
+        WHEREVER THE WORK ORDER IS PARKED (`RETRY_SWEEP_STATUSES`, issue #259). The
+        settler leaves a paused order's status alone, so most of what this touches is
+        active — but a turn can be refused on a work order that had already SETTLED into
+        `waiting_pr_merge`, `needs_review` or `failed`, and those three were unreachable
+        here while the sweep asked for `ACTIVE_STATUSES`. `invariants.stuck_message` has
+        always called an undelivered message in exactly those statuses a defect, so the
+        OS diagnosed the stall and had nothing that would ever repair it.
+
         What the relaunch SENDS is `worker_session.retry`'s business, and it is not the
         same for all: a refused turn was never sent, so the prompt goes again verbatim; a
         turn that died in flight already reached the model, so the worker is nudged to
@@ -1027,7 +1039,7 @@ class Daemon:
         `_park_on_signin`. Held means the pause stays parked with nothing written.
         """
         budget = project.max_concurrent - store.count_active()
-        for wo in store.list_work_orders(statuses=ACTIVE_STATUSES):
+        for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
             if state is not None and state.blocked():
                 return
             if wo["origin"] in UNGOVERNED_ORIGINS:
@@ -1064,14 +1076,30 @@ class Daemon:
                 "seq": turn["seq"], "retried_seq": pause.turn["seq"],
                 "attempt": pause.attempts, "of": pause.max_attempts,
                 "reason": pause.reason,
+                # WHERE THIS TURN CAME FROM, read back by `ops.resumed_from` when it
+                # settles. Recorded here because this is the only moment that knows it.
+                "was": wo["status"],
             })
-            # Only an auth pause is ever parked out of `running` (`_park_on_signin`), so
-            # this is where that gets put back — the same two lines `_deliver` uses, for
-            # the same reason: the turn is out, and a record still saying "waiting on
-            # you" about a worker that is working would be a lie.
+            # The turn is out, so the record must stop saying somebody else has it.
+            # Two shapes reach this: the auth pause, parked out of `running` by
+            # `_park_on_signin`, and since issue #259 an order that was already settled
+            # when its turn was refused.
+            #
+            # `running` IS REQUIRED FOR THE SECOND, not merely tidier. All three statuses
+            # issue #259 added are in `PR_POLL_STATUSES`, which excludes the in-flight
+            # ones precisely so `complete_merged` cannot end a work order out from under
+            # a worker that is still writing to it — so leaving a relaunched order where
+            # it was would put a live turn back in front of that poll.
             if wo["status"] != "running":
                 store.set_status(wo["id"], "running")
-                store.clear_attention(wo["id"])
+                # ONLY THE PAUSE'S OWN FLAG. `_park_on_signin` is the one that raises an
+                # item this relaunch answers; every other reason on a newly-swept row —
+                # assumptions pending review, a red build — is asking for the USER, and
+                # the usage window reopening did not answer it (kn-b6977de3). The
+                # sign-in item has to go, though: `true_blockers` re-derives it from
+                # `waiting_input`, and nothing re-derives it once this row is `running`.
+                if wo["attention_reason"] == invariants_mod.AUTH_BLOCKER:
+                    store.clear_attention(wo["id"])
 
     # -- 3. message delivery ----------------------------------------------------------
 
@@ -1842,6 +1870,12 @@ class Daemon:
             ppath = paths.get(q["project"])
             pstore = ProjectStore(ppath) if ppath and ppath.is_dir() else None
             try:
+                if q.get("kind") == "triage":
+                    # FIRST, and it returns: this is the one kind with no work order
+                    # behind it, so every branch below — each of which reaches for
+                    # `q["wo_id"]` — is meaningless here (issue #240).
+                    self._deliver_triage_verdict(central, q, verdict)
+                    return
                 if q.get("kind") == "approval":
                     self._deliver_gate_verdict(central, pstore, q, verdict)
                 elif q.get("kind") == "plan":
@@ -2846,7 +2880,13 @@ class Daemon:
                 # beyond the status itself.
                 from . import ops as ops_mod
 
-                back = ops_mod.pr_repair_origin(store, wo["id"]) or "waiting_pr_merge"
+                # `resumed_from` is the same rule as `pr_repair_origin` for the other
+                # way the OS takes a work order out of its status (issue #259): a
+                # relaunched turn must not end by filing the review somebody still owes
+                # as a merge-queue entry. It answers for `needs_review` alone — see it.
+                back = (ops_mod.pr_repair_origin(store, wo["id"])
+                        or ops_mod.resumed_from(store, wo["id"], turn["seq"])
+                        or "waiting_pr_merge")
                 if fresh["status"] != back:
                     store.set_status(wo["id"], back)
                     if back == "waiting_pr_merge":
@@ -3215,6 +3255,16 @@ class Daemon:
             return
         log.info("[%s] auto-merged %s — completing %s", project.name, wo["pr_url"],
                  wo_id)
+        if merged["after_merge_cause"]:
+            # THE MERGE LANDED AND THE COMMAND THAT MADE IT DID NOT SUCCEED (issue #253,
+            # spec §5.5). A note on the timeline and nothing else: not `automerge_failed`,
+            # which is a claim about the PULL REQUEST, and no inbox row, because neither
+            # cause needs a person and the work order completes below either way. The
+            # kind comes from the cause — `automerge.AFTER_MERGE_EVENT`'s reason.
+            store.add_event(wo_id,
+                            automerge.AFTER_MERGE_EVENT[merged["after_merge_cause"]], {
+                "head_sha": decision.judged_sha, "approval_id": approval["id"],
+                "reason": merged["after_merge_error"], "pr_url": wo.get("pr_url")})
         # No `merged_at`: that column holds GITHUB's `mergedAt`, and this path has not
         # asked GitHub anything since the merge. The `automerge_merged` event's own
         # timestamp is when it landed, and inventing a local clock reading for a remote
@@ -3642,6 +3692,218 @@ class Daemon:
         else:
             log.info("[%s] %s %s — asking %s to fix it (attempt %s)",
                      project.name, wo["pr_url"], what, wo["id"], out["attempts"])
+
+    def _deliver_triage_verdict(self, central: CentralStore, q: dict,
+                                verdict: dict) -> None:
+        """Route a filed bug now that Neo has ruled on the priority it was claimed at.
+
+        The filing agent's rating is a claim; this is the verdict. `issues.settle_triage`
+        holds the whole decision — what gets a work order, what stays in the backlog, and
+        what the tracker is told — so this is only the part that has to happen in the
+        daemon: catching a failure so one bad row cannot stop the Neo queue, and telling
+        the user in the two cases they would otherwise never hear about.
+
+        **AN UNCONFIRMED CLAIM IS AN INBOX ROW, NOT A DISPATCH.** Neo escalating, or
+        producing output nobody could parse, leaves the bug in the backlog and says so —
+        the user's instruction, and the right refusal direction: an unconfirmed `blocker`
+        that quietly became a release is the worse failure by a long way.
+        """
+        from . import issues
+
+        try:
+            out = issues.settle_triage(self.catalog, q, verdict)
+        except Exception:  # noqa: BLE001 — one unreadable row must not stall the queue
+            log.exception("triage verdict for neo question %s failed", q.get("id"))
+            return
+        log.info("[%s] triage %s: %s -> %s%s", q.get("project"), out.get("outcome"),
+                 out.get("claimed"), out.get("settled"),
+                 f" ({out['wo_id']})" if out.get("wo_id") else "")
+        # The head of the reasoning, and a pointer to the rest. Every inbox row reaches
+        # every sink, Telegram included, so the full text stays one `jarvis neo show`
+        # away — the rule the escalation row above already follows. This is also the ONLY
+        # place it goes now: the tracker comment carries the two levels and nothing else
+        # (`issues.TRIAGE_COMMENT`, review round 2).
+        why = (out.get("reason") or "").strip()
+        head = (why[:300] + ("…" if len(why) > 300 else "")) or "no reason given"
+        full = f"Neo's reasoning in full: jarvis neo show {q.get('id')}"
+        if out["outcome"] == "unconfirmed":
+            central.add_inbox(
+                project=q.get("project") or "jarvis-os", level="warning",
+                title=f"a `{out['claimed']}` bug report is UNCONFIRMED",
+                body=(f"{out['issue_url']}\nNeo could not settle the priority "
+                      f"({head}), so NOTHING was dispatched and no release was cut. It "
+                      f"is queued at {out.get('backlog_id') or '(no backlog item)'} — "
+                      f"promote it with `jarvis backlog promote "
+                      f"{out.get('backlog_id') or '<id>'}` if you agree with the "
+                      f"rating.\n{full}"))
+        elif out["outcome"] == "downgraded":
+            central.add_inbox(
+                project=q.get("project") or "jarvis-os", level="info",
+                title=f"Neo downgraded a `{out['claimed']}` bug to "
+                      f"`{out['settled']}`",
+                body=(f"{out['issue_url']}\n{head}\n"
+                      f"Queued at {out.get('backlog_id') or '(no backlog item)'} rather "
+                      f"than dispatched.\n{full}"))
+
+    def sync_issues(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Keep the tracker saying what the OS is actually doing. Issue #240.
+
+        The counterpart to `poll_pull_requests`, pointed the other way: that step asks
+        GitHub what happened, this one tells GitHub what happened here. A bug the OS
+        filed itself carries `issue_url`, and its issue must be labelled while a work
+        order is on it and closed when that work lands — without which the tracker is a
+        thing only a human maintains, which is the whole of the issue.
+
+        **A COMPARISON, NOT A SCHEDULE OF POKES.** `issues.desired_state` derives where
+        the issue belongs from the work order, `issue_state` records where the OS last
+        put it, and nothing is sent while the two agree. So the common case — every
+        tracked work order already reconciled — costs ONE indexed query for the whole
+        project and no subprocess at all, and a project that has never filed a bug does
+        not even pay that (the query returns nothing).
+
+        It is also the retry. `issues.record_applied` writes the column only after
+        GitHub accepted the change, so a tick that could not reach `gh` leaves the two
+        disagreeing and the next sweep tries again — which is what lets the filing path
+        label optimistically without owning a failure (#240 E).
+        """
+        tracked = store.work_orders_tracking_issues()
+        if not tracked:
+            return
+        from . import github, issues
+
+        for wo in tracked:
+            want = issues.desired_state(store, wo)
+            if want == (wo.get("issue_state") or ""):
+                continue
+            try:
+                applied = issues.record_applied(store, wo, project.bugs.label)
+            except github.GitHubError as e:
+                # Same shape as the pull-request poll: one unreachable tracker must not
+                # hide the rest, and the user hears once per daemon run.
+                log.debug("[%s] could not sync %s for %s: %s", project.name,
+                          wo.get("issue_url"), wo["id"], e)
+                self._warn_issue_sync_broken(project, store, e)
+                continue
+            except Exception:  # noqa: BLE001 — never let one work order stall the rest
+                log.exception("[%s] syncing the issue for %s failed", project.name,
+                              wo["id"])
+                continue
+            log.info("[%s] %s is now %s (%s)", project.name, wo.get("issue_url"),
+                     applied, wo["id"])
+            # THE SHIP IS TRIGGERED BY THE TRACKER CLOSING, WHICH IS THE LANDING SIGNAL
+            # AND NOT `completed`. `issues.desired_state` only reaches CLOSED for a
+            # merged pull request or an order that produced nothing to land, so this
+            # inherits issue #232's distinction rather than restating it — a fix sitting
+            # on an unmerged branch never gets here. `pr_url` separates those two routes:
+            # an order with no code to land has nothing to put in a release.
+            if (applied == issues.CLOSED and wo.get("pr_url")
+                    and issues.dispatches(wo.get("issue_priority") or "")):
+                self.ensure_release(project, store, wo)
+
+    #: The key under a work order's `metadata` that says "this order exists to ship
+    #: fixes, and these are the ones it is shipping". The batch lives HERE rather than in
+    #: a column because it is a list that grows while the order waits, and because
+    #: nothing outside this file has a reason to query it.
+    RELEASE_BATCH_KEY = "release_for_issues"
+
+    #: What the release work order is told to do. It runs the ORDINARY release path —
+    #: `scripts/shipit.sh --stage`, through the gate, exactly as a human-filed release
+    #: would (the user's instruction). `--stage` rather than an inline restart because
+    #: restarting inline kills the worker's own session: 0.5.1 landed as `failed` after a
+    #: perfect deploy, which is the whole reason staged mode exists.
+    RELEASE_BRIEF = """\
+Ship a release. These fixes have LANDED on `main` and the bugs they close were confirmed \
+`critical` or `blocker` by Neo, so the OS owes the fleet a release carrying them:
+
+{fixes}
+
+Run the ordinary release path and nothing else:
+
+    scripts/shipit.sh --stage --wo {wo_id}
+
+That is a PRIVILEGED ACTION and it will be gated — that is correct and expected. Make \
+your case first (`jarvis gate request`), and read `jarvis brief gates` before you do. Do \
+NOT invent a second release path, do not restart any service by hand, and do not drop \
+`--stage`: an inline restart kills your own session mid-turn.
+
+Check `main` is green before you ask. If it is not, say so and stop — a release is not \
+the place to fix a red build."""
+
+    def ensure_release(self, project: ProjectSpec, store: ProjectStore,
+                       wo: dict) -> str:
+        """Make sure a release carrying this landed fix is on its way. Returns its id.
+
+        **BATCHED, and that is the whole of this function.** Two blockers landing ten
+        minutes apart must not cut two releases: an open release order picks the second
+        fix up instead, because a release ships whatever is on `main` and the first one
+        has not gone out yet. Only once it has settled does the next landed fix earn a
+        new one.
+
+        Idempotent for the same reason the rest of the lifecycle is — a fix already in
+        the batch is not added twice, so a sweep that runs again changes nothing.
+        """
+        from . import db
+        from .project_store import OPEN_STATUSES
+
+        url = wo.get("issue_url") or ""
+        line = (f"- {url} — fixed by `{wo['id']}`"
+                + (f" ({wo['pr_url']})" if wo.get("pr_url") else ""))
+        for candidate in store.list_work_orders(statuses=OPEN_STATUSES,
+                                                include_hidden=True):
+            meta = db.from_json(candidate.get("metadata"), {}) or {}
+            batch = meta.get(self.RELEASE_BATCH_KEY)
+            if not isinstance(batch, list):
+                continue
+            if url not in batch:
+                store.update_work_order(
+                    candidate["id"],
+                    metadata=db.to_json({**meta,
+                                         self.RELEASE_BATCH_KEY: [*batch, url]}),
+                    description=f"{candidate.get('description') or ''}\n{line}")
+                store.add_event(candidate["id"], "release_batched",
+                                {"issue_url": url, "wo_id": wo["id"]})
+                log.info("[%s] %s joins the pending release %s", project.name, url,
+                         candidate["id"])
+            return str(candidate["id"])
+
+        # The brief names the work order's OWN id (`shipit.sh --wo`), which does not
+        # exist until the row does — hence create, then fill in.
+        fresh = store.create_work_order(
+            title=f"Ship the fix for {wo.get('title') or url}",
+            description="", origin="jarvis",
+            metadata={self.RELEASE_BATCH_KEY: [url]})
+        store.update_work_order(
+            fresh["id"],
+            description=self.RELEASE_BRIEF.format(wo_id=fresh["id"], fixes=line))
+        store.add_event(fresh["id"], "release_batched",
+                        {"issue_url": url, "wo_id": wo["id"]})
+        log.info("[%s] %s landed — filed release %s", project.name, url, fresh["id"])
+        return str(fresh["id"])
+
+    def _warn_issue_sync_broken(self, project: ProjectSpec, store: ProjectStore,
+                                error: Exception) -> None:
+        """Tell the user once per daemon run that the tracker is not being kept up.
+
+        `_warn_pr_poll_broken`'s twin, and it says a different thing on purpose: that
+        one warns that merges will not register, this one that issues the OS filed will
+        sit labelled and open until somebody closes them by hand. Both are the state the
+        OS reverts to, said plainly, rather than a stack trace.
+        """
+        from . import github
+
+        if project.name in self.issue_sync_warned:
+            return
+        self.issue_sync_warned.add(project.name)
+        log.warning("[%s] issue lifecycle unavailable: %s", project.name, error)
+        hint = ("" if isinstance(error, github.GhUnavailable) else
+                " If this is the daemon, `gh`'s keyring credentials may be out of "
+                "reach — set GH_TOKEN in the service environment.")
+        store.add_notification(
+            title=f"the bug tracker is not being kept up to date for {project.name}",
+            body=(f"{error}\n\nIssues Jarvis filed will stay as they are — labelled and "
+                  f"open — until you close them yourself.{hint}"),
+            level="warning", source="issue-sync",
+        )
 
     def _warn_pr_poll_broken(self, project: ProjectSpec, store: ProjectStore,
                              error: Exception) -> None:

@@ -43,6 +43,7 @@ from .project_store import (
     DEPENDENCY_DEAD_STATUSES,
     FO_OPEN_STATUSES,
     OPEN_STATUSES,
+    RETRY_SWEEP_STATUSES,
     RUNNABLE_VALIDATION_OUTCOMES,
     SLOT_STATUSES,
     UNGOVERNED_ORIGINS,
@@ -666,6 +667,12 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     if wo["status"] in ACTIVE_STATUSES:
         note = pause_note(store, wo) or neo_wait_note(wo)
         return f"{wo['status']} — {note}" if note else wo["status"]
+    # A booked retry on one of the settled-looking statuses the sweep reaches and the
+    # branch above does not (issue #259). Ranked over the round note below it: a turn the
+    # transport dropped is why nothing is moving, and it names the moment that changes.
+    parked = pause_note(store, wo)
+    if parked:
+        return f"{wo['status']} — {parked}"
     # `needs_review` no longer means the panel is waiting for the user: since issue 212
     # the round runs in parallel with the assumption review, and a status that said only
     # "needs_review" would hide the half of the work that is still moving.
@@ -759,8 +766,14 @@ def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
     The transient line names the attempt as well as the clock, because unlike a usage
     window — which reopens once, at a stated time — a backoff can be on its fourth of
     five, and "retrying at 14:07" without that reads as a promise it might not keep.
+
+    SCOPED TO `RETRY_SWEEP_STATUSES`, which is the set this sentence is a promise about:
+    it says the OS will relaunch the turn, so it must be readable exactly where the
+    sweep will. Since issue #259 that includes the three settled-looking statuses a
+    refused turn can land on, where the note was blank and the work order looked simply
+    finished.
     """
-    if wo["status"] not in ACTIVE_STATUSES:
+    if wo["status"] not in RETRY_SWEEP_STATUSES:
         return ""
     pause = worker_session.turn_pause(store, wo["id"])
     if pause is None or pause.exhausted:
@@ -1346,16 +1359,32 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
     overwrites no verdict (`NeoStore.supersede` is guarded on the open statuses).
     """
     from .neo_store import USER_HELD_Q_STATUSES, NeoStore
+    from .ops import registered_project_paths
 
     readonly = getattr(store, "readonly", False)
     neo = NeoStore()
     try:
         held = [q for q in neo.list_questions(statuses=USER_HELD_Q_STATUSES)
-                if q["kind"] in ("approval", "plan", "alarm", "assumption")]
+                if q["kind"] in ("approval", "plan", "alarm", "triage",
+                                 "assumption")]
+        # `triage` is the one kind whose subject is not a row in THIS database — it is a
+        # central backlog item, and the question carries no work order at all (issue
+        # #240). So ownership cannot be read off the project store the way the other
+        # three read it, and without this the same question would be reported by every
+        # project on the same tick. Resolved once, and only when there is one to resolve.
+        #
+        # `assumption` needs none of this: its subject IS a row in this database, reached
+        # by `assumption_for_question`, so a question belonging to another project reads
+        # as a missing row and is left alone — the rule all the non-`triage` kinds share.
+        mine = (registered_project_paths()
+                if any(q["kind"] == "triage" for q in held) else {})
         for q in held:
+            if q["kind"] == "triage" and mine.get(q["project"]) != store.project_path:
+                continue
             moot = {"approval": _stale_approval_question,
                     "plan": _stale_plan_question,
                     "alarm": _stale_alarm_question,
+                    "triage": _stale_triage_question,
                     "assumption": _stale_assumption_question}[q["kind"]](store, q)
             if moot is None:
                 continue
@@ -1454,6 +1483,45 @@ def _stale_assumption_question(store: ProjectStore,
             f"assumption {assumption['id']} was already {assumption['status']}")
 
 
+def _stale_triage_question(store: ProjectStore,
+                           q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) if this priority re-assessment is moot, else None. Issue #240.
+
+    The subject of a `triage` question is the BACKLOG ITEM the filing left behind, not a
+    work order — this is the only kind with no work order behind it at all. So "still
+    live" means that item is still waiting: once the user has promoted it, or dismissed
+    it, or it has gone, nobody can act on the rating any more and the escalation is
+    asking for a ruling that would change nothing.
+
+    A missing item is decisive here, unlike `_stale_alarm_question`, and for the reason
+    that check spells out: the backlog is CENTRAL, so absence means gone rather than
+    "belongs to another project" — the caller has already established this project owns
+    the question before calling.
+    """
+    from . import issues
+    from .central_store import CentralStore
+
+    payload = issues.triage_payload(q)
+    item_id = (payload or {}).get("backlog_id") or ""
+    if not item_id:
+        # A question whose context nobody can parse. `settle_triage` already refuses to
+        # act on one, and closing it here would guess at what it was about.
+        return None
+    central = CentralStore()
+    try:
+        item = central.get_backlog(item_id)
+    finally:
+        central.close()
+    if item is None:
+        return ("SUPERSEDED — the backlog item this was about is gone",
+                f"backlog item {item_id} no longer exists")
+    if item["status"] == "open":
+        return None
+    return (f"SUPERSEDED — backlog item {item_id} is {item['status']}",
+            f"backlog item {item_id} was already {item['status']}, so the rating "
+            f"changes nothing")
+
+
 def check_proposed_remedies_are_live(store: ProjectStore) -> Iterator[Violation]:
     """INV-REMEDY-PROPOSAL-STALE — a proposal nobody can answer must not sit for ever.
 
@@ -1535,8 +1603,11 @@ def check_paused_turns_resume(store: ProjectStore) -> Iterator[Violation]:
     omission, or an exception inside the pass would all reproduce the same silent day.
     This checks the OUTCOME instead of any one cause, so it survives the next one.
 
-    Predicate: an active, governed work order whose pause came due more than
-    `PAUSE_OVERDUE_GRACE` ago. The pass runs every `RETRY_EVERY_TICKS` ticks — about ten
+    Predicate: a governed work order in `RETRY_SWEEP_STATUSES` whose pause came due more
+    than `PAUSE_OVERDUE_GRACE` ago. THE SAME TUPLE THE PASS WALKS, and it has to be: a
+    check scoped narrower than the loop it audits is blind in exactly the rows the loop
+    never reaches, which is how issue #259 went unreported while `stuck_message` named it
+    on demand. The pass runs every `RETRY_EVERY_TICKS` ticks — about ten
     seconds — so the grace is two orders of magnitude of slack, and anything reported
     here is stuck rather than merely waiting its turn.
 
@@ -1557,7 +1628,7 @@ def check_paused_turns_resume(store: ProjectStore) -> Iterator[Violation]:
     and there is nothing left to report. Exhausted pauses are skipped because the retry
     pass skips them too — those already reach the user through the attention flag.
     """
-    for wo in store.list_work_orders(statuses=ACTIVE_STATUSES):
+    for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
         if wo["origin"] in UNGOVERNED_ORIGINS:
             continue  # the user's own session; Jarvis does not drive it
         try:
@@ -1613,7 +1684,7 @@ def check_pause_deadline_stable(store: ProjectStore) -> Iterator[Violation]:
     Report-only. A disagreement means the derivation is wrong, and which of the two
     numbers to believe is exactly the judgement an invariant must not make on its own.
     """
-    for wo in store.list_work_orders(statuses=ACTIVE_STATUSES):
+    for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
         if wo["origin"] in UNGOVERNED_ORIGINS:
             continue
         try:

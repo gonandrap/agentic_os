@@ -173,6 +173,30 @@ jarvis validation show <wo-id|fo-id>       # HOW a unit was judged. `wo show` an
                                            # nothing pushes it at the user; reach for it
                                            # when they ask WHY a unit was rejected, not to
                                            # report that it was. Takes either id.
+jarvis validation force <wo-id> --reason "…"    # judge this work order AGAIN, now. The
+                                           # panel's verdict is about a COMMIT, and every
+                                           # round judged before 0.10.0 recorded none — so
+                                           # those orders can never auto-merge, however
+                                           # green. This opens a fresh round that reads
+                                           # the CURRENT pull request and records the
+                                           # commit, with no worker and no `finished`
+                                           # event on the timeline. --reason is required
+                                           # and is stored on the round, so a forced
+                                           # re-judgement never reads afterwards like a
+                                           # worker's own re-delivery. ONLY on an order
+                                           # that has DELIVERED and whose worker is not
+                                           # typing: `waiting_pr_merge` (the case it
+                                           # exists for) or `needs_review`. A running one
+                                           # is refused — an open round owns the worker's
+                                           # session, so forcing there would put the
+                                           # panel's feedback into a session mid-task —
+                                           # and so is a settled one. It leaves the order
+                                           # `validating` until the verdict, back to
+                                           # `waiting_pr_merge` if it passes. It spends a
+                                           # round number like any other, so a REJECTION
+                                           # at or past `max_rounds` comes to you rather
+                                           # than to a worker. Also refuses with no pull
+                                           # request or with a round already open.
 jarvis gate list [--pending]               # privileged-action approvals (merge a PR, ship
                                            # a release). Workers attempt these and get
                                            # blocked; Neo reviews and decides, so most
@@ -237,10 +261,32 @@ jarvis learn retract <id> --reason "…"     # same for the knowledge base: reti
                                            # workers — it leaves the index too, not
                                            # just the payload — without erasing that
                                            # it was true
-jarvis bug report "title" -d "..." -e "expected" -a "actual" [--steps "..."]
+jarvis bug report "title" -d "..." -e "expected" -a "actual" -p <priority>
                                            # a bug in the OS itself -> GitHub issue on
                                            # the (PUBLIC) tracker + Telegram ping.
                                            # Every agent has the report-jarvis-bug skill.
+                                           # --priority is REQUIRED and is the ONLY thing
+                                           # that routes the bug: low/medium/high queue
+                                           # in the backlog for the user to promote;
+                                           # critical/blocker are RE-ASSESSED BY NEO
+                                           # against the rubric in `--help`, and only if
+                                           # Neo confirms does a work order get created
+                                           # and a release ship once that fix LANDS. The
+                                           # filing agent states a claim, not a verdict —
+                                           # the level it claimed stays in the issue body,
+                                           # the level after Neo is the `priority:` label,
+                                           # and both are on the issue. Neo's REASONING
+                                           # never is — it is private, in the inbox and
+                                           # in `jarvis neo show`, because nothing a
+                                           # model wrote in prose goes on a public
+                                           # tracker unread. Neo
+                                           # unreachable = it stays queued, unconfirmed:
+                                           # nothing is dispatched off an unconfirmed
+                                           # blocker. A picked-up issue is labelled
+                                           # `in progress` and closes ITSELF — with the
+                                           # work order and the PR on it — once the code
+                                           # lands, so never close one by hand: you would
+                                           # be racing the daemon.
 jarvis doctor [project] [--repair]         # check the OS's own post-conditions;
                                            # read-only unless --repair. The daemon runs
                                            # the same checks every reconcile tick.

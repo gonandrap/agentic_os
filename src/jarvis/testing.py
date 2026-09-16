@@ -868,7 +868,7 @@ else:
 
 FAKE_GH = r'''#!/usr/bin/env python3
 """Fake `gh` CLI for tests: records invocations, files issues, serves PR states."""
-import json, os, sys
+import json, os, sys, time
 
 state_dir = os.environ["FAKE_GH_DIR"]
 argv = sys.argv[1:]
@@ -880,8 +880,109 @@ fail = os.environ.get("FAKE_GH_FAIL")
 if fail:
     sys.stderr.write(fail + "\n")
     sys.exit(1)
+def issues():
+    """The tracker, as this fake keeps it: {url: {"state", "labels"}}."""
+    path = os.path.join(state_dir, "issues.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return json.loads(os.environ.get("FAKE_GH_ISSUES", "{}"))
+
+
+def save(rows):
+    with open(os.path.join(state_dir, "issues.json"), "w") as f:
+        json.dump(rows, f)
+
+
+def labels():
+    """The labels the repository has. `--add-label` refuses anything else, exactly as
+    real `gh` does — which is the whole reason `issues.ensure_label` exists."""
+    path = os.path.join(state_dir, "labels.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return json.loads(os.environ.get("FAKE_GH_LABELS", '["bug"]'))
+
+
+def save_labels(names):
+    with open(os.path.join(state_dir, "labels.json"), "w") as f:
+        json.dump(sorted(set(names)), f)
+
+
+def row(url):
+    """The issue at `url`, defaulted OPEN with no labels — the shape `gh issue create`
+    leaves behind, so a test that filed one never has to register it a second time."""
+    rows = issues()
+    return rows, rows.setdefault(url, {"state": "OPEN", "labels": []})
+
+
+# The roster the fixture registered, with anything a MERGE in this test has since done
+# to it laid over the top. A merge really does change what `pr view` answers, and until
+# issue #253 this fake could not say so: every state it held came from an env var the
+# test set, so a merge was invisible to the very read that judges whether it landed.
+merged_path = os.path.join(state_dir, "merged.json")
+
+
+def roster():
+    prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
+    try:
+        with open(merged_path) as f:
+            landed = json.load(f)
+    except (OSError, ValueError):
+        landed = {}
+    for u, patch in landed.items():
+        if u in prs:
+            prs[u] = {**prs[u], **patch}
+    return prs
+
+
 if argv[:2] == ["issue", "create"]:
-    print(os.environ["FAKE_GH_ISSUE_URL"])
+    url = os.environ["FAKE_GH_ISSUE_URL"]
+    rows, r = row(url)
+    if "--label" in argv:
+        r["labels"] = sorted(set(r["labels"]) | {argv[argv.index("--label") + 1]})
+    save(rows)
+    print(url)
+elif argv[:2] == ["issue", "view"]:
+    rows, r = row(argv[2] if len(argv) > 2 else "")
+    if r.get("_missing"):
+        sys.stderr.write("could not find any issue\n")
+        sys.exit(1)
+    save(rows)
+    number = argv[2].rstrip("/").rsplit("/", 1)[-1]
+    whole = {"number": int(number) if number.isdigit() else 0,
+             "state": r["state"], "url": argv[2],
+             "labels": [{"name": n} for n in r["labels"]]}
+    fields = argv[argv.index("--json") + 1].split(",") if "--json" in argv else []
+    print(json.dumps({k: v for k, v in whole.items() if not fields or k in fields}))
+elif argv[:2] == ["issue", "edit"]:
+    rows, r = row(argv[2] if len(argv) > 2 else "")
+    if "--add-label" in argv:
+        label = argv[argv.index("--add-label") + 1]
+        if label not in labels():
+            sys.stderr.write("could not add label: '%s' not found\n" % label)
+            sys.exit(1)
+        r["labels"] = sorted(set(r["labels"]) | {label})
+    if "--remove-label" in argv:
+        label = argv[argv.index("--remove-label") + 1]
+        r["labels"] = [n for n in r["labels"] if n != label]
+    save(rows)
+elif argv[:2] == ["issue", "comment"]:
+    rows, r = row(argv[2] if len(argv) > 2 else "")
+    r.setdefault("comments", []).append(stdin)
+    save(rows)
+elif argv[:2] == ["issue", "close"]:
+    rows, r = row(argv[2] if len(argv) > 2 else "")
+    r["state"] = "CLOSED"
+    if "--comment" in argv:
+        r.setdefault("comments", []).append(argv[argv.index("--comment") + 1])
+    save(rows)
+elif argv[:2] == ["label", "create"]:
+    known = labels()
+    if argv[2] in known:
+        sys.stderr.write("label with this name already exists\n")
+        sys.exit(1)
+    save_labels([*known, argv[2]])
 elif argv[:2] == ["pr", "view"]:
     # `gh pr view <url> --json <fields>`. The roster comes from the fixture; a URL
     # nobody registered gets gh's own "no pull requests found" shape, because a test
@@ -891,7 +992,7 @@ elif argv[:2] == ["pr", "view"]:
     # a test prove the poll loop and the evidence collector ask for different things:
     # a fake that answered with everything it held would pass a collector that never
     # requested `body` at all.
-    prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
+    prs = roster()
     pr = prs.get(argv[2] if len(argv) > 2 else "")
     if pr is None:
         sys.stderr.write("no pull requests found for this URL\n")
@@ -899,7 +1000,7 @@ elif argv[:2] == ["pr", "view"]:
     fields = argv[argv.index("--json") + 1].split(",") if "--json" in argv else []
     print(json.dumps({k: v for k, v in pr.items() if not fields or k in fields}))
 elif argv[:2] == ["pr", "diff"]:
-    prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
+    prs = roster()
     pr = prs.get(argv[2] if len(argv) > 2 else "")
     if pr is None:
         sys.stderr.write("no pull requests found for this URL\n")
@@ -919,7 +1020,7 @@ elif argv[:2] == ["pr", "merge"]:
     if merge_fail:
         sys.stderr.write(merge_fail + "\n")
         sys.exit(1)
-    prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
+    prs = roster()
     url = argv[2] if len(argv) > 2 else ""
     pr = prs.get(url)
     if pr is None:
@@ -935,6 +1036,28 @@ elif argv[:2] == ["pr", "merge"]:
     if pr.get("state") != "OPEN":
         sys.stderr.write(f"pull request is {pr.get('state')}\n")
         sys.exit(1)
+    # MERGED FIRST, AND THEN WHATEVER FOLLOWS IT MAY FAIL. That ordering is the whole
+    # of issue #253: the real CLI merges remotely and then tidies up locally, and one
+    # exit status reports both. Recording the merge before the cleanup can fail is what
+    # lets a test say "GitHub accepted it AND gh exited non-zero".
+    try:
+        with open(merged_path) as f:
+            landed = json.load(f)
+    except (OSError, ValueError):
+        landed = {}
+    landed[url] = {"state": "MERGED", "mergedAt": "2026-09-15T10:00:00Z",
+                   "mergeable": None}
+    with open(merged_path, "w") as f:
+        json.dump(landed, f)
+    cleanup_fail = os.environ.get("FAKE_GH_FAIL_MERGE_CLEANUP")
+    if cleanup_fail:
+        sys.stderr.write(cleanup_fail + "\n")
+        sys.exit(1)
+    if os.environ.get("FAKE_GH_HANG_MERGE"):
+        # Merged, then never returns: the caller's timeout is what ends this. The other
+        # half of issue #253 — a command that did not FINISH is not a command that
+        # cleaned up badly, and the record must not say it was.
+        time.sleep(3600)
     print(f"Merged pull request {url}")
 else:
     sys.stderr.write(f"fake gh: unhandled argv {argv}\n")
@@ -1115,6 +1238,12 @@ def fake_systemd(tmp_path, monkeypatch):
     return Handle()
 
 
+#: The repository every fixture in this harness pretends is the OS's bug tracker. It is
+#: deliberately NOT `bugreport.DEFAULT_BUG_REPO`: see `fake_gh`.
+FIXTURE_BUG_REPO = "jarvis-fixture/no-such-tracker"
+FIXTURE_ISSUE_URL = f"https://github.com/{FIXTURE_BUG_REPO}/issues/7"
+
+
 @pytest.fixture()
 def fake_gh(tmp_path, monkeypatch):
     """Install a fake `gh` binary; returns a handle to its recorded state."""
@@ -1123,13 +1252,22 @@ def fake_gh(tmp_path, monkeypatch):
     binpath = gdir / "gh"
     binpath.write_text(FAKE_GH)
     binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
-    url = "https://github.com/example/repo/issues/7"
+    # THE TRACKER THESE TESTS WRITE TO DOES NOT EXIST (review round 2). `issues.py`
+    # refuses to write anywhere but `bugreport.bug_repo()`, so a fixture issue on some
+    # other repository could only ever exercise the refusal — but pointing the fixture at
+    # the REAL tracker leaves `BLOCKED_GH` as the only thing between a test that escapes
+    # the fake and a live label, comment or close on a public issue. So the fixture moves
+    # the ANSWER instead of the URL: `bug_repo()` becomes a repository nobody owns, the
+    # URL check still has something to enforce, and an escaped write has nowhere to land.
+    monkeypatch.setenv("JARVIS_BUG_REPO", FIXTURE_BUG_REPO)
+    url = FIXTURE_ISSUE_URL
     monkeypatch.setenv("FAKE_GH_DIR", str(gdir))
     monkeypatch.setenv("FAKE_GH_ISSUE_URL", url)
     monkeypatch.setenv("JARVIS_GH_BIN", str(binpath))
 
     class Handle:
         dir = gdir
+        repo = FIXTURE_BUG_REPO
         issue_url = url
         prs: dict[str, dict] = {}
 
@@ -1154,6 +1292,66 @@ def fake_gh(tmp_path, monkeypatch):
             write.
             """
             monkeypatch.setenv("FAKE_GH_FAIL_MERGE", message)
+
+        def works(self) -> None:
+            """Undo `fail` — a test that proves the lifecycle RETRIES has to."""
+            monkeypatch.delenv("FAKE_GH_FAIL", raising=False)
+
+        @property
+        def issues(self) -> dict[str, dict]:
+            """The tracker as the fake holds it: `{url: {"state", "labels", ...}}`."""
+            path = gdir / "issues.json"
+            return json.loads(path.read_text()) if path.exists() else {}
+
+        def issue(self, issue_url: str | None = None) -> dict:
+            """One issue, defaulted OPEN and unlabelled like a freshly filed one."""
+            return self.issues.get(issue_url or url,
+                                   {"state": "OPEN", "labels": [], "comments": []})
+
+        def set_issue(self, issue_url: str, state: str = "OPEN",
+                      labels: list[str] | None = None) -> None:
+            """Put an issue where a test needs it — closed by a human, say."""
+            rows = self.issues
+            rows[issue_url] = {**rows.get(issue_url, {"comments": []}),
+                               "state": state.upper(),
+                               "labels": sorted(labels or [])}
+            (gdir / "issues.json").write_text(json.dumps(rows))
+
+        def next_issue(self, issue_url: str) -> str:
+            """Where the NEXT `gh issue create` lands. The fake files every issue at one
+            url, which is what a test wanting two distinct bugs on the rails has to
+            move."""
+            monkeypatch.setenv("FAKE_GH_ISSUE_URL", issue_url)
+            return issue_url
+
+        def set_labels(self, names: list[str]) -> None:
+            """Which labels the repository already has. `--add-label` refuses everything
+            else, exactly as real `gh` does."""
+            (gdir / "labels.json").write_text(json.dumps(sorted(set(names))))
+
+        def fail_merge_cleanup(self, message: str) -> None:
+            """Land the merge, then fail — THE SEAM OF ISSUE #253.
+
+            Distinct from `fail_merge`, and the difference is the entire bug: there,
+            nothing merged; here, GitHub accepted the merge and the command still exits
+            non-zero, because the local tidy-up after it failed. Both live merges of
+            0.10.0 came out this way and were reported to the user as refused by GitHub.
+            A test that only drives `fail_merge` cannot see it.
+            """
+            monkeypatch.setenv("FAKE_GH_FAIL_MERGE_CLEANUP", message)
+
+        def hang_merge_after_landing(self, timeout: float = 1.0) -> None:
+            """Land the merge, then never return — the caller's timeout ends it.
+
+            The second landed shape of issue #253, and NOT the same fact as
+            `fail_merge_cleanup`: this command attempted no branch deletion, so a record
+            that calls it a cleanup failure sends the reader hunting one. Shortens
+            `automerge.MERGE_TIMEOUT` so the test costs a second rather than a minute.
+            """
+            from . import automerge
+
+            monkeypatch.setattr(automerge, "MERGE_TIMEOUT", timeout)
+            monkeypatch.setenv("FAKE_GH_HANG_MERGE", "1")
 
         def set_pr(self, pr_url: str, state: str, merged_at: str | None = None,
                    mergeable: str | None = None, base_ref: str = "main",
@@ -1195,6 +1393,14 @@ def fake_gh(tmp_path, monkeypatch):
                 row["headRefOid"] = head_oid
             self.prs[pr_url] = row
             monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
+            # "Re-calling re-states it" includes un-doing a merge the fake performed:
+            # this is the authoritative statement of what the pull request is now, so
+            # it outranks the overlay rather than being silently overridden by it.
+            landed = gdir / "merged.json"
+            if landed.exists():
+                held = json.loads(landed.read_text())
+                if held.pop(pr_url, None) is not None:
+                    landed.write_text(json.dumps(held))
 
         def set_pr_artifact(self, pr_url: str, *, diff: str = "", title: str = "",
                     body: str = "", files: list[dict] | None = None,

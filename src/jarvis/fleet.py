@@ -18,7 +18,7 @@ from typing import Any, Mapping
 
 from . import worker_session
 from .invariants import clock
-from .project_store import ACTIVE_STATUSES, UNGOVERNED_ORIGINS, ProjectStore
+from .project_store import RETRY_SWEEP_STATUSES, UNGOVERNED_ORIGINS, ProjectStore
 
 log = logging.getLogger("jarvisd")
 
@@ -98,15 +98,24 @@ def read(cap: int, stores: Mapping[str, ProjectStore],
          now: float | None = None) -> Fleet:
     """The fleet's state, derived from every project's turns.
 
-    Costs one COUNT per project plus one indexed `latest_turn` per ACTIVE work order —
-    the same shape and roughly the same cost as `Daemon.retry_paused_turns`, which walks
-    the same rows to ask the same question of one project at a time.
+    Costs one COUNT per project plus one indexed `latest_turn` per work order in
+    `RETRY_SWEEP_STATUSES` — the same shape and roughly the same cost as
+    `Daemon.retry_paused_turns`, which walks the same rows to ask the same question of
+    one project at a time.
+
+    THE SAME TUPLE THAT SWEEP WALKS, and issue #259 is why. The outage is a fact about
+    the ACCOUNT, not about the work order the refusal happened to land on, so a window
+    whose only evidence is a pause parked in `waiting_pr_merge` is just as shut — and
+    read through `ACTIVE_STATUSES` this could not see one, leaving the OS dispatching
+    fresh work into a closed window. Nothing new can be held for ever by the widening:
+    `due()` below still releases the hold the moment the window reopens, and the pause
+    that proves it is one the retry sweep now relaunches.
     """
     in_flight = 0
     outage: Outage | None = None
     for name, store in stores.items():
         in_flight += store.count_running_turns()
-        for wo in store.list_work_orders(statuses=ACTIVE_STATUSES):
+        for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
             if wo["origin"] in UNGOVERNED_ORIGINS:
                 continue  # the user's own session; its refusals are not Jarvis's news
             try:

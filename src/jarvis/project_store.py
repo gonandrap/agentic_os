@@ -43,6 +43,19 @@ OPEN_STATUSES = ("pending", "dispatching", "running", "waiting_input", "validati
 # Settled: nothing more will happen to these on their own. They are the bulk of an old
 # project's history, so listings collapse them behind a count rather than printing them.
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
+# Where a PERSON may force a fresh validation round (`ops.force_validation`). AN
+# ALLOWLIST, not a blocklist, and the two are not the same statement here: the question is
+# not "has this settled" but "has this work order DELIVERED, and is nobody typing". An
+# open round OWNS the worker's session (kn-01a4ab27) — `Daemon._reject` posts the panel's
+# feedback to whatever fills the `implementor` role — so a round opened over a live worker
+# gives that session two writers and moves the branch head under the seats mid-round.
+# `running`, `dispatching` and `waiting_input` are live sessions; `pending` has not begun.
+# Neither has anything to re-judge, and both are refused by NOT being here rather than by
+# a rule that has to be kept in step with `WO_STATUSES` as it grows.
+#
+# `validating` is absent for a different reason and is not a silent omission: its round is
+# open by definition, which is its own refusal with its own sentence.
+FORCEABLE_STATUSES = ("waiting_pr_merge", "needs_review")
 
 # The seat names a validation panel may be rostered with. This is the VOCABULARY, not
 # the set whose markdown ships in a given build: a catalog may name a seat whose
@@ -107,14 +120,43 @@ WO_KINDS = ("worker", "planner", "manager")
 
 # A work order with a LIVE SESSION: dispatched, running, or parked mid-conversation on
 # somebody else. The per-feature cap (`claim_next_pending`, spent by
-# `feature_orders.max_parallel`), the retry sweep and every "a turn may be in flight"
-# reader mean this.
+# `feature_orders.max_parallel`) and every "a turn may be in flight" reader mean this.
 #
 # NOT what the project-wide `max_concurrent` counts any more — see `SLOT_STATUSES` below
 # and issue #134. The two were one constant until then, on the reasoning that its readers
 # must agree; they are two because the readers turned out to be asking different
 # questions, and the split is deliberate rather than drift.
+#
+# NOT what the retry sweep walks either, since issue #259 — see `RETRY_SWEEP_STATUSES`.
 ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
+
+# Where a paused turn may be relaunched: every status a work order can be sitting in when
+# `worker_session.turn_pause` says a retry is booked (`Daemon.retry_paused_turns`, and the
+# two invariants that watch it).
+#
+# WIDER THAN `ACTIVE_STATUSES`, and issue #259 is why. A work order that finishes behind
+# a pull request, takes a message, and has that turn refused for the usage limit lands in
+# `waiting_pr_merge` HOLDING A RESUMABLE, DUE PAUSE — and the sweep, scoped to the active
+# set, could never see it. `invariants.MESSAGE_STUCK_STATUSES` already called that a
+# defect, so the OS diagnosed the stall perfectly (`jarvis wo resume-auto`: "its retry
+# came due and has not happened") and then had no loop that would ever run it. Measured
+# on wo-f35e603e: three messages queued behind one lost turn, none delivered, and the
+# only remedy on offer was `jarvis wo done` — abandoning the work.
+#
+# The two tuples below PARTITION `WO_STATUSES`, asserted by a test rather than derived
+# from each other: a status added to `WO_STATUSES` fails that test until somebody decides
+# which side it belongs on. That is the opposite shape from kn-32434cef's allowlist rule
+# because the failure direction is inverted — there, a status silently allowed through is
+# the danger; here, a status silently left OUT is a work order nothing will ever resume.
+RETRY_SWEEP_STATUSES = ("dispatching", "running", "waiting_input", "validating",
+                        "needs_review", "failed", "waiting_pr_merge")
+
+# The rest of `WO_STATUSES`, and why a due retry is not run there. `pending` has no turn
+# to relaunch (it has never been dispatched, so `turn_pause` reads nothing); `completed`
+# and `cancelled` were ENDED BY A PERSON, and relaunching a turn under one would reopen
+# work its owner closed. `failed` is not with them: the OS failed that one, the user did
+# not, and recovering it is the point.
+NOT_RETRIED = ("pending", "completed", "cancelled")
 
 # What spends one of a project's `max_concurrent` slots: a work order whose turn is
 # actually executing, plus the claim that is about to launch one (issue #134).
@@ -452,6 +494,10 @@ CREATE TABLE IF NOT EXISTS validation_rounds (
     -- Which configuration judged it (`os_config_versions.id`). Also in ADDED_COLUMNS —
     -- this table already ships, so a live database gets it only there.
     config_version TEXT,
+    -- Why a PERSON opened this round by hand (`jarvis validation force`). '' is the
+    -- ordinary round, opened by a submission. Also in ADDED_COLUMNS, where the
+    -- reasoning is.
+    forced_reason TEXT NOT NULL DEFAULT '',
     CHECK ((wo_id IS NULL) <> (fo_id IS NULL))
 );
 -- PARTIAL unique indexes, NOT `UNIQUE (wo_id, fo_id, round)`. SQLite treats NULLs as
@@ -669,6 +715,24 @@ ADDED_COLUMNS = {
         # `pr_state`: "ran before the console existed", never version 1. See
         # docs/superpowers/specs/2026-08-27-the-config-console.md §5.
         "config_version": "TEXT",
+        # The tracker issue this work order exists to fix, when the OS filed it itself
+        # (`jarvis bug report`). NULL for every work order a human or a planner created,
+        # which is nearly all of them, and the reason `Daemon.sync_issues` is a single
+        # indexed query that usually returns nothing.
+        "issue_url": "TEXT",
+        # The priority the bug was settled at — one of `issues.PRIORITIES`. Only ever
+        # `critical` or `blocker` on a work order, because those are the only two that
+        # become one. Here rather than re-read from the tracker because the thing that
+        # needs it is the release trigger, which runs offline and must not depend on a
+        # label a human may have edited.
+        "issue_priority": "TEXT",
+        # The tracker state the OS last SUCCESSFULLY applied to `issue_url` — one of
+        # `issues.IN_PROGRESS`, `issues.RELEASED`, `issues.CLOSED`. The pair is
+        # `pr_url`/`pr_state`'s shape with the arrow reversed: `pr_state` caches what
+        # GitHub told us, this caches what we told GitHub. Comparing it against
+        # `issues.desired_state` is what makes the sweep free while they agree and a
+        # retry when `gh` was unreachable — see the `issues` module docstring.
+        "issue_state": "TEXT",
     },
     "feature_orders": {
         # Same, one level up: a feature's bill is its children's, and children can be
@@ -724,6 +788,17 @@ ADDED_COLUMNS = {
         # from a worktree, and `validated_head` reads '' as "not recorded" — which never
         # auto-merges. NOT NULL so there is one spelling of "nothing" rather than two.
         "head_sha": "TEXT NOT NULL DEFAULT ''",
+        # WHY A PERSON FORCED THIS ROUND — `jarvis validation force --reason`, verbatim.
+        # The population this exists for is every round judged before `head_sha` shipped:
+        # they all carry '' and can never auto-merge, so an operator has to open a fresh
+        # round by hand, and a re-judgement that looked organic afterwards would be
+        # indistinguishable from a worker re-delivering (spec
+        # docs/superpowers/specs/2026-09-15-forcing-a-validation-round.md §3).
+        #
+        # DEFAULT '' MEANS "NOT FORCED", which is the honest reading of every round
+        # written by a submission and of every round written before this column existed.
+        # NOT NULL so there is one spelling of "nobody forced this" rather than two.
+        "forced_reason": "TEXT NOT NULL DEFAULT ''",
     },
     "approvals": {
         # Which SEAT attempted the command, when a subagent did. NULL means the session's
@@ -936,6 +1011,8 @@ class ProjectStore:
         parent_id: str | None = None,
         kind: str = "worker",
         spec_section: str | None = None,
+        issue_url: str | None = None,
+        issue_priority: str | None = None,
     ) -> dict[str, Any]:
         """Create a work order. `status` and `session_id` are set in the same INSERT
         rather than afterwards, because the row is visible to the daemon the instant it
@@ -965,13 +1042,14 @@ class ProjectStore:
             """INSERT INTO work_orders (id, title, description, status, origin,
                    created_at, updated_at, model, effort, permission_mode,
                    append_system_prompt, backlog_id, metadata, session_id, depends_on,
-                   parent_id, kind, spec_section)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   parent_id, kind, spec_section, issue_url, issue_priority)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 wo_id, title, description, status, origin, ts, ts, model, effort,
                 permission_mode, append_system_prompt, backlog_id,
                 db.to_json(metadata or {}), session_id, db.to_json(deps),
-                parent_id, kind, spec_section or None,
+                parent_id, kind, spec_section or None, issue_url or None,
+                issue_priority or None,
             ),
         )
         self.add_event(wo_id, "created", {"origin": origin, "depends_on": deps,
@@ -984,6 +1062,32 @@ class ProjectStore:
         if row is None:
             raise KeyError(f"work order {wo_id!r} not found in {self.db_path}")
         return dict(row)
+
+    def work_orders_for_issue(self, issue_url: str) -> list[dict[str, Any]]:
+        """Every work order filed against this tracker issue, newest first.
+
+        The idempotency question in one query (issue #240 D): a second `jarvis bug
+        report` for an issue that already has an OPEN work order must not file another,
+        and a REOPENED issue whose old work order is terminal must be free to get one.
+        Hidden rows are included — hiding stops a record being listed, it does not stop
+        it being the work order that already exists.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM work_orders WHERE issue_url=? ORDER BY created_at DESC",
+            (issue_url,)).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def work_orders_tracking_issues(self) -> list[dict[str, Any]]:
+        """Every work order that owns a tracker issue. The sweep's whole input.
+
+        Usually empty, and always small: only `jarvis bug report` writes `issue_url`.
+        Hidden rows included for `record_pr_closed`'s reason — a hidden work order's
+        issue may not go on saying something untrue.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM work_orders WHERE issue_url IS NOT NULL AND issue_url != ''"
+        ).fetchall()
+        return db.rows_to_dicts(rows)
 
     def find_by_session(self, session_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
@@ -2486,7 +2590,8 @@ class ProjectStore:
                               summary: str = "", evidence: str = "",
                               pr_url: str | None = None,
                               round: int | None = None,
-                              config_version: str | None = None) -> dict[str, Any]:
+                              config_version: str | None = None,
+                              forced_reason: str = "") -> dict[str, Any]:
         """Start a round on one subject, or return the one that already holds its number.
 
         1-based and per subject. Left to itself the number is derived from what is
@@ -2502,6 +2607,9 @@ class ProjectStore:
 
         `config_version` stamps the round with the configuration it is being judged
         under; None means the ledger holds nothing yet, and reads as "not recorded".
+
+        `forced_reason` is set only by `ops.force_validation`, and its emptiness is what
+        every other surface reads as "a submission opened this".
         """
         col, subject_id = self._subject(wo_id, fo_id)
         if round is None:
@@ -2513,10 +2621,10 @@ class ProjectStore:
             cur = self.conn.execute(
                 f"""INSERT INTO validation_rounds ({col}, round, ts, fingerprint,
                                                    summary, evidence, pr_url,
-                                                   config_version)
-                    VALUES (?,?,?,?,?,?,?,?)""",
+                                                   config_version, forced_reason)
+                    VALUES (?,?,?,?,?,?,?,?,?)""",
                 (subject_id, round, db.now(), fingerprint, summary, evidence, pr_url,
-                 config_version),
+                 config_version, forced_reason),
             )
         except sqlite3.IntegrityError:
             existing = self.conn.execute(
@@ -2640,6 +2748,21 @@ class ProjectStore:
         ).fetchall()
         return db.rows_to_dicts(rows)
 
+    @staticmethod
+    def round_machine_owns(round_row: dict[str, Any] | None) -> bool:
+        """Does the round machine still own the work order this row is the latest round
+        of? THE ONE DEFINITION, and it takes the ROW for `validated_head`'s reason.
+
+        A caller that needs the predicate AND the wording — "round 2 is pending, wait for
+        it" — must derive both from ONE read, or the panel opening a round on its own
+        thread between the two hands it a predicate and a sentence taken a microsecond
+        apart (kn-08f2ff9b, the `HELD_SHA_UNRECORDED` bug). A staticmethod over the row
+        cannot re-fetch, which is what makes that impossible rather than merely unlikely.
+
+        None — the unit has never been judged — is False: nothing owns it.
+        """
+        return str((round_row or {}).get("outcome") or "") in RUNNABLE_VALIDATION_OUTCOMES
+
     def validation_round_open(self, wo_id: str) -> bool:
         """Is the round machine going to act on this work order?
 
@@ -2656,18 +2779,14 @@ class ProjectStore:
         queued — and a red build the worker is about to push over is worth telling it
         about. See §4.1 of
         docs/superpowers/specs/2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md.
+
+        It fetches the latest round and hands it to `round_machine_owns` rather than
+        asking SQL the same question a second way: a caller that needs the predicate AND
+        the round it is about (`ops.force_validation`) can then take one read and derive
+        both, which is the only shape that cannot straddle a round opening on the panel's
+        thread.
         """
-        marks = ",".join("?" * len(RUNNABLE_VALIDATION_OUTCOMES))
-        row = self.conn.execute(
-            f"""SELECT 1 FROM validation_rounds r
-                 WHERE r.wo_id = ?
-                   AND r.outcome IN ({marks})
-                   AND r.round = (SELECT MAX(round) FROM validation_rounds
-                                   WHERE wo_id = r.wo_id)
-                 LIMIT 1""",
-            (wo_id, *RUNNABLE_VALIDATION_OUTCOMES),
-        ).fetchone()
-        return row is not None
+        return self.round_machine_owns(self.latest_validation_round(wo_id=wo_id))
 
     def latest_validation_round(self, *, wo_id: str | None = None,
                                 fo_id: str | None = None) -> dict[str, Any] | None:

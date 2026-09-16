@@ -223,6 +223,12 @@ class _VersionAction(argparse.Action):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # Imported HERE rather than at module scope: `jarvis --help` is the one path that
+    # needs the rubric, and `issues` pulls in `github` and `bugreport` behind it. Every
+    # other CLI import in this file is deferred for the same reason.
+    from .issues import PRIORITIES as _PRIORITIES
+    from .issues import PRIORITY_RUBRIC as _PRIORITY_RUBRIC
+
     # A leaf module with no store or CLI dependency, so importing it here costs nothing
     # and lets `--help` state the shipped defaults rather than repeating their values.
     from . import catalog
@@ -833,6 +839,23 @@ def build_parser() -> argparse.ArgumentParser:
     # which one it is (`fo-…` is a feature order, anything else a work order).
     v.add_argument("unit_id", metavar="WO_ID|FO_ID")
     v.add_argument("--project")
+    # ...and the one write verb on the same noun. `validation force` rather than `wo
+    # validate --force`: the subject is the ROUND, not the work order, and it belongs
+    # beside the command that shows the rounds.
+    f = va.add_parser(
+        "force", help="open a fresh validation round on a work order by hand, with no "
+                      "worker and no `finished` event. ONLY on an order that has "
+                      "delivered and whose worker is not typing — `waiting_pr_merge` "
+                      "(the case it exists for) or `needs_review`; a live or settled "
+                      "one is refused. It goes to `validating`, and back to "
+                      "`waiting_pr_merge` if the round passes. It spends a round number "
+                      "like any other, so a rejection at or past `max_rounds` is "
+                      "escalated to you rather than sent to a worker")
+    f.add_argument("wo_id", metavar="WO_ID")
+    f.add_argument("--reason", required=True,
+                   help="why you are forcing it — recorded on the round, so the "
+                        "re-judgement never reads afterwards like a worker's own")
+    f.add_argument("--project")
 
     # notifications ----------------------------------------------------------------------------
     n = sub.add_parser("notify", help="emit a notification into the OS pipeline")
@@ -858,6 +881,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="what happened, in Jarvis OS terms")
     br.add_argument("--expected", "-e", required=True, help="what you expected")
     br.add_argument("--actual", "-a", required=True, help="what you got instead")
+    # REQUIRED, with no default and no inference: it is the only thing that decides what
+    # happens to the report, so a default would be the OS rating someone else's bug. The
+    # rubric rides on the help text because this is where an agent reads it —
+    # `issues.PRIORITY_RUBRIC` is the one definition and argparse renders it verbatim.
+    br.add_argument("--priority", "-p", required=True, choices=list(_PRIORITIES),
+                    help="how bad this is for the FLEET. " + _PRIORITY_RUBRIC)
     br.add_argument("--steps", default="", help="optional steps to reproduce")
     br.add_argument("--project", default="", help="reporting project (default: $JARVIS_PROJECT)")
     br.add_argument("--wo-id", default="", help="reporting work order (default: $JARVIS_WO_ID)")
@@ -2787,6 +2816,28 @@ def cmd_neo(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_validation_force(args: argparse.Namespace) -> int:
+    """`jarvis validation force <wo-id> --reason` — a person opening a fresh round.
+
+    Prints where the work order went and what it is waiting for, because "it is
+    `validating`" is only half an answer: nothing else in the terminal will say when the
+    panel has finished.
+    """
+    from . import ops
+
+    result = ops.force_validation(args.wo_id, reason=args.reason,
+                                  project_name=args.project)
+    if args.json:
+        _print(result, True)
+        return 0
+    print(f"{result['wo_id']} [{result['project']}]: round {result['round']} opened by "
+          f"hand — {result['reason']}")
+    print(f"  was {result['was']}, now {result['status']}; the panel judges it on the "
+          f"daemon's next tick. `jarvis validation show {result['wo_id']}` for the "
+          f"verdict")
+    return 0
+
+
 def cmd_validation(args: argparse.Namespace) -> int:
     """`jarvis validation show <id>` — the panel's whole deliberation on one unit.
 
@@ -2876,11 +2927,18 @@ def cmd_notify(args: argparse.Namespace) -> int:
 
 
 def cmd_bug(args: argparse.Namespace) -> int:
-    from .bugreport import report_bug
+    from .bugreport import pickup_note, report_bug
     result = report_bug(title=args.title, description=args.description,
                         expected=args.expected, actual=args.actual, steps=args.steps,
+                        priority=args.priority,
                         project=args.project, wo_id=args.wo_id)
-    _print(result, args.json)
+    if args.json:
+        _print(result, True)
+    else:
+        # The nested `pickup` flattened to the one line a reporting agent needs: whether
+        # anything is going to happen to this issue, or whether it is theirs to chase.
+        _print({k: v for k, v in result.items() if k != "pickup"}, False)
+        print(pickup_note(result["pickup"]))
     return 0
 
 
@@ -2973,6 +3031,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "neo":
             return cmd_neo(args)
         if args.cmd == "validation":
+            if args.validation_cmd == "force":
+                return cmd_validation_force(args)
             return cmd_validation(args)
         if args.cmd == "notify":
             return cmd_notify(args)

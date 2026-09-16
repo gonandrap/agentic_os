@@ -47,28 +47,30 @@ OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
 # the OS's classifier false-positive rate. Plan reviews are neither, and mixing them in
 # would corrupt the one metric that says whether the gate recognisers are improving.
 #
-# ADDING A KIND IS SEVEN EDITS, NOT ONE (kn-4edb0eb7, which corrects kn-9b18a8eb's four,
-# and §3 of docs/superpowers/specs/2026-08-31-the-supervisor.md):
+# ADDING A KIND IS SEVEN EDITS, NOT FOUR (kn-4edb0eb7, which extends kn-9b18a8eb, and §3
+# of docs/superpowers/specs/2026-08-31-the-supervisor.md). The four: this tuple, a
+# `deliver()` branch in `Daemon._neo_drain`, the `ops._neo_attention` filter, and the
+# `invariants.check_neo_escalations_are_live` filter (which also needs a
+# `_stale_<kind>_question` predicate). The three that are easiest to miss are the
+# USER-FACING ANSWER PATHS, and every one of them ends in `queue_message`:
+# `ops.neo_answer_escalated`, `ops.neo_review`'s `--correct` tail, and the `answer_form`
+# macro in `ui/templates/_question.html`. A kind that skips any of them speaks to a
+# worker that is not waiting — or, for `triage`, to one that does not exist.
 #
-#   1. this tuple;
-#   2. a `deliver()` branch in `Daemon._neo_drain`;
-#   3. the `ops._neo_attention` filter;
-#   4. the `invariants.check_neo_escalations_are_live` filter;
+# `alarm` still has the `--correct` tail open; `assumption` closed all three.
 #
-# ...and THE THREE kn-9b18a8eb DOES NOT LIST, which are the ones that speak to a worker
-# that has finished — every one of them a user-facing ANSWER path ending in
-# `queue_message`, so a kind that skips them is a kind the user can reopen a settled work
-# order through without ever meaning to:
+# `triage` is the odd one out, deliberately: it is the only kind with NO work order
+# behind it, so its `wo_id` is EMPTY. A bug filed through `jarvis bug report` has an
+# issue and a backlog item and nothing else, and the whole point of the question is to
+# decide whether it earns a work order at all (issue #240, and the user's ruling of
+# 2026-09-14). Everything its verdict has to act on travels in `context` as JSON — see
+# `issues.ask_triage`. Its real resolution is `jarvis backlog promote`, which is what all
+# seven sites above are told.
 #
-#   5. `ops.neo_answer_escalated` — reached by `jarvis neo answer <qid>`;
-#   6. `answer_form` in `ui/templates/_question.html` — the reply box on /neo, which the
-#      CLI does not go through, so both halves are needed;
-#   7. the `--correct` tail of `ops.neo_review` — it forwards the correction to the
-#      worker whenever the order is not terminal.
-#
-# A kind with no `deliver()` branch falls through to `queue_message` and speaks to the
-# worker. `alarm` still has gap 7 open; `assumption` closed all three.
-Q_KINDS = ("question", "approval", "plan", "alarm", "assumption")
+# `assumption` is the one the OS files ITSELF, against a work order parked in
+# `needs_review` — see `autoreview.py`. Like `triage` and `alarm` nobody asked it, so its
+# answer must never reach the worker: the worker finished before the question existed.
+Q_KINDS = ("question", "approval", "plan", "alarm", "triage", "assumption")
 
 # The panel's seats — see docs/superpowers/specs/2026-08-02-neo-team-design.md.
 # `premise` asks whether this was even the question that was asked (and routes),

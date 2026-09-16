@@ -346,8 +346,8 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                     f"by mistake", "no privileged action was authorised")
         return (f"Ran the approved {p.get('kind') or 'command'}",
                 f"use {p.get('use')} of {p.get('of')}")
-    # The validation loop. Five kinds rather than one with an outcome in the payload,
-    # because the four are the whole story a reader wants at a glance — and each gets a
+    # The validation loop. Six kinds rather than one with an outcome in the payload,
+    # because each is the whole story a reader wants at a glance — and each gets a
     # LABEL of its own here. `event_level` returns "signal" for anything it does not
     # know, so these arriving unclassified would look fine on the timeline while
     # rendering as a bare kind and a JSON blob.
@@ -355,6 +355,18 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         rnd = p.get("round")
         return ("Submitted for validation",
                 f"round {rnd}" if rnd else "")
+    if kind == "validation_forced":
+        # A SIXTH kind, and the only one no worker produced — `jarvis validation force`,
+        # a person re-opening the round. It says so in the LABEL rather than only in the
+        # detail: the whole point of the command is that a forced re-judgement must not
+        # read afterwards like a worker re-delivering, and the timeline is where that
+        # reading happens. The reason is the ask the operator answered, so like
+        # `validation_rejected` it is shown rather than folded away.
+        rnd, was = p.get("round"), p.get("was")
+        return (f"Validation forced by hand — round {rnd}" if rnd
+                else "Validation forced by hand",
+                f"{p.get('reason') or ''}"
+                + (f" (was {was})" if was else ""))
     if kind == "validation_passed":
         return "Validation passed", p.get("reason") or ""
     if kind == "validation_rejected":
@@ -400,6 +412,38 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "pr_checks_unresolved":
         return ("Failing checks the worker could not fix — over to you",
                 f"{p.get('attempts')} attempts")
+    # THE ONLY `automerge_*` KINDS WITH LABELS HERE, and deliberately: every other one is
+    # rendered by `ops.automerge_state` as the mechanism's one-line state on the work
+    # order. These two are excluded from `ops.AUTOMERGE_EVENTS` — the state after either
+    # is "merged" — so the timeline is the only surface they have, and without a label
+    # they fall through to the kind plus a raw JSON payload (issue #253, spec §5.5).
+    #
+    # Two kinds and not one: only the first is a cleanup. Saying "the cleanup" about a
+    # merge command that TIMED OUT sends the reader hunting a branch deletion that was
+    # never attempted (`automerge.AFTER_MERGE_EVENT`).
+    if kind == "automerge_cleanup_failed":
+        return ("The merge landed; the cleanup after it did not",
+                (p.get("reason") or "")[:200])
+    if kind == "automerge_command_unfinished":
+        return ("The merge command never finished — GitHub says the merge landed",
+                (p.get("reason") or "")[:200])
+    # THE TRACKER SIDE OF THE RECORD (issue #240). `issues.record_applied` writes one of
+    # these three after — and only after — GitHub accepted the change, so each is the
+    # evidence that a claim on the public tracker is now true. The timeline is their only
+    # surface: the issue itself shows the result, not when the OS decided it, and
+    # `issue_state` is a column nothing renders. kn-3f133363.
+    if kind == "issue_in_progress":
+        return "Its GitHub issue says work is under way", p.get("issue_url") or ""
+    if kind == "issue_released":
+        return ("Its GitHub issue was handed back — nothing is under way",
+                p.get("issue_url") or "")
+    if kind == "issue_closed":
+        return "Its GitHub issue was closed", p.get("issue_url") or ""
+    if kind == "release_batched":
+        # On the RELEASE order, naming the fix it is carrying. Written once per fix, so a
+        # batched release reads as the list of bugs the next version closes.
+        return ("Carrying a landed fix into the next release",
+                " — ".join(x for x in (p.get("issue_url"), p.get("wo_id")) if x))
     if kind == "deferral_submitted":
         # The worker deciding something is not its job is a scope decision, and the
         # timeline is the only place the user ever sees it: the item itself lands on the
