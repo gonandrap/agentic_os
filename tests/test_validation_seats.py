@@ -735,6 +735,24 @@ def test_the_chair_is_told_what_a_seat_that_blocked_nothing_looks_like():
     assert "appears as one line saying so, and nothing else — no verdict word, no " \
            "message, no asks, no remark of any kind" in body
     assert "its absence is not something to wonder about" in body
+    assert "errored, timed out, or answered something nothing could be read in" in body
+
+
+def test_the_chair_is_told_what_the_ABSENCE_of_the_follow_up_line_means():
+    """The mandate used to promise "a line at the end says how many there were", and
+    `build_chair_prompt` omits that line entirely at zero. A chair told to expect a line and
+    shown none cannot tell "none were filed" from "the line was dropped", and the whole
+    design rests on it trusting that what it sees is complete.
+
+    Fixed in the mandate rather than by printing a zero line, because the mandate can state
+    BOTH cases and a zero line can only state one — and "they have been filed as tickets"
+    is false prose when nothing was.
+    """
+    body = flat("chair")
+
+    assert "When any were filed, a line at the END of the opinions says how many; when " \
+           "that line is absent, none were filed and there is nothing you have not been " \
+           "shown." in body
 
 
 def test_the_chair_is_told_next_to_its_output_shape_that_follow_ups_are_not_before_it():
@@ -911,6 +929,44 @@ def test_a_rejection_whose_only_finding_has_an_unreadable_severity_still_reaches
         "I could not classify this but it must not land"
 
 
+@pytest.mark.parametrize("word", ["reject", "rejected", "REJECTED", "Rejected",
+                                 "blocked", "needs changes", "no", "refuse", ""])
+def test_any_verdict_that_is_not_an_affirmative_pass_still_reaches_the_chair(word):
+    """ROUND 2's FINDING, AT ITS FULL WIDTH. The review named `"rejected"`; that one was
+    already safe, because `_verdict` narrows by PREFIX. The words that were not are
+    `blocked`, `needs changes`, `no`, `refuse` and a missing `verdict` key — each a
+    well-formed JSON objection that produced no blocker and was then printed to the chair
+    under `NO_BLOCKER_LINE`, which says that seat cleared the work.
+
+    So step 2 asks for the ABSENCE OF A PASS rather than the presence of a rejection. Both
+    halves are parametrised here: the four spellings that always worked are pinned so a
+    future tightening of `_verdict` cannot quietly drop them, and the five that did not are
+    the regression.
+    """
+    found = validation.findings(opinion(
+        verdict=word, reason="this must not land as written", asks=["fix it"]))
+
+    assert [f["severity"] for f in found] == ["blocker"], (
+        f"a seat answering {word!r} was read as raising nothing")
+    assert found[0]["title"] == "this must not land as written"
+
+
+@pytest.mark.parametrize("word", ["pass", "passed", "PASS", "Passed"])
+def test_an_affirmative_pass_is_the_one_answer_that_synthesises_nothing(word):
+    """The negative control of the row above, and the reason step 2's condition is an
+    absence rather than a catch-all: a helper that synthesised for EVERY verdict would
+    satisfy every case there and would block every passing submission in the fleet."""
+    assert validation.findings(opinion(verdict=word, reason="all fine", asks=[])) == []
+
+
+def test_a_reply_nothing_can_be_read_in_synthesises_nothing_either():
+    """The other boundary of the same condition. There is no `reason` to synthesise from,
+    and a blocker invented for a seat that may well have passed is a fabrication pointing
+    the other way. That case is silence, and `build_chair_prompt` reports it as silence."""
+    assert validation.findings(opinion(status="ok", raw="not json at all")) == []
+    assert validation.findings(opinion(status="ok", raw="{}")) == []
+
+
 def test_a_rejection_that_already_carries_a_blocker_synthesises_nothing():
     """THE NEGATIVE CONTROL of the three above. A fail-safe that fired on every rejection
     would satisfy all of them and would double every honest seat's blocker."""
@@ -1046,13 +1102,17 @@ def test_an_un_upgraded_seats_rejection_still_reaches_the_chair_in_full():
     assert "add a case for the empty packet" in prompt
 
 
-def test_a_reply_that_will_not_parse_is_reported_as_silence_and_never_as_prose():
-    """A non-chair seat whose reply will not parse is recorded `failed` by
-    `seats._run_seat`, so the chair reads it as an abstention — silence, never agreement.
+def test_an_unreadable_reply_is_reported_as_silence_and_never_as_having_blocked_nothing():
+    """ROUND 2's FINDING. `NO_BLOCKER_LINE` is a CLAIM, not a redaction: printed over a
+    reply nothing could be read from, it tells the chair that seat cleared the work. Before
+    this feature such a reply reached the chair as its raw text; losing the text is the
+    design, but stating the opposite of it is a fail-open.
 
-    The second row is the defensive one: a stored `ok` row that will not parse renders the
-    neutral line and NOT its own prose. Falling back to the raw text there would reopen the
-    very channel this filter closes, for the replies least likely to be well behaved.
+    `seats._run_seat` records an unparseable reply `failed`, so the second row here is the
+    defensive one — reached by a replay over a stored `ok` row. Both must read as silence,
+    which is what `_reply` and `arbitrate` have always called it, and neither may read as
+    its own prose: that would reopen the channel this filter closes, for exactly the replies
+    least likely to be well behaved.
     """
     prompt = validation.build_chair_prompt([
         seats.Opinion(seat="tester", raw="", status="failed", replied=True),
@@ -1060,8 +1120,10 @@ def test_a_reply_that_will_not_parse_is_reported_as_silence_and_never_as_prose()
                       status="ok")])
 
     assert "## Seat: tester\n(no opinion — the seat failed)" in prompt
-    assert "## Seat: security\n" + validation.NO_BLOCKER_LINE in prompt
+    assert "## Seat: security\n" + validation.UNREADABLE_LINE in prompt
     assert "PROSE_MARKER" not in prompt
+    assert validation.NO_BLOCKER_LINE not in prompt, (
+        "a reply nobody could read was reported as a seat that found nothing blocking")
 
 
 # -- the severity split: what `decide` returns ---------------------------------------------
@@ -1104,12 +1166,20 @@ def test_decide_returns_the_follow_ups_the_seats_raised_and_the_chair_never_saw(
      "test-forced architect rejection with an empty list"),
     ("FORCE_ODD_SEVERITY_ARCHITECT",
      "test-forced architect rejection at an unknown severity"),
+    ("FORCE_ODD_VERDICT_ARCHITECT",
+     "test-forced architect objection worded off-vocabulary"),
 ])
 def test_every_shape_of_rejection_reaches_the_chair_through_the_whole_panel(
         hook, detail, store, jarvis_home, fake_claude):
-    """The three inputs to §3.1's fail-safe, each named, each driven through `decide` rather
+    """The four inputs to §3.1's fail-safe, each named, each driven through `decide` rather
     than through the helper alone — the helper being right does not prove the chair prompt
-    is built from it."""
+    is built from it. The last is round 2's: a verdict word `_verdict` cannot read.
+
+    The second assertion is the one that matters most and it is not about the finding being
+    present: it is that the seat is not described to the chair as having blocked nothing.
+    Losing an objection is bad; telling the chair the objector cleared the work is worse,
+    and only the second assertion can tell those two apart.
+    """
     wo = store.create_work_order("t")
     round_row = store.open_validation_round(wo_id=wo["id"], fingerprint="f")
 

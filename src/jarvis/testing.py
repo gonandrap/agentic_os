@@ -569,10 +569,11 @@ elif "-p" in argv and "--resume" not in argv:
                                        "title": f"the {vseat} follow-up",
                                        "detail": f"what the {vseat} seat would file "
                                                  f"rather than argue"}]}
-            # THE THREE INPUTS TO THE BLOCKER FAIL-SAFE, staged separately because each
-            # is missed on its own. All three are a seat REJECTING while classifying no
-            # blocker, and all three must reach the chair as a blocker or the seat's
-            # rejection disappears behind the severity filter.
+            # THE FOUR INPUTS TO THE BLOCKER FAIL-SAFE, staged separately because each is
+            # missed on its own. All four are a seat NOT AGREEING while classifying no
+            # blocker, and all four must reach the chair as a blocker or the seat's
+            # objection disappears behind the severity filter — worse, the chair is told
+            # that seat cleared the work.
             elif f"FORCE_REJECT_{vseat.upper()}" in said:
                 # (1) THE UN-UPGRADED SEAT: no `findings` key at all. Deliberately left
                 # in the pre-feature shape — every row already in `validation_opinions`
@@ -596,6 +597,14 @@ elif "-p" in argv and "--resume" not in argv:
                                        "title": f"the {vseat} unreadable severity",
                                        "detail": f"what the {vseat} seat could not "
                                                  f"classify"}]}
+            elif f"FORCE_ODD_VERDICT_{vseat.upper()}" in said:
+                # (4) A VERDICT WORD `_verdict` CANNOT READ. It narrows by prefix, so
+                # `rejected` is fine and `blocked` is not — and a rule keyed on "the
+                # verdict is reject" reads this well-formed objection as no objection.
+                reply = {"verdict": "blocked", "blocking": False,
+                         "reason": f"test-forced {vseat} objection worded off-vocabulary",
+                         "asks": [f"answer the off-vocabulary {vseat} objection"],
+                         "findings": []}
         emit_headless(json.dumps(reply))
         sys.exit(0)
     # A SUPERVISOR REVIEW, AND IT IS IDENTIFIED BY THE SYSTEM PROMPT FOR THE REASON THE

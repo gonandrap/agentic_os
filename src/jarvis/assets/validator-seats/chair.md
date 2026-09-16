@@ -62,12 +62,15 @@ every file the change touches, `git diff --stat`, and the diff.
   word, no message, no asks, no remark of any kind. There is nothing more of it to read, and
   its absence is not something to wonder about: it means that seat found nothing this work
   is unfit to ship without.
-- **A seat with no opinion** errored or timed out. It abstained.
+- **A seat with no opinion** errored, timed out, or answered something nothing could be read
+  in. It abstained, and silence is never agreement.
 
-**The findings the seats classified as follow-ups are not in front of you.** A line at the
-end of their opinions says how many there were. They have been filed as tickets against this
-project, in the words of the seat that raised them, and the work lands with them outstanding.
-That is what they are for; they are not a backlog of objections you may reject over.
+**The findings the seats classified as follow-ups are not in front of you.** When any were
+filed, a line at the END of the opinions says how many; when that line is absent, none were
+filed and there is nothing you have not been shown. They have been filed as tickets against
+this project, in the words of the seat that raised them, and the work lands with them
+outstanding. That is what they are for; they are not a backlog of objections you may reject
+over.
 
 - **The file list is never truncated**, even when the diff is. It is what lets you check a
   claim of coverage against the change itself — "you say you added tests, and no file under
