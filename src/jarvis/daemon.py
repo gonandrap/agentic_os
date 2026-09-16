@@ -57,11 +57,11 @@ from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
-    ACTIVE_STATUSES,
     FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
     OPEN_STATUSES,
     PRE_APPROVED_KEY,
+    RETRY_SWEEP_STATUSES,
     UNGOVERNED_ORIGINS,
     ProjectStore,
     resume_spends_slot,
@@ -1006,8 +1006,14 @@ class Daemon:
         and `tick` decides `retry_paused` once, outside the project loop, so every
         project's parked orders are swept on the same tick.
 
-        Every work order this touches is in an ACTIVE status, because the settler
-        deliberately did not fail it (see `settle_work_order` and `_park_on_signin`).
+        WHEREVER THE WORK ORDER IS PARKED (`RETRY_SWEEP_STATUSES`, issue #259). The
+        settler leaves a paused order's status alone, so most of what this touches is
+        active — but a turn can be refused on a work order that had already SETTLED into
+        `waiting_pr_merge`, `needs_review` or `failed`, and those three were unreachable
+        here while the sweep asked for `ACTIVE_STATUSES`. `invariants.stuck_message` has
+        always called an undelivered message in exactly those statuses a defect, so the
+        OS diagnosed the stall and had nothing that would ever repair it.
+
         What the relaunch SENDS is `worker_session.retry`'s business, and it is not the
         same for all: a refused turn was never sent, so the prompt goes again verbatim; a
         turn that died in flight already reached the model, so the worker is nudged to
@@ -1028,7 +1034,7 @@ class Daemon:
         `_park_on_signin`. Held means the pause stays parked with nothing written.
         """
         budget = project.max_concurrent - store.count_active()
-        for wo in store.list_work_orders(statuses=ACTIVE_STATUSES):
+        for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
             if state is not None and state.blocked():
                 return
             if wo["origin"] in UNGOVERNED_ORIGINS:
@@ -1065,14 +1071,30 @@ class Daemon:
                 "seq": turn["seq"], "retried_seq": pause.turn["seq"],
                 "attempt": pause.attempts, "of": pause.max_attempts,
                 "reason": pause.reason,
+                # WHERE THIS TURN CAME FROM, read back by `ops.resumed_from` when it
+                # settles. Recorded here because this is the only moment that knows it.
+                "was": wo["status"],
             })
-            # Only an auth pause is ever parked out of `running` (`_park_on_signin`), so
-            # this is where that gets put back — the same two lines `_deliver` uses, for
-            # the same reason: the turn is out, and a record still saying "waiting on
-            # you" about a worker that is working would be a lie.
+            # The turn is out, so the record must stop saying somebody else has it.
+            # Two shapes reach this: the auth pause, parked out of `running` by
+            # `_park_on_signin`, and since issue #259 an order that was already settled
+            # when its turn was refused.
+            #
+            # `running` IS REQUIRED FOR THE SECOND, not merely tidier. All three statuses
+            # issue #259 added are in `PR_POLL_STATUSES`, which excludes the in-flight
+            # ones precisely so `complete_merged` cannot end a work order out from under
+            # a worker that is still writing to it — so leaving a relaunched order where
+            # it was would put a live turn back in front of that poll.
             if wo["status"] != "running":
                 store.set_status(wo["id"], "running")
-                store.clear_attention(wo["id"])
+                # ONLY THE PAUSE'S OWN FLAG. `_park_on_signin` is the one that raises an
+                # item this relaunch answers; every other reason on a newly-swept row —
+                # assumptions pending review, a red build — is asking for the USER, and
+                # the usage window reopening did not answer it (kn-b6977de3). The
+                # sign-in item has to go, though: `true_blockers` re-derives it from
+                # `waiting_input`, and nothing re-derives it once this row is `running`.
+                if wo["attention_reason"] == invariants_mod.AUTH_BLOCKER:
+                    store.clear_attention(wo["id"])
 
     # -- 3. message delivery ----------------------------------------------------------
 
@@ -2845,7 +2867,13 @@ class Daemon:
                 # beyond the status itself.
                 from . import ops as ops_mod
 
-                back = ops_mod.pr_repair_origin(store, wo["id"]) or "waiting_pr_merge"
+                # `resumed_from` is the same rule as `pr_repair_origin` for the other
+                # way the OS takes a work order out of its status (issue #259): a
+                # relaunched turn must not end by filing the review somebody still owes
+                # as a merge-queue entry. It answers for `needs_review` alone — see it.
+                back = (ops_mod.pr_repair_origin(store, wo["id"])
+                        or ops_mod.resumed_from(store, wo["id"], turn["seq"])
+                        or "waiting_pr_merge")
                 if fresh["status"] != back:
                     store.set_status(wo["id"], back)
                     if back == "waiting_pr_merge":
@@ -3214,6 +3242,16 @@ class Daemon:
             return
         log.info("[%s] auto-merged %s — completing %s", project.name, wo["pr_url"],
                  wo_id)
+        if merged["after_merge_cause"]:
+            # THE MERGE LANDED AND THE COMMAND THAT MADE IT DID NOT SUCCEED (issue #253,
+            # spec §5.5). A note on the timeline and nothing else: not `automerge_failed`,
+            # which is a claim about the PULL REQUEST, and no inbox row, because neither
+            # cause needs a person and the work order completes below either way. The
+            # kind comes from the cause — `automerge.AFTER_MERGE_EVENT`'s reason.
+            store.add_event(wo_id,
+                            automerge.AFTER_MERGE_EVENT[merged["after_merge_cause"]], {
+                "head_sha": decision.judged_sha, "approval_id": approval["id"],
+                "reason": merged["after_merge_error"], "pr_url": wo.get("pr_url")})
         # No `merged_at`: that column holds GITHUB's `mergedAt`, and this path has not
         # asked GitHub anything since the merge. The `automerge_merged` event's own
         # timestamp is when it landed, and inventing a local clock reading for a remote

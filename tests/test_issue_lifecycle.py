@@ -901,3 +901,146 @@ def test_the_release_order_is_filed_once_however_often_the_sweep_runs(fleet):
     fleet.sweep()
     fleet.sweep()
     assert len(fleet.releases()) == 1
+
+
+# -- the record, and the question nobody is waiting on --------------------------------
+
+
+def _escalate(fleet, reason="not enough evidence"):
+    """Drive the triage question to `escalated`, exactly as `neo.drain_queue` does.
+
+    The daemon's delivery and the question's own status are written by two different
+    callers — `_deliver_triage_verdict` and `drain_queue` — so a test that only calls the
+    first is testing the inbox row and nothing else.
+    """
+    from jarvis.neo_store import NeoStore
+
+    q = fleet._last_triage()
+    fleet.triage(escalate=True, approve=False, reason=reason)
+    neo = NeoStore()
+    try:
+        neo.mark(q["id"], "escalated", reason=reason)
+    finally:
+        neo.close()
+    return q["id"]
+
+
+@pytest.mark.parametrize("kind,label", [
+    ("issue_in_progress", "under way"),
+    ("issue_released", "handed back"),
+    ("issue_closed", "closed"),
+    ("release_batched", "release"),
+])
+def test_every_event_this_feature_writes_has_a_label_a_reader_can_read(kind, label):
+    """kn-3f133363: falling through to the generic renderer is NOT the same claim as a
+    reader being able to see it — the fallback prints the bare kind beside a JSON blob.
+
+    The timeline is the ONLY surface these four have. The issue shows the result but
+    never when the OS decided it, and `issue_state` is a column nothing renders.
+    """
+    from jarvis import timeline
+
+    text, _detail = timeline._describe(kind, {"issue_url": "u", "wo_id": "w"})
+    assert text != kind, f"{kind} falls through to the raw-kind renderer"
+    assert label in text.lower()
+
+
+def test_the_events_the_lifecycle_writes_reach_the_timeline(fleet):
+    """And the labels are reachable from real events, not only from `_describe`."""
+    from jarvis import timeline
+
+    wo_id = fleet.blocker_wo()
+    store = fleet.store()
+    try:
+        entries = timeline.build_timeline(store.get_work_order(wo_id),
+                                          store.list_events(wo_id),
+                                          store.list_messages(wo_id))
+    finally:
+        store.close()
+    assert any("under way" in (e.get("label") or "") for e in entries), \
+        "the label put on the tracker has to show up on the record"
+
+
+def test_an_unconfirmed_triage_question_is_visible_and_points_at_the_backlog(fleet):
+    """kn-4edb0eb7: a Q_KIND is a claim about WHO IS WAITING, and for `triage` the answer
+    is nobody — its `wo_id` is empty. It must still reach the user, because an
+    unconfirmed `blocker` nobody hears about is the failure this path exists to prevent,
+    but pointed at the command that actually resolves it."""
+    from jarvis import ops
+
+    pickup = fleet.file_bug(priority="blocker")["pickup"]
+    qid = _escalate(fleet)
+
+    items = [a for a in ops.os_status()["attention"]
+             if a.get("neo_question_id") == qid]
+    assert items, "an escalated priority claim must not be invisible"
+    assert "backlog promote" in items[0]["decide"], \
+        "`jarvis neo answer` would message a work order that does not exist"
+    assert pickup["backlog_id"] in items[0]["decide"]
+
+
+def test_answering_a_triage_question_is_refused_and_names_the_right_command(fleet):
+    """The other half of the same guard. `ops.neo_answer_escalated` forwards every kind
+    it does not refuse, and the forward here would look up `wo_id=''`."""
+    from jarvis import ops
+
+    pickup = fleet.file_bug(priority="blocker")["pickup"]
+    qid = _escalate(fleet)
+
+    with pytest.raises(ops.OpsError) as e:
+        ops.neo_answer_escalated(qid, "make it a blocker")
+    assert "backlog promote" in str(e.value) and pickup["backlog_id"] in str(e.value)
+
+
+def test_correcting_neo_on_a_triage_question_messages_nobody(fleet):
+    """kn-4edb0eb7's worst case: `neo review --correct` forwards to the worker whenever
+    the order is not terminal, and it is the command the OS itself tells the user to
+    run. The learning still lands — that is what teaches the rubric."""
+    from jarvis import ops
+    from jarvis.neo_store import NeoStore
+
+    fleet.file_bug(priority="blocker")
+    qid = fleet._last_triage()["id"]
+    fleet.triage(approve=False, answer="medium", reason="bounded to one command")
+    neo = NeoStore()
+    try:  # what `neo.drain_queue` records beside the delivery the fixture just drove
+        neo.record_answer(qid, "medium", reason="bounded to one command")
+    finally:
+        neo.close()
+
+    out = ops.neo_review(qid, approved=False, feedback="that was a real blocker")
+    assert out["learning_recorded"], "the correction still teaches Neo"
+    assert not out["forwarded_to_worker"]
+
+
+def test_a_triage_question_is_closed_once_its_backlog_item_moves(fleet):
+    """INV-NEO-ESCALATION-STALE, extended to the one kind whose subject is a CENTRAL
+    backlog item rather than a row in this project's database. Without it a claim the
+    user has already promoted goes on asking for a ruling nobody can give — the exact
+    production shape that invariant was written for."""
+    from jarvis import invariants
+    from jarvis.central_store import CentralStore
+    from jarvis.neo_store import NeoStore
+
+    pickup = fleet.file_bug(priority="blocker")["pickup"]
+    qid = _escalate(fleet)
+
+    store = fleet.store()
+    try:
+        assert not list(invariants.check_neo_escalations_are_live(store)), \
+            "while the item is still queued the question is live"
+        central = CentralStore()
+        try:
+            central.mark_backlog(pickup["backlog_id"], "promoted")
+        finally:
+            central.close()
+        found = list(invariants.check_neo_escalations_are_live(store))
+    finally:
+        store.close()
+
+    assert found and found[0].invariant == "INV-NEO-ESCALATION-STALE"
+    neo = NeoStore()
+    try:
+        assert neo.get(qid)["status"] not in ("escalated", "failed")
+    finally:
+        neo.close()

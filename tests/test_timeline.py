@@ -94,6 +94,34 @@ def test_signal_entries_read_as_prose_not_json():
     ]
 
 
+def test_a_cleanup_failure_reads_as_a_sentence_and_not_a_json_dump():
+    """THE TIMELINE IS THIS KIND'S ONLY SURFACE. Every other `automerge_*` event is
+    rendered by `ops.automerge_state` as the mechanism's state line on the work order;
+    this one is deliberately not in `ops.AUTOMERGE_EVENTS`, because the state after it
+    is "merged". Unregistered it still appeared — unknown kinds are signal — as the bare
+    kind plus its payload as JSON, which is written and not seen (issue #253)."""
+    entry = build_timeline({}, [ev("automerge_cleanup_failed", 1.0,
+                                   reason="cannot delete branch 'worktree-wo-1'",
+                                   head_sha="a1b2c3d")], [])[0]
+    assert entry["level"] == "signal"
+    assert entry["label"] == "The merge landed; the cleanup after it did not"
+    assert entry["detail"] == "cannot delete branch 'worktree-wo-1'"
+    assert "{" not in entry["label"] + entry["detail"]
+
+
+def test_a_merge_that_timed_out_is_not_described_as_a_cleanup():
+    """The two landed shapes are separate kinds precisely so this sentence differs: a
+    timed-out merge attempted no branch deletion, and calling it a cleanup failure sends
+    the reader hunting one (issue #253, spec §5.5)."""
+    entry = build_timeline({}, [ev("automerge_command_unfinished", 1.0,
+                                   reason="the merge command did not complete: timeout",
+                                   head_sha="a1b2c3d")], [])[0]
+    assert entry["label"] == \
+        "The merge command never finished — GitHub says the merge landed"
+    assert "cleanup" not in entry["label"]
+    assert entry["detail"] == "the merge command did not complete: timeout"
+
+
 def test_messages_appear_as_prompt_and_reply():
     """Both directions are moments on the timeline; the words are the conversation's."""
     messages = [

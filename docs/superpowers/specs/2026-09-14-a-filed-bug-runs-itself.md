@@ -196,6 +196,42 @@ it to its description, because a release ships whatever is on `main` and the fir
 has not gone out yet. Only once that order has settled does the next landed fix earn a
 new one — the rule is "one release in flight", not "one release".
 
+## 6a. The wiring a new event kind and a new question kind each owe
+
+Two mechanisms in this OS have a list of places that must be told about a new member,
+and both lists are longer than they look (review round 4).
+
+**Four new event kinds** — `issue_in_progress`, `issue_released`, `issue_closed`,
+`release_batched` — are named in `timeline._describe`. An unregistered kind is not
+hidden, it renders as the bare kind string beside a raw JSON payload, and that is not
+the same claim as a reader being able to see it (kn-3f133363). The question to ask is
+which surface is a kind's ONLY one: for these four the timeline is it, because the issue
+shows the result but never when the OS decided it, and `issue_state` is a column nothing
+renders.
+
+**`triage` is a Neo question kind with an EMPTY `wo_id`**, the first of its sort, and a
+question kind is a claim about who is waiting (kn-4edb0eb7). For `triage` the answer is
+nobody: the bug is sitting in the backlog and no work order exists. All seven sites are
+told, and all seven say the same thing — the resolution is `jarvis backlog promote`:
+
+* `neo_store.Q_KINDS`, and `Daemon._neo_drain`'s `deliver()` branch, which returns FIRST
+  because every branch below it reaches for `q["wo_id"]`.
+* `ops._neo_attention` / `os_status` — the question is still LISTED, because an
+  unconfirmed `blocker` nobody hears about is the failure this whole path exists to
+  prevent, but its `decide` line names the backlog item rather than `jarvis neo answer`.
+* `invariants.check_neo_escalations_are_live`, with `_stale_triage_question`. Its subject
+  is a CENTRAL backlog item rather than a row in the project store, so ownership is
+  resolved through `registered_project_paths` — otherwise every project would report the
+  same question on the same tick.
+* `ops.neo_answer_escalated`, refused: the delivery would look up `wo_id=""`.
+* `ops.neo_review`'s `--correct` tail, which forwards to the worker whenever the order is
+  not terminal. Stated rather than left to the lookup failing, because this is the
+  command the OS itself tells the user to run. The learning is still recorded — that is
+  what teaches the rubric.
+* `ui/templates/_question.html`'s `answer_form`, which otherwise offers a textarea
+  labelled "it goes straight to the worker". The template and the `ops` guard have to
+  move together: either alone leaves one of the two surfaces open.
+
 ## 7. What the user is told
 
 `report_bug` raises only if the ISSUE could not be created — its existing rule, that a
