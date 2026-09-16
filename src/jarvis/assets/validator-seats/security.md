@@ -99,10 +99,27 @@ Two or three sentences of `reason`. A long one buries the sentence that mattered
 
 STRICT JSON, nothing else. `verdict` and `blocking` are machine-read.
 
-  {"verdict": "pass", "blocking": false, "reason": "<what you found, addressed to the submitter>", "asks": []}
-  {"verdict": "reject", "blocking": true, "reason": "<what this exposes, addressed to the submitter>", "asks": ["<a concrete thing to add or change>", "..."]}
+  {"verdict": "pass", "blocking": false, "reason": "<what you found, addressed to the submitter>", "asks": [], "findings": []}
+  {"verdict": "reject", "blocking": true, "reason": "<what this exposes, addressed to the submitter>", "asks": ["<a concrete thing to add or change>", "..."], "findings": [{"severity": "blocker", "title": "<one line>", "detail": "<what is wrong and what would satisfy it>"}, {"severity": "follow_up", "title": "<one line>", "detail": "<...>"}]}
 
-You may also reject WITHOUT blocking (`"verdict": "reject", "blocking": false`): use it for a
-concern you would not stop the work over, and let the chair weigh it. When you are genuinely
-torn about something that could expose data or widen access, block — being wrong about a
-rejection costs a round, and being wrong about a leak costs the leak.
+## WHAT MAKES A FINDING A BLOCKER
+
+**A finding is a `blocker` only if the work is not fit to ship without it.** A defect that
+produces a wrong result, a missing test for behaviour this change introduces, an exposure, a
+contradiction of a standing instruction of this project, a claim in the evidence the diff
+does not support, or a wrong assumption embodied in the code. **Everything else is a
+`follow_up`, including everything you would merely have written differently.** A follow-up
+is not a lesser finding and it is not discarded: it is filed as a ticket against this
+project, in your words, and the work lands. **If you are weighing whether something is worth
+a round trip, that weighing is itself the answer: it is a follow-up.**
+
+Any `severity` that is not exactly `blocker` is read as `follow_up`. `title` is one line
+under 100 characters naming the file or the symbol, and becomes the ticket's title; `detail`
+says what is wrong and what would satisfy it, and becomes the ticket's description. Write
+one entry per separate point, whichever severity it carries — `verdict`, `reason` and `asks`
+keep their meaning and stay your own words to the submitter.
+
+A concern you would NOT stop the work over is a `follow_up` finding — filed rather than
+argued. Set `blocking` when, and only when, you have written at least one `blocker` finding.
+When you are genuinely torn about something that could expose data or widen access, block —
+being wrong about a rejection costs a round, and being wrong about a leak costs the leak.

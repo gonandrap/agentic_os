@@ -540,20 +540,42 @@ elif "-p" in argv and "--resume" not in argv:
             elif "FORCE_VALIDATION_NO_OUTCOME" in said:
                 reply = {"reason": "a reply with no outcome at all"}
         else:
+            # `findings` IS EXPLICIT AND EMPTY ON THE UNFORCED REPLY, not omitted. Left
+            # out, every test in the suite would exercise the absent-key fallback and
+            # nothing would ever exercise the severity split itself.
             reply = {"verdict": "pass", "blocking": False,
                      "reason": f"the {vseat} question is answered by this change",
-                     "asks": []}
+                     "asks": [], "findings": []}
             if f"FORCE_BLOCK_{vseat.upper()}" in said:
                 # `blocking` true from EVERY seat, veto-holder or not. Arbitration, not
                 # the seat, decides what that forces — which is exactly the row the
                 # architect and maintainer tests need staged.
                 reply = {"verdict": "reject", "blocking": True,
                          "reason": f"test-forced {vseat} objection",
-                         "asks": [f"answer the {vseat} objection"]}
+                         "asks": [f"answer the {vseat} objection"],
+                         "findings": [{"severity": "blocker",
+                                       "title": f"the {vseat} blocker",
+                                       "detail": f"what the {vseat} seat would stop "
+                                                 f"this over"}]}
             elif f"FORCE_REJECT_{vseat.upper()}" in said:
                 reply = {"verdict": "reject", "blocking": False,
                          "reason": f"test-forced {vseat} concern that blocks nothing",
-                         "asks": []}
+                         "asks": [],
+                         "findings": [{"severity": "blocker",
+                                       "title": f"the {vseat} blocker",
+                                       "detail": f"what the {vseat} seat would stop "
+                                                 f"this over"}]}
+            elif f"FORCE_FOLLOWUP_{vseat.upper()}" in said:
+                # THE ONE THE CHAIR MUST NEVER SEE. A reject carrying nothing but a
+                # follow-up: the seat had something to say and said the work ships
+                # anyway.
+                reply = {"verdict": "reject", "blocking": False,
+                         "reason": f"test-forced {vseat} remark worth filing",
+                         "asks": [],
+                         "findings": [{"severity": "follow_up",
+                                       "title": f"the {vseat} follow-up",
+                                       "detail": f"what the {vseat} seat would file "
+                                                 f"rather than argue"}]}
         emit_headless(json.dumps(reply))
         sys.exit(0)
     # A SUPERVISOR REVIEW, AND IT IS IDENTIFIED BY THE SYSTEM PROMPT FOR THE REASON THE
