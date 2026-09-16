@@ -92,8 +92,11 @@ VALIDATION_OPINION_STATUSES = ("ok", "abstained", "failed")
 # with `jarvis wo inject`; adhoc is the legacy marker for a session the reconciler
 # adopted on its own, which it no longer does (GitHub issue 47); neo is one Neo filed
 # itself (a ledger cleanup), which nobody asked for by hand — worth telling apart from
-# `jarvis` in listings for exactly that reason.
-WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected", "neo")
+# `jarvis` in listings for exactly that reason; `schedule` is one a RECURRING JOB filed
+# (src/jarvis/schedule.py), and it is here for `neo`'s reason turned up a notch — it is
+# the only origin where not even a model decided to file this, a clock did, so "why am I
+# paying for this work order" is unanswerable without it.
+WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected", "neo", "schedule")
 
 # Origins whose session Jarvis did not dispatch: it belongs to the user, never received
 # the worker briefing or `JARVIS_WO_ID`, and therefore cannot satisfy the worker contract
@@ -434,6 +437,28 @@ CREATE TABLE IF NOT EXISTS health_reviews (
     outcome TEXT NOT NULL,              -- HEALTH_OUTCOMES
     findings INTEGER NOT NULL DEFAULT 0,
     detail TEXT NOT NULL DEFAULT ''
+);
+-- THE SCHEDULER'S CLOCK, one row per job this project runs
+-- (docs/superpowers/specs/2026-09-14-the-scheduler.md §3). In the PROJECT store rather
+-- than `os_state`, because what a firing produces is a project work order and two
+-- projects sharing one clock would mean the first to fire silenced the rest.
+--
+-- `last_fired_at` IS THE ANCHOR AND IT IS NEVER NULL: seeded to the moment the job was
+-- first seen enabled, so neither enabling a job nor restarting the daemon can make one
+-- due. `last_wo_id IS NULL` is what tells a seeded job apart from one that has fired.
+--
+-- The held pair is the other half of Neo's ruling on holding silently: a job parked
+-- behind its own unsettled order raises no attention, but the park is RECORDED, so
+-- `jarvis doctor` can tell a scheduler that is waiting from one that is dead
+-- (`invariants.check_schedule_progresses`). New table, so no migration — the
+-- `CREATE TABLE IF NOT EXISTS` every open already runs is the whole upgrade.
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+    job_id TEXT PRIMARY KEY,            -- schedule.JOB_IDS
+    created_at REAL NOT NULL,
+    last_fired_at REAL NOT NULL,
+    last_wo_id TEXT,                    -- no FK: the order may be deleted, the clock stays
+    held_since REAL,
+    held_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS wo_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1380,6 +1405,64 @@ class ProjectStore:
         self.get_work_order(wo_id)  # KeyError if it doesn't exist
         self.update_work_order(wo_id, hidden=1 if hidden else 0)
         self.add_event(wo_id, "hidden", {"hidden": bool(hidden)})
+
+    # -- the scheduler's clock (`scheduled_jobs`) -------------------------------------
+    #
+    # Dumb on purpose, like `ack_attention`: the store keeps the row, `schedule.decide`
+    # holds the policy. Nothing here consults a catalog or a clock it was not handed.
+
+    def seed_schedule(self, job_id: str, now: float | None = None) -> dict[str, Any]:
+        """This job's clock, created on first sight if it has never been seen.
+
+        `last_fired_at = now` AT SEED TIME is what makes enabling a job mean "from the
+        next interval" rather than "right now", and it is the same row a restart reads
+        back, so neither event can fire an order. See `schedule.decide`.
+        """
+        now = db.now() if now is None else now
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO scheduled_jobs (job_id, created_at, last_fired_at)"
+                " VALUES (?,?,?)", (job_id, now, now))
+        row = self.conn.execute("SELECT * FROM scheduled_jobs WHERE job_id=?",
+                                (job_id,)).fetchone()
+        return dict(row)
+
+    def schedule_state(self, job_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM scheduled_jobs WHERE job_id=?",
+                                (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_schedule_states(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM scheduled_jobs ORDER BY job_id")]
+
+    def record_schedule_fire(self, job_id: str, wo_id: str,
+                             now: float | None = None) -> None:
+        """A job fired: advance its clock to NOW and clear any hold.
+
+        `now`, never `last_fired_at + interval` — that is the whole of "at most one
+        catch-up, never a backfill" (`schedule.decide`), and moving it here rather than
+        in the caller is what stops a second caller getting it wrong.
+        """
+        now = db.now() if now is None else now
+        with self.conn:
+            self.conn.execute(
+                "UPDATE scheduled_jobs SET last_fired_at=?, last_wo_id=?, held_since=NULL,"
+                " held_reason=NULL WHERE job_id=?", (now, wo_id, job_id))
+
+    def record_schedule_hold(self, job_id: str, reason: str,
+                             now: float | None = None) -> None:
+        """A job wanted to fire and could not. Idempotent in `held_since`.
+
+        The FIRST such tick is the one that matters — how long this has been parked is
+        the number `check_schedule_progresses` judges by — so a held job re-held on the
+        next tick keeps its original timestamp and only refreshes the words.
+        """
+        now = db.now() if now is None else now
+        with self.conn:
+            self.conn.execute(
+                "UPDATE scheduled_jobs SET held_since=COALESCE(held_since, ?),"
+                " held_reason=? WHERE job_id=?", (now, reason, job_id))
 
     def delete_work_order(self, wo_id: str) -> dict[str, int]:
         """Erase a work order and everything hanging off it. Returns the row counts.

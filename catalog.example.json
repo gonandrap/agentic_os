@@ -32,6 +32,28 @@
       "learnings_limit": 50,
       "$comment_digest": "which model shortens an over-long question for the neo tab; \"\" turns it off and every question renders in full",
       "digest_model": "haiku"
+    },
+    "schedule": {
+      "$comment": [
+        "RECURRING WORK ORDERS: the only thing in Jarvis that files work, and therefore",
+        "spends money, with nobody asking. Ships disabled fleet-wide; turn it on here for",
+        "every project, or per project in the block below. Known jobs: daily-doctor.",
+        "",
+        "daily-doctor runs `jarvis doctor <project> --repair` once an interval and files",
+        "a work order for anything it found that a person has to fix. Only the project",
+        "that contains the running jarvis install also runs the OS-level checks — the",
+        "rest pass --skip-os, so one broken dashboard is reported once and not per",
+        "project.",
+        "",
+        "It never stacks: a job whose previous order has not settled holds silently, and",
+        "jarvis doctor reports it as INV-SCHEDULE-HELD after held_alarm_intervals whole",
+        "intervals. Yesterday's order is hidden as today's is filed, so the listing",
+        "carries one per job — what a run FOUND leaves as its own work orders and stays."
+      ],
+      "enabled": false,
+      "interval_hours": 24,
+      "jobs": ["daily-doctor"],
+      "held_alarm_intervals": 3
     }
   },
   "projects": [
@@ -70,7 +92,9 @@
       "name": "my_research",
       "path": "~/workspace/my_research",
       "description": "Data analysis scripts and notebooks",
-      "model": "haiku"
+      "model": "haiku",
+      "$comment_schedule": "field-level inheritance like every other block: this project names ONE key and keeps os.schedule's answer for the rest. Deliberately NOT enabled:true — copying this file must not make the OS start filing work orders nobody asked for, which is the whole thing the scheduler ships disabled to avoid",
+      "schedule": { "interval_hours": 12 }
     }
   ]
 }

@@ -197,6 +197,7 @@ IDLE_NO_FINISH_BLOCKER = ("the worker stopped mid-task without `jarvis wo finish
                           "nothing it started is still running; review the session")
 
 SECONDS_PER_MINUTE = 60  # a unit, not a setting
+SECONDS_PER_HOUR = 3600  # ditto
 
 #: What a work order says when its turn has ended, nothing is in flight, and the OS is
 #: still calling it work in progress. FREE OF ANY ELAPSED TIME, deliberately: this string
@@ -2497,6 +2498,58 @@ def check_os() -> list[Violation]:
     return found
 
 
+def check_schedule_progresses(store: ProjectStore) -> Iterator[Violation]:
+    """INV-SCHEDULE-HELD — a recurring job that has wanted to fire for days.
+
+    The scheduler holds SILENTLY by design: a job whose previous order has not settled
+    does not fire, does not queue, and does not flag anything, because a stack of
+    identical daily orders is the alarm nobody reads (`schedule.decide`). The cost of
+    that choice is that a scheduler which has quietly stopped looks exactly like one that
+    is politely waiting, and the difference is invisible on every surface. This is the
+    difference, and it is why `scheduled_jobs` persists the hold rather than recomputing
+    it: what matters is how long, and only the row remembers.
+
+    `held_alarm_intervals` whole intervals, three by default — a doctor order the user
+    has not reviewed by lunchtime is a normal Tuesday, and reporting that would put the
+    scheduler on the attention list for working correctly.
+
+    NOT REPAIRABLE, and it must not try: the remedy is to settle the order that is in the
+    way (or to decide it never will be), which is a judgement about that work, not a
+    derivation. Silent on a project whose scheduler is OFF, or which does not run the
+    job any more — `check_health_sweep_produces_judgements`' lesson, where a switched-off
+    mechanism with rows still on disk would otherwise alarm for ever.
+    """
+    from .ops import schedule_config_at
+    from .schedule import held_seconds
+
+    cfg = schedule_config_at(store.project_path)
+    if not cfg.enabled:
+        return
+    # `db.now`, not `time.time`: `held_since` was written from that clock by
+    # `record_schedule_hold`, and judging a stored moment against a different clock is
+    # how a check comes to disagree with the thing it is checking (kn-e6373014).
+    now = db.now()
+    limit = cfg.held_alarm_intervals * cfg.interval_seconds
+    for state in store.list_schedule_states():
+        if state["job_id"] not in cfg.jobs:
+            continue
+        held = held_seconds(state, now)
+        if held <= limit:
+            continue
+        waiting_for = state["held_reason"] or "its previous order has not settled"
+        yield Violation(
+            invariant="INV-SCHEDULE-HELD",
+            wo_id=state["last_wo_id"],
+            detail=(f"scheduled job {state['job_id']!r} has been unable to fire for "
+                    f"{held / SECONDS_PER_HOUR:.0f}h — longer than "
+                    f"{cfg.held_alarm_intervals} intervals of {cfg.interval_hours}h. "
+                    f"It is waiting because {waiting_for}. Settle that work order and "
+                    f"the job files its next one on the following tick."),
+            context={"job_id": state["job_id"], "held_seconds": held,
+                     "held_reason": state["held_reason"] or ""},
+        )
+
+
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
     check_no_orphan_gate_requests,  # ...and gates before the flag checks: an orphan
@@ -2518,6 +2571,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # did not do, with nothing to repair
     check_pause_deadline_stable,   # ...and its companion: the pass can also be failing
                                    # because the moment it was given keeps moving
+    check_schedule_progresses,     # ditto, one mechanism over: a pure read of the
+                                   # scheduler's clock, repairing nothing
     check_validation_progresses,   # after the flag checks: its repair touches no flag,
                                    # and a `validating` row is invisible to all of them
     check_feature_failures_are_real,  # order-free: it reads and writes feature orders
