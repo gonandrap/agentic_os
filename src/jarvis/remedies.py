@@ -64,6 +64,38 @@ change course on the strength of it."""
 #: settled alone and "escalated" alone does not say that an action was asked for.
 REFUSED_REASON = "the {remedy} remedy was {verdict} by {by}: {reason}"
 
+#: How much of the judge's argument becomes the new work order's TITLE. A title is an
+#: index entry — it is what `jarvis wo list`, the dashboard and every attention line show
+#: — so it is clipped rather than wrapped, and the whole argument survives in the brief.
+TITLE_CHARS = 120
+
+#: The fix order's brief. The JUDGE supplies the prose and the OS supplies the frame: the
+#: worker sees only this text (prime directive 3), so the alarm it came from has to travel
+#: with it or the order arrives as an assertion with no evidence behind it.
+FIX_BRIEF = """The supervisor raised this off cost alarm {alarm_id}.
+
+WHAT IT SAW: {reason}
+
+WHAT IT WANTS DONE: {argument}
+
+Read the alarm before you start — `jarvis alarms show {alarm_id}` — and fix the ROOT
+CAUSE rather than the symptom it was measured by. A separate work order is already filed
+to ship your fix once this one completes, so finish behind a pull request as usual and do
+not release anything yourself."""
+
+#: The ship order's title and brief, and these words are the OS's rather than the judge's
+#: on purpose: "ship it" is the same job every time, and a judge writing its own release
+#: instructions each time is a judge inventing a procedure the `shipit` skill already owns.
+SHIP_TITLE = "Ship the fix for {alarm_id} to production"
+SHIP_BRIEF = """This order ships {fix_id}, and runs only after it completes.
+
+Cut a release from ALREADY-MERGED main and deploy it with the `shipit` skill, which is the
+only supported route. The release is a PRIVILEGED ACTION: you will be blocked, the request
+is filed, and a reviewer decides. That is expected — make the case in the request rather
+than looking for a way around it.
+
+Why it is worth shipping promptly: {reason}"""
+
 #: Inbox titles. User-facing copy, so they live here rather than at their call sites —
 #: every inbox row reaches every sink, Telegram included. There is deliberately NO row
 #: for a proposal being FILED: telling the user before the reviewer has even looked is
@@ -121,10 +153,11 @@ def _carrier_id(pstore: Any, alarm: dict[str, Any]) -> str | None:
 # -- the handlers. EVERY ACTING CALL IN THIS MODULE IS INSIDE ONE OF THESE ------------
 #
 # `tests/test_remedies.py::test_the_acting_calls_stay_inside_the_handlers` walks this
-# file's AST for `send_message`, `queue_message`, `unblock_work_order`, `cancel`,
-# `cancel_work_order` and `set_status` as an attribute or a bare name, and requires the
-# nearest enclosing function to be one of `REMEDIES[*].apply`. Reachability is not
-# decidable from an AST; enclosure is, and it is the property that actually matters.
+# file's AST for `send_message`, `queue_message`, `unblock_work_order`,
+# `create_work_order`, `cancel`, `cancel_work_order` and `set_status` as an attribute or a
+# bare name, and requires the nearest enclosing function to be one of `REMEDIES[*].apply`.
+# Reachability is not decidable from an AST; enclosure is, and it is the property that
+# actually matters.
 
 
 def _apply_nudge(pstore: Any, central: Any, project: str, subject: dict[str, Any],
@@ -178,6 +211,65 @@ def _apply_unblock(pstore: Any, central: Any, project: str, subject: dict[str, A
             f"still blocked by: {', '.join(remaining) or 'nothing'}")
 
 
+def _title_from(argument: str) -> str:
+    """The judge's first line, as a work order's title.
+
+    Its FIRST LINE and not a summary of it: asking a model for a title as well as an
+    argument is a second thing to get wrong, and the first line of an argument written to
+    be read by a human already is one.
+    """
+    first = next((line.strip() for line in argument.splitlines() if line.strip()), "")
+    return first[:TITLE_CHARS]
+
+
+def _apply_file_work_order(pstore: Any, central: Any, project: str,
+                           subject: dict[str, Any], alarm: dict[str, Any]) -> str:
+    """File the fix, then the order that ships it, joined by a dependency edge.
+
+    TWO ORDERS IN ONE APPLICATION, AND THAT IS THE REMEDY RATHER THAN TWO REMEDIES: a fix
+    nobody ships is not a fix (issue 164 item 1), and `--depends-on` is the OS's own idiom
+    for ordering a two-step job in one go. Nothing reaches production on the strength of
+    this permission — the ship order still meets the release gate when it runs, and a
+    reviewer still decides there.
+
+    THE JUDGE SUPPLIES PROSE AND THE MODULE SUPPLIES STRUCTURE, which is the same
+    closed-vocabulary discipline as the rest of this file: there is no free-text action
+    here either, only a free-text BRIEF inside one.
+
+    THE SHIP ORDER'S FAILURE IS REPORTED, NEVER RAISED. `RemedyRefused` means nothing was
+    done, and by then the fix order exists — so a raise would write a false statement into
+    the record of the one path that already did half its work.
+    """
+    from . import ops
+
+    argument = (alarm.get("remedy_argument") or "").strip()
+    if not argument:
+        raise RemedyRefused(
+            f"{alarm['id']} proposed `file_work_order` with no argument — there is "
+            f"nothing to brief a work order with")
+    reason = (alarm.get("reason") or "").strip()
+    try:
+        fix = ops.create_work_order(
+            project, _title_from(argument),
+            description=FIX_BRIEF.format(alarm_id=alarm["id"], reason=reason,
+                                         argument=argument))
+    except ops.OpsError as exc:
+        raise RemedyRefused(str(exc)) from exc
+    try:
+        ship = ops.create_work_order(
+            project, SHIP_TITLE.format(alarm_id=alarm["id"]),
+            description=SHIP_BRIEF.format(fix_id=fix["id"], reason=reason),
+            depends_on=[fix["id"]])
+    except ops.OpsError as exc:
+        log.warning("filed %s for %s but could not file its ship order: %s",
+                    fix["id"], alarm["id"], exc)
+        return (f"filed {fix['id']} to fix the root cause; its ship order could NOT be "
+                f"filed ({exc}) — file one by hand with `jarvis wo create {project} "
+                f"\"…\" --depends-on {fix['id']}`")
+    return (f"filed {fix['id']} to fix the root cause, and {ship['id']} to ship it "
+            f"(blocked until {fix['id']} completes; the release itself is still gated)")
+
+
 REMEDIES: dict[str, Remedy] = {
     "nudge": Remedy(
         id="nudge",
@@ -200,11 +292,25 @@ REMEDIES: dict[str, Remedy] = {
         subjects=("work_order",),
         apply=_apply_unblock,
     ),
+    "file_work_order": Remedy(
+        id="file_work_order",
+        headline="file a work order to fix the root cause, and a second one to ship "
+                 "that fix, blocked until the first completes",
+        blast="creates TWO NEW work orders in this project and touches nothing that "
+              "already exists: no running session is reached, no status is changed and "
+              "no existing order is altered. The first is dispatched as soon as a slot "
+              "is free and will spend a whole worker session; the second waits for it, "
+              "and when it runs the release is still a gated action a reviewer must "
+              "approve. An order can be cancelled, but the tokens the first one spends "
+              "before anyone looks cannot be taken back.",
+        subjects=("work_order", "feature_order"),
+        apply=_apply_file_work_order,
+    ),
 }
 
 #: Asserted equal to `tuple(REMEDIES)`. The registry is closed BY A TEST rather than by
 #: a convention, so widening what the OS may do fails a suite and is read by a human.
-SHIPPED_REMEDIES: tuple[str, ...] = ("nudge", "unblock")
+SHIPPED_REMEDIES: tuple[str, ...] = ("nudge", "unblock", "file_work_order")
 
 
 def get(remedy_id: str) -> Remedy:

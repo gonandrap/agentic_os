@@ -359,6 +359,54 @@ DEFAULT_INSPECT_ALARM_WRITE_TOKENS = 300_000
 #: sitting here an hour later is not slow, it is stopped — wo-a4bd6958 sat 7h13m.
 DEFAULT_INSPECT_ALARM_PARKED_MINUTES = 60
 
+# -- the AGGREGATE half of the re-write tax. Everything above judges one live turn;
+# these five judge a PROJECT over a cohort window of settled orders, which is the
+# standing condition no surface raised (issue 164 item 1, finding 1 of
+# docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md).
+
+#: The cohort window, in days. NOT ALL HISTORY, and that is the point (kn-1449447a (5)):
+#: the split between the two causes is drifting, and an average over everything ever
+#: sealed reports the trend away.
+DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS = 7
+
+#: What fraction of the window's bill went on re-sending conversations whose PROMPT
+#: PREFIX had moved — the cause no cache TTL can touch. MEASURED over this fleet's sealed
+#: bills on 2026-09-14: jarvis_os sits at 10.5% over the trailing 7 days and 11.1% over
+#: 30. Set above that deliberately, so the alarm reports the tax GETTING WORSE rather than
+#: restating a standing figure the findings doc already recorded; a project that wants the
+#: standing figure raised lowers it with `jarvis config set <p>
+#: inspect.alarm_rewrite_prefix_share`.
+DEFAULT_INSPECT_ALARM_REWRITE_PREFIX_SHARE = 0.15
+
+#: The same fraction for the other cause: the cache entry EXPIRING. Measured at 10.3% (7
+#: days) and 10.9% (30) on the same run, so the two causes are at near parity on this
+#: fleet now — itself the drift kn-1449447a (5) predicted.
+#:
+#: THIS IS NOT THE TRIGGER FOR SWITCHING THE WRITE TTL, and confusing the two is the trap
+#: kn-1449447a (4) exists for: that decision is `rewrite_ttl_write / cache_write` against
+#: 39.5%, a different ratio over a much larger denominator, and it runs at about half this
+#: one. This is a share of the BILL.
+DEFAULT_INSPECT_ALARM_REWRITE_TTL_SHARE = 0.15
+
+#: A share computed over fewer settled orders than this is one order's shape rather than
+#: the project's. Measured: it excludes openclaw_sandbox's single $28.26 order sitting at
+#: 31.8%, which is a work order to look at and not a project to alarm on.
+DEFAULT_INSPECT_ALARM_REWRITE_MIN_ORDERS = 5
+
+#: …and below this much spend in the window a percentage is arithmetic on noise. Measured:
+#: it excludes shared_schedule ($0.54 over 3 orders) and painforwisdom ($2.32 over 4)
+#: without excluding anything that had money in it. Zero is legal — see
+#: `INSPECT_MONEY_KEYS`.
+DEFAULT_INSPECT_ALARM_REWRITE_MIN_USD = 10.0
+
+#: `InspectConfig` fields that are a FRACTION, not a count. `_parse_inspect` refuses every
+#: other field below 1, which would reject every legal value of these two.
+INSPECT_FRACTION_KEYS = ("alarm_rewrite_prefix_share", "alarm_rewrite_ttl_share")
+
+#: …and the one that is money. Zero is legal here and nowhere else: a project may ask to
+#: hear about its re-write tax however little it spent.
+INSPECT_MONEY_KEYS = ("alarm_rewrite_min_usd",)
+
 
 @dataclass
 class InspectConfig:
@@ -373,9 +421,9 @@ class InspectConfig:
     `enabled` turns only the ALARMS off, never the report: `jarvis inspect` reads files
     that are already on disk and costs nothing until someone runs it, whereas the alarm
     reads a transcript per running work order per reconcile tick. It covers
-    `alarm_parked_minutes` too (`invariants._parked_minutes`) — one switch for "raise
-    nothing here", because a second way to turn one thing off is a second way to be
-    surprised by it.
+    `alarm_parked_minutes` too (`invariants._parked_minutes`) and the `alarm_rewrite_`
+    five (`Daemon.check_rewrite_tax`) — one switch for "raise nothing here", because a
+    second way to turn one thing off is a second way to be surprised by it.
     """
 
     enabled: bool = True
@@ -387,6 +435,11 @@ class InspectConfig:
     alarm_join_seconds: int = DEFAULT_INSPECT_ALARM_JOIN_SECONDS
     alarm_write_tokens: int = DEFAULT_INSPECT_ALARM_WRITE_TOKENS
     alarm_parked_minutes: int = DEFAULT_INSPECT_ALARM_PARKED_MINUTES
+    alarm_rewrite_window_days: int = DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS
+    alarm_rewrite_prefix_share: float = DEFAULT_INSPECT_ALARM_REWRITE_PREFIX_SHARE
+    alarm_rewrite_ttl_share: float = DEFAULT_INSPECT_ALARM_REWRITE_TTL_SHARE
+    alarm_rewrite_min_orders: int = DEFAULT_INSPECT_ALARM_REWRITE_MIN_ORDERS
+    alarm_rewrite_min_usd: float = DEFAULT_INSPECT_ALARM_REWRITE_MIN_USD
 
 
 # -- message delivery: how long a queued message may stay undelivered before the OS
@@ -861,12 +914,18 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
     `base` is what an omitted key falls through to — the same field-level inheritance
     `_parse_validation` uses (kn-6ca2bcd9): `os.inspect` parses against the shipped
     defaults and each project parses against the OS answer, so a project naming one key
-    inherits the other five and no caller ever has to consult two objects.
+    inherits the rest and no caller ever has to consult two objects.
 
-    Every threshold is REFUSED rather than clamped below 1. Zero would report every write
-    a session makes and flag every work order the fleet runs — the exact failure the
+    Every COUNT is REFUSED rather than clamped below 1. Zero would report every write a
+    session makes and flag every work order the fleet runs — the exact failure the
     defaults were measured to avoid — and it arrives by a typo in a `jarvis config set`,
     so it is caught where the message can name the key.
+
+    THE THREE VOCABULARIES ARE KEPT APART because one rule cannot serve them: a SHARE is
+    refused outside `(0, 1]` — above 1 it is not a stricter alarm, it is one that can
+    never fire — and the one MONEY floor is refused below 0, since zero is a project
+    asking to hear about its tax however little it spent. Running either through the
+    ">= 1" rule would reject every legal value.
     """
     base = base or InspectConfig()
     if not isinstance(raw, dict):
@@ -887,9 +946,27 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
                                        base.alarm_write_tokens)),
         alarm_parked_minutes=int(raw.get("alarm_parked_minutes",
                                          base.alarm_parked_minutes)),
+        alarm_rewrite_window_days=int(raw.get("alarm_rewrite_window_days",
+                                              base.alarm_rewrite_window_days)),
+        alarm_rewrite_prefix_share=float(raw.get("alarm_rewrite_prefix_share",
+                                                 base.alarm_rewrite_prefix_share)),
+        alarm_rewrite_ttl_share=float(raw.get("alarm_rewrite_ttl_share",
+                                              base.alarm_rewrite_ttl_share)),
+        alarm_rewrite_min_orders=int(raw.get("alarm_rewrite_min_orders",
+                                             base.alarm_rewrite_min_orders)),
+        alarm_rewrite_min_usd=float(raw.get("alarm_rewrite_min_usd",
+                                            base.alarm_rewrite_min_usd)),
     )
     for name, value in vars(cfg).items():
-        if name != "enabled" and value < 1:
+        if name in INSPECT_FRACTION_KEYS:
+            if not 0 < value <= 1:
+                raise _err(f"{where}.{name} must be a fraction in (0, 1] — {value} is "
+                           f"a share of the project's bill, and above 1 it is not a "
+                           f"strict threshold but one that can never fire")
+        elif name in INSPECT_MONEY_KEYS:
+            if value < 0:
+                raise _err(f"{where}.{name} must be >= 0")
+        elif name != "enabled" and value < 1:
             raise _err(f"{where}.{name} must be >= 1")
     return cfg
 

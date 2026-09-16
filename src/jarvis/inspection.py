@@ -713,6 +713,23 @@ TURN_ALARM, JOIN_ALARM, WRITE_ALARM = "long-turn", "long-join", "big-rewrite"
 #: The one alarm here whose finding is that NOTHING was spent — see `ALARM_KINDS`.
 STALL_ALARM = "stalled-turn"
 
+#: THE AGGREGATE PAIR, and the only kinds in this module that are not about one turn:
+#: `alarms()` never raises them and cannot. They are a PROJECT's re-write tax over a
+#: cohort window of settled orders, computed by `bill.rewrite_tax` and raised by
+#: `Daemon.check_rewrite_tax` — the standing condition `WRITE_ALARM` cannot report,
+#: because that one judges a single call while the turn that made it is still running.
+#:
+#: They are declared HERE, beside the live four, because `ALARM_KINDS` is the one place a
+#: surface looks up what an alarm kind MEANS (`ui.app` passes it to /alarms) and a kind
+#: missing from it renders as a bare id. The raising lives where the arithmetic is.
+#:
+#: TWO KINDS RATHER THAN ONE WITH THE CAUSE IN ITS PROSE: the prefix moving is bought
+#: back by keeping the prefix still and the entry expiring by a longer TTL, so they are
+#: opposite cures (kn-1449447a), and one kind would make "which cure" a detail of a
+#: sentence instead of the identity a dedupe, a filter and a learning can key on.
+REWRITE_PREFIX_ALARM = "rewrite-tax-prefix"
+REWRITE_TTL_ALARM = "rewrite-tax-ttl"
+
 #: What each kind IS, for a surface listing alarms rather than raising one. An `Alarm`'s
 #: own `reason` is about one turn and carries its numbers; this is the standing meaning,
 #: and it lives beside the constants so a dashboard and the CLI cannot drift on it.
@@ -724,6 +741,12 @@ ALARM_KINDS = {
     STALL_ALARM: "a turn open with no API call ever made — nothing is being billed",
     JOIN_ALARM: "a join open past the cache TTL — the wait is paid for twice",
     WRITE_ALARM: "the conversation sent again, at the cache-write rate",
+    # The two aggregate kinds. Worded as a share of a PROJECT rather than of a turn, so a
+    # reader of the legend cannot take them for another reading of `big-rewrite`.
+    REWRITE_PREFIX_ALARM: "a project's conversations re-sent because the prompt PREFIX "
+                          "moved — the half no cache TTL can buy back",
+    REWRITE_TTL_ALARM: "a project's conversations re-sent because the cache entry "
+                       "EXPIRED — the half a longer TTL could buy back",
 }
 
 
