@@ -912,7 +912,7 @@ def test_the_user_cannot_answer_an_escalated_assumption_into_a_finished_worker(s
 
 
 def test_a_question_the_user_answered_another_way_stops_asking_for_a_ruling(started):
-    """Adding a Neo question kind is four edits, and this is the fourth
+    """Adding a Neo question kind is seven edits (kn-4edb0eb7), and this is the fourth
     (`invariants.check_neo_escalations_are_live`). The user answers an escalated
     assumption question with `jarvis wo review`, which never touches the question — so
     without this it goes on asking for a ruling that has already been given."""
@@ -930,5 +930,55 @@ def test_a_question_the_user_answered_another_way_stops_asking_for_a_ruling(star
     try:
         (q,) = questions()
         assert neo_store.get(q["id"])["status"] not in ("escalated", "failed")
+    finally:
+        neo_store.close()
+
+
+def test_an_assumption_still_waiting_on_the_user_is_not_swept(started):
+    """THE HALF THAT MATTERS MORE, and the one a sweep gets wrong in the dangerous
+    direction. `_stale_assumption_question` closes a question whose assumption has been
+    settled; a version that closed one whose assumption is STILL PENDING would silently
+    retire a live escalation — the user would never see the decision they are owed, and
+    nothing would say it had gone."""
+    from jarvis import invariants
+
+    store, wo = park(started, auto_review=True)
+    ask(started, store)
+    drain(started)                       # the fake escalates by default
+    (q,) = questions()
+
+    violations = list(invariants.check_neo_escalations_are_live(store))
+
+    assert violations == []
+    assert store.pending_assumptions(wo["id"])
+    neo_store = NeoStore()
+    try:
+        assert neo_store.get(q["id"])["status"] == "escalated"
+    finally:
+        neo_store.close()
+
+
+def test_another_projects_assumption_question_is_left_alone(started):
+    """The rule all four siblings share, stated in `_stale_assumption_question`: the
+    checks run per project against an OS-WIDE `neo.db`, so "no such assumption here" is
+    how another project's rows are skipped — and it cannot be told apart from a subject
+    that has gone. A missing row must therefore be left alone, not swept."""
+    from jarvis import invariants
+
+    store, _wo = park(started, auto_review=True)
+    neo_store = NeoStore()
+    try:
+        stranger = neo_store.ask("proj_b", "wo-elsewhere",
+                                 "ASSUMPTION REVIEW — someone else's order",
+                                 kind="assumption")
+        neo_store.mark(stranger["id"], "escalated", reason="theirs to decide")
+    finally:
+        neo_store.close()
+
+    assert list(invariants.check_neo_escalations_are_live(store)) == []
+
+    neo_store = NeoStore()
+    try:
+        assert neo_store.get(stranger["id"])["status"] == "escalated"
     finally:
         neo_store.close()

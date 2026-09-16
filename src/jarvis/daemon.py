@@ -3324,7 +3324,7 @@ class Daemon:
         themselves, which is what they did for every assumption before this existed, and
         the work order is already on their list carrying `assumptions pending review`.
 
-        THREE HOLDS ARE NOT RECORDED, and all three are things the reader would be told
+        FOUR HOLDS ARE NOT RECORDED, and all four are things the reader would be told
         about a mechanism that was never a candidate — the asymmetry `_note_automerge_held`
         names, where a missing hold event says nothing and a spurious one is deduped for
         ever and then rendered:

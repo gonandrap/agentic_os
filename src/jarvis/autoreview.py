@@ -60,9 +60,14 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-#: The Neo question kind. `neo_store.Q_KINDS`, and adding one is four edits, not one —
-#: this constant, a `deliver()` branch in `Daemon._neo_drain`, `ops._neo_attention`'s
-#: filter and `invariants.check_neo_escalations_are_live`'s (kn-9b18a8eb).
+#: The Neo question kind. `neo_store.Q_KINDS` carries the full list — adding one is SEVEN
+#: edits, not one (kn-4edb0eb7, which corrects kn-9b18a8eb's four). The four everyone
+#: finds: this constant, a `deliver()` branch in `Daemon._neo_drain`,
+#: `ops._neo_attention`'s filter and `invariants.check_neo_escalations_are_live`'s. The
+#: three that bit this work order, all of them user-facing ANSWER paths that end in
+#: `queue_message` and so can reopen a finished work order: `ops.neo_answer_escalated`,
+#: `answer_form` in `ui/templates/_question.html`, and `ops.neo_review`'s `--correct`
+#: tail. All seven are done for this kind; see the comment at `Q_KINDS`.
 QUESTION_KIND = "assumption"
 
 #: `assumptions.decided_by` for a verdict this module reached. Spelled through
@@ -282,6 +287,16 @@ def read_ruling(verdict: dict[str, Any], default_model: str = "") -> Ruling:
     `verdict: deny` — Neo thinking the assumption is WRONG — escalates too, carrying its
     reason. There is no machine rejection (module docstring), and the user reading "Neo
     would have turned this down: …" is strictly better informed than they are today.
+
+    **WHY THIS COMPARES `"approved"` WHEN THE PERSONA ASKS FOR `"approve"`.** It is not a
+    mismatch: `neo._validate_verdict` puts every reply through `neo._gate_verdict`, whose
+    `_VERDICT_ALIASES` maps the bare verb to the past participle before this function sees
+    it, and falls back to `denied` for anything it does not recognise. So the persona's
+    word and the database's word are the same fact and the normalisation is one layer
+    down. The direction of that fallback is what makes comparing the participle safe: if a
+    future persona edit taught Neo a word `_VERDICT_ALIASES` has never heard of, every
+    reply would read `denied` and this feature would stop accepting anything — dead rather
+    than dangerous, which is the one way round it is allowed to break.
 
     `stakes` OVERRIDES AN ACCEPTANCE, AND IT IS READ AS AN ALLOWLIST. The reviewer is asked
     to classify the stakes separately from ruling on them, and the classification wins, for

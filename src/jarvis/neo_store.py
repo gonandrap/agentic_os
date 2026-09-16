@@ -47,11 +47,27 @@ OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
 # the OS's classifier false-positive rate. Plan reviews are neither, and mixing them in
 # would corrupt the one metric that says whether the gate recognisers are improving.
 #
-# ADDING A KIND IS FOUR EDITS, NOT ONE (kn-9b18a8eb, and §3 of
-# docs/superpowers/specs/2026-08-31-the-supervisor.md): this tuple, a `deliver()` branch
-# in `Daemon._neo_drain`, the `ops._neo_attention` filter and the
-# `invariants.check_neo_escalations_are_live` filter. A kind with no `deliver()` branch
-# falls through to `queue_message` and speaks to the worker.
+# ADDING A KIND IS SEVEN EDITS, NOT ONE (kn-4edb0eb7, which corrects kn-9b18a8eb's four,
+# and §3 of docs/superpowers/specs/2026-08-31-the-supervisor.md):
+#
+#   1. this tuple;
+#   2. a `deliver()` branch in `Daemon._neo_drain`;
+#   3. the `ops._neo_attention` filter;
+#   4. the `invariants.check_neo_escalations_are_live` filter;
+#
+# ...and THE THREE kn-9b18a8eb DOES NOT LIST, which are the ones that speak to a worker
+# that has finished — every one of them a user-facing ANSWER path ending in
+# `queue_message`, so a kind that skips them is a kind the user can reopen a settled work
+# order through without ever meaning to:
+#
+#   5. `ops.neo_answer_escalated` — reached by `jarvis neo answer <qid>`;
+#   6. `answer_form` in `ui/templates/_question.html` — the reply box on /neo, which the
+#      CLI does not go through, so both halves are needed;
+#   7. the `--correct` tail of `ops.neo_review` — it forwards the correction to the
+#      worker whenever the order is not terminal.
+#
+# A kind with no `deliver()` branch falls through to `queue_message` and speaks to the
+# worker. `alarm` still has gap 7 open; `assumption` closed all three.
 Q_KINDS = ("question", "approval", "plan", "alarm", "assumption")
 
 # The panel's seats — see docs/superpowers/specs/2026-08-02-neo-team-design.md.
