@@ -43,6 +43,7 @@ from .project_store import (
     DEPENDENCY_DEAD_STATUSES,
     FO_OPEN_STATUSES,
     OPEN_STATUSES,
+    RETRY_SWEEP_STATUSES,
     RUNNABLE_VALIDATION_OUTCOMES,
     SLOT_STATUSES,
     UNGOVERNED_ORIGINS,
@@ -666,6 +667,12 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     if wo["status"] in ACTIVE_STATUSES:
         note = pause_note(store, wo) or neo_wait_note(wo)
         return f"{wo['status']} — {note}" if note else wo["status"]
+    # A booked retry on one of the settled-looking statuses the sweep reaches and the
+    # branch above does not (issue #259). Ranked over the round note below it: a turn the
+    # transport dropped is why nothing is moving, and it names the moment that changes.
+    parked = pause_note(store, wo)
+    if parked:
+        return f"{wo['status']} — {parked}"
     # `needs_review` no longer means the panel is waiting for the user: since issue 212
     # the round runs in parallel with the assumption review, and a status that said only
     # "needs_review" would hide the half of the work that is still moving.
@@ -759,8 +766,14 @@ def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
     The transient line names the attempt as well as the clock, because unlike a usage
     window — which reopens once, at a stated time — a backoff can be on its fourth of
     five, and "retrying at 14:07" without that reads as a promise it might not keep.
+
+    SCOPED TO `RETRY_SWEEP_STATUSES`, which is the set this sentence is a promise about:
+    it says the OS will relaunch the turn, so it must be readable exactly where the
+    sweep will. Since issue #259 that includes the three settled-looking statuses a
+    refused turn can land on, where the note was blank and the work order looked simply
+    finished.
     """
-    if wo["status"] not in ACTIVE_STATUSES:
+    if wo["status"] not in RETRY_SWEEP_STATUSES:
         return ""
     pause = worker_session.turn_pause(store, wo["id"])
     if pause is None or pause.exhausted:
@@ -1514,8 +1527,11 @@ def check_paused_turns_resume(store: ProjectStore) -> Iterator[Violation]:
     omission, or an exception inside the pass would all reproduce the same silent day.
     This checks the OUTCOME instead of any one cause, so it survives the next one.
 
-    Predicate: an active, governed work order whose pause came due more than
-    `PAUSE_OVERDUE_GRACE` ago. The pass runs every `RETRY_EVERY_TICKS` ticks — about ten
+    Predicate: a governed work order in `RETRY_SWEEP_STATUSES` whose pause came due more
+    than `PAUSE_OVERDUE_GRACE` ago. THE SAME TUPLE THE PASS WALKS, and it has to be: a
+    check scoped narrower than the loop it audits is blind in exactly the rows the loop
+    never reaches, which is how issue #259 went unreported while `stuck_message` named it
+    on demand. The pass runs every `RETRY_EVERY_TICKS` ticks — about ten
     seconds — so the grace is two orders of magnitude of slack, and anything reported
     here is stuck rather than merely waiting its turn.
 
@@ -1536,7 +1552,7 @@ def check_paused_turns_resume(store: ProjectStore) -> Iterator[Violation]:
     and there is nothing left to report. Exhausted pauses are skipped because the retry
     pass skips them too — those already reach the user through the attention flag.
     """
-    for wo in store.list_work_orders(statuses=ACTIVE_STATUSES):
+    for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
         if wo["origin"] in UNGOVERNED_ORIGINS:
             continue  # the user's own session; Jarvis does not drive it
         try:
@@ -1592,7 +1608,7 @@ def check_pause_deadline_stable(store: ProjectStore) -> Iterator[Violation]:
     Report-only. A disagreement means the derivation is wrong, and which of the two
     numbers to believe is exactly the judgement an invariant must not make on its own.
     """
-    for wo in store.list_work_orders(statuses=ACTIVE_STATUSES):
+    for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
         if wo["origin"] in UNGOVERNED_ORIGINS:
             continue
         try:
