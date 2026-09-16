@@ -264,7 +264,11 @@ jarvis bug report "title" -d "..." -e "expected" -a "actual" -p <priority>
                                            # filing agent states a claim, not a verdict —
                                            # the level it claimed stays in the issue body,
                                            # the level after Neo is the `priority:` label,
-                                           # and Neo's reasoning is a comment. Neo
+                                           # and both are on the issue. Neo's REASONING
+                                           # never is — it is private, in the inbox and
+                                           # in `jarvis neo show`, because nothing a
+                                           # model wrote in prose goes on a public
+                                           # tracker unread. Neo
                                            # unreachable = it stays queued, unconfirmed:
                                            # nothing is dispatched off an unconfirmed
                                            # blocker. A picked-up issue is labelled
