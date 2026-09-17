@@ -218,6 +218,78 @@ def test_a_forced_round_re_reads_the_pull_request_rather_than_the_old_packet(
     assert rounds[-1]["round"] == 3 and rounds[-1]["head_sha"] == LIVE_HEAD
 
 
+# -- the repeat-submission guard does not eat it (issue #272) -------------------------
+
+
+def test_a_forced_round_on_an_unchanged_branch_is_judged_rather_than_discarded(
+        fleet, project, fake_gh):
+    """THE DEFECT. `Daemon._repeat_submission` escalates a round whose fingerprint
+    matches the one before it — right for a submitter re-delivering unchanged work in
+    answer to feedback, and fatal here: the branch is unchanged BY CONSTRUCTION whenever
+    the reason for forcing is the judgement rather than the work, which is every case
+    this command exists for. The forced round was dropped before any seat ran, spending
+    a round number and producing nothing.
+
+    The artifact is registered BEFORE `parked`, so round 1 and the forced round collect
+    the SAME pull request and the fingerprints genuinely collide — a fixture that armed
+    the two rounds off different packets would pass without the fix."""
+    artifact(fake_gh)
+    store, wo = parked(fleet, project)
+
+    ops.force_validation(wo["id"], reason="round 1 recorded no commit")
+    panel = Panel("passed")
+    judge(fleet, store, panel)
+
+    rounds = store.validation_rounds(wo_id=wo["id"])
+    assert rounds[0]["fingerprint"] == rounds[1]["fingerprint"], (
+        "the collision this test is about never happened")
+    assert panel.rounds == [2], "no seat opined on the forced round"
+    assert rounds[1]["outcome"] == "passed"
+    assert store.events_of_kind(wo["id"], "validation_escalated") == []
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+
+
+def test_forcing_twice_over_the_same_pull_request_is_judged_twice(fleet, project,
+                                                                 fake_gh):
+    """The guard compares against the IMMEDIATELY PRECEDING round, so a second forced
+    round collides with the first one — an exemption keyed on the previous round being
+    forced, rather than on this one being forced, would fix the test above and leave
+    this one broken. Re-judging after a panel configuration change is exactly this
+    shape."""
+    artifact(fake_gh)
+    store, wo = parked(fleet, project)
+
+    ops.force_validation(wo["id"], reason="first re-judgement")
+    judge(fleet, store, Panel("passed"))
+    ops.force_validation(wo["id"], reason="and again under the new panel")
+    second = Panel("passed")
+    judge(fleet, store, second)
+
+    assert second.rounds == [3]
+    rounds = store.validation_rounds(wo_id=wo["id"])
+    assert [r["outcome"] for r in rounds] == ["passed"] * 3
+
+
+def test_an_ordinary_resubmission_that_changed_nothing_is_still_refused(fleet, project,
+                                                                       fake_gh):
+    """The negative control, and the reason the exemption is keyed on `forced_reason`
+    rather than removed: a WORKER handed feedback and re-delivering the identical packet
+    still reaches nobody. Exempting every unchanged submission would hand the panel work
+    it has already judged and call the result new."""
+    artifact(fake_gh)
+    store, wo = parked(fleet, project, outcome="rejected")
+    store.set_status(wo["id"], "running")
+
+    ops.finish(wo["id"], "opened a PR", pr_url=PR, evidence="ran the suite")
+    panel = Panel("passed")
+    judge(fleet, store, panel)
+
+    assert panel.rounds == [], "a repeat submission reached the panel"
+    reason = store.validation_rounds(wo_id=wo["id"])[-1]["reason"]
+    assert "identical to round 1" in reason
+    assert store.get_work_order(wo["id"])["status"] == "needs_review"
+
+
 # -- the record: no worker finished, and the reason survives --------------------------
 
 
