@@ -72,9 +72,10 @@ def _finding_lines(opinion: dict[str, Any], filed: dict[str, Any]) -> list[str]:
     prints is what the round actually acted on — including the blocker it SYNTHESISES
     for a seat that objected without classifying, which is otherwise invisible.
 
-    A follow-up with no ticket beside it is not an error: it was already filed by an
-    earlier round, or filing is off for this project. Absence of an id says only that
-    this round did not file this one — so it is not narrated as a failure.
+    A follow-up with no issue beside it is not an error: it was already filed by an
+    earlier round, or filing is off for this project. Absence of a link says only that
+    this round did not file this one — so it is not narrated as a failure. What a round
+    genuinely could not file is counted separately, below the seats.
 
     THE CHAIR IS SKIPPED, as it is in `validation._follow_ups`: its objection is the
     round's own reason, which `ops.round_line` has already printed one line above.
@@ -87,7 +88,7 @@ def _finding_lines(opinion: dict[str, Any], filed: dict[str, Any]) -> list[str]:
     lines = [f"blocked: {f['title']}" for f in validation.blockers(found)]
     for f in validation.follow_ups(found):
         item = filed.get(ops.follow_up_key(f["title"]))
-        lines.append(f"follow-up {item['id']}: {f['title']}" if item
+        lines.append(f"follow-up {item['url']}: {f['title']}" if item
                      else f"follow-up: {f['title']}")
     return lines
 
@@ -2893,10 +2894,10 @@ def cmd_validation(args: argparse.Namespace) -> int:
         print(f"\n{ops.round_line(rnd)}")
         if rnd["evidence"]:
             print(f"  evidence: {rnd['evidence']}")
-        # THE BACKLOG ITEM BESIDE THE FINDING THAT CAUSED IT, keyed on the title exactly
-        # as the filing deduped on it (`ops.follow_up_key`). This is the deliberation
-        # surface, so it is also the one place besides the backlog row where a seat's
-        # name sits next to what it said.
+        # THE ISSUE BESIDE THE FINDING THAT CAUSED IT, keyed on the title exactly as the
+        # filing deduped on it (`ops.follow_up_key`). This is the deliberation surface,
+        # so it is also the one place besides the issue body where a seat's name sits
+        # next to what it said.
         filed = {i["title"]: i
                  for i in (rnd.get("follow_ups") or {}).get("filed") or []}
         for o in rnd["opinions"]:
@@ -2909,9 +2910,13 @@ def cmd_validation(args: argparse.Namespace) -> int:
                 print(f"      {line}")
         if not rnd["opinions"]:
             print("  no seat opined on this round")
-        if dropped := (rnd.get("follow_ups") or {}).get("dropped"):
+        follow_ups = rnd.get("follow_ups") or {}
+        if dropped := follow_ups.get("dropped"):
             print(f"  {dropped} further follow-up(s) went over the per-round cap and "
                   f"were not filed; a later round may raise them again")
+        if failed := follow_ups.get("failed"):
+            why = follow_ups.get("reason") or "the tracker refused or was unreachable"
+            print(f"  {failed} follow-up(s) could not be filed as issues — {why}")
     # The bus, on the same page as the rounds it carried. Delivered envelopes are
     # routine and live here rather than in any default listing; an UNDELIVERABLE one is
     # a failure, so it is also flagged where nobody has to go looking — `jarvis doctor`

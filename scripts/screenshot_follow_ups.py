@@ -5,11 +5,18 @@ pair is the whole claim: round 1 rejected over a blocker and filed two follow-up
 passed and filed none. A shot of the filing round alone would not show that an ordinary
 round renders nothing here — which is every round on a fleet that has the panel off.
 
-**THE BACKLOG ROWS AND THE EVENT ARE WRITTEN BY `ops.file_validation_follow_ups` ITSELF**,
-not seeded by hand. The picture is then evidence of the path the daemon takes: the
-origin columns, the note naming the seat, the cap and the dedupe are whatever that
-function really produces. Only the panel's VERDICT is faked, because a real one would
-need five model calls.
+**THE ISSUES AND THE EVENT ARE FILED BY `ops.file_validation_follow_ups` ITSELF**, not
+seeded by hand. The picture is then evidence of the path the daemon takes: the issue
+links, the cap, the dedupe and the failure counting are whatever that function really
+produces. Only the panel's VERDICT is faked, because a real one would need five model
+calls.
+
+**`gh` IS THE SHIPPED FAKE (`testing.FAKE_GH`), TWO WAYS.** Follow-ups are filed on the
+project under review's own tracker, and this script's project claims `gonandrap/agentic_os`
+as its `origin` so the shot shows plausible issue numbers — which is a PUBLIC tracker, so
+a real `gh` here would open real issues. `JARVIS_GH_BIN` points at the fake and the fake's
+directory goes on `PATH` as well: the belt is the env var `issues.py` reads, the braces
+are for anything that ever shells out to a bare `gh`.
 
 Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`
 and a temp catalog, so it never reads or writes the live OS:
@@ -46,12 +53,42 @@ FINDINGS = [
 ]
 
 
+ORIGIN = "https://github.com/gonandrap/agentic_os.git"
+ISSUES = "https://github.com/gonandrap/agentic_os/issues"
+
+
 def _repo(path: Path) -> None:
-    """An empty checkout, the shape `testing.make_git_project` builds for the suite."""
+    """An empty checkout, the shape `testing.make_git_project` builds for the suite.
+
+    WITH AN `origin`, unlike that helper: `ops.follow_up_repo` reads the remote to decide
+    where the issues go, and a checkout without one exercises the failure path instead —
+    which is a different picture (and one this script's sibling assertion in
+    `tests/test_validation_follow_ups.py` already covers).
+    """
     import subprocess
 
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "remote", "add", "origin", ORIGIN], cwd=path, check=True)
     (path / "README.md").write_text("# jarvis_os\n")
+
+
+def _fake_gh(home: Path) -> None:
+    """Install the suite's own fake `gh`, so nothing here can reach a public tracker."""
+    import stat
+
+    from jarvis.testing import FAKE_GH
+
+    gdir = home / "fake-gh"
+    gdir.mkdir()
+    binpath = gdir / "gh"
+    binpath.write_text(FAKE_GH)
+    binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+    os.environ["JARVIS_GH_BIN"] = str(binpath)
+    os.environ["PATH"] = f"{gdir}{os.pathsep}{os.environ.get('PATH', '')}"
+    os.environ["FAKE_GH_DIR"] = str(gdir)
+    os.environ["FAKE_GH_ISSUE_SERIES"] = ISSUES   # one issue number per create
+    os.environ["FAKE_GH_ISSUE_URL"] = f"{ISSUES}/1"
+    os.environ["FAKE_GH_LABELS"] = "[]"           # the label does not exist there yet
 
 
 def order(store, catalog) -> str:
@@ -86,8 +123,8 @@ def order(store, catalog) -> str:
                           "findings": [{"severity": "follow_up",
                                         "title": FINDINGS[1]["title"],
                                         "detail": FINDINGS[1]["detail"]}]}, indent=1))
-    ops.file_validation_follow_ups(store, "jarvis_os", dict(first), FINDINGS, cfg,
-                                   wo_id=wo["id"])
+    ops.file_validation_follow_ups(store, catalog.project("jarvis_os"), dict(first),
+                                   FINDINGS, cfg, wo_id=wo["id"])
     store.close_validation_round(
         first["id"], "rejected",
         "The repair loop counts one budget for two independent failures, so a merge "
@@ -118,6 +155,7 @@ def seed() -> tuple[Path, str]:
     from jarvis.project_store import ProjectStore
 
     home = Path(tempfile.mkdtemp())
+    _fake_gh(home)
     project = home / "jarvis_os"
     project.mkdir(parents=True)
     _repo(project)

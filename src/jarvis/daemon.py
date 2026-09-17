@@ -1369,24 +1369,31 @@ class Daemon:
 
         The filing itself is `ops.file_validation_follow_ups` — business logic the CLI
         can reach, not daemon-private. What is here is the log line §4.4 asks for, in ONE
-        place so the two loops cannot word it differently, and the refusal to let a
-        backlog write take a round down: the verdict has been paid for and the seats are
-        already recorded, so a `CentralStore` that will not open must cost the follow-ups
-        and nothing else.
+        place so the two loops cannot word it differently, and the refusal to let filing
+        take a round down.
+
+        THAT REFUSAL IS NOT BELT-AND-BRACES, and it matters more now than it did when
+        this wrote a backlog row: `_validate_work_order`'s own `except` would abandon the
+        round half-settled — no outcome branch, the round left `pending`, the unit
+        stranded in `validating`. The verdict has been paid for and every seat is already
+        recorded by the time this runs, so a tracker that will not answer must cost the
+        follow-ups and nothing else. `ops` already counts the failures it EXPECTS; this
+        catches the ones it does not.
         """
         from . import ops
 
         try:
             filed = ops.file_validation_follow_ups(
-                store, project.name, round_row, follow_ups, cfg,
-                wo_id=wo_id, fo_id=fo_id)
+                store, project, round_row, follow_ups, cfg, wo_id=wo_id, fo_id=fo_id)
         except Exception:  # noqa: BLE001 — see the docstring
             log.exception("[%s] %s: filing follow-ups failed", project.name, unit)
             return
-        if filed["ids"] or filed["dropped"]:
-            log.info("[%s] %s: round %d filed %d follow-up(s), dropped %d over the cap",
-                     project.name, unit, filed["round"], len(filed["ids"]),
-                     filed["dropped"])
+        if filed["items"] or filed["dropped"] or filed["failed"]:
+            log.info("[%s] %s: round %d filed %d follow-up issue(s), dropped %d over the "
+                     "cap, %d could not be filed%s",
+                     project.name, unit, filed["round"], len(filed["items"]),
+                     filed["dropped"], filed["failed"],
+                     f" ({filed['reason']})" if filed.get("reason") else "")
 
     @staticmethod
     def _preceding_round(store: ProjectStore, n: int, *, wo_id: str | None = None,
