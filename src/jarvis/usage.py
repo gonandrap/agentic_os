@@ -109,6 +109,21 @@ CACHE_READ_RATE = 0.10  # x input price, under either TTL
 #: The TTL Jarvis buys (`claude_cli.PROMPT_CACHE_5M_ENV`). A boundary closer together
 #: than this cannot be an expiry, whatever else it looks like.
 WRITE_TTL_SECONDS = 300.0
+
+#: The share of ALL cache writes that must be TTL expiry before buying the 1-hour write
+#: starts paying. The premium is charged on every written token and recovered only on
+#: the ones a longer entry would have kept, so:
+#:
+#:     1h wins iff  rewrite_ttl_write / cache_write  >  0.75 / 1.90  =  39.5%
+#:
+#: Derived from the three rates above rather than written down, and defined HERE because
+#: two surfaces take the decision against it — `scripts/cache_ttl_cohort.py` and
+#: `invariants.check_cache_ttl_trigger`. The denominator is the trap (kn-1449447a (4)):
+#: the TTL's share of the RE-WRITE TAX is a different, much larger ratio, and reading
+#: that one against this number says "switch now" when the answer is "keep the 5-minute
+#: write". Nothing here compares a share of the tax to this.
+TTL_BREAK_EVEN = (CACHE_WRITE_1H_RATE - CACHE_WRITE_RATE) / (
+    (CACHE_WRITE_1H_RATE - CACHE_WRITE_RATE) + (CACHE_WRITE_RATE - CACHE_READ_RATE))
 #: There is no module-level default for the cold-prefix floor on purpose. It is
 #: `os.cold_prefix_floor`, every reader passes it in, and a caller with no catalog gets
 #: the catalog's own error rather than a number this module invented — a report that

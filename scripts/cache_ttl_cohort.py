@@ -6,8 +6,13 @@ prints it for a COHORT WINDOW, which is the form the decision actually needs: th
 moves as the OS changes, and a figure averaged over all history hides the trend that
 will eventually reverse it. Measured 2026-08-30, as a share of ALL cache writes: 0.3%
 was TTL expiry before the `includeGitInstructions` fix, 15.4% after it, and 20.4% over
-the trailing week — against a 39.5% break-even. See
-`docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md`.
+the trailing week — against a 39.5% break-even. RE-MEASURED 2026-09-16: 30.5% over 30
+days and 34.2% over 7, so the drift is real and the answer is now a close call. See
+`docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md` and its appendix.
+
+`invariants.check_cache_ttl_trigger` now watches the crossing so nobody has to remember
+to run this, but over Jarvis's own worker sessions rather than every transcript here;
+this is still what prices the decision over the whole machine.
 
 Classification is `usage.read_session`'s own, not a second implementation, so this
 script and `jarvis cost` cannot drift apart — including the `os.cold_prefix_floor`
@@ -28,13 +33,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from jarvis import usage  # noqa: E402
 
-#: A 1h write costs 2.0x base input where a 5m write costs 1.25x, and a read is 0.1x
-#: under either. So switching pays 0.75x more on EVERY written token and buys back 1.15x
-#: on only those re-written because a 5m entry expired:
-#:     1h wins iff  W_ttl / W_total > 0.75 / 1.90
-TRIGGER = (usage.CACHE_WRITE_1H_RATE - usage.CACHE_WRITE_RATE) / (
-    (usage.CACHE_WRITE_1H_RATE - usage.CACHE_WRITE_RATE)
-    + (usage.CACHE_WRITE_RATE - usage.CACHE_READ_RATE))
+#: Not re-derived here. `invariants.check_cache_ttl_trigger` takes the same decision on
+#: the same break-even, and two spellings of one ratio is how the two surfaces come to
+#: disagree about when to switch.
+TRIGGER = usage.TTL_BREAK_EVEN
 
 
 def _day(text: str) -> float:
