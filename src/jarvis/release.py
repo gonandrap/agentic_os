@@ -379,28 +379,75 @@ def _settle(store: ProjectStore, wo_id: str, tag: str) -> str:
     return f"completed (was {wo['status']})"
 
 
-def verify_release_claim(version: str, tag: str) -> str:
-    """Did this release ACTUALLY land? `""` when it checks out, else why it could not be.
+#: Seconds of slack allowed on the tag-postdates-approval check — see its call site.
+TAG_CLOCK_SLACK = 1.0
+
+
+def _tag_created_at(root: Path, tag: str) -> float | None:
+    """When the ANNOTATED tag object was made, or None if it cannot be read as one.
+
+    `taggerdate` and not `creatordate`: the latter falls back to the commit's date for a
+    lightweight tag, so a plain `git tag <name>` on an old commit would answer with that
+    commit's age and read as a release that happened long ago. A release always makes an
+    annotated tag; anything else here is "cannot tell", which is a refusal.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "for-each-ref", "--format=%(taggerdate:unix)",
+             f"refs/tags/{tag}"],
+            capture_output=True, text=True, timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    stamp = out.stdout.strip()
+    if out.returncode != 0 or not stamp:
+        return None
+    try:
+        return float(stamp)
+    except ValueError:
+        return None
+
+
+def verify_release_claim(store: ProjectStore, wo_id: str, version: str, tag: str) -> str:
+    """Did THIS WORK ORDER ship this release? `""` when it checks out, else why not.
 
     THE PROVENANCE CHECK BEHIND `attested`, and the reason the validation panel may skip
     a release round at all (spec
     docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §4).
 
-    The marker and the timeline both say what a release DID, and neither is proof of it:
-    a marker is a JSON file under `$JARVIS_HOME/run/` and an event is a row, so a work
-    order that delivered nothing could write either and hand itself an attested effect —
-    review round 1 on wo-47242e78. This measures the claim against the PRODUCTION
-    CHECKOUT instead, which no submitting worker owns and which only an actual deploy
-    moves: forging the claim past this means having performed the release.
+    Three checks, and each one closes a hole the previous draft left open.
 
-    BOTH SOURCES, on kn-58429229's rule and for its reason — the version from the FILE
-    and the ref from GIT answered differently during the 0.5.0 half-apply, so a check
-    that reads one of them is the check that was already fooled once.
+    1. **Production is on exactly this version AND at exactly this tag.** The marker and
+       the timeline both say what a release DID, and neither is proof of it: a marker is
+       a JSON file under `$JARVIS_HOME/run/` and an event is a row, so a work order that
+       delivered nothing could write either (review round 1). The production checkout is
+       state no submitting worker owns. BOTH readings, on kn-58429229's rule and for its
+       reason — the version from the FILE and the ref from GIT answered differently
+       during the 0.5.0 half-apply, so a check that reads one of them is the check that
+       was already fooled once.
+
+    2. **This work order holds an APPROVED `release` gate that it actually used.** Check
+       1 alone proves that *a* release landed and stays true until the next one, so a
+       work order that delivered nothing could name the version production was ALREADY on
+       and replay it at no cost (review round 2). An `approvals` row reaching `approved`
+       is written by `ProjectStore.decide_approval` on a verdict from Neo or the user —
+       a worker cannot author one for itself — and `uses > 0` means the gate actually
+       opened for it. `dismissed` deliberately does not count: a dismissal records that
+       the recogniser was wrong and no authorisation at all.
+
+    3. **The tag was created after that authorisation.** Otherwise an order approved to
+       ship could still be credited with a tag that already existed when it was approved.
 
     Never raises, and every "cannot tell" is a failure with a sentence: the caller turns
     any non-empty return into an effect that is NOT attested, which sends the round to
-    the panel. A fleet with no production checkout therefore judges its releases rather
-    than voiding them, which is the safe direction.
+    the panel. A fleet with no production checkout, or one that does not gate releases,
+    therefore JUDGES its releases rather than voiding them — the safe direction, and the
+    reason none of this can fail open.
+
+    WHAT IS STILL NOT PROVEN, said out loud because a reader will otherwise assume it is:
+    nothing in the production checkout names a work order, so these checks bind the order
+    to an AUTHORISATION and a WINDOW rather than to the deploy itself. An order holding
+    its own approved release gate, whose tag postdates that approval, is as close as the
+    recorded state gets.
     """
     if not version or not tag:
         return "the release claim names no version or no tag"
@@ -409,9 +456,27 @@ def verify_release_claim(version: str, tag: str) -> str:
         return "the production checkout's version could not be read"
     if live != version:
         return f"production is on {live}, not {version}"
-    ref = _production_ref(production_code_dir())
+    root = production_code_dir()
+    ref = _production_ref(root)
     if ref != tag:
         return f"the production checkout is at {ref}, not {tag}"
+
+    grants = [a for a in store.list_approvals(wo_id=wo_id, statuses=("approved",))
+              if a["kind"] == "release" and int(a["uses"] or 0) > 0]
+    if not grants:
+        return (f"{wo_id} holds no approved release gate it used, so nothing ties this "
+                f"order to the release production is running")
+    authorised = min(float(g["decided_at"] or g["ts"]) for g in grants)
+    made = _tag_created_at(root, tag)
+    if made is None:
+        return f"{tag} is not an annotated tag in the production checkout"
+    # `+ TAG_CLOCK_SLACK`: a tag's date has one-second resolution and the approval's does
+    # not, so a tag cut in the same second it was approved reads as fractionally older.
+    # The slack is spent on the honest side — a replay has to beat the approval by a
+    # whole second, and a real release is minutes of scripted work after it.
+    if made + TAG_CLOCK_SLACK < authorised:
+        return (f"{tag} already existed when {wo_id} was authorised to release, so this "
+                f"order did not cut it")
     return ""
 
 

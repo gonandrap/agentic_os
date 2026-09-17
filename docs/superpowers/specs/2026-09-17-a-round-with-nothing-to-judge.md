@@ -99,15 +99,46 @@ deploy moves:
 because those two answered differently during the 0.5.0 half-apply — a check that reads
 one of them is the check that was already fooled once.
 
-Forging a claim past this means having actually performed the release. And
+**That pair proves a release happened. It does not prove THIS ORDER performed it**, and
+review round 2 caught the difference. Production stays on the last release until the next
+one, so an order that delivered nothing can name the version and tag production is
+*already* running: a marker naming the live version passes both checks and costs a forger
+a single file write. The two checks above are about the FLEET's state; the claim is about
+an ORDER. Two more bind them together:
+
+3. The order holds a `release` approval that reached `approved` and was USED. `approved`
+   is only ever written by `decide_approval`, on a verdict from Neo or the user, and
+   `uses` only moves in `consume_grant`, when the gate actually opened. Both live in the
+   central approvals table; a worker can *request* one and can neither decide nor consume
+   it. A `dismissed` gate is not one of these — a dismissal records a classifier defect,
+   not an authorisation.
+4. The annotated tag was made AFTER that approval. Otherwise the release being claimed
+   already existed when the order was allowed to ship, so the order did not cut it — and
+   an order genuinely authorised to release could otherwise be credited with the tag some
+   earlier order made. Read from `taggerdate` and never `creatordate`: the latter falls
+   back to the *commit's* date for a lightweight tag, which would let `git tag` on an old
+   commit answer as a release made long ago. One second of slack absorbs the difference
+   between a tag date's whole-second resolution and the approval's float.
+
+**What this does and does not bind.** Nothing in the production checkout names a work
+order, so 3 and 4 tie the claim to an AUTHORISATION and a WINDOW rather than to the deploy
+itself: they establish that this order was permitted to ship, opened that gate, and that
+the release production is running was cut afterwards. Forging past them means holding a
+gate a reviewer granted and having a release appear inside your window — which is the
+release. The residual is an order that held a real, used release gate while somebody
+else's release landed in the same window; that is a concurrent-release race, not a forgery
+a submitter can arrange.
+
+And
 `release.verify_on_boot` remains the OS's own second proof after the restart
 (`ExecMainStartTimestamp` on both units, never `is-active`), which is why a panel asked
 to re-judge a *verified* release adds nothing it can check.
 
 **"Cannot tell" is a failure, never a pass.** No production checkout, an unreadable
-`pyproject.toml`, a version that does not match — each returns a sentence, the effect is
-collected but NOT attested, and the round goes to the panel. A fleet with no production
-checkout therefore judges its releases instead of voiding them.
+`pyproject.toml`, a version that does not match, a tag that is not an annotated tag —
+each returns a sentence, the effect is collected but NOT attested, and the round goes to
+the panel. A fleet with no production checkout therefore judges its releases instead of
+voiding them.
 
 ## §5 The collector reads two sources, and that is the race
 

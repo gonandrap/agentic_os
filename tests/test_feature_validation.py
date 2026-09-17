@@ -595,21 +595,29 @@ def test_a_feature_whose_children_only_shipped_a_RELEASE_is_voided(
     prod = tmp_path / "production" / "jarvis_os"
     prod.mkdir(parents=True)
     monkeypatch.setenv("PRODUCTION_CODE", str(tmp_path / "production"))
-    _git(prod, "init", "-q")
-    (prod / "pyproject.toml").write_text(
-        '[project]\nname = "jarvis-os"\nversion = "0.11.0"\n')
-    _git(prod, "add", "-A")
-    _git(prod, "commit", "-qm", "Release jarvis-0.11.0")
-    _git(prod, "tag", "-a", "jarvis-0.11.0", "-m", "Jarvis OS 0.11.0")
-    _git(prod, "checkout", "-q", "jarvis-0.11.0")
 
     store = fleet.store()
     try:
         fo_id = fleet.release("ship 0.11.0", "one")
         fleet.land_children(fo_id, store)  # a release merges nothing to the branch
         for child in store.feature_children(fo_id):
+            # The approved-and-used gate the attestation leans on, granted BEFORE the tag
+            # is cut — which is the order a real release happens in, and the order the
+            # provenance check requires.
+            row = store.add_approval(str(child["id"]), "release", "ship 0.11.0",
+                                     matched="shipit")
+            store.decide_approval(int(row["id"]), "approved", "ready to ship", "neo")
+            store.consume_grant(int(row["id"]))
             store.add_event(str(child["id"]), "release_verified",
                             {"version": "0.11.0", "tag": "jarvis-0.11.0"})
+
+        _git(prod, "init", "-q")
+        (prod / "pyproject.toml").write_text(
+            '[project]\nname = "jarvis-os"\nversion = "0.11.0"\n')
+        _git(prod, "add", "-A")
+        _git(prod, "commit", "-qm", "Release jarvis-0.11.0")
+        _git(prod, "tag", "-a", "jarvis-0.11.0", "-m", "Jarvis OS 0.11.0")
+        _git(prod, "checkout", "-q", "jarvis-0.11.0")
 
         fleet.drain()
 

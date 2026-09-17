@@ -10,6 +10,7 @@ tests/test_validation_side_effects.py gives — the defect was never in one func
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import replace
 
 import pytest
@@ -54,6 +55,24 @@ def stage_release(wo_id: str, version: str = "0.10.5") -> None:
         "tag": f"jarvis-{version}", "staged_at": 1_758_000_000, "state": "staged"}))
 
 
+def authorise(fleet, wo_id: str, version: str = "0.10.5") -> None:
+    """The approved `release` gate a real shipping order holds, and USES.
+
+    A row only reaches `approved` through `decide_approval`, on a verdict from Neo or the
+    user; `uses` only moves when the gate actually opens. Neither is something a worker
+    can write for itself, which is the whole reason the attestation is allowed to lean on
+    it — and why the tests that stage a release WITHOUT calling this are the ones that
+    prove a forger gets nowhere.
+    """
+    store = fleet.store()
+    try:
+        row = store.add_approval(wo_id, "release", f"ship {version}", matched="shipit")
+        store.decide_approval(int(row["id"]), "approved", "ready to ship", "neo")
+        store.consume_grant(int(row["id"]))
+    finally:
+        store.close()
+
+
 @pytest.fixture(autouse=True)
 def deploy(tmp_path, monkeypatch):
     """A REAL production checkout at a tag: what a release leaves behind, and the state
@@ -71,15 +90,19 @@ def deploy(tmp_path, monkeypatch):
     (root / "jarvis_os").mkdir(parents=True)
     monkeypatch.setenv("PRODUCTION_CODE", str(root))
 
-    def deployed(version: str = "0.10.5") -> None:
+    def deployed(version: str = "0.10.5", when: float | None = None) -> None:
         repo = root / "jarvis_os"
         if not (repo / ".git").is_dir():
             _git(repo, "init", "-q")
         (repo / "pyproject.toml").write_text(
             f'[project]\nname = "jarvis-os"\nversion = "{version}"\n')
+        # `when` dates the TAG OBJECT, which is what the provenance check reads. Without
+        # it a test cannot tell "cut before the approval" from "cut in the same second".
+        stamp = {"GIT_COMMITTER_DATE": f"{int(when)} +0000"} if when else None
         _git(repo, "add", "-A")
         _git(repo, "commit", "-qm", f"Release jarvis-{version}")
-        _git(repo, "tag", "-a", f"jarvis-{version}", "-m", f"Jarvis OS {version}")
+        _git(repo, "tag", "-a", f"jarvis-{version}", "-m", f"Jarvis OS {version}",
+             env_extra=stamp)
         _git(repo, "checkout", "-q", f"jarvis-{version}")
 
     return deployed
@@ -186,6 +209,7 @@ def test_a_release_work_order_ships_and_settles_with_no_human_touch(fleet, deplo
     seen = Validator(passed())
     fleet.daemon.validator = seen
     wo = fleet.dispatch("ship 0.10.5")  # a release authors nothing in its worktree
+    authorise(fleet, wo["id"])
     deploy("0.10.5")
     stage_release(wo["id"])
 
@@ -219,6 +243,7 @@ def test_the_void_is_on_the_timeline_in_words(fleet, deploy):
 
     fleet.daemon.validator = Validator(passed())
     wo = fleet.dispatch("ship it")
+    authorise(fleet, wo["id"])
     deploy("0.10.5")
     stage_release(wo["id"])
     finish(fleet, wo["id"], summary="shipped", pr=None)
@@ -242,6 +267,7 @@ def test_the_release_effect_survives_the_marker_being_consumed(fleet, deploy):
     seen = Validator(passed())
     fleet.daemon.validator = seen
     wo = fleet.dispatch("ship 0.11.0")
+    authorise(fleet, wo["id"], "0.11.0")
     deploy("0.11.0")
     store = fleet.store()
     try:
@@ -282,6 +308,7 @@ def test_a_release_that_also_wrote_knowledge_is_judged_not_voided(fleet, deploy)
     seen = Validator(passed())
     fleet.daemon.validator = seen
     wo = fleet.dispatch("ship and learn")
+    authorise(fleet, wo["id"])
     deploy("0.10.5")
     stage_release(wo["id"])
     ops.learn_add("what shipping taught us", wo_id=wo["id"])
@@ -298,11 +325,13 @@ def test_a_release_that_also_wrote_knowledge_is_judged_not_voided(fleet, deploy)
 def test_the_release_effect_says_what_a_reader_can_check(fleet, deploy):
     """The packet is the record too: a void that recorded nothing would leave the OS
     unable to say WHAT it decided not to review."""
+    wo = fleet.dispatch("ship 1.2.3")
+    authorise(fleet, wo["id"], "1.2.3")
+    deploy("1.2.3")
+    stage_release(wo["id"], version="1.2.3")
     store = fleet.store()
     try:
-        deploy("1.2.3")
-        stage_release("wo-x", version="1.2.3")
-        effect = ops.side_effects_of(store, "wo-x")[0]
+        effect = ops.side_effects_of(store, wo["id"])[0]
     finally:
         store.close()
     assert effect["kind"] == "release_staged"
@@ -339,15 +368,139 @@ def test_a_marker_nobody_deployed_is_a_claim_and_NEVER_voids(fleet):
 def test_production_on_a_DIFFERENT_version_is_not_attested(fleet, deploy):
     """The cross-check is an equality, not a presence test: a fleet that shipped 0.10.4
     last week does not attest a claim to have shipped 0.10.5 today."""
+    wo = fleet.dispatch("claims 0.10.5")
+    authorise(fleet, wo["id"])
+    deploy("0.10.4")
+    stage_release(wo["id"], version="0.10.5")
     store = fleet.store()
     try:
-        deploy("0.10.4")
-        stage_release("wo-x", version="0.10.5")
-        effect = ops.side_effects_of(store, "wo-x")[0]
+        effect = ops.side_effects_of(store, wo["id"])[0]
     finally:
         store.close()
     assert effect["attested"] is False
     assert "production is on 0.10.4, not 0.10.5" in effect["detail"]
+
+
+def test_REPLAYING_the_release_that_is_already_live_is_not_attested(fleet, deploy):
+    """ROUND 2's HOLE, and it cost an attacker nothing: production stays on the last
+    release until the next one, so naming the version already live passes any check that
+    only asks "is production on this". The forger holds no approved release gate of its
+    own, and that is what it cannot write."""
+    deploy("0.10.5", when=time.time() - 7 * 86400)  # a real release, by somebody else
+    wo = fleet.dispatch("delivered nothing, claims the live version")
+    stage_release(wo["id"], version="0.10.5")  # no authorise(): none was ever granted
+
+    store = fleet.store()
+    try:
+        effect = ops.side_effects_of(store, wo["id"])[0]
+    finally:
+        store.close()
+    assert effect["attested"] is False
+    assert "no approved release gate" in effect["detail"]
+
+
+def test_replaying_it_ON_THE_TIMELINE_is_not_attested_either(fleet, deploy):
+    """The same replay through the other source. Both go through one cross-check, so the
+    fallback is not the marker hole with an extra step."""
+    deploy("0.10.5", when=time.time() - 7 * 86400)
+    wo = fleet.dispatch("delivered nothing")
+    store = fleet.store()
+    try:
+        store.add_event(wo["id"], "release_verified",
+                        {"version": "0.10.5", "tag": "jarvis-0.10.5"})
+        effect = ops.side_effects_of(store, wo["id"])[0]
+    finally:
+        store.close()
+    assert effect["attested"] is False
+    assert "no approved release gate" in effect["detail"]
+
+
+def test_a_TAG_THAT_PREDATES_THE_AUTHORISATION_is_not_this_orders_release(fleet, deploy):
+    """The case an approved gate alone would still let through: an order genuinely
+    authorised to ship, credited with a tag that already existed when it was approved."""
+    # The tag was cut BEFORE anyone authorised this order — the case an approved gate on
+    # its own still lets through, since the order really does hold one.
+    deploy("0.10.5", when=time.time() - 3600)
+    wo = fleet.dispatch("authorised, but shipped nothing")
+    authorise(fleet, wo["id"])
+    stage_release(wo["id"], version="0.10.5")
+
+    store = fleet.store()
+    try:
+        effect = ops.side_effects_of(store, wo["id"])[0]
+    finally:
+        store.close()
+    assert effect["attested"] is False
+    assert "already existed when" in effect["detail"]
+
+
+def test_a_LIGHTWEIGHT_tag_cannot_stand_in_for_a_release(fleet, deploy, tmp_path):
+    """`creatordate` falls back to the tagged COMMIT's date for a lightweight tag, so
+    reading that instead would let `git tag` on an old commit answer as a release made
+    long ago. A release always makes an annotated tag; anything else is "cannot tell"."""
+    wo = fleet.dispatch("ship 2.0.0")
+    authorise(fleet, wo["id"], "2.0.0")
+    repo = tmp_path / "production" / "jarvis_os"
+    _git(repo, "init", "-q")
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "jarvis-os"\nversion = "2.0.0"\n')
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "Release jarvis-2.0.0")
+    _git(repo, "tag", "jarvis-2.0.0")  # lightweight, not annotated
+    _git(repo, "checkout", "-q", "jarvis-2.0.0")
+    stage_release(wo["id"], version="2.0.0")
+
+    store = fleet.store()
+    try:
+        effect = ops.side_effects_of(store, wo["id"])[0]
+    finally:
+        store.close()
+    assert effect["attested"] is False
+    assert "not an annotated tag" in effect["detail"]
+
+
+def test_a_DISMISSED_gate_is_not_an_authorisation(fleet, deploy):
+    """A dismissal says the recogniser was wrong, not that the action was allowed — it
+    records no authorisation, so it cannot be one half of an attestation."""
+    wo = fleet.dispatch("ship 0.10.5")
+    store = fleet.store()
+    try:
+        row = store.add_approval(wo["id"], "release", "ship it", matched="shipit")
+        store.decide_approval(int(row["id"]), "dismissed", "classifier defect", "neo")
+        store.consume_grant(int(row["id"]))
+    finally:
+        store.close()
+    deploy("0.10.5")
+    stage_release(wo["id"])
+
+    store = fleet.store()
+    try:
+        effect = ops.side_effects_of(store, wo["id"])[0]
+    finally:
+        store.close()
+    assert effect["attested"] is False
+    assert "no approved release gate" in effect["detail"]
+
+
+def test_an_approved_gate_the_worker_never_used_is_not_an_authorisation(fleet, deploy):
+    """`uses > 0` is the gate actually OPENING. Permission granted and never exercised
+    is not a release."""
+    wo = fleet.dispatch("ship 0.10.5")
+    store = fleet.store()
+    try:
+        row = store.add_approval(wo["id"], "release", "ship it", matched="shipit")
+        store.decide_approval(int(row["id"]), "approved", "go ahead", "neo")
+    finally:
+        store.close()
+    deploy("0.10.5")
+    stage_release(wo["id"])
+
+    store = fleet.store()
+    try:
+        effect = ops.side_effects_of(store, wo["id"])[0]
+    finally:
+        store.close()
+    assert effect["attested"] is False
 
 
 def test_a_forged_TIMELINE_event_does_not_void_either(fleet):
@@ -375,10 +528,12 @@ def test_a_forged_TIMELINE_event_does_not_void_either(fleet):
 def test_a_fleet_with_no_production_checkout_judges_instead_of_voiding(fleet):
     """"Cannot tell" is a failure with a sentence, never a pass: the effect is still
     COLLECTED and put in front of the panel, and only the void is withheld."""
+    wo = fleet.dispatch("ship 0.10.5")
+    authorise(fleet, wo["id"])
+    stage_release(wo["id"])  # the autouse root exists but is empty
     store = fleet.store()
     try:
-        stage_release("wo-x", version="0.10.5")  # the autouse root exists but is empty
-        effect = ops.side_effects_of(store, "wo-x")[0]
+        effect = ops.side_effects_of(store, wo["id"])[0]
     finally:
         store.close()
     assert effect["attested"] is False
@@ -405,6 +560,7 @@ def test_the_staged_release_handshake_still_runs_end_to_end(fleet, deploy):
     runner = FakeRunner()
     fleet.daemon.release_runner = runner  # the daemon's own seam — see `no_real_systemd`
     wo = fleet.dispatch("ship 0.6.0")
+    authorise(fleet, wo["id"], "0.6.0")
     deploy("0.6.0")
     stage_release(wo["id"], version="0.6.0")
     finish(fleet, wo["id"], summary="shipped 0.6.0", pr=None)

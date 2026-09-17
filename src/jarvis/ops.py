@@ -6708,11 +6708,15 @@ def _release_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
     nor the kind of an event carries provenance: the timeline has no author column, so
     "only the daemon writes these kinds" is a convention and not a check.
 
-    So the claim is measured against the PRODUCTION CHECKOUT, which no submitting worker
-    owns and which only a real deploy moves (`release.verify_release_claim`). The effect
-    is COLLECTED either way — it belongs on the record, and a packet that carries it is
-    one the panel can judge — but it is `verified` only when that cross-check passes, and
-    an unverified effect is never attested and so never voids a round.
+    So the claim is measured against state this order could not author
+    (`release.verify_release_claim`): the production checkout, THIS order's own approved
+    release gate, and a tag that postdates that approval. Production alone is not enough —
+    it stays on the last release until the next one, so a work order that delivered
+    nothing could name the version already live and replay it for free (review round 2).
+
+    The effect is COLLECTED either way — it belongs on the record, and a packet that
+    carries it is one the panel can judge — but it is `verified` only when that
+    cross-check passes, and an unverified effect is never attested and so never voids.
 
     Raises nothing on absence, which is the registry's rule: see `side_effects_of`.
     """
@@ -6735,7 +6739,7 @@ def _release_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
                 break
     if not tag:
         return []
-    unverified = release.verify_release_claim(version, tag)
+    unverified = release.verify_release_claim(store, wo_id, version, tag)
     checked = ("production is on this exact version and checked out at this exact tag, "
                "so the release named here really did land"
                if not unverified else

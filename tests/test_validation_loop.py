@@ -36,12 +36,18 @@ from jarvis.testing import make_git_project
 # -- the fixture: a real repository, a real worktree, a fake panel --------------------
 
 
-def _git(cwd: Path, *args: str) -> str:
-    """git with a pinned identity and no user or system config in sight."""
+def _git(cwd: Path, *args: str, env_extra: dict[str, str] | None = None) -> str:
+    """git with a pinned identity and no user or system config in sight.
+
+    `env_extra` is for the few tests that have to place a commit or a tag at a specific
+    MOMENT (`GIT_COMMITTER_DATE`), since the env here is built from scratch rather than
+    inherited.
+    """
     env = {"HOME": str(cwd), "PATH": os.environ.get("PATH", ""),
            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
-           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+           **(env_extra or {})}
     return subprocess.run(["git", "-C", str(cwd), *args], check=True, env=env,
                           capture_output=True, text=True).stdout
 
