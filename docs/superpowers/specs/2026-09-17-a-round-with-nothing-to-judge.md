@@ -54,6 +54,11 @@ Void must therefore be:
 * **Opt-in per collector.** `attested` defaults to False. A future collector that forgets
   to think about it gets its effects JUDGED (or, if it is the only one, escalated) — never
   silently voided. Today the release collector is the only member.
+* **Never over a pull request.** `packet.files` is the PR's when the PR could be read and
+  the WORKTREE's when it could not (`pr_error`), so a release-shaped packet beside an
+  unreadable pull request would void and `land_when_cleared` would park that PR on the
+  merge queue unread (review round 1). A release has no pull request, so refusing to void
+  any unit carrying one costs the case void exists for nothing.
 
 The decision table, and it is the whole rule (`evidence.nothing_to_judge`):
 
@@ -61,24 +66,48 @@ The decision table, and it is the whole rule (`evidence.nothing_to_judge`):
 |-------|-------------------------------|---------------------------------------------|
 | any   | any                           | judged — the diff is the review             |
 | none  | none                          | **escalate** — unchanged, this is the guard |
+| none  | a pull request is named       | judged — never voided, see above            |
 | none  | at least one NOT attested     | judged — issue #200's case, unchanged       |
 | none  | all attested                  | **void**                                    |
 
-## §4 What makes the release attested
+## §4 What makes the release attested — and what does NOT
 
-Two independent machine checks, neither of which is a model reading prose:
+**The first draft of this section was wrong, and the way it was wrong is the lesson.** It
+said the marker's existence is "a claim no submitter can make by delivering nothing,
+because writing it requires running the gated release command". It does not. The gate
+stops a *command*; writing `$JARVIS_HOME/run/pending_release.json` is a file write, and
+adding a `release_verified` row is a row. Either is available to a work order that
+delivered nothing, which could therefore hand itself an attested effect and settle
+`completed` with no flag and nobody having reviewed it — the one thing void must never be
+reachable by (review round 1).
 
-1. The marker is written by the deploy script's `--stage` step 5b, which is reached only
-   after the branch push, the tag push and the production deploy have all succeeded. Its
-   existence is a claim no submitter can make by delivering nothing — writing it requires
-   running the release command, which is a GATED privileged action that Neo has already
-   reviewed.
-2. `release.verify_on_boot` proves the release landed after the restart — production's
-   `pyproject.toml` version equals the marker's, and `ExecMainStartTimestamp` on BOTH
-   units is newer than the restart — and settles the work order itself. Never
-   `is-active`, never `git describe` (kn-58429229).
+So neither source is proof, and nothing about them is treated as proof:
 
-A panel asked to re-judge that adds nothing it can check.
+- The marker's own `wo_id` field is a claim about whose release it is.
+- An event's *kind* is a claim about who wrote it. The timeline has no author column, so
+  "only `release.py` writes these kinds" is a convention, not a check, and no amount of
+  extra payload fixes that — a forger can write the payload too.
+
+`release.verify_release_claim` is what carries provenance instead. It measures the claim
+against the PRODUCTION CHECKOUT, which no submitting worker owns and which only a real
+deploy moves:
+
+1. `pyproject.toml` in the production checkout carries exactly the claimed version.
+2. That checkout's git HEAD is exactly the claimed annotated tag.
+
+**Both, on kn-58429229's rule.** The version comes from the FILE and the ref from GIT
+because those two answered differently during the 0.5.0 half-apply — a check that reads
+one of them is the check that was already fooled once.
+
+Forging a claim past this means having actually performed the release. And
+`release.verify_on_boot` remains the OS's own second proof after the restart
+(`ExecMainStartTimestamp` on both units, never `is-active`), which is why a panel asked
+to re-judge a *verified* release adds nothing it can check.
+
+**"Cannot tell" is a failure, never a pass.** No production checkout, an unreadable
+`pyproject.toml`, a version that does not match — each returns a sentence, the effect is
+collected but NOT attested, and the round goes to the panel. A fleet with no production
+checkout therefore judges its releases instead of voiding them.
 
 ## §5 The collector reads two sources, and that is the race
 
@@ -89,18 +118,29 @@ succeeds the marker is DELETED, and a round still pending across that daemon res
 would collect an empty packet and escalate a release that had already shipped. The union
 has no gap — the marker exists from staging until the restart events are on the timeline.
 
+Both paths go through the §4 cross-check, so the fallback is not the marker hole with an
+extra step. The effect is COLLECTED either way — it belongs on the record, and a packet
+carrying an unverified claim is one the panel can judge, with the packet saying in words
+which source the claim came from and why it could not be verified.
+
 A collector MAY NOT RAISE on absence. Nothing swallows it: a collector that throws leaves
 the round unjudged and retried, which is correct, whereas swallowing it could drop a
 judgeable effect from a packet that then reads as all-attested and voids.
 
-## §6 `attested` is stamped by the registry and hashed by nothing
+## §6 `attested` is computed by the registry and hashed by nothing
 
-The registry stamps `attested` onto every record its collector returns, so a collector
-cannot mark its own effects. That makes it a field the OS writes and the submitter cannot
-move — `history`'s rule exactly (spec 2026-09-15-the-panel-blocks-on-blockers.md §5.5) —
-so `evidence.side_effects_digest` excludes it. Including it would change the digest of
-every knowledge effect already collected and make the next round of every open work order
-read as new evidence, silently disabling `Daemon._repeat_submission`.
+`SideEffectCollector.attested` is a CEILING, not a stamp: it says this collector may
+produce machine-verified effects. Whether a *particular* effect is one is that effect's
+own `verified`, because the artifact a collector reads is usually a claim (§4). The
+registry ANDs the two and consumes `verified`, so exactly one flag reaches the packet and
+a collector that sets `attested` on its own records has it overwritten. Absent `verified`
+means not verified, so the fail-safe direction is the default in both halves.
+
+That makes `attested` a field the OS writes and the submitter cannot move — `history`'s
+rule exactly (spec 2026-09-15-the-panel-blocks-on-blockers.md §5.5) — so
+`evidence.side_effects_digest` excludes it. Including it would change the digest of every
+knowledge effect already collected and make the next round of every open work order read
+as new evidence, silently disabling `Daemon._repeat_submission`.
 
 ## §7 Where a voided unit lands
 

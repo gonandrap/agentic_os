@@ -10,13 +10,15 @@ tests/test_validation_side_effects.py gives — the defect was never in one func
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
 from jarvis import evidence, ops, release
 from jarvis.evidence import EvidencePacket
 from jarvis.invariants import VALIDATION_STUCK_BLOCKER, true_blockers
-from tests.test_release_staging import FakeRunner, prod_checkout  # noqa: F401
+from tests.test_release_staging import FakeRunner
+from tests.test_validation_loop import _git
 from tests.test_validation_loop import (  # noqa: F401
     Validator, fleet, finish, passed)
 
@@ -39,12 +41,48 @@ def _round(fleet, wo_id):
 
 
 def stage_release(wo_id: str, version: str = "0.10.5") -> None:
-    """The marker `scripts/shipit.sh --stage` writes, byte for byte in shape."""
+    """The marker the deploy script's staging mode writes, byte for byte in shape.
+
+    A CLAIM AND NOT PROOF, which is the point of every test below that pairs it with
+    `deploy` — and of the ones that deliberately do not. Any process that can write a
+    file can write this one, including a work order that delivered nothing.
+    """
     path = release.marker_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
         "wo_id": wo_id, "project": "proj_a", "version": version,
         "tag": f"jarvis-{version}", "staged_at": 1_758_000_000, "state": "staged"}))
+
+
+@pytest.fixture(autouse=True)
+def deploy(tmp_path, monkeypatch):
+    """A REAL production checkout at a tag: what a release leaves behind, and the state
+    `release.verify_release_claim` measures a claim against.
+
+    A git repository rather than a lone `pyproject.toml`, because the check reads the
+    version from the FILE and the ref from GIT — kn-58429229's pairing, where those two
+    answered differently during a half-applied release.
+
+    AUTOUSE so `PRODUCTION_CODE` always points somewhere isolated: a test that never calls
+    the returned function gets an EMPTY production root, which is the "cannot cross-check"
+    case rather than whatever the developer's machine happens to be running.
+    """
+    root = tmp_path / "production"
+    (root / "jarvis_os").mkdir(parents=True)
+    monkeypatch.setenv("PRODUCTION_CODE", str(root))
+
+    def deployed(version: str = "0.10.5") -> None:
+        repo = root / "jarvis_os"
+        if not (repo / ".git").is_dir():
+            _git(repo, "init", "-q")
+        (repo / "pyproject.toml").write_text(
+            f'[project]\nname = "jarvis-os"\nversion = "{version}"\n')
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", f"Release jarvis-{version}")
+        _git(repo, "tag", "-a", f"jarvis-{version}", "-m", f"Jarvis OS {version}")
+        _git(repo, "checkout", "-q", f"jarvis-{version}")
+
+    return deployed
 
 
 # ------------------------------------------------- the rule itself, one packet at a time
@@ -74,6 +112,25 @@ def test_the_whole_decision_table():
     # Files present outrank everything — a release that also changed code is reviewed.
     assert evidence.nothing_to_judge(
         _packet(files=("a.py",), side_effects=[attested])) == ""
+
+
+def test_a_unit_that_pointed_at_a_pull_request_is_never_voided():
+    """`files` falls back to the WORKTREE's when the pull request could not be read, so
+    without this a release-shaped packet beside an unreadable PR voids — and
+    `land_when_cleared` parks that PR on the merge queue with nobody having read a line
+    of it. Review round 1."""
+    attested = {"kind": "release_staged", "attested": True}
+
+    with_pr = replace(_packet(side_effects=[attested]),
+                      pr_url="https://github.com/x/y/pull/9")
+    assert evidence.nothing_to_judge(with_pr) == ""
+    unreadable = replace(_packet(side_effects=[attested]),
+                         pr_url="https://github.com/x/y/pull/9",
+                         pr_error="gh exited 1: not found")
+    assert evidence.nothing_to_judge(unreadable) == ""
+    # ...and the guard below it is untouched: a PR with nothing at all still escalates.
+    assert evidence.nothing_to_judge(
+        replace(_packet(), pr_url="https://github.com/x/y/pull/9")) == "escalate"
 
 
 def test_an_effect_with_no_attested_key_at_all_is_judged_not_voided():
@@ -124,11 +181,12 @@ def test_attested_is_not_hashed_into_the_digest():
 # ------------------------------------------------------ the release, collected and voided
 
 
-def test_a_release_work_order_ships_and_settles_with_no_human_touch(fleet):
+def test_a_release_work_order_ships_and_settles_with_no_human_touch(fleet, deploy):
     """THE DEFINITION OF DONE. wo-ec96a1e9 did all of this and was escalated anyway."""
     seen = Validator(passed())
     fleet.daemon.validator = seen
     wo = fleet.dispatch("ship 0.10.5")  # a release authors nothing in its worktree
+    deploy("0.10.5")
     stage_release(wo["id"])
 
     finish(fleet, wo["id"], summary="shipped 0.10.5", pr=None)
@@ -154,13 +212,14 @@ def test_a_release_work_order_ships_and_settles_with_no_human_touch(fleet):
         store.close()
 
 
-def test_the_void_is_on_the_timeline_in_words(fleet):
+def test_the_void_is_on_the_timeline_in_words(fleet, deploy):
     """The record is what the user and Neo read — a round that vanished silently is the
     same defect one step quieter."""
     from jarvis import timeline
 
     fleet.daemon.validator = Validator(passed())
     wo = fleet.dispatch("ship it")
+    deploy("0.10.5")
     stage_release(wo["id"])
     finish(fleet, wo["id"], summary="shipped", pr=None)
     fleet.drain()
@@ -177,12 +236,13 @@ def test_the_void_is_on_the_timeline_in_words(fleet):
     assert labels == ["Validation voided — nothing for a reviewer to judge"]
 
 
-def test_the_release_effect_survives_the_marker_being_consumed(fleet):
+def test_the_release_effect_survives_the_marker_being_consumed(fleet, deploy):
     """`verify_on_boot` DELETES the marker on success. A round still pending across that
     daemon restart would otherwise collect nothing and escalate a shipped release."""
     seen = Validator(passed())
     fleet.daemon.validator = seen
     wo = fleet.dispatch("ship 0.11.0")
+    deploy("0.11.0")
     store = fleet.store()
     try:
         store.add_event(wo["id"], "release_verified",
@@ -216,12 +276,13 @@ def test_a_marker_naming_a_DIFFERENT_work_order_is_not_this_ones_effect(fleet):
     assert "nothing to review" in rnd["reason"]
 
 
-def test_a_release_that_also_wrote_knowledge_is_judged_not_voided(fleet):
+def test_a_release_that_also_wrote_knowledge_is_judged_not_voided(fleet, deploy):
     """One attested effect does not clear the packet: the knowledge write is something a
     reviewer can read, so the round goes to the panel."""
     seen = Validator(passed())
     fleet.daemon.validator = seen
     wo = fleet.dispatch("ship and learn")
+    deploy("0.10.5")
     stage_release(wo["id"])
     ops.learn_add("what shipping taught us", wo_id=wo["id"])
 
@@ -234,11 +295,12 @@ def test_a_release_that_also_wrote_knowledge_is_judged_not_voided(fleet):
     assert _round(fleet, wo["id"])["outcome"] == "passed"
 
 
-def test_the_release_effect_says_what_a_reader_can_check(fleet):
+def test_the_release_effect_says_what_a_reader_can_check(fleet, deploy):
     """The packet is the record too: a void that recorded nothing would leave the OS
     unable to say WHAT it decided not to review."""
     store = fleet.store()
     try:
+        deploy("1.2.3")
         stage_release("wo-x", version="1.2.3")
         effect = ops.side_effects_of(store, "wo-x")[0]
     finally:
@@ -247,7 +309,81 @@ def test_the_release_effect_says_what_a_reader_can_check(fleet):
     assert effect["id"] == "jarvis-1.2.3"
     assert "jarvis-1.2.3" in effect["summary"]
     assert "1.2.3" in effect["detail"]
+    assert "production is on this exact version" in effect["detail"]
     assert effect["attested"] is True
+    assert "verified" not in effect, "the registry must consume its own input"
+
+
+# ---------------------------------------------- a claim is not proof: the cross-check
+
+
+def test_a_marker_nobody_deployed_is_a_claim_and_NEVER_voids(fleet):
+    """THE HOLE REVIEW ROUND 1 FOUND. Writing JSON under `$JARVIS_HOME/run/` is not the
+    gated release command, so a work order that delivered nothing could hand itself an
+    attested effect and settle `completed` with no flag and nobody having reviewed it."""
+    seen = Validator(passed())
+    fleet.daemon.validator = seen
+    wo = fleet.dispatch("delivered nothing, says otherwise")
+    stage_release(wo["id"], version="9.9.9")  # no deploy: production never moved
+
+    finish(fleet, wo["id"], summary="totally shipped it", pr=None)
+    fleet.drain()
+
+    assert len(seen.calls) == 1, "an unverified claim skipped the panel"
+    effect = seen.calls[0]["packet"].side_effects[0]
+    assert effect["attested"] is False
+    assert "NOT VERIFIED" in effect["detail"]
+    assert _round(fleet, wo["id"])["outcome"] != "void"
+
+
+def test_production_on_a_DIFFERENT_version_is_not_attested(fleet, deploy):
+    """The cross-check is an equality, not a presence test: a fleet that shipped 0.10.4
+    last week does not attest a claim to have shipped 0.10.5 today."""
+    store = fleet.store()
+    try:
+        deploy("0.10.4")
+        stage_release("wo-x", version="0.10.5")
+        effect = ops.side_effects_of(store, "wo-x")[0]
+    finally:
+        store.close()
+    assert effect["attested"] is False
+    assert "production is on 0.10.4, not 0.10.5" in effect["detail"]
+
+
+def test_a_forged_TIMELINE_event_does_not_void_either(fleet):
+    """The timeline has no author column, so "only the daemon writes this kind" is a
+    convention rather than a check. The same cross-check is what carries provenance on
+    the fallback path — otherwise it is the marker hole with an extra step."""
+    seen = Validator(passed())
+    fleet.daemon.validator = seen
+    wo = fleet.dispatch("delivered nothing")
+    store = fleet.store()
+    try:
+        store.add_event(wo["id"], "release_verified",
+                        {"version": "9.9.9", "tag": "jarvis-9.9.9"})
+    finally:
+        store.close()
+
+    finish(fleet, wo["id"], summary="shipped, honest", pr=None)
+    fleet.drain()
+
+    assert len(seen.calls) == 1
+    assert seen.calls[0]["packet"].side_effects[0]["attested"] is False
+    assert _round(fleet, wo["id"])["outcome"] != "void"
+
+
+def test_a_fleet_with_no_production_checkout_judges_instead_of_voiding(fleet):
+    """"Cannot tell" is a failure with a sentence, never a pass: the effect is still
+    COLLECTED and put in front of the panel, and only the void is withheld."""
+    store = fleet.store()
+    try:
+        stage_release("wo-x", version="0.10.5")  # the autouse root exists but is empty
+        effect = ops.side_effects_of(store, "wo-x")[0]
+    finally:
+        store.close()
+    assert effect["attested"] is False
+    assert "could not be read" in effect["detail"]
+    assert effect["kind"] == "release_staged", "the effect was dropped, not downgraded"
 
 
 def test_a_work_order_that_shipped_nothing_collects_no_release_effect(fleet):
@@ -258,7 +394,7 @@ def test_a_work_order_that_shipped_nothing_collects_no_release_effect(fleet):
         store.close()
 
 
-def test_the_staged_release_handshake_still_runs_end_to_end(fleet, prod_checkout):
+def test_the_staged_release_handshake_still_runs_end_to_end(fleet, deploy):
     """The void is not the end of the release — the daemon's half still has to run.
 
     Void → `completed`, the reconcile hook restarts the units because the shipping
@@ -269,6 +405,7 @@ def test_the_staged_release_handshake_still_runs_end_to_end(fleet, prod_checkout
     runner = FakeRunner()
     fleet.daemon.release_runner = runner  # the daemon's own seam — see `no_real_systemd`
     wo = fleet.dispatch("ship 0.6.0")
+    deploy("0.6.0")
     stage_release(wo["id"], version="0.6.0")
     finish(fleet, wo["id"], summary="shipped 0.6.0", pr=None)
     fleet.drain()

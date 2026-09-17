@@ -379,6 +379,42 @@ def _settle(store: ProjectStore, wo_id: str, tag: str) -> str:
     return f"completed (was {wo['status']})"
 
 
+def verify_release_claim(version: str, tag: str) -> str:
+    """Did this release ACTUALLY land? `""` when it checks out, else why it could not be.
+
+    THE PROVENANCE CHECK BEHIND `attested`, and the reason the validation panel may skip
+    a release round at all (spec
+    docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §4).
+
+    The marker and the timeline both say what a release DID, and neither is proof of it:
+    a marker is a JSON file under `$JARVIS_HOME/run/` and an event is a row, so a work
+    order that delivered nothing could write either and hand itself an attested effect —
+    review round 1 on wo-47242e78. This measures the claim against the PRODUCTION
+    CHECKOUT instead, which no submitting worker owns and which only an actual deploy
+    moves: forging the claim past this means having performed the release.
+
+    BOTH SOURCES, on kn-58429229's rule and for its reason — the version from the FILE
+    and the ref from GIT answered differently during the 0.5.0 half-apply, so a check
+    that reads one of them is the check that was already fooled once.
+
+    Never raises, and every "cannot tell" is a failure with a sentence: the caller turns
+    any non-empty return into an effect that is NOT attested, which sends the round to
+    the panel. A fleet with no production checkout therefore judges its releases rather
+    than voiding them, which is the safe direction.
+    """
+    if not version or not tag:
+        return "the release claim names no version or no tag"
+    live = _production_version()
+    if live is None:
+        return "the production checkout's version could not be read"
+    if live != version:
+        return f"production is on {live}, not {version}"
+    ref = _production_ref(production_code_dir())
+    if ref != tag:
+        return f"the production checkout is at {ref}, not {tag}"
+    return ""
+
+
 def _production_version() -> str | None:
     """The version the production checkout carries ON DISK.
 

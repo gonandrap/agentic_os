@@ -323,18 +323,27 @@ def nothing_to_judge(packet: EvidencePacket) -> str:
     | any   | any                         | `""` — the diff is the review          |
     | none  | none                        | `"escalate"` — THE GUARD, unchanged    |
     | none  | at least one NOT `attested` | `""` — issue #200's case, unchanged     |
-    | none  | all `attested`              | `"void"`                               |
+    | none  | all `attested`, no PR       | `"void"`                               |
 
     **`"void"` IS DERIVED AND NEVER CHOSEN.** No seat returns it and no validator verdict
     produces it: it is decided here, from the packet, before any seat is called — and a
     submitter cannot reach it by delivering nothing, because that is row 2. `attested` is
-    stamped by `ops`'s collector registry and defaults to False, so a collector added
+    computed by `ops`'s collector registry and defaults to False, so a collector added
     tomorrow that has not thought about this gets JUDGED, never silently voided (§3).
+
+    **A UNIT THAT POINTED AT A PULL REQUEST IS NEVER VOIDED**, whatever its effects.
+    `packet.files` is the PR's when the PR could be read and the WORKTREE's when it could
+    not (`pr_error`), so a release-shaped packet with an unreadable pull request beside it
+    would otherwise void — and `ops.land_when_cleared` would park that pull request on the
+    merge queue with nobody having read a line of it (review round 1). A release has no
+    pull request, so this costs the case void exists for nothing.
     """
     if packet.files:
         return ""
     if not packet.side_effects:
         return "escalate"
+    if packet.pr_url or packet.pr_error:
+        return ""
     if all(e.get("attested") for e in packet.side_effects):
         return "void"
     return ""

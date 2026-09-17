@@ -576,16 +576,33 @@ def test_a_feature_whose_children_merged_nothing_escalates(fleet):
         store.close()
 
 
-def test_a_feature_whose_children_only_shipped_a_RELEASE_is_voided(fleet):
+def test_a_feature_whose_children_only_shipped_a_RELEASE_is_voided(
+        fleet, tmp_path, monkeypatch):
     """The same empty packet, through the same shared helper, ending the other way.
 
     Without it a feature order whose children were releases escalates for exactly the
     reason the work-order guard has just stopped escalating for, and the two guards
     drift — Neo's condition on question 378; spec
     docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §8.
+
+    The production checkout is REAL here for the reason tests/test_validation_void.py
+    gives at length: the timeline event is a claim, and only the deployed state attests
+    it. A feature inherits that through its children's effects like everything else.
     """
     validator = Validator(passed())
     fleet.daemon.validator = validator
+
+    prod = tmp_path / "production" / "jarvis_os"
+    prod.mkdir(parents=True)
+    monkeypatch.setenv("PRODUCTION_CODE", str(tmp_path / "production"))
+    _git(prod, "init", "-q")
+    (prod / "pyproject.toml").write_text(
+        '[project]\nname = "jarvis-os"\nversion = "0.11.0"\n')
+    _git(prod, "add", "-A")
+    _git(prod, "commit", "-qm", "Release jarvis-0.11.0")
+    _git(prod, "tag", "-a", "jarvis-0.11.0", "-m", "Jarvis OS 0.11.0")
+    _git(prod, "checkout", "-q", "jarvis-0.11.0")
+
     store = fleet.store()
     try:
         fo_id = fleet.release("ship 0.11.0", "one")

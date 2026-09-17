@@ -6686,7 +6686,7 @@ _RELEASE_EVENT_STATES = (("release_verified", "verified"),
 
 
 def _release_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
-    """The release this work order shipped, if it shipped one. ATTESTED — §4 of spec
+    """The release this work order shipped, if it shipped one. §4 and §5 of spec
     docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md.
 
     A release authors nothing in the worker's worktree: the version bump and the tag are
@@ -6694,11 +6694,25 @@ def _release_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
     happened to origin, to the production checkout and to systemd. So the packet was
     empty, the panel escalated, and autonomous shipping needed a human (wo-ec96a1e9).
 
-    TWO SOURCES, because neither covers the whole window. `--stage` writes the marker and
-    no timeline event, so before the restart the marker is all there is; `verify_on_boot`
-    DELETES the marker on success, so a round still pending across that daemon restart
-    would otherwise collect nothing and escalate a release that had already landed. The
-    union has no gap.
+    TWO SOURCES FOR THE CLAIM, because neither covers the whole window. `--stage` writes
+    the marker and no timeline event, so before the restart the marker is all there is;
+    `verify_on_boot` DELETES the marker on success, so a round still pending across that
+    daemon restart would otherwise collect nothing and escalate a release that had
+    already landed. The union has no gap.
+
+    **BOTH SOURCES ARE CLAIMS, NOT PROOF, AND THE DIFFERENCE IS THE WHOLE OF `verified`.**
+    A marker is a JSON file under `$JARVIS_HOME/run/` and a timeline event is a row; a
+    work order that delivered nothing could write either one and hand itself an attested
+    effect, settling `completed` with no flag and nobody having reviewed it — exactly what
+    void must never be reachable by (review round 1). Neither `wo_id` inside the marker
+    nor the kind of an event carries provenance: the timeline has no author column, so
+    "only the daemon writes these kinds" is a convention and not a check.
+
+    So the claim is measured against the PRODUCTION CHECKOUT, which no submitting worker
+    owns and which only a real deploy moves (`release.verify_release_claim`). The effect
+    is COLLECTED either way — it belongs on the record, and a packet that carries it is
+    one the panel can judge — but it is `verified` only when that cross-check passes, and
+    an unverified effect is never attested and so never voids a round.
 
     Raises nothing on absence, which is the registry's rule: see `side_effects_of`.
     """
@@ -6707,9 +6721,10 @@ def _release_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
     marker = release.read_marker() or {}
     if str(marker.get("wo_id") or "") == wo_id:
         tag, version = str(marker.get("tag") or ""), str(marker.get("version") or "")
-        state = str(marker.get("state") or "staged")
+        state, source = str(marker.get("state") or "staged"), "the staged-release marker"
     else:
         tag = version = state = ""
+        source = "this work order's timeline"
         for kind, at in _RELEASE_EVENT_STATES:
             events = store.events_of_kind(wo_id, kind)
             if events:
@@ -6720,21 +6735,29 @@ def _release_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
                 break
     if not tag:
         return []
+    unverified = release.verify_release_claim(version, tag)
+    checked = ("production is on this exact version and checked out at this exact tag, "
+               "so the release named here really did land"
+               if not unverified else
+               f"NOT VERIFIED — {unverified}. The claim above comes from "
+               f"{source}, which is written state rather than proof, so it is reported "
+               f"to you as a claim and judged like any other part of the submission.")
     return [{
         "kind": "release_staged", "id": tag,
         "summary": f"shipped {tag}: release branch and annotated tag pushed to origin, "
                    f"production deployed to that tag and its venv rebuilt "
-                   f"(hand-off state: {state})",
+                   f"(hand-off state: {state})"
+                   + ("" if not unverified else " — CLAIMED, NOT VERIFIED"),
         "detail": (
-            f"version {version or '?'}, tag {tag}.\n\n"
-            "Every step of this is machine-checked without a reviewer, which is why the "
-            "effect is ATTESTED. The marker is written by the release script only after "
-            "the branch push, the tag push and the production deploy have all succeeded, "
-            "and running that script at all is a GATED privileged action that was "
-            "reviewed before it ran. `release.verify_on_boot` then proves the release "
-            "landed — production's pyproject version equals the marker's and both "
-            "systemd units restarted after the deploy — and settles this work order "
-            "itself."),
+            f"version {version or '?'}, tag {tag}, as recorded by {source}.\n\n"
+            f"Cross-checked against the production checkout: {checked}\n\n"
+            "What a release does that no diff can show: the release branch and the "
+            "annotated tag are pushed to origin, the production checkout is deployed to "
+            "that tag and its venv rebuilt, the systemd units are re-rendered, and "
+            "`release.verify_on_boot` proves the version on disk and both units' restart "
+            "timestamps before settling this work order."),
+        # Consumed by the registry, which turns it into `attested`. See `side_effects_of`.
+        "verified": not unverified,
     }]
 
 
@@ -6743,9 +6766,15 @@ class SideEffectCollector:
     """One kind of durable change no diff can show, and whether a reviewer can judge it.
 
     `attested` is OPT-IN and defaults to False: a collector added tomorrow that has not
-    thought about the question gets its effects JUDGED, never silently voided. The
-    registry stamps the flag onto each record so a collector cannot mark its own — the
-    reason `evidence.side_effects_digest` may leave it out of the hash.
+    thought about the question gets its effects JUDGED, never silently voided.
+
+    IT IS A CEILING AND NOT A STAMP, which is the correction review round 1 forced. The
+    flag says this collector MAY produce machine-verified effects; whether a PARTICULAR
+    effect is one is the collector's per-effect `verified`, because the artifact a
+    collector reads is often a claim the submitter could have written (see
+    `_release_effects`). The registry ANDs the two, and a collector that sets `attested`
+    on its own records has it overwritten — which is what lets
+    `evidence.side_effects_digest` leave the field out of the hash.
     """
 
     name: str
@@ -6769,11 +6798,18 @@ def side_effects_of(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
     unjudged and retried on the next tick, which is right; catching it would drop a
     JUDGEABLE effect from a packet that could then read as all-attested and void. So a
     collector must return `[]` for "nothing of my kind", never raise.
+
+    `attested` is computed HERE and only here: the collector's opt-in ANDed with that
+    effect's own `verified`, which is consumed rather than carried so exactly one flag
+    reaches the packet. Absent `verified` means not verified, so the fail-safe direction
+    is the default in both halves.
     """
     effects: list[dict[str, Any]] = []
     for collector in SIDE_EFFECT_COLLECTORS:
         for effect in collector.collect(store, wo_id):
-            effects.append({**effect, "attested": collector.attested})
+            record = {k: v for k, v in effect.items() if k != "verified"}
+            record["attested"] = collector.attested and bool(effect.get("verified"))
+            effects.append(record)
     return effects
 
 
