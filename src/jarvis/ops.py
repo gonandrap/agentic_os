@@ -1869,7 +1869,9 @@ def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
         return "validating"
     # `escalated` lands. The panel gave up and put this in front of the user, and the
     # only caller that can reach here with one is `review_work_order` — the user saying
-    # ship it anyway, which is the whole exit from a give-up.
+    # ship it anyway, which is the whole exit from a give-up. So does `void`, which is
+    # the panel finding nothing a reviewer could add and settling the unit itself
+    # (`Daemon._void`, which passes `panel_cleared` and so never re-reads it here).
     return land_finished(store, wo, pr_url)
 
 
@@ -1918,7 +1920,7 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
 
     packet = evidence_mod.collect_work_order(
         project_path, wo, declared=declared, diff_chars=cfg.diff_chars,
-        spec=specs.spec_of(store, wo), side_effects=side_effects_of(str(wo["id"])),
+        spec=specs.spec_of(store, wo), side_effects=side_effects_of(store, str(wo["id"])),
         # The store read is the caller's: `evidence` may not touch a database (spec §4).
         assumptions=store.all_assumptions(wo["id"]))
     nxt = store.counted_validation_rounds(wo_id=wo["id"]) + 1
@@ -6643,8 +6645,8 @@ def _record_side_effect(wo_id: str, kind: str, payload: dict[str, Any]) -> bool:
     return True
 
 
-def side_effects_of(wo_id: str) -> list[dict[str, Any]]:
-    """Durable, non-file change this work order made, for its evidence packet.
+def _knowledge_effects(_store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
+    """Knowledge-base writes and retractions attributed to this work order (issue #200).
 
     Read from the knowledge base's own attribution columns rather than from the timeline
     events `_record_side_effect` writes: the event is best effort and the row is not, so
@@ -6676,6 +6678,145 @@ def side_effects_of(wo_id: str) -> list[dict[str, Any]]:
     return effects
 
 
+#: What a staged release carries on the work order's timeline, newest source first, and
+#: what the marker's `state` would have said at that point. See `_release_effects` for
+#: why reading only one of the two sources has a gap.
+_RELEASE_EVENT_STATES = (("release_verified", "verified"),
+                         ("release_restart", "restarting"))
+
+
+def _release_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
+    """The release this work order shipped, if it shipped one. §4 and §5 of spec
+    docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md.
+
+    A release authors nothing in the worker's worktree: the version bump and the tag are
+    made in a throwaway worktree on a branch nobody merges, and everything else it did
+    happened to origin, to the production checkout and to systemd. So the packet was
+    empty, the panel escalated, and autonomous shipping needed a human (wo-ec96a1e9).
+
+    TWO SOURCES FOR THE CLAIM, because neither covers the whole window. `--stage` writes
+    the marker and no timeline event, so before the restart the marker is all there is;
+    `verify_on_boot` DELETES the marker on success, so a round still pending across that
+    daemon restart would otherwise collect nothing and escalate a release that had
+    already landed. The union has no gap.
+
+    **BOTH SOURCES ARE CLAIMS, NOT PROOF, AND THE DIFFERENCE IS THE WHOLE OF `verified`.**
+    A marker is a JSON file under `$JARVIS_HOME/run/` and a timeline event is a row; a
+    work order that delivered nothing could write either one and hand itself an attested
+    effect, settling `completed` with no flag and nobody having reviewed it — exactly what
+    void must never be reachable by (review round 1). Neither `wo_id` inside the marker
+    nor the kind of an event carries provenance: the timeline has no author column, so
+    "only the daemon writes these kinds" is a convention and not a check.
+
+    So the claim is measured against state this order could not author
+    (`release.verify_release_claim`): the production checkout, THIS order's own approved
+    release gate, and a tag that postdates that approval. Production alone is not enough —
+    it stays on the last release until the next one, so a work order that delivered
+    nothing could name the version already live and replay it for free (review round 2).
+
+    The effect is COLLECTED either way — it belongs on the record, and a packet that
+    carries it is one the panel can judge — but it is `verified` only when that
+    cross-check passes, and an unverified effect is never attested and so never voids.
+
+    Raises nothing on absence, which is the registry's rule: see `side_effects_of`.
+    """
+    from . import release
+
+    marker = release.read_marker() or {}
+    if str(marker.get("wo_id") or "") == wo_id:
+        tag, version = str(marker.get("tag") or ""), str(marker.get("version") or "")
+        state, source = str(marker.get("state") or "staged"), "the staged-release marker"
+    else:
+        tag = version = state = ""
+        source = "this work order's timeline"
+        for kind, at in _RELEASE_EVENT_STATES:
+            events = store.events_of_kind(wo_id, kind)
+            if events:
+                payload = db.from_json(events[-1]["payload"], {})
+                tag = str(payload.get("tag") or "")
+                version = str(payload.get("version") or "")
+                state = at
+                break
+    if not tag:
+        return []
+    unverified = release.verify_release_claim(store, wo_id, version, tag)
+    checked = ("production is on this exact version and checked out at this exact tag, "
+               "so the release named here really did land"
+               if not unverified else
+               f"NOT VERIFIED — {unverified}. The claim above comes from "
+               f"{source}, which is written state rather than proof, so it is reported "
+               f"to you as a claim and judged like any other part of the submission.")
+    return [{
+        "kind": "release_staged", "id": tag,
+        "summary": f"shipped {tag}: release branch and annotated tag pushed to origin, "
+                   f"production deployed to that tag and its venv rebuilt "
+                   f"(hand-off state: {state})"
+                   + ("" if not unverified else " — CLAIMED, NOT VERIFIED"),
+        "detail": (
+            f"version {version or '?'}, tag {tag}, as recorded by {source}.\n\n"
+            f"Cross-checked against the production checkout: {checked}\n\n"
+            "What a release does that no diff can show: the release branch and the "
+            "annotated tag are pushed to origin, the production checkout is deployed to "
+            "that tag and its venv rebuilt, the systemd units are re-rendered, and "
+            "`release.verify_on_boot` proves the version on disk and both units' restart "
+            "timestamps before settling this work order."),
+        # Consumed by the registry, which turns it into `attested`. See `side_effects_of`.
+        "verified": not unverified,
+    }]
+
+
+@dataclass(frozen=True)
+class SideEffectCollector:
+    """One kind of durable change no diff can show, and whether a reviewer can judge it.
+
+    `attested` is OPT-IN and defaults to False: a collector added tomorrow that has not
+    thought about the question gets its effects JUDGED, never silently voided.
+
+    IT IS A CEILING AND NOT A STAMP, which is the correction review round 1 forced. The
+    flag says this collector MAY produce machine-verified effects; whether a PARTICULAR
+    effect is one is the collector's per-effect `verified`, because the artifact a
+    collector reads is often a claim the submitter could have written (see
+    `_release_effects`). The registry ANDs the two, and a collector that sets `attested`
+    on its own records has it overwritten — which is what lets
+    `evidence.side_effects_digest` leave the field out of the hash.
+    """
+
+    name: str
+    collect: Callable[[ProjectStore, str], list[dict[str, Any]]]
+    attested: bool = False
+
+
+#: THE REGISTRY. Adding a kind of invisible effect is an entry here, not another widening
+#: of `daemon.py`'s empty-packet guard — which has now been widened twice for the same
+#: lesson (issue #200, then wo-ec96a1e9). Spec §1.
+SIDE_EFFECT_COLLECTORS = (
+    SideEffectCollector("knowledge", _knowledge_effects),
+    SideEffectCollector("release", _release_effects, attested=True),
+)
+
+
+def side_effects_of(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
+    """Durable, non-file change this work order made, for its evidence packet.
+
+    NOTHING IS SWALLOWED HERE, deliberately. A collector that raises leaves the round
+    unjudged and retried on the next tick, which is right; catching it would drop a
+    JUDGEABLE effect from a packet that could then read as all-attested and void. So a
+    collector must return `[]` for "nothing of my kind", never raise.
+
+    `attested` is computed HERE and only here: the collector's opt-in ANDed with that
+    effect's own `verified`, which is consumed rather than carried so exactly one flag
+    reaches the packet. Absent `verified` means not verified, so the fail-safe direction
+    is the default in both halves.
+    """
+    effects: list[dict[str, Any]] = []
+    for collector in SIDE_EFFECT_COLLECTORS:
+        for effect in collector.collect(store, wo_id):
+            record = {k: v for k, v in effect.items() if k != "verified"}
+            record["attested"] = collector.attested and bool(effect.get("verified"))
+            effects.append(record)
+    return effects
+
+
 def feature_side_effects(store: ProjectStore, fo_id: str) -> list[dict[str, Any]]:
     """Every child's side effects, in the feature's own child order.
 
@@ -6685,7 +6826,7 @@ def feature_side_effects(store: ProjectStore, fo_id: str) -> list[dict[str, Any]
     """
     effects: list[dict[str, Any]] = []
     for child in store.feature_children(fo_id):
-        for effect in side_effects_of(str(child["id"])):
+        for effect in side_effects_of(store, str(child["id"])):
             effects.append({**effect, "wo_id": str(child["id"])})
     return effects
 

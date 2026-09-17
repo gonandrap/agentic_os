@@ -11,6 +11,7 @@ import pytest
 
 from jarvis import ops
 from jarvis.central_store import CentralStore
+from jarvis.project_store import ProjectStore
 
 
 @pytest.fixture()
@@ -18,6 +19,15 @@ def central():
     store = CentralStore()
     yield store
     store.close()
+
+
+@pytest.fixture()
+def store(project):
+    """`side_effects_of` takes the caller's project store — the release collector reads
+    the shipping order's timeline when the marker has already been consumed."""
+    s = ProjectStore(project)
+    yield s
+    s.close()
 
 
 # ------------------------------------------------------------------------- the columns
@@ -68,30 +78,30 @@ def test_an_empty_work_order_id_matches_nothing(central):
 # --------------------------------------------------------------- the side-effect records
 
 
-def test_side_effects_of_describes_both_halves_of_a_replacement():
+def test_side_effects_of_describes_both_halves_of_a_replacement(store):
     old = ops.learn_add("the old advice", wo_id="wo-old", topic="paths")
     ops.learn_retract(old["id"], "it breaks gate matching", wo_id="wo-1")
     new = ops.learn_add("the new advice", wo_id="wo-1", topic="paths")
 
-    effects = {e["kind"]: e for e in ops.side_effects_of("wo-1")}
+    effects = {e["kind"]: e for e in ops.side_effects_of(store, "wo-1")}
     assert set(effects) == {"knowledge_retracted", "knowledge_added"}
     assert effects["knowledge_retracted"]["id"] == old["id"]
     assert "it breaks gate matching" in effects["knowledge_retracted"]["summary"]
     assert effects["knowledge_added"]["id"] == new["id"]
 
 
-def test_a_retraction_carries_the_whole_retired_text_not_a_headline():
+def test_a_retraction_carries_the_whole_retired_text_not_a_headline(store):
     """A reviewer asked to judge a retraction cannot do it from a summary line: the
     question is whether the text that was retired deserved to be."""
     body = "line one\n" + "the middle matters\n" * 20 + "line last\n"
     row = ops.learn_add(body, wo_id="wo-author")
     ops.learn_retract(row["id"], "superseded", wo_id="wo-1")
-    detail = ops.side_effects_of("wo-1")[0]["detail"]
+    detail = ops.side_effects_of(store, "wo-1")[0]["detail"]
     assert detail == body
 
 
-def test_a_work_order_that_touched_no_knowledge_has_no_side_effects():
-    assert ops.side_effects_of("wo-quiet") == []
+def test_a_work_order_that_touched_no_knowledge_has_no_side_effects(store):
+    assert ops.side_effects_of(store, "wo-quiet") == []
 
 
 # ------------------------------------------------------------------ the durable/best-effort split
@@ -104,11 +114,11 @@ def test_the_entry_still_lands_when_the_work_order_does_not_exist(central):
     assert central.get_knowledge(row["id"])["wo_id"] == "wo-deleted-long-ago"
 
 
-def test_side_effects_are_read_from_the_rows_and_not_from_the_timeline():
+def test_side_effects_are_read_from_the_rows_and_not_from_the_timeline(store):
     """`_record_side_effect` can fail silently; the row cannot. An entry whose event
     never landed is still judged."""
     ops.learn_add("no timeline anywhere", wo_id="wo-no-project")
-    assert len(ops.side_effects_of("wo-no-project")) == 1
+    assert len(ops.side_effects_of(store, "wo-no-project")) == 1
 
 
 def test_retract_raises_exactly_what_the_store_raises():

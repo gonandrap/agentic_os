@@ -2045,6 +2045,25 @@ def test_the_feature_page_shows_its_rounds_and_folds_the_seats_away(client, proj
     assert "Panel deliberation" in page
 
 
+def test_a_voided_round_reads_as_voided_and_not_as_the_raw_word(client, project):
+    """Every outcome the machine can write needs a badge here, or the dashboard shows a
+    round nobody can interpret — `kn-99e37a4b`, a server-rendered template is a surface.
+    """
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship 0.10.5")
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="cccc3333")
+    store.close_validation_round(rnd["id"], "void", "the OS verifies it itself")
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert 'id="validation"' in page
+    assert "voided</span>" in page
+    assert "the OS verifies it itself" in page
+    # The fall-through badge prints the raw outcome and colours it "in flight", which is
+    # the one reading a settled round must not get.
+    assert ">void</span>" not in page
+
+
 def test_a_unit_that_was_never_validated_gets_no_validation_section(client, project):
     """No empty box. Validation ships disabled, so this is every unit in the fleet —
     a section that renders as a heading over nothing would be on almost every page in

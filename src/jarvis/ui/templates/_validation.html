@@ -32,6 +32,9 @@
       {% elif r.outcome == 'rejected' %}<span class="st tone-warn"><span class="i">◭</span>rejected</span>
       {% elif r.outcome == 'escalated' %}<span class="st tone-warn"><span class="i">🙋</span>escalated</span>
       {% elif r.outcome == 'failed' %}<span class="st tone-bad"><span class="i">✗</span>failed</span>
+      {# Voided: nothing here was for a reviewer, so no seat was asked. Muted rather than
+         warn — the unit settled and nobody is owed a decision. #}
+      {% elif r.outcome == 'void' %}<span class="st tone-muted"><span class="i">∅</span>voided</span>
       {% else %}<span class="st tone-active"><span class="i">◑</span>{{ r.outcome }}</span>{% endif %}
       <span class="sub">{{ fmt_age(r.ts) }} ago</span>
       {# WHO OPENED IT, and only when the answer is not "a submission did". A round a

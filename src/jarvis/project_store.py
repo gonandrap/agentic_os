@@ -77,7 +77,14 @@ VALIDATOR_SEATS = ("tester", "security", "architect", "maintainer", "chair")
 
 # How a round ended. `pending` is a round still open; `failed` is the panel itself
 # breaking (no seat answered), which is not the same as the work being `rejected`.
-VALIDATION_OUTCOMES = ("pending", "passed", "rejected", "escalated", "failed")
+# `void` is a round there was nothing for a REVIEWER to judge — a staged release, whose
+# every effect the OS verifies itself — and it is DERIVED from the packet before any seat
+# is called, never returned by one (spec
+# docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §3). It joins this
+# tuple and NO OTHER below, deliberately: not `COUNTED` because nobody judged, so the
+# submitter spent no round; not `RUNNABLE` or `OPEN` because it is terminal and the panel
+# has finished with the unit.
+VALIDATION_OUTCOMES = ("pending", "passed", "rejected", "escalated", "failed", "void")
 # The outcomes that mean a round was JUDGED, and so that the submitter spent one of its
 # `max_rounds`. `pending` and `failed` are deliberately absent: see
 # `counted_validation_rounds`, which is the only thing that may count a round.

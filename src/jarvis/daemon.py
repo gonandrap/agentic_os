@@ -1344,7 +1344,7 @@ class Daemon:
             packet = evidence_mod.collect_work_order(
                 project.path, wo, declared=str(round_row["evidence"] or ""),
                 diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo),
-                side_effects=ops.side_effects_of(wo_id),
+                side_effects=ops.side_effects_of(store, wo_id),
                 assumptions=store.all_assumptions(wo_id),
                 # WHAT EARLIER ROUNDS ALREADY ASKED FOR, so a seat cannot re-litigate
                 # settled ground or read an instruction it was given as a defect. ONLY
@@ -1375,20 +1375,29 @@ class Daemon:
                          project.name, wo_id, n)
                 return
 
-            # AN EMPTY SUBMISSION never reaches the validator. A reviewer handed
-            # nothing to review will approve it, and that single silent pass would make
-            # the whole feature theatre.
+            # A SUBMISSION WITH NOTHING FOR A REVIEWER never reaches the validator. A
+            # reviewer handed nothing to review will approve it, and that single silent
+            # pass would make the whole feature theatre.
             #
-            # "Empty" is no files AND no side effects. The guard's intent was always
-            # right and only its premise was wrong: "no files changed" is not the same
-            # statement as "nothing was delivered", and a work order whose whole
-            # deliverable was a knowledge-base retraction was escalated unjudged for
-            # years of fleet time on the difference (issue #200, spec 2026-09-12 §5).
-            if not packet.files and not packet.side_effects:
+            # The rule itself is `evidence.nothing_to_judge` — one home, shared with the
+            # feature loop below. TWO ANSWERS, and which side of the line each case falls
+            # on is the whole of spec
+            # docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §3:
+            # nothing delivered AT ALL still escalates, because a work order that was
+            # supposed to author code and authored none is exactly what the guard is for;
+            # a deliverable the OS verifies ITSELF — today only a staged release — is
+            # VOIDED, because no seat can add anything to a machine check.
+            empty = evidence_mod.nothing_to_judge(packet)
+            if empty == "escalate":
                 self._escalate(store, wo, round_id, n,
                                "this submission changes no files and records no other "
                                "durable effect, so there is nothing to review. Nobody "
                                "has judged the work.")
+                return
+            if empty == "void":
+                self._void(store, wo, round_id, n, evidence_mod.void_reason(packet))
+                log.info("[%s] %s: round %d voided — nothing for a reviewer to judge",
+                         project.name, wo_id, n)
                 return
 
             # A REPEAT of the IMMEDIATELY PRECEDING round only. Compared against every
@@ -1507,6 +1516,34 @@ class Daemon:
                      round=n, outcome="rejected",
                      reason=REVIEW_FEEDBACK.format(n=n, max=max_rounds, reason=reason,
                                                    wo_id=wo_id)))
+
+    @staticmethod
+    def _void(store: ProjectStore, wo: dict, round_id: int, n: int,
+              reason: str) -> None:
+        """Close a round that had nothing for a reviewer, WITHOUT asking the user.
+
+        The deliberate opposite of `_escalate` below, one line at a time: no attention
+        flag, no notification, and the unit settles where it settles with the panel
+        switched off. Not a verdict — nothing judged the work — but not a give-up either,
+        because nothing was left undecided: spec
+        docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §7.
+
+        `panel_cleared` for the no-validator path's reason: this caller just closed the
+        round itself and `land_when_cleared` must not re-read what it wrote.
+
+        NOTHING RE-DERIVES A FLAG HERE, which is the half a `set_status` alone would miss:
+        `invariants._validation_escalated` keys on `outcome == "escalated"`, so
+        `true_blockers` cannot put `VALIDATION_STUCK_BLOCKER` back on the next reconcile
+        tick — and `void` is in none of the OPEN/RUNNABLE/COUNTED outcome sets, so no
+        other machine picks the unit up either.
+        """
+        from . import ops
+
+        wo_id = wo["id"]
+        store.close_validation_round(round_id, "void", reason)
+        store.add_event(wo_id, "validation_void",
+                        {"round": n, "round_id": round_id, "reason": reason})
+        ops.land_when_cleared(store, wo, panel_cleared=True)
 
     @staticmethod
     def _escalate(store: ProjectStore, wo: dict, round_id: int, n: int,
@@ -1681,6 +1718,7 @@ class Daemon:
         panel, exactly as an empty diff does and for the same reason — a reviewer handed
         the wrong evidence will answer about the wrong evidence.
         """
+        from . import evidence as evidence_mod
         from . import ops
 
         store = ProjectStore(project.path)  # thread-local connection — see the docstring
@@ -1745,12 +1783,23 @@ class Daemon:
                     "honest way to say what it changed. It was released before the OS "
                     "started recording one. Nobody has judged the work.")
                 return
-            if not packet.files and not packet.side_effects:
+            # The SAME helper the work-order loop calls, never a second copy of the rule:
+            # a feature whose children were releases would otherwise keep escalating for
+            # the identical reason after the work-order guard was fixed (spec §8). It
+            # runs AFTER the base guard above, which does not yield to it.
+            empty = evidence_mod.nothing_to_judge(packet)
+            if empty == "escalate":
                 self._escalate_feature(
                     store, fo, round_id, n,
                     "nothing has changed on the default branch since this feature "
                     "started and its children record no other durable effect, so there "
                     "is nothing to review. Nobody has judged the work.")
+                return
+            if empty == "void":
+                self._void_feature(store, fo, round_id, n,
+                                   evidence_mod.void_reason(packet))
+                log.info("[%s] feature %s: round %d voided — nothing for a reviewer "
+                         "to judge", project.name, fo_id, n)
                 return
 
             previous = self._preceding_round(store, n, fo_id=fo_id)
@@ -1837,6 +1886,24 @@ class Daemon:
                                                            reason=reason, fo_id=fo_id)))
         store.set_feature_status(fo_id, "executing")
         store.clear_feature_attention(fo_id)
+
+    def _void_feature(self, store: ProjectStore, fo: dict, round_id: int, n: int,
+                      reason: str) -> None:
+        """`_void` one level up: close the round and complete the feature, silently.
+
+        `_complete_feature` is the same landing a PASS gets, for the reason the
+        no-validator path lands there too — a feature the panel never judged must settle
+        exactly where it settles with validation off, and stranding it strands its
+        manager with it.
+        """
+        from . import ops
+
+        fo_id = fo["id"]
+        store.close_validation_round(round_id, "void", reason)
+        ops.feature_event(store, fo_id, "validation_void",
+                          {"round": n, "round_id": round_id, "reason": reason,
+                           "feature_order": fo_id})
+        self._complete_feature(store, fo)
 
     @staticmethod
     def _escalate_feature(store: ProjectStore, fo: dict, round_id: int, n: int,
