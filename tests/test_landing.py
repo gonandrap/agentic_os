@@ -89,6 +89,18 @@ class Repo:
         _git(self.path, "push", "-q", "origin", "trunk")
 
 
+def _assess(repo: Repo, wo_id: str = WO, **kw) -> landing.Landing:
+    """`landing.assess` against a default branch this fixture has just pushed to.
+
+    `base_current=True` is a FACT about the fixture and not a convenience: `Repo.push`
+    updates `origin/trunk` in this clone, so the ref every test below measures against
+    holds everything the bare origin does. Issue #271 is what happens when that is NOT
+    true in production and nobody says so — the two tests at the end of this file are
+    the ones that pass `base_current=False`.
+    """
+    return landing.assess(repo.path, wo_id, base_current=True, **kw)
+
+
 @pytest.fixture()
 def repo(tmp_path) -> Repo:
     path = make_git_project(tmp_path, "proj")
@@ -124,9 +136,9 @@ def test_an_order_that_produced_nothing_is_not_flagged_and_one_that_did_is(repo)
 
     assert landing.authored(planner).produced is False
     assert landing.authored(coder).produced is True
-    assert landing.assess(repo.path, "wo-planner",
+    assert _assess(repo, "wo-planner",
                           worktree=planner).verdict == landing.NOT_PRODUCED
-    assert landing.assess(repo.path, "wo-coder",
+    assert _assess(repo, "wo-coder",
                           worktree=coder).verdict == landing.STRANDED
 
 
@@ -183,8 +195,8 @@ def test_a_squash_merged_branch_reads_as_landed_and_an_unmerged_one_as_stranded(
         ahead = _git(repo.path, "rev-list", "--count", f"trunk..{branch}").strip()
         assert ahead == "1", f"{branch} is ahead of trunk even though it landed"
 
-    good = landing.assess(repo.path, "wo-landed", worktree=landed_wt)
-    bad = landing.assess(repo.path, "wo-strand", worktree=stranded_wt)
+    good = _assess(repo, "wo-landed", worktree=landed_wt)
+    bad = _assess(repo, "wo-strand", worktree=stranded_wt)
 
     assert good.verdict == landing.LANDED, good.detail
     assert good.coverage >= landing.LANDED_COVERAGE
@@ -212,7 +224,7 @@ def test_half_a_branch_on_trunk_is_partial_and_neither_landed_nor_stranded(repo)
     repo.squash_merge(f"worktree-{WO}", f"[{WO}] the first half (#5)")
     repo.commit(wt, "src/second.py", _feature("second"), "the tail nobody merged")
 
-    found = landing.assess(repo.path, WO, worktree=wt)
+    found = _assess(repo, WO, worktree=wt)
 
     assert found.verdict == landing.PARTIAL, found.detail
     assert found.rung == "coverage"
@@ -238,12 +250,12 @@ def test_a_landed_branch_whose_worktree_still_holds_work_is_partial_not_landed(r
     repo.squash_merge(f"worktree-{WO}", f"[{WO}] the feature (#6)")
 
     # The pairing, asserted first: with a clean worktree this exact branch is LANDED.
-    clean = landing.assess(repo.path, WO, worktree=wt)
+    clean = _assess(repo, WO, worktree=wt)
     assert clean.verdict == landing.LANDED, clean.detail
 
     (wt / "src" / "never_added.py").write_text(_feature("orphan"))
 
-    found = landing.assess(repo.path, WO, worktree=wt)
+    found = _assess(repo, WO, worktree=wt)
 
     assert found.verdict == landing.PARTIAL, found.detail
     assert found.rung == "coverage"
@@ -264,12 +276,12 @@ def test_the_commit_subject_rung_confirms_but_never_condemns(repo):
     (wt / "app.py").unlink()
     _git(wt, "commit", "-aqm", "drop the module")
 
-    unconfirmed = landing.assess(repo.path, WO, worktree=wt)
+    unconfirmed = _assess(repo, WO, worktree=wt)
     assert unconfirmed.verdict == landing.UNKNOWN
     assert unconfirmed.rung == "subject"
 
     repo.squash_merge(f"worktree-{WO}", f"[{WO}] drop the module (#2)")
-    assert landing.assess(repo.path, WO, worktree=wt).verdict == landing.LANDED
+    assert _assess(repo, WO, worktree=wt).verdict == landing.LANDED
 
 
 # -- Mode C: a merged pull request, and the work that came after it --------------------
@@ -287,13 +299,13 @@ def test_mode_c_a_merged_pr_with_a_tail_is_stranded_and_one_without_is_landed(re
     head = repo.squash_merge(f"worktree-{WO}", f"[{WO}] the first half (#3)")
     pr = "https://github.com/acme/proj/pull/3"
 
-    settled = landing.assess(repo.path, WO, worktree=wt, pr_url=pr,
+    settled = _assess(repo, WO, worktree=wt, pr_url=pr,
                              pr_merged=True, pr_head_oid=head)
     assert settled.verdict == landing.LANDED, settled.detail
 
     repo.commit(wt, "src/second.py", _feature("second"), "the tail nobody merged")
 
-    tail = landing.assess(repo.path, WO, worktree=wt, pr_url=pr,
+    tail = _assess(repo, WO, worktree=wt, pr_url=pr,
                           pr_merged=True, pr_head_oid=head)
     assert tail.verdict == landing.STRANDED
     assert tail.rung == "merged-tail"
@@ -312,9 +324,9 @@ def test_an_open_pull_request_is_stranded_and_an_unasked_one_is_not_assumed_open
     repo.squash_merge(f"worktree-{WO}", f"[{WO}] the feature (#4)")
     pr = "https://github.com/acme/proj/pull/4"
 
-    assert landing.assess(repo.path, WO, worktree=wt, pr_url=pr,
+    assert _assess(repo, WO, worktree=wt, pr_url=pr,
                           pr_merged=False).verdict == landing.STRANDED
-    unasked = landing.assess(repo.path, WO, worktree=wt, pr_url=pr, pr_merged=None)
+    unasked = _assess(repo, WO, worktree=wt, pr_url=pr, pr_merged=None)
     assert unasked.verdict == landing.LANDED, unasked.detail
 
 
@@ -328,7 +340,7 @@ def test_a_branch_is_found_by_name_when_the_worktree_is_gone(repo):
     repo.commit(wt, "src/rescued.py", _feature("rescued"))
     _git(repo.path, "worktree", "remove", "--force", str(wt))
 
-    found = landing.assess(repo.path, WO)
+    found = _assess(repo, WO)
     assert found.ref == f"rescue/{WO}"
     assert found.verdict == landing.STRANDED
 
@@ -382,7 +394,7 @@ def test_the_pushed_branch_is_read_and_not_a_local_one_left_behind(repo):
     _git(repo.path, "worktree", "remove", "--force", str(wt))
     _git(repo.path, "branch", "-f", f"worktree-{WO}", early)   # local now behind origin
 
-    found = landing.assess(repo.path, WO)
+    found = _assess(repo, WO)
 
     assert found.ref == f"origin/worktree-{WO}"
     # The proof it is not the stale one: `src/late.py` exists only on what was pushed.
@@ -398,7 +410,7 @@ def test_a_failed_content_read_is_unknown_and_never_stranded(repo):
     _git(repo.path, "worktree", "remove", "--force", str(wt))
     _drop_object(repo, blob)
 
-    found = landing.assess(repo.path, WO)
+    found = _assess(repo, WO)
 
     assert found.verdict == landing.UNKNOWN
     assert found.rung == "unreadable"
@@ -421,7 +433,101 @@ def test_a_failed_commit_count_is_unknown_and_never_a_cached_not_produced(repo):
     assert work.unreadable and not work.produced
 
     _git(repo.path, "worktree", "remove", "--force", str(wt))
-    found = landing.assess(repo.path, WO)
+    found = _assess(repo, WO)
 
     assert found.verdict == landing.UNKNOWN
     assert found.verdict not in landing.SETTLED_VERDICTS
+
+
+# -- the default branch nothing ever moved (issue #271) --------------------------------
+
+
+def _rewind_base(repo: Repo, sha: str) -> None:
+    """Put `origin/trunk` back where it was, leaving the merge on the bare origin.
+
+    A clone that has not fetched since somebody else's pull request landed, which is
+    every clone in the fleet at the moment a merge completes a work order: the poll sees
+    the merge over the network, and nothing here moves this ref.
+    """
+    _git(repo.path, "update-ref", "refs/remotes/origin/trunk", sha)
+
+
+def test_a_branch_that_landed_since_the_last_fetch_is_unknown_and_never_stranded(repo):
+    """The false positive issue #271 measured at one per merge, repeating every hour.
+
+    The verdict is WITHHELD rather than reversed — `stale-base` is `UNKNOWN`, which is
+    re-derived every sweep — and the second half is what makes that honest rather than
+    evasive: `refresh_base` really does move the ref, so the answer arrives.
+    """
+    stale = _git(repo.path, "rev-parse", "origin/trunk").strip()
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("feature"))
+    repo.squash_merge(f"worktree-{WO}", f"[{WO}] the feature (#7)")
+    _rewind_base(repo, stale)
+
+    withheld = landing.assess(repo.path, WO, worktree=wt, base_current=False)
+
+    assert withheld.verdict == landing.UNKNOWN, withheld.detail
+    assert withheld.rung == "stale-base"
+    assert withheld.verdict not in landing.SETTLED_VERDICTS   # asked again next sweep
+    # "src/feature.py is nowhere" is the sharpest line the report can show and the one
+    # a base that may predate the merge cannot support.
+    assert not withheld.missing_files
+
+    assert landing.refresh_base(repo.path) is True
+    assert _git(repo.path, "rev-parse", "origin/trunk").strip() != stale
+    assert _assess(repo, WO, worktree=wt).verdict == landing.LANDED
+
+
+def test_a_stale_base_withholds_absence_and_never_presence(repo):
+    """Two branches, one out-of-date ref: the earlier one is still `LANDED`.
+
+    The asymmetry the whole guard rests on. A branch only grows, so lines FOUND on an
+    out-of-date default branch are on the up-to-date one too. Demoting this half as well
+    would be the blind spot rather than the fix: on a fleet where no refresh ever
+    succeeds nothing would be confirmed as landed again, and an audit that has quietly
+    stopped working looks exactly like a fleet with nothing stranded.
+    """
+    first = repo.worktree("wo-first")
+    repo.commit(first, "src/first.py", _feature("first"))
+    repo.squash_merge("worktree-wo-first", "[wo-first] the first half (#8)")
+    after_first = _git(repo.path, "rev-parse", "origin/trunk").strip()
+
+    second = repo.worktree("wo-second")
+    repo.commit(second, "src/second.py", _feature("second"))
+    repo.squash_merge("worktree-wo-second", "[wo-second] the second half (#9)")
+    _rewind_base(repo, after_first)
+
+    present = landing.assess(repo.path, "wo-first", worktree=first, base_current=False)
+    absent = landing.assess(repo.path, "wo-second", worktree=second, base_current=False)
+
+    assert present.verdict == landing.LANDED, present.detail
+    assert present.rung == "coverage"           # answered, not withheld
+    assert absent.verdict == landing.UNKNOWN, absent.detail
+
+
+def test_a_refresh_that_cannot_run_is_false_rather_than_an_error(repo, tmp_path):
+    """Three ways to have no fresh ref, and not one of them may raise or condemn.
+
+    `allow_network=False` is the read-only `jarvis doctor`, which may not write to a
+    repository at all; the unreachable remote is an offline machine or a deleted fork.
+    The third is the case with nothing to be behind — a project whose default branch is
+    LOCAL has no remote copy to be out of date against, and demoting it would break
+    every project that was never cloned from anywhere.
+    """
+    before = _git(repo.path, "rev-parse", "origin/trunk").strip()
+    assert landing.refresh_base(repo.path, allow_network=False) is False
+    assert _git(repo.path, "rev-parse", "origin/trunk").strip() == before
+
+    # `main` and not `trunk` (the rule at the top of this file): rung 3 of the pinned
+    # ladder knows exactly two names, so this one is the ladder's, not git's default.
+    solo = make_git_project(tmp_path, "solo")
+    _git(solo, "symbolic-ref", "HEAD", "refs/heads/main")
+    (solo / "app.py").write_text(_feature("solo", 4))
+    _git(solo, "add", "-A")
+    _git(solo, "commit", "-qm", "base")
+    assert landing.base_ref(solo) == "main"
+    assert landing.refresh_base(solo, allow_network=False) is True
+
+    _git(repo.path, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    assert landing.refresh_base(repo.path) is False

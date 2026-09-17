@@ -531,25 +531,39 @@ def test_an_order_the_user_marked_done_is_not_reported_by_the_sweep_for_ever(
     assert _violations(project) == found      # and it stays silent on the next sweep too
 
 
-def test_the_read_only_doctor_reports_the_same_thing_and_records_nothing(started,
-                                                                        project):
-    """What the plain `jarvis doctor` a human types actually does — which is not what
-    the daemon does, and the docstrings now say so.
+def test_the_read_only_doctor_withholds_the_content_verdict_and_records_nothing(started,
+                                                                               project):
+    """What the plain `jarvis doctor` a human types actually does — which is LESS than
+    what the daemon does, in two ways, and the docstrings now say so.
 
     `ops.run_doctor` passes `slow=True` with `repair=False`, so `check_project` hands the
-    sweep a `_ReadOnly` proxy and `add_event` — the `landing_checked` cache write — is
-    swallowed. The report is identical; the cache is simply not populated, so the run
-    pays the full per-file git walk every time.
+    sweep a `_ReadOnly` proxy. `add_event` — the `landing_checked` cache write — is
+    swallowed, so the run pays the full per-file git walk every time. And refreshing the
+    default branch is a write to the repository, so this path does not do it and will not
+    condemn a branch against a ref it could not bring up to date (issue #271): the
+    coverage verdict is withheld as `unknown` and only the daemon's repairing sweep,
+    which refreshed, reports it.
 
-    Left that way on purpose rather than worked around: a read-only doctor that wrote to
-    a timeline would be a worse defect than a repeated git walk, and the daemon's hourly
-    repairing sweep fills the cache for both of them. Asserted because a promise about
-    caching that only holds on one of two paths is the kind of thing that rots into a
-    performance bug nobody can find.
+    Both left that way on purpose rather than worked around. The pairing is what stops
+    that from being a check nobody runs: `merged-tail` reads no base at all, so Mode C —
+    a branch carrying commits after the sha that merged — is still reported here.
     """
     stranded = _order(project, "launcher contract", code="launcher")
     clean = _order(project, "answered it")
+    tailed = _order(project, "the cap", code="cap")
     _settle(project, stranded["id"], clean["id"])
+    ops.finish(tailed["id"], "opened a PR", pr_url=PR)
+    store = ProjectStore(project)
+    try:
+        ops.complete_merged(store, store.get_work_order(tailed["id"]),
+                            merged_at="2026-08-02T10:00:00Z",
+                            head_oid=_git(tailed["worktree_path"],
+                                          "rev-parse", "HEAD").strip())
+    finally:
+        store.close()
+    (tailed["worktree_path"] / "onboarding.py").write_text(_feature("onboarding"))
+    _git(tailed["worktree_path"], "add", "-A")
+    _git(tailed["worktree_path"], "commit", "-qm", "the tail nobody merged")
 
     store = ProjectStore(project)
     try:
@@ -558,13 +572,16 @@ def test_the_read_only_doctor_reports_the_same_thing_and_records_nothing(started
     finally:
         store.close()
 
-    assert [v.wo_id for v in found] == [stranded["id"]]
-    assert found[0].context["verdict"] == landing.STRANDED
-    # Nothing was written, for either verdict — the settled one included.
+    # The rung that needs a current default branch is withheld; the one that needs none
+    # answers as it always did.
+    assert [v.wo_id for v in found] == [tailed["id"]]
+    assert found[0].context["rung"] == "merged-tail"
+    # Nothing was written, for any verdict — the settled one included.
     assert _events(project, clean["id"], "landing_checked") == []
     assert _events(project, stranded["id"], "landing_checked") == []
-    # The repairing path is what fills it, and it is the daemon's.
-    _violations(project)
+    # The repairing path refreshes the ref, so it both fills the cache and says what the
+    # read-only run would not.
+    assert {v.wo_id for v in _violations(project)} == {stranded["id"], tailed["id"]}
     assert len(_events(project, clean["id"], "landing_checked")) == 1
 
 

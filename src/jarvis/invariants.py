@@ -2018,11 +2018,22 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
     ARE INCLUDED, on `poll_pull_requests`' reasoning: hiding drops a record from listings,
     it does not mean the record may go on saying something untrue.
 
-    **NO NETWORK, EVER.** Everything it needs about a pull request it reads off the work
-    order's own timeline — `pr_merged` and the `head_oid` that event now carries — never
-    from `pr_state`, which kn-dbc4971d records as stale by construction with one permitted
-    reader. That is what makes it cheap enough to run on the daemon's slow cadence instead
-    of only when a human types `jarvis doctor`.
+    **IT NEVER ASKS GITHUB.** Everything it needs about a pull request it reads off the
+    work order's own timeline — `pr_merged` and the `head_oid` that event now carries —
+    never from `pr_state`, which kn-dbc4971d records as stale by construction with one
+    permitted reader. That is what makes it cheap enough to run on the daemon's slow
+    cadence instead of only when a human types `jarvis doctor`.
+
+    **IT DOES REFRESH THE DEFAULT BRANCH, ONCE PER SWEEP, ON THE REPAIRING PATH.** The
+    ref everything here is measured against is `origin/main`, and until issue #271 nothing
+    in the OS ever moved it: a merge is detected over the network, so a work order
+    completed while the local ref still pointed at the commit before its squash, and this
+    check reported the order that had just landed as `STRANDED` every hour until a human
+    happened to fetch. One bounded `landing.refresh_base` per project per sweep fixes the
+    measurement; `base_current` is what makes the fix unconditional, because a refresh
+    that FAILED — offline, no remote, or the read-only path below, which may not write to
+    a repository at all — answers `UNKNOWN` rather than condemning the branch anyway.
+    The refresh is lazy: a project with nothing to audit does not pay for a round trip.
 
     **THE VERDICT IS CACHED, and only the settled half of it.** `landed` and
     `not-produced` are recorded as a `landing_checked` event and never recomputed: a
@@ -2056,6 +2067,7 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
     """
     from . import landing
 
+    base_current: bool | None = None
     for wo in store.list_work_orders(statuses=("completed",), include_hidden=True):
         wo_id = wo["id"]
         if store.work_abandoned(wo_id) or store.work_unlanded_open(
@@ -2064,6 +2076,13 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
         if any(db.from_json(e["payload"], {}).get("verdict") in landing.SETTLED_VERDICTS
                for e in store.events_of_kind(wo_id, "landing_checked")):
             continue
+        if base_current is None:
+            # Below every exclusion, so the round trip is only spent on a project that
+            # actually has something to measure — and once, because the ref it moves is
+            # the same one for every work order here.
+            base_current = landing.refresh_base(
+                store.project_path,
+                allow_network=not getattr(store, "readonly", False))
         merges = store.events_of_kind(wo_id, "pr_merged")
         merged = db.from_json(merges[-1]["payload"], {}) if merges else {}
         found = landing.assess(
@@ -2074,7 +2093,8 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
             # "GitHub says this is still open" and would flag every order in a project
             # whose pull requests the OS has never been able to poll.
             pr_merged=True if merges else None,
-            pr_head_oid=str(merged.get("head_oid") or ""))
+            pr_head_oid=str(merged.get("head_oid") or ""),
+            base_current=base_current)
         if found.verdict in landing.SETTLED_VERDICTS:
             store.add_event(wo_id, "landing_checked",
                             {"verdict": found.verdict, "rung": found.rung,
@@ -2832,10 +2852,11 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
 #: Invariants that shell out. They answer a question no other check can — "is this work
 #: on the default branch" needs the repository, not the database — and they cost a `git`
 #: invocation per touched file of every completed order whose verdict is not already
-#: settled. So they are OFF by default and run on their own cadence, exactly as
-#: `Daemon.PR_POLL_EVERY_TICKS` is its own cadence for being the only step that leaves
-#: the machine. `jarvis doctor` always runs them: a human who typed the command is
-#: waiting for the answer, and the answer is the point of the command.
+#: settled — plus, on the repairing path, ONE round trip to refresh the ref all of that
+#: is measured against (issue #271; `landing.refresh_base`). So they are OFF by default
+#: and run on their own cadence, as `Daemon.PR_POLL_EVERY_TICKS` does for the same
+#: reason. `jarvis doctor` always runs them: a human who typed the command is waiting for
+#: the answer, and the answer is the point of the command.
 SLOW_INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_work_lands,
 )

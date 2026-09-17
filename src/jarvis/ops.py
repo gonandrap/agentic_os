@@ -190,11 +190,16 @@ def run_doctor(project: str | None = None, repair: bool = False,
     on the default branch" has no other home, and the audit that first answered it
     (GitHub issue #232, six stranded work orders) was a one-off done by hand.
 
-    It also pays full price for it without `repair`. INV-WORK-LANDED caches its settled
-    verdicts as a timeline event, and a read-only run has no timeline to write to, so
-    the default `jarvis doctor` re-reads git for every completed work order every single
-    time — the cache is populated by the daemon's hourly sweep and by `--repair`, never
-    by a plain run. Read-only is worth more than the seconds: see `check_work_lands`.
+    It also pays full price for it without `repair`, and answers LESS. INV-WORK-LANDED
+    caches its settled verdicts as a timeline event, and a read-only run has no timeline
+    to write to, so the default `jarvis doctor` re-reads git for every completed work
+    order every single time — the cache is populated by the daemon's hourly sweep and by
+    `--repair`, never by a plain run. The same rule costs it the coverage verdict
+    outright: refreshing the default branch writes to the repository, so a plain run does
+    not (`landing.refresh_base(allow_network=False)`) and will not condemn a branch
+    against a ref it could not bring up to date — it reports stranded work through the
+    rungs that read no base, and `unknown` where the content test would have answered.
+    Read-only is worth more than either: see `check_work_lands`.
 
     `include_os=False` drops the OS-LEVEL checks — `check_os` and the release marker —
     and keeps the per-project ones. The scheduler's daily run passes it for every project

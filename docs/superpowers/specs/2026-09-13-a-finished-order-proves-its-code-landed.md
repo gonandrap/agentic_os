@@ -143,10 +143,43 @@ opposite of what is true. kn-eafe383a is this exact bug one level over.
 `INV-WORK-LANDED` sweeps `completed` work orders, hidden ones included (hiding drops a
 record from listings; it does not mean the record may go on saying something untrue).
 
-**No network, ever.** Everything it needs about a pull request it reads off the work
+**It never asks GitHub.** Everything it needs about a pull request it reads off the work
 order's own timeline — `pr_merged`, and the `head_oid` that event now carries, which is
 what answers Mode C exactly. Never `pr_state`, which kn-dbc4971d records as stale by
 construction with one permitted reader.
+
+### The default branch has to be refreshed, and the property is narrower than "no network"
+
+This section originally said "no network, ever", and meant it about re-asking `gh`. It
+was also true of `git`, and that was a bug (issue #271). The sweep measures against
+`origin/main`, a remote-tracking ref nothing in the OS ever moved, while the merge that
+ends a work order is detected over the NETWORK — so the order completed with the local
+ref still pointing at the commit before its squash, and the content test looked for the
+branch's lines in a copy of the file that predates the merge. One false `STRANDED` per
+merge, repeating every hour, on the checker whose own module docstring says a checker
+that flags everything gets switched off within a day.
+
+The property is now: **no network on the read-only path; one bounded fetch of the default
+branch per project per repairing sweep.** `landing.refresh_base` does it — a single
+explicit refspec, `--no-tags`, a timeout, non-fatal — and the daemon (`repair=True`) and
+`jarvis doctor --repair` are the only callers that pass `allow_network=True`. A plain
+`jarvis doctor` does not write to a repository, which is a promise `ops.run_doctor` makes
+in print.
+
+**And the guard is unconditional, because the refresh can fail.** `assess` takes
+`base_current` and will not answer `STRANDED` or `PARTIAL` off a ref that was not
+refreshed THIS sweep: a failed fetch, an offline machine and the read-only path all
+demote the coverage verdict to `UNKNOWN` at the `stale-base` rung. Neither half is
+sufficient alone. Without the refresh, the sweep still condemns a branch whenever the
+network blips; without the guard, the false positive becomes a permanent blind spot,
+since `UNKNOWN` is never cached and a fleet where nobody fetches would never confirm a
+landing again — the "quietly stopped working" failure §4 calls worse than no checker.
+
+Only absence is affected. `LANDED` stands whatever the base's age, because a branch only
+grows and lines found on an out-of-date default branch are on the up-to-date one too; the
+`pull-request-open` and `merged-tail` rungs never read the base at all. So a read-only
+doctor still reports Mode C — a branch carrying commits after the sha that merged — and
+what it withholds is the content measurement, which is the only thing staleness touches.
 
 ### The `merged-tail` rung is blind to the fleet that already exists
 
