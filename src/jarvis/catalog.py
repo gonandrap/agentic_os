@@ -601,6 +601,35 @@ DEFAULT_SCHEDULE_HELD_ALARM_INTERVALS = 3
 
 
 @dataclass
+class WiringConfig:
+    """Which of the USER'S OWN MCP servers, skills and plugins reach this project's
+    workers. Read `wiring.py` for the levers; spec
+    docs/superpowers/specs/2026-09-16-per-project-wiring.md §2 for why they are these.
+
+    OPT-OUT, and that is the whole shape (user ruling, 2026-09-16): every default here
+    means "wired", so a project that never opens /config launches exactly the session it
+    launched before this block existed, and a server the user installs next month is
+    wired everywhere without a catalog edit. What a project stores is its DEVIATION.
+
+    Mixed polarity is deliberate and the page hides it: the two flags name a block
+    nothing can subdivide (the claude.ai connectors move as one, and Claude Code's
+    bundled skills likewise), while the two lists name individuals. Both render as one
+    checkbox per row, so "wired" is the only word a reader meets.
+
+    The lists REPLACE rather than merge when a project overrides them — `ScheduleConfig.
+    jobs`' rule (kn-6ca2bcd9), for its reason: inheritance is field-level.
+    """
+
+    claude_ai_connectors: bool = True
+    bundled_skills: bool = True
+    #: `<plugin>@<marketplace>` ids, as `claude plugin list` spells them.
+    disabled_plugins: tuple[str, ...] = ()
+    #: Skill names — user and project skills only. A PLUGIN's skills follow their
+    #: plugin: Claude Code ignores `skillOverrides` for a plugin-sourced skill.
+    disabled_skills: tuple[str, ...] = ()
+
+
+@dataclass
 class ScheduleConfig:
     """Recurring work orders: whether, how often, and which.
 
@@ -772,6 +801,7 @@ class ProjectSpec:
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+    wiring: WiringConfig = field(default_factory=WiringConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -872,6 +902,7 @@ class OsConfig:
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+    wiring: WiringConfig = field(default_factory=WiringConfig)
 
 
 @dataclass
@@ -1187,6 +1218,37 @@ def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
     return cfg
 
 
+def _parse_wiring(raw: Any, base: WiringConfig | None = None,
+                  where: str = "os.wiring") -> WiringConfig:
+    """`os.wiring`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    The ids are NOT validated against what the machine currently has, and that is the
+    one decision here worth stating. A catalog is read by the daemon on a box where the
+    user's Claude configuration can change under it — uninstall a plugin and a list that
+    named it would fail the whole catalog, taking the fleet down over a deselection that
+    has simply come true. An id naming nothing is inert, exactly as an allow rule naming
+    an absent tool is (`dispatch.SERENA_TOOL_PREFIXES`); `jarvis config wiring` is where
+    a stale entry is visible, and it says so there.
+    """
+    base = base or WiringConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+
+    def _names(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+        value = raw.get(key, default)
+        if isinstance(value, str) or not isinstance(value, (list, tuple)):
+            raise _err(f"{where}.{key} must be a list of names")
+        return tuple(str(v) for v in value)
+
+    return WiringConfig(
+        claude_ai_connectors=bool(raw.get("claude_ai_connectors",
+                                          base.claude_ai_connectors)),
+        bundled_skills=bool(raw.get("bundled_skills", base.bundled_skills)),
+        disabled_plugins=_names("disabled_plugins", base.disabled_plugins),
+        disabled_skills=_names("disabled_skills", base.disabled_skills),
+    )
+
+
 def _parse_schedule(raw: Any, base: ScheduleConfig | None = None,
                    where: str = "os.schedule") -> ScheduleConfig:
     """`os.schedule`, or a project's override of it — field-level, like `_parse_inspect`.
@@ -1413,6 +1475,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         messaging=_parse_messaging(os_raw.get("messaging", {})),
         bugs=_parse_bugs(os_raw.get("bugs", {})),
         schedule=_parse_schedule(os_raw.get("schedule", {})),
+        wiring=_parse_wiring(os_raw.get("wiring", {})),
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")
@@ -1482,6 +1545,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         schedule_cfg = _parse_schedule(
             p.get("schedule", {}), base=os_cfg.schedule,
             where=f"projects[{i}] ({name}).schedule")
+        wiring_cfg = _parse_wiring(
+            p.get("wiring", {}), base=os_cfg.wiring,
+            where=f"projects[{i}] ({name}).wiring")
         projects.append(
             ProjectSpec(
                 name=name,
@@ -1498,6 +1564,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 messaging=messaging_cfg,
                 bugs=bugs_cfg,
                 schedule=schedule_cfg,
+                wiring=wiring_cfg,
                 raw=p,
             )
         )

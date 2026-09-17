@@ -688,6 +688,16 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--reason", default="")
     c.add_argument("--catalog")
 
+    c = cf.add_parser(
+        "wiring",
+        help="which of YOUR MCP servers, skills and plugins reach this project's "
+             "workers. Reads your Claude configuration to list them and never writes "
+             "to it; deselect on the dashboard's /config page")
+    c.add_argument("project", nargs="?", help="a project, or the fleet base if omitted")
+    c.add_argument("--refresh", action="store_true",
+                   help="re-read your Claude configuration instead of the cached answer")
+    c.add_argument("--catalog")
+
     c = cf.add_parser("history", help="who changed what, when and why")
     c.add_argument("project", nargs="?")
     c.add_argument("--limit", type=int, default=20)
@@ -2330,6 +2340,37 @@ def _print_config_versions(rows: list[dict]) -> None:
             print(f"      … and {len(row['changes']) - 4} more")
 
 
+WIRING_KIND_TITLES = {"mcp": "MCP servers", "skill": "Skills", "plugin": "Plugins"}
+
+
+def _print_wiring(data: dict[str, Any]) -> None:
+    """`jarvis config wiring` — what the user has, and what this scope wires of it.
+
+    Deliberately says where each row CAME FROM: the whole page is populated from the
+    user's own Claude configuration, and a reader has to be able to tell a deselection
+    Jarvis is making from something they turned off themselves.
+    """
+    scope = data["project"] or "the fleet (os.wiring — every project inherits it)"
+    print(f"wiring for {scope}")
+    for err in data["errors"]:
+        print(f"  ⚠ {err}")
+    for kind, title in WIRING_KIND_TITLES.items():
+        items = [i for i in data["items"] if i.kind == kind]
+        if not items:
+            continue
+        print(f"\n{title}")
+        for item in items:
+            mark = "●" if item.wired else "○"
+            state = "wired" if item.wired else "NOT wired"
+            print(f"  {mark} {item.name}  ({state}; {item.source})")
+            note = item.note if not item.lever else ""
+            for line in (item.detail, note):
+                if line:
+                    print(f"      {line}")
+    print("\nnothing here is written to your Claude configuration — this is which of it "
+          "\nJarvis wires into a worker at dispatch. Change it on /config.")
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     from . import ops
 
@@ -2372,6 +2413,15 @@ def cmd_config(args: argparse.Namespace) -> int:
         data = ops.unset_config(args.path, project=args.project, reason=args.reason,
                                 catalog_path=args.catalog)
         _print(data, True) if args.json else _print_config_write(data)
+    elif args.cfg_cmd == "wiring":
+        data = ops.wiring_show(project=args.project, refresh=args.refresh,
+                               catalog_path=args.catalog)
+        if args.json:
+            _print({"project": data["project"], "unwired": data["unwired"],
+                    "errors": data["errors"],
+                    "items": [vars(i) for i in data["items"]]}, True)
+        else:
+            _print_wiring(data)
     elif args.cfg_cmd == "history":
         rows = ops.config_history(project=args.project, limit=args.limit)
         if args.json:
@@ -2707,7 +2757,8 @@ def cmd_brief(args: argparse.Namespace) -> int:
             gates_enabled = None
 
     print(worker_brief.render_section(args.section, wo_id=wo_id, project=project,
-                                      gates_enabled=gates_enabled))
+                                      gates_enabled=gates_enabled,
+                                      serena=os.environ.get("JARVIS_SERENA") != "0"))
     return 0
 
 

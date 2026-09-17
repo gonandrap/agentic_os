@@ -4630,6 +4630,10 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     ("*.permission_mode", "next-dispatch"),
     ("*.autocompact_window", "next-dispatch"),
     ("*.append_system_prompt", "next-dispatch"),
+    # Read once per spawn, into the settings file that spawn passes to `--settings`
+    # (`dispatch._write_worker_settings`). A running worker's session already holds the
+    # servers and skills it was launched with; nothing re-reads this at it.
+    ("*.wiring.*", "next-dispatch"),
 )
 
 APPLY_NOTES = {
@@ -5076,6 +5080,69 @@ def config_show(project: str | None = None, version: str | None = None,
             "file_version": live_id,
             "written": _written_paths(document, in_scope),
             "drift": drift}
+
+
+def wiring_config(project: str | None = None,
+                  catalog_path: str | None = None) -> Any:
+    """The `WiringConfig` a scope runs under — a project's, or the fleet's base.
+
+    The CATALOG OBJECT rather than the resolved map, because a deselection is a
+    read-modify-write of a list and `_parse_wiring` is what has already applied the
+    project's inheritance from `os.wiring`.
+    """
+    catalog = resolve_catalog(catalog_path)
+    if project is None:
+        return catalog.os.wiring
+    return project_spec(catalog, project).wiring
+
+
+def wiring_show(project: str | None = None, *, refresh: bool = False,
+                block: bool = True,
+                catalog_path: str | None = None) -> dict[str, Any]:
+    """What the user has configured, and which of it this scope wires.
+
+    The user's own Claude configuration is READ here and never written: this is the
+    populate half of the feature, and the only half that touches it at all.
+
+    `block=False` is the dashboard's call: it takes whatever has been read and lets a
+    re-read run behind the page (`wiring.cached`), because the MCP half of discovery is
+    a network round trip per server. `reading` is then True and `items` empty, which is
+    a different claim from "you have nothing configured" and renders as one.
+    """
+    from . import wiring as wiring_mod
+
+    cfg = wiring_config(project, catalog_path)
+    inv = (wiring_mod.discover(refresh=refresh) if block
+           else wiring_mod.cached(refresh=refresh))
+    if inv is None:
+        return {"project": project, "reading": True, "items": [],
+                "errors": [], "unwired": [], "ts": 0.0}
+    inv = wiring_mod.applied(cfg, inv)
+    return {"project": project, "reading": False,
+            "items": inv.items, "errors": inv.errors, "ts": inv.ts,
+            "unwired": [i.name for i in inv.unwired]}
+
+
+def set_wiring(lever: str, wired: bool, project: str | None = None, *,
+               reason: str = "", catalog_path: str | None = None,
+               actor: str = "user") -> dict[str, Any]:
+    """Wire or unwire one thing for one scope — `jarvis config set` underneath.
+
+    A lever rather than a path, so no caller has to know that unwiring a plugin appends
+    to a list while unwiring the claude.ai connectors flips a flag; `wiring.lever_setting`
+    owns that, and the page and the CLI therefore cannot disagree about it (kn-4ea33fe6).
+    """
+    from . import wiring as wiring_mod
+
+    cfg = wiring_config(project, catalog_path)
+    try:
+        path, value = wiring_mod.lever_setting(lever, wired, cfg)
+    except ValueError as e:
+        raise OpsError(str(e)) from e
+    if project is None:
+        path = f"os.{path}"
+    return set_config(path, value, project, reason=reason,
+                      catalog_path=catalog_path, actor=actor)
 
 
 def config_history(project: str | None = None,

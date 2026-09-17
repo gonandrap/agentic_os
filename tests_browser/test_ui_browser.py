@@ -740,6 +740,56 @@ def test_the_safety_marker_has_a_legend_beside_it(page, server, project):
     _shot(page, "config-fleet")
 
 
+def _wired(items):
+    """Put a fixed inventory in the wiring cache. The UI server runs in a THREAD of this
+    process (see conftest), so this reaches the page — and nothing shells out to
+    `claude`, which the isolation gate has pointed at a fake anyway."""
+    import time as _time
+
+    from jarvis import wiring
+
+    wiring._STATE["inventory"] = wiring.Inventory(items=list(items), ts=_time.time())
+    wiring._STATE["thread"] = None
+
+
+def test_the_wiring_table_stays_inside_its_panel(page, server, project):
+    """The wiring rows are a THIRD table on this page, and the two the console shipped
+    with both ran past their panel until `table-layout: fixed` (reported item 7). A long
+    MCP command is exactly the content that does it, so it is what this renders."""
+    from jarvis import wiring
+
+    _wired([
+        wiring.Item(kind="mcp", name="plugin:serena:serena", source="plugin serena@m",
+                    detail="uvx --from git+https://github.com/oraios/serena serena "
+                           "start-mcp-server --context ide-assistant --project .",
+                    lever=f"{wiring.LEVER_PLUGIN}serena@m",
+                    note="unwiring it unwires the whole plugin"),
+    ])
+    page.set_viewport_size({"width": 900, "height": 900})
+    page.goto(f"{server}/config?scope=projects.proj_a")
+    over = page.evaluate("""() => {
+        const p = document.querySelector('#wiring');
+        const t = p.querySelector('table');
+        return Math.round(t.getBoundingClientRect().right
+                          - p.getBoundingClientRect().right);
+    }""")
+    assert over <= 0, f"the wiring table overflows its panel by {over}px"
+    assert page.locator("#wiring button:has-text('unwire')").is_visible()
+    _shot(page, "config-wiring")
+
+
+def test_unwiring_a_plugin_from_the_browser_reaches_the_catalog(page, server, project):
+    from jarvis import wiring
+
+    _wired([wiring.Item(kind="plugin", name="caveman@caveman", source="user scope",
+                        lever=f"{wiring.LEVER_PLUGIN}caveman@caveman")])
+    page.goto(f"{server}/config?scope=projects.proj_a")
+    page.click("#wiring button:has-text('unwire')")
+    page.wait_for_url("**scope=projects.proj_a*")
+    assert ops.wiring_config("proj_a").disabled_plugins == ("caveman@caveman",)
+    assert "not wired" in page.locator("#wiring").inner_text()
+
+
 def test_a_fresh_fleet_is_not_warned_about_an_edit_nobody_made(page, server, project):
     """Reported item 10. `drift` is true with an EMPTY ledger too, so the page opened on
     a warning about a hand edit on every install that had never run `config adopt`."""

@@ -70,6 +70,31 @@
       "settings_overrides": {
         "permissions": { "allow": ["Bash(npm run *)"] }
       },
+      "wiring": {
+        "$comment": [
+          "Which of YOUR OWN MCP servers, skills and plugins reach this project's",
+          "workers. Opt-out: every default means WIRED, so omitting this key entirely",
+          "(and omitting os.wiring) leaves every project with everything your Claude",
+          "configuration has — including anything you install later. What you list here",
+          "is what this project does NOT want. The dashboard's /config page fills the",
+          "list from your machine and writes these keys for you.",
+          "",
+          "YOUR CLAUDE CONFIGURATION IS NEVER WRITTEN. This only changes the settings",
+          "file a dispatched worker is spawned with, so it reaches work orders and",
+          "feature orders and never a session you opened yourself.",
+          "",
+          "A lever exists per SOURCE, not per item: the claude.ai connectors move as one",
+          "block (claude_ai_connectors), so do Claude Code's own skills",
+          "(bundled_skills), a plugin takes its MCP servers and skills with it, and a",
+          "skill can be dropped by name only if it is yours rather than a plugin's. A",
+          "server added by hand has no lever at all — turning that one off means",
+          "`/mcp disable`, which writes your config, which this will not do.",
+          "docs/superpowers/specs/2026-09-16-per-project-wiring.md"
+        ],
+        "claude_ai_connectors": false,
+        "disabled_plugins": ["caveman@caveman"],
+        "disabled_skills": []
+      },
       "gates": {
         "$comment": [
           "Privileged actions a worker may ATTEMPT, with an independent review by Neo",

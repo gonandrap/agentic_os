@@ -191,6 +191,7 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any],
     lowering it in the catalog must reach the long-running work orders that are the
     reason to lower it — not just the ones dispatched afterwards.
     """
+    from . import wiring
     from .bootstrap import install_agent_assets
     from .dispatch import _write_worker_settings
     from .worker_brief import git_briefing
@@ -207,7 +208,8 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any],
             git_briefing(model),
             wo.get("append_system_prompt") or project.worker.append_system_prompt),
         "settings_file": _write_worker_settings(project, wo),
-        "add_dirs": (install_agent_assets(project.path, wo.get("kind") or "worker")
+        "add_dirs": (install_agent_assets(project.path, wo.get("kind") or "worker",
+                                          serena=wiring.serena_wired(project.wiring))
                      + ([agent_dir] if agent_dir else [])),
         "autocompact_window": project.worker.autocompact_window,
     }

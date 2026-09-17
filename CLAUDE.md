@@ -287,6 +287,17 @@ jarvis bug report "title" -d "..." -e "expected" -a "actual" -p <priority>
                                            # work order and the PR on it — once the code
                                            # lands, so never close one by hand: you would
                                            # be racing the daemon.
+jarvis config wiring [project]             # which of the USER'S OWN MCP servers, skills
+                                           # and plugins reach this project's workers.
+                                           # Everything is wired by default, including
+                                           # anything they install later; a project
+                                           # DESELECTS what it does not want, on /config.
+                                           # Their Claude configuration is read to fill
+                                           # the list and NEVER written — a deselection
+                                           # only changes the settings file a dispatch
+                                           # spawns a worker with, so it reaches work
+                                           # orders and feature orders and never a
+                                           # session they opened themselves.
 jarvis doctor [project] [--repair]         # check the OS's own post-conditions;
                                            # read-only unless --repair. The daemon runs
                                            # the same checks every reconcile tick.
