@@ -2670,9 +2670,13 @@ def check_prefix_stable() -> Iterator[Violation]:
     where its number comes from: the cache accounting the API ITSELF reported, read back
     through the boundary classification in `usage._usage_of` and frozen onto each order's
     bill. Any other prefix-drift signal here is a proxy and defers to this one — whether
-    it works by hashing the rendered system prompt at session start, or by comparing
-    against a recorded baseline. Both of those infer that the prefix moved; this reads
-    what the cache actually did. When they disagree, this is right.
+    it works by hashing the rendered system prompt at session start, by comparing against
+    a recorded baseline, or by asserting in CI which region of the rendered prompt each
+    piece of text lives in (`evals/test_prefix_drift.py`). All of those infer that the
+    prefix moved; this reads what the cache actually did. When they disagree, this is
+    right. They are worth having anyway, because they are the EARLY ones: they fail in
+    the pull request that causes the drift, where this can only report it days later out
+    of transcripts already paid for.
 
     THE RATIO IS OVER ALL CACHE WRITES, not over the tax and not over the boundaries.
     Prefix writes as a share of the tax FALLS when TTL expiry rises, so it would report
@@ -2704,7 +2708,10 @@ def check_prefix_stable() -> Iterator[Violation]:
             f"calls. The usual suspects, in the order they are worth "
             f"checking: a Claude CLI upgrade, an MCP server added or changed mid-session, "
             f"and an edit to `worker_brief.git_briefing` or to a project's CLAUDE.md. "
-            f"`jarvis inspect <wo-id>` labels every re-write of one order by cause. "
+            f"`jarvis inspect <wo-id>` labels every re-write of one order by cause, and "
+            f"`pytest evals/test_prefix_drift.py` says whether the part of the prompt "
+            f"JARVIS renders still has its shared head where the code says — green there "
+            f"with this red points at the CLI or an MCP server rather than at this tree. "
             f"{_cohort_note(cfg, writes)}"),
         context={"prefix_share_of_writes": share,
                  "threshold": cfg.cache_health_prefix_share,
