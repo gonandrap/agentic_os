@@ -805,20 +805,29 @@ def claude_cli_version(env: dict[str, str]) -> str:
 
     Read off disk rather than from `claude --version`: a subprocess would cost more than
     everything else in this hook put together, for a string that is already spelled out
-    in the install layout. The native installer resolves `claude` to
-    `…/versions/<x.y.z>`; the updater's own receipt is the fallback; and anything else
+    in the install layout. The updater's own receipt is the fallback, and anything else
     reports unknown rather than guessing.
+
+    TWO LAYOUTS, because getting this wrong is silent. The native installer symlinks
+    `claude` at a file whose NAME is the version — verified on this machine, where
+    `~/.local/share/claude/versions/2.1.272` is the 218MB executable itself and not a
+    directory holding one. The other plausible shape puts the binary INSIDE a
+    version-named directory (`…/versions/2.1.272/claude`), where the answer is the
+    parent's name. Reading only the first would leave the second at `?` for ever, which
+    `prefix_drift` skips on both sides — so the ingredient would be dead and every
+    fingerprint-to-fingerprint test would still pass (review round 2).
     """
     import shutil
 
     exe = shutil.which("claude", path=env.get("PATH") or os.defpath)
     if exe:
         try:
-            name = Path(exe).resolve().name
+            resolved = Path(exe).resolve()
         except OSError:
-            name = ""
-        if _VERSION_DIR.fullmatch(name):
-            return name
+            resolved = None
+        for candidate in ((resolved.name, resolved.parent.name) if resolved else ()):
+            if _VERSION_DIR.fullmatch(candidate):
+                return candidate
     receipt = Path.home() / ".claude" / ".last-update-result.json"
     try:
         version = json.loads(receipt.read_text()).get("version_to")

@@ -165,13 +165,18 @@ def install(tmp_path, monkeypatch):
     bindir = tmp_path / "bin"
     bindir.mkdir()
 
-    def lay_out(resolves_to: str | None = None, receipt: object = None):
+    def lay_out(resolves_to: str | None = None, receipt: object = None,
+                inside_dir: bool = False):
         if resolves_to is not None:
             target = tmp_path / "versions" / resolves_to
+            if inside_dir:
+                target = target / "claude"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text("#!/bin/sh\n")
             target.chmod(0o755)
-            (bindir / "claude").symlink_to(target)
+            link = bindir / "claude"
+            link.unlink(missing_ok=True)
+            link.symlink_to(target)
         if receipt is not None:
             (home / ".claude" / ".last-update-result.json").write_text(receipt)
         return {"PATH": str(bindir)}
@@ -180,8 +185,25 @@ def install(tmp_path, monkeypatch):
 
 
 def test_the_version_comes_off_the_resolved_binary(install):
-    """The native installer's layout, and the cheap path: one readlink, no subprocess."""
+    """The native installer's layout, and the cheap path: one readlink, no subprocess.
+
+    Verified against the real install on this machine while answering review round 2:
+    `~/.local/bin/claude` is a symlink to `~/.local/share/claude/versions/2.1.272`, and
+    that path is the 218MB executable ITSELF — not a directory holding one.
+    """
     env = install(resolves_to="9.9.72")
+
+    assert hooks.claude_cli_version(env) == "9.9.72"
+
+
+def test_the_version_is_also_read_from_a_version_named_directory(install):
+    """The other plausible layout, `…/versions/9.9.72/claude`, where the answer is the
+    PARENT's name. Not what this machine does, but reading only the first shape would
+    leave such an install at `?` for ever — and `?` is skipped on both sides of every
+    comparison, so the ingredient would be dead while every fingerprint-to-fingerprint
+    test still passed (review round 2).
+    """
+    env = install(resolves_to="9.9.72", inside_dir=True)
 
     assert hooks.claude_cli_version(env) == "9.9.72"
 
