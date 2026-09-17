@@ -576,6 +576,37 @@ def test_a_feature_whose_children_merged_nothing_escalates(fleet):
         store.close()
 
 
+def test_a_feature_whose_children_only_shipped_a_RELEASE_is_voided(fleet):
+    """The same empty packet, through the same shared helper, ending the other way.
+
+    Without it a feature order whose children were releases escalates for exactly the
+    reason the work-order guard has just stopped escalating for, and the two guards
+    drift — Neo's condition on question 378; spec
+    docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §8.
+    """
+    validator = Validator(passed())
+    fleet.daemon.validator = validator
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("ship 0.11.0", "one")
+        fleet.land_children(fo_id, store)  # a release merges nothing to the branch
+        for child in store.feature_children(fo_id):
+            store.add_event(str(child["id"]), "release_verified",
+                            {"version": "0.11.0", "tag": "jarvis-0.11.0"})
+
+        fleet.drain()
+
+        assert validator.calls == [], "a reviewer was asked to judge a release"
+        rnd = store.latest_validation_round(fo_id=fo_id)
+        assert rnd["outcome"] == "void"
+        assert "jarvis-0.11.0" in rnd["reason"]
+        after = store.get_feature_order(fo_id)
+        assert after["status"] == "completed"
+        assert after["needs_attention"] == 0
+    finally:
+        store.close()
+
+
 # -- 3. the rejection, and who reads it -----------------------------------------------
 
 

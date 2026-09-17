@@ -391,6 +391,12 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return "Validation rejected — sent back", p.get("reason") or ""
     if kind == "validation_escalated":
         return ("Validation gave up — over to you", p.get("reason") or "")
+    if kind == "validation_void":
+        # NOT a give-up and NOT a verdict, and the label has to say both: nobody judged
+        # this, and nobody needs to. A reader who takes it for an escalation goes looking
+        # for a decision the OS is not waiting on.
+        return ("Validation voided — nothing for a reviewer to judge",
+                p.get("reason") or "")
     if kind == "validation_failed":
         # A FIFTH kind, and the one most easily misread: nothing judged the work here.
         # A reader who takes this for a rejection goes looking for something to fix that

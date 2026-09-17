@@ -1869,7 +1869,9 @@ def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
         return "validating"
     # `escalated` lands. The panel gave up and put this in front of the user, and the
     # only caller that can reach here with one is `review_work_order` — the user saying
-    # ship it anyway, which is the whole exit from a give-up.
+    # ship it anyway, which is the whole exit from a give-up. So does `void`, which is
+    # the panel finding nothing a reviewer could add and settling the unit itself
+    # (`Daemon._void`, which passes `panel_cleared` and so never re-reads it here).
     return land_finished(store, wo, pr_url)
 
 
@@ -1918,7 +1920,7 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
 
     packet = evidence_mod.collect_work_order(
         project_path, wo, declared=declared, diff_chars=cfg.diff_chars,
-        spec=specs.spec_of(store, wo), side_effects=side_effects_of(str(wo["id"])),
+        spec=specs.spec_of(store, wo), side_effects=side_effects_of(store, str(wo["id"])),
         # The store read is the caller's: `evidence` may not touch a database (spec §4).
         assumptions=store.all_assumptions(wo["id"]))
     nxt = store.counted_validation_rounds(wo_id=wo["id"]) + 1
@@ -6643,8 +6645,8 @@ def _record_side_effect(wo_id: str, kind: str, payload: dict[str, Any]) -> bool:
     return True
 
 
-def side_effects_of(wo_id: str) -> list[dict[str, Any]]:
-    """Durable, non-file change this work order made, for its evidence packet.
+def _knowledge_effects(_store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
+    """Knowledge-base writes and retractions attributed to this work order (issue #200).
 
     Read from the knowledge base's own attribution columns rather than from the timeline
     events `_record_side_effect` writes: the event is best effort and the row is not, so
@@ -6676,6 +6678,105 @@ def side_effects_of(wo_id: str) -> list[dict[str, Any]]:
     return effects
 
 
+#: What a staged release carries on the work order's timeline, newest source first, and
+#: what the marker's `state` would have said at that point. See `_release_effects` for
+#: why reading only one of the two sources has a gap.
+_RELEASE_EVENT_STATES = (("release_verified", "verified"),
+                         ("release_restart", "restarting"))
+
+
+def _release_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
+    """The release this work order shipped, if it shipped one. ATTESTED — §4 of spec
+    docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md.
+
+    A release authors nothing in the worker's worktree: the version bump and the tag are
+    made in a throwaway worktree on a branch nobody merges, and everything else it did
+    happened to origin, to the production checkout and to systemd. So the packet was
+    empty, the panel escalated, and autonomous shipping needed a human (wo-ec96a1e9).
+
+    TWO SOURCES, because neither covers the whole window. `--stage` writes the marker and
+    no timeline event, so before the restart the marker is all there is; `verify_on_boot`
+    DELETES the marker on success, so a round still pending across that daemon restart
+    would otherwise collect nothing and escalate a release that had already landed. The
+    union has no gap.
+
+    Raises nothing on absence, which is the registry's rule: see `side_effects_of`.
+    """
+    from . import release
+
+    marker = release.read_marker() or {}
+    if str(marker.get("wo_id") or "") == wo_id:
+        tag, version = str(marker.get("tag") or ""), str(marker.get("version") or "")
+        state = str(marker.get("state") or "staged")
+    else:
+        tag = version = state = ""
+        for kind, at in _RELEASE_EVENT_STATES:
+            events = store.events_of_kind(wo_id, kind)
+            if events:
+                payload = db.from_json(events[-1]["payload"], {})
+                tag = str(payload.get("tag") or "")
+                version = str(payload.get("version") or "")
+                state = at
+                break
+    if not tag:
+        return []
+    return [{
+        "kind": "release_staged", "id": tag,
+        "summary": f"shipped {tag}: release branch and annotated tag pushed to origin, "
+                   f"production deployed to that tag and its venv rebuilt "
+                   f"(hand-off state: {state})",
+        "detail": (
+            f"version {version or '?'}, tag {tag}.\n\n"
+            "Every step of this is machine-checked without a reviewer, which is why the "
+            "effect is ATTESTED. The marker is written by the release script only after "
+            "the branch push, the tag push and the production deploy have all succeeded, "
+            "and running that script at all is a GATED privileged action that was "
+            "reviewed before it ran. `release.verify_on_boot` then proves the release "
+            "landed — production's pyproject version equals the marker's and both "
+            "systemd units restarted after the deploy — and settles this work order "
+            "itself."),
+    }]
+
+
+@dataclass(frozen=True)
+class SideEffectCollector:
+    """One kind of durable change no diff can show, and whether a reviewer can judge it.
+
+    `attested` is OPT-IN and defaults to False: a collector added tomorrow that has not
+    thought about the question gets its effects JUDGED, never silently voided. The
+    registry stamps the flag onto each record so a collector cannot mark its own — the
+    reason `evidence.side_effects_digest` may leave it out of the hash.
+    """
+
+    name: str
+    collect: Callable[[ProjectStore, str], list[dict[str, Any]]]
+    attested: bool = False
+
+
+#: THE REGISTRY. Adding a kind of invisible effect is an entry here, not another widening
+#: of `daemon.py`'s empty-packet guard — which has now been widened twice for the same
+#: lesson (issue #200, then wo-ec96a1e9). Spec §1.
+SIDE_EFFECT_COLLECTORS = (
+    SideEffectCollector("knowledge", _knowledge_effects),
+    SideEffectCollector("release", _release_effects, attested=True),
+)
+
+
+def side_effects_of(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
+    """Durable, non-file change this work order made, for its evidence packet.
+
+    NOTHING IS SWALLOWED HERE, deliberately. A collector that raises leaves the round
+    unjudged and retried on the next tick, which is right; catching it would drop a
+    JUDGEABLE effect from a packet that could then read as all-attested and void. So a
+    collector must return `[]` for "nothing of my kind", never raise.
+    """
+    effects: list[dict[str, Any]] = []
+    for collector in SIDE_EFFECT_COLLECTORS:
+        for effect in collector.collect(store, wo_id):
+            effects.append({**effect, "attested": collector.attested})
+    return effects
+
+
 def feature_side_effects(store: ProjectStore, fo_id: str) -> list[dict[str, Any]]:
     """Every child's side effects, in the feature's own child order.
 
@@ -6685,7 +6786,7 @@ def feature_side_effects(store: ProjectStore, fo_id: str) -> list[dict[str, Any]
     """
     effects: list[dict[str, Any]] = []
     for child in store.feature_children(fo_id):
-        for effect in side_effects_of(str(child["id"])):
+        for effect in side_effects_of(store, str(child["id"])):
             effects.append({**effect, "wo_id": str(child["id"])})
     return effects
 

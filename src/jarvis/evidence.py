@@ -156,7 +156,9 @@ class EvidencePacket:
     #: pointed at something else.
     pr_error: str = ""
     #: Durable change that no diff can show, collected by `ops` and passed in. One dict
-    #: per effect: `{"kind", "id", "summary", "detail"}`. Empty is the normal case.
+    #: per effect: `{"kind", "id", "summary", "detail", "attested"}`. Empty is the normal
+    #: case. `attested` is stamped by the collector REGISTRY, never by the collector, and
+    #: is what `nothing_to_judge` reads — see it, and `STAMPED_EFFECT_KEYS`.
     side_effects: tuple[dict, ...] = ()
     #: sha256 over `side_effects`, computed at collection time exactly as `diff_sha` is,
     #: and hashed into `fingerprint` for exactly the same reason — see that function.
@@ -277,6 +279,12 @@ def judged_head(packet: EvidencePacket) -> str:
     return str(packet.pr.get("head_sha") or "")
 
 
+#: Keys the REGISTRY stamps on an effect rather than the collector producing them — the
+#: OS classifying an effect, not a submitter delivering one. Excluded from the digest on
+#: `history`'s rule; spec docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §6.
+STAMPED_EFFECT_KEYS = frozenset({"attested"})
+
+
 def side_effects_digest(side_effects: Iterable[dict[str, Any]]) -> str:
     """sha256 over a packet's side effects, stable against dict ordering.
 
@@ -285,16 +293,60 @@ def side_effects_digest(side_effects: Iterable[dict[str, Any]]) -> str:
     fingerprint the same as one of those. Giving "nothing" a non-empty digest would
     change every existing fingerprint and make the next round of every open work order
     read as new evidence.
+
+    `STAMPED_EFFECT_KEYS` are skipped for the second half of that same sentence: they
+    arrived after the field did, and hashing them would change the digest of every
+    knowledge effect already collected — making the next round of every open work order
+    read as new evidence and silently disabling `Daemon._repeat_submission`.
     """
     effects = list(side_effects)
     if not effects:
         return ""
     h = hashlib.sha256()
     for effect in effects:
-        for key in sorted(effect):
+        for key in sorted(k for k in effect if k not in STAMPED_EFFECT_KEYS):
             h.update(f"{key}={effect[key]}\n".encode("utf-8"))
         h.update(b"\x00")
     return h.hexdigest()
+
+
+def nothing_to_judge(packet: EvidencePacket) -> str:
+    """Is there anything here for a REVIEWER? `""` yes, else `"void"` or `"escalate"`.
+
+    THE ONE HOME of the empty-packet rule, called by both of `daemon.py`'s validation
+    loops. Two copies is how a feature order whose children were releases keeps
+    escalating after the work-order guard has been fixed — spec
+    docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §8.
+
+    | files | side effects                | answer                                 |
+    |-------|-----------------------------|----------------------------------------|
+    | any   | any                         | `""` — the diff is the review          |
+    | none  | none                        | `"escalate"` — THE GUARD, unchanged    |
+    | none  | at least one NOT `attested` | `""` — issue #200's case, unchanged     |
+    | none  | all `attested`              | `"void"`                               |
+
+    **`"void"` IS DERIVED AND NEVER CHOSEN.** No seat returns it and no validator verdict
+    produces it: it is decided here, from the packet, before any seat is called — and a
+    submitter cannot reach it by delivering nothing, because that is row 2. `attested` is
+    stamped by `ops`'s collector registry and defaults to False, so a collector added
+    tomorrow that has not thought about this gets JUDGED, never silently voided (§3).
+    """
+    if packet.files:
+        return ""
+    if not packet.side_effects:
+        return "escalate"
+    if all(e.get("attested") for e in packet.side_effects):
+        return "void"
+    return ""
+
+
+def void_reason(packet: EvidencePacket) -> str:
+    """Why this round was voided, in the words the record keeps. One home, two loops."""
+    what = "; ".join(str(e.get("summary") or e.get("kind") or "effect")
+                     for e in packet.side_effects)
+    return ("this submission changed no files, and everything it did deliver is an "
+            "effect the OS verifies itself rather than one a reviewer can judge, so "
+            f"no seat was asked: {what}")
 
 
 def _history(rounds: Iterable[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
