@@ -335,6 +335,17 @@ fingerprint adds **1.25ms to a 165ms invocation — 0.76%** (`scripts/bench_hook
 median of 21). The memory walk is capped at 32 files and 256KiB so the figure cannot grow
 with somebody's rules directory.
 
+**It is not the detector this action promised**, and the shortfall is stated here and in
+the code rather than left for a reader to discover. Action 1's selling point was that "a
+regression is caught at the moment it happens". Two gaps remain, both structural. It
+cannot tell a regression from an edit: every ingredient it watches also moves for good
+reasons, and nothing in a digest separates a new CLAUDE.md rule from
+`includeGitInstructions` being flipped back on. And nothing is paged: the event lands on
+one work order's timeline, while the fleet-level "the prefix has got worse" judgement is
+still INV-PREFIX-DRIFT's, on the doctor's cadence. What arrives at the moment it happens
+is the *evidence*; the verdict still arrives later. A fleet that believes it is watched
+stops looking, so this is the expensive way to be wrong about what landed here.
+
 **It records and does not alarm.** An ingredient changing is ordinary — an edit to a
 project's CLAUDE.md legitimately moves the prefix for every worker in it — so a proxy
 raising its own violation would fire on routine edits *and* would stand beside the

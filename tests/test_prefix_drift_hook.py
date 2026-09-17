@@ -290,6 +290,12 @@ def test_the_hook_defers_to_the_authoritative_check_where_it_computes_its_number
     assert "`invariants.check_prefix_stable` IS THE MEASUREMENT" in section
     assert "PROXY" in section
     assert "check_prefix_stable` wins" in section, "and which one wins is the whole rule"
+    # The shortfall against finding 4's "caught at the moment it happens", stated as
+    # plainly as the deference — a reader who takes this for the detector the finding
+    # asked for stops looking, which is the expensive way to be wrong (Neo q363).
+    assert "NOT A DETECTOR" in section
+    assert "CANNOT TELL A REGRESSION FROM AN EDIT" in section
+    assert "NOTHING IS PAGED" in section
     assert "invariants.check_prefix_stable" in (note_prefix.__doc__ or ""), (
         "the function that writes the event has to carry it too — the section comment is "
         "one scroll away from whoever is reading `note_prefix` in isolation")

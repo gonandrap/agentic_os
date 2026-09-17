@@ -739,6 +739,22 @@ def capture_memory_write(payload: dict[str, Any], env: dict[str, str]) -> dict[s
 # warning, arriving on the turn it happened rather than on the next doctor run over a
 # 30-day cohort; that earliness is the whole of what it adds.
 #
+# AND IT IS NOT A DETECTOR, which is a shortfall against what finding 4 promised action 1
+# would be — "a regression is caught at the moment it happens". Two gaps, both structural
+# rather than fixable here (Neo q363):
+#   · IT CANNOT TELL A REGRESSION FROM AN EDIT. Every ingredient it watches also moves for
+#     good reasons — the CLI updates itself, a project's CLAUDE.md gets a new rule — and
+#     nothing in a digest distinguishes those from `includeGitInstructions` being flipped
+#     back on. It reports that the prefix moved; whether it should have is a judgement,
+#     and this makes no claim on it.
+#   · NOTHING IS PAGED. A `prefix_drift` event lands on ONE work order's timeline, which
+#     is read when somebody opens that work order. The fleet-level "the prefix has got
+#     worse" judgement is still INV-PREFIX-DRIFT's, on the doctor's cadence and over its
+#     cohort. So what arrives at the moment it happens is the EVIDENCE, and the verdict
+#     still arrives later.
+# Reading this as the detector finding 4 asked for is therefore a mistake, and it is the
+# expensive kind: a fleet that believes it is watched stops looking.
+#
 # WHAT IT COSTS, since the finding's second con is that it runs on every session for a
 # condition that changes rarely: nothing per session that was not already being spent.
 # `SessionStart` already runs `jarvis _hook` (`assets/settings.base.json`), so there is no
