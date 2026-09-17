@@ -725,6 +725,231 @@ def capture_memory_write(payload: dict[str, Any], env: dict[str, str]) -> dict[s
     return {"captured": topic, "wo_id": wo_id}
 
 
+# -- the prompt prefix, and what moves it -------------------------------------------------
+#
+# Finding 4 of docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md, whose
+# own con is answered below rather than argued with.
+#
+# THIS IS A PROXY AND `invariants.check_prefix_stable` IS THE MEASUREMENT. A cache
+# boundary is a fact the RESPONSE reports, and no hook sits in that path: what this
+# records is that an INPUT to the prompt prefix changed between two turns of one
+# conversation, which is a reason to expect a re-write, not an observation of one. When
+# the two disagree, `check_prefix_stable` wins — it reads the accounting the API itself
+# returned, through `usage._usage_of`'s boundary classification. This is the early
+# warning, arriving on the turn it happened rather than on the next doctor run over a
+# 30-day cohort; that earliness is the whole of what it adds.
+#
+# WHAT IT COSTS, since the finding's second con is that it runs on every session for a
+# condition that changes rarely: nothing per session that was not already being spent.
+# `SessionStart` already runs `jarvis _hook` (`assets/settings.base.json`), so there is no
+# new process, and the work added inside it is four small reads and a hash against a
+# ~155ms process baseline (`scripts/bench_hook_cost.py` measures both halves).
+#
+# WHAT IT DOES NOT COVER, so that the ingredient list is not read as exhaustive:
+#   · THE MCP TOOL SET — 35% of the post-fix prefix re-writes by volume (finding 4), and
+#     deliberately absent. Tool definitions render at position 0, so a server connecting
+#     MID-TURN re-writes the entire conversation (kn-f94abf34 (2)); SessionStart runs
+#     before that connect, so a fingerprint taken here cannot see the case that costs the
+#     money. Finding 4 action 3 is what settles MCP.
+#   · A PROJECT'S STANDING `append_system_prompt` from the catalog. Importing
+#     `jarvis.catalog` costs ~60ms against a 155ms hook — a 39% tax on every session to
+#     watch a field nothing but a human edit moves. The work order's own override is
+#     covered, because that row is already loaded.
+
+#: Bounds on the memory-file walk, so the hook's cost cannot grow with someone's rules
+#: directory. Exceeding either is not an error: the digest simply covers what fitted, and
+#: the same bound applies on both sides of every comparison.
+PREFIX_MEMORY_FILE_CAP = 32
+PREFIX_MEMORY_BYTE_CAP = 256 * 1024
+
+#: The ingredients, in the order a reader should check them when one moves — which is the
+#: order finding 4 puts them in, commonest cause first.
+PREFIX_INGREDIENTS = ("cli_version", "git_briefing", "worker_settings", "memory")
+
+#: What an ingredient reads when it could not be established. Drift INTO or OUT OF it is
+#: never reported: "I could not tell" and "it changed" are different claims, and a hook
+#: that conflates them cries wolf every time a file is briefly unreadable.
+PREFIX_UNKNOWN = "?"
+
+_VERSION_DIR = re.compile(r"\d+\.\d+\.\d+")
+
+
+def _digest(*chunks: bytes) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    for chunk in chunks:
+        h.update(len(chunk).to_bytes(8, "big"))  # length-prefixed: no chunk-boundary ties
+        h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def claude_cli_version(env: dict[str, str]) -> str:
+    """Which Claude Code built the prompt — the first suspect when the prefix moves.
+
+    Read off disk rather than from `claude --version`: a subprocess would cost more than
+    everything else in this hook put together, for a string that is already spelled out
+    in the install layout. The native installer resolves `claude` to
+    `…/versions/<x.y.z>`; the updater's own receipt is the fallback; and anything else
+    reports unknown rather than guessing.
+    """
+    import shutil
+
+    exe = shutil.which("claude", path=env.get("PATH") or os.defpath)
+    if exe:
+        try:
+            name = Path(exe).resolve().name
+        except OSError:
+            name = ""
+        if _VERSION_DIR.fullmatch(name):
+            return name
+    receipt = Path.home() / ".claude" / ".last-update-result.json"
+    try:
+        version = json.loads(receipt.read_text()).get("version_to")
+    except (OSError, ValueError, AttributeError):
+        return PREFIX_UNKNOWN
+    return version if isinstance(version, str) and version else PREFIX_UNKNOWN
+
+
+def memory_files(root: Path, cwd: Path) -> list[Path]:
+    """The CLAUDE.md-shaped files Claude Code loads into the prompt, nearest first.
+
+    The worktree and the directories above it up to the project root, then the user's own
+    — which is the CLI's own resolution order, and the order that makes a truncated walk
+    truncate the least relevant end.
+    """
+    found: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path) -> None:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return
+        if resolved not in seen and resolved.is_file():
+            seen.add(resolved)
+            found.append(resolved)
+
+    here = cwd.resolve() if cwd.exists() else cwd
+    # Both sides resolved, or the stop never matches and the walk climbs out of the
+    # project: a worker's cwd is `<root>/.claude/worktrees/<id>`, which is a symlinked
+    # path on some checkouts and a plain one on others.
+    stop = root.resolve() if root.exists() else root
+    for candidate in (here, *here.parents):
+        add(candidate / "CLAUDE.md")
+        if candidate == stop:
+            break
+    user = Path.home() / ".claude"
+    add(user / "CLAUDE.md")
+    for rule in sorted(user.glob("rules/*.md")):
+        add(rule)
+    return found[:PREFIX_MEMORY_FILE_CAP]
+
+
+def _memory_digest(root: Path, cwd: Path) -> str:
+    chunks: list[bytes] = []
+    budget = PREFIX_MEMORY_BYTE_CAP
+    for path in memory_files(root, cwd):
+        try:
+            body = path.read_bytes()[:budget]
+        except OSError:
+            continue
+        chunks += [str(path).encode(), body]  # the path too: a file APPEARING is drift
+        budget -= len(body)
+        if budget <= 0:
+            break
+    return _digest(*chunks) if chunks else PREFIX_UNKNOWN
+
+
+def prefix_fingerprint(root: Path, cwd: Path, wo: dict[str, Any],
+                       env: dict[str, str]) -> dict[str, str]:
+    """One token per ingredient of this work order's prompt prefix.
+
+    A version is recorded VERBATIM and everything else as a digest, because the drift
+    report is read by a person: "2.1.271 -> 2.1.272" is the answer, and a pair of hashes
+    is only the question restated.
+
+    Compared within ONE work order and never across two. That is not a simplification —
+    it is the cache's own scope. A prefix that differs between two conversations costs
+    nothing, since each writes its own entry; a prefix that moves between turn 4 and
+    turn 5 of one conversation re-writes turns 1-4. Comparing across work orders would
+    report the per-work-order lines in the settings file as drift on every dispatch.
+    """
+    from .worker_brief import git_briefing
+
+    settings = (root / ".jarvis" / "worker-settings" / f"{wo['id']}.json")
+    try:
+        settings_bytes = settings.read_bytes()
+    except OSError:
+        settings_bytes = b""
+    briefing = git_briefing(wo.get("model"))
+    standing = wo.get("append_system_prompt") or ""
+    return {
+        "cli_version": claude_cli_version(env),
+        "git_briefing": _digest(briefing.encode(), standing.encode()),
+        "worker_settings": (_digest(settings_bytes) if settings_bytes
+                            else PREFIX_UNKNOWN),
+        "memory": _memory_digest(root, cwd),
+    }
+
+
+def prefix_baseline(root: Path, wo_id: str) -> Path:
+    return root / ".jarvis" / "prefix" / f"{wo_id}.json"
+
+
+def prefix_drift(before: dict[str, str], after: dict[str, str]) -> tuple[str, ...]:
+    """Which ingredients moved. An ingredient unknown on either side is not one of them."""
+    return tuple(
+        name for name in PREFIX_INGREDIENTS
+        if before.get(name, PREFIX_UNKNOWN) != after.get(name, PREFIX_UNKNOWN)
+        and PREFIX_UNKNOWN not in (before.get(name, PREFIX_UNKNOWN),
+                                   after.get(name, PREFIX_UNKNOWN))
+    )
+
+
+def note_prefix(payload: dict[str, Any], env: dict[str, str], root: Path,
+                store: ProjectStore, wo: dict[str, Any]) -> tuple[str, ...]:
+    """SessionStart: record this turn's fingerprint, and the drift since the last one.
+
+    Returns the ingredients that moved, so the caller can say so; `()` covers both "the
+    prefix held" and "there was nothing yet to compare against", which read the same from
+    out here and need no distinction — the first turn of a conversation writes a cold
+    entry either way.
+
+    An EARLY WARNING and not a measurement: `invariants.check_prefix_stable` reads the
+    cache accounting the API itself returned and is the number that wins when the two
+    disagree — see the section comment above for why nothing here can see a boundary.
+
+    Records, and does not alarm. An ingredient changing is ORDINARY: an edit to a
+    project's CLAUDE.md legitimately moves the prefix for every worker in it, so a proxy
+    that raised its own violation here would fire on routine edits and would be a second
+    prefix-drift verdict standing beside `invariants.check_prefix_stable`'s with no rule
+    saying which to believe (Neo q363, and kn-376c88eb is that failure in general).
+    """
+    wo_id = wo["id"]
+    cwd = Path(payload.get("cwd") or env.get("PWD") or ".")
+    current = prefix_fingerprint(root, cwd, wo, env)
+    path = prefix_baseline(root, wo_id)
+    try:
+        loaded = json.loads(path.read_text())
+    except (OSError, ValueError):
+        loaded = None
+    before: dict[str, str] = loaded if isinstance(loaded, dict) else {}
+
+    changed = prefix_drift(before, current) if before else ()
+    if changed:
+        store.add_event(wo_id, "prefix_drift", {
+            "changed": list(changed),
+            "before": {name: before[name] for name in changed if name in before},
+            "after": {name: current[name] for name in changed},
+            "session_id": payload.get("session_id") or "",
+            "source": payload.get("source") or "",
+        })
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(current))
+    return changed
+
+
 # -- surviving compaction ---------------------------------------------------------------
 #
 # Design and the measurements behind it:
@@ -974,6 +1199,14 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
             # where the worker starts talking before the daemon's next tick.
             if store.get_work_order(wo_id)["status"] == "dispatching":
                 store.set_status(wo_id, "running")
+            # ...and the prefix fingerprint, which wants exactly this moment: once per
+            # turn, before the turn's first API call. A failure here is never the
+            # session's problem — the signal is an early warning and the measurement is
+            # elsewhere, so a broken read costs a data point and nothing else.
+            try:
+                note_prefix(payload, env, root, store, wo)
+            except Exception:  # noqa: BLE001
+                pass
 
         elif not _is_current_session(store, wo_id, session_id):
             # A superseded session reporting on itself. Its own end is not the work
