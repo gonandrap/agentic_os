@@ -161,7 +161,8 @@ def section_names() -> list[str]:
 
 def render_section(name: str, *, wo_id: str | None = None,
                    project: str | None = None,
-                   gates_enabled: tuple[str, ...] | None = None) -> str:
+                   gates_enabled: tuple[str, ...] | None = None,
+                   serena: bool = True) -> str:
     """One full section, rendered with real ids when the caller has them.
 
     Read-only and total: every listed name renders non-empty text with placeholders
@@ -177,7 +178,7 @@ def render_section(name: str, *, wo_id: str | None = None,
     if name == "record":
         return record_section(wo)
     if name == "navigation":
-        return navigation_section()
+        return navigation_section(serena)
     if name == "concision":
         return concision_section()
     if name == "knowledge":
@@ -278,7 +279,14 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
     return lines
 
 
-def section_index(wo_id: str, gated: bool) -> list[str]:
+#: The `navigation` hook for a project that has deselected Serena. The index line is in
+#: EVERY worker's opening prompt, so leaving "Serena first" there would advertise a
+#: server the same dispatch removed — `gated` below is the same rule for gates.
+NO_SERENA_HOOK = ("Glob and Grep — how to find code here, and what a text search "
+                  "cannot answer")
+
+
+def section_index(wo_id: str, gated: bool, serena: bool = True) -> list[str]:
     """The map of the full sections, mirroring the knowledge-index pattern."""
     lines = [
         "# Full briefings on demand",
@@ -291,6 +299,8 @@ def section_index(wo_id: str, gated: bool) -> list[str]:
     for name, hook in SECTION_HOOKS.items():
         if name == "gates" and not gated:
             continue  # never point at territory this project does not have
+        if name == "navigation" and not serena:
+            hook = NO_SERENA_HOOK
         lines.append(f"- `{name}` — {hook}")
     return lines
 
@@ -478,15 +488,38 @@ def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
     return "\n".join(lines)
 
 
-def navigation_section() -> str:
+def navigation_section(serena: bool = True) -> str:
     """Serena before grep, for every session Jarvis dispatches.
 
     Prose rather than a capability restriction, and it has to be: a worker needs
     `Grep` and `Bash` for its actual job, so the seats' trick of simply not
-    granting the tool is not available. Stated conditionally because Jarvis knows
-    nothing about Serena — whether a worker has it depends on the user's own Claude
-    configuration and on whether the project is indexed.
+    granting the tool is not available. Stated conditionally because whether a
+    worker has Serena depends on the user's own Claude configuration and on whether
+    the project is indexed.
+
+    `serena=False` is the one case Jarvis DOES know about: the project deselected it
+    on /config, so `dispatch` did not wire it. Recommending it there would send every
+    worker to try a tool the same dispatch removed — so the text changes rather than
+    the worker discovering it.
     """
+    if not serena:
+        return "\n".join([
+            "# Navigating the code: Glob and Grep",
+            "This project does not wire Serena to its workers (`jarvis config wiring "
+            "<project>` says so), so there are no symbol tools in your tool list and "
+            "nothing to activate. `Glob` and `Grep` are the tools for finding code "
+            "here, and there is nothing to apologise for — just expect to work harder "
+            "for a less complete picture than a symbol index would give.",
+            "",
+            "- Search for the DEFINITION spelling, not the mention: `grep -rn \"def "
+            "foo\"` before `grep -rn foo`, and widen only when it misses.",
+            "- Callers are the expensive question here. Grep the bare name, then read "
+            "each hit — a caller that spells it differently (an alias, a getattr, a "
+            "string in a table) is the one text search cannot find, so say what your "
+            "sweep would have missed rather than claiming it was exhaustive.",
+            "- Read a file's imports and its module docstring before its body: on a "
+            "project with a written map, the map is cheaper than the code.",
+        ])
     lines = [
         "# Navigating the code: Serena first, grep second",
         "If this project has Serena (its symbol tools appear in your tool list, or "

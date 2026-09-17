@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -76,7 +77,34 @@ def _rebuild(src: Path, root: Path, leaf: str) -> Path:
     return root
 
 
-def install_agent_assets(project_path: Path, kind: str = "worker") -> list[Path]:
+#: Prepended to a planning seat's definition when the project has deselected Serena.
+#: The seat files are written for a fleet that HAS it — their first instruction is a
+#: Serena call — so an override at the top is what keeps a deselection coherent all the
+#: way into a planner's subagents. The `tools:` entries are stripped beside it: naming an
+#: absent tool is inert, but leaving it there is the settings file granting what the
+#: same dispatch removed (`dispatch._write_worker_settings`).
+NO_SERENA_SEAT_NOTE = (
+    "> **Serena is not wired for this project.** It was deselected on Jarvis's\n"
+    "> /config page, so its symbol tools are not in your tool list and there is\n"
+    "> nothing to activate. Read every instruction below about `activate_project`\n"
+    "> and the symbol tools as already answered: Serena is genuinely unavailable\n"
+    "> here, so use `Glob`, `Grep` and `Read`, and say so in your answer.\n\n"
+)
+
+_SERENA_TOOL_ENTRY = re.compile(r",\s*mcp__(?:plugin_)?serena[A-Za-z0-9_]*")
+
+
+def _strip_serena(text: str) -> str:
+    """A seat definition with its Serena tool grants removed and the note prepended."""
+    head, sep, body = text.partition("---\n")          # opening fence
+    front, sep2, rest = body.partition("\n---\n")      # closing fence
+    if not sep or not sep2:
+        return NO_SERENA_SEAT_NOTE + text  # not front matter we recognise; still honest
+    return f"{head}{sep}{_SERENA_TOOL_ENTRY.sub('', front)}{sep2}\n{NO_SERENA_SEAT_NOTE}{rest}"
+
+
+def install_agent_assets(project_path: Path, kind: str = "worker",
+                         serena: bool = True) -> list[Path]:
     """Materialize the OS-provided agent assets for a work order of `kind`; return the
     directories to hand Claude via `--add-dir`.
 
@@ -99,8 +127,14 @@ def install_agent_assets(project_path: Path, kind: str = "worker") -> list[Path]
     roots = [_rebuild(ASSETS / "skills",
                       project_state_dir(project_path) / "agent-skills", "skills")]
     if kind == "planner":
-        roots.append(_rebuild(ASSETS / "agents",
-                              project_state_dir(project_path) / "agent-seats", "agents"))
+        root = _rebuild(ASSETS / "agents",
+                        project_state_dir(project_path) / "agent-seats", "agents")
+        if not serena:
+            # Safe to rewrite in place: `_rebuild` just dropped and recopied the whole
+            # destination, and it is regenerated on every dispatch.
+            for seat in (root / ".claude" / "agents").glob("*.md"):
+                seat.write_text(_strip_serena(seat.read_text()))
+        roots.append(root)
     return roots
 
 

@@ -13,7 +13,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import bill, fleet, invariants, ops, specs, uilog
+from .. import bill, fleet, invariants, ops, specs, uilog, wiring
 from ..catalog import CatalogError
 from ..central_store import CentralStore
 from ..daemon import daemon_running
@@ -572,6 +572,67 @@ def config_rows(show: dict, setters: dict[str, str], scope: str,
     return rows
 
 
+#: Which of the user's own MCP servers, skills and plugins reach this scope's workers.
+#: The order is the page's: the servers first, because that is the one measured to move
+#: the prompt prefix (kn-809104fc) and therefore the one with a reason to be here.
+WIRING_GROUPS = (
+    ("mcp", "MCP servers",
+     "Every server your Claude configuration has. Deselecting one keeps it out of the "
+     "sessions this scope dispatches — your own Claude configuration is not touched."),
+    ("skill", "Skills",
+     "Your own skills, plus the block Claude Code ships. A plugin's skills follow "
+     "their plugin, in the next group."),
+    ("plugin", "Plugins",
+     "An enabled plugin reaches a worker whole: its MCP servers, its skills and its "
+     "agents. Deselecting it takes all three."),
+)
+
+#: The one row the page has evidence about, so it is the one row that carries any. Kept
+#: to a sentence: the finding's own headline warns against reading it as more than it is
+#: (docs/superpowers/findings/2026-09-14-which-mcp-server-moves-the-prefix.md, finding 1).
+WIRING_EVIDENCE = {
+    wiring.LEVER_CONNECTORS:
+        "Measured: this block precedes a conversation-sized cache write 83.7% of the "
+        "time — the worst of any cohort measured. Nothing cleared any other server.",
+}
+
+
+def wiring_project(scope: str) -> str | None:
+    """The project a /config scope names, or None for the fleet base."""
+    return None if scope == "os" else scope.split(".", 1)[1]
+
+
+def wiring_groups(scope: str, *, refresh: bool = False) -> dict[str, object]:
+    """The wiring section for one scope, or an `error` the page renders instead.
+
+    Total, like every other read this page makes: discovery shells out to the `claude`
+    CLI and reads the user's files, so a machine where that fails must still render the
+    settings table underneath. The failure becomes a line, never a 500.
+    """
+    try:
+        data = ops.wiring_show(project=wiring_project(scope), refresh=refresh,
+                               block=False)
+    except (ops.OpsError, OSError, ValueError) as e:
+        return {"error": str(e), "groups": [], "errors": [], "reading": False}
+    groups = []
+    # ONCE PER LEVER, not once per row: nine claude.ai connectors share one switch, and
+    # the same sentence nine times down the column is how a measurement becomes
+    # wallpaper. It goes on the first row the lever appears on.
+    said: set[str] = set()
+    for kind, title, blurb in WIRING_GROUPS:
+        rows = []
+        for i in (x for x in data["items"] if x.kind == kind):
+            evidence = "" if i.lever in said else WIRING_EVIDENCE.get(i.lever, "")
+            if evidence:
+                said.add(i.lever)
+            rows.append({"item": i, "evidence": evidence})
+        if rows:
+            groups.append({"kind": kind, "title": title, "blurb": blurb, "rows": rows})
+    return {"error": "", "groups": groups, "errors": data["errors"],
+            "reading": data["reading"], "ts": data["ts"],
+            "unwired": data["unwired"], "project": data["project"]}
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None)
 
@@ -1061,7 +1122,7 @@ def create_app() -> FastAPI:
 
     @app.get("/config", response_class=HTMLResponse)
     def config_page(request: Request, a: str = "", b: str = "", scope: str = "",
-                    node: str = "", q: str = ""):
+                    node: str = "", q: str = "", refresh: str = ""):
         """What the fleet is configured to run, who changed it, and what changed.
 
         A form over `jarvis config` — see
@@ -1095,6 +1156,7 @@ def create_app() -> FastAPI:
             except ops.OpsError as e:
                 diff_error = str(e)
         return render(request, "config.html", active="config", show=show,
+                      wiring=wiring_groups(scope, refresh=bool(refresh)),
                       scopes=scopes, scope=scope, node=node, q=q,
                       scope_title=next(s["title"] for s in scopes if s["key"] == scope),
                       # The tree root wants the SHORT name: "os — the fleet" wrapped
@@ -1394,6 +1456,28 @@ def create_app() -> FastAPI:
             sep = "&" if "?" in back else "?"
             # `quote`, not the default `quote_plus`: the flash is read by a human
             # off the address bar as often as by the page.
+            return RedirectResponse(
+                f"{back}{sep}{urlencode({'error': str(e)}, quote_via=quote)}",
+                status_code=303)
+        return RedirectResponse(back, status_code=303)
+
+    @app.post("/config/wiring")
+    def config_wiring(lever: str = Form(...), wired: str = Form(""),
+                      scope: str = Form("os"), back: str = Form("/config")):
+        """Wire or unwire one thing for one scope — `ops.set_wiring` under another name.
+
+        No `reason` box, and that is a decision rather than an omission: a wiring key is
+        not a `SAFETY_KEYS` path. Unwiring only narrows what a worker can reach, and
+        wiring back only restores what the user's own Claude configuration already says
+        — neither widens what a worker is ALLOWED to do, which is what that demand is
+        for (kn-64f4922c: the reason exists to justify a change in permission, and a
+        write that moves none has nothing to put on the row).
+        """
+        back = back if back.startswith("/config") else "/config"
+        try:
+            ops.set_wiring(lever, wired == "1", project=wiring_project(scope))
+        except (ops.OpsError, ValueError, TypeError) as e:
+            sep = "&" if "?" in back else "?"
             return RedirectResponse(
                 f"{back}{sep}{urlencode({'error': str(e)}, quote_via=quote)}",
                 status_code=303)

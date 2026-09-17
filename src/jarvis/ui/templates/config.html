@@ -34,7 +34,7 @@
      a nowrap button sets the table's width from its content, the percentages below are
      advisory, and every rule runs past the panel it is drawn in. `overflow: hidden`
      on the panel is the belt to that braces. */
-  .cfg-panel { overflow: hidden; }
+  .cfg-panel, .wiring-panel { overflow: hidden; }
   .cfg-table { table-layout: fixed; }
   .cfg-table td, .cfg-table th { overflow-wrap: anywhere; }
   .cfg-table td { padding: 7px 12px; }
@@ -86,6 +86,8 @@
   Every setting here is editable, and each save is the same
   <code>jarvis config set</code> the terminal calls — recorded as a version, with a
   reason where one is required.
+  <a href="#wiring">Wiring</a>, below, is the same page's other half: which of your own
+  MCP servers, skills and plugins reach the workers this scope dispatches.
 </p>
 <div class="panel" style="padding: 10px 16px">
   {# `drift` is also true when the ledger is EMPTY, and "edited outside Jarvis" is the
@@ -181,6 +183,70 @@
       {% endfor %}
     </table>
   </div>
+</div>
+
+<h2>Wiring — what reaches {{ 'every project' if scope == 'os' else scope_short }}'s workers</h2>
+<p class="kv">
+  Your own MCP servers, skills and plugins, read from your Claude configuration to fill
+  this list. <strong>Nothing here is written back to it</strong> — a deselection is
+  Jarvis's own setting, and it takes effect when a work order or a feature order is
+  dispatched, never in a session you opened yourself.
+  {% if scope == 'os' %}This is the fleet base: a project inherits it and can deselect
+  more.{% else %}Inherited from the fleet base (<a href="/config?scope=os#wiring">os</a>)
+  unless this project says otherwise.{% endif %}
+  <a href="/config?scope={{ scope|urlencode }}&amp;refresh=1#wiring">re-read my Claude
+  configuration</a>
+</p>
+{# NOT `cfg-panel`: that class is a browser test's locator for the settings pane
+   (`page.locator(".cfg-panel").inner_text()`), and a second match is a strict-mode
+   violation — the `nav a.here` trap of kn-42c52cec, one page later. Same overflow
+   rule under its own name. #}
+<div class="panel wiring-panel" id="wiring">
+  {% if wiring.error %}
+  <div class="empty">could not read your Claude configuration: {{ wiring.error }}</div>
+  {% elif wiring.reading %}
+  {# Not the same claim as an empty list, and the difference matters: `claude mcp list`
+     health-checks every server over the network, so the first read runs behind the page
+     rather than holding it. #}
+  <div class="empty">reading your Claude configuration — reload in a moment</div>
+  {% else %}
+  {% for e in wiring.errors %}<div class="sub tone-warn" style="padding:8px 16px">⚠ {{ e }}</div>{% endfor %}
+  {% for g in wiring.groups %}
+  <div class="cfg-group sub" style="padding:5px 16px; letter-spacing:.05em">{{ g.title }}</div>
+  <div class="sub" style="padding:4px 16px 8px">{{ g.blurb }}</div>
+  <table class="cfg-table">
+    <tr><th style="width:44%">what</th><th style="width:38%">where it comes from</th>
+        <th style="width:18%">wired here</th></tr>
+    {% for r in g.rows %}
+    <tr>
+      <td><span class="mono">{{ r.item.name }}</span>
+        {% if r.item.detail %}<div class="sub">{{ r.item.detail }}</div>{% endif %}
+        {% if r.evidence %}<div class="sub tone-warn">{{ r.evidence }}</div>{% endif %}
+      </td>
+      <td class="sub">{{ r.item.source }}
+        {% if r.item.note %}<div>{{ r.item.note }}</div>{% endif %}</td>
+      <td>
+        {% if r.item.lever %}
+        <form method="post" action="/config/wiring" class="cfg-edit">
+          <input type="hidden" name="lever" value="{{ r.item.lever }}">
+          <input type="hidden" name="scope" value="{{ scope }}">
+          <input type="hidden" name="back" value="{{ here }}">
+          <input type="hidden" name="wired" value="{{ '' if r.item.wired else '1' }}">
+          <span class="cfg-val">{{ '● wired' if r.item.wired else '○ not wired' }}</span>
+          <button>{{ 'unwire' if r.item.wired else 'wire' }}</button>
+        </form>
+        {% else %}
+        <span class="sub">● wired — no lever</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <div class="empty">no MCP servers, skills or plugins found in your Claude
+    configuration</div>
+  {% endfor %}
+  {% endif %}
 </div>
 
 <h2>History</h2>

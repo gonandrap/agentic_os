@@ -66,12 +66,19 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     """
     import json as _json
 
-    from . import agent_usage
-    from .bootstrap import build_settings
+    from . import agent_usage, wiring
+    from .bootstrap import build_settings, deep_merge
     from .paths import jarvis_home
 
     settings = build_settings(project.settings_overrides)
     settings.pop("_jarvis", None)
+
+    # WHAT THE PROJECT DESELECTED on /config, and the only place a deselection takes
+    # effect: the user's own Claude configuration is read to populate that page and
+    # never written. Merged before the rules below so the permission block can ask
+    # whether Serena survived. See `wiring.settings_patch`.
+    settings = deep_merge(settings, wiring.settings_patch(project.wiring))
+    serena = wiring.serena_wired(project.wiring)
 
     # Declarative worker permissions: full edit rights inside its own worktree,
     # read rights over the whole project. Workers default to `auto` mode (which runs
@@ -90,8 +97,11 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # Read-only code navigation. Without these the symbol tools are visible and
         # unrunnable, which is worse than absent: the worker is told to prefer Serena,
         # tries, gets blocked, and either stalls asking for permission it cannot be
-        # granted headlessly or falls back to grep having wasted a call.
-        *serena_allow_rules(),
+        # granted headlessly or falls back to grep having wasted a call. Omitted
+        # entirely when the project has deselected Serena — a rule naming an absent
+        # tool is inert, but a settings file that both removes a server and grants its
+        # tools is the incoherence this feature exists to avoid.
+        *(serena_allow_rules() if serena else ()),
     ):
         if rule not in allow:
             allow.append(rule)
@@ -129,6 +139,12 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # as env rather than being looked up per hook call: the hook runs on every Bash
         # command and must not load and parse the catalog to decide it has nothing to do.
         "JARVIS_GATES": project.gates.to_json(),
+        # Whether the navigation briefing may say "Serena first" — `jarvis brief
+        # navigation` is a separate process and would otherwise recommend a server this
+        # same file has just removed. Travels as env for `JARVIS_GATES`' reason: the
+        # answer is fixed at spawn, and a per-call catalog read would be a second
+        # source of truth that can disagree with the settings beside it.
+        "JARVIS_SERENA": "1" if serena else "0",
         # Buy the 5-minute prompt cache (write 1.25x) instead of the 1-hour one (2x),
         # which Claude Code would otherwise pick for a headless session. Taken from
         # `claude_cli` rather than spelled again: the settings file and the spawn
@@ -263,7 +279,7 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         return _planner_prompt(wo, project, knowledge)
     if wo.get("kind") == "manager":
         return _manager_prompt(wo, project, knowledge, feature)
-    from . import worker_brief
+    from . import wiring, worker_brief
     from .gates import KINDS
 
     live_gates = tuple(k.name for k in KINDS
@@ -292,7 +308,8 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         *worker_brief.core_contract(wo["id"], wo["title"], project.name,
                                     bool(knowledge), live_gates),
         "",
-        *worker_brief.section_index(wo["id"], gated=bool(project.gates)),
+        *worker_brief.section_index(wo["id"], gated=bool(project.gates),
+                                    serena=wiring.serena_wired(project.wiring)),
     ]
     pre_approved = _pre_approval(wo)
     if pre_approved:
@@ -308,13 +325,13 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
     return "\n".join(parts)
 
 
-def _navigation_briefing() -> list[str]:
+def _navigation_briefing(serena: bool = True) -> list[str]:
     """Serena before grep — the full text lives in `worker_brief` (single source
     with `jarvis brief navigation`); this shape survives for the planner's
     `_common_briefing` tail."""
     from . import worker_brief
 
-    return worker_brief.navigation_section().splitlines()
+    return worker_brief.navigation_section(serena).splitlines()
 
 
 def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
@@ -326,7 +343,9 @@ def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
     index are the parts a worker still gets inline, composed in
     `build_worker_prompt` directly.
     """
-    parts += ["", *_navigation_briefing()]
+    from . import wiring
+
+    parts += ["", *_navigation_briefing(wiring.serena_wired(project.wiring))]
     pre_approved = _pre_approval(wo)
     if pre_approved:
         parts += ["", *_pre_approved_briefing(pre_approved)]
