@@ -155,6 +155,24 @@ SETTLED_VERDICTS = (LANDED, NOT_PRODUCED)
 #: credential appears in anything git prints. See `_scrub`.
 _CREDENTIALS_RE = re.compile(r"://[^/\s@]+@")
 
+#: What a failed fetch was about, and the phrases that say so. An allowlist over text the
+#: REMOTE controls — see `_cause`. Lower-cased needles; first match wins, so the order is
+#: the specific before the general ("not found" would otherwise claim an auth failure
+#: whose message happens to mention a missing branch).
+_FETCH_CAUSES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("the remote refused our credentials",
+     ("authentication failed", "could not read username", "could not read password",
+      "permission denied", "invalid username or password", "access denied",
+      "terminal prompts disabled")),
+    ("the remote could not be reached",
+     ("could not resolve host", "failed to connect", "connection refused",
+      "connection timed out", "network is unreachable", "operation timed out",
+      "no route to host", "ssl certificate problem")),
+    ("the remote has no such repository or ref",
+     ("repository not found", "does not appear to be a git repository",
+      "couldn't find remote ref", "not our ref", "remote branch")),
+)
+
 #: A GitHub pull-request URL sitting in prose. Mode A of issue #232: four work orders
 #: finished with a summary that NAMED a draft pull request and passed no `--pr`, so
 #: `pr_url` stayed NULL and no poller ever watched it. Anchored on `/pull/<n>` rather
@@ -624,6 +642,15 @@ def _fetch(repo: Path, remote: str, branch: str) -> bool:
 
     Never raises. A failure here is `base_current=False`, which is `UNKNOWN` — the
     verdict that costs a sweep its answer and never a branch its reputation.
+
+    **IT DOES NOT QUOTE THE REMOTE.** A failing fetch prints the remote URL back at you —
+    "fatal: Authentication failed for 'https://x-access-token:<token>@github.com/…'" — so
+    a project whose `origin` carries a token in its URL would write that token into the
+    daemon's log once an hour, for ever, and daemon text leaves this machine through
+    alarms and `jarvis bug report`. Scrubbing that message would be a denylist over text
+    the remote controls; `_cause` is an allowlist instead, and it is the only thing about
+    the failure that reaches a warning. The message itself is kept for whoever is
+    debugging, at DEBUG, and scrubbed even there.
     """
     spec = f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"
     try:
@@ -632,28 +659,46 @@ def _fetch(repo: Path, remote: str, branch: str) -> bool:
                               errors="replace", check=False,
                               timeout=FETCH_TIMEOUT_SECONDS)
     except (OSError, subprocess.SubprocessError) as exc:
-        log.warning("could not refresh %s in %s: %s", spec, repo, _scrub(str(exc)))
+        # Python's own text about a command whose argv holds a remote NAME, never a URL.
+        # Scrubbed regardless: this is the branch nobody re-reads before adding to it.
+        log.warning("could not refresh %s in %s: %s", spec, repo,
+                    _scrub(str(exc))[:200])
         return False
     if proc.returncode != 0:
         log.warning("refreshing %s in %s exited %d: %s", spec, repo, proc.returncode,
-                    _scrub(proc.stderr.strip())[:200])
+                    _cause(proc.stderr))
+        log.debug("refreshing %s in %s said: %s", spec, repo,
+                  _scrub(proc.stderr.strip())[:500])
         return False
     return True
 
 
+def _cause(stderr: str) -> str:
+    """What a failed fetch was ABOUT, in this module's own words.
+
+    An ALLOWLIST, and that is the whole point: `_fetch`'s message is the one text here a
+    remote controls, so nothing of it is repeated — a phrase is recognised and a fixed
+    string of ours is logged. A scrub is a denylist and only removes the leak somebody
+    already thought of; this cannot leak whatever a future host decides to print.
+
+    The four causes are the ones that change what a reader does — fix the credentials,
+    fix the URL, wait, look harder — which is what a warning is for. "an unrecognised
+    error" is a real answer and not a shrug: it says the sweep is not measuring, and the
+    message behind it is one `--debug` away.
+    """
+    low = stderr.lower()
+    for cause, needles in _FETCH_CAUSES:
+        if any(needle in low for needle in needles):
+            return cause
+    return "an unrecognised error"
+
+
 def _scrub(text: str) -> str:
-    """`text` with any URL userinfo replaced, for anything that reaches the log.
+    """`text` with any URL userinfo replaced, for anything of the remote's that is kept.
 
-    THE FAILING FETCH IS THE ONE THAT QUOTES THE REMOTE URL BACK AT YOU — "fatal:
-    Authentication failed for 'https://x-access-token:<token>@github.com/…'" — so the one
-    branch that logs a remote's own words is also the one where a project whose `origin`
-    carries a token in its URL would write that token into the daemon's log. Truncation
-    is no help: the URL is on the first line. Credentials only ever appear as userinfo,
-    which is why one pattern covers it rather than a list of message shapes.
-
-    The rest of the message is kept. A refusal, a missing repository and an unreachable
-    host all read differently and a sweep that stopped working would otherwise be a
-    returncode with no cause.
+    Credentials only ever appear as userinfo, which is why one pattern covers it rather
+    than a list of message shapes. Second line of defence only — what reaches a WARNING
+    is `_cause`, which repeats nothing.
     """
     return _CREDENTIALS_RE.sub("://<redacted>@", text)
 

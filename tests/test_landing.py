@@ -536,34 +536,43 @@ def test_a_stale_base_keeps_the_partial_that_rests_on_a_dirty_worktree(repo):
 
 
 def test_a_failed_refresh_never_logs_a_credential_out_of_the_remote_url(repo, caplog):
-    """The failing fetch is the one that quotes the remote URL back at you, and this log
-    call is the only thing on this path that puts a remote's own words into the log.
+    """A failing fetch prints the remote URL back at you, and this sweep runs hourly.
 
-    TWO ASSERTIONS BECAUSE ONE CANNOT COVER IT. End to end, a real failed fetch against a
-    credentialed remote must carry nothing secret into the record — but which message git
-    chooses is git's business, and the connection failure it emits here happens to redact
-    the userinfo itself. The message it does NOT redact is the authentication failure,
-    which cannot be provoked without a server that refuses a login, so the scrubber is
-    held to that string directly. Quoted verbatim from git rather than paraphrased: a
-    redaction test written against an invented message tests the invention.
+    So a project whose `origin` carries a token would write it to the log once an hour
+    for ever, and daemon text leaves the machine through alarms and `jarvis bug report`.
+    Captured at DEBUG, not WARNING: "does not appear in any emitted record" has to mean
+    any, and the message is kept at DEBUG for whoever is debugging.
+
+    THE SECOND HALF IS WHAT MAKES THE FIRST MEAN ANYTHING. Which message git chooses is
+    git's business — the connection failure provoked here happens to redact the userinfo
+    itself, so this assertion would pass against code that logged stderr raw. The
+    message git does NOT redact is the authentication failure, and it cannot be provoked
+    without a server that refuses a login, so `_cause` is held to that string directly,
+    quoted verbatim rather than invented.
     """
-    secret = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
+    secret = "ghp_FAKETOKEN0123456789abcdefghijklmnop"
+    # Port 1 rather than 443 so the connection fails at once instead of after a timeout.
     _git(repo.path, "remote", "set-url", "origin",
          f"https://x-access-token:{secret}@127.0.0.1:1/acme/proj.git")
 
-    with caplog.at_level("WARNING", logger="jarvis.landing"):
+    with caplog.at_level("DEBUG", logger="jarvis.landing"):
         assert landing.refresh_base(repo.path) is False
 
-    logged = "\n".join(r.getMessage() for r in caplog.records)
-    assert secret not in logged
-    assert "127.0.0.1" in logged      # ...and the reason it failed is still readable
+    assert caplog.records
+    for record in caplog.records:
+        assert secret not in record.getMessage()
+        assert "x-access-token" not in record.getMessage()
+    warnings = "\n".join(r.getMessage() for r in caplog.records
+                         if r.levelname == "WARNING")
+    # Nothing of the remote's own text, and still a cause a reader can act on.
+    assert "127.0.0.1" not in warnings
+    assert "could not be reached" in warnings
 
-    scrubbed = landing._scrub(
-        f"fatal: Authentication failed for "
-        f"'https://x-access-token:{secret}@github.com/acme/proj.git/'")
-    assert secret not in scrubbed
-    assert scrubbed.endswith("'https://<redacted>@github.com/acme/proj.git/'")
-    assert scrubbed.startswith("fatal: Authentication failed for")
+    verbatim = (f"fatal: Authentication failed for "
+                f"'https://x-access-token:{secret}@github.com/acme/proj.git/'")
+    assert landing._cause(verbatim) == "the remote refused our credentials"
+    assert secret not in landing._cause(verbatim)
+    assert secret not in landing._scrub(verbatim)      # the DEBUG line's second defence
 
 
 def test_a_refresh_that_cannot_run_is_false_rather_than_an_error(repo, tmp_path):
