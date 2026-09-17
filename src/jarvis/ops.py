@@ -16,7 +16,7 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from . import landing
@@ -2035,14 +2035,62 @@ def force_validation(wo_id: str, *, reason: str,
         store.close()
 
 
+def prior_round_history(store: ProjectStore, *, wo_id: str | None = None,
+                        fo_id: str | None = None,
+                        before: int) -> list[dict[str, Any]]:
+    """What earlier rounds of this unit's review asked for, for `EvidencePacket.history`.
+
+    Here rather than in `evidence` for `collect_feature_evidence`'s reason: it is two
+    store reads per round, and that module may not touch a store.
+
+    **BLOCKERS ONLY, and `validation.blockers(validation.findings(...))` is what decides
+    which** — the same pair the chair's own prompt is built with, never a second reader.
+    A reader that classified even slightly differently would put a follow-up into the
+    shared prefix, which `_run_chair` hands the chair (spec
+    docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md §5.2.1).
+
+    **Only the rounds the budget counted.** `pending` is a round in flight and `failed` is
+    an outage or a panel that was never wired in, so its stored reason is about the OS
+    rather than about the code — rendering either under "these points were raised" would
+    tell five seats something false about the submission.
+
+    A round whose opinions yield no blocker still earns an entry: the round row's own
+    `outcome` and `reason` are what the submitter was actually told, and every opinion
+    stored before this feature — and every one an injected validator writes — is prose
+    that parses to no findings at all.
+    """
+    from . import validation
+    from .project_store import COUNTED_VALIDATION_OUTCOMES
+
+    out: list[dict[str, Any]] = []
+    for r in store.validation_rounds(wo_id=wo_id, fo_id=fo_id):
+        if int(r["round"]) >= before:
+            continue
+        if str(r["outcome"] or "") not in COUNTED_VALIDATION_OUTCOMES:
+            continue
+        raised: list[dict[str, str]] = []
+        for op in store.validation_opinions(int(r["id"])):
+            raised += validation.blockers(validation.findings(op))
+        out.append({"round": int(r["round"]), "outcome": str(r["outcome"] or ""),
+                    "reason": str(r["reason"] or ""),
+                    "head_sha": str(r["head_sha"] or ""), "blockers": raised})
+    return out
+
+
 def collect_feature_evidence(store: ProjectStore, project_path: Path,
                              fo: dict[str, Any], *, declared: str, summary: str,
-                             cfg: Any) -> Any:
+                             cfg: Any,
+                             history: Iterable[dict[str, Any]] = ()) -> Any:
     """The feature's packet, with each child's own account attached.
 
     Here rather than in `evidence` because assembling `children` is a store read per
     child, and that module may not touch a store — its whole value is that nothing it
     reports could have been influenced by the work it is reporting on.
+
+    `history` is a PARAMETER and defaults to nothing on purpose: both callers pass
+    through here, and only the daemon's — the packet the seats actually read — carries it.
+    `submit_feature_for_validation` builds a packet to fingerprint, and `history` is
+    excluded from that hash (spec 2026-09-15 §5.1).
 
     A child contributes what its OWN last validation round was told, not what it wrote
     into its pull request: that text was already judged once, so a feature seat comparing
@@ -2059,7 +2107,8 @@ def collect_feature_evidence(store: ProjectStore, project_path: Path,
     return evidence_mod.collect_feature(project_path, fo, children, declared=declared,
                                         summary=summary, diff_chars=cfg.diff_chars,
                                         side_effects=feature_side_effects(store,
-                                                                          fo["id"]))
+                                                                          fo["id"]),
+                                        history=history)
 
 
 def submit_feature_for_validation(store: ProjectStore, project_path: Path,

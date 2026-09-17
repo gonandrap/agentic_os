@@ -37,7 +37,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import claude_cli, ops
+from jarvis import claude_cli, ops, validation
 from jarvis.catalog import load_catalog
 from jarvis.daemon import VALIDATION_ESCALATED_TITLE, Daemon
 from jarvis.invariants import VALIDATION_STUCK_BLOCKER
@@ -703,6 +703,38 @@ def test_the_round_counter_does_not_reset_when_the_feature_goes_back_to_executin
         assert len(envelopes(store)) == 2
     finally:
         store.close()
+
+
+def test_a_features_second_round_carries_what_its_first_one_asked_for(fleet):
+    """THE FEATURE CALL SITE, which the work-order tests cannot reach. `_validate_feature`
+    builds its packet through `ops.collect_feature_evidence`, so the history travels a
+    different path here and a wiring that was only done on the work-order side would leave
+    a feature's round 2 as blind as its round 1.
+
+    Paired with round 1, whose packet must carry no history section at all."""
+    validator = Validator(rejected(), passed())
+    fleet.daemon.validator = validator
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+        fleet.drain()
+
+        fleet.merge("fix.py", "# what the review actually asked for\n")
+        assert ops.submit_feature(fo_id, "round 2", evidence="ran the suite")[
+            "round"] == 2
+        fleet.drain()
+        assert [r["round"] for r in store.validation_rounds(fo_id=fo_id)] == [1, 2]
+    finally:
+        store.close()
+
+    first, second = (validation.build_packet_prompt(c["packet"])
+                     for c in validator.calls[:2])
+    assert validation.HISTORY_HEADING not in first
+    assert "the exporter and its caller disagree about the header row" not in first
+    assert validation.HISTORY_HEADING in second
+    assert "the exporter and its caller disagree about the header row" in second
 
 
 def test_a_repeated_fingerprint_escalates_without_calling_the_panel(fleet):

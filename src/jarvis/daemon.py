@@ -1299,7 +1299,13 @@ class Daemon:
                 project.path, wo, declared=str(round_row["evidence"] or ""),
                 diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo),
                 side_effects=ops.side_effects_of(wo_id),
-                assumptions=store.all_assumptions(wo_id))
+                assumptions=store.all_assumptions(wo_id),
+                # WHAT EARLIER ROUNDS ALREADY ASKED FOR, so a seat cannot re-litigate
+                # settled ground or read an instruction it was given as a defect. ONLY
+                # this packet carries it — the one `ops.submit_for_validation` builds
+                # exists to be fingerprinted, and `history` is excluded from that hash
+                # (spec 2026-09-15-the-panel-blocks-on-blockers.md §5.1, §5.5).
+                history=ops.prior_round_history(store, wo_id=wo_id, before=n))
             # WHICH COMMIT THIS ROUND IS JUDGING, recorded before any verdict exists and
             # whatever the verdict turns out to be: it is a fact about the packet, and a
             # rejection that recorded nothing could not later say what it rejected. `""`
@@ -1619,7 +1625,8 @@ class Daemon:
             # because reading this line alone makes the feature path look half-wired.
             packet = ops.collect_feature_evidence(
                 store, project.path, fo, declared=str(round_row["evidence"] or ""),
-                summary=str(round_row["summary"] or ""), cfg=cfg)
+                summary=str(round_row["summary"] or ""), cfg=cfg,
+                history=ops.prior_round_history(store, fo_id=fo_id, before=n))
 
             validator = (self.validator if self.validator is not None
                          else self._validator(cfg))
