@@ -502,6 +502,67 @@ def test_a_partly_landed_order_is_reported_and_its_verdict_is_never_cached(
     assert len(_violations(project)) == 1      # ...and it is still reported until then
 
 
+def _base_sha(project: Path) -> str:
+    return _git(project, "rev-parse", "origin/trunk").strip()
+
+
+def test_the_sweep_refreshes_the_default_branch_and_is_silent_on_what_just_merged(
+        started, project):
+    """ISSUE #271 END TO END, through the one caller that computes `base_current`.
+
+    `tests/test_landing.py` proves the detector's half; this is the production path, and
+    it is the one the bug was actually reported against. A merge is detected over the
+    NETWORK — the poll asks GitHub, `complete_merged` ends the work order — while
+    `refs/remotes/origin/trunk` in this clone still points at the commit before the
+    squash, because nothing in the OS had ever moved it. The rewind is exactly that
+    state: origin holds the merge, the remote-tracking ref does not.
+
+    The sweep used to report the order that had just landed as `stranded`, with a
+    coverage figure near zero, every hour until a human happened to fetch. Both halves
+    of the fix are asserted here because neither is visible in the other's absence:
+    the repairing run MOVES the ref and then settles `landed`, and the read-only run
+    LEAVES IT ALONE and settles nothing.
+
+    "No violation" pins the read-only verdict to `unknown` rather than to `landed`:
+    against a base that predates the merge the branch's lines are nowhere, so the only
+    coverage answers reachable are `stranded` — which is the bug — and the `stale-base`
+    `unknown` that replaced it. There is no arithmetic by which a stale base scores this
+    branch as landed.
+    """
+    wo = _order(project, "launcher contract", code="launcher")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR)
+    merged_sha = _git(wo["worktree_path"], "rev-parse", "HEAD").strip()
+    stale = _base_sha(project)
+    _git(project, "merge", "--squash", "-q", f"worktree-{wo['id']}")
+    _git(project, "commit", "-qm", f"[{wo['id']}] launcher contract (#9)")
+    _git(project, "push", "-q", "origin", "trunk")
+    store = ProjectStore(project)
+    try:
+        ops.complete_merged(store, store.get_work_order(wo["id"]),
+                            merged_at="2026-08-02T10:00:00Z", head_oid=merged_sha)
+    finally:
+        store.close()
+    # The clone that never fetched. `push` updated the remote-tracking ref on the way
+    # past, which is a fixture artefact and not what a merge on GitHub does.
+    _git(project, "update-ref", "refs/remotes/origin/trunk", stale)
+
+    store = ProjectStore(project)
+    try:
+        read_only = [v for v in invariants.check_project(store, repair=False, slow=True)
+                     if v.invariant == "INV-WORK-LANDED"]
+    finally:
+        store.close()
+
+    assert read_only == []
+    assert _base_sha(project) == stale        # it may not write to a repository
+    assert _events(project, wo["id"], "landing_checked") == []   # and settled nothing
+
+    assert _violations(project) == []
+    assert _base_sha(project) != stale        # ...whereas the repairing run refreshed
+    [cached] = _events(project, wo["id"], "landing_checked")
+    assert json.loads(cached["payload"])["verdict"] == landing.LANDED
+
+
 def test_an_order_the_user_marked_done_is_not_reported_by_the_sweep_for_ever(
         started, project):
     """`jarvis wo done` is a decision, and the sweep has to read it as one.
