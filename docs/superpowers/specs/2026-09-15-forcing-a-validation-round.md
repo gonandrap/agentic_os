@@ -180,3 +180,36 @@ indistinguishable from one never cleared.
 The boundary has its own test: a forced round that escalates *again* flags the user
 afresh. The flag comes down because the machine took the question back, not because
 forcing a round is a way to silence it.
+
+## 7. The repeat-submission guard is exempted, and the fingerprint is not touched
+
+*Added 2026-09-16 in wo-5fb24ace, after issue #272: the command shipped as a no-op for the
+whole population it was written for.*
+
+`Daemon._validate_work_order` escalates a round whose fingerprint equals the immediately
+preceding round's — "this submission is identical to round N". §1 above is the case where
+that always fires: the round before recorded no commit, so **nothing about the branch
+needs to have changed**, and the fingerprint (`diff_sha + side_effects_sha + declared`,
+kn-6f15bba2) is identical by construction. The forced round settled `escalated` with no
+seat having opined, the work order went back to `needs_review` in the state it was already
+in, and the round number was spent. Same for a round forced because the panel
+configuration moved.
+
+**A forced round is exempt.** The guard's subject is a SUBMITTER re-delivering unchanged
+work in answer to feedback; `validation force` has no submitter, and its `--reason` says
+the judgement is what changed. `Daemon._repeat_submission(round_row, previous)` is the
+single home of the rule and returns `False` for any round carrying a `forced_reason` —
+both loops call it, so a feature round that becomes forceable does not have to remember
+this separately.
+
+**The alternative — adding the panel configuration to the fingerprint — is refused.**
+`evidence.fingerprint` hashes exactly the evidence, and every field deliberately left out
+(`head`, `base`, `summary`, `pr_url`) is one a submitter can move *without producing any*;
+`config_version` is such a field and already has its own column on the round. Hashing it
+would also make the next ordinary round of every open work order read as new evidence the
+first time a config lands — silently, with no error anywhere (kn-6f15bba2's digest trap,
+by a new door).
+
+**What is NOT exempted**: the empty-submission guard above it. A forced round over a
+packet with no files and no side effects still has nothing to judge, and the reason it was
+forced does not change that.

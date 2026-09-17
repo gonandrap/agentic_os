@@ -1395,7 +1395,7 @@ class Daemon:
             # earlier round it would punish a submitter that was told to go back to a
             # shape it had already tried, which is a legitimate answer to feedback.
             previous = self._preceding_round(store, n, wo_id=wo_id)
-            if previous and previous["fingerprint"] == round_row["fingerprint"]:
+            if self._repeat_submission(round_row, previous):
                 self._escalate(
                     store, wo, round_id, n,
                     f"this submission is identical to round {previous['round']} — the "
@@ -1445,6 +1445,32 @@ class Daemon:
             log.exception("[%s] validating %s failed", project.name, wo_id)
         finally:
             store.close()
+
+    @staticmethod
+    def _repeat_submission(round_row: dict[str, Any],
+                           previous: dict[str, Any] | None) -> bool:
+        """Is this round the SAME SUBMISSION as the one before it, with nothing new?
+
+        A round a PERSON forced is never one, whatever it hashes to. The guard is about a
+        SUBMITTER re-delivering unchanged work in answer to feedback; `jarvis validation
+        force` has no submitter, and its stated reason is that the JUDGEMENT changed —
+        the missing commit of spec 2026-09-14 §5.2, or a panel configuration that has
+        moved since. The branch is therefore unchanged BY CONSTRUCTION in every case the
+        command exists to serve, so the fingerprints always match and the recovery it
+        offers was a no-op that spent a round (issue #272, spec
+        docs/superpowers/specs/2026-09-15-forcing-a-validation-round.md §7).
+
+        The panel configuration is NOT the alternative fix: `evidence.fingerprint` hashes
+        exactly the evidence and nothing a submitter can move without producing any
+        (kn-6f15bba2), and `config_version` is already its own column beside it.
+
+        Shared by both loops so the rule has one home — a feature round cannot be forced
+        today, and the copy in `validate_features` is how that stops being true quietly.
+        """
+        if str(round_row["forced_reason"] or "").strip():
+            return False
+        return (previous is not None
+                and previous["fingerprint"] == round_row["fingerprint"])
 
     @staticmethod
     def _preceding_round(store: ProjectStore, n: int, *, wo_id: str | None = None,
@@ -1728,7 +1754,7 @@ class Daemon:
                 return
 
             previous = self._preceding_round(store, n, fo_id=fo_id)
-            if previous and previous["fingerprint"] == round_row["fingerprint"]:
+            if self._repeat_submission(round_row, previous):
                 self._escalate_feature(
                     store, fo, round_id, n,
                     f"this submission is identical to round {previous['round']} — the "
