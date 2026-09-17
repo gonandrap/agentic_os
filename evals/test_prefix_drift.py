@@ -291,27 +291,52 @@ def test_rebuilding_the_agent_assets_changes_nothing(tmp_path, jarvis_home):
     assert tree() == first
 
 
-@scenario("prefix-drift", "the precedence over the authoritative measurement is stated")
-def test_this_battery_names_the_signal_that_outranks_it():
-    """Two prefix-drift signals in one tree with no stated precedence is kn-376c88eb: a
-    later reader trusts whichever they found first. So the rule lives in the code that
-    computes each verdict — this module's own failure message on one side, the
-    invariant's docstring on the other — and both halves are held here, because a
-    reference that silently stops resolving is how the rule quietly ceases to exist.
-    """
-    import inspect
+#: A cohort that trips the prefix ceiling, so `check_prefix_stable` renders its message.
+#: The numbers are arbitrary and only have to clear both volume floors and the ceiling;
+#: what is being read is the TEXT, and the arithmetic behind it belongs to
+#: tests/test_cache_health.py.
+_FIRING_COHORT = dict(orders=25, cache_write=1_000_000, ttl_write=100_000,
+                      prefix_write=500_000, boundaries=100, ttl_boundaries=20)
 
+
+@scenario("prefix-drift", "the authority this battery defers to still resolves")
+def test_the_signal_that_outranks_this_one_still_exists():
+    """`AUTHORITY` is the whole precedence rule in one string, and a string cannot fail
+    to resolve on its own. Renaming or deleting the invariant would otherwise leave this
+    module confidently deferring to nothing — kn-376c88eb, where two surfaces disagree
+    about one fact and nothing says which wins.
+
+    The invariant's own DOCSTRING half of the rule is held by
+    tests/test_cache_health.py::test_prefix_stability_is_written_down_as_the_authoritative_measurement.
+    One clause, one owner.
+    """
     from jarvis import invariants
 
     module, _, name = AUTHORITY.rpartition(".")
     assert module == invariants.__name__.rpartition(".")[2]
-    check = getattr(invariants, name, None)
-    assert callable(check), f"{AUTHORITY} no longer exists"
+    assert callable(getattr(invariants, name, None)), f"{AUTHORITY} no longer exists"
 
-    source = inspect.getsource(check)
-    assert "AUTHORITATIVE MEASUREMENT" in (check.__doc__ or ""), "the authority stopped claiming it"
-    # and the other direction: INV-PREFIX-DRIFT's own violation text sends the triaging
-    # reader here, because green here with that red rules this tree out and leaves the
-    # CLI and the MCP servers — which is the first thing worth knowing.
-    assert "evals/test_prefix_drift.py" in source, (
-        "the authoritative invariant no longer points at this battery")
+
+@scenario("prefix-drift", "the authority's violation sends its reader to this battery")
+def test_the_violation_a_triaging_reader_sees_points_here(monkeypatch):
+    """The OTHER half of the reference, and the one with a reader: INV-PREFIX-DRIFT's
+    rendered `detail` is what the daily doctor order reads when it triages, and it is the
+    only place the two signals are ever put side by side. Green here beside red there
+    rules this tree out and leaves the CLI or an MCP server, which is the first thing
+    worth knowing — so the sentence saying it is load-bearing, not decoration.
+
+    Asserted on the RENDERED message rather than on the function's source, because the
+    source carries the docstring too and a grep over it passes on either mention alone
+    (review round 1). Driven through a synthetic cohort so this stays a text assertion:
+    whether the threshold is right is tests/test_cache_health.py's question.
+    """
+    from jarvis import bill, catalog, invariants
+
+    writes = bill.CacheWrites(**_FIRING_COHORT)
+    monkeypatch.setattr(invariants, "_cache_health",
+                        lambda: (catalog.OsConfig(), writes))
+
+    found = list(invariants.check_prefix_stable())
+    assert len(found) == 1, "the synthetic cohort no longer trips the ceiling"
+    assert "evals/test_prefix_drift.py" in found[0].detail, (
+        "INV-PREFIX-DRIFT no longer points a triaging reader at this battery")

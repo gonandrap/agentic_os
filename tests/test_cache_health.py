@@ -340,7 +340,8 @@ def test_prefix_stability_is_written_down_as_the_authoritative_measurement():
     assert "AUTHORITATIVE" in doc
     assert "hashing the rendered system prompt" in doc     # the session-start hook
     assert "recorded baseline" in doc                      # a snapshot-style proxy
-    assert "which region of the rendered prompt" in doc     # evals/test_prefix_drift.py
+    assert "which region of the rendered prompt" in doc     # the structural proxy
+    assert "evals/test_prefix_drift.py" in doc              # named, so it resolves
     assert "the API ITSELF reported" in doc                # why this one wins
 
 
