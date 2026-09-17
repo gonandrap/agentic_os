@@ -156,10 +156,12 @@
     </div>
     {% endif %}
   {% endif %}
-  {# What a `waiting_input` work order is actually waiting for, flagged or not. Its status
+  {# What a parked work order is actually waiting for, flagged or not. `waiting_input`
      reads "Waiting on you" everywhere, and for the whole time Neo holds its question that
-     is simply false. #}
-  {% if wo.status == 'waiting_input' and waiting.what != 'prompt' %}
+     is simply false. `idle` no longer lies about it in the status (issue #264), but the
+     reader still wants the sentence — a page saying only "idle" invites the nudge the
+     status exists to stop. #}
+  {% if wo.status in ('waiting_input', 'idle') and waiting.what != 'prompt' %}
     <p class="sub"><span class="i">◔</span>{{ waiting.detail }}</p>
   {% endif %}
   {% if wo.result_summary %}

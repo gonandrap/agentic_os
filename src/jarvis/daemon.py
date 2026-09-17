@@ -1119,11 +1119,16 @@ class Daemon:
             # `_park_on_signin`, and since issue #259 an order that was already settled
             # when its turn was refused.
             #
-            # `running` IS REQUIRED FOR THE SECOND, not merely tidier. All three statuses
+            # `running` IS REQUIRED FOR THE SECOND, not merely tidier. The statuses
             # issue #259 added are in `PR_POLL_STATUSES`, which excludes the in-flight
             # ones precisely so `complete_merged` cannot end a work order out from under
             # a worker that is still writing to it — so leaving a relaunched order where
             # it was would put a live turn back in front of that poll.
+            #
+            # `idle` is required for a third reason (issue #264): it asserts that this
+            # manager has nothing to act on, which `ops.waiting_on` reports verbatim and
+            # `resume-auto` refuses to nudge on. A live turn reading `idle` would be the
+            # OS confidently describing a state it had just contradicted.
             if wo["status"] != "running":
                 store.set_status(wo["id"], "running")
                 # ONLY THE PAUSE'S OWN FLAG. `_park_on_signin` is the one that raises an
@@ -2953,8 +2958,14 @@ class Daemon:
         for turn in worker_session.poll(store):
             log.info("[%s] turn %s of %s ended: %s", project.name, turn["seq"],
                      turn["wo_id"], turn["state"])
+        # `idle` is in the sweep, and it is what MIGRATES the managers this release
+        # finds already parked in `waiting_input` (issue #264): each one falls through
+        # to the manager branch below on the first tick and is re-statused, before the
+        # invariant pass that would otherwise read it as blocked on the user. It also
+        # keeps an idle manager reachable by the branch that closes it when its feature
+        # settles.
         for wo in store.list_work_orders(
-                statuses=("running", "waiting_input", "dispatching")):
+                statuses=("running", "idle", "waiting_input", "dispatching")):
             if wo["origin"] in UNGOVERNED_ORIGINS:
                 continue  # not ours to run; track_injected_sessions follows these
             try:
@@ -2964,7 +2975,7 @@ class Daemon:
 
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
                           wo: dict) -> None:
-        from .invariants import awaiting_neo
+        from .invariants import awaiting_neo, something_is_out, true_blockers
 
         if wo["status"] == "validating":
             # THE ROUND MACHINE OWNS THIS WORK ORDER. Everything below re-derives the
@@ -3115,6 +3126,15 @@ class Daemon:
             # never finishes itself either: `_close_feature_manager` completes it when
             # its feature settles.
             #
+            # `idle`, NOT `waiting_input`, since issue #264. This branch used to park it
+            # in the status that means "blocked on the user", which every surface renders
+            # "Waiting on you" and which `ops.waiting_on` could explain only as an
+            # unanswered permission prompt — impossible under the `auto` mode the fleet
+            # runs. Suppressing the FLAG was never enough: six other surfaces re-derive
+            # meaning from the status alone, which is kn-cffc8905's trap paid a third
+            # time. A manager that genuinely ASKED for something stays in
+            # `waiting_input`, which is where it belongs — see the guard below.
+            #
             # UNLESS ITS FEATURE IS ALREADY OVER, and that ordering is one the feature
             # round machine makes reachable. A manager is created `pending` and claimed
             # by `dispatch_pending`; a feature settling on the VALIDATE thread can close
@@ -3128,8 +3148,36 @@ class Daemon:
             feature = store.get_feature_order(parent) if parent else None
             if feature and feature["status"] in FO_TERMINAL_STATUSES:
                 self._close_feature_manager(store, str(parent))
-            elif fresh["status"] != "waiting_input":
-                store.set_status(wo["id"], "waiting_input")
+            elif something_is_out(store, wo["id"]):
+                # HOLD IT WHERE IT IS. `waiting_input` is the only carrier of the fact
+                # that this manager ASKED for something, and re-statusing it `idle` would
+                # say the opposite — nothing to act on — about an order waiting for a
+                # verdict: muted, out of FEATURED_STATUSES, and refused a nudge.
+                #
+                # NOT LEFT TO THE BRANCH ORDER ABOVE, which is two thirds of the same
+                # question and looks like all of it. That `elif` reads `pending_approvals`
+                # and misses `awaiting_case` — a gate request the worker filed by running
+                # the command before arguing it, which `gates.file_request` parks here
+                # just the same. Under the old code missing it cost nothing, because this
+                # branch's write was `waiting_input` either way; since issue #264 it is a
+                # rewrite, so the predicate has to be the whole one. `something_is_out` is
+                # that predicate, shared with `invariants.end_wait_if_nothing_is_out` so
+                # the two cannot drift (kn-4ea33fe6).
+                pass
+            elif fresh["status"] != "idle":
+                store.set_status(wo["id"], "idle")
+                # The one write the re-status cannot do on its own: a manager carried
+                # over from before issue #264 may have been flagged while it was in
+                # `waiting_input`, and INV-ATTENTION-PHANTOM only clears terminal rows,
+                # so that flag would outlive the status it was derived from for ever.
+                #
+                # RE-DERIVED AGAINST THE NEW STATUS, never assumed. `true_blockers` is
+                # read on the row AS IT NOW IS — an unconditional clear would drop a
+                # blocker that survives the move, and reading `fresh` would re-derive the
+                # old status's "worker is waiting on your input" and never clear at all.
+                moved = store.get_work_order(wo["id"])
+                if moved["needs_attention"] and not true_blockers(store, moved):
+                    store.clear_attention(wo["id"])
         else:
             from .invariants import IDLE_NO_FINISH_BLOCKER
 

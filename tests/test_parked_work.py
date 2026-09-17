@@ -200,9 +200,29 @@ def test_a_turn_waiting_on_its_scheduled_retry_is_not_parked(project):
     assert parked_reason(store, wo, now=_later(store, wo["id"])) is None
 
 
-def test_a_manager_is_never_parked(project):
+def test_an_idle_manager_is_never_parked(project):
     """A project manager is idle BY DESIGN between its feature's messages — flagging one
-    would put a permanent second line on every feature order in the fleet."""
+    would put a permanent second line on every feature order in the fleet.
+
+    The SILENCE IS BOUGHT BY THE STATUS, not by the kind (issue #264): `idle` is absent
+    from PARKABLE_STATUSES because "nothing is in flight" is its definition rather than
+    news about it, which is what replaced this function's `kind == 'manager'` carve-out.
+    """
+    store = ProjectStore(project)
+    wo = store.create_work_order("manage the feature", kind="manager")
+    store.set_status(wo["id"], "idle")
+    turn = store.create_turn(wo["id"], "dispatch", "manage it")
+    store.finish_turn(turn["id"], "done", result="nothing to do")
+
+    assert parked_reason(store, store.get_work_order(wo["id"]),
+                         now=_later(store, wo["id"])) is None
+
+
+def test_a_manager_stranded_in_waiting_input_IS_parked(project):
+    """The other half, and the reason the kind carve-out had to go. A manager reaches
+    `waiting_input` only by ASKING for something; one sitting there with a finished turn
+    and nothing out has had its wait end without anything restarting it, and no reconciler
+    will notice. The carve-out silenced exactly that."""
     store = ProjectStore(project)
     wo = store.create_work_order("manage the feature", kind="manager")
     store.set_status(wo["id"], "waiting_input")
@@ -210,7 +230,7 @@ def test_a_manager_is_never_parked(project):
     store.finish_turn(turn["id"], "done", result="nothing to do")
 
     assert parked_reason(store, store.get_work_order(wo["id"]),
-                         now=_later(store, wo["id"])) is None
+                         now=_later(store, wo["id"])) is not None
 
 
 def test_an_injected_session_is_never_parked(project):

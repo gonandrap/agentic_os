@@ -328,8 +328,8 @@ def test_fo_cancel_cancels_the_manager(boot, store):
 # -- 4. settlement ---------------------------------------------------------------------
 
 
-def test_an_idle_manager_settles_to_waiting_input_without_attention(boot, store,
-                                                                    settle_turns):
+def test_an_idle_manager_settles_to_idle_without_attention(boot, store,
+                                                           settle_turns):
     """Idle by design on one side, idle by abandonment on the other, in one settlement
     pass over one feature. Without the manager branch every feature order in the fleet
     would carry a permanent false flag."""
@@ -345,7 +345,7 @@ def test_an_idle_manager_settles_to_waiting_input_without_attention(boot, store,
     daemon.settle_turns(spec, store)
 
     parked = store.get_work_order(manager["id"])
-    assert parked["status"] == "waiting_input"
+    assert parked["status"] == "idle"
     assert not parked["needs_attention"]
 
     idle = store.get_work_order(child["id"])
@@ -357,12 +357,12 @@ def test_an_idle_manager_stays_unflagged_across_a_reconcile_tick(boot, store,
                                                                  settle_turns):
     """Settling it quietly is only half the job: `true_blockers` derives
     "worker is waiting on your input" from the status alone, and INV-ATTENTION-MISSING
-    repairs any unflagged blocked work order — so before the `kind='manager'` exemption
-    the flag came straight back on the very next tick, which is where the user would
+    repairs any unflagged blocked work order — so before the manager had a status of its
+    own the flag came straight back on the very next tick, which is where the user would
     actually have seen it.
 
-    Paired in the same test with an ordinary worker parked in the SAME status, which must
-    still be flagged: the exemption has to buy accuracy, not silence.
+    Paired in the same test with an ordinary worker parked in `waiting_input`, which must
+    still be flagged: `idle` has to buy accuracy, not silence.
     """
     from jarvis.invariants import true_blockers
 
@@ -374,7 +374,7 @@ def test_an_idle_manager_stays_unflagged_across_a_reconcile_tick(boot, store,
     daemon.tick()
     assert settle_turns(store), "the turns never ended"
     daemon.settle_turns(spec, store)
-    assert store.get_work_order(manager["id"])["status"] == "waiting_input"
+    assert store.get_work_order(manager["id"])["status"] == "idle"
 
     parked = ops.create_work_order("proj_a", "an ordinary worker",
                                    description="something")
@@ -389,8 +389,9 @@ def test_an_idle_manager_stays_unflagged_across_a_reconcile_tick(boot, store,
 
 
 def test_a_manager_in_any_other_status_still_reaches_the_user(boot, store):
-    """The exemption is on `waiting_input`, not on the kind. A manager that FAILED is a
-    feature with no addressee left, which is exactly the thing the user has to know."""
+    """The silence is bought by the `idle` status, not by the kind. A manager that FAILED
+    is a feature with no addressee left, which is exactly the thing the user has to
+    know."""
     from jarvis.invariants import true_blockers
 
     daemon = boot(validation=True)
@@ -535,6 +536,12 @@ def test_an_envelope_to_the_manager_role_is_delivered_to_the_manager(boot, store
 
     The envelope is about a CHILD work order, which is the shape the validation loop
     posts: the sender names a role and a subject and never learns who read it.
+
+    STOPS AT THE QUEUE, deliberately: what is under test here is `bus.resolve` finding
+    the manager, and the manager is left `running` because no settle pass is run. So this
+    proves nothing about waking one that is `idle` — see
+    `test_an_envelope_wakes_an_idle_manager_and_it_settles_back_to_idle` in §7, which
+    carries the same envelope the rest of the way through a real `daemon.tick`.
     """
     daemon = boot(validation=True)
     spec = daemon.catalog.project("proj_a")
@@ -561,3 +568,367 @@ def test_an_envelope_to_the_manager_role_is_delivered_to_the_manager(boot, store
     delivered = next(e for e in store.envelopes() if e["id"] == envelope_id)
     assert delivered["state"] == "delivered"
     assert delivered["delivered_wo_id"] == manager["id"]
+
+
+# -- 6. `idle`: the status that says so (GitHub issue #264) ----------------------------
+#
+# docs/superpowers/specs/2026-09-16-an-idle-manager-is-not-waiting-on-you.md. Suppressing
+# the attention FLAG was never enough — six surfaces re-derive meaning from the status
+# alone — so these tests are about what each of them now says, not about the flag.
+
+
+def test_an_idle_manager_does_not_read_as_waiting_on_the_user(boot, store, settle_turns):
+    """The eleven hours in the issue were spent reading "Waiting on you" off a status,
+    with the flag already down. Paired with an ordinary `waiting_input` worker, which
+    must still read that way: `idle` has to buy accuracy, not silence."""
+    from jarvis.timeline import STATUS_LABEL
+    from jarvis.ui.app import FEATURED_STATUSES, STATUS_META
+
+    daemon = boot(validation=True)
+    spec = daemon.catalog.project("proj_a")
+    fo_id = release(daemon, "CSV export", "one")
+    manager = store.manager_work_order(fo_id)
+    assert manager is not None
+    daemon.tick()
+    assert settle_turns(store), "the turns never ended"
+    daemon.settle_turns(spec, store)
+
+    fresh = store.get_work_order(manager["id"])
+    assert fresh["status"] == "idle"
+    assert "Waiting on you" not in STATUS_LABEL["idle"]
+    assert "waiting on you" not in STATUS_META["idle"]["word"]
+    assert STATUS_META["idle"]["tone"] != "warn"
+    assert "idle" not in FEATURED_STATUSES, (
+        "the dashboard's needs-me strip is for decisions somebody owes")
+    assert "waiting on you" not in invariants.status_label(store, fresh).lower()
+    # The control, in the same test.
+    assert STATUS_LABEL["waiting_input"] == "Waiting on you"
+
+
+def test_resume_auto_names_the_idle_manager_instead_of_a_permission_prompt(
+        boot, store, settle_turns):
+    """`waiting_on`'s fall-through called it an unanswered permission prompt — impossible
+    under `auto`, where nothing can prompt. And the nudge it offered bought one turn of
+    the manager saying nothing was needed, which is the loop the issue measured at 0.37
+    USD a lap: it must be refused, and no message may be queued."""
+    daemon = boot(validation=True)
+    spec = daemon.catalog.project("proj_a")
+    fo_id = release(daemon, "CSV export", "one")
+    manager = store.manager_work_order(fo_id)
+    assert manager is not None
+    daemon.tick()
+    assert settle_turns(store), "the turns never ended"
+    daemon.settle_turns(spec, store)
+
+    wait = ops.waiting_on(store, store.get_work_order(manager["id"]))
+    assert wait["what"] == "manager_idle"
+    assert not wait["stalled"]
+    assert "permission prompt" not in wait["detail"]
+
+    out = ops.resume_in_auto(manager["id"], project_name="proj_a")
+    assert out["nudged"] is False
+    assert out["waiting_on"] == "manager_idle"
+    assert not store.queued_messages(manager["id"]), "the lap must not be re-run"
+    assert "resume_auto_declined" in [e["kind"] for e in store.list_events(manager["id"])]
+
+
+def test_a_manager_carried_over_in_waiting_input_is_migrated_on_the_first_tick(
+        boot, store, settle_turns):
+    """Every manager alive when this release lands is parked in `waiting_input`, some of
+    them flagged. `settle_turns` is what migrates them, which is why `idle` is in its
+    sweep — and it must take the flag down itself: INV-ATTENTION-PHANTOM clears only
+    terminal rows, so a flag raised under the old status would outlive it for ever."""
+    daemon = boot(validation=True)
+    spec = daemon.catalog.project("proj_a")
+    fo_id = release(daemon, "CSV export", "one")
+    manager = store.manager_work_order(fo_id)
+    assert manager is not None
+    daemon.tick()
+    assert settle_turns(store), "the turns never ended"
+    # Exactly where 0.10.3 left it.
+    store.set_status(manager["id"], "waiting_input")
+    store.flag_attention(manager["id"], "worker is waiting on your input")
+
+    daemon.settle_turns(spec, store)
+
+    fresh = store.get_work_order(manager["id"])
+    assert fresh["status"] == "idle"
+    assert not fresh["needs_attention"]
+
+
+def test_a_manager_whose_question_neo_hands_back_still_reaches_the_user(boot, store):
+    """The bug the old `kind != 'manager'` carve-out was HIDING. A manager reaches
+    `waiting_input` only by asking, so the one case that exemption suppressed was the one
+    that most needed the user: Neo giving the question back."""
+    from jarvis.neo_store import NeoStore
+
+    daemon = boot(validation=True)
+    fo_id = release(daemon, "CSV export", "one")
+    manager = store.manager_work_order(fo_id)
+    assert manager is not None
+    store.set_status(manager["id"], "waiting_input")
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", manager["id"], "Two children conflict — which wins?")
+        neo.mark(q["id"], "escalated")
+    finally:
+        neo.close()
+
+    blockers = invariants.true_blockers(store, store.get_work_order(manager["id"]))
+
+    assert blockers and str(q["id"]) in blockers[0]
+
+
+def test_a_relaunched_manager_settles_back_to_idle(boot, store, settle_turns,
+                                                   fake_claude, monkeypatch):
+    """`idle` is in RETRY_SWEEP_STATUSES because a manager's turn can be refused for the
+    usage limit, and a sweep that skipped it would strand the one work order a feature
+    routes everything through. The relaunch reads `running` while the turn is out — and
+    lands back in `idle`, not in `needs_review`."""
+    from jarvis import worker_session
+
+    monkeypatch.setattr(worker_session, "RATE_LIMIT_MIN_DELAY", 0)
+    daemon = boot(validation=True)
+    spec = daemon.catalog.project("proj_a")
+    fo_id = release(daemon, "CSV export", "one")
+    manager = store.manager_work_order(fo_id)
+    assert manager is not None
+    daemon.tick()
+    assert settle_turns(store), "the turns never ended"
+    daemon.settle_turns(spec, store)
+    assert store.get_work_order(manager["id"])["status"] == "idle"
+    turn = store.create_turn(manager["id"], kind="message", prompt="a child reported")
+    store.finish_turn(turn["id"], "failed",
+                      error="Claude AI usage limit reached|1000000000")
+
+    daemon.retry_paused_turns(spec, store)
+    assert store.get_work_order(manager["id"])["status"] == "running", (
+        "a live turn must not read as 'nothing to act on'")
+    assert settle_turns(store), "the relaunched turn never ran"
+    daemon.settle_work_order(spec, store, store.get_work_order(manager["id"]))
+
+    assert store.get_work_order(manager["id"])["status"] == "idle"
+
+
+def test_a_message_rotting_on_an_idle_manager_still_reaches_the_user(project,
+                                                                    monkeypatch):
+    """The one blocker `idle` may still derive, and the reason it is in BLOCKED_STATUSES
+    and MESSAGE_STUCK_STATUSES at all. A feature routes everything through its manager,
+    so a message the manager will never see strands the feature silently — issue 43 one
+    level up. It inherited this coverage from `waiting_input`; moving the status without
+    moving the coverage would have dropped it."""
+    from jarvis.invariants import MESSAGE_STUCK_BLOCKER, true_blockers
+
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("manage the feature", kind="manager")
+        store.set_status(wo["id"], "idle")  # no session_id: HOLD_NO_SESSION, unaccounted
+        store.queue_message(wo["id"], "a child deferred something to you")
+        # Aged in the ROW, because `stuck_message` reads the clock itself.
+        store.conn.execute("UPDATE wo_messages SET ts=ts-? WHERE wo_id=?",
+                           (90 * 60, wo["id"]))
+
+        assert MESSAGE_STUCK_BLOCKER in true_blockers(store,
+                                                      store.get_work_order(wo["id"]))
+    finally:
+        store.close()
+
+
+# -- 7. what the migration must NOT touch ----------------------------------------------
+#
+# Review round 1. Since issue #264 the manager branch of `Daemon.settle_work_order` is a
+# REWRITE (`waiting_input` -> `idle`) plus an unflag, where it used to be a no-op for a
+# manager already parked. `waiting_input` is the only carrier of the fact that a manager
+# ASKED, so every test below poses a manager that asked, drives a REAL settle pass, and
+# asserts the status, the flag and the derived blocker all survive it. Hand-setting a
+# status and calling `true_blockers` directly — which §6's Neo test does — cannot catch a
+# settler that would have overwritten the status first, which is the point of these.
+
+
+def _manager_with_a_finished_turn(boot, store, settle_turns):
+    """A manager whose turn is DONE — the shape that reaches the branch under test."""
+    daemon = boot(validation=True)
+    spec = daemon.catalog.project("proj_a")
+    fo_id = release(daemon, "CSV export", "one")
+    manager = store.manager_work_order(fo_id)
+    assert manager is not None
+    daemon.tick()
+    assert settle_turns(store), "the turns never ended"
+    return daemon, spec, manager
+
+
+def _settled_idle(boot, store, settle_turns):
+    """A manager that has actually reached `idle` through the real settler."""
+    daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
+    daemon.settle_turns(spec, store)
+    assert store.get_work_order(manager["id"])["status"] == "idle", "the precondition"
+    return daemon, spec, store.get_work_order(manager["id"])
+
+
+def test_an_envelope_wakes_an_idle_manager_and_it_settles_back_to_idle(boot, store,
+                                                                      settle_turns):
+    """THE BEHAVIOUR THE MANAGER EXISTS FOR, end to end through a real `daemon.tick`.
+
+    Review round 2, and the gap it names is real: §5's
+    `test_an_envelope_to_the_manager_role_is_delivered_to_the_manager` stops at
+    `queued_messages` and never runs a delivery pass, and its manager is never settled,
+    so it is still `running` — it could not have caught a delivery path that keys off a
+    status tuple holding `waiting_input` and not `idle`. Nothing else did either: every
+    other test here poses a manager that is idle or that asked, and
+    `test_a_relaunched_manager_settles_back_to_idle` hand-builds its turn with
+    `store.create_turn`, which is the retry sweep's path and not delivery's.
+
+    Adding `idle` to MESSAGE_STUCK_STATUSES lets the OS report this path FAILING. This is
+    the other half: it succeeding. One tick routes the envelope AND delivers it — see the
+    ordering comment in `Daemon.tick` — so the assertions below are about the real
+    `deliver_envelopes` -> `deliver_messages` -> `worker_session.send` chain, with no
+    status filter anywhere in it that a manager could fall out of.
+
+    The FULL CYCLE is the point, not just the wake: idle -> message -> running -> idle. A
+    manager that woke once and then stuck in `running` would be the same silent stranding
+    one status further along.
+    """
+    daemon, spec, manager = _settled_idle(boot, store, settle_turns)
+    before = store.latest_turn(manager["id"])["seq"]
+    child = store.feature_children(manager["parent_id"])[0]
+
+    bus.post(
+        store,
+        subject=bus.Subject(wo_id=child["id"]),
+        from_role="reviewer",
+        to_role="manager",
+        payload=bus.ReviewFeedback(
+            round=1, outcome="rejected",
+            reason="the tests do not exercise the change",
+            asks=("cover the empty result set",)),
+    )
+    daemon.tick()
+
+    woken = store.get_work_order(manager["id"])
+    assert store.latest_turn(manager["id"])["seq"] > before, \
+        "no turn was created: the envelope reached an idle manager and died there"
+    assert woken["status"] == "running", "a turn is out; the record must say so"
+    assert not store.queued_messages(manager["id"]), "the message was consumed"
+
+    assert settle_turns(store), "the woken turn never ran"
+    daemon.settle_turns(spec, store)
+
+    assert store.get_work_order(manager["id"])["status"] == "idle", \
+        "it must go back to sleep, not stick in `running`"
+
+
+def test_a_user_message_wakes_an_idle_manager_too(boot, store, settle_turns):
+    """The other road in, and it is a different call: `ops.send_message` is what
+    `jarvis wo send` and the dashboard's box use, where the envelope above is what the
+    validation loop posts. Paired with it because they converge on `deliver_messages`
+    only if nothing between them filters on status."""
+    daemon, spec, manager = _settled_idle(boot, store, settle_turns)
+    before = store.latest_turn(manager["id"])["seq"]
+
+    ops.send_message(manager["id"], "the second child is blocked on the first",
+                     project_name="proj_a")
+    daemon.tick()
+
+    assert store.latest_turn(manager["id"])["seq"] > before
+    assert settle_turns(store), "the woken turn never ran"
+    daemon.settle_turns(spec, store)
+
+    assert store.get_work_order(manager["id"])["status"] == "idle"
+
+
+def test_a_manager_parked_on_an_escalated_question_is_not_migrated(boot, store,
+                                                                   settle_turns):
+    """Neo handed the question BACK, so the user owes an answer. A settle pass must not
+    relabel that "nothing to act on".
+
+    `neo_store.OPEN_Q_STATUSES` includes `escalated`, so `awaiting_neo` still answers for
+    it — asserted here rather than assumed, because that membership is the only thing
+    that makes this case reachable by the guard at all.
+    """
+    from jarvis.neo_store import NeoStore
+
+    daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
+    store.set_status(manager["id"], "waiting_input")
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", manager["id"], "Two children conflict — which wins?")
+        neo.mark(q["id"], "escalated")
+    finally:
+        neo.close()
+    store.flag_attention(manager["id"], invariants.neo_question_blocker(
+        {"id": q["id"], "status": "escalated"}))
+    assert invariants.something_is_out(store, manager["id"])
+
+    daemon.settle_turns(spec, store)
+
+    fresh = store.get_work_order(manager["id"])
+    assert fresh["status"] == "waiting_input", "it asked; the status must say so"
+    assert fresh["needs_attention"]
+    blockers = invariants.true_blockers(store, fresh)
+    assert blockers and str(q["id"]) in blockers[0]
+
+
+def test_a_manager_parked_on_a_held_gate_is_not_migrated(boot, store, settle_turns):
+    """The case the branch order genuinely did NOT cover, and the reason the guard is a
+    predicate rather than a fall-through.
+
+    `gates.file_request` parks a work order in `waiting_input` down both its roads, but
+    the `elif` above the manager branch reads `pending_approvals`, which excludes
+    `awaiting_case` — a request the worker filed by running the command before arguing
+    it. Under the old code missing it cost nothing, because this branch's write was
+    `waiting_input` either way. `invariants.something_is_out` is the whole predicate.
+    """
+    daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
+    store.set_status(manager["id"], "waiting_input")
+    store.add_approval(manager["id"], "pr_merge", "gh " + "pr merge 42",
+                       status="awaiting_case")
+    assert not store.pending_approvals(manager["id"]), "the premise: HELD, not pending"
+    assert invariants.something_is_out(store, manager["id"])
+
+    daemon.settle_turns(spec, store)
+
+    assert store.get_work_order(manager["id"])["status"] == "waiting_input"
+
+
+def test_a_manager_parked_on_a_sign_in_keeps_its_status_and_its_flag(boot, store,
+                                                                     settle_turns,
+                                                                     signin):
+    """`_park_on_signin` raises AUTH_BLOCKER on a manager whose turn died on auth. The
+    settler must leave both alone — and, since the `kind != 'manager'` carve-out went,
+    `true_blockers` re-derives that blocker for a manager too, which it never did before.
+
+    The protection is `settle_work_order`'s early return on a FAILED turn, one branch
+    above everything §6 tests. Pinned here because nothing else pins it for a manager.
+    """
+    daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
+    turn = store.create_turn(manager["id"], kind="message", prompt="a child reported")
+    row = store.finish_turn(
+        turn["id"], "failed",
+        error="Failed to authenticate: OAuth session expired and could not be refreshed")
+    store.conn.execute("UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
+                       (row["started_at"] - 3600, row["ended_at"] - 3600, turn["id"]))
+
+    daemon.settle_turns(spec, store)
+
+    fresh = store.get_work_order(manager["id"])
+    assert fresh["status"] == "waiting_input", "a sign-in is the user's to do"
+    assert fresh["attention_reason"] == invariants.AUTH_BLOCKER
+    assert invariants.true_blockers(store, fresh) == [invariants.AUTH_BLOCKER]
+
+
+def test_the_migration_keeps_a_flag_that_survives_the_move(boot, store, settle_turns):
+    """The unflag is narrowed, not unconditional: it re-derives `true_blockers` against
+    the row AS IT NOW IS. A pending assumption is owed whatever the status, so it stays —
+    paired with §6's carried-over case, where the only blocker was the status itself and
+    the flag correctly goes down."""
+    daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
+    store.set_status(manager["id"], "waiting_input")
+    store.add_assumption(manager["id"], "filed the third child as its own work order")
+    store.flag_attention(manager["id"], "1 assumption pending your review")
+
+    daemon.settle_turns(spec, store)
+
+    fresh = store.get_work_order(manager["id"])
+    assert fresh["status"] == "idle", "nothing was OUT, so the migration still runs"
+    assert fresh["needs_attention"], "a decision the user owes outlives the status move"
+    assert fresh["attention_reason"] == "1 assumption pending your review"

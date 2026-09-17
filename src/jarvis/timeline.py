@@ -55,6 +55,9 @@ STATUS_LABEL = {
     "pending": "Queued",
     "dispatching": "Dispatching worker",
     "running": "Running",
+    # NOT "Waiting on you". A manager between its feature's messages asks nothing of
+    # anybody, and eleven hours of it reading otherwise is GitHub issue #264.
+    "idle": "Idle — waiting for its feature",
     "waiting_input": "Waiting on you",
     "validating": "Under review by the validation panel",
     "needs_review": "Needs your review",
