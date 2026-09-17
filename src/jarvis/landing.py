@@ -70,17 +70,20 @@ reports `STRANDED`, every hour, until a human happens to fetch in that checkout 
 #271: one false positive per merge, on the checker whose docstring above says a checker
 that flags everything gets switched off within a day).
 
-So `refresh_base` moves it, and `assess` will not say `STRANDED` or `PARTIAL` off a ref
-nobody refreshed: `base_current=False` turns both into `UNKNOWN` at the `stale-base`
-rung. The two halves are not interchangeable — the refresh alone still condemns a branch
-whenever a fetch fails, and the guard alone would turn the false positive into a
-permanent blind spot, since `UNKNOWN` is never cached and a fleet where nobody fetches
-would never confirm a landing again.
+So `refresh_base` moves it, and `assess` will not condemn a branch off a ref nobody
+refreshed: with `base_current=False` a verdict that rests on lines NOT FOUND becomes
+`UNKNOWN` at the `stale-base` rung. The two halves are not interchangeable — the refresh
+alone still condemns a branch whenever a fetch fails, and the guard alone would turn the
+false positive into a permanent blind spot, since `UNKNOWN` is never cached and a fleet
+where nobody fetches would never confirm a landing again.
 
 Absence is what staleness breaks, never presence: lines FOUND on an out-of-date default
-branch are on the up-to-date one too, because a branch only grows. That is why `LANDED`,
-`merged-tail` and `pull-request-open` are left alone — the first is monotonic and the
-other two never read the base at all.
+branch are on the up-to-date one too, because a branch only grows. So the guard is keyed
+on the EVIDENCE and not on the verdict's name, which cannot carry the difference —
+`PARTIAL` is reached both from a middling score (absence, withheld) and from a full score
+beside a dirty worktree (presence plus a fact about the worktree, kept). `LANDED`,
+`merged-tail` and `pull-request-open` are left alone for the same reason: the first is
+monotonic and the other two never read the base at all.
 
 ## Why this module imports almost nothing
 
@@ -147,6 +150,10 @@ UNSETTLED_VERDICTS = (STRANDED, PARTIAL)
 #: branch has stopped moving, and content on the default branch stays on it. `UNKNOWN` is
 #: pointedly not here — it is the answer that a later push or a repaired remote fixes.
 SETTLED_VERDICTS = (LANDED, NOT_PRODUCED)
+
+#: The userinfo of a URL — `scheme://user:password@host` — which is the only place a
+#: credential appears in anything git prints. See `_scrub`.
+_CREDENTIALS_RE = re.compile(r"://[^/\s@]+@")
 
 #: A GitHub pull-request URL sitting in prose. Mode A of issue #232: four work orders
 #: finished with a summary that NAMED a draft pull request and passed no `--pr`, so
@@ -302,12 +309,14 @@ def refresh_base(repo: Path, *, allow_network: bool = True) -> bool:
 
     True means the base holds everything the remote does, by one of two routes:
 
-    * there is nothing to be behind — the ladder landed on a LOCAL branch (rung 3), so
-      this project has no remote view of a default branch and its own is authoritative;
+    * there is nothing to be behind — the ladder landed on a LOCAL branch AND the clone
+      has no remotes at all, so its own default branch is authoritative;
     * the fetch ran and exited 0.
 
-    False is every other outcome — no default branch at all, `allow_network=False`, a
-    remote that could not be reached, a fetch that timed out — and it is not an error.
+    False is every other outcome — no default branch at all, a ref that could not be
+    named, a local default branch in a clone that DOES have a remote (nothing can refresh
+    that, and it can be months old), `allow_network=False`, a remote that could not be
+    reached, a fetch that timed out — and none of them is an error.
     It is the input that makes `assess` answer `UNKNOWN` instead of condemning a branch
     on the strength of a ref nobody refreshed.
 
@@ -322,12 +331,25 @@ def refresh_base(repo: Path, *, allow_network: bool = True) -> bool:
     if not ref:
         return False
     full = (_git(repo, "rev-parse", "--symbolic-full-name", ref) or "").strip()
+    if not full:
+        # The ref could not be named. Nothing is claimed about a ref that could not be
+        # read at all — this is the `_git`-failed case, and it is False for `_git`'s own
+        # reason: an error must never arrive somewhere as a fact.
+        return False
     if not full.startswith("refs/remotes/"):
-        # Rung 3, or a ref that could not be named at all: either way there is no remote
-        # copy of the default branch in this clone, so nothing here can be out of date.
-        return bool(full)
+        # Rung 3: the ladder landed on a LOCAL branch, which this cannot refresh — a
+        # fetch updates `refs/remotes/...` and would not move it. So it is trustworthy
+        # only when there is nothing it could be behind, and that is a question about
+        # the CLONE, not about the ref: a single-branch clone of another branch has an
+        # `origin` and still lands here, and its local `main` can be months old.
+        return not (_git(repo, "remote") or "").split()
     remote, _, branch = full[len("refs/remotes/"):].partition("/")
-    return bool(remote and branch) and allow_network and _fetch(repo, remote, branch)
+    if not (remote and branch) or remote.startswith("-") or branch.startswith("-"):
+        # A leading `-` is read by `git fetch` as an option rather than a remote. It takes
+        # write access to `.git/config` to arrange and there is no shell here, so this is
+        # argument confusion rather than injection — and it costs one line to not have.
+        return False
+    return allow_network and _fetch(repo, remote, branch)
 
 
 def assess(repo: Path, wo_id: str, *, worktree: Path | None = None,
@@ -361,10 +383,10 @@ def assess(repo: Path, wo_id: str, *, worktree: Path | None = None,
     `base_current` is `refresh_base`'s answer and DEFAULTS TO FALSE, because the ref this
     measures against is a remote-tracking one that nothing moves on its own: a caller
     that has not refreshed it has not earned a condemnation, and a default of True would
-    hand one to every caller written after this. False demotes the two verdicts that read
-    absence off the base — `STRANDED` and `PARTIAL` at the `coverage` rung — to `UNKNOWN`
-    at `stale-base`. Nothing else moves; see the module docstring on why presence
-    survives staleness and absence does not.
+    hand one to every caller written after this. False demotes the `coverage` rung's
+    verdicts that rest on lines NOT FOUND — every `STRANDED`, and the `PARTIAL` of a
+    middling score — to `UNKNOWN` at `stale-base`. Nothing else moves, the dirty-worktree
+    `PARTIAL` included; see the module docstring on why presence survives staleness.
 
     A sixth rung, `unreadable`, is not part of that sequence: it is what a `git` command
     that ERRORED produces, at whichever rung it errored on. `_git` keeps that distinct
@@ -436,6 +458,10 @@ def assess(repo: Path, wo_id: str, *, worktree: Path | None = None,
     cov = present / total
     verdict = (LANDED if cov >= LANDED_COVERAGE else
                STRANDED if cov <= STRANDED_COVERAGE else PARTIAL)
+    # Keyed on the EVIDENCE, not on the verdict's name — the distinction the stale-base
+    # branch below turns on, and one the name cannot carry: `PARTIAL` is reached from two
+    # different facts and only one of them reads absence off the base.
+    reads_absence = cov < LANDED_COVERAGE
     # `==`, never `is`: the verdicts are plain strings, and identity holds here only
     # because `verdict` is bound to this module's own constant. The day it arrives from
     # an event payload or any other round trip, `is` goes quietly False and this branch —
@@ -446,18 +472,24 @@ def assess(repo: Path, wo_id: str, *, worktree: Path | None = None,
         verdict, cov_note = PARTIAL, " but its worktree still holds uncommitted work"
     else:
         cov_note = ""
-    if verdict != LANDED and not base_current:
+    if reads_absence and not base_current:
         # Issue #271. A low score off a ref nobody refreshed is not evidence of anything:
         # the merge that landed this branch may already be on the remote's default branch
         # and simply not in this clone yet. `UNKNOWN` is re-derived every sweep, so the
         # answer arrives of its own accord as soon as a refresh succeeds. `missing_files`
         # is dropped on the way: "this file is nowhere" is exactly the claim a base that
         # may predate the merge cannot support.
+        #
+        # NOT `verdict != LANDED`, which is the same test everywhere except the one place
+        # it matters: the `PARTIAL` above rests on a dirty WORKTREE beside a full score,
+        # and nothing about the base's age touches either half of that. Demoting it would
+        # break this module's own rule one line after stating it, and would print "only
+        # 145/145 (100%)" at whoever was holding the report.
         return Landing(wo_id, UNKNOWN, "stale-base", ref=ref, base=base, pr_url=pr_url,
                        coverage=cov, added_lines=total, dirty=dirty,
-                       detail=f"only {present}/{total} of the lines `{ref}` added are on "
-                              f"`{base}` ({cov:.0%}), but `{base}` was not refreshed — "
-                              f"it may predate the merge that landed them")
+                       detail=f"`{base}` was not refreshed, so it may predate the merge "
+                              f"that landed `{ref}`: the {present}/{total} of its added "
+                              f"lines found there ({cov:.0%}) proves nothing either way")
     return Landing(wo_id, verdict, "coverage", ref=ref, base=base, pr_url=pr_url,
                    coverage=cov, added_lines=total, missing_files=missing, dirty=dirty,
                    detail=f"{present}/{total} of the lines `{ref}` added are on "
@@ -600,13 +632,30 @@ def _fetch(repo: Path, remote: str, branch: str) -> bool:
                               errors="replace", check=False,
                               timeout=FETCH_TIMEOUT_SECONDS)
     except (OSError, subprocess.SubprocessError) as exc:
-        log.warning("could not refresh %s in %s: %s", spec, repo, exc)
+        log.warning("could not refresh %s in %s: %s", spec, repo, _scrub(str(exc)))
         return False
     if proc.returncode != 0:
         log.warning("refreshing %s in %s exited %d: %s", spec, repo, proc.returncode,
-                    proc.stderr.strip()[:200])
+                    _scrub(proc.stderr.strip())[:200])
         return False
     return True
+
+
+def _scrub(text: str) -> str:
+    """`text` with any URL userinfo replaced, for anything that reaches the log.
+
+    THE FAILING FETCH IS THE ONE THAT QUOTES THE REMOTE URL BACK AT YOU — "fatal:
+    Authentication failed for 'https://x-access-token:<token>@github.com/…'" — so the one
+    branch that logs a remote's own words is also the one where a project whose `origin`
+    carries a token in its URL would write that token into the daemon's log. Truncation
+    is no help: the URL is on the first line. Credentials only ever appear as userinfo,
+    which is why one pattern covers it rather than a list of message shapes.
+
+    The rest of the message is kept. A refusal, a missing repository and an unreachable
+    host all read differently and a sweep that stopped working would otherwise be a
+    returncode with no cause.
+    """
+    return _CREDENTIALS_RE.sub("://<redacted>@", text)
 
 
 def _git(repo: Path, *args: str) -> str | None:

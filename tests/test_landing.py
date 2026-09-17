@@ -506,6 +506,66 @@ def test_a_stale_base_withholds_absence_and_never_presence(repo):
     assert absent.verdict == landing.UNKNOWN, absent.detail
 
 
+def test_a_stale_base_keeps_the_partial_that_rests_on_a_dirty_worktree(repo):
+    """The guard is keyed on the EVIDENCE, and `PARTIAL` is where that stops being
+    pedantry: two different facts arrive at it.
+
+    A middling score is a claim about what is missing from the base and is withheld. A
+    FULL score beside uncommitted work is Mode C — presence, plus a fact about the
+    worktree — and an out-of-date base makes it no less true. Keyed on the verdict's name
+    instead, this one would be silenced on the read-only doctor and would print "only
+    80/80 (100%)" on its way out.
+    """
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("feature"))
+    repo.squash_merge(f"worktree-{WO}", f"[{WO}] the feature (#10)")
+    after_wo = _git(repo.path, "rev-parse", "origin/trunk").strip()
+    # Somebody else's work lands on top, so the ref really is out of date — and this
+    # branch is nonetheless fully present on the copy we have.
+    other = repo.worktree("wo-other")
+    repo.commit(other, "src/other.py", _feature("other"))
+    repo.squash_merge("worktree-wo-other", "[wo-other] somebody else (#11)")
+    _rewind_base(repo, after_wo)
+    (wt / "src" / "later.py").write_text(_feature("later"))   # never committed
+
+    kept = landing.assess(repo.path, WO, worktree=wt, base_current=False)
+
+    assert kept.verdict == landing.PARTIAL, kept.detail
+    assert kept.rung == "coverage"
+    assert "uncommitted" in kept.detail
+
+
+def test_a_failed_refresh_never_logs_a_credential_out_of_the_remote_url(repo, caplog):
+    """The failing fetch is the one that quotes the remote URL back at you, and this log
+    call is the only thing on this path that puts a remote's own words into the log.
+
+    TWO ASSERTIONS BECAUSE ONE CANNOT COVER IT. End to end, a real failed fetch against a
+    credentialed remote must carry nothing secret into the record — but which message git
+    chooses is git's business, and the connection failure it emits here happens to redact
+    the userinfo itself. The message it does NOT redact is the authentication failure,
+    which cannot be provoked without a server that refuses a login, so the scrubber is
+    held to that string directly. Quoted verbatim from git rather than paraphrased: a
+    redaction test written against an invented message tests the invention.
+    """
+    secret = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
+    _git(repo.path, "remote", "set-url", "origin",
+         f"https://x-access-token:{secret}@127.0.0.1:1/acme/proj.git")
+
+    with caplog.at_level("WARNING", logger="jarvis.landing"):
+        assert landing.refresh_base(repo.path) is False
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert secret not in logged
+    assert "127.0.0.1" in logged      # ...and the reason it failed is still readable
+
+    scrubbed = landing._scrub(
+        f"fatal: Authentication failed for "
+        f"'https://x-access-token:{secret}@github.com/acme/proj.git/'")
+    assert secret not in scrubbed
+    assert scrubbed.endswith("'https://<redacted>@github.com/acme/proj.git/'")
+    assert scrubbed.startswith("fatal: Authentication failed for")
+
+
 def test_a_refresh_that_cannot_run_is_false_rather_than_an_error(repo, tmp_path):
     """Three ways to have no fresh ref, and not one of them may raise or condemn.
 
@@ -528,6 +588,13 @@ def test_a_refresh_that_cannot_run_is_false_rather_than_an_error(repo, tmp_path)
     _git(solo, "commit", "-qm", "base")
     assert landing.base_ref(solo) == "main"
     assert landing.refresh_base(solo, allow_network=False) is True
+
+    # ...and the pairing, because "there is nothing to be behind" is a question about the
+    # CLONE and not about the ref. Add a remote and that local `main` can be months old
+    # with nothing able to move it — a single-branch clone of another branch lands here.
+    _git(solo, "remote", "add", "origin", str(tmp_path / "elsewhere.git"))
+    assert landing.base_ref(solo) == "main"
+    assert landing.refresh_base(solo) is False
 
     _git(repo.path, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
     assert landing.refresh_base(repo.path) is False

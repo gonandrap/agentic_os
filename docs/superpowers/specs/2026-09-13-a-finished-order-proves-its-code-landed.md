@@ -167,9 +167,12 @@ explicit refspec, `--no-tags`, a timeout, non-fatal — and the daemon (`repair=
 in print.
 
 **And the guard is unconditional, because the refresh can fail.** `assess` takes
-`base_current` and will not answer `STRANDED` or `PARTIAL` off a ref that was not
-refreshed THIS sweep: a failed fetch, an offline machine and the read-only path all
-demote the coverage verdict to `UNKNOWN` at the `stale-base` rung. Neither half is
+`base_current` and will not condemn a branch off a ref that was not refreshed THIS sweep:
+a failed fetch, an offline machine and the read-only path all demote the coverage rung's
+absence-derived verdicts — every `STRANDED`, and the `PARTIAL` of a middling score — to
+`UNKNOWN` at the `stale-base` rung. Keyed on the evidence, not on the verdict's name: the
+`PARTIAL` of a full score beside a dirty worktree rests on presence plus a fact about the
+worktree, so staleness does not touch it and it is kept. Neither half is
 sufficient alone. Without the refresh, the sweep still condemns a branch whenever the
 network blips; without the guard, the false positive becomes a permanent blind spot,
 since `UNKNOWN` is never cached and a fleet where nobody fetches would never confirm a

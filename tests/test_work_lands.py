@@ -563,6 +563,41 @@ def test_the_sweep_refreshes_the_default_branch_and_is_silent_on_what_just_merge
     assert json.loads(cached["payload"])["verdict"] == landing.LANDED
 
 
+def test_the_refresh_is_once_per_sweep_and_not_paid_by_a_project_with_nothing_to_audit(
+        started, project, monkeypatch):
+    """The round trip is per PROJECT and it is LAZY, and both are load-bearing claims.
+
+    Per project because the ref it moves is the same one for every order here; lazy —
+    below every exclusion — because a fleet of settled projects would otherwise fetch
+    once an hour each to audit nothing. Neither is visible in a verdict, so a later
+    reordering of that block re-introduces a per-work-order fetch in silence. Counted
+    rather than asserted on timings, for the obvious reason.
+    """
+    calls: list[Path] = []
+    real = landing.refresh_base
+
+    def counting(repo, **kw):
+        calls.append(repo)
+        return real(repo, **kw)
+
+    monkeypatch.setattr(landing, "refresh_base", counting)
+
+    for name in ("launcher contract", "the cap", "onboarding"):
+        _settle(project, _order(project, name, code=name.split()[0])["id"])
+    assert len(_violations(project)) == 3
+    assert len(calls) == 1      # three orders, one ref, one round trip
+
+    # `stranded` is never cached, so those three are re-derived every sweep and keep
+    # paying for the refresh. The project that pays NOTHING is the one where every
+    # candidate has been excluded — here by the user closing them.
+    for v in _violations(project):
+        ops.mark_done(str(v.wo_id))
+    calls.clear()
+
+    assert _violations(project) == []
+    assert calls == []
+
+
 def test_an_order_the_user_marked_done_is_not_reported_by_the_sweep_for_ever(
         started, project):
     """`jarvis wo done` is a decision, and the sweep has to read it as one.
