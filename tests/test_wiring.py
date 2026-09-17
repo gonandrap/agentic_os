@@ -56,18 +56,57 @@ def test_the_shipped_default_wires_everything_and_writes_nothing(project, jarvis
     assert set(serena_allow_rules()) <= set(settings["permissions"]["allow"])
 
 
-def test_a_deselection_never_reaches_the_projects_own_settings_file(project,
-                                                                    jarvis_home):
-    """The user's own sessions in the project are not Jarvis's to narrow. `bootstrap`
-    writes `<project>/.claude/settings.json` for THEM; the wiring patch belongs to the
-    per-work-order file and nowhere else — the constraint the ask calls load-bearing."""
-    spec = ProjectSpec(name="proj_a", path=project,
-                       wiring=WiringConfig(claude_ai_connectors=False,
-                                           disabled_plugins=(SERENA,)))
-    _write_worker_settings(spec, {"id": "wo-x", "title": "t"})
-    injected = bootstrap.build_settings(spec.settings_overrides)
-    assert "disableClaudeAiConnectors" not in injected
-    assert "enabledPlugins" not in injected
+def test_no_file_of_the_users_own_is_written_by_a_deselection(monkeypatch, tmp_path,
+                                                              project, jarvis_home,
+                                                              fake_claude, catalog_file):
+    """THE load-bearing constraint, pinned on the FILESYSTEM: the user's Claude
+    configuration is read to populate the list and never written, and neither is the
+    project's own `.claude/` tree, which belongs to the sessions they open themselves.
+
+    Snapshot-and-compare rather than an assertion on a return value, because the claim
+    is about absence: nothing an output contains can catch a write to a file the test
+    never looked at. The whole path runs between the two snapshots — discovery,
+    `ops.set_wiring`, and the dispatch seam that turns the result into a spawn."""
+    home = tmp_path / "user-home"
+    skill = home / ".claude" / "skills" / "note-taker"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: note-taker\ndescription: takes notes\n---\nbody")
+    (home / ".claude" / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {SERENA: True}}))
+    # The file `/mcp disable` would write `disabledMcpServers` into, which is why a
+    # hand-added server gets no button: that lever cannot be pulled from here.
+    (home / ".claude.json").write_text(json.dumps({"projects": {str(project): {}}}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
+    assert wiring.claude_home() == home / ".claude"
+
+    ops.start_os(str(catalog_file), foreground=True)  # writes `<project>/.claude`; then
+    (project / ".claude" / "settings.local.json").write_text(  # this one is the user's
+        json.dumps({"permissions": {"allow": ["Bash(ls:*)"]}}))
+
+    def snapshot() -> dict[str, tuple[bytes, int]]:
+        return {str(p): (p.read_bytes(), p.stat().st_mtime_ns)
+                for root in (home, project / ".claude")
+                for p in sorted(root.rglob("*")) if p.is_file()}
+
+    before = snapshot()
+    assert len(before) >= 4
+
+    monkeypatch.setattr(wiring, "read_plugins", lambda **k: [
+        {"id": SERENA, "enabled": True, "scope": "user", "installPath": str(tmp_path)}])
+    monkeypatch.setattr(wiring, "read_mcp_servers",
+                        lambda **k: [("plugin:serena:serena", "uvx")])
+    inv = wiring.discover(refresh=True)
+    # Proof the snapshotted tree was READ, without which "unchanged" would be trivial.
+    assert "note-taker" in {i.name for i in inv.items}
+
+    ops.set_wiring(f"{wiring.LEVER_PLUGIN}{SERENA}", False, project="proj_a")
+    w = ops.wiring_config("proj_a")
+    assert w.disabled_plugins == (SERENA,)
+    # ...and it did take effect, so the comparison below is about a live deselection.
+    assert _settings(project, w)["enabledPlugins"] == {SERENA: False}
+
+    assert snapshot() == before
 
 
 def test_a_project_inherits_the_fleet_base_and_may_deselect_more(tmp_path):

@@ -118,10 +118,21 @@ def shoot() -> None:
         page.screenshot(path=SHOTS / "config-wiring-deselected.png")
 
         # The history below it: a deselection is an ordinary config version, and the
-        # page says which project it moved and when.
-        page.locator("h2", has_text="History").first.scroll_into_view_if_needed()
-        page.wait_for_timeout(200)
-        page.screenshot(path=SHOTS / "config-wiring-history.png")
+        # page says which project it moved and when. CLIPPED to the section rather
+        # than scrolled to it — a viewport shot of a page that happens to fit is
+        # byte-identical to the one above, which is how a screenshot ends up
+        # evidencing the wrong view.
+        page.evaluate("window.scrollTo(0, 0)")  # so a box is a document coordinate
+        page.wait_for_timeout(100)
+        head = page.locator("h2", has_text="History").first
+        panel = head.locator("xpath=following-sibling::div[1]")
+        h, p_ = head.bounding_box(), panel.bounding_box()
+        assert h and p_, "the History section did not render"
+        page.screenshot(path=SHOTS / "config-wiring-history.png", full_page=True, clip={
+            "x": max(h["x"] - 12, 0), "y": max(h["y"] - 12, 0),
+            "width": p_["width"] + 24,
+            "height": min(p_["y"] + p_["height"] - h["y"] + 24, 900),
+        })
         browser.close()
 
 
