@@ -325,6 +325,13 @@ exhaustive:
   before that connect, so a fingerprint taken there cannot see the case that costs the
   money. Action 3 is what settles MCP. INV-PREFIX-DRIFT says so when it fires: a crossing
   with no ingredient named is the case to suspect a server in.
+- **The CLI version on an install layout the parse does not recognise.** It is the one
+  ingredient read out of the environment rather than hashed from bytes, so it can fail in
+  a way that looks like working: `?` is skipped on both sides of every comparison, and a
+  CLI upgrade is then never reported. Because a crossing with no named cause is supposed
+  to mean *suspect a server*, a dead ingredient would send the reader to the wrong
+  suspect — so INV-PREFIX-DRIFT now opens by naming any ingredient this machine could not
+  read at all (`hooks.unreadable_ingredients`), before the ones that moved.
 - **A project's standing `append_system_prompt` from the catalog.** Importing
   `jarvis.catalog` costs ~60ms against a ~155ms hook. The work order's own override is
   covered, because that row is already loaded.

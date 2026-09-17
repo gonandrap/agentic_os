@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from pathlib import Path
 
 import pytest
 
@@ -135,6 +136,112 @@ def test_two_work_orders_are_never_compared_with_each_other(jarvis_home, fake_cl
 
     assert events(project, first["id"]) == []
     assert events(project, second["id"]) == []
+
+
+# -- 1b. the one ingredient parsed out of the environment --------------------------------
+#
+# The other three are hashed from bytes and fail loudly. This one is READ from the install
+# layout, so it can be wrong in a way that looks like working: a silent `?` is skipped on
+# both sides of every comparison by design, and a CLI upgrade — the FIRST suspect in
+# INV-PREFIX-DRIFT's own text — would then never be reported on that machine. Nothing in
+# the ingredient tests above would notice, because they compare fingerprints to each other.
+
+
+@pytest.fixture()
+def install(tmp_path, monkeypatch):
+    """A fake Claude install and a fake home, so these never read the test machine's own.
+
+    Returns a helper that lays out one of the two shapes on demand. The native installer
+    makes `claude` a symlink to a file whose NAME is the version — not a file inside a
+    directory named for it — which is the detail the parse turns on.
+    """
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    # A user-level memory file, so `memory` is READABLE and the version is the only
+    # ingredient these vary. Without it the fake home has nothing to hash, `memory` is
+    # `?` too, and a test about one dead ingredient quietly grades two.
+    (home / ".claude" / "CLAUDE.md").write_text("# standing instructions\nbe brief\n")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+
+    def lay_out(resolves_to: str | None = None, receipt: object = None):
+        if resolves_to is not None:
+            target = tmp_path / "versions" / resolves_to
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("#!/bin/sh\n")
+            target.chmod(0o755)
+            (bindir / "claude").symlink_to(target)
+        if receipt is not None:
+            (home / ".claude" / ".last-update-result.json").write_text(receipt)
+        return {"PATH": str(bindir)}
+
+    return lay_out
+
+
+def test_the_version_comes_off_the_resolved_binary(install):
+    """The native installer's layout, and the cheap path: one readlink, no subprocess."""
+    env = install(resolves_to="9.9.72")
+
+    assert hooks.claude_cli_version(env) == "9.9.72"
+
+
+def test_a_non_version_resolution_falls_through_to_the_updater_receipt(install):
+    """npm, a distro package, a wrapper script — anything whose `claude` does not resolve
+    to a version-named file. The updater writes down what it installed, so there is a
+    second source that does not depend on the layout."""
+    env = install(resolves_to="claude-wrapper",
+                  receipt='{"version_from": "9.9.71", "version_to": "9.9.72"}')
+
+    assert hooks.claude_cli_version(env) == "9.9.72"
+
+
+def test_no_claude_on_the_path_still_reads_the_receipt(install):
+    """The hook runs with the worker's PATH, not a login shell's."""
+    env = install(receipt='{"version_to": "9.9.72"}')
+
+    assert hooks.claude_cli_version(env) == "9.9.72"
+
+
+@pytest.mark.parametrize("receipt", [
+    None,                              # no receipt at all
+    "not json at all",                 # malformed
+    '{"version_from": "9.9.71"}',     # right file, missing key
+    '{"version_to": ""}',              # present and empty
+    '{"version_to": 2.1}',             # present and not a string
+])
+def test_an_unreadable_version_is_unknown_and_never_a_guess(install, receipt):
+    env = install(resolves_to="claude-wrapper", receipt=receipt)
+
+    assert hooks.claude_cli_version(env) == PREFIX_UNKNOWN
+
+
+def test_the_fingerprint_carries_the_real_version_not_the_unknown(install, wo, project):
+    """The branch tests above prove the parse; this proves the fingerprint actually USES
+    it. A version silently stuck at `?` is skipped on both sides of every comparison, so
+    the ingredient would be dead while every other test still passed."""
+    env = install(resolves_to="9.9.72")
+
+    assert prefix_fingerprint(project, project, wo, env)["cli_version"] == "9.9.72"
+
+
+def test_a_cli_upgrade_mid_conversation_is_reported_end_to_end(install, wo, project):
+    """The whole point of the ingredient, through `handle_hook` rather than through the
+    fingerprint: this is the case finding 4 names first and the one INV-PREFIX-DRIFT sends
+    the reader to check first."""
+    settings_file(project, wo["id"]).write_text("{}")
+    e = {**env(project, wo["id"]), **install(resolves_to="9.9.71")}
+    handle_hook(session_start(cwd=project), e)
+
+    (Path(e["PATH"]) / "claude").unlink()
+    upgraded = install(resolves_to="9.9.72")
+    handle_hook(session_start(cwd=project), {**e, **upgraded})
+
+    [drift] = events(project, wo["id"])
+    payload = json.loads(drift["payload"])
+    assert payload["changed"] == ["cli_version"]
+    assert payload["before"]["cli_version"] == "9.9.71"
+    assert payload["after"]["cli_version"] == "9.9.72"
 
 
 # -- 2. an unreadable ingredient is not a changed one ------------------------------------
@@ -348,6 +455,40 @@ def test_the_witness_narrows_the_suspect_list_and_never_replaces_it(jarvis_home,
 
     assert invariants._prefix_witness(cfg) == ""
     assert "The usual suspects" in inspect.getsource(invariants.check_prefix_stable)
+
+
+def test_a_dead_ingredient_is_named_rather_than_left_as_silence(install, wo, project,
+                                                                catalog_file):
+    """Review round 1's finding. `cli_version` is the only ingredient parsed out of the
+    environment, so on a machine whose install layout is not recognised it is `?` for
+    ever — and `?` is skipped on both sides of every comparison, so a CLI upgrade is never
+    reported. That is not silence: this check tells the reader a crossing with nothing
+    named points at MCP, so a dead ingredient sends them to the WRONG suspect.
+    """
+    settings_file(project, wo["id"]).write_text("{}")
+    unreadable = install(resolves_to="claude-wrapper")  # no receipt either
+    handle_hook(session_start(cwd=project), {**env(project, wo["id"]), **unreadable})
+
+    from jarvis.ops import resolve_catalog
+
+    witness = invariants._prefix_witness(resolve_catalog(str(catalog_file)).os)
+
+    assert "could not read the Claude Code version" in witness
+    assert "neither confirmed nor ruled out" in witness
+
+
+def test_a_readable_ingredient_is_not_reported_as_dark(install, wo, project, catalog_file):
+    """The other half, or the warning above is on every violation for ever and stops
+    meaning anything."""
+    settings_file(project, wo["id"]).write_text("{}")
+    handle_hook(session_start(cwd=project),
+                {**env(project, wo["id"]), **install(resolves_to="9.9.72")})
+
+    from jarvis.ops import resolve_catalog
+
+    witness = invariants._prefix_witness(resolve_catalog(str(catalog_file)).os)
+
+    assert "could not read" not in witness
 
 
 def test_the_measurement_says_it_is_blind_to_mcp(jarvis_home, fake_claude, catalog_file,

@@ -2685,9 +2685,11 @@ def _prefix_witness(cfg: Any, limit: int = 200) -> str:
 
     seen: Counter[str] = Counter()
     latest: dict[str, float] = {}
+    blind: set[str] = set()
     for row in rows:
         if row["status"] != "active" or not Path(row["path"]).is_dir():
             continue
+        blind |= hooks.unreadable_ingredients(Path(row["path"]))
         store = Store(Path(row["path"]))
         try:
             events = store.events_across("prefix_drift", limit)
@@ -2702,13 +2704,24 @@ def _prefix_witness(cfg: Any, limit: int = 200) -> str:
                 seen[name] += 1
                 latest[name] = max(latest.get(name, 0.0), event["ts"])
 
+    # A dead ingredient is reported even when nothing moved, and BEFORE the movers: the
+    # reader's next step turns on which suspects were actually being watched, and the
+    # suspect list below would otherwise be read as four checks when it was three.
+    dark = ""
+    if blind:
+        unwatched = ", ".join(sorted(timeline.PREFIX_INGREDIENT_LABEL.get(name, name)
+                                     for name in blind))
+        dark = (f"FIRST, WHAT WAS NOT BEING WATCHED: the SessionStart hook could not read "
+                f"{unwatched} on this machine, so that suspect is neither confirmed nor "
+                f"ruled out below and has to be checked by hand (`hooks.claude_cli_version` "
+                f"for the version, whose install layout is the usual reason). ")
     if not seen:
-        return ""
+        return dark
     named = ", ".join(
         f"{timeline.PREFIX_INGREDIENT_LABEL.get(name, name)} "
         f"({count}x, last {_date(latest[name])})"
         for name, count in seen.most_common(len(hooks.PREFIX_INGREDIENTS)))
-    return (f"The SessionStart hook watched these move in the same window, commonest "
+    return (f"{dark}The SessionStart hook watched these move in the same window, commonest "
             f"first: {named}. That is an early warning and not this measurement — it "
             f"reports what went INTO the prompt, which is why it can name a cause and "
             f"this cannot. It is also blind to the MCP tool set, so an unexplained "

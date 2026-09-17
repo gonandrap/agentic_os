@@ -913,6 +913,41 @@ def prefix_baseline(root: Path, wo_id: str) -> Path:
     return root / ".jarvis" / "prefix" / f"{wo_id}.json"
 
 
+#: How many recorded fingerprints `unreadable_ingredients` reads. It runs only when
+#: INV-PREFIX-DRIFT is already firing, so the cap is about a pathological directory rather
+#: than about a hot path.
+PREFIX_BASELINE_SCAN_CAP = 50
+
+
+def unreadable_ingredients(root: Path) -> set[str]:
+    """Which ingredients this machine could not establish at all, over recent fingerprints.
+
+    THE FAILURE THIS EXISTS FOR IS SILENT, AND IT MISDIRECTS. `cli_version` is the only
+    ingredient parsed out of the environment rather than hashed from bytes, so on a
+    machine whose install layout this does not recognise it is `?` for ever — and `?` is
+    skipped on both sides of every comparison by design, so a CLI upgrade is simply never
+    reported. That is not silence: INV-PREFIX-DRIFT tells the reader that a crossing with
+    nothing named points at MCP, so a dead ingredient actively sends them to the wrong
+    suspect. Naming it is what turns that back into a known unknown (review round 1).
+    """
+    found: set[str] = set()
+    directory = root / ".jarvis" / "prefix"
+    try:
+        recorded = sorted(directory.iterdir())[:PREFIX_BASELINE_SCAN_CAP]
+    except OSError:
+        return found
+    for path in recorded:
+        try:
+            fingerprint = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(fingerprint, dict):
+            continue
+        found |= {name for name in PREFIX_INGREDIENTS
+                  if fingerprint.get(name) == PREFIX_UNKNOWN}
+    return found
+
+
 def prefix_drift(before: dict[str, str], after: dict[str, str]) -> tuple[str, ...]:
     """Which ingredients moved. An ingredient unknown on either side is not one of them."""
     return tuple(
