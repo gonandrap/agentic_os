@@ -146,6 +146,38 @@ def _ref(kind: str, p: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+#: Each ingredient of the prompt prefix in the words a reader can act on, since the
+#: payload's keys are the names `hooks.PREFIX_INGREDIENTS` uses and those name the code.
+PREFIX_INGREDIENT_LABEL = {
+    "cli_version": "the Claude Code version",
+    "git_briefing": "the git briefing Jarvis adds to every turn",
+    "worker_settings": "the worker's settings file",
+    "memory": "a CLAUDE.md the worker loads",
+}
+
+
+def _prefix_changes(p: dict[str, Any]) -> str:
+    """"the Claude Code version (2.1.271 -> 2.1.272) changed", from the drift payload.
+
+    A version moved is quoted and a digest moved is not: the before/after of a hash is
+    the question restated, while the before/after of a version is the answer.
+    """
+    changed = p.get("changed") or []
+    before, after = p.get("before") or {}, p.get("after") or {}
+    parts = []
+    for name in changed:
+        label = PREFIX_INGREDIENT_LABEL.get(name) or str(name)
+        was, now = before.get(name), after.get(name)
+        if name == "cli_version" and was and now:
+            label += f" ({was} → {now})"
+        parts.append(label)
+    if not parts:
+        return "Something in the prompt prefix changed"
+    joined = (parts[0] if len(parts) == 1
+              else ", ".join(parts[:-1]) + " and " + parts[-1])
+    return joined[0].upper() + joined[1:] + " changed since the last turn"
+
+
 def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     """(label, detail) in plain language for one event, from its payload alone."""
     if kind == "created":
@@ -308,6 +340,15 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 p.get("reason") or "no reason recorded")
     if kind == "learning_captured":
         return "Learning captured", p.get("topic") or ""
+    if kind == "prefix_drift":
+        # Labelled an early warning on the surface too, and not only in the code that
+        # computes it: `jarvis doctor`'s INV-PREFIX-DRIFT reads what the API actually
+        # billed, this reads what went into the prompt, and a reader who meets this line
+        # first must not take it for the measurement (hooks.note_prefix).
+        return ("Prompt prefix moved — early warning, not a measurement",
+                f"{_prefix_changes(p)}. This turn's cached prefix was probably re-written, "
+                f"so the conversation so far was re-sent; `jarvis doctor` reports what it "
+                f"actually cost.")
     if kind == "gate_requested":
         # The seat, when a subagent tripped the gate. `add_approval` only writes the key
         # when there is one, so the unqualified line is still what a plain worker gets.

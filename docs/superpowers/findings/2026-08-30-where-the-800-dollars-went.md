@@ -309,3 +309,67 @@ a quiet day" — is answered by two floors, `os.cache_health_min_orders` (20) an
 `os.cache_health_min_boundaries` (50), below which **both checks report nothing at all**
 rather than reporting a hedged number. Measured against 51 sealed orders and 294
 boundaries in a normal week.
+
+---
+
+## Appendix, 2026-09-16 — finding 4 action 1 landed, and what it is not (wo-be1ede5e)
+
+`hooks.note_prefix` fingerprints the inputs to a worker's prompt prefix on every
+`SessionStart` and records a `prefix_drift` event when one moves between two turns of the
+same conversation. Both of the cons this finding stated against action 1 are answered
+here rather than argued with.
+
+**"A hook is a proxy."** Correct, and stronger than the finding put it: a hook cannot hash
+the rendered system prompt either. That string is nowhere a hook can reach — it is not in
+the payload, and it is not in the transcript (surveyed across 4,799 transcripts on CLI
+2.1.272; the records carry `version`, `promptSource` and the messages, never the system
+prompt). So what is hashed is the *ingredients*: the Claude Code version, the git briefing
+Jarvis appends, the worker's settings file, and the CLAUDE.md set. An ingredient moving is
+a reason to expect a re-write, not an observation of one. `check_prefix_stable` reads what
+the API actually billed and remains the measurement; when the two disagree it wins, and
+that rule is written beside the computation in `src/jarvis/hooks.py`, not here.
+
+Two things the fingerprint deliberately does not cover, so the list is not read as
+exhaustive:
+
+- **The MCP tool set** — 35% of the post-fix prefix re-writes by volume, and the largest
+  single named cause. Tool definitions render at position 0, so a server connecting
+  *mid-turn* re-writes the whole conversation (kn-f94abf34 (2)); `SessionStart` runs
+  before that connect, so a fingerprint taken there cannot see the case that costs the
+  money. Action 3 is what settles MCP. INV-PREFIX-DRIFT says so when it fires: a crossing
+  with no ingredient named is the case to suspect a server in.
+- **The CLI version on an install layout the parse does not recognise.** It is the one
+  ingredient read out of the environment rather than hashed from bytes, so it can fail in
+  a way that looks like working: `?` is skipped on both sides of every comparison, and a
+  CLI upgrade is then never reported. Because a crossing with no named cause is supposed
+  to mean *suspect a server*, a dead ingredient would send the reader to the wrong
+  suspect — so INV-PREFIX-DRIFT now opens by naming any ingredient this machine could not
+  read at all (`hooks.unreadable_ingredients`), before the ones that moved.
+- **A project's standing `append_system_prompt` from the catalog.** Importing
+  `jarvis.catalog` costs ~60ms against a ~155ms hook. The work order's own override is
+  covered, because that row is already loaded.
+
+**"It runs on every session for a condition that changes rarely."** Measured, not
+promised: `SessionStart` already ran `jarvis _hook`, so there is no new process, and the
+fingerprint adds **1.25ms to a 165ms invocation — 0.76%** (`scripts/bench_hook_cost.py`,
+median of 21). The memory walk is capped at 32 files and 256KiB so the figure cannot grow
+with somebody's rules directory.
+
+**It is not the detector this action promised**, and the shortfall is stated here and in
+the code rather than left for a reader to discover. Action 1's selling point was that "a
+regression is caught at the moment it happens". Two gaps remain, both structural. It
+cannot tell a regression from an edit: every ingredient it watches also moves for good
+reasons, and nothing in a digest separates a new CLAUDE.md rule from
+`includeGitInstructions` being flipped back on. And nothing is paged: the event lands on
+one work order's timeline, while the fleet-level "the prefix has got worse" judgement is
+still INV-PREFIX-DRIFT's, on the doctor's cadence. What arrives at the moment it happens
+is the *evidence*; the verdict still arrives later. A fleet that believes it is watched
+stops looking, so this is the expensive way to be wrong about what landed here.
+
+**It records and does not alarm.** An ingredient changing is ordinary — an edit to a
+project's CLAUDE.md legitimately moves the prefix for every worker in it — so a proxy
+raising its own violation would fire on routine edits *and* would stand beside the
+authoritative check as a second verdict with no rule saying which to believe. What it adds
+instead is the cause: INV-PREFIX-DRIFT knows the prefix got worse and previously had only
+a list of three suspects to offer, and now names which of them actually moved, how often,
+and when.
