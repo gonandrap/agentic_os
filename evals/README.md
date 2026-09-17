@@ -31,6 +31,14 @@ Run the LLM layer before changing any persona/prompt text (Neo's PERSONA, the wo
 contract, CLAUDE.md, the seat mandates in `src/jarvis/assets/neo-seats/`) and paste the
 scorecard into the PR description.
 
+### The prefix-drift battery
+
+`test_prefix_drift.py` is in the deterministic layer on purpose — a drift detector that
+only runs when somebody opts in is not a detector. It asserts the STRUCTURE of the
+worker prompt (which region each piece of text lives in), not a pinned render, so
+rewording the briefing is free and moving it is not. It is the early signal;
+`invariants.check_prefix_stable` is the authority, and the module says so.
+
 ### The panel eval
 
 `evals/llm/test_neo_panel_judgment.py` is the measurement that Neo's panel is gated on:
