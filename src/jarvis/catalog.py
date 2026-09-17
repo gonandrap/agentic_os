@@ -445,6 +445,36 @@ DEFAULT_INSPECT_ALARM_REWRITE_MIN_ORDERS = 5
 #: `INSPECT_MONEY_KEYS`.
 DEFAULT_INSPECT_ALARM_REWRITE_MIN_USD = 10.0
 
+# -- who is still buying the ONE-HOUR cache write. The two above judge a project's own
+# sealed bills; these two judge the TRANSCRIPT TREE, including sessions the OS never
+# dispatched and has no other record of (issue 164 item 3, finding 3 of
+# docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md).
+
+#: The window, in days. Seven for `DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS`' reason and
+#: one of its own: the condition this detects is a SETTING going missing — a fresh
+#: machine, a new shell profile — and a week is short enough that the leak is named while
+#: the change that caused it is still recent.
+DEFAULT_INSPECT_ALARM_CACHE_1H_WINDOW_DAYS = 7
+
+#: One-hour tokens written in the window by sessions JARVIS DID NOT DISPATCH. THIS IS A
+#: LEAK DETECTOR AND NOT A HEADLINE SAVING, and the threshold says so: the 1h premium on
+#: 500k tokens is ~$1.88 at Opus list, so this is not sized to catch money, it is sized to
+#: catch the setting disappearing before a year of it adds up. MEASURED on this machine
+#: 2026-09-16: zero 1h tokens in the trailing 7 and 14 days (the user's own
+#: `FORCE_PROMPT_CACHING_5M` is holding), against ~3.8M/week in the ten days before it was
+#: set — so this fires within a week of the line being lost and never on a quiet one. Set
+#: above the median offending session (87k) so one afternoon's hand-opened `claude` is not
+#: an alarm.
+DEFAULT_INSPECT_ALARM_CACHE_1H_TOKENS = 500_000
+
+#: The same, for turns JARVIS ITSELF dispatched — a BREACH of `claude_cli.cache_env`, and
+#: a defect in this OS rather than in anyone's personal config. An order of magnitude
+#: lower because it is a different finding, not a smaller one: a worker turn writes
+#: 100-300k at a boundary, so this catches a SINGLE breached turn while staying above a
+#: stray row. The last one the fleet had was 299,610 tokens over 2026-08-22/23, before
+#: the transport fix reached production.
+DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS = 50_000
+
 #: `InspectConfig` fields that are a FRACTION, not a count. `_parse_inspect` refuses every
 #: other field below 1, which would reject every legal value of these two.
 INSPECT_FRACTION_KEYS = ("alarm_rewrite_prefix_share", "alarm_rewrite_ttl_share")
@@ -486,6 +516,10 @@ class InspectConfig:
     alarm_rewrite_ttl_share: float = DEFAULT_INSPECT_ALARM_REWRITE_TTL_SHARE
     alarm_rewrite_min_orders: int = DEFAULT_INSPECT_ALARM_REWRITE_MIN_ORDERS
     alarm_rewrite_min_usd: float = DEFAULT_INSPECT_ALARM_REWRITE_MIN_USD
+    alarm_cache_1h_window_days: int = DEFAULT_INSPECT_ALARM_CACHE_1H_WINDOW_DAYS
+    alarm_cache_1h_tokens: int = DEFAULT_INSPECT_ALARM_CACHE_1H_TOKENS
+    alarm_cache_1h_dispatched_tokens: int = \
+        DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS
 
 
 # -- message delivery: how long a queued message may stay undelivered before the OS
@@ -1086,6 +1120,13 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
                                              base.alarm_rewrite_min_orders)),
         alarm_rewrite_min_usd=float(raw.get("alarm_rewrite_min_usd",
                                             base.alarm_rewrite_min_usd)),
+        alarm_cache_1h_window_days=int(raw.get("alarm_cache_1h_window_days",
+                                               base.alarm_cache_1h_window_days)),
+        alarm_cache_1h_tokens=int(raw.get("alarm_cache_1h_tokens",
+                                          base.alarm_cache_1h_tokens)),
+        alarm_cache_1h_dispatched_tokens=int(
+            raw.get("alarm_cache_1h_dispatched_tokens",
+                    base.alarm_cache_1h_dispatched_tokens)),
     )
     for name, value in vars(cfg).items():
         if name in INSPECT_FRACTION_KEYS:

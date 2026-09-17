@@ -141,6 +141,29 @@ LANDING_SWEEP_EVERY_TICKS = 720
 #: default (`catalog.ScheduleConfig`).
 SCHEDULE_EVERY_TICKS = 12
 
+#: Walk the transcript tree for one-hour cache writes every N ticks — six hours at the
+#: default 5s interval. ITS OWN CADENCE BECAUSE IT IS BY FAR THE DEAREST READ IN THE
+#: DAEMON: a substring pass over every transcript on the machine (843MB and 4,584 files
+#: here) plus a full parse of the few that match, measured at ~20s. That is 0.1% of a
+#: six-hour period and 60x the whole reconcile tick, which is why it cannot live there.
+#:
+#: Six hours rather than daily because the condition is a SETTING going missing and the
+#: window it is judged over is a week: four looks a day bounds how long a lost line runs
+#: unreported without making the scan's cost noticeable. The dedupe is what stops four
+#: looks becoming four alarms — `Daemon.check_cache_ttl` raises once per kind per window.
+#:
+#: Not catalog-configurable, for `PR_POLL_EVERY_TICKS`' reason: the THRESHOLDS are
+#: settings because a project may genuinely want to hear sooner, but how often the OS
+#: reads its own disk is not a decision anyone has information to make.
+CACHE_TTL_EVERY_TICKS = 4320
+
+#: WHICH tick of each period, and the only cadence here that is not `== 1`. Tick 1 is the
+#: daemon's FIRST, when it is starting the fleet: a 20-second disk walk there delays every
+#: dispatch behind it, and a daemon restarted more often than the period would pay that
+#: cost on every boot and never reach a later tick to do the scan it skipped. Five minutes
+#: in is past the start-up burst and still inside any session anybody is watching.
+CACHE_TTL_TICK_OFFSET = 60
+
 #: How many dashboard digests one batch may produce. Bounds the cost of the FIRST batch
 #: on an instance upgrading into the feature with a backlog of long questions already in
 #: `neo.db` — the rest are picked up on later ticks and render in full until then. It is
@@ -234,6 +257,22 @@ REWRITE_INBOX_TITLE = {
         "{project} is paying to re-send conversations whose prompt PREFIX moved",
     inspection.REWRITE_TTL_ALARM:
         "{project} is paying to re-send conversations whose cache entry EXPIRED",
+}
+
+#: The same, for the ONE-HOUR CACHE pair. ITS OWN DICT AND NOT A THIRD AND FOURTH ENTRY
+#: ABOVE: a dict named for one alarm family is a thing a test reads WHOLE — the sibling's
+#: does, asserting its two titles are exactly the two inbox rows a raise produced — so
+#: adding to it silently changes what an existing assertion means. One family, one dict.
+#:
+#: ONE PER CAUSE for `REWRITE_INBOX_TITLE`'s reason, though here the two name different
+#: CULPRITS rather than different cures. A row saying only "the fleet is buying the
+#: one-hour cache" sends the reader to the OS when the answer is their own settings file,
+#: or to their settings file when the answer is a bug in here.
+CACHE_1H_INBOX_TITLE = {
+    inspection.CACHE_1H_DISPATCHED_ALARM:
+        "Jarvis's OWN turns are buying the one-hour cache write — a transport defect",
+    inspection.CACHE_1H_FOREIGN_ALARM:
+        "Hand-opened Claude sessions are buying the one-hour cache write",
 }
 
 
@@ -509,6 +548,8 @@ class Daemon:
         retry_paused = self.tick_count % RETRY_EVERY_TICKS == 1
         sweep_landings = self.tick_count % LANDING_SWEEP_EVERY_TICKS == 1
         run_schedule = self.tick_count % SCHEDULE_EVERY_TICKS == 1
+        scan_cache_ttl = \
+            self.tick_count % CACHE_TTL_EVERY_TICKS == CACHE_TTL_TICK_OFFSET
         # `None` means "the roster was not read this tick" — either nothing is injected
         # or the listing failed — and is NOT the same as an empty roster, which would
         # mean every injected session ended. Session tracking is skipped on None.
@@ -583,6 +624,11 @@ class Daemon:
                 # same pass claims it instead of leaving it a whole poll interval late.
                 if run_schedule:
                     self.schedule_tick(project, store)
+                # Its own cadence, and OUTSIDE the reconcile block: a ~20s transcript
+                # walk (`CACHE_TTL_EVERY_TICKS`) has no business on a 30-second beat.
+                # Only the OS-owning project does any work here — see `check_cache_ttl`.
+                if scan_cache_ttl:
+                    self.check_cache_ttl(project, store)
                 self.dispatch_pending(project, store, state)
                 if poll_prs:
                     self.poll_pull_requests(project, store)
@@ -2953,6 +2999,80 @@ class Daemon:
                      f"Read it with: jarvis alarms show {row['id']}",
                 wo_id=tax.worst_id)
             log.info("[%s] %s: %s", project.name, kind, reason)
+
+    def check_cache_ttl(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Raise the fleet's remaining ONE-HOUR cache writes, split by who bought them.
+
+        Issue 164 item 3; finding 3 of
+        docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
+
+        A FLEET READING CARRIED BY ONE PROJECT, which is why this returns immediately for
+        every project but the one `schedule.os_owner` names. Transcripts are indexed by
+        the cwd a session was created in and a hand-opened one belongs to no project at
+        all, so there is nothing to attribute per project — and N projects raising the
+        same fleet fault is N-1 copies of an alarm nobody reads (`schedule.JobContext`
+        made the same call for the OS-level doctor checks).
+
+        FOUR THINGS HERE MATCH `check_rewrite_tax` AND ONE DOES NOT.
+
+        Matching: no attention flag (the carrier has settled and
+        `invariants.check_no_phantom_attention` would clear it next tick), the inbox row
+        as the durable half, an EXEMPLAR carrier rather than a culprit, and one alarm per
+        kind per window via `last_alarm_of_kind`.
+
+        NOT matching, and it is the whole character of this alarm: the foreign half
+        reports a condition THE OS CANNOT FIX. The remedy is a line in the user's own
+        `~/.claude/settings.json`, which Jarvis must never write — so what the supervisor
+        can do is file a work order telling a person to add it, and the reason carries the
+        line verbatim so that order is writable without a second investigation.
+
+        THE CARRIER IS THE PROJECT'S MOST RECENT SETTLED ORDER and stands for nothing but
+        the foreign key. `check_rewrite_tax` could pick the biggest contributor because
+        its subject WAS a work order; this one's subject is a session the OS never
+        dispatched, so there is no order the number is about. `SUPERVISOR_PERSONA` says
+        so: the alarm is about the fleet, and the order under it is a hook.
+        """
+        from .project_store import NO_TURN
+
+        cfg = project.inspect
+        if not cfg.enabled or project.name != self._os_owner():
+            return
+        days = cfg.alarm_cache_1h_window_days
+        since = db.now() - days * 86_400
+        try:
+            found = inspection.one_hour_writes(since)
+        except OSError:  # a transcript tree that moved or is unreadable
+            log.exception("[%s] the one-hour cache scan could not read transcripts",
+                          project.name)
+            return
+        raised = inspection.hour_alarms(found, cfg, days=days)
+        if not raised:
+            return
+        carrier = store.latest_settled_order()
+        if carrier is None:
+            # Nothing to hang the foreign key on. The finding is not lost — it is still
+            # true on the next pass, and the first order this project settles carries it
+            # then. Alarming against an order that does not exist is the alternative.
+            log.info("[%s] one-hour cache writes found, but no settled order to carry "
+                     "the alarm yet", project.name)
+            return
+        for alarm in raised:
+            last = store.last_alarm_of_kind(alarm.kind)
+            if last is not None and float(last["ts"] or 0.0) >= since:
+                continue
+            row = store.add_finding(carrier["id"], kind=alarm.kind, reason=alarm.reason,
+                                    seq=NO_TURN, source="cost")
+            store.add_event(carrier["id"], "cost_alarm",
+                            {"kind": alarm.kind, "seq": NO_TURN,
+                             "reason": alarm.reason, "alarm_id": row["id"]})
+            self.central.add_inbox(
+                project=project.name, level="warning",
+                title=CACHE_1H_INBOX_TITLE[alarm.kind],
+                body=f"{alarm.reason}\n"
+                     f"The supervisor will look before you have to. "
+                     f"Read it with: jarvis alarms show {row['id']}",
+                wo_id=carrier["id"])
+            log.info("[%s] %s: %s", project.name, alarm.kind, alarm.reason)
 
     def settle_turns(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Reap finished turns, then move each work order to where its turn says it is.

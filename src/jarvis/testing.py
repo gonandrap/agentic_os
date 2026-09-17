@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from . import agent_usage, paths, release, systemd_units
+from . import agent_usage, paths, release, systemd_units, usage
 from .bugreport import GH_BIN_ENV
 from .claude_cli import CLAUDE_BIN_ENV, CREDENTIALS_ENV
 from .notify import DISABLE_EXTERNAL_SINKS_ENV
@@ -1519,6 +1519,22 @@ def jarvis_home(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_HOME", str(home))
     if not _bills_real_tokens():
         monkeypatch.setenv(agent_usage.SPEND_HOME_ENV, str(home))
+    # CLAUDE CODE'S TRANSCRIPTS FOLLOW THE HOME, for the same reason and one of their
+    # own. A test that does not point this somewhere reads the DEVELOPER'S real
+    # `~/.claude/projects` — every session on the machine, whatever they happen to have
+    # run — so its result depends on a tree no test wrote and CI does not have. It is
+    # also slow: `Daemon.check_cache_ttl` walks that tree, which took a ticking test file
+    # from 6s to 26s here before this line existed. A test that wants transcripts still
+    # sets the variable itself; setting it here only makes the DEFAULT empty rather than
+    # whatever the machine is carrying.
+    # `claude-projects` and not `transcripts`: four existing fixtures already build their
+    # own tree at `tmp_path / "transcripts"` with a bare `mkdir()`, and a default sharing
+    # that path turns every one of them into a FileExistsError. A test that wants
+    # transcripts still overrides the variable; this only decides where it points when
+    # nobody sets it.
+    transcripts = tmp_path / "claude-projects"
+    transcripts.mkdir(exist_ok=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(transcripts))
     return home
 
 
@@ -1551,12 +1567,20 @@ def fake_claude(tmp_path, monkeypatch):
 
         @property
         def calls(self) -> list[dict]:
-            """Every invocation, oldest first (one file each; the name is a timestamp)."""
+            """Every invocation, oldest first (one file each; the name is a timestamp).
+
+            `.json` ONLY, and it is load-bearing rather than tidy. Each record is
+            written twice to the same name (see `_write_call_record`), and the second
+            write lands as a COMPLETE `<name>.json.part<pid>` beside the first one's
+            already-renamed `<name>.json` for the instant before `os.replace` runs. A
+            directory listing taken in that instant parses both and reports one
+            invocation as two — which is what a poller does for a living.
+            """
             cdir = fdir / "calls"
             if not cdir.is_dir():
                 return []
             out = []
-            for path in sorted(cdir.iterdir()):
+            for path in sorted(p for p in cdir.iterdir() if p.name.endswith(".json")):
                 try:
                     out.append(json.loads(path.read_text()))
                 except (OSError, json.JSONDecodeError):

@@ -68,6 +68,25 @@ def run_turn(daemon, store, settle_turns):
     daemon.tick()
 
 
+def test_a_call_being_rewritten_is_not_counted_twice(fake_claude):
+    """The `unit (3.11)` flake of 2026-09-16, reduced to its mechanism.
+
+    Every fake invocation records itself TWICE — on entry, then from `atexit` to fill in
+    `finished_at` — through a temp file in the SAME directory these tests poll. For the
+    instant between the second write and its `os.replace`, a COMPLETE
+    `<name>.json.part<pid>` sits beside the `<name>.json` the first write left; both
+    parse, so a listing taken there reports one worker turn as two. That is what made
+    `test_dispatch_flow` fail on `assert len(opening) == 1` with two identical argvs,
+    and polling while processes exit is what `wait_calls` does for a living.
+    """
+    calls = fake_claude.dir / "calls"
+    calls.mkdir(exist_ok=True)
+    record = {"argv": ["-p", "--session-id", "s"], "cwd": "/tmp"}
+    (calls / "1-7.json").write_text(json.dumps(record))
+    (calls / "1-7.json.part7").write_text(json.dumps(record))
+    assert fake_claude.calls == [record]
+
+
 def test_start_bootstraps_and_registers(started, project, jarvis_home):
     assert (project / "OPERATION.md").exists()
     assert (project / ".jarvis" / "jarvis.db").parent.is_dir()

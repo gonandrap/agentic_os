@@ -58,6 +58,18 @@ fix at the wrong one. Never propose changing a cache TTL off a `rewrite-tax-ttl`
 alone: its threshold is a share of the BILL and the TTL decision is taken against a
 different ratio, which the alarm's own text names along with the command that measures it.
 
+AND TWO MORE ARE NOT ABOUT THIS PROJECT AT ALL. `cache-1h-dispatched` and
+`cache-1h-foreign` are the FLEET's remaining one-hour cache writes — every transcript on
+the machine, including sessions no project owns. The work order they hang off carries the
+foreign key and NOTHING else: it is not the exemplar of the number, it did not cause it,
+and it may have nothing to do with it. The two are opposite faults. `cache-1h-dispatched`
+says Jarvis's own transport bought the expensive write, which is a DEFECT IN THIS
+CODEBASE and a work order anyone can act on. `cache-1h-foreign` says a person's own
+`claude` did — the remedy is one line in THEIR `~/.claude/settings.json`, which Jarvis
+must never write, so the only honest outcome is a work order asking a PERSON to add it.
+Never propose a remedy that has the OS edit a user's personal configuration, and never
+answer a `cache-1h-foreign` alarm as though the OS were at fault.
+
 READ WHAT A TURN COST BEFORE YOU CALL IT EXPENSIVE. Every turn in the packet carries its
 API call count and the tokens and dollars it actually bought. A turn that made NO API call
 has spent nothing however long its wall clock is: it STALLED, and it is the work never
