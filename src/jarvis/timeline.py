@@ -55,6 +55,9 @@ STATUS_LABEL = {
     "pending": "Queued",
     "dispatching": "Dispatching worker",
     "running": "Running",
+    # NOT "Waiting on you". A manager between its feature's messages asks nothing of
+    # anybody, and eleven hours of it reading otherwise is GitHub issue #264.
+    "idle": "Idle — waiting for its feature",
     "waiting_input": "Waiting on you",
     "validating": "Under review by the validation panel",
     "needs_review": "Needs your review",
@@ -111,6 +114,11 @@ def _neo_question_id(p: dict[str, Any]) -> int | None:
 ALARM_KINDS = frozenset({"cost_alarm", "alarm_reviewed", "alarm_escalated",
                          "alarm_advice", "health_finding", "health_reviewed",
                          "remedy_proposed", "remedy_applied", "remedy_refused"})
+
+#: `project_store.NO_TURN`, duplicated for `ALARM_KINDS`' reason — a leaf may not import
+#: a store — and pinned equal to it by the same test. A `cost_alarm` carrying it judged
+#: no turn: see `_describe`.
+NO_TURN = -1
 
 
 def _ref(kind: str, p: dict[str, Any]) -> dict[str, Any] | None:
@@ -193,6 +201,14 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # Its own line rather than folded into "Needs you": only the FIRST alarm of a
         # turn raises the flag, so the rest exist only here, and this is the row that
         # says a turn was already known to be expensive while it was still running.
+        #
+        # …EXCEPT for the aggregate kinds, which judge no turn (`seq == NO_TURN`) and
+        # land on an order that has already settled. "while it runs" would be a claim
+        # about a running turn on a row where none is running, which is the class of
+        # false statement `inspection._spend_so_far` exists to prevent on the other
+        # surface.
+        if p.get("seq") == NO_TURN:
+            return "A standing cost finding on this project", p.get("reason") or ""
         return "Costing money while it runs", p.get("reason") or ""
     # The supervisor's three. Same trap as the validation kinds below, already paid for
     # once here: `event_level` calls an unknown kind "signal", so a kind with no branch

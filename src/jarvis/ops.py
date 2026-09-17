@@ -17,7 +17,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 log = logging.getLogger("jarvis.ops")
 
@@ -181,7 +181,8 @@ def stop_os() -> dict[str, Any]:
 # -- status ------------------------------------------------------------------------------
 
 def run_doctor(project: str | None = None, repair: bool = False,
-               catalog_path: str | None = None) -> dict[str, Any]:
+               catalog_path: str | None = None,
+               include_os: bool = True) -> dict[str, Any]:
     """Run the OS's post-condition checks over one project or the whole fleet.
 
     Read-only unless `repair` is set, so it is safe to run at any time. The daemon runs
@@ -194,11 +195,23 @@ def run_doctor(project: str | None = None, repair: bool = False,
     on the default branch" has no other home, and the audit that first answered it
     (GitHub issue #232, six stranded work orders) was a one-off done by hand.
 
-    It also pays full price for it without `repair`. INV-WORK-LANDED caches its settled
-    verdicts as a timeline event, and a read-only run has no timeline to write to, so
-    the default `jarvis doctor` re-reads git for every completed work order every single
-    time — the cache is populated by the daemon's hourly sweep and by `--repair`, never
-    by a plain run. Read-only is worth more than the seconds: see `check_work_lands`.
+    It also pays full price for it without `repair`, and answers LESS. INV-WORK-LANDED
+    caches its settled verdicts as a timeline event, and a read-only run has no timeline
+    to write to, so the default `jarvis doctor` re-reads git for every completed work
+    order every single time — the cache is populated by the daemon's hourly sweep and by
+    `--repair`, never by a plain run. The same rule costs it the coverage verdict
+    outright: refreshing the default branch writes to the repository, so a plain run does
+    not (`landing.refresh_base(allow_network=False)`) and will not condemn a branch
+    against a ref it could not bring up to date — it reports stranded work through the
+    rungs that read no base, and `unknown` where the content test would have answered.
+    Read-only is worth more than either: see `check_work_lands`.
+
+    `include_os=False` drops the OS-LEVEL checks — `check_os` and the release marker —
+    and keeps the per-project ones. The scheduler's daily run passes it for every project
+    but the one that owns the install: those checks are about the OS, not about any
+    project, so a fleet of six would otherwise report one broken dashboard six times
+    every morning. Interactive `jarvis doctor` leaves it on, which is why the default is
+    True: a human who typed the command is asking about everything they can see.
     """
     from .invariants import check_catalog, check_os, check_project, check_release_marker
 
@@ -232,7 +245,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
     # OS-level checks first: they are about the OS itself (is the dashboard alive?),
     # not about any one project, and `--project` must not filter them out — a fleet
     # scoped to one project still wants to know its web UI is broken.
-    os_found = check_os()
+    os_found = check_os() if include_os else []
     results, total = [], len(os_found)
     for p in rows:
         if p["status"] != "active":
@@ -275,7 +288,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
     # OS-level state under $JARVIS_HOME, owned by no project: a pending-release marker
     # stuck in flight. Reported under its own heading; never repaired (which half of
     # the hand-off died is not derivable from the file).
-    os_violations = check_release_marker()
+    os_violations = check_release_marker() if include_os else []
     if os_violations:
         total += len(os_violations)
         results.append({
@@ -288,6 +301,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
         })
     out = {
         "repair": repair,
+        "include_os": include_os,
         "violations": total,
         "os": [{"invariant": v.invariant, "detail": v.detail, "repaired": v.repaired,
                 "repair": v.repair, "context": v.context} for v in os_found],
@@ -383,6 +397,28 @@ def _neo_attention() -> tuple[dict[str, int], list[dict[str, Any]]]:
         neo.close()
 
 
+def _held_jobs(store: ProjectStore, catalog: Catalog | None = None) -> list[dict[str, Any]]:
+    """Scheduled jobs this project is STILL SUPPOSED TO RUN and cannot.
+
+    Only the held ones: a scheduler ticking along is not news, and a line per job per
+    project on every `jarvis status` would spend exactly the attention budget the
+    scheduler exists to protect.
+
+    Filtered by the config for `invariants.check_schedule_progresses`' reason — a hold
+    survives being switched off, because only a firing clears it, and a project that has
+    been told to stop scheduling will never reach one. Resolved through
+    `schedule_config_at`, the SAME call that invariant makes, so the two cannot answer
+    differently for one project.
+    """
+    cfg = schedule_config_at(store.project_path, catalog)
+    if not cfg.enabled:
+        return []
+    return [{"job_id": st["job_id"], "since": st["held_since"],
+             "reason": st["held_reason"] or "", "wo_id": st["last_wo_id"]}
+            for st in store.list_schedule_states()
+            if st["held_since"] and st["job_id"] in cfg.jobs]
+
+
 def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
     central = CentralStore()
     try:
@@ -402,6 +438,11 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             fleet_state = fleet.current(_cat)
         except (OpsError, CatalogError):
             mode_by_project = {}
+            # `_cat` stays None and `_held_jobs` resolves the catalog itself, landing on
+            # `schedule_config_at`'s single fallback. Deliberately NOT a second map here:
+            # a name-keyed one beside the invariant's path-keyed lookup is how the two
+            # surfaces came to disagree about the same project in the first place.
+            _cat = None
         # Read Neo's questions BEFORE the project loop, not after it: a question Neo sent
         # up already gets its own attention line below, carrying the text and the
         # `jarvis neo answer` command, and the work order it came from must not add a
@@ -551,6 +592,15 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         for wo in open_wos
                     ],
                     "settings_drift": drift,
+                    # ONLY THE HELD ONES. A scheduler that is ticking along is not news
+                    # and adding a line per job per project to every `jarvis status`
+                    # would spend exactly the attention budget the scheduler is designed
+                    # to protect; a job that has wanted to fire and could not is the one
+                    # state where silence and death look the same from outside.
+                    # INV-SCHEDULE-HELD is the louder half, once it has been held for
+                    # days — this is what answers "why has there been no doctor order
+                    # since Tuesday" before then.
+                    "schedule_held": _held_jobs(store, _cat),
                 })
                 if drift:
                     attention.append({
@@ -1121,9 +1171,38 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
     if wo["status"] == "pending":
         return {"what": "pending", "stalled": False,
                 "detail": "not dispatched yet — no worker exists to nudge"}
+    # THE FALL-THROUGH BELOW USED TO ANSWER FOR THIS ONE, and it was the OS giving a
+    # confident wrong explanation for a state it had created itself: a manager parked
+    # between its feature's messages reached here as `waiting_input` with nothing
+    # running and nothing queued, which is exactly the shape the last line calls a
+    # permission prompt — impossible under `auto` (GitHub issue #264).
+    if wo["status"] == "idle":
+        return {"what": "manager_idle", "stalled": False,
+                "detail": "it is the feature's manager and has nothing to act on — "
+                          "idle until its feature sends it something, which is what "
+                          "this work order is for"}
     return {"what": "prompt", "stalled": True,
             "detail": "nothing else accounts for it: an unanswered permission prompt "
                       "is what is left"}
+
+
+#: The `waiting_on` answers where a nudge is ACTIVELY WRONG rather than merely useless,
+#: mapped to the sentence that says why. They need their own refusal because every other
+#: one below is bought by `could_prompt` being False — so a project running a mode that
+#: CAN prompt would fall through and send the message anyway.
+#:
+#: `message_stuck`: the nudge is `send_message`, another row on the queue that is already
+#: not moving, and `invariants.MESSAGE_STUCK_BLOCKER` sends the user to this command.
+#:
+#: `manager_idle`: the nudge buys a turn whose whole content is the worker saying nothing
+#: was needed, and then the OS parks it back where it was — the loop GitHub issue #264
+#: measured at 0.37 USD a lap.
+NUDGE_IS_WRONG = {
+    "message_stuck": "a nudge cannot help — it is another message on the queue that is "
+                     "already stuck.",
+    "manager_idle": "a nudge cannot help — it buys one turn of the manager saying "
+                    "nothing was needed, and it ends up back here.",
+}
 
 
 def resume_in_auto(wo_id: str, project_name: str | None = None,
@@ -1156,13 +1235,7 @@ def resume_in_auto(wo_id: str, project_name: str | None = None,
     could_prompt = worker_stalls_on_prompts(mode) if mode else True
     out = {"project": name, "wo_id": wo_id, "permission_mode": mode,
            "waiting_on": wait["what"], "diagnosis": wait["detail"]}
-    if not force and wait["what"] == "message_stuck":
-        # THE ONE ANSWER WHERE A NUDGE IS ACTIVELY WRONG rather than merely useless, and
-        # the reason it needs a branch of its own: every other refusal below is bought by
-        # `could_prompt` being False, so a project running a mode that CAN prompt would
-        # fall through to the nudge — and the nudge is `send_message`, another row on the
-        # queue that is already not moving. `invariants.MESSAGE_STUCK_BLOCKER` sends the
-        # user here, so this is the command that has to say what is wrong instead.
+    if not force and wait["what"] in NUDGE_IS_WRONG:
         store = ProjectStore(path)
         try:
             store.add_event(wo_id, "resume_auto_declined",
@@ -1171,8 +1244,8 @@ def resume_in_auto(wo_id: str, project_name: str | None = None,
             store.close()
         out.update({
             "nudged": False, "changed": False,
-            "note": f"a nudge cannot help — it is another message on the queue that is "
-                    f"already stuck. {wait['detail']}. Send one anyway with --force.",
+            "note": f"{NUDGE_IS_WRONG[wait['what']]} {wait['detail']}. Send one anyway "
+                    f"with --force.",
         })
         return out
     if not force and not could_prompt and not wait["stalled"]:
@@ -2261,14 +2334,62 @@ def force_validation(wo_id: str, *, reason: str,
         store.close()
 
 
+def prior_round_history(store: ProjectStore, *, wo_id: str | None = None,
+                        fo_id: str | None = None,
+                        before: int) -> list[dict[str, Any]]:
+    """What earlier rounds of this unit's review asked for, for `EvidencePacket.history`.
+
+    Here rather than in `evidence` for `collect_feature_evidence`'s reason: it is two
+    store reads per round, and that module may not touch a store.
+
+    **BLOCKERS ONLY, and `validation.blockers(validation.findings(...))` is what decides
+    which** — the same pair the chair's own prompt is built with, never a second reader.
+    A reader that classified even slightly differently would put a follow-up into the
+    shared prefix, which `_run_chair` hands the chair (spec
+    docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md §5.2.1).
+
+    **Only the rounds the budget counted.** `pending` is a round in flight and `failed` is
+    an outage or a panel that was never wired in, so its stored reason is about the OS
+    rather than about the code — rendering either under "these points were raised" would
+    tell five seats something false about the submission.
+
+    A round whose opinions yield no blocker still earns an entry: the round row's own
+    `outcome` and `reason` are what the submitter was actually told, and every opinion
+    stored before this feature — and every one an injected validator writes — is prose
+    that parses to no findings at all.
+    """
+    from . import validation
+    from .project_store import COUNTED_VALIDATION_OUTCOMES
+
+    out: list[dict[str, Any]] = []
+    for r in store.validation_rounds(wo_id=wo_id, fo_id=fo_id):
+        if int(r["round"]) >= before:
+            continue
+        if str(r["outcome"] or "") not in COUNTED_VALIDATION_OUTCOMES:
+            continue
+        raised: list[dict[str, str]] = []
+        for op in store.validation_opinions(int(r["id"])):
+            raised += validation.blockers(validation.findings(op))
+        out.append({"round": int(r["round"]), "outcome": str(r["outcome"] or ""),
+                    "reason": str(r["reason"] or ""),
+                    "head_sha": str(r["head_sha"] or ""), "blockers": raised})
+    return out
+
+
 def collect_feature_evidence(store: ProjectStore, project_path: Path,
                              fo: dict[str, Any], *, declared: str, summary: str,
-                             cfg: Any) -> Any:
+                             cfg: Any,
+                             history: Iterable[dict[str, Any]] = ()) -> Any:
     """The feature's packet, with each child's own account attached.
 
     Here rather than in `evidence` because assembling `children` is a store read per
     child, and that module may not touch a store — its whole value is that nothing it
     reports could have been influenced by the work it is reporting on.
+
+    `history` is a PARAMETER and defaults to nothing on purpose: both callers pass
+    through here, and only the daemon's — the packet the seats actually read — carries it.
+    `submit_feature_for_validation` builds a packet to fingerprint, and `history` is
+    excluded from that hash (spec 2026-09-15 §5.1).
 
     A child contributes what its OWN last validation round was told, not what it wrote
     into its pull request: that text was already judged once, so a feature seat comparing
@@ -2285,7 +2406,8 @@ def collect_feature_evidence(store: ProjectStore, project_path: Path,
     return evidence_mod.collect_feature(project_path, fo, children, declared=declared,
                                         summary=summary, diff_chars=cfg.diff_chars,
                                         side_effects=feature_side_effects(store,
-                                                                          fo["id"]))
+                                                                          fo["id"]),
+                                        history=history)
 
 
 def submit_feature_for_validation(store: ProjectStore, project_path: Path,
@@ -6043,6 +6165,44 @@ def inspect_config_at(project_path: Path) -> Any:
         return catalog.os.inspect
     except (OpsError, CatalogError, OSError, ValueError):
         return InspectConfig()
+
+
+def schedule_config_at(project_path: Path, catalog: Catalog | None = None) -> Any:
+    """THE ONLY WAY ANYTHING LEARNS WHETHER THIS PROJECT SCHEDULES ANYTHING.
+
+    One resolver with one fallback, called by both surfaces that read a hold
+    (`_held_jobs` for `jarvis status`, `invariants.check_schedule_progresses` for
+    `jarvis doctor`). They used to resolve separately — one by NAME with a disabled
+    fallback, one by PATH with `os.schedule`'s — which meant they could give opposite
+    answers about the same project and the OS would contradict itself about a mechanism
+    it had been told to stop running.
+
+    BY PATH, because that is the only key both callers hold: an invariant is handed a
+    store and no name. `catalog` may be passed by a caller that has already loaded one,
+    which is a saved file read per project and not a second code path — the resolution
+    and the fallback below are the same either way.
+
+    A PROJECT THE CATALOG DOES NOT LIST FALLS BACK TO `ScheduleConfig()` — DISABLED — and
+    deliberately NOT to `catalog.os.schedule`, where `inspect_config_at` and
+    `messaging_config_at` go. Those answer "by what threshold shall I judge this work",
+    which a fleet-wide default answers perfectly well for a project nobody has configured.
+    This answers "is this mechanism supposed to be running here", and for a project absent
+    from the catalog the daemon's answer is no: `Daemon.tick` iterates `catalog.projects`,
+    so such a project's jobs can never fire and its holds can never clear. Inheriting an
+    enabled `os.schedule` would make both surfaces report a permanent hold for a project
+    the OS does not drive — §4's failure, reached by a third route.
+    """
+    from .catalog import ScheduleConfig
+
+    try:
+        cat = catalog if catalog is not None else resolve_catalog()
+        target = Path(project_path).resolve()
+        for spec in cat.projects:
+            if Path(spec.path).resolve() == target:
+                return spec.schedule
+    except (OpsError, CatalogError, OSError, ValueError):
+        pass
+    return ScheduleConfig()
 
 
 def messaging_config_at(project_path: Path) -> Any:

@@ -54,6 +54,10 @@ STATUS_META = {
     "pending":       {"word": "pending",     "icon": "◌", "tone": "muted"},
     "dispatching":   {"word": "dispatching", "icon": "◍", "tone": "active"},
     "running":       {"word": "running",     "icon": "●", "tone": "active"},
+    # Toned `muted`, not `warn`, and absent from FEATURED_STATUSES below: a manager
+    # between its feature's messages is the OS at rest, not a decision anyone owes
+    # (issue #264).
+    "idle":          {"word": "idle",           "icon": "◎", "tone": "muted"},
     "waiting_input": {"word": "waiting on you", "icon": "◉", "tone": "warn"},
     # Toned `active`, not `warn`: a round in flight is the OS working, and nothing is
     # being asked of the user. Templates index this dict BY STATUS — every one of them

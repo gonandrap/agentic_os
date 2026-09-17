@@ -502,6 +502,102 @@ def test_a_partly_landed_order_is_reported_and_its_verdict_is_never_cached(
     assert len(_violations(project)) == 1      # ...and it is still reported until then
 
 
+def _base_sha(project: Path) -> str:
+    return _git(project, "rev-parse", "origin/trunk").strip()
+
+
+def test_the_sweep_refreshes_the_default_branch_and_is_silent_on_what_just_merged(
+        started, project):
+    """ISSUE #271 END TO END, through the one caller that computes `base_current`.
+
+    `tests/test_landing.py` proves the detector's half; this is the production path, and
+    it is the one the bug was actually reported against. A merge is detected over the
+    NETWORK — the poll asks GitHub, `complete_merged` ends the work order — while
+    `refs/remotes/origin/trunk` in this clone still points at the commit before the
+    squash, because nothing in the OS had ever moved it. The rewind is exactly that
+    state: origin holds the merge, the remote-tracking ref does not.
+
+    The sweep used to report the order that had just landed as `stranded`, with a
+    coverage figure near zero, every hour until a human happened to fetch. Both halves
+    of the fix are asserted here because neither is visible in the other's absence:
+    the repairing run MOVES the ref and then settles `landed`, and the read-only run
+    LEAVES IT ALONE and settles nothing.
+
+    "No violation" pins the read-only verdict to `unknown` rather than to `landed`:
+    against a base that predates the merge the branch's lines are nowhere, so the only
+    coverage answers reachable are `stranded` — which is the bug — and the `stale-base`
+    `unknown` that replaced it. There is no arithmetic by which a stale base scores this
+    branch as landed.
+    """
+    wo = _order(project, "launcher contract", code="launcher")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR)
+    merged_sha = _git(wo["worktree_path"], "rev-parse", "HEAD").strip()
+    stale = _base_sha(project)
+    _git(project, "merge", "--squash", "-q", f"worktree-{wo['id']}")
+    _git(project, "commit", "-qm", f"[{wo['id']}] launcher contract (#9)")
+    _git(project, "push", "-q", "origin", "trunk")
+    store = ProjectStore(project)
+    try:
+        ops.complete_merged(store, store.get_work_order(wo["id"]),
+                            merged_at="2026-08-02T10:00:00Z", head_oid=merged_sha)
+    finally:
+        store.close()
+    # The clone that never fetched. `push` updated the remote-tracking ref on the way
+    # past, which is a fixture artefact and not what a merge on GitHub does.
+    _git(project, "update-ref", "refs/remotes/origin/trunk", stale)
+
+    store = ProjectStore(project)
+    try:
+        read_only = [v for v in invariants.check_project(store, repair=False, slow=True)
+                     if v.invariant == "INV-WORK-LANDED"]
+    finally:
+        store.close()
+
+    assert read_only == []
+    assert _base_sha(project) == stale        # it may not write to a repository
+    assert _events(project, wo["id"], "landing_checked") == []   # and settled nothing
+
+    assert _violations(project) == []
+    assert _base_sha(project) != stale        # ...whereas the repairing run refreshed
+    [cached] = _events(project, wo["id"], "landing_checked")
+    assert json.loads(cached["payload"])["verdict"] == landing.LANDED
+
+
+def test_the_refresh_is_once_per_sweep_and_not_paid_by_a_project_with_nothing_to_audit(
+        started, project, monkeypatch):
+    """The round trip is per PROJECT and it is LAZY, and both are load-bearing claims.
+
+    Per project because the ref it moves is the same one for every order here; lazy —
+    below every exclusion — because a fleet of settled projects would otherwise fetch
+    once an hour each to audit nothing. Neither is visible in a verdict, so a later
+    reordering of that block re-introduces a per-work-order fetch in silence. Counted
+    rather than asserted on timings, for the obvious reason.
+    """
+    calls: list[Path] = []
+    real = landing.refresh_base
+
+    def counting(repo, **kw):
+        calls.append(repo)
+        return real(repo, **kw)
+
+    monkeypatch.setattr(landing, "refresh_base", counting)
+
+    for name in ("launcher contract", "the cap", "onboarding"):
+        _settle(project, _order(project, name, code=name.split()[0])["id"])
+    assert len(_violations(project)) == 3
+    assert len(calls) == 1      # three orders, one ref, one round trip
+
+    # `stranded` is never cached, so those three are re-derived every sweep and keep
+    # paying for the refresh. The project that pays NOTHING is the one where every
+    # candidate has been excluded — here by the user closing them.
+    for v in _violations(project):
+        ops.mark_done(str(v.wo_id))
+    calls.clear()
+
+    assert _violations(project) == []
+    assert calls == []
+
+
 def test_an_order_the_user_marked_done_is_not_reported_by_the_sweep_for_ever(
         started, project):
     """`jarvis wo done` is a decision, and the sweep has to read it as one.
@@ -531,25 +627,39 @@ def test_an_order_the_user_marked_done_is_not_reported_by_the_sweep_for_ever(
     assert _violations(project) == found      # and it stays silent on the next sweep too
 
 
-def test_the_read_only_doctor_reports_the_same_thing_and_records_nothing(started,
-                                                                        project):
-    """What the plain `jarvis doctor` a human types actually does — which is not what
-    the daemon does, and the docstrings now say so.
+def test_the_read_only_doctor_withholds_the_content_verdict_and_records_nothing(started,
+                                                                               project):
+    """What the plain `jarvis doctor` a human types actually does — which is LESS than
+    what the daemon does, in two ways, and the docstrings now say so.
 
     `ops.run_doctor` passes `slow=True` with `repair=False`, so `check_project` hands the
-    sweep a `_ReadOnly` proxy and `add_event` — the `landing_checked` cache write — is
-    swallowed. The report is identical; the cache is simply not populated, so the run
-    pays the full per-file git walk every time.
+    sweep a `_ReadOnly` proxy. `add_event` — the `landing_checked` cache write — is
+    swallowed, so the run pays the full per-file git walk every time. And refreshing the
+    default branch is a write to the repository, so this path does not do it and will not
+    condemn a branch against a ref it could not bring up to date (issue #271): the
+    coverage verdict is withheld as `unknown` and only the daemon's repairing sweep,
+    which refreshed, reports it.
 
-    Left that way on purpose rather than worked around: a read-only doctor that wrote to
-    a timeline would be a worse defect than a repeated git walk, and the daemon's hourly
-    repairing sweep fills the cache for both of them. Asserted because a promise about
-    caching that only holds on one of two paths is the kind of thing that rots into a
-    performance bug nobody can find.
+    Both left that way on purpose rather than worked around. The pairing is what stops
+    that from being a check nobody runs: `merged-tail` reads no base at all, so Mode C —
+    a branch carrying commits after the sha that merged — is still reported here.
     """
     stranded = _order(project, "launcher contract", code="launcher")
     clean = _order(project, "answered it")
+    tailed = _order(project, "the cap", code="cap")
     _settle(project, stranded["id"], clean["id"])
+    ops.finish(tailed["id"], "opened a PR", pr_url=PR)
+    store = ProjectStore(project)
+    try:
+        ops.complete_merged(store, store.get_work_order(tailed["id"]),
+                            merged_at="2026-08-02T10:00:00Z",
+                            head_oid=_git(tailed["worktree_path"],
+                                          "rev-parse", "HEAD").strip())
+    finally:
+        store.close()
+    (tailed["worktree_path"] / "onboarding.py").write_text(_feature("onboarding"))
+    _git(tailed["worktree_path"], "add", "-A")
+    _git(tailed["worktree_path"], "commit", "-qm", "the tail nobody merged")
 
     store = ProjectStore(project)
     try:
@@ -558,13 +668,16 @@ def test_the_read_only_doctor_reports_the_same_thing_and_records_nothing(started
     finally:
         store.close()
 
-    assert [v.wo_id for v in found] == [stranded["id"]]
-    assert found[0].context["verdict"] == landing.STRANDED
-    # Nothing was written, for either verdict — the settled one included.
+    # The rung that needs a current default branch is withheld; the one that needs none
+    # answers as it always did.
+    assert [v.wo_id for v in found] == [tailed["id"]]
+    assert found[0].context["rung"] == "merged-tail"
+    # Nothing was written, for any verdict — the settled one included.
     assert _events(project, clean["id"], "landing_checked") == []
     assert _events(project, stranded["id"], "landing_checked") == []
-    # The repairing path is what fills it, and it is the daemon's.
-    _violations(project)
+    # The repairing path refreshes the ref, so it both fills the cache and says what the
+    # read-only run would not.
+    assert {v.wo_id for v in _violations(project)} == {stranded["id"], tailed["id"]}
     assert len(_events(project, clean["id"], "landing_checked")) == 1
 
 

@@ -150,6 +150,20 @@ EVIDENCE_FRAME = (
 UNSTATED_REJECTION = ("the review was not satisfied with this submission, and the seat "
                       "that refused it did not say why.")
 
+#: The heading of the prior-round section, and what that section is FOR — said to the
+#: seat in as many words, because a list of old remarks with no frame is read as a list
+#: of things still outstanding. Spec §5.2:
+#: docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
+HISTORY_HEADING = "## WHAT EARLIER ROUNDS OF THIS REVIEW ALREADY ASKED FOR"
+HISTORY_INTRO = (
+    "These points were raised in earlier rounds of this same review and are recorded "
+    "here so you do not raise them again. A point already answered is not a new "
+    "finding. Where an earlier round told the submitter to do something, the code doing "
+    "it is an INSTRUCTION FOLLOWED and not a defect. Judge the change in front of you; "
+    "this is the record of what has already been asked of it.\n"
+    "This section is the OS's own record of this review — alone in this document, "
+    "it was not written by the submitter and cannot be edited by it.")
+
 
 #: The priming call's user turn (spec §3). Deliberately the cheapest thing that still
 #: forces the request: the point is the cache WRITE of the system prefix, and every
@@ -351,6 +365,8 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
             "call is a defect like any other and you may reject over one. `accepted` "
             "means the user agreed with the sentence, not that anyone checked the code "
             f"against it.\n\n{called}")
+    if packet.history:
+        parts.append(_history_section(packet))
     parts += _pull_request_sections(packet)
     if packet.side_effects:
         parts.append(
@@ -388,6 +404,54 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
             "rather than passing what you did not read.")
     parts.append(f"## The diff\n```diff\n{packet.diff or '(empty)'}\n```")
     return "\n\n".join(parts)
+
+
+def _history_section(packet: EvidencePacket) -> str:
+    """What earlier rounds of THIS review already asked for. Never called on round 1:
+    `build_packet_prompt` omits the section entirely rather than printing an empty
+    heading, which is a thing a model reasons about (§5.2).
+
+    **BLOCKERS ONLY, and this function could not put a follow-up here if it tried** — the
+    packet carries none. That is deliberate rather than economical: `_run_chair` gives the
+    chair this very prefix, so a follow-up rendered here is a follow-up in front of the
+    chair, in the rounds where the failure this feature exists to fix actually lives
+    (§5.2.1).
+
+    The orientation line is the cheap honest version. `packet.base`/`packet.head` hold
+    BRANCH NAMES on the pull-request path, and the prior round's real sha is on a column
+    this prompt's collector may not read — so the caller passes it in, and when either end
+    of the comparison is unrecorded the line is omitted rather than guessed (§5.4).
+    """
+    from . import evidence
+
+    judging = evidence.judged_head(packet)
+    parts = [HISTORY_HEADING, HISTORY_INTRO]
+    for entry in packet.history:
+        n = entry.get("round")
+        lines = [f"### Round {n} — {entry.get('outcome') or 'unrecorded'}"]
+        sha = str(entry.get("head_sha") or "")
+        if sha and judging:
+            lines.append(f"Round {n} judged commit `{sha}`; you are judging "
+                         f"`{judging}`.")
+        reason = str(entry.get("reason") or "").strip()
+        if reason:
+            lines += ["", "What the submitter was told:", _quoted(reason)]
+        raised = entry.get("blockers") or ()
+        if raised:
+            lines += ["", "What that round said had to change:"]
+            lines += [_blocker_line(str(b.get("title") or ""),
+                                    str(b.get("detail") or "")) for b in raised]
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+
+def _blocker_line(title: str, detail: str) -> str:
+    """One prior blocker as a bullet. Either half may be empty — `_parsed_findings` asks
+    only that one of them says something — and an empty bold run beside a dash reads as
+    a finding whose title was lost rather than one that never had one."""
+    if title and detail:
+        return f"- **{title}** — {detail}"
+    return f"- **{title}**" if title else f"- {detail}"
 
 
 def _assumption_state(status: str) -> str:

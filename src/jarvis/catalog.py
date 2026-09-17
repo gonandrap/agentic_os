@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from . import probes as probes_mod
+from . import schedule as schedule_mod
 from .gates import GateConfig
 from .neo_store import Q_KINDS, SEATS
 from .project_store import VALIDATOR_SEATS
@@ -36,6 +37,11 @@ SAFETY_KEYS = (
     # for `*.validation.*`'s reason: the per-project form is the same switch with a
     # smaller blast radius, and both halves — the flag and the allow-list — widen it.
     "*.supervisor.remedies.*",
+    # The whole scheduler block, not just its switch. It is the only thing in the OS
+    # that files work with nobody asking, so enabling it and shortening its interval are
+    # the same act at two magnitudes — and a change here is invisible until the morning
+    # it starts spending. docs/superpowers/specs/2026-09-14-the-scheduler.md §2.
+    "*.schedule.*",
 )
 
 # Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
@@ -154,6 +160,46 @@ DEFAULT_COLD_PREFIX_FLOOR = 5_000
 #: defaults are literals here; both values are `os.` keys the config console can change
 #: without a release.
 DEFAULT_COLD_PREFIX_FLOOR_MAX = 100_000
+
+# -- CACHE HEALTH: the window and the floors `invariants.check_cache_ttl_trigger` and
+# `invariants.check_prefix_stable` judge the FLEET's cache configuration over.
+#
+# At `os.` and not at `os.defaults.` for the reason above, and here the reason is even
+# less arguable: both checks decide something there is only one of — the write TTL every
+# worker is launched with, and the `includeGitInstructions` line in
+# `dispatch._write_worker_settings`. A per-project value would be a per-project answer to
+# a fleet-wide question, and the check would report one decision once per project.
+
+#: The cohort window both checks measure over. NEVER all history: the split between the
+#: two causes is drifting, and an average over everything averages the trend away
+#: (kn-1449447a (5)). Thirty days because that is what `bill.COHORT_COMMAND` tells the
+#: reader to run — the doctor and the script differ on population, and they should not
+#: also differ on window.
+DEFAULT_CACHE_HEALTH_WINDOW_DAYS = 30
+
+#: Below this many MEASURED orders in the window, both checks report nothing at all. THE
+#: ANSWER TO "a quiet day gives a wild ratio": a fleet that settled three work orders has
+#: a ratio, and it is one order's shape wearing the fleet's name. Measured on this
+#: machine 2026-09-16: 51 sealed orders in the trailing 7 days and 226 in 30, so an
+#: ordinary week clears this twice over while a genuinely quiet window does not.
+DEFAULT_CACHE_HEALTH_MIN_ORDERS = 20
+
+#: …and the floor that actually bounds the noise, because the ratios are token-weighted
+#: and a single boundary can carry a 300k write. Below this many observed boundaries the
+#: window is a handful of events, not a rate. Measured on the same run: 294 boundaries in
+#: 7 days, 752 in 30 — so this is about a sixth of a normal week, and each boundary is at
+#: most 2% of the count at the floor itself. Both floors are needed: too few orders is
+#: one order's shape, too few boundaries is one boundary's.
+DEFAULT_CACHE_HEALTH_MIN_BOUNDARIES = 50
+
+#: Prefix-invalidation writes as a share of ALL cache writes, above which the prefix fix
+#: is reported as drifting. Measured over the sealed-bill population on 2026-09-16:
+#: 34.6% over 7 days, 35.2% over 30. Set above that deliberately — the same choice
+#: `DEFAULT_INSPECT_ALARM_REWRITE_PREFIX_SHARE` makes — so the check reports the prefix
+#: GETTING WORSE rather than restating the standing figure the findings doc already
+#: recorded. There is no principled break-even for this one, unlike the TTL's: it is an
+#: empirical "is this still the number it was".
+DEFAULT_CACHE_HEALTH_PREFIX_SHARE = 0.45
 
 
 _MISSING = object()
@@ -380,6 +426,84 @@ DEFAULT_INSPECT_ALARM_WRITE_TOKENS = 300_000
 #: sitting here an hour later is not slow, it is stopped — wo-a4bd6958 sat 7h13m.
 DEFAULT_INSPECT_ALARM_PARKED_MINUTES = 60
 
+# -- the AGGREGATE half of the re-write tax. Everything above judges one live turn;
+# these five judge a PROJECT over a cohort window of settled orders, which is the
+# standing condition no surface raised (issue 164 item 1, finding 1 of
+# docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md).
+
+#: The cohort window, in days. NOT ALL HISTORY, and that is the point (kn-1449447a (5)):
+#: the split between the two causes is drifting, and an average over everything ever
+#: sealed reports the trend away.
+DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS = 7
+
+#: What fraction of the window's bill went on re-sending conversations whose PROMPT
+#: PREFIX had moved — the cause no cache TTL can touch. MEASURED over this fleet's sealed
+#: bills on 2026-09-14: jarvis_os sits at 10.5% over the trailing 7 days and 11.1% over
+#: 30. Set above that deliberately, so the alarm reports the tax GETTING WORSE rather than
+#: restating a standing figure the findings doc already recorded; a project that wants the
+#: standing figure raised lowers it with `jarvis config set <p>
+#: inspect.alarm_rewrite_prefix_share`.
+DEFAULT_INSPECT_ALARM_REWRITE_PREFIX_SHARE = 0.15
+
+#: The same fraction for the other cause: the cache entry EXPIRING. Measured at 10.3% (7
+#: days) and 10.9% (30) on the same run, so the two causes are at near parity on this
+#: fleet now — itself the drift kn-1449447a (5) predicted.
+#:
+#: THIS IS NOT THE TRIGGER FOR SWITCHING THE WRITE TTL, and confusing the two is the trap
+#: kn-1449447a (4) exists for: that decision is `rewrite_ttl_write / cache_write` against
+#: 39.5%, a different ratio over a much larger denominator, and it runs at about half this
+#: one. This is a share of the BILL.
+DEFAULT_INSPECT_ALARM_REWRITE_TTL_SHARE = 0.15
+
+#: A share computed over fewer settled orders than this is one order's shape rather than
+#: the project's. Measured: it excludes openclaw_sandbox's single $28.26 order sitting at
+#: 31.8%, which is a work order to look at and not a project to alarm on.
+DEFAULT_INSPECT_ALARM_REWRITE_MIN_ORDERS = 5
+
+#: …and below this much spend in the window a percentage is arithmetic on noise. Measured:
+#: it excludes shared_schedule ($0.54 over 3 orders) and painforwisdom ($2.32 over 4)
+#: without excluding anything that had money in it. Zero is legal — see
+#: `INSPECT_MONEY_KEYS`.
+DEFAULT_INSPECT_ALARM_REWRITE_MIN_USD = 10.0
+
+# -- who is still buying the ONE-HOUR cache write. The two above judge a project's own
+# sealed bills; these two judge the TRANSCRIPT TREE, including sessions the OS never
+# dispatched and has no other record of (issue 164 item 3, finding 3 of
+# docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md).
+
+#: The window, in days. Seven for `DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS`' reason and
+#: one of its own: the condition this detects is a SETTING going missing — a fresh
+#: machine, a new shell profile — and a week is short enough that the leak is named while
+#: the change that caused it is still recent.
+DEFAULT_INSPECT_ALARM_CACHE_1H_WINDOW_DAYS = 7
+
+#: One-hour tokens written in the window by sessions JARVIS DID NOT DISPATCH. THIS IS A
+#: LEAK DETECTOR AND NOT A HEADLINE SAVING, and the threshold says so: the 1h premium on
+#: 500k tokens is ~$1.88 at Opus list, so this is not sized to catch money, it is sized to
+#: catch the setting disappearing before a year of it adds up. MEASURED on this machine
+#: 2026-09-16: zero 1h tokens in the trailing 7 and 14 days (the user's own
+#: `FORCE_PROMPT_CACHING_5M` is holding), against ~3.8M/week in the ten days before it was
+#: set — so this fires within a week of the line being lost and never on a quiet one. Set
+#: above the median offending session (87k) so one afternoon's hand-opened `claude` is not
+#: an alarm.
+DEFAULT_INSPECT_ALARM_CACHE_1H_TOKENS = 500_000
+
+#: The same, for turns JARVIS ITSELF dispatched — a BREACH of `claude_cli.cache_env`, and
+#: a defect in this OS rather than in anyone's personal config. An order of magnitude
+#: lower because it is a different finding, not a smaller one: a worker turn writes
+#: 100-300k at a boundary, so this catches a SINGLE breached turn while staying above a
+#: stray row. The last one the fleet had was 299,610 tokens over 2026-08-22/23, before
+#: the transport fix reached production.
+DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS = 50_000
+
+#: `InspectConfig` fields that are a FRACTION, not a count. `_parse_inspect` refuses every
+#: other field below 1, which would reject every legal value of these two.
+INSPECT_FRACTION_KEYS = ("alarm_rewrite_prefix_share", "alarm_rewrite_ttl_share")
+
+#: …and the one that is money. Zero is legal here and nowhere else: a project may ask to
+#: hear about its re-write tax however little it spent.
+INSPECT_MONEY_KEYS = ("alarm_rewrite_min_usd",)
+
 
 @dataclass
 class InspectConfig:
@@ -394,9 +518,9 @@ class InspectConfig:
     `enabled` turns only the ALARMS off, never the report: `jarvis inspect` reads files
     that are already on disk and costs nothing until someone runs it, whereas the alarm
     reads a transcript per running work order per reconcile tick. It covers
-    `alarm_parked_minutes` too (`invariants._parked_minutes`) — one switch for "raise
-    nothing here", because a second way to turn one thing off is a second way to be
-    surprised by it.
+    `alarm_parked_minutes` too (`invariants._parked_minutes`) and the `alarm_rewrite_`
+    five (`Daemon.check_rewrite_tax`) — one switch for "raise nothing here", because a
+    second way to turn one thing off is a second way to be surprised by it.
     """
 
     enabled: bool = True
@@ -408,6 +532,15 @@ class InspectConfig:
     alarm_join_seconds: int = DEFAULT_INSPECT_ALARM_JOIN_SECONDS
     alarm_write_tokens: int = DEFAULT_INSPECT_ALARM_WRITE_TOKENS
     alarm_parked_minutes: int = DEFAULT_INSPECT_ALARM_PARKED_MINUTES
+    alarm_rewrite_window_days: int = DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS
+    alarm_rewrite_prefix_share: float = DEFAULT_INSPECT_ALARM_REWRITE_PREFIX_SHARE
+    alarm_rewrite_ttl_share: float = DEFAULT_INSPECT_ALARM_REWRITE_TTL_SHARE
+    alarm_rewrite_min_orders: int = DEFAULT_INSPECT_ALARM_REWRITE_MIN_ORDERS
+    alarm_rewrite_min_usd: float = DEFAULT_INSPECT_ALARM_REWRITE_MIN_USD
+    alarm_cache_1h_window_days: int = DEFAULT_INSPECT_ALARM_CACHE_1H_WINDOW_DAYS
+    alarm_cache_1h_tokens: int = DEFAULT_INSPECT_ALARM_CACHE_1H_TOKENS
+    alarm_cache_1h_dispatched_tokens: int = \
+        DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS
 
 
 # -- message delivery: how long a queued message may stay undelivered before the OS
@@ -468,6 +601,54 @@ class MessagingConfig:
     """
 
     stuck_minutes: int = DEFAULT_MESSAGING_STUCK_MINUTES
+
+
+# -- the scheduler: the OS filing a work order nobody typed. ABOVE `ProjectSpec` for the
+# `field(default_factory=…)` reason kn-6ca2bcd9 gives, and a catalog setting rather than a
+# module constant for kn-67cdb54b's: "how often, and which jobs" is policy the user holds
+# an opinion about. Reasoning: docs/superpowers/specs/2026-09-14-the-scheduler.md §2.
+
+#: Daily, which is the cadence the ask named. Hours rather than a cron expression on
+#: purpose: a cron string can express "every minute", and the first mechanism that spends
+#: money on its own should not be one typo away from doing so.
+DEFAULT_SCHEDULE_INTERVAL_HOURS = 24
+
+#: How many whole intervals a job may sit HELD — wanting to fire, blocked behind its own
+#: unsettled previous order — before `invariants.check_schedule_progresses` reports it.
+#: Three rather than one: a doctor order the user has not got round to reviewing is a
+#: normal Tuesday, and flagging that would put the scheduler itself on the attention list
+#: for the crime of working. Three days of silence is a scheduler that has stopped.
+DEFAULT_SCHEDULE_HELD_ALARM_INTERVALS = 3
+
+
+@dataclass
+class ScheduleConfig:
+    """Recurring work orders: whether, how often, and which.
+
+    TWO SWITCHES RATHER THAN ONE, `RemedyConfig`'s pattern and for a sharper reason: this
+    is the only thing in the OS that files work — and therefore spends the user's money —
+    with nobody asking. `enabled` ships FALSE, so a fleet that upgrades into this feature
+    schedules nothing until somebody says so, while `jobs` still carries a meaningful
+    default roster so turning it on is one setting and not two.
+
+    `jobs` names ids of `schedule.JOBS`; an unknown one is a `CatalogError` naming the
+    known ids (`GateConfig.parse`'s rule — a typo must not silently leave a job unset).
+    It REPLACES rather than merges when a project overrides it, for the reason
+    `seat_models` does (kn-6ca2bcd9): inheritance is field-level and this is one field.
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance:
+    "should this project be swept daily" is exactly the kind of claim that differs by
+    project — an OS checkout wants it, an archived repo does not.
+    """
+
+    enabled: bool = False
+    interval_hours: int = DEFAULT_SCHEDULE_INTERVAL_HOURS
+    jobs: tuple[str, ...] = schedule_mod.JOB_IDS
+    held_alarm_intervals: int = DEFAULT_SCHEDULE_HELD_ALARM_INTERVALS
+
+    @property
+    def interval_seconds(self) -> float:
+        return self.interval_hours * schedule_mod.SECONDS_PER_HOUR
 
 
 # -- the supervisor: it JUDGES a cost alarm, so every number it judges by is a setting
@@ -611,6 +792,7 @@ class ProjectSpec:
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
+    schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -686,6 +868,12 @@ class OsConfig:
     #: Read by the cost surfaces, not by a worker launch — see DEFAULT_COLD_PREFIX_FLOOR.
     cold_prefix_floor: int = DEFAULT_COLD_PREFIX_FLOOR
     cold_prefix_floor_max: int = DEFAULT_COLD_PREFIX_FLOOR_MAX
+    #: Read by the two `jarvis doctor` cache-health post-conditions, which judge the
+    #: fleet and not a project — see DEFAULT_CACHE_HEALTH_WINDOW_DAYS.
+    cache_health_window_days: int = DEFAULT_CACHE_HEALTH_WINDOW_DAYS
+    cache_health_min_orders: int = DEFAULT_CACHE_HEALTH_MIN_ORDERS
+    cache_health_min_boundaries: int = DEFAULT_CACHE_HEALTH_MIN_BOUNDARIES
+    cache_health_prefix_share: float = DEFAULT_CACHE_HEALTH_PREFIX_SHARE
     notification_sinks: list[str] = field(default_factory=lambda: ["log"])
     telegram_token_env: str = "JARVIS_TELEGRAM_TOKEN"
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
@@ -704,6 +892,7 @@ class OsConfig:
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
+    schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
 
 
 @dataclass
@@ -747,6 +936,34 @@ def _cold_prefix_floor_or_err(os_raw: dict[str, Any]) -> tuple[int, int]:
         raise _err(f"os.cold_prefix_floor {floor} out of range 0-{ceiling} "
                    f"(os.cold_prefix_floor_max)")
     return floor, ceiling
+
+
+def _cache_health_or_err(os_raw: dict[str, Any]) -> tuple[int, int, int, float]:
+    """The cache-health window and its three floors, validated at boot.
+
+    Rejected here rather than at report time for `_cold_prefix_floor_or_err`'s reason:
+    a bad value would surface as a post-condition that never fires, or one that fires on
+    three orders — a config error wearing a finding's clothes.
+    """
+    days = _positive_int_or_err(os_raw, "cache_health_window_days",
+                                DEFAULT_CACHE_HEALTH_WINDOW_DAYS)
+    if days < 1:
+        raise _err(f"os.cache_health_window_days {days} must be >= 1")
+    min_orders = _positive_int_or_err(os_raw, "cache_health_min_orders",
+                                      DEFAULT_CACHE_HEALTH_MIN_ORDERS)
+    if min_orders < 1:
+        raise _err(f"os.cache_health_min_orders {min_orders} must be >= 1")
+    min_boundaries = _positive_int_or_err(os_raw, "cache_health_min_boundaries",
+                                          DEFAULT_CACHE_HEALTH_MIN_BOUNDARIES)
+    if min_boundaries < 1:
+        raise _err(f"os.cache_health_min_boundaries {min_boundaries} must be >= 1")
+    share = os_raw.get("cache_health_prefix_share", DEFAULT_CACHE_HEALTH_PREFIX_SHARE)
+    if isinstance(share, bool) or not isinstance(share, (int, float)):
+        raise _err("os.cache_health_prefix_share must be a number")
+    if not 0.0 < float(share) <= 1.0:
+        raise _err(f"os.cache_health_prefix_share {share} out of range 0-1 "
+                   f"(a share of all cache writes, not a percentage)")
+    return days, min_orders, min_boundaries, float(share)
 
 
 def _autocompact_or_err(raw: dict[str, Any], key: str, where: str,
@@ -890,12 +1107,18 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
     `base` is what an omitted key falls through to — the same field-level inheritance
     `_parse_validation` uses (kn-6ca2bcd9): `os.inspect` parses against the shipped
     defaults and each project parses against the OS answer, so a project naming one key
-    inherits the other five and no caller ever has to consult two objects.
+    inherits the rest and no caller ever has to consult two objects.
 
-    Every threshold is REFUSED rather than clamped below 1. Zero would report every write
-    a session makes and flag every work order the fleet runs — the exact failure the
+    Every COUNT is REFUSED rather than clamped below 1. Zero would report every write a
+    session makes and flag every work order the fleet runs — the exact failure the
     defaults were measured to avoid — and it arrives by a typo in a `jarvis config set`,
     so it is caught where the message can name the key.
+
+    THE THREE VOCABULARIES ARE KEPT APART because one rule cannot serve them: a SHARE is
+    refused outside `(0, 1]` — above 1 it is not a stricter alarm, it is one that can
+    never fire — and the one MONEY floor is refused below 0, since zero is a project
+    asking to hear about its tax however little it spent. Running either through the
+    ">= 1" rule would reject every legal value.
     """
     base = base or InspectConfig()
     if not isinstance(raw, dict):
@@ -916,9 +1139,34 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
                                        base.alarm_write_tokens)),
         alarm_parked_minutes=int(raw.get("alarm_parked_minutes",
                                          base.alarm_parked_minutes)),
+        alarm_rewrite_window_days=int(raw.get("alarm_rewrite_window_days",
+                                              base.alarm_rewrite_window_days)),
+        alarm_rewrite_prefix_share=float(raw.get("alarm_rewrite_prefix_share",
+                                                 base.alarm_rewrite_prefix_share)),
+        alarm_rewrite_ttl_share=float(raw.get("alarm_rewrite_ttl_share",
+                                              base.alarm_rewrite_ttl_share)),
+        alarm_rewrite_min_orders=int(raw.get("alarm_rewrite_min_orders",
+                                             base.alarm_rewrite_min_orders)),
+        alarm_rewrite_min_usd=float(raw.get("alarm_rewrite_min_usd",
+                                            base.alarm_rewrite_min_usd)),
+        alarm_cache_1h_window_days=int(raw.get("alarm_cache_1h_window_days",
+                                               base.alarm_cache_1h_window_days)),
+        alarm_cache_1h_tokens=int(raw.get("alarm_cache_1h_tokens",
+                                          base.alarm_cache_1h_tokens)),
+        alarm_cache_1h_dispatched_tokens=int(
+            raw.get("alarm_cache_1h_dispatched_tokens",
+                    base.alarm_cache_1h_dispatched_tokens)),
     )
     for name, value in vars(cfg).items():
-        if name != "enabled" and value < 1:
+        if name in INSPECT_FRACTION_KEYS:
+            if not 0 < value <= 1:
+                raise _err(f"{where}.{name} must be a fraction in (0, 1] — {value} is "
+                           f"a share of the project's bill, and above 1 it is not a "
+                           f"strict threshold but one that can never fire")
+        elif name in INSPECT_MONEY_KEYS:
+            if value < 0:
+                raise _err(f"{where}.{name} must be >= 0")
+        elif name != "enabled" and value < 1:
             raise _err(f"{where}.{name} must be >= 1")
     return cfg
 
@@ -964,6 +1212,39 @@ def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
     )
     for name, value in vars(cfg).items():
         if value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    return cfg
+
+
+def _parse_schedule(raw: Any, base: ScheduleConfig | None = None,
+                   where: str = "os.schedule") -> ScheduleConfig:
+    """`os.schedule`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    `jobs` is validated against `schedule.JOBS` rather than accepted as written: an id
+    that names no job would otherwise be a job that silently never runs, and the whole
+    point of this block is that the user can tell what the OS is about to do on its own.
+    """
+    base = base or ScheduleConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    jobs_raw = raw.get("jobs", base.jobs)
+    if isinstance(jobs_raw, str) or not isinstance(jobs_raw, (list, tuple)):
+        raise _err(f"{where}.jobs must be a list of job ids "
+                   f"(known: {list(schedule_mod.JOB_IDS)})")
+    jobs = tuple(str(j) for j in jobs_raw)
+    unknown = [j for j in jobs if j not in schedule_mod.JOB_IDS]
+    if unknown:
+        raise _err(f"{where}.jobs names unknown job(s) {unknown} "
+                   f"(known: {list(schedule_mod.JOB_IDS)})")
+    cfg = ScheduleConfig(
+        enabled=bool(raw.get("enabled", base.enabled)),
+        interval_hours=int(raw.get("interval_hours", base.interval_hours)),
+        jobs=jobs,
+        held_alarm_intervals=int(raw.get("held_alarm_intervals",
+                                         base.held_alarm_intervals)),
+    )
+    for name in ("interval_hours", "held_alarm_intervals"):
+        if getattr(cfg, name) < 1:
             raise _err(f"{where}.{name} must be >= 1")
     return cfg
 
@@ -1130,6 +1411,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     )
 
     cold_floor, cold_floor_max = _cold_prefix_floor_or_err(os_raw)
+    health_days, health_orders, health_bounds, health_prefix = _cache_health_or_err(os_raw)
     os_cfg = OsConfig(
         default_model=defaults.get("model", DEFAULT_MODEL),
         default_effort=defaults.get("effort"),
@@ -1146,6 +1428,10 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         ui_base_url=str(ui.get("base_url", "") or "").rstrip("/"),
         cold_prefix_floor=cold_floor,
         cold_prefix_floor_max=cold_floor_max,
+        cache_health_window_days=health_days,
+        cache_health_min_orders=health_orders,
+        cache_health_min_boundaries=health_bounds,
+        cache_health_prefix_share=health_prefix,
         knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
         knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 40)),
         knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 4000)),
@@ -1155,6 +1441,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
         bugs=_parse_bugs(os_raw.get("bugs", {})),
+        schedule=_parse_schedule(os_raw.get("schedule", {})),
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")
@@ -1221,6 +1508,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         bugs_cfg = _parse_bugs(
             p.get("bugs", {}), base=os_cfg.bugs,
             where=f"projects[{i}] ({name}).bugs")
+        schedule_cfg = _parse_schedule(
+            p.get("schedule", {}), base=os_cfg.schedule,
+            where=f"projects[{i}] ({name}).schedule")
         projects.append(
             ProjectSpec(
                 name=name,
@@ -1236,6 +1526,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 supervisor=supervisor_cfg,
                 messaging=messaging_cfg,
                 bugs=bugs_cfg,
+                schedule=schedule_cfg,
                 raw=p,
             )
         )

@@ -55,12 +55,13 @@ class Env:
     project: Path
     worktree: Path
 
-    def collect(self, *, declared: str = "ran the tests", assumptions=(),
+    def collect(self, *, declared: str = "ran the tests", assumptions=(), history=(),
                 **over) -> evidence.EvidencePacket:
         wo = {**WO_FIELDS, **over}
         chars = wo.pop("diff_chars", evidence.DEFAULT_DIFF_CHARS)
         return evidence.collect_work_order(self.project, wo, declared=declared,
-                                           diff_chars=chars, assumptions=assumptions)
+                                           diff_chars=chars, assumptions=assumptions,
+                                           history=history)
 
 
 @pytest.fixture()
@@ -167,6 +168,44 @@ def test_an_assumption_moves_the_fingerprint_and_the_users_verdict_on_it_does_no
     decided = env.collect(assumptions=[{"n": 1, "content": "the exporter writes UTF-8",
                                         "status": "accepted"}])
     assert evidence.fingerprint(decided) == evidence.fingerprint(filed)
+
+
+def test_prior_round_history_is_not_in_the_fingerprint_and_the_declared_evidence_is(env):
+    """The pin the whole field turns on. `history` is written by the OS and differs every
+    round by construction, so hashing it would make every unchanged resubmission look new
+    — `Daemon._preceding_round` would stop catching a submitter that changed nothing, and
+    every round already stored would change hash.
+
+    Paired with `declared`, which MUST move the hash: "the fingerprint ignores everything"
+    passes the first half on its own."""
+    (env.worktree / "app.py").write_text(_body("app", 30, "edited"))
+    bare = env.collect()
+    carried = env.collect(history=[
+        {"round": 1, "outcome": "rejected", "reason": "no test covers the change",
+         "head_sha": "a" * 40,
+         "blockers": [{"title": "untested branch",
+                       "detail": "the new branch has no test"}]}])
+    assert carried.history and not bare.history          # the pairing is real
+    assert evidence.fingerprint(carried) == evidence.fingerprint(bare)
+
+    restated = env.collect(declared="ran the tests, and one of them failed")
+    assert evidence.fingerprint(restated) != evidence.fingerprint(bare)
+
+
+def test_history_reaches_the_packet_as_blockers_with_no_seat_and_no_severity(env):
+    """The collector normalises, so no caller decides the shape — and what it drops is
+    the point: a `severity` word invites a second filter, and the second filter is the
+    one that disagrees with the first."""
+    (env.worktree / "app.py").write_text(_body("app", 30, "edited"))
+    packet = env.collect(history=[
+        {"round": 1, "outcome": "rejected", "reason": "why",
+         "blockers": [{"severity": "blocker", "seat": "tester", "title": "t",
+                       "detail": "d"}]}])
+
+    entry = packet.history[0]
+    assert set(entry) == {"round", "outcome", "reason", "head_sha", "blockers"}
+    assert entry["head_sha"] == ""                       # absent, not guessed
+    assert entry["blockers"] == ({"title": "t", "detail": "d"},)
 
 
 def test_the_same_worktree_fingerprints_identically_at_two_truncation_limits(env):

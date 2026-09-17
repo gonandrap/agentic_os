@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -713,6 +714,37 @@ TURN_ALARM, JOIN_ALARM, WRITE_ALARM = "long-turn", "long-join", "big-rewrite"
 #: The one alarm here whose finding is that NOTHING was spent — see `ALARM_KINDS`.
 STALL_ALARM = "stalled-turn"
 
+#: THE AGGREGATE PAIR, and the only kinds in this module that are not about one turn:
+#: `alarms()` never raises them and cannot. They are a PROJECT's re-write tax over a
+#: cohort window of settled orders, computed by `bill.rewrite_tax` and raised by
+#: `Daemon.check_rewrite_tax` — the standing condition `WRITE_ALARM` cannot report,
+#: because that one judges a single call while the turn that made it is still running.
+#:
+#: They are declared HERE, beside the live four, because `ALARM_KINDS` is the one place a
+#: surface looks up what an alarm kind MEANS (`ui.app` passes it to /alarms) and a kind
+#: missing from it renders as a bare id. The raising lives where the arithmetic is.
+#:
+#: TWO KINDS RATHER THAN ONE WITH THE CAUSE IN ITS PROSE: the prefix moving is bought
+#: back by keeping the prefix still and the entry expiring by a longer TTL, so they are
+#: opposite cures (kn-1449447a), and one kind would make "which cure" a detail of a
+#: sentence instead of the identity a dedupe, a filter and a learning can key on.
+REWRITE_PREFIX_ALARM = "rewrite-tax-prefix"
+REWRITE_TTL_ALARM = "rewrite-tax-ttl"
+
+#: THE OTHER AGGREGATE PAIR, and the only alarms in the OS about spend it did not make.
+#: A one-hour cache write costs 2.0x base input where a five-minute one costs 1.25x, and
+#: `claude_cli.cache_env` forces the cheap one on every process Jarvis starts — so a 1h
+#: write left in the fleet is one of two unrelated faults. `Daemon.check_cache_ttl` raises
+#: them off `one_hour_writes`; issue 164 item 3.
+#:
+#: TWO KINDS AND NEVER ONE, for the reason the pair above is two: `…-dispatched` is a
+#: BREACH of this OS's own transport guarantee and a defect to fix in this repository,
+#: while `…-foreign` is a person's own `claude` and can only be REPORTED — the setting is
+#: their personal config and Jarvis must not write it. Merging them would blame the OS for
+#: a human sitting next to it, which is the misreading finding 3 was written to prevent.
+CACHE_1H_DISPATCHED_ALARM = "cache-1h-dispatched"
+CACHE_1H_FOREIGN_ALARM = "cache-1h-foreign"
+
 #: What each kind IS, for a surface listing alarms rather than raising one. An `Alarm`'s
 #: own `reason` is about one turn and carries its numbers; this is the standing meaning,
 #: and it lives beside the constants so a dashboard and the CLI cannot drift on it.
@@ -724,6 +756,18 @@ ALARM_KINDS = {
     STALL_ALARM: "a turn open with no API call ever made — nothing is being billed",
     JOIN_ALARM: "a join open past the cache TTL — the wait is paid for twice",
     WRITE_ALARM: "the conversation sent again, at the cache-write rate",
+    # The two aggregate kinds. Worded as a share of a PROJECT rather than of a turn, so a
+    # reader of the legend cannot take them for another reading of `big-rewrite`.
+    REWRITE_PREFIX_ALARM: "a project's conversations re-sent because the prompt PREFIX "
+                          "moved — the half no cache TTL can buy back",
+    REWRITE_TTL_ALARM: "a project's conversations re-sent because the cache entry "
+                       "EXPIRED — the half a longer TTL could buy back",
+    # The 1h pair. Worded as WHO BOUGHT IT rather than what it cost, because that is the
+    # whole distinction and the legend is where a reader meets these kinds first.
+    CACHE_1H_DISPATCHED_ALARM: "Jarvis's own turns bought the one-hour cache write — a "
+                               "breach of the transport's 5-minute guarantee",
+    CACHE_1H_FOREIGN_ALARM: "sessions Jarvis never dispatched bought the one-hour cache "
+                            "write — reportable, not fixable from inside the OS",
 }
 
 
@@ -848,3 +892,215 @@ def live_alarms(session_id: str, cfg: InspectConfig, *, wo_id: str = "",
     reading = replace(cfg, report_write_floor=cfg.alarm_write_tokens)
     anatomy = read_session(session_id, reading, root=root, index=index)
     return alarms(anatomy, cfg, wo_id=wo_id, now=now, dispatched=dispatched)
+
+
+# -- the fleet's cache-TTL hygiene: who is still buying the one-hour write --------------
+#
+# Finding 3 of docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md. A 1h
+# cache write costs 2.0x base input where a 5m write costs 1.25x, and `claude_cli.
+# cache_env` forces the cheap one on every process Jarvis starts — so any 1h write left
+# in the fleet is either a BREACH of that guarantee or a `claude` a person typed, and
+# those are unrelated faults with unrelated fixes.
+#
+# THIS IS THE ONE COST READING THAT CANNOT COME OFF A BILL. `bill.rewrite_tax` reads
+# sealed bills precisely to avoid a transcript walk; the sessions this exists to find
+# were never dispatched, so they have no work order, no bill and no row anywhere in the
+# OS. The transcript is the only place they exist.
+
+#: The `cache_creation` key that says a write bought the hour. Also this module's cheap
+#: pre-filter: a file that never mentions it has nothing to say here, which is 98% of
+#: them, and skipping those is what makes the walk affordable at all.
+ONE_HOUR_KEY = '"ephemeral_1h_input_tokens"'
+
+
+@dataclass
+class HourWrites:
+    """One session's ONE-HOUR cache writes, split by who sent the prompt.
+
+    NEVER ADDED UP, and that is the whole design. `dispatched` means Jarvis's own
+    transport bought the expensive write, which is a defect in this OS; `foreign` means a
+    person's own session did, which the OS can only report. Finding 3 established that
+    an alarm merging the two blames the OS for a human sitting next to it.
+    """
+
+    session_id: str
+    #: The transcript directory: the slugified cwd the session was created in. Kept as
+    #: the raw slug rather than a path, because reconstructing one guesses at every `-`
+    #: that was once a `/` — it is an identifier here, not a location.
+    directory: str = ""
+    dispatched: int = 0
+    foreign: int = 0
+    #: First and last 1h WRITE, not the session's lifetime. A session mostly paying the
+    #: correct rate must not report its whole span as the leak.
+    first_ts: float = 0.0
+    last_ts: float = 0.0
+
+    @property
+    def total(self) -> int:
+        return self.dispatched + self.foreign
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"session_id": self.session_id, "directory": self.directory,
+                "dispatched": self.dispatched, "foreign": self.foreign,
+                "total": self.total, "first_ts": self.first_ts,
+                "last_ts": self.last_ts}
+
+
+def _mentions(path: Path, needle: str) -> bool:
+    """Whether a file contains `needle` at all, without parsing a line of it."""
+    try:
+        with path.open(errors="replace") as handle:
+            return any(needle in line for line in handle)
+    except OSError:
+        return False
+
+
+def _subagent_transcripts(path: Path) -> list[Path]:
+    """The subagent transcripts written beside one session file — `read_session`'s rule.
+
+    Their spend is charged to the session that SPAWNED them, here as there: a subagent
+    has no id anyone can resume, so it is not an answer to "which session do I go and
+    look at".
+    """
+    directory = path.with_suffix("") / "subagents"
+    return sorted(directory.glob("*.jsonl")) if directory.is_dir() else []
+
+
+def one_hour_writes(since: float, *, root: Path | None = None,
+                    cfg: InspectConfig | None = None) -> list[HourWrites]:
+    """Every session that bought the one-hour cache write since `since`, biggest first.
+
+    ATTRIBUTION IS `_prompt_of`'s, NOT A SECOND POLICY. A turn is Jarvis's when the
+    prompt that started it carries `promptSource: "sdk"` — the same discriminator
+    `Prompt.source` has always used and the one finding 3 established by hand. Keying on
+    `work_orders.session_id` instead gets it WRONG on the largest offender the fleet has:
+    wo-2df8828c's transcript is ONE file holding both a dispatched turn and the same
+    worktree reopened by hand afterwards, and all 2,512,088 of its 1h tokens are the
+    hand-opened half's.
+
+    A TURN IS JARVIS'S ONLY IF EVERY TRIGGER IS. `Daemon.deliver_messages` coalesces
+    what it queues, so a turn has several, and one prompt a person typed among them means
+    a person was at the keyboard — the claim `dispatched` makes is about the process, and
+    a wrong one there accuses the OS of a defect it does not have.
+
+    SUBAGENTS INHERIT THEIR PARENT'S CLASSIFICATION, because their transcripts carry no
+    `promptSource` at all (measured: 1,002 user rows, none with the field). Classified on
+    their own evidence every one of them would read as a person's, which would hide
+    exactly the breach this exists to catch. `_attach_calls` does the inheriting — their
+    calls land in the parent turn that was running, by the rule the bill already uses.
+
+    AN UNKNOWN TTL IS NOT A 1h TTL. Only `ephemeral_1h_input_tokens` itself counts, so a
+    row written before Claude Code reported the split contributes nothing — the floor
+    `usage`'s module note sets out. An alarm that read absence as the expensive write
+    would fire on every old transcript in the fleet.
+    """
+    root = root or usage_mod.transcript_root()
+    if not root.is_dir():
+        return []
+    cfg = cfg or InspectConfig()
+    found: dict[str, HourWrites] = {}
+    for path in sorted(root.glob("*/*.jsonl")):
+        subagents = _subagent_transcripts(path)
+        if not any(_mentions(p, ONE_HOUR_KEY) for p in (path, *subagents)):
+            continue
+        turns, _ = read_transcript(path, cfg)
+        calls = usage_mod.calls_of(path)
+        for sub in subagents:
+            calls.extend(usage_mod.calls_of(sub))
+        calls.sort(key=lambda c: c.ts)
+        _attach_calls(turns, calls)
+        for turn in turns:
+            dispatched = bool(turn.triggers) and all(
+                p.source == "sdk" for p in turn.triggers)
+            for call in turn.calls:
+                if not call.cache_1h or call.ts < since:
+                    continue
+                entry = found.get(path.stem)
+                if entry is None:
+                    entry = found[path.stem] = HourWrites(session_id=path.stem,
+                                                          directory=path.parent.name)
+                if dispatched:
+                    entry.dispatched += call.cache_1h
+                else:
+                    entry.foreign += call.cache_1h
+                entry.first_ts = min(entry.first_ts, call.ts) or call.ts
+                entry.last_ts = max(entry.last_ts, call.ts)
+    return sorted(found.values(), key=lambda e: (-e.total, e.session_id))
+
+
+#: The one line that fixes the foreign half, quoted verbatim because the alarm's whole
+#: job is to make the work order behind it writable without a second investigation.
+#: `claude_cli.PROMPT_CACHE_5M_ENV` is the same flag, applied where Jarvis CAN apply it.
+REMEDY_LINE = '"env": {"FORCE_PROMPT_CACHING_5M": "1"}  in ~/.claude/settings.json'
+
+#: Said on the foreign alarm and on nothing else. THE HONEST CON, recorded in finding 3
+#: and not to be papered over: this reports a condition Jarvis cannot itself fix, because
+#: the file is the user's personal config. Naming the limit is what stops a supervisor
+#: proposing a remedy that would have Jarvis write there.
+NOT_OURS_TO_FIX = (
+    "JARVIS CANNOT FIX THIS AND MUST NOT TRY: the file is the user's own Claude "
+    "configuration, outside every project the OS manages. The deliverable is a work "
+    "order that tells a PERSON to add the line above, and a check that it took."
+)
+
+#: How many offending sessions the reason names before it stops. Enough that a work order
+#: can be written off the alarm alone; bounded because the reason is read in an inbox row
+#: and a Telegram push, and the tail of a long list is tokens nobody acts on.
+NAMED_SESSIONS = 3
+
+
+def _hour_premium_usd(tokens: int) -> float:
+    """What buying the hour COST above the five-minute write, at Opus list prices.
+
+    The premium and not the price: these tokens would have been written either way, so the
+    avoidable money is the rate difference alone (kn-f94abf34 (0)). Opus because
+    `HourWrites` counts tokens and not models — the alarm says "at Opus list" in as many
+    words rather than implying a precision it does not have.
+    """
+    premium = usage_mod.CACHE_WRITE_1H_RATE - usage_mod.CACHE_WRITE_RATE
+    return premium * tokens * usage_mod.DEFAULT_PRICE[0] / 1e6
+
+
+def _name_sessions(found: Sequence[HourWrites], attr: str) -> str:
+    """The biggest offenders, named. WHICH SESSION is the fact finding 3 turns on."""
+    named = [e for e in found if getattr(e, attr)][:NAMED_SESSIONS]
+    return "; ".join(
+        f"{e.session_id} in {e.directory} ({getattr(e, attr):,} tokens, last written "
+        f"{datetime.fromtimestamp(e.last_ts, tz=timezone.utc):%Y-%m-%d})"
+        for e in named)
+
+
+def hour_alarms(found: Sequence[HourWrites], cfg: InspectConfig, *,
+                days: int) -> list[Alarm]:
+    """What is standing-wrong with the fleet's cache TTL, one alarm per CAUSE.
+
+    The dispatched one first, because it is the more serious finding by far and `alarms`'
+    ordering contract is most-actionable-first: one is a defect in this repository and the
+    other is a note to a person about their own machine.
+    """
+    dispatched = sum(e.dispatched for e in found)
+    foreign = sum(e.foreign for e in found)
+    window = f"in the last {days} days"
+    raised: list[Alarm] = []
+    if dispatched >= cfg.alarm_cache_1h_dispatched_tokens:
+        raised.append(Alarm(CACHE_1H_DISPATCHED_ALARM, (
+            f"{dispatched:,} tokens were written at the ONE-HOUR cache TTL {window} by "
+            f"turns JARVIS ITSELF dispatched — about "
+            f"${_hour_premium_usd(dispatched):,.2f} at Opus list above what the "
+            f"five-minute write would have cost. `claude_cli.cache_env` forces "
+            f"FORCE_PROMPT_CACHING_5M on every process this OS starts, so this is a "
+            f"BREACH of that guarantee and a defect in the OS — not in anyone's personal "
+            f"configuration. Start at `claude_cli._run` and `spawn_turn`, the only two "
+            f"functions here that start a process, and at "
+            f"`dispatch._write_worker_settings`. Sessions: "
+            f"{_name_sessions(found, 'dispatched')}.")))
+    if foreign >= cfg.alarm_cache_1h_tokens:
+        raised.append(Alarm(CACHE_1H_FOREIGN_ALARM, (
+            f"{foreign:,} tokens were written at the ONE-HOUR cache TTL {window} by "
+            f"sessions Jarvis never dispatched — about "
+            f"${_hour_premium_usd(foreign):,.2f} at Opus list above what the five-minute "
+            f"write would have cost. These are `claude` processes a person started, so "
+            f"the OS's own transport is not implicated. The fix is one line: "
+            f"{REMEDY_LINE}. {NOT_OURS_TO_FIX} Sessions: "
+            f"{_name_sessions(found, 'foreign')}.")))
+    return raised

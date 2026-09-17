@@ -20,6 +20,15 @@ WO_STATUSES = (
     "pending",       # created, waiting for the project orchestrator to pick it up
     "dispatching",   # claimed by the daemon, worker being spawned
     "running",       # worker session active
+    # A `kind='manager'` order between its feature's messages. Idle-until-messaged is
+    # its designed steady state, not a question, and it used to be parked in
+    # `waiting_input` — which every surface renders "Waiting on you" and which
+    # `ops.waiting_on` could only explain as an unanswered permission prompt. GitHub
+    # issue #264: the user cleared it twice, each nudge bought another turn saying
+    # nothing was needed. A status that lies is the defect; the two `kind == 'manager'`
+    # carve-outs that were paying for it are gone. See
+    # docs/superpowers/specs/2026-09-16-an-idle-manager-is-not-waiting-on-you.md.
+    "idle",
     "waiting_input", # worker asked something / is blocked on the user
     # The worker has claimed the job done and an independent panel is judging the
     # claim (see the validation-panel design). Ordered here rather than appended
@@ -38,8 +47,8 @@ WO_STATUSES = (
     "failed",
     "cancelled",
 )
-OPEN_STATUSES = ("pending", "dispatching", "running", "waiting_input", "validating",
-                 "needs_review", "waiting_pr_merge")
+OPEN_STATUSES = ("pending", "dispatching", "running", "idle", "waiting_input",
+                 "validating", "needs_review", "waiting_pr_merge")
 # Settled: nothing more will happen to these on their own. They are the bulk of an old
 # project's history, so listings collapse them behind a count rather than printing them.
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
@@ -92,8 +101,11 @@ VALIDATION_OPINION_STATUSES = ("ok", "abstained", "failed")
 # with `jarvis wo inject`; adhoc is the legacy marker for a session the reconciler
 # adopted on its own, which it no longer does (GitHub issue 47); neo is one Neo filed
 # itself (a ledger cleanup), which nobody asked for by hand — worth telling apart from
-# `jarvis` in listings for exactly that reason.
-WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected", "neo")
+# `jarvis` in listings for exactly that reason; `schedule` is one a RECURRING JOB filed
+# (src/jarvis/schedule.py), and it is here for `neo`'s reason turned up a notch — it is
+# the only origin where not even a model decided to file this, a clock did, so "why am I
+# paying for this work order" is unanswerable without it.
+WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected", "neo", "schedule")
 
 # Origins whose session Jarvis did not dispatch: it belongs to the user, never received
 # the worker briefing or `JARVIS_WO_ID`, and therefore cannot satisfy the worker contract
@@ -128,6 +140,11 @@ WO_KINDS = ("worker", "planner", "manager")
 # questions, and the split is deliberate rather than drift.
 #
 # NOT what the retry sweep walks either, since issue #259 — see `RETRY_SWEEP_STATUSES`.
+#
+# `idle` is absent on the same reading that keeps `waiting_input` out of `SLOT_STATUSES`:
+# a manager between messages has no turn in flight and draws nothing. It is in
+# RETRY_SWEEP_STATUSES below regardless, because those two tuples answer different
+# questions and issue #259 is the standing example of assuming they do not.
 ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
 
 # Where a paused turn may be relaunched: every status a work order can be sitting in when
@@ -148,7 +165,7 @@ ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
 # which side it belongs on. That is the opposite shape from kn-32434cef's allowlist rule
 # because the failure direction is inverted — there, a status silently allowed through is
 # the danger; here, a status silently left OUT is a work order nothing will ever resume.
-RETRY_SWEEP_STATUSES = ("dispatching", "running", "waiting_input", "validating",
+RETRY_SWEEP_STATUSES = ("dispatching", "running", "idle", "waiting_input", "validating",
                         "needs_review", "failed", "waiting_pr_merge")
 
 # The rest of `WO_STATUSES`, and why a due retry is not run there. `pending` has no turn
@@ -156,12 +173,17 @@ RETRY_SWEEP_STATUSES = ("dispatching", "running", "waiting_input", "validating",
 # and `cancelled` were ENDED BY A PERSON, and relaunching a turn under one would reopen
 # work its owner closed. `failed` is not with them: the OS failed that one, the user did
 # not, and recovering it is the point.
+#
+# `idle` is NOT here, and the direction of the mistake is why: a manager whose turn was
+# refused for the usage limit settles back to `idle` HOLDING A RESUMABLE, DUE PAUSE
+# (`Daemon.settle_work_order` leaves a paused turn's status alone), so a sweep that
+# skipped it would strand the one work order a feature routes all its messages through.
 NOT_RETRIED = ("pending", "completed", "cancelled")
 
 # What spends one of a project's `max_concurrent` slots: a work order whose turn is
 # actually executing, plus the claim that is about to launch one (issue #134).
 #
-# `waiting_input` and `validating` are OUT. Both park a work order on somebody else — a
+# `idle`, `waiting_input` and `validating` are OUT. All three park a work order — a
 # Neo question, a gate, the panel — with no turn in flight and no tokens moving, and
 # counting them meant a project capped at 5 could have one turn running and refuse to
 # claim a sixth order. `dispatching` is IN even though it is transient
@@ -434,6 +456,28 @@ CREATE TABLE IF NOT EXISTS health_reviews (
     outcome TEXT NOT NULL,              -- HEALTH_OUTCOMES
     findings INTEGER NOT NULL DEFAULT 0,
     detail TEXT NOT NULL DEFAULT ''
+);
+-- THE SCHEDULER'S CLOCK, one row per job this project runs
+-- (docs/superpowers/specs/2026-09-14-the-scheduler.md §3). In the PROJECT store rather
+-- than `os_state`, because what a firing produces is a project work order and two
+-- projects sharing one clock would mean the first to fire silenced the rest.
+--
+-- `last_fired_at` IS THE ANCHOR AND IT IS NEVER NULL: seeded to the moment the job was
+-- first seen enabled, so neither enabling a job nor restarting the daemon can make one
+-- due. `last_wo_id IS NULL` is what tells a seeded job apart from one that has fired.
+--
+-- The held pair is the other half of Neo's ruling on holding silently: a job parked
+-- behind its own unsettled order raises no attention, but the park is RECORDED, so
+-- `jarvis doctor` can tell a scheduler that is waiting from one that is dead
+-- (`invariants.check_schedule_progresses`). New table, so no migration — the
+-- `CREATE TABLE IF NOT EXISTS` every open already runs is the whole upgrade.
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+    job_id TEXT PRIMARY KEY,            -- schedule.JOB_IDS
+    created_at REAL NOT NULL,
+    last_fired_at REAL NOT NULL,
+    last_wo_id TEXT,                    -- no FK: the order may be deleted, the clock stays
+    held_since REAL,
+    held_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS wo_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1302,6 +1346,65 @@ class ProjectStore:
             " ORDER BY updated_at LIMIT ?", (*TERMINAL_STATUSES, limit)).fetchall()
         return [dict(r) for r in rows]
 
+    def sealed_bills_since(self, since: float) -> list[dict[str, Any]]:
+        """Every work order whose bill was frozen at or after `since`, newest first.
+
+        THE CHEAP AGGREGATE, and it is what makes an alarm about a project's SPEND
+        affordable on the reconcile cadence: a bill is frozen JSON on the row already, so
+        a window's worth is one indexed read and a JSON parse per order. Walking the
+        transcripts instead is the objection finding 2 of
+        docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md raised against
+        doing this at all, and the reason nobody did.
+
+        Sealed bills only, which is also the right population: an OPEN order's cost is
+        still moving, and a share of a denominator that has not stopped changing would
+        report a different number every tick for the same facts.
+        """
+        rows = self.conn.execute(
+            "SELECT id, title, status, hidden, bill_sealed_at, bill_json"
+            " FROM work_orders WHERE bill_json IS NOT NULL AND bill_sealed_at >= ?"
+            " ORDER BY bill_sealed_at DESC", (since,)).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def last_alarm_of_kind(self, kind: str) -> dict[str, Any] | None:
+        """The newest alarm of one kind in this project, whatever became of it.
+
+        THE DEDUPE MEMORY FOR AN ALARM ABOUT A STANDING CONDITION.
+        `Daemon.check_burning_turns` matches on `(kind, seq)` because a burning turn has
+        a turn to key on; a project's re-write tax has none, is still true on the next
+        tick, and would re-raise for ever. `Daemon.check_rewrite_tax` keys on this
+        instead: one alarm per kind per cohort window.
+
+        WHATEVER BECAME OF IT is the whole point — judged, escalated, skipped or still
+        open all mean the same thing here, that this window has already been reported.
+        Filtering to the unsettled ones would re-raise the moment the supervisor acked.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM wo_alarms WHERE kind=? ORDER BY ts DESC LIMIT 1",
+            (kind,)).fetchone()
+        return dict(row) if row else None
+
+    def latest_settled_order(self) -> dict[str, Any] | None:
+        """The most recently settled work order, as a CARRIER and nothing more.
+
+        `wo_alarms.wo_id` is a real foreign key, so a finding about something that is not
+        a work order still needs one. `Daemon.check_rewrite_tax` can use the biggest
+        contributor, because its subject IS a work order; `Daemon.check_cache_ttl`'s
+        subject is a session the OS never dispatched, and no order is the number's
+        exemplar — so this picks the one a reader following the link will find least
+        confusing to be shown, and the alarm's own text says it stands for nothing.
+
+        SETTLED and not merely existing: a running order's page is about a turn in
+        flight, and hanging a standing finding there would put a fleet-wide claim beside
+        live work it has nothing to do with.
+        """
+        row = self.conn.execute(
+            f"""SELECT * FROM work_orders
+                WHERE status IN ({','.join('?' * len(TERMINAL_STATUSES))})
+                ORDER BY updated_at DESC LIMIT 1""",
+            TERMINAL_STATUSES).fetchone()
+        return dict(row) if row else None
+
     def unsealed_terminal_features(self, limit: int = 2) -> list[dict[str, Any]]:
         marks = ", ".join("?" for _ in FO_TERMINAL_STATUSES)
         rows = self.conn.execute(
@@ -1342,6 +1445,64 @@ class ProjectStore:
         self.get_work_order(wo_id)  # KeyError if it doesn't exist
         self.update_work_order(wo_id, hidden=1 if hidden else 0)
         self.add_event(wo_id, "hidden", {"hidden": bool(hidden)})
+
+    # -- the scheduler's clock (`scheduled_jobs`) -------------------------------------
+    #
+    # Dumb on purpose, like `ack_attention`: the store keeps the row, `schedule.decide`
+    # holds the policy. Nothing here consults a catalog or a clock it was not handed.
+
+    def seed_schedule(self, job_id: str, now: float | None = None) -> dict[str, Any]:
+        """This job's clock, created on first sight if it has never been seen.
+
+        `last_fired_at = now` AT SEED TIME is what makes enabling a job mean "from the
+        next interval" rather than "right now", and it is the same row a restart reads
+        back, so neither event can fire an order. See `schedule.decide`.
+        """
+        now = db.now() if now is None else now
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO scheduled_jobs (job_id, created_at, last_fired_at)"
+                " VALUES (?,?,?)", (job_id, now, now))
+        row = self.conn.execute("SELECT * FROM scheduled_jobs WHERE job_id=?",
+                                (job_id,)).fetchone()
+        return dict(row)
+
+    def schedule_state(self, job_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM scheduled_jobs WHERE job_id=?",
+                                (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_schedule_states(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM scheduled_jobs ORDER BY job_id")]
+
+    def record_schedule_fire(self, job_id: str, wo_id: str,
+                             now: float | None = None) -> None:
+        """A job fired: advance its clock to NOW and clear any hold.
+
+        `now`, never `last_fired_at + interval` — that is the whole of "at most one
+        catch-up, never a backfill" (`schedule.decide`), and moving it here rather than
+        in the caller is what stops a second caller getting it wrong.
+        """
+        now = db.now() if now is None else now
+        with self.conn:
+            self.conn.execute(
+                "UPDATE scheduled_jobs SET last_fired_at=?, last_wo_id=?, held_since=NULL,"
+                " held_reason=NULL WHERE job_id=?", (now, wo_id, job_id))
+
+    def record_schedule_hold(self, job_id: str, reason: str,
+                             now: float | None = None) -> None:
+        """A job wanted to fire and could not. Idempotent in `held_since`.
+
+        The FIRST such tick is the one that matters — how long this has been parked is
+        the number `check_schedule_progresses` judges by — so a held job re-held on the
+        next tick keeps its original timestamp and only refreshes the words.
+        """
+        now = db.now() if now is None else now
+        with self.conn:
+            self.conn.execute(
+                "UPDATE scheduled_jobs SET held_since=COALESCE(held_since, ?),"
+                " held_reason=? WHERE job_id=?", (now, reason, job_id))
 
     def delete_work_order(self, wo_id: str) -> dict[str, int]:
         """Erase a work order and everything hanging off it. Returns the row counts.

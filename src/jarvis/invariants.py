@@ -24,6 +24,13 @@ Three rules for this module:
 Adding an invariant: write a `_check_*` generator yielding `Violation`s and register it
 in `INVARIANTS`. Give it a stable id — ids appear in work order timelines and in
 `jarvis doctor` output, so renaming one rewrites history.
+
+REGISTER IT IN `OS_INVARIANTS` INSTEAD when what it checks is a fact about the OS rather
+than about one project — the dashboard, the production checkout, the fleet's cache
+configuration. Those take no store, run once per `jarvis doctor` rather than once per
+project, and never run on the daemon's reconcile tick. Putting a fleet-wide check in
+`INVARIANTS` is not a smaller mistake than the reverse: it reports one decision once per
+project, which is how a finding becomes noise.
 """
 
 from __future__ import annotations
@@ -69,7 +76,14 @@ BLOCKED_STATUSES = ("waiting_input", "needs_review", "failed", "pending",
                     # state THEY have: a turn that ended without finishing the work and
                     # nothing in flight behind it (`parked_reason`). Silent otherwise —
                     # a running worker is still not blocked on anything the user can see.
-                    "running", "dispatching")
+                    "running", "dispatching",
+                    # `idle` is here for exactly one blocker and derives no other: a
+                    # message the user or the bus sent a manager that it will never see
+                    # (MESSAGE_STUCK_BLOCKER). Being idle asks nothing of anyone — that
+                    # is the whole of issue #264 — but a feature routes everything
+                    # through its manager, so a message rotting there strands the
+                    # feature silently, which is issue 43 one level up.
+                    "idle")
 # Statuses where nothing can possibly be pending: the work order is over.
 TERMINAL_STATUSES = ("completed", "cancelled")
 
@@ -197,6 +211,7 @@ IDLE_NO_FINISH_BLOCKER = ("the worker stopped mid-task without `jarvis wo finish
                           "nothing it started is still running; review the session")
 
 SECONDS_PER_MINUTE = 60  # a unit, not a setting
+SECONDS_PER_HOUR = 3600  # ditto
 
 #: What a work order says when its turn has ended, nothing is in flight, and the OS is
 #: still calling it work in progress. FREE OF ANY ELAPSED TIME, deliberately: this string
@@ -219,6 +234,11 @@ STALE_FINISH_BLOCKER = ("the worker went back to work after finishing and stoppe
 #: round machine owns that work order and INV-VALIDATION-STRANDED already watches it;
 #: `pending` has no turn to be parked after; `waiting_pr_merge` is waiting on
 #: `Daemon.poll_pull_requests`, which is in flight by definition.
+#:
+#: `idle` is absent because "nothing is in flight" is the DEFINITION of that status
+#: rather than news about it. That absence is what replaced `parked_reason`'s
+#: `kind == "manager"` carve-out: the status now carries the fact the carve-out was
+#: asserting, so a manager in any OTHER status is judged like anything else.
 PARKABLE_STATUSES = ("dispatching", "running", "waiting_input", "needs_review")
 
 #: What a work order says when something the user sent it is still sitting in the queue
@@ -240,8 +260,13 @@ MESSAGE_STUCK_BLOCKER = ("a message you sent is still queued and the worker has 
 #: unrecoverable case is DEAD_DEPENDENCY_BLOCKER's); `validating` for the reason it is
 #: absent from BLOCKED_STATUSES; the terminal pair because INV-ATTENTION-PHANTOM clears
 #: any flag raised there, so the two checks would fight every tick.
-MESSAGE_STUCK_STATUSES = ("dispatching", "running", "waiting_input", "needs_review",
-                          "failed", "waiting_pr_merge")
+#:
+#: `idle` IS here, and it is the one thing an idle manager can still owe the user. It
+#: inherited the coverage rather than gaining it — a manager used to sit in
+#: `waiting_input` — and dropping it while moving the status would have made every stuck
+#: message to a feature's only addressee invisible.
+MESSAGE_STUCK_STATUSES = ("dispatching", "running", "idle", "waiting_input",
+                          "needs_review", "failed", "waiting_pr_merge")
 
 #: The `ops.waiting_on` answers that mean the OS itself will do the next thing, with
 #: nobody typing. A list of what IS coming rather than a second guess at what is not:
@@ -368,15 +393,12 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # steering the user at `jarvis wo resume-auto`, which cannot help. Three of five
     # sampled `jarvis_os` work orders had it.
     #
-    # A MANAGER is the second exception, and it is a stronger one: a project manager
-    # order sits in `waiting_input` for its feature's entire life, because acting on a
-    # message and then going idle is the whole of what it does. Nobody is waiting on the
-    # user for it — there is nothing to type into it — so without this every feature order
-    # in the fleet would carry a permanent false flag, put back by INV-ATTENTION-MISSING
-    # on the tick after `Daemon.settle_work_order` parked it. Narrow on purpose: a manager
-    # in any OTHER status is judged exactly like any other work order, so a failed one
-    # still reaches the user.
-    if wo["status"] == "waiting_input" and wo.get("kind") != "manager" and not auth_parked:
+    # A MANAGER used to be the second exception, on the grounds that it sits in
+    # `waiting_input` for its feature's entire life. It has its own status now (`idle`,
+    # issue #264) and the exception is gone — which fixes a bug the exception was
+    # hiding. A manager reaches `waiting_input` only by asking, so the one case it USED
+    # to suppress was the case that most needed the user: Neo handing its question back.
+    if wo["status"] == "waiting_input" and not auth_parked:
         question = awaiting_neo(wo["id"])
         if question is not None and question["status"] in USER_HELD_Q_STATUSES:
             # Neo handed the decision back. That IS the user's, and it gets a reason
@@ -572,11 +594,11 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
     the catalog read and `waiting_on`'s cross-database question about Neo both sit behind
     the two free row checks. No model, no transcript.
     """
-    if wo.get("origin") in UNGOVERNED_ORIGINS or wo.get("kind") == "manager":
-        # A manager is idle BY DESIGN between its feature's messages, and an injected
-        # session was never briefed on `jarvis wo finish`. `true_blockers` excuses both
-        # above for those reasons; excusing them in one place and not the other would
-        # give every feature order in the fleet a permanent second flag.
+    if wo.get("origin") in UNGOVERNED_ORIGINS:
+        # An injected session was never briefed on `jarvis wo finish`, so a turn of its
+        # that ends without one is not a worker parking mid-task. A manager used to be
+        # excused here too; `idle` is not in PARKABLE_STATUSES, so the status says it
+        # now and the kind does not have to (issue #264).
         return None
     if wo["status"] not in PARKABLE_STATUSES:
         return None
@@ -673,6 +695,10 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     parked = pause_note(store, wo)
     if parked:
         return f"{wo['status']} — {parked}"
+    # Below the pause note above, which names a moment this one cannot: a manager whose
+    # turn was refused IS coming back, and "idle" alone would read as the steady state.
+    if wo["status"] == "idle":
+        return "idle — waiting for a message from its feature"
     # `needs_review` no longer means the panel is waiting for the user: since issue 212
     # the round runs in parallel with the assumption review, and a status that said only
     # "needs_review" would hide the half of the work that is still moving.
@@ -887,6 +913,27 @@ def awaiting_neo(wo_id: str) -> dict[str, Any] | None:
     return open_questions[0] if open_questions else None
 
 
+def something_is_out(store: ProjectStore, wo_id: str) -> bool:
+    """Is this work order parked on somebody, rather than merely having nothing to do?
+
+    ONE RESOLVER, and kn-4ea33fe6 is why it is a function rather than a rule written
+    twice: `end_wait_if_nothing_is_out` asks it to decide whether a wait has ENDED, and
+    `Daemon.settle_work_order`'s manager branch asks it to decide whether a manager is
+    free to be re-statused `idle`. Those two disagreeing means a manager parked on a gate
+    is quietly relabelled "nothing to act on" — muted, out of the dashboard's needs-me
+    strip, and refused a nudge — which is the bug issue #264 exists to remove, recreated.
+
+    `held_approvals` counts as out, and it is the clause a caller inheriting this from
+    `settle_work_order`'s `pending_approvals` check would drop. Nobody is REVIEWING a
+    held request, so it is not "with a reviewer" — but the work order is not free either:
+    `gates.file_request` parks it in `waiting_input` down BOTH its roads, the OS refuses
+    it on the `gates.case_ttl_seconds` timer, and until then the worker is waiting for a
+    verdict exactly as it would be for an argued one.
+    """
+    return bool(store.pending_approvals(wo_id) or store.held_approvals(wo_id)
+                or awaiting_neo(wo_id))
+
+
 def end_wait_if_nothing_is_out(store: ProjectStore, wo_id: str) -> bool:
     """Take a work order out of `waiting_input` once nothing is holding it there.
 
@@ -906,12 +953,7 @@ def end_wait_if_nothing_is_out(store: ProjectStore, wo_id: str) -> bool:
     """
     if store.get_work_order(wo_id)["status"] != "waiting_input":
         return False
-    # `held_approvals` counts as out. Nobody is reviewing one, but the work order is not
-    # free either: the OS will refuse it on a timer and message the worker (see
-    # `gates.sweep_unargued`), and ending the wait now would say the turn has somewhere
-    # to go when it does not.
-    if (store.pending_approvals(wo_id) or store.held_approvals(wo_id)
-            or awaiting_neo(wo_id)):
+    if something_is_out(store, wo_id):
         return False
     store.set_status(wo_id, "running")
     return True
@@ -1976,11 +2018,22 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
     ARE INCLUDED, on `poll_pull_requests`' reasoning: hiding drops a record from listings,
     it does not mean the record may go on saying something untrue.
 
-    **NO NETWORK, EVER.** Everything it needs about a pull request it reads off the work
-    order's own timeline — `pr_merged` and the `head_oid` that event now carries — never
-    from `pr_state`, which kn-dbc4971d records as stale by construction with one permitted
-    reader. That is what makes it cheap enough to run on the daemon's slow cadence instead
-    of only when a human types `jarvis doctor`.
+    **IT NEVER ASKS GITHUB.** Everything it needs about a pull request it reads off the
+    work order's own timeline — `pr_merged` and the `head_oid` that event now carries —
+    never from `pr_state`, which kn-dbc4971d records as stale by construction with one
+    permitted reader. That is what makes it cheap enough to run on the daemon's slow
+    cadence instead of only when a human types `jarvis doctor`.
+
+    **IT DOES REFRESH THE DEFAULT BRANCH, ONCE PER SWEEP, ON THE REPAIRING PATH.** The
+    ref everything here is measured against is `origin/main`, and until issue #271 nothing
+    in the OS ever moved it: a merge is detected over the network, so a work order
+    completed while the local ref still pointed at the commit before its squash, and this
+    check reported the order that had just landed as `STRANDED` every hour until a human
+    happened to fetch. One bounded `landing.refresh_base` per project per sweep fixes the
+    measurement; `base_current` is what makes the fix unconditional, because a refresh
+    that FAILED — offline, no remote, or the read-only path below, which may not write to
+    a repository at all — answers `UNKNOWN` rather than condemning the branch anyway.
+    The refresh is lazy: a project with nothing to audit does not pay for a round trip.
 
     **THE VERDICT IS CACHED, and only the settled half of it.** `landed` and
     `not-produced` are recorded as a `landing_checked` event and never recomputed: a
@@ -2014,6 +2067,7 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
     """
     from . import landing
 
+    base_current: bool | None = None
     for wo in store.list_work_orders(statuses=("completed",), include_hidden=True):
         wo_id = wo["id"]
         if store.work_abandoned(wo_id) or store.work_unlanded_open(
@@ -2022,6 +2076,13 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
         if any(db.from_json(e["payload"], {}).get("verdict") in landing.SETTLED_VERDICTS
                for e in store.events_of_kind(wo_id, "landing_checked")):
             continue
+        if base_current is None:
+            # Below every exclusion, so the round trip is only spent on a project that
+            # actually has something to measure — and once, because the ref it moves is
+            # the same one for every work order here.
+            base_current = landing.refresh_base(
+                store.project_path,
+                allow_network=not getattr(store, "readonly", False))
         merges = store.events_of_kind(wo_id, "pr_merged")
         merged = db.from_json(merges[-1]["payload"], {}) if merges else {}
         found = landing.assess(
@@ -2032,7 +2093,8 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
             # "GitHub says this is still open" and would flag every order in a project
             # whose pull requests the OS has never been able to poll.
             pr_merged=True if merges else None,
-            pr_head_oid=str(merged.get("head_oid") or ""))
+            pr_head_oid=str(merged.get("head_oid") or ""),
+            base_current=base_current)
         if found.verdict in landing.SETTLED_VERDICTS:
             store.add_event(wo_id, "landing_checked",
                             {"verdict": found.verdict, "rung": found.rung,
@@ -2474,12 +2536,212 @@ def check_production_clean() -> Iterator[Violation]:
     )
 
 
+# -- cache health ----------------------------------------------------------------------
+#
+# Two post-conditions on the fleet's cache configuration, from findings 2 and 4 of
+# docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md. Both are OS-level
+# and not per-project: each decides something there is exactly one of, and a per-project
+# copy would report one fleet decision once per project.
+#
+# NEITHER WALKS A TRANSCRIPT. They read `bill.cache_writes_since`, which is an indexed
+# query and a JSON parse per sealed order — the objection finding 2 raised against doing
+# this at all was the cost of the scan, and on this machine a full walk is ~5 minutes
+# over 4,642 transcripts. The price is that both see only bills sealed at
+# `bill.PAYLOAD_VERSION` 3 or later, which each violation says out loud.
+
+
+def _cache_health() -> tuple[Any, Any] | None:
+    """The fleet's cache-write cohort, and the config that judges it. None if no catalog.
+
+    Summed across every active project, because both readers are asking about the fleet.
+    A project whose path has gone is skipped rather than reported: that is
+    `ops.run_doctor`'s own finding to make, and it makes it per project.
+
+    Recomputed by each check rather than shared between them. Two indexed queries per
+    project per `jarvis doctor` run is not worth a memo that outlives the run it was
+    taken in — the whole point of a post-condition is that it reads the state as it
+    currently is.
+    """
+    from . import bill
+    from .central_store import CentralStore
+    from .ops import resolve_catalog
+    from .project_store import ProjectStore as Store
+
+    try:
+        cfg = resolve_catalog().os
+    except Exception:  # noqa: BLE001 — no catalog is not a cache-health finding
+        return None
+    central = CentralStore()
+    try:
+        rows = central.list_projects()
+    finally:
+        central.close()
+    since = db.now() - cfg.cache_health_window_days * 86_400
+    found = bill.CacheWrites()
+    for row in rows:
+        if row["status"] != "active" or not Path(row["path"]).is_dir():
+            continue
+        store = Store(Path(row["path"]))
+        try:
+            found = found + bill.cache_writes_since(store, since)
+        finally:
+            store.close()
+    return cfg, found
+
+
+def _thin_cohort(cfg: Any, writes: Any) -> bool:
+    """THE ANSWER TO "it cries wolf on a quiet day", and it is a silence, not a caveat.
+
+    Below either floor both checks yield nothing at all rather than a hedged finding: a
+    fleet that settled three orders yesterday HAS a ratio, and reporting it with a note
+    about the volume still puts a number in front of a reader who will act on it. The
+    two floors answer different questions — too few orders is one order's shape wearing
+    the fleet's name, too few boundaries is one 300k write's — so either alone lets the
+    other case through (`catalog.DEFAULT_CACHE_HEALTH_MIN_ORDERS`).
+    """
+    return (writes.orders < cfg.cache_health_min_orders
+            or writes.boundaries < cfg.cache_health_min_boundaries)
+
+
+def _cohort_note(cfg: Any, writes: Any) -> str:
+    """What was actually measured. Said on both violations, because the number they
+    report is over Jarvis's own worker sessions and the command they send the reader to
+    is over every transcript on the machine — two populations, one decision."""
+    from . import bill
+
+    skipped = ""
+    if writes.unmeasured_orders:
+        skipped = (f", and {writes.unmeasured_orders} more whose bill was sealed before "
+                   f"the OS recorded the split and cannot be re-read")
+    return (f"Measured over {writes.orders} settled work orders in the last "
+            f"{cfg.cache_health_window_days} days ({writes.boundaries} boundaries, "
+            f"{writes.cache_write:,} cache-write tokens){skipped}. That population is "
+            f"Jarvis's OWN dispatched workers, which is the population the fleet's cache "
+            f"settings reach; `{bill.cohort_command(cfg.cache_health_window_days)}` "
+            f"measures every transcript on this machine, including sessions opened by "
+            f"hand, so the two figures differ by design.")
+
+
+def check_cache_ttl_trigger() -> Iterator[Violation]:
+    """INV-CACHE-TTL-TRIGGER — the 1-hour cache write has started paying, and nobody
+    would have noticed.
+
+    Finding 2 kept the 5-minute write and its action was "re-measure monthly"; its own
+    stated con was that the trigger needs a person to remember, and for two weeks nobody
+    did. This is the reminder, and it is a post-condition rather than a reminder because
+    the crossing is a fact about the fleet's own bill.
+
+    THE COMPARISON IS THE ENTIRE HAZARD OF THIS CHECK. `usage.TTL_BREAK_EVEN` is a share
+    of ALL CACHE WRITES, because the 1-hour premium is charged on every written token.
+    The TTL's share of the RE-WRITE TAX is a different ratio over a much smaller
+    denominator, it runs at about double, and comparing THAT against 39.5% says "switch
+    now" when the answer is "keep the 5-minute write" — the error PR #160's own draft
+    made (kn-1449447a (4)). `bill.CacheWrites.ttl_share_of_tax` exists only to be printed
+    beside the deciding ratio here, never to be compared with anything, and
+    `tests/test_cache_health.py` pins that a cohort straddling the two stays quiet.
+
+    Reports rather than decides: switching the TTL is a fleet-wide config change and
+    `scripts/cache_ttl_cohort.py` is what prices it against the wider population.
+    """
+    from . import usage as usage_mod
+
+    health = _cache_health()
+    if health is None:
+        return
+    cfg, writes = health
+    if _thin_cohort(cfg, writes):
+        return
+    deciding = writes.ttl_share_of_writes
+    if deciding is None or deciding <= usage_mod.TTL_BREAK_EVEN:
+        return
+    of_tax = writes.ttl_share_of_tax
+    yield Violation(
+        invariant="INV-CACHE-TTL-TRIGGER",
+        detail=(
+            f"{deciding:.1%} of the fleet's cache writes are now re-writes the cache "
+            f"entry EXPIRING caused, against the {usage_mod.TTL_BREAK_EVEN:.1%} "
+            f"break-even where buying the 1-hour cache write starts paying — so the "
+            f"fleet's 5-minute write (`claude_cli.PROMPT_CACHE_5M_ENV`) is now costing "
+            f"money rather than saving it. Price it over the wider population before "
+            f"changing anything. For contrast and NOT for comparison, TTL expiry is "
+            f"{of_tax:.1%} of the re-write tax — a larger figure, because its "
+            f"denominator is only the writes seen at a boundary rather than every "
+            f"written token. The break-even does not apply to it, and reading it "
+            f"against {usage_mod.TTL_BREAK_EVEN:.1%} is how a fleet talks itself into "
+            f"switching when the arithmetic says do not. "
+            f"{_cohort_note(cfg, writes)}"),
+        context={"ttl_share_of_writes": deciding, "break_even": usage_mod.TTL_BREAK_EVEN,
+                 "ttl_share_of_tax": of_tax, "orders": writes.orders,
+                 "boundaries": writes.boundaries, "days": cfg.cache_health_window_days},
+    )
+
+
+def check_prefix_stable() -> Iterator[Violation]:
+    """INV-PREFIX-DRIFT — the prompt prefix has started moving again.
+
+    The fix is one line (`includeGitInstructions: false` in
+    `dispatch._write_worker_settings`, plus `worker_brief.git_briefing`), it was verified
+    once in a clean room and then trusted, and prefix invalidation is still the larger
+    half of the re-write tax. A CLI upgrade, a new MCP server or an edit to the briefing
+    would re-break it and nothing would say so — it would surface months later as a
+    bigger bill (finding 4).
+
+    THIS IS THE AUTHORITATIVE MEASUREMENT OF PREFIX STABILITY IN THIS TREE, because of
+    where its number comes from: the cache accounting the API ITSELF reported, read back
+    through the boundary classification in `usage._usage_of` and frozen onto each order's
+    bill. Any other prefix-drift signal here is a proxy and defers to this one — whether
+    it works by hashing the rendered system prompt at session start, or by comparing
+    against a recorded baseline. Both of those infer that the prefix moved; this reads
+    what the cache actually did. When they disagree, this is right.
+
+    THE RATIO IS OVER ALL CACHE WRITES, not over the tax and not over the boundaries.
+    Prefix writes as a share of the tax FALLS when TTL expiry rises, so it would report
+    the prefix improving on a day when only the cache got colder. The honest caveat,
+    stated rather than engineered around: this ratio does move with the fleet's turn
+    shape, since a fleet of shorter, choppier sessions crosses more boundaries per token.
+    That is why the threshold is empirical and set above a measured normal rather than
+    derived — `catalog.DEFAULT_CACHE_HEALTH_PREFIX_SHARE`.
+    """
+    health = _cache_health()
+    if health is None:
+        return
+    cfg, writes = health
+    if _thin_cohort(cfg, writes):
+        return
+    share = writes.prefix_share_of_writes
+    if share is None or share < cfg.cache_health_prefix_share:
+        return
+    yield Violation(
+        invariant="INV-PREFIX-DRIFT",
+        detail=(
+            f"{share:.1%} of the fleet's cache writes are being spent re-sending "
+            f"conversations whose PROMPT PREFIX had moved, over the "
+            f"{cfg.cache_health_prefix_share:.1%} ceiling this fleet is held to — a "
+            f"ceiling set above the figure measured while the `includeGitInstructions` "
+            f"fix was known to be working, so crossing it means the prefix has got "
+            f"WORSE and not merely that it costs something. No cache TTL buys any of it "
+            f"back: the cure is whatever is now changing the head of the prompt between "
+            f"calls. The usual suspects, in the order they are worth "
+            f"checking: a Claude CLI upgrade, an MCP server added or changed mid-session, "
+            f"and an edit to `worker_brief.git_briefing` or to a project's CLAUDE.md. "
+            f"`jarvis inspect <wo-id>` labels every re-write of one order by cause. "
+            f"{_cohort_note(cfg, writes)}"),
+        context={"prefix_share_of_writes": share,
+                 "threshold": cfg.cache_health_prefix_share,
+                 "prefix_boundaries": writes.prefix_boundaries,
+                 "orders": writes.orders, "boundaries": writes.boundaries,
+                 "days": cfg.cache_health_window_days},
+    )
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
     check_gate_canaries,
     check_config_drift,
     check_service_path,
     check_production_clean,
+    check_cache_ttl_trigger,
+    check_prefix_stable,
 )
 
 
@@ -2495,6 +2757,58 @@ def check_os() -> list[Violation]:
                 detail=f"invariant raised {e!r}",
             ))
     return found
+
+
+def check_schedule_progresses(store: ProjectStore) -> Iterator[Violation]:
+    """INV-SCHEDULE-HELD — a recurring job that has wanted to fire for days.
+
+    The scheduler holds SILENTLY by design: a job whose previous order has not settled
+    does not fire, does not queue, and does not flag anything, because a stack of
+    identical daily orders is the alarm nobody reads (`schedule.decide`). The cost of
+    that choice is that a scheduler which has quietly stopped looks exactly like one that
+    is politely waiting, and the difference is invisible on every surface. This is the
+    difference, and it is why `scheduled_jobs` persists the hold rather than recomputing
+    it: what matters is how long, and only the row remembers.
+
+    `held_alarm_intervals` whole intervals, three by default — a doctor order the user
+    has not reviewed by lunchtime is a normal Tuesday, and reporting that would put the
+    scheduler on the attention list for working correctly.
+
+    NOT REPAIRABLE, and it must not try: the remedy is to settle the order that is in the
+    way (or to decide it never will be), which is a judgement about that work, not a
+    derivation. Silent on a project whose scheduler is OFF, or which does not run the
+    job any more — `check_health_sweep_produces_judgements`' lesson, where a switched-off
+    mechanism with rows still on disk would otherwise alarm for ever.
+    """
+    from .ops import schedule_config_at
+    from .schedule import held_seconds
+
+    cfg = schedule_config_at(store.project_path)
+    if not cfg.enabled:
+        return
+    # `db.now`, not `time.time`: `held_since` was written from that clock by
+    # `record_schedule_hold`, and judging a stored moment against a different clock is
+    # how a check comes to disagree with the thing it is checking (kn-e6373014).
+    now = db.now()
+    limit = cfg.held_alarm_intervals * cfg.interval_seconds
+    for state in store.list_schedule_states():
+        if state["job_id"] not in cfg.jobs:
+            continue
+        held = held_seconds(state, now)
+        if held <= limit:
+            continue
+        waiting_for = state["held_reason"] or "its previous order has not settled"
+        yield Violation(
+            invariant="INV-SCHEDULE-HELD",
+            wo_id=state["last_wo_id"],
+            detail=(f"scheduled job {state['job_id']!r} has been unable to fire for "
+                    f"{held / SECONDS_PER_HOUR:.0f}h — longer than "
+                    f"{cfg.held_alarm_intervals} intervals of {cfg.interval_hours}h. "
+                    f"It is waiting because {waiting_for}. Settle that work order and "
+                    f"the job files its next one on the following tick."),
+            context={"job_id": state["job_id"], "held_seconds": held,
+                     "held_reason": state["held_reason"] or ""},
+        )
 
 
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
@@ -2518,6 +2832,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # did not do, with nothing to repair
     check_pause_deadline_stable,   # ...and its companion: the pass can also be failing
                                    # because the moment it was given keeps moving
+    check_schedule_progresses,     # ditto, one mechanism over: a pure read of the
+                                   # scheduler's clock, repairing nothing
     check_validation_progresses,   # after the flag checks: its repair touches no flag,
                                    # and a `validating` row is invisible to all of them
     check_feature_failures_are_real,  # order-free: it reads and writes feature orders
@@ -2536,10 +2852,11 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
 #: Invariants that shell out. They answer a question no other check can — "is this work
 #: on the default branch" needs the repository, not the database — and they cost a `git`
 #: invocation per touched file of every completed order whose verdict is not already
-#: settled. So they are OFF by default and run on their own cadence, exactly as
-#: `Daemon.PR_POLL_EVERY_TICKS` is its own cadence for being the only step that leaves
-#: the machine. `jarvis doctor` always runs them: a human who typed the command is
-#: waiting for the answer, and the answer is the point of the command.
+#: settled — plus, on the repairing path, ONE round trip to refresh the ref all of that
+#: is measured against (issue #271; `landing.refresh_base`). So they are OFF by default
+#: and run on their own cadence, as `Daemon.PR_POLL_EVERY_TICKS` does for the same
+#: reason. `jarvis doctor` always runs them: a human who typed the command is waiting for
+#: the answer, and the answer is the point of the command.
 SLOW_INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_work_lands,
 )

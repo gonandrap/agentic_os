@@ -954,6 +954,14 @@ registry is a registry:
 | `nudge` | both | Queue ONE short message asking the session to say where it is — on the work order, or on a feature's `carrier_for_feature(fo_id)`. |
 | `unblock` | work_order | `ops.unblock_work_order` in its **default, dead-edges-only** mode — cut a dependency edge that can never clear because the dependency was cancelled, failed or deleted. Never `drop_all`. |
 
+> **Amended, issue 164 item 1.** A third remedy, `file_work_order`, was added later: one
+> application files a work order to fix a root cause and a second to ship that fix,
+> `--depends-on` the first. It is what makes the aggregate re-write-tax alarms
+> (`inspection.REWRITE_PREFIX_ALARM` / `REWRITE_TTL_ALARM`) actionable rather than merely
+> reported. The registry is still closed, still allow-listed and still gated; `REMEDIES`
+> and `SHIPPED_REMEDIES` in the code are the current list, and this section is the
+> original two.
+
 ### THE NUDGE DOES NOT GO THROUGH `ops.send_message`, AND THIS IS NOT A STYLE CHOICE
 
 `ops.send_message` ends with `if wo["needs_attention"]: store.clear_attention(wo_id)` — a

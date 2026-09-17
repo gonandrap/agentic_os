@@ -198,12 +198,18 @@ def prompt_row(at: float, text: str, *, sdk: bool = True, meta: bool = False) ->
 
 
 def assistant_row(at: float, mid: str, *, write: int = 0, read: int = 0,
-                  content: list | None = None) -> dict:
+                  content: list | None = None, ttl_1h: int = 0,
+                  ttl_5m: int = 0) -> dict:
+    counts: dict = {"input_tokens": 0, "cache_creation_input_tokens": write,
+                    "cache_read_input_tokens": read, "output_tokens": 1}
+    # Only written when a test asks for it: most rows in the wild predate the split, and
+    # `one_hour_writes` has to read their absence as "not the expensive write".
+    if ttl_1h or ttl_5m:
+        counts["cache_creation"] = {"ephemeral_1h_input_tokens": ttl_1h,
+                                    "ephemeral_5m_input_tokens": ttl_5m}
     return {
         "type": "assistant", "timestamp": stamp(at),
-        "message": {"id": mid, "model": "claude-opus-5",
-                    "usage": {"input_tokens": 0, "cache_creation_input_tokens": write,
-                              "cache_read_input_tokens": read, "output_tokens": 1},
+        "message": {"id": mid, "model": "claude-opus-5", "usage": counts,
                     "content": content or [{"type": "text", "text": "ok"}]},
     }
 
@@ -228,9 +234,17 @@ def write_transcript(tmp_path, monkeypatch):
     (root / "-proj").mkdir(parents=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
 
-    def write(session_id: str, rows: list[dict]) -> str:
-        (root / "-proj" / f"{session_id}.jsonl").write_text(
+    def write(session_id: str, rows: list[dict], *, slug: str = "-proj",
+              subagents: dict[str, list[dict]] | None = None) -> str:
+        directory = root / slug
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{session_id}.jsonl").write_text(
             "".join(json.dumps(r) + "\n" for r in rows))
+        for name, sub_rows in (subagents or {}).items():
+            sub_dir = directory / session_id / "subagents"
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            (sub_dir / f"{name}.jsonl").write_text(
+                "".join(json.dumps(r) + "\n" for r in sub_rows))
         return session_id
 
     return write
@@ -667,14 +681,21 @@ def test_nothing_in_the_module_hard_codes_a_threshold():
     thresholds are policy and they belong in the catalog, so a later change that reaches
     for a literal instead of a setting fails here rather than in review.
 
-    `TTL_5M`/`TTL_1H` are exempt and are the only exemption: they are the two durations
-    Anthropic's cache actually offers, not a number anyone gets to choose.
+    WHAT IS EXEMPT IS EVERYTHING THAT IS NOT A CHOICE. `TTL_5M`/`TTL_1H` are the two
+    durations Anthropic's cache actually offers; `1e6` is the unit its prices are quoted
+    in. Neither is a number anyone gets to set, so neither belongs in a catalog — and
+    listing them here rather than widening the rule is what keeps the rule meaning
+    something. `NAMED_SESSIONS` is the one judgement call in the list: it bounds how much
+    of a list an alarm's prose carries, which is a display decision like
+    `DEFAULT_INSPECT_QUOTE_CHARS` and not a condition anything fires on.
     """
     import ast
     import inspect as stdlib_inspect
 
     tree = ast.parse(stdlib_inspect.getsource(inspection))
-    allowed = {0, 1, 2, 4, 60, 300.0, 3600.0}  # indices, seconds-per-minute, the TTLs
+    allowed = {0, 1, 2, 4, 60, 300.0, 3600.0,   # indices, seconds-per-minute, the TTLs
+               1e6,                             # tokens per million: the price unit
+               inspection.NAMED_SESSIONS}       # a display bound, see the docstring
     literals = {node.value for node in ast.walk(tree)
                 if isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
                 and not isinstance(node.value, bool)}
@@ -1110,3 +1131,117 @@ def test_the_alarm_status_is_not_the_thing_the_page_calls_live(
 
     ops.ack_attention(wo_id, project_name="proj_a")
     assert ops.list_cost_alarms()[0]["live"] is False
+
+
+# -- who is still buying the one-hour write --------------------------------------------
+#
+# Finding 3 of docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md. The
+# value of this reading is entirely in the SPLIT: the same tokens mean a defect in this
+# OS or a person's own session, and those have unrelated fixes.
+
+#: Before every timestamp below, so `since` is inert unless a test says otherwise.
+ALL_OF_IT = -1.0
+
+
+def test_one_transcript_holding_both_halves_is_split_per_turn(write_transcript):
+    """THE CASE THE DESIGN TURNS ON, and it is wo-2df8828c's real shape: a dispatched
+    worker session whose worktree was reopened by hand after the order completed, so one
+    file and one session id hold both. Paired — a reader that classified the FILE rather
+    than each turn would satisfy either half alone."""
+    write_transcript("both", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        assistant_row(10, "m1", write=900, ttl_1h=900),
+        prompt_row(20, "carry on, I'll drive", sdk=False),
+        assistant_row(30, "m2", write=4_000, ttl_1h=4_000),
+    ])
+
+    (entry,) = inspection.one_hour_writes(ALL_OF_IT)
+
+    assert (entry.dispatched, entry.foreign) == (900, 4_000)
+    assert entry.total == 4_900 and entry.directory == "-proj"
+
+
+def test_a_coalesced_turn_with_one_typed_prompt_is_not_jarvis_s(write_transcript):
+    """`Daemon.deliver_messages` coalesces, so a turn has several triggers. One of them
+    typed means a person was at the keyboard, and `dispatched` is a claim about the
+    PROCESS — getting it wrong accuses the OS of a defect it does not have."""
+    write_transcript("mixed", [
+        prompt_row(0, "<task-notification>done"),
+        prompt_row(0.02, "actually, do this instead", sdk=False),
+        assistant_row(10, "m1", write=2_000, ttl_1h=2_000),
+    ])
+
+    (entry,) = inspection.one_hour_writes(ALL_OF_IT)
+
+    assert (entry.dispatched, entry.foreign) == (0, 2_000)
+
+
+def test_a_subagent_inherits_its_parents_classification_either_way(write_transcript):
+    """Subagent transcripts carry NO `promptSource` — measured over every one on this
+    machine, 1,002 user rows and not a single field. So classifying them on their own
+    evidence reads every subagent as a person's, which would hide the breach this exists
+    to catch. Both directions in one test, because inheriting only one of them is
+    indistinguishable from a constant."""
+    write_transcript("dispatched-parent", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        assistant_row(10, "m1", write=10, ttl_1h=10),
+    ], subagents={"agent-a": [assistant_row(12, "s1", write=2_000, ttl_1h=2_000)]})
+    write_transcript("typed-parent", [
+        prompt_row(0, "have a look at this", sdk=False),
+        assistant_row(10, "m1", write=10, ttl_1h=10),
+    ], slug="-other",
+        subagents={"agent-b": [assistant_row(12, "s2", write=3_000, ttl_1h=3_000)]})
+
+    split = {e.session_id: (e.dispatched, e.foreign)
+             for e in inspection.one_hour_writes(ALL_OF_IT)}
+
+    assert split == {"dispatched-parent": (2_010, 0), "typed-parent": (0, 3_010)}
+
+
+def test_an_unknown_ttl_is_not_counted_as_the_expensive_one(write_transcript):
+    """A row written before Claude Code reported the split has no `cache_creation` at
+    all. Reading that absence as 1h would fire this on every old transcript in the fleet
+    — `usage`'s module note calls the 5-minute rate the floor, and so does this."""
+    write_transcript("cheap", [
+        prompt_row(0, "hi", sdk=False),
+        assistant_row(10, "m1", write=8_000, ttl_5m=8_000),
+        assistant_row(20, "m2", write=9_000),  # no split reported at all
+    ])
+    write_transcript("leaky", [
+        prompt_row(0, "hi", sdk=False),
+        assistant_row(10, "m1", write=10, ttl_1h=10),
+    ], slug="-other")
+
+    assert [e.session_id for e in inspection.one_hour_writes(ALL_OF_IT)] == ["leaky"]
+
+
+def test_since_cuts_on_the_write_not_on_the_session(write_transcript):
+    """A session outlives a window: wo-2df8828c's was still being written to four days
+    after its work order completed. So one old write and one new one report only the
+    new one, and the span reported is the WRITES' own."""
+    day = 86_400
+    write_transcript("long-lived", [
+        prompt_row(0, "hi", sdk=False),
+        assistant_row(10, "m1", write=7_000, ttl_1h=7_000),
+        assistant_row(5 * day, "m2", write=300, ttl_1h=300),
+    ])
+
+    (recent,) = inspection.one_hour_writes(2 * day)
+    assert (recent.foreign, recent.first_ts, recent.last_ts) == (300, 5 * day, 5 * day)
+    assert inspection.one_hour_writes(ALL_OF_IT)[0].foreign == 7_300
+
+
+def test_the_biggest_offender_is_first(write_transcript):
+    """The caller quotes the top of this list into an alarm, so the order is the ranking
+    by what it cost rather than whatever the filesystem returned."""
+    write_transcript("small", [
+        prompt_row(0, "hi", sdk=False),
+        assistant_row(10, "m1", write=50, ttl_1h=50),
+    ])
+    write_transcript("big", [
+        prompt_row(0, "hi", sdk=False),
+        assistant_row(10, "m1", write=9_000, ttl_1h=9_000),
+    ], slug="-other")
+
+    assert [e.session_id for e in inspection.one_hour_writes(ALL_OF_IT)] == \
+        ["big", "small"]

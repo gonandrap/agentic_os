@@ -60,6 +60,31 @@ with no commits over its base and a clean worktree produced nothing, so there is
 to land, so `NOT_PRODUCED`. A category list would also be wrong — an investigation that
 does commit a script HAS produced something.
 
+## THE DEFAULT BRANCH IS A REMOTE-TRACKING REF, AND NOTHING ELSE EVER MOVES IT
+
+`base_ref` resolves to `origin/main`, and a merge is detected over the NETWORK — the
+poll asks `gh`, GitHub says MERGED, and the work order completes while that local ref
+still points at the commit before the squash. The content test then looks for the
+branch's lines in a copy of the file that predates the merge, scores near zero and
+reports `STRANDED`, every hour, until a human happens to fetch in that checkout (issue
+#271: one false positive per merge, on the checker whose docstring above says a checker
+that flags everything gets switched off within a day).
+
+So `refresh_base` moves it, and `assess` will not condemn a branch off a ref nobody
+refreshed: with `base_current=False` a verdict that rests on lines NOT FOUND becomes
+`UNKNOWN` at the `stale-base` rung. The two halves are not interchangeable — the refresh
+alone still condemns a branch whenever a fetch fails, and the guard alone would turn the
+false positive into a permanent blind spot, since `UNKNOWN` is never cached and a fleet
+where nobody fetches would never confirm a landing again.
+
+Absence is what staleness breaks, never presence: lines FOUND on an out-of-date default
+branch are on the up-to-date one too, because a branch only grows. So the guard is keyed
+on the EVIDENCE and not on the verdict's name, which cannot carry the difference —
+`PARTIAL` is reached both from a middling score (absence, withheld) and from a full score
+beside a dirty worktree (presence plus a fact about the worktree, kept). `LANDED`,
+`merged-tail` and `pull-request-open` are left alone for the same reason: the first is
+monotonic and the other two never read the base at all.
+
 ## Why this module imports almost nothing
 
 Same rule as `evidence`, for a weaker but real version of the same reason: this is the
@@ -97,6 +122,12 @@ log = logging.getLogger("jarvis.landing")
 LANDED_COVERAGE = 0.75
 STRANDED_COVERAGE = 0.25
 
+#: How long one refresh of the default branch may take before it is abandoned. It is a
+#: single ref with no tags, so this is generous rather than tight; what it is really
+#: sized against is a daemon tick, which must not be held open by an unreachable remote.
+#: Timing out is not an error here — it is `base_current=False`, which is `UNKNOWN`.
+FETCH_TIMEOUT_SECONDS = 20
+
 #: A line has to be long enough and wordy enough that finding it in another file means
 #: something. `}`, `"""`, `return`, a blank line and a lone bracket all appear in every
 #: Python file ever written, so counting them as "present on the default branch" would
@@ -119,6 +150,28 @@ UNSETTLED_VERDICTS = (STRANDED, PARTIAL)
 #: branch has stopped moving, and content on the default branch stays on it. `UNKNOWN` is
 #: pointedly not here — it is the answer that a later push or a repaired remote fixes.
 SETTLED_VERDICTS = (LANDED, NOT_PRODUCED)
+
+#: The userinfo of a URL — `scheme://user:password@host` — which is the only place a
+#: credential appears in anything git prints. See `_scrub`.
+_CREDENTIALS_RE = re.compile(r"://[^/\s@]+@")
+
+#: What a failed fetch was about, and the phrases that say so. An allowlist over text the
+#: REMOTE controls — see `_cause`. Lower-cased needles; first match wins, so the order is
+#: the specific before the general ("not found" would otherwise claim an auth failure
+#: whose message happens to mention a missing branch).
+_FETCH_CAUSES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("the remote refused our credentials",
+     ("authentication failed", "could not read username", "could not read password",
+      "permission denied", "invalid username or password", "access denied",
+      "terminal prompts disabled")),
+    ("the remote could not be reached",
+     ("could not resolve host", "failed to connect", "connection refused",
+      "connection timed out", "network is unreachable", "operation timed out",
+      "no route to host", "ssl certificate problem")),
+    ("the remote has no such repository or ref",
+     ("repository not found", "does not appear to be a git repository",
+      "couldn't find remote ref", "not our ref", "remote branch")),
+)
 
 #: A GitHub pull-request URL sitting in prose. Mode A of issue #232: four work orders
 #: finished with a summary that NAMED a draft pull request and passed no `--pr`, so
@@ -265,9 +318,61 @@ class Landing:
         return self.verdict in UNSETTLED_VERDICTS
 
 
+def refresh_base(repo: Path, *, allow_network: bool = True) -> bool:
+    """Bring the default branch up to date, and say whether it may be measured against.
+
+    The answer to `assess`'s `base_current`, and the ONLY thing in the OS that moves a
+    remote-tracking ref. Call it once per sweep, never once per work order: it is a
+    round trip, and the ref it updates is shared by every order in the project.
+
+    True means the base holds everything the remote does, by one of two routes:
+
+    * there is nothing to be behind — the ladder landed on a LOCAL branch AND the clone
+      has no remotes at all, so its own default branch is authoritative;
+    * the fetch ran and exited 0.
+
+    False is every other outcome — no default branch at all, a ref that could not be
+    named, a local default branch in a clone that DOES have a remote (nothing can refresh
+    that, and it can be months old), `allow_network=False`, a remote that could not be
+    reached, a fetch that timed out — and none of them is an error.
+    It is the input that makes `assess` answer `UNKNOWN` instead of condemning a branch
+    on the strength of a ref nobody refreshed.
+
+    `allow_network=False` is the read-only path: `check_project(repair=False)`, the
+    `jarvis doctor` a human types without `--repair`. A fetch writes to the repository,
+    and "read-only unless you asked for repair" is a promise `ops.run_doctor` makes in
+    print. The cost is that a read-only doctor cannot report `STRANDED` by coverage, only
+    by the rungs that read no base; the daemon's hourly sweep is what refreshes the ref
+    and reports.
+    """
+    ref = base_ref(repo)
+    if not ref:
+        return False
+    full = (_git(repo, "rev-parse", "--symbolic-full-name", ref) or "").strip()
+    if not full:
+        # The ref could not be named. Nothing is claimed about a ref that could not be
+        # read at all — this is the `_git`-failed case, and it is False for `_git`'s own
+        # reason: an error must never arrive somewhere as a fact.
+        return False
+    if not full.startswith("refs/remotes/"):
+        # Rung 3: the ladder landed on a LOCAL branch, which this cannot refresh — a
+        # fetch updates `refs/remotes/...` and would not move it. So it is trustworthy
+        # only when there is nothing it could be behind, and that is a question about
+        # the CLONE, not about the ref: a single-branch clone of another branch has an
+        # `origin` and still lands here, and its local `main` can be months old.
+        return not (_git(repo, "remote") or "").split()
+    remote, _, branch = full[len("refs/remotes/"):].partition("/")
+    if not (remote and branch) or remote.startswith("-") or branch.startswith("-"):
+        # A leading `-` is read by `git fetch` as an option rather than a remote. It takes
+        # write access to `.git/config` to arrange and there is no shell here, so this is
+        # argument confusion rather than injection — and it costs one line to not have.
+        return False
+    return allow_network and _fetch(repo, remote, branch)
+
+
 def assess(repo: Path, wo_id: str, *, worktree: Path | None = None,
            pr_url: str = "", pr_merged: bool | None = None,
-           pr_head_oid: str = "") -> Landing:
+           pr_head_oid: str = "", base_current: bool = False) -> Landing:
     """Is this work order's code on the default branch? A ladder, exact rungs first.
 
     `pr_merged` and `pr_head_oid` are what GitHub said, passed IN — this module does not
@@ -292,6 +397,14 @@ def assess(repo: Path, wo_id: str, *, worktree: Path | None = None,
     5. `subject` — the corroborating rung, reached only when the branch added no
        significant lines at all (a pure deletion, a rename, a config tweak). Absence of
        a `[<wo-id>]` commit is NOT evidence here, so a miss ends at `unknown`.
+
+    `base_current` is `refresh_base`'s answer and DEFAULTS TO FALSE, because the ref this
+    measures against is a remote-tracking one that nothing moves on its own: a caller
+    that has not refreshed it has not earned a condemnation, and a default of True would
+    hand one to every caller written after this. False demotes the `coverage` rung's
+    verdicts that rest on lines NOT FOUND — every `STRANDED`, and the `PARTIAL` of a
+    middling score — to `UNKNOWN` at `stale-base`. Nothing else moves, the dirty-worktree
+    `PARTIAL` included; see the module docstring on why presence survives staleness.
 
     A sixth rung, `unreadable`, is not part of that sequence: it is what a `git` command
     that ERRORED produces, at whichever rung it errored on. `_git` keeps that distinct
@@ -363,6 +476,10 @@ def assess(repo: Path, wo_id: str, *, worktree: Path | None = None,
     cov = present / total
     verdict = (LANDED if cov >= LANDED_COVERAGE else
                STRANDED if cov <= STRANDED_COVERAGE else PARTIAL)
+    # Keyed on the EVIDENCE, not on the verdict's name — the distinction the stale-base
+    # branch below turns on, and one the name cannot carry: `PARTIAL` is reached from two
+    # different facts and only one of them reads absence off the base.
+    reads_absence = cov < LANDED_COVERAGE
     # `==`, never `is`: the verdicts are plain strings, and identity holds here only
     # because `verdict` is bound to this module's own constant. The day it arrives from
     # an event payload or any other round trip, `is` goes quietly False and this branch —
@@ -373,6 +490,24 @@ def assess(repo: Path, wo_id: str, *, worktree: Path | None = None,
         verdict, cov_note = PARTIAL, " but its worktree still holds uncommitted work"
     else:
         cov_note = ""
+    if reads_absence and not base_current:
+        # Issue #271. A low score off a ref nobody refreshed is not evidence of anything:
+        # the merge that landed this branch may already be on the remote's default branch
+        # and simply not in this clone yet. `UNKNOWN` is re-derived every sweep, so the
+        # answer arrives of its own accord as soon as a refresh succeeds. `missing_files`
+        # is dropped on the way: "this file is nowhere" is exactly the claim a base that
+        # may predate the merge cannot support.
+        #
+        # NOT `verdict != LANDED`, which is the same test everywhere except the one place
+        # it matters: the `PARTIAL` above rests on a dirty WORKTREE beside a full score,
+        # and nothing about the base's age touches either half of that. Demoting it would
+        # break this module's own rule one line after stating it, and would print "only
+        # 145/145 (100%)" at whoever was holding the report.
+        return Landing(wo_id, UNKNOWN, "stale-base", ref=ref, base=base, pr_url=pr_url,
+                       coverage=cov, added_lines=total, dirty=dirty,
+                       detail=f"`{base}` was not refreshed, so it may predate the merge "
+                              f"that landed `{ref}`: the {present}/{total} of its added "
+                              f"lines found there ({cov:.0%}) proves nothing either way")
     return Landing(wo_id, verdict, "coverage", ref=ref, base=base, pr_url=pr_url,
                    coverage=cov, added_lines=total, missing_files=missing, dirty=dirty,
                    detail=f"{present}/{total} of the lines `{ref}` added are on "
@@ -492,6 +627,80 @@ def _subject_landed(repo: Path, base: str, wo_id: str) -> bool:
     """
     return any(line.startswith(f"[{wo_id}]")
                for line in (_git(repo, "log", "--format=%s", base) or "").splitlines())
+
+
+def _fetch(repo: Path, remote: str, branch: str) -> bool:
+    """Update `refs/remotes/<remote>/<branch>` from the network. True if it worked.
+
+    THE ONE COMMAND IN THIS MODULE THAT WRITES, and the only one that leaves the machine,
+    which is why it is not `_git`: that helper is documented read-only and its callers
+    read its output as data, while this one is called for its effect and answers a
+    yes/no. Everything it does is narrowed on purpose — ONE explicit refspec so a
+    single-branch clone is updated too and no other ref moves, `--no-tags` so a busy
+    repository's tag list is not dragged across per sweep, `--quiet`, and a timeout,
+    because an unreachable remote must not hold a daemon tick open.
+
+    Never raises. A failure here is `base_current=False`, which is `UNKNOWN` — the
+    verdict that costs a sweep its answer and never a branch its reputation.
+
+    **IT DOES NOT QUOTE THE REMOTE.** A failing fetch prints the remote URL back at you —
+    "fatal: Authentication failed for 'https://x-access-token:<token>@github.com/…'" — so
+    a project whose `origin` carries a token in its URL would write that token into the
+    daemon's log once an hour, for ever, and daemon text leaves this machine through
+    alarms and `jarvis bug report`. Scrubbing that message would be a denylist over text
+    the remote controls; `_cause` is an allowlist instead, and it is the only thing about
+    the failure that reaches a warning. The message itself is kept for whoever is
+    debugging, at DEBUG, and scrubbed even there.
+    """
+    spec = f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"
+    try:
+        proc = subprocess.run(["git", "-C", str(repo), "fetch", "--quiet", "--no-tags",
+                               remote, spec], capture_output=True, text=True,
+                              errors="replace", check=False,
+                              timeout=FETCH_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError) as exc:
+        # Python's own text about a command whose argv holds a remote NAME, never a URL.
+        # Scrubbed regardless: this is the branch nobody re-reads before adding to it.
+        log.warning("could not refresh %s in %s: %s", spec, repo,
+                    _scrub(str(exc))[:200])
+        return False
+    if proc.returncode != 0:
+        log.warning("refreshing %s in %s exited %d: %s", spec, repo, proc.returncode,
+                    _cause(proc.stderr))
+        log.debug("refreshing %s in %s said: %s", spec, repo,
+                  _scrub(proc.stderr.strip())[:500])
+        return False
+    return True
+
+
+def _cause(stderr: str) -> str:
+    """What a failed fetch was ABOUT, in this module's own words.
+
+    An ALLOWLIST, and that is the whole point: `_fetch`'s message is the one text here a
+    remote controls, so nothing of it is repeated — a phrase is recognised and a fixed
+    string of ours is logged. A scrub is a denylist and only removes the leak somebody
+    already thought of; this cannot leak whatever a future host decides to print.
+
+    The four causes are the ones that change what a reader does — fix the credentials,
+    fix the URL, wait, look harder — which is what a warning is for. "an unrecognised
+    error" is a real answer and not a shrug: it says the sweep is not measuring, and the
+    message behind it is one `--debug` away.
+    """
+    low = stderr.lower()
+    for cause, needles in _FETCH_CAUSES:
+        if any(needle in low for needle in needles):
+            return cause
+    return "an unrecognised error"
+
+
+def _scrub(text: str) -> str:
+    """`text` with any URL userinfo replaced, for anything of the remote's that is kept.
+
+    Credentials only ever appear as userinfo, which is why one pattern covers it rather
+    than a list of message shapes. Second line of defence only — what reaches a WARNING
+    is `_cause`, which repeats nothing.
+    """
+    return _CREDENTIALS_RE.sub("://<redacted>@", text)
 
 
 def _git(repo: Path, *args: str) -> str | None:

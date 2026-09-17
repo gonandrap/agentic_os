@@ -49,7 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import bugreport, bus, claude_cli, db, fleet, worker_session
+from . import bugreport, bus, claude_cli, db, fleet, inspection, worker_session
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
@@ -62,6 +62,7 @@ from .project_store import (
     OPEN_STATUSES,
     PRE_APPROVED_KEY,
     RETRY_SWEEP_STATUSES,
+    TERMINAL_STATUSES,
     UNGOVERNED_ORIGINS,
     ProjectStore,
     resume_spends_slot,
@@ -130,6 +131,38 @@ RETRY_EVERY_TICKS = 2
 #: line up would silently sweep at some beat frequency of the two. 720 % 6 == 0, and both
 #: fire on tick 721.
 LANDING_SWEEP_EVERY_TICKS = 720
+
+#: Look at the scheduler's clock every N ticks — a minute at the default 5s interval. Its
+#: own cadence because it is the cheapest pass in the daemon and the one whose lateness
+#: matters least: the shortest interval a job can declare is an hour, so a minute of slop
+#: is noise, and running it every tick would be 12x the reads for no difference anybody
+#: could observe. One indexed `scheduled_jobs` read per enabled job per pass, and NOTHING
+#: AT ALL for a project that has not switched the scheduler on, which is every project by
+#: default (`catalog.ScheduleConfig`).
+SCHEDULE_EVERY_TICKS = 12
+
+#: Walk the transcript tree for one-hour cache writes every N ticks — six hours at the
+#: default 5s interval. ITS OWN CADENCE BECAUSE IT IS BY FAR THE DEAREST READ IN THE
+#: DAEMON: a substring pass over every transcript on the machine (843MB and 4,584 files
+#: here) plus a full parse of the few that match, measured at ~20s. That is 0.1% of a
+#: six-hour period and 60x the whole reconcile tick, which is why it cannot live there.
+#:
+#: Six hours rather than daily because the condition is a SETTING going missing and the
+#: window it is judged over is a week: four looks a day bounds how long a lost line runs
+#: unreported without making the scan's cost noticeable. The dedupe is what stops four
+#: looks becoming four alarms — `Daemon.check_cache_ttl` raises once per kind per window.
+#:
+#: Not catalog-configurable, for `PR_POLL_EVERY_TICKS`' reason: the THRESHOLDS are
+#: settings because a project may genuinely want to hear sooner, but how often the OS
+#: reads its own disk is not a decision anyone has information to make.
+CACHE_TTL_EVERY_TICKS = 4320
+
+#: WHICH tick of each period, and the only cadence here that is not `== 1`. Tick 1 is the
+#: daemon's FIRST, when it is starting the fleet: a 20-second disk walk there delays every
+#: dispatch behind it, and a daemon restarted more often than the period would pay that
+#: cost on every boot and never reach a later tick to do the scan it skipped. Five minutes
+#: in is past the start-up burst and still inside any session anybody is watching.
+CACHE_TTL_TICK_OFFSET = 60
 
 #: How many dashboard digests one batch may produce. Bounds the cost of the FIRST batch
 #: on an instance upgrading into the feature with a backlog of long questions already in
@@ -211,6 +244,36 @@ VALIDATION_REASON_CHARS = 500
 #: clipped one. Without it a sentence simply stops and the truncation reads as the
 #: machine having nothing more to say.
 VALIDATION_REASON_CUT = " […]"
+
+
+#: What the inbox row for an aggregate re-write-tax alarm says. Up here rather than at
+#: its call site because every inbox row reaches every sink, Telegram included, and
+#: `remedies`' and `supervisor`'s titles live at the top of their modules for that reason.
+#: ONE PER CAUSE, because the inbox is the durable half of this alarm and two rows
+#: reading identically merge exactly the two failures this whole change exists to keep
+#: apart — a title that says only "the tax" sends the reader to the wrong cure.
+REWRITE_INBOX_TITLE = {
+    inspection.REWRITE_PREFIX_ALARM:
+        "{project} is paying to re-send conversations whose prompt PREFIX moved",
+    inspection.REWRITE_TTL_ALARM:
+        "{project} is paying to re-send conversations whose cache entry EXPIRED",
+}
+
+#: The same, for the ONE-HOUR CACHE pair. ITS OWN DICT AND NOT A THIRD AND FOURTH ENTRY
+#: ABOVE: a dict named for one alarm family is a thing a test reads WHOLE — the sibling's
+#: does, asserting its two titles are exactly the two inbox rows a raise produced — so
+#: adding to it silently changes what an existing assertion means. One family, one dict.
+#:
+#: ONE PER CAUSE for `REWRITE_INBOX_TITLE`'s reason, though here the two name different
+#: CULPRITS rather than different cures. A row saying only "the fleet is buying the
+#: one-hour cache" sends the reader to the OS when the answer is their own settings file,
+#: or to their settings file when the answer is a bug in here.
+CACHE_1H_INBOX_TITLE = {
+    inspection.CACHE_1H_DISPATCHED_ALARM:
+        "Jarvis's OWN turns are buying the one-hour cache write — a transport defect",
+    inspection.CACHE_1H_FOREIGN_ALARM:
+        "Hand-opened Claude sessions are buying the one-hour cache write",
+}
 
 
 def escalation_body(reason: str) -> str:
@@ -484,6 +547,9 @@ class Daemon:
         poll_prs = self.tick_count % PR_POLL_EVERY_TICKS == 1
         retry_paused = self.tick_count % RETRY_EVERY_TICKS == 1
         sweep_landings = self.tick_count % LANDING_SWEEP_EVERY_TICKS == 1
+        run_schedule = self.tick_count % SCHEDULE_EVERY_TICKS == 1
+        scan_cache_ttl = \
+            self.tick_count % CACHE_TTL_EVERY_TICKS == CACHE_TTL_TICK_OFFSET
         # `None` means "the roster was not read this tick" — either nothing is injected
         # or the listing failed — and is NOT the same as an empty roster, which would
         # mean every injected session ended. Session tracking is skipped on None.
@@ -553,6 +619,16 @@ class Daemon:
                 # pending work order, so it is claimed by the same pass rather than
                 # waiting a whole poll interval to start.
                 self.plan_features(project, store)
+                # Before dispatch for the planner's reason one step removed: an order the
+                # scheduler files this tick is an ordinary pending work order, so the
+                # same pass claims it instead of leaving it a whole poll interval late.
+                if run_schedule:
+                    self.schedule_tick(project, store)
+                # Its own cadence, and OUTSIDE the reconcile block: a ~20s transcript
+                # walk (`CACHE_TTL_EVERY_TICKS`) has no business on a 30-second beat.
+                # Only the OS-owning project does any work here — see `check_cache_ttl`.
+                if scan_cache_ttl:
+                    self.check_cache_ttl(project, store)
                 self.dispatch_pending(project, store, state)
                 if poll_prs:
                     self.poll_pull_requests(project, store)
@@ -579,6 +655,10 @@ class Daemon:
                     # Before the invariants, because it is a fact about work that is
                     # still RUNNING rather than about state that has settled.
                     self.check_burning_turns(project, store)
+                    # AFTER `seal_bills`, never before: it reads the sealed bills, so an
+                    # order that settled on this tick is in this tick's window rather
+                    # than a reconcile interval late.
+                    self.check_rewrite_tax(project, store)
                     # Also before them: this is the only thing that ever closes a gate
                     # request no reviewer can see, so leaving it until after would let
                     # the invariants judge a hold the OS was about to refuse.
@@ -1085,11 +1165,16 @@ class Daemon:
             # `_park_on_signin`, and since issue #259 an order that was already settled
             # when its turn was refused.
             #
-            # `running` IS REQUIRED FOR THE SECOND, not merely tidier. All three statuses
+            # `running` IS REQUIRED FOR THE SECOND, not merely tidier. The statuses
             # issue #259 added are in `PR_POLL_STATUSES`, which excludes the in-flight
             # ones precisely so `complete_merged` cannot end a work order out from under
             # a worker that is still writing to it — so leaving a relaunched order where
             # it was would put a live turn back in front of that poll.
+            #
+            # `idle` is required for a third reason (issue #264): it asserts that this
+            # manager has nothing to act on, which `ops.waiting_on` reports verbatim and
+            # `resume-auto` refuses to nudge on. A live turn reading `idle` would be the
+            # OS confidently describing a state it had just contradicted.
             if wo["status"] != "running":
                 store.set_status(wo["id"], "running")
                 # ONLY THE PAUSE'S OWN FLAG. `_park_on_signin` is the one that raises an
@@ -1260,7 +1345,13 @@ class Daemon:
                 project.path, wo, declared=str(round_row["evidence"] or ""),
                 diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo),
                 side_effects=ops.side_effects_of(wo_id),
-                assumptions=store.all_assumptions(wo_id))
+                assumptions=store.all_assumptions(wo_id),
+                # WHAT EARLIER ROUNDS ALREADY ASKED FOR, so a seat cannot re-litigate
+                # settled ground or read an instruction it was given as a defect. ONLY
+                # this packet carries it — the one `ops.submit_for_validation` builds
+                # exists to be fingerprinted, and `history` is excluded from that hash
+                # (spec 2026-09-15-the-panel-blocks-on-blockers.md §5.1, §5.5).
+                history=ops.prior_round_history(store, wo_id=wo_id, before=n))
             # WHICH COMMIT THIS ROUND IS JUDGING, recorded before any verdict exists and
             # whatever the verdict turns out to be: it is a fact about the packet, and a
             # rejection that recorded nothing could not later say what it rejected. `""`
@@ -1304,7 +1395,7 @@ class Daemon:
             # earlier round it would punish a submitter that was told to go back to a
             # shape it had already tried, which is a legitimate answer to feedback.
             previous = self._preceding_round(store, n, wo_id=wo_id)
-            if previous and previous["fingerprint"] == round_row["fingerprint"]:
+            if self._repeat_submission(round_row, previous):
                 self._escalate(
                     store, wo, round_id, n,
                     f"this submission is identical to round {previous['round']} — the "
@@ -1394,6 +1485,32 @@ class Daemon:
                      project.name, unit, filed["round"], len(filed["items"]),
                      filed["dropped"], filed["failed"],
                      f" ({filed['reason']})" if filed.get("reason") else "")
+
+    @staticmethod
+    def _repeat_submission(round_row: dict[str, Any],
+                           previous: dict[str, Any] | None) -> bool:
+        """Is this round the SAME SUBMISSION as the one before it, with nothing new?
+
+        A round a PERSON forced is never one, whatever it hashes to. The guard is about a
+        SUBMITTER re-delivering unchanged work in answer to feedback; `jarvis validation
+        force` has no submitter, and its stated reason is that the JUDGEMENT changed —
+        the missing commit of spec 2026-09-14 §5.2, or a panel configuration that has
+        moved since. The branch is therefore unchanged BY CONSTRUCTION in every case the
+        command exists to serve, so the fingerprints always match and the recovery it
+        offers was a no-op that spent a round (issue #272, spec
+        docs/superpowers/specs/2026-09-15-forcing-a-validation-round.md §7).
+
+        The panel configuration is NOT the alternative fix: `evidence.fingerprint` hashes
+        exactly the evidence and nothing a submitter can move without producing any
+        (kn-6f15bba2), and `config_version` is already its own column beside it.
+
+        Shared by both loops so the rule has one home — a feature round cannot be forced
+        today, and the copy in `validate_features` is how that stops being true quietly.
+        """
+        if str(round_row["forced_reason"] or "").strip():
+            return False
+        return (previous is not None
+                and previous["fingerprint"] == round_row["fingerprint"])
 
     @staticmethod
     def _preceding_round(store: ProjectStore, n: int, *, wo_id: str | None = None,
@@ -1620,7 +1737,8 @@ class Daemon:
             # because reading this line alone makes the feature path look half-wired.
             packet = ops.collect_feature_evidence(
                 store, project.path, fo, declared=str(round_row["evidence"] or ""),
-                summary=str(round_row["summary"] or ""), cfg=cfg)
+                summary=str(round_row["summary"] or ""), cfg=cfg,
+                history=ops.prior_round_history(store, fo_id=fo_id, before=n))
 
             validator = (self.validator if self.validator is not None
                          else self._validator(cfg))
@@ -1676,7 +1794,7 @@ class Daemon:
                 return
 
             previous = self._preceding_round(store, n, fo_id=fo_id)
-            if previous and previous["fingerprint"] == round_row["fingerprint"]:
+            if self._repeat_submission(round_row, previous):
                 self._escalate_feature(
                     store, fo, round_id, n,
                     f"this submission is identical to round {previous['round']} — the "
@@ -2659,6 +2777,101 @@ class Daemon:
         finally:
             neo_store.close()
 
+    # -- 6b. the scheduler: work orders nobody typed ---------------------------------------
+
+    def _os_owner(self) -> str | None:
+        """Which project runs the fleet-wide OS checks — `schedule.os_owner`, per tick."""
+        from . import schedule
+
+        return schedule.os_owner((p.name, p.path) for p in self.catalog.projects)
+
+    @staticmethod
+    def _schedule_blocker(store: ProjectStore, state: dict[str, Any]) -> dict[str, Any] | None:
+        """The job's own previous order, if it has not settled yet.
+
+        A DELETED previous order is not a blocker: the clock outlives the work order it
+        filed (`scheduled_jobs` carries no foreign key), and a job that could never fire
+        again because somebody tidied up its last receipt would be a scheduler killed by
+        housekeeping.
+        """
+        prev = state.get("last_wo_id")
+        if not prev:
+            return None
+        try:
+            wo = store.get_work_order(str(prev))
+        except KeyError:
+            return None
+        return None if wo["status"] in TERMINAL_STATUSES else wo
+
+    @staticmethod
+    def _retire_previous(store: ProjectStore, state: dict[str, Any]) -> None:
+        """Hide yesterday's receipt as today's is filed — the attention-budget rule.
+
+        A daily job left alone fills the listing with a year of identical rows, which is
+        the alarm nobody reads that this whole design is written against. So exactly one
+        scheduled order per job stays visible: the newest.
+
+        HIDING IS EARNED, NOT AUTOMATIC. A previous order that ended badly — flagged, or
+        holding an assumption the user has not ruled on — is left where it is, because
+        those are the two states in which it is still asking for something. What a run
+        FOUND does not live here either way: findings leave as their own work orders,
+        filed under their own origin, and nothing hides those.
+        """
+        prev = state.get("last_wo_id")
+        if not prev:
+            return
+        try:
+            wo = store.get_work_order(str(prev))
+        except KeyError:
+            return
+        if (wo["status"] in TERMINAL_STATUSES and not wo["needs_attention"]
+                and not wo["hidden"] and not store.pending_assumptions(wo["id"])):
+            store.set_hidden(wo["id"])
+
+    def schedule_tick(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """File the work orders this project's clock says are due.
+
+        THE ONLY PLACE IN THE OS THAT CREATES WORK NOBODY ASKED FOR, and every guard rail
+        it leans on is somewhere else on purpose: the cadence is `schedule.decide` (pure,
+        so it is tested without a daemon), the roster and the master switch are
+        `catalog.ScheduleConfig` (so `jarvis config show` answers "what will this spend"),
+        and the clock is `scheduled_jobs` (so a restart cannot re-fire one). What is left
+        here is the wiring. Spec: docs/superpowers/specs/2026-09-14-the-scheduler.md.
+        """
+        from . import schedule
+
+        cfg = project.schedule
+        if not cfg.enabled or not cfg.jobs:
+            return
+        owner = self._os_owner()
+        now = db.now()
+        for job_id in cfg.jobs:
+            try:
+                spec = schedule.job(job_id)
+            except KeyError:
+                # `_parse_schedule` refuses an unknown id at boot, so this is only
+                # reachable on a DOWNGRADE — a catalog naming a job the running build no
+                # longer ships. Skipping beats refusing the whole tick.
+                log.warning("project %s: no scheduled job %r in this build",
+                            project.name, job_id)
+                continue
+            state = store.seed_schedule(job_id, now)
+            decision = schedule.decide(
+                state, interval_seconds=cfg.interval_seconds, now=now,
+                blocker=self._schedule_blocker(store, state))
+            if decision.action == schedule.WAIT:
+                continue
+            if decision.action == schedule.HOLD:
+                store.record_schedule_hold(job_id, decision.reason, now)
+                continue
+            ctx = schedule.JobContext(project=project.name,
+                                      owns_os=owner == project.name)
+            wo = store.create_work_order(title=spec.title, description=spec.describe(ctx),
+                                         origin=schedule.ORIGIN)
+            self._retire_previous(store, state)
+            store.record_schedule_fire(job_id, wo["id"], now)
+            log.info("scheduled job %s filed %s in %s", job_id, wo["id"], project.name)
+
     def abandon_unargued_gates(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Close every gate request whose case never came. See `gates.sweep_unargued`.
 
@@ -2742,7 +2955,6 @@ class Daemon:
         Read-only and free of the model: one transcript read per running work order, on
         the reconcile cadence rather than every tick.
         """
-        from . import inspection
         from . import usage as usage_mod
 
         # The PROJECT's thresholds, already resolved against the OS block by
@@ -2787,6 +2999,151 @@ class Daemon:
             if fresh and not wo["needs_attention"]:
                 store.flag_attention(wo["id"], fresh[0].reason)
 
+    def check_rewrite_tax(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Raise a project's STANDING re-write tax, split by the cause that produced it.
+
+        THE AGGREGATE HALF OF `check_burning_turns`. That one reports a single call
+        re-sending a single conversation while the turn is still running and already
+        names its cause; this one reports the condition ACROSS settled orders, which no
+        surface raised and which the user asked for in issue 164 item 1.
+
+        Read off sealed bills, so it costs an indexed query and a JSON parse per order in
+        the window — no transcript walk, and no model call.
+
+        THREE THINGS HERE ARE DELIBERATE AND EACH WOULD LOOK LIKE AN OMISSION.
+
+        * NO ATTENTION FLAG. The carrier is a settled order, and
+          `invariants.check_no_phantom_attention` clears the flag on every terminal order
+          on the next tick — so a flag here would evaporate and the OS would be raising a
+          finding it then hides. The INBOX ROW is the durable half, which is
+          `remedies._flag_and_tell`'s own reasoning arrived at from the other side. The
+          supervisor's queue is what carries it onward: it claims the alarm, judges it,
+          and may propose `file_work_order`. The cost of that, stated rather than
+          discovered: on a project running the supervisor the user hears twice, once here
+          and once at the verdict. It is paid deliberately, because the supervisor SHIPS
+          OFF and a finding whose only reader is a disabled subsystem reaches nobody at
+          all (Neo question 291).
+        * THE CARRIER IS AN EXEMPLAR, NOT A CULPRIT. `wo_alarms.wo_id` is a real foreign
+          key and an aggregate finding is about a project, so something must carry it;
+          the biggest single contributor is the one order whose evidence packet is
+          actually about the number being judged. `SUPERVISOR_PERSONA` says so in as many
+          words, because a judge shown a settled order would otherwise look for what is
+          wrong with THAT order.
+        * THE DEDUPE IS ONE ALARM PER KIND PER WINDOW. The condition is still true on the
+          next tick — that is what makes it standing rather than burning — so matching on
+          `(kind, seq)` the way `check_burning_turns` does would re-raise it every
+          reconcile for ever. `last_alarm_of_kind` is the memory, and the window is the
+          same cohort window the arithmetic used.
+        """
+        from . import bill as bill_mod
+        from .project_store import NO_TURN
+
+        cfg = project.inspect
+        if not cfg.enabled:
+            return
+        tax = bill_mod.rewrite_tax(store, days=cfg.alarm_rewrite_window_days)
+        if tax is None:
+            return
+        # BOTH floors, and they answer different questions: too few orders is one
+        # order's shape wearing the project's name, too little money is a percentage of
+        # nothing. Either alone lets the other case through.
+        if tax.orders < cfg.alarm_rewrite_min_orders \
+                or tax.bill_usd < cfg.alarm_rewrite_min_usd:
+            return
+        # `(kind, reason)` and not an `inspection.Alarm`: `bill` is accounting and does
+        # not import the config layer to name a string — see `bill.REWRITE_PREFIX_ALARM`.
+        for kind, reason in bill_mod.rewrite_alarms(tax, cfg):
+            last = store.last_alarm_of_kind(kind)
+            if last is not None and float(last["ts"] or 0.0) >= tax.since:
+                continue
+            row = store.add_finding(tax.worst_id, kind=kind, reason=reason,
+                                    seq=NO_TURN, source="cost")
+            store.add_event(tax.worst_id, "cost_alarm",
+                            {"kind": kind, "seq": NO_TURN,
+                             "reason": reason, "alarm_id": row["id"]})
+            self.central.add_inbox(
+                project=project.name, level="warning",
+                title=REWRITE_INBOX_TITLE[kind].format(project=project.name),
+                body=f"{reason}\n"
+                     f"The supervisor will look before you have to. "
+                     f"Read it with: jarvis alarms show {row['id']}",
+                wo_id=tax.worst_id)
+            log.info("[%s] %s: %s", project.name, kind, reason)
+
+    def check_cache_ttl(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Raise the fleet's remaining ONE-HOUR cache writes, split by who bought them.
+
+        Issue 164 item 3; finding 3 of
+        docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
+
+        A FLEET READING CARRIED BY ONE PROJECT, which is why this returns immediately for
+        every project but the one `schedule.os_owner` names. Transcripts are indexed by
+        the cwd a session was created in and a hand-opened one belongs to no project at
+        all, so there is nothing to attribute per project — and N projects raising the
+        same fleet fault is N-1 copies of an alarm nobody reads (`schedule.JobContext`
+        made the same call for the OS-level doctor checks).
+
+        FOUR THINGS HERE MATCH `check_rewrite_tax` AND ONE DOES NOT.
+
+        Matching: no attention flag (the carrier has settled and
+        `invariants.check_no_phantom_attention` would clear it next tick), the inbox row
+        as the durable half, an EXEMPLAR carrier rather than a culprit, and one alarm per
+        kind per window via `last_alarm_of_kind`.
+
+        NOT matching, and it is the whole character of this alarm: the foreign half
+        reports a condition THE OS CANNOT FIX. The remedy is a line in the user's own
+        `~/.claude/settings.json`, which Jarvis must never write — so what the supervisor
+        can do is file a work order telling a person to add it, and the reason carries the
+        line verbatim so that order is writable without a second investigation.
+
+        THE CARRIER IS THE PROJECT'S MOST RECENT SETTLED ORDER and stands for nothing but
+        the foreign key. `check_rewrite_tax` could pick the biggest contributor because
+        its subject WAS a work order; this one's subject is a session the OS never
+        dispatched, so there is no order the number is about. `SUPERVISOR_PERSONA` says
+        so: the alarm is about the fleet, and the order under it is a hook.
+        """
+        from .project_store import NO_TURN
+
+        cfg = project.inspect
+        if not cfg.enabled or project.name != self._os_owner():
+            return
+        days = cfg.alarm_cache_1h_window_days
+        since = db.now() - days * 86_400
+        try:
+            found = inspection.one_hour_writes(since)
+        except OSError:  # a transcript tree that moved or is unreadable
+            log.exception("[%s] the one-hour cache scan could not read transcripts",
+                          project.name)
+            return
+        raised = inspection.hour_alarms(found, cfg, days=days)
+        if not raised:
+            return
+        carrier = store.latest_settled_order()
+        if carrier is None:
+            # Nothing to hang the foreign key on. The finding is not lost — it is still
+            # true on the next pass, and the first order this project settles carries it
+            # then. Alarming against an order that does not exist is the alternative.
+            log.info("[%s] one-hour cache writes found, but no settled order to carry "
+                     "the alarm yet", project.name)
+            return
+        for alarm in raised:
+            last = store.last_alarm_of_kind(alarm.kind)
+            if last is not None and float(last["ts"] or 0.0) >= since:
+                continue
+            row = store.add_finding(carrier["id"], kind=alarm.kind, reason=alarm.reason,
+                                    seq=NO_TURN, source="cost")
+            store.add_event(carrier["id"], "cost_alarm",
+                            {"kind": alarm.kind, "seq": NO_TURN,
+                             "reason": alarm.reason, "alarm_id": row["id"]})
+            self.central.add_inbox(
+                project=project.name, level="warning",
+                title=CACHE_1H_INBOX_TITLE[alarm.kind],
+                body=f"{alarm.reason}\n"
+                     f"The supervisor will look before you have to. "
+                     f"Read it with: jarvis alarms show {row['id']}",
+                wo_id=carrier["id"])
+            log.info("[%s] %s: %s", project.name, alarm.kind, alarm.reason)
+
     def settle_turns(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Reap finished turns, then move each work order to where its turn says it is.
 
@@ -2798,8 +3155,14 @@ class Daemon:
         for turn in worker_session.poll(store):
             log.info("[%s] turn %s of %s ended: %s", project.name, turn["seq"],
                      turn["wo_id"], turn["state"])
+        # `idle` is in the sweep, and it is what MIGRATES the managers this release
+        # finds already parked in `waiting_input` (issue #264): each one falls through
+        # to the manager branch below on the first tick and is re-statused, before the
+        # invariant pass that would otherwise read it as blocked on the user. It also
+        # keeps an idle manager reachable by the branch that closes it when its feature
+        # settles.
         for wo in store.list_work_orders(
-                statuses=("running", "waiting_input", "dispatching")):
+                statuses=("running", "idle", "waiting_input", "dispatching")):
             if wo["origin"] in UNGOVERNED_ORIGINS:
                 continue  # not ours to run; track_injected_sessions follows these
             try:
@@ -2809,7 +3172,7 @@ class Daemon:
 
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
                           wo: dict) -> None:
-        from .invariants import awaiting_neo
+        from .invariants import awaiting_neo, something_is_out, true_blockers
 
         if wo["status"] == "validating":
             # THE ROUND MACHINE OWNS THIS WORK ORDER. Everything below re-derives the
@@ -2960,6 +3323,15 @@ class Daemon:
             # never finishes itself either: `_close_feature_manager` completes it when
             # its feature settles.
             #
+            # `idle`, NOT `waiting_input`, since issue #264. This branch used to park it
+            # in the status that means "blocked on the user", which every surface renders
+            # "Waiting on you" and which `ops.waiting_on` could explain only as an
+            # unanswered permission prompt — impossible under the `auto` mode the fleet
+            # runs. Suppressing the FLAG was never enough: six other surfaces re-derive
+            # meaning from the status alone, which is kn-cffc8905's trap paid a third
+            # time. A manager that genuinely ASKED for something stays in
+            # `waiting_input`, which is where it belongs — see the guard below.
+            #
             # UNLESS ITS FEATURE IS ALREADY OVER, and that ordering is one the feature
             # round machine makes reachable. A manager is created `pending` and claimed
             # by `dispatch_pending`; a feature settling on the VALIDATE thread can close
@@ -2973,8 +3345,36 @@ class Daemon:
             feature = store.get_feature_order(parent) if parent else None
             if feature and feature["status"] in FO_TERMINAL_STATUSES:
                 self._close_feature_manager(store, str(parent))
-            elif fresh["status"] != "waiting_input":
-                store.set_status(wo["id"], "waiting_input")
+            elif something_is_out(store, wo["id"]):
+                # HOLD IT WHERE IT IS. `waiting_input` is the only carrier of the fact
+                # that this manager ASKED for something, and re-statusing it `idle` would
+                # say the opposite — nothing to act on — about an order waiting for a
+                # verdict: muted, out of FEATURED_STATUSES, and refused a nudge.
+                #
+                # NOT LEFT TO THE BRANCH ORDER ABOVE, which is two thirds of the same
+                # question and looks like all of it. That `elif` reads `pending_approvals`
+                # and misses `awaiting_case` — a gate request the worker filed by running
+                # the command before arguing it, which `gates.file_request` parks here
+                # just the same. Under the old code missing it cost nothing, because this
+                # branch's write was `waiting_input` either way; since issue #264 it is a
+                # rewrite, so the predicate has to be the whole one. `something_is_out` is
+                # that predicate, shared with `invariants.end_wait_if_nothing_is_out` so
+                # the two cannot drift (kn-4ea33fe6).
+                pass
+            elif fresh["status"] != "idle":
+                store.set_status(wo["id"], "idle")
+                # The one write the re-status cannot do on its own: a manager carried
+                # over from before issue #264 may have been flagged while it was in
+                # `waiting_input`, and INV-ATTENTION-PHANTOM only clears terminal rows,
+                # so that flag would outlive the status it was derived from for ever.
+                #
+                # RE-DERIVED AGAINST THE NEW STATUS, never assumed. `true_blockers` is
+                # read on the row AS IT NOW IS — an unconditional clear would drop a
+                # blocker that survives the move, and reading `fresh` would re-derive the
+                # old status's "worker is waiting on your input" and never clear at all.
+                moved = store.get_work_order(wo["id"])
+                if moved["needs_attention"] and not true_blockers(store, moved):
+                    store.clear_attention(wo["id"])
         else:
             from .invariants import IDLE_NO_FINISH_BLOCKER
 
@@ -3143,6 +3543,11 @@ class Daemon:
                     self.heal_pull_request(project, store, wo, ops.PR_CONFLICT,
                                            "conflicts",
                                            base=pr.base_ref or "its base branch")
+                    # ...and say what is holding the merge NOW. Issue #263: repairing
+                    # used to skip `auto_merge` entirely, so the auto-merge line kept
+                    # naming whatever held last — CI, while the real blocker was this
+                    # conflict. `record_only` cannot merge or propose.
+                    self.auto_merge(project, store, wo, pr, record_only=True)
                 elif pr.failing:
                     self.heal_pull_request(
                         project, store, wo, ops.PR_CHECKS,
@@ -3152,6 +3557,7 @@ class Daemon:
                         # never causes one: spec §5.
                         behind=(ops.PR_BEHIND_NOTE.format(base=pr.base_ref or "its base")
                                 if pr.behind else ""))
+                    self.auto_merge(project, store, wo, pr, record_only=True)
                 else:
                     healed = pr.mergeable_now and ops.clear_pr_repair(
                         store, wo, ops.PR_CONFLICT)
@@ -3177,13 +3583,15 @@ class Daemon:
                                      project.name, wo["pr_url"], wo["id"])
                     # AFTER the repairs clear, and inside the same branch: a pull request
                     # the OS is still nudging a worker about is not one it may merge.
+                    # The repair branches above call this too, `record_only` — which
+                    # writes the hold and merges nothing, so that rule is untouched.
                     self.auto_merge(project, store, wo, pr)
             except Exception:  # noqa: BLE001
                 log.exception("[%s] settling %s against its PR failed", project.name,
                               wo["id"])
 
     def auto_merge(self, project: ProjectSpec, store: ProjectStore, wo: dict,
-                   pr: Any) -> None:
+                   pr: Any, *, record_only: bool = False) -> None:
         """Merge this pull request, if six positive facts line up. Usually: do nothing.
 
         docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md. The decision is
@@ -3210,6 +3618,20 @@ class Daemon:
           a candidate for, on the one surface that exists to say what the mechanism did.
           `_note_automerge_held` drops `HELD_STATUS` as well, for the same reason from
           the other side.
+
+        **`record_only=True` DECIDES AND RECORDS THE HOLD, AND STOPS THERE.** It is how
+        the two repair branches of `poll_pull_requests` keep the auto-merge line honest
+        while a worker is being nudged, and issue #263 is why they have to: the hold
+        `ops.automerge_state` renders is the last one WRITTEN, so a pull request that
+        holds on CI and then stops merging cleanly went on naming CI — the branch that
+        saw the conflict never called this at all. A hold is a sentence about a pull
+        request, not permission to touch it, so recording one costs the repair nothing.
+
+        Nothing arms under it, and nothing could: `github.PullRequest.conflicting` means
+        `mergeable` is not `MERGEABLE`, and a failing check means `checks_green` is false,
+        so `decide` holds on conditions 6b and 6c respectively before a grant is ever
+        looked up. The flag is belt to that braces — a caller that is repairing must not
+        be able to merge even if that implication is one day broken.
 
         `project.validation` resolves per project — a project that names `auto_merge`
         keeps its answer, one that does not takes the fleet's, and the shipped answer at
@@ -3240,6 +3662,8 @@ class Daemon:
         if not decision.armed:
             self._note_automerge_held(store, wo_id, decision)
             return
+        if record_only:
+            return          # unreachable: a repairing pull request cannot arm, see above
 
         approval = store.latest_approval_for(
             wo_id, automerge.GATE_KIND,
@@ -3597,6 +4021,15 @@ class Daemon:
         at the SAME commit: "CI has not finished" is a wait, and "the panel has not
         passed this" is not, and one of them arriving after the other is the news.
 
+        THE REASON'S TEXT IS IN THE KEY, not just its code, and issue #263 is why: a code
+        is coarser than the sentence it names. `ops.automerge_state` renders the NEWEST
+        hold, so a changed reason this function drops is a user reading a hold that has
+        stopped being true — sent to look at CI for a merge conflict. `automerge`'s codes
+        are one per condition for the same reason; the text catches what a code cannot,
+        which is a condition whose wording carries the value (`BEHIND` against `DIRTY`,
+        round 2 rejected against round 3). A reason is built from a bounded vocabulary
+        plus the commit already in the key, so this stays a handful of rows per commit.
+
         **DELIBERATELY NOT AN ATTENTION ITEM.** A held auto-merge means the user merges
         this one by hand, which is what they did for every pull request before this
         existed. A heal-loop push invalidating a pass is ordinary, and the attention list
@@ -3620,10 +4053,11 @@ class Daemon:
         if decision.code in (automerge.HELD_DISABLED,   # both unreachable via the poll:
                              automerge.HELD_STATUS):    # `auto_merge` returns before here
             return
-        key = (decision.head_sha, decision.code)
+        key = (decision.head_sha, decision.code, decision.reason)
         for event in store.events_of_kind(wo_id, "automerge_held"):
             payload = db.from_json(event["payload"], {})
-            if (str(payload.get("head_sha") or ""), str(payload.get("code") or "")) == key:
+            if (str(payload.get("head_sha") or ""), str(payload.get("code") or ""),
+                    str(payload.get("reason") or "")) == key:
                 return
         store.add_event(wo_id, "automerge_held", {
             "code": decision.code, "reason": decision.reason,

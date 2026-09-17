@@ -111,14 +111,23 @@ def test_a_due_retry_fires_wherever_the_work_order_is_parked(sweep, status):
 def test_the_relaunched_work_order_stops_saying_somebody_else_has_it(sweep, status):
     """The turn is out, so the record must not go on saying the work order is settled.
 
-    Required rather than tidy: every status here is in `PR_POLL_STATUSES`, which leaves
+    Required rather than tidy, and for two different reasons depending on the status.
+
+    Every status here that carries a PULL REQUEST is in `PR_POLL_STATUSES`, which leaves
     the in-flight ones out precisely so `complete_merged` cannot end a work order out
     from under a worker still writing to it. Leaving a relaunched order where it was
     would put a live turn back in front of that poll.
+
+    `idle` is the exception and has its own reason (issue #264): it means "this manager
+    has nothing to act on", which `ops.waiting_on` reports verbatim and `resume-auto`
+    refuses to nudge on. A live turn reading `idle` would be the OS giving a confident
+    wrong answer about a state it had just created — the whole of the bug that status
+    exists to fix.
     """
     store, run, _settle = sweep
     wo = _refused(store, status)
-    assert status in PR_POLL_STATUSES, "the argument above depends on this"
+    assert status in PR_POLL_STATUSES or status == "idle", (
+        "the argument above depends on this")
 
     run()
 

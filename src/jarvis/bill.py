@@ -76,7 +76,10 @@ TURN_CALL_LIMIT = 200
 #: 1 — the original payload.
 #: 2 — per-API-call rows on each turn (`call_rows`), the `api_calls` count taken from
 #:     the transcript rather than from the envelope's sample, and `cost.write_rate`.
-PAYLOAD_VERSION = 2
+#: 3 — the re-write block's RAW cause split (`ttl_write`, `prefix_write`) and the worker
+#:     session's own `cache_write`, which the cache-TTL decision needs as its
+#:     denominator. `ttl_share` alone cannot recover them: it is their ratio.
+PAYLOAD_VERSION = 3
 
 #: The actor a line belongs to. Three, because they are three different KINDS of spend
 #: and the user's first question about the old line was why the OS's half looked like
@@ -1101,6 +1104,15 @@ def _worker_extras(session: Any) -> dict[str, Any]:
             "ttl_share": total.rewrite_ttl_share,
             "ttl_tokens": total.rewrite_ttl_excess,
             "ttl_boundaries": total.boundaries_ttl,
+            # THE RAW OBSERVATIONS, and not a second apportionment of the tax. Every key
+            # above is a share OF the tax; the cache-TTL decision is taken against a
+            # share of EVERY written token, so it needs both halves seen at a boundary
+            # and the whole cache-write line to divide them by (`usage.TTL_BREAK_EVEN`,
+            # kn-1449447a (4)). Their sum is deliberately not `tokens` — see
+            # `usage.Usage.rewrite_ttl_write`.
+            "ttl_write": total.rewrite_ttl_write,
+            "prefix_write": total.rewrite_prefix_write,
+            "cache_write": total.cache_write,
         },
         "context_peak": total.context_peak,
     }
@@ -1214,3 +1226,343 @@ def _check_children(line: dict[str, Any]) -> list[str]:
         for child in children:
             problems.extend(_check_children(child))
     return problems
+
+
+# -- the re-write tax as a STANDING condition ------------------------------------------
+#
+# `inspection.alarms` reports one call re-sending one conversation, while the turn that
+# made it is still running, and it already names the cause. What nothing reported is the
+# aggregate: a PROJECT's re-write tax over a window, and which of the two causes it was.
+# Issue 164 item 1; finding 1 of
+# docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
+#
+# Read off SEALED BILLS (`ProjectStore.sealed_bills_since`) rather than transcripts,
+# which is what makes it affordable on the reconcile cadence — the objection finding 2
+# raised against doing this at all.
+
+#: `inspection`'s two aggregate alarm kinds, duplicated as literals rather than imported
+#: — the same answer `probes.RESERVED_IDS` gives, and for the same reason one level over:
+#: `inspection` imports `catalog`, and this module is accounting that knows `db` and
+#: `usage` and must not learn the config layer to name a string. `cfg` below stays
+#: duck-typed for that reason too. `tests/test_rewrite_tax_alarm.py` pins both equal.
+REWRITE_PREFIX_ALARM = "rewrite-tax-prefix"
+REWRITE_TTL_ALARM = "rewrite-tax-ttl"
+
+
+def cohort_command(days: int = 30) -> str:
+    """The `scripts/cache_ttl_cohort.py` invocation a finding points its reader at.
+
+    Spelled once: the whole hazard of these findings is a reader acting on the wrong
+    ratio, and a command written out differently in two places is one of them going
+    stale. Takes the window because `invariants._cohort_note` reports over a configured
+    one, and sending that reader to a 30-day cohort would answer a different question
+    from the one they were just shown.
+    """
+    return f"uv run python scripts/cache_ttl_cohort.py --days {days}"
+
+
+#: The default window's spelling, which is what `rewrite_alarms` quotes.
+COHORT_COMMAND = cohort_command()
+
+#: The break-even the TTL decision is actually taken against, as a sentence rather than a
+#: number this module branches on — nothing here compares anything to it. It is in the
+#: alarm's prose because the alarm's own threshold is a share of the BILL, roughly half
+#: this ratio, and a judge that read one against the other would propose switching the
+#: write TTL on evidence that says keep it (kn-1449447a (4), which is the error the
+#: findings doc's own draft made).
+TTL_DECISION_NOTE = (
+    "This is a share of the BILL and is NOT the trigger for switching the write TTL. "
+    "That decision is TTL-expiry tokens as a share of ALL cache writes, against a "
+    f"break-even of {usage_mod.TTL_BREAK_EVEN:.1%} — a different ratio over a much "
+    "larger denominator, running at about half this figure. Measure it with "
+    f"`{COHORT_COMMAND}` before proposing any change to the cache TTL."
+)
+
+
+@dataclass
+class RewriteTax:
+    """One project's re-write tax over a cohort window, split by CAUSE.
+
+    `ttl_share` is the TTL's share OF THE TAX and is None when no boundary in the window
+    was classified — `usage.Usage.rewrite_ttl_share`'s rule, kept all the way up here:
+    unmeasured must never print as 0%, and with no split there is no cause to name, so no
+    alarm is raised at all.
+
+    THE SPLIT AND THE DENOMINATOR COME FROM DIFFERENT POPULATIONS ON PURPOSE.
+    `bill_usd`, `tax_usd` and `tax_tokens` are every sealed order in the window, because
+    an order that paid no tax is still spend the tax is a share OF. The ratio is taken
+    only over the orders whose boundaries were classified (`classified_tokens`) and then
+    applied to the whole — dropping the unclassified orders from the denominator instead
+    would shrink it and inflate every share printed.
+    """
+
+    days: int
+    since: float
+    orders: int
+    bill_usd: float
+    tax_usd: float
+    tax_tokens: int
+    classified_tokens: int
+    ttl_tokens: int
+    #: The biggest single contributor, which is the alarm's CARRIER and its exemplar —
+    #: never its culprit. See `Daemon.check_rewrite_tax`.
+    worst_id: str
+    worst_title: str
+    worst_tax_usd: float
+    #: Sealed orders in the window carrying NO re-write block at all, so absent from
+    #: `orders` and from `bill_usd` alike. Said on the alarm, because a denominator
+    #: introduced as "this project's bill" while some of that bill was never looked at
+    #: is a claim wider than the number behind it (kn-6c0bef4c (2)).
+    unmeasured_orders: int = 0
+
+    @property
+    def ttl_share(self) -> float | None:
+        """Of the tax, the fraction the cache entry EXPIRING accounts for."""
+        if not self.classified_tokens:
+            return None
+        return self.ttl_tokens / self.classified_tokens
+
+    @property
+    def tax_share(self) -> float:
+        """The whole tax as a fraction of the window's bill, both at list prices."""
+        return self.tax_usd / self.bill_usd if self.bill_usd else 0.0
+
+    @property
+    def ttl_share_of_bill(self) -> float | None:
+        """None, never 0.0, when nothing was classified — the rule this class's own
+        docstring states, and the one a dashboard reading these would otherwise break:
+        a window no boundary could be classified in has no TTL half to print, and 0%
+        reads as "measured, and it is nothing"."""
+        share = self.ttl_share
+        return self.tax_share * share if share is not None else None
+
+    @property
+    def prefix_share_of_bill(self) -> float | None:
+        """None when unmeasured — see `ttl_share_of_bill`."""
+        share = self.ttl_share
+        return self.tax_share * (1 - share) if share is not None else None
+
+    @property
+    def coverage(self) -> float:
+        """How much of the tax the split actually accounts for. Stated on the alarm when
+        it is partial, because a share drawn from half the evidence is a weaker claim."""
+        return self.classified_tokens / self.tax_tokens if self.tax_tokens else 0.0
+
+
+def rewrite_tax(store: Any, *, days: int, now: float | None = None) -> RewriteTax | None:
+    """One project's re-write tax over the trailing `days`, or None if nothing settled.
+
+    A COHORT WINDOW AND NEVER ALL HISTORY (kn-1449447a (5)): the split between the two
+    causes is drifting, and an average over everything ever sealed averages the trend
+    away — which is the difference between an alarm that notices a change and one that
+    restates a constant.
+    """
+    now = now if now is not None else db.now()
+    since = now - days * 86_400
+    orders = store.sealed_bills_since(since)
+    bill_usd = tax_usd = 0.0
+    tax_tokens = classified = ttl_tokens = 0
+    counted = unmeasured = 0
+    worst = ("", "", 0.0)
+    for order in orders:
+        payload = db.from_json(order.get("bill_json") or "", {}) or {}
+        rewrite = payload.get("rewrite")
+        if not isinstance(rewrite, dict):
+            # A bill sealed before `_worker_extras` carried the block, or one sealed
+            # EMPTY because it could not be computed (`Daemon.seal_bills`). Neither is
+            # evidence of a small tax, so it is left out of both halves rather than
+            # counted as a zero — which would dilute every share on this record. The
+            # count is kept so the alarm can say the denominator is not the whole bill.
+            unmeasured += 1
+            continue
+        counted += 1
+        total = payload.get("total") or {}
+        # LIST prices on both sides. `rewrite.list_usd` has no exact twin — it is derived
+        # from a rate, not billed — so pairing it with `exact_usd` would divide one
+        # currency by another and print the answer as a percentage.
+        bill_usd += float((total.get("cost") or {}).get("list_usd") or 0.0)
+        this_tax = float(rewrite.get("list_usd") or 0.0)
+        tax_usd += this_tax
+        tokens = int(rewrite.get("tokens") or 0)
+        tax_tokens += tokens
+        if rewrite.get("ttl_share") is not None:
+            classified += tokens
+            ttl_tokens += int(rewrite.get("ttl_tokens") or 0)
+        if this_tax > worst[2]:
+            worst = (str(order["id"]), str(order.get("title") or ""), this_tax)
+    if not counted or not worst[0]:
+        return None
+    return RewriteTax(days=days, since=since, orders=counted, bill_usd=bill_usd,
+                      tax_usd=tax_usd, tax_tokens=tax_tokens,
+                      classified_tokens=classified, ttl_tokens=ttl_tokens,
+                      worst_id=worst[0], worst_title=worst[1], worst_tax_usd=worst[2],
+                      unmeasured_orders=unmeasured)
+
+
+def _coverage_note(tax: RewriteTax) -> str:
+    """Said only when the split rests on part of the tax. A claim drawn from half the
+    evidence and one drawn from all of it must not read identically."""
+    if tax.coverage >= 0.99:
+        return ""
+    return (f" The split is measured over {tax.coverage:.0%} of the tax; the rest "
+            f"crossed no boundary this OS could classify.")
+
+
+def _denominator_note(tax: RewriteTax) -> str:
+    """The OTHER coverage, which `_coverage_note` does not cover: the split's evidence is
+    part of the tax, and the tax's own denominator is part of the project's spend."""
+    if not tax.unmeasured_orders:
+        return ""
+    return (f" That bill is the {tax.orders} settled orders carrying a re-write "
+            f"measurement; {tax.unmeasured_orders} more settled in the window with no "
+            f"re-write block to read, and their spend is in neither half.")
+
+
+def rewrite_alarms(tax: RewriteTax, cfg: Any) -> list[tuple[str, str]]:
+    """What is standing-wrong with this project's spend, one alarm per CAUSE.
+
+    A `(kind, reason)` pair and NOT an `inspection.Alarm`: that class lives behind the
+    config layer, and the caller who raises these already holds it.
+
+    NEITHER IS RAISED WHEN THE SPLIT IS UNMEASURED. `ttl_share` is None exactly when no
+    boundary was classified, and an alarm that named a cause anyway would be inventing
+    the one fact it exists to carry.
+
+    Each reason is self-contained down to the command that checks it, because the
+    supervisor judges on the alarm and the evidence packet and can look nothing up.
+    """
+    ttl_share = tax.ttl_share
+    if ttl_share is None:
+        return []
+    prefix_of_bill, ttl_of_bill = tax.prefix_share_of_bill, tax.ttl_share_of_bill
+    assert prefix_of_bill is not None and ttl_of_bill is not None  # measured, see above
+    window = f"over the last {tax.days} days ({tax.orders} settled orders)"
+    worst = (f"Biggest single contributor: {tax.worst_id} "
+             f"(${tax.worst_tax_usd:.2f}) — `jarvis inspect {tax.worst_id}` labels every "
+             f"re-write it made by cause.")
+    raised: list[tuple[str, str]] = []
+    if prefix_of_bill >= cfg.alarm_rewrite_prefix_share:
+        raised.append((REWRITE_PREFIX_ALARM, (
+            f"{prefix_of_bill:.0%} of this project's ${tax.bill_usd:,.0f} bill "
+            f"{window} went on re-sending conversations whose PROMPT PREFIX had moved — "
+            f"${tax.tax_usd * (1 - ttl_share):,.2f}, and no cache TTL can buy back "
+            f"any of it. The cure is whatever is changing the head of the prompt between "
+            f"calls.{_coverage_note(tax)}{_denominator_note(tax)} {worst}")))
+    if ttl_of_bill >= cfg.alarm_rewrite_ttl_share:
+        raised.append((REWRITE_TTL_ALARM, (
+            f"{ttl_of_bill:.0%} of this project's ${tax.bill_usd:,.0f} bill "
+            f"{window} went on conversations re-sent because the CACHE ENTRY EXPIRED — "
+            f"${tax.tax_usd * ttl_share:,.2f}, the part a longer cache TTL could have "
+            f"bought back. {TTL_DECISION_NOTE}{_coverage_note(tax)}"
+            f"{_denominator_note(tax)} {worst}")))
+    return raised
+
+
+# -- cache health: the two ratios the FLEET's cache configuration is judged on ----------
+#
+# `RewriteTax` above is one project's tax as a share of its BILL — money, per project,
+# raised as an alarm. This is the other question entirely: two ratios over CACHE-WRITE
+# TOKENS, summed across every project, because what they decide is fleet-wide (the write
+# TTL every worker is launched with, and one line of `dispatch._write_worker_settings`).
+# `invariants.check_cache_ttl_trigger` and `invariants.check_prefix_stable` are the
+# readers; this module only counts.
+
+
+@dataclass
+class CacheWrites:
+    """Cache-write tokens over a cohort window, split by what happened at each boundary.
+
+    Summed from SEALED BILLS — an indexed query and a JSON parse per order, never a
+    transcript walk, which is what lets a check on this run whenever `jarvis doctor` does
+    (the walk is ~5 minutes over this machine's 4,642 transcripts, measured 2026-09-16).
+    Addable, because the fleet's answer is the sum of its projects'.
+
+    THE THREE RATIOS BELOW HAVE DIFFERENT DENOMINATORS AND ONLY THE FIRST TWO DECIDE
+    ANYTHING. `ttl_share_of_writes` is the one the 1-hour cache write is bought on;
+    `ttl_share_of_tax` is roughly double it and is carried only so a reader who has met
+    that number elsewhere can see both side by side and not confuse them (kn-1449447a
+    (4) — the error PR #160's own draft made).
+    """
+
+    orders: int = 0
+    cache_write: int = 0
+    ttl_write: int = 0
+    prefix_write: int = 0
+    boundaries: int = 0
+    ttl_boundaries: int = 0
+    #: Sealed orders in the window whose bill predates `PAYLOAD_VERSION` 3 and so has no
+    #: raw split to read. Counted, never treated as a zero: an unmeasured order is not
+    #: evidence of a healthy one, and saying how many were skipped is what keeps the
+    #: ratios' denominator from being introduced as more than it is.
+    unmeasured_orders: int = 0
+
+    def __add__(self, other: CacheWrites) -> CacheWrites:
+        return CacheWrites(
+            orders=self.orders + other.orders,
+            cache_write=self.cache_write + other.cache_write,
+            ttl_write=self.ttl_write + other.ttl_write,
+            prefix_write=self.prefix_write + other.prefix_write,
+            boundaries=self.boundaries + other.boundaries,
+            ttl_boundaries=self.ttl_boundaries + other.ttl_boundaries,
+            unmeasured_orders=self.unmeasured_orders + other.unmeasured_orders,
+        )
+
+    @property
+    def prefix_boundaries(self) -> int:
+        return self.boundaries - self.ttl_boundaries
+
+    @property
+    def ttl_share_of_writes(self) -> float | None:
+        """THE DECIDING RATIO for the write TTL: TTL-expiry writes over ALL cache writes.
+
+        The 1-hour premium is charged on every written token and recovered only on the
+        ones a longer entry would have kept, so this — and nothing else — is what
+        `usage.TTL_BREAK_EVEN` is compared against.
+
+        None, never 0.0, when the window wrote nothing: unmeasured must not read as a
+        finding (`usage.Usage.rewrite_ttl_share`'s rule, kept up here).
+        """
+        return self.ttl_write / self.cache_write if self.cache_write else None
+
+    @property
+    def prefix_share_of_writes(self) -> float | None:
+        """The same denominator, the other cause: writes spent re-sending a MOVED PREFIX.
+
+        Deliberately not `1 - ttl_share_of_writes`. The two do not partition the
+        cache-write line — most writes happen at no boundary at all — so a prefix
+        regression raises this whether or not TTL expiry moves.
+        """
+        return self.prefix_write / self.cache_write if self.cache_write else None
+
+    @property
+    def ttl_share_of_tax(self) -> float | None:
+        """NOT A TRIGGER. The TTL's share of the classified re-write tax, which runs at
+        about double `ttl_share_of_writes` because its denominator is far smaller.
+        Reported beside it so the two are never met one at a time."""
+        seen = self.ttl_write + self.prefix_write
+        return self.ttl_write / seen if seen else None
+
+
+def cache_writes_since(store: Any, since: float) -> CacheWrites:
+    """One project's `CacheWrites` over the window, read off its sealed bills.
+
+    Only `PAYLOAD_VERSION` 3 bills carry the raw split, so this sees nothing older than
+    that version — and an order whose transcript was pruned before its bill was upgraded
+    never will (`_upgrade_seal` refuses to adopt a re-derivation that lost tokens, which
+    is the rule that keeps a bill from shrinking). Those land in `unmeasured_orders` and
+    the checks say so rather than quietly narrowing their own denominator.
+    """
+    found = CacheWrites()
+    for order in store.sealed_bills_since(since):
+        payload = db.from_json(order.get("bill_json") or "", {}) or {}
+        rewrite = payload.get("rewrite")
+        if not isinstance(rewrite, dict) or "cache_write" not in rewrite:
+            found.unmeasured_orders += 1
+            continue
+        found.orders += 1
+        found.cache_write += int(rewrite.get("cache_write") or 0)
+        found.ttl_write += int(rewrite.get("ttl_write") or 0)
+        found.prefix_write += int(rewrite.get("prefix_write") or 0)
+        found.boundaries += int(rewrite.get("boundaries") or 0)
+        found.ttl_boundaries += int(rewrite.get("ttl_boundaries") or 0)
+    return found
