@@ -47,11 +47,35 @@ BASELINE_PATH = REPO_ROOT / "evals" / "llm" / "validation_baseline.json"
 #: changing it here is a test failure rather than a silent lifetime skip.
 ENV_VAR = "JARVIS_EVALS_LLM"
 
-BATTERIES = ("MUST_REJECT", "MUST_PASS", "FEATURE_CASES")
+BATTERIES = ("MUST_REJECT", "MUST_PASS", "MUST_PASS_WITH_FOLLOW_UPS",
+             "MUST_REJECT_WITH_FOLLOW_UPS", "FEATURE_CASES")
 
 #: How many cases each battery must hold. The eval's thresholds are stated out of these
 #: numbers, so a battery that shrank would quietly make its floor easier to clear.
-SIZES = {"MUST_REJECT": 4, "MUST_PASS": 3, "FEATURE_CASES": 2}
+SIZES = {"MUST_REJECT": 4, "MUST_PASS": 3, "MUST_PASS_WITH_FOLLOW_UPS": 3,
+         "MUST_REJECT_WITH_FOLLOW_UPS": 2, "FEATURE_CASES": 2}
+
+#: Every battery's floor, by the name of the constant that holds it. A battery listed in
+#: `BATTERIES` and missing from here gets none of the floor guards below — reachable,
+#: matching the baseline, not above what was measured — which is an ungraded battery
+#: wearing a graded one's clothes.
+FLOORS = {"MUST_REJECT": "MUST_REJECT_FLOOR", "MUST_PASS": "MUST_PASS_FLOOR",
+          "MUST_PASS_WITH_FOLLOW_UPS": "MUST_PASS_WITH_FOLLOW_UPS_FLOOR",
+          "MUST_REJECT_WITH_FOLLOW_UPS": "MUST_REJECT_WITH_FOLLOW_UPS_FLOOR"}
+
+#: The floors and the cases the 2026-09-15 feature may not have bought itself. Written out
+#: as literals: a fresh paid run regenerates the EXISTING batteries' scores too, and if
+#: `MUST_PASS` comes back 2/3 the cheapest exit is to lower its floor by one. That exit is
+#: what this closes. Spec §6:
+#: docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
+PINNED_FLOORS = {"MUST_REJECT_FLOOR": 4, "MUST_PASS_FLOOR": 3}
+PINNED_MUST_REJECT = ("untested-new-function", "todo-instead-of-backlog",
+                      "evidence-contradicts-diff", "raw-sql-where-a-store-method-exists")
+
+#: How many added lines a "small change" may carry. The battery grades what happens to a
+#: hundred-line submission that is correct and improvable; a case that grew past this is
+#: no longer the thing the user complained about.
+SMALL_CHANGE_ADDED_LINES = 130
 
 #: Strings that would mean a case reaches outside the repo. Every submission is INVENTED:
 #: a real path is how a synthetic eval turns into one that depends on a machine, and this
@@ -390,13 +414,68 @@ def test_the_standing_instruction_the_todo_case_depends_on_is_seeded(
 def test_the_thresholds_are_reachable_and_not_vacuous(eval_module) -> None:
     """A floor of 0 grades nothing and a floor above `n` can never be met. Both are ways
     for a paid scorecard to say something that is not about the panel."""
-    for name, floor, battery in (("MUST_REJECT_FLOOR", eval_module.MUST_REJECT_FLOOR,
-                                  eval_module.MUST_REJECT),
-                                 ("MUST_PASS_FLOOR", eval_module.MUST_PASS_FLOOR,
-                                  eval_module.MUST_PASS)):
-        assert 1 <= floor <= len(battery), (
-            f"{name}={floor} is outside 1..{len(battery)}: it is either unreachable or "
-            "vacuous")
+    for battery, const in FLOORS.items():
+        floor = getattr(eval_module, const)
+        n = len(getattr(eval_module, battery))
+        assert 1 <= floor <= n, (
+            f"{const}={floor} is outside 1..{n}: it is either unreachable or vacuous")
+
+
+def test_the_floors_and_cases_the_feature_may_not_buy_itself_are_unchanged(
+        eval_module) -> None:
+    """A panel that blocks on nothing scores full marks on every battery added for the
+    2026-09-15 feature. What stops that being an improvement is `MUST_REJECT` — and the
+    cheapest way to make a red paid run green is to move the very numbers that battery is
+    stated in.
+
+    Pinned as literals here rather than trusted to review: the eval and the baseline are
+    edited together on the run that would need the excuse, and
+    `test_no_threshold_is_higher_than_what_was_measured` below is satisfied by lowering
+    BOTH."""
+    for const, expected in PINNED_FLOORS.items():
+        assert getattr(eval_module, const) == expected, (
+            f"{const} is {getattr(eval_module, const)} and must be {expected}: a floor "
+            "lowered to fit a run is the measurement being written by the thing it "
+            "measures")
+    assert tuple(c[0] for c in eval_module.MUST_REJECT) == PINNED_MUST_REJECT, (
+        "MUST_REJECT's cases moved. Every one of them is a defect nobody disputes, and "
+        "dropping one is the same exit as lowering the floor")
+
+    # And the two batteries the feature added carry NO headroom at all, by construction.
+    # The complaint was a correct change that never landed; "two of the three landed" is
+    # that complaint with a better score, so their floors are `n` and the only way to pass
+    # is for every case to hold.
+    for battery in ("MUST_PASS_WITH_FOLLOW_UPS", "MUST_REJECT_WITH_FOLLOW_UPS"):
+        floor, n = getattr(eval_module, FLOORS[battery]), len(getattr(eval_module,
+                                                                     battery))
+        assert floor == n, (
+            f"{FLOORS[battery]} is {floor} of {n}. This battery is the feature's own "
+            "claim and it does not get to be true of most of its cases")
+
+
+def test_a_small_correct_submission_is_actually_small(eval_module) -> None:
+    """The new battery's own premise, and nothing else checks it.
+
+    The complaint this feature answers was about a hundred-line change taking five rounds.
+    A case that grew to five hundred added lines would still be correct and still be
+    improvable, and would no longer be evidence about the thing that was broken."""
+    for case in eval_module.MUST_PASS_WITH_FOLLOW_UPS:
+        added = [ln for ln in case[5].splitlines()
+                 if ln.startswith("+") and not ln.startswith("+++")]
+        assert len(added) <= SMALL_CHANGE_ADDED_LINES, (
+            f"MUST_PASS_WITH_FOLLOW_UPS[{case[0]}] adds {len(added)} lines; this battery "
+            f"grades a SMALL correct change and {SMALL_CHANGE_ADDED_LINES} is where that "
+            "stops being the claim")
+
+
+def test_the_veto_case_is_one_of_the_defective_submissions(eval_module) -> None:
+    """`test_a_veto_rejects_and_the_chair_is_never_asked` grades one NAMED case, and its
+    assertions are vacuous over a submission that was allowed to pass: there would be no
+    veto to short-circuit. Same shape as the degraded case's guard above, and the same
+    reason — a scenario pinned to a name has to have that name checked somewhere free."""
+    assert eval_module.VETO_CASE in {c[0] for c in eval_module.MUST_REJECT}, (
+        f"{eval_module.VETO_CASE!r} is not in MUST_REJECT, so 'a veto seat blocked' is "
+        "graded on work no seat had reason to block")
 
 
 # -- the baseline: the record that makes the next recalibration free -------------------------
@@ -439,8 +518,8 @@ def test_no_threshold_is_higher_than_what_was_measured(eval_module) -> None:
     time somebody pays for it — the most expensive possible way to learn that a number
     was optimistic."""
     data = json.loads(BASELINE_PATH.read_text())
-    for battery, floor in (("MUST_REJECT", eval_module.MUST_REJECT_FLOOR),
-                           ("MUST_PASS", eval_module.MUST_PASS_FLOOR)):
+    for battery, const in FLOORS.items():
+        floor = getattr(eval_module, const)
         recorded = data["thresholds"][battery]
         assert floor == recorded["floor"], (
             f"{battery}'s floor is {floor} in the eval and {recorded['floor']} in the "
@@ -458,6 +537,11 @@ def test_the_baseline_records_what_each_seat_said() -> None:
     data = json.loads(BASELINE_PATH.read_text())
     for name, run in data["runs"].items():
         assert run["seats"], f"{name} recorded no seat opinions at all"
+        # The severity split is the thing the 2026-09-15 feature turns on, and "the
+        # battery went red" is a different investigation depending on whether the seats
+        # stopped classifying or the chair started weighing a follow-up.
+        assert "severities" in run and "filed" in run, (
+            f"{name} records no severity reading: {sorted(run)}")
         for row in run["seats"]:
             assert row["seat"] in VALIDATOR_SEATS, f"{name}: unknown seat {row['seat']!r}"
             assert set(row) >= {"seat", "status", "verdict", "blocking", "reply"}, (
