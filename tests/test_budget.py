@@ -89,6 +89,26 @@ def tick_until_parked(daemon, store, wo_id: str, timeout: float = 15.0) -> str:
     return status
 
 
+def tick_until_reserved(daemon, store, fo_id: str, timeout: float = 15.0) -> dict:
+    """Tick until the feature's first child has been dispatched and handed its slice.
+
+    The other half of `tick_until_parked`'s race, and it loses the same way on a loaded
+    machine: a fixed count of ticks has either not dispatched the child yet — no slice,
+    so `budget.ceiling` is None and nothing can be exhausted — or has already reaped its
+    worker and settled the order, and `settle_work_orders` never looks at a settled one
+    again. Either way the billing below lands on an order the budget cannot park, which
+    is what CI saw twice on a 3.11 runner that took 34 minutes.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        daemon.tick()
+        cut = [c for c in store.feature_children(fo_id) if c["budget_reserved_usd"]]
+        if cut:
+            return cut[0]
+        time.sleep(0.05)
+    raise AssertionError(f"no child of {fo_id} was handed a slice within {timeout}s")
+
+
 def budget_flag(call: dict) -> str | None:
     """`--max-budget-usd`'s value in one recorded invocation, or None if absent."""
     argv = call["argv"]
@@ -918,12 +938,9 @@ def test_topping_a_child_up_with_a_broke_feature_says_to_raise_the_feature(
     the note names the feature and its unreserved remainder rather than repeating a
     ceiling the user just raised."""
     fo = a_feature(started, store, "reader", budget_usd=3.0)
-    for _ in range(4):
-        started.tick()
-    child = store.feature_children(fo["id"])[0]
+    child = tick_until_reserved(started, store, fo["id"])
     bill_the_turn(store, child["id"], 9.0)          # past the slice AND past the family
-    started.tick()
-    assert store.get_work_order(child["id"])["status"] == "budget_exhausted"
+    assert tick_until_parked(started, store, child["id"]) == "budget_exhausted"
 
     out = ops.set_work_order_budget(child["id"], 500.0)
     assert not out["resumed"]

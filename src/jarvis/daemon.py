@@ -340,9 +340,6 @@ class Daemon:
         # The validator seam (see `_validator`). None means "ask the catalog"; tests
         # inject a callable here, exactly as `release_runner` injects systemd.
         self.validator: Validator | None = None
-        # Invariant violations already reported this run, so a standing problem is
-        # surfaced once instead of every tick. Keyed by (invariant, wo_id).
-        self.reported_violations: set[tuple[str, str | None]] = set()
         # Projects already warned that their pull requests cannot be polled (no `gh`, no
         # credentials, an unreachable host). Same idea: say it once, not every 2 minutes
         # forever. Reset by restarting the daemon, which is also what fixes it.
@@ -3113,11 +3110,22 @@ class Daemon:
         other step here trusts that its writes stuck; this is the only one that checks.
         Repairs are recorded on the work order's timeline so a self-healed inconsistency
         is visible rather than silently papered over, and each distinct violation is
-        reported once per daemon run.
+        reported ONCE FOR AS LONG AS IT STANDS — `store.open_violation_report`, which is
+        a table rather than a set on this object because the set died with the process
+        and every release therefore re-announced the whole standing set to Telegram.
 
         `sweep_landings` adds `invariants.SLOW_INVARIANTS` — the checks that shell out —
         on `LANDING_SWEEP_EVERY_TICKS`. `jarvis doctor` runs them every time; the daemon
         cannot, which is the whole reason the flag exists.
+
+        THAT FLAG IS ALSO WHY A REPORT IS ONLY CLOSED ON A SWEEP TICK. A violation that
+        is gone must be forgotten, or the recurrence never reaches the user — but on the
+        719 ticks in 720 that run only the fast checks, INV-WORK-LANDED is absent because
+        nobody looked, not because it was fixed. Closing on that absence would re-announce
+        the whole batch hourly, which is the reported bug with a slower clock. Cost of the
+        choice: a violation fixed just after a sweep stays open for up to an hour, so a
+        fix-and-recur inside that window is announced late rather than twice. Silence is
+        the failure mode this exists to buy (Neo, question 419).
         """
         from .invariants import check_project
 
@@ -3127,10 +3135,15 @@ class Daemon:
             log.exception("[%s] invariant check failed", project.name)
             return
 
+        if sweep_landings:
+            for invariant, wo_id in store.close_violation_reports(
+                    v.key for v in violations):
+                log.info("[%s] %s%s no longer violated", project.name,
+                         f"{wo_id}: " if wo_id else "", invariant)
+
         for v in violations:
-            if v.key in self.reported_violations:
+            if not store.open_violation_report(v.invariant, v.wo_id):
                 continue
-            self.reported_violations.add(v.key)
             log.warning("[%s] %s", project.name, v)
             if v.wo_id:
                 store.add_event(v.wo_id, "invariant", {
