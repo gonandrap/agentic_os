@@ -203,7 +203,11 @@ def run_doctor(project: str | None = None, repair: bool = False,
     PULL REQUEST it is a pure timeline read with nothing to write and no ref to be stale
     — what it cannot do is ASK GITHUB, and that round trip is the daemon's
     (`Daemon.refresh_landings`). So a plain run and a repairing one say the same
-    thing, and both say nothing about a project the daemon has never swept.
+    thing. On a project the daemon has never swept both say the same thing too, and it is
+    not silence: `INV-LANDING-AUDIT-FRESH` names how many pull requests the audit has no
+    current answer for. Until review round 1 of wo-16a488ee it WAS silence, so this
+    command printed "all OS invariants hold" over an audit that had no data — a lie that
+    is worse than any false positive, because nothing shows it happening.
 
     `include_os=False` drops the OS-LEVEL checks — `check_os` and the release marker —
     and keeps the per-project ones. The scheduler's daily run passes it for every project

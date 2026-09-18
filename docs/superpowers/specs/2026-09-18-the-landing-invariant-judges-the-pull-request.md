@@ -127,6 +127,27 @@ verdict, which would exempt orders invisibly. The pass continues to the next ord
 than stopping: each one asks about a different url, so an unreadable pull request is a
 fact about that url.
 
+### An audit with no data must not render as a clean bill of health
+
+Review round 1's finding, and the sharpest thing in this change. Because the refresh is the
+daemon's, `check_work_lands` has no data until the first sweep — and it was right to stay
+silent about an order it had not looked at, but silence is what `jarvis doctor` renders as
+`✓ all OS invariants hold`. A project with genuinely unmerged work read identically to a
+clean one, which is worse than any false positive: nothing shows it happening.
+
+So the same function yields a second violation, **`INV-LANDING-AUDIT-FRESH`**: one
+project-level line, no `wo_id`, naming how many orders in the population have never been
+read or were last read more than `landing.FRESH_FOR_SECONDS` ago. It shrinks as the sweep
+fills in, disappears in steady state, and stands for ever on a project whose daemon is not
+running — which is exactly what is true. Counting *stale* readings and not just missing
+ones is the same defect a week later: `landed` silences the check, so a dead daemon would
+otherwise go on reporting nothing off arbitrarily old answers.
+
+`FRESH_FOR_SECONDS` and `REFRESH_PER_SWEEP` therefore live in `landing`, not beside the
+daemon's cadences. Both halves need them — one to decide when to re-ask, the other to
+decide when it has no answer and to say how fast the backlog drains — and two copies of
+that number would let the audit go quiet at the exact moment it stopped knowing anything.
+
 ## 5b. The remedy has to CLEAR the alert, and for months it did not
 
 Found while trying to clear the eight live `jarvis_os` alerts by hand on 2026-09-18. Both
@@ -163,8 +184,9 @@ panel has something to look at; both halves have a test.
   MERGED and says nothing. A known consequence of the layering in §3, not a defect of this
   check: a `pr_url` that does not reflect the work is a RECORDING defect, and recording is
   INV-PR-RECORDED's half. Asserted as a test, so it cannot turn into a surprise.
-* **An order the daemon has never asked about.** Silent until the first sweep, which is
-  the same silence as "no pull request" rather than a guess.
+* **An order the daemon has never asked about.** No verdict until the first sweep — but
+  it is COUNTED and reported by `INV-LANDING-AUDIT-FRESH` rather than passed over, so the
+  absence of data is visible. See §5.
 * **Issue #232's Mode C** — a first pull request merges and the worker keeps going. The
   `merged-tail` rung measured the branch against the sha GitHub merged; the pull request
   merged, so the invariant is satisfied, and commits pushed to the branch afterwards are
@@ -182,6 +204,15 @@ Nothing was added to `github.py`. The first implementation of this spec added
 `pr_list_for_branch`, `BranchPullRequest`, `BRANCH_RE` and a third entry in
 `READ_ONLY_VERBS`; §3 removed the need for all of it, and the module is unchanged from
 `main`.
+
+**`landing._scrub` and `_CREDENTIALS_RE` are KEPT**, though the code that motivated them
+(`_fetch`) is gone and no caller of `_git` touches a remote today. Review round 1 caught
+that deleting them left the fleet with no credential scrub anywhere and no assertion that
+a token in an `origin` URL never reaches a log — while `_git` still pipes git's stderr
+into a `log.warning`. Four lines, on the function rather than on this month's callers, and
+two tests: a unit assertion against the verbatim authentication-failure string git does
+NOT self-redact, and an end-to-end one driving `_git` at an unreachable remote. The scrub
+runs BEFORE the 200-character truncation, because the URL is on the first line.
 
 `authored()` and everything §§1-6 of the superseded spec describe are untouched — the
 settle-time refusal is a different question at a different cost, and it was never the one

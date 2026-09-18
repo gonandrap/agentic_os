@@ -33,7 +33,6 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import daemon as daemon_mod
 from jarvis import invariants, landing, ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
@@ -633,7 +632,7 @@ def test_a_settled_reading_is_not_re_asked_every_sweep_and_an_unsettled_one_is(
     try:
         store.conn.execute(
             "UPDATE wo_events SET ts = ts - ? WHERE wo_id = ? AND kind = 'landing_seen'",
-            (daemon_mod.LANDING_REFRESH_TTL_SECONDS + 1, landed["id"]))
+            (landing.FRESH_FOR_SECONDS + 1, landed["id"]))
         store.conn.commit()
     finally:
         store.close()
@@ -651,7 +650,7 @@ def test_one_sweep_asks_about_at_most_the_cap_and_the_rest_arrive_next_time(
 
     Counted rather than timed, for the obvious reason.
     """
-    monkeypatch.setattr(daemon_mod, "LANDING_REFRESH_PER_SWEEP", 2)
+    monkeypatch.setattr(landing, "REFRESH_PER_SWEEP", 2)
     urls = [PR, OTHER_PR, THIRD_PR]
     orders = [_delivered(project, f"order {n}", urls[n], code=f"code{n}")
               for n in range(3)]
@@ -824,3 +823,105 @@ def test_a_live_order_abandoning_still_goes_through_validation(validating, proje
                abandon="the approach does not work")
 
     assert len(_events(project, wo["id"], "validation_submitted")) == 1
+
+
+# -- an audit with no data must not read as a clean bill of health ---------------------
+
+
+def _all_violations(project: Path) -> list[invariants.Violation]:
+    """Everything `jarvis doctor` would print, not just INV-WORK-LANDED."""
+    store = ProjectStore(project)
+    try:
+        return list(invariants.check_project(store, repair=True, slow=True))
+    finally:
+        store.close()
+
+
+def test_an_order_nobody_has_read_yet_is_reported_as_unread_not_as_landed(
+        started, project, fake_gh):
+    """REVIEW ROUND 1'S FINDING, and the sharpest one in this change.
+
+    The refresh is the daemon's, so INV-WORK-LANDED has no data until the first sweep. It
+    is right to stay silent about an order it has not looked at — a guess would be worse —
+    but silence is what `jarvis doctor` renders as "✓ all OS invariants hold", so a project
+    with genuinely unmerged work read identically to a clean one. An audit that has no data
+    must SAY it has no data.
+
+    Asserted on the whole doctor output rather than on the landing violations alone,
+    because the defect was in what the whole output said.
+    """
+    wo = _delivered(project, "launcher contract", PR, code="launcher")
+    fake_gh.set_pr(PR, "OPEN")
+
+    found = [v for v in _all_violations(project)
+             if v.invariant == "INV-LANDING-AUDIT-FRESH"]
+
+    assert len(found) == 1
+    assert found[0].wo_id is None            # it is about the project, not one order
+    assert found[0].context == {"unchecked": 1, "population": 1}
+    assert "NOT the same as saying they landed" in found[0].detail
+    assert _violations(project) == []        # ...and INV-WORK-LANDED still says nothing
+    assert wo["id"]
+
+
+def test_the_unread_report_clears_once_the_sweep_has_run(started, project, fake_gh):
+    """The pairing, and what makes the line worth printing rather than nagging.
+
+    It shrinks as the sweep fills in and is gone in steady state. A count that does not
+    shrink means the daemon is not running, which is the thing the line exists to make
+    visible.
+    """
+    _delivered(project, "the cap", PR, code="cap")
+    _delivered(project, "launcher contract", OTHER_PR, code="launcher")
+    fake_gh.set_pr(PR, "MERGED")
+    fake_gh.set_pr(OTHER_PR, "MERGED")
+    assert [v.context["unchecked"] for v in _all_violations(project)
+            if v.invariant == "INV-LANDING-AUDIT-FRESH"] == [2]
+
+    _refresh(started, project)
+
+    assert [v for v in _all_violations(project)
+            if v.invariant == "INV-LANDING-AUDIT-FRESH"] == []
+
+
+def test_a_reading_older_than_the_freshness_window_counts_as_unread(
+        started, project, fake_gh):
+    """A DEAD DAEMON MUST NOT LOOK LIKE A CLEAN FLEET EITHER, which is the same defect
+    arriving a week later.
+
+    `landed` is the verdict that silences the check, so a project whose daemon stopped
+    would go on reporting nothing for ever off readings that are arbitrarily old. Past
+    `landing.FRESH_FOR_SECONDS` the answer is treated as no answer — and that constant
+    lives in `landing` precisely so the half that RE-ASKS and the half that reports having
+    no answer cannot disagree about when it expired.
+    """
+    wo = _delivered(project, "the cap", PR, code="cap")
+    fake_gh.set_pr(PR, "MERGED")
+    _refresh(started, project)
+    assert [v for v in _all_violations(project)
+            if v.invariant == "INV-LANDING-AUDIT-FRESH"] == []
+
+    store = ProjectStore(project)
+    try:
+        store.conn.execute(
+            "UPDATE wo_events SET ts = ts - ? WHERE wo_id = ? AND kind = 'landing_seen'",
+            (landing.FRESH_FOR_SECONDS + 1, wo["id"]))
+        store.conn.commit()
+    finally:
+        store.close()
+
+    found = [v for v in _all_violations(project)
+             if v.invariant == "INV-LANDING-AUDIT-FRESH"]
+    assert [v.context["unchecked"] for v in found] == [1]
+
+
+def test_a_project_with_nothing_in_the_population_says_nothing(started, project):
+    """The negative control. An order with no `pr_url` is out of scope, so it is not
+    "unread" either — counting it would put a permanent line on every project whose work
+    is planners and investigations, which is most of them."""
+    planner = ops.create_work_order("proj_a", "wrote a plan")
+    committed = _order(project, "never opened a pull request", code="orphan")
+    _settle(project, planner["id"], committed["id"])
+
+    assert [v for v in _all_violations(project)
+            if v.invariant == "INV-LANDING-AUDIT-FRESH"] == []

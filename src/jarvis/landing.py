@@ -77,7 +77,9 @@ chain, neither of them re-deriving the other's half:
 
 The state of that pull request reaches the timeline as a `landing_seen` event, written by
 `Daemon.refresh_landings` — the half with a network. `judge` reads that event and nothing
-else.
+else, and an order it has no CURRENT event for (`FRESH_FOR_SECONDS`) is counted and
+reported as unread by `INV-LANDING-AUDIT-FRESH` rather than passed over: an audit with no
+data must not render as a clean bill of health.
 
 ## Why this module imports almost nothing
 
@@ -121,6 +123,35 @@ NO_PULL_REQUEST = "no-pull-request"
 #: took, but they took it on GitHub, where the work order cannot see it — so the order is
 #: still claiming `completed` over work nothing landed.
 UNSETTLED_VERDICTS = (AWAITING_MERGE, REFUSED)
+
+#: How long a reading of a pull request stands before it is stale — a week. It lives HERE
+#: rather than beside the daemon's cadences because BOTH halves need it and they must not
+#: disagree: `Daemon.refresh_landings` re-asks past it, and `invariants.check_work_lands`
+#: reports that it has no current answer past it. Two copies of this number would let the
+#: audit go quiet at exactly the moment it stopped knowing anything.
+#:
+#: Not "for ever", which is what a MERGED answer looks like it could be: `landed` is the
+#: verdict that SILENCES the check, so the one answer nobody would re-read is the one that
+#: would hide a revert. A week is far inside the window that matters — the orders GitHub
+#: issue #232 found had been unmerged for seven — and costs a mature project a handful of
+#: round trips a day.
+FRESH_FOR_SECONDS = 7 * 24 * 3600
+
+#: How many work orders one landing sweep may ask GitHub about. The cap is about the
+#: TICK, not about the day: a project with two hundred completed orders and a cold
+#: timeline would otherwise spend two hundred round trips inside one tick, and the daemon
+#: has everything else to do. At this size a cold project fills in over about eight hourly
+#: sweeps and a warm one never touches the cap.
+#:
+#: Here rather than beside the daemon's cadences for `FRESH_FOR_SECONDS`' reason: the
+#: audit quotes it when it reports how much it has not read yet, so a reader can tell "the
+#: backlog is draining" from "the daemon is dead".
+REFRESH_PER_SWEEP = 25
+
+#: URL userinfo — `https://x-access-token:TOKEN@github.com/...` — which is the ONLY place
+#: a credential appears in git's text, so one pattern covers it rather than a list of
+#: message shapes. See `_scrub`.
+_CREDENTIALS_RE = re.compile(r"://[^/\s@]+@")
 
 #: A GitHub pull-request URL sitting in prose. Mode A of issue #232: four work orders
 #: finished with a summary that NAMED a draft pull request and passed no `--pr`, so
@@ -317,6 +348,28 @@ def judge(wo_id: str, pr_url: str, state: str) -> Landing:
 
 # --------------------------------------------------------------------------- internals
 
+def _scrub(text: str) -> str:
+    """`text` with any URL userinfo replaced. Every log line carrying git's stderr uses it.
+
+    **KEPT AFTER THE CODE THAT MOTIVATED IT WAS DELETED, DELIBERATELY.** It arrived with
+    `landing._fetch` (kn-4bba177d): git quotes the remote URL back on failure —
+    `fatal: Authentication failed for https://x-access-token:TOKEN@github.com/...` — so
+    any line carrying fetch stderr writes a token into the daemon log for every project
+    whose `origin` embeds one. Truncating to 200 characters does not help: the URL is on
+    the FIRST line. `_fetch` went with the content machinery on 2026-09-18 and no caller
+    of `_git` touches a remote today, which is exactly the argument for keeping this
+    rather than dropping it — the guard is four lines, the next remote-touching caller
+    will not think about it, and it was the fleet's ONLY credential scrub.
+
+    One pattern, because credentials only ever appear as userinfo.
+
+    NOTE for whoever tests the next leak: git SELF-redacts on a connection failure and
+    does NOT on an authentication failure, so an offline end-to-end test cannot reach the
+    leaking message. Pair it with a unit assertion against the verbatim string.
+    """
+    return _CREDENTIALS_RE.sub("://<redacted>@", text)
+
+
 def _git(repo: Path, *args: str) -> str | None:
     """One read-only git command in `repo`. Its stdout, or None if it FAILED.
 
@@ -335,10 +388,12 @@ def _git(repo: Path, *args: str) -> str | None:
         proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
                               text=True, errors="replace", check=False)
     except OSError as exc:
-        log.warning("git %s in %s could not run: %s", " ".join(args), repo, exc)
+        log.warning("git %s in %s could not run: %s", " ".join(args), repo, _scrub(str(exc)))
         return None
     if proc.returncode != 0:
+        # `_scrub` BEFORE the truncation and not after: a token sits in the URL on the
+        # first line, so slicing to 200 characters keeps it rather than cutting it off.
         log.warning("git %s in %s exited %d: %s", " ".join(args), repo,
-                    proc.returncode, proc.stderr.strip()[:200])
+                    proc.returncode, _scrub(proc.stderr.strip())[:200])
         return None
     return proc.stdout

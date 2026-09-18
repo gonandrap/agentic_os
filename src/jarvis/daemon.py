@@ -130,29 +130,13 @@ RETRY_EVERY_TICKS = 2
 #: walks every completed order the project has ever had, which no other invariant does.
 #: An hour is far inside the window that matters — the orders GitHub issue #232 found had
 #: been unmerged for SEVEN WEEKS — and a settled reading stands for
-#: `LANDING_REFRESH_TTL_SECONDS`, so a mature project's steady-state cost is the orders
+#: `landing.FRESH_FOR_SECONDS`, so a mature project's steady-state cost is the orders
 #: nobody has merged yet, which is the number this exists to drive to zero.
 #:
 #: A MULTIPLE OF `RECONCILE_EVERY_TICKS` on purpose: the sweep runs inside the reconcile
 #: block, so a cadence that did not line up would silently sweep at some beat frequency
 #: of the two. 720 % 6 == 0, and both fire on tick 721.
 LANDING_SWEEP_EVERY_TICKS = 720
-
-#: How many completed work orders one landing sweep may ask GitHub about
-#: (`Daemon.refresh_landings`). The cap is about the TICK, not about the day: a project
-#: with two hundred completed orders and a cold timeline would otherwise spend two hundred
-#: round trips inside one tick, and the daemon has everything else to do. At this size a
-#: cold project fills in over about eight hourly sweeps and a warm one never touches the
-#: cap.
-LANDING_REFRESH_PER_SWEEP = 25
-
-#: How long a SETTLED reading stands before the pull request is asked about again — a
-#: week. Not "for ever", which is what a MERGED answer looks like it could be: a pull
-#: request can be reverted, and `landed` is the verdict that silences the check, so the
-#: one answer nobody would ever re-ask is the one that hides a regression. A week is far
-#: inside the window that matters (issue #232's orders sat unmerged for seven) and costs a
-#: mature project a handful of round trips a day.
-LANDING_REFRESH_TTL_SECONDS = 7 * 24 * 3600
 
 #: Look at the scheduler's clock every N ticks — a minute at the default 5s interval. Its
 #: own cadence because it is the cheapest pass in the daemon and the one whose lateness
@@ -3768,9 +3752,9 @@ class Daemon:
         reproduce the false positives this rewrite removed.
 
         **IT COSTS ONE `gh pr view` PER ORDER, BOUNDED THREE WAYS.** By cadence:
-        `LANDING_SWEEP_EVERY_TICKS`, an hour. By `LANDING_REFRESH_TTL_SECONDS`, which stops
+        `LANDING_SWEEP_EVERY_TICKS`, an hour. By `landing.FRESH_FOR_SECONDS`, which stops
         a settled order being re-asked every sweep for ever. And by
-        `LANDING_REFRESH_PER_SWEEP`, which caps how many orders one sweep may ask about —
+        `landing.REFRESH_PER_SWEEP`, which caps how many orders one sweep may ask about —
         a project with two hundred completed orders and a cold timeline would otherwise
         spend two hundred round trips inside a single tick. It fills in over a few sweeps
         instead, newest first, which is `list_work_orders`' own order and the right one: a
@@ -3790,7 +3774,7 @@ class Daemon:
                 store.work_abandoned(wo["id"])
                 or store.work_unlanded_open(wo["id"], closed_by="marked_done"))]
         stale = [wo for wo in candidates if self._needs_landing_refresh(store, wo["id"])]
-        for wo in stale[:LANDING_REFRESH_PER_SWEEP]:
+        for wo in stale[:landing.REFRESH_PER_SWEEP]:
             wo_id = wo["id"]
             try:
                 pr = github.pr_view(str(wo["pr_url"]), cwd=project.path)
@@ -3817,7 +3801,7 @@ class Daemon:
 
         Never read -> yes. Recorded as unsettled -> yes, every sweep: an open pull request
         is the one that changes. Recorded as settled -> only past
-        `LANDING_REFRESH_TTL_SECONDS`; see `refresh_landings` on why "settled" is not "for
+        `landing.FRESH_FOR_SECONDS`; see `refresh_landings` on why "settled" is not "for
         ever" here.
         """
         from . import landing
@@ -3828,7 +3812,7 @@ class Daemon:
         latest = seen[-1]
         if landing.from_record(wo_id, db.from_json(latest["payload"], {})).unsettled:
             return True
-        return db.now() - float(latest["ts"] or 0.0) >= LANDING_REFRESH_TTL_SECONDS
+        return db.now() - float(latest["ts"] or 0.0) >= landing.FRESH_FOR_SECONDS
 
     def auto_merge(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                    pr: Any, *, record_only: bool = False) -> None:

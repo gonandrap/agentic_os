@@ -2127,11 +2127,24 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
     the round trip, reading the order's own `pr_url`, and writes what GitHub said to the
     timeline as a `landing_seen` event; this reads the latest one.
 
-    **AN ORDER NOTHING HAS READ YET IS SILENT**, exactly as one with no pull request is.
-    The refresh is the daemon's, so a `jarvis doctor` on a project the daemon has never
-    swept reports nothing here rather than reporting a guess — and unlike the cache this
-    replaces, `repair=False` now changes nothing about the answer: there is no write on
-    this path at all.
+    **AN ORDER NOTHING HAS READ YET IS SILENT ABOUT ITS PULL REQUEST, AND SAYS SO OUT
+    LOUD** — `INV-LANDING-AUDIT-FRESH`, the second violation this function yields, and it
+    is here because review round 1 caught the alternative being a lie. The refresh is the
+    daemon's, so this check has no data until the first sweep; without that second
+    violation `jarvis doctor` printed "✓ all OS invariants hold" on a project with
+    genuinely unmerged work, which is an audit with NO DATA reading identically to a clean
+    bill of health. That is the single worst thing a checker can do, and it is worse than
+    the false positives this rewrite removed, because nothing shows it happening.
+
+    So: one project-level line, no `wo_id`, naming how many orders in the population have
+    never been read or were last read more than `landing.FRESH_FOR_SECONDS` ago. It shrinks
+    as the sweep fills in and disappears in steady state; it stands for ever on a project
+    whose daemon is not running, which is exactly what is true. The freshness window is
+    `landing`'s and not the daemon's precisely so the two halves cannot disagree — a
+    second copy of that number would let the audit go quiet at the moment it stopped
+    knowing anything.
+
+    `repair=False` changes nothing about either answer: there is no write on this path.
 
     **AN ORDER THE USER CLOSED BY HAND IS EXCLUDED.** `jarvis wo done` over unlanded
     work is the one landing that records instead of refusing (`ops.mark_done`), and its
@@ -2148,6 +2161,8 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
     """
     from . import landing
 
+    population = 0
+    unchecked = 0
     for wo in store.list_work_orders(statuses=("completed",), include_hidden=True):
         wo_id = wo["id"]
         if store.work_abandoned(wo_id) or store.work_unlanded_open(
@@ -2155,9 +2170,13 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
             continue  # the decision was taken and written down; that is the whole ask
         if not wo.get("pr_url"):
             continue  # INV-PR-RECORDED's question, not this one's — see the docstring
+        population += 1
         seen = store.events_of_kind(wo_id, "landing_seen")
-        if not seen:
-            continue  # nothing has looked yet — see the docstring on why that is silent
+        if not seen or db.now() - float(seen[-1]["ts"] or 0.0) >= landing.FRESH_FOR_SECONDS:
+            # No current answer about this pull request. COUNTED, never guessed at, and
+            # reported once below rather than per order — see the docstring.
+            unchecked += 1
+            continue
         found = landing.from_record(wo_id, db.from_json(seen[-1]["payload"], {}))
         if not found.unsettled:
             continue
@@ -2174,6 +2193,20 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
                     f"finish {wo_id} --summary \"...\" --abandon \"<why>\"`."),
             context={"verdict": found.verdict, "pr_url": found.pr_url,
                      "pr_state": found.pr_state},
+        )
+
+    if unchecked:
+        days = int(landing.FRESH_FOR_SECONDS // 86400)
+        yield Violation(
+            invariant="INV-LANDING-AUDIT-FRESH",
+            detail=(f"the landing audit has no current answer for {unchecked} of "
+                    f"{population} completed work order(s) carrying a pull request, so "
+                    f"INV-WORK-LANDED is silent about them — which is NOT the same as "
+                    f"saying they landed. `Daemon.refresh_landings` fills this in on the "
+                    f"hourly sweep ({landing.REFRESH_PER_SWEEP} per sweep, re-asked every "
+                    f"{days} days); a count that does not shrink means the daemon is not "
+                    f"running or `gh` cannot read this repository's pull requests."),
+            context={"unchecked": unchecked, "population": population},
         )
 
 

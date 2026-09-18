@@ -240,3 +240,56 @@ def test_an_unreadable_record_is_silent_rather_than_a_complaint():
     """
     assert landing.from_record(WO, {"nonsense": 1}).verdict == landing.NO_PULL_REQUEST
     assert landing.from_record(WO, {}).unsettled is False
+
+
+# -- credentials: git quotes the remote URL back at you, and this module logs its stderr -
+
+
+def test_the_authentication_failure_git_does_not_redact_is_scrubbed_verbatim():
+    """THE HALF THAT ACTUALLY MATTERS, and it is a unit assertion for a reason.
+
+    git SELF-redacts the userinfo on a CONNECTION failure and does NOT on an
+    AUTHENTICATION failure — and an authentication failure cannot be provoked offline,
+    because it needs a server that refuses a login. So an end-to-end test alone would
+    pass against code that logged stderr raw. The string below is git's, quoted rather
+    than invented (kn-4bba177d, restored by review round 1 of wo-16a488ee).
+
+    Truncation is not a defence: the URL is on the FIRST line, so `stderr[:200]` keeps
+    the token. `_git` therefore scrubs BEFORE it slices.
+    """
+    secret = "ghp_FAKETOKEN0123456789abcdefghijklmnop"
+    raw = (f"fatal: Authentication failed for "
+           f"'https://x-access-token:{secret}@github.com/acme/proj.git/'")
+
+    scrubbed = landing._scrub(raw)
+
+    assert secret not in scrubbed
+    assert "x-access-token" not in scrubbed
+    assert secret not in scrubbed[:200]
+    assert "github.com/acme/proj.git" in scrubbed   # still says WHICH remote refused
+
+
+def test_no_git_failure_this_module_logs_can_carry_a_credential(repo, caplog):
+    """The guard is on `_git`, not on today's callers, and that is the point.
+
+    `landing._fetch` — the one caller that touched a remote — was deleted on 2026-09-18
+    with the rest of the content machinery, and with it went the fleet's only credential
+    scrub and this assertion. Nothing in this module reaches the network today. The next
+    thing that does will go through `_git` and will not think about it, so the test drives
+    `_git` with a remote-touching command directly rather than through a caller that
+    happens to exist this month.
+
+    Captured at DEBUG so that "appears in no emitted record" means ANY record.
+    """
+    secret = "ghp_FAKETOKEN0123456789abcdefghijklmnop"
+    # Port 1 rather than 443 so the connection fails at once instead of after a timeout.
+    _git(repo.path, "remote", "set-url", "origin",
+         f"https://x-access-token:{secret}@127.0.0.1:1/acme/proj.git")
+
+    with caplog.at_level("DEBUG", logger="jarvis.landing"):
+        assert landing._git(repo.path, "ls-remote", "origin") is None
+
+    assert caplog.records, "a failure that logs nothing proves nothing"
+    for record in caplog.records:
+        assert secret not in record.getMessage()
+        assert "x-access-token" not in record.getMessage()
