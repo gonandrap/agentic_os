@@ -116,6 +116,37 @@ jarvis wo review <id> [--reject] [--feedback "why"]   # feedback teaches Neo; on
                                            # against each assumption, saying the OS
                                            # decided it and never you. Correct one with
                                            # `jarvis neo review <qid> --correct "…"`.
+jarvis wo budget <id> [<usd>] [--clear]    # a DOLLAR CEILING on one order. `jarvis wo
+                                           # create ... --budget` sets it up front; this
+                                           # shows it, changes it, or removes it. It
+                                           # governs the WHOLE bill `jarvis cost <id>`
+                                           # reports — the worker's turns PLUS what
+                                           # Jarvis spent on that order (Neo, the panel)
+                                           # — so the number the user typed is the number
+                                           # they can check. Every turn is launched with
+                                           # no more than what is left; at the cap the
+                                           # order stops in `budget_exhausted`, a state
+                                           # of its own because nothing went WRONG, it
+                                           # ran out of money. RAISING IT RESUMES IT, in
+                                           # the same session with its half-finished work
+                                           # intact — so an order stopped this way is
+                                           # never lost. Raising it by less than the
+                                           # overshoot leaves it where it is and says so.
+                                           # NO BUDGET IS THE DEFAULT and means no
+                                           # ceiling, exactly as before. A project can
+                                           # set a standing one in the catalog
+                                           # (`worker.budget_usd`).
+jarvis fo budget <id> [<usd>] [--clear]    # the same one level up, and it is a FAMILY
+                                           # budget: it bounds the feature's whole
+                                           # rollup — planner, manager, every child. A
+                                           # child takes a slice of what is UNRESERVED
+                                           # when it is dispatched, so two children
+                                           # running at once can never both spend the
+                                           # same remainder, and an unspent slice returns
+                                           # to the pool when its child settles. A child
+                                           # that runs out says what the feature still
+                                           # has unreserved, so "top up the child" and
+                                           # "top up the feature" are distinguishable.
 jarvis wo ack <id> / --all                 # "seen it" — puts the attention flag down for
                                            # good (the reconciler re-derives attention
                                            # every tick, so nothing else makes it stick).

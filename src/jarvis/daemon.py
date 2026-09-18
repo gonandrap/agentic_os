@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import bugreport, bus, claude_cli, db, fleet, inspection, worker_session
+from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
@@ -62,6 +63,7 @@ from .project_store import (
     OPEN_STATUSES,
     PRE_APPROVED_KEY,
     RETRY_SWEEP_STATUSES,
+    RUNNABLE_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
     UNGOVERNED_ORIGINS,
     ProjectStore,
@@ -893,7 +895,24 @@ class Daemon:
             dead_feature_children,
         )
 
-        for fo in store.list_feature_orders(statuses=("executing",)):
+        # THE FAMILY BUDGET IS ASKED ON A WIDER SET than the rest of this method, and
+        # `budget_exhausted` is in it so a topped-up feature can leave the state the same
+        # way it entered it. A feature runs no session of its own, so nothing else here
+        # would ever re-derive the status back to `executing`.
+        for fo in store.list_feature_orders(
+                statuses=("executing", budget_mod.FO_EXHAUSTED)):
+            pool = budget_mod.feature_exhaustion(store, self.central, fo)
+            if pool is not None:
+                budget_mod.escalate_feature(store, fo, pool)
+                continue
+            if fo["status"] == budget_mod.FO_EXHAUSTED:
+                # Topped up: back to work. Its children are still parked in their own
+                # `budget_exhausted` until each is topped up or re-reserved, which is the
+                # honest shape — the family has money again, and which child gets it is
+                # the user's call (`jarvis fo budget` re-cuts the slices).
+                store.set_feature_status(fo["id"], "executing")
+                store.clear_feature_attention(fo["id"])
+                continue
             children = store.feature_children(fo["id"])
             if not children:
                 continue  # released with nothing in it; nothing to settle against
@@ -1136,6 +1155,14 @@ class Daemon:
                 continue
             try:
                 turn = worker_session.retry(store, project, wo, pause)
+            except budget_mod.BudgetExhausted as e:
+                # `NOT_RETRIED` already keeps this sweep off an order already parked in
+                # `budget_exhausted`; this is the order that ran out BETWEEN the last
+                # reconcile tick and now — a panel round landing on it while its turn
+                # waited out a backoff. Park it rather than retry it: relaunching would
+                # spend money nobody authorised.
+                budget_mod.escalate(store, wo, e.exhausted)
+                continue
             except claude_cli.ClaudeCliError as e:
                 # Not fatal and not the user's problem yet: the next pass tries again,
                 # and the streak cap is what stops this going round for ever.
@@ -2036,6 +2063,12 @@ class Daemon:
         text = "\n\n".join(m["content"] for m in msgs)
         try:
             turn = worker_session.send(store, project, wo, text, msg_id=ids[0])
+        except budget_mod.BudgetExhausted as e:
+            # The messages stay QUEUED, not `failed`: nothing is wrong with them and the
+            # user raising the budget is exactly what sends them. `delivery_hold` keeps
+            # the next tick from re-attempting, so this runs once per exhaustion.
+            budget_mod.escalate(store, wo, e.exhausted)
+            return
         except claude_cli.ClaudeCliError as e:
             log.error("[%s] delivery of message(s) %s failed: %s", project.name, ids, e)
             for msg_id in ids:
@@ -3240,6 +3273,35 @@ class Daemon:
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
                           wo: dict) -> None:
         from .invariants import awaiting_neo, something_is_out, true_blockers
+
+        # OUT OF MONEY, asked before the turn is looked at but AFTER the round machine's
+        # claim below. The budget governs the order's WHOLE bill, so what spends the last
+        # of it is as often a panel round as a worker turn — which is why this reads the
+        # accounting rather than the turn's exit code (`budget.exhaustion` says why).
+        #
+        # A ROUND THAT IS ALREADY OPEN IS ALLOWED TO FINISH. Judging delivered work is
+        # how that work LANDS, and `work_orders_awaiting_validation` is keyed off the
+        # round and bounded by `OPEN_STATUSES` — which this status is in — so parking the
+        # order would not stop the machine anyway. It would only make the two fight: the
+        # round settles the status, this re-parks it on the next tick, and the user
+        # watches the flag flap. A REJECTED round is a different matter and is not
+        # exempted: what it asks for is another worker turn, which is exactly the spend
+        # there is no money for.
+        #
+        # Free for the fleet as it stands: `ceiling` returns None the moment the row has
+        # neither a budget nor a reservation, which is every work order until someone
+        # sets one.
+        round_open = (store.latest_validation_round(wo_id=wo["id"]) or {}).get("outcome")
+        if round_open not in RUNNABLE_VALIDATION_OUTCOMES:
+            spent = budget_mod.exhaustion(store, self.central, wo)
+            if spent is not None:
+                budget_mod.escalate(store, wo, spent)
+                return
+        if wo["status"] == budget_mod.EXHAUSTED:
+            # Parked here and no longer over its cap: the user raised the budget. The
+            # relaunch is `ops.set_work_order_budget`'s, which has the project in hand;
+            # all this has to do is not re-settle the row underneath it.
+            return
 
         if wo["status"] == "validating":
             # THE ROUND MACHINE OWNS THIS WORK ORDER. Everything below re-derives the

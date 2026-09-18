@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
-from . import db, worker_session
+from . import budget, db, worker_session
 from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS, DEFAULT_VALIDATION_TIMEOUT
 from .neo_store import USER_HELD_Q_STATUSES
 from .project_store import (
@@ -83,7 +83,10 @@ BLOCKED_STATUSES = ("waiting_input", "needs_review", "failed", "pending",
                     # is the whole of issue #264 — but a feature routes everything
                     # through its manager, so a message rotting there strands the
                     # feature silently, which is issue 43 one level up.
-                    "idle")
+                    "idle",
+                    # An order that spent its budget. Only the user can decide whether to
+                    # fund another turn, so nothing else will ever move it.
+                    "budget_exhausted")
 # Statuses where nothing can possibly be pending: the work order is over.
 TERMINAL_STATUSES = ("completed", "cancelled")
 
@@ -92,6 +95,42 @@ TERMINAL_STATUSES = ("completed", "cancelled")
 #: only source of attention reasons — INV-ATTENTION-REASON rewrites any flag it cannot
 #: derive, so a reason raised by `Daemon.poll_pull_requests` and not repeated here would
 #: silently become the generic IDLE_NO_FINISH_BLOCKER below on the next reconcile tick.
+#: The fallback when an order is parked in `budget_exhausted` but the accounting no
+#: longer says so — the user raised the budget and the reconcile tick that would move the
+#: status has not run yet. Says the status and nothing it cannot stand behind.
+BUDGET_SPENT_BLOCKER = ("budget spent — raise it with `jarvis wo budget <id> <amount>` "
+                        "or close the order")
+
+
+def budget_blocker(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """The attention line for a work order parked in `budget_exhausted`.
+
+    Opens its own `CentralStore` for the Jarvis half of the bill and closes it again.
+    That cost is paid only by an order ALREADY in this status — a handful fleet-wide —
+    because the caller checks the status first; `true_blockers` runs against every work
+    order on every tick and must not open a second database for the ones with no budget.
+
+    A store that will not open DEGRADES rather than raises: the reason is then derived
+    from the worker's turns alone, which understates the spend rather than inventing one,
+    and an unopenable database must not take the whole attention list down with it.
+    """
+    from .central_store import CentralStore
+
+    central = None
+    try:
+        central = CentralStore()
+    except Exception:  # noqa: BLE001 — see the docstring
+        pass
+    try:
+        out = budget.exhaustion(store, central, wo)
+    finally:
+        if central is not None:
+            central.close()
+    # None means the accounting no longer says it is spent: the user raised the budget
+    # and the tick that moves the status has not run yet.
+    return out.reason if out else BUDGET_SPENT_BLOCKER
+
+
 PR_CLOSED_BLOCKER = "pull request closed without merging — the work was not accepted"
 
 #: What a work order says when settling it would have stranded the code it wrote
@@ -368,6 +407,18 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # the contract anyway made every such session a guaranteed attention item.
     # See Daemon.retire_ungoverned.
     governed = wo.get("origin") not in UNGOVERNED_ORIGINS
+    # OUT OF MONEY, and the reason is REBUILT rather than read off `attention_reason`:
+    # this function is the only source of attention reasons — INV-ATTENTION-REASON
+    # rewrites any flag it cannot derive — so a line `budget.escalate` wrote and this did
+    # not repeat would be replaced by a generic one on the next reconcile tick. Rebuilt
+    # from live accounting, so the figures in it stay current as the panel spends, and it
+    # states the feature's unreserved remainder for a child whose slice ran out.
+    #
+    # ABOVE `failed`, and above every wait below: an order in this status has nothing
+    # else it can be waiting for, and the question the user is being asked is about
+    # money rather than about the work.
+    if wo["status"] == budget.EXHAUSTED:
+        blockers.append(budget_blocker(store, wo))
     if governed and wo["status"] == "failed":
         blockers.append("worker failed — review and retry")
     # Parked on the user's Claude Code sign-in (`Daemon._park_on_signin`). Before the
@@ -689,6 +740,21 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     if wo["status"] in ACTIVE_STATUSES:
         note = pause_note(store, wo) or neo_wait_note(wo)
         return f"{wo['status']} — {note}" if note else wo["status"]
+    # OUT OF MONEY, and ABOVE the pause note: a work order can hold a booked retry AND
+    # be over its budget, and only one of the two is going to happen. `NOT_RETRIED` is
+    # what makes that true — the sweep never relaunches this status — so a label naming
+    # the retry would promise a turn that is never coming.
+    #
+    # Rendered with the figures rather than the bare word, because this is the string
+    # every listing prints and "budget_exhausted" alone sends the reader to a second
+    # command to learn the one thing they need: how much more it would take.
+    if wo["status"] == budget.EXHAUSTED:
+        cap = budget.ceiling(store, None, wo)
+        if cap is None:
+            # The budget was cleared and the tick that moves the status has not run.
+            return "budget spent — cleared, resuming shortly"
+        return (f"budget spent — ${cap.spent_usd:.2f} of ${cap.cap_usd:.2f}"
+                + (" (its feature's slice)" if cap.source == "feature" else ""))
     # A booked retry on one of the settled-looking statuses the sweep reaches and the
     # branch above does not (issue #259). Ranked over the round note below it: a turn the
     # transport dropped is why nothing is moving, and it names the moment that changes.
@@ -2897,6 +2963,55 @@ def check_schedule_progresses(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+def check_budgets_are_enforced(store: ProjectStore) -> Iterator[Violation]:
+    """INV-BUDGET-OVERSPENT — an order past its ceiling that is still able to spend.
+
+    The post-condition behind the whole feature, stated as the OS's own claim rather than
+    as a test's: a work order with a budget is either inside it or parked in
+    `budget_exhausted`. Anything else means the next dispatch, message delivery or retry
+    will hand `claude` a negative remainder — or, if a caller ever skips
+    `worker_session._launch`, no cap at all.
+
+    THE REPAIR IS THE SETTLER'S OWN. `Daemon.settle_work_order` parks a spent order every
+    tick, so a violation here is not "nobody has parked it yet" — it is that something is
+    keeping it out of that branch, and the one thing that can is a status the settler
+    returns early on. Reporting rather than repairing keeps this a check on the settler
+    instead of a second implementation of it.
+
+    Silent for every order with no budget, which is the fleet as it stands: `ceiling`
+    returns None on a row with neither a budget nor a reservation, so this costs one
+    indexed read per open order and yields nothing.
+    """
+    from . import budget as budget_mod
+    from .central_store import CentralStore
+
+    central = None
+    try:
+        central = CentralStore()
+    except Exception:  # noqa: BLE001 — a degraded reading beats no invariant at all
+        pass
+    try:
+        for wo in store.list_work_orders(statuses=OPEN_STATUSES, include_hidden=True):
+            if wo["status"] == budget_mod.EXHAUSTED:
+                continue
+            cap = budget_mod.ceiling(store, central, wo)
+            if cap is None or not cap.exhausted:
+                continue
+            yield Violation(
+                invariant="INV-BUDGET-OVERSPENT",
+                wo_id=wo["id"],
+                detail=(f"{wo['id']} has spent ${cap.spent_usd:.2f} of its "
+                        f"${cap.cap_usd:.2f} ceiling and is still {wo['status']} — the "
+                        f"settler should have parked it in `budget_exhausted`. Until it "
+                        f"does, every turn it starts is launched with no headroom."),
+                context={"status": wo["status"], "cap_usd": cap.cap_usd,
+                         "spent_usd": cap.spent_usd, "source": cap.source},
+            )
+    finally:
+        if central is not None:
+            central.close()
+
+
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
     check_no_orphan_gate_requests,  # ...and gates before the flag checks: an orphan
@@ -2920,6 +3035,9 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # because the moment it was given keeps moving
     check_schedule_progresses,     # ditto, one mechanism over: a pure read of the
                                    # scheduler's clock, repairing nothing
+    check_budgets_are_enforced,    # ditto again: it reports what the settler did not do
+                                   # and repairs nothing, so nothing depends on where it
+                                   # sits
     check_validation_progresses,   # after the flag checks: its repair touches no flag,
                                    # and a `validating` row is invisible to all of them
     check_feature_failures_are_real,  # order-free: it reads and writes feature orders

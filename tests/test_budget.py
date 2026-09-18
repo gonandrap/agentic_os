@@ -1,0 +1,732 @@
+"""A dollar ceiling per order, enforced on every `claude` call.
+
+Four things are pinned here, and the first is the one the whole feature rests on.
+
+**The flag is per INVOCATION.** `claude --max-budget-usd` caps one process and forgets
+what the session spent before it (measured 2026-09-18; the probe is written up at the top
+of src/jarvis/budget.py). So the value Jarvis passes has to be `budget - spent so far`,
+recomputed on every single turn — a value resolved once at dispatch would let a ten-turn
+work order spend ten budgets. `test_each_turn_is_capped_at_what_is_left` is that claim.
+
+**The budget governs the WHOLE bill**, worker turns plus what Jarvis spent on the order
+(Neo, the panel). Ruled by the user through Neo on question 404: the number they typed has
+to be the number `jarvis cost` shows them.
+
+**A feature's budget is a family budget, allocated by RESERVE-ON-DISPATCH.** Two children
+dispatched in parallel must not be handed the same remainder. The invariant is
+`already spent + everything live children may still spend <= the budget`, and it is
+asserted directly rather than through a proxy.
+
+**Default off.** An order with no budget behaves exactly as it did before this shipped —
+no flag on the argv, and the new status unreachable. That is the definition of done's
+second half, and it is checked on the same paths as the first.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from jarvis import budget, ops
+from jarvis.catalog import CatalogError, parse_catalog
+from jarvis.claude_cli import turn_args
+from jarvis.daemon import Daemon
+from jarvis.project_store import (
+    FO_OPEN_STATUSES,
+    FO_STATUSES,
+    NOT_RETRIED,
+    OPEN_STATUSES,
+    RETRY_SWEEP_STATUSES,
+    TERMINAL_STATUSES,
+    WO_STATUSES,
+    ProjectStore,
+)
+from jarvis.testing import FIXTURE_DESIGN_DOC, fixture_spec_section
+
+
+ASK = ("Add a CSV exporter to the reporting module, with a command that calls it and "
+       "tests over both the happy path and an empty result set.")
+
+
+@pytest.fixture()
+def started(jarvis_home, fake_claude, catalog_file, project):
+    from jarvis.catalog import load_catalog
+
+    ops.start_os(str(catalog_file), foreground=True)
+    return Daemon(load_catalog(catalog_file))
+
+
+@pytest.fixture()
+def store(project):
+    s = ProjectStore(project)
+    yield s
+    s.close()
+
+
+def budget_flag(call: dict) -> str | None:
+    """`--max-budget-usd`'s value in one recorded invocation, or None if absent."""
+    argv = call["argv"]
+    return argv[argv.index("--max-budget-usd") + 1] if "--max-budget-usd" in argv else None
+
+
+def worker_calls(fake_claude) -> list[dict]:
+    """Every recorded WORKER TURN, oldest first — never a Neo or panel call."""
+    return [c for c in fake_claude.calls
+            if "-p" in c["argv"] and ("--session-id" in c["argv"]
+                                      or "--resume" in c["argv"])]
+
+
+def bill_the_turn(store: ProjectStore, wo_id: str, usd: float) -> None:
+    """Charge a settled turn `usd`, the way a reaped turn's envelope would.
+
+    Writes the column `budget.spent` sums rather than going through a fake turn, so a
+    test about the ARITHMETIC of the ceiling is not also a test of the transport.
+    """
+    turn = store.create_turn(wo_id, kind="message", prompt="work")
+    store.finish_turn(turn["id"], "done", result="done", cost_usd=usd,
+                      usage_json=json.dumps({"total_cost_usd": usd}))
+
+
+# -- the flag, and what the CLI does with it ------------------------------------------
+
+
+def test_the_flag_is_absent_when_no_budget_is_set():
+    """DEFAULT OFF, at the argv. An OS that starts refusing to work because of a number
+    nobody set would be worse than the problem, so an unbudgeted order's command line is
+    byte-for-byte what it was before this shipped."""
+    assert "--max-budget-usd" not in turn_args("go", "sid", resume=False)
+
+
+def test_the_flag_carries_the_remaining_budget():
+    args = turn_args("go", "sid", resume=False, max_budget_usd=4.25)
+    assert args[args.index("--max-budget-usd") + 1] == "4.250000"
+
+
+def test_a_tiny_remainder_never_reaches_argv_in_scientific_notation():
+    """`str(1e-05)` is "1e-05", which the CLI's parser does not accept — and a remainder
+    that small is exactly what the last turn of a spent budget is handed."""
+    args = turn_args("go", "sid", resume=False, max_budget_usd=0.00001)
+    assert args[args.index("--max-budget-usd") + 1] == "0.000010"
+
+
+def test_the_flag_is_not_in_the_shared_briefing():
+    """`--max-budget-usd` only works with `--print`. `_briefing_args` is shared with
+    `spawn_background`, which has no `-p`, so a flag placed there would be accepted and
+    silently ignored — capping nothing while reading as capped."""
+    from jarvis.claude_cli import _briefing_args
+
+    assert "--max-budget-usd" not in _briefing_args(model="sonnet", effort="high")
+
+
+def test_the_cli_refusal_is_read_off_the_structured_fields():
+    """Never off the prose: this repo's own workers write about budget exhaustion, and a
+    text match would let a worker quoting the error park its own work order."""
+    from jarvis.claude_cli import TurnResult, stopped_for_budget
+
+    assert stopped_for_budget(TurnResult(ok=False, terminal_reason="budget_exhausted"))
+    assert stopped_for_budget(TurnResult(ok=False, subtype="error_max_budget_usd"))
+    assert not stopped_for_budget(TurnResult(ok=False, terminal_reason="api_error"))
+    assert not stopped_for_budget(
+        TurnResult(ok=False, result="Reached maximum budget ($5.00)"))
+
+
+def test_a_budget_stop_reports_what_the_envelope_said(tmp_path):
+    """The real CLI writes NO `result` field when it stops for the budget, so without the
+    `errors` fallback the record would read "turn reported is_error" about a turn whose
+    own envelope said why."""
+    from jarvis.claude_cli import read_turn_result
+
+    out = tmp_path / "t.json"
+    out.write_text(json.dumps({
+        "type": "result", "subtype": "error_max_budget_usd", "is_error": True,
+        "terminal_reason": "budget_exhausted", "total_cost_usd": 0.047,
+        "errors": ["Reached maximum budget ($0.001)"],
+    }))
+    result = read_turn_result(out)
+    assert result is not None
+    assert "Reached maximum budget" in result.error
+    # And the spend is still recorded: the turn paid for everything up to the refusal.
+    assert result.cost_usd == 0.047
+
+
+# -- the arithmetic -------------------------------------------------------------------
+
+
+def test_the_ceiling_counts_both_halves_of_the_bill(started, store):
+    """The user's $20 is the $20 `jarvis cost` shows: the worker's turns AND what Jarvis
+    spent on the order. Neo, question 404."""
+    from jarvis.central_store import CentralStore
+
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=10.0)
+    bill_the_turn(store, wo["id"], 3.0)
+    central = CentralStore()
+    try:
+        central.add_agent_call("neo", label="question", model="sonnet",
+                                  project="proj_a", wo_id=wo["id"], ok=True,
+                                  usage={"total_cost_usd": 1.0})
+        spend = budget.spent(store, central, wo["id"])
+        cap = budget.ceiling(store, central, store.get_work_order(wo["id"]))
+    finally:
+        central.close()
+    assert spend.worker_usd == 3.0
+    assert spend.jarvis_usd == 1.0
+    assert cap is not None
+    assert cap.remaining_usd == 6.0
+
+
+def test_no_budget_means_no_ceiling(started, store):
+    wo = ops.create_work_order("proj_a", "uncapped", description="do it")
+    assert store.get_work_order(wo["id"])["budget_usd"] is None
+    assert budget.ceiling(store, None, store.get_work_order(wo["id"])) is None
+
+
+def test_the_tighter_of_the_two_caps_wins(started, store):
+    """An order can carry its own budget AND a slice its feature reserved for it. They
+    are not added — neither claim entitles the order to the other's dollars."""
+    wo = ops.create_work_order("proj_a", "child", description="do it", budget_usd=10.0)
+    store.update_work_order(wo["id"], budget_reserved_usd=4.0)
+    cap = budget.ceiling(store, None, store.get_work_order(wo["id"]))
+    assert cap is not None
+    assert (cap.cap_usd, cap.source) == (4.0, "feature")
+
+    store.update_work_order(wo["id"], budget_reserved_usd=40.0)
+    cap = budget.ceiling(store, None, store.get_work_order(wo["id"]))
+    assert cap is not None
+    assert (cap.cap_usd, cap.source) == (10.0, "work_order")
+
+
+def test_exhaustion_is_answered_from_the_accounting_not_the_exit_code(started, store):
+    """The budget governs the whole bill, so a run of Neo answers can carry an order past
+    its cap with no worker turn having failed — or even run. A check that keyed on
+    `terminal_reason` would miss every one of those."""
+    from jarvis.central_store import CentralStore
+
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=1.0)
+    central = CentralStore()
+    try:
+        central.add_agent_call("panel", label="tester", model="sonnet",
+                                  project="proj_a", wo_id=wo["id"], ok=True,
+                                  usage={"total_cost_usd": 1.5})
+        out = budget.exhaustion(store, central, store.get_work_order(wo["id"]))
+    finally:
+        central.close()
+    assert out is not None
+    assert store.list_turns(wo["id"]) == []  # no turn ever ran, let alone failed
+    assert "$1.50" in out.reason and "$1.00" in out.reason
+
+
+# -- end to end: a capped order stops, and says what it spent -------------------------
+
+
+def test_a_budgeted_order_stops_at_its_budget_and_says_what_it_spent(
+        started, store, fake_claude, monkeypatch):
+    """THE DEFINITION OF DONE, first half."""
+    monkeypatch.setenv("FAKE_CLAUDE_TURN", "budget")
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=0.50)
+    started.tick()
+    fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
+    started.tick()
+
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "budget_exhausted"
+    assert row["needs_attention"]
+    # What it spent, not what the cap was: the CLI overshoots by the call that crossed
+    # the line, and a reason quoting the cap would understate the bill.
+    assert "$0.55" in row["attention_reason"]
+    assert "$0.50" in row["attention_reason"]
+    kinds = [e["kind"] for e in store.list_events(wo["id"])]
+    assert "turn_budget_exhausted" in kinds
+    assert "budget_exhausted" in kinds
+
+
+def test_an_unbudgeted_order_behaves_exactly_as_before(started, store, fake_claude):
+    """THE DEFINITION OF DONE, second half — checked on the same path as the first."""
+    wo = ops.create_work_order("proj_a", "uncapped", description="do it")
+    started.tick()
+    fake_claude.wait_calls(lambda c: "--session-id" in c["argv"])
+    started.tick()
+
+    assert budget_flag(worker_calls(fake_claude)[0]) is None
+    assert store.get_work_order(wo["id"])["status"] != "budget_exhausted"
+
+
+def test_each_turn_is_capped_at_what_is_left(started, store, fake_claude):
+    """THE CLAIM THE WHOLE DESIGN RESTS ON. `--max-budget-usd` is per INVOCATION — a
+    resumed session's earlier spend does not count against it — so a value resolved once
+    at dispatch would let a ten-turn work order spend ten budgets. Every turn must be
+    handed a SMALLER number than the last."""
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=5.0)
+    started.tick()
+    fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
+    started.tick()
+
+    ops.send_message(wo["id"], "keep going")
+    started.tick()
+    fake_claude.wait_calls(lambda c: "--resume" in c["argv"])
+    started.tick()
+
+    caps = [float(f) for f in (budget_flag(c) for c in worker_calls(fake_claude))
+            if f is not None]
+    assert len(caps) >= 2, caps
+    assert caps[0] == 5.0            # nothing spent yet
+    assert caps[1] < caps[0]         # ...and the first turn's $0.01 came off the second
+    assert caps[1] == pytest.approx(5.0 - 0.01)
+
+
+def test_a_spent_order_is_never_relaunched_by_the_retry_sweep():
+    """Relaunching would spend money nobody authorised, and the sweep cannot ask.
+
+    Asserted against the partition rather than the sweep's body: the two tuples cover
+    `WO_STATUSES` between them, so this is the decision, not a symptom of it.
+    """
+    assert "budget_exhausted" in NOT_RETRIED
+    assert "budget_exhausted" not in RETRY_SWEEP_STATUSES
+
+
+def test_the_new_state_is_open_and_not_terminal():
+    """Terminal would make it a DEPENDENCY_DEAD_STATUS: every dependent stranded and the
+    parent feature failed, over a number the user can change in one command. It is also
+    what makes resuming possible at all."""
+    assert "budget_exhausted" in WO_STATUSES
+    assert "budget_exhausted" in OPEN_STATUSES
+    assert "budget_exhausted" not in TERMINAL_STATUSES
+    assert "budget_exhausted" in FO_STATUSES
+    assert "budget_exhausted" in FO_OPEN_STATUSES
+
+
+def test_the_reason_survives_a_reconcile_tick(started, store, fake_claude, monkeypatch):
+    """`invariants.true_blockers` re-derives every attention reason on every tick, so a
+    line only `budget.escalate` knew how to write would be overwritten by a generic one.
+    Ticking twice more is the test."""
+    monkeypatch.setenv("FAKE_CLAUDE_TURN", "budget")
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=0.50)
+    started.tick()
+    fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
+    started.tick()
+    first = store.get_work_order(wo["id"])["attention_reason"]
+
+    started.tick()
+    started.tick()
+    assert store.get_work_order(wo["id"])["attention_reason"] == first
+    assert store.get_work_order(wo["id"])["needs_attention"]
+
+
+def test_a_queued_message_waits_rather_than_launching_an_unfunded_turn(
+        started, store, fake_claude, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_TURN", "budget")
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=0.50)
+    started.tick()
+    fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
+    started.tick()
+    assert store.get_work_order(wo["id"])["status"] == "budget_exhausted"
+
+    before = len(worker_calls(fake_claude))
+    ops.send_message(wo["id"], "carry on")
+    started.tick()
+    assert len(worker_calls(fake_claude)) == before
+    assert [m["status"] for m in store.list_messages(wo["id"])] == ["queued"]
+
+
+# -- raising the budget and carrying on ------------------------------------------------
+
+
+def test_raising_the_budget_resumes_the_same_session(
+        started, store, fake_claude, monkeypatch):
+    """Partial work is preserved and the transcript is resumable (measured), so a top-up
+    continues the conversation rather than restarting the work."""
+    monkeypatch.setenv("FAKE_CLAUDE_TURN", "budget")
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=0.50)
+    started.tick()
+    fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
+    started.tick()
+    session = store.get_work_order(wo["id"])["session_id"]
+
+    monkeypatch.delenv("FAKE_CLAUDE_TURN")
+    before = len(worker_calls(fake_claude))
+    out = ops.set_work_order_budget(wo["id"], 20.0)
+    assert out["resumed"], out
+    assert store.get_work_order(wo["id"])["status"] != "budget_exhausted"
+    fake_claude.wait_calls(lambda c: budget_flag(c) == "20.000000")
+
+    # THE SAME SESSION ID, which is the whole claim: the stopped turn left a complete
+    # transcript, so the top-up continues that conversation instead of opening a new one
+    # and throwing away everything the worker had already done.
+    #
+    # Asserted on the ID rather than on `--resume` because `worker_session.retry`
+    # re-decides that flag from the filesystem — a session whose transcript was never
+    # written cannot be resumed and has to be re-opened with `--session-id`, which is the
+    # branch the fake takes. Either flag preserves the id; only the id is the property.
+    assert len(worker_calls(fake_claude)) > before
+    argv = worker_calls(fake_claude)[-1]["argv"]
+    flag = "--resume" if "--resume" in argv else "--session-id"
+    assert argv[argv.index(flag) + 1] == session
+
+
+def test_raising_it_by_too_little_does_not_launch_a_doomed_turn(
+        started, store, fake_claude, monkeypatch):
+    """Setting $0.52 on an order that has already spent $0.55 must leave it where it is
+    — the CLI would stop the turn on its first call and charge for the privilege."""
+    monkeypatch.setenv("FAKE_CLAUDE_TURN", "budget")
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=0.50)
+    started.tick()
+    fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
+    started.tick()
+
+    before = len(worker_calls(fake_claude))
+    out = ops.set_work_order_budget(wo["id"], 0.52)
+    assert not out["resumed"]
+    assert "still over its ceiling" in out["note"]
+    assert store.get_work_order(wo["id"])["status"] == "budget_exhausted"
+    assert len(worker_calls(fake_claude)) == before
+
+
+def test_clearing_the_budget_resumes_it_too(started, store, fake_claude, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_TURN", "budget")
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=0.50)
+    started.tick()
+    fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
+    started.tick()
+
+    monkeypatch.delenv("FAKE_CLAUDE_TURN")
+    out = ops.set_work_order_budget(wo["id"], None)
+    assert out["resumed"]
+    assert store.get_work_order(wo["id"])["budget_usd"] is None
+    # No ceiling means no flag, on the relaunch as much as on a first dispatch.
+    fake_claude.wait_calls(lambda c: "--resume" in c["argv"] or (
+        "--session-id" in c["argv"] and budget_flag(c) is None), count=1)
+    assert budget_flag(worker_calls(fake_claude)[-1]) is None
+
+
+# -- the family budget -----------------------------------------------------------------
+
+
+def a_feature(daemon, store, *keys: str, budget_usd: float | None = None,
+              max_parallel: int | None = None) -> dict:
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK,
+                                  budget_usd=budget_usd, max_parallel=max_parallel)
+    daemon.tick()
+    ops.submit_plan(fo["id"], {
+        "summary": "an exporter FORCE_APPROVE",
+        "design_doc": FIXTURE_DESIGN_DOC,
+        "children": [{
+            "key": k, "title": f"Build {k}",
+            "description": (f"Build the {k} part of the exporter: add the module, wire "
+                            f"it into the command that calls it, and cover both paths "
+                            f"with tests. FORCE_APPROVE"),
+            "needs": [], "spec_section": fixture_spec_section(k),
+        } for k in keys],
+    })
+    daemon._neo_drain()
+    return store.get_feature_order(fo["id"])
+
+
+def test_two_parallel_children_are_never_handed_the_same_remainder(
+        started, store, fake_claude):
+    """THE HAZARD THE WORK ORDER CALLED OUT, and the reason allocation is
+    reserve-on-dispatch rather than re-read-per-turn. Re-reading is always TRUE and still
+    lets N live children each spend the whole remainder once."""
+    fo = a_feature(started, store, "reader", "writer", budget_usd=12.0)
+    for _ in range(4):
+        started.tick()
+
+    children = store.feature_children(fo["id"])
+    reserved = [c["budget_reserved_usd"] for c in children
+                if c["budget_reserved_usd"] is not None]
+    assert len(reserved) == 2, [dict(c) for c in children]
+    assert sum(reserved) <= 12.0
+    # Not the same dollars: neither slice is the whole remainder.
+    assert all(r < 12.0 for r in reserved)
+
+
+def test_the_family_never_promises_more_than_it_has(started, store, fake_claude):
+    """THE INVARIANT, asserted directly rather than through a proxy:
+
+        already spent + everything live children may still spend <= the budget
+    """
+    from jarvis.central_store import CentralStore
+
+    fo = a_feature(started, store, "reader", "writer", "docs", budget_usd=12.0)
+    for _ in range(5):
+        started.tick()
+
+    central = CentralStore()
+    try:
+        pool = budget.pool(store, central, store.get_feature_order(fo["id"]))
+        assert pool is not None
+        committed = pool.spent_usd + pool.held_usd
+        assert committed <= pool.budget_usd + 1e-9, (pool.spent_usd, pool.held_usd)
+        assert pool.unreserved_usd == pytest.approx(pool.budget_usd - committed)
+    finally:
+        central.close()
+
+
+def test_a_settled_child_releases_the_rest_of_its_slice(started, store):
+    """Release needs no write: a settled child drops out of `held`, and its real spend is
+    already inside the pool's total. This is what makes an equal split self-correcting —
+    a cheap child leaves more for the next one."""
+    from jarvis.central_store import CentralStore
+
+    fo = a_feature(started, store, "reader", "writer", budget_usd=12.0)
+    for _ in range(4):
+        started.tick()
+    children = store.feature_children(fo["id"])
+
+    central = CentralStore()
+    try:
+        before = budget.pool(store, central, store.get_feature_order(fo["id"]))
+        bill_the_turn(store, children[0]["id"], 1.0)
+        store.set_status(children[0]["id"], "completed")
+        after = budget.pool(store, central, store.get_feature_order(fo["id"]))
+    finally:
+        central.close()
+    assert before is not None and after is not None
+    assert after.held_usd < before.held_usd
+    assert after.unreserved_usd > before.unreserved_usd
+
+
+def test_a_child_that_runs_out_is_told_what_its_feature_still_has(started, store):
+    """NEO'S CONDITION ON RESERVE-ON-DISPATCH (question 404): a child can exhaust its
+    slice while the feature is still funded, and without this the user cannot tell a
+    stalled feature from one they only need to top up."""
+    from jarvis.central_store import CentralStore
+
+    fo = a_feature(started, store, "reader", "writer", budget_usd=12.0)
+    for _ in range(4):
+        started.tick()
+    child = store.feature_children(fo["id"])[0]
+    bill_the_turn(store, child["id"], (child["budget_reserved_usd"] or 0) + 1)
+
+    central = CentralStore()
+    try:
+        out = budget.exhaustion(store, central, store.get_work_order(child["id"]))
+    finally:
+        central.close()
+    assert out is not None
+    assert out.pool is not None
+    assert "unreserved" in out.reason
+    assert "its feature's slice" in out.reason
+
+
+def test_a_feature_stops_when_the_whole_family_has_spent_its_budget(started, store):
+    fo = a_feature(started, store, "reader", "writer", budget_usd=12.0)
+    for _ in range(4):
+        started.tick()
+    for child in store.feature_children(fo["id"]):
+        bill_the_turn(store, child["id"], 9.0)
+    started.tick()
+
+    fresh = store.get_feature_order(fo["id"])
+    assert fresh["status"] == "budget_exhausted"
+    assert fresh["needs_attention"]
+    assert "$12.00" in fresh["attention_reason"]
+
+
+def test_a_feature_with_no_budget_reserves_nothing(started, store):
+    """DEFAULT OFF one level up: a feature without a budget lends its children nothing
+    and they run uncapped, exactly as every feature did before this shipped."""
+    fo = a_feature(started, store, "reader", "writer")
+    for _ in range(4):
+        started.tick()
+    assert all(c["budget_reserved_usd"] is None
+               for c in store.feature_children(fo["id"]))
+    assert budget.pool(store, None, store.get_feature_order(fo["id"])) is None
+
+
+def test_topping_up_a_feature_puts_it_back_to_executing(started, store):
+    fo = a_feature(started, store, "reader", budget_usd=12.0)
+    for _ in range(4):
+        started.tick()
+    for child in store.feature_children(fo["id"]):
+        bill_the_turn(store, child["id"], 20.0)
+    started.tick()
+    assert store.get_feature_order(fo["id"])["status"] == "budget_exhausted"
+
+    ops.set_feature_budget(fo["id"], 100.0)
+    started.tick()
+    assert store.get_feature_order(fo["id"])["status"] == "executing"
+
+
+# -- the surfaces ----------------------------------------------------------------------
+
+
+def test_a_project_default_is_stamped_onto_new_orders(started, store, monkeypatch,
+                                                      catalog_file):
+    """Stamped at CREATION, unlike the autocompact window, which is re-read every turn.
+    A budget is a contract about ONE order: `jarvis wo show` has to be able to state it,
+    and lowering a fleet default must not strand work already authorised at the old
+    number."""
+    data = json.loads(catalog_file.read_text())
+    data["projects"][0]["worker"] = {"budget_usd": 7.5, "feature_budget_usd": 60}
+    catalog_file.write_text(json.dumps(data))
+
+    wo = ops.create_work_order("proj_a", "capped", description="do it")
+    assert store.get_work_order(wo["id"])["budget_usd"] == 7.5
+    # ...and an explicit --budget still wins over the default.
+    wo2 = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=1.0)
+    assert store.get_work_order(wo2["id"])["budget_usd"] == 1.0
+
+
+def test_a_bad_catalog_budget_fails_at_load_not_at_the_first_dispatch():
+    for bad in (0, -1, "five"):
+        with pytest.raises(CatalogError):
+            parse_catalog({"os": {"defaults": {"budget_usd": bad}}, "projects": []})
+
+
+def test_the_catalog_budget_reaches_the_config_ledger():
+    """A setting outside the version ledger is a setting that cannot be audited or rolled
+    back with the rest of the configuration."""
+    from jarvis import config_version
+
+    resolved = config_version.resolve(parse_catalog(
+        {"os": {"defaults": {"budget_usd": 5, "feature_budget_usd": 40}},
+         "projects": []}))
+    assert resolved["os.defaults.budget_usd"] == 5.0
+    assert resolved["os.defaults.feature_budget_usd"] == 40.0
+
+
+def test_an_amount_is_parsed_the_way_a_user_types_it():
+    assert budget.parse_amount("5") == 5.0
+    assert budget.parse_amount("$5.50") == 5.5
+    assert budget.parse_amount(" 1,250 ") == 1250.0
+
+
+def test_zero_is_refused_rather_than_read_as_no_ceiling():
+    """`--budget 0` reads like "spend nothing"; silently inverting that into "spend
+    anything" is the one misreading that costs money."""
+    with pytest.raises(ValueError):
+        budget.parse_amount("0")
+    with pytest.raises(ValueError):
+        budget.parse_amount("-3")
+
+
+def test_the_budget_verb_reports_both_halves(started, store):
+    from jarvis.central_store import CentralStore
+
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=10.0)
+    bill_the_turn(store, wo["id"], 2.0)
+    central = CentralStore()
+    try:
+        central.add_agent_call("neo", label="question", model="sonnet",
+                                  project="proj_a", wo_id=wo["id"], ok=True,
+                                  usage={"total_cost_usd": 0.5})
+    finally:
+        central.close()
+
+    out = ops.work_order_budget(wo["id"])
+    assert out["worker_usd"] == 2.0
+    assert out["jarvis_usd"] == 0.5
+    assert out["remaining_usd"] == 7.5
+
+
+def test_a_settled_order_refuses_a_budget(started, store):
+    wo = ops.create_work_order("proj_a", "done", description="do it")
+    store.set_status(wo["id"], "completed")
+    with pytest.raises(ops.OpsError, match="nothing left to spend"):
+        ops.set_work_order_budget(wo["id"], 5.0)
+
+
+# -- the post-condition ----------------------------------------------------------------
+
+
+def test_the_os_reports_an_order_that_outran_its_ceiling_unparked(started, store):
+    """INV-BUDGET-OVERSPENT. The settler parks a spent order every tick, so a violation
+    here is not "nobody has got to it yet" — it is that something is keeping the order
+    out of that branch, and until it clears, every turn the order starts is launched with
+    no headroom."""
+    from jarvis.invariants import check_budgets_are_enforced
+
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=1.0)
+    bill_the_turn(store, wo["id"], 4.0)
+    store.set_status(wo["id"], "running")
+
+    found = list(check_budgets_are_enforced(store))
+    assert [v.invariant for v in found] == ["INV-BUDGET-OVERSPENT"]
+    assert found[0].wo_id == wo["id"]
+
+    # ...and it goes quiet once the order is where it belongs.
+    store.set_status(wo["id"], "budget_exhausted")
+    assert list(check_budgets_are_enforced(store)) == []
+
+
+def test_the_post_condition_is_silent_on_an_unbudgeted_fleet(started, store):
+    from jarvis.invariants import check_budgets_are_enforced
+
+    wo = ops.create_work_order("proj_a", "uncapped", description="do it")
+    bill_the_turn(store, wo["id"], 400.0)
+    store.set_status(wo["id"], "running")
+    assert list(check_budgets_are_enforced(store)) == []
+
+
+def test_the_status_reads_with_its_figures(started, store):
+    """`status_label` is the string every listing prints. "budget_exhausted" alone sends
+    the reader to a second command for the one thing they need — how much more it takes."""
+    from jarvis.invariants import status_label
+
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=2.0)
+    bill_the_turn(store, wo["id"], 2.5)
+    store.set_status(wo["id"], "budget_exhausted")
+    label = status_label(store, store.get_work_order(wo["id"]))
+    assert "$2.50" in label and "$2.00" in label
+
+
+def test_the_label_does_not_promise_a_retry_that_will_never_come(started, store):
+    """A spent order can also hold a booked retry, and only one of the two happens:
+    `NOT_RETRIED` means the sweep never relaunches this status."""
+    from jarvis.invariants import status_label
+
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=2.0)
+    turn = store.create_turn(wo["id"], kind="message", prompt="work")
+    store.finish_turn(turn["id"], "failed",
+                      error="API Error: 500 Internal server error. This is a "
+                            "server-side issue, usually temporary.",
+                      cost_usd=2.5, terminal_reason="api_error", api_error_status=500,
+                      usage_json=json.dumps({"total_cost_usd": 2.5,
+                                             "duration_api_ms": 1000}))
+    store.set_status(wo["id"], "budget_exhausted")
+    label = status_label(store, store.get_work_order(wo["id"]))
+    assert "budget spent" in label
+    assert "retry" not in label
+
+
+def test_a_resumed_worker_is_told_the_truth_about_why_it_stopped(started, store,
+                                                                fake_claude, monkeypatch):
+    """The nudge is what the WORKER reads, and the transport wording is false here: its
+    turn was not lost to a 500, it cost money and the user chose to fund more. Telling it
+    "this was the transport, not anything you or the work did" would be a false account
+    of its own conversation."""
+    from jarvis.worker_session import PAUSE_BUDGET, TurnPause, _nudge
+
+    nudge = _nudge(TurnPause(reason=PAUSE_BUDGET, turn={}, retry_at=0.0, attempts=1,
+                             message="its budget was raised"))
+    assert "budget" in nudge
+    assert "transport" not in nudge
+    assert "API" not in nudge
+    # ...and it still carries the one instruction the whole nudge exists for.
+    assert "Do not start again" in nudge
+
+
+def test_an_open_round_is_allowed_to_finish_over_budget(started, store, catalog_file):
+    """Judging delivered work is how that work LANDS, so a round already open is not
+    interrupted by the budget. Parking would not even stop the machine —
+    `work_orders_awaiting_validation` is keyed off the round and bounded by
+    `OPEN_STATUSES`, which `budget_exhausted` is in — it would only make the two fight,
+    the round settling the status and the settler re-parking it on every tick."""
+    from jarvis.catalog import load_catalog
+
+    spec = load_catalog(catalog_file).projects[0]
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=1.0)
+    store.update_work_order(wo["id"], session_id="sess-x", result_summary="done",
+                            pr_url="https://example.invalid/pr/1")
+    bill_the_turn(store, wo["id"], 5.0)
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="fp-1")
+    store.set_status(wo["id"], "validating")
+
+    started.settle_work_order(spec, store, store.get_work_order(wo["id"]))
+    assert store.get_work_order(wo["id"])["status"] == "validating"
+
+    # ...and the moment the round settles, the budget takes over.
+    store.close_validation_round(rnd["id"], "passed")
+    store.set_status(wo["id"], "waiting_pr_merge")
+    started.settle_work_order(spec, store, store.get_work_order(wo["id"]))
+    assert store.get_work_order(wo["id"])["status"] == "budget_exhausted"
