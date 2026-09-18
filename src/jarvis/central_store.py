@@ -1281,6 +1281,19 @@ class CentralStore:
             f"SELECT * FROM agent_calls {clause} ORDER BY ts DESC LIMIT ?",
             (*params, limit)).fetchall())
 
+    def wo_call_cost(self, wo_id: str) -> float:
+        """What the OS ITSELF has spent on one work order, in dollars. One indexed sum.
+
+        The Jarvis half of `budget.Spend` — every Neo answer, panel seat, supervisor
+        review and digest charged to this order. Separate from `agent_call_totals`, which
+        groups the whole fleet for the cost report: this is asked on every dispatch and
+        every reconcile tick of every budgeted order, and it must be one number.
+        """
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS c FROM agent_calls WHERE wo_id=?",
+            (wo_id,)).fetchone()
+        return float(row["c"] or 0.0)
+
     def agent_call_totals(self, project: str | None = None) -> list[dict[str, Any]]:
         """Every work order's recorded spend, summed in SQL, grouped by kind/label/model.
 

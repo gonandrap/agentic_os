@@ -477,6 +477,7 @@ def turn_args(
     add_dirs: list[Path] | None = None,
     autocompact_window: int | None = None,
     agent: str | None = None,
+    max_budget_usd: float | None = None,
 ) -> list[str]:
     """argv for one worker turn. Split out from `spawn_turn` so tests can assert on it.
 
@@ -494,6 +495,22 @@ def turn_args(
         args += ["--worktree", worktree]
     args += _briefing_args(model, effort, permission_mode, append_system_prompt,
                            settings_file, add_dirs, autocompact_window, agent)
+    if max_budget_usd is not None:
+        # THE ENFORCEMENT POINT for a per-order budget (src/jarvis/budget.py, which
+        # documents the flag's measured behaviour in full). Three facts shape its use
+        # here, and none of them is in `claude --help`:
+        #
+        #  * the cap is PER INVOCATION — a resumed session's earlier spend does not count
+        #    against it — so the value passed is `budget - spent so far`, recomputed by
+        #    `worker_session.briefing_for` on every single turn, and NOT the budget;
+        #  * it is checked between API calls, so the turn overshoots by up to one call;
+        #  * the CLI only honours it with `--print`, which is why it lives HERE and not
+        #    in `_briefing_args`: `spawn_background` shares that helper and would take
+        #    the flag silently and ignore it, capping nothing while reading as capped.
+        #
+        # Formatted rather than str()'d so a computed remainder never reaches argv in
+        # scientific notation, which the CLI's parser does not accept.
+        args += ["--max-budget-usd", f"{max_budget_usd:.6f}"]
     # Same fence, same reason as `spawn_background`: `--add-dir` and `--tools` are both
     # variadic and will eat the prompt as an option value if it arrives bare. Nothing
     # may be appended after this.
@@ -609,11 +626,19 @@ def read_turn_result(outfile: Path, errfile: Path | None = None) -> TurnResult |
         except OSError:
             stderr_tail = ""
     ok = not data.get("is_error")
+    # `errors` is the CLI's own list of what went wrong, and it is the ONLY place some
+    # failures say anything at all: a turn stopped by `--max-budget-usd` writes no
+    # `result` field and no stderr, so without this the record would read "turn reported
+    # is_error" about a turn whose envelope said "Reached maximum budget ($5.00)".
+    # Below `result` in the fallback chain because when both exist `result` is the
+    # worker's own voice, which is the more useful of the two.
+    errors = " · ".join(str(e) for e in (data.get("errors") or []) if e)
     return TurnResult(
         ok=ok,
         result=data.get("result") or "",
         session_id=data.get("session_id") or "",
-        error="" if ok else (data.get("result") or stderr_tail or "turn reported is_error"),
+        error="" if ok else (data.get("result") or errors or stderr_tail
+                             or "turn reported is_error"),
         cost_usd=data.get("total_cost_usd"),
         num_turns=data.get("num_turns"),
         subtype=data.get("subtype") or "",
@@ -962,6 +987,28 @@ def transient_failure(text: str | None, *, terminal_reason: str | None = None,
     if _TRANSIENT_TEXT_RE.search(text):
         return TransientFailure(message=_summarise(text), status=None)
     return None
+
+
+# -- the budget ran out ---------------------------------------------------------------
+
+#: `terminal_reason` and `subtype` on an envelope the CLI stopped for `--max-budget-usd`.
+#: Measured on 2026-09-18 against the real API; the full envelope, and what else it does
+#: and does not carry, is documented at the top of src/jarvis/budget.py.
+BUDGET_TERMINAL_REASON = "budget_exhausted"
+BUDGET_SUBTYPE = "error_max_budget_usd"
+
+
+def stopped_for_budget(result: TurnResult) -> bool:
+    """Did `claude` stop this turn because it hit its budget?
+
+    STRUCTURED FIELDS ONLY, never the prose, for the reason `transient_failure` gives at
+    length: this repo's own workers write about budget exhaustion, and a text match would
+    let a worker quoting the error park its own work order. Both fields are read because
+    they are two independent statements of the same fact, and a CLI build carrying only
+    one of them must still be recognised.
+    """
+    return (result.terminal_reason == BUDGET_TERMINAL_REASON
+            or result.subtype == BUDGET_SUBTYPE)
 
 
 # -- the account cannot answer ---------------------------------------------------------

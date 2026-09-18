@@ -7,22 +7,26 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import os
 import signal
 import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
+
+log = logging.getLogger("jarvis.ops")
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from . import landing
 
 from .bootstrap import BootstrapReport, bootstrap_project, settings_drift
 from .catalog import (
+    DEFAULT_VALIDATION_FOLLOW_UP_CAP,
     SAFETY_KEYS,
     Catalog,
     CatalogError,
@@ -31,10 +35,11 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import config_version, db, fleet, invariants
+from . import budget, config_version, db, fleet, invariants
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import CentralStore
 from .daemon import daemon_running
+from .github import GitHubError
 from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
@@ -46,6 +51,7 @@ from .project_store import (
     OPEN_STATUSES,
     FORCEABLE_STATUSES,
     OPEN_VALIDATION_OUTCOMES,
+    TERMINAL_STATUSES,
     ProjectStore,
 )
 
@@ -741,8 +747,15 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       depends_on: list[str] | None = None,
                       parent_id: str | None = None,
                       issue_url: str | None = None,
-                      issue_priority: str | None = None) -> dict[str, Any]:
+                      issue_priority: str | None = None,
+                      budget_usd: float | None = None) -> dict[str, Any]:
     """File a work order. `parent_id` files it UNDER a feature order.
+
+    `budget_usd` caps what the order may spend; None falls back to the project's catalog
+    default, and None again — the fleet default — means no ceiling at all, which is what
+    every work order had before budgets existed. Resolved HERE, at creation, so `jarvis
+    wo show` can state the number and a later catalog edit cannot move a ceiling the user
+    has already been told about (`budget.default_for`).
 
     Until now the only way a work order acquired a parent was a plan release, because the
     only thing that filed one was a planner. A feature's project manager order files
@@ -777,6 +790,8 @@ def create_work_order(project_name: str, title: str, description: str = "",
             append_system_prompt=append_system_prompt, backlog_id=backlog_id,
             depends_on=depends_on, parent_id=parent_id, issue_url=issue_url,
             issue_priority=issue_priority,
+            budget_usd=(budget_usd if budget_usd is not None
+                        else budget.default_for(_spec_or_none(project_name))),
         )
     except (KeyError, ValueError) as e:
         # A dependency on a work order in another project cannot be honoured — the edge
@@ -1351,9 +1366,29 @@ def round_line(rnd: dict[str, Any]) -> str:
     # indistinguishability is the whole defect `jarvis validation force` removes — and the
     # place it has to say so is the line every surface already prints.
     forced = (rnd.get("forced_reason") or "").strip()
+    # WHAT THE ROUND FILED RATHER THAN BLOCKED ON. A count only: the items themselves are
+    # deliberation and live behind `jarvis validation show`, and naming the seat that
+    # raised one here would put a seat's name on a surface the submitter reads. Silent at
+    # zero — a line saying "0 follow-ups" on every round in the fleet would spend
+    # attention on an absence, the way `automerge_state` returns None rather than "off".
+    filed = rnd.get("follow_ups") or NO_FOLLOW_UPS
+    n_filed, dropped = len(filed.get("filed") or ()), int(filed.get("dropped") or 0)
+    failed = int(filed.get("failed") or 0)
+    # Assembled as a LIST and joined, not appended to a string: the three are
+    # independent, any subset can be empty, and string-appending a separator per clause
+    # is how a round that only FAILED came out as "· , · 6 not filed".
+    parts = []
+    if n_filed:
+        parts.append(f"{n_filed} follow-up issue{'' if n_filed == 1 else 's'} filed")
+    if dropped:
+        parts.append(f"{dropped} over the cap")
+    if failed:
+        parts.append(f"{failed} not filed")
+    note = f" · {', '.join(parts)}" if parts else ""
     return (f"round {rnd['round']} · {rnd['fingerprint']} · {rnd['outcome']}"
             f" · config {rnd.get('config_version') or 'not recorded'}"
             f" · commit {sha[:10] or 'not recorded'}"
+            + note
             + (f" · forced: {forced}" if forced else "")
             + (f" — {reason}" if reason else ""))
 
@@ -1446,6 +1481,262 @@ def alarm_standing_line(alarms: list[dict[str, Any]]) -> str:
     return f"{len(alarms)} ({standing}) — " + ", ".join(a["id"] for a in alarms)
 
 
+#: The event one filing writes, and the only link between a round and the issues it
+#: produced. Spec §4.6:
+#: docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
+#:
+#: ITS PAYLOAD DEPARTS FROM §4.6's `{round, round_id, ids, seats, dropped}` because the
+#: destination changed (user ruling, 2026-09-16: GitHub issues, not backlog rows). `items`
+#: carries the url, number, title and seat of each issue TOGETHER rather than as parallel
+#: lists, and `failed` is new — filing can now fail on a network, which a local insert
+#: could not.
+FOLLOW_UPS_EVENT = "validation_follow_ups_filed"
+
+#: What a round with nothing filed projects. PRESENT ON EVERY ROUND, which is the rule
+#: `validation_rounds`, `assumptions` and `alarms` already follow: a key that comes and
+#: goes is a key every consumer has to guard, and a Jinja template guards it by
+#: rendering nothing at all (`kn-99e37a4b`).
+NO_FOLLOW_UPS: dict[str, Any] = {"filed": [], "dropped": 0, "failed": 0}
+
+
+def follow_up_key(title: Any) -> str:
+    """The dedupe key for one finding's title: stripped, whitespace collapsed.
+
+    The house normalisation, the one `evidence._normalise` applies for the same reason.
+    NOT hashed, though §4.4 calls it a digest: the comparison is a set lookup in memory,
+    a hash buys nothing there, and the key is worth being able to read in a log line.
+    """
+    return " ".join(str(title or "").split())
+
+
+def follow_up_repo(project_path: Path) -> str:
+    """`owner/name` of the repository a follow-up for this project belongs on, or "".
+
+    Read from the CHECKOUT's own `origin` and from nowhere else. That is the point: the
+    repository name becomes a `gh --repo` argument, and the one source that no model and
+    no stored string can influence is the local remote (`github.LOCAL_GIT_READS`).
+
+    "" for a project with no `origin` at all — several in the fleet are local-only — and
+    the caller reports that as a filing it could not make rather than as a finding that
+    did not exist.
+    """
+    from . import github
+
+    pair = github.origin_repo(project_path)
+    return f"{pair[0]}/{pair[1]}" if pair else ""
+
+
+def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
+                               round_row: Mapping[str, Any],
+                               follow_ups: Sequence[Mapping[str, Any]],
+                               cfg: Any, *, wo_id: str | None = None,
+                               fo_id: str | None = None) -> dict[str, Any]:
+    """File this round's non-blocking findings as issues on the project's own tracker.
+
+    Called by BOTH daemon validation loops immediately after the opinions are recorded
+    and BEFORE the outcome branch: a follow-up is filed whether the round passed or was
+    rejected. Making it conditional on an outcome the seat could not see when it wrote
+    would reintroduce, in miniature, the treadmill this feature exists to end.
+
+    **Not in `validation.py`.** That module's contract is "it is called; it is never
+    messaged, and it messages nobody" — a panel that files GitHub issues has a side
+    effect the round machine cannot roll back when the round later fails on transport.
+    That is a contract boundary rather than a mechanical one, which is why it is written
+    down here.
+
+    **Not in `daemon.py` either.** One function, two callers, for the reason
+    `side_effects_of` and `collect_feature_evidence` are already here — and two inline
+    copies of a filing rule is the shape that drifts, when `_round_config`'s docstring
+    records Neo's ruling (question 176) that the two loops are held identical.
+
+    **NOT OVER THE BUS, though `bus.DeferralRequest` is exactly this shape** and
+    `reviewer` is already a legal sender. When the subject is under a feature order,
+    `bus.resolve` finds the manager and the deferral is DELIVERED AS A MESSAGE telling it
+    to run a command — a manager turn per nit, and the same fact recorded two different
+    ways depending on parentage. Direct filing has one behaviour.
+
+    **THE SUBMITTER IS TOLD NOTHING.** These are the project's tracker, not the worker's
+    homework, and `validation.REASON_LIMIT` is 1500 characters that
+    `daemon.REVIEW_FEEDBACK` and then `bus.render` each re-frame — every sentence added
+    there pushes the instructions that matter off the bottom.
+
+    **A FAILURE IS COUNTED, NEVER SWALLOWED.** Filing crosses a network now, so it can
+    fail in a way the backlog insert this replaced could not: no `origin`, no `gh`, no
+    credentials, a rate limit. Each such finding lands in `failed`, which reaches the
+    event, the timeline and every surface — because a finding that silently evaporated
+    is indistinguishable from a round that raised none.
+
+    Returns the event payload whether or not anything was written.
+    """
+    from . import issues
+
+    n, round_id = int(round_row["round"]), int(round_row["id"])
+    unit_id = wo_id or fo_id or ""
+    payload: dict[str, Any] = {"round": n, "round_id": round_id, "unit": unit_id,
+                               "items": [], "dropped": 0, "failed": 0}
+    # `follow_ups` is read defensively by the CALLER too (`verdict.get(...) or ()`):
+    # `Daemon.validator` is injectable and several suites inject fakes that return only
+    # the three keys that predate this.
+    if not getattr(cfg, "follow_ups", True) or not follow_ups:
+        return payload
+
+    # DISTINCT TITLES FIRST, and no network yet: two seats can reach the same nit in one
+    # round, and the tracker cannot dedupe an issue this round has not filed yet.
+    pending = _distinct(follow_ups)
+    if not pending:
+        return payload
+
+    repo = follow_up_repo(project.path)
+    if not repo:
+        # A project with no GitHub remote. Reported rather than silently skipped, and
+        # counted as failures because that is what they are: findings the panel raised
+        # and the OS could not record anywhere.
+        payload["failed"] += len(pending)
+        payload["reason"] = "the project has no GitHub `origin`"
+        return _record_filing(store, payload, wo_id=wo_id, fo_id=fo_id)
+
+    try:
+        # ONE round trip for the dedupe, whatever the cap — see `issues.follow_ups_filed`
+        # for why it must read `--state all`.
+        already = {follow_up_key(r.get("title"))
+                   for r in issues.follow_ups_filed(repo, unit_id)}
+    except GitHubError as e:
+        # The tracker could not be READ, so nothing may be written: filing blind would
+        # duplicate every follow-up this unit already has.
+        log.info("[%s] %s: could not read %s for dedupe: %s",
+                 project.name, unit_id, repo, e)
+        payload["failed"] += len(pending)
+        payload["reason"] = "the tracker could not be read"
+        return _record_filing(store, payload, wo_id=wo_id, fo_id=fo_id)
+
+    # DEDUPE BEFORE THE CAP, AND THE ORDER IS THE WHOLE CORRECTNESS OF THIS.
+    #
+    # Capping first reads as the tidier rule — bound the work before doing any of it —
+    # and it STARVES: a unit whose first `cap` findings are already filed spends the
+    # whole cap on duplicates and never reaches the ones behind them, on this round or
+    # any later one, for ever. Caught by a test, not by review.
+    #
+    # Nothing is paid for the order. The dedupe is ONE `issue list` call however many
+    # findings there are, and the per-finding network calls are the creates below, which
+    # the cap still bounds. So "cap before the network" is satisfied where it actually
+    # mattered.
+    fresh = [f for f in pending if follow_up_key(f.get("title")) not in already]
+    cap = int(getattr(cfg, "max_follow_ups", DEFAULT_VALIDATION_FOLLOW_UP_CAP))
+    payload["dropped"] = max(0, len(fresh) - cap)
+
+    pr_url = str(round_row.get("pr_url") or "")
+    for finding in fresh[:cap]:
+        title = follow_up_key(finding.get("title"))
+        seat = str(finding.get("seat") or "")
+        try:
+            url = issues.file_follow_up(
+                repo, title,
+                _follow_up_body(finding, unit_id=unit_id, round_no=n, pr_url=pr_url,
+                                seat=seat))
+        except GitHubError as e:
+            log.info("[%s] %s: filing %r on %s failed: %s",
+                     project.name, unit_id, title, repo, e)
+            payload["failed"] += 1
+            continue
+        payload["items"].append({"url": url, "number": issues.issue_number(url),
+                                 "title": title, "seat": seat})
+    return _record_filing(store, payload, wo_id=wo_id, fo_id=fo_id)
+
+
+def _distinct(follow_ups: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The findings worth trying to file: titled, and one per normalised title.
+
+    A finding with nothing to call it cannot be an issue anybody can act on, and it is
+    dropped SILENTLY rather than counted — `dropped` means "over the cap, a later round
+    may raise it again", and a titleless finding retried later produces the same nothing.
+    """
+    kept: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for finding in follow_ups:
+        title = follow_up_key(finding.get("title"))
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        kept.append(finding)
+    return kept
+
+
+def _record_filing(store: ProjectStore, payload: dict[str, Any], *,
+                   wo_id: str | None, fo_id: str | None) -> dict[str, Any]:
+    """Write the event, unless the round had nothing at all to say."""
+    if payload["items"] or payload["dropped"] or payload["failed"]:
+        if wo_id:
+            store.add_event(wo_id, FOLLOW_UPS_EVENT, payload)
+        else:
+            feature_event(store, str(fo_id), FOLLOW_UPS_EVENT,
+                          {**payload, "feature_order": fo_id})
+    return payload
+
+
+def _follow_up_body(finding: Mapping[str, Any], *, unit_id: str, round_no: int,
+                    pr_url: str, seat: str) -> str:
+    """The issue body: the finding's own detail, then where it came from.
+
+    THE SEAT IS NAMED HERE, and this is one of the two places it may be (the other is
+    `jarvis validation show`). Deliberation never reaches the submitter, but the tracker
+    is the project's own record, read later by a person deciding whether to act, and
+    which reviewer said this is exactly what they need. This door is deliberate; do not
+    close it (spec §4.2).
+
+    The footer is the only context whoever picks this up will have: the seat's sentence
+    alone does not say which change it was written about.
+    """
+    detail = str(finding.get("detail") or "").strip()
+    footer = [
+        "",
+        "---",
+        f"Raised by the Jarvis validation panel's `{seat or 'panel'}` seat in round "
+        f"{round_no} of `{unit_id}`, as a follow-up rather than a blocker — the review "
+        f"judged the work shippable without it.",
+    ]
+    if pr_url:
+        footer.append(f"Pull request: {pr_url}")
+    return "\n".join([detail or "_The seat recorded no detail._", *footer])
+
+
+def filed_follow_ups(store: ProjectStore, *, wo_id: str | None = None,
+                     fo_id: str | None = None) -> dict[int, dict[str, Any]]:
+    """What the panel filed, per round id, for the surfaces that print a round.
+
+    ONE resolver, because `validation_rounds` and `validation_detail` are two different
+    projections read by four surfaces between them, and two of them computing this
+    separately is how they come to show different things (`kn-4ea33fe6`, `kn-99e37a4b`).
+
+    Read from the EVENT alone — no network, ever. A surface that asked GitHub what a
+    round filed would make `jarvis wo show` fail when the tracker is unreachable, and
+    would re-read one issue per round per page view. The event is what the OS recorded
+    that it did, which is the honest thing for a record to show.
+
+    Free on a fleet that has never filed one: no event, no work.
+    """
+    rows = (store.events_of_kind(wo_id, FOLLOW_UPS_EVENT) if wo_id
+            else feature_events_of_kind(store, str(fo_id), FOLLOW_UPS_EVENT))
+    if not rows:
+        return {}
+    out: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        p = db.from_json(row["payload"], {})
+        # A round RETRIED after a transport failure files again and writes a second
+        # event. The tracker deduped the writes, so the two events are a partition of one
+        # round's filing: items accumulate, and `dropped`/`failed` are the LAST attempt's
+        # — the attempt that decided what is still missing.
+        rnd = out.setdefault(int(p.get("round_id") or 0),
+                             {"filed": [], "dropped": 0, "failed": 0})
+        for item in p.get("items") or ():
+            if isinstance(item, Mapping) and item.get("url"):
+                rnd["filed"].append(dict(item))
+        rnd["dropped"] = int(p.get("dropped") or 0)
+        rnd["failed"] = int(p.get("failed") or 0)
+        if p.get("reason"):
+            rnd["reason"] = str(p["reason"])
+    return out
+
+
 def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
                       fo_id: str | None = None) -> list[dict[str, Any]]:
     """One unit's rounds, oldest first, WITHOUT the seats' opinions.
@@ -1455,8 +1746,15 @@ def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
     they are a copy of what the unit already says about itself, and a round listing is
     read to answer "how many times, and what came back", not to re-read the submission.
     """
-    return [{k: r[k] for k in ("id", "round", "ts", "fingerprint", "outcome", "reason",
-                               "pr_url", "config_version", "head_sha", "forced_reason")}
+    filed = filed_follow_ups(store, wo_id=wo_id, fo_id=fo_id)
+    return [{**{k: r[k] for k in ("id", "round", "ts", "fingerprint", "outcome",
+                                  "reason", "pr_url", "config_version", "head_sha",
+                                  "forced_reason")},
+             # ALWAYS PRESENT, even empty — the rule this key list, `assumptions` and
+             # `alarms` already follow. `jarvis wo show`, `jarvis fo show` and both
+             # dashboard pages read THIS projection, so a key that came and went would
+             # be one every consumer had to guard (spec §4.7).
+             "follow_ups": filed.get(int(r["id"]), NO_FOLLOW_UPS)}
             for r in store.validation_rounds(wo_id=wo_id, fo_id=fo_id)]
 
 
@@ -1639,7 +1937,13 @@ def validation_detail(store: ProjectStore, *, wo_id: str | None = None,
     an open store so the pages that already have one do not open a second, and so the
     CLI and the dashboard cannot drift about what a deliberation contains.
     """
-    rounds = [{**rnd, "opinions": store.validation_opinions(rnd["id"])}
+    # `validation_rounds` is a DIFFERENT projection, and this one is what the dashboard
+    # macro and `jarvis validation show` are fed — so the key is added in both, off the
+    # same resolver, because two surfaces computing it separately is how they come to
+    # show different things (`kn-99e37a4b`).
+    filed = filed_follow_ups(store, wo_id=wo_id, fo_id=fo_id)
+    rounds = [{**rnd, "opinions": store.validation_opinions(rnd["id"]),
+               "follow_ups": filed.get(int(rnd["id"]), NO_FOLLOW_UPS)}
               for rnd in store.validation_rounds(wo_id=wo_id, fo_id=fo_id)]
     envelopes = store.envelopes(subject_wo_id=wo_id, subject_fo_id=fo_id)
     return {"rounds": rounds, "envelopes": envelopes,
@@ -3167,7 +3471,8 @@ def review_work_order(wo_id: str, accept: bool = True,
 def create_feature_order(project_name: str, title: str, description: str = "",
                          origin: str = "jarvis",
                          backlog_id: str | None = None,
-                         max_parallel: int | None = None) -> dict[str, Any]:
+                         max_parallel: int | None = None,
+                         budget_usd: float | None = None) -> dict[str, Any]:
     """File the coarse ask. Nothing is decomposed here — the daemon opens a planner.
 
     Deliberately the same shape as `create_work_order`, because the whole point of the
@@ -3199,11 +3504,55 @@ def create_feature_order(project_name: str, title: str, description: str = "",
         )
     store = ProjectStore(paths[project_name])
     try:
-        return store.create_feature_order(title=title, description=description,
-                                          origin=origin, backlog_id=backlog_id,
-                                          max_parallel=max_parallel)
+        return store.create_feature_order(
+            title=title, description=description, origin=origin, backlog_id=backlog_id,
+            max_parallel=max_parallel,
+            # A FAMILY budget, so it takes the family default and never the
+            # per-work-order one — `catalog.DEFAULT_FEATURE_BUDGET_USD` says why they are
+            # two settings rather than one scaled from the other.
+            budget_usd=(budget_usd if budget_usd is not None
+                        else budget.feature_default_for(_spec_or_none(project_name))))
     finally:
         store.close()
+
+
+def _spec_or_none(project_name: str) -> Any:
+    """This project's catalog entry, or None when the catalog cannot be read.
+
+    None is a DEFAULT, not a failure: the only thing read off the spec here is a standing
+    budget, and a catalog that has moved must not stop a work order being filed. No
+    catalog means no default means no ceiling — the behaviour the OS has always had.
+    """
+    try:
+        return project_spec(resolve_catalog(), project_name)
+    except (OpsError, CatalogError):
+        return None
+
+
+def feature_order_budget(fo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """A feature's family budget, what the family has spent, and what is unreserved."""
+    name, path, fo = find_feature_order(fo_id, project_name)
+    store = ProjectStore(path)
+    central = CentralStore()
+    try:
+        p = budget.pool(store, central, fo)
+        spend = budget.feature_spent(store, central, fo)
+        children = [
+            {"wo_id": c["id"], "status": c["status"],
+             "reserved_usd": c.get("budget_reserved_usd"),
+             "spent_usd": budget.spent(store, central, c["id"]).total_usd}
+            for c in store.feature_children(fo_id)
+        ]
+    finally:
+        central.close()
+        store.close()
+    return {"project": name, "fo_id": fo_id, "title": fo["title"],
+            "status": fo["status"], "budget_usd": fo.get("budget_usd"),
+            "worker_usd": spend.worker_usd, "jarvis_usd": spend.jarvis_usd,
+            "spent_usd": spend.total_usd,
+            "reserved_usd": p.held_usd if p else None,
+            "unreserved_usd": p.unreserved_usd if p else None,
+            "children": children}
 
 
 def find_feature_order(fo_id: str, project_name: str | None = None
@@ -7000,3 +7349,204 @@ def knowledge_usage_report(project: str | None = None, days: int | None = None,
         "silent_orders": silent[:limit], "silent_order_count": len(silent),
         "could_have_read": missed[:limit], "could_have_read_count": len(missed),
     }
+
+
+# -- budgets -----------------------------------------------------------------------
+#
+# The verbs behind `jarvis wo budget` and `jarvis fo budget`. Setting a budget is an
+# ordinary write; RAISING one on an order that has already stopped for it is the thing
+# these exist to make possible, and the measured fact that makes it possible is that a
+# turn stopped by `--max-budget-usd` leaves a complete, resumable transcript behind
+# (src/jarvis/budget.py). So a top-up does not restart the work, it continues it.
+
+
+def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """What this work order's ceiling is and what it has spent. Read-only."""
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    central = CentralStore()
+    try:
+        cap = budget.ceiling(store, central, wo)
+        spend = budget.spent(store, central, wo_id)
+        parent_pool = None
+        if wo.get("parent_id"):
+            try:
+                parent_pool = budget.pool(store, central,
+                                          store.get_feature_order(wo["parent_id"]))
+            except KeyError:
+                parent_pool = None
+    finally:
+        central.close()
+        store.close()
+    return {
+        "project": name, "wo_id": wo_id, "title": wo["title"], "status": wo["status"],
+        "budget_usd": wo.get("budget_usd"),
+        "reserved_usd": wo.get("budget_reserved_usd"),
+        "worker_usd": spend.worker_usd, "jarvis_usd": spend.jarvis_usd,
+        "spent_usd": spend.total_usd,
+        "cap_usd": cap.cap_usd if cap else None,
+        "cap_source": cap.source if cap else None,
+        "remaining_usd": cap.remaining_usd if cap else None,
+        "feature_unreserved_usd": parent_pool.unreserved_usd if parent_pool else None,
+    }
+
+
+def set_work_order_budget(wo_id: str, amount: float | None,
+                          project_name: str | None = None) -> dict[str, Any]:
+    """Set, change or clear a work order's budget — and resume it if it had stopped.
+
+    `amount=None` clears the ceiling: the order runs uncapped again, which is what every
+    order does by default.
+
+    THE RESUME IS THE POINT. A budget that can only ever stop work is a worse OS than no
+    budget at all, so raising the number on a `budget_exhausted` order puts it back to
+    work in the SAME session, with its context and its half-finished work intact. The
+    turn that was cut off is relaunched by `worker_session.retry`'s rules — a nudge when
+    the conversation already reached the model, the original prompt when it did not — so
+    the worker is never told to redo what it has already done.
+
+    It refuses to resume on a number that is not enough to resume ON. Setting $5 on an
+    order that has already spent $6 leaves it exactly where it is, with a message saying
+    so, rather than launching a turn the CLI would stop on its first call and charging
+    the user for the privilege.
+
+    A CHILD OF A FEATURE IS RE-CUT BEFORE IT IS JUDGED. Its ceiling is the tighter of its
+    own budget and the slice its feature reserved for it, so raising the budget alone
+    would leave the stale slice winning the `min` and the order stuck for ever. The
+    re-cut spends the feature's CURRENT unreserved remainder, which is the money the
+    family actually has — and when that is nothing, the note says so and names the
+    feature, because "top up the child" and "top up the feature" are then different acts.
+    """
+    name, path, wo = find_work_order(wo_id, project_name)
+    if wo["status"] in TERMINAL_STATUSES:
+        raise OpsError(
+            f"{wo_id} is {wo['status']} — a settled order has nothing left to spend")
+    store = ProjectStore(path)
+    central = CentralStore()
+    resumed = False
+    note = ""
+    try:
+        store.update_work_order(wo_id, budget_usd=amount)
+        store.add_event(wo_id, "budget_set", {
+            "budget_usd": amount, "previous_usd": wo.get("budget_usd"), "by": "user"})
+        fresh = store.get_work_order(wo_id)
+        if fresh["status"] == budget.EXHAUSTED and fresh.get("budget_reserved_usd"):
+            budget.reserve(store, central, fresh)
+            fresh = store.get_work_order(wo_id)
+        cap = budget.ceiling(store, central, fresh)
+        spend = budget.spent(store, central, wo_id)
+        if fresh["status"] == budget.EXHAUSTED:
+            if cap is not None and cap.exhausted:
+                note = (f"still over its ceiling — {budget.format_usd(spend.total_usd)} "
+                        f"spent against {budget.format_usd(cap.cap_usd)}")
+                if cap.source == "feature":
+                    note += (" (its feature's slice, and the feature has "
+                             f"{budget.format_usd(_feature_unreserved(store, central, fresh))}"
+                             " unreserved — raise the feature with `jarvis fo budget`)")
+            else:
+                resumed, note = _resume_after_budget(store, name, fresh)
+    finally:
+        central.close()
+        store.close()
+    return {"project": name, "wo_id": wo_id, "title": wo["title"],
+            "budget_usd": amount, "previous_usd": wo.get("budget_usd"),
+            "spent_usd": spend.total_usd, "resumed": resumed, "note": note}
+
+
+def _feature_unreserved(store: ProjectStore, central: CentralStore,
+                        wo: dict[str, Any]) -> float:
+    """What this child's feature has that no live child has claimed. 0.0 if it has none.
+
+    Neo's condition on reserve-on-dispatch, reached from the other end: the escalation
+    states it when the child stops, and this states it again when a top-up of the child
+    could not find any money to give it.
+    """
+    parent_id = wo.get("parent_id")
+    if not parent_id:
+        return 0.0
+    try:
+        fo = store.get_feature_order(parent_id)
+    except KeyError:
+        return 0.0
+    p = budget.pool(store, central, fo, claimant=wo["id"])
+    return p.unreserved_usd if p else 0.0
+
+
+def _resume_after_budget(store: ProjectStore, project_name: str,
+                         wo: dict[str, Any]) -> tuple[bool, str]:
+    """Put a topped-up work order back to work, or say why it could not be.
+
+    Best effort, and a failure is REPORTED rather than raised: the budget has been raised
+    either way, and the daemon's own loops reach the order again on the next tick now
+    that it is out of `budget_exhausted`. Losing the new number because a relaunch could
+    not happen this second would be the worse outcome.
+    """
+    from . import worker_session
+
+    turn = store.latest_turn(wo["id"])
+    if turn is None:
+        # Never dispatched — it stopped before its first turn ran. `pending` is where the
+        # dispatch loop picks it up, and it reserves a fresh slice on the way in.
+        store.set_status(wo["id"], "pending")
+        store.clear_attention(wo["id"])
+        return True, "back on the dispatch queue"
+    try:
+        spec = project_spec(resolve_catalog(), project_name)
+    except OpsError as e:
+        store.set_status(wo["id"], "pending")
+        store.clear_attention(wo["id"])
+        return False, f"budget raised, but the catalog could not be read ({e})"
+    pause = worker_session.TurnPause(
+        # Constructed, never diagnosed: `turn_pause` returns None for a budget stop
+        # (worker_session._reap files it without a `reason` precisely so the retry sweep
+        # can never pick it up). This exists only to hand `retry` the two things it needs
+        # — the turn to relaunch, and a reason to word a nudge from.
+        reason=worker_session.PAUSE_BUDGET, turn=turn, retry_at=0.0, attempts=1,
+        message="its budget was raised",
+    )
+    store.set_status(wo["id"], "running")
+    store.clear_attention(wo["id"])
+    try:
+        fresh = worker_session.retry(store, spec, wo, pause)
+    except budget.BudgetExhausted as e:
+        budget.escalate(store, store.get_work_order(wo["id"]), e.exhausted)
+        return False, "still has no headroom — it stopped again immediately"
+    except Exception as e:  # noqa: BLE001 — see the docstring
+        store.set_status(wo["id"], "pending")
+        return False, f"budget raised, but the relaunch failed ({e})"
+    store.add_event(wo["id"], "budget_resumed",
+                    {"budget_usd": wo.get("budget_usd"), "turn": fresh["seq"]})
+    return True, f"resumed at turn {fresh['seq']}"
+
+
+def set_feature_budget(fo_id: str, amount: float | None,
+                       project_name: str | None = None) -> dict[str, Any]:
+    """Set, change or clear a FEATURE order's family budget.
+
+    Raising it takes the feature out of `budget_exhausted` on the next reconcile tick
+    (`Daemon.settle_features`). Its CHILDREN stay parked in their own exhausted state
+    until each is topped up: the family has money again, but which child gets it is the
+    user's call, and silently re-funding every one of them would spend the new budget on
+    whatever happened to be running rather than on what the user meant to rescue.
+
+    `exhausted_children` in the result is that list, and it is the whole instruction —
+    `jarvis wo budget <child> <amount>` re-cuts the child's slice out of the money this
+    just added, and resumes it. Nothing here writes a reservation: doing it from this end
+    would have to guess the split, which is the guess the user came to make.
+    """
+    name, path, fo = find_feature_order(fo_id, project_name)
+    store = ProjectStore(path)
+    central = CentralStore()
+    try:
+        store.update_feature_order(fo_id, budget_usd=amount)
+        p = budget.pool(store, central, store.get_feature_order(fo_id))
+        stuck = [c["id"] for c in store.feature_children(fo_id)
+                 if c["status"] == budget.EXHAUSTED]
+    finally:
+        central.close()
+        store.close()
+    return {"project": name, "fo_id": fo_id, "title": fo["title"],
+            "budget_usd": amount, "previous_usd": fo.get("budget_usd"),
+            "spent_usd": p.spent_usd if p else None,
+            "unreserved_usd": p.unreserved_usd if p else None,
+            "exhausted_children": stuck}

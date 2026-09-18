@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -133,6 +134,59 @@ DEFAULT_MAX_IN_FLIGHT = 3
 # routine event. The CLI accepts 100k-1M and rejects anything outside; a project can move
 # it either way, or set it to null to opt out and take the model's own window.
 DEFAULT_AUTOCOMPACT_WINDOW = 400_000
+# A STANDING DOLLAR BUDGET for every new order in a project, in US dollars, or None for
+# no ceiling — which is the default and is what the OS did before budgets existed. An OS
+# that starts refusing to work because of a number nobody set would be worse than the
+# problem, so nothing here is populated by default and a project opts in.
+#
+# Two settings rather than one scaled from the other. A feature order's budget bounds its
+# whole family (planner, manager, every child), and nothing at the moment the default is
+# written knows how many children a feature will have — so a per-work-order number says
+# nothing useful about a family, and a multiple of it would be a guess wearing a
+# configuration's clothes. A project that sets only one gets a ceiling on that kind of
+# order alone.
+#
+# Resolved at CREATION and stamped onto the row, unlike `autocompact_window` just above,
+# which is re-read from the catalog on every turn. Deliberately the opposite choice: a
+# budget is a contract about ONE order that `jarvis wo show` has to be able to state, and
+# lowering a fleet default must not strand work the user already authorised at the old
+# number. See src/jarvis/budget.py.
+DEFAULT_BUDGET_USD: float | None = None
+DEFAULT_FEATURE_BUDGET_USD: float | None = None
+
+
+def _parse_budget(raw: dict[str, Any], key: str, where: str,
+                  default: float | None) -> float | None:
+    """Validate a dollar budget. An explicit null means "no ceiling".
+
+    Rejected at load time for the reason the autocompact window is: a bad value would
+    otherwise surface as a refused `claude` invocation on the first dispatch, hours after
+    the edit that caused it. Zero is refused rather than read as "no ceiling" — it looks
+    like an instruction to spend nothing, and silently inverting that is the one
+    misreading that costs money.
+
+    `NaN` IS REFUSED HERE AND NOT ONLY IN `budget.parse_amount`, because `json.loads`
+    accepts a bare `NaN` literal, so a catalog can carry one and this is the only thing
+    between it and every new order in the project. Its danger is spelled out in that
+    function: a NaN budget fails OPEN while rendering as enabled, and stamped on a
+    project default it does so fleet-wide and silently. `isinstance(value, float)` is
+    true of it, and so is `not (value <= 0)`.
+    """
+    if key not in raw:
+        return default
+    value = raw[key]
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CatalogError(f"{where} must be a dollar amount or null, got {value!r}")
+    if not math.isfinite(value):
+        raise CatalogError(f"{where} must be a finite dollar amount, got {value!r}")
+    if value <= 0:
+        raise CatalogError(
+            f"{where} must be greater than zero (use null for no ceiling), got {value}")
+    return float(value)
+
+
 AUTOCOMPACT_MIN = 100_000    # `claude --autocompact` rejects anything under this
 AUTOCOMPACT_MAX = 1_000_000  # ... or over this
 
@@ -241,6 +295,9 @@ class WorkerDefaults:
     append_system_prompt: str | None = None
     # None = no bound (the model's own window stands). See DEFAULT_AUTOCOMPACT_WINDOW.
     autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
+    # None = no ceiling, which is the default everywhere. See DEFAULT_BUDGET_USD.
+    budget_usd: float | None = DEFAULT_BUDGET_USD
+    feature_budget_usd: float | None = DEFAULT_FEATURE_BUDGET_USD
 
 
 # The validation panel's default roster: every seat in the vocabulary. Unlike Neo's
@@ -268,6 +325,16 @@ DEFAULT_VALIDATION_MAX_ROUNDS = 3
 # is 150,380 chars. Spec §6:
 # docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md
 DEFAULT_VALIDATION_DIFF_CHARS = 150000
+
+# How many follow-up findings one round may file against the project backlog.
+#
+# A BOUND, NOT A JUDGEMENT. Title matching is the only dedupe available — a seat writes a
+# slightly different sentence for the same nit each round — so near-duplicate rows WILL
+# get through. 5 keeps that failure a handful of items a user drops in a minute rather
+# than a backlog nobody can read; findings past it are dropped and a later round may
+# raise them again. Spec §4.4:
+# docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
+DEFAULT_VALIDATION_FOLLOW_UP_CAP = 5
 
 
 @dataclass
@@ -338,6 +405,17 @@ class ValidationConfig:
     # what makes an accepted assumption safe to land is that the panel judged the work it
     # was part of; turning the panel off must stop this with it.
     auto_review: bool = False
+    # WHETHER A NON-BLOCKING FINDING IS KEPT AS A BACKLOG ITEM, or discarded. `False`
+    # does not restore the old behaviour — the panel stopped rejecting over one with no
+    # knob at all — it only throws the finding away, so this is the named instance of the
+    # carve-out above and it ships True. `kn-a88a56b6` is the discriminator; do not
+    # re-decide it here. Spec §4.5:
+    # docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
+    #
+    # Per project by the same field-level fallback as `auto_merge` and `auto_review`.
+    follow_ups: bool = True
+    # The cap above, per project. See DEFAULT_VALIDATION_FOLLOW_UP_CAP.
+    max_follow_ups: int = DEFAULT_VALIDATION_FOLLOW_UP_CAP
 
 
 # -- `jarvis inspect`: what counts as worth reporting, and what as worth interrupting for
@@ -874,6 +952,8 @@ class OsConfig:
     #: DEFAULT_MAX_IN_FLIGHT.
     max_in_flight: int = DEFAULT_MAX_IN_FLIGHT
     default_autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
+    default_budget_usd: float | None = DEFAULT_BUDGET_USD
+    default_feature_budget_usd: float | None = DEFAULT_FEATURE_BUDGET_USD
     #: Read by the cost surfaces, not by a worker launch — see DEFAULT_COLD_PREFIX_FLOOR.
     cold_prefix_floor: int = DEFAULT_COLD_PREFIX_FLOOR
     cold_prefix_floor_max: int = DEFAULT_COLD_PREFIX_FLOOR_MAX
@@ -1084,6 +1164,11 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     diff_chars = int(raw.get("diff_chars", base.diff_chars))
     if diff_chars < 1:
         raise _err(f"{where}.diff_chars must be >= 1")
+    max_follow_ups = int(raw.get("max_follow_ups", base.max_follow_ups))
+    if max_follow_ups < 0:
+        # 0 is legal and is NOT the same setting as `follow_ups: false`: it files
+        # nothing while leaving every dropped finding counted on the round's event.
+        raise _err(f"{where}.max_follow_ups must be >= 0")
     return ValidationConfig(
         enabled=bool(raw.get("enabled", base.enabled)),
         roster=roster,
@@ -1093,6 +1178,9 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         max_rounds=max_rounds,
         diff_chars=diff_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
+        # Same field-level fallback as every flag in this block — see `auto_merge` below.
+        follow_ups=bool(raw.get("follow_ups", base.follow_ups)),
+        max_follow_ups=max_follow_ups,
         # `base.auto_merge` is the fleet answer when this project names nothing, and the
         # shipped `False` when the fleet names nothing either — the field-level fallback
         # that makes this per-project rather than global. A project opts in by naming it.
@@ -1454,6 +1542,11 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         default_autocompact_window=_autocompact_or_err(
             defaults, "autocompact_window", "os.defaults.autocompact_window",
             DEFAULT_AUTOCOMPACT_WINDOW),
+        default_budget_usd=_parse_budget(
+            defaults, "budget_usd", "os.defaults.budget_usd", DEFAULT_BUDGET_USD),
+        default_feature_budget_usd=_parse_budget(
+            defaults, "feature_budget_usd", "os.defaults.feature_budget_usd",
+            DEFAULT_FEATURE_BUDGET_USD),
         notification_sinks=notif.get("sinks", ["log"]),
         telegram_token_env=telegram.get("token_env", "JARVIS_TELEGRAM_TOKEN"),
         telegram_chat_id_env=telegram.get("chat_id_env", "JARVIS_TELEGRAM_CHAT_ID"),
@@ -1522,6 +1615,12 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 w, "autocompact_window",
                 f"project {name}: worker.autocompact_window",
                 os_cfg.default_autocompact_window),
+            budget_usd=_parse_budget(
+                w, "budget_usd", f"project {name}: worker.budget_usd",
+                os_cfg.default_budget_usd),
+            feature_budget_usd=_parse_budget(
+                w, "feature_budget_usd", f"project {name}: worker.feature_budget_usd",
+                os_cfg.default_feature_budget_usd),
         )
         try:
             gate_cfg = GateConfig.parse(p.get("gates"))

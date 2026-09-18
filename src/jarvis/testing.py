@@ -428,6 +428,41 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
                                 "usage": {"input_tokens": 0, "output_tokens": 0}},
                 }) + "\n")
         sys.exit(0)
+    # THE BUDGET STOP, and every field here was measured off a real envelope on
+    # 2026-09-18 rather than invented (src/jarvis/budget.py records the probe). Three of
+    # them are the ones a fake usually gets wrong, and each is load-bearing:
+    #
+    #  * there is NO `result` key. The real CLI writes none, so `read_turn_result` has to
+    #    fall back to `errors` — a fake that supplied a `result` would test a path the
+    #    real one never takes and hide that the record would otherwise read "turn
+    #    reported is_error".
+    #  * `total_cost_usd` EXCEEDS the cap that was passed. The check runs between API
+    #    calls, so the turn always overshoots by the call that crossed the line, and a
+    #    fake that stopped exactly at the cap would let an off-by-one in the accounting
+    #    through.
+    #  * it exits 1 having written a complete, parseable envelope. Both halves matter:
+    #    the non-zero status is what a caller sees first, and the envelope is what makes
+    #    the last turn billable.
+    #
+    # BELOW the transcript write, like `api_error` and unlike the usage limit: the turn
+    # ran, did work and spent money before it was stopped, which is exactly why the
+    # session stays resumable once the user raises the budget.
+    if os.environ.get("FAKE_CLAUDE_TURN") == "budget":
+        cap = float(opt("--max-budget-usd", "0") or 0)
+        print(json.dumps({
+            "type": "result", "subtype": "error_max_budget_usd", "is_error": True,
+            "session_id": sid, "num_turns": 1,
+            "total_cost_usd": round(cap + 0.05, 6),
+            "duration_api_ms": 4765, "stop_reason": "end_turn",
+            "terminal_reason": "budget_exhausted",
+            "errors": ["Reached maximum budget ($%s)" % cap],
+            "usage": {"input_tokens": 2, "output_tokens": 190},
+            "modelUsage": {"claude-fake-1": {
+                "inputTokens": 2, "outputTokens": 190, "cacheReadInputTokens": 18656,
+                "cacheCreationInputTokens": 16193, "costUSD": round(cap + 0.05, 6),
+                "contextWindow": 200000, "maxOutputTokens": 32000}},
+        }))
+        sys.exit(1)
     if os.environ.get("FAKE_CLAUDE_TURN") == "error":
         print(json.dumps({"type": "result", "subtype": "error_during_execution",
                           "is_error": True, "result": "model call failed",
@@ -988,12 +1023,54 @@ def roster():
 
 
 if argv[:2] == ["issue", "create"]:
-    url = os.environ["FAKE_GH_ISSUE_URL"]
+    # ONE URL PER CALL when FAKE_GH_ISSUE_SERIES is set, the fixed url otherwise. The
+    # fixed url is the older behaviour and every existing test depends on it; a caller
+    # that files SEVERAL issues in one go (a validation round's follow-ups) needs them to
+    # come back distinct, or a dedupe bug is invisible — the second create silently
+    # overwrites the first and the tracker ends up with exactly one issue either way.
+    series = os.environ.get("FAKE_GH_ISSUE_SERIES")
+    if series:
+        counter = os.path.join(state_dir, "issue-seq")
+        n = 0
+        if os.path.exists(counter):
+            with open(counter) as f:
+                n = int(f.read() or 0)
+        n += 1
+        with open(counter, "w") as f:
+            f.write(str(n))
+        url = series.rstrip("/") + "/" + str(n)
+    else:
+        url = os.environ["FAKE_GH_ISSUE_URL"]
     rows, r = row(url)
     if "--label" in argv:
         r["labels"] = sorted(set(r["labels"]) | {argv[argv.index("--label") + 1]})
+    if "--title" in argv:
+        r["title"] = argv[argv.index("--title") + 1]
+    r["body"] = stdin
     save(rows)
     print(url)
+elif argv[:2] == ["issue", "list"]:
+    # THE DEDUPE'S READ. Honours --state and --label and --search the way the real CLI
+    # does, because every one of those is load-bearing for the caller: --state all is
+    # what stops a closed follow-up being re-filed for ever, --label is what keeps a
+    # person's own issue out of the answer, and --search carries the unit id.
+    want_state = argv[argv.index("--state") + 1].upper() if "--state" in argv else "OPEN"
+    want_label = argv[argv.index("--label") + 1] if "--label" in argv else ""
+    search = argv[argv.index("--search") + 1] if "--search" in argv else ""
+    term = search.replace(" in:body", "").strip()
+    out = []
+    for u, r in sorted(issues().items()):
+        if want_state != "ALL" and r.get("state", "OPEN").upper() != want_state:
+            continue
+        if want_label and want_label not in r.get("labels", []):
+            continue
+        if term and term not in (r.get("body") or ""):
+            continue
+        number = u.rstrip("/").rsplit("/", 1)[-1]
+        out.append({"number": int(number) if number.isdigit() else 0,
+                    "title": r.get("title", ""), "url": u,
+                    "state": r.get("state", "OPEN")})
+    print(json.dumps(out))
 elif argv[:2] == ["issue", "view"]:
     rows, r = row(argv[2] if len(argv) > 2 else "")
     if r.get("_missing"):
@@ -1365,6 +1442,27 @@ def fake_gh(tmp_path, monkeypatch):
             rows = self.issues
             rows[issue_url] = {**rows.get(issue_url, {"comments": []}),
                                "state": state.upper(),
+                               "labels": sorted(labels or [])}
+            (gdir / "issues.json").write_text(json.dumps(rows))
+
+        def issue_series(self, base: str) -> str:
+            """Make `gh issue create` mint `<base>/1`, `<base>/2`, … one per call.
+
+            What a test filing SEVERAL issues in one round needs. Without it the fake
+            answers one url every time, two follow-ups collapse onto one issue, and a
+            broken dedupe is indistinguishable from a working one.
+            """
+            monkeypatch.setenv("FAKE_GH_ISSUE_SERIES", base.rstrip("/"))
+            return base
+
+        def add_issue(self, issue_url: str, title: str, body: str = "",
+                      state: str = "OPEN", labels: list[str] | None = None) -> None:
+            """Put an issue on the tracker as `issue list` will see it — title and body
+            included, which `set_issue` does not carry because nothing read them before
+            the follow-up dedupe did."""
+            rows = self.issues
+            rows[issue_url] = {**rows.get(issue_url, {"comments": []}),
+                               "state": state.upper(), "title": title, "body": body,
                                "labels": sorted(labels or [])}
             (gdir / "issues.json").write_text(json.dumps(rows))
 

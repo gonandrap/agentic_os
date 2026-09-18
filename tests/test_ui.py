@@ -2181,3 +2181,68 @@ def test_an_abandoned_request_is_not_shown_as_expired(gated):
     assert "abandoned, never reviewed" in page
     # ...and counted beside the false-positive rate rather than inside it.
     assert "1 more were abandoned" in page
+
+
+# -- budgets ---------------------------------------------------------------------------
+
+
+def test_the_work_order_page_offers_a_budget_even_when_there_is_none(client):
+    """The box is always offered: setting a budget on an order that has none is as much a
+    thing the reader came here to do as raising one that ran out."""
+    wo = ops.create_work_order("proj_a", "uncapped", description="do it")
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert "No budget" in page
+    assert f"/wo/proj_a/{wo['id']}/budget" in page
+    assert "Set budget" in page
+
+
+def test_setting_a_budget_from_the_dashboard_calls_the_same_op(client):
+    wo = ops.create_work_order("proj_a", "capped", description="do it")
+    r = client.post(f"/wo/proj_a/{wo['id']}/budget", data={"amount": "$12.50"})
+    assert r.status_code == 303
+    assert ops.work_order_budget(wo["id"])["budget_usd"] == 12.5
+    assert "$0.00 of $12.50" in client.get(f"/wo/proj_a/{wo['id']}").text
+
+
+def test_an_empty_box_is_not_a_clear(client):
+    """A form submitted by accident must not silently remove a ceiling. Clearing takes
+    its own named control, the same separation `jarvis wo budget --clear` makes."""
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=9.0)
+    r = client.post(f"/wo/proj_a/{wo['id']}/budget", data={"amount": "  "})
+    assert r.status_code == 303
+    assert "error=" in r.headers["location"]
+    assert ops.work_order_budget(wo["id"])["budget_usd"] == 9.0
+
+    r = client.post(f"/wo/proj_a/{wo['id']}/budget", data={"clear": "1"})
+    assert ops.work_order_budget(wo["id"])["budget_usd"] is None
+
+
+def test_a_bad_amount_comes_back_as_a_flash_not_a_traceback(client):
+    wo = ops.create_work_order("proj_a", "capped", description="do it")
+    r = client.post(f"/wo/proj_a/{wo['id']}/budget", data={"amount": "lots"})
+    assert r.status_code == 303
+    assert "error=" in r.headers["location"]
+    assert ops.work_order_budget(wo["id"])["budget_usd"] is None
+
+
+def test_the_budget_box_refuses_nan_rather_than_accepting_an_uncappable_cap(client):
+    """The dashboard POST is an entry point of its own, and `nan` is the input that gets
+    PAST a `> 0` check: an order carrying it renders as budgeted and is never capped. It
+    has to come back as a flash, leaving the order exactly as unbudgeted as it was."""
+    wo = ops.create_work_order("proj_a", "capped", description="do it")
+    for bad in ("nan", "inf", "-inf"):
+        r = client.post(f"/wo/proj_a/{wo['id']}/budget", data={"amount": bad})
+        assert r.status_code == 303
+        assert "error=" in r.headers["location"]
+        assert ops.work_order_budget(wo["id"])["budget_usd"] is None
+
+
+def test_a_spent_order_is_featured_ahead_of_everything_else(client, daemon):
+    """It is the only blocker the reader cannot answer by reading: the order is stopped
+    and spending nothing until they decide."""
+    from jarvis.ui.app import FEATURED_STATUSES, group_open
+
+    assert FEATURED_STATUSES[0] == "budget_exhausted"
+    featured, _ = group_open([{"status": "needs_review", "id": "wo-1"},
+                              {"status": "budget_exhausted", "id": "wo-2"}])
+    assert [w["id"] for w in featured] == ["wo-2", "wo-1"]
