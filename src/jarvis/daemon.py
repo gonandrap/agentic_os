@@ -1017,9 +1017,19 @@ class Daemon:
         manager = store.manager_work_order(fo_id)
         if not manager or manager["status"] not in OPEN_STATUSES:
             return
+        from . import ops as ops_mod
+
+        # RECORDS, like `mark_done`, and does not refuse: the feature is over and parking
+        # its manager would put an attention item on a settled feature. A manager is told
+        # it writes no product code, and one that did anyway is exactly what
+        # INV-PR-RECORDED is for — this is the only moment its worktree still exists to
+        # say so.
+        work = ops_mod.authorship(store, manager)
         store.set_status(manager["id"], "completed")
         store.clear_attention(manager["id"])
-        store.add_event(manager["id"], "feature_settled", {"feature_order": fo_id})
+        store.add_event(manager["id"], "feature_settled",
+                        {"feature_order": fo_id,
+                         **({"authored": work.record()} if work.base else {})})
 
     def _close_feature_backlog(self, fo: dict) -> None:
         """A feature order promoted from the backlog closes its item when it lands.
@@ -3430,8 +3440,15 @@ class Daemon:
                     if back == "waiting_pr_merge":
                         store.clear_attention(wo["id"])
             else:
-                store.set_status(wo["id"], "completed")
-                store.clear_attention(wo["id"])
+                # THROUGH `land_finished`, never straight to `completed`. That function
+                # is where "a work order with commits and no pull request may not
+                # complete" lives, and this branch — a turn that ended with a summary
+                # and no `pr_url` — used to be the one route to `completed` that walked
+                # past it. It also unparks: `park_unlanded` leaves `needs_review` behind,
+                # and this ran a tick later and completed the order it had just held.
+                from . import ops as ops_mod
+
+                ops_mod.land_finished(store, fresh)
         elif store.pending_approvals(wo["id"]) or awaiting_neo(wo["id"]):
             # Parked on the delegate — a privileged-action gate awaiting a verdict, or a
             # question awaiting an answer. Either way the worker was TOLD to end its turn
