@@ -1453,6 +1453,12 @@ class Daemon:
                     status=str(seat.get("status") or "ok"),
                     model=str(seat.get("model") or ""),
                     latency_ms=int(seat.get("latency_ms") or 0))
+            # BEFORE THE OUTCOME BRANCH, not inside it: a follow-up is filed whether the
+            # round passed or was rejected. `.get(...) or ()` because `self.validator` is
+            # injectable and fakes returning only the three older keys are legitimate.
+            self._file_follow_ups(store, project, round_row,
+                                  verdict.get("follow_ups") or (), cfg,
+                                  unit=wo_id, wo_id=wo_id)
             outcome = str(verdict.get("outcome") or "")
             reason = str(verdict.get("reason") or "")
 
@@ -1481,6 +1487,40 @@ class Daemon:
             log.exception("[%s] validating %s failed", project.name, wo_id)
         finally:
             store.close()
+
+    @staticmethod
+    def _file_follow_ups(store: ProjectStore, project: ProjectSpec,
+                         round_row: Any, follow_ups: Any, cfg: Any, *, unit: str,
+                         wo_id: str | None = None, fo_id: str | None = None) -> None:
+        """File this round's non-blocking findings, and say so in the log.
+
+        The filing itself is `ops.file_validation_follow_ups` — business logic the CLI
+        can reach, not daemon-private. What is here is the log line §4.4 asks for, in ONE
+        place so the two loops cannot word it differently, and the refusal to let filing
+        take a round down.
+
+        THAT REFUSAL IS NOT BELT-AND-BRACES, and it matters more now than it did when
+        this wrote a backlog row: `_validate_work_order`'s own `except` would abandon the
+        round half-settled — no outcome branch, the round left `pending`, the unit
+        stranded in `validating`. The verdict has been paid for and every seat is already
+        recorded by the time this runs, so a tracker that will not answer must cost the
+        follow-ups and nothing else. `ops` already counts the failures it EXPECTS; this
+        catches the ones it does not.
+        """
+        from . import ops
+
+        try:
+            filed = ops.file_validation_follow_ups(
+                store, project, round_row, follow_ups, cfg, wo_id=wo_id, fo_id=fo_id)
+        except Exception:  # noqa: BLE001 — see the docstring
+            log.exception("[%s] %s: filing follow-ups failed", project.name, unit)
+            return
+        if filed["items"] or filed["dropped"] or filed["failed"]:
+            log.info("[%s] %s: round %d filed %d follow-up issue(s), dropped %d over the "
+                     "cap, %d could not be filed%s",
+                     project.name, unit, filed["round"], len(filed["items"]),
+                     filed["dropped"], filed["failed"],
+                     f" ({filed['reason']})" if filed.get("reason") else "")
 
     @staticmethod
     def _repeat_submission(round_row: dict[str, Any],
@@ -1904,6 +1944,10 @@ class Daemon:
                     status=str(seat.get("status") or "ok"),
                     model=str(seat.get("model") or ""),
                     latency_ms=int(seat.get("latency_ms") or 0))
+            # `_validate_work_order`'s line, in the same place and for the same reason.
+            self._file_follow_ups(store, project, round_row,
+                                  verdict.get("follow_ups") or (), cfg,
+                                  unit=fo_id, fo_id=fo_id)
             outcome = str(verdict.get("outcome") or "")
             reason = str(verdict.get("reason") or "")
 
