@@ -638,6 +638,10 @@ class Daemon:
                     # a second poll interval for news the OS already has is the gap
                     # issue #240 is about, one step smaller.
                     self.sync_issues(project, store)
+                    # Beside it, on the same cadence and for the same reason: the
+                    # tracker is the surface a person scans when choosing what to pick
+                    # up, and a reference count that lags is one they act on wrongly.
+                    self.sync_issue_references(project, store)
                 # After the pull-request poll, so the merge that completes a feature's
                 # last child settles the feature in the same tick rather than the next
                 # one — but outside the `if`, because a child can also finish without
@@ -4529,6 +4533,73 @@ class Daemon:
             if (applied == issues.CLOSED and wo.get("pr_url")
                     and issues.dispatches(wo.get("issue_priority") or "")):
                 self.ensure_release(project, store, wo)
+
+    #: How long a cached issue state is good for. An hour, because nothing the OS does
+    #: depends on it being fresher: it decides whether a reference may be written and how
+    #: a list renders, and an issue a person closed five minutes ago is one the sweep
+    #: leaves alone for at most one more hour.
+    ISSUE_STATE_TTL = 3600
+
+    #: How many issues ONE sweep will re-read. `sync_issues` costs nothing while the
+    #: tracker and the record agree; this one has state that expires, so it needs a
+    #: ceiling of its own — a project whose tracker has grown must not turn one tick into
+    #: a hundred subprocesses. Whatever is left over is the next sweep's, oldest first.
+    ISSUE_REFRESH_PER_SWEEP = 10
+
+    def sync_issue_references(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Keep each linked issue saying how many work orders have pointed at it.
+
+        `sync_issues`' sibling, one relation out: that one tells the tracker what the OS
+        is DOING about an issue, this one tells it how much the fleet has RUN INTO it.
+        The count is a priority signal the user reads when choosing what to work on next,
+        so it has to be on the issue itself as well as in Jarvis.
+
+        **NOTHING IS WRITTEN TO AN ISSUE WHOSE STATE THE OS HAS NOT READ.** Not a
+        comment, not a label. A closed issue is a decision somebody made, and the rule
+        `issues.apply` holds — the OS does not argue with a human — is only enforceable
+        against a state actually read; "" means not read, and it fails closed.
+
+        Three comparisons, none of which costs anything while they agree: the cached
+        state against its TTL, `unannounced` against zero, and `refs` against
+        `refs_labelled`. A project that has never linked an issue does not even pay the
+        query.
+        """
+        rows = store.issues_to_sync()
+        if not rows:
+            return
+        from . import github, issues
+
+        refreshed = 0
+        for row in rows:
+            url, repo = row["issue_url"], row["repo"]
+            if not repo:
+                continue
+            try:
+                checked = row["checked_at"]
+                if ((checked is None or time.time() - checked > self.ISSUE_STATE_TTL)
+                        and refreshed < self.ISSUE_REFRESH_PER_SWEEP):
+                    issue = issues.view(url, repo)
+                    refreshed += 1
+                    store.record_issue(url, number=issue.number, repo=repo,
+                                       title=issue.title, state=issue.state)
+                    row = {**row, "state": issue.state}
+                if (row.get("state") or "") != "OPEN":
+                    continue
+                for link in store.unannounced_links(url):
+                    issues.comment(url, issues.reference_comment(
+                        link["unit_id"], project.name, link["kind"]), repo)
+                    store.mark_issue_announced(url, link["unit_id"])
+                if int(row["refs"]) != int(row["refs_labelled"]):
+                    issues.set_reference_label(url, int(row["refs"]), repo)
+                    store.record_issue_label(url, int(row["refs"]))
+            except github.GitHubError as e:
+                log.debug("[%s] could not sync references on %s: %s", project.name,
+                          url, e)
+                self._warn_issue_sync_broken(project, store, e)
+                continue
+            except Exception:  # noqa: BLE001 — one issue must not stall the rest
+                log.exception("[%s] syncing references on %s failed", project.name, url)
+                continue
 
     #: The key under a work order's `metadata` that says "this order exists to ship
     #: fixes, and these are the ones it is shipping". The batch lives HERE rather than in

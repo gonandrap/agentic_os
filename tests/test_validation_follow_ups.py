@@ -679,16 +679,15 @@ def test_validation_show_classifies_each_finding_and_links_the_issue(fleet, trac
     assert "tester" in out, "the deliberation surface withheld the seat"
 
 
-def test_the_dashboard_page_links_the_issue_and_leaves_the_other_round_bare(fleet,
-                                                                            tracker):
+def test_the_dashboard_page_lists_the_issue_once_for_the_whole_order(fleet, tracker):
     """THE TEMPLATE IS A SURFACE YOU GO AND COUNT (`kn-99e37a4b`). The page does NOT read
-    `ops.validation_rounds` — it is fed `ops.validation_detail`, a different projection —
-    and `{% if filed.filed %}` is SILENTLY FALSY: drop the key from the projection the
-    PAGE reads and the whole section disappears with no error and a green suite.
+    `ops.validation_rounds` — `_issues.html` is fed `ops.issue_index`, a projection of its
+    own — and `{% if index.raised %}` is SILENTLY FALSY: drop the key and the whole
+    section disappears with no error and a green suite.
 
-    Both rounds are rendered, because "the round that filed one says so" and "the round
-    that filed none is bare" are different claims, and a template that printed the
-    section on every round satisfies the first.
+    ONCE FOR THE ORDER, NOT ONCE PER ROUND, which is the change: two rounds ran and the
+    issue is listed one time, with a count beside it. The per-round fragment it replaced
+    could show neither.
     """
     from fastapi.testclient import TestClient
 
@@ -701,9 +700,11 @@ def test_the_dashboard_page_links_the_issue_and_leaves_the_other_round_bare(flee
 
     page = TestClient(create_app(), follow_redirects=False).get(
         f"/wo/proj_a/{wo['id']}").text
+    shown = " ".join(page.split())
 
-    assert page.count("Filed as follow-ups:") == 1, "one round filed, one did not"
-    assert f'href="{url}"' in page, "the issue is not reachable from the work order"
+    assert shown.count("Raised by this order") == 1, "the list is per round again"
+    assert page.count(f'href="{url}"') == 1, "the issue is listed twice"
+    assert "1 follow-up" in shown, "the consolidated list has no count"
     assert "Name the retry budget" in page
     assert ops.FOLLOW_UPS_EVENT not in page      # the raw kind never reaches a reader
     assert "maintainer" not in page              # nor does the seat
@@ -711,23 +712,23 @@ def test_the_dashboard_page_links_the_issue_and_leaves_the_other_round_bare(flee
 
 def test_the_dashboard_section_bites_when_the_projection_loses_the_key(fleet, tracker,
                                                                        monkeypatch):
-    """The mutation that proves the assertion above is load-bearing. `validation_detail`
-    is the projection THAT page reads; mutating `validation_rounds` instead would leave
-    this test green, which is how you learn they were never one surface."""
+    """The mutation that proves the assertion above is load-bearing. `issue_index` is the
+    projection THAT section reads; mutating `validation_rounds` or `validation_detail`
+    instead would leave this test green, which is how you learn they were never one
+    surface."""
     from fastapi.testclient import TestClient
 
     from jarvis.ui.app import create_app
 
     wo = judged(fleet, "passed", "Name the retry budget")
-    real = ops.validation_detail
-    monkeypatch.setattr(ops, "validation_detail", lambda *a, **k: {
-        **real(*a, **k),
-        "rounds": [{**r, "follow_ups": None} for r in real(*a, **k)["rounds"]]})
+    real = ops.issue_index
+    monkeypatch.setattr(ops, "issue_index",
+                        lambda *a, **k: {**real(*a, **k), "raised": []})
 
     page = TestClient(create_app(), follow_redirects=False).get(
         f"/wo/proj_a/{wo['id']}").text
 
-    assert "Filed as follow-ups:" not in page
+    assert "Raised by this order" not in page
 
 
 def test_the_dashboard_says_what_could_not_be_filed(fleet, fake_gh):

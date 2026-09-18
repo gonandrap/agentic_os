@@ -397,6 +397,16 @@ ALARM_EVENT_KINDS = ("cost_alarm", "alarm_reviewed", "alarm_escalated", "alarm_a
                      "health_finding", "health_reviewed",
                      "remedy_proposed", "remedy_applied", "remedy_refused")
 
+# HOW A WORK ORDER CAN BE LINKED TO A TRACKER ISSUE, weakest first — the order IS the
+# precedence, and `link_issue` never demotes. The admitting set is deliberately small
+# (Neo, question 409): a count that admits passing mentions is not a priority signal.
+#
+#   cited     — the order's brief names the issue, by URL or by `#N` on the project's own
+#               repository. Someone wrote it down on purpose.
+#   assigned  — the order exists to FIX the issue (`work_orders.issue_url`).
+#   raised    — the validation panel filed the issue out of this order's own review.
+ISSUE_LINK_KINDS = ("cited", "assigned", "raised")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS work_orders (
     id TEXT PRIMARY KEY,
@@ -754,6 +764,38 @@ CREATE TABLE IF NOT EXISTS envelopes (
     note TEXT NOT NULL DEFAULT '',
     CHECK ((subject_wo_id IS NULL) <> (subject_fo_id IS NULL))
 );
+-- A TRACKER ISSUE THIS PROJECT IS LINKED TO, and what the OS last saw of it. Cached
+-- rather than fetched, for `ops.filed_follow_ups`'s reason: a surface that asked GitHub
+-- what state an issue is in would make `jarvis wo show` fail when the tracker is
+-- unreachable. `state` is "" until the sweep has looked once.
+CREATE TABLE IF NOT EXISTS tracked_issues (
+    issue_url TEXT PRIMARY KEY,
+    number INTEGER NOT NULL DEFAULT 0,
+    repo TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT '',
+    checked_at REAL,
+    -- The count last written to the issue as its `referenced: N` label. -1 means never,
+    -- which is not the same claim as 0 and is why the default is not 0.
+    refs_labelled INTEGER NOT NULL DEFAULT -1
+);
+-- THE RELATION THE ISSUE BODY USED TO CARRY IN PROSE ONLY. One row per (issue, unit),
+-- so the reference COUNT is a count of distinct work orders — which is the signal the
+-- user asked for — and an order that both raised and cites an issue counts once.
+CREATE TABLE IF NOT EXISTS issue_links (
+    issue_url TEXT NOT NULL,
+    unit_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    round INTEGER NOT NULL DEFAULT 0,
+    seat TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    -- When the comment naming this reference landed on the issue. NULL until the sweep
+    -- has said it out loud; the `raised` link is stamped at creation because the filing
+    -- already writes that sentence into the body.
+    announced_at REAL,
+    PRIMARY KEY (issue_url, unit_id)
+);
+CREATE INDEX IF NOT EXISTS idx_issue_links_unit ON issue_links(unit_id);
 CREATE INDEX IF NOT EXISTS idx_turns_wo ON wo_turns(wo_id, seq);
 CREATE INDEX IF NOT EXISTS idx_turns_state ON wo_turns(state);
 CREATE INDEX IF NOT EXISTS idx_wo_status ON work_orders(status);
@@ -1232,6 +1274,140 @@ class ProjectStore:
         rows = self.conn.execute(
             "SELECT * FROM work_orders WHERE issue_url=? ORDER BY created_at DESC",
             (issue_url,)).fetchall()
+        return db.rows_to_dicts(rows)
+
+    # -- the issue <-> work order relation ------------------------------------------
+    #
+    # Both directions answerable WITHOUT A NETWORK CALL, which is the whole of why the
+    # relation exists: the origin used to live only in the issue body's prose, so "which
+    # issues did this order raise" could only be answered by scraping GitHub and
+    # `jarvis wo show` could not answer it at all.
+
+    def link_issue(self, issue_url: str, unit_id: str, kind: str, *,
+                   round_no: int = 0, seat: str = "", announced: bool = False) -> bool:
+        """Record that `unit_id` raised, was assigned, or cites `issue_url`.
+
+        Returns True only when this is a link the project did not have — the caller's
+        signal that something new happened, and what keeps the sweep from re-announcing
+        a reference it has already commented on.
+
+        ONE ROW PER (issue, unit) AND THE KIND ONLY EVER STRENGTHENS (`ISSUE_LINK_KINDS`
+        is the order). An order whose brief cites the very issue it was dispatched to fix
+        must not count twice, and re-recording the weaker kind afterwards must not
+        overwrite the stronger one — either would corrupt the count the user reads as a
+        priority signal.
+        """
+        if kind not in ISSUE_LINK_KINDS:
+            raise ValueError(f"{kind!r} is not one of {ISSUE_LINK_KINDS}")
+        row = self.conn.execute(
+            "SELECT kind FROM issue_links WHERE issue_url=? AND unit_id=?",
+            (issue_url, unit_id)).fetchone()
+        with db.write_transaction(self.conn):
+            if row is None:
+                self.conn.execute(
+                    "INSERT INTO issue_links (issue_url, unit_id, kind, round, seat, "
+                    "created_at, announced_at) VALUES (?,?,?,?,?,?,?)",
+                    (issue_url, unit_id, kind, round_no, seat, db.now(),
+                     db.now() if announced else None))
+                return True
+            if ISSUE_LINK_KINDS.index(kind) > ISSUE_LINK_KINDS.index(row["kind"]):
+                self.conn.execute(
+                    "UPDATE issue_links SET kind=?, round=?, seat=? "
+                    "WHERE issue_url=? AND unit_id=?",
+                    (kind, round_no, seat, issue_url, unit_id))
+        return False
+
+    def record_issue(self, issue_url: str, *, number: int = 0, repo: str = "",
+                     title: str = "", state: str | None = None) -> None:
+        """Remember what the OS knows about one issue. Upsert; never unlearns.
+
+        `state=None` leaves the cached state alone, so the filing path can record an
+        issue's identity without claiming to have read its state — and a title already
+        read off GitHub is not overwritten by a blank.
+        """
+        with db.write_transaction(self.conn):
+            self.conn.execute(
+                "INSERT INTO tracked_issues (issue_url, number, repo, title, state, "
+                "checked_at) VALUES (?,?,?,?,?,?) ON CONFLICT(issue_url) DO NOTHING",
+                (issue_url, number, repo, title, state or "",
+                 db.now() if state else None))
+            if number:
+                self.conn.execute("UPDATE tracked_issues SET number=? WHERE issue_url=?",
+                                  (number, issue_url))
+            if repo:
+                self.conn.execute("UPDATE tracked_issues SET repo=? WHERE issue_url=?",
+                                  (repo, issue_url))
+            if title:
+                self.conn.execute("UPDATE tracked_issues SET title=? WHERE issue_url=?",
+                                  (title, issue_url))
+            if state:
+                self.conn.execute(
+                    "UPDATE tracked_issues SET state=?, checked_at=? WHERE issue_url=?",
+                    (state, db.now(), issue_url))
+
+    def record_issue_label(self, issue_url: str, count: int) -> None:
+        """The `referenced: N` the OS last managed to put on the issue."""
+        with db.write_transaction(self.conn):
+            self.conn.execute(
+                "UPDATE tracked_issues SET refs_labelled=? WHERE issue_url=?",
+                (count, issue_url))
+
+    def mark_issue_announced(self, issue_url: str, unit_id: str) -> None:
+        with db.write_transaction(self.conn):
+            self.conn.execute(
+                "UPDATE issue_links SET announced_at=? WHERE issue_url=? AND unit_id=?",
+                (db.now(), issue_url, unit_id))
+
+    def issue_links_of(self, unit_id: str) -> list[dict[str, Any]]:
+        """Every issue this one work order or feature order is linked to.
+
+        Joined onto the cached facts so a caller gets the issue's number, title and last
+        known state in the same read — the projection behind the consolidated list on
+        `jarvis wo show` and the work-order page.
+        """
+        rows = self.conn.execute(
+            "SELECT l.*, i.number, i.repo, i.title, i.state, i.checked_at "
+            "FROM issue_links l LEFT JOIN tracked_issues i USING (issue_url) "
+            "WHERE l.unit_id=? ORDER BY l.round, i.number", (unit_id,)).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def issue_board(self) -> list[dict[str, Any]]:
+        """Every tracked issue with its reference count, most-referenced first.
+
+        The ranking the user reads when choosing what to work on next. `refs` counts
+        DISTINCT work orders by construction — one row per (issue, unit) — so the number
+        means what the user asked it to mean.
+        """
+        rows = self.conn.execute(
+            "SELECT i.*, COUNT(l.unit_id) AS refs FROM tracked_issues i "
+            "JOIN issue_links l USING (issue_url) GROUP BY i.issue_url "
+            "ORDER BY refs DESC, i.number DESC").fetchall()
+        out = db.rows_to_dicts(rows)
+        for row in out:
+            row["units"] = [dict(r) for r in self.conn.execute(
+                "SELECT unit_id, kind, round, seat FROM issue_links WHERE issue_url=? "
+                "ORDER BY created_at", (row["issue_url"],)).fetchall()]
+        return out
+
+    def issues_to_sync(self) -> list[dict[str, Any]]:
+        """Every linked issue, with its reference count and what is still unsaid.
+
+        The sweep's whole input, in one query: `refs` is what the label should say,
+        `refs_labelled` what it does say, and `unannounced` how many references have not
+        been commented onto the issue yet. Nothing is sent while all three agree.
+        """
+        rows = self.conn.execute(
+            "SELECT i.*, COUNT(l.unit_id) AS refs, "
+            "SUM(CASE WHEN l.announced_at IS NULL THEN 1 ELSE 0 END) AS unannounced "
+            "FROM tracked_issues i JOIN issue_links l USING (issue_url) "
+            "GROUP BY i.issue_url ORDER BY i.checked_at IS NOT NULL, i.checked_at"
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def unannounced_links(self, issue_url: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM issue_links WHERE issue_url=? AND announced_at IS NULL "
+            "ORDER BY created_at", (issue_url,)).fetchall()
         return db.rows_to_dicts(rows)
 
     def work_orders_tracking_issues(self) -> list[dict[str, Any]]:

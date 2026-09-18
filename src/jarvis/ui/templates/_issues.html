@@ -1,0 +1,75 @@
+{# TRACKER ISSUES, from both ends of the relation.
+
+   `unit` renders ONE ORDER'S WHOLE LIST — every follow-up it raised across every round,
+   plus every other issue it points at. That consolidation is the point: the per-round
+   fragment in `_validation.html` answers "what did this round file", which for an order
+   judged four times is four fragments and no total.
+
+   `board` renders the other end: issues ranked by how many work orders have pointed at
+   them, which is the priority signal the user reads when choosing what to pick up.
+
+   Both render NOTHING when there is nothing, by construction — the rule `_validation.html`
+   already follows, and which keeps the section off every page in a fleet that has never
+   filed one. The state beside an issue is what the daemon's sweep last read; blank means
+   it has not looked yet, and blank is deliberately not the word "unknown" on every issue
+   filed in the last hour. #}
+
+{% macro unit(index, heading='h2') %}
+{% if index and (index.raised or index.references) %}
+<{{ heading }} id="issues">Tracker issues</{{ heading }}>
+<div class="panel">
+  {% if index.raised %}
+  <div class="row">
+    <div class="grow">
+      <strong>Raised by this order</strong>
+      <span class="sub">{{ index.raised|length }} follow-up{{ '' if index.raised|length == 1 else 's' }}</span>
+      {% for i in index.raised %}{{ line(i) }}{% endfor %}
+    </div>
+  </div>
+  {% endif %}
+  {% if index.references %}
+  <div class="row">
+    <div class="grow">
+      <strong>Referenced by this order</strong>
+      {% for i in index.references %}{{ line(i) }}{% endfor %}
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+{% endmacro %}
+
+{% macro line(i) %}
+<div class="sub">
+  <a href="{{ i.url }}" class="mono" rel="noreferrer noopener" target="_blank">{%
+    if i.number %}#{{ i.number }}{% else %}issue{% endif %}</a>
+  {% if i.state == 'CLOSED' %}<span class="st tone-muted"><span class="i">✓</span>closed</span>
+  {% elif i.state == 'OPEN' %}<span class="st tone-active"><span class="i">◌</span>open</span>{% endif %}
+  {{ i.title }}
+  {# NO SEAT NAME — `_validation.html` states the rule; this page is read by everyone. #}
+  {% if i.round %}<span class="sub">round {{ i.round }}</span>{% endif %}
+  {% if i.kind and i.kind != 'raised' %}<span class="sub">{{ i.kind }}</span>{% endif %}
+</div>
+{% endmacro %}
+
+{% macro board(rows, project, heading='h2') %}
+{% if rows %}
+<{{ heading }} id="issues">Tracker issues the fleet keeps hitting</{{ heading }}>
+<div class="panel">
+  {% for row in rows %}
+  <div class="row">
+    <span class="st {{ 'tone-warn' if row.refs > 1 else 'tone-muted' }}">
+      <span class="i">↗</span>{{ row.refs }}</span>
+    <div class="grow">
+      <a href="{{ row.issue_url }}" class="mono" rel="noreferrer noopener"
+         target="_blank">#{{ row.number }}</a> {{ row.title or row.issue_url }}
+      <div class="sub">
+        {% for u in row.units %}<a href="/wo/{{ project }}/{{ u.unit_id }}"
+          class="mono">{{ u.unit_id }}</a> ({{ u.kind }}){{ ', ' if not loop.last }}{% endfor %}
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+{% endmacro %}
