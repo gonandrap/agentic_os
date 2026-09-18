@@ -259,6 +259,46 @@
 </div>
 {% endif %}
 
+{# `jarvis validation force`, and the diagnosis that says why anyone would want it.
+   Above the rounds because it acts on them, and outside the tabs for the section below's
+   reason. Nothing here decides anything: `ops.force_validation_state` says whether the
+   control exists at all, `ops.force_validation_refusal` says why it is disabled in the
+   words the CLI refuses with, and the diagnosis is the hold `automerge.decide` already
+   computed. See docs/superpowers/specs/2026-09-15-forcing-a-validation-round.md. #}
+{% if force %}
+<h2 id="rejudge">Re-judge this pull request</h2>
+<div class="panel">
+  {% if forced_lines %}
+  <div class="row tone-ok">
+    <div class="grow">✓ {{ forced_lines[0] }}
+      <div class="sub">{{ forced_lines[1] }} — the verdict lands in
+        <a href="#validation">the rounds below</a>.</div>
+    </div>
+  </div>
+  {% endif %}
+  <div class="row">
+    <div class="grow">
+      {% if force.diagnosis %}<p class="kv">◭ {{ force.diagnosis }}</p>{% endif %}
+      {% if force.refusal %}
+        <p class="sub">◌ No round can be forced here: {{ force.refusal }}</p>
+      {% endif %}
+      <form method="post" action="/wo/{{ project }}/{{ wo.id }}/validation/force">
+        <p class="sub">A fresh round reads the pull request as it stands now and records
+          the commit it judged, which is what an automatic merge binds itself to. No
+          worker runs and nothing is written as a worker's account — your reason is kept
+          on the round, so it never reads afterwards like a re-delivery.</p>
+        <textarea name="reason" rows="2" required
+                  placeholder="why you are re-judging it — recorded on the round"
+                  {{ 'disabled' if not force.can_force }}></textarea>
+        <button {{ 'disabled' if not force.can_force }}
+                title="Open a new validation round over this pull request">
+          Open a new round</button>
+      </form>
+    </div>
+  </div>
+</div>
+{% endif %}
+
 {# Outside the tabs with the gates and the assumptions: a round that was rejected or
    escalated is the page asking something of the reader — §6. #}
 {{ validation_ui.section(validation) }}

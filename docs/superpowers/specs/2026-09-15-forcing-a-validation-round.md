@@ -213,3 +213,54 @@ by a new door).
 **What is NOT exempted**: the empty-submission guard above it. A forced round over a
 packet with no files and no side effects still has nothing to judge, and the reason it was
 forced does not change that.
+
+## 8. The operator can reach it without a terminal
+
+*Added 2026-09-17 in wo-43c4c665. The user needed this four times in two days, and every
+time it took someone at a prompt.*
+
+A control on the work-order page, `POST /wo/{project}/{wo_id}/validation/force`, calling
+`ops.force_validation` — the verb, not a second route into `submit_for_validation`. The
+reason box is `required` for the same reason `--reason` is.
+
+### 8.1 The rule is one function, and the page teaches it
+
+`ops.force_validation_refusal(store, wo, project=…, cfg=…)` returns the sentence §5
+refuses with, or `None`. `force_validation` raises whatever it returns; the page renders
+the control **disabled with that same sentence beside it**, so the user learns the rule
+from the page rather than from a failed submit. The sharing is what matters: two
+carefully-written copies of "which statuses may be re-judged" pass every behavioural test
+and drift the day one is edited (kn-4ea33fe6), so the test that protects it replaces the
+resolver and requires BOTH surfaces to change their answer.
+
+**One refusal is rendered as nothing at all**: `validation.enabled` off for the project.
+That is a fact about the project rather than about this work order, and a control for a
+mechanism nobody switched on is the noise `ops.automerge_state` already declines to print.
+`ops.force_validation_state` returns `None` there, and the section does not exist.
+
+### 8.2 The diagnosis is the other half
+
+A user looking at a parked pull request could see that it was parked and not **why**. The
+page now says: the commit each round judged (`_validation.html`'s `@<sha>`, already
+rendered), the live head, and — when they differ — that fact in words.
+
+It is `automerge.decide`'s hold, read back off the `automerge_held` event the poll
+recorded, and never a second opinion: deriving one here needs a `gh` call from a web
+request and would describe a different moment than the record does (`automerge_state`'s
+own note). Only the two codes a fresh round actually CLEARS are diagnosed —
+`HELD_SHA_MOVED` and `HELD_SHA_UNRECORDED`. A red build or a conflict is a hold this
+button cannot help with, and wording one of those as something to force a round over is
+how a user comes to spend round numbers on a failing CI run.
+
+### 8.3 Reporting what it did
+
+`ops.forced_round_lines` is the two lines §2's command prints, and the page renders the
+same two — a POST that only redrew the page answers "did that do anything" by scrolling.
+The redirect carries `?forced=<round>` and **nothing else**: the words are rebuilt from
+the `validation_forced` event by `ops.forced_round_notice`, so nothing a visitor types
+into the query string reaches the page as text, and a round number naming no forced round
+renders nothing.
+
+The refusals are still enforced at the route. The disabled control cannot prevent the
+panel opening a round between the render and the press, so that press is refused and
+flashed like any other error.

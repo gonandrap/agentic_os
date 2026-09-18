@@ -860,7 +860,8 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/wo/{name}/{wo_id}", response_class=HTMLResponse)
-    def work_order(request: Request, name: str, wo_id: str, debug: str = ""):
+    def work_order(request: Request, name: str, wo_id: str, debug: str = "",
+                   forced: str = ""):
         try:
             pname, path, wo = ops.find_work_order(wo_id, name)
         except ops.OpsError as e:
@@ -910,6 +911,17 @@ def create_app() -> FastAPI:
             # None for every order the automatic merge has never touched, which is what
             # keeps the line off the page entirely rather than rendering "off" forever.
             auto_merge = ops.automerge_state(store, wo)
+            # The re-judge control and the diagnosis behind it, off the SAME hold the
+            # auto-merge line above renders — a parked order's page has to say why it is
+            # parked, and `automerge.decide` already worked that out on the tick that
+            # declined to merge it. None on a project with the panel off.
+            force = ops.force_validation_state(store, wo, project=pname,
+                                               held=auto_merge)
+            # What forcing a round just did, rebuilt from the record rather than carried
+            # in the query — the same two lines `jarvis validation force` prints.
+            forced_lines = ops.forced_round_notice(
+                store, wo, project=pname,
+                round_n=int(forced)) if forced.isdigit() else []
             # And the same for the assumption review, on the same rule — and for the
             # same reason one authority along: None keeps the line off the page for
             # every order the mechanism never looked at.
@@ -927,7 +939,7 @@ def create_app() -> FastAPI:
         return render(request, "work_order.html", project=pname, wo=wo, parked=parked,
                       pause=pause, waiting=waiting, status_label=label,
                       validation=validation, spec=spec, auto_merge=auto_merge,
-                      auto_review=auto_review,
+                      auto_review=auto_review, force=force, forced_lines=forced_lines,
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug),
                       debug=show_debug, debug_count=count_debug(events),
@@ -1306,6 +1318,28 @@ def create_app() -> FastAPI:
     def resume_auto(name: str, wo_id: str):
         ops.resume_in_auto(wo_id, project_name=name)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
+
+    @app.post("/wo/{name}/{wo_id}/validation/force")
+    def force_validation(name: str, wo_id: str, reason: str = Form(...)):
+        """`jarvis validation force` from the dashboard — the SAME `ops` call, so the two
+        surfaces cannot come to disagree about which states may be re-judged.
+
+        The page renders the control disabled with its reason, so an error landing here is
+        the race rather than the ordinary refusal: a round the panel opened between the
+        render and the press. It is flashed all the same — the rule is the same rule.
+
+        `?forced=<round>` is what the page reads back to report the round it opened. It
+        carries a number and nothing else; the words come from the record.
+        """
+        back = f"/wo/{name}/{wo_id}"
+        try:
+            result = ops.force_validation(wo_id, reason=reason, project_name=name)
+        except ops.OpsError as e:
+            return RedirectResponse(
+                f"{back}?{urlencode({'error': str(e)}, quote_via=quote)}#rejudge",
+                status_code=303)
+        return RedirectResponse(f"{back}?forced={result['round']}#rejudge",
+                                status_code=303)
 
     @app.post("/fo/create")
     def create_fo(project: str = Form(...), title: str = Form(...),
