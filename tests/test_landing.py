@@ -4,8 +4,8 @@ Two halves, and they are answered at completely different distances — see the 
 docstring of `src/jarvis/landing.py`:
 
 * `authored()`, the settle-time predicate, which reads a worktree and is exact;
-* `branches_for()` + `judge()`, the audit, which names the branches a work order's code
-  could be on and then judges the PULL REQUESTS somebody else asked GitHub about.
+* `judge()`, the audit, which says what one pull request's state means for a work order
+  that has already claimed `completed`.
 
 THE AUDIT NO LONGER MEASURES CONTENT, and the tests that did are gone with it. The user
 narrowed INV-WORK-LANDED on 2026-09-18 after five of its seven live findings turned out
@@ -13,10 +13,14 @@ to be work that had merged months earlier and been refactored since; the coverag
 the commit-subject rung, the merged-tail rung and the default-branch refresh they were
 all measured against went with the verdict they produced.
 
-NOTHING HERE FAKES GIT, for `tests/test_evidence.py`'s reason: `branches_for` is a
-reading of what git actually says about refs, and a fake would only test the fake. What
-GitHub says is passed IN to `judge`, so no test here needs a `gh` at all —
-`tests/test_work_lands.py` drives the real discovery read through the fake CLI.
+NOR DOES IT GO LOOKING FOR A PULL REQUEST. It judges the one the order recorded, on the
+user's second ruling the same day, and an order with no `pr_url` is INV-PR-RECORDED's
+(work order `wo-2005a89b`). So `judge` takes a url and a state and is pure: no git, no
+`gh`, no store. `tests/test_work_lands.py` drives the real `gh` read through the fake CLI
+and joins the two halves end to end.
+
+NOTHING HERE FAKES GIT, for `tests/test_evidence.py`'s reason: `authored` is a reading of
+what git actually says, and a fake would only test the fake.
 
 THE BRANCH NAME IS ALWAYS EXPLICIT, and it is `trunk` rather than `main` or `master`:
 kn-4b6f18f5 is a whole CI-only failure caused by a git fixture inheriting
@@ -34,10 +38,10 @@ from pathlib import Path
 import pytest
 
 from jarvis import landing
-from jarvis.github import BranchPullRequest
 from jarvis.testing import make_git_project
 
 WO = "wo-abc12345"
+PR = "https://github.com/acme/proj/pull/42"
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -54,13 +58,6 @@ def _feature(salt: str, n: int = 40) -> str:
     return "".join(f"def {salt}_helper_{i}(argument):  # {salt} feature line {i}\n"
                    f"    return compute_{salt}_result({i}, argument)\n"
                    for i in range(n))
-
-
-def _pr(number: int, state: str) -> BranchPullRequest:
-    """One pull request as `github.pr_list_for_branch` returns it."""
-    return BranchPullRequest(number=number,
-                             url=f"https://github.com/acme/proj/pull/{number}",
-                             state=state)
 
 
 @dataclass
@@ -154,53 +151,7 @@ def test_a_missing_worktree_is_unreadable_not_produced(repo):
     assert gone.unreadable == "no worktree on disk"
 
 
-# -- the audit, half one: which branches could this work order's code be on? ------------
-
-
-def test_every_branch_naming_the_order_is_found_including_after_the_worktree_is_gone(
-        repo):
-    """The audit runs months later, when every worktree has been reclaimed.
-
-    BOTH branches, not the first. `_ref_for`, which this replaced, answered one match,
-    and that was a defect the moment a work order used two: `wo-f1ce0f24` has
-    `worktree-wo-f1ce0f24` (#225) and `worktree-wo-f1ce0f24-memory` (#226), and either
-    alone reports on half the work. All three naming shapes this fleet has produced
-    carry the work-order id, which is how the original audit found the six.
-    """
-    first = repo.worktree(WO)
-    repo.commit(first, "src/a.py", _feature("a"))
-    second = repo.worktree(f"{WO}-memory", branch=f"rescue/{WO}")
-    repo.commit(second, "src/b.py", _feature("b"))
-    _git(repo.path, "worktree", "remove", "--force", str(first))
-    _git(repo.path, "worktree", "remove", "--force", str(second))
-
-    assert sorted(landing.branches_for(repo.path, WO)) == [
-        f"rescue/{WO}", f"worktree-{WO}"]
-
-
-def test_a_remote_branch_is_named_as_github_names_it_and_not_twice(repo):
-    """`gh pr list --head` wants `rescue/wo-x`, never `origin/rescue/wo-x`.
-
-    And a branch that exists locally AND on the remote is ONE head as far as GitHub is
-    concerned, so it must not be asked about twice — that is a round trip per sweep per
-    order, paid to get the same answer.
-    """
-    wt = repo.worktree(WO, branch=f"rescue/{WO}")
-    repo.commit(wt, "src/rescued.py", _feature("rescued"))
-    _git(repo.path, "push", "-q", "origin", f"rescue/{WO}")
-
-    assert landing.branches_for(repo.path, WO) == (f"rescue/{WO}",)
-
-
-def test_an_order_with_no_branch_anywhere_names_nothing(repo):
-    """Which reaches `judge` as `no-pull-request` — silent, and costing no `gh` call.
-
-    The majority case on a mature project, and the reason discovery is affordable at all.
-    """
-    assert landing.branches_for(repo.path, "wo-neverexisted") == ()
-
-
-# -- the audit, half two: what the pull requests say --------------------------------
+# -- the audit: what GitHub says about the pull request the order recorded --------------
 
 
 def test_a_merged_pull_request_is_the_whole_answer():
@@ -209,11 +160,11 @@ def test_a_merged_pull_request_is_the_whole_answer():
     The five false positives of 2026-09-18 were all this shape: work that merged and was
     refactored afterwards, which the content test scored at 44%, 31% and 72%.
     """
-    found = landing.judge(WO, [_pr(42, "MERGED")], [f"worktree-{WO}"])
+    found = landing.judge(WO, PR, "MERGED")
 
     assert found.verdict == landing.LANDED
     assert found.unsettled is False
-    assert found.pr_url.endswith("/pull/42")
+    assert found.pr_url == PR
 
 
 def test_an_open_pull_request_says_the_work_is_waiting_on_a_merge():
@@ -222,7 +173,7 @@ def test_an_open_pull_request_says_the_work_is_waiting_on_a_merge():
     Delivered work sitting in an open pull request needs a merge, not a rescue, and a
     report that says "its code is not on main" sends the reader hunting for a branch.
     """
-    found = landing.judge(WO, [_pr(7, "OPEN")], [f"worktree-{WO}"])
+    found = landing.judge(WO, PR, "OPEN")
 
     assert found.verdict == landing.AWAITING_MERGE
     assert found.unsettled is True
@@ -230,59 +181,42 @@ def test_an_open_pull_request_says_the_work_is_waiting_on_a_merge():
 
 
 def test_a_pull_request_closed_unmerged_is_delivered_and_refused():
-    """wo-69a06ff4's shape: PR #231, closed, titled "superseded, not for merge".
+    """wo-69a06ff4's shape: pull request #231, closed, "superseded, not for merge".
 
     A decision somebody took on GitHub, where the work order cannot see it — so the order
     is still claiming `completed` over work nothing landed.
     """
-    found = landing.judge(WO, [_pr(231, "CLOSED")], [f"rescue/{WO}"])
+    found = landing.judge(WO, PR, "CLOSED")
 
     assert found.verdict == landing.REFUSED
     assert found.unsettled is True
     assert "refused" in found.detail
 
 
-def test_no_pull_request_at_all_is_out_of_scope_and_silent():
-    """THE NARROWING, stated as a test. wo-5a6b2d6d is the case it gives up.
+def test_no_recorded_pull_request_is_out_of_scope_and_silent():
+    """THE NARROWING, stated as a test, and the layering with it.
 
-    Its only product is a WIP commit on `rescue/wo-5a6b2d6d` with no pull request, and
-    under this rule nothing here reports it. The user accepts that: the place to catch an
-    order settling with nothing delivered is the validation round that let it settle.
+    An order with no `pr_url` is INV-PR-RECORDED's (wo-2005a89b), which refuses to let an
+    order that changed code settle without one. This half says nothing rather than
+    guessing — including about wo-5a6b2d6d, whose only product is a WIP commit on
+    `rescue/wo-5a6b2d6d`, and which the user accepts giving up here.
     """
-    found = landing.judge(WO, [], [f"rescue/{WO}"])
+    found = landing.judge(WO, "", "")
 
     assert found.verdict == landing.NO_PULL_REQUEST
     assert found.unsettled is False
 
 
-def test_an_open_pull_request_outranks_an_earlier_merge():
-    """wo-cd73c537 EXACTLY: #81 merged, then #116 opened on the same branch.
+def test_a_state_github_has_never_answered_is_reported_rather_than_swallowed():
+    """A state this module does not recognise is a reason to LOOK, not to fall silent.
 
-    The order's recorded `pr_url` names #81 and the old check called it stranded off a
-    content score of 2%. The truth is both simpler and different: there is an open pull
-    request carrying the rest of the work, and that is what the report must say.
-
-    Open BEATS merged rather than "newest wins", because those two rules disagree on the
-    other arrangement — an order that merged and then had a follow-up opened and closed —
-    and only one of them gets it right. The next test is that one.
+    The silent verdict is reserved for "there is no pull request", which is a fact about
+    the work order. An unrecognised state would otherwise exempt it for ever, invisibly.
     """
-    found = landing.judge(WO, [_pr(81, "MERGED"), _pr(116, "OPEN")], [f"worktree-{WO}"])
+    found = landing.judge(WO, PR, "SOMETHING_NEW")
 
-    assert found.verdict == landing.AWAITING_MERGE
-    assert found.pr_url.endswith("/pull/116")
-    assert found.detail.endswith("(#116 OPEN, #81 MERGED)")   # newest first, both shown
-
-
-def test_a_later_closed_pull_request_does_not_un_land_a_merge():
-    """The arrangement "newest wins" would get wrong, and it is not hypothetical:
-    a follow-up opened against a branch and then abandoned is an ordinary week.
-
-    The work landed. A closed pull request is not evidence against a merge that happened.
-    """
-    found = landing.judge(WO, [_pr(42, "MERGED"), _pr(58, "CLOSED")], [f"worktree-{WO}"])
-
-    assert found.verdict == landing.LANDED
-    assert found.pr_url.endswith("/pull/42")
+    assert found.unsettled is True
+    assert found.pr_state == "SOMETHING_NEW"
 
 
 def test_a_verdict_survives_the_round_trip_through_an_event_payload():
@@ -291,40 +225,18 @@ def test_a_verdict_survives_the_round_trip_through_an_event_payload():
     permanently, quiet — indistinguishable from a fleet with nothing unmerged."""
     import json
 
-    original = landing.judge(WO, [_pr(81, "MERGED"), _pr(116, "OPEN")],
-                             [f"worktree-{WO}"])
+    original = landing.judge(WO, PR, "OPEN")
 
     read_back = landing.from_record(WO, json.loads(json.dumps(original.record())))
 
     assert read_back == original
 
 
-def test_an_unreadable_discovery_record_is_silent_and_never_a_complaint():
-    """An event written by some other release is a shape nobody can change afterwards.
+def test_an_unreadable_record_is_silent_rather_than_a_complaint():
+    """An event written by a release that spelled the payload differently.
 
-    Silence is the only safe answer: this audit may say nothing, and may never make a
-    complaint it cannot substantiate.
+    It errs towards saying nothing: a hygiene sweep that invents a violation out of a
+    shape it cannot parse is worse than one that waits for the next refresh.
     """
-    found = landing.from_record(WO, {"verdict": "coverage-was-0.02"})
-
-    assert found.verdict == landing.NO_PULL_REQUEST
-    assert found.unsettled is False
-
-
-# -- Mode A: the pull request named in prose and not passed as --pr --------------------
-
-
-def test_a_pr_url_is_recognised_in_prose_and_ordinary_prose_yields_none():
-    """Four of the six stranded orders finished with a summary naming a draft PR.
-
-    Two were recovered only because the user personally noticed and filed work orders
-    titled "circle back on this PR .../pull/33".
-    """
-    found = landing.pr_urls_in(
-        "Opened a draft at https://github.com/acme/proj/pull/33. "
-        "See also https://github.com/acme/proj/pull/33 and the issue "
-        "https://github.com/acme/proj/issues/99.")
-
-    assert found == ("https://github.com/acme/proj/pull/33",)   # deduped, no issue URL
-    assert landing.pr_urls_in("Answered the question; no code was needed.") == ()
-    assert landing.pr_urls_in("") == ()
+    assert landing.from_record(WO, {"nonsense": 1}).verdict == landing.NO_PULL_REQUEST
+    assert landing.from_record(WO, {}).unsettled is False

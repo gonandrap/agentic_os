@@ -2093,8 +2093,28 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
       them looking for something that is sitting in a pull request.
     * closed unmerged -> delivered and REFUSED. Somebody decided, on GitHub, where the
       work order could not see it, and the order is still claiming `completed`.
-    * NO PULL REQUEST -> out of scope, silent. Whether an order should have produced one
-      is validation's question, asked while the work is live.
+    * NO PULL REQUEST -> out of scope, silent. See the next paragraph: that is another
+      invariant's question, and this one would answer it wrong.
+
+    **THIS CHECK IS HALF A CHAIN, AND THE OTHER HALF IS INV-PR-RECORDED** (work order
+    `wo-2005a89b`). Read them together or neither of them is safe.
+
+    * INV-PR-RECORDED holds the front: an order that CHANGED CODE may not settle with an
+      empty `pr_url`. It is what makes the column trustworthy, and it is the reason the
+      filter below is allowed to be `if not wo["pr_url"]: continue` — a skip that would
+      otherwise be a silent exemption for exactly the orders this exists for. `pr_url` is
+      NULL on the live `wo-5eedc84d`, which merged pull request #42, and that order is
+      INV-PR-RECORDED's to report, not this one's.
+    * THIS check holds the back: once the order is completed, the pull request it recorded
+      must have merged.
+    * The `wo-cd73c537` shape — a `pr_url` naming a MERGED #81 while #116 carries the rest
+      of the work and is open — reads as `landed` here and is silent. Said plainly rather
+      than worked around: this check judges the pull request the order RECORDED. A
+      `pr_url` that names the wrong pull request is a recording defect, which is the front
+      half of the chain, per the user's ruling of 2026-09-18: *"If there is any code
+      change made in an order, then pr_url must not be empty, and the invariant should
+      rely on that pr_url to check the change lands on main once the order gets
+      completed."*
 
     Scoped to `completed`, and only that. `waiting_pr_merge` is a merge queue the poll
     already watches; `cancelled` and `failed` never claimed the work was done. `completed`
@@ -2102,18 +2122,16 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
     ARE INCLUDED, on `poll_pull_requests`' reasoning: hiding drops a record from listings,
     it does not mean the record may go on saying something untrue.
 
-    **IT NEVER ASKS GITHUB, AND IT NEVER READS `pr_url`.** Both halves matter. The first
-    is what keeps it cheap enough for the daemon's sweep — it is now a pure timeline read
-    with no subprocess at all. The second is what makes it correct: `pr_url` is NULL on
-    `wo-5eedc84d`, which merged #42, and stale on `wo-cd73c537`, which records a merged
-    #81 while #116 is open. `Daemon.discover_pull_requests` asks GitHub by BRANCH and
-    writes the answer to the timeline as `pr_discovered`; this reads the latest one.
+    **IT NEVER ASKS GITHUB.** That is what keeps it cheap enough for the daemon's sweep —
+    it is a pure timeline read with no subprocess at all. `Daemon.refresh_landings` makes
+    the round trip, reading the order's own `pr_url`, and writes what GitHub said to the
+    timeline as a `landing_seen` event; this reads the latest one.
 
-    **AN ORDER NOTHING HAS DISCOVERED YET IS SILENT**, exactly as one with no pull
-    request is. Discovery is the daemon's, so a `jarvis doctor` on a project the daemon
-    has never swept reports nothing here rather than reporting a guess — and unlike the
-    cache this replaces, `repair=False` now changes nothing about the answer: there is
-    no write on this path at all.
+    **AN ORDER NOTHING HAS READ YET IS SILENT**, exactly as one with no pull request is.
+    The refresh is the daemon's, so a `jarvis doctor` on a project the daemon has never
+    swept reports nothing here rather than reporting a guess — and unlike the cache this
+    replaces, `repair=False` now changes nothing about the answer: there is no write on
+    this path at all.
 
     **AN ORDER THE USER CLOSED BY HAND IS EXCLUDED.** `jarvis wo done` over unlanded
     work is the one landing that records instead of refusing (`ops.mark_done`), and its
@@ -2135,7 +2153,9 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
         if store.work_abandoned(wo_id) or store.work_unlanded_open(
                 wo_id, closed_by="marked_done"):
             continue  # the decision was taken and written down; that is the whole ask
-        seen = store.events_of_kind(wo_id, "pr_discovered")
+        if not wo.get("pr_url"):
+            continue  # INV-PR-RECORDED's question, not this one's — see the docstring
+        seen = store.events_of_kind(wo_id, "landing_seen")
         if not seen:
             continue  # nothing has looked yet — see the docstring on why that is silent
         found = landing.from_record(wo_id, db.from_json(seen[-1]["payload"], {}))
@@ -2153,8 +2173,7 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
                     f"{remedy}, or record the decision to drop it with `jarvis wo "
                     f"finish {wo_id} --summary \"...\" --abandon \"<why>\"`."),
             context={"verdict": found.verdict, "pr_url": found.pr_url,
-                     "pr_state": found.pr_state, "branches": list(found.branches),
-                     "pull_requests": [f"#{n} {state}" for n, _, state in found.seen]},
+                     "pr_state": found.pr_state},
         )
 
 
@@ -3054,7 +3073,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
 #:
 #: THIS USED TO SAY "invariants that shell out", and that is no longer what they are:
 #: since the landing check began judging the pull request instead of the diff it runs no
-#: subprocess at all (`Daemon.discover_pull_requests` is where the round trip went). The
+#: subprocess at all (`Daemon.refresh_landings` is where the round trip went). The
 #: cadence is unchanged because the reason for it was always the population, not the
 #: `git` calls. `jarvis doctor` always runs them: a human who typed the command is
 #: waiting for the answer, and the answer is the point of the command.

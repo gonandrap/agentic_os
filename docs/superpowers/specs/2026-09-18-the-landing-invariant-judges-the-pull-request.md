@@ -40,64 +40,67 @@ pull request:
    request on the same branch was invisible.
 4. A pull request closed without merging is an abandon decision the check could not see.
 
-## 3. The predicate
+## 3. The second ruling: rely on the other invariant, do not re-derive it
 
-**Scope: completed work orders that HAVE a pull request.** That is the whole population.
+The first implementation of this spec solved the unreliable-`pr_url` problem inside this
+check, by discovering pull requests from the work order's BRANCHES. The user struck that
+out the same day:
 
-| GitHub says | Verdict | Reported |
+> what you explain about pr_url not correctly reflecting the work done is a bug. The
+> invariant should rely on other invariants. If there is any code change made in an order,
+> then pr_url must not be empty, and the invariant should rely on that pr_url to check the
+> change lands on main once the order gets completed.
+
+So the column is made trustworthy **at its source** and this check reads it:
+
+| Invariant | Holds | Work order |
+|---|---|---|
+| INV-PR-RECORDED | an order that CHANGED CODE may not settle with an empty `pr_url` | wo-2005a89b |
+| INV-WORK-LANDED | once completed, the pull request it recorded must have merged | this one |
+
+A reader of either check alone must be able to see the other half, so the chain is written
+into both docstrings by name — `invariants.check_work_lands` and `landing`'s module
+docstring from this end.
+
+## 4. The predicate
+
+**Scope: completed work orders with a non-empty `pr_url`.** That is the whole population,
+and it is now exactly what it looks like.
+
+| GitHub says about the recorded pull request | Verdict | Reported |
 |---|---|---|
 | merged | `landed` | no |
 | open | `awaiting-merge` | yes — "delivered and waiting on a merge", remedy is merge-shaped |
 | closed, unmerged | `refused` | yes — "delivered and refused" |
-| no pull request | `no-pull-request` | **no. Out of scope, silent.** |
+| anything else | `refused` | yes — an unrecognised state is a reason to look, not to fall silent |
+| *(no `pr_url` on the order)* | `no-pull-request` | **no. Out of scope, silent.** |
 
-Two pull requests on one branch resolve in this order — **open beats merged beats
-closed** — and the order is load-bearing rather than a tie-break:
-
-* open over merged, because wo-cd73c537 merged #81 and then had #116 opened carrying the
-  rest of the work. An earlier merge does not deliver what is still unmerged.
-* merged over closed, because a follow-up opened against a landed branch and then
-  abandoned is an ordinary week, and it does not un-land the merge. A "newest wins" rule
-  gets this one wrong, which is why the rule is not "newest wins".
-
-## 4. `pr_url` is not the population filter
-
-The obvious scoping — `if not wo["pr_url"]: skip` — is wrong in both directions, and both
-are live in the production records:
-
-* **NULL where a pull request exists.** wo-5eedc84d has `pr_url` NULL and merged #42; its
-  worker finished before `--pr` was enforced. Skipping on the column would silently exempt
-  exactly the orders this invariant exists for — a worse failure than the noise, because
-  nothing shows it happening.
-* **Stale where a newer one is live.** wo-cd73c537 records #81, merged, while #116 is
-  open.
-
-So the question is asked of the **branch**, which is what the work is actually on.
-`landing.branches_for` names every branch whose name carries the work-order id — the
-worktree's own HEAD first, then local and remote refs, remote names stripped to the branch
-GitHub knows — and returns ALL of them, because wo-f1ce0f24 used two
-(`worktree-wo-f1ce0f24` → #225, `worktree-wo-f1ce0f24-memory` → #226) and either alone
-reports on half the work.
+There is no resolution order any more, because there is no longer a set of pull requests
+to resolve: one order, one recorded url, one state.
 
 ## 5. How the fact reaches the timeline
 
 `invariants.py` states as a hard rule that it never calls `gh`. That rule is kept, and the
 round trip moves to the daemon.
 
-**`Daemon.discover_pull_requests`**, on the existing `LANDING_SWEEP_EVERY_TICKS` cadence
-and immediately before `check_invariants` in the same tick: for each completed order not
-already excused, `landing.branches_for` locally, then one `github.pr_list_for_branch` per
-branch, then `landing.judge`, then one `pr_discovered` event carrying the verdict and every
-pull request seen.
+**`Daemon.refresh_landings`**, on the existing `LANDING_SWEEP_EVERY_TICKS` cadence and
+immediately before `check_invariants` in the same tick: for each completed order that has
+a `pr_url` and is not already excused, one `github.pr_view`, then `landing.judge`, then one
+`landing_seen` event carrying the verdict.
 
-**`invariants.check_work_lands`** reads the newest `pr_discovered` event and nothing else.
-It now runs no subprocess at all.
+**`invariants.check_work_lands`** reads the newest `landing_seen` event and nothing else.
+It runs no subprocess at all.
+
+**Why it asks at all, rather than reading the timeline.** `Daemon.poll_pull_requests`
+writes `pr_merged` only while an order is parked in `waiting_pr_merge`. An order that
+reached `completed` any other way — reviewed, marked done, finished before that poll
+existed — has a `pr_url` and no event about it, which is most of the live records.
+Inferring "no `pr_merged` event" as "did not merge" would reproduce the false positives
+§2 is about.
 
 Alternatives considered and rejected:
 
-* *Extend what a worker records on `finish`.* Fixes nothing already on the timeline, and
-  the stale case (a pull request opened after the order settled) is by construction
-  outside any worker's knowledge.
+* *Extend what a worker records on `finish`.* Fixes nothing already on a timeline.
 * *A deliberate exception to the no-`gh` rule for this one check.* Would put a network
   round trip per completed order inside `check_project`, which `jarvis doctor` calls
   synchronously and the daemon calls on every reconcile tick.
@@ -105,24 +108,49 @@ Alternatives considered and rejected:
 ### Cost, bounded three ways
 
 * **Cadence** — an hour (`LANDING_SWEEP_EVERY_TICKS`).
-* **`PR_DISCOVERY_PER_SWEEP = 25`** — the cap is about the TICK. A project with two
+* **`LANDING_REFRESH_PER_SWEEP = 25`** — the cap is about the TICK. A project with two
   hundred cold completed orders fills in over about eight sweeps instead of spending two
   hundred round trips inside one. Newest first, which is `list_work_orders`' own order:
   the recently completed orders are the ones a merge is still plausibly coming for.
-* **`PR_DISCOVERY_TTL_SECONDS` = 7 days** — a settled answer is re-asked, not kept for
-  ever. wo-cd73c537 is why: #116 was opened after #81 merged, so an answer cached at merge
-  time would have hidden the exact shape this was rebuilt for. Unsettled answers are
-  re-asked every sweep, because those are the ones a merge resolves.
+* **`LANDING_REFRESH_TTL_SECONDS` = 7 days** — a settled reading is re-asked, not kept for
+  ever. `landed` is the verdict that SILENCES the check, so the one answer nobody would
+  ever re-read is the one that would hide a revert. Unsettled readings are re-asked every
+  sweep, because those are the ones a merge resolves.
 
-An order with no branch costs nothing at all — no `gh` call — which covers the 60-of-89
+An order with no `pr_url` costs nothing at all — no `gh` call — which covers the 60-of-89
 planners, investigations and knowledge-base writes the old check needed a whole
 `not-produced` rung to exclude.
 
-A `gh` that cannot answer stops the pass and leaves the previous record standing, rather
-than continuing per work order. The failure is `gh` itself, identically for every order,
-and an empty answer read as a fact would be recorded as `no-pull-request` — which is
-silent.
+A pull request `gh` cannot read records nothing, so the previous reading stands and its
+violation keeps being reported. Reading a failure as an empty answer would be the SILENT
+verdict, which would exempt orders invisibly. The pass continues to the next order rather
+than stopping: each one asks about a different url, so an unreadable pull request is a
+fact about that url.
 
+## 5b. The remedy has to CLEAR the alert, and for months it did not
+
+Found while trying to clear the eight live `jarvis_os` alerts by hand on 2026-09-18. Both
+routes out of this violation were no-ops for most of the orders it fires on.
+
+**`jarvis wo done`.** `ops.mark_done` wrote its `work_unlanded` exclusion only when
+`ops.unlanded_work` reported something, and that reads the WORKTREE while this check reads
+the PULL REQUEST. Five of the eight alerted orders had no worktree left on disk. Worse,
+`unlanded_work` answers "nothing" for ANY order carrying a `pr_url` — so across the whole
+of this check's narrowed population it could never record an exclusion at all. Fixed with
+`ops.unmerged_pull_request`: the order's recorded pull request, unless a `pr_merged` event
+or a settled `landing_seen` says it merged. No round trip — this runs inside a CLI command
+somebody is waiting on. Nothing having looked yet reads as unmerged, which over-records
+rather than under-records, and `work_unlanded_open`'s episode arithmetic retires it when a
+`pr_merged` lands.
+
+**`jarvis wo finish --abandon`.** The abandonment itself was always written. What went
+wrong is everything after it: `finish` submitted the order for validation, the panel
+answered "this submission changes no files and records no other durable effect", the order
+was escalated to `needs_review` and an attention item appeared. The user cleared one alert
+and was handed a different one (`wo-5eedc84d`, 2026-09-18). `--abandon` on an order whose
+status is already terminal now records and returns — recording a decision about finished
+work is not a delivery. A LIVE order abandoning still opens a round, because there the
+panel has something to look at; both halves have a test.
 ## 6. What this gives up, deliberately
 
 * **An order that delivered nothing.** wo-5a6b2d6d is completed; its only product, a
@@ -130,13 +158,17 @@ silent.
   on no branch that ever merged, with no pull request. Nothing reports it now. The user
   accepts this: the place to catch an order settling with nothing delivered is the
   validation round that let it settle, and that is the sibling work order.
+* **An order whose `pr_url` names the wrong pull request.** wo-cd73c537 records a merged
+  #81 while #116 carries the rest of its work and is open; this check reads #81, sees
+  MERGED and says nothing. A known consequence of the layering in §3, not a defect of this
+  check: a `pr_url` that does not reflect the work is a RECORDING defect, and recording is
+  INV-PR-RECORDED's half. Asserted as a test, so it cannot turn into a surprise.
+* **An order the daemon has never asked about.** Silent until the first sweep, which is
+  the same silence as "no pull request" rather than a guess.
 * **Issue #232's Mode C** — a first pull request merges and the worker keeps going. The
   `merged-tail` rung measured the branch against the sha GitHub merged; the pull request
   merged, so the invariant is satisfied, and commits pushed to the branch afterwards are
   no longer this check's business. wo-752eced8 is the live example.
-* **A project the daemon has never swept** reports nothing here, because discovery has not
-  run. That is the price of keeping `gh` out of the invariant, and it is the same silence
-  as "no pull request" rather than a guess.
 
 ## 7. Removed
 
@@ -145,6 +177,11 @@ silent.
 `SIGNIFICANT_CHARS`, `FETCH_TIMEOUT_SECONDS`, the `STRANDED` / `PARTIAL` / `NOT_PRODUCED` /
 `UNKNOWN` verdicts, `SETTLED_VERDICTS`, and the `landing_checked` cache. Nothing else
 called any of them; `jarvis doctor` reached them only through `check_work_lands`.
+
+Nothing was added to `github.py`. The first implementation of this spec added
+`pr_list_for_branch`, `BranchPullRequest`, `BRANCH_RE` and a third entry in
+`READ_ONLY_VERBS`; §3 removed the need for all of it, and the module is unchanged from
+`main`.
 
 `authored()` and everything §§1-6 of the superseded spec describe are untouched — the
 settle-time refusal is a different question at a different cost, and it was never the one

@@ -57,7 +57,7 @@ GH_TIMEOUT = 30
 #: subset of this one. A write verb added here would have to be added deliberately, in a
 #: commit that also changes the test — which is the whole mechanism: see the module
 #: docstring for why the panel's blind review depends on it.
-READ_ONLY_VERBS = (("pr", "view"), ("pr", "diff"), ("pr", "list"))
+READ_ONLY_VERBS = (("pr", "view"), ("pr", "diff"))
 
 #: The LOCAL git subcommands this module runs, held to the same standard by the same
 #: test. `origin_repo` shells out to git to learn which repository this checkout belongs
@@ -375,90 +375,6 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
         checks=read_checks(payload),
         head_oid=str(payload.get("headRefOid") or ""),
     )
-
-
-#: The shape a branch name must have before it becomes an argument to `gh pr list`.
-#: `pr_view`'s exposure is a submitter-written URL; this one's is a REF NAME read off the
-#: project's own repository, which is a much shorter leash — but a ref whose name begins
-#: with `-` is still read by `gh` as a flag, and git will create one if asked. So the same
-#: rule applies: the argument is checked against a shape, never scrubbed into one.
-BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
-
-#: How many pull requests one branch may have before the rest are ignored. A branch that
-#: has had more than this is not something a sweep is going to settle.
-BRANCH_PR_LIMIT = 20
-
-
-@dataclass(frozen=True)
-class BranchPullRequest:
-    """One pull request GitHub knows of for a branch — its number, url and state.
-
-    Deliberately thinner than `PullRequest`: this is the answer to "what pull requests
-    exist for this branch", asked about a work order that settled months ago, and all
-    that is read off it is which state it ended in. Mergeability, checks and the head sha
-    are questions about a pull request somebody is still working on.
-    """
-
-    number: int
-    url: str
-    state: str
-
-    @property
-    def merged(self) -> bool:
-        return self.state == "MERGED"
-
-    @property
-    def is_open(self) -> bool:
-        return self.state == "OPEN"
-
-
-def pr_list_for_branch(branch: str, cwd: Path | None = None
-                       ) -> tuple[BranchPullRequest, ...]:
-    """Every pull request whose head is `branch`, whatever state it ended in.
-
-    THE ANSWER `pr_url` CANNOT GIVE. A work order's recorded pull request is what its
-    worker typed at `jarvis wo finish --pr`, once: it is NULL on every order that settled
-    before that flag existed, and it is stale the moment a second pull request opens on
-    the same branch. Both shapes are real in this fleet and both come out right here,
-    because the question is asked of the BRANCH — the thing the work is actually on.
-    `Daemon.discover_pull_requests` is the caller and carries the evidence.
-
-    **NO `--repo`, EVER.** The repository comes from `cwd`, so this can only read the
-    checkout's own pull requests, and no submitter-written string reaches the argument
-    list at all. That is a stronger story than `pr_view`'s; `BRANCH_RE` is the one
-    remaining sharp edge.
-
-    Raises `GitHubError` on any doubt, exactly as `pr_view` does. No answer is not an
-    empty answer, and a caller that read one as "this work order has no pull request"
-    would exempt it from the landing sweep for ever.
-    """
-    if not BRANCH_RE.match(branch or ""):
-        raise GitHubError(f"{branch!r} is not a branch name this may ask about",
-                          GitHubError.URL_REFUSED)
-    stdout = _run(["pr", "list", "--head", branch, "--state", "all",
-                   "--limit", str(BRANCH_PR_LIMIT), "--json", "number,url,state"],
-                  url=branch, cwd=cwd,
-                  missing_hint="so Jarvis cannot tell whether completed work landed")
-    try:
-        rows = json.loads(stdout or "[]")
-    except json.JSONDecodeError as e:
-        raise GitHubError(f"`gh pr list --head {branch}` returned no JSON "
-                          f"({stdout[:200]!r})", GitHubError.UNREADABLE) from e
-    if not isinstance(rows, list):
-        raise GitHubError(f"`gh pr list --head {branch}` answered {rows!r}",
-                          GitHubError.UNREADABLE)
-    found = []
-    for row in rows:
-        state = str(row.get("state") or "").upper()
-        url = str(row.get("url") or "")
-        if not (state and url):
-            # A row missing either is not a fact about a pull request. Dropping it errs
-            # in the direction that matters: the sweep reports less, never more.
-            log.info("`gh pr list --head %s` returned an unusable row: %r", branch, row)
-            continue
-        found.append(BranchPullRequest(number=int(row.get("number") or 0), url=url,
-                                       state=state))
-    return tuple(found)
 
 
 #: The fields of one `gh pr view --json …` for the PANEL, which needs the pull request

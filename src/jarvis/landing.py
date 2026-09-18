@@ -16,9 +16,9 @@ allowed to cost nothing and allowed to be certain. It is what makes `ops.finish`
 (docs/superpowers/specs/2026-09-13-a-finished-order-proves-its-code-landed.md §2).
 
 **`judge()` is the audit.** Months later, for an order that settled long ago: did this
-work order's pull request land? That is one question about one artifact, and it is
-answered from what GitHub said about the pull requests on the work order's branches —
-never from the content of the repository.
+work order's pull request land? That is one question about one artifact — the pull
+request the order recorded — and it is answered from what GitHub said about it, never
+from the content of the repository.
 
 ## THE AUDIT ASKS ABOUT THE PULL REQUEST. IT USED TO MEASURE THE DIFF, AND IT WAS WRONG
 
@@ -54,18 +54,30 @@ commit on a branch nobody ever opened a pull request for is now reported by noth
 example. The user accepts that, because the place to catch it is the validation round
 that let the order settle.
 
-## `pr_url` IS NOT THE POPULATION FILTER, AND SKIPPING ON IT WOULD BE WORSE THAN NOISE
+## `pr_url` IS THE POPULATION FILTER, AND ANOTHER INVARIANT IS WHAT MAKES IT TRUSTWORTHY
 
-`pr_url` is what a worker typed at `jarvis wo finish --pr`, once. In the production
-`jarvis_os` records it is NULL on `wo-5eedc84d`, which had pull request #42 all along and
-merged it; and on `wo-cd73c537` it is stale, naming a merged #81 while #116 — carrying
-that order's unmerged commits — is open. A check that skipped on `if not wo["pr_url"]`
-would silently exempt exactly the orders this exists for.
+`pr_url` is what a worker typed at `jarvis wo finish --pr`, once, so it is only as good
+as that habit — and in the production records it is not good: NULL on `wo-5eedc84d`,
+which merged pull request #42 all along, and on `wo-cd73c537` it names a merged #81 while
+#116 carries the rest of that order's work and is open.
 
-So the population comes from the BRANCH instead. `branches_for` names every branch this
-work order's code could be on, `Daemon.discover_pull_requests` asks GitHub for the pull
-requests whose head is each of them, and the answer is written to the timeline as a
-`pr_discovered` event. `judge` reads that event and nothing else.
+That is a REAL defect and it is deliberately not fixed here. The user's second ruling,
+2026-09-18: *"If there is any code change made in an order, then pr_url must not be
+empty, and the invariant should rely on that pr_url to check the change lands on main
+once the order gets completed."* So the column is made trustworthy at its source, by
+INV-PR-RECORDED (work order `wo-2005a89b`), which refuses to let an order that wrote code
+settle without one; and this audit reads it and judges THAT pull request. Two checks, one
+chain, neither of them re-deriving the other's half:
+
+- **no `pr_url` -> out of scope here, silent.** Not an unknown and not a shrug. Whether an
+  order should have had one is INV-PR-RECORDED's question, asked while the work is live.
+- **a `pr_url` that names the wrong pull request** — the `wo-cd73c537` shape — is also
+  INV-PR-RECORDED's. This module judges the pull request the order recorded and says so;
+  it does not go looking for a better one.
+
+The state of that pull request reaches the timeline as a `landing_seen` event, written by
+`Daemon.refresh_landings` — the half with a network. `judge` reads that event and nothing
+else.
 
 ## Why this module imports almost nothing
 
@@ -86,7 +98,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from . import worker_session
 from .evidence import ProjectRef, base_ref
@@ -228,35 +240,30 @@ def authored(worktree: Path | None) -> Authored:
 class Landing:
     """The audit's verdict on one work order, and the pull request behind it.
 
-    `pr_url` is the pull request the verdict is ABOUT — which is not necessarily the one
-    the work order recorded, and that difference is the point: see the module docstring.
-    `seen` carries every pull request discovery found, so a report can say "#116 is open,
-    #81 merged" rather than making the reader go and look.
+    `pr_url` is the pull request the verdict is ABOUT, and it is always the one the work
+    order recorded — never one this module went looking for. See the module docstring on
+    why that is a layering decision and not an oversight.
     """
 
     wo_id: str
     verdict: str
     detail: str
     pr_url: str = ""
+    #: GitHub's own enum as `github.PullRequest` reports it: OPEN, MERGED or CLOSED.
     pr_state: str = ""
-    branches: tuple[str, ...] = ()
-    #: `(number, url, state)` per pull request, newest first. A plain tuple of tuples so
-    #: it survives a round trip through an event payload unchanged.
-    seen: tuple[tuple[int, str, str], ...] = ()
 
     @property
     def unsettled(self) -> bool:
         return self.verdict in UNSETTLED_VERDICTS
 
     def record(self) -> dict[str, object]:
-        """This, as a `pr_discovered` payload. `from_record` is the other half."""
+        """This, as a `landing_seen` payload. `from_record` is the other half."""
         return {"verdict": self.verdict, "detail": self.detail, "pr_url": self.pr_url,
-                "pr_state": self.pr_state, "branches": list(self.branches),
-                "seen": [list(row) for row in self.seen]}
+                "pr_state": self.pr_state}
 
 
 def from_record(wo_id: str, payload: dict[str, Any]) -> Landing:
-    """A `pr_discovered` payload read back. The inverse of `Landing.record`.
+    """A `landing_seen` payload read back. The inverse of `Landing.record`.
 
     Defensive about every field, because this crosses a JSON round trip and an event
     written by an older release is a shape nobody can change afterwards. An unreadable
@@ -267,112 +274,45 @@ def from_record(wo_id: str, payload: dict[str, Any]) -> Landing:
     verdict = str(payload.get("verdict") or "")
     if verdict not in (LANDED, AWAITING_MERGE, REFUSED, NO_PULL_REQUEST):
         return Landing(wo_id, NO_PULL_REQUEST,
-                       detail=f"unreadable discovery record ({payload!r})")
-    seen = []
-    for row in payload.get("seen") or ():
-        if isinstance(row, (list, tuple)) and len(row) == 3:
-            seen.append((int(row[0] or 0), str(row[1]), str(row[2])))
+                       detail=f"unreadable landing record ({payload!r})")
     return Landing(wo_id, verdict, detail=str(payload.get("detail") or ""),
                    pr_url=str(payload.get("pr_url") or ""),
-                   pr_state=str(payload.get("pr_state") or ""),
-                   branches=tuple(str(b) for b in payload.get("branches") or ()),
-                   seen=tuple(seen))
+                   pr_state=str(payload.get("pr_state") or ""))
 
 
-def judge(wo_id: str, prs: Sequence[Any], branches: Sequence[str] = ()) -> Landing:
-    """Did this work order's pull request land? `prs` is what GitHub said, passed in.
+def judge(wo_id: str, pr_url: str, state: str) -> Landing:
+    """Did this work order's recorded pull request land? `state` is what GitHub said.
 
-    Each entry needs `.number`, `.url` and `.state` — `github.BranchPullRequest` — and
-    this module never asks for them itself, for the reason the module docstring gives.
+    One pull request, one state, no arithmetic. `state` is `github.PullRequest.state`,
+    fetched by the caller — this module never asks for it itself, for the reason the
+    module docstring gives.
 
-    THE RULE, in the order it resolves, because a branch can carry more than one pull
-    request and `wo-cd73c537` really does:
-
-    1. **Any pull request OPEN** -> `AWAITING_MERGE`. It outranks a merge, and that is
-       deliberate: `wo-cd73c537` merged #81 and then had #116 opened on the same branch
-       carrying the rest of the work. An earlier merge does not deliver what is still
-       sitting in an open pull request, so the open one is what the report is about.
-    2. **Otherwise any MERGED** -> `LANDED`. Merged is the answer; nothing else is
-       measured. A later pull request that was opened and closed does not un-land it —
-       which is the shape a "newest one wins" rule would get wrong.
-    3. **Otherwise pull requests exist and every one was closed unmerged** -> `REFUSED`.
-       The work was delivered and somebody said no, on GitHub, where the work order
-       cannot see it.
-    4. **No pull request at all** -> `NO_PULL_REQUEST`, which is out of scope and silent.
+    - **MERGED** -> `LANDED`. Merged is the answer. Nothing is measured against it: the
+      whole point of the 2026-09-18 rewrite is that a merged pull request stays merged
+      however far the default branch is refactored afterwards.
+    - **OPEN** -> `AWAITING_MERGE`. The work is delivered and waiting on a merge, which
+      is a different sentence from "stranded" and the remedy differs with it.
+    - **CLOSED**, or anything else GitHub says -> `REFUSED`. Delivered, and somebody said
+      no on GitHub where the work order cannot see it. An unrecognised state lands here
+      rather than in silence: a state this module does not know is a reason to look.
+    - **no `pr_url`** -> `NO_PULL_REQUEST`, out of scope and silent. INV-PR-RECORDED's
+      question, not this one's.
     """
-    rows = tuple(sorted(((int(getattr(p, "number", 0) or 0), str(getattr(p, "url", "")),
-                          str(getattr(p, "state", "")).upper()) for p in prs),
-                        key=lambda r: -r[0]))
-    branches = tuple(branches)
-    if not rows:
-        return Landing(wo_id, NO_PULL_REQUEST, branches=branches,
-                       detail=("no pull request was ever opened for "
-                               + (", ".join(f"`{b}`" for b in branches)
-                                  if branches else "this work order")))
-    listing = ", ".join(f"#{n} {state}" for n, _, state in rows)
-    opened = [r for r in rows if r[2] == "OPEN"]
-    if opened:
-        url = opened[0][1]
-        return Landing(wo_id, AWAITING_MERGE, pr_url=url, pr_state="OPEN",
-                       branches=branches, seen=rows,
-                       detail=f"the work is delivered and waiting on a merge: {url} is "
-                              f"open ({listing})")
-    merged = [r for r in rows if r[2] == "MERGED"]
-    if merged:
-        url = merged[0][1]
-        return Landing(wo_id, LANDED, pr_url=url, pr_state="MERGED", branches=branches,
-                       seen=rows, detail=f"{url} merged")
-    _, url, state = rows[0]
-    return Landing(wo_id, REFUSED, pr_url=url, pr_state=state, branches=branches,
-                   seen=rows,
-                   detail=f"the work was delivered and refused: {url} was closed "
-                          f"without merging ({listing})")
-
-
-def branches_for(repo: Path, wo_id: str, worktree: Path | None = None) -> tuple[str, ...]:
-    """Every branch this work order's code could be on, as GitHub would name it.
-
-    The input to `Daemon.discover_pull_requests`, and the reason the audit does not have
-    to trust `pr_url`. LOCAL ONLY — refs and a worktree HEAD, no network.
-
-    ALL of them, not the first. `_ref_for`, which this replaces, returned one match and
-    that was a defect the moment a work order used two branches: `wo-f1ce0f24` has
-    `worktree-wo-f1ce0f24` (#225) and `worktree-wo-f1ce0f24-memory` (#226), and taking
-    either alone reports on half the work.
-
-    Remote names are stripped to the branch, which is what `gh pr list --head` wants:
-    `origin/rescue/wo-x` is the pull request's `rescue/wo-x`. Local and remote copies of
-    one branch therefore collapse to a single entry, which is right — they are one head
-    as far as GitHub is concerned.
-
-    The worktree's HEAD goes in first because it is the only answer that cannot be wrong;
-    the ref scan covers the rest, and it has to, because a worktree is usually gone by the
-    time anyone audits. It matches all three shapes this fleet has produced:
-    `worktree-wo-x`, `wo-x-some-slug` and `rescue/wo-x`.
-
-    An empty answer means the audit cannot name a branch, which reaches `judge` as
-    `NO_PULL_REQUEST` — silent. A clone that has never fetched the branch is the shape
-    that produces it, and saying nothing is the right failure for a hygiene sweep.
-    """
-    found: dict[str, None] = {}
-    if worktree is not None and worktree.is_dir():
-        head = (_git(worktree, "rev-parse", "--abbrev-ref", "HEAD") or "").strip()
-        if head and head != "HEAD":
-            found.setdefault(head, None)
-    for pattern, strip_remote in (("refs/heads/", False), ("refs/remotes/", True)):
-        names = (_git(repo, "for-each-ref", "--format=%(refname:short)", pattern)
-                 or "").split()
-        for name in names:
-            if wo_id not in name:
-                continue
-            if strip_remote:
-                # `origin/rescue/wo-x` -> `rescue/wo-x`. One partition, because a branch
-                # name may itself contain slashes and the remote never does.
-                _, _, name = name.partition("/")
-            if name.endswith("/HEAD") or not name:
-                continue
-            found.setdefault(name, None)
-    return tuple(found)
+    pr_url = (pr_url or "").strip()
+    state = (state or "").strip().upper()
+    if not pr_url:
+        return Landing(wo_id, NO_PULL_REQUEST,
+                       detail="this work order recorded no pull request")
+    if state == "MERGED":
+        return Landing(wo_id, LANDED, pr_url=pr_url, pr_state=state,
+                       detail=f"{pr_url} merged")
+    if state == "OPEN":
+        return Landing(wo_id, AWAITING_MERGE, pr_url=pr_url, pr_state=state,
+                       detail=f"the work is delivered and waiting on a merge: {pr_url} "
+                              f"is still open")
+    return Landing(wo_id, REFUSED, pr_url=pr_url, pr_state=state or "UNKNOWN",
+                   detail=f"the work was delivered and refused: {pr_url} was closed "
+                          f"without merging")
 
 
 # --------------------------------------------------------------------------- internals
@@ -385,13 +325,11 @@ def _git(repo: Path, *args: str) -> str | None:
     git at all must produce a thin answer rather than an exception that strands it.
 
     But it does not return "" for a failure either, because every caller here reads the
-    output as DATA and "" is a meaningful datum: no commits ahead, no branch of this work
-    order anywhere. A transient failure smuggled in as "" would make `authored` report
-    `produced=False` and let a settling strand real work, and would make `branches_for`
-    answer "no branch", which is silence. So the failure is a separate value the callers
-    have to handle, and it is logged: this module is otherwise silent by design, and a
-    fleet-wide audit that quietly stopped working would look exactly like a fleet with
-    nothing stranded.
+    output as DATA and "" is a meaningful datum: no commits ahead, nothing uncommitted. A
+    transient failure smuggled in as "" would make `authored` report `produced=False` and
+    let a settling strand real work. So the failure is a separate value the caller has to
+    handle, and it is logged: this module is otherwise silent by design, and a check that
+    quietly stopped working would look exactly like a fleet with nothing stranded.
     """
     try:
         proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
