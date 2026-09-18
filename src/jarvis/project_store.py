@@ -43,12 +43,27 @@ WO_STATUSES = (
     # through in the dashboard, not a decision blocking the OS, and putting every
     # finished work order in the "NEEDS YOU" strip is how that strip stops being read.
     "waiting_pr_merge",
+    # The order spent its dollar budget (`budget.EXHAUSTED`). A status of its own rather
+    # than a reuse of one above, because the two candidates both say something false:
+    # `failed` says the work went wrong, `needs_review` says a judgement is wanted, and
+    # neither is true of an order that was doing fine and ran out of money. Ordered here
+    # — after the merge queue, before the terminal three — because this tuple IS the
+    # order the dashboard renders status counts in, and running out of money belongs
+    # with the things that have stopped rather than with the things in flight.
+    #
+    # OPEN, NOT TERMINAL, and that is the whole reason the state is worth having: the
+    # user raises the budget and the work carries on in the same session
+    # (`ops.set_work_order_budget`). Making it terminal would paint it into the corner
+    # the work order that asked for it explicitly warned against — and would also make
+    # it a DEPENDENCY_DEAD_STATUS, stranding every dependent and failing the parent
+    # feature over a number the user can change in one command.
+    "budget_exhausted",
     "completed",
     "failed",
     "cancelled",
 )
 OPEN_STATUSES = ("pending", "dispatching", "running", "idle", "waiting_input",
-                 "validating", "needs_review", "waiting_pr_merge")
+                 "validating", "needs_review", "waiting_pr_merge", "budget_exhausted")
 # Settled: nothing more will happen to these on their own. They are the bulk of an old
 # project's history, so listings collapse them behind a count rather than printing them.
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
@@ -185,7 +200,12 @@ RETRY_SWEEP_STATUSES = ("dispatching", "running", "idle", "waiting_input", "vali
 # refused for the usage limit settles back to `idle` HOLDING A RESUMABLE, DUE PAUSE
 # (`Daemon.settle_work_order` leaves a paused turn's status alone), so a sweep that
 # skipped it would strand the one work order a feature routes all its messages through.
-NOT_RETRIED = ("pending", "completed", "cancelled")
+#
+# `budget_exhausted` IS here, and it is the one entry whose reason is money rather than
+# ownership: relaunching that turn would spend dollars the user has not authorised, and
+# the sweep cannot ask them. The relaunch is `ops.set_work_order_budget`'s, and it
+# happens only once a person has raised the number.
+NOT_RETRIED = ("pending", "completed", "cancelled", "budget_exhausted")
 
 # What spends one of a project's `max_concurrent` slots: a work order whose turn is
 # actually executing, plus the claim that is about to launch one (issue #134).
@@ -247,10 +267,21 @@ FO_STATUSES = (
     "executing",    # children dispatching / running
     "validating",   # every child is done and the panel is judging the feature as a whole
     "completed",    # every child settled successfully
+    # The FAMILY budget is gone — planner, manager and children together have spent
+    # `feature_orders.budget_usd`. Open, for the same reason the work-order status is:
+    # `jarvis fo budget <id> <amount>` puts the feature back to work.
+    #
+    # AFTER `completed` AND NOT BEFORE IT, which is the one place it differs from the
+    # work-order tuple above. This tuple is also a render order, and its happy path —
+    # `executing`, `validating`, `completed` — is CONTIGUOUS and asserted as such
+    # (tests/test_stores.py). Running out of money is a stop rather than a stage of that
+    # pipeline, so it sits with the other endings instead of interrupting them.
+    "budget_exhausted",
     "failed",       # a child failed or was cancelled
     "cancelled",    # the user stopped it
 )
-FO_OPEN_STATUSES = ("pending", "planning", "plan_review", "executing", "validating")
+FO_OPEN_STATUSES = ("pending", "planning", "plan_review", "executing", "validating",
+                    "budget_exhausted")
 FO_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
 # Work-order metadata key: this work order was authorised by whoever filed it, so the
@@ -699,6 +730,24 @@ CREATE INDEX IF NOT EXISTS idx_envelopes_subject ON envelopes(subject_wo_id, sub
 # existing database, so new columns must be ALTERed in on open.
 ADDED_COLUMNS = {
     "work_orders": {
+        # THE DOLLAR CEILING THE USER SET on this one order, or NULL for no ceiling —
+        # which is what every row written before this existed says, and what the OS does
+        # by default. See src/jarvis/budget.py for what the number governs (the order's
+        # whole bill, worker turns plus Jarvis's own calls on it) and how it is enforced.
+        #
+        # Stamped at creation from the catalog default when there is one, rather than
+        # re-read from the catalog on every turn the way `autocompact_window` is. The
+        # opposite choice on purpose: a budget is a contract about ONE order, `jarvis wo
+        # show` has to be able to state it, and lowering a fleet default must not
+        # silently strand work the user already authorised at the old number.
+        "budget_usd": "REAL",
+        # ...and the slice this child's FEATURE reserved for it at dispatch — see the
+        # reserve-on-dispatch note in budget.py. NULL for every standalone work order and
+        # for a child whose feature has no budget. The two columns are separate, and the
+        # tighter of them wins (`budget.ceiling`), because "what the user typed" and
+        # "what the family lent it" are different claims and an escalation has to name
+        # which one ran out.
+        "budget_reserved_usd": "REAL",
         "job_id": "TEXT",
         "reply_job_id": "TEXT",
         # Hidden orders stay on the record but stop competing for the user's attention:
@@ -793,6 +842,12 @@ ADDED_COLUMNS = {
         # See the CREATE TABLE comment. A live database already has `feature_orders`,
         # so the column only reaches it through here.
         "base_sha": "TEXT",
+        # A FAMILY BUDGET: the ceiling on this feature's whole rollup — its planner, its
+        # manager and every child — the same dollars `jarvis cost <fo-id>` adds up. It is
+        # not a per-child number and is never divided up front; a child takes its slice
+        # out of the unreserved remainder at the moment it is dispatched
+        # (`budget.reserve`). NULL is no ceiling, exactly as before this shipped.
+        "budget_usd": "REAL",
     },
     "wo_turns": {
         # See the CREATE TABLE comment. Live databases already have `wo_turns`, so the
@@ -1064,6 +1119,7 @@ class ProjectStore:
         spec_section: str | None = None,
         issue_url: str | None = None,
         issue_priority: str | None = None,
+        budget_usd: float | None = None,
     ) -> dict[str, Any]:
         """Create a work order. `status` and `session_id` are set in the same INSERT
         rather than afterwards, because the row is visible to the daemon the instant it
@@ -1093,19 +1149,21 @@ class ProjectStore:
             """INSERT INTO work_orders (id, title, description, status, origin,
                    created_at, updated_at, model, effort, permission_mode,
                    append_system_prompt, backlog_id, metadata, session_id, depends_on,
-                   parent_id, kind, spec_section, issue_url, issue_priority)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   parent_id, kind, spec_section, issue_url, issue_priority,
+                   budget_usd)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 wo_id, title, description, status, origin, ts, ts, model, effort,
                 permission_mode, append_system_prompt, backlog_id,
                 db.to_json(metadata or {}), session_id, db.to_json(deps),
                 parent_id, kind, spec_section or None, issue_url or None,
-                issue_priority or None,
+                issue_priority or None, budget_usd,
             ),
         )
         self.add_event(wo_id, "created", {"origin": origin, "depends_on": deps,
                                           **({"parent_id": parent_id} if parent_id else {}),
-                                          **({"kind": kind} if kind != "worker" else {})})
+                                          **({"kind": kind} if kind != "worker" else {}),
+                                          **({"budget_usd": budget_usd} if budget_usd else {})})
         return self.get_work_order(wo_id)
 
     def get_work_order(self, wo_id: str) -> dict[str, Any]:
@@ -1558,17 +1616,19 @@ class ProjectStore:
                              origin: str = "jarvis", backlog_id: str | None = None,
                              metadata: dict[str, Any] | None = None,
                              fo_id: str | None = None,
-                             max_parallel: int | None = None) -> dict[str, Any]:
+                             max_parallel: int | None = None,
+                             budget_usd: float | None = None) -> dict[str, Any]:
         assert origin in WO_ORIGINS, origin
         assert max_parallel is None or max_parallel >= 1, max_parallel
         fo_id = fo_id or db.new_id("fo")
         ts = db.now()
         self.conn.execute(
             """INSERT INTO feature_orders (id, title, description, status, origin,
-                   created_at, updated_at, backlog_id, metadata, max_parallel)
-               VALUES (?,?,?,'pending',?,?,?,?,?,?)""",
+                   created_at, updated_at, backlog_id, metadata, max_parallel,
+                   budget_usd)
+               VALUES (?,?,?,'pending',?,?,?,?,?,?,?)""",
             (fo_id, title, description, origin, ts, ts, backlog_id,
-             db.to_json(metadata or {}), max_parallel),
+             db.to_json(metadata or {}), max_parallel, budget_usd),
         )
         return self.get_feature_order(fo_id)
 
