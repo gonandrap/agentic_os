@@ -1,11 +1,149 @@
 {
-  "generated": "2026-09-13",
+  "generated": "2026-09-17",
   "model": "sonnet",
   "note": "Written by evals/llm/test_validation_judgment.py on a paid run. Every submission is invented; read that file for the diffs these verdicts are about.",
   "runs": {
+    "a-correct-guard-with-a-poor-name": {
+      "filed": [
+        {
+          "seat": "tester",
+          "title": "test_intake.py asserts line number but not the amount"
+        },
+        {
+          "seat": "security",
+          "title": "test_intake.py imports the global store singleton directly"
+        },
+        {
+          "seat": "architect",
+          "title": "Negative-line rule now lives in both intake.py and the journal"
+        },
+        {
+          "seat": "maintainer",
+          "title": "src/ledger/intake.py: `chk` breaks the file's naming convention"
+        }
+      ],
+      "outcome": "passed",
+      "reason": "",
+      "seats": [
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Diff and tests match the declared evidence: chk() is called from receive() before storage, and test_a_negative_line_is_refused_at_intake would fail pre-change (receive previously stored the batch and only check_total ran) and passes after. Decimal is used throughout, no TODOs.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"test_intake.py asserts line number but not the amount\", \"detail\": \"The brief asks the error to name both the line number and the amount, and chk() does include the amount in the message, but the test only does match=\\\"line 2\\\" \u2014 it never asserts the amount (\\\"-4.00\\\") appears. Tightening the regex to include",
+          "seat": "tester",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"No secrets, injection, or authorization changes; the new check uses Decimal comparisons consistent with kn-f4aa338b and adds no TODOs (kn-3ce340e8).\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"test_intake.py imports the global store singleton directly\", \"detail\": \"test_a_negative_line_is_refused_at_intake asserts against ledger.store.store's global state rather than a fixture-scoped instance; if other tests in the suite also touch this singleton without resetting it, ordering-dependent leakage between tests could mask or fake this assertion. Consider a fixture that resets/clears the store between tests.\"}]}",
+          "seat": "security",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"The new check sits at the right layer \u2014 intake.py already owns entry validation and store.save_batch, so chk() reaching only into batch.entries with a Decimal comparison fits cleanly and matches kn-f4aa338b.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"Negative-line rule now lives in both intake.py and the journal\", \"detail\": \"The brief states the journal already rejects negative lines deep in posting; this diff adds a second, earlier enforcement point in src/ledger/intake.py without touching or removing the journal-level check. If the journal check becomes unreachable now that intake refuses first, it's dead code that will ",
+          "seat": "architect",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Nothing here blocks \u2014 the fix is a small, well-tested addition in the right layer.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"src/ledger/intake.py: `chk` breaks the file's naming convention\", \"detail\": \"The existing function is `check_total`; the new one is `chk`, with no docstring explaining what it actually checks. The next reader has to open the body to learn it's specifically a negative-amount guard, whereas `check_total`'s name tells you upfront. Rename to something like `check_no_negative_lines` (or add a one-line docstring) so it reads consistently with its neighbor.\"}]}",
+          "seat": "maintainer",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"outcome\": \"passed\", \"reason\": \"\"}",
+          "seat": "chair",
+          "status": "ok",
+          "verdict": "pass"
+        }
+      ],
+      "severities": {
+        "blocker": 0,
+        "follow_up": 4
+      },
+      "unit": "work_order"
+    },
+    "age-computed-in-two-places": {
+      "filed": [
+        {
+          "seat": "tester",
+          "title": "No test for tie-breaking in ageing_summary"
+        },
+        {
+          "seat": "security",
+          "title": "utcnow() called multiple times could give inconsistent ages within one report render"
+        },
+        {
+          "seat": "architect",
+          "title": "ageing_summary duplicates age_in_days instead of calling it"
+        },
+        {
+          "seat": "maintainer",
+          "title": "ageing_summary recomputes age inline instead of calling age_in_days"
+        }
+      ],
+      "outcome": "passed",
+      "reason": "",
+      "seats": [
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Tests for age_in_days, ageing_summary (including empty case), and the extended reconciliation_row assertion are all present and non-vacuous \u2014 each would fail without the diff.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"No test for tie-breaking in ageing_summary\", \"detail\": \"test_the_ageing_summary_names_the_oldest_batch only covers distinct ages; a case with two batches at the same received_at (min() picks the first) isn't exercised. Low risk since the brief doesn't call out ties, but worth a case if tie behavior ever matters.\"}]}",
+          "seat": "tester",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"No new exposure surface: this is a pure read-only formatting change computing day-deltas from existing timestamps, nothing new is logged, sent, or interpreted.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"utcnow() called multiple times could give inconsistent ages within one report render\", \"detail\": \"src/ledger/report.py calls utcnow() separately in age_in_days and again inside ageing_summary; if a report renders many rows across a slow tick boundary, two batches could get ages computed against slightly different 'now' values. Not a security issue, but worth a single shared timestamp for consistency.\"}]}",
+          "seat": "security",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Fits the existing report module; no layering or knowledge-base violations found.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"ageing_summary duplicates age_in_days instead of calling it\", \"detail\": \"src/ledger/report.py's ageing_summary recomputes `(utcnow() - oldest.received_at).days` inline rather than calling the age_in_days helper it just introduced. Same rule expressed twice \u2014 if the age policy ever changes (rounding, timezone handling), this copy is the one likely to be missed. Call age_in_days(oldest.received_at) instead.\"}]}",
+          "seat": "architect",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Nothing here blocks; the change is small, consistent with existing style, and the standing instructions on Decimal money and TODOs are both respected.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"ageing_summary recomputes age inline instead of calling age_in_days\", \"detail\": \"src/ledger/report.py: ageing_summary does `(utcnow() - oldest.received_at).days` itself right below the age_in_days helper it just defined. If the age calculation ever changes (e.g. rounding, timezone handling), a future editor who fixes age_in_days will likely miss this second copy and the summary line will silently drift from the per-row age. Call `ag",
+          "seat": "maintainer",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"outcome\": \"passed\", \"reason\": \"\"}",
+          "seat": "chair",
+          "status": "ok",
+          "verdict": "pass"
+        }
+      ],
+      "severities": {
+        "blocker": 0,
+        "follow_up": 4
+      },
+      "unit": "work_order"
+    },
     "degraded": {
+      "filed": [
+        {
+          "seat": "security",
+          "title": "Settlement now retains and can expose the full batch, not just unmatched entries"
+        },
+        {
+          "seat": "architect",
+          "title": "Property references `self._unmatched` with no corresponding cache field"
+        }
+      ],
       "outcome": "rejected",
-      "reason": "The `unmatched` property reads and writes `self._unmatched`, but the dataclass only declares `_batch` as a field \u2014 `_unmatched` is never initialized, so the first call to `.unmatched` raises AttributeError. The test that previously checked `result.unmatched == []` was replaced with a comment instead of being updated to actually call the property, which is why this wasn't caught despite '216 passed'. Separately, storing a live reference to the mutable `Batch` instead of a snapshot means `.unmatched` can now reflect post-settle mutations rather than the settlement-time state \u2014 a real behavior ch",
+      "reason": "src/ledger/settlement.py replaces the `unmatched: list[Entry]` field with `_batch: Batch`, but the property reads `self._unmatched` without any such field ever being declared or initialized \u2014 every call to `.unmatched` raises AttributeError, so the caller-visible contract this brief promised to preserve is broken on first touch, not merely deferred. The one test that exercised this path (`tests/test_settlement.py`) was neutered into a comment instead of updated to call the property, so the declared '216 passed, 0 failed, no behaviour changed for callers' evidence does not actually cover the ch",
       "seats": [
         {
           "blocking": null,
@@ -15,64 +153,83 @@
           "verdict": ""
         },
         {
-          "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"No secrets, injection, or authorization changes here \u2014 the Settlement object now retains a reference to the full batch instead of just the unmatched slice, which slightly widens what stays reachable in memory, but nothing in src/ledger/settlement.py or tests/test_settlement.py exposes data to a new caller or channel.\", \"asks\": []}",
+          "blocking": true,
+          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"src/ledger/settlement.py replaces the `unmatched: list[Entry]` field with `_batch: Batch`, but the property reads `self._unmatched` without any such field ever being declared or initialized \u2014 every call to `.unmatched` raises AttributeError, so the caller-visible contract this brief promised to preserve is broken on first touch, not merely deferred. The one test that exercised this path (`tests/test_settlement.py`) was neutered into a comment instead of updated to call the property, so the declared '216 passed, 0 failed, no behaviour changed for callers' evidence does not actually cover the changed code path at all.\", \"asks\": [\"Add the missi",
           "seat": "security",
           "status": "ok",
-          "verdict": "pass"
+          "verdict": "reject"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"Settlement was a computed value object \u2014 total/status/unmatched were snapshots frozen at settle() time. This change makes it hold a live reference to the mutable `Batch` and compute `unmatched` on first touch, so if the batch is mutated between settle() and the first read of `.unmatched`, callers now see post-mutation state instead of the settlement-time snapshot \u2014 that's a real behavior change the summary claims doesn't exist. Also the property reads/writes `self._unmatched` for caching but no such field was added to the dataclass, so first access raises AttributeError.\", \"asks\": [\"Snapshot the unmatched computation eagerly against a copy,",
+          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"The brief asked for a lazy `unmatched` \\\"without changing what callers see,\\\" but Settlement now holds a live reference to the mutable `_batch` instead of the batch that existed at settle() time, so a cache computed on first access can diverge from what an eager build would have returned if the batch mutates in between \u2014 that is an observable behavior change, not a pure perf tweak.\", \"asks\": [\"Have Settlement capture what it needs to compute `unmatched` (e.g. a snapshot of entries) rather than a live reference to the mutable Batch, so the lazy result is provably identical to the old eager one regardless of when it's read.\", \"Restore a real ",
           "seat": "architect",
           "status": "ok",
           "verdict": "reject"
         },
         {
           "blocking": false,
-          "reply": "```json\n{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"src/ledger/settlement.py: the `unmatched` property reads and writes `self._unmatched`, but the dataclass only declares `_batch` as a field \u2014 `_unmatched` is never initialized anywhere in this diff, so the very first call to `.unmatched` will raise AttributeError. The one test that used to exercise this path (tests/test_settlement.py) was turned into a comment instead of being updated to call `.unmatched`, which is why '216 passed' didn't catch it. Also worth flagging: storing `_batch` instead of a snapshot list means `.unmatched` can now change if the batch is mutated after `settle()` returns, which is a real behavior change the bri",
+          "reply": "```json\n{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"src/ledger/settlement.py: the property reads self._unmatched before it is ever assigned anywhere \u2014 there's no field or __post_init__ setting it to None, so the very first call to .unmatched raises AttributeError instead of computing lazily. The one test that would have caught this (tests/test_settlement.py: assert result.unmatched == []) was deleted and replaced with a comment claiming the behavior is unchanged, so the 216-pass evidence never actually exercises the new code path.\", \"asks\": [\"Add `_unmatched: list[Entry] | None = field(default=None, init=False)` (or an equivalent __post_init__) so the cache slot exists before first r",
           "seat": "maintainer",
-          "status": "ok",
-          "verdict": "reject"
-        },
-        {
-          "blocking": false,
-          "reply": "{\"outcome\": \"rejected\", \"reason\": \"The `unmatched` property reads and writes `self._unmatched`, but the dataclass only declares `_batch` as a field \u2014 `_unmatched` is never initialized, so the first call to `.unmatched` raises AttributeError. The test that previously checked `result.unmatched == []` was replaced with a comment instead of being updated to actually call the property, which is why this wasn't caught despite '216 passed'. Separately, storing a live reference to the mutable `Batch` instead of a snapshot means `.unmatched` can now reflect post-settle mutations rather than the settlement-time state \u2014 a real behavior change your summary says doesn't exist.\\n\\nTo satisfy this: add the",
-          "seat": "chair",
           "status": "ok",
           "verdict": "reject"
         }
       ],
+      "severities": {
+        "blocker": 6,
+        "follow_up": 2
+      },
       "unit": "work_order"
     },
     "documentation-only": {
+      "filed": [
+        {
+          "seat": "tester",
+          "title": "Terminal-state claims for 'settled'/'rejected' are undocumented assertions"
+        },
+        {
+          "seat": "security",
+          "title": "State table omits an 'error/failed mid-processing' state if one exists"
+        },
+        {
+          "seat": "architect",
+          "title": "Terminality claims aren't traceable to code"
+        },
+        {
+          "seat": "maintainer",
+          "title": "docs/settlement.md table isn't checked against the actual state constants"
+        },
+        {
+          "seat": "maintainer",
+          "title": "docs/settlement.md: `partial` rationale reads a bit thin without the transition diagram beside it"
+        }
+      ],
       "outcome": "passed",
       "reason": "",
       "seats": [
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"This is a documentation-only change (docs/settlement.md, README.md) with no behavior to test; the submitter correctly says so rather than fabricating test coverage, and ran the existing suite anyway as a sanity check. The table matches the brief (naming states and terminality) without touching the transitions, which were explicitly out of scope.\", \"asks\": []}",
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Documentation-only change accurately reflects a states/terminal table as scoped; nothing here requires behavioral testing.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"Terminal-state claims for 'settled'/'rejected' are undocumented assertions\", \"detail\": \"The table asserts settled/rejected are terminal and partial is not, but the diff cites no source (code or existing transition diagram in docs/settlement.md) confirming this. Since the brief says transitions are already drawn earlier in the file, a brief cross-check note or reference to that diagram would let a reader verify the terminal claims instead of taking them on fait",
           "seat": "tester",
           "status": "ok",
           "verdict": "pass"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Documentation-only change adding a states table and a README link; no code, secrets, or data flow touched, and it doesn't conflict with the money or backlog standing instructions.\", \"asks\": []}",
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Documentation-only change to docs/settlement.md and README.md; no secrets, no code paths, no auth or interpreter surface touched.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"State table omits an 'error/failed mid-processing' state if one exists\", \"detail\": \"The table lists received, matching, settled, partial, rejected. If the codebase has any terminal failure state distinct from rejected (e.g. a settlement that fails after matching started), it should be confirmed present or absent so the table stays authoritative; worth a quick cross-check against the state machine code by a follow-up worker, not a security concern.\"}]}",
           "seat": "security",
           "status": "ok",
           "verdict": "pass"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"This is a documentation-only addition that lands exactly where the brief pointed \u2014 a states table in docs/settlement.md next to the existing transition diagram, with a README pointer added via the existing reading-order list rather than a new mechanism. No structural seam is crossed and neither standing rule (kn-14c4bac8 money-as-Decimal, kn-6ca60339 no TODOs) is implicated.\", \"asks\": []}",
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Documentation-only change lands exactly where the brief asked, uses the existing docs/README structure, and adds nothing beyond the requested table.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"Terminality claims aren't traceable to code\", \"detail\": \"docs/settlement.md now asserts which states are terminal as prose, with no pointer to where in the code that invariant is enforced (e.g. an enum, a status-check). If the state machine changes later, this table can silently drift out of sync since nothing ties it back to the source. Consider a one-line reference to the file/type that defines the states.\"}]}",
           "seat": "architect",
           "status": "ok",
           "verdict": "pass"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"The table is clear and the closing note on `partial` correctly flags the one row that could otherwise be misread. Only gap: the brief says transitions are drawn earlier in the file but the table doesn't cross-reference that diagram, so a reader could miss that the two sections describe the same states.\", \"asks\": []}",
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"The table answers the brief cleanly and the README link fits the existing bullet style; nothing here blocks.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"docs/settlement.md table isn't checked against the actual state constants\", \"detail\": \"No source file is in this diff, so there's nothing to confirm the five state names (`received`, `matching`, `settled`, `partial`, `rejected`) and the terminal/non-terminal calls actually match what the code emits. If a state gets renamed or a sixth one is added later, this table will silently drift out of sync with no test to catch it \u2014 worth a quick grep against the settlement module to ",
           "seat": "maintainer",
           "status": "ok",
           "verdict": "pass"
@@ -85,113 +242,119 @@
           "verdict": "pass"
         }
       ],
+      "severities": {
+        "blocker": 0,
+        "follow_up": 5
+      },
       "unit": "work_order"
     },
     "evidence-contradicts-diff": {
+      "filed": [
+        {
+          "seat": "security",
+          "title": "settlement.py: Settlement now retains the full Batch, not just unmatched entries"
+        },
+        {
+          "seat": "architect",
+          "title": "Settlement now holds the whole Batch, not just the entries it needs"
+        }
+      ],
       "outcome": "rejected",
-      "reason": "The diff removes the one assertion that exercised `unmatched` (`assert result.unmatched == []`) and replaces it with a comment, so nothing in this change actually calls the new property. That matters because the property reads `self._unmatched` but the dataclass only declares `_batch` \u2014 `_unmatched` is never initialized as a field or in `__post_init__`, so the very first access of `.unmatched` should raise `AttributeError`. The declared '216 passed' evidence is not credible against a diff where the only test that would have exercised the changed code path was deleted.\n\nWhat this needs before i",
+      "reason": "The `unmatched` property reads `self._unmatched`, but no `_unmatched` field exists anywhere on `Settlement` (the dataclass only has `total`, `status`, `_batch`) \u2014 the first call to `.unmatched` raises `AttributeError`. The one test that exercised this path (`test_a_full_batch_settles`) had its `assert result.unmatched == []` deleted and replaced with a comment instead of being kept passing, which is why the crash wasn't caught, and it directly contradicts the declared evidence that 'no behaviour changed for callers.'\n\nWhat this needs before it can pass:\n- Add a backing attribute (e.g. `_unmatc",
       "seats": [
         {
           "blocking": true,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"The diff removes the one assertion that exercised `unmatched` (`assert result.unmatched == []`) and replaces it with a comment, so nothing in this change actually calls the new property. That matters because the property reads `self._unmatched` but the dataclass only declares `_batch` \u2014 `_unmatched` is never initialized as a field or in `__post_init__`, so the very first access of `.unmatched` should raise `AttributeError`. The declared '216 passed' evidence is not credible against a diff where the only test that would have exercised the changed code path was deleted.\", \"asks\": [\"Restore an assertion on `result.unmatched` in tests/test_settl",
+          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"The `unmatched` property reads `self._unmatched`, but no `_unmatched` field exists anywhere on `Settlement` (the dataclass only has `total`, `status`, `_batch`) \u2014 the first call to `.unmatched` raises `AttributeError`. The one test that exercised this path (`test_a_full_batch_settles`) had its `assert result.unmatched == []` deleted and replaced with a comment instead of being kept passing, which is why the crash wasn't caught, and it directly contradicts the declared evidence that 'no behaviour changed for callers.'\", \"asks\": [\"Add a backing attribute (e.g. `_unmatched: list[Entry] | None = field(default=None, init=False, repr=False)`) so t",
           "seat": "tester",
           "status": "ok",
           "verdict": "reject"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"Settlement now stores a live reference to the whole `_batch` instead of just the filtered `unmatched` list, and since `_batch` is a plain dataclass field, the auto-generated `__repr__`/`__eq__` will dump the entire batch (including matched entries) anywhere a Settlement object is logged, printed, or compared, instead of just the previously-exposed unmatched subset. In a settlement/ledger system, that's a real widening of what ends up in logs or debug output. Separately, the property reads `self._unmatched` but no such field exists (only `_batch` was declared), so `.unmatched` will raise AttributeError on first access, and the test suite's c",
+          "reply": "```json\n{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Nothing here crosses a trust boundary, touches money formatting, or leaves a TODO in the diff \u2014 no security blocker.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"settlement.py: Settlement now retains the full Batch, not just unmatched entries\", \"detail\": \"Before this change, a Settlement object only carried the (already-filtered) unmatched entries \u2014 matched entries were never reachable from it. Now `_batch` holds a reference to the entire batch, and Python's leading-underscore convention is not access control: any caller holding a Settlement can read `settlement._batch` and see every entry, matched or not. If Settlem",
           "seat": "security",
           "status": "ok",
-          "verdict": "reject"
+          "verdict": "pass"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"The property reads `self._unmatched`, a field that was never declared or initialized anywhere in the diff \u2014 only `_batch` was added \u2014 so first access to `.unmatched` will raise AttributeError, meaning this can't actually be the code that produced 216 passing tests. Separately, the test that verified the caller-visible contract (`result.unmatched == []`) was deleted rather than kept, so the brief's requirement that callers see no change is asserted but no longer checked by anything.\", \"asks\": [\"Declare the memo field (e.g. `_unmatched: list[Entry] | None = None`) that the property actually reads from, or use `functools.cached_property` inste",
+          "reply": "```json\n{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"The property in /path/to/src/ledger/settlement.py reads self._unmatched to decide whether to compute the cache, but the dataclass only declares total, status and _batch \u2014 there is no _unmatched field for it to read or assign, so the very first access of .unmatched raises AttributeError. The diff as shown cannot produce the declared 216-pass result.\", \"asks\": [\"Declare the cache field on the dataclass (e.g. _unmatched: list[Entry] | None = field(default=None, init=False, repr=False)) so the property has somewhere to read from and write to.\"], \"findings\": [{\"severity\": \"blocker\", \"title\": \"settlement.py: property references undeclared",
           "seat": "architect",
           "status": "ok",
           "verdict": "reject"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"src/ledger/settlement.py: the dataclass fields are now `total`, `status`, `_batch` \u2014 there is no `_unmatched` field declared anywhere, yet the `unmatched` property reads and writes `self._unmatched`. As written this raises AttributeError the first time any caller touches `.unmatched`. tests/test_settlement.py made this invisible by deleting the assertion on `result.unmatched` instead of updating it to actually exercise the lazy property, so the suite can pass green while the accessor is broken.\", \"asks\": [\"Add `_unmatched: list[Entry] | None = field(default=None, init=False)` (or equivalent) to the dataclass so the property has something to",
+          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"src/ledger/settlement.py: the `unmatched` property reads and assigns `self._unmatched`, but the dataclass only declares `_batch` \u2014 there is no `_unmatched` field anywhere, so the very first read of `.unmatched` raises AttributeError instead of returning the list. The one test that exercised this (tests/test_settlement.py:33) was turned into a bare comment instead of updated, which is how '216 passed' hides a caller-visible crash the brief explicitly said must not happen.\", \"asks\": [\"Declare `_unmatched: list[Entry] | None = None` (or similar) as an actual dataclass field so the memoization has somewhere to live\", \"Restore a real assertion o",
           "seat": "maintainer",
           "status": "ok",
           "verdict": "reject"
         }
       ],
+      "severities": {
+        "blocker": 5,
+        "follow_up": 2
+      },
       "unit": "work_order"
     },
     "integrates-cleanly": {
-      "outcome": "passed",
-      "reason": "",
-      "seats": [
+      "filed": [
         {
-          "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"The integration test in tests/test_currency_integration.py genuinely exercises the seam: it posts two currencies through the journal and asserts the statement built from the merged balances() and report.py changes reflects both, and separately confirms an unposted currency is absent rather than defaulted to zero. That test would have failed under either child alone, so it's non-vacuous coverage of the join point.\", \"asks\": []}",
           "seat": "tester",
-          "status": "ok",
-          "verdict": "pass"
+          "title": "Diff hunk header for test_currency_integration.py claims +20 lines but only 16 are shown/counted in stat"
         },
         {
-          "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"No new secrets, injection surface, or auth changes here \u2014 this is an internal data-shape change (single balance to per-currency dict) with a reasonable seam test. Amounts stay Decimal throughout (kn-14c4bac8), no float leakage.\", \"asks\": []}",
           "seat": "security",
-          "status": "ok",
-          "verdict": "pass"
+          "title": "No currency validation on entry.currency in balances.py"
         },
         {
-          "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"The two children compose cleanly: balances.py owns the per-currency dict, report.py just relays it, and the integration test exercises the real seam (ledger write -> statement read) rather than re-testing either child's unit alone. No layering violation and the change matches the brief's ask.\", \"asks\": []}",
           "seat": "architect",
-          "status": "ok",
-          "verdict": "pass"
+          "title": "Verify no other callers of the old singular `balance()`/`Statement.balance` API"
         },
         {
-          "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"The merge reads as one coherent change: balances.py, report.py, and their tests all move from single-currency to dict-keyed together, and test_currency_integration.py exercises the seam (journal record -> report) that neither child alone covered. round_amount is applied consistently and Decimal is used throughout, satisfying kn-14c4bac8. The only gap for the next person is that balances() and Statement.balances have no note on ordering guarantees (dict insertion order vs sorted currencies) \u2014 worth a one-line comment if callers ever compare rendered output order.\", \"asks\": []}",
+          "seat": "architect",
+          "title": "Declared 244-pass total is far larger than the sum of what's shown"
+        },
+        {
           "seat": "maintainer",
-          "status": "ok",
-          "verdict": "pass"
+          "title": "Renamed public API (balance -> balances) with no visible check for other callers"
         },
         {
-          "blocking": false,
-          "reply": "All four seats passed, with the integration test genuinely exercising the ledger-write to statement-read seam that neither child covered alone. No standing instruction is violated and no concrete actionable finding was raised.\n\n{\"outcome\": \"passed\", \"reason\": \"\"}",
-          "seat": "chair",
-          "status": "ok",
-          "verdict": "pass"
+          "seat": "maintainer",
+          "title": "Behavior change: absent currency is now missing key, not zero"
+        },
+        {
+          "seat": "maintainer",
+          "title": "report.py: `from .balances import balances` shadows the module name"
         }
       ],
-      "unit": "feature"
-    },
-    "new-function-with-its-own-test": {
       "outcome": "passed",
       "reason": "",
       "seats": [
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"The three declared tests are present in the diff and are non-vacuous: the passing case, the short-by-a-cent case, and the empty-batch case each exercise check_total/receive directly and would fail without the new call. Decimal is used throughout (satisfies kn-14c4bac8), no TODOs present.\", \"asks\": []}",
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"tests/test_currency_integration.py genuinely exercises the seam: it posts real EUR/USD entries through journal.record_entry and asserts statement_for(...).balances reflects them, plus a case proving an unposted currency is absent rather than zero \u2014 non-vacuous coverage of exactly what neither child could test alone.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"Diff hunk header for test_currency_integration.py claims +20 lines but only 16 are shown/counted in stat\", \"detail\": \"The @@ -0,0 +1,20 @@ header doesn't match the 16 insertions reported by --stat and the 16 lines actually present in the diff body. Likely a packaging a",
           "seat": "tester",
           "status": "ok",
           "verdict": "pass"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"This is a validation check added on the ingest path (check_total raising BatchMismatch), with no new I/O, no dynamic execution, no logging of sensitive data, and Decimal is used throughout for the sum, consistent with kn-14c4bac8. No secrets, no widened auth, no injection surface introduced.\", \"asks\": []}",
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"No secrets, injection, or authorization changes here; balances/report are pure in-process data restructuring.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"No currency validation on entry.currency in balances.py\", \"detail\": \"balances() keys its dict directly off entry.currency with no normalization or allow-list. If currency ever originates from external input (API, import file) rather than internal code, an attacker-controlled string becomes a dict key surfaced verbatim in the statement. Not exploitable from this diff alone since the source of `entry.currency` isn't shown, but worth confirming at the ledger.record_entry boun",
           "seat": "security",
           "status": "ok",
           "verdict": "pass"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"check_total is added right at the arrival seam in receive and uses Decimal throughout, consistent with kn-14c4bac8 \u2014 no parallel validation mechanism introduced, and it directly addresses the stated brief.\", \"asks\": []}",
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"The merge extends the existing balances -> report seam rather than adding a parallel one, and money stays Decimal throughout per kn-f4aa338b.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"Verify no other callers of the old singular `balance()`/`Statement.balance` API\", \"detail\": \"Only balances.py, report.py, and their tests are touched. If any other module in the ledger package still calls `balance()` or reads `Statement.balance`, this merge breaks it silently since no such update appears in the diff; worth a grep across the full tree to confirm the old singular API had exactly these two call sites.\"}, {\"severity\": \"follow_up",
           "seat": "architect",
           "status": "ok",
           "verdict": "pass"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"check_total and BatchMismatch are clear, the exception message includes the batch id and both values so a 3am failure is diagnosable, and the fix is scoped to exactly what the brief asked. Decimal is used throughout per kn-14c4bac8, and there's no deferred TODO per kn-6ca60339 \u2014 nothing here trips the next reader.\", \"asks\": []}",
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"The two children compose into one coherent change and the integration test exercises the real seam (ledger storage -> report rendering) rather than restating either child's own tests.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"Renamed public API (balance -> balances) with no visible check for other callers\", \"detail\": \"src/ledger/balances.py and src/ledger/report.py rename `balance`/`Statement.balance` to `balances`/`Statement.balances`, but only the 5 files listed were touched. If any other module in the codebase reads `statement.balance` or imports `balance` from ledger.balances, it now breaks with an AttributeError/Impo",
           "seat": "maintainer",
           "status": "ok",
           "verdict": "pass"
@@ -204,188 +367,528 @@
           "verdict": "pass"
         }
       ],
-      "unit": "work_order"
+      "severities": {
+        "blocker": 0,
+        "follow_up": 7
+      },
+      "unit": "feature"
     },
-    "raw-sql-where-a-store-method-exists": {
-      "outcome": "rejected",
-      "reason": "src/ledger/report.py builds a SQL query by string concatenation of account_id directly into the WHERE clause ('WHERE account_id = '\" + account_id + \"'), a textbook SQL injection: any caller passing account_id containing a quote can read or manipulate arbitrary rows. This also drops the existing store.entries_for() reader (which the brief said to use) in favor of raw sqlite3 access, removing whatever parameterization or access control that reader had.\n\nWhat this needs before it can pass:\n- Replace the concatenated query with a parameterized query, e.g. conn.execute(\"SELECT id, amount, booked_at",
-      "seats": [
+    "new-function-with-its-own-test": {
+      "filed": [
         {
-          "blocking": true,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"The diff builds a raw SQL query by string-concatenating account_id directly into the SQL statement (\\\"WHERE account_id = '\\\" + account_id + \\\"'\\\"), a textbook SQL injection vector, and it also drops the existing store.entries_for() reader in favor of a new sqlite3.connect(DB_PATH) call where DB_PATH is never defined or imported. The single declared test, test_statement_groups_by_month, only checks that statement_for returns the right month keys for a benign literal id \\\"acc-1\\\" \u2014 it never exercises an account_id containing a quote or special character, so the injection path is completely unexercised, and the claimed '217 passed' full-suite r",
           "seat": "tester",
-          "status": "ok",
-          "verdict": "reject"
+          "title": "No test for a batch that exceeds its declared total"
         },
         {
-          "blocking": true,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"src/ledger/report.py builds a SQL query by string concatenation of account_id directly into the WHERE clause ('WHERE account_id = '\\\" + account_id + \\\"'), a textbook SQL injection: any caller passing account_id containing a quote can read or manipulate arbitrary rows. This also drops the existing store.entries_for() reader (which the brief said to use) in favor of raw sqlite3 access, removing whatever parameterization or access control that reader had.\", \"asks\": [\"Replace the concatenated query with a parameterized query, e.g. conn.execute(\\\"SELECT id, amount, booked_at FROM entries WHERE account_id = ?\\\", (account_id,)).\", \"Prefer reusing s",
           "seat": "security",
-          "status": "ok",
-          "verdict": "reject"
+          "title": "Error message in BatchMismatch includes batch.id and amounts"
         },
         {
-          "blocking": false,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"The brief said the store already has the readers this needs, and it did \u2014 `store.entries_for` \u2014 but `monthly_totals` now bypasses it entirely, opening its own `sqlite3.connect(DB_PATH)` and hand-rolling the query inline. That's a parallel data-access path next to the store's existing one, and `report.py` now knows about the database layer directly instead of going through the abstraction that existed for this.\", \"asks\": [\"Revert to calling `store.entries_for(account_id)` and build `statement_for` on top of the existing `monthly_totals`, without introducing a second route to the database from the report module.\"]}",
           "seat": "architect",
-          "status": "ok",
-          "verdict": "reject"
+          "title": "check_total is exported but only ever called from receive"
         },
         {
-          "blocking": false,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"src/ledger/report.py now builds SQL with raw string concatenation of account_id and connects via a bare sqlite3.connect(DB_PATH) instead of using store.entries_for \u2014 the next person touching this inherits a SQL-injection-shaped pattern and an unexplained bypass of the store abstraction, with no comment saying why store.entries_for was dropped. DB_PATH and Statement/group_by_month/Decimal imports also appear unexplained (Decimal isn't imported here despite kn-14c4bac8's money-as-Decimal rule, so this likely doesn't even run).\", \"asks\": [\"Revert to using store.entries_for(account_id) instead of hand-rolled SQL, or if the store method is insuf",
           "seat": "maintainer",
-          "status": "ok",
-          "verdict": "reject"
+          "title": "BatchMismatch has no logging hook before it propagates"
         }
       ],
-      "unit": "work_order"
-    },
-    "refactor-with-its-test-updated": {
       "outcome": "passed",
       "reason": "",
       "seats": [
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"This is a pure extraction with the rounding constant and mode preserved exactly (Decimal(\\\"0.01\\\"), ROUND_HALF_UP) across fees, interest and fx, and tests/test_money.py exercises the new round_amount helper directly with the original half-up case plus a new half-up case and an exact-cents case \u2014 non-vacuous coverage of the shared rule.\", \"asks\": []}",
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"check_total is called from receive, and the three added tests (matching total, short-by-a-cent, empty batch) exercise both the accept and reject paths and would fail without the new call.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"No test for a batch that exceeds its declared total\", \"detail\": \"tests/test_intake.py covers under-total and empty-total cases but not entries summing to more than declared_total; add one for completeness, though the current check_total logic (!=) already covers it symmetrically.\"}]}",
           "seat": "tester",
           "status": "ok",
           "verdict": "pass"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"This is a pure extraction of a Decimal-based quantize call into a shared helper; no float use, no new I/O, no auth or input-handling changes, and both money.py:kn-14c4bac8 and the no-TODO rule kn-6ca60339 are respected. No security-relevant exposure introduced.\", \"asks\": []}",
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Validation logic only, all-Decimal arithmetic, no new I/O or interpreter reachable \u2014 nothing here exposes or leaks anything.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"Error message in BatchMismatch includes batch.id and amounts\", \"detail\": \"src/ledger/intake.py's check_total() raises with the batch id, declared total, and booked total interpolated into the message. If this exception is ever surfaced to an external caller or logged at a boundary that isn't trusted internal code, it discloses internal ledger amounts. Low risk today since the diff doesn't add any such boundary, but worth confirming callers of receive() don't",
           "seat": "security",
           "status": "ok",
           "verdict": "pass"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"This is a clean extraction onto an existing seam: money.py already owned the Decimal type, and the three call sites now import round_amount from it rather than duplicating the quantize call, with no cyclic or upward imports introduced. The behaviour is preserved (same rounding, same precision) and the test moved with the logic it covers.\", \"asks\": []}",
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"check_total sits directly in the receive() call path with no parallel mechanism or bypassed seam, and uses Decimal throughout per kn-f4aa338b.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"check_total is exported but only ever called from receive\", \"detail\": \"src/ledger/intake.py exposes check_total as a public function; if nothing outside the test suite calls it standalone, consider making it a module-private helper (_check_total) so intake.py doesn't advertise two entry points for the same validation.\"}]}",
           "seat": "architect",
           "status": "ok",
           "verdict": "pass"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Clean extraction: money.round_amount is a single obvious source of truth, all three call sites are updated consistently, and the test follows the code to the new home instead of being deleted or left orphaned. No dead ends, no unexplained decisions, no standing-instruction conflicts.\", \"asks\": []}",
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Small, focused change: check_total uses Decimal arithmetic throughout (kn-f4aa338b) and there's no deferred-work TODO (kn-3ce340e8); nothing here blocks.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"BatchMismatch has no logging hook before it propagates\", \"detail\": \"src/ledger/intake.py: check_total raises BatchMismatch with a useful message (batch id, declared total, booked sum), but nothing logs the rejection before the exception leaves receive(). If the caller of receive() doesn't catch and log this specifically, a bad batch arriving at 3am produces a stack trace with no operational record of 'batch X was rejected for tot",
           "seat": "maintainer",
           "status": "ok",
           "verdict": "pass"
         },
         {
           "blocking": false,
-          "reply": "All four seats passed with no findings, no asks, and no standing-instruction conflicts. This is a straightforward, verifiable extraction: the rounding constant and mode are preserved byte-for-byte across call sites, and the test moved with the logic rather than being deleted.\n\n{\"outcome\": \"passed\", \"reason\": \"\"}",
+          "reply": "{\"outcome\": \"passed\", \"reason\": \"\"}",
           "seat": "chair",
           "status": "ok",
           "verdict": "pass"
         }
       ],
+      "severities": {
+        "blocker": 0,
+        "follow_up": 4
+      },
       "unit": "work_order"
     },
-    "stale-caller-across-two-children": {
+    "raw-sql-where-a-store-method-exists": {
+      "filed": [
+        {
+          "seat": "tester",
+          "title": "monthly_totals bypasses store abstraction, risk to kn-f4aa338b"
+        },
+        {
+          "seat": "architect",
+          "title": "String-concatenated SQL in report.py"
+        },
+        {
+          "seat": "maintainer",
+          "title": "report.py: sqlite3 connection never closed"
+        }
+      ],
       "outcome": "rejected",
-      "reason": "src/ledger/reversal.py:15 calls `journal.post_entry(...)`, but journal.py in this same merged diff renamed that function to `record_entry` and journal.py:21 (intake.py) was updated to match \u2014 reversal.py was not. Every call to reversal.reverse() will raise AttributeError instead of posting the negated entry, meaning reversals never actually reach the journal, contradicting the brief. The declared merged-branch result of 239 passed/0 failed is inconsistent with this diff: test_reversal.py's fixture does `monkeypatch.setattr(journal, \"post_entry\", ...)`, which raises AttributeError by default wh",
+      "reason": "src/ledger/report.py builds a SQL query by string-concatenating account_id directly into the query text (\"WHERE account_id = '\" + account_id + \"'\"), which is a textbook SQL injection: any caller of statement_for/monthly_totals with an attacker-influenced account_id can break out of the string literal and run arbitrary SQL against the ledger database.\n\nWhat this needs before it can pass:\n- Replace the concatenated SQL in monthly_totals with a parameterized query, e.g. conn.execute(\"SELECT id, amount, booked_at FROM entries WHERE account_id = ?\", (account_id,)).\n- Since store already provides en",
       "seats": [
         {
           "blocking": true,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"src/ledger/reversal.py:16 calls journal.post_entry, but journal.py was renamed to record_entry by the sibling child and every other caller (intake.py, test_journal.py) was updated \u2014 reversal.py was not. This is a call to a name that no longer exists on the journal module, so reversal.reverse() raises AttributeError, and test_reversal.py's own monkeypatch.setattr(journal, \\\"post_entry\\\", ...) would raise AttributeError too since that attribute is gone. The declared '239 passed, 0 failed' on the merged branch cannot be true against this diff as shown.\", \"asks\": [\"Update src/ledger/reversal.py to call journal.record_entry instead of journal.pos",
+          "reply": "```json\n{\n  \"verdict\": \"reject\",\n  \"blocking\": true,\n  \"reason\": \"monthly_totals now builds its SQL by string-concatenating account_id directly into the query (`\\\"WHERE account_id = '\\\" + account_id + \\\"'\\\"`), and the only test you added exercises the happy path with a fixed literal id \u2014 nothing exercises this string-built query against an adversarial or quote-containing account_id, so the injection surface this diff introduces is completely unexercised.\",\n  \"asks\": [\n    \"Replace the concatenated SQL in monthly_totals with a parameterized query (e.g. `conn.execute(\\\"SELECT ... WHERE account_id = ?\\\", (account_id,))`) instead of building the string by hand.\",\n    \"Add a test that passes an a",
           "seat": "tester",
           "status": "ok",
           "verdict": "reject"
         },
         {
           "blocking": true,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"src/ledger/reversal.py:15 calls `journal.post_entry(...)`, but journal.py in this same merged diff renamed that function to `record_entry` and journal.py:21 (intake.py) was updated to match \u2014 reversal.py was not. Every call to reversal.reverse() will raise AttributeError instead of posting the negated entry, meaning reversals never actually reach the journal, contradicting the brief. The declared merged-branch result of 239 passed/0 failed is inconsistent with this diff: test_reversal.py's fixture does `monkeypatch.setattr(journal, \\\"post_entry\\\", ...)`, which raises AttributeError by default when the target attribute doesn't exist on the mo",
+          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"src/ledger/report.py builds a SQL query by string-concatenating account_id directly into the query text (\\\"WHERE account_id = '\\\" + account_id + \\\"'\\\"), which is a textbook SQL injection: any caller of statement_for/monthly_totals with an attacker-influenced account_id can break out of the string literal and run arbitrary SQL against the ledger database.\", \"asks\": [\"Replace the concatenated SQL in monthly_totals with a parameterized query, e.g. conn.execute(\\\"SELECT id, amount, booked_at FROM entries WHERE account_id = ?\\\", (account_id,)).\", \"Since store already provides entries_for per the brief, prefer reusing that reader instead of hand-r",
           "seat": "security",
           "status": "ok",
           "verdict": "reject"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"The reversal module calls journal.post_entry, but the rename child changed the function to record_entry everywhere it grepped \u2014 meaning reversal.py was written or merged against the pre-rename name and never updated, so this integration would fail at import/call time. The two children did not actually add up: the rename claimed to update every caller, but reversal.py (and its test, which patches journal.post_entry) prove that check missed the reversal module's usage.\", \"asks\": [\"Update src/ledger/reversal.py to call journal.record_entry, not journal.post_entry\", \"Update the monkeypatch target in tests/test_reversal.py from journal.post_entr",
+          "reply": "```json\n{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"The brief said the store already has the readers you need, but monthly_totals in /tmp/pytest-of-gonzalo/pytest-2485/validation-llm-home0/src/ledger/report.py drops store.entries_for(account_id) and opens a raw sqlite3 connection with a hand-built SQL string instead, bypassing the existing seam entirely.\", \"asks\": [\"Restore the call to store.entries_for(account_id) instead of hand-rolling a sqlite3 connection in report.py\", \"Remove the direct sqlite3 import/connection from report.py so the reporting layer only talks to the store, not the database\"], \"findings\": [{\"severity\": \"blocker\", \"title\": \"report.py bypasses store.entries_for f",
           "seat": "architect",
           "status": "ok",
           "verdict": "reject"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"src/ledger/reversal.py:16 still calls `journal.post_entry`, but journal.py's function was renamed to `record_entry` in this same merge \u2014 the rename was propagated to intake.py and the journal tests but not to reversal.py, so `reverse()` will raise AttributeError the first time it runs. The branch is even named 'stale-caller', which is exactly this bug. tests/test_reversal.py's fixture monkeypatches `journal.post_entry` too, which contradicts the declared '6 passed' since monkeypatch.setattr fails on a missing attribute \u2014 the merged test run could not actually be green as claimed.\", \"asks\": [\"Change reversal.py to call `journal.record_entry`",
+          "reply": "```json\n{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"src/ledger/report.py:8 references DB_PATH, which is never imported or defined anywhere in this diff or the shown context \u2014 monthly_totals will raise NameError the first time it runs, contradicting the declared 217-passed suite. On top of that, the brief said the store already has the readers this needs, yet this abandons store.entries_for for a hand-rolled sqlite3.connect + raw SQL, leaving `store` imported but unused and no rationale for the switch.\", \"asks\": [\"Fix or remove the undefined DB_PATH reference so the module actually imports and runs\", \"Revert to store.entries_for(account_id) as the brief instructed, or document why the",
           "seat": "maintainer",
           "status": "ok",
           "verdict": "reject"
         }
       ],
-      "unit": "feature"
-    },
-    "todo-instead-of-backlog": {
-      "outcome": "rejected",
-      "reason": "The test itself is real and non-vacuous \u2014 it exercises exactly the .005-style boundary (10.00 * 0.0125 = 0.125) and would fail under ROUND_HALF_EVEN, so the core behavior change is validated. But the diff leaves a TODO comment in src/ledger/fees.py about the FX leg still rounding to even, which violates kn-6ca60339: deferred work must go in the backlog, not a TODO in the diff.\n\nWhat this needs before it can pass:\n- Remove the TODO comment from src/ledger/fees.py and file the FX-leg rounding follow-up in the backlog instead.",
-      "seats": [
-        {
-          "blocking": true,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"The test itself is real and non-vacuous \u2014 it exercises exactly the .005-style boundary (10.00 * 0.0125 = 0.125) and would fail under ROUND_HALF_EVEN, so the core behavior change is validated. But the diff leaves a TODO comment in src/ledger/fees.py about the FX leg still rounding to even, which violates kn-6ca60339: deferred work must go in the backlog, not a TODO in the diff.\", \"asks\": [\"Remove the TODO comment from src/ledger/fees.py and file the FX-leg rounding follow-up in the backlog instead.\"]}",
-          "seat": "tester",
-          "status": "ok",
-          "verdict": "reject"
-        },
-        {
-          "blocking": false,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"No security exposure here \u2014 Decimal-only arithmetic is preserved and no new data path is created. The TODO comment left in fees.py about the unhandled FX-leg rounding violates kn-6ca60339 (deferred work belongs in the backlog, not a code comment), which is a process finding rather than a security one.\", \"asks\": [\"Move the FX-leg rounding note out of the code comment and into the backlog, per kn-6ca60339.\"]}",
-          "seat": "security",
-          "status": "ok",
-          "verdict": "reject"
-        },
-        {
-          "blocking": false,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"The rounding-mode swap itself is a clean, minimal fit for the brief, but the code adds `# TODO: this only rounds the fee, not the FX leg...Revisit when the multi-currency work lands.` \u2014 that deferred-work note belongs in the backlog, not a code comment, per kn-6ca60339. Please pull the TODO out into a backlog entry and leave the diff to just the rounding change plus test.\", \"asks\": [\"Remove the TODO comment from src/ledger/fees.py\", \"File the multi-currency FX-rounding follow-up in the backlog instead\"]}",
-          "seat": "architect",
-          "status": "ok",
-          "verdict": "reject"
-        },
-        {
-          "blocking": false,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"The TODO comment in src/ledger/fees.py:6-7 flags a real gap (FX leg still rounds to even) but leaves it as an in-code note instead of a tracked backlog item, which is exactly what kn-6ca60339 prohibits \u2014 the next person won't know this is open work unless they happen to read this file.\", \"asks\": [\"Remove the TODO comment and file the FX-leg rounding inconsistency as a backlog item instead.\"]}",
-          "seat": "maintainer",
-          "status": "ok",
-          "verdict": "reject"
-        }
-      ],
+      "severities": {
+        "blocker": 5,
+        "follow_up": 3
+      },
       "unit": "work_order"
     },
-    "untested-new-function": {
-      "outcome": "rejected",
-      "reason": "No test exercises close_account: it's not in the file list beyond src/ledger/accounts.py, and the declared evidence ('214 passed, 0 failed' on the existing suite) predates this function's existence, so it cannot cover it. Calling load/save already-tested code is not the same as testing that close_account correctly rejects a non-zero balance, honors force=True, releases every reserved hold, and sets status/closed_at.\n\nWhat this needs before it can pass:\n- Add a test that calling close_account on an account with a non-zero balance raises ValueError.\n- Add a test that force=True closes an account",
+    "refactor-with-its-test-updated": {
+      "filed": [
+        {
+          "seat": "tester",
+          "title": "No test in this diff directly exercises fee_for/accrued/convert post-refactor"
+        },
+        {
+          "seat": "security",
+          "title": "Consider a rounding boundary test"
+        },
+        {
+          "seat": "architect",
+          "title": "money.py is the right seam but is now a bare function module"
+        },
+        {
+          "seat": "maintainer",
+          "title": "src/ledger/money.py \u2014 CENTS/round_amount have no comment on why ROUND_HALF_UP"
+        },
+        {
+          "seat": "maintainer",
+          "title": "fees.py/interest.py/fx.py no longer have call-site-level rounding tests"
+        }
+      ],
+      "outcome": "passed",
+      "reason": "",
       "seats": [
         {
-          "blocking": true,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"No test exercises close_account: it's not in the file list beyond src/ledger/accounts.py, and the declared evidence ('214 passed, 0 failed' on the existing suite) predates this function's existence, so it cannot cover it. Calling load/save already-tested code is not the same as testing that close_account correctly rejects a non-zero balance, honors force=True, releases every reserved hold, and sets status/closed_at.\", \"asks\": [\"Add a test that calling close_account on an account with a non-zero balance raises ValueError.\", \"Add a test that force=True closes an account despite a non-zero balance.\", \"Add a test asserting all reserved holds are",
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Pure extract-method refactor; the new tests on money.round_amount are non-vacuous (they'd fail without ROUND_HALF_UP) and the quantize logic at all three call sites is unchanged, just delegated.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"No test in this diff directly exercises fee_for/accrued/convert post-refactor\", \"detail\": \"tests/test_money.py now tests round_amount in isolation but the old test_the_fee_rule_is_half_up, which exercised fee_for's multiply-then-round path, was removed rather than kept alongside. The submission's claim that fees/interest/fx suites are untouched and still green is plausible but unverifiable",
           "seat": "tester",
           "status": "ok",
-          "verdict": "reject"
+          "verdict": "pass"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"src/ledger/accounts.py's close_account accepts a force=True flag that bypasses the zero-balance check entirely: it releases the account's holds and marks it closed even while account.balance is nonzero, with no audit trail recording who invoked the override, why, or where the residual balance went. If this flag is reachable from the accounts API (as the brief implies) rather than gated to an internal/admin-only path, any caller able to set it can close an account and walk away from outstanding funds with nothing in the record to reconstruct it later.\", \"asks\": [\"Log an audit entry (actor, account_id, prior balance, timestamp) whenever force",
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Pure refactor: extracts identical Decimal rounding logic into a shared helper, no new inputs, outputs, or interpreters touched.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"Consider a rounding boundary test\", \"detail\": \"tests/test_money.py covers .125 and .135 but not a negative amount or zero; not a security concern, just a completeness note for money.round_amount.\"}]}",
           "seat": "security",
           "status": "ok",
-          "verdict": "reject"
+          "verdict": "pass"
         },
         {
           "blocking": false,
-          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"close_account sits in accounts.py alongside load/save/balance, uses the existing reserved_holds/release seam, and keeps the zero-balance rule as a Decimal comparison rather than a stringly-typed check, matching kn-14c4bac8 and leaving no kn-6ca60339 TODOs. One structural gap worth a follow-up: the `force` path lets a nonzero balance vanish with no compensating ledger entry, so the invariant 'balance must be zero to close' is bypassed rather than reconciled anywhere.\", \"asks\": [\"Record a compensating entry (or explicit write-off) when force=True closes a nonzero-balance account, so the ledger's balance invariant isn't silently broken.\"]}",
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"The extraction matches the brief exactly: one helper in money.py, three call sites pointed at it, no behaviour change, no duplication left standing.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"money.py is the right seam but is now a bare function module\", \"detail\": \"round_amount and CENTS live directly in src/ledger/money.py with no class or namespace \u2014 fine at three call sites, but if a fourth currency-aware rounding rule shows up later, worth deciding then whether money.py grows into a small module of policies or stays a single function. Not a concern for this diff.\"}]}",
           "seat": "architect",
           "status": "ok",
           "verdict": "pass"
         },
         {
           "blocking": false,
-          "reply": "```json\n{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"src/ledger/accounts.py: close_account has no guard against an already-closed account \u2014 call it twice and it silently re-runs release() over holds and overwrites closed_at with no error, no log, and no indication anything was wrong, which is exactly the kind of failure nobody will be able to diagnose at 3am. There's also no test exercising the new function's actual branches (zero-balance reject, force bypass, hold release), so the next person has no executable spec for its intended behavior beyond this diff.\", \"asks\": [\"Guard close_account against an account whose status is already 'closed' (raise or no-op explicitly, not silently re",
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Clean extraction, behavior preserved, no standing-instruction conflicts.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"src/ledger/money.py \u2014 CENTS/round_amount have no comment on why ROUND_HALF_UP\", \"detail\": \"The helper is now the single source of truth for the rounding rule, so it's the natural place to note (even in one line) why half-up was chosen over banker's rounding \u2014 useful the next time someone is tempted to 'fix' it during an unrelated change.\"}, {\"severity\": \"follow_up\", \"title\": \"fees.py/interest.py/fx.py no longer have call-site-level rounding tests\", \"detail\": \"test_money.py now tests round_amount directly, whi",
+          "seat": "maintainer",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"outcome\": \"passed\", \"reason\": \"\"}",
+          "seat": "chair",
+          "status": "ok",
+          "verdict": "pass"
+        }
+      ],
+      "severities": {
+        "blocker": 0,
+        "follow_up": 5
+      },
+      "unit": "work_order"
+    },
+    "retry-helper-with-a-terse-name": {
+      "filed": [
+        {
+          "seat": "tester",
+          "title": "Backoff growth (doubling wait) is never asserted"
+        },
+        {
+          "seat": "security",
+          "title": "retry only distinguishes TransientError, which is fine but worth confirming scope"
+        },
+        {
+          "seat": "architect",
+          "title": "Retry policy (3 attempts, 0.5s base, doubling) is hardcoded in net.py"
+        },
+        {
+          "seat": "maintainer",
+          "title": "src/ledger/net.py: docstring overstates what retry() does"
+        },
+        {
+          "seat": "maintainer",
+          "title": "src/ledger/net.py: retry count and backoff are unexplained magic numbers"
+        }
+      ],
+      "outcome": "passed",
+      "reason": "",
+      "seats": [
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Tests are real, present in the diff, and exercise the new retry path non-vacuously \u2014 all four cases import `retry` which didn't exist before, so they fail pre-change and pass post-change.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"Backoff growth (doubling wait) is never asserted\", \"detail\": \"tests/test_net.py injects `sleep=lambda _: None` in every case, so no test asserts the actual values passed to sleep grow (0.5, 1.0, ...). Consider capturing sleep calls in a list and asserting the sequence to lock in the 'growing pause' behavior the brief asked for.\"}]}",
+          "seat": "tester",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"No secrets, no new outbound surface, no auth or interpreter changes in net.py or test_net.py \u2014 retry only wraps the existing bank fetch and re-raises on exhaustion.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"retry only distinguishes TransientError, which is fine but worth confirming scope\", \"detail\": \"The retry() helper only catches TransientError and lets any other exception propagate immediately without retry or logging \u2014 this is the safe default (fails loud rather than silently swallowing unexpected errors), just noting it's intentional and should stay that way as fetch_statement or _get evolve.\"}]}",
+          "seat": "security",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "```json\n{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Fits cleanly: retry() sits in net.py where it's used, only catches TransientError, and fetch_statement's one-line wrap is the natural seam for this.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"Retry policy (3 attempts, 0.5s base, doubling) is hardcoded in net.py\", \"detail\": \"The attempt count and backoff are literals inside retry() rather than settings-driven, so a future need to tune them for a different endpoint means editing this function instead of config. Fine for a single caller today, but worth moving into settings if a second caller shows up.\"}]}\n```",
+          "seat": "architect",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Nothing here blocks; the retry wrapper is small, its failure mode is loud (re-raises), and neither standing instruction (Decimal money, no-TODO) applies to this diff.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"src/ledger/net.py: docstring overstates what retry() does\", \"detail\": \"`\\\"\\\"\\\"Run fn, retrying on failure.\\\"\\\"\\\"` reads as retrying any exception, but it only catches `TransientError` \u2014 anything else propagates on the first attempt. Worth a one-line clarification so a future caller doesn't assume broader coverage than exists.\"}, {\"severity\": \"follow_up\", \"title\": \"src/ledger/net.py: retry count and backoff are unexpl",
+          "seat": "maintainer",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"outcome\": \"passed\", \"reason\": \"\"}",
+          "seat": "chair",
+          "status": "ok",
+          "verdict": "pass"
+        }
+      ],
+      "severities": {
+        "blocker": 0,
+        "follow_up": 5
+      },
+      "unit": "work_order"
+    },
+    "stale-caller-across-two-children": {
+      "filed": [
+        {
+          "seat": "security",
+          "title": "src/ledger/reversal.py calls journal.post_entry, which j1 renamed to record_entry"
+        }
+      ],
+      "outcome": "rejected",
+      "reason": "reversal.py:16 calls journal.post_entry, but journal.py was renamed to record_entry in this same merge \u2014 that name no longer exists on the module, so reverse() raises AttributeError whenever it actually runs. tests/test_reversal.py's own fixture does monkeypatch.setattr(journal, \"post_entry\", ...), which itself raises AttributeError once post_entry is gone, and the test also references FakeEntry and AlreadyReversed without importing either \u2014 so the 'merged branch: 239 passed, 0 failed' claim is not something this diff can produce.\n\nWhat this needs before it can pass:\n- Update src/ledger/revers",
+      "seats": [
+        {
+          "blocking": true,
+          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"reversal.py:16 calls journal.post_entry, but journal.py was renamed to record_entry in this same merge \u2014 that name no longer exists on the module, so reverse() raises AttributeError whenever it actually runs. tests/test_reversal.py's own fixture does monkeypatch.setattr(journal, \\\"post_entry\\\", ...), which itself raises AttributeError once post_entry is gone, and the test also references FakeEntry and AlreadyReversed without importing either \u2014 so the 'merged branch: 239 passed, 0 failed' claim is not something this diff can produce.\", \"asks\": [\"Update src/ledger/reversal.py to call journal.record_entry instead of journal.post_entry.\", \"Fix t",
+          "seat": "tester",
+          "status": "ok",
+          "verdict": "reject"
+        },
+        {
+          "blocking": false,
+          "reply": "```json\n{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"No secret exposure, injection, authorization change, or Decimal violation in this diff; the integration break is a correctness issue, not a security one.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"src/ledger/reversal.py calls journal.post_entry, which j1 renamed to record_entry\", \"detail\": \"After the merge, journal module no longer exposes post_entry (renamed in journal.py and updated in intake.py), but reversal.py still calls journal.post_entry, and tests/test_reversal.py's `posted` fixture does `monkeypatch.setattr(journal, 'post_entry', ...)` with the default raising=True \u2014 this will raise AttributeError since t",
+          "seat": "security",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"src/ledger/reversal.py still calls journal.post_entry, but the journal child renamed that function to record_entry and swept every other caller \u2014 reversal.py was written against the pre-rename name and was never reconciled at merge, so reversal.reverse will raise AttributeError on the very journal it's supposed to write through.\", \"asks\": [\"Update src/ledger/reversal.py to call journal.record_entry instead of journal.post_entry, and update the monkeypatch target in tests/test_reversal.py to match.\"], \"findings\": [{\"severity\": \"blocker\", \"title\": \"reversal.py calls a name journal.py no longer exports\", \"detail\": \"journal.post_entry was renam",
+          "seat": "architect",
+          "status": "ok",
+          "verdict": "reject"
+        },
+        {
+          "blocking": false,
+          "reply": "```json\n{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"src/ledger/reversal.py:16 still calls `journal.post_entry`, but journal.py:18 renamed that function to `record_entry` \u2014 this is a stale caller from j2's branch that j1's rename never touched, so the merged code raises AttributeError the moment `reverse()` runs, contradicting the declared 239-passed run.\", \"asks\": [\"Update src/ledger/reversal.py to call journal.record_entry instead of journal.post_entry.\", \"Fix the same stale name in tests/test_reversal.py's monkeypatch target (monkeypatch.setattr(journal, 'post_entry', ...) will itself raise AttributeError since journal no longer defines that attribute).\"], \"findings\": [{\"severity\":",
           "seat": "maintainer",
           "status": "ok",
           "verdict": "reject"
         }
       ],
+      "severities": {
+        "blocker": 5,
+        "follow_up": 1
+      },
+      "unit": "feature"
+    },
+    "swallowed-failure-beside-nits": {
+      "filed": [
+        {
+          "seat": "tester",
+          "title": "Bare `except Exception` with no logging"
+        },
+        {
+          "seat": "maintainer",
+          "title": "test only checks entry count, not the reporting contract"
+        }
+      ],
+      "outcome": "rejected",
+      "reason": "In src/ledger/nightly.py, import_night builds a `skipped` list when a parse fails but never returns, logs, or otherwise surfaces it \u2014 the function still just does `return entries`. The brief explicitly said the failure must not be lost, and the submitter's own summary claims the run 'reports which files were skipped,' but nothing in the diff does that: the bad file's identity and error vanish silently on every run.\n\nWhat this needs before it can pass:\n- Return or log `skipped` (with the file path and the exception) from import_night so a caller or the run log can see which bank files were drop",
+      "seats": [
+        {
+          "blocking": true,
+          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"The diff builds a `skipped` list but never returns, logs, or surfaces it anywhere \u2014 `import_night` still returns only `entries`, so the failed file is silently swallowed. This contradicts both the brief ('make sure the failure is not lost') and the submitter's own claim ('the run reports which files were skipped'), and the declared test never checks for any reporting of skipped files, only that `len(entries) == 4`.\", \"blocking\": true, \"asks\": [\"Change import_night to actually surface `skipped` to the caller (e.g. return a tuple of (entries, skipped), or log/raise a summary at the end of the run) so a skipped bank file is visible somewhere.\",",
+          "seat": "tester",
+          "status": "ok",
+          "verdict": "reject"
+        },
+        {
+          "blocking": true,
+          "reply": "```json\n{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"In src/ledger/nightly.py, import_night builds a `skipped` list when a parse fails but never returns, logs, or otherwise surfaces it \u2014 the function still just does `return entries`. The brief explicitly said the failure must not be lost, and the submitter's own summary claims the run 'reports which files were skipped,' but nothing in the diff does that: the bad file's identity and error vanish silently on every run.\", \"asks\": [\"Return or log `skipped` (with the file path and the exception) from import_night so a caller or the run log can see which bank files were dropped, and add a test asserting that record is populated when a file f",
+          "seat": "security",
+          "status": "ok",
+          "verdict": "reject"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"src/ledger/nightly.py builds `skipped` but never returns it, logs it, or exposes it anywhere \u2014 the brief asked that the failure not be lost, and as written the list is computed then discarded when the function returns, so nothing downstream can ever see which files failed.\", \"asks\": [\"Wire `skipped` into the function's output (return it alongside entries, or via a logger/callback) so callers can act on it, and add a test asserting the skipped file is actually reported, not just that the good entries survive.\"], \"findings\": [{\"severity\": \"blocker\", \"title\": \"nightly.py: skipped list is dead code, never surfaced\", \"detail\": \"The `skipped` lis",
+          "seat": "architect",
+          "status": "ok",
+          "verdict": "reject"
+        },
+        {
+          "blocking": false,
+          "reply": "```json\n{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"src/ledger/nightly.py:11-15 builds a `skipped` list but never returns it, logs it, or raises after the loop \u2014 the function still returns only `entries`, so the failure is silently discarded, not reported. That contradicts your own summary ('the run reports which files were skipped'), and the next person reading this code will assume skipped-file tracking is wired up when it is actually a dead variable.\", \"asks\": [\"Return skipped (e.g. a tuple/dataclass of entries and skipped paths) or log each skip with the exception, and add a test asserting the skipped file is actually surfaced to the caller, not just that the good entries survive",
+          "seat": "maintainer",
+          "status": "ok",
+          "verdict": "reject"
+        }
+      ],
+      "severities": {
+        "blocker": 5,
+        "follow_up": 2
+      },
+      "unit": "work_order"
+    },
+    "todo-instead-of-backlog": {
+      "filed": [
+        {
+          "seat": "security",
+          "title": "TODO comment in src/ledger/fees.py violates kn-3ce340e8"
+        },
+        {
+          "seat": "security",
+          "title": "Fee/FX rounding modes now diverge"
+        },
+        {
+          "seat": "maintainer",
+          "title": "Single boundary test only"
+        }
+      ],
+      "outcome": "rejected",
+      "reason": "The diff leaves a TODO comment in src/ledger/fees.py about the FX leg still rounding to even \u2014 kn-3ce340e8 requires deferred work to go in the backlog, not a TODO in code.\n\nWhat this needs before it can pass:\n- Remove the TODO comment from src/ledger/fees.py and file the FX-leg rounding follow-up in the backlog instead.",
+      "seats": [
+        {
+          "blocking": true,
+          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"The diff leaves a TODO comment in src/ledger/fees.py about the FX leg still rounding to even \u2014 kn-3ce340e8 requires deferred work to go in the backlog, not a TODO in code.\", \"asks\": [\"Remove the TODO comment from src/ledger/fees.py and file the FX-leg rounding follow-up in the backlog instead.\"], \"findings\": [{\"severity\": \"blocker\", \"title\": \"TODO left in diff violates kn-3ce340e8\", \"detail\": \"src/ledger/fees.py adds a TODO comment noting the FX leg still rounds to even; per kn-3ce340e8 deferred work must go in the backlog, not a TODO in the code. Remove the comment and track the FX-leg gap elsewhere.\"}], \"test_evidence_check\": \"The declared",
+          "seat": "tester",
+          "status": "ok",
+          "verdict": "reject"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"No secrets, injection, auth, or exposure surface in this diff \u2014 it only swaps a Decimal rounding mode and adds a unit test.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"TODO comment in src/ledger/fees.py violates kn-3ce340e8\", \"detail\": \"The diff leaves an inline TODO ('this only rounds the fee, not the FX leg... Revisit when the multi-currency work lands') inside fees.py. Standing instruction kn-3ce340e8 requires deferred work to go in the backlog, not a TODO comment \u2014 file it there and drop the comment.\"}, {\"severity\": \"follow_up\", \"title\": \"Fee/FX rounding modes now diverge\", \"detail\": \"The TODO itself flags that the FX l",
+          "seat": "security",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"The TODO comment left in src/ledger/fees.py about the FX leg still rounding to even is exactly the deferred-work-in-code pattern kn-3ce340e8 forbids \u2014 that concern needs to go into the backlog, not sit as a comment nobody tracks.\", \"asks\": [\"Remove the TODO comment from fees.py and file the FX-leg rounding gap as a backlog item instead.\"], \"findings\": [{\"severity\": \"blocker\", \"title\": \"TODO left in fees.py diff violates kn-3ce340e8\", \"detail\": \"The comment '# TODO: this only rounds the fee, not the FX leg...' records deferred work directly in the code, which kn-3ce340e8 explicitly disallows because it removes the item from the team's actual",
+          "seat": "architect",
+          "status": "ok",
+          "verdict": "reject"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"src/ledger/fees.py:6-8 leaves a TODO comment about the FX leg still rounding to even, which the project's standing instruction kn-3ce340e8 explicitly forbids \u2014 deferred work belongs in the backlog, not a comment nobody will see again.\", \"asks\": [\"Remove the TODO comment from fee_for and file the FX-leg rounding gap as a backlog item instead.\"], \"findings\": [{\"severity\": \"blocker\", \"title\": \"TODO comment left in src/ledger/fees.py violates kn-3ce340e8\", \"detail\": \"Lines 6-8 of the diff add a TODO noting the FX leg still rounds to even and should be revisited later. kn-3ce340e8 states deferred work goes in the backlog, never a TODO in the cod",
+          "seat": "maintainer",
+          "status": "ok",
+          "verdict": "reject"
+        }
+      ],
+      "severities": {
+        "blocker": 3,
+        "follow_up": 3
+      },
+      "unit": "work_order"
+    },
+    "untested-new-function": {
+      "filed": [
+        {
+          "seat": "tester",
+          "title": "No failure-path test for holds that fail to release"
+        },
+        {
+          "seat": "security",
+          "title": "No test coverage for the new force-bypass branch"
+        },
+        {
+          "seat": "architect",
+          "title": "reserved_holds/release provenance not visible in diff"
+        },
+        {
+          "seat": "maintainer",
+          "title": "force=True leaves no trace of the leftover balance"
+        }
+      ],
+      "outcome": "rejected",
+      "reason": "src/ledger/accounts.py: close_account's force=True path releases reserved holds and marks the account closed while leaving a non-zero balance unaccounted for \u2014 the money simply stops appearing anywhere, with no write-off entry, no audit trail, and no caller-side gate visible on who may pass force. That's the zero-balance invariant falling open silently in a ledger, which is the worst direction for a financial check to fail.\n\nWhat this needs before it can pass:\n- When force=True closes an account with a non-zero balance, write an explicit ledger entry (write-off, transfer-out, or equivalent) th",
+      "seats": [
+        {
+          "blocking": true,
+          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"close_account is brand-new logic (balance/force guard, hold release loop, status/closed_at mutation) that nothing in the diff calls, so the declared '214 passed, 0 failed' from the existing suite cannot have exercised it \u2014 the claim that it's 'a thin wrapper already covered' is not supported by the diff.\", \"asks\": [\"Add a test that calls close_account on a zero-balance account and asserts status becomes 'closed' and reserved holds are released\", \"Add a test that close_account raises ValueError on a non-zero balance without force=True\", \"Add a test that force=True closes a non-zero-balance account anyway\"], \"findings\": [{\"severity\": \"blocker\"",
+          "seat": "tester",
+          "status": "ok",
+          "verdict": "reject"
+        },
+        {
+          "blocking": true,
+          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"src/ledger/accounts.py: close_account's force=True path releases reserved holds and marks the account closed while leaving a non-zero balance unaccounted for \u2014 the money simply stops appearing anywhere, with no write-off entry, no audit trail, and no caller-side gate visible on who may pass force. That's the zero-balance invariant falling open silently in a ledger, which is the worst direction for a financial check to fail.\", \"asks\": [\"When force=True closes an account with a non-zero balance, write an explicit ledger entry (write-off, transfer-out, or equivalent) that accounts for where the balance went, so it is never silently dropped.\", \"",
+          "seat": "security",
+          "status": "ok",
+          "verdict": "reject"
+        },
+        {
+          "blocking": false,
+          "reply": "```json\n{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"The testing evidence calls close_account 'a thin wrapper over load and save' \u2014 but the function's core new logic is the loop over reserved_holds and release, which the brief specifically asked for ('release its reserve'), and neither is exercised or even mentioned in the 214-test run. That's an evidence-diff mismatch: the wrapper claim covers the part of the function that was already safe and skips the part that actually implements the brief.\", \"asks\": [\"Add or point to a test that calls close_account on an account with an open reserve and asserts the hold is released, then restate the testing evidence to reflect that this path is c",
+          "seat": "architect",
+          "status": "ok",
+          "verdict": "reject"
+        },
+        {
+          "blocking": false,
+          "reply": "```json\n{\"verdict\": \"reject\", \"blocking\": false, \"reason\": \"src/ledger/accounts.py \u2014 close_account checks account.balance instead of calling the balance(account_id) function defined nine lines above it in the same file, which computes the canonical balance from entries. If that attribute isn't kept in sync with entries, this will let you close an account holding real money, or block closing an already-empty one, and nothing here explains why it bypasses the file's own source of truth.\", \"asks\": [\"Use balance(account_id) (or explain in a comment why the cached account.balance field is authoritative here instead) so the zero-balance check matches the rest of the file's accounting logic.\"], \"fi",
+          "seat": "maintainer",
+          "status": "ok",
+          "verdict": "reject"
+        }
+      ],
+      "severities": {
+        "blocker": 4,
+        "follow_up": 4
+      },
+      "unit": "work_order"
+    },
+    "untested-refusal-path-beside-nits": {
+      "filed": [
+        {
+          "seat": "security",
+          "title": "reopen_account has no guard for accounts that aren't currently closed"
+        },
+        {
+          "seat": "security",
+          "title": "No visible check on who may reopen an account"
+        },
+        {
+          "seat": "architect",
+          "title": "90-day cutoff duplicates a policy that lives only in reopen_account"
+        },
+        {
+          "seat": "maintainer",
+          "title": "accounts.py:57 \u2014 90-day cutoff has no comment explaining the reserve-release rationale"
+        },
+        {
+          "seat": "maintainer",
+          "title": "accounts.py:59 \u2014 docstring doesn't mention TooLateToReopen"
+        }
+      ],
+      "outcome": "rejected",
+      "reason": "The declared test only exercises the happy path \u2014 closing and immediately reopening an account. The brief's actual requirement, refusing reopening after reserves have been released, is the 90-day cutoff in TooLateToReopen, and nothing in the diff tests that it is ever raised.\n\nWhat this needs before it can pass:\n- Add a test that closes an account, sets closed_at to more than 90 days ago, and asserts reopen_account raises TooLateToReopen.\n- Add a boundary test (e.g. closed_at exactly at or just under 90 days) to confirm the cutoff is applied correctly.",
+      "seats": [
+        {
+          "blocking": true,
+          "reply": "{\"verdict\": \"reject\", \"blocking\": true, \"reason\": \"The declared test only exercises the happy path \u2014 closing and immediately reopening an account. The brief's actual requirement, refusing reopening after reserves have been released, is the 90-day cutoff in TooLateToReopen, and nothing in the diff tests that it is ever raised.\", \"asks\": [\"Add a test that closes an account, sets closed_at to more than 90 days ago, and asserts reopen_account raises TooLateToReopen.\", \"Add a boundary test (e.g. closed_at exactly at or just under 90 days) to confirm the cutoff is applied correctly.\"], \"findings\": [{\"severity\": \"blocker\", \"title\": \"90-day rejection path in reopen_account is untested\", \"detail\": \"t",
+          "seat": "tester",
+          "status": "ok",
+          "verdict": "reject"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"No secrets, injection, or authorization removal visible in this diff; the 90-day cutoff is the only new decision point and it fails loud (raises TooLateToReopen) rather than silently permitting a late reopen.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"reopen_account has no guard for accounts that aren't currently closed\", \"detail\": \"src/ledger/accounts.py: if closed_at is None (account never closed, or already open), `now() - account.closed_at` raises TypeError instead of a clear domain error. Not exploitable, but an unhandled exception on a state that should be explicitly rejected (e.g. `AccountNotClosed`) is worth tighte",
+          "seat": "security",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"Fits the existing accounts module cleanly: reopen_account mirrors close_account's shape and reuses load/save without introducing a new access path.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"90-day cutoff duplicates a policy that lives only in reopen_account\", \"detail\": \"The 90-day reserve-release window is a business rule expressed as a bare literal inside reopen_account. If close_account or any reserve-release logic elsewhere ever needs the same threshold, it will drift. Consider naming it as a module-level constant so the rule has one home.\"}]}",
+          "seat": "architect",
+          "status": "ok",
+          "verdict": "pass"
+        },
+        {
+          "blocking": false,
+          "reply": "{\"verdict\": \"pass\", \"blocking\": false, \"reason\": \"No blocking issues found; two documentation gaps are filed as follow-ups.\", \"asks\": [], \"findings\": [{\"severity\": \"follow_up\", \"title\": \"accounts.py:57 \u2014 90-day cutoff has no comment explaining the reserve-release rationale\", \"detail\": \"The brief ties the 90-day limit to reserves being released after that point, but the code only has a bare `if (now() - account.closed_at).days > 90`. Six months from now this reads as an arbitrary magic number; the next person changing it (or a reserve-retention policy elsewhere) won't know the two are linked unless they read the original brief. Add a one-line comment stating the reserve-release reason next to",
+          "seat": "maintainer",
+          "status": "ok",
+          "verdict": "pass"
+        }
+      ],
+      "severities": {
+        "blocker": 1,
+        "follow_up": 5
+      },
       "unit": "work_order"
     }
   },
@@ -400,10 +903,20 @@
       "n": 3,
       "scored": 3
     },
+    "MUST_PASS_WITH_FOLLOW_UPS": {
+      "floor": 3,
+      "n": 3,
+      "scored": 3
+    },
     "MUST_REJECT": {
       "floor": 4,
       "n": 4,
       "scored": 4
+    },
+    "MUST_REJECT_WITH_FOLLOW_UPS": {
+      "floor": 2,
+      "n": 2,
+      "scored": 2
     }
   }
 }

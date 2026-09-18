@@ -28,6 +28,16 @@ WHAT IS MEASURED HERE, all of it invented, none of it production data:
                       bounce (>= MUST_PASS_FLOOR of 3). The failure mode this battery
                       grades is the expensive one: a rejection loop spends exactly the
                       attention this feature exists to save.
+  * `MUST_PASS_WITH_FOLLOW_UPS`
+                    — THE PROPERTY THE 2026-09-15 FEATURE IS JUDGED ON: small, correct
+                      submissions that are also obviously improvable. They must land in
+                      ONE round, the seats must still have raised follow-ups, and none of
+                      those may have reached the submitter. Passed, with findings, silent.
+  * `MUST_REJECT_WITH_FOLLOW_UPS`
+                    — and the half that keeps it honest: the SAME submission carrying a
+                      real defect and cosmetic remarks. The defect must block; the
+                      remarks must file. A rubber stamp scores full marks on the battery
+                      above and fails here.
   * `FEATURE_CASES` — the half of the feature nothing else in the OS can judge: an
                       integration defect INVISIBLE CHILD BY CHILD, plus a feature that
                       integrates cleanly. Both directions, because a panel that rejected
@@ -99,6 +109,22 @@ MUST_REJECT_FLOOR = 4
 #: loop is the failure mode that makes this panel cost more than it saves, so this floor
 #: is not a lower bar than the one above — it is the same bar, pointed the other way.
 MUST_PASS_FLOOR = 3
+
+#: Of 3 small, correct, obviously improvable work-order submissions, how many the panel
+#: must let through IN ONE ROUND. Equal to `n`, the `FEATURE_CASES` shape: this battery is
+#: the property the whole feature is judged on (spec §6), and "two of three land" is not
+#: the claim — it is the treadmill with a better score.
+MUST_PASS_WITH_FOLLOW_UPS_FLOOR = 3
+
+#: Of 2 submissions carrying a real defect AND cosmetic remarks, how many the panel must
+#: refuse. Also equal to `n`. THE MIRROR THE FEATURE NEEDS: nothing else in the suite
+#: separates "blocks on blockers" from "rubber-stamps anything small".
+MUST_REJECT_WITH_FOLLOW_UPS_FLOOR = 2
+
+#: The case the veto scenario is graded on, and it is NAMED rather than discovered. Both
+#: veto seats blocked this one in the recorded run, and a test asking whether SOME case
+#: took the veto path is satisfied by whichever one happens to (`kn-abb7356b`).
+VETO_CASE = "raw-sql-where-a-store-method-exists"
 
 #: The seat taken down for the degradation scenario. A VETO HOLDER, and not the chair:
 #: losing the chair is total failure by design (`_run_chair` re-raises), and losing
@@ -322,8 +348,10 @@ MUST_PASS = [
 diff --git a/src/ledger/fees.py b/src/ledger/fees.py
 --- a/src/ledger/fees.py
 +++ b/src/ledger/fees.py
-@@ -1,8 +1,8 @@
+@@ -1,8 +1,9 @@
 -from decimal import Decimal, ROUND_HALF_UP
++from decimal import Decimal
++
 +from .money import round_amount
 
 
@@ -333,8 +361,10 @@ diff --git a/src/ledger/fees.py b/src/ledger/fees.py
 diff --git a/src/ledger/interest.py b/src/ledger/interest.py
 --- a/src/ledger/interest.py
 +++ b/src/ledger/interest.py
-@@ -1,8 +1,8 @@
+@@ -1,8 +1,9 @@
 -from decimal import Decimal, ROUND_HALF_UP
++from decimal import Decimal
++
 +from .money import round_amount
 
 
@@ -345,8 +375,10 @@ diff --git a/src/ledger/interest.py b/src/ledger/interest.py
 diff --git a/src/ledger/fx.py b/src/ledger/fx.py
 --- a/src/ledger/fx.py
 +++ b/src/ledger/fx.py
-@@ -1,9 +1,9 @@
+@@ -1,9 +1,10 @@
 -from decimal import Decimal, ROUND_HALF_UP
++from decimal import Decimal
++
 +from .money import round_amount
 
 
@@ -356,7 +388,8 @@ diff --git a/src/ledger/fx.py b/src/ledger/fx.py
 diff --git a/tests/test_money.py b/tests/test_money.py
 --- a/tests/test_money.py
 +++ b/tests/test_money.py
-@@ -1,6 +1,10 @@
+@@ -1,6 +1,11 @@
+ from decimal import Decimal
 -from ledger.fees import fee_for
 +from ledger.money import round_amount
 
@@ -443,11 +476,17 @@ diff --git a/README.md b/README.md
 diff --git a/tests/test_intake.py b/tests/test_intake.py
 --- a/tests/test_intake.py
 +++ b/tests/test_intake.py
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,31 @@
 +import pytest
 +from decimal import Decimal
 +
++from ledger.batches import Batch, Entry
 +from ledger.intake import BatchMismatch, check_total, receive
++
++
++def make_batch(amounts, *, declared):
++    return Batch(id="b-1", declared_total=Decimal(declared),
++                 entries=[Entry(amount=Decimal(a)) for a in amounts])
 +
 +
 +def test_a_batch_that_adds_up_is_accepted():
@@ -469,7 +508,371 @@ diff --git a/tests/test_intake.py b/tests/test_intake.py
     ),
 ]
 
-# -- battery three: FEATURE orders, where the diff is integrated merged work ----------------
+# -- battery three: small, correct, and obviously improvable -------------------------------
+#
+# THE BATTERY THE FEATURE IS JUDGED ON, and the one battery here whose cases are chosen to
+# give the seats something to say. Spec §6:
+# docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
+#
+# Each submission is correct, tested, and small — and carries remarks any reviewer would
+# make: a terse name, a docstring that says nothing, a computation written twice. Under the
+# rule this feature replaced, every one of these was a rejection with a fresh crop of
+# findings next round. The measurement is that they land in ONE round AND that the remarks
+# were still raised: a battery the seats pass by finding NOTHING would score identically
+# with this feature reverted, which is the trap `test_the_improvements_were_filed_not_argued`
+# exists to close.
+
+MUST_PASS_WITH_FOLLOW_UPS = [
+    (
+        "retry-helper-with-a-terse-name",
+        "Retry the bank-file fetch when the endpoint is briefly unavailable",
+        "The nightly fetch gives up the moment the bank's endpoint refuses a connection, "
+        "and the whole run has to be started again by hand. Retry a failed fetch a few "
+        "times with a growing pause before giving up.",
+        "Adds `retry` in `src/ledger/net.py` and fetches the statement through it. A "
+        "transient failure is retried up to three times with a doubling pause, and the "
+        "last error is re-raised when the attempts run out.",
+        "Added tests/test_net.py with four cases: a call that succeeds first time is not "
+        "retried, a call that fails twice and then succeeds returns the value, a call "
+        "that fails every time re-raises the last error, and "
+        "::test_fetch_statement_retries_a_refused_connection, which patches `_get` to "
+        "refuse once and asserts the statement still comes back. The pause is injected so "
+        "the tests do not wait. All four fail without the new `retry` and pass with it. "
+        "Suite: 224 passed, 0 failed.",
+        """diff --git a/src/ledger/net.py b/src/ledger/net.py
+--- a/src/ledger/net.py
++++ b/src/ledger/net.py
+@@ -1,7 +1,24 @@
+ import time
+
++from .errors import TransientError
+ from .config import settings
+
+
++def retry(fn, *, sleep=None):
++    \"\"\"Run fn, retrying on failure.\"\"\"
++    sleep = sleep or time.sleep
++    wait = 0.5
++    last = None
++    for _ in range(3):
++        try:
++            return fn()
++        except TransientError as e:
++            last = e
++            sleep(wait)
++            wait = wait * 2
++    raise last
++
++
+ def fetch_statement(account_id: str) -> bytes:
+-    return _get(settings.bank_url, account_id)
++    return retry(lambda: _get(settings.bank_url, account_id))
+diff --git a/tests/test_net.py b/tests/test_net.py
+--- a/tests/test_net.py
++++ b/tests/test_net.py
+@@ -0,0 +1,53 @@
++import pytest
++
++from ledger import net
++from ledger.errors import TransientError
++from ledger.net import retry
++
++
++def test_a_call_that_succeeds_is_not_retried():
++    calls = []
++
++    def once():
++        calls.append(1)
++        return "statement"
++
++    assert retry(once, sleep=lambda _: None) == "statement"
++    assert len(calls) == 1
++
++
++def test_a_call_that_fails_twice_then_succeeds_returns_the_value():
++    attempts = []
++
++    def flaky():
++        attempts.append(1)
++        if len(attempts) < 3:
++            raise TransientError("the bank is busy")
++        return "statement"
++
++    assert retry(flaky, sleep=lambda _: None) == "statement"
++    assert len(attempts) == 3
++
++
++def test_the_last_error_is_raised_when_the_attempts_run_out():
++    def always():
++        raise TransientError("the bank is down")
++
++    with pytest.raises(TransientError, match="the bank is down"):
++        retry(always, sleep=lambda _: None)
++
++
++def test_fetch_statement_retries_a_refused_connection(monkeypatch):
++    attempts = []
++
++    def refusing(url, account_id):
++        attempts.append(url)
++        if len(attempts) < 2:
++            raise TransientError("connection refused")
++        return b"statement bytes"
++
++    monkeypatch.setattr(net, "_get", refusing)
++    monkeypatch.setattr(net.time, "sleep", lambda _: None)
++
++    assert net.fetch_statement("acc-1") == b"statement bytes"
++    assert len(attempts) == 2
+""",
+    ),
+    (
+        "age-computed-in-two-places",
+        "Show how old an unsettled batch is on the reconciliation report",
+        "An operator reading the reconciliation report cannot tell whether an unsettled "
+        "batch arrived this morning or three weeks ago. Put the age in days on the "
+        "reconciliation row, and on the ageing summary line above it.",
+        "Adds `age_in_days` in `src/ledger/report.py`, renders it as a new column on the "
+        "reconciliation row, and puts the oldest batch's age on the ageing summary line.",
+        "Added tests/test_report.py::test_age_in_days_counts_whole_days and "
+        "::test_a_batch_received_today_is_zero_days_old for the helper, extended "
+        "::test_a_reconciliation_row_renders_every_column to assert the new column, and "
+        "added ::test_the_ageing_summary_names_the_oldest_batch and "
+        "::test_the_ageing_summary_of_nothing_says_so for the summary line and its empty "
+        "case. Every one of them fails without this change. Suite: 226 passed, 0 failed.",
+        """diff --git a/src/ledger/report.py b/src/ledger/report.py
+--- a/src/ledger/report.py
++++ b/src/ledger/report.py
+@@ -1,10 +1,26 @@
++from datetime import datetime
++
+ from .clock import utcnow
+ from .store import store
+
+
++def age_in_days(received_at: datetime) -> int:
++    \"\"\"Age in days.\"\"\"
++    return (utcnow() - received_at).days
++
++
+ def reconciliation_row(batch: Batch) -> str:
+-    return f"{batch.id:<12} {batch.status:<10} {batch.total:>12}"
++    return (f"{batch.id:<12} {batch.status:<10} {batch.total:>12} "
++            f"{age_in_days(batch.received_at):>4}d")
++
++
++def ageing_summary(batches: list[Batch]) -> str:
++    if not batches:
++        return "nothing unsettled"
++    oldest = min(batches, key=lambda b: b.received_at)
++    return (f"{len(batches)} unsettled, oldest {oldest.id} at "
++            f"{(utcnow() - oldest.received_at).days} days")
+diff --git a/tests/test_report.py b/tests/test_report.py
+--- a/tests/test_report.py
++++ b/tests/test_report.py
+@@ -1,6 +1,7 @@
+-from ledger.report import monthly_totals, reconciliation_row
++from ledger.report import (age_in_days, ageing_summary, monthly_totals,
++                           reconciliation_row)
+@@ -10,6 +11,29 @@ def test_monthly_totals_are_decimal():
+     assert all(isinstance(v, Decimal) for v in monthly_totals("acc-1").values())
++
++
++def test_age_in_days_counts_whole_days():
++    received = utcnow() - timedelta(days=3, hours=5)
++    assert age_in_days(received) == 3
++
++
++def test_a_batch_received_today_is_zero_days_old():
++    assert age_in_days(utcnow() - timedelta(hours=2)) == 0
++
++
++def test_the_ageing_summary_names_the_oldest_batch():
++    batches = [make_batch(id="b-1", received_at=utcnow() - timedelta(days=2)),
++               make_batch(id="b-2", received_at=utcnow() - timedelta(days=11))]
++    assert ageing_summary(batches) == "2 unsettled, oldest b-2 at 11 days"
++
++
++def test_the_ageing_summary_of_nothing_says_so():
++    assert ageing_summary([]) == "nothing unsettled"
++
++
+ def test_a_reconciliation_row_renders_every_column():
+     row = reconciliation_row(make_batch(id="b-1", status="partial", total="15.00",
+                                         received_at=utcnow() - timedelta(days=9)))
+-    assert row.split() == ["b-1", "partial", "15.00"]
++    assert row.split() == ["b-1", "partial", "15.00", "9d"]
+""",
+    ),
+    (
+        "a-correct-guard-with-a-poor-name",
+        "Refuse a negative line at intake instead of at posting",
+        "A negative line amount is only caught deep in the journal, where the error names "
+        "an entry id the operator cannot map back to a line in the file they uploaded. "
+        "Catch it on arrival and name the line.",
+        "Adds `chk` in `src/ledger/intake.py` and calls it from `receive`, so a batch "
+        "carrying a negative line is refused with `BadLine` naming the line number and "
+        "the amount, before anything is stored.",
+        "Added tests/test_intake.py::test_a_negative_line_is_refused_at_intake, which "
+        "asserts the message names the line number, and "
+        "::test_a_batch_of_positive_lines_is_accepted. The first fails before this change "
+        "— the batch is stored and the journal raises later, naming an entry id — and "
+        "passes after; the second pins that nothing else moved. Suite: 230 passed, 0 "
+        "failed.",
+        """diff --git a/src/ledger/intake.py b/src/ledger/intake.py
+--- a/src/ledger/intake.py
++++ b/src/ledger/intake.py
+@@ -12,7 +12,18 @@ def check_total(batch: Batch) -> None:
+             f"{batch.id} declares {batch.declared_total} and its entries sum to {booked}")
+
+
++class BadLine(ValueError):
++    \"\"\"A line in the batch is not acceptable.\"\"\"
++
++
++def chk(batch: Batch) -> None:
++    for i, line in enumerate(batch.entries, start=1):
++        if line.amount < Decimal("0"):
++            raise BadLine(f"line {i} of {batch.id} is {line.amount}")
++
++
+ def receive(batch: Batch) -> Batch:
++    chk(batch)
+     check_total(batch)
+     store.save_batch(batch)
+     return batch
+diff --git a/tests/test_intake.py b/tests/test_intake.py
+--- a/tests/test_intake.py
++++ b/tests/test_intake.py
+@@ -4,7 +4,8 @@ from decimal import Decimal
+-from ledger.intake import BatchMismatch, check_total, receive
++from ledger.intake import BadLine, BatchMismatch, check_total, receive
++from ledger.store import store
+@@ -22,3 +22,16 @@ def test_an_empty_batch_declaring_a_total_is_rejected():
+     batch = make_batch([], declared="15.00")
+     with pytest.raises(BatchMismatch):
+         check_total(batch)
++
++
++def test_a_negative_line_is_refused_at_intake():
++    batch = make_batch(["10.00", "-4.00"], declared="6.00")
++    with pytest.raises(BadLine, match="line 2"):
++        receive(batch)
++    assert store.saved_batches() == []
++
++
++def test_a_batch_of_positive_lines_is_accepted():
++    batch = make_batch(["10.00", "5.00"], declared="15.00")
++    assert receive(batch) is batch
+""",
+    ),
+]
+
+# -- battery four: a real defect standing beside remarks that are not ----------------------
+#
+# THE DISCRIMINATION THIS FEATURE CLAIMS, and the only thing in the suite that measures it.
+# Every case here carries ONE defect that must change before the work ships AND remarks
+# that must not cost a round — the same submission, so the panel cannot score by being
+# lenient or by being strict. A feature that files everything scores full marks on the
+# battery above and fails here, which is the point of the pairing (spec §6).
+
+MUST_REJECT_WITH_FOLLOW_UPS = [
+    (
+        "swallowed-failure-beside-nits",
+        "Keep the nightly import going when one bank file is unreadable",
+        "One unreadable bank file aborts the whole nightly import and the other banks' "
+        "files are never read. Carry on past a file that cannot be parsed, and make sure "
+        "the failure is not lost.",
+        "`import_night` now continues past a file that fails to parse, and the run "
+        "reports which files were skipped.",
+        "Added tests/test_nightly.py::test_a_bad_file_does_not_stop_the_others, which "
+        "feeds three files with an unparseable one in the middle and asserts the entries "
+        "from the other two are returned. Suite: 233 passed, 0 failed.",
+        """diff --git a/src/ledger/nightly.py b/src/ledger/nightly.py
+--- a/src/ledger/nightly.py
++++ b/src/ledger/nightly.py
+@@ -8,9 +8,15 @@ from .parser import parse
+
+ def import_night(paths: list[str]) -> list[Entry]:
+     entries = []
++    skipped = []
+     for path in paths:
+-        entries += parse(path)
++        try:
++            entries += parse(path)
++        except Exception:
++            skipped.append(path)
++            continue
+     return entries
+diff --git a/tests/test_nightly.py b/tests/test_nightly.py
+--- a/tests/test_nightly.py
++++ b/tests/test_nightly.py
+@@ -0,0 +1,12 @@
++from ledger.nightly import import_night
++
++
++def test_a_bad_file_does_not_stop_the_others(tmp_path):
++    good_one = write_file(tmp_path, "bank-a.csv", TWO_GOOD_LINES)
++    bad = write_file(tmp_path, "bank-b.csv", "not a statement at all")
++    good_two = write_file(tmp_path, "bank-c.csv", TWO_GOOD_LINES)
++
++    entries = import_night([good_one, bad, good_two])
++
++    assert len(entries) == 4
+""",
+    ),
+    (
+        "untested-refusal-path-beside-nits",
+        "Let an operator re-open an account closed by mistake",
+        "An account closed in error cannot be re-opened and the operator has to edit the "
+        "store by hand. Add a way to re-open one, but not indefinitely: an account closed "
+        "long enough ago has had its reserves released and re-opening it would be wrong.",
+        "Adds `reopen_account`, which clears the closed marker and puts the account back "
+        "to `open`. It refuses an account that was closed more than 90 days ago.",
+        "Added tests/test_accounts.py::test_a_closed_account_can_be_reopened. Suite: 235 "
+        "passed, 0 failed.",
+        """diff --git a/src/ledger/accounts.py b/src/ledger/accounts.py
+--- a/src/ledger/accounts.py
++++ b/src/ledger/accounts.py
+@@ -52,6 +52,22 @@ def close_account(account_id: str) -> None:
+     save(account)
+
+
++class TooLateToReopen(ValueError):
++    pass
++
++
++def reopen_account(account_id: str) -> None:
++    \"\"\"Re-open a closed account.\"\"\"
++    account = load(account_id)
++    if (now() - account.closed_at).days > 90:
++        raise TooLateToReopen(account_id)
++    account.status = "open"
++    account.closed_at = None
++    save(account)
++
++
+ def entries(account_id: str) -> list[Entry]:
+     return [Entry(**row) for row in store.entries_for(account_id)]
+diff --git a/tests/test_accounts.py b/tests/test_accounts.py
+--- a/tests/test_accounts.py
++++ b/tests/test_accounts.py
+@@ -30,3 +30,11 @@ def test_a_closed_account_holds_no_reserves():
+     close_account("acc-3")
+     assert reserved_holds("acc-3") == []
++
++
++def test_a_closed_account_can_be_reopened():
++    close_account("acc-4")
++    reopen_account("acc-4")
++    account = load("acc-4")
++    assert account.status == "open"
++    assert account.closed_at is None
+""",
+    ),
+]
+
+# -- battery five: FEATURE orders, where the diff is integrated merged work ----------------
 #
 # (name, title, brief, summary, declared evidence, diff, children), where each child is
 # (id, title, what it claimed to do, what it declared as evidence). THE FIRST CASE IS THE
@@ -807,6 +1210,44 @@ class Run:
     def reason(self) -> str:
         return str(self.result.get("reason") or "")
 
+    @property
+    def filed(self) -> list[dict[str, Any]]:
+        """The follow-ups `decide` handed back for `ops` to file as tickets.
+
+        The CONTRACT KEY, not a re-derivation from the stored replies: what the submitter
+        was spared is exactly what came out of this key, and a battery graded on a private
+        re-reading of the seats' JSON would stay green if `_follow_ups` stopped returning
+        any of it."""
+        raw = self.result.get("follow_ups")
+        return list(raw) if isinstance(raw, (list, tuple)) else []
+
+    def severities(self) -> dict[str, int]:
+        """How many findings of each severity the SEATS THEMSELVES wrote, counted off the
+        stored replies rather than off `findings()`.
+
+        Deliberately not `validation.findings`: that normaliser reads an unreadable
+        severity as `follow_up` and synthesises a blocker for a seat that objected without
+        naming one, both of which are fail-safes about the CODE. What this battery grades
+        is whether the seats classify, so it counts the words they actually emitted.
+        """
+        out = {validation.BLOCKER: 0, validation.FOLLOW_UP: 0}
+        for row in self.opinions:
+            # The chair is excluded here for the same reason `_follow_ups` excludes it: a
+            # chair finding would be a chair-originated judgement, which its mandate
+            # forbids, and counting one would grade the wrong seat's classification.
+            if row["seat"] == "chair":
+                continue
+            data = structured.parse_json_object(str(row.get("reply") or ""))
+            if not isinstance(data, dict):
+                continue
+            for item in data.get("findings") or []:
+                if not isinstance(item, dict):
+                    continue
+                word = item.get("severity")
+                out[validation.BLOCKER if word == validation.BLOCKER
+                    else validation.FOLLOW_UP] += 1
+        return out
+
     def seat(self, seat: str) -> dict[str, Any] | None:
         """The stored `validation_opinions` row for one seat, or None if it has none.
 
@@ -867,6 +1308,8 @@ def _report(config: Any, runs: dict[str, Run]) -> None:
     groups = [
         ("work_order (must-reject)", [c[0] for c in MUST_REJECT]),
         ("work_order (must-pass)", [c[0] for c in MUST_PASS]),
+        ("work_order (pass + file)", [c[0] for c in MUST_PASS_WITH_FOLLOW_UPS]),
+        ("work_order (block + file)", [c[0] for c in MUST_REJECT_WITH_FOLLOW_UPS]),
         ("feature", [c[0] for c in FEATURE_CASES]),
         (f"degraded ({DEGRADED_SEAT} down)", ["degraded"]),
     ]
@@ -907,6 +1350,15 @@ def _score(runs: dict[str, Run]) -> dict[str, int]:
     return {
         "MUST_REJECT": sum(1 for c in MUST_REJECT if runs[c[0]].outcome != "passed"),
         "MUST_PASS": sum(1 for c in MUST_PASS if runs[c[0]].outcome == "passed"),
+        # BOTH HALVES OF THE CASE, scored together on purpose: a submission that passed
+        # because every seat found nothing is not this battery's property, and scoring the
+        # outcome alone would record it as one.
+        "MUST_PASS_WITH_FOLLOW_UPS": sum(
+            1 for c in MUST_PASS_WITH_FOLLOW_UPS
+            if runs[c[0]].outcome == "passed" and runs[c[0]].filed),
+        "MUST_REJECT_WITH_FOLLOW_UPS": sum(
+            1 for c in MUST_REJECT_WITH_FOLLOW_UPS
+            if runs[c[0]].outcome != "passed" and runs[c[0]].filed),
         "FEATURE_CASES": sum(
             1 for c in FEATURE_CASES
             if (runs[c[0]].outcome == "passed") == (c[0] == CLEAN_FEATURE_CASE)),
@@ -933,6 +1385,14 @@ def _write_baseline(runs: dict[str, Run]) -> None:
                             "scored": scores["MUST_REJECT"]},
             "MUST_PASS": {"floor": MUST_PASS_FLOOR, "n": len(MUST_PASS),
                           "scored": scores["MUST_PASS"]},
+            "MUST_PASS_WITH_FOLLOW_UPS": {
+                "floor": MUST_PASS_WITH_FOLLOW_UPS_FLOOR,
+                "n": len(MUST_PASS_WITH_FOLLOW_UPS),
+                "scored": scores["MUST_PASS_WITH_FOLLOW_UPS"]},
+            "MUST_REJECT_WITH_FOLLOW_UPS": {
+                "floor": MUST_REJECT_WITH_FOLLOW_UPS_FLOOR,
+                "n": len(MUST_REJECT_WITH_FOLLOW_UPS),
+                "scored": scores["MUST_REJECT_WITH_FOLLOW_UPS"]},
             "FEATURE_CASES": {"floor": len(FEATURE_CASES), "n": len(FEATURE_CASES),
                               "scored": scores["FEATURE_CASES"]},
         },
@@ -941,6 +1401,12 @@ def _write_baseline(runs: dict[str, Run]) -> None:
                 "unit": run.unit,
                 "outcome": run.outcome,
                 "reason": run.reason[:600],
+                # What the severity split actually did on this submission, so the next
+                # worker can see whether a battery moved because the seats stopped
+                # classifying or because the chair started weighing it differently.
+                "severities": run.severities(),
+                "filed": [{"seat": f.get("seat"), "title": f.get("title")}
+                          for f in run.filed],
                 "seats": [
                     {"seat": row["seat"], "status": row["status"],
                      "verdict": row["verdict"], "blocking": _blocking(row),
@@ -983,7 +1449,8 @@ def runs(tmp_path_factory, request):
     claude_cli.run_headless_result = meter  # type: ignore[assignment]
     out: dict[str, Run] = {}
     try:
-        for case in MUST_REJECT + MUST_PASS:
+        for case in (MUST_REJECT + MUST_PASS + MUST_PASS_WITH_FOLLOW_UPS
+                     + MUST_REJECT_WITH_FOLLOW_UPS):
             wo = store.create_work_order(case[1], description=case[2])
             out[case[0]] = _decide(store, case[0], case, "work_order", wo["id"], meter)
 
@@ -1069,7 +1536,125 @@ def test_a_pass_carries_no_reason(runs):
     assert not talkative, f"a passing round came back with feedback on it: {talkative}"
 
 
-# -- battery three: the feature level, which is the point of feature validation -------------
+# -- battery three: a small correct change lands in ONE round ------------------------------
+
+
+@scenario("validation-llm/must-pass-with-follow-ups",
+          "a small correct change that could be improved passes in one round")
+def test_an_improvable_submission_passes_in_one_round(runs):
+    """THE PROPERTY THE FEATURE IS JUDGED ON. Spec §6:
+    docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
+
+    Threshold MUST_PASS_WITH_FOLLOW_UPS_FLOOR, equal to `n`, and that is not the usual
+    floor-with-headroom: the measured failure this feature replaced was a hundred-line
+    change taking five rounds and never landing, so "most of them land" is the same defect
+    with a better score.
+
+    IN ONE ROUND is the whole claim and it is what `runs` gives for free — every case is
+    judged exactly once, so a pass here is a pass on the first showing."""
+    landed = [c[0] for c in MUST_PASS_WITH_FOLLOW_UPS if runs[c[0]].outcome == "passed"]
+    bounced = {c[0]: runs[c[0]].reason[:250] for c in MUST_PASS_WITH_FOLLOW_UPS
+               if c[0] not in landed}
+    assert len(landed) >= MUST_PASS_WITH_FOLLOW_UPS_FLOOR, (
+        f"bounced {len(bounced)}/{len(MUST_PASS_WITH_FOLLOW_UPS)} small correct "
+        f"submissions — {bounced}")
+
+
+@scenario("validation-llm/remarks-are-filed-not-argued",
+          "the remarks on a passing submission are filed and none of them reach the "
+          "submitter")
+def test_the_improvements_were_filed_not_argued(runs):
+    """THE CONTROL WITHOUT WHICH THE TEST ABOVE MEASURES NOTHING, and both halves are here
+    because each one alone has a cheap way to be green.
+
+    A panel that found NOTHING in these submissions would score full marks above and would
+    score identically with this feature reverted — so the first assertion is that remarks
+    WERE raised. And remarks raised are only filed if none of them reached the party who
+    would have to spend a round on them — so the second is that the round carries no
+    reason at all. Passed, with findings, and silent to the submitter: that is the
+    feature."""
+    silent = {c[0] for c in MUST_PASS_WITH_FOLLOW_UPS
+              if runs[c[0]].outcome == "passed" and not runs[c[0]].filed}
+    assert not silent, (
+        "these submissions passed with no follow-up raised at all, so the battery would "
+        f"score the same with the severity split reverted: {sorted(silent)}")
+
+    talkative = {c[0]: runs[c[0]].reason[:200] for c in MUST_PASS_WITH_FOLLOW_UPS
+                 if runs[c[0]].outcome == "passed" and runs[c[0]].reason.strip()}
+    assert not talkative, (
+        f"a remark reached the submitter on a passing round: {talkative}")
+
+
+# -- battery four: the defect blocks and the nits do not ------------------------------------
+
+
+@scenario("validation-llm/must-reject-with-follow-ups",
+          "a real defect still blocks when the panel also had nits")
+def test_a_defect_standing_beside_nits_still_blocks(runs):
+    """THE RUBBER-STAMP CHECK. A feature that files everything would pass this work, and
+    every other battery here would still be green — `MUST_REJECT`'s cases carry one clean
+    defect each and nothing to be lenient about.
+
+    `!= "passed"` for the same reason as `MUST_REJECT`: an escalation is the panel
+    refusing to clear work it could not judge, and what must never happen is a pass."""
+    blocked = [c[0] for c in MUST_REJECT_WITH_FOLLOW_UPS
+               if runs[c[0]].outcome != "passed"]
+    let_through = {c[0]: _verdicts(runs[c[0]]) for c in MUST_REJECT_WITH_FOLLOW_UPS
+                   if c[0] not in blocked}
+    assert len(blocked) >= MUST_REJECT_WITH_FOLLOW_UPS_FLOOR, (
+        f"passed {len(let_through)}/{len(MUST_REJECT_WITH_FOLLOW_UPS)} submissions whose "
+        f"defect must change before they ship — {let_through}")
+
+
+@scenario("validation-llm/severity-discriminates",
+          "the defect is classified a blocker and the nits are not")
+def test_the_nits_beside_a_defect_are_filed_rather_than_argued(runs):
+    """THE DISCRIMINATION, and it is measured on ONE submission at a time rather than
+    across the batteries — a panel that blocks on everything scores full marks on the test
+    above, and a panel that files everything scores full marks on battery three. Only a
+    case holding both can tell them apart, and only if both severities are read off the
+    same case.
+
+    Counted off the seats' OWN words (`Run.severities`), because what is graded here is
+    whether a reviewer can tell the two apart — not whether `validation.findings`
+    normalises a reply, which a free test already pins."""
+    for case in MUST_REJECT_WITH_FOLLOW_UPS:
+        run = runs[case[0]]
+        counted = run.severities()
+        assert counted[validation.BLOCKER], (
+            f"{case[0]}: no seat wrote a `blocker` finding, so the rejection rests on the "
+            f"code's fail-safe rather than on a seat classifying the defect — {counted}, "
+            f"seats {_verdicts(run)}")
+        assert run.filed, (
+            f"{case[0]}: every remark on this submission was argued as a blocker and "
+            f"none was filed — {counted}. The nits are costing the round they used to.")
+
+
+@scenario("validation-llm/veto-still-short-circuits",
+          "a veto seat blocking rejects without the chair being asked")
+def test_a_veto_rejects_and_the_chair_is_never_asked(runs):
+    """THE GUARD RAIL THIS FEATURE MAY NOT HAVE MOVED. Named on ONE case rather than
+    discovered across the battery: "some case took the veto path" is satisfied by whichever
+    one happens to, and the case that stopped doing so is the one it would then hide
+    (`kn-abb7356b`).
+
+    `arbitrate` runs before the chair and nothing it returns can be a pass, so a blocking
+    veto seat must still end the round on its own words. The absence of a chair row is what
+    proves the short circuit: a chair that ran and agreed looks identical in the outcome."""
+    run = runs[VETO_CASE]
+    blocking = [o["seat"] for o in run.opinions
+                if o["seat"] in validation.VETO_SEATS and _blocking(o)]
+    assert blocking, (
+        f"no veto seat blocked {VETO_CASE}, so this scenario graded the chair's judgement "
+        f"and not the veto — seats {_verdicts(run)}")
+    assert run.outcome == "rejected", (
+        f"a veto seat blocked and the round came back {run.outcome!r}")
+    assert run.seat("chair") is None, (
+        "the chair was asked over a blocking veto seat, so the short circuit that keeps "
+        "the safety rule out of a prompt is gone")
+
+
+# -- battery five: the feature level, which is the point of feature validation -------------
 
 
 @scenario("validation-llm/feature-integration-defect",
@@ -1138,13 +1723,19 @@ def test_the_panel_survives_a_veto_seat_going_down(runs):
         "healthy panel")
 
     result = run.result
-    assert set(result) == {"outcome", "reason", "seats"}, sorted(result)
+    # EXACT, not `>=`: this is the contract the round machine reads, and a key it does not
+    # know is a key nothing stores. `follow_ups` is the fourth and it was added with the
+    # severity split — a degraded panel still owes `ops` a list to file, empty or not.
+    assert set(result) == {"outcome", "reason", "seats", "follow_ups"}, sorted(result)
     assert result["outcome"] in ("passed", "rejected", "escalated"), result["outcome"]
     assert isinstance(result["reason"], str)
     assert len(result["reason"]) <= validation.REASON_LIMIT
     for row in result["seats"]:
         assert set(row) >= {"seat", "status", "verdict", "reply"}, sorted(row)
         assert row["verdict"] in ("pass", "reject", ""), row["verdict"]
+    for f in run.filed:
+        assert set(f) >= {"seat", "title", "detail", "round"}, sorted(f)
+        assert f["seat"] in FULL_ROSTER and f["seat"] != "chair", f["seat"]
 
 
 @scenario("validation-llm/degradation-fails-safe",
