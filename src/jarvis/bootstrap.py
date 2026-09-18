@@ -1,7 +1,8 @@
 """Project bootstrap ("adopt"): make a project OS-ready, idempotently.
 
 - README.md         required; stub generated when missing
-- OPERATION.md      the operating contract, generated from a versioned template
+- OPERATION.md      the operating contract, generated from a versioned template —
+                    but never over a copy the repository has committed (issue 279)
 - .jarvis/          per-project state dir, added to .gitignore
 - .claude/settings.json  injected: OS baseline deep-merged with catalog overrides,
                     marked with a "_jarvis" key (managed flag + content hash) so
@@ -15,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -285,27 +287,75 @@ def ensure_readme(project: ProjectSpec, report: BootstrapReport) -> None:
     report.warn("README.md was missing — a stub was generated, edit it")
 
 
-def ensure_operation_md(project: ProjectSpec, report: BootstrapReport) -> None:
-    """Generate/refresh OPERATION.md, preserving the 'Project specifics' section."""
-    op_path = project.path / "OPERATION.md"
-    specifics = "_None yet._"
-    if op_path.exists():
-        current = op_path.read_text()
-        if f"template v{TEMPLATE_VERSION}" in current.split("\n", 1)[0]:
-            report.note("OPERATION.md already at current template version")
-            return
-        marker = "## Project specifics"
-        if marker in current:
-            specifics = current.split(marker, 1)[1].strip() or specifics
-    template = (ASSETS / "OPERATION.md.tmpl").read_text()
-    op_path.write_text(
-        template.format(
-            template_version=TEMPLATE_VERSION,
-            project_name=project.name,
-            project_specifics=specifics,
-            gates_section=_gates_section(project),
-        )
+SPECIFICS_MARKER = "## Project specifics"
+DEFAULT_SPECIFICS = "_None yet._"
+
+
+def operation_specifics(text: str) -> str:
+    """The hand-written 'Project specifics' section of an existing OPERATION.md."""
+    if SPECIFICS_MARKER not in text:
+        return DEFAULT_SPECIFICS
+    return text.split(SPECIFICS_MARKER, 1)[1].strip() or DEFAULT_SPECIFICS
+
+
+def render_operation_md(project: ProjectSpec,
+                        specifics: str = DEFAULT_SPECIFICS) -> str:
+    """The contract exactly as it belongs on disk, rendered but not written."""
+    return (ASSETS / "OPERATION.md.tmpl").read_text().format(
+        template_version=TEMPLATE_VERSION,
+        project_name=project.name,
+        project_specifics=specifics,
+        gates_section=_gates_section(project),
     )
+
+
+def tracked_in_vcs(path: Path) -> bool:
+    """Whether the repository — rather than the OS — owns this file.
+
+    Fails open (False): the no-overwrite rule below only binds where we can positively
+    prove the file is committed, so a project with no git binary keeps the old
+    behaviour rather than silently stopping getting its contract refreshed.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path.parent), "ls-files", "--error-unmatch", "--",
+             path.name],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):  # no git binary, or it hung
+        return False
+    return proc.returncode == 0
+
+
+def ensure_operation_md(project: ProjectSpec, report: BootstrapReport,
+                        force: bool = False) -> None:
+    """Generate/refresh OPERATION.md, preserving the 'Project specifics' section.
+
+    Two rules, both from issue 279. Staleness is decided by COMPARING THE RENDER, not
+    by matching `template vN` in the first line: that string is a proxy for the content
+    and was wrong in both directions — it missed a gates section gone stale under an
+    unchanged version, and it reported a rewrite as needed on a file that already said
+    the right thing. And a render that does differ is still not written over a TRACKED
+    copy: the OS never commits, so such a write dirties the tree permanently and leaves
+    `git pull --ff-only` refusing before every release. Drift on a tracked file is
+    reported for a human to regenerate and commit (`--force-config`), never applied.
+    """
+    op_path = project.path / "OPERATION.md"
+    current = op_path.read_text() if op_path.exists() else None
+    desired = render_operation_md(
+        project, operation_specifics(current) if current is not None else DEFAULT_SPECIFICS)
+
+    if current == desired:
+        report.note("OPERATION.md already up to date")
+        return
+    if current is not None and not force and tracked_in_vcs(op_path):
+        was = re.search(r"template v(\d+)", current.split("\n", 1)[0])
+        report.warn(
+            f"OPERATION.md is committed at template v{was.group(1) if was else '?'} but "
+            f"the generator renders v{TEMPLATE_VERSION} — left alone, because the OS "
+            f"does not overwrite files the repository owns. Regenerate and commit it: "
+            f"`jarvis adopt {project.path} --force-config`")
+        return
+    op_path.write_text(desired)
     report.note("wrote OPERATION.md")
 
 
@@ -486,7 +536,7 @@ def bootstrap_project(project: ProjectSpec, force_config: bool = False,
             report.note("would trust workspace in ~/.claude.json")
         return report
     ensure_readme(project, report)
-    ensure_operation_md(project, report)
+    ensure_operation_md(project, report, force=force_config)
     ensure_state_dir(project, report)
     ensure_gitignore(project, report)
     inject_settings(project, report, force=force_config)

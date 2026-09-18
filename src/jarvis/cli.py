@@ -277,7 +277,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("start", help="start the OS: bootstrap projects + run the daemon")
     sp.add_argument("--catalog", required=True, help="path to the project catalog JSON")
     sp.add_argument("--force-config", action="store_true",
-                    help="overwrite manually-edited injected settings")
+                    help="overwrite manually-edited injected settings, and a committed "
+                         "OPERATION.md the generator would otherwise leave alone")
     sp.add_argument("--foreground", action="store_true", help="run the daemon in-process")
     sp.add_argument("--poll-interval", type=float, default=5.0)
 
@@ -375,7 +376,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("path", help="project directory")
     sp.add_argument("--name", help="project name (default: directory name)")
     sp.add_argument("--catalog", help="catalog to take overrides/defaults from")
-    sp.add_argument("--force-config", action="store_true")
+    sp.add_argument("--force-config", action="store_true",
+                    help="overwrite manually-edited injected settings, and a committed "
+                         "OPERATION.md the generator would otherwise leave alone")
     sp.add_argument("--dry-run", action="store_true")
 
     # work orders -------------------------------------------------------------------
