@@ -109,6 +109,11 @@
     background: var(--raised); color: var(--ink); border: 1px solid var(--line);
     border-radius: 6px; padding: 7px 14px; font: 13.5px var(--sans); cursor: pointer;
   }
+  /* A control rendered disabled has to LOOK disabled: the reason beside it teaches
+     nothing if the button it explains is indistinguishable from one that would work. */
+  button:disabled, textarea:disabled, input:disabled, select:disabled {
+    opacity: .45; cursor: not-allowed; border-style: dashed;
+  }
   button:hover { border-color: var(--ink-3); }
   button.primary { background: color-mix(in srgb, var(--cyan) 18%, var(--raised));
                    border-color: color-mix(in srgb, var(--cyan) 45%, transparent); }

@@ -2244,6 +2244,59 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     return round_row
 
 
+def force_validation_refusal(store: ProjectStore, wo: dict[str, Any], *,
+                             project: str, cfg: Any) -> str | None:
+    """Why a round CANNOT be forced on this work order, in the sentence that refuses it —
+    or None when one can.
+
+    THE ONE HOME OF THE RULE, because two surfaces apply it: `force_validation` raises
+    whatever this returns, and the dashboard renders its control disabled beside it, so
+    the user learns the rule from the page instead of from a failed submit. Two carefully
+    written copies of a predicate pass every behavioural test and drift anyway
+    (kn-4ea33fe6) — the sharing has to be structural, which is why the page calls this
+    rather than checking a status tuple of its own.
+
+    It takes an OPEN STORE and an already-resolved `cfg` so a page that holds both does
+    not open a second store to ask, and it writes nothing: asking is free, and a surface
+    that had to attempt the write to learn the answer is the surface this replaces.
+
+    Order is the order a reader can act in — the project switch, then what the order IS,
+    then what it has, then what is already running over it. It decides only which
+    sentence a work order with two problems is given.
+    """
+    if cfg is None or not cfg.enabled:
+        return (f"the validation panel is off for {project}, so there is nothing to "
+                f"force a round with — turn it on (`jarvis config set {project} "
+                f"validation.enabled true`) before forcing a round")
+    wo_id = str(wo["id"])
+    status = str(wo["status"] or "")
+    if status not in FORCEABLE_STATUSES:
+        return (f"{wo_id} is {status}, and a round can only be forced on a work order "
+                f"that has DELIVERED and whose worker is not typing — "
+                f"{' or '.join(FORCEABLE_STATUSES)}. A settled order would be reopened "
+                f"by a verdict that could change nothing; a live one would have its "
+                f"session claimed by the round machine while its worker is still "
+                f"writing to it")
+    if not str(wo.get("pr_url") or ""):
+        return (f"{wo_id} carries no pull request, so a fresh round would read its "
+                f"worktree and record no commit — which is the state this command "
+                f"exists to get out of. Give it its pull request first "
+                f"(`jarvis wo finish {wo_id} --pr <url>`)")
+    # ONE READ, predicate and wording derived from it (kn-08f2ff9b): the panel opens
+    # rounds on its own thread, and two reads can straddle one — refusing while naming a
+    # round that has since settled, or allowing over a round that has since opened.
+    # `round_machine_owns` is the round machine's own definition of "this is mine", and a
+    # round it still owns is one about to run or be retried: a second round underneath
+    # would take the MAX-round slot out from under it.
+    latest = store.latest_validation_round(wo_id=wo_id)
+    if ProjectStore.round_machine_owns(latest):
+        assert latest is not None  # `round_machine_owns` is False for None
+        return (f"round {latest['round']} on {wo_id} is {latest['outcome']} — the panel "
+                f"has not finished with it. Wait for the verdict; forcing a round now "
+                f"would judge the same pull request twice")
+    return None
+
+
 def force_validation(wo_id: str, *, reason: str,
                      project_name: str | None = None) -> dict[str, Any]:
     """`jarvis validation force` — a PERSON opening a fresh round, with no worker.
@@ -2294,42 +2347,13 @@ def force_validation(wo_id: str, *, reason: str,
                        "afterwards as one a person forced, and why")
     name, path, _wo = find_work_order(wo_id, project_name)
     cfg = validation_config(name)
-    if cfg is None or not cfg.enabled:
-        raise OpsError(
-            f"the validation panel is off for {name}, so there is nothing to force a "
-            f"round with — turn it on (`jarvis config set {name} validation.enabled "
-            f"true`) before forcing a round")
     store = ProjectStore(path)
     try:
         wo = store.get_work_order(wo_id)
         status = str(wo["status"] or "")
-        if status not in FORCEABLE_STATUSES:
-            raise OpsError(
-                f"{wo_id} is {status}, and a round can only be forced on a work order "
-                f"that has DELIVERED and whose worker is not typing — "
-                f"{' or '.join(FORCEABLE_STATUSES)}. A settled order would be reopened "
-                f"by a verdict that could change nothing; a live one would have its "
-                f"session claimed by the round machine while its worker is still "
-                f"writing to it")
-        if not str(wo.get("pr_url") or ""):
-            raise OpsError(
-                f"{wo_id} carries no pull request, so a fresh round would read its "
-                f"worktree and record no commit — which is the state this command "
-                f"exists to get out of. Give it its pull request first "
-                f"(`jarvis wo finish {wo_id} --pr <url>`)")
-        # ONE READ, predicate and wording derived from it (kn-08f2ff9b): the panel opens
-        # rounds on its own thread, and two reads can straddle one — refusing while
-        # naming a round that has since settled, or allowing over a round that has since
-        # opened. `round_machine_owns` is the round machine's own definition of "this is
-        # mine", and a round it still owns is one about to run or be retried: a second
-        # round underneath would take the MAX-round slot out from under it.
-        latest = store.latest_validation_round(wo_id=wo_id)
-        if ProjectStore.round_machine_owns(latest):
-            assert latest is not None  # `round_machine_owns` is False for None
-            raise OpsError(
-                f"round {latest['round']} on {wo_id} is {latest['outcome']} — the panel "
-                f"has not finished with it. Wait for the verdict; forcing a round now "
-                f"would judge the same pull request twice")
+        refusal = force_validation_refusal(store, wo, project=name, cfg=cfg)
+        if refusal:
+            raise OpsError(refusal)
         round_row = submit_for_validation(store, path, wo,
                                           declared=declared_evidence(store, wo_id),
                                           cfg=cfg, forced_reason=reason)
@@ -2344,6 +2368,90 @@ def force_validation(wo_id: str, *, reason: str,
                 "status": store.get_work_order(wo_id)["status"]}
     finally:
         store.close()
+
+
+def force_validation_state(store: ProjectStore, wo: dict[str, Any], *, project: str,
+                           held: dict[str, Any] | None) -> dict[str, Any] | None:
+    """What the work-order page's "re-judge this pull request" control shows, or None.
+
+    None — no control at all — when the validation panel is off for the project. A button
+    for a mechanism a project never switched on is the noise `automerge_state` declines to
+    print, one authority along. Every OTHER refusal renders the control DISABLED with its
+    sentence, because those are rules about THIS work order and the page is where a person
+    should learn them rather than by pressing a button.
+
+    `held` is `automerge_state`'s answer, PASSED IN and never re-derived: the diagnosis is
+    the hold `automerge.decide` already computed for this order, on the tick that declined
+    to merge it. A second opinion derived here would need a `gh` call from a web request
+    and would answer about a different moment than the record is describing
+    (`automerge_state`'s own note).
+
+    Only the two holds a fresh round CLEARS are diagnosed. A red build or a conflict is a
+    hold this control cannot help with, and wording one of those as something to force a
+    round over is how a user comes to spend round numbers on a failing CI run.
+    """
+    from . import automerge
+
+    cfg = validation_config(project)
+    if cfg is None or not cfg.enabled:
+        return None
+    refusal = force_validation_refusal(store, wo, project=project, cfg=cfg)
+    state: dict[str, Any] = dict(held or {})
+    if state.get("kind") != "automerge_held":
+        state = {}
+    code = str(state.get("code") or "")
+    judged = str(state.get("judged_sha") or "")
+    head = str(state.get("head_sha") or "")
+    diagnosis = ""
+    if code == automerge.HELD_SHA_MOVED:
+        diagnosis = (f"The panel judged {judged[:10]}; the head of the pull request is "
+                     f"now {head[:10] or 'unknown'}. They are not the same commit, and "
+                     f"nothing merges a commit no round judged — a fresh round is what "
+                     f"binds a verdict to the one that is there now.")
+    elif code == automerge.HELD_SHA_UNRECORDED:
+        diagnosis = (f"Round {state.get('round')} passed, but it never recorded WHICH "
+                     f"commit it judged — it read a worktree rather than the pull "
+                     f"request. Nothing can bind a merge to a diff until a round records "
+                     f"one.")
+    return {"can_force": refusal is None, "refusal": refusal, "diagnosis": diagnosis,
+            "judged_sha": judged, "head_sha": head}
+
+
+def forced_round_lines(result: dict[str, Any]) -> list[str]:
+    """What forcing a round REPORTED, in two lines: the round it opened, and where the
+    work order went.
+
+    One formatter for the terminal and the page, over the dict `force_validation` returns
+    — "it is `validating`" is only half an answer on either surface, and two renderings of
+    one act are two chances to word it differently. The pointer at the verdict is NOT here:
+    a terminal's is a command and a page's is a link, so each surface adds its own.
+    """
+    return [f"{result['wo_id']} [{result['project']}]: round {result['round']} opened by "
+            f"hand — {result['reason']}",
+            f"was {result['was']}, now {result['status']}; the panel judges it on the "
+            f"daemon's next tick"]
+
+
+def forced_round_notice(store: ProjectStore, wo: dict[str, Any], *, project: str,
+                        round_n: int) -> list[str]:
+    """`forced_round_lines` for a page that has just redirected after forcing a round.
+
+    Rebuilt from the RECORD — the `validation_forced` event carries the reason and the
+    status the order was in — rather than carried across the redirect, so nothing a
+    visitor can type into the query string reaches the page as text. The round number only
+    selects which event is read, and an unknown one renders nothing.
+    """
+    from . import db
+
+    for event in store.events_of_kind(str(wo["id"]), "validation_forced"):
+        payload = db.from_json(event["payload"], {})
+        if int(payload.get("round") or 0) != round_n:
+            continue
+        return forced_round_lines({
+            "wo_id": wo["id"], "project": project, "round": round_n,
+            "reason": payload.get("reason") or "", "was": payload.get("was") or "",
+            "status": wo["status"]})
+    return []
 
 
 def prior_round_history(store: ProjectStore, *, wo_id: str | None = None,

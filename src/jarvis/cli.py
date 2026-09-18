@@ -2985,7 +2985,8 @@ def cmd_validation_force(args: argparse.Namespace) -> int:
 
     Prints where the work order went and what it is waiting for, because "it is
     `validating`" is only half an answer: nothing else in the terminal will say when the
-    panel has finished.
+    panel has finished. The two lines are `ops.forced_round_lines`, which the dashboard's
+    control renders too; only the pointer at the verdict is this surface's own.
     """
     from . import ops
 
@@ -2994,11 +2995,9 @@ def cmd_validation_force(args: argparse.Namespace) -> int:
     if args.json:
         _print(result, True)
         return 0
-    print(f"{result['wo_id']} [{result['project']}]: round {result['round']} opened by "
-          f"hand — {result['reason']}")
-    print(f"  was {result['was']}, now {result['status']}; the panel judges it on the "
-          f"daemon's next tick. `jarvis validation show {result['wo_id']}` for the "
-          f"verdict")
+    first, second = ops.forced_round_lines(result)
+    print(first)
+    print(f"  {second}. `jarvis validation show {result['wo_id']}` for the verdict")
     return 0
 
 

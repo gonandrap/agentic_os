@@ -228,6 +228,12 @@ jarvis validation force <wo-id> --reason "…"    # judge this work order AGAIN,
                                            # at or past `max_rounds` comes to you rather
                                            # than to a worker. Also refuses with no pull
                                            # request or with a round already open.
+                                           # The work order's dashboard page carries the
+                                           # same control, disabled with the reason
+                                           # whenever one of those refusals applies — and
+                                           # it is where the user can SEE why an order is
+                                           # parked: the commit each round judged against
+                                           # the live head of the pull request.
 jarvis gate list [--pending]               # privileged-action approvals (merge a PR, ship
                                            # a release). Workers attempt these and get
                                            # blocked; Neo reviews and decides, so most
