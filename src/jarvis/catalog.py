@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -163,6 +164,13 @@ def _parse_budget(raw: dict[str, Any], key: str, where: str,
     the edit that caused it. Zero is refused rather than read as "no ceiling" — it looks
     like an instruction to spend nothing, and silently inverting that is the one
     misreading that costs money.
+
+    `NaN` IS REFUSED HERE AND NOT ONLY IN `budget.parse_amount`, because `json.loads`
+    accepts a bare `NaN` literal, so a catalog can carry one and this is the only thing
+    between it and every new order in the project. Its danger is spelled out in that
+    function: a NaN budget fails OPEN while rendering as enabled, and stamped on a
+    project default it does so fleet-wide and silently. `isinstance(value, float)` is
+    true of it, and so is `not (value <= 0)`.
     """
     if key not in raw:
         return default
@@ -171,6 +179,8 @@ def _parse_budget(raw: dict[str, Any], key: str, where: str,
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise CatalogError(f"{where} must be a dollar amount or null, got {value!r}")
+    if not math.isfinite(value):
+        raise CatalogError(f"{where} must be a finite dollar amount, got {value!r}")
     if value <= 0:
         raise CatalogError(
             f"{where} must be greater than zero (use null for no ceiling), got {value}")

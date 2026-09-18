@@ -163,6 +163,17 @@ call.
 | dashboard | the ceiling, the spend, and the control, on both order pages |
 | catalog | `worker.budget_usd`, `worker.feature_budget_usd`, and the `os.defaults` twins |
 
+**Every one of those surfaces funnels through two validators**, `budget.parse_amount` for
+anything a person typed and `catalog._parse_budget` for anything a file carried, and both
+refuse a value that is not **finite and greater than zero**. `nan` is the case worth naming:
+`float()` accepts it, `nan <= 0` is False like every comparison against it, and a budget
+carrying it **fails open while rendering as enabled** — `Ceiling.exhausted` is
+`nan - spent <= 0`, false for the life of the order, so the cap is never reached and
+`INV-BUDGET-OVERSPENT` never fires, while `max(0.0, nan)` is `0.0` and every turn goes out
+under `--max-budget-usd 0.000000`. `json.loads` accepts a bare `NaN` literal, so the
+catalog guard is not redundant with the typed one: without it one line in a catalog stamps
+an uncappable default onto every new order in the project.
+
 Two catalog settings rather than one scaled from the other: a feature's children are not
 known when the default is written, so a per-work-order number says nothing useful about a
 family. The defaults are resolved at **creation** and stamped onto the row — unlike

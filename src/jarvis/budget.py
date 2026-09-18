@@ -49,6 +49,7 @@ own exit code is only corroboration — see its docstring.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -505,12 +506,25 @@ def parse_amount(raw: str) -> float:
     Zero is refused rather than treated as "no budget": `--budget 0` reads like an
     instruction to spend nothing, and silently turning it into "spend anything" is the
     one misreading that costs money. `--clear` is how a budget is removed.
+
+    `nan` AND `inf` ARE REFUSED FIRST, and they are why `float()` alone is not enough:
+    both are accepted by `float()` and both survive a `<= 0` test, `nan` because every
+    comparison against it is False. A `nan` budget is the worst possible outcome for a
+    spend control — it FAILS OPEN while reading as enabled. `Ceiling.exhausted` is
+    `nan - spent <= 0`, False for the life of the order, so the cap is never reached and
+    `INV-BUDGET-OVERSPENT` never fires; meanwhile `briefing_for`'s `max(0.0, nan)` is
+    0.0 (`max` keeps its first argument when the comparison is False), so every turn goes
+    out under `--max-budget-usd 0.000000`, a value the probes at the top of this file
+    never measured. The dashboard would show the order as budgeted throughout. An
+    infinite budget is the same lie told less subtly.
     """
     text = raw.strip().lstrip("$").replace(",", "")
     try:
         value = float(text)
     except ValueError:
         raise ValueError(f"not a dollar amount: {raw!r}") from None
+    if not math.isfinite(value):
+        raise ValueError(f"not a dollar amount: {raw!r}")
     if value <= 0:
         raise ValueError(
             f"a budget must be greater than zero (got {value}); use --clear to remove one")

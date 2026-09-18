@@ -609,6 +609,21 @@ def test_a_bad_catalog_budget_fails_at_load_not_at_the_first_dispatch():
             parse_catalog({"os": {"defaults": {"budget_usd": bad}}, "projects": []})
 
 
+def test_a_catalog_carrying_nan_is_refused_at_load():
+    """`json.loads` accepts a BARE `NaN` literal, so a catalog can carry one, and this is
+    the only thing between it and every new order in the project. It passes both earlier
+    guards: `isinstance(nan, float)` is true, and `nan <= 0` is False like every other
+    comparison against it."""
+    loaded = json.loads('{"os": {"defaults": {"budget_usd": NaN}}, "projects": []}')
+    assert loaded["os"]["defaults"]["budget_usd"] != loaded["os"]["defaults"]["budget_usd"]
+    with pytest.raises(CatalogError):
+        parse_catalog(loaded)
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(CatalogError):
+            parse_catalog({"os": {"defaults": {"feature_budget_usd": bad}},
+                           "projects": []})
+
+
 def test_the_catalog_budget_reaches_the_config_ledger():
     """A setting outside the version ledger is a setting that cannot be audited or rolled
     back with the rest of the configuration."""
@@ -634,6 +649,32 @@ def test_zero_is_refused_rather_than_read_as_no_ceiling():
         budget.parse_amount("0")
     with pytest.raises(ValueError):
         budget.parse_amount("-3")
+
+
+def test_a_budget_that_is_not_a_finite_number_is_refused():
+    """`float()` accepts all of these, and none of them is a dollar amount. Reachable from
+    `jarvis wo budget <id> nan` and from the dashboard's budget box, both of which parse
+    here."""
+    for bad in ("nan", "NaN", "inf", "-inf", "Infinity", "$nan"):
+        with pytest.raises(ValueError):
+            budget.parse_amount(bad)
+
+
+def test_why_nan_is_the_one_that_matters_it_fails_open():
+    """NOT a restatement of the guard — this is the behaviour the guard exists to prevent,
+    asserted on the real `Ceiling` and the real argv formatter so that removing the guard
+    fails HERE with the consequence spelled out rather than only at the parser.
+
+    A `nan` cap reads as enabled on every surface and enforces nothing: `exhausted` is
+    `nan - spent <= 0`, False for the life of the order, so the order never parks and
+    `INV-BUDGET-OVERSPENT` never fires — while the turn goes out under a cap of zero,
+    because `max(0.0, nan)` keeps its FIRST argument when the comparison is False.
+    """
+    nan = float("nan")
+    cap = budget.Ceiling(cap_usd=nan, spent_usd=10_000.0, source="work_order")
+    assert not cap.exhausted                     # ...after ten thousand dollars
+    assert max(0.0, cap.remaining_usd) == 0.0    # ...and the turn is capped at nothing
+    assert f"{max(0.0, cap.remaining_usd):.6f}" == "0.000000"
 
 
 def test_the_budget_verb_reports_both_halves(started, store):

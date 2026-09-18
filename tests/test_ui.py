@@ -2225,6 +2225,18 @@ def test_a_bad_amount_comes_back_as_a_flash_not_a_traceback(client):
     assert ops.work_order_budget(wo["id"])["budget_usd"] is None
 
 
+def test_the_budget_box_refuses_nan_rather_than_accepting_an_uncappable_cap(client):
+    """The dashboard POST is an entry point of its own, and `nan` is the input that gets
+    PAST a `> 0` check: an order carrying it renders as budgeted and is never capped. It
+    has to come back as a flash, leaving the order exactly as unbudgeted as it was."""
+    wo = ops.create_work_order("proj_a", "capped", description="do it")
+    for bad in ("nan", "inf", "-inf"):
+        r = client.post(f"/wo/proj_a/{wo['id']}/budget", data={"amount": bad})
+        assert r.status_code == 303
+        assert "error=" in r.headers["location"]
+        assert ops.work_order_budget(wo["id"])["budget_usd"] is None
+
+
 def test_a_spent_order_is_featured_ahead_of_everything_else(client, daemon):
     """It is the only blocker the reader cannot answer by reading: the order is stopped
     and spending nothing until they decide."""
