@@ -1372,11 +1372,16 @@ def create_app() -> FastAPI:
 
     @app.post("/fo/create")
     def create_fo(project: str = Form(...), title: str = Form(...),
-                  description: str = Form("")):
+                  description: str = Form(""), budget: str = Form("")):
+        from .. import budget as budget_mod
+
         try:
-            fo = ops.create_feature_order(project, title, description=description,
-                                          origin="ui")
-        except ops.OpsError as e:
+            fo = ops.create_feature_order(
+                project, title, description=description, origin="ui",
+                # A FAMILY budget: the whole rollup, not the planner alone. Empty means
+                # the project's default — see `create_wo` on why never zero.
+                budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
+        except (ValueError, ops.OpsError) as e:
             return RedirectResponse(f"/project/{project}?error={e}", status_code=303)
         return RedirectResponse(f"/fo/{project}/{fo['id']}", status_code=303)
 

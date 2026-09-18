@@ -145,6 +145,13 @@
       </select>
       <input type="text" name="title" placeholder="what needs doing" required>
       <input type="text" name="model" placeholder="model (default: catalog)" style="max-width: 180px;">
+      {# `pattern` so a typo bounces off the browser instead of costing the description
+         typed below it; `budget.parse_amount` is still the authority (Neo, q418). #}
+      <input type="text" name="budget" placeholder="budget $ (default: catalog)"
+             pattern="\s*\$?\s*[0-9,]*\.?[0-9]+\s*" style="max-width: 200px;"
+             title="A dollar ceiling on this order's WHOLE bill — its own turns plus what
+                    Jarvis spends on it. e.g. 5 or $5.50. Leave empty for the project's
+                    default, which is usually no ceiling.">
     </div>
     <div style="display: flex; gap: 10px; align-items: flex-start;">
       <textarea name="description" placeholder="details, context, constraints (optional)"></textarea>
@@ -165,6 +172,12 @@
         {% for p in st.projects %}<option value="{{ p.name }}">{{ p.name }}</option>{% endfor %}
       </select>
       <input type="text" name="title" placeholder="the whole feature" required>
+      {# A FAMILY budget — see `create_fo`. Same pattern rule as the form above. #}
+      <input type="text" name="budget" placeholder="budget $ (default: catalog)"
+             pattern="\s*\$?\s*[0-9,]*\.?[0-9]+\s*" style="max-width: 200px;"
+             title="A ceiling on this feature's WHOLE rollup — planner, manager and every
+                    child. Each child takes a slice of what is left when it is dispatched.
+                    e.g. 50 or $50.00.">
     </div>
     <div style="display: flex; gap: 10px; align-items: flex-start;">
       <textarea name="description" required
