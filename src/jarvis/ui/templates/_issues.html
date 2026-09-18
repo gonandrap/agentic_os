@@ -47,8 +47,8 @@
   {% elif i.state == 'OPEN' %}<span class="st tone-active"><span class="i">◌</span>open</span>{% endif %}
   {{ i.title }}
   {# NO SEAT NAME — `_validation.html` states the rule; this page is read by everyone. #}
-  {% if i.round %}<span class="sub">round {{ i.round }}</span>{% endif %}
-  {% if i.kind and i.kind != 'raised' %}<span class="sub">{{ i.kind }}</span>{% endif %}
+  {% if i.round %}<span class="sub">· round {{ i.round }}</span>{% endif %}
+  {% if i.kind and i.kind != 'raised' %}<span class="sub">· {{ i.kind }}</span>{% endif %}
 </div>
 {% endmacro %}
 
