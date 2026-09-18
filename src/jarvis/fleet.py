@@ -83,12 +83,26 @@ class Fleet:
         ranking, and the same reasoning, as the dependency label above the slot label in
         `invariants.status_label`.
         """
-        if self.outage is not None and self.at < self.outage.reopens_at:
+        if self.shut():
             return ("the Claude usage window is spent, reopening at "
-                    f"{clock(self.outage.reopens_at)}")
+                    f"{clock(self.outage.reopens_at)}")  # type: ignore[union-attr]
         if self.in_flight >= self.cap:
             return f"{self.in_flight} of {self.cap} worker turns already in flight"
         return ""
+
+    def shut(self) -> bool:
+        """Is the ACCOUNT refusing turns right now — the outage half of `blocked`, alone?
+
+        The panel needs this one and NOT the cap. A validation seat is a `claude -p` call,
+        not a worker turn: it does not count against `max_in_flight` and holding it back
+        because workers are busy would stall reviews for no reason. It is refused by the
+        same window, though, and that half does apply (GitHub issue #235,
+        `Daemon.validation_tick`).
+
+        Reads `self.at`, not the clock, for the reason the attribute exists: one tick, one
+        answer, however many callers ask.
+        """
+        return self.outage is not None and self.at < self.outage.reopens_at
 
     def launched(self) -> None:
         self.in_flight += 1

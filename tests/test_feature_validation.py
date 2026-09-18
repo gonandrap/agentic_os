@@ -1054,6 +1054,39 @@ def test_a_transport_outage_costs_the_feature_no_round(fleet):
         store.close()
 
 
+def test_a_feature_round_met_by_a_usage_window_waits_rather_than_spending_a_retry(fleet):
+    """The work-order twin is tests/test_validation_usage_limit.py — this is the half of
+    GitHub issue #235 that lives on the MANAGER's timeline.
+
+    `max_rounds=1` so that a consumed round would show up at once, and four drains is
+    past the whole transport budget: a window that cost the feature its retries would
+    have escalated by the last of them.
+    """
+    from jarvis.claude_cli import UsageLimit, UsageLimitError
+
+    fleet.reconfigure(max_rounds=1)
+    validator = Validator(UsageLimitError(UsageLimit(
+        message="You've hit your session limit · resets 11:50pm (America/Los_Angeles)",
+        reset_at=time.time() + 3600)))
+    fleet.daemon.validator = validator
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+
+        fleet.drain(ticks=4)
+
+        assert len(validator.calls) == 1, "the panel walked back into a closed window"
+        assert store.latest_validation_round(fo_id=fo_id)["outcome"] == "failed"
+        assert store.counted_validation_rounds(fo_id=fo_id) == 0
+        assert store.get_feature_order(fo_id)["status"] == "validating"
+        assert VALIDATION_STUCK_BLOCKER not in str(
+            store.get_feature_order(fo_id)["attention_reason"] or "")
+    finally:
+        store.close()
+
+
 def test_a_feature_with_no_manager_escalates_without_calling_the_panel(fleet):
     """A feature whose plan was released while validation was off has no manager, so a
     rejection would have no addressee and the round's own events would have no timeline
