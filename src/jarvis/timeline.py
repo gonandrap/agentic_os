@@ -469,6 +469,14 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         if p.get("cause") == "no_validator":
             return ("Validation skipped — no validator was configured",
                     p.get("reason") or "")
+        if p.get("cause") == "usage_limit":  # project_store.VALIDATION_HELD_CAUSE
+            # A THIRD cause, and the one a reader must not take for either of the others:
+            # nothing is wrong, nobody is needed, and the round goes again by itself. The
+            # moment is the whole content of the line (GitHub issue #235).
+            when = _clock(p.get("reopens_at"))
+            return ("Validation held — the Claude usage window is spent",
+                    (f"resuming by itself at {when}" if when else "")
+                    + (f" · {p.get('error')}" if p.get("error") else ""))
         attempt = p.get("attempt")
         return ("Validation could not be run — the reviewer was unreachable",
                 f"attempt {attempt}: {p.get('error') or ''}" if attempt

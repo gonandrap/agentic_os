@@ -112,6 +112,39 @@ RUNNABLE_VALIDATION_OUTCOMES = ("pending", "failed")
 # up and the USER holds it — and so is `passed`, which is the one that clears.
 # See docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §2.
 OPEN_VALIDATION_OUTCOMES = ("pending", "failed", "rejected")
+
+# Why a `failed` round failed, on its `validation_failed` event. THREE causes and they
+# want three different responses, which is the whole reason the field exists: `transport`
+# retries on the next tick and gives up after `VALIDATION_OUTAGE_LIMIT`, `no_validator`
+# settles the unit where it settles with the panel off, and `usage_limit` WAITS — the
+# account's window is spent and the refusal named the moment it reopens.
+VALIDATION_HELD_CAUSE = "usage_limit"
+
+
+def validation_hold_until(events: Iterable[Any], round_no: int) -> float:
+    """The moment this round may go again, or 0 when nothing is holding it back.
+
+    Derived from the events and from nothing else: no column, no status, no flag — the
+    rule this module states for `waiting_pr_merge` ("that earned a status because nothing
+    derived it; this does not") and that `worker_session.turn_pause` already follows for
+    the worker-side twin of exactly this hold.
+
+    NEWEST WINS, which is not the same as first: a window that reopened, was retried and
+    shut again writes a second event for the same round number, and taking the earlier
+    moment would send the round straight back into a closed window every tick.
+
+    Takes ROWS rather than a store because the same rule has to answer for a feature
+    order, whose events live on its manager's timeline and come back through
+    `ops.feature_events_of_kind`. One home, two carriers (GitHub issue #235).
+    """
+    held = 0.0
+    for e in events:
+        payload = db.from_json(e["payload"], {})
+        if (payload.get("round") == round_no
+                and payload.get("cause") == VALIDATION_HELD_CAUSE):
+            held = max(held, float(payload.get("reopens_at") or 0.0))
+    return held
+
 # What one seat proposed. "" is a seat that offered none — it ran, but said nothing the
 # arbiter can count.
 VALIDATION_VERDICTS = ("pass", "reject", "")

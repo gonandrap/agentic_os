@@ -66,8 +66,10 @@ from .project_store import (
     RUNNABLE_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
     UNGOVERNED_ORIGINS,
+    VALIDATION_HELD_CAUSE,
     ProjectStore,
     resume_spends_slot,
+    validation_hold_until,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -611,12 +613,12 @@ class Daemon:
                 # After delivery, not before: an envelope this round machine posted on
                 # an earlier tick is already on its way to the worker, so the work order
                 # it rejected has left `validating` and is not looked at again here.
-                self.validation_tick(project, store)
+                self.validation_tick(project, store, state)
                 # Beside its twin and for the same reason: an envelope a feature round
                 # posted on an earlier tick has already gone out to the manager above,
                 # so the feature it rejected has left `validating` and is not looked at
                 # again here. Both machines share one thread and one in-flight set.
-                self.feature_validation_tick(project, store)
+                self.feature_validation_tick(project, store, state)
                 # Before dispatch, not after: a planner filed this tick is an ordinary
                 # pending work order, so it is claimed by the same pass rather than
                 # waiting a whole poll interval to start.
@@ -1303,8 +1305,14 @@ class Daemon:
 
     # -- 3b. the validation round machine (see the validation-panel design) -----------
 
-    def validation_tick(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def validation_tick(self, project: ProjectSpec, store: ProjectStore,
+                        state: fleet.Fleet | None = None) -> None:
         """Judge every work order with an open round, off this thread.
+
+        `state` IS THE TICK'S ONE FLEET READING, and only its outage half is read here —
+        never `blocked()`. A seat is not a worker turn and does not count against
+        `max_in_flight`, but it is refused by the very same account-wide window, so the
+        cap must not hold the panel and the outage must (GitHub issue #235).
 
         THE KILL SWITCH IS NOT CHECKED HERE, and that is the point of the whole design:
         `os.validation.enabled` gates OPENING a round (`ops.finish`) and never settling
@@ -1323,12 +1331,24 @@ class Daemon:
         `statuses=("validating",)` — what this used to ask for — could not see one, which
         is the whole of why validation waited on the user.
         """
+        if state is not None and state.shut():
+            # Nothing would be judged; every seat would be refused free and instantly,
+            # and the round would only have to be held anyway. Held BEFORE the first
+            # refusal rather than after it, the way `dispatch_pending` holds a worker.
+            return
         for wo in store.work_orders_awaiting_validation():
             wo_id = wo["id"]
             if wo_id in self.validating:
                 continue  # its round is in flight; a second tick must not start another
             round_row = store.latest_validation_round(wo_id=wo_id)
             if round_row is None:  # pragma: no cover - the query selected on this round
+                continue
+            # This round met a window of its own, and the refusal named when it lifts.
+            # `failed` is RUNNABLE, so without this the same closed window is walked into
+            # every tick — which is how `VALIDATION_OUTAGE_LIMIT` used to be spent in
+            # fifteen seconds against an eleven-hour outage (`_validation_held`).
+            if validation_hold_until(store.events_of_kind(wo_id, "validation_failed"),
+                                     int(round_row["round"])) > time.time():
                 continue
             self.validating.add(wo_id)
             future = self.validate_pool.submit(
@@ -1443,6 +1463,13 @@ class Daemon:
 
             try:
                 verdict = validator(store, dict(round_row), packet)
+            except claude_cli.UsageLimitError as e:
+                # BEFORE the generic outage below, and that ordering is the fix: a spent
+                # window is not a transport fault and must not spend its budget.
+                self._validation_held(store, wo, round_id, n, e.limit)
+                log.info("[%s] %s: round %d held until the usage window reopens",
+                         project.name, wo_id, n)
+                return
             except claude_cli.ClaudeCliError as e:
                 self._validation_outage(store, wo, round_id, n, e)
                 return
@@ -1652,6 +1679,40 @@ class Daemon:
             source="validation",
         )
 
+    @staticmethod
+    def _validation_held(store: ProjectStore, wo: dict, round_id: int, n: int,
+                         limit: claude_cli.UsageLimit) -> None:
+        """The account's window is spent. WAIT IT OUT — this costs no outage attempt.
+
+        The transport budget above is sized for a blip and is spent on CONSECUTIVE TICKS,
+        so at a 5s tick all three attempts and the terminal escalation behind them landed
+        inside fifteen seconds — against an outage the inbox had already measured at 11.2
+        hours (GitHub issue #235, wo-752eced8 round 3). A usage limit is the one failure
+        that states when it ends, so there is nothing to guess and nothing to ration.
+
+        The round is closed `failed` for the same reason `_validation_outage` closes it
+        that way — it is `RUNNABLE`, and `counted_validation_rounds` ignores it, so the
+        submitter spends nothing and the next tick owns the same round again. What is new
+        is `reopens_at` on the event: `validation_tick` reads it back and does not
+        re-submit until it has passed, which is the same contract `dispatch_pending`
+        already honours for a worker turn.
+
+        WORK ORDERS ALREADY ESCALATED BY A PAST WINDOW ARE NOT REOPENED (Neo, question
+        390). Their escalation reached the inbox and flagged attention, so the user has
+        seen it, and re-judging behind their back could land and auto-merge a pull request
+        nobody asked for. The recovery is one command, on demand:
+
+            jarvis validation force <wo-id> --reason "held by a usage window, see #235"
+        """
+        from .invariants import usage_hold_note
+
+        reopens = limit.reset_at or (time.time()
+                                     + worker_session.RATE_LIMIT_FALLBACK_DELAY)
+        store.close_validation_round(round_id, "failed", usage_hold_note(reopens))
+        store.add_event(wo["id"], "validation_failed",
+                        {"round": n, "cause": VALIDATION_HELD_CAUSE,
+                         "reopens_at": reopens, "error": limit.message[:500]})
+
     def _validation_outage(self, store: ProjectStore, wo: dict, round_id: int, n: int,
                            error: Exception) -> None:
         """The validator could not be reached. That is a transport failure, NOT a
@@ -1738,8 +1799,11 @@ class Daemon:
 
     # -- 3c. the same machine, one level up: feature orders ---------------------------
 
-    def feature_validation_tick(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def feature_validation_tick(self, project: ProjectSpec, store: ProjectStore,
+                                state: fleet.Fleet | None = None) -> None:
         """Judge every FEATURE order parked in `validating`, off this thread.
+
+        `state` is read exactly as `validation_tick` reads it — the outage half only.
 
         The twin of `validation_tick`, and it does not read the kill switch either, for
         the same reason: `enabled` and `feature_units` gate opening a round and never
@@ -1752,6 +1816,10 @@ class Daemon:
         kind, so a `wo-` key and an `fo-` key cannot collide, and one set means one pool
         and one re-entrancy rule to reason about instead of two.
         """
+        from . import ops
+
+        if state is not None and state.shut():
+            return  # see `validation_tick`: every seat would be refused, free and instantly
         for fo in store.list_feature_orders(statuses=("validating",)):
             fo_id = fo["id"]
             if fo_id in self.validating:
@@ -1765,6 +1833,10 @@ class Daemon:
                 continue
             if round_row["outcome"] not in ("pending", "failed"):
                 continue  # already judged — settlement is what moves it, not a re-run
+            if validation_hold_until(
+                    ops.feature_events_of_kind(store, fo_id, "validation_failed"),
+                    int(round_row["round"])) > time.time():
+                continue  # this round met a window of its own (`_feature_held`)
             self.validating.add(fo_id)
             future = self.validate_pool.submit(
                 self._validate_feature, project, fo_id, int(round_row["id"]))
@@ -1882,6 +1954,13 @@ class Daemon:
 
             try:
                 verdict = validator(store, dict(round_row), packet)
+            except claude_cli.UsageLimitError as e:
+                # Held, not spent — the work-order twin's reasoning verbatim
+                # (`_validation_held`), and the two settle paths stay identical.
+                self._feature_held(store, fo, round_id, n, e.limit)
+                log.info("[%s] feature %s: round %d held until the window reopens",
+                         project.name, fo_id, n)
+                return
             except claude_cli.ClaudeCliError as e:
                 self._feature_outage(store, fo, round_id, n, e)
                 return
@@ -2017,6 +2096,35 @@ class Daemon:
             title=VALIDATION_ESCALATED_TITLE.format(unit=fo_id, n=n),
             body=escalation_body(reason), level="warning", source="validation",
         )
+
+    @staticmethod
+    def _feature_held(store: ProjectStore, fo: dict, round_id: int, n: int,
+                      limit: claude_cli.UsageLimit) -> None:
+        """`_validation_held` for a feature round — read that one; this is its twin.
+
+        The only difference is the carrier: these events live on the MANAGER's timeline
+        (`ops.feature_event`), because `wo_events.wo_id` is a foreign key into
+        `work_orders`. `feature_validation_tick` reads them back through
+        `ops.feature_events_of_kind` and waits the same moment out.
+
+        NO `not recorded` BACKSTOP, unlike the outage beside it, and the difference is
+        deliberate: that one escalates when the event cannot be written, because its
+        budget is counted FROM the events and an uncountable budget retries for ever.
+        This holds on a moment rather than a count, so an unwritten event costs one round
+        an unnecessary retry on the next tick — which is where it started — and never a
+        silent stall.
+        """
+        from . import ops
+        from .invariants import usage_hold_note
+
+        fo_id = fo["id"]
+        reopens = limit.reset_at or (time.time()
+                                     + worker_session.RATE_LIMIT_FALLBACK_DELAY)
+        store.close_validation_round(round_id, "failed", usage_hold_note(reopens))
+        ops.feature_event(store, fo_id, "validation_failed",
+                          {"round": n, "cause": VALIDATION_HELD_CAUSE,
+                           "reopens_at": reopens, "error": limit.message[:500],
+                           "feature_order": fo_id})
 
     def _feature_outage(self, store: ProjectStore, fo: dict, round_id: int, n: int,
                         error: Exception) -> None:

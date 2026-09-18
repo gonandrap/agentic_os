@@ -274,3 +274,26 @@ git -C "$PRODUCTION_CODE/jarvis_os" checkout -f jarvis-<older>
 (cd "$PRODUCTION_CODE/jarvis_os" && uv sync --frozen --extra ui)
 systemctl --user restart jarvis jarvis-ui
 ```
+
+## Upgrade notes
+
+### A validation panel held by a usage limit (GitHub issue #235)
+
+From this release a validation round refused by the Claude usage window **waits for the
+window and judges itself afterwards**, with no human touch — the same contract dispatch
+already honours for a worker turn. It spends no round and no transport-retry budget, and
+the work order reads as *"the Claude usage window is spent, the review resumes by itself
+at HH:MM"* rather than as needing your judgement.
+
+**Work orders escalated by a window BEFORE this release are not reopened.** That is
+deliberate: their escalation already reached the inbox and flagged attention, so
+re-judging them on upgrade could land and auto-merge a pull request nobody asked for.
+Reopen one on demand:
+
+```bash
+jarvis validation force <wo-id> --reason "held by a usage window, see issue #235"
+```
+
+They are the orders whose latest round reads `escalated` with *"nobody could be reached
+to review this submission, so the work has not been judged."* — `jarvis validation show
+<wo-id>` prints it. Known at the time of writing: `wo-752eced8`.

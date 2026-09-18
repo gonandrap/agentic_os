@@ -54,6 +54,7 @@ from .project_store import (
     RUNNABLE_VALIDATION_OUTCOMES,
     SLOT_STATUSES,
     UNGOVERNED_ORIGINS,
+    validation_hold_until,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -696,6 +697,29 @@ def dead_dependencies(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str,
             if dep["status"] in DEPENDENCY_DEAD_STATUSES or dep["status"] == "missing"]
 
 
+def usage_hold_note(until: float) -> str:
+    """"the Claude usage window is spent, …" — the PANEL's twin of `pause_note` above.
+
+    Worded to match the worker-side sentence deliberately: one window refuses a worker
+    turn and a validation seat alike, and a user reading a quiet fleet at midnight should
+    not have to learn that these are two different things (GitHub issue #235).
+
+    Takes the MOMENT rather than a store because three surfaces need it off three
+    different carriers — the held round's own `reason`, `status_label`, and
+    `parallel_round_note` — and a helper that fetched for itself would have to be written
+    three times to reach them.
+    """
+    return ("the Claude usage window is spent, the review resumes by itself at "
+            f"{clock(until)}")
+
+
+def validation_hold_note(store: ProjectStore, wo_id: str, round_no: int) -> str:
+    """`usage_hold_note` for a round that is actually held, or "" for one that is not."""
+    until = validation_hold_until(store.events_of_kind(wo_id, "validation_failed"),
+                                  round_no)
+    return usage_hold_note(until) if until > time.time() else ""
+
+
 def parallel_round_note(store: ProjectStore, wo_id: str) -> str:
     """" — review round N is running in parallel", or "" when none is.
 
@@ -710,6 +734,9 @@ def parallel_round_note(store: ProjectStore, wo_id: str) -> str:
     """
     latest = store.latest_validation_round(wo_id=wo_id)
     if latest and latest["outcome"] in RUNNABLE_VALIDATION_OUTCOMES:
+        held = validation_hold_note(store, wo_id, int(latest["round"]))
+        if held:
+            return f" — review round {latest['round']} is held: {held}"
         return f" — review round {latest['round']} is running in parallel"
     return ""
 
@@ -736,7 +763,11 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
         # `os.validation.max_rounds`: every surface renders a status through here, and
         # this function is handed a store and a row — no catalog is in reach, and
         # threading one through every caller to print a number is not worth it.
-        return f"validating — review round {round_no} of {DEFAULT_VALIDATION_MAX_ROUNDS}"
+        label = f"validating — review round {round_no} of {DEFAULT_VALIDATION_MAX_ROUNDS}"
+        # Why nothing is happening, when the answer is a spent window rather than a slow
+        # reviewer. Without it the label promises a review that is in fact waiting hours.
+        held = validation_hold_note(store, wo["id"], int(round_no))
+        return f"{label} — {held}" if held else label
     if wo["status"] in ACTIVE_STATUSES:
         note = pause_note(store, wo) or neo_wait_note(wo)
         return f"{wo['status']} — {note}" if note else wo["status"]
