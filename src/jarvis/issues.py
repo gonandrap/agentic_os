@@ -13,11 +13,22 @@ comment naming the work order and the pull request, when that work lands.
 held to the same AST test in `tests/test_issue_lifecycle.py`. "What can Jarvis write to
 GitHub" therefore has exactly one answer, in one file, in a list.
 
-Writes are confined to the OS's own bug tracker (`bugreport.bug_repo()`). A work order's
-`issue_url` is a column like `pr_url`, so it is a string the record hands back to a
-command run with the operator's credentials; `checked_issue_url` holds it to an anchored
-shape AND to that one repository before it can become an argument, for the reasons
-`github.UntrustedPullRequest` spells out.
+## Which repositories the OS may write to
+
+TWO, and the second arrived with the validation panel's follow-ups (user ruling,
+2026-09-16). The bug-tracker lifecycle above writes to `bugreport.bug_repo()`. A panel
+follow-up is filed on **the repository of the project under review** — the finding is
+about that project's code and belongs on that project's tracker, not on the OS's.
+
+**The rule that replaced "one constant repository" is not weaker, and the distinction is
+where the repository NAME comes from.** It is never a string out of the record and never
+anything a model wrote: it is `github.origin_repo(<the project's checkout>)`, a local
+`git remote get-url origin` already declared in `github.LOCAL_GIT_READS`. `checked_repo`
+then holds that name to an anchored shape before it can be an argument, and
+`checked_issue_url` holds every URL to an anchored shape AND to the repository the
+CALLER named — so a URL out of the record still cannot redirect a write, which is the
+whole of what `github.UntrustedPullRequest` spells out. What changed is who names the
+repository, not whether one is checked.
 
 ## Desired state, not a sequence of pokes
 
@@ -54,7 +65,13 @@ log = logging.getLogger("jarvis.issues")
 #: `github.py` read-only, pointed the other way: a command added here has to be added
 #: deliberately, in a commit that also edits the test.
 ISSUE_VERBS = (("issue", "view"), ("issue", "edit"), ("issue", "comment"),
-               ("issue", "close"), ("label", "create"))
+               ("issue", "close"), ("label", "create"),
+               # Added deliberately, in the commit that also edited the AST test — which
+               # is the mechanism working, not a hole in it. `issue create` files a
+               # validation follow-up; `issue list` is the READ that dedupes it, and it
+               # is here rather than in `github.py` because that module may build no
+               # command against a repository it was not given by `origin`.
+               ("issue", "create"), ("issue", "list"))
 
 #: One round trip against GitHub's API. Same budget as `github.GH_TIMEOUT`, and for the
 #: same reason: the daemon's reconcile tick must not block on a network problem.
@@ -223,9 +240,14 @@ def checked_issue_url(url: str, repo: str | None = None) -> str:
 
     Stricter than `github.checked_pr_url`'s origin test, and deliberately so: that one
     skips its repository check when `origin` cannot be read, because losing PR polling
-    over a moved checkout would be worse than the exposure. Here the repository is a
-    CONSTANT (`bugreport.bug_repo()`) — there is no degraded case to be lenient about,
-    so a URL that is not on the OS's own tracker is refused outright.
+    over a moved checkout would be worse than the exposure. There is no degraded case
+    here — the caller always knows which repository it means — so a URL that is not on
+    that repository is refused outright.
+
+    `repo` DEFAULTS to the OS's own tracker and is passed explicitly by the follow-up
+    path, which writes to the project under review instead (see the module docstring).
+    The check is the same either way: the caller names the repository, and a URL out of
+    the record cannot disagree with it.
     """
     match = ISSUE_URL_RE.match(url or "")
     if match is None:
@@ -249,6 +271,27 @@ def checked_issue_url(url: str, repo: str | None = None) -> str:
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:/-]{0,49}$")
 
 
+#: The ONLY shape a repository may have before it becomes a `--repo` argument. Anchored
+#: and dash-free at the front for `LABEL_RE`'s reason: `gh` reads a leading `-` as a flag,
+#: and this value now varies per project instead of being one constant.
+REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def checked_repo(repo: str) -> str:
+    """`repo` if it may become a `gh --repo` argument. Raises otherwise.
+
+    Its callers derive the name from `github.origin_repo`, which reads the checkout's own
+    `origin`. That is already trustworthy; this is the layer that stays true when some
+    later caller derives it from somewhere else.
+    """
+    if not REPO_RE.match(repo or ""):
+        raise IssueLifecycleError(
+            f"{repo!r} is not a repository this OS will send to GitHub — it must be "
+            f"`owner/name`, starting with a letter or digit",
+            GitHubError.URL_REFUSED)
+    return repo
+
+
 def checked_label(label: str) -> str:
     """`label` if it may become a `gh` argument. Raises `IssueLifecycleError` otherwise.
 
@@ -264,17 +307,23 @@ def checked_label(label: str) -> str:
     return label
 
 
-def _run(args: list[str], *, url: str, tolerate: str = "") -> str:
+def _run(args: list[str], *, url: str, tolerate: str = "",
+         stdin: str | None = None) -> str:
     """One `gh` call. Raises `IssueLifecycleError` unless `tolerate` matches its stderr.
 
     `tolerate` is the one concession to `gh`'s habit of failing on a no-op: creating a
     label that already exists is exit 1 with "already exists" on stderr, and that is the
     success case for `ensure_label`.
+
+    `stdin` feeds `--body-file -`. It is a parameter here rather than a second copy of
+    this function because a body long enough to need stdin is exactly a body whose call
+    needs the same timeout, the same `gh`-missing message and the same rule that remote
+    text is logged and never raised.
     """
     shown = "`gh " + " ".join(args[:2]) + f" {url}`"
     try:
-        proc = subprocess.run([gh_bin(), *args], capture_output=True, text=True,
-                              timeout=GH_TIMEOUT)
+        proc = subprocess.run([gh_bin(), *args], input=stdin, capture_output=True,
+                              text=True, timeout=GH_TIMEOUT)
     except FileNotFoundError as e:
         raise GhUnavailable(
             gh_missing_message("so Jarvis cannot keep its own tracker up to date"),
@@ -321,9 +370,10 @@ def ensure_label(label: str, repo: str | None = None) -> None:
     case instead of two, and `gh label create` is the only thing that can answer the
     question without a race anyway.
     """
-    _run(["label", "create", checked_label(label), "--repo", repo or bug_repo(),
+    repo = checked_repo(repo or bug_repo())
+    _run(["label", "create", checked_label(label), "--repo", repo,
           "--color", LABEL_COLOUR, "--description", LABEL_DESCRIPTION],
-         url=repo or bug_repo(), tolerate="already exists")
+         url=repo, tolerate="already exists")
 
 
 def add_label(url: str, label: str) -> None:
@@ -343,22 +393,7 @@ def comment(url: str, body: str) -> None:
     several links, and argv has a length limit that stdin does not.
     """
     url = checked_issue_url(url)
-    shown = f"`gh issue comment {url}`"
-    try:
-        proc = subprocess.run([gh_bin(), "issue", "comment", url, "--body-file", "-"],
-                              input=body, capture_output=True, text=True,
-                              timeout=GH_TIMEOUT)
-    except FileNotFoundError as e:
-        raise GhUnavailable(
-            gh_missing_message("so Jarvis cannot keep its own tracker up to date"),
-            GitHubError.NO_GH) from e
-    except subprocess.TimeoutExpired as e:
-        raise IssueLifecycleError(f"{shown} timed out after {GH_TIMEOUT}s",
-                                  GitHubError.TIMEOUT) from e
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
-        log.info("%s failed: %s", shown, detail)
-        raise IssueLifecycleError(f"{shown} failed: {detail}", GitHubError.REFUSED)
+    _run(["issue", "comment", url, "--body-file", "-"], url=url, stdin=body)
 
 
 def close(url: str, body: str) -> None:
@@ -372,6 +407,89 @@ def close(url: str, body: str) -> None:
 
 
 # -- what the tracker should say, given what the work order is doing ----------------
+
+
+# -- validation follow-ups: the panel's non-blocking findings, on the project's tracker --
+#
+# User ruling, 2026-09-16: a finding the panel judged the work shippable WITHOUT is filed
+# as a GitHub issue on the project under review, not as a row in the OS's backlog. Spec
+# §4 of docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md, whose §4.2 said
+# `CentralStore.add_backlog`; the ruling supersedes it and nothing else in §4 moved.
+
+#: What marks an issue as the panel's rather than a person's. It is BOTH halves of the
+#: mechanism: the label the filing applies, and the term the dedupe searches on — so an
+#: issue the panel filed is findable without reading every issue on the tracker.
+FOLLOW_UP_LABEL = "validation follow-up"
+
+#: The colour and blurb `FOLLOW_UP_LABEL` is created with, distinct from the bug label's
+#: green so the two read apart at a glance on a tracker carrying both.
+FOLLOW_UP_COLOUR = "c5def5"
+FOLLOW_UP_DESCRIPTION = "Raised by the Jarvis validation panel; not a blocker."
+
+
+def file_follow_up(repo: str, title: str, body: str) -> str:
+    """File one follow-up on `repo` and return its issue URL.
+
+    The body travels on stdin (`--body-file -`) for `bugreport.create_issue`'s reason:
+    a finding carries the seat's detail plus a provenance footer, and argv has a length
+    limit that stdin does not.
+
+    **THE LABEL IS ENSURED FIRST, and that is not belt-and-braces.** `gh` refuses
+    `--label` for a label the repository does not define (`kn-eefc35a8` fact 1), and
+    unlike the OS's own tracker these repositories have never been asked to carry one —
+    the FIRST follow-up on every project in the fleet would fail without this.
+    """
+    repo = checked_repo(repo)
+    ensure_follow_up_label(repo)
+    stdout = _run(["issue", "create", "--repo", repo, "--title", title,
+                   "--label", FOLLOW_UP_LABEL, "--body-file", "-"],
+                  url=repo, stdin=body)
+    url = (stdout or "").strip().splitlines()[-1] if (stdout or "").strip() else ""
+    # Held to the shape AND to the repository we just named, exactly as every other URL
+    # in this module is: the answer came back over a pipe, and it becomes an argument.
+    return checked_issue_url(url, repo)
+
+
+def ensure_follow_up_label(repo: str) -> None:
+    """`ensure_label` with the follow-up's own colour and blurb.
+
+    Not `ensure_label(FOLLOW_UP_LABEL, repo)`: that one describes a label meaning "a work
+    order is on this", which is the opposite of what a follow-up is — nobody is on it.
+    """
+    repo = checked_repo(repo)
+    _run(["label", "create", checked_label(FOLLOW_UP_LABEL), "--repo", repo,
+          "--color", FOLLOW_UP_COLOUR, "--description", FOLLOW_UP_DESCRIPTION],
+         url=repo, tolerate="already exists")
+
+
+def follow_ups_filed(repo: str, unit_id: str) -> list[dict[str, Any]]:
+    """Every follow-up the panel has already filed on `repo` for one unit.
+
+    The dedupe's source of truth, and it is the TRACKER rather than any local record for
+    the reason the backlog was before the ruling: "has this already been filed" is a
+    question about the destination.
+
+    **`--state all`, and that keyword is the whole correctness of this.** `gh issue list`
+    defaults to OPEN issues only. A follow-up the user has since closed would drop out of
+    the answer, the dedupe would stop seeing it, and every subsequent round would file it
+    again — for ever. It is the exact trap `CentralStore.list_backlog`'s `status="open"`
+    default set on the path this replaced, one layer out.
+
+    Searched by LABEL AND by the unit id in the body, so the query is one round trip per
+    round rather than one per finding, and it cannot match a person's own issue that
+    happens to share a title. An unreachable `gh` raises; the caller decides what a round
+    that could not read the tracker does.
+    """
+    repo = checked_repo(repo)
+    stdout = _run(["issue", "list", "--repo", repo, "--state", "all",
+                   "--label", checked_label(FOLLOW_UP_LABEL),
+                   "--search", f"{unit_id} in:body", "--limit", "100",
+                   "--json", "number,title,url,state"], url=repo)
+    try:
+        rows = json.loads(stdout or "[]")
+    except ValueError:
+        return []
+    return [r for r in rows if isinstance(r, dict) and r.get("url")]
 
 
 def desired_state(store: Any, wo: dict[str, Any]) -> str:

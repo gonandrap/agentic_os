@@ -212,6 +212,51 @@ def test_the_tracker_url_is_accepted():
     assert issues.checked_issue_url(url) == url
 
 
+# -- the second repository: a project's own tracker (user ruling, 2026-09-16) ----------
+#
+# The panel's follow-ups are filed on the project under review, so this module no longer
+# writes to exactly one repository. THE CHECK DID NOT GO AWAY, it gained a caller who
+# names the repository — and these pin that the widening is bounded rather than open.
+
+
+def test_a_caller_may_name_its_own_repository_and_is_still_held_to_it():
+    """The new authority and its limit, in one pair. A URL on the repository the caller
+    named is accepted; one on any OTHER repository is refused just as hard as before —
+    so a URL out of the record still cannot redirect a write, which is the whole of the
+    exposure `github.UntrustedPullRequest` describes."""
+    ours = "https://github.com/acme/proj_a/issues/12"
+    assert issues.checked_issue_url(ours, "acme/proj_a") == ours
+    with pytest.raises(issues.IssueLifecycleError):
+        issues.checked_issue_url(ours, "someone/else")
+    # ...and naming a repository does not relax the SHAPE rule either.
+    with pytest.raises(issues.IssueLifecycleError):
+        issues.checked_issue_url("--repo=acme/proj_a", "acme/proj_a")
+
+
+def test_the_default_is_still_the_os_tracker():
+    """Every pre-existing caller passes no repository, so the bug-tracker lifecycle's
+    confinement is untouched by the widening. Without this the parameter could quietly
+    default to "anywhere" and every test above would still pass."""
+    with pytest.raises(issues.IssueLifecycleError):
+        issues.checked_issue_url("https://github.com/acme/proj_a/issues/12")
+
+
+@pytest.mark.parametrize("repo", [
+    "", "acme", "acme/", "/proj_a", "-acme/proj_a",       # reads as a flag
+    "acme/proj_a extra", "acme/proj a", "acme/proj_a;rm",
+])
+def test_a_repository_name_is_checked_before_it_becomes_an_argument(repo):
+    """`--repo` is the value that now VARIES per project, where it used to be one
+    constant — so it is held to an anchored shape for `checked_label`'s reason: `gh`
+    reads a leading `-` as a flag."""
+    with pytest.raises(issues.IssueLifecycleError):
+        issues.checked_repo(repo)
+
+
+def test_a_real_repository_name_is_accepted():
+    assert issues.checked_repo("acme/proj_a") == "acme/proj_a"
+
+
 # -- where an issue belongs, given its work order -------------------------------------
 
 

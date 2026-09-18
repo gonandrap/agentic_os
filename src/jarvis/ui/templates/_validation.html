@@ -44,6 +44,7 @@
       {% if r.forced_reason %}<span class="st tone-active"><span class="i">⟳</span>forced</span>{% endif %}
       {% if r.reason %}<div class="sub" style="white-space: pre-wrap;">{{ r.reason }}</div>{% endif %}
       {% if r.forced_reason %}<div class="sub">forced by hand — {{ r.forced_reason }}</div>{% endif %}
+      {{ follow_ups(r.follow_ups) }}
       {{ deliberation(r.opinions) }}
     </div>
   </div>
@@ -88,5 +89,44 @@
     {% endfor %}
   </table>
 </details>
+{% endif %}
+{% endmacro %}
+
+{# WHAT THE ROUND FILED RATHER THAN BLOCKED ON. Shown outright rather than folded into
+   the deliberation <details>: an issue is an OUTCOME of the round, not a seat's opinion
+   about it, and it is the half of this feature a reader has to be able to reach from the
+   work order — a follow-up filed into a tracker nobody can find from here is worse than
+   the nit coming back as feedback.
+
+   NO SEAT NAME. The seat that raised one is in the issue body and on
+   `jarvis validation show`; this page is read by everyone.
+
+   WHAT COULD NOT BE FILED IS SHOWN TOO, and it is the line that matters most: filing
+   crosses a network now, so a finding can be raised and land nowhere, and a reader who
+   is not told never learns it existed.
+
+   Absent entirely when nothing was filed, which is every round on a fleet that has not
+   turned the panel on. `follow_ups` is nonetheless ALWAYS in the projection — a key that
+   came and went would vanish here silently, which is `kn-99e37a4b`'s whole lesson. #}
+{% macro follow_ups(filed) %}
+{% if filed and (filed.filed or filed.dropped or filed.failed) %}
+<div class="sub" style="margin-top:6px">
+  {% if filed.filed %}
+  Filed as follow-ups:
+  {% for i in filed.filed %}
+  <a href="{{ i.url }}" class="mono" rel="noreferrer noopener" target="_blank">{%
+    if i.number %}#{{ i.number }}{% else %}issue{% endif %}</a> {{ i.title }}{{ "," if not loop.last }}
+  {% endfor %}
+  {% endif %}
+  {% if filed.dropped %}
+  <div>{{ filed.dropped }} further follow-up{{ '' if filed.dropped == 1 else 's' }} went
+    over the per-round cap and {{ 'was' if filed.dropped == 1 else 'were' }} not filed.</div>
+  {% endif %}
+  {% if filed.failed %}
+  <div class="tone-bad">{{ filed.failed }} follow-up{{ '' if filed.failed == 1 else 's' }}
+    could not be filed as {{ 'an issue' if filed.failed == 1 else 'issues' }}{%
+    if filed.reason %} — {{ filed.reason }}{% endif %}.</div>
+  {% endif %}
+</div>
 {% endif %}
 {% endmacro %}
