@@ -244,6 +244,12 @@ def test_route_the_reconciler_settling_a_turn_no_longer_walks_past_the_guard(sta
 
     It also UNPARKED: `park_unlanded` leaves `needs_review` behind and this ran a tick
     later over the same done turn, completing the order it had just held.
+
+    **AND THE SECOND TICK IS THE HALF THAT IS EASY TO GET WRONG.** This branch re-derives
+    from the LATEST turn on EVERY tick, which is exactly why it unparked — so a park that
+    is not idempotent trades "unparks and completes" for "re-parks, re-flags and writes a
+    fresh `work_unlanded` every tick", the renotify-on-every-restart shape the user called
+    out. Ticked five times: still `needs_review`, still ONE record, still one flag.
     """
     wo = _order(project, code="scratch", branch=f"rescue/{_order.__name__}-wip")
     store = ProjectStore(project)
@@ -252,13 +258,83 @@ def test_route_the_reconciler_settling_a_turn_no_longer_walks_past_the_guard(sta
         store.finish_turn(turn["id"] if isinstance(turn, dict) else turn, "done")
         store.update_work_order(wo["id"], result_summary="wrote the design doc")
         store.set_status(wo["id"], "running")
+        for _ in range(5):
+            started.settle_work_order(started.catalog.projects[0], store,
+                                      store.get_work_order(wo["id"]))
+            assert store.get_work_order(wo["id"])["status"] == "needs_review"
+        events = store.events_of_kind(wo["id"], "work_unlanded")
+        # The flag is raised once and stays; a second `attention` event would be the
+        # same defect arriving through the notifier instead of the timeline.
+        flags = store.events_of_kind(wo["id"], "attention")
+    finally:
+        store.close()
+
+    assert len(events) == 1, f"the park re-fired: {len(events)} work_unlanded events"
+    assert len(flags) == 1, f"the flag re-fired: {len(flags)} attention events"
+    assert _payload(project, wo["id"], "work_unlanded")["commits"] == 1
+
+
+def test_an_acked_park_is_not_re_flagged_by_the_next_tick(started, project):
+    """The same defect wearing the column instead of the event. `jarvis wo ack` puts the
+    flag down for good, and the quiet path in `park_unlanded` must not raise it again —
+    which is why that path asserts the status and leaves the flag to `true_blockers`,
+    the only derivation that honours `acknowledged_blockers`."""
+    wo = _order(project, code="scratch")
+    store = ProjectStore(project)
+    try:
+        turn = store.create_turn(wo["id"], "dispatch", "go")
+        store.finish_turn(turn["id"] if isinstance(turn, dict) else turn, "done")
+        store.update_work_order(wo["id"], result_summary="wrote it")
+        store.set_status(wo["id"], "running")
         started.settle_work_order(started.catalog.projects[0], store,
                                   store.get_work_order(wo["id"]))
+        assert store.get_work_order(wo["id"])["needs_attention"] == 1
+    finally:
+        store.close()
+
+    ops.ack_attention(wo["id"])
+
+    store = ProjectStore(project)
+    try:
+        started.settle_work_order(started.catalog.projects[0], store,
+                                  store.get_work_order(wo["id"]))
+        assert store.get_work_order(wo["id"])["needs_attention"] == 0
         assert store.get_work_order(wo["id"])["status"] == "needs_review"
     finally:
         store.close()
 
-    assert _payload(project, wo["id"], "work_unlanded")["commits"] == 1
+
+def test_a_re_delivery_opens_a_new_episode_and_the_next_park_does_record(started,
+                                                                        project):
+    """THE PAIRING FOR THE DEDUPE ABOVE, and the reason it is keyed on the EPISODE rather
+    than on "has this order ever been parked". A quiet second park would be the same
+    class of defect one step along: the order silently stops being recorded as unlanded
+    the moment it has been once. `work_unlanded_open` lapses on any `finished`,
+    `abandoned` or `pr_merged` since the park, so a work order sent back and delivered
+    again is judged afresh.
+    """
+    wo = _order(project, code="scratch")
+    store = ProjectStore(project)
+    try:
+        turn = store.create_turn(wo["id"], "dispatch", "go")
+        store.finish_turn(turn["id"] if isinstance(turn, dict) else turn, "done")
+        store.update_work_order(wo["id"], result_summary="first go")
+        store.set_status(wo["id"], "running")
+        started.settle_work_order(started.catalog.projects[0], store,
+                                  store.get_work_order(wo["id"]))
+    finally:
+        store.close()
+
+    ops.finish(wo["id"], "delivered behind a PR after all", pr_url=PR)  # ends the episode
+    store = ProjectStore(project)
+    try:
+        store.update_work_order(wo["id"], pr_url="")   # ...and the record loses it again
+        started.settle_work_order(started.catalog.projects[0], store,
+                                  store.get_work_order(wo["id"]))
+        assert store.get_work_order(wo["id"])["status"] == "needs_review"
+        assert len(store.events_of_kind(wo["id"], "work_unlanded")) == 2
+    finally:
+        store.close()
 
 
 def test_route_the_reconciler_still_completes_an_order_that_wrote_nothing(started,

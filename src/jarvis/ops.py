@@ -2140,7 +2140,27 @@ def park_unlanded(store: ProjectStore, wo: dict[str, Any],
     `pr_url` NULL over the fact that a commit existed — so the record afterwards said
     the order had produced nothing. This writes down what was there instead: the branch,
     the count, and the files that were never committed at all.
+
+    **ONCE PER EPISODE, NOT ONCE PER CALLER.** `Daemon.settle_work_order` re-derives an
+    order's ending from the LATEST turn on EVERY tick, so it reaches here again on the
+    tick after a park, over the same done turn, with nothing changed — and an
+    unconditional write would trade "unparks and completes" for a fresh `work_unlanded`
+    and a fresh flag every tick, which is the renotify-on-every-restart shape the
+    invariants module's third rule exists to forbid. `work_unlanded_open` is the episode
+    test and already means exactly this: a park with no `finished`, `abandoned` or
+    `pr_merged` since. A re-delivery writes one of those, so the NEXT park is a new
+    episode and does record again.
+
+    The STATUS is still asserted on the quiet path and the FLAG is deliberately not.
+    `UNLANDED_BLOCKER` is one `true_blockers` re-derives from `work_unlanded_open`, so
+    INV-ATTENTION-MISSING puts it back if it is genuinely missing — and that path honours
+    `acknowledged_blockers`, which re-flagging here would silently overwrite. A user who
+    ran `jarvis wo ack` over a parked order must not have the flag raised again by the
+    next tick; that is the same renotify defect wearing the column instead of the event.
     """
+    if store.work_unlanded_open(wo["id"]):
+        store.update_work_order(wo["id"], status="needs_review")
+        return "needs_review"
     store.add_event(wo["id"], "work_unlanded", {**work.record(), "was": wo["status"]})
     store.set_status(wo["id"], "needs_review")
     store.flag_attention(wo["id"], UNLANDED_BLOCKER)

@@ -58,6 +58,23 @@ function exists to prevent.
 `_close_feature_manager` records rather than parks: the feature is over, and parking its
 manager would put an attention item on a settled feature.
 
+### 3a. The park has to be idempotent, and it was not
+
+Routing the reconciler through `land_finished` is only half a fix. That branch re-derives
+from the *latest* turn on every tick, which is why it unparked in the first place — so it
+reaches `park_unlanded` again on the tick after a park, over the same done turn, with
+nothing changed. `park_unlanded` wrote unconditionally, which trades "unparks and
+completes" for a fresh `work_unlanded` and a fresh `attention` every tick: the
+renotify-on-every-restart shape rule 3 of `invariants.py` exists to forbid. Measured
+before the fix: five ticks, five `work_unlanded` events.
+
+`park_unlanded` is now keyed on the EPISODE — `work_unlanded_open`, which already means
+"parked, with no `finished`, `abandoned` or `pr_merged` since". Not on "has this order
+ever been parked", which would be the same defect one step along: the order would
+silently stop being recorded as unlanded the moment it had been once. A re-delivery
+writes one of those three events, so the next park is a new episode and does record.
+Both directions have a test, and the wrong key fails the second one.
+
 ## 4. How the invariant knows, months later
 
 Neo question 429. `landing.authored` is exact only while the worktree exists, and a
