@@ -190,22 +190,20 @@ def run_doctor(project: str | None = None, repair: bool = False,
     the same checks with repair enabled on every reconcile tick — this is the manual
     handle for "is the OS lying to me right now?".
 
-    It runs MORE than the daemon does on most ticks: `invariants.SLOW_INVARIANTS` shell
-    out to git, so the daemon rations them to its own cadence and this does not.
-    INV-WORK-LANDED is the one that matters — "what has this fleet produced that is not
-    on the default branch" has no other home, and the audit that first answered it
-    (GitHub issue #232, six stranded work orders) was a one-off done by hand.
+    It runs MORE than the daemon does on most ticks: `invariants.SLOW_INVARIANTS` walk
+    every completed order a project has ever had, so the daemon rations them to its own
+    cadence and this does not. INV-WORK-LANDED is the one that matters — "what has this
+    fleet delivered that nobody merged" has no other home, and the audit that first
+    answered it (GitHub issue #232, six stranded work orders) was a one-off done by hand.
 
-    It also pays full price for it without `repair`, and answers LESS. INV-WORK-LANDED
-    caches its settled verdicts as a timeline event, and a read-only run has no timeline
-    to write to, so the default `jarvis doctor` re-reads git for every completed work
-    order every single time — the cache is populated by the daemon's hourly sweep and by
-    `--repair`, never by a plain run. The same rule costs it the coverage verdict
-    outright: refreshing the default branch writes to the repository, so a plain run does
-    not (`landing.refresh_base(allow_network=False)`) and will not condemn a branch
-    against a ref it could not bring up to date — it reports stranded work through the
-    rungs that read no base, and `unknown` where the content test would have answered.
-    Read-only is worth more than either: see `check_work_lands`.
+    `repair` no longer changes that answer. It used to: the check kept a cache of settled
+    verdicts as a timeline event and refreshed the default branch it measured against,
+    and a read-only run could do neither, so a plain `jarvis doctor` paid a per-file git
+    walk every time AND withheld the content verdict. Since the check began judging the
+    PULL REQUEST it is a pure timeline read with nothing to write and no ref to be stale
+    — what it cannot do is DISCOVER, and discovery is the daemon's
+    (`Daemon.discover_pull_requests`). So a plain run and a repairing one say the same
+    thing, and both say nothing about a project the daemon has never swept.
 
     `include_os=False` drops the OS-LEVEL checks — `check_os` and the release marker —
     and keeps the per-project ones. The scheduler's daily run passes it for every project
@@ -260,7 +258,8 @@ def run_doctor(project: str | None = None, repair: bool = False,
         try:
             # `slow=True` unconditionally: INV-WORK-LANDED is the whole reason issue
             # #232 asked for a report, and a human who typed `jarvis doctor` is waiting
-            # for its answer. The daemon is the caller that has to ration it.
+            # for its answer. The daemon is the caller that has to ration it — it walks
+            # the whole settled backlog, which no other check here does.
             found = check_project(store, repair=repair, slow=True)
         finally:
             store.close()
@@ -2812,10 +2811,11 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
     `head_oid` is the sha that merged, and it goes on the event because THE EVENT IS THE
     ONLY PLACE IT CAN LIVE. `pr_state` is stale by construction with one permitted reader
     (kn-dbc4971d), and asking GitHub again months later is a round trip per settled work
-    order; a fact recorded when it was true is neither. It is what lets the landing sweep
-    answer issue #232's Mode C exactly — commits the branch grew AFTER the merge — rather
-    than falling back to the content heuristic. Empty for every work order that merged
-    before this shipped, which is exactly why that fallback exists.
+    order; a fact recorded when it was true is neither. It answered issue #232's Mode C
+    exactly — commits the branch grew AFTER the merge — until the user narrowed
+    INV-WORK-LANDED to the pull request on 2026-09-18, and NOTHING READS IT NOW. It stays
+    because a merge whose commit is not written down anywhere is a hole in the record,
+    and this is the one path that knows it.
 
     `automerge` says WHO merged it, which `head_oid` cannot: it is the `pr_merged` rule
     above cutting the other way. A merge the OS performed itself is indistinguishable

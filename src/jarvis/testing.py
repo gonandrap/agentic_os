@@ -1127,6 +1127,29 @@ elif argv[:2] == ["pr", "view"]:
         sys.exit(1)
     fields = argv[argv.index("--json") + 1].split(",") if "--json" in argv else []
     print(json.dumps({k: v for k, v in pr.items() if not fields or k in fields}))
+elif argv[:2] == ["pr", "list"]:
+    # `gh pr list --head <branch> --state all --json number,url,state`. The landing
+    # sweep's discovery read. Filters the roster by `headRefName`, which is the WHOLE
+    # point of the call: a fake that answered every registered pull request would pass a
+    # caller that never sent `--head` at all, and "which branch is this pull request on"
+    # is the fact the check now rests on.
+    #
+    # NEWEST FIRST, by number, as the real CLI orders it — `wo-cd73c537` has a merged #81
+    # and an open #116 on one branch and the report says so in that order.
+    head = argv[argv.index("--head") + 1] if "--head" in argv else ""
+    want_state = argv[argv.index("--state") + 1].upper() if "--state" in argv else "OPEN"
+    out = []
+    for u, pr in roster().items():
+        if head and pr.get("headRefName") != head:
+            continue
+        state = (pr.get("state") or "OPEN").upper()
+        if want_state != "ALL" and state != want_state:
+            continue
+        number = u.rstrip("/").rsplit("/", 1)[-1]
+        out.append({"number": int(number) if number.isdigit() else 0, "url": u,
+                    "state": state})
+    out.sort(key=lambda r: -r["number"])
+    print(json.dumps(out))
 elif argv[:2] == ["pr", "diff"]:
     prs = roster()
     pr = prs.get(argv[2] if len(argv) > 2 else "")
@@ -1505,7 +1528,8 @@ def fake_gh(tmp_path, monkeypatch):
         def set_pr(self, pr_url: str, state: str, merged_at: str | None = None,
                    mergeable: str | None = None, base_ref: str = "main",
                    checks: list[dict] | None = None,
-                   merge_state: str | None = None, head_oid: str = "") -> None:
+                   merge_state: str | None = None, head_oid: str = "",
+                   head_ref: str = "") -> None:
             """Register what `gh pr view <pr_url>` answers. Re-calling re-states it,
             which is how a test walks a pull request from OPEN to MERGED — or from
             MERGEABLE to CONFLICTING and back.
@@ -1528,12 +1552,20 @@ def fake_gh(tmp_path, monkeypatch):
             It is OMITTED rather than sent empty when unset, because GitHub never answers
             an empty sha: a test that wants the field absent must get it absent
             (`github.PR_FIELDS` asks for `headRefOid` on every call), and one that wants
-            it present says so."""
+            it present says so.
+
+            `head_ref` is `headRefName`, and it is what `gh pr list --head` filters on —
+            the discovery read behind INV-WORK-LANDED. Omitted when unset for `head_oid`'s
+            reason with a sharper edge: a pull request that answered `headRefName: ""`
+            would be returned for a query about a branch called "", which is a match no
+            real repository can produce."""
             if mergeable is None:
                 mergeable = "MERGEABLE" if state == "OPEN" else None
             row = {**self.prs.get(pr_url, {}),
                    "state": state, "mergedAt": merged_at,
                    "mergeable": mergeable, "baseRefName": base_ref}
+            if head_ref:
+                row["headRefName"] = head_ref
             if checks is not None:
                 row["statusCheckRollup"] = checks
             if merge_state is not None:

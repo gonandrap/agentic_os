@@ -1,9 +1,16 @@
 """Settling a work order asserts the deliverable (GitHub issue #232).
 
-`tests/test_landing.py` proves the DETECTOR against real branches. This file proves what
-the OS does with it: the two landings that refuse, the escape that records an
-abandonment, and the standing sweep that answers "what has this fleet produced that is
-not on the default branch".
+`tests/test_landing.py` proves the two predicates in isolation. This file proves what the
+OS does with them: the two landings that refuse, the escape that records an abandonment,
+and the standing sweep that answers "what has this fleet delivered that nobody merged".
+
+THE SWEEP IS TWO STEPS NOW, and they are separate on purpose. `Daemon.discover_pull_requests`
+is the half with a network: it asks GitHub which pull requests a completed order's
+BRANCHES ever had and writes the answer to the timeline. `invariants.check_work_lands` is
+the half that judges, and it reads that event and nothing else. Every sweep test below
+drives both, in that order, through the fake `gh` — because the joint between them is a
+dict key, and a key that did not match would leave the check permanently, invisibly
+quiet.
 
 EVERY REFUSAL IS PAIRED WITH THE CASE THAT MUST STILL PASS, because a check that blocks
 a worker from finishing is worse than no check at all — it gets switched off within a
@@ -21,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from jarvis import daemon as daemon_mod
 from jarvis import invariants, landing, ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
@@ -28,6 +36,10 @@ from jarvis.project_store import ProjectStore
 
 PR = "https://github.com/acme/proj/pull/7"
 OTHER_PR = "https://github.com/acme/proj/pull/8"
+THIRD_PR = "https://github.com/acme/proj/pull/9"
+#: A HIGHER number than `PR`, and that is the whole of it: `wo-cd73c537` had #116 opened
+#: on the branch whose #81 had already merged, and the report has to name the later one.
+LATER_PR = "https://github.com/acme/proj/pull/116"
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -203,7 +215,8 @@ def test_abandon_completes_the_order_and_writes_down_what_was_dropped(started, p
 
 
 def test_the_remedy_the_sweep_prints_works_on_an_order_already_completed(started,
-                                                                          project):
+                                                                          project,
+                                                                          fake_gh):
     """INV-WORK-LANDED tells the user to run `wo finish --abandon` on a COMPLETED order.
 
     Every order the sweep names is already settled — that is what the sweep looks at — so
@@ -213,6 +226,8 @@ def test_the_remedy_the_sweep_prints_works_on_an_order_already_completed(started
     """
     wo = _order(project, "launcher contract", code="launcher")
     _settle(project, wo["id"])
+    fake_gh.set_pr(PR, "OPEN", head_ref=f"worktree-{wo['id']}")
+    _discover(started, project)
     [violation] = _violations(project)
     assert f"finish {wo['id']}" in violation.detail and "--abandon" in violation.detail
 
@@ -356,6 +371,7 @@ def test_wo_done_records_the_unlanded_work_and_still_closes_it(started, project)
 # -- the standing report: jarvis doctor ------------------------------------------------
 
 
+
 def _violations(project: Path) -> list[invariants.Violation]:
     store = ProjectStore(project)
     try:
@@ -365,36 +381,178 @@ def _violations(project: Path) -> list[invariants.Violation]:
         store.close()
 
 
-def test_the_sweep_reports_a_completed_order_whose_code_is_not_on_the_branch(
-        started, project):
-    """The audit that found the six was a one-off; this is it, running on demand."""
-    stranded = _order(project, "launcher contract", code="launcher")
-    landed = _order(project, "the cap", code="cap")
-    # Settled by hand, which is exactly how the six got there: they reached `completed`
-    # through Mode A before any of this existed, and the sweep's job is that historical
-    # backlog. Going through `finish` would be the wrong fixture — it now refuses.
-    _settle(project, stranded["id"], landed["id"])
-    _git(project, "merge", "--squash", "-q", f"worktree-{landed['id']}")
-    _git(project, "commit", "-qm", f"[{landed['id']}] the cap (#9)")
-    _git(project, "push", "-q", "origin", "trunk")
+def _discover(daemon: Daemon, project: Path) -> None:
+    """One landing sweep's discovery pass — `Daemon.discover_pull_requests`.
 
+    The step the invariant reads. Nothing here calls it implicitly: the two are joined by
+    a timeline event on purpose, and a test that could not run one without the other
+    could not prove the check is silent before discovery has happened.
+    """
+    store = ProjectStore(project)
+    try:
+        daemon.discover_pull_requests(daemon.catalog.project("proj_a"), store)
+    finally:
+        store.close()
+
+
+def _pr_calls(fake_gh) -> list[list[str]]:
+    """Every `gh pr list` this test has caused, as argv. The cost, counted."""
+    return [c["argv"] for c in fake_gh.calls if c["argv"][:2] == ["pr", "list"]]
+
+
+def test_a_merged_pull_request_is_the_answer_and_an_open_one_is_a_violation(
+        started, project, fake_gh):
+    """THE NARROWED PREDICATE, all three reportable states in one sweep.
+
+    Merged is satisfied with no arithmetic: the content test scored three orders that had
+    merged months earlier and been refactored since at 44%, 31% and 72%, which is what
+    the user's ruling of 2026-09-18 struck out.
+
+    The open one is a violation that says something TRUE — the work is delivered and
+    waiting on a merge — and its remedy is merge-shaped. "Its code is not on main" sent
+    the reader hunting for a branch that was sitting in a pull request all along.
+    """
+    merged = _order(project, "the cap", code="cap")
+    waiting = _order(project, "launcher contract", code="launcher")
+    refused = _order(project, "superseded", code="superseded")
+    _settle(project, merged["id"], waiting["id"], refused["id"])
+    fake_gh.set_pr(PR, "MERGED", head_ref=f"worktree-{merged['id']}")
+    fake_gh.set_pr(OTHER_PR, "OPEN", head_ref=f"worktree-{waiting['id']}")
+    fake_gh.set_pr(THIRD_PR, "CLOSED", head_ref=f"worktree-{refused['id']}")
+
+    _discover(started, project)
+    found = {v.wo_id: v for v in _violations(project)}
+
+    assert set(found) == {waiting["id"], refused["id"]}
+    assert found[waiting["id"]].context["verdict"] == landing.AWAITING_MERGE
+    assert "waiting on a merge" in found[waiting["id"]].detail
+    assert "Merge it, or record the decision to drop it" in found[waiting["id"]].detail
+    assert found[refused["id"]].context["verdict"] == landing.REFUSED
+    assert "delivered and refused" in found[refused["id"]].detail
+    assert "Re-open and merge it" in found[refused["id"]].detail
+    assert not found[waiting["id"]].repaired    # what to do with it is the user's call
+
+
+def test_an_order_with_no_pull_request_is_silent_and_costs_no_round_trip(
+        started, project, fake_gh):
+    """THE NARROWING, stated where it takes effect. wo-5a6b2d6d is the case it gives up:
+    a completed planner whose only product is a WIP commit on `rescue/wo-5a6b2d6d` that
+    no pull request was ever opened for. Nothing reports it now, by the user's ruling —
+    validation is where an order that settles with nothing delivered belongs.
+
+    And the order with no BRANCH at all never reaches GitHub, which is what makes the
+    sweep affordable: 60 of the audit's 89 candidates were planners, investigations and
+    knowledge-base writes, and each of them used to cost a per-file git walk.
+    """
+    committed = _order(project, "never opened a pull request", code="orphan")
+    planner = ops.create_work_order("proj_a", "wrote a plan")
+    _settle(project, committed["id"], planner["id"])
+
+    _discover(started, project)
+
+    assert _violations(project) == []
+    # The one with a branch was asked about; the one without was not.
+    assert _pr_calls(fake_gh) == [["pr", "list", "--head", f"worktree-{committed['id']}",
+                                  "--state", "all", "--limit", "20",
+                                  "--json", "number,url,state"]]
+
+
+def test_a_null_pr_url_does_not_exempt_an_order_from_the_sweep(
+        started, project, fake_gh):
+    """wo-5eedc84d: `pr_url` NULL in the production record, pull request #42 all along.
+
+    The trap the whole discovery step exists to avoid. `if not wo["pr_url"]: skip` is the
+    obvious way to scope this invariant to orders that have a pull request, and it would
+    silently exempt exactly the orders it exists for — a worse failure than the noise it
+    replaced, because nothing shows it happening.
+
+    Asserted in BOTH directions: the merged one is silent because GitHub says merged, not
+    because the column is empty, and the open one proves an empty column is no excuse.
+    """
+    landed = _order(project, "the cap", code="cap")
+    open_pr = _order(project, "launcher contract", code="launcher")
+    _settle(project, landed["id"], open_pr["id"])
+    assert _row(project, landed["id"])["pr_url"] is None
+    assert _row(project, open_pr["id"])["pr_url"] is None
+    fake_gh.set_pr(PR, "MERGED", head_ref=f"worktree-{landed['id']}")
+    fake_gh.set_pr(OTHER_PR, "OPEN", head_ref=f"worktree-{open_pr['id']}")
+
+    _discover(started, project)
     found = _violations(project)
 
-    assert [v.wo_id for v in found] == [stranded["id"]]
-    assert found[0].context["verdict"] == landing.STRANDED
-    assert "launcher.py" in found[0].context["missing_files"]
-    assert not found[0].repaired      # what to do with it is the user's call
+    assert [v.wo_id for v in found] == [open_pr["id"]]
+    assert found[0].context["pr_url"] == OTHER_PR
+
+
+def test_a_newer_pull_request_on_the_same_branch_outranks_the_recorded_one(
+        started, project, fake_gh):
+    """wo-cd73c537: the record names #81, which merged; #116 is open and carries the rest.
+
+    The old check read `pr_url`, saw a merged pull request, fell through to the content
+    test and reported 2% — "stranded" — about work that was in an open pull request the
+    whole time. Asking by BRANCH sees both, and the OPEN one is what the report is about:
+    an earlier merge does not deliver what is still unmerged.
+    """
+    wo = _order(project, "the validation layer", code="validation")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR)
+    store = ProjectStore(project)
+    try:
+        ops.complete_merged(store, store.get_work_order(wo["id"]),
+                            merged_at="2026-08-02T10:00:00Z")
+    finally:
+        store.close()
+    assert _row(project, wo["id"])["status"] == "completed"
+    fake_gh.set_pr(PR, "MERGED", head_ref=f"worktree-{wo['id']}")
+    fake_gh.set_pr(LATER_PR, "OPEN", head_ref=f"worktree-{wo['id']}")
+
+    _discover(started, project)
+    found = _violations(project)
+
+    assert [v.wo_id for v in found] == [wo["id"]]
+    assert found[0].context["verdict"] == landing.AWAITING_MERGE
+    assert found[0].context["pr_url"] == LATER_PR          # not the recorded one
+    assert found[0].context["pull_requests"] == ["#116 OPEN", "#7 MERGED"]
+
+
+def test_a_merged_pull_request_with_a_tail_on_its_branch_is_no_longer_reported(
+        started, project, fake_gh):
+    """THE SECOND THING THE NARROWING GIVES UP, and it is worth stating as a test.
+
+    Issue #232's Mode C — a first pull request merges and the worker keeps going — used
+    to be caught by the `merged-tail` rung, which measured the branch against the sha
+    GitHub merged. That rung went with the rest of the content machinery: the pull
+    request merged, so the invariant is satisfied, and what was pushed to the branch
+    afterwards is not this check's business. wo-752eced8 is the live example, where the
+    only finding was one uncommitted file in a leftover worktree.
+    """
+    wo = _order(project, "launcher contract", code="launcher")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR)
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-08-02T10:00:00Z",
+                   head_oid=_git(wo["worktree_path"], "rev-parse", "HEAD").strip(),
+                   head_ref=f"worktree-{wo['id']}")
+    store = ProjectStore(project)
+    try:
+        started.poll_pull_requests(started.catalog.project("proj_a"), store)
+    finally:
+        store.close()
+    assert _row(project, wo["id"])["status"] == "completed"
+    (wo["worktree_path"] / "onboarding.py").write_text(_feature("onboarding"))
+    _git(wo["worktree_path"], "add", "-A")
+    _git(wo["worktree_path"], "commit", "-qm", "the onboarding half")
+
+    _discover(started, project)
+
+    assert _violations(project) == []
 
 
 def test_complete_merged_writes_the_sha_that_merged_onto_the_event(started, project):
-    """The one place that sha can live, and the sweep's only exact answer to Mode C.
+    """WHICH COMMIT merged, on the record, because the event IS the record.
 
-    `pr_state` is stale by construction with one permitted reader (kn-dbc4971d) and
-    re-asking GitHub months later is a round trip per settled work order, so
-    `landing.assess` reads `head_oid` off this payload and nowhere else. Asserted on the
-    event rather than inferred from a verdict: the producer and the consumer are joined
-    by a dict key, and a key that did not match would make the exact rung silently
-    dormant for ever — indistinguishable from a fleet with nothing stranded.
+    No longer an input to any check — the landing sweep judges the pull request and never
+    measures a branch against this sha — but it is the only place the merged commit is
+    written down at all, and `ops.complete_merged`'s contract is that its event says what
+    happened. Asserted on the event rather than inferred from a verdict: a producer whose
+    consumer has gone is exactly the thing that rots in silence.
     """
     wo = _order(project, "launcher contract", code="launcher")
     ops.finish(wo["id"], "opened a PR", pr_url=PR)
@@ -411,287 +569,187 @@ def test_complete_merged_writes_the_sha_that_merged_onto_the_event(started, proj
     assert json.loads(event["payload"])["head_oid"] == sha
 
 
-def test_a_tail_after_the_merged_sha_is_stranded_and_a_clean_merge_is_not(
+def test_the_check_is_silent_until_discovery_has_run_and_never_guesses(
         started, project, fake_gh):
-    """MODE C END TO END, through every joint the sha crosses.
+    """The invariant is a pure timeline read, so an order nothing has looked at yet is
+    silent — the same answer as one with no pull request.
 
-    `gh pr view` -> `github.pr_view` -> `Daemon.poll_pull_requests` -> `complete_merged`
-    -> the `pr_merged` event -> `check_work_lands` -> `assess(pr_head_oid=...)`. Calling
-    `assess` directly with a sha proves the rung and none of that carriage, and by
-    assumption [6] the rung cannot fire for any order that merged before this shipped —
-    so this test is the only thing standing between a mistyped key and a check that is
-    permanently, invisibly quiet.
-
-    Both work orders merged. The difference is the work that came after: three of the
-    six stranded orders had a first pull request merge while the worker kept going.
-    """
-    tailed = _order(project, "launcher contract", code="launcher")
-    clean = _order(project, "the cap", code="cap")
-    for wo, pr in ((tailed, PR), (clean, OTHER_PR)):
-        ops.finish(wo["id"], "opened a PR", pr_url=pr)
-        # The sha GitHub reports as merged is the branch tip at the moment it merged.
-        merged_sha = _git(wo["worktree_path"], "rev-parse", "HEAD").strip()
-        _git(project, "merge", "--squash", "-q", f"worktree-{wo['id']}")
-        _git(project, "commit", "-qm", f"[{wo['id']}] {wo['title']} (#9)")
-        fake_gh.set_pr(pr, "MERGED", merged_at="2026-08-02T10:00:00Z",
-                       head_oid=merged_sha)
-    _git(project, "push", "-q", "origin", "trunk")
-
-    store = ProjectStore(project)
-    try:
-        started.poll_pull_requests(started.catalog.project("proj_a"), store)
-    finally:
-        store.close()
-    assert _row(project, tailed["id"])["status"] == "completed"
-
-    # ...and the worker kept going after the merge. This is the whole of Mode C.
-    (tailed["worktree_path"] / "onboarding.py").write_text(_feature("onboarding"))
-    _git(tailed["worktree_path"], "add", "-A")
-    _git(tailed["worktree_path"], "commit", "-qm", "the onboarding half")
-
-    found = _violations(project)
-
-    assert [v.wo_id for v in found] == [tailed["id"]]
-    assert found[0].context["rung"] == "merged-tail"   # the exact rung, not the heuristic
-    assert found[0].context["verdict"] == landing.STRANDED
-
-
-def test_the_sweep_is_silent_on_orders_that_produced_nothing_and_on_abandoned_ones(
-        started, project):
-    """The two exclusions, asserted together because either one alone leaves a report
-    nobody reads: 67% of the audit's candidates produced no code, and an abandonment is
-    a decision that was taken."""
-    ops.finish(_order(project, "answered it")["id"], "no code needed")
-    dropped = _order(project, "spiked it", code="spike")
-    ops.finish(dropped["id"], "not landing this", abandon="the approach does not work")
-
-    assert _violations(project) == []
-
-
-def test_a_partly_landed_order_is_reported_and_its_verdict_is_never_cached(
-        started, project):
-    """THE ONLY RUNG THAT CAN SEE THE FLEET THAT ALREADY EXISTS, at the sweep's level.
-
-    `tests/test_landing.py` proves the detector returns `PARTIAL`; this proves the sweep
-    does something with it. Both halves matter and the second one more: `PARTIAL` must
-    NOT be written to `landing_checked`, because that cache is never recomputed and the
-    order's tail is exactly the thing a later merge resolves. A sweep that cached this
-    would answer "all clear" for ever on a work order that is half on the branch.
-
-    The shape is issue #232's Mode C without a `head_oid` to key on (spec §7): the first
-    pull request squash-merged, the worker kept going, and the second half never left
-    the branch.
-    """
-    wo = _order(project, "launcher contract", code="first")
-    _settle(project, wo["id"])
-    _git(project, "merge", "--squash", "-q", f"worktree-{wo['id']}")
-    _git(project, "commit", "-qm", f"[{wo['id']}] the first half (#9)")
-    _git(project, "push", "-q", "origin", "trunk")
-    (wo["worktree_path"] / "second.py").write_text(_feature("second"))
-    _git(wo["worktree_path"], "add", "-A")
-    _git(wo["worktree_path"], "commit", "-qm", "the tail nobody merged")
-
-    found = _violations(project)
-
-    assert [v.wo_id for v in found] == [wo["id"]]
-    assert found[0].context["verdict"] == landing.PARTIAL
-    assert found[0].context["rung"] == "coverage"
-    assert "second.py" in found[0].context["missing_files"]
-    # Re-derived, not remembered: the moment the tail merges, this stops being reported.
-    assert _events(project, wo["id"], "landing_checked") == []
-    assert len(_violations(project)) == 1      # ...and it is still reported until then
-
-
-def _base_sha(project: Path) -> str:
-    return _git(project, "rev-parse", "origin/trunk").strip()
-
-
-def test_the_sweep_refreshes_the_default_branch_and_is_silent_on_what_just_merged(
-        started, project):
-    """ISSUE #271 END TO END, through the one caller that computes `base_current`.
-
-    `tests/test_landing.py` proves the detector's half; this is the production path, and
-    it is the one the bug was actually reported against. A merge is detected over the
-    NETWORK — the poll asks GitHub, `complete_merged` ends the work order — while
-    `refs/remotes/origin/trunk` in this clone still points at the commit before the
-    squash, because nothing in the OS had ever moved it. The rewind is exactly that
-    state: origin holds the merge, the remote-tracking ref does not.
-
-    The sweep used to report the order that had just landed as `stranded`, with a
-    coverage figure near zero, every hour until a human happened to fetch. Both halves
-    of the fix are asserted here because neither is visible in the other's absence:
-    the repairing run MOVES the ref and then settles `landed`, and the read-only run
-    LEAVES IT ALONE and settles nothing.
-
-    "No violation" pins the read-only verdict to `unknown` rather than to `landed`:
-    against a base that predates the merge the branch's lines are nowhere, so the only
-    coverage answers reachable are `stranded` — which is the bug — and the `stale-base`
-    `unknown` that replaced it. There is no arithmetic by which a stale base scores this
-    branch as landed.
+    Deliberate, and it is the cost of keeping `gh` out of the invariant. A `jarvis doctor`
+    on a project the daemon has never swept reports nothing here rather than a guess, and
+    the daemon's hourly sweep is what fills it in. The pairing is the second half: once
+    discovery HAS run, the same order is reported.
     """
     wo = _order(project, "launcher contract", code="launcher")
-    ops.finish(wo["id"], "opened a PR", pr_url=PR)
-    merged_sha = _git(wo["worktree_path"], "rev-parse", "HEAD").strip()
-    stale = _base_sha(project)
-    _git(project, "merge", "--squash", "-q", f"worktree-{wo['id']}")
-    _git(project, "commit", "-qm", f"[{wo['id']}] launcher contract (#9)")
-    _git(project, "push", "-q", "origin", "trunk")
-    store = ProjectStore(project)
-    try:
-        ops.complete_merged(store, store.get_work_order(wo["id"]),
-                            merged_at="2026-08-02T10:00:00Z", head_oid=merged_sha)
-    finally:
-        store.close()
-    # The clone that never fetched. `push` updated the remote-tracking ref on the way
-    # past, which is a fixture artefact and not what a merge on GitHub does.
-    _git(project, "update-ref", "refs/remotes/origin/trunk", stale)
-
-    store = ProjectStore(project)
-    try:
-        read_only = [v for v in invariants.check_project(store, repair=False, slow=True)
-                     if v.invariant == "INV-WORK-LANDED"]
-    finally:
-        store.close()
-
-    assert read_only == []
-    assert _base_sha(project) == stale        # it may not write to a repository
-    assert _events(project, wo["id"], "landing_checked") == []   # and settled nothing
+    _settle(project, wo["id"])
+    fake_gh.set_pr(PR, "OPEN", head_ref=f"worktree-{wo['id']}")
 
     assert _violations(project) == []
-    assert _base_sha(project) != stale        # ...whereas the repairing run refreshed
-    [cached] = _events(project, wo["id"], "landing_checked")
-    assert json.loads(cached["payload"])["verdict"] == landing.LANDED
+    assert _events(project, wo["id"], "pr_discovered") == []
+
+    _discover(started, project)
+
+    assert [v.wo_id for v in _violations(project)] == [wo["id"]]
 
 
-def test_the_refresh_is_once_per_sweep_and_not_paid_by_a_project_with_nothing_to_audit(
-        started, project, monkeypatch):
-    """The round trip is per PROJECT and it is LAZY, and both are load-bearing claims.
+def test_the_sweep_is_silent_on_abandoned_orders_and_never_asks_about_them(
+        started, project, fake_gh):
+    """An abandonment is a decision that was taken, and asking GitHub about it would be
+    spending a round trip an hour to re-report something the user already closed."""
+    dropped = _order(project, "spiked it", code="spike")
+    ops.finish(dropped["id"], "not landing this", abandon="the approach does not work")
+    fake_gh.set_pr(PR, "OPEN", head_ref=f"worktree-{dropped['id']}")
 
-    Per project because the ref it moves is the same one for every order here; lazy —
-    below every exclusion — because a fleet of settled projects would otherwise fetch
-    once an hour each to audit nothing. Neither is visible in a verdict, so a later
-    reordering of that block re-introduces a per-work-order fetch in silence. Counted
-    rather than asserted on timings, for the obvious reason.
-    """
-    calls: list[Path] = []
-    real = landing.refresh_base
-
-    def counting(repo, **kw):
-        calls.append(repo)
-        return real(repo, **kw)
-
-    monkeypatch.setattr(landing, "refresh_base", counting)
-
-    for name in ("launcher contract", "the cap", "onboarding"):
-        _settle(project, _order(project, name, code=name.split()[0])["id"])
-    assert len(_violations(project)) == 3
-    assert len(calls) == 1      # three orders, one ref, one round trip
-
-    # `stranded` is never cached, so those three are re-derived every sweep and keep
-    # paying for the refresh. The project that pays NOTHING is the one where every
-    # candidate has been excluded — here by the user closing them.
-    for v in _violations(project):
-        ops.mark_done(str(v.wo_id))
-    calls.clear()
+    _discover(started, project)
 
     assert _violations(project) == []
-    assert calls == []
+    assert _pr_calls(fake_gh) == []
 
 
 def test_an_order_the_user_marked_done_is_not_reported_by_the_sweep_for_ever(
-        started, project):
+        started, project, fake_gh):
     """`jarvis wo done` is a decision, and the sweep has to read it as one.
 
     `mark_done` is the one landing that records instead of refusing: the user closing an
     order over a pull request that will never merge is the documented exit, and it writes
     `work_unlanded` with `closed_by: marked_done`. But the sweep only ever excused
-    `abandoned` — so the order it just closed came straight back, flagged `stranded`,
-    with a remedy telling it to run `jarvis wo finish --abandon` on a work order that is
-    already `completed`. Every hour. For ever. That is the hourly nag spec §3 is written
-    against, and it gets the checker switched off within a day.
+    `abandoned` — so the order it just closed came straight back with a remedy telling it
+    to run `jarvis wo finish --abandon` on a work order that is already `completed`.
+    Every hour. For ever. That is the hourly nag spec §3 is written against, and it gets
+    the checker switched off within a day.
 
     The pairing is the order beside it, which was NOT closed and must still be named.
     """
     closed = _order(project, "will never merge", code="orphaned")
     still_open = _order(project, "launcher contract", code="launcher")
     _settle(project, still_open["id"])
+    fake_gh.set_pr(PR, "OPEN", head_ref=f"worktree-{closed['id']}")
+    fake_gh.set_pr(OTHER_PR, "OPEN", head_ref=f"worktree-{still_open['id']}")
 
     assert ops.mark_done(closed["id"])["status"] == "completed"
     # The evidence is on the record either way — that is what issue #232 asked for.
     assert json.loads(_events(project, closed["id"], "work_unlanded")[-1]["payload"]
                       )["closed_by"] == "marked_done"
 
+    _discover(started, project)
     found = _violations(project)
 
     assert [v.wo_id for v in found] == [still_open["id"]]
-    assert _violations(project) == found      # and it stays silent on the next sweep too
+    assert _violations(project) == found     # and it stays silent on the next sweep too
 
 
-def test_the_read_only_doctor_withholds_the_content_verdict_and_records_nothing(started,
-                                                                               project):
-    """What the plain `jarvis doctor` a human types actually does — which is LESS than
-    what the daemon does, in two ways, and the docstrings now say so.
+def test_a_settled_discovery_is_not_re_asked_every_sweep_and_an_unsettled_one_is(
+        started, project, fake_gh):
+    """The TTL, which is what stops the sweep costing a round trip per completed order
+    per hour for ever — and the exception that makes it correct.
 
-    `ops.run_doctor` passes `slow=True` with `repair=False`, so `check_project` hands the
-    sweep a `_ReadOnly` proxy. `add_event` — the `landing_checked` cache write — is
-    swallowed, so the run pays the full per-file git walk every time. And refreshing the
-    default branch is a write to the repository, so this path does not do it and will not
-    condemn a branch against a ref it could not bring up to date (issue #271): the
-    coverage verdict is withheld as `unknown` and only the daemon's repairing sweep,
-    which refreshed, reports it.
-
-    Both left that way on purpose rather than worked around. The pairing is what stops
-    that from being a check nobody runs: `merged-tail` reads no base at all, so Mode C —
-    a branch carrying commits after the sha that merged — is still reported here.
+    A `landed` answer is not asked again until `PR_DISCOVERY_TTL_SECONDS`, because a
+    merged pull request stays merged. It is not kept FOR EVER, though, and wo-cd73c537 is
+    why: #116 was opened on its branch after #81 merged, so an answer cached permanently
+    would have hidden the exact shape this check was rebuilt for. An OPEN one is re-asked
+    every sweep, because that is the one a merge resolves.
     """
-    stranded = _order(project, "launcher contract", code="launcher")
-    clean = _order(project, "answered it")
-    tailed = _order(project, "the cap", code="cap")
-    _settle(project, stranded["id"], clean["id"])
-    ops.finish(tailed["id"], "opened a PR", pr_url=PR)
+    landed = _order(project, "the cap", code="cap")
+    waiting = _order(project, "launcher contract", code="launcher")
+    _settle(project, landed["id"], waiting["id"])
+    fake_gh.set_pr(PR, "MERGED", head_ref=f"worktree-{landed['id']}")
+    fake_gh.set_pr(OTHER_PR, "OPEN", head_ref=f"worktree-{waiting['id']}")
+
+    _discover(started, project)
+    assert len(_pr_calls(fake_gh)) == 2
+    _discover(started, project)
+
+    # The open one alone; the merged one is inside its TTL.
+    assert [c[3] for c in _pr_calls(fake_gh)[2:]] == [f"worktree-{waiting['id']}"]
+
+    # ...and past the TTL it is asked again, which is how a pull request opened AFTER a
+    # merge is ever noticed at all.
     store = ProjectStore(project)
     try:
-        ops.complete_merged(store, store.get_work_order(tailed["id"]),
-                            merged_at="2026-08-02T10:00:00Z",
-                            head_oid=_git(tailed["worktree_path"],
-                                          "rev-parse", "HEAD").strip())
+        store.conn.execute(
+            "UPDATE wo_events SET ts = ts - ? WHERE wo_id = ? AND kind = 'pr_discovered'",
+            (daemon_mod.PR_DISCOVERY_TTL_SECONDS + 1, landed["id"]))
+        store.conn.commit()
     finally:
         store.close()
-    (tailed["worktree_path"] / "onboarding.py").write_text(_feature("onboarding"))
-    _git(tailed["worktree_path"], "add", "-A")
-    _git(tailed["worktree_path"], "commit", "-qm", "the tail nobody merged")
+    fake_gh.set_pr(LATER_PR, "OPEN", head_ref=f"worktree-{landed['id']}")
+    _discover(started, project)
+
+    assert {v.wo_id for v in _violations(project)} == {landed["id"], waiting["id"]}
+
+
+def test_one_sweep_asks_about_at_most_the_cap_and_the_rest_arrive_next_time(
+        started, project, fake_gh, monkeypatch):
+    """The cap is about the TICK. A project with two hundred cold completed orders would
+    otherwise spend two hundred round trips inside one daemon tick, and the daemon has
+    everything else to do — so it fills in over several sweeps instead.
+
+    Counted rather than timed, for the obvious reason.
+    """
+    monkeypatch.setattr(daemon_mod, "PR_DISCOVERY_PER_SWEEP", 2)
+    orders = [_order(project, f"order {n}", code=f"code{n}") for n in range(3)]
+    _settle(project, *[o["id"] for o in orders])
+
+    _discover(started, project)
+    assert len(_pr_calls(fake_gh)) == 2
+
+    _discover(started, project)
+
+    # The third one, and no re-ask of the two already settled as `no-pull-request`.
+    assert len(_pr_calls(fake_gh)) == 3
+    assert {c[3] for c in _pr_calls(fake_gh)} == {f"worktree-{o['id']}" for o in orders}
+
+
+def test_a_gh_that_cannot_answer_leaves_the_last_record_standing(
+        started, project, fake_gh):
+    """A broken poll must make the sweep STALE, never wrong.
+
+    The failure here is `gh` itself — the same command against the same repository, once
+    per work order — so the pass stops rather than recording N identical failures. What
+    it guards against is the shape an empty answer would take: `no-pull-request`, which
+    is SILENT, so a `gh` failure read as "no pull requests" would quietly exempt every
+    completed order in the project.
+    """
+    wo = _order(project, "launcher contract", code="launcher")
+    _settle(project, wo["id"])
+    fake_gh.set_pr(PR, "OPEN", head_ref=f"worktree-{wo['id']}")
+    _discover(started, project)
+    assert [v.wo_id for v in _violations(project)] == [wo["id"]]
+
+    fake_gh.fail("gh: could not read credentials")
+    _discover(started, project)
+
+    # Still reported, off the record discovery left behind — not dropped, not re-judged.
+    assert [v.wo_id for v in _violations(project)] == [wo["id"]]
+    assert len(_events(project, wo["id"], "pr_discovered")) == 1
+
+
+def test_the_read_only_doctor_gives_the_same_answer_and_writes_nothing(
+        started, project, fake_gh):
+    """What the plain `jarvis doctor` a human types does — which is now exactly what the
+    daemon's sweep does, and that is the change.
+
+    The check this replaced kept a `landing_checked` cache only a repairing run could
+    write, so `jarvis doctor` paid a full per-file git walk every time AND answered less:
+    it could not refresh the default branch, so the content verdict was withheld as
+    `unknown`. There is no write on this path now and no ref that can be stale, so
+    `repair=False` changes nothing about the answer.
+    """
+    waiting = _order(project, "launcher contract", code="launcher")
+    landed = _order(project, "the cap", code="cap")
+    _settle(project, waiting["id"], landed["id"])
+    fake_gh.set_pr(PR, "OPEN", head_ref=f"worktree-{waiting['id']}")
+    fake_gh.set_pr(OTHER_PR, "MERGED", head_ref=f"worktree-{landed['id']}")
+    _discover(started, project)
 
     store = ProjectStore(project)
     try:
+        before = len(store.events_of_kind(waiting["id"], "pr_discovered"))
         found = [v for v in invariants.check_project(store, repair=False, slow=True)
                  if v.invariant == "INV-WORK-LANDED"]
+        after = len(store.events_of_kind(waiting["id"], "pr_discovered"))
     finally:
         store.close()
 
-    # The rung that needs a current default branch is withheld; the one that needs none
-    # answers as it always did.
-    assert [v.wo_id for v in found] == [tailed["id"]]
-    assert found[0].context["rung"] == "merged-tail"
-    # Nothing was written, for any verdict — the settled one included.
-    assert _events(project, clean["id"], "landing_checked") == []
-    assert _events(project, stranded["id"], "landing_checked") == []
-    # The repairing path refreshes the ref, so it both fills the cache and says what the
-    # read-only run would not.
-    assert {v.wo_id for v in _violations(project)} == {stranded["id"], tailed["id"]}
-    assert len(_events(project, clean["id"], "landing_checked")) == 1
-
-
-def test_a_settled_verdict_is_cached_and_an_unsettled_one_is_re_derived(started, project):
-    """A landed order must not pay for git on every sweep; a stranded one must, or the
-    check would go on complaining after the user merged it."""
-    stranded = _order(project, "stranded", code="strand")
-    clean = _order(project, "no code")
-    _settle(project, stranded["id"], clean["id"])
-
-    assert len(_violations(project)) == 1
-    # `not-produced` is settled, so it was recorded once and is not looked at again.
-    assert len(_events(project, clean["id"], "landing_checked")) == 1
-    assert _violations(project) and len(_events(project, clean["id"],
-                                                "landing_checked")) == 1
-    # ...while the stranded one carries no cached verdict at all and is re-derived.
-    assert _events(project, stranded["id"], "landing_checked") == []
+    assert [v.wo_id for v in found] == [waiting["id"]]
+    assert before == after == 1
+    assert [v.wo_id for v in _violations(project)] == [waiting["id"]]
