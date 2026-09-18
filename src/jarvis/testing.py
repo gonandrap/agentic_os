@@ -428,6 +428,41 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
                                 "usage": {"input_tokens": 0, "output_tokens": 0}},
                 }) + "\n")
         sys.exit(0)
+    # THE BUDGET STOP, and every field here was measured off a real envelope on
+    # 2026-09-18 rather than invented (src/jarvis/budget.py records the probe). Three of
+    # them are the ones a fake usually gets wrong, and each is load-bearing:
+    #
+    #  * there is NO `result` key. The real CLI writes none, so `read_turn_result` has to
+    #    fall back to `errors` — a fake that supplied a `result` would test a path the
+    #    real one never takes and hide that the record would otherwise read "turn
+    #    reported is_error".
+    #  * `total_cost_usd` EXCEEDS the cap that was passed. The check runs between API
+    #    calls, so the turn always overshoots by the call that crossed the line, and a
+    #    fake that stopped exactly at the cap would let an off-by-one in the accounting
+    #    through.
+    #  * it exits 1 having written a complete, parseable envelope. Both halves matter:
+    #    the non-zero status is what a caller sees first, and the envelope is what makes
+    #    the last turn billable.
+    #
+    # BELOW the transcript write, like `api_error` and unlike the usage limit: the turn
+    # ran, did work and spent money before it was stopped, which is exactly why the
+    # session stays resumable once the user raises the budget.
+    if os.environ.get("FAKE_CLAUDE_TURN") == "budget":
+        cap = float(opt("--max-budget-usd", "0") or 0)
+        print(json.dumps({
+            "type": "result", "subtype": "error_max_budget_usd", "is_error": True,
+            "session_id": sid, "num_turns": 1,
+            "total_cost_usd": round(cap + 0.05, 6),
+            "duration_api_ms": 4765, "stop_reason": "end_turn",
+            "terminal_reason": "budget_exhausted",
+            "errors": ["Reached maximum budget ($%s)" % cap],
+            "usage": {"input_tokens": 2, "output_tokens": 190},
+            "modelUsage": {"claude-fake-1": {
+                "inputTokens": 2, "outputTokens": 190, "cacheReadInputTokens": 18656,
+                "cacheCreationInputTokens": 16193, "costUSD": round(cap + 0.05, 6),
+                "contextWindow": 200000, "maxOutputTokens": 32000}},
+        }))
+        sys.exit(1)
     if os.environ.get("FAKE_CLAUDE_TURN") == "error":
         print(json.dumps({"type": "result", "subtype": "error_during_execution",
                           "is_error": True, "result": "model call failed",

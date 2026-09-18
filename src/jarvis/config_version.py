@@ -47,6 +47,8 @@ _RENAMES: dict[type, dict[str, str]] = {
         "default_max_concurrent": "defaults.max_concurrent",
         "max_in_flight": "defaults.max_in_flight",
         "default_autocompact_window": "defaults.autocompact_window",
+        "default_budget_usd": "defaults.budget_usd",
+        "default_feature_budget_usd": "defaults.feature_budget_usd",
         "notification_sinks": "notifications.sinks",
         "telegram_token_env": "notifications.telegram.token_env",
         "telegram_chat_id_env": "notifications.telegram.chat_id_env",

@@ -35,7 +35,7 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import config_version, db, fleet, invariants
+from . import budget, config_version, db, fleet, invariants
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import CentralStore
 from .daemon import daemon_running
@@ -51,6 +51,7 @@ from .project_store import (
     OPEN_STATUSES,
     FORCEABLE_STATUSES,
     OPEN_VALIDATION_OUTCOMES,
+    TERMINAL_STATUSES,
     ProjectStore,
 )
 
@@ -746,8 +747,15 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       depends_on: list[str] | None = None,
                       parent_id: str | None = None,
                       issue_url: str | None = None,
-                      issue_priority: str | None = None) -> dict[str, Any]:
+                      issue_priority: str | None = None,
+                      budget_usd: float | None = None) -> dict[str, Any]:
     """File a work order. `parent_id` files it UNDER a feature order.
+
+    `budget_usd` caps what the order may spend; None falls back to the project's catalog
+    default, and None again — the fleet default — means no ceiling at all, which is what
+    every work order had before budgets existed. Resolved HERE, at creation, so `jarvis
+    wo show` can state the number and a later catalog edit cannot move a ceiling the user
+    has already been told about (`budget.default_for`).
 
     Until now the only way a work order acquired a parent was a plan release, because the
     only thing that filed one was a planner. A feature's project manager order files
@@ -782,6 +790,8 @@ def create_work_order(project_name: str, title: str, description: str = "",
             append_system_prompt=append_system_prompt, backlog_id=backlog_id,
             depends_on=depends_on, parent_id=parent_id, issue_url=issue_url,
             issue_priority=issue_priority,
+            budget_usd=(budget_usd if budget_usd is not None
+                        else budget.default_for(_spec_or_none(project_name))),
         )
     except (KeyError, ValueError) as e:
         # A dependency on a work order in another project cannot be honoured — the edge
@@ -3461,7 +3471,8 @@ def review_work_order(wo_id: str, accept: bool = True,
 def create_feature_order(project_name: str, title: str, description: str = "",
                          origin: str = "jarvis",
                          backlog_id: str | None = None,
-                         max_parallel: int | None = None) -> dict[str, Any]:
+                         max_parallel: int | None = None,
+                         budget_usd: float | None = None) -> dict[str, Any]:
     """File the coarse ask. Nothing is decomposed here — the daemon opens a planner.
 
     Deliberately the same shape as `create_work_order`, because the whole point of the
@@ -3493,11 +3504,55 @@ def create_feature_order(project_name: str, title: str, description: str = "",
         )
     store = ProjectStore(paths[project_name])
     try:
-        return store.create_feature_order(title=title, description=description,
-                                          origin=origin, backlog_id=backlog_id,
-                                          max_parallel=max_parallel)
+        return store.create_feature_order(
+            title=title, description=description, origin=origin, backlog_id=backlog_id,
+            max_parallel=max_parallel,
+            # A FAMILY budget, so it takes the family default and never the
+            # per-work-order one — `catalog.DEFAULT_FEATURE_BUDGET_USD` says why they are
+            # two settings rather than one scaled from the other.
+            budget_usd=(budget_usd if budget_usd is not None
+                        else budget.feature_default_for(_spec_or_none(project_name))))
     finally:
         store.close()
+
+
+def _spec_or_none(project_name: str) -> Any:
+    """This project's catalog entry, or None when the catalog cannot be read.
+
+    None is a DEFAULT, not a failure: the only thing read off the spec here is a standing
+    budget, and a catalog that has moved must not stop a work order being filed. No
+    catalog means no default means no ceiling — the behaviour the OS has always had.
+    """
+    try:
+        return project_spec(resolve_catalog(), project_name)
+    except (OpsError, CatalogError):
+        return None
+
+
+def feature_order_budget(fo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """A feature's family budget, what the family has spent, and what is unreserved."""
+    name, path, fo = find_feature_order(fo_id, project_name)
+    store = ProjectStore(path)
+    central = CentralStore()
+    try:
+        p = budget.pool(store, central, fo)
+        spend = budget.feature_spent(store, central, fo)
+        children = [
+            {"wo_id": c["id"], "status": c["status"],
+             "reserved_usd": c.get("budget_reserved_usd"),
+             "spent_usd": budget.spent(store, central, c["id"]).total_usd}
+            for c in store.feature_children(fo_id)
+        ]
+    finally:
+        central.close()
+        store.close()
+    return {"project": name, "fo_id": fo_id, "title": fo["title"],
+            "status": fo["status"], "budget_usd": fo.get("budget_usd"),
+            "worker_usd": spend.worker_usd, "jarvis_usd": spend.jarvis_usd,
+            "spent_usd": spend.total_usd,
+            "reserved_usd": p.held_usd if p else None,
+            "unreserved_usd": p.unreserved_usd if p else None,
+            "children": children}
 
 
 def find_feature_order(fo_id: str, project_name: str | None = None
@@ -7294,3 +7349,204 @@ def knowledge_usage_report(project: str | None = None, days: int | None = None,
         "silent_orders": silent[:limit], "silent_order_count": len(silent),
         "could_have_read": missed[:limit], "could_have_read_count": len(missed),
     }
+
+
+# -- budgets -----------------------------------------------------------------------
+#
+# The verbs behind `jarvis wo budget` and `jarvis fo budget`. Setting a budget is an
+# ordinary write; RAISING one on an order that has already stopped for it is the thing
+# these exist to make possible, and the measured fact that makes it possible is that a
+# turn stopped by `--max-budget-usd` leaves a complete, resumable transcript behind
+# (src/jarvis/budget.py). So a top-up does not restart the work, it continues it.
+
+
+def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """What this work order's ceiling is and what it has spent. Read-only."""
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    central = CentralStore()
+    try:
+        cap = budget.ceiling(store, central, wo)
+        spend = budget.spent(store, central, wo_id)
+        parent_pool = None
+        if wo.get("parent_id"):
+            try:
+                parent_pool = budget.pool(store, central,
+                                          store.get_feature_order(wo["parent_id"]))
+            except KeyError:
+                parent_pool = None
+    finally:
+        central.close()
+        store.close()
+    return {
+        "project": name, "wo_id": wo_id, "title": wo["title"], "status": wo["status"],
+        "budget_usd": wo.get("budget_usd"),
+        "reserved_usd": wo.get("budget_reserved_usd"),
+        "worker_usd": spend.worker_usd, "jarvis_usd": spend.jarvis_usd,
+        "spent_usd": spend.total_usd,
+        "cap_usd": cap.cap_usd if cap else None,
+        "cap_source": cap.source if cap else None,
+        "remaining_usd": cap.remaining_usd if cap else None,
+        "feature_unreserved_usd": parent_pool.unreserved_usd if parent_pool else None,
+    }
+
+
+def set_work_order_budget(wo_id: str, amount: float | None,
+                          project_name: str | None = None) -> dict[str, Any]:
+    """Set, change or clear a work order's budget — and resume it if it had stopped.
+
+    `amount=None` clears the ceiling: the order runs uncapped again, which is what every
+    order does by default.
+
+    THE RESUME IS THE POINT. A budget that can only ever stop work is a worse OS than no
+    budget at all, so raising the number on a `budget_exhausted` order puts it back to
+    work in the SAME session, with its context and its half-finished work intact. The
+    turn that was cut off is relaunched by `worker_session.retry`'s rules — a nudge when
+    the conversation already reached the model, the original prompt when it did not — so
+    the worker is never told to redo what it has already done.
+
+    It refuses to resume on a number that is not enough to resume ON. Setting $5 on an
+    order that has already spent $6 leaves it exactly where it is, with a message saying
+    so, rather than launching a turn the CLI would stop on its first call and charging
+    the user for the privilege.
+
+    A CHILD OF A FEATURE IS RE-CUT BEFORE IT IS JUDGED. Its ceiling is the tighter of its
+    own budget and the slice its feature reserved for it, so raising the budget alone
+    would leave the stale slice winning the `min` and the order stuck for ever. The
+    re-cut spends the feature's CURRENT unreserved remainder, which is the money the
+    family actually has — and when that is nothing, the note says so and names the
+    feature, because "top up the child" and "top up the feature" are then different acts.
+    """
+    name, path, wo = find_work_order(wo_id, project_name)
+    if wo["status"] in TERMINAL_STATUSES:
+        raise OpsError(
+            f"{wo_id} is {wo['status']} — a settled order has nothing left to spend")
+    store = ProjectStore(path)
+    central = CentralStore()
+    resumed = False
+    note = ""
+    try:
+        store.update_work_order(wo_id, budget_usd=amount)
+        store.add_event(wo_id, "budget_set", {
+            "budget_usd": amount, "previous_usd": wo.get("budget_usd"), "by": "user"})
+        fresh = store.get_work_order(wo_id)
+        if fresh["status"] == budget.EXHAUSTED and fresh.get("budget_reserved_usd"):
+            budget.reserve(store, central, fresh)
+            fresh = store.get_work_order(wo_id)
+        cap = budget.ceiling(store, central, fresh)
+        spend = budget.spent(store, central, wo_id)
+        if fresh["status"] == budget.EXHAUSTED:
+            if cap is not None and cap.exhausted:
+                note = (f"still over its ceiling — {budget.format_usd(spend.total_usd)} "
+                        f"spent against {budget.format_usd(cap.cap_usd)}")
+                if cap.source == "feature":
+                    note += (" (its feature's slice, and the feature has "
+                             f"{budget.format_usd(_feature_unreserved(store, central, fresh))}"
+                             " unreserved — raise the feature with `jarvis fo budget`)")
+            else:
+                resumed, note = _resume_after_budget(store, name, fresh)
+    finally:
+        central.close()
+        store.close()
+    return {"project": name, "wo_id": wo_id, "title": wo["title"],
+            "budget_usd": amount, "previous_usd": wo.get("budget_usd"),
+            "spent_usd": spend.total_usd, "resumed": resumed, "note": note}
+
+
+def _feature_unreserved(store: ProjectStore, central: CentralStore,
+                        wo: dict[str, Any]) -> float:
+    """What this child's feature has that no live child has claimed. 0.0 if it has none.
+
+    Neo's condition on reserve-on-dispatch, reached from the other end: the escalation
+    states it when the child stops, and this states it again when a top-up of the child
+    could not find any money to give it.
+    """
+    parent_id = wo.get("parent_id")
+    if not parent_id:
+        return 0.0
+    try:
+        fo = store.get_feature_order(parent_id)
+    except KeyError:
+        return 0.0
+    p = budget.pool(store, central, fo, claimant=wo["id"])
+    return p.unreserved_usd if p else 0.0
+
+
+def _resume_after_budget(store: ProjectStore, project_name: str,
+                         wo: dict[str, Any]) -> tuple[bool, str]:
+    """Put a topped-up work order back to work, or say why it could not be.
+
+    Best effort, and a failure is REPORTED rather than raised: the budget has been raised
+    either way, and the daemon's own loops reach the order again on the next tick now
+    that it is out of `budget_exhausted`. Losing the new number because a relaunch could
+    not happen this second would be the worse outcome.
+    """
+    from . import worker_session
+
+    turn = store.latest_turn(wo["id"])
+    if turn is None:
+        # Never dispatched — it stopped before its first turn ran. `pending` is where the
+        # dispatch loop picks it up, and it reserves a fresh slice on the way in.
+        store.set_status(wo["id"], "pending")
+        store.clear_attention(wo["id"])
+        return True, "back on the dispatch queue"
+    try:
+        spec = project_spec(resolve_catalog(), project_name)
+    except OpsError as e:
+        store.set_status(wo["id"], "pending")
+        store.clear_attention(wo["id"])
+        return False, f"budget raised, but the catalog could not be read ({e})"
+    pause = worker_session.TurnPause(
+        # Constructed, never diagnosed: `turn_pause` returns None for a budget stop
+        # (worker_session._reap files it without a `reason` precisely so the retry sweep
+        # can never pick it up). This exists only to hand `retry` the two things it needs
+        # — the turn to relaunch, and a reason to word a nudge from.
+        reason=worker_session.PAUSE_BUDGET, turn=turn, retry_at=0.0, attempts=1,
+        message="its budget was raised",
+    )
+    store.set_status(wo["id"], "running")
+    store.clear_attention(wo["id"])
+    try:
+        fresh = worker_session.retry(store, spec, wo, pause)
+    except budget.BudgetExhausted as e:
+        budget.escalate(store, store.get_work_order(wo["id"]), e.exhausted)
+        return False, "still has no headroom — it stopped again immediately"
+    except Exception as e:  # noqa: BLE001 — see the docstring
+        store.set_status(wo["id"], "pending")
+        return False, f"budget raised, but the relaunch failed ({e})"
+    store.add_event(wo["id"], "budget_resumed",
+                    {"budget_usd": wo.get("budget_usd"), "turn": fresh["seq"]})
+    return True, f"resumed at turn {fresh['seq']}"
+
+
+def set_feature_budget(fo_id: str, amount: float | None,
+                       project_name: str | None = None) -> dict[str, Any]:
+    """Set, change or clear a FEATURE order's family budget.
+
+    Raising it takes the feature out of `budget_exhausted` on the next reconcile tick
+    (`Daemon.settle_features`). Its CHILDREN stay parked in their own exhausted state
+    until each is topped up: the family has money again, but which child gets it is the
+    user's call, and silently re-funding every one of them would spend the new budget on
+    whatever happened to be running rather than on what the user meant to rescue.
+
+    `exhausted_children` in the result is that list, and it is the whole instruction —
+    `jarvis wo budget <child> <amount>` re-cuts the child's slice out of the money this
+    just added, and resumes it. Nothing here writes a reservation: doing it from this end
+    would have to guess the split, which is the guess the user came to make.
+    """
+    name, path, fo = find_feature_order(fo_id, project_name)
+    store = ProjectStore(path)
+    central = CentralStore()
+    try:
+        store.update_feature_order(fo_id, budget_usd=amount)
+        p = budget.pool(store, central, store.get_feature_order(fo_id))
+        stuck = [c["id"] for c in store.feature_children(fo_id)
+                 if c["status"] == budget.EXHAUSTED]
+    finally:
+        central.close()
+        store.close()
+    return {"project": name, "fo_id": fo_id, "title": fo["title"],
+            "budget_usd": amount, "previous_usd": fo.get("budget_usd"),
+            "spent_usd": p.spent_usd if p else None,
+            "unreserved_usd": p.unreserved_usd if p else None,
+            "exhausted_children": stuck}

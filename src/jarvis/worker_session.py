@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import claude_cli, systemd_units, usage
+from . import budget, claude_cli, systemd_units, usage
 from .catalog import ProjectSpec
 from .project_store import ProjectStore
 
@@ -149,7 +149,8 @@ def feature_agent(store: ProjectStore | None, project: ProjectSpec,
 
 
 def briefing_for(project: ProjectSpec, wo: dict[str, Any],
-                 store: ProjectStore | None = None) -> dict[str, Any]:
+                 store: ProjectStore | None = None,
+                 central: Any = None) -> dict[str, Any]:
     """The flags every turn of this work order is launched with.
 
     A resumed session re-derives its model, effort, permission mode, system prompt and
@@ -190,6 +191,19 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any],
     opposite case on purpose. It is a spend control, not a property of the task, so
     lowering it in the catalog must reach the long-running work orders that are the
     reason to lower it — not just the ones dispatched afterwards.
+
+    `max_budget_usd` is RECOMPUTED HERE ON EVERY TURN and that is not an optimisation,
+    it is the only thing that makes a budget hold: `claude --max-budget-usd` caps ONE
+    INVOCATION and forgets what the session spent before it (measured — see
+    src/jarvis/budget.py), so a value resolved once at dispatch would let a ten-turn
+    work order spend ten budgets. None when the order has no ceiling, which is the
+    default and leaves the argv exactly as it was before this shipped.
+
+    `central` is optional for the same reason `store` is, and the consequence is stated
+    rather than hidden: without it the Jarvis half of the bill (Neo, the panel) is
+    invisible, so the ceiling is computed from the worker's turns alone and is therefore
+    too GENEROUS. Every dispatch path passes one; the callers that do not are tests and
+    the read-only briefing preview.
     """
     from . import wiring
     from .bootstrap import install_agent_assets
@@ -198,6 +212,7 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any],
 
     model = wo.get("model") or project.worker.model
     agent, agent_dir = feature_agent(store, project, wo)
+    cap = budget.ceiling(store, central, wo) if store is not None else None
     return {
         "model": model,
         "agent": agent,
@@ -212,6 +227,9 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any],
                                           serena=wiring.serena_wired(project.wiring))
                      + ([agent_dir] if agent_dir else [])),
         "autocompact_window": project.worker.autocompact_window,
+        # Never negative: `_launch` refuses a spent order outright, so anything that
+        # reaches argv is money the order still has.
+        "max_budget_usd": max(0.0, cap.remaining_usd) if cap else None,
     }
 
 
@@ -230,6 +248,7 @@ def busy(store: ProjectStore, wo_id: str) -> dict[str, Any] | None:
 #: NOTHING DOES TODAY — both callers read `accounted` and `reason` only — so these are a
 #: label on the record, not a dispatch table, and a new kind costs no caller a branch.
 HOLD_NO_SESSION = "no_session"
+HOLD_BUDGET = "budget"
 HOLD_TURN_IN_FLIGHT = "turn_in_flight"
 HOLD_RETRY_BOOKED = "retry_booked"
 HOLD_RETRY_OVERDUE = "retry_overdue"
@@ -269,6 +288,13 @@ def delivery_hold(store: ProjectStore, wo: dict[str, Any],
     definition, and whether that is a wait or a defect is a question about the work
     order rather than about delivery (`invariants.MESSAGE_STUCK_STATUSES`).
     """
+    if wo["status"] == budget.EXHAUSTED:
+        # Delivering would launch a turn there is no money for, and `_launch` would
+        # refuse it anyway. `accounted`: the work order is already flagged and in front
+        # of the user with the budget on it, so a second line about a message waiting
+        # would be the same fact twice.
+        return DeliveryHold(HOLD_BUDGET, accounted=True,
+                            reason="its budget is spent — raise it and the message goes")
     if not wo.get("session_id"):
         # Nothing carries a queued message into a dispatch prompt — it goes out as the
         # order's SECOND turn, once `start` mints a session.
@@ -327,9 +353,24 @@ def send(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], text: st
 def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], prompt: str,
             kind: str, resume: bool, worktree: str | None, cwd: Path,
             msg_id: int | None = None) -> dict[str, Any]:
+    from .central_store import CentralStore
     from .dispatch import worker_name
 
     wo_id = wo["id"]
+    # THE ONE POINT EVERY TURN PASSES THROUGH, which is why the budget is both checked
+    # and computed here rather than at the three callers. A `CentralStore` is opened per
+    # launch because the Jarvis half of the bill lives in it and the alternative was
+    # threading one through `start`, `send` and `retry` and every one of their callers —
+    # a connection whose cost is nothing beside spawning a `claude` process, and a
+    # correctness property (no launch path can forget the cap) bought for it.
+    central = CentralStore()
+    try:
+        out = budget.exhaustion(store, central, wo)
+        if out is not None:
+            raise budget.BudgetExhausted(out)
+        briefing = briefing_for(project, wo, store, central)
+    finally:
+        central.close()
     tdir = turns_dir(project, wo_id)
     # The row exists before the process does: a turn that started with nothing on record
     # would run to completion with no one to reap it or capture what it said.
@@ -352,7 +393,7 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
             unit=systemd_units.unit_name(wo_id, turn["seq"]),
             name=worker_name(wo),
             worktree=worktree,
-            **briefing_for(project, wo, store),
+            **briefing,
         )
     except claude_cli.ClaudeCliError as e:
         store.finish_turn(turn["id"], "failed", error=str(e))
@@ -458,11 +499,31 @@ def _reap(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any]:
         # is the same evidence `_diagnose` will re-read later (the row carries both
         # fields for exactly that reason) — but this is the one moment the stderr tail is
         # also in hand.
-        auth = claude_cli.auth_failure(result.error)
-        limit = None if auth else claude_cli.usage_limit(result.error)
-        transient = None if auth or limit else claude_cli.transient_failure(
+        # THE BUDGET IS TESTED FIRST AND IT IS NOT A PAUSE. A turn the CLI stopped for
+        # `--max-budget-usd` did real work and spent real money, and nothing about it
+        # gets better by being retried — a relaunch would simply spend the next budget
+        # the same way. So it gets its own event and falls through to `finish_turn`
+        # without a `reason`, which is what keeps `turn_pause` returning None for it and
+        # stops `retry_paused_turns` ever picking it up. What the WORK ORDER does about
+        # it is `Daemon.settle_work_order`'s, decided from the accounting rather than
+        # from this signal (`budget.exhaustion` says why).
+        overspent = claude_cli.stopped_for_budget(result)
+        auth = None if overspent else claude_cli.auth_failure(result.error)
+        limit = None if overspent or auth else claude_cli.usage_limit(result.error)
+        transient = None if overspent or auth or limit else claude_cli.transient_failure(
             result.error, terminal_reason=result.terminal_reason,
             api_error_status=result.api_error_status)
+        if overspent:
+            store.add_event(wo_id, "turn_budget_exhausted",
+                            {"seq": turn["seq"], "cost_usd": result.cost_usd,
+                             "error": result.error[:500]})
+            return store.finish_turn(turn["id"], "failed", error=result.error,
+                                     result=result.result or None,
+                                     cost_usd=result.cost_usd,
+                                     num_turns=result.num_turns,
+                                     usage_json=usage_json,
+                                     terminal_reason=result.terminal_reason,
+                                     api_error_status=result.api_error_status)
         payload = {"seq": turn["seq"], "error": result.error[:500]}
         if auth:
             payload |= {"reason": PAUSE_AUTH}
@@ -616,6 +677,15 @@ PAUSE_TRANSIENT = "transient"
 #: 167's `max_attempts = 0`, which settled these into `failed`).
 PAUSE_AUTH = "auth"
 
+#: NOT A TRANSPORT PAUSE, AND NEVER DIAGNOSED AS ONE. `_reap` files a budget stop without
+#: a reason and `turn_pause` therefore returns None for it, which is what keeps
+#: `Daemon.retry_paused_turns` from relaunching a turn there is no money for — the whole
+#: point of the status. This value exists for the ONE relaunch that is legitimate:
+#: `ops._resume_after_budget`, after a person has raised the number, which constructs a
+#: `TurnPause` by hand to reuse `retry`'s rule about what a relaunch re-sends. Nothing
+#: reads it off a stored row, because nothing ever writes it to one.
+PAUSE_BUDGET = "budget"
+
 #: A `retry_at` that will not arrive. Not a far-future deadline: `resumable` tests for
 #: this exact value, so nothing goes looking at a clock that was never a promise.
 NEVER = float("inf")
@@ -627,6 +697,7 @@ PAUSE_NOUN = {
     PAUSE_USAGE_LIMIT: "usage-limit",
     PAUSE_TRANSIENT: "Claude API",
     PAUSE_AUTH: "Claude Code authentication",
+    PAUSE_BUDGET: "budget",
 }
 
 
@@ -893,6 +964,22 @@ def _nudge(pause: TurnPause) -> str:
     that can see the gap in its own transcript will otherwise spend a turn working out
     what it missed.
     """
+    # THE BUDGET IS NOT THE TRANSPORT, and saying so matters to the reader: a worker told
+    # "the Claude API failed" when in fact its spending ceiling was reached and then
+    # raised has been given a false account of its own conversation, and the sentence
+    # after it ("this was the transport, not anything you or the work did") compounds it.
+    # The work did cause this one — it cost money — and the honest framing is that the
+    # user has decided to fund more of it.
+    if pause.reason == PAUSE_BUDGET:
+        return (
+            "[Jarvis] Your previous turn was cut short because this work order reached "
+            "its spending budget. The user has since raised it, so you may continue. "
+            "Nothing you had already done was lost — the conversation above is intact "
+            "and is where you left off. Carry on from there and finish that turn. Do "
+            "not start again and do not repeat work that is already done; re-check the "
+            "state on disk first if you are unsure how far you got. The new budget is "
+            "not unlimited, so prefer finishing what is in flight over widening scope."
+        )
     what = ("Claude's usage limit was reached" if pause.reason == PAUSE_USAGE_LIMIT
             else f"the Claude API failed ({pause.message})")
     return (

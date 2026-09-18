@@ -231,7 +231,7 @@ def _stamp(ts: float | None) -> str:
 
 STATUS_ICON = {
     "pending": "⏳", "dispatching": "🚀", "running": "🟢",
-    "idle": "💤", "waiting_input": "🙋",
+    "idle": "💤", "waiting_input": "🙋", "budget_exhausted": "💸",
     "needs_review": "👀", "waiting_pr_merge": "🔀", "completed": "✅", "failed": "❌",
     "cancelled": "🚫",
 }
@@ -397,6 +397,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="file it UNDER this feature order: it becomes one of the "
                         "feature's children, so the feature waits for it and shows it "
                         "in its tree (the feature must still be open)")
+    c.add_argument("--budget", metavar="USD", help="cap this order's spend at N dollars. It governs the WHOLE bill `jarvis cost` reports — the worker's turns plus what Jarvis spends on it (Neo, the validation panel) — and every turn is launched with no more than what is left. At the cap the order stops in `budget_exhausted` and asks you; raise it with `jarvis wo budget` and it carries on in the same session. Omit for no ceiling, which is the default and what the OS has always done")
+
+    b = wo.add_parser("budget", help="show, set, raise or clear a work order's dollar "
+                                     "ceiling — and resume it if it stopped at one")
+    b.add_argument("wo_id")
+    b.add_argument("amount", nargs="?", metavar="USD",
+                   help="the new ceiling, in dollars ('5', '5.50', '$5.50'). Omit to "
+                        "just show what the ceiling is and what has gone against it")
+    b.add_argument("--clear", action="store_true",
+                   help="remove the ceiling: the order runs uncapped again")
+    b.add_argument("--project")
 
     ub = wo.add_parser("unblock", help="cut the dependency edges holding a work order "
                                        "back (by default only the ones that can never "
@@ -538,6 +549,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "right answer unless the children contend for something the OS "
                         "cannot see (a test database, a rate-limited API, review "
                         "attention)")
+    f.add_argument("--budget", metavar="USD", help='cap the WHOLE FEATURE at N dollars — its planner, its manager and every child together, the same total `jarvis cost <fo-id>` adds up. Each child takes a slice of what is left when it is dispatched, so two running at once cannot both spend the same remainder. Omit for no ceiling')
+
+    f = fo.add_parser("budget", help="show, set, raise or clear a feature's FAMILY "
+                                     "budget — the ceiling on its whole rollup")
+    f.add_argument("fo_id")
+    f.add_argument("amount", nargs="?", metavar="USD",
+                   help="the new ceiling, in dollars. Omit to just show it")
+    f.add_argument("--clear", action="store_true", help="remove the ceiling")
+    f.add_argument("--project")
 
     f = fo.add_parser("list", help="feature orders and how far along they are")
     f.add_argument("project", nargs="?")
@@ -1848,6 +1868,26 @@ def cmd_adopt(args: argparse.Namespace) -> int:
     return 0 if not report.warnings else 1
 
 
+def _parse_budget_amount(raw: str) -> float:
+    """A dollar amount off the command line, refused at the surface rather than deeper.
+
+    `budget.parse_amount` raises `ValueError`; the CLI's contract is `OpsError`, which is
+    what turns a bad value into one line on stderr instead of a traceback.
+    """
+    from . import budget, ops
+
+    try:
+        return budget.parse_amount(raw)
+    except ValueError as e:
+        raise ops.OpsError(str(e)) from e
+
+
+def _budget_arg(args: argparse.Namespace) -> float | None:
+    """`--budget` as a number, or None for "no ceiling" — which is every order today."""
+    raw = getattr(args, "budget", None)
+    return _parse_budget_amount(raw) if raw else None
+
+
 def cmd_wo(args: argparse.Namespace) -> int:
     from . import invariants, ops
     from .project_store import OPEN_STATUSES, ProjectStore
@@ -1860,13 +1900,22 @@ def cmd_wo(args: argparse.Namespace) -> int:
             args.project, args.title, description=args.description, origin=args.origin,
             model=args.model, effort=args.effort, permission_mode=args.permission_mode,
             append_system_prompt=args.append_system_prompt, depends_on=deps,
-            parent_id=parent or None,
+            parent_id=parent or None, budget_usd=_budget_arg(args),
         )
         _print({"created": wo["id"], "project": args.project, "status": wo["status"],
                 "depends_on": deps,
                 **({"parent": parent} if parent else {}),
+                **({"budget_usd": wo["budget_usd"]} if wo.get("budget_usd") else {}),
                 "note": (f"jarvisd will dispatch it once {', '.join(deps)} completes"
                          if deps else "jarvisd will dispatch it shortly")}, args.json)
+
+    elif args.wo_cmd == "budget":
+        if args.amount is None and not args.clear:
+            _print(ops.work_order_budget(args.wo_id, args.project), args.json)
+        else:
+            amount = None if args.clear else _parse_budget_amount(args.amount)
+            _print(ops.set_work_order_budget(args.wo_id, amount, args.project),
+                   args.json)
 
     elif args.wo_cmd == "unblock":
         _print(ops.unblock_work_order(args.wo_id, drop_all=args.drop_all,
@@ -1961,9 +2010,16 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # alarms, not `ops.list_cost_alarms`' fleet-wide dict, whose join columns
                 # (title, status, hidden) are already above — §4.
                 "alarms": store.alarms_of(args.wo_id),
+                # THE CEILING AND WHAT HAS GONE AGAINST IT. Always present, even as
+                # nulls: this is the record a user checks a number they typed against,
+                # and a key that comes and goes is one every consumer has to guard.
+                # Computed outside the `store` block — it opens the central store for
+                # the Jarvis half of the bill and must not nest a second connection
+                # inside this one's lifetime.
             }
         finally:
             store.close()
+        detail["budget"] = ops.work_order_budget(args.wo_id, name)
         _print(_readable_config(_readable_autoreview(_readable_automerge(
             _readable_alarms(_readable_rounds(detail)))))
                if not args.json else detail, args.json)
@@ -2018,7 +2074,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
 
 
 FO_ICON = {"pending": "⏳", "planning": "🧭", "plan_review": "👀", "executing": "🟢",
-           "validating": "🔎", "completed": "✅", "failed": "❌", "cancelled": "🚫"}
+           "validating": "🔎", "budget_exhausted": "💸", "completed": "✅",
+           "failed": "❌", "cancelled": "🚫"}
 
 
 def cmd_fo(args: argparse.Namespace) -> int:
@@ -2029,11 +2086,20 @@ def cmd_fo(args: argparse.Namespace) -> int:
     if args.fo_cmd == "create":
         fo = ops.create_feature_order(args.project, args.title,
                                       description=args.description, origin=args.origin,
-                                      max_parallel=args.max_parallel)
+                                      max_parallel=args.max_parallel,
+                                      budget_usd=_budget_arg(args))
         _print({"created": fo["id"], "project": args.project, "status": fo["status"],
                 **({"max_parallel": fo["max_parallel"]} if fo["max_parallel"] else {}),
+                **({"budget_usd": fo["budget_usd"]} if fo.get("budget_usd") else {}),
                 "note": "jarvisd will open a planner for it shortly; the plan comes "
                         "back for review before any work order is created"}, args.json)
+
+    elif args.fo_cmd == "budget":
+        if args.amount is None and not args.clear:
+            _print(ops.feature_order_budget(args.fo_id, args.project), args.json)
+        else:
+            amount = None if args.clear else _parse_budget_amount(args.amount)
+            _print(ops.set_feature_budget(args.fo_id, amount, args.project), args.json)
 
     elif args.fo_cmd == "list":
         rows = ops.list_feature_orders(args.project, include_settled=args.all)
@@ -2051,6 +2117,9 @@ def cmd_fo(args: argparse.Namespace) -> int:
 
     elif args.fo_cmd == "show":
         detail = ops.show_feature_order(args.fo_id, args.project)
+        # Always present, even as nulls, on `jarvis wo show`'s rule: the family budget is
+        # a number the user typed and must be checkable without a second command.
+        detail["budget"] = ops.feature_order_budget(args.fo_id, detail["project"])
         if args.json:
             _print(detail, True)
         else:
@@ -2059,6 +2128,10 @@ def cmd_fo(args: argparse.Namespace) -> int:
             print(f"\n{detail['description']}\n")
             if detail["attention_reason"]:
                 print(f"⚠ {detail['attention_reason']}\n")
+            if detail["budget"]["budget_usd"]:
+                b = detail["budget"]
+                print(f"budget: ${b['spent_usd']:.2f} of ${b['budget_usd']:.2f} "
+                      f"(${b['unreserved_usd']:.2f} unreserved)\n")
             if detail["planner"]:
                 p = detail["planner"]
                 print(f"planner: {p['id']} ({p['status']})")

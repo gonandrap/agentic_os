@@ -66,6 +66,9 @@ STATUS_META = {
     "validating":    {"word": "under review",   "icon": "◑", "tone": "active"},
     "needs_review":  {"word": "needs review",   "icon": "◭", "tone": "warn"},
     "waiting_pr_merge": {"word": "waiting for PR merge", "icon": "⑃", "tone": "ok"},
+    # Toned `warn` rather than `bad`: nothing went wrong with the work, it ran out of
+    # money, and the thing to do about it is a decision rather than a diagnosis.
+    "budget_exhausted": {"word": "budget spent", "icon": "◒", "tone": "warn"},
     "completed":     {"word": "completed",   "icon": "✓", "tone": "ok"},
     "failed":        {"word": "failed",      "icon": "✗", "tone": "bad"},
     "cancelled":     {"word": "cancelled",   "icon": "–", "tone": "muted"},
@@ -82,6 +85,7 @@ FO_STATUS_META = {
     # A feature order validates as a whole once every child is done — same reading as
     # the work-order entry above, one level up.
     "validating":  {"word": "under review",  "icon": "◑", "tone": "active"},
+    "budget_exhausted": {"word": "budget spent", "icon": "◒", "tone": "warn"},
     "completed":   {"word": "completed",    "icon": "✓", "tone": "ok"},
     "failed":      {"word": "failed",       "icon": "✗", "tone": "bad"},
     "cancelled":   {"word": "cancelled",    "icon": "–", "tone": "muted"},
@@ -135,7 +139,12 @@ REFRESH_SECONDS = 15
 # same breath. Status, not the attention flag, decides: `jarvis wo ack` puts the flag down
 # for good, and an acked work order that vanished from the only listing of open work would
 # be unfindable.
-FEATURED_STATUSES = ("needs_review", "waiting_input", "running", "waiting_pr_merge")
+# `budget_exhausted` is featured for the same reason `needs_review` and `waiting_input`
+# are: `invariants.true_blockers` names it a genuine blocker, and a listing that disagrees
+# with that is a bug in the listing. FIRST, because it is the only one of them the user
+# cannot answer by reading — the order is stopped and spending nothing until they decide.
+FEATURED_STATUSES = ("budget_exhausted", "needs_review", "waiting_input", "running",
+                     "waiting_pr_merge")
 
 
 def group_open(wos: list[dict], revealed: str = "") -> tuple[list[dict], list[dict]]:
@@ -841,6 +850,7 @@ def create_app() -> FastAPI:
         finally:
             store.close()
         return render(request, "feature_order.html", fo=detail, project=detail["project"],
+                      cap=ops.feature_order_budget(fo_id, detail["project"]),
                       validation=validation, error=error)
 
     @app.get("/project/{name}/sessions", response_class=HTMLResponse)
@@ -924,7 +934,14 @@ def create_app() -> FastAPI:
             store.close()
         show_debug = debug not in ("", "0", "false")
         bill = wo_bill(wo_id, pname)
+        # The ceiling, what has gone against it, and (for a child) what its feature still
+        # has to top it up with. Its own two indexed sums rather than a reading off
+        # `bill` above: `bill` is the transcript-walking view and can lag or fall back to
+        # an estimate, and the number beside a control that CHANGES the budget has to be
+        # the same number the enforcement uses.
+        cap = ops.work_order_budget(wo_id, pname)
         return render(request, "work_order.html", project=pname, wo=wo, parked=parked,
+                      cap=cap,
                       pause=pause, waiting=waiting, status_label=label,
                       validation=validation, spec=spec, auto_merge=auto_merge,
                       auto_review=auto_review,
@@ -1227,11 +1244,18 @@ def create_app() -> FastAPI:
 
     @app.post("/wo/create")
     def create_wo(project: str = Form(...), title: str = Form(...),
-                  description: str = Form(""), model: str = Form("")):
+                  description: str = Form(""), model: str = Form(""),
+                  budget: str = Form("")):
+        from .. import budget as budget_mod
+
         try:
-            wo = ops.create_work_order(project, title, description=description,
-                                       model=model or None, origin="ui")
-        except ops.OpsError as e:
+            wo = ops.create_work_order(
+                project, title, description=description, model=model or None,
+                origin="ui",
+                # Empty means "whatever the project's default is", which is usually no
+                # ceiling — never zero. `parse_amount` refuses zero for the same reason.
+                budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
+        except (ValueError, ops.OpsError) as e:
             return RedirectResponse(f"/?error={e}", status_code=303)
         return RedirectResponse(f"/wo/{project}/{wo['id']}", status_code=303)
 
@@ -1255,6 +1279,45 @@ def create_app() -> FastAPI:
                feedback: str = Form("")):
         ops.review_work_order(wo_id, accept=(decision == "accept"), feedback=feedback)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
+
+    @app.post("/wo/{name}/{wo_id}/budget")
+    def set_wo_budget(name: str, wo_id: str, amount: str = Form(""),
+                      clear: str = Form("")):
+        """Set, raise or clear one work order's ceiling — and resume it if it stopped.
+
+        An EMPTY box is not a clear: a form submitted by accident would otherwise remove
+        a ceiling silently. Clearing takes its own named control (`clear`), which is the
+        same separation `jarvis wo budget --clear` makes.
+        """
+        from .. import budget
+
+        if not clear and not amount.strip():
+            return RedirectResponse(
+                f"/wo/{name}/{wo_id}?error=enter+an+amount+or+use+Remove+ceiling",
+                status_code=303)
+        try:
+            parsed = None if clear else budget.parse_amount(amount)
+            ops.set_work_order_budget(wo_id, parsed, project_name=name)
+        except (ValueError, ops.OpsError) as e:
+            return RedirectResponse(f"/wo/{name}/{wo_id}?error={e}", status_code=303)
+        return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
+
+    @app.post("/fo/{name}/{fo_id}/budget")
+    def set_fo_budget(name: str, fo_id: str, amount: str = Form(""),
+                      clear: str = Form("")):
+        """The same, for a feature's whole family. See `set_wo_budget` on the empty box."""
+        from .. import budget
+
+        if not clear and not amount.strip():
+            return RedirectResponse(
+                f"/fo/{name}/{fo_id}?error=enter+an+amount+or+use+Remove+ceiling",
+                status_code=303)
+        try:
+            parsed = None if clear else budget.parse_amount(amount)
+            ops.set_feature_budget(fo_id, parsed, project_name=name)
+        except (ValueError, ops.OpsError) as e:
+            return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
+        return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/cancel")
     def cancel_wo(name: str, wo_id: str):

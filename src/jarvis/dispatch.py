@@ -798,7 +798,7 @@ def dispatch_work_order(
     resolved model/effort/permission mode — and hands the running of it to
     `worker_session`, which owns the transport.
     """
-    from . import worker_session
+    from . import budget, worker_session
 
     cfg = os_config or OsConfig()
     knowledge = central.knowledge_brief(
@@ -822,10 +822,23 @@ def dispatch_work_order(
         "config_version": (central.head_config_version() or {}).get("id"),
     }
     store.update_work_order(wo["id"], **resolved)
+    # A CHILD TAKES ITS SLICE OF THE FEATURE'S BUDGET HERE, and here is the only place it
+    # ever does: reserve-on-dispatch is what stops two children claimed in the same tick
+    # being handed the same remainder (src/jarvis/budget.py). No-op for a standalone
+    # order and for a child whose feature has no budget, which is nearly all of them.
+    budget.reserve(store, central, wo)
     wo = store.get_work_order(wo["id"])
 
     try:
         turn = worker_session.start(store, project, wo, prompt)
+    except budget.BudgetExhausted as e:
+        # Spent before it ever ran a turn — its feature had nothing left to lend it, or
+        # the panel and Neo spent the order's own budget on an earlier round. Not a
+        # dispatch FAILURE: nothing is broken and the work has not been judged, so it
+        # goes to the user as what it is (`budget.escalate` writes the timeline entry,
+        # the flag and the notification) rather than to `failed`.
+        budget.escalate(store, wo, e.exhausted)
+        return store.get_work_order(wo["id"])
     except claude_cli.ClaudeCliError as e:
         store.set_status(wo["id"], "failed")
         store.flag_attention(wo["id"], f"dispatch failed: {e}")
