@@ -907,9 +907,11 @@ class Daemon:
                 continue
             if fo["status"] == budget_mod.FO_EXHAUSTED:
                 # Topped up: back to work. Its children are still parked in their own
-                # `budget_exhausted` until each is topped up or re-reserved, which is the
-                # honest shape — the family has money again, and which child gets it is
-                # the user's call (`jarvis fo budget` re-cuts the slices).
+                # `budget_exhausted` until each is topped up, which is the honest shape —
+                # the family has money again, and which child gets it is the user's call.
+                # `jarvis wo budget <child>` is what re-cuts that child's slice out of
+                # the new money; nothing here writes a reservation, because doing it from
+                # this end would have to guess the split.
                 store.set_feature_status(fo["id"], "executing")
                 store.clear_feature_attention(fo["id"])
                 continue

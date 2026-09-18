@@ -84,7 +84,7 @@ Allocation is **reserve-on-dispatch** (option A, ruled on question 404):
 
 The invariant, asserted directly in `tests/test_budget.py`:
 
-> already spent + everything live children may still spend ≤ the budget
+> the allocator never *promises* more than `unreserved`, which is floored at zero
 
 It holds because a reservation is only ever cut from `unreserved`, which already has every
 outstanding reservation subtracted from it. **Two children dispatched in parallel are
@@ -92,9 +92,32 @@ therefore never handed the same remainder** — which the alternative (re-read t
 remainder on every turn) cannot say: it is always *true*, and still lets N live children
 each spend the full remainder once, overshooting by up to (N−1) turns.
 
+The stronger-sounding statement — *already spent + everything live children may still
+spend ≤ the budget* — is **not** claimed, and cannot be: §1 measured the flag overshooting,
+so a child that runs 51c past its slice has already put the family 51c over before any
+allocation happens. The allocator owns what it promises, not what the CLI spends.
+
 Neo attached one condition: when a child exhausts its slice, the escalation states the
 feature's unreserved remainder, so the user can top up rather than guess why a funded
 feature stalled. `Exhaustion.reason` carries it.
+
+**Getting a slice-exhausted child back is two steps, and that is the design.** The ceiling
+is `min(the child's own budget, its reservation)`, so raising the child's budget alone
+cannot free it — the stale slice goes on winning the `min`. `ops.set_work_order_budget`
+therefore **re-cuts** the reservation (`budget.reserve`, no longer dispatch-only) before it
+judges, spending the family's *current* unreserved remainder on that child. Equal splitting
+means the children hold the whole pool between them, so usually there is nothing spare
+until either a sibling settles cheaply or the user tops the **family** up first:
+`jarvis fo budget` adds the money and lists the stuck children, `jarvis wo budget <child>`
+spends it on the one they pick. Re-funding every child from the feature would make that
+choice for them. When the re-cut finds nothing, the note names the feature and its
+unreserved remainder rather than repeating a ceiling the user just raised.
+
+The reservation written is `already spent + the new share`, not the share alone, because it
+is a *lifetime* cap and `ceiling` measures the child's whole spend against it. Cutting the
+share alone would price the child's past twice — once in the pool's total, once inside its
+own ceiling. At dispatch the child has spent nothing and the two are the same number, which
+is why this only ever shows up on a re-cut.
 
 ## 4. The new state
 
@@ -113,6 +136,14 @@ command. It is also what leaves resuming possible.
   write would be overwritten by a generic one on the next tick.
 - `worker_session.delivery_hold` holds queued messages rather than failing them: nothing is
   wrong with the message, and raising the budget is exactly what sends it.
+- `INV-BUDGET-OVERSPENT` asserts the post-condition — a budgeted order is either inside its
+  ceiling or parked here — with **one exemption**: an order whose validation round is still
+  runnable. `Daemon.settle_work_order` declines to park that window on purpose (a round
+  already open is how delivered work lands, and `work_orders_awaiting_validation` is keyed
+  off the round and bounded by `OPEN_STATUSES`, which this status is in, so parking would
+  only make the two fight). An invariant that flagged it would report the OS's own design
+  as a defect on every tick. The exemption uses the settler's own predicate rather than
+  restating it, so widening that branch widens the check with it.
 
 **Raising the budget resumes it**, in the same session (`ops.set_work_order_budget`). The
 relaunch goes through `worker_session.retry`'s rules — a nudge when the conversation

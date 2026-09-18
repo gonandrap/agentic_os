@@ -2978,6 +2978,15 @@ def check_budgets_are_enforced(store: ProjectStore) -> Iterator[Violation]:
     returns early on. Reporting rather than repairing keeps this a check on the settler
     instead of a second implementation of it.
 
+    EXCEPT WHERE THE SETTLER DECLINES ON PURPOSE. An order whose validation round is
+    still runnable is deliberately left unparked so the panel can finish judging work
+    that is already delivered, and an invariant that flagged that window would report the
+    OS's own design as a defect on every tick — noise that teaches the reader to ignore
+    the line. The exemption is narrow by construction: it is the same predicate the
+    settler branches on, so if that branch is ever widened this check widens with it, and
+    a round that is not runnable is judged like anything else. Nothing escapes for long —
+    a panel round cannot outlive `validation.timeout`.
+
     Silent for every order with no budget, which is the fleet as it stands: `ceiling`
     returns None on a row with neither a budget nor a reservation, so this costs one
     indexed read per open order and yields nothing.
@@ -2996,6 +3005,11 @@ def check_budgets_are_enforced(store: ProjectStore) -> Iterator[Violation]:
                 continue
             cap = budget_mod.ceiling(store, central, wo)
             if cap is None or not cap.exhausted:
+                continue
+            # The window the settler declines on purpose. Asked AFTER the cap, so the
+            # query is paid for only by an order that is actually over its ceiling.
+            outcome = (store.latest_validation_round(wo_id=wo["id"]) or {}).get("outcome")
+            if outcome in RUNNABLE_VALIDATION_OUTCOMES:
                 continue
             yield Violation(
                 invariant="INV-BUDGET-OVERSPENT",

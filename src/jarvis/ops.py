@@ -7409,6 +7409,13 @@ def set_work_order_budget(wo_id: str, amount: float | None,
     order that has already spent $6 leaves it exactly where it is, with a message saying
     so, rather than launching a turn the CLI would stop on its first call and charging
     the user for the privilege.
+
+    A CHILD OF A FEATURE IS RE-CUT BEFORE IT IS JUDGED. Its ceiling is the tighter of its
+    own budget and the slice its feature reserved for it, so raising the budget alone
+    would leave the stale slice winning the `min` and the order stuck for ever. The
+    re-cut spends the feature's CURRENT unreserved remainder, which is the money the
+    family actually has — and when that is nothing, the note says so and names the
+    feature, because "top up the child" and "top up the feature" are then different acts.
     """
     name, path, wo = find_work_order(wo_id, project_name)
     if wo["status"] in TERMINAL_STATUSES:
@@ -7423,13 +7430,19 @@ def set_work_order_budget(wo_id: str, amount: float | None,
         store.add_event(wo_id, "budget_set", {
             "budget_usd": amount, "previous_usd": wo.get("budget_usd"), "by": "user"})
         fresh = store.get_work_order(wo_id)
+        if fresh["status"] == budget.EXHAUSTED and fresh.get("budget_reserved_usd"):
+            budget.reserve(store, central, fresh)
+            fresh = store.get_work_order(wo_id)
         cap = budget.ceiling(store, central, fresh)
         spend = budget.spent(store, central, wo_id)
         if fresh["status"] == budget.EXHAUSTED:
             if cap is not None and cap.exhausted:
                 note = (f"still over its ceiling — {budget.format_usd(spend.total_usd)} "
-                        f"spent against {budget.format_usd(cap.cap_usd)}"
-                        + (" (its feature's slice)" if cap.source == "feature" else ""))
+                        f"spent against {budget.format_usd(cap.cap_usd)}")
+                if cap.source == "feature":
+                    note += (" (its feature's slice, and the feature has "
+                             f"{budget.format_usd(_feature_unreserved(store, central, fresh))}"
+                             " unreserved — raise the feature with `jarvis fo budget`)")
             else:
                 resumed, note = _resume_after_budget(store, name, fresh)
     finally:
@@ -7438,6 +7451,25 @@ def set_work_order_budget(wo_id: str, amount: float | None,
     return {"project": name, "wo_id": wo_id, "title": wo["title"],
             "budget_usd": amount, "previous_usd": wo.get("budget_usd"),
             "spent_usd": spend.total_usd, "resumed": resumed, "note": note}
+
+
+def _feature_unreserved(store: ProjectStore, central: CentralStore,
+                        wo: dict[str, Any]) -> float:
+    """What this child's feature has that no live child has claimed. 0.0 if it has none.
+
+    Neo's condition on reserve-on-dispatch, reached from the other end: the escalation
+    states it when the child stops, and this states it again when a top-up of the child
+    could not find any money to give it.
+    """
+    parent_id = wo.get("parent_id")
+    if not parent_id:
+        return 0.0
+    try:
+        fo = store.get_feature_order(parent_id)
+    except KeyError:
+        return 0.0
+    p = budget.pool(store, central, fo, claimant=wo["id"])
+    return p.unreserved_usd if p else 0.0
 
 
 def _resume_after_budget(store: ProjectStore, project_name: str,
@@ -7496,6 +7528,11 @@ def set_feature_budget(fo_id: str, amount: float | None,
     until each is topped up: the family has money again, but which child gets it is the
     user's call, and silently re-funding every one of them would spend the new budget on
     whatever happened to be running rather than on what the user meant to rescue.
+
+    `exhausted_children` in the result is that list, and it is the whole instruction —
+    `jarvis wo budget <child> <amount>` re-cuts the child's slice out of the money this
+    just added, and resumes it. Nothing here writes a reservation: doing it from this end
+    would have to guess the split, which is the guess the user came to make.
     """
     name, path, fo = find_feature_order(fo_id, project_name)
     store = ProjectStore(path)

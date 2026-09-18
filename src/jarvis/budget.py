@@ -158,11 +158,19 @@ def _family(store: ProjectStore, fo: dict[str, Any]) -> list[dict[str, Any]]:
 #
 # THE INVARIANT, which `Pool` exists to keep and `test_budget.py` pins:
 #
-#     already spent  +  everything live children may still spend  <=  the budget
+#     the allocator never PROMISES more than `unreserved`, which is floored at zero
 #
 # It holds because a reservation is only ever cut from `unreserved`, which already has
 # every outstanding reservation subtracted from it. Release needs no write at all: a
 # settled child drops out of `held`, and its real spend is already inside `total`.
+#
+# NOT the stronger-sounding `spent + everything live children may still spend <= budget`,
+# which cannot hold and whose failure has nothing to do with allocation: the flag is
+# checked between API calls and overshoots (see the probe at the top of this file), so a
+# child that ran 51c past its slice has already put the family 51c over before anything
+# here is asked. State the property the allocator owns, not the one it would be nice to
+# have — a comment claiming the stronger one sends the next reader hunting a bug in the
+# arithmetic that is really in the CLI.
 
 
 @dataclass(frozen=True)
@@ -236,12 +244,26 @@ def pool(store: ProjectStore, central: CentralStore | None, fo: dict[str, Any],
 
 def reserve(store: ProjectStore, central: CentralStore | None,
             wo: dict[str, Any]) -> float | None:
-    """Cut this child's slice out of its feature's budget. Called once, at dispatch.
+    """Cut this child's slice out of its feature's budget, at dispatch or afterwards.
 
-    Returns the slice, or None when there is nothing to cut from — no parent, or a
-    parent with no budget, in which case the child is bounded by its own budget alone.
-    Idempotent by way of `pool(claimant=…)`: dispatching the same child twice re-cuts
-    the same share rather than stacking two reservations.
+    Returns the new reservation, or None when there is nothing to cut from — no parent,
+    or a parent with no budget, in which case the child is bounded by its own budget
+    alone. Idempotent by way of `pool(claimant=…)`: reserving twice re-cuts one share
+    rather than stacking two.
+
+    RE-CUTTING IS THE WAY BACK for a child that stopped on its slice. A reservation is
+    the child's ceiling, and `ceiling` takes the tighter of it and the child's own
+    budget, so without a re-cut a slice-exhausted child could never be raised out of
+    `budget_exhausted` by any number the user typed on it — the stale slice would go on
+    winning the `min`. `ops.set_work_order_budget` calls this before it decides, so
+    topping up the child spends the family's CURRENT unreserved remainder on it.
+
+    The reservation written is `already spent + the new share`, not the share alone,
+    because it is a LIFETIME cap and `ceiling` measures the child's whole spend against
+    it. Cutting the share alone would price the child's past twice — once inside
+    `pool.spent_usd` and once inside its own ceiling — and leave the family holding back
+    money it had already accounted for. At dispatch the child has spent nothing and the
+    two are the same number.
     """
     parent_id = wo.get("parent_id")
     if not parent_id:
@@ -253,14 +275,16 @@ def reserve(store: ProjectStore, central: CentralStore | None,
     p = pool(store, central, fo, claimant=wo["id"])
     if p is None:
         return None
+    already = spent(store, central, wo["id"]).total_usd
     share = p.slice_for_one_more()
-    store.update_work_order(wo["id"], budget_reserved_usd=share)
+    store.update_work_order(wo["id"], budget_reserved_usd=already + share)
     store.add_event(wo["id"], "budget_reserved", {
-        "fo_id": parent_id, "reserved_usd": round(share, 4),
+        "fo_id": parent_id, "reserved_usd": round(already + share, 4),
+        "share_usd": round(share, 4), "spent_usd": round(already, 4),
         "feature_budget_usd": p.budget_usd, "feature_spent_usd": round(p.spent_usd, 4),
         "unreserved_usd": round(p.unreserved_usd, 4),
     })
-    return share
+    return already + share
 
 
 # -- the ceiling one turn is launched under -------------------------------------------

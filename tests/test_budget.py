@@ -13,9 +13,12 @@ work order spend ten budgets. `test_each_turn_is_capped_at_what_is_left` is that
 to be the number `jarvis cost` shows them.
 
 **A feature's budget is a family budget, allocated by RESERVE-ON-DISPATCH.** Two children
-dispatched in parallel must not be handed the same remainder. The invariant is
-`already spent + everything live children may still spend <= the budget`, and it is
-asserted directly rather than through a proxy.
+dispatched in parallel must not be handed the same remainder. The invariant is that the
+allocator never PROMISES more than the feature's unreserved remainder, and it is asserted
+directly rather than through a proxy. The stronger-sounding
+`spent + everything live children may still spend <= the budget` is deliberately not
+claimed: the flag overshoots, so a child can put the family over before any allocation
+happens. See `test_a_re_cut_never_promises_money_the_family_does_not_have`.
 
 **Default off.** An order with no budget behaves exactly as it did before this shipped —
 no flag on the argv, and the new status unreachable. That is the definition of done's
@@ -25,6 +28,7 @@ second half, and it is checked on the same paths as the first.
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -62,6 +66,27 @@ def store(project):
     s = ProjectStore(project)
     yield s
     s.close()
+
+
+def tick_until_parked(daemon, store, wo_id: str, timeout: float = 15.0) -> str:
+    """Tick until the order lands in `budget_exhausted`, and say where it actually got to.
+
+    A worker turn is a DETACHED process, so `wait_calls` only proves the turn was
+    launched — the settler cannot park the order until that process has written its result
+    and been reaped. A fixed two ticks is therefore a race, and the way it loses is
+    peculiarly nasty: the top-up under test then runs against an order that is not parked,
+    `resumed` is False for a reason that has nothing to do with the code under test, and it
+    only happens on a loaded machine.
+    """
+    deadline = time.monotonic() + timeout
+    status = ""
+    while time.monotonic() < deadline:
+        daemon.tick()
+        status = store.get_work_order(wo_id)["status"]
+        if status == budget.EXHAUSTED:
+            return status
+        time.sleep(0.05)
+    return status
 
 
 def budget_flag(call: dict) -> str | None:
@@ -226,10 +251,9 @@ def test_a_budgeted_order_stops_at_its_budget_and_says_what_it_spent(
     wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=0.50)
     started.tick()
     fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
-    started.tick()
+    assert tick_until_parked(started, store, wo["id"]) == "budget_exhausted"
 
     row = store.get_work_order(wo["id"])
-    assert row["status"] == "budget_exhausted"
     assert row["needs_attention"]
     # What it spent, not what the cap was: the CLI overshoots by the call that crossed
     # the line, and a reason quoting the cap would understate the bill.
@@ -303,7 +327,7 @@ def test_the_reason_survives_a_reconcile_tick(started, store, fake_claude, monke
     wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=0.50)
     started.tick()
     fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
-    started.tick()
+    assert tick_until_parked(started, store, wo["id"]) == "budget_exhausted"
     first = store.get_work_order(wo["id"])["attention_reason"]
 
     started.tick()
@@ -318,8 +342,7 @@ def test_a_queued_message_waits_rather_than_launching_an_unfunded_turn(
     wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=0.50)
     started.tick()
     fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
-    started.tick()
-    assert store.get_work_order(wo["id"])["status"] == "budget_exhausted"
+    assert tick_until_parked(started, store, wo["id"]) == "budget_exhausted"
 
     before = len(worker_calls(fake_claude))
     ops.send_message(wo["id"], "carry on")
@@ -339,15 +362,13 @@ def test_raising_the_budget_resumes_the_same_session(
     wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=0.50)
     started.tick()
     fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
-    started.tick()
+    assert tick_until_parked(started, store, wo["id"]) == "budget_exhausted"
     session = store.get_work_order(wo["id"])["session_id"]
 
     monkeypatch.delenv("FAKE_CLAUDE_TURN")
-    before = len(worker_calls(fake_claude))
     out = ops.set_work_order_budget(wo["id"], 20.0)
     assert out["resumed"], out
     assert store.get_work_order(wo["id"])["status"] != "budget_exhausted"
-    fake_claude.wait_calls(lambda c: budget_flag(c) == "20.000000")
 
     # THE SAME SESSION ID, which is the whole claim: the stopped turn left a complete
     # transcript, so the top-up continues that conversation instead of opening a new one
@@ -357,8 +378,19 @@ def test_raising_the_budget_resumes_the_same_session(
     # re-decides that flag from the filesystem — a session whose transcript was never
     # written cannot be resumed and has to be re-opened with `--session-id`, which is the
     # branch the fake takes. Either flag preserves the id; only the id is the property.
-    assert len(worker_calls(fake_claude)) > before
-    argv = worker_calls(fake_claude)[-1]["argv"]
+    #
+    # Read off the list `wait_calls` RETURNS rather than off `calls[-1]`: the relaunch is
+    # detached, `wait_calls` gives up quietly on timeout, and indexing the log afterwards
+    # would then assert against the turn BEFORE the one under test — a failure that only
+    # appears when the machine is loaded, which is exactly when nobody can reproduce it.
+    # The relaunch's cap is the REMAINDER, 20 less the 0.55 already spent — not the 20 the
+    # user typed. Matching on "20.000000" would never fire, and the old spelling only
+    # looked green because `wait_calls` times out quietly and the assertion below then ran
+    # against whatever call happened to be last.
+    sent = fake_claude.wait_calls(
+        lambda c: budget_flag(c) is not None and 0 < float(budget_flag(c) or 0) < 20)
+    assert sent, "the top-up never launched a turn"
+    argv = sent[-1]["argv"]
     flag = "--resume" if "--resume" in argv else "--session-id"
     assert argv[argv.index(flag) + 1] == session
 
@@ -371,7 +403,7 @@ def test_raising_it_by_too_little_does_not_launch_a_doomed_turn(
     wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=0.50)
     started.tick()
     fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
-    started.tick()
+    assert tick_until_parked(started, store, wo["id"]) == "budget_exhausted"
 
     before = len(worker_calls(fake_claude))
     out = ops.set_work_order_budget(wo["id"], 0.52)
@@ -386,16 +418,20 @@ def test_clearing_the_budget_resumes_it_too(started, store, fake_claude, monkeyp
     wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=0.50)
     started.tick()
     fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
-    started.tick()
+    assert tick_until_parked(started, store, wo["id"]) == "budget_exhausted"
 
     monkeypatch.delenv("FAKE_CLAUDE_TURN")
+    session = store.get_work_order(wo["id"])["session_id"]
     out = ops.set_work_order_budget(wo["id"], None)
     assert out["resumed"]
     assert store.get_work_order(wo["id"])["budget_usd"] is None
-    # No ceiling means no flag, on the relaunch as much as on a first dispatch.
-    fake_claude.wait_calls(lambda c: "--resume" in c["argv"] or (
-        "--session-id" in c["argv"] and budget_flag(c) is None), count=1)
-    assert budget_flag(worker_calls(fake_claude)[-1]) is None
+    # No ceiling means no flag, on the relaunch as much as on a first dispatch. Matched on
+    # the ABSENCE of the flag for this session, which only the relaunch can satisfy — the
+    # first dispatch carried one — and read off what `wait_calls` returns, so a loaded
+    # machine fails here rather than silently asserting against the earlier turn.
+    sent = fake_claude.wait_calls(
+        lambda c: session in c["argv"] and budget_flag(c) is None)
+    assert sent, "the clear never launched an uncapped turn"
 
 
 # -- the family budget -----------------------------------------------------------------
@@ -730,3 +766,148 @@ def test_an_open_round_is_allowed_to_finish_over_budget(started, store, catalog_
     store.set_status(wo["id"], "waiting_pr_merge")
     started.settle_work_order(spec, store, store.get_work_order(wo["id"]))
     assert store.get_work_order(wo["id"])["status"] == "budget_exhausted"
+
+
+# -- review round 1: the two paths that were stated and not shown -----------------------
+
+
+def test_a_child_stopped_on_its_slice_is_resumable_by_topping_the_child_up(
+        started, store, fake_claude):
+    """THE WHOLE LOOP for a child that ran out on its FEATURE'S slice, not its own budget.
+
+    `ceiling` takes the tighter of the child's own budget and its reservation, so without
+    the re-cut in `ops.set_work_order_budget` no number the user typed on the child could
+    ever free it: the stale slice would go on winning the `min` and the order would
+    answer "still over its ceiling" for ever.
+
+    TWO STEPS, and that is the design rather than a wrinkle. Equal splitting hands the
+    children the whole pool between them, so a feature whose child overran has nothing
+    spare to re-cut from until either a sibling settles cheaply or the user tops the
+    FAMILY up. `jarvis fo budget` adds the money and says which children are stuck;
+    `jarvis wo budget` spends it on the one the user chose. Re-funding every child from
+    the feature would make that choice for them.
+    """
+    fo = a_feature(started, store, "reader", "writer", budget_usd=20.0)
+    for _ in range(4):
+        started.tick()
+    child = store.feature_children(fo["id"])[0]
+    slice_usd = child["budget_reserved_usd"]
+    assert slice_usd, "the fixture never reserved, so the claim is vacuous"
+
+    # Billed rather than acted out through the fake CLI: exhaustion is answered from the
+    # ACCOUNTING, so the settler parks it from this alone, and a fake worker stopping on
+    # its own cap would only also test the transport. `running` because that is where an
+    # order that runs out actually is — the fixture's children have already delivered.
+    store.set_status(child["id"], "running")
+    bill_the_turn(store, child["id"], slice_usd + 1.0)
+    started.tick()
+    assert store.get_work_order(child["id"])["status"] == "budget_exhausted"
+
+    # Step one: the family. This alone does NOT move the child — the recorded assumption
+    # — and the result says which children are waiting on the user's choice.
+    fed = ops.set_feature_budget(fo["id"], 200.0)
+    assert child["id"] in fed["exhausted_children"]
+    started.tick()
+    assert store.get_work_order(child["id"])["status"] == "budget_exhausted"
+
+    # Step two: the child. The re-cut finds the new money and the order goes back to work.
+    session = store.get_work_order(child["id"])["session_id"]
+
+    def a_capped_turn_for_this_child(call: dict) -> bool:
+        return session in call["argv"] and budget_flag(call) is not None
+
+    before = len([c for c in fake_claude.calls if a_capped_turn_for_this_child(c)])
+    out = ops.set_work_order_budget(child["id"], 60.0)
+    assert out["resumed"], out
+    fresh = store.get_work_order(child["id"])
+    assert fresh["status"] != "budget_exhausted"
+    # Re-cut above what it has already spent, which is what makes it resumable at all.
+    assert fresh["budget_reserved_usd"] > slice_usd + 1.0
+
+    # ...and a turn really goes out, under the re-cut slice. Waited for rather than read
+    # straight off: the relaunch is a detached process that records itself when it runs.
+    sent = fake_claude.wait_calls(a_capped_turn_for_this_child, count=before + 1)
+    assert len(sent) == before + 1
+    assert float(budget_flag(sent[-1]) or 0) > slice_usd
+
+
+def test_a_re_cut_never_promises_money_the_family_does_not_have(started, store):
+    """The re-cut is bounded by `unreserved`, which is floored at zero, so it can only
+    ever hand out money nobody has claimed — and hands out NOTHING when a sibling is
+    holding the pool. It therefore never widens an overshoot it did not cause.
+
+    Note what is NOT asserted: that `spent + held <= budget` still holds here. It cannot,
+    and not because of the re-cut — `--max-budget-usd` is checked between API calls and
+    overshoots, so a child that ran 51c past its slice has already put the family 51c
+    over. The property the allocator owns is that it never PROMISES more, and that is the
+    one measured.
+    """
+    from jarvis.central_store import CentralStore
+
+    fo = a_feature(started, store, "reader", "writer", budget_usd=20.0)
+    for _ in range(4):
+        started.tick()
+    child = store.feature_children(fo["id"])[0]
+    bill_the_turn(store, child["id"], (child["budget_reserved_usd"] or 0) + 0.5)
+    started.tick()
+
+    central = CentralStore()
+    try:
+        f = store.get_feature_order(fo["id"])
+        spare = budget.pool(store, central, f, claimant=child["id"])
+        before = budget.pool(store, central, f)
+        cut = budget.reserve(store, central, store.get_work_order(child["id"]))
+        after = budget.pool(store, central, f)
+        burnt = budget.spent(store, central, child["id"]).total_usd
+    finally:
+        central.close()
+    assert spare is not None and before is not None and after is not None
+    # A sibling holds the pool, so there was nothing spare and nothing was promised.
+    assert spare.unreserved_usd == 0.0
+    assert after.held_usd <= before.held_usd + spare.unreserved_usd + 1e-9
+    # ...and the cut is still the child's whole spend, so the row stays readable as a
+    # lifetime cap rather than becoming a number smaller than what it has already spent.
+    assert cut == pytest.approx(burnt)
+
+
+def test_topping_a_child_up_with_a_broke_feature_says_to_raise_the_feature(
+        started, store):
+    """"Top up the child" and "top up the feature" are different acts, and a user who
+    cannot tell them apart tops up the wrong one. When the re-cut finds nothing to cut,
+    the note names the feature and its unreserved remainder rather than repeating a
+    ceiling the user just raised."""
+    fo = a_feature(started, store, "reader", budget_usd=3.0)
+    for _ in range(4):
+        started.tick()
+    child = store.feature_children(fo["id"])[0]
+    bill_the_turn(store, child["id"], 9.0)          # past the slice AND past the family
+    started.tick()
+    assert store.get_work_order(child["id"])["status"] == "budget_exhausted"
+
+    out = ops.set_work_order_budget(child["id"], 500.0)
+    assert not out["resumed"]
+    assert "its feature's slice" in out["note"]
+    assert "jarvis fo budget" in out["note"]
+    assert "unreserved" in out["note"]
+
+
+def test_the_post_condition_exempts_the_window_the_settler_declines(started, store):
+    """INV-BUDGET-OVERSPENT must not report the OS's own design as a defect. An order
+    whose validation round is still runnable is deliberately left unparked so the panel
+    can finish judging delivered work — flagging it would fire on EVERY tick of that
+    window and teach the reader to ignore the line."""
+    from jarvis.invariants import check_budgets_are_enforced
+
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=1.0)
+    bill_the_turn(store, wo["id"], 4.0)
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="fp-1")
+    store.set_status(wo["id"], "validating")
+    assert list(check_budgets_are_enforced(store)) == []
+
+    # ...and the exemption is exactly as wide as the settler's, no wider: the moment the
+    # round is no longer runnable, an unparked over-budget order is a violation again.
+    store.close_validation_round(rnd["id"], "passed")
+    store.set_status(wo["id"], "running")
+    assert [v.invariant for v in check_budgets_are_enforced(store)] == [
+        "INV-BUDGET-OVERSPENT"]
+
