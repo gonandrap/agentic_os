@@ -269,6 +269,16 @@ DEFAULT_VALIDATION_MAX_ROUNDS = 3
 # docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md
 DEFAULT_VALIDATION_DIFF_CHARS = 150000
 
+# How many follow-up findings one round may file against the project backlog.
+#
+# A BOUND, NOT A JUDGEMENT. Title matching is the only dedupe available — a seat writes a
+# slightly different sentence for the same nit each round — so near-duplicate rows WILL
+# get through. 5 keeps that failure a handful of items a user drops in a minute rather
+# than a backlog nobody can read; findings past it are dropped and a later round may
+# raise them again. Spec §4.4:
+# docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
+DEFAULT_VALIDATION_FOLLOW_UP_CAP = 5
+
 
 @dataclass
 class ValidationConfig:
@@ -338,6 +348,17 @@ class ValidationConfig:
     # what makes an accepted assumption safe to land is that the panel judged the work it
     # was part of; turning the panel off must stop this with it.
     auto_review: bool = False
+    # WHETHER A NON-BLOCKING FINDING IS KEPT AS A BACKLOG ITEM, or discarded. `False`
+    # does not restore the old behaviour — the panel stopped rejecting over one with no
+    # knob at all — it only throws the finding away, so this is the named instance of the
+    # carve-out above and it ships True. `kn-a88a56b6` is the discriminator; do not
+    # re-decide it here. Spec §4.5:
+    # docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
+    #
+    # Per project by the same field-level fallback as `auto_merge` and `auto_review`.
+    follow_ups: bool = True
+    # The cap above, per project. See DEFAULT_VALIDATION_FOLLOW_UP_CAP.
+    max_follow_ups: int = DEFAULT_VALIDATION_FOLLOW_UP_CAP
 
 
 # -- `jarvis inspect`: what counts as worth reporting, and what as worth interrupting for
@@ -1084,6 +1105,11 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     diff_chars = int(raw.get("diff_chars", base.diff_chars))
     if diff_chars < 1:
         raise _err(f"{where}.diff_chars must be >= 1")
+    max_follow_ups = int(raw.get("max_follow_ups", base.max_follow_ups))
+    if max_follow_ups < 0:
+        # 0 is legal and is NOT the same setting as `follow_ups: false`: it files
+        # nothing while leaving every dropped finding counted on the round's event.
+        raise _err(f"{where}.max_follow_ups must be >= 0")
     return ValidationConfig(
         enabled=bool(raw.get("enabled", base.enabled)),
         roster=roster,
@@ -1093,6 +1119,9 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         max_rounds=max_rounds,
         diff_chars=diff_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
+        # Same field-level fallback as every flag in this block — see `auto_merge` below.
+        follow_ups=bool(raw.get("follow_ups", base.follow_ups)),
+        max_follow_ups=max_follow_ups,
         # `base.auto_merge` is the fleet answer when this project names nothing, and the
         # shipped `False` when the fleet names nothing either — the field-level fallback
         # that makes this per-project rather than global. A project opts in by naming it.

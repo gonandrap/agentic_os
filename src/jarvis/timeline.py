@@ -403,7 +403,7 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                     f"by mistake", "no privileged action was authorised")
         return (f"Ran the approved {p.get('kind') or 'command'}",
                 f"use {p.get('use')} of {p.get('of')}")
-    # The validation loop. Six kinds rather than one with an outcome in the payload,
+    # The validation loop. Seven kinds rather than one with an outcome in the payload,
     # because each is the whole story a reader wants at a glance — and each gets a
     # LABEL of its own here. `event_level` returns "signal" for anything it does not
     # know, so these arriving unclassified would look fine on the timeline while
@@ -424,6 +424,30 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 else "Validation forced by hand",
                 f"{p.get('reason') or ''}"
                 + (f" (was {was})" if was else ""))
+    if kind == "validation_follow_ups_filed":
+        # A SEVENTH kind, and the only one that is not a verdict: the round's
+        # non-blocking remarks, filed as issues on the project's own tracker instead of
+        # sent back (spec §4.6, and the user's ruling of 2026-09-16 on where they go).
+        # NO SEAT IS NAMED — the payload carries them, and the timeline is read by the
+        # submitter; which reviewer said it belongs in the issue body and on
+        # `jarvis validation show` (spec §4.7).
+        items = [i for i in (p.get("items") or ()) if isinstance(i, dict)]
+        dropped, failed = int(p.get("dropped") or 0), int(p.get("failed") or 0)
+        parts = [f"#{i.get('number')}" if i.get("number") else str(i.get("url") or "")
+                 for i in items]
+        if dropped:
+            parts.append(f"{dropped} more over the per-round cap")
+        # A FINDING THAT COULD NOT BE FILED IS THE INTERESTING ONE. Filing crosses a
+        # network, so it can fail where the backlog row it replaced could not, and a
+        # reader who is not told simply never learns the remark existed.
+        if failed:
+            parts.append(f"{failed} could not be filed"
+                         + (f" — {p['reason']}" if p.get("reason") else ""))
+        if not items:
+            return ("Review raised follow-ups it could not file"
+                    if failed else "Review filed no follow-ups", "; ".join(parts))
+        return (f"Review filed {len(items)} follow-up issue"
+                f"{'' if len(items) == 1 else 's'}", "; ".join(parts))
     if kind == "validation_passed":
         return "Validation passed", p.get("reason") or ""
     if kind == "validation_rejected":
