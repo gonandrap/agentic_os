@@ -2246,3 +2246,100 @@ def test_a_spent_order_is_featured_ahead_of_everything_else(client, daemon):
     featured, _ = group_open([{"status": "needs_review", "id": "wo-1"},
                               {"status": "budget_exhausted", "id": "wo-2"}])
     assert [w["id"] for w in featured] == ["wo-2", "wo-1"]
+
+
+# -- a budget at CREATION time ----------------------------------------------------------
+
+
+def _form(page: str, action: str) -> str:
+    """The one form posting to `action`. Both create forms carry an identical budget
+    input, so a whole-page assertion is answered by whichever renders first."""
+    start = page.index(f'action="{action}"')
+    return page[start:page.index("</form>", start)]
+
+
+def test_both_create_forms_offer_a_budget(client):
+    """The ceiling was settable only after the order existed — which is after the money
+    it was meant to bound had started being spent."""
+    page = client.get("/").text
+    assert 'name="budget"' in _form(page, "/wo/create")
+    assert 'name="budget"' in _form(page, "/fo/create")
+
+
+def test_creating_a_work_order_from_the_browser_stamps_the_budget(client):
+    r = client.post("/wo/create", data={"project": "proj_a", "title": "capped",
+                                        "description": "do it", "budget": "$12.50"})
+    assert r.status_code == 303
+    wo_id = r.headers["location"].rsplit("/", 1)[-1]
+    assert ops.work_order_budget(wo_id)["budget_usd"] == 12.5
+
+
+def test_creating_a_feature_order_from_the_browser_stamps_the_family_budget(client):
+    r = client.post("/fo/create", data={"project": "proj_a", "title": "CSV export",
+                                        "description": "the whole ask, at length, "
+                                                       "with enough detail to plan",
+                                        "budget": "50"})
+    assert r.status_code == 303
+    fo_id = r.headers["location"].rsplit("/", 1)[-1]
+    assert ops.feature_order_budget(fo_id)["budget_usd"] == 50.0
+
+
+def test_an_empty_budget_box_on_creation_is_not_a_zero(client):
+    """Empty means "the project's default", which is usually no ceiling. Zero would read
+    as "spend nothing", which is why `parse_amount` refuses it outright."""
+    r = client.post("/wo/create", data={"project": "proj_a", "title": "uncapped",
+                                        "description": "do it", "budget": "  "})
+    wo_id = r.headers["location"].rsplit("/", 1)[-1]
+    assert ops.work_order_budget(wo_id)["budget_usd"] is None
+
+    r = client.post("/fo/create", data={"project": "proj_a", "title": "uncapped",
+                                        "description": "the whole ask, at length",
+                                        "budget": ""})
+    fo_id = r.headers["location"].rsplit("/", 1)[-1]
+    assert ops.feature_order_budget(fo_id)["budget_usd"] is None
+
+
+@pytest.mark.parametrize("bad", ["lots", "nan", "inf", "-inf", "0"])
+def test_a_bad_budget_refuses_the_order_rather_than_filing_it_uncapped(client, project,
+                                                                      bad):
+    """`nan` is the one that matters: it survives a `> 0` check, so an order carrying it
+    renders as budgeted and is never capped. Filing the order and dropping the ceiling
+    would be worse than refusing — the user asked for a cap and would not get one."""
+    r = client.post("/wo/create", data={"project": "proj_a", "title": "capped",
+                                        "description": "do it", "budget": bad})
+    assert r.status_code == 303
+    assert r.headers["location"].startswith("/?error=")
+
+    r = client.post("/fo/create", data={"project": "proj_a", "title": "capped",
+                                        "description": "the whole ask, at length",
+                                        "budget": bad})
+    assert r.status_code == 303
+    assert r.headers["location"].startswith("/project/proj_a?error=")
+
+    store = ProjectStore(project)
+    assert store.list_work_orders() == []
+    assert ops.list_feature_orders("proj_a") == []
+
+
+def test_the_browser_side_pattern_never_rejects_what_the_server_accepts(client):
+    """The pattern exists so a typo bounces before it costs the description typed beside
+    it (Neo, q418). It is allowed to be LOOSER than `budget.parse_amount` — that just
+    means the flash does the work — but never tighter, or the box refuses a real amount
+    with no message any server-side test would ever see."""
+    import re
+
+    from jarvis import budget
+
+    page = client.get("/").text
+    # Per form, so dropping the attribute from ONE of them is not covered by the other.
+    found = {form: re.findall(r'pattern="([^"]+)"', _form(page, form))
+             for form in ("/wo/create", "/fo/create")}
+    assert all(len(v) == 1 for v in found.values()), f"one rule per form, got {found}"
+    patterns = {v[0] for v in found.values()}
+    assert len(patterns) == 1, f"the two forms disagree on the rule: {patterns}"
+    pattern = patterns.pop()
+    for good in ("5", "5.50", "$5.50", "1,000", "1,000.50", ".5"):
+        budget.parse_amount(good)  # the server takes it, so the browser must too
+        assert re.fullmatch(pattern, good), f"{pattern!r} rejects {good!r}"
+    for bad in ("lots", "nan", "inf", "five dollars", "$"):
+        assert not re.fullmatch(pattern, bad), f"{pattern!r} accepts {bad!r}"
