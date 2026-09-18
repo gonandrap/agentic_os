@@ -303,7 +303,7 @@ def test_the_project_page_ranks_the_issues_by_how_many_orders_hit_them(fleet, tr
     fleet.tick()
 
     page = TestClient(create_app(), follow_redirects=False).get(
-        f"/project/{"proj_a"}").text
+        "/project/proj_a").text
     shown = " ".join(page.split())
 
     assert "Tracker issues the fleet keeps hitting" in shown
@@ -349,7 +349,7 @@ def test_the_round_still_reports_what_it_could_not_file(fleet, fake_gh):  # noqa
     wo = judged(fleet, "passed", "Name the retry budget")
 
     page = TestClient(create_app(), follow_redirects=False).get(
-        f"/wo/{"proj_a"}/{wo['id']}").text
+        f"/wo/proj_a/{wo['id']}").text
     shown = " ".join(page.split())
 
     assert "1 follow-up could not be filed as an issue" in shown
