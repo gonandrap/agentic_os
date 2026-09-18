@@ -824,7 +824,11 @@ def test_a_filed_follow_up_never_becomes_the_submitters_side_effect(fleet, track
     wo = judged(fleet, "passed", "Name the retry budget")
 
     assert filed(tracker), "the fixture filed nothing, so the claim is vacuous"
-    assert ops.side_effects_of(wo["id"]) == []
+    store = fleet.store()
+    try:
+        assert ops.side_effects_of(store, wo["id"]) == []
+    finally:
+        store.close()
 
 
 def test_nothing_reaches_the_projects_backlog_any_more(fleet, tracker):
