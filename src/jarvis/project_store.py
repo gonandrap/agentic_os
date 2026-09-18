@@ -538,6 +538,21 @@ CREATE TABLE IF NOT EXISTS notifications (
     source TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'new'  -- new | routed
 );
+-- One invariant violation the OS has already announced, and the only thing that makes
+-- "report once, not every tick" (invariants.py rule 3) survive a restart. The dedupe
+-- used to be a set on the Daemon object, so every release re-announced the whole
+-- standing unrepaired set to Telegram — noise that scaled with release cadence (wo-31bb26ff).
+CREATE TABLE IF NOT EXISTS violation_reports (
+    invariant TEXT NOT NULL,
+    -- '' rather than NULL for a violation that carries no work order (this is the
+    -- INV-HEALTH-SWEEP-MUTE case): NULLs are DISTINCT under a SQLite primary key, so a
+    -- nullable column here would open a fresh row — and fire afresh — every tick.
+    wo_id TEXT NOT NULL DEFAULT '',
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    seen INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (invariant, wo_id)
+);
 CREATE TABLE IF NOT EXISTS assumptions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     wo_id TEXT NOT NULL REFERENCES work_orders(id),
@@ -2721,6 +2736,53 @@ class ProjectStore:
 
     def mark_notification_routed(self, notif_id: int) -> None:
         self.conn.execute("UPDATE notifications SET status='routed' WHERE id=?", (notif_id,))
+
+    # -- invariant violation reports -------------------------------------------
+
+    def open_violation_report(self, invariant: str, wo_id: str | None = None) -> bool:
+        """Note that this violation is standing. True the FIRST time it is seen.
+
+        The caller announces on True and says nothing on False — `invariants.py` rule 3,
+        made durable. `seen` and `last_seen` are the audit trail that a per-tick inbox
+        row would otherwise have been.
+        """
+        key = (invariant, wo_id or "")
+        now = db.now()
+        row = self.conn.execute(
+            "SELECT seen FROM violation_reports WHERE invariant=? AND wo_id=?", key
+        ).fetchone()
+        if row is None:
+            self.conn.execute(
+                "INSERT INTO violation_reports (invariant, wo_id, first_seen, last_seen)"
+                " VALUES (?,?,?,?)", (*key, now, now))
+            return True
+        self.conn.execute(
+            "UPDATE violation_reports SET last_seen=?, seen=seen+1"
+            " WHERE invariant=? AND wo_id=?", (now, *key))
+        return False
+
+    def close_violation_reports(
+            self, standing: Iterable[tuple[str, str | None]]) -> list[tuple[str, str]]:
+        """Forget every report whose violation is not in `standing`, so that one which
+        comes back is announced again.
+
+        ONLY SOUND WHERE EVERY CHECK RAN — absence otherwise means "not looked at".
+        `Daemon.check_invariants` is the one caller and holds that reasoning.
+        """
+        keys = {(inv, wo or "") for inv, wo in standing}
+        gone = [(r["invariant"], r["wo_id"])
+                for r in self.conn.execute(
+                    "SELECT invariant, wo_id FROM violation_reports").fetchall()
+                if (r["invariant"], r["wo_id"]) not in keys]
+        for key in gone:
+            self.conn.execute(
+                "DELETE FROM violation_reports WHERE invariant=? AND wo_id=?", key)
+        return gone
+
+    def violation_reports(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM violation_reports ORDER BY first_seen").fetchall()
+        return db.rows_to_dicts(rows)
 
     # -- assumptions -----------------------------------------------------------
 
