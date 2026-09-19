@@ -75,8 +75,23 @@ ids exist to cite. `None.` if you wrote none.
 **Test evidence** — the command you ran and what it actually reported. Not "tests
 pass": the numbers.
 
+**RUN THE TARGETED TESTS ONLY. DO NOT RUN THE FULL SUITE LOCALLY.** CI runs it for you,
+on more interpreters than you can: `.github/workflows/ci.yml` runs `pytest tests -q` on
+Python 3.11, 3.12 AND 3.13 plus `pytest evals -q`. Your one local pass is strictly less
+than that and it is not what the reviewer reads — the tester seat judges your declared
+evidence against the pull request's check runs, so a local green that CI contradicts is
+a rejection, not evidence. It is also expensive: the suite takes ~21 minutes, your turn
+is a single conversation with a 5-minute prompt cache, and one blocking call that long
+re-sends the whole conversation at the cache-write rate on the next call. One work order
+burned ~1.5M tokens that way (kn-356c724b).
+
+So: run the tests for what you changed, cite CI for the rest, and finish. **You do not
+wait for CI** — `jarvis wo finish` returns immediately and the OS holds the validation
+round until GitHub reports, at no cost to you.
+
 ```
-| Unit / integration | `uv run pytest tests/ evals/` | 1965 passed, 70 skipped |
+| Unit / integration | `uv run pytest tests/test_landing.py tests/test_work_lands.py -q` | 47 passed; full suite on CI |
+| Eval | not run locally — `pytest evals -q` on CI | see checks |
 ```
 
 Keep all four rows. A row that does not apply says so **and says why** — "n/a, no UI

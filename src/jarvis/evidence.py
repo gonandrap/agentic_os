@@ -279,6 +279,39 @@ def judged_head(packet: EvidencePacket) -> str:
     return str(packet.pr.get("head_sha") or "")
 
 
+def ci_pending(packet: EvidencePacket) -> tuple[str, ...]:
+    """The names of the checks GitHub has not finished running, newest packet only.
+
+    `()` — nothing to wait for — covers BOTH green answers and the two that are not
+    answers at all: a repository that runs no checks, and a packet with no pull request
+    behind it. Neither can ever become a verdict, so a round that waited on one would
+    wait for ever; `daemon._validate_work_order` reads "wait" from this and must not be
+    handed a wait nothing can end.
+
+    WHY THIS EXISTS. Until 2026-09-18 a worker proved its own suite locally and declared
+    the number, which the panel then had to take on the submitter's word — and could not,
+    because `validator-seats/tester.md` judges the declared evidence against the pull
+    request's check runs. A worker that stops running the suite (the user's ruling, and
+    kn-356c724b) has nothing to declare until CI reports, so the OS waits for CI on the
+    worker's behalf rather than putting the wait inside a worker turn where it would sit
+    blocked for twenty minutes and re-write the whole conversation at the cache-WRITE
+    rate on the next call (wo-16a488ee: seven such re-writes, ~1.5M tokens).
+
+    Reading `status` and not `conclusion` is the whole of the distinction: an
+    unfinished check has no conclusion yet, and `failing_checks` — which reads
+    `conclusion` — is deliberately silent about it. A RED check is NOT pending: the
+    answer is in, it is bad, and the round should open so a seat can say so.
+    """
+    from . import github
+
+    if packet.source != "pull_request" or not packet.pr:
+        return ()
+    return tuple(
+        str(c.get("name") or "(unnamed check)")
+        for c in (packet.pr.get("checks") or ())
+        if str(c.get("status") or "").upper() in github.UNFINISHED_STATUSES)
+
+
 #: Keys the REGISTRY stamps on an effect rather than the collector producing them — the
 #: OS classifying an effect, not a submitter delivering one. Excluded from the digest on
 #: `history`'s rule; spec docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §6.

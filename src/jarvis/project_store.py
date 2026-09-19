@@ -120,6 +120,20 @@ OPEN_VALIDATION_OUTCOMES = ("pending", "failed", "rejected")
 # account's window is spent and the refusal named the moment it reopens.
 VALIDATION_HELD_CAUSE = "usage_limit"
 
+# ...and this one is a round waiting for GITHUB to finish running the checks. A separate
+# cause because the two are told apart on every surface that reads the timeline: a usage
+# window is the account being out of budget, and this is the ordinary, expected pause
+# between a worker pushing and CI reporting. Same MECHANISM, and that sharing is the
+# point — see `validation_hold_until`.
+VALIDATION_CI_CAUSE = "ci_pending"
+
+#: Every cause that means "this round is not failed, it is WAITING". A round closed with
+#: one of these is `RUNNABLE` and uncounted, so the submitter spends no round number on
+#: it and the next tick owns the same round again. ONE set, because `validation_hold_until`
+#: is the only reader and a cause missing from here is a round that holds once and then
+#: spins every tick for ever.
+VALIDATION_HOLDING_CAUSES = frozenset({VALIDATION_HELD_CAUSE, VALIDATION_CI_CAUSE})
+
 
 def validation_hold_until(events: Iterable[Any], round_no: int) -> float:
     """The moment this round may go again, or 0 when nothing is holding it back.
@@ -133,6 +147,15 @@ def validation_hold_until(events: Iterable[Any], round_no: int) -> float:
     shut again writes a second event for the same round number, and taking the earlier
     moment would send the round straight back into a closed window every tick.
 
+    TWO CAUSES HOLD, and the caller is told apart from neither: a spent usage window
+    (`VALIDATION_HELD_CAUSE`) and GitHub still running the checks
+    (`VALIDATION_CI_CAUSE`). They are different facts about why nobody is judging yet and
+    identical in what the tick must do about it, so the vocabulary is
+    `VALIDATION_HOLDING_CAUSES` and the behaviour is this one function. A round holding
+    for both — a window that shut while CI was still running — takes the later moment,
+    which is the same "newest wins" rule and the right one: going again before either has
+    lifted is a refusal either way.
+
     Takes ROWS rather than a store because the same rule has to answer for a feature
     order, whose events live on its manager's timeline and come back through
     `ops.feature_events_of_kind`. One home, two carriers (GitHub issue #235).
@@ -141,7 +164,7 @@ def validation_hold_until(events: Iterable[Any], round_no: int) -> float:
     for e in events:
         payload = db.from_json(e["payload"], {})
         if (payload.get("round") == round_no
-                and payload.get("cause") == VALIDATION_HELD_CAUSE):
+                and payload.get("cause") in VALIDATION_HOLDING_CAUSES):
             held = max(held, float(payload.get("reopens_at") or 0.0))
     return held
 

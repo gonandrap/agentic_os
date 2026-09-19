@@ -34,7 +34,12 @@
 
 <!-- What you RAN and what it REPORTED — the command and its actual output, not the
      claim that it passed. Keep every row: a row that does not apply says so and says
-     why, because "no UI test" and "no UI change" are different facts to a reviewer. -->
+     why, because "no UI test" and "no UI change" are different facts to a reviewer.
+
+     TARGETED TESTS ONLY. Do not run the full suite locally — CI runs it on three
+     interpreters, it takes ~21 minutes, and a blocking call that long re-sends your
+     whole conversation at the cache-write rate (kn-356c724b). Name the tests you ran
+     for what you changed and cite the checks on this PR for the rest. -->
 
 | Kind | Command | Result |
 | --- | --- | --- |

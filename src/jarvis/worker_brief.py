@@ -458,8 +458,21 @@ def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
         f"`--summary`. The summary says what you built and where; the evidence "
         f"says how you know it works, and it is read beside your diff by someone "
         f"who was not in this session and takes nothing on trust. \"Ran the "
-        f"suite\" is not evidence; \"`uv run pytest -q` — 412 passed, 0 failed, "
-        f"including the 6 new cases in tests/test_thing.py\" is.",
+        f"suite\" is not evidence; \"`uv run pytest tests/test_thing.py -q` — 412 "
+        f"passed, 0 failed, including the 6 new cases\" is.",
+        "",
+        "RUN THE TARGETED TESTS, NOT THE WHOLE SUITE. The tests for what you changed "
+        "belong in a worker turn; the full suite belongs to CI, which runs it on more "
+        "interpreters than you can and whose result the reviewer reads instead of your "
+        "claim. Running it yourself is slower, weaker evidence AND expensive: your turn "
+        "is one conversation with a five-minute prompt cache, so a single twenty-minute "
+        "blocking call re-sends the whole conversation at the cache-WRITE rate on the "
+        "next call. One work order paid that seven times over (kn-356c724b).",
+        "",
+        "DO NOT WAIT FOR CI EITHER — that is the same blocked turn with a different "
+        "command in it. Finish as soon as your targeted tests pass and the pull request "
+        "is open: the OS holds the validation round until GitHub has reported, and "
+        "nothing is billed while it waits.",
         "",
         "Review feedback may come back asking for more: a case you did not cover, "
         "a claim the diff does not support, a check you described but did not "
