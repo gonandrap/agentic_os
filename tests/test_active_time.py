@@ -22,7 +22,7 @@ from test_cost_report import registered  # noqa: F401 — a project `ops` can re
 from test_inspection import (assistant_row, prompt_row,  # noqa: F401 — fixture by name
                              tool_rows, write_transcript)
 
-from jarvis import holds, inspection, ops
+from jarvis import holds, inspection, invariants, ops
 from jarvis.catalog import InspectConfig
 from jarvis.project_store import ProjectStore
 
@@ -510,3 +510,127 @@ def test_every_hold_cause_has_a_phrase_for_the_user():
 
     assert opened <= named and closed <= named
     assert set(holds._RANK) == named
+
+
+# -- the two branches that fail silently ------------------------------------------------
+#
+# Both of these stop a work order being reported, so their failure mode is silence rather
+# than a wrong number: a hold whose closer never arrives runs to `now` for ever, and the
+# order it belongs to disappears off the attention list permanently. Every case below is
+# therefore a PAIR — held and unheld, or the cause and its near neighbour — so neither
+# branch can pass by never reporting anything.
+
+
+#: Four hours held, then five quiet minutes of nobody's making. Chosen so the unheld
+#: reading is over `alarm_parked_minutes` (60) and the held one is well under it: a margin
+#: either side, rather than a number that happens to land on the threshold.
+PARKED_HELD = 4 * 3600
+PARKED_RESIDUAL = 300.0
+
+
+def parked_shape(rec: Record, store: ProjectStore, wo: str) -> float:
+    """An order whose worker settled a turn, and which was then held for four hours.
+
+    The dispatch after that turn was refused before a process existed — `kn-fa875823`'s
+    instant opening refusal, which writes `turn_paused` and no turn row — so the LATEST
+    turn is still the settled one and `parked_reason` reaches its threshold test. That is
+    the only shape in which this suppression can ever matter: a paused order whose latest
+    turn is `failed` is turned away several lines earlier, and `ops.waiting_on` would
+    answer `retry_pending` for it besides.
+
+    Returns the moment to read the record at.
+    """
+    seq = rec.turn(T0, T0 + 60)
+    store.set_status(wo, "running")
+    rec.event("turn_paused", T0 + 60,
+              {"seq": seq, "reason": "usage_limit",
+               "error": "You've hit your session limit · resets 2:10pm"})
+    rec.event("turn_resumed", T0 + 60 + PARKED_HELD,
+              {"seq": seq + 1, "retried_seq": seq, "reason": "usage_limit"})
+    return T0 + 60 + PARKED_HELD + PARKED_RESIDUAL
+
+
+def test_an_order_held_for_four_hours_is_not_reported_as_parked(record):
+    """The suppression itself. Four hours and five minutes of silence is well past
+    `alarm_parked_minutes`, and all but five minutes of it was the OS holding the order —
+    which is the whole correction this work order exists for, applied to the attention
+    list rather than to the alarm."""
+    rec, store, wo = record
+    now = parked_shape(rec, store, wo)
+
+    assert invariants.parked_reason(store, store.get_work_order(wo), now=now) is None
+
+
+def test_the_same_record_without_the_hold_events_is_still_reported(record):
+    """The other half, and the one that makes the first mean something. The record is
+    IDENTICAL — same turn, same statuses, same `now` — but for the two events, so a
+    suppression that had simply stopped reporting parked orders would fail here."""
+    rec, store, wo = record
+    now = parked_shape(rec, store, wo)
+    store.conn.execute(
+        "DELETE FROM wo_events WHERE wo_id=? AND kind IN ('turn_paused','turn_resumed')",
+        (wo,))
+
+    assert (invariants.parked_reason(store, store.get_work_order(wo), now=now)
+            == invariants.PARKED_BLOCKER)
+
+
+def test_a_validation_round_held_by_the_usage_window_holds_the_work_order(record):
+    """`VALIDATION_HELD_CAUSE`: the panel could not be run because the window was spent.
+
+    The only hold with no opening event of its own. `Daemon` closes the round `failed`
+    and there is no `turn_paused` behind it, because no worker turn was ever launched —
+    so `_episodes` synthesises the usage-limit span at the failure and ends it at the
+    next submission, which is the OS reopening the round itself. Without it the four
+    hours read as the work order idling.
+    """
+    rec, store, wo = record
+    rec.turn(T0, T0 + 60)
+    rec.event("validation_submitted", T0 + 120, {"round": 1})
+    rec.event("validation_failed", T0 + 180,
+              {"round": 1, "cause": "usage_limit", "reopens_at": T0 + 14_580})
+    rec.event("validation_submitted", T0 + 14_580, {"round": 2})
+    rec.event("validation_passed", T0 + 14_700, {"round": 2})
+
+    spans = holds.held(store, wo, now=T0 + 14_800)
+
+    assert [(h.cause, h.started, h.ended) for h in spans] == [
+        (holds.VALIDATION, T0 + 120, T0 + 180),        # round 1, submitted -> failed
+        (holds.PAUSE_USAGE_LIMIT, T0 + 180, T0 + 14_580),   # the window, synthesised
+        (holds.VALIDATION, T0 + 14_580, T0 + 14_700),  # round 2, submitted -> passed
+    ]
+
+
+def test_a_validation_round_that_merely_failed_synthesises_no_usage_hold(record):
+    """The near neighbour, because the branch turns on one payload key. A round that
+    failed for any other reason — an outage, a validator crash — is the round ending and
+    nothing holding the work order after it. Reading `cause` loosely here would hold
+    every failed round open to `now` and silently retire the order from the attention
+    list, which is the failure mode this pair exists to catch."""
+    rec, store, wo = record
+    rec.turn(T0, T0 + 60)
+    rec.event("validation_submitted", T0 + 120, {"round": 1})
+    rec.event("validation_failed", T0 + 180, {"round": 1, "cause": "outage"})
+
+    spans = holds.held(store, wo, now=T0 + 14_800)
+
+    assert [(h.cause, h.started, h.ended) for h in spans] == [
+        (holds.VALIDATION, T0 + 120, T0 + 180)]
+    assert all(h.cause != holds.PAUSE_USAGE_LIMIT for h in spans)
+
+
+def test_a_held_round_never_resubmitted_is_still_reported_as_open(record):
+    """The live case, stated rather than discovered. A synthesised hold whose closer has
+    not arrived runs to `now`, exactly like every other open hold — which is right while
+    the window is genuinely shut, and is the reason the pair above matters: if the branch
+    ever fired on the wrong `cause`, THIS is the shape it would leave behind."""
+    rec, store, wo = record
+    rec.turn(T0, T0 + 60)
+    rec.event("validation_submitted", T0 + 120, {"round": 1})
+    rec.event("validation_failed", T0 + 180, {"round": 1, "cause": "usage_limit"})
+
+    spans = holds.held(store, wo, now=T0 + 14_800)
+
+    assert spans[-1].cause == holds.PAUSE_USAGE_LIMIT
+    assert spans[-1].open is True
+    assert spans[-1].finish(T0 + 14_800) == T0 + 14_800
