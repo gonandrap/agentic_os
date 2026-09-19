@@ -501,10 +501,19 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
     # `modelUsage` speaks for all of it). A fake whose two agreed is what let the OS
     # record the wrong one for months: every fixture agreed, so no test could tell which
     # was being read. Keep them apart — three API calls' worth against one call's tail.
+    #
+    # AND `modelUsage` ACCUMULATES ACROSS THE TURNS OF A SESSION, because the real CLI
+    # does from 2.1.277 and so does `total_cost_usd` (issue #470). Same rule as the
+    # paragraph above, one field along: a fake that reported each turn separately could
+    # not tell a per-turn reading from a session one, which is how every multi-turn bill
+    # came to count turn 1 once per turn that followed it. `usage` stays per-turn — it
+    # is the delta — so a correct reader still sees 0.01 and 3,000 written tokens on
+    # every turn of a ten-turn order, and a reader that sums the running total sees ten
+    # different answers.
     print(json.dumps({
         "type": "result", "subtype": "success", "is_error": False,
         "session_id": sid, "result": f"final: {prompt[:60]}",
-        "num_turns": seq, "total_cost_usd": 0.01,
+        "num_turns": seq, "total_cost_usd": round(0.01 * seq, 6),
         "duration_api_ms": 1200, "duration_ms": 1500,
         "usage": {
             "input_tokens": 3, "cache_creation_input_tokens": 1000,
@@ -520,8 +529,9 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
                                                "ephemeral_5m_input_tokens": 0}}],
         },
         "modelUsage": {"claude-fake-1": {
-            "inputTokens": 9, "outputTokens": 300, "cacheReadInputTokens": 6000,
-            "cacheCreationInputTokens": 3000, "costUSD": 0.01,
+            "inputTokens": 9 * seq, "outputTokens": 300 * seq,
+            "cacheReadInputTokens": 6000 * seq,
+            "cacheCreationInputTokens": 3000 * seq, "costUSD": round(0.01 * seq, 6),
             "contextWindow": 200000, "maxOutputTokens": 32000}},
     }))
 elif "-p" in argv and "--resume" not in argv:

@@ -381,17 +381,112 @@ class TurnResult:
 #: silently compared against rows counted a different way.
 #:
 #: 1 — token totals taken from the envelope's top-level `usage` object.
-#: 2 — token totals taken from `modelUsage`, which is what the turn actually spent.
-USAGE_SCHEMA_VERSION = 2
+#: 2 — token totals taken from `modelUsage`, read as what the turn alone spent. Wrong
+#:     from CLI 2.1.277 on, where that block is a session running total.
+#: 3 — token totals are the turn's own share of `modelUsage`: its DELTA against the
+#:     previous turn's reading where the envelope continues one, and the whole of it
+#:     where it does not (`_continues_previous`).
+USAGE_SCHEMA_VERSION = 3
+
+#: The four token classes, as this envelope names them and as the two accountings in a
+#: result JSON name them. Written out once because the mapping is the whole of the
+#: difference between `modelUsage` (per model, complete) and `usage` (per turn, lead
+#: agent only).
+_MODEL_TOKEN_KEYS = {
+    "input": "inputTokens",
+    "cache_write": "cacheCreationInputTokens",
+    "cache_read": "cacheReadInputTokens",
+    "output": "outputTokens",
+}
+_USAGE_TOKEN_KEYS = {
+    "input": "input_tokens",
+    "cache_write": "cache_creation_input_tokens",
+    "cache_read": "cache_read_input_tokens",
+    "output": "output_tokens",
+}
+_TOKEN_CLASSES = tuple(_MODEL_TOKEN_KEYS)
 
 
-def derive_turn_usage(data: dict[str, Any]) -> dict[str, Any] | None:
+def _reported_of(envelope: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The CUMULATIVE reading a stored envelope was derived from, or None.
+
+    A version-3 envelope carries it verbatim (`reported`) so the next turn never has to
+    re-read an outfile. A version-2 one holds the raw `modelUsage` figures in its own
+    totals, which is the same thing under another name. A version-1 one holds top-level
+    `usage` instead and is NOT a baseline: it predates the cumulative CLI by a month, so
+    the turn after it is read whole rather than diffed against a number that never
+    accumulated.
+    """
+    if not isinstance(envelope, dict):
+        return None
+    reported = envelope.get("reported")
+    if isinstance(reported, dict):
+        return reported
+    if (envelope.get("usage_v") or 1) < 2:
+        return None
+    return {
+        "session_id": envelope.get("session_id") or "",
+        "total_cost_usd": envelope.get("total_cost_usd"),
+        "by_model": {m.get("model") or "": {c: m.get(c) or 0 for c in _TOKEN_CLASSES}
+                     | {"cost_usd": m.get("cost_usd")}
+                     for m in (envelope.get("by_model") or [])},
+    }
+
+
+def _sum_classes(by_model: dict[str, Any]) -> dict[str, int]:
+    return {c: sum(m.get(c) or 0 for m in by_model.values()) for c in _TOKEN_CLASSES}
+
+
+def _continues_previous(reported: dict[str, Any], previous: dict[str, Any] | None,
+                        own: dict[str, int]) -> bool:
+    """Is this envelope's `modelUsage` a running total that already contains `previous`?
+
+    THE CLASSIFIER, and the reason this module cannot simply subtract. `modelUsage` is
+    per-turn up to CLI 2.1.274 and session-cumulative from 2.1.277 (measured: issue #470
+    and docs/superpowers/findings/2026-09-19-the-turn-that-billed-the-session.md), the
+    envelope carries no version, and subtracting unconditionally deflates every turn
+    written before the change. Three conditions, each of which a continuation must meet:
+
+    * SAME SESSION. A different accumulator cannot contain this one's history. Tested
+      only when BOTH readings name one: a version-2 baseline recorded no session id, and
+      an unknown is not a difference — treating it as one would leave the turn after a
+      pruned result JSON carrying the whole session again.
+    * MONOTONE in every token class. A total that went down is a new process's total —
+      the reset case, where the file's own figure IS the turn.
+    * THE IMPLIED DELTA COVERS THE TURN'S OWN `usage`. That object is the lead agent's
+      spend for this turn alone and never exceeds the turn's true total, so it is a
+      FLOOR: a "delta" smaller than it cannot be this turn's spend, which is what a
+      per-turn envelope looks like when you try to diff it. Where the envelope reports
+      no `usage` at all — an API error that never returned one — there is no floor to
+      test and monotonicity decides alone.
+    """
+    if previous is None:
+        return False
+    here, before_id = reported.get("session_id") or "", previous.get("session_id") or ""
+    if here and before_id and here != before_id:
+        return False
+    before = _sum_classes(previous.get("by_model") or {})
+    now = _sum_classes(reported.get("by_model") or {})
+    if any(now[c] < before[c] for c in _TOKEN_CLASSES):
+        return False
+    floor = sum(own.values())
+    if not floor:
+        return True
+    return sum(now[c] - before[c] for c in _TOKEN_CLASSES) >= floor
+
+
+def derive_turn_usage(data: dict[str, Any],
+                      previous: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """The turn's exact accounting, compacted from one result envelope.
 
     The raw JSON on disk (`<project>/.jarvis/turns/<wo>/<seq>.json`) stays the source
     of truth; this dict is what `wo_turns.usage_json` persists so the record outlives
     the file. Exact by construction — every number is the CLI's own, never a list-price
     estimate:
+
+    `previous` is the PRECEDING TURN's envelope of the same work order, and it is what
+    makes this a per-turn figure rather than a session one — see below. None is correct
+    for a first turn and for any one-shot call, where there is no history to subtract.
 
     * token totals come from `modelUsage`, summed across the models the turn used, and
       `by_model` keeps them split (a turn that fell back to a cheaper model is a fact
@@ -408,13 +503,26 @@ def derive_turn_usage(data: dict[str, Any]) -> dict[str, Any] | None:
       reported at all;
     * `context_window` and per-model `costUSD` come from `modelUsage`.
 
-    WHY `modelUsage` AND NOT `usage`. The top-level `usage` object is NOT the turn's
-    total — measured over the 186 live result files that carry both, it runs at 33-60%
-    of `modelUsage`, which in turn agrees to the TOKEN with the transcript that
-    `usage.read_session` derives independently, and whose `costUSD` sums to
-    `total_cost_usd` to the cent. Two independent sources agreeing settled it (Neo,
-    question 121 on wo-4576667e). Dollars were never wrong — they come from
-    `total_cost_usd` — so what this corrects is every token figure the OS has recorded.
+    WHY `modelUsage` AND NOT `usage`, AND WHY IT MUST BE DIFFED. `modelUsage` is the
+    complete accounting — it contains the turn's subagents and the side-model calls the
+    top-level `usage` object omits — and `usage` is the lead agent's own spend for this
+    turn. From CLI 2.1.277 `modelUsage` and `total_cost_usd` became RUNNING TOTALS for
+    the resumed session, so the complete figure is complete about the wrong span, and
+    summing it over a work order's turns counts turn 1 once per turn that follows it.
+    `_continues_previous` decides which reading an envelope is, per turn, and the totals
+    here are that turn's share; `reported` keeps the raw cumulative reading so the next
+    turn can be diffed against it without re-reading this file.
+
+    THE VERSION-2 NOTE REASONED FROM THE RIGHT EVIDENCE BACKWARDS, and this replaces it.
+    It observed `usage` running at "33-60% of `modelUsage`" and concluded `usage` was
+    undercounting; that ratio is what a per-turn delta looks like against a cumulative
+    total. Its other two proofs are artefacts of the same thing: `modelUsage` agrees
+    with the whole transcript on the LAST turn of a session (a running total's final
+    value is the total), and `costUSD` sums to `total_cost_usd` within one file because
+    both are cumulative. Measured over the 814 result files on the dev machine, before
+    2.1.277 `modelUsage` equals `usage` on 93% of them — the residue is subagents, not a
+    fraction — and blind subtraction across that era loses a median 15% of every bill
+    (docs/superpowers/findings/2026-09-19-the-turn-that-billed-the-session.md).
 
     THE 1h/5m SPLIT IS A SAMPLE, not a partition of `cache_write`: it is reported for
     whatever part of the turn the top-level `usage` speaks for, and `cache_1h + cache_5m`
@@ -446,34 +554,48 @@ def derive_turn_usage(data: dict[str, Any]) -> dict[str, Any] | None:
         + (usage.get("cache_creation_input_tokens") or 0)
     ]
     windows = [mu["contextWindow"] for mu in models.values() if mu.get("contextWindow")]
+    own = {cls: usage.get(key) or 0 for cls, key in _USAGE_TOKEN_KEYS.items()}
+    reported = {
+        "session_id": data.get("session_id") or "",
+        "total_cost_usd": data.get("total_cost_usd"),
+        "by_model": {
+            name: {cls: mu.get(key) or 0 for cls, key in _MODEL_TOKEN_KEYS.items()}
+            | {"cost_usd": mu.get("costUSD")}
+            for name, mu in models.items()
+        },
+    }
+    before = _reported_of(previous)
+    continues = _continues_previous(reported, before, own)
+    prior = (before or {}).get("by_model") or {}
     by_model = [
         {
             "model": name,
-            "input": mu.get("inputTokens") or 0,
-            "cache_write": mu.get("cacheCreationInputTokens") or 0,
-            "cache_read": mu.get("cacheReadInputTokens") or 0,
-            "output": mu.get("outputTokens") or 0,
-            "cost_usd": mu.get("costUSD"),
-            "context_window": mu.get("contextWindow"),
+            # A model absent from the previous reading is new to the session, so its
+            # whole figure is this turn's however the envelope is read; one that went
+            # DOWN cannot be a continuation of the one before it either.
+            **_model_delta(counts, prior.get(name) if continues else None),
+            "context_window": models[name].get("contextWindow"),
         }
-        for name, mu in models.items()
+        for name, counts in reported["by_model"].items()
     ]
     if by_model:
-        totals = {c: sum(m[c] for m in by_model)
-                  for c in ("input", "cache_write", "cache_read", "output")}
+        totals = {c: sum(m[c] for m in by_model) for c in _TOKEN_CLASSES}
         version = USAGE_SCHEMA_VERSION
     else:
-        totals = {
-            "input": usage.get("input_tokens") or 0,
-            "cache_write": usage.get("cache_creation_input_tokens") or 0,
-            "cache_read": usage.get("cache_read_input_tokens") or 0,
-            "output": usage.get("output_tokens") or 0,
-        }
+        totals = dict(own)
         version = 1
+    cost = reported["total_cost_usd"]
+    if continues and cost is not None:
+        cost = max(0.0, cost - ((before or {}).get("total_cost_usd") or 0.0))
     return {
         "usage_v": version,
-        "total_cost_usd": data.get("total_cost_usd"),
+        "total_cost_usd": cost,
         **totals,
+        # WHAT THE ENVELOPE SAID, before the delta — the baseline the NEXT turn is
+        # diffed against, and the only thing that makes this derivation re-runnable
+        # once the result JSON is pruned.
+        "reported": reported,
+        "continues": continues,
         "cache_1h": cache_creation.get("ephemeral_1h_input_tokens") or 0,
         "cache_5m": cache_creation.get("ephemeral_5m_input_tokens") or 0,
         # NOT the number of API calls, and it never was — see the note above. A count
@@ -486,10 +608,25 @@ def derive_turn_usage(data: dict[str, Any]) -> dict[str, Any] | None:
         "context_peak": max(contexts),
         "context_window": max(windows) if windows else None,
         "duration_api_ms": data.get("duration_api_ms"),
-        "cost_by_model": {name: mu["costUSD"] for name, mu in models.items()
-                          if mu.get("costUSD") is not None},
+        "cost_by_model": {m["model"]: m["cost_usd"] for m in by_model
+                          if m.get("cost_usd") is not None},
         "by_model": by_model,
     }
+
+
+def _model_delta(counts: dict[str, Any],
+                 before: dict[str, Any] | None) -> dict[str, Any]:
+    """One model's share of a turn: its reading less the previous turn's, or the whole
+    of it where there is no continuation to subtract."""
+    if before is None or any((counts.get(c) or 0) < (before.get(c) or 0)
+                             for c in _TOKEN_CLASSES):
+        return {c: counts.get(c) or 0 for c in _TOKEN_CLASSES} | {
+            "cost_usd": counts.get("cost_usd")}
+    cost = counts.get("cost_usd")
+    if cost is not None:
+        cost = max(0.0, cost - (before.get("cost_usd") or 0.0))
+    return {c: (counts.get(c) or 0) - (before.get(c) or 0)
+            for c in _TOKEN_CLASSES} | {"cost_usd": cost}
 
 
 #: The prompt that compacts a resumed session, and the whole of the transport for it.
@@ -651,11 +788,17 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
     return SpawnedTurn(pid=proc.pid)
 
 
-def read_turn_result(outfile: Path, errfile: Path | None = None) -> TurnResult | None:
+def read_turn_result(outfile: Path, errfile: Path | None = None,
+                     previous: dict[str, Any] | None = None) -> TurnResult | None:
     """Parse a finished turn's output. None means "nothing usable there (yet)".
 
     The caller decides what None means: still running (the process is alive) or a
     turn that died without saying anything (it is not).
+
+    `previous` is the preceding turn's usage envelope, and every caller that has one
+    must pass it: without it a turn under CLI 2.1.277+ reports the whole session's
+    spend as its own (`derive_turn_usage`), and `cost_usd` — which is what a budget is
+    enforced against — reports the session's bill as this turn's.
     """
     try:
         raw = outfile.read_text()
@@ -683,20 +826,26 @@ def read_turn_result(outfile: Path, errfile: Path | None = None) -> TurnResult |
     # Below `result` in the fallback chain because when both exist `result` is the
     # worker's own voice, which is the more useful of the two.
     errors = " · ".join(str(e) for e in (data.get("errors") or []) if e)
+    turn_usage = derive_turn_usage(data, previous)
     return TurnResult(
         ok=ok,
         result=data.get("result") or "",
         session_id=data.get("session_id") or "",
         error="" if ok else (data.get("result") or errors or stderr_tail
                              or "turn reported is_error"),
-        cost_usd=data.get("total_cost_usd"),
+        # THIS TURN's dollars, not the session's: the same delta the usage envelope
+        # carries, so `wo_turns.cost_usd` — the column `budget.spent` sums — means the
+        # same thing on every row of a work order. Only a result with no usage at all
+        # falls back to the envelope's own figure.
+        cost_usd=turn_usage["total_cost_usd"] if turn_usage
+        else data.get("total_cost_usd"),
         num_turns=data.get("num_turns"),
         subtype=data.get("subtype") or "",
         terminal_reason=data.get("terminal_reason") or "",
         api_error_status=_int_or_none(data.get("api_error_status")),
         # Derived on the failed path too: the usage rides on a failed result JSON just
         # the same (a 429'd turn has already paid for everything up to the refusal).
-        usage=derive_turn_usage(data),
+        usage=turn_usage,
     )
 
 

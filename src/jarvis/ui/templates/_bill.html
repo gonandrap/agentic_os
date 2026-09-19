@@ -61,7 +61,10 @@
   {{ line.models|join(' · ') }}
   {%- if 1 in line.usage_versions %} · <span class="tone-warn">counted the old way</span>
     — this line's result JSON is gone, so its tokens are the pre-fix reading and are
-    understated{% endif %}</p>
+    understated{% endif %}
+  {%- if 2 in line.usage_versions %} · <span class="tone-warn">counted the old way</span>
+    — this line's result JSON is gone, so each of its turns still carries the whole
+    session's running total and is OVERstated{% endif %}</p>
 {% endif %}
 {% endmacro %}
 

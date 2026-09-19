@@ -213,7 +213,29 @@ def test_the_recorded_turn_is_the_model_usage_total(fleet, settle_turns):
     assert (tokens["input"], tokens["cache_write"], tokens["cache_read"],
             tokens["output"]) == (9, 3_000, 6_000, 300)
     worker = next(line for line in b["actors"] if line["key"] == "worker")
-    assert worker["usage_versions"] == [2]
+    assert worker["usage_versions"] == [3]
+
+
+@scenario("bill accounting", "a turn's tokens are its own, not the session's so far")
+def test_a_conversation_is_billed_once_per_turn(fleet, settle_turns):
+    """The same correction one turn along, which is where it was wrong for months.
+
+    The fake CLI reports `modelUsage` and `total_cost_usd` as running totals for the
+    resumed session, because the real one has since 2.1.277. A three-turn order
+    therefore has to come to three times a one-turn order — summing what each envelope
+    reports comes to SIX times it, and that is the 3-6x every multi-turn bill carried
+    (issue #470). Asserted against the single-turn figures above rather than against
+    the stores, which hold whatever the capture put there.
+    """
+    wo = dispatched(fleet, settle_turns, "three turns of one conversation", turns=3)
+
+    b = ops.bill(wo["id"])
+    tokens = b["total"]["tokens"]
+
+    assert (tokens["input"], tokens["cache_write"], tokens["cache_read"],
+            tokens["output"]) == (27, 9_000, 18_000, 900)
+    assert b["total"]["cost"]["exact_usd"] == pytest.approx(0.03)
+    assert [row["cache_read"] for row in b["turn_rows"]] == [6_000, 6_000, 6_000]
 
 
 @scenario("bill accounting", "every charge lands on exactly one turn")

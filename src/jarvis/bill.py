@@ -27,8 +27,10 @@ first. `reconcile` proves it on every payload anyway, and the result rides along
 ## Where each leaf comes from
 
 * THE WORKER's turns: `wo_turns.usage_json`, the `claude` CLI's own per-turn accounting
-  (`claude_cli.derive_turn_usage`). Exact, and — since the version-2 reading — equal to
-  the token for what the session transcript says the whole conversation cost.
+  (`claude_cli.derive_turn_usage`). Exact, and — since the version-3 reading, which
+  takes each turn's share of a running total the CLI reports per session — summing to
+  what the session transcript independently says the conversation cost. `reconcile`
+  compares the two rather than trusting either (`_check_calls`).
 * THE WORKER's unrecorded turns: the transcript total MINUS the recorded turns, when a
   work order has both and they disagree. That difference is precisely the turns whose
   result JSON is gone, and leaving it out is how a bill quietly loses a third of itself.
@@ -84,7 +86,11 @@ TURN_CALL_LIMIT = 200
 #:     (`usage.Usage.rewrite_compact_write`). Absent on a version-3 seal means ZERO
 #:     rather than unknown — those orders predate compaction — so an old bill stays
 #:     readable and `prefix_boundaries` keeps its meaning across the change.
-PAYLOAD_VERSION = 4
+#: 5 — turns counted as their own spend rather than as the resumed session's running
+#:     total (`claude_cli.USAGE_SCHEMA_VERSION` 3). The ONLY version bump so far whose
+#:     re-derivation makes a bill SMALLER, which is why `_upgrade_seal` had to learn
+#:     that a correction is not a loss.
+PAYLOAD_VERSION = 5
 
 #: The actor a line belongs to. Three, because they are three different KINDS of spend
 #: and the user's first question about the old line was why the OS's half looked like
@@ -404,7 +410,15 @@ def _turn_items(turn_rows: Sequence[dict[str, Any]],
         for m in models:
             for cls in usage_mod.TOKEN_CLASSES:
                 recorded[cls] += m.get(cls) or 0
-        turn_items, missed = _agent_items(row, models, subs_by_turn.get(row["seq"], []))
+        subs = subs_by_turn.get(row["seq"], [])
+        # What the turn's subagents came to, beside what its own API calls came to.
+        # Together they are what the turn's total has to be made of, and `_check_calls`
+        # tests exactly that — a turn bigger than everything found inside it is the
+        # signature of a figure that belongs to something larger than the turn.
+        row["subagent_cover"] = {
+            cls: sum(getattr(s.usage, cls) for s in subs)
+            for cls in usage_mod.TOKEN_CLASSES}
+        turn_items, missed = _agent_items(row, models, subs)
         stranded += missed
         items.extend(turn_items)
     if stranded:
@@ -830,6 +844,16 @@ def _upgrade_seal(project: str, path: Path, order: dict[str, Any],
     seal stands untouched for good. A bill must never shrink because someone looked at
     it again (kn-3629fa87), and this cannot make it.
 
+    THE ONE SHRINK THAT IS ALLOWED is a CORRECTION: a seal whose turns were counted
+    under a superseded reading of the result envelope, re-derived from the same result
+    JSONs under the current one. That is the case a seal cannot survive on its own — an
+    order settled under `USAGE_SCHEMA_VERSION` 2 holds the whole resumed session's spend
+    once per turn, three to six times its real bill — and "never shrink" would freeze
+    exactly the wrong number for ever. It is admitted only when the fresh reading is
+    ENTIRELY current (no version-2 turn left in it, which is what a pruned result JSON
+    leaves behind) so a shrink can never come from evidence that merely aged, and it is
+    ANNOUNCED: `accuracy.corrected_from` carries what the seal used to say.
+
     `bill_sealed_at` is preserved: WHEN this order settled is not changed by re-deriving
     its payload, and `accuracy.resealed_at` records that the re-derivation happened, so
     the page is not quietly claiming today's reading was taken back then.
@@ -845,10 +869,14 @@ def _upgrade_seal(project: str, path: Path, order: dict[str, Any],
         fresh = (for_feature_order(project, path, order) if feature
                  else for_work_order(project, path, order))
         stale, now = sealed["total"]["tokens"], fresh["total"]["tokens"]
-        if any(now.get(cls, 0) < stale.get(cls, 0)
-               for cls in (*usage_mod.TOKEN_CLASSES, "total")):
+        shrank = any(now.get(cls, 0) < stale.get(cls, 0)
+                     for cls in (*usage_mod.TOKEN_CLASSES, "total"))
+        corrects = _corrects_a_reading(sealed, fresh)
+        if shrank and not corrects:
             return None
         at = order.get("bill_sealed_at")
+        if shrank:
+            fresh["accuracy"] = {**fresh["accuracy"], "corrected_from": stale}
         # Stamped BEFORE it is written, so the record on disk says it was re-derived
         # too. Setting it only on the returned copy would make the fact visible exactly
         # once — to this reader — and invisible to the next one.
@@ -862,6 +890,23 @@ def _upgrade_seal(project: str, path: Path, order: dict[str, Any],
     except Exception:  # noqa: BLE001 — an upgrade that fails must not cost the reader
         return None                                        # the bill they already have
     return fresh
+
+
+def _corrects_a_reading(sealed: dict[str, Any], fresh: dict[str, Any]) -> bool:
+    """Is the fresh bill smaller because the OLD one counted wrong, or because the
+    evidence has aged? Only the first may replace a seal.
+
+    The seal must hold turns read under a superseded `USAGE_SCHEMA_VERSION`, and the
+    fresh reading must hold none — one version-2 turn left in it is a result JSON that
+    has been pruned, and its spend would be the transcript estimate, which is exactly
+    the ageing this guard exists to refuse.
+    """
+    from . import claude_cli
+
+    was = set(sealed["total"].get("usage_versions") or [])
+    now = set(fresh["total"].get("usage_versions") or [])
+    superseded = {v for v in (*was, *now) if v < claude_cli.USAGE_SCHEMA_VERSION}
+    return bool(was & superseded) and not (now & superseded)
 
 
 def unseal(order: dict[str, Any]) -> dict[str, Any] | None:
@@ -913,10 +958,20 @@ def _accuracy(payload: dict[str, Any], turn_rows: Sequence[dict[str, Any]],
     if turn_rows and not session.found:
         gaps.append("Claude Code's transcript for the worker's session is gone, so any "
                     "turn without a result JSON of its own could not be counted at all.")
-    if 1 in (payload["total"].get("usage_versions") or []):
+    versions = payload["total"].get("usage_versions") or []
+    if 1 in versions:
         gaps.append("Some turns were counted before the modelUsage fix and their result "
                     "JSON is gone too, so their tokens are the old, low reading — a "
                     "floor, not a total.")
+    if 2 in versions:
+        # The opposite disclaimer to the one above, and it has to be said as plainly:
+        # these turns hold the whole resumed session's running total each, so the
+        # figure is a CEILING and the order really cost less. Only a turn whose result
+        # JSON has been pruned can still be in this state — anything still on disk is
+        # re-derived on sight (`ops._turn_usage`).
+        gaps.append("Some turns were counted before the per-turn fix and their result "
+                    "JSON is gone, so each one still carries the whole session's "
+                    "running total — a ceiling, not a total.")
     if any("no result JSON left" in (line.get("label") or "")
            for line in payload.get("turns") or []):
         gaps.append("Some turns no longer have the result JSON the CLI wrote; their "
@@ -1172,18 +1227,39 @@ def reconcile(payload: dict[str, Any], tolerance: float = 1e-6) -> dict[str, Any
     return {"balanced": not problems, "problems": problems}
 
 
-def _check_calls(payload: dict[str, Any]) -> list[str]:
-    """Per-call rows are a PARTITION of their turn, so they may not exceed it.
+#: How far a turn's own figure may stand above everything found INSIDE it — its API
+#: calls plus its subagents — before that is a defect rather than measurement noise.
+#: The gap is real and small: `modelUsage` also counts side-model calls that write no
+#: assistant message and so appear in no transcript, which over the 127 multi-turn
+#: orders on the dev machine runs to 1% of a bill and never more than 2%. A turn
+#: carrying the session's running total instead of its own starts at 200%, so the line
+#: sits an order of magnitude clear of both (issue #470).
+CALL_COVER_SLACK = 1.10
 
-    Checked in one direction only, and deliberately. A shortfall is ordinary and has a
-    meaning — these are the lead agent's calls, and a turn that spawned subagents spent
-    more than its lead agent did — while an excess is the thing kn-7a2180ba forbids: a
-    bill that grows when you look closer. On wo-e23252e4 the two sides are equal to the
-    token in all four classes on all three turns, which is what makes the per-call view
-    worth showing at all.
+
+def _check_calls(payload: dict[str, Any]) -> list[str]:
+    """Per-call rows are a PARTITION of their turn: they may not exceed it, and — with
+    the turn's subagents beside them — they may not fall hopelessly short of it either.
+
+    THE EXCESS direction is the thing kn-7a2180ba forbids: a bill that grows when you
+    look closer. On wo-e23252e4 the two sides are equal to the token in all four classes
+    on all three turns, which is what makes the per-call view worth showing at all.
+
+    THE SHORTFALL direction was left unchecked, and that is how a bill got to say 184.6M
+    in its headline over a per-call table summing to 49.0M without anything failing
+    (wo-966987af). A shortfall is ordinary — the lead agent's calls are less than a turn
+    that spawned subagents — so what is checked is the turn against its calls PLUS its
+    subagents, both drawn from transcripts.
+
+    IT IS ASKED ONLY OF A CONVERSATION THE TRANSCRIPT ACCOUNTS FOR ENTIRELY: every
+    recorded turn with calls of its own found inside it. A transcript Claude Code has
+    part-pruned makes a turn look bigger than its evidence for a reason that is not a
+    bug, and one that cannot place a single call in a turn window says nothing about
+    that turn at all.
     """
     problems: list[str] = []
-    for row in payload.get("turn_rows") or []:
+    rows = payload.get("turn_rows") or []
+    for row in rows:
         cover = row.get("calls_cover")
         if not cover:
             continue
@@ -1192,6 +1268,20 @@ def _check_calls(payload: dict[str, Any]) -> list[str]:
                 problems.append(
                     f"turn {row['seq']}: its API calls total {cover[cls]} {cls}, more "
                     f"than the turn's own {row.get(cls) or 0}")
+    recorded = [row for row in rows if row.get("recorded")]
+    if not recorded or not all(row.get("calls_cover") for row in recorded):
+        return problems
+    for row in recorded:
+        subs = row.get("subagent_cover") or {}
+        inside = (row["calls_cover"]["total"]
+                  + sum(subs.get(cls, 0) for cls in usage_mod.TOKEN_CLASSES))
+        mine = sum(row.get(cls) or 0 for cls in usage_mod.TOKEN_CLASSES)
+        if inside and mine > inside * CALL_COVER_SLACK:
+            problems.append(
+                f"turn {row['seq']}: it claims {mine} tokens but everything inside it — "
+                f"{row['calls_cover']['total']} across its API calls and "
+                f"{inside - row['calls_cover']['total']} across its subagents — comes "
+                f"to {inside}")
     return problems
 
 

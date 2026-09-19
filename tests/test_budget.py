@@ -220,6 +220,36 @@ def test_the_ceiling_counts_both_halves_of_the_bill(started, store):
     assert cap.remaining_usd == 6.0
 
 
+def test_a_ceiling_re_reads_turns_counted_as_the_whole_session(started, store,
+                                                               tmp_path):
+    """A live order's remaining budget cannot be computed from the old reading.
+
+    `wo_turns.cost_usd` held each turn's `total_cost_usd`, and from CLI 2.1.277 that is
+    the resumed session's running bill — so a three-turn order looked to have spent
+    $2.49 + $16.90 + $27.10 when it had spent $27.10, and stopped at a third of the
+    ceiling its user set (issue #470). The rows are re-derived from the result JSONs
+    before they are summed, which is the only way an order already stopped on a phantom
+    overrun starts running again.
+    """
+    from tests.test_turn_usage import running, spend, turn_file
+
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=10.0)
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    for i, (own, cum, cost) in enumerate(zip(turns, running(turns), [2.0, 6.5]),
+                                         start=1):
+        out = turn_file(tmp_path, i, own=own, cumulative=cum, cost=cost)
+        turn = store.create_turn(wo["id"], kind="message", prompt="work")
+        store.conn.execute("UPDATE wo_turns SET outfile=? WHERE id=?",
+                           (str(out), turn["id"]))
+        # Recorded the way the release before this one did: the session's running bill.
+        store.finish_turn(turn["id"], "done", result="done", cost_usd=cost,
+                          usage_json=json.dumps({"usage_v": 2, "total_cost_usd": cost}))
+
+    assert budget.spent(store, None, wo["id"]).worker_usd == pytest.approx(6.5)
+    cap = budget.ceiling(store, None, store.get_work_order(wo["id"]))
+    assert cap is not None and cap.remaining_usd == pytest.approx(3.5)
+
+
 def test_no_budget_means_no_ceiling(started, store):
     wo = ops.create_work_order("proj_a", "uncapped", description="do it")
     assert store.get_work_order(wo["id"])["budget_usd"] is None

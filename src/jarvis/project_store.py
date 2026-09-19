@@ -2895,16 +2895,42 @@ class ProjectStore:
         )
         return self.get_turn(turn_id)  # type: ignore[return-value]
 
-    def set_turn_usage(self, turn_id: int, usage_json: str) -> None:
-        """Backfill a settled turn's recorded usage (parsed late from its outfile)."""
-        self.conn.execute("UPDATE wo_turns SET usage_json=? WHERE id=?",
-                          (usage_json, turn_id))
+    def set_turn_usage(self, turn_id: int, usage_json: str,
+                       cost_usd: float | None = None) -> None:
+        """Backfill a settled turn's recorded usage (parsed late from its outfile).
+
+        `cost_usd` travels with it because the two are one reading: a re-derived
+        envelope that left the column holding the old figure would keep `budget.spent`
+        summing numbers the bill no longer agrees with.
+        """
+        if cost_usd is None:
+            self.conn.execute("UPDATE wo_turns SET usage_json=? WHERE id=?",
+                              (usage_json, turn_id))
+            return
+        self.conn.execute("UPDATE wo_turns SET usage_json=?, cost_usd=? WHERE id=?",
+                          (usage_json, cost_usd, turn_id))
 
     def latest_turn(self, wo_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq DESC LIMIT 1", (wo_id,)
         ).fetchone()
         return dict(row) if row else None
+
+    def turn_usage_before(self, wo_id: str, seq: int) -> dict[str, Any] | None:
+        """The usage envelope of the last turn recorded before `seq`, or None.
+
+        The baseline a turn's own spend is measured against: from CLI 2.1.277 a result
+        envelope reports the whole resumed session's usage, so the turn before it is
+        what makes the newest one a per-turn figure (`claude_cli.derive_turn_usage`).
+        Any KIND of turn counts — a `/compact` spends inside the same session and the
+        running total contains it.
+        """
+        row = self.conn.execute(
+            "SELECT usage_json FROM wo_turns WHERE wo_id=? AND seq<? AND "
+            "usage_json IS NOT NULL ORDER BY seq DESC LIMIT 1", (wo_id, seq)
+        ).fetchone()
+        envelope = db.from_json(row["usage_json"], None) if row else None
+        return envelope if isinstance(envelope, dict) else None
 
     def running_turns(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(

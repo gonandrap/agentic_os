@@ -53,6 +53,7 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .claude_cli import USAGE_SCHEMA_VERSION
 from .project_store import (
     FO_TERMINAL_STATUSES,
     TERMINAL_STATUSES,
@@ -110,14 +111,38 @@ class Spend:
 
 def spent(store: ProjectStore, central: CentralStore | None, wo_id: str) -> Spend:
     """One work order's whole bill to date. Two queries, no transcript walk."""
-    row = store.conn.execute(
-        "SELECT COALESCE(SUM(cost_usd), 0) AS c FROM wo_turns WHERE wo_id=?", (wo_id,)
-    ).fetchone()
+    row = _worker_row(store, wo_id)
+    if row["stale"]:
+        # A turn counted under an older reading of the result envelope is re-derived
+        # before it is summed, ONCE, and written back (`ops._turn_usage`) — the same
+        # lazy repair `jarvis cost` runs, done here because this is the number that
+        # STOPS work: version-2 rows hold the resumed session's running total, so an
+        # order would exhaust a budget it had spent a third of. Costs one JSON read per
+        # stale turn and nothing at all afterwards.
+        from . import ops
+
+        ops._turn_rows(store, wo_id)
+        row = _worker_row(store, wo_id)
     worker = float(row["c"] or 0.0)
     jarvis = 0.0
     if central is not None:
         jarvis = central.wo_call_cost(wo_id)
     return Spend(worker_usd=worker, jarvis_usd=jarvis)
+
+
+def _worker_row(store: ProjectStore, wo_id: str) -> Any:
+    """The worker half of one order's spend, and how many of its turns were counted
+    under a superseded reading of the result envelope — in one query, because the
+    common case is zero and must stay a single indexed scan."""
+    return store.conn.execute(
+        "SELECT COALESCE(SUM(cost_usd), 0) AS c, "
+        "       COALESCE(SUM(CASE WHEN COALESCE("
+        "           json_extract(usage_json, '$.usage_v'), 1) < ? "
+        "           AND outfile IS NOT NULL AND outfile <> '' "
+        "           AND state IN ('done', 'failed') THEN 1 ELSE 0 END), 0) AS stale "
+        "FROM wo_turns WHERE wo_id=?",
+        (USAGE_SCHEMA_VERSION, wo_id),
+    ).fetchone()
 
 
 def feature_spent(store: ProjectStore, central: CentralStore | None,
