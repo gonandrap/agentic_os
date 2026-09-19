@@ -522,6 +522,15 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "pr_conflict_unresolved":
         return ("Merge conflict the worker could not resolve — over to you",
                 f"{p.get('attempts')} attempts")
+    # Issue #469: the two lines that say an attempt was NOT spent, and why. Neither
+    # asks anything of the user — the gate is the item that does.
+    if kind == "pr_conflict_deferred":
+        return ("Merge conflict — waiting for gate "
+                f"{p.get('approval_id')} before asking the worker",
+                f"`{p.get('kind')}` is under review")
+    if kind == "pr_conflict_rearmed":
+        return ("Merge conflict — attempts given back, the gate had refused them",
+                f"{p.get('attempts')} attempts restored")
     # The same three for the other repair (issue #224). Separate lines rather than one
     # parameterised pair: the words a user reads about a red build are not the words
     # they read about a conflict, and this function is a vocabulary, not a mechanism.
@@ -536,6 +545,13 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "pr_checks_unresolved":
         return ("Failing checks the worker could not fix — over to you",
                 f"{p.get('attempts')} attempts")
+    if kind == "pr_checks_deferred":
+        return ("Failing checks — waiting for gate "
+                f"{p.get('approval_id')} before asking the worker",
+                f"`{p.get('kind')}` is under review")
+    if kind == "pr_checks_rearmed":
+        return ("Failing checks — attempts given back, the gate had refused them",
+                f"{p.get('attempts')} attempts restored")
     # THE ONLY `automerge_*` KINDS WITH LABELS HERE, and deliberately: every other one is
     # rendered by `ops.automerge_state` as the mechanism's one-line state on the work
     # order. These two are excluded from `ops.AUTOMERGE_EVENTS` — the state after either
