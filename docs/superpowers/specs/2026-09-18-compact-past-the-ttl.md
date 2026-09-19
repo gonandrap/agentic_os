@@ -97,11 +97,17 @@ summarised and warm.
   holding in its head;
 * the last turn was ITSELF a compaction — nothing was added, and if that one failed,
   repeating it is the loop rather than the fix;
-* **a relaunched turn** (`Daemon.retry_paused_turns` never asks). Two reasons, either
+* **the last turn is PAUSED**, tested in `compaction_due` itself. Two reasons, either
   sufficient: `worker_session._nudge` tells the worker "the conversation above is
   intact and is where you left off", which a compaction makes false; and the pause is
   re-derived from the LATEST turn every time it is read, so a compact turn behind a
-  paused one would erase the pause and strand the relaunch;
+  paused one would erase the pause and strand the relaunch — a permanent stall, not a
+  cost. `Daemon.retry_paused_turns` never asks the question, and `delivery_hold`
+  holds a queued message behind a RESUMABLE pause, so two of the three callers never
+  get here — but a NON-resumable pause is deliberately not a hold (the message is the
+  only thing left that can restart the conversation), so the delivery path does reach
+  the decision with a pause outstanding. The exclusion is therefore mechanical rather
+  than caller-dependent;
 * `os.compact_min_context: null` — the only off switch. There is no per-order opt-in
   and no enable flag, per the pinned self-healing learning.
 

@@ -425,14 +425,15 @@ def compaction_due(store: ProjectStore, wo: dict[str, Any],
     * The conversation is under the floor. Below it the summary's own output tokens
       cost more than the re-write they replace — measured, see
       `catalog.DEFAULT_COMPACT_MIN_CONTEXT`.
-
-    NOT DECIDED HERE, and deliberately: a turn the OS is RELAUNCHING is never compacted
-    before (`Daemon.retry_paused_turns` never calls this). Two reasons, either enough.
-    A relaunch that continues an interrupted turn tells the worker "the conversation
-    above is intact and is where you left off" (`_nudge`), which a compaction would
-    make false. And the pause itself is re-derived from the LATEST turn every time it
-    is read (`turn_pause`), so inserting a compact turn behind a paused one would erase
-    the pause and strand the relaunch it was waiting for.
+    * The last turn is PAUSED. Two reasons, either enough. The relaunch tells the
+      worker "the conversation above is intact and is where you left off" (`_nudge`),
+      which a compaction would make false. And the pause is re-derived from the LATEST
+      turn every time it is read (`turn_pause`), so a compact turn behind a paused one
+      ERASES the pause — the relaunch it was waiting for never comes and the order
+      stalls for good. `Daemon.retry_paused_turns` never asks this question at all, and
+      `delivery_hold` holds the delivery for a RESUMABLE pause — but a non-resumable
+      one is not a hold by design, so the delivery path does reach here with a pause
+      outstanding, and this is the test that stops it.
     """
     if min_context is None:
         return None
@@ -447,6 +448,11 @@ def compaction_due(store: ProjectStore, wo: dict[str, Any],
         return None
     context = turn_context(turn)
     if context < min_context:
+        return None
+    # Last, because it is the only one that costs a second query — and `turn_pause`
+    # answers None for every turn that did not fail, so the streak count behind it is
+    # only ever reached by a turn that is genuinely paused.
+    if turn["state"] == "failed" and turn_pause(store, wo["id"]) is not None:
         return None
     return Compaction(age=age, context=context)
 

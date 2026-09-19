@@ -82,6 +82,13 @@ def _age_last_turn(store: ProjectStore, wo_id: str, seconds: float) -> None:
                        (turn["ended_at"] - seconds, turn["id"]))
 
 
+def _big_context(store: ProjectStore, wo_id: str, tokens: int = BIG * 10) -> None:
+    """Put a context on the last turn, the only input the floor test has."""
+    turn = store.latest_turn(wo_id)
+    store.conn.execute("UPDATE wo_turns SET usage_json=? WHERE id=?",
+                       (json.dumps({"context_peak": tokens}), turn["id"]))
+
+
 def _deliver(fleet, wo_id: str) -> None:
     fleet["daemon"].deliver_messages(fleet["project"], fleet["store"])
 
@@ -219,6 +226,69 @@ def test_a_relaunched_turn_is_never_compacted_before(fleet, fake_claude, settle_
     # …and the pause survived to be retried at all, which is the half a compaction
     # would have broken.
     assert _turns(store, wo["id"])[-1][0] == "message"
+
+
+def test_a_message_queued_behind_a_paused_turn_never_compacts(fleet, fake_claude,
+                                                              settle_turns):
+    """The delivery path, not the retry path — and this is the stall that is permanent.
+
+    `turn_pause` is re-derived from the LATEST turn, so a compact turn inserted behind
+    a paused one erases the pause: nothing relaunches the lost turn and the message
+    waits for ever. Asserted through `Daemon.deliver_messages` because that is the
+    caller that can get here, and then asked of the decision directly, because
+    `delivery_hold` doing the right thing is not the same as the decision being safe.
+    """
+    store = fleet["store"]
+    wo = _running_wo(fleet, settle_turns)
+    fake_claude.turns_rate_limited()
+    worker_session.send(store, fleet["project"], store.get_work_order(wo["id"]), "more")
+    assert settle_turns(store)
+    fake_claude.turns_recover()
+    ops.send_message(wo["id"], "and this as well")
+    _age_last_turn(store, wo["id"], usage.WRITE_TTL_SECONDS + 60)
+    _big_context(store, wo["id"])
+    before = worker_session.turn_pause(store, wo["id"])
+    assert before is not None
+
+    _deliver(fleet, wo["id"])
+
+    assert COMPACT_TURN not in [k for k, _ in _turns(store, wo["id"])]
+    after = worker_session.turn_pause(store, wo["id"])
+    assert after is not None and after.turn["id"] == before.turn["id"]
+    assert [m["content"] for m in store.queued_messages(wo["id"])] == [
+        "and this as well"]
+    assert worker_session.compaction_due(store, store.get_work_order(wo["id"]),
+                                         BIG) is None
+
+
+def test_a_pause_nothing_will_relaunch_reaches_the_decision_and_is_refused(
+        fleet, settle_turns):
+    """The case where nothing upstream rules it out. `delivery_hold` deliberately does
+    NOT hold behind a non-resumable pause — the message is the only thing left that can
+    start the conversation again — so the delivery pass arrives here with a pause on
+    record, past the TTL, over the floor, and only `compaction_due` can refuse it."""
+    store = fleet["store"]
+    wo = _running_wo(fleet, settle_turns)
+    for _ in range(len(worker_session.TRANSIENT_BACKOFF) + 1):
+        turn = store.create_turn(wo["id"], kind="message", prompt="x")
+        store.finish_turn(turn["id"], "failed",
+                          error="API Error: 500 Internal server error.")
+    pause = worker_session.turn_pause(store, wo["id"])
+    assert pause is not None and pause.exhausted and not pause.resumable
+    _age_last_turn(store, wo["id"], usage.WRITE_TTL_SECONDS + 60)
+    _big_context(store, wo["id"])
+    fresh = store.get_work_order(wo["id"])
+    assert worker_session.delivery_hold(store, fresh) is None, "the premise"
+    assert worker_session.compaction_due(store, fresh, BIG) is None
+    ops.send_message(wo["id"], "go on")
+
+    _deliver(fleet, wo["id"])
+
+    # The message goes, as it did before this change; what must not be in front of it
+    # is a compaction.
+    assert _turns(store, wo["id"])[-1] == ("message", "go on")
+    assert COMPACT_TURN not in [k for k, _ in _turns(store, wo["id"])]
+    assert settle_turns(store)
 
 
 def test_a_compaction_the_transport_lost_is_re_sent_verbatim(fleet, fake_claude,
