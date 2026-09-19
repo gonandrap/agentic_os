@@ -106,8 +106,11 @@ def test_the_artifact_carries_the_body_the_diff_and_the_checks(artifact):
     assert art.diff == "diff --git a/a.py b/a.py\n@@\n+one\n"
     assert art.files == ("a.py",)
     assert art.additions == 3 and art.deletions == 1
+    # `started_at` and `workflow` ride along for `ci.inherited` and cost nothing: `gh`
+    # answers `statusCheckRollup` whole, so neither field set grew. The panel ignores
+    # them — `validation.py` renders a check by the three keys above.
     assert art.checks == ({"name": "tests", "status": "COMPLETED",
-                           "conclusion": "SUCCESS"},)
+                           "conclusion": "SUCCESS", "started_at": "", "workflow": ""},)
 
 
 def test_the_diff_comes_from_pr_diff_and_not_from_the_json(artifact):
@@ -125,8 +128,10 @@ def test_a_legacy_commit_status_is_read_as_a_check(fake_gh):
     empty conclusion, which a seat has to treat as "not known to pass"."""
     fake_gh.set_pr_artifact(PR, checks=[{"context": "ci/legacy", "state": "SUCCESS"}])
     art = github.pr_artifact(PR)
+    # Neither new field exists on a commit status, and both read as "" — which is what
+    # makes `ci.inherited` refuse to judge one rather than guess about it.
     assert art.checks == ({"name": "ci/legacy", "status": "SUCCESS",
-                           "conclusion": "SUCCESS"},)
+                           "conclusion": "SUCCESS", "started_at": "", "workflow": ""},)
 
 
 def test_no_checks_is_an_empty_tuple_and_not_an_error(fake_gh):

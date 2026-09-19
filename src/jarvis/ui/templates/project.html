@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_issues.html" as issues_ui %}
 {% block title %}{{ project_name }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -134,6 +135,11 @@
     .catch(function () { /* no panel is better than a broken page */ });
 })();
 </script>
+
+{# Where the user picks the next thing to work on, so the count that says how many
+   separate pieces of work have run into an issue belongs here and not on a page of its
+   own (Neo, question 410). #}
+{{ issues_ui.board(issue_board, project_name) }}
 
 {% if backlog %}
 <h2>Open backlog for this project</h2>

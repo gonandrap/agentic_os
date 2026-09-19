@@ -206,6 +206,10 @@ class Authored:
         `ops.park_unlanded` and `ops.finish --abandon` record the SAME fact about the
         same branch and are read back side by side on the timeline; issue #232's Mode B
         is what happens when the evidence a settling had is not written down anywhere.
+
+        `ops.finish` now writes it on EVERY settling, not only the two that refuse —
+        this is the only durable answer to "did that order write code", and the worktree
+        it is read from is deleted long before anyone audits (`authored_in`).
         """
         return {"branch": self.branch, "base": self.base, "commits": self.commits,
                 "dirty": list(self.dirty)}
@@ -220,6 +224,56 @@ class Authored:
             parts.append(f"{len(self.dirty)} uncommitted file"
                          f"{'s' if len(self.dirty) != 1 else ''}")
         return " and ".join(parts) or "nothing"
+
+
+#: The events a settlement writes, any of which may carry an `Authored` record. Read
+#: newest-first by `latest_authorship`, which is how INV-PR-RECORDED knows months later
+#: that an order wrote code without going anywhere near the repository.
+SETTLEMENT_EVENTS = ("finished", "abandoned", "work_unlanded", "feature_settled")
+
+
+def authored_in(payload: dict[str, object]) -> Authored | None:
+    """The `Authored` a settlement event recorded, or None if it recorded none.
+
+    TWO SHAPES, because the three writers were not built together and unifying them now
+    would rewrite payloads `work_unlanded_open`, `true_blockers` and the timeline
+    renderer already read. `ops.finish` nests it under `authored` beside its summary;
+    `park_unlanded` and `finish --abandon` spread it at the top level beside their own
+    `was`/`reason`. Both are the output of `Authored.record`, so one reader serves both.
+
+    None means NOBODY LOOKED — an order that settled before this shipped, or one whose
+    worktree could not be read. It is not "produced nothing": `commits: 0` says that, and
+    the two must stay distinguishable or the invariant that reads this would treat an
+    unreadable settling as an exoneration.
+    """
+    inner = payload.get("authored")
+    if isinstance(inner, dict):
+        payload = inner
+    if "commits" not in payload:
+        return None
+    dirty = payload.get("dirty")
+    count = payload.get("commits")
+    return Authored(branch=str(payload.get("branch") or ""),
+                    base=str(payload.get("base") or ""),
+                    commits=count if isinstance(count, int) else 0,
+                    dirty=tuple(str(f) for f in dirty) if isinstance(dirty, list) else ())
+
+
+def latest_authorship(events: list[tuple[float, dict[str, object]]]) -> Authored | None:
+    """The newest `Authored` among these settlement events, or None if none carries one.
+
+    NEWEST WINS, the episode arithmetic `ProjectStore.work_abandoned` uses and for its
+    reason: a work order sent back and re-delivered has authored something different by
+    the end, and the record of what it produced must move with it. Ties go to the last
+    one seen, which is `events_of_kind`'s own order.
+    """
+    found: Authored | None = None
+    newest = float("-inf")
+    for ts, payload in events:
+        record = authored_in(payload)
+        if record is not None and ts >= newest:
+            found, newest = record, ts
+    return found
 
 
 def worktree_of(project_path: Path, wo: dict[str, object]) -> Path | None:

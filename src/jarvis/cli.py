@@ -64,6 +64,48 @@ def _readable_rounds(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def issue_line(row: dict[str, Any]) -> str:
+    """One linked issue, in the one wording every surface that prints one uses.
+
+    `kn-99e37a4b`'s rule: the CLI and the dashboard read different projections, so the
+    formatter is the thing they share — the alternative is two wordings for one fact.
+    An unknown state prints as nothing rather than as a word: the sweep has not looked
+    yet, and "unknown" beside every freshly filed issue is noise.
+
+    NO SEAT NAME, though the projection carries one. `_validation.html` states the rule
+    and this is the same rule one surface along: the seat that raised a finding is in the
+    issue body and on `jarvis validation show`, which is the deliberation surface. This
+    one is a default document.
+    """
+    number = f"#{row['number']}" if row.get("number") else row.get("url") or "issue"
+    state = f" [{(row.get('state') or '').lower()}]" if row.get("state") else ""
+    where = []
+    if row.get("round"):
+        where.append(f"round {row['round']}")
+    if row.get("kind") and row["kind"] != "raised":
+        where.append(row["kind"])
+    tail = f" ({', '.join(where)})" if where else ""
+    return f"{number}{state} {row.get('title') or ''}{tail}".strip()
+
+
+def _readable_issues(detail: dict[str, Any]) -> dict[str, Any]:
+    """The issue index collapsed to one line each, for HUMAN output.
+
+    `_readable_rounds`' trick, including the disappearing key: a unit that has raised
+    nothing and cites nothing reads exactly as it did before the index existed, which is
+    every unit on a fleet that has not turned the panel on. `--json` keeps the rows.
+    """
+    row = dict(detail)
+    index = row.pop("issues", None) or {}
+    raised = [issue_line(i) for i in index.get("raised") or []]
+    refs = [issue_line(i) for i in index.get("references") or []]
+    if raised:
+        row["follow_ups_raised"] = raised
+    if refs:
+        row["issues_referenced"] = refs
+    return row
+
+
 def _finding_lines(opinion: dict[str, Any], filed: dict[str, Any]) -> list[str]:
     """One seat's findings, classified, above its raw reply.
 
@@ -321,6 +363,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="list blocking joins at or above this long, for this run only "
                          "(default: the project's os.inspect.report_join_floor, "
                          f"{catalog.DEFAULT_INSPECT_REPORT_JOIN_FLOOR})")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser(
+        "issues",
+        help="tracker issues the fleet keeps running into, most-referenced first")
+    sp.add_argument("project", nargs="?", help="one project (default: the whole fleet)")
+    sp.add_argument("--limit", type=int, default=50, help="issues to show (default: 50)")
     sp.add_argument("--json", action="store_true")
 
     # `jarvis alarms` and `jarvis alarms <project>` are the two spellings that already
@@ -1646,6 +1695,36 @@ def _normalise_alarms(argv: list[str]) -> list[str]:
     return [argv[0], "list", *argv[1:]]
 
 
+def cmd_issues(args: argparse.Namespace) -> int:
+    """Which tracker issues the fleet keeps running into — the priority signal.
+
+    Ranked by how many DISTINCT work orders have pointed at each issue, because that is
+    the question the ranking exists to answer: an issue three separate pieces of work ran
+    into is worth more than one somebody raised once. Closed issues are not here — their
+    count is history and there is nothing to act on.
+
+    A READ OF WHAT THE OS RECORDED, with no network call, on every other listing's rule:
+    the command works when the tracker does not. The state beside each issue is what the
+    daemon's sweep last read.
+    """
+    from . import ops
+
+    rows = ops.issue_board_across(args.project, limit=args.limit)
+    if args.json:
+        _print(rows, True)
+        return 0
+    if not rows:
+        print("no tracker issue is linked to any work order yet")
+        return 0
+    for row in rows:
+        title = row["title"] or row["issue_url"]
+        print(f"{row['refs']:>3}  #{row['number']}  [{row['project']}] {title}")
+        print(f"     {row['issue_url']}")
+        who = ", ".join(f"{u['unit_id']} ({u['kind']})" for u in row["units"])
+        print(f"     {who}")
+    return 0
+
+
 def cmd_alarms(args: argparse.Namespace) -> int:
     """The dashboard's `/alarms` page in the terminal — the CLI is the OS.
 
@@ -2038,6 +2117,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # that comes and goes is one every consumer has to guard. The seats'
                 # replies are NOT here — see `jarvis validation show`.
                 "validation_rounds": ops.validation_rounds(store, wo_id=args.wo_id),
+                # EVERY FOLLOW-UP THIS ORDER RAISED, across every round, and every other
+                # issue it points at. Always present, empty or not: `validation_rounds`'
+                # rule, and the reason it is not folded into those rounds is that an
+                # order judged four times filed into four fragments with no total.
+                "issues": ops.issue_index(store, args.wo_id),
                 # Whether the OS merged this pull request, is waiting for permission to,
                 # or is holding — and why. NOT always present, unlike the keys above: a
                 # work order the mechanism never touched has no line here at all, which
@@ -2063,7 +2147,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
             store.close()
         detail["budget"] = ops.work_order_budget(args.wo_id, name)
         _print(_readable_config(_readable_autoreview(_readable_automerge(
-            _readable_alarms(_readable_rounds(detail)))))
+            _readable_alarms(_readable_rounds(_readable_issues(detail))))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
@@ -2165,6 +2249,7 @@ def cmd_fo(args: argparse.Namespace) -> int:
         if args.json:
             _print(detail, True)
         else:
+            detail = _readable_issues(detail)
             print(f"{FO_ICON.get(detail['status'], '•')} {detail['id']} "
                   f"[{detail['project']}] {detail['title']} ({detail['status']})")
             print(f"\n{detail['description']}\n")
@@ -2186,6 +2271,12 @@ def cmd_fo(args: argparse.Namespace) -> int:
                 print("\nvalidation:")
                 for rnd in detail["validation_rounds"]:
                     print(f"  {ops.round_line(rnd)}")
+            for heading, key in (("follow-ups raised", "follow_ups_raised"),
+                                 ("issues referenced", "issues_referenced")):
+                if detail.get(key):
+                    print(f"\n{heading}:")
+                    for line in detail[key]:
+                        print(f"  {line}")
             # `jarvis wo show`'s line, from the same formatter and in the same words —
             # a feature is watched by the same supervisor as a work order and a second
             # wording for one standing is how the two surfaces come to disagree (§6).
@@ -3236,6 +3327,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_inspect(args)
         if args.cmd == "alarms":
             return cmd_alarms(args)
+        if args.cmd == "issues":
+            return cmd_issues(args)
         if args.cmd == "supervisor":
             return cmd_supervisor(args)
         if args.cmd == "adopt":

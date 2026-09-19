@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -150,12 +151,54 @@ def test_never_installs_over_an_existing_catalog(tmp_path):
     assert json.loads(catalog.read_text())["projects"][0]["name"] == "mine"
 
 
+def _interpreter_dir(tmp_path: Path) -> Path:
+    """A directory holding a `python3.13` this test's restricted PATH can find.
+
+    The prerequisite gate wants uv, pipx or Python >= 3.13, and a test that narrows PATH
+    to the system directories is at the mercy of whatever the distro ships — Ubuntu 24.04
+    LTS ships 3.12, so `/usr/bin:/bin` alone fails the gate for a reason that has nothing
+    to do with what the test is about. Symlinking the RUNNING interpreter (which is >=
+    3.13 by `requires-python`) keeps the gate satisfied without weakening it.
+    """
+    shim = tmp_path / "interp"
+    shim.mkdir(exist_ok=True)
+    (shim / "python3.13").symlink_to(sys.executable)
+    return shim
+
+
 def test_warns_when_the_bin_dir_is_not_on_path(tmp_path):
     """Workers and hooks invoke `jarvis` by name — a silent off-PATH install is a trap."""
     remote = _remote_with_tags(tmp_path, "jarvis-1.0.0")
-    r = _install(tmp_path, remote=remote, env={"PATH": "/usr/bin:/bin"})
+    path = f"{_interpreter_dir(tmp_path)}:/usr/bin:/bin"
+    r = _install(tmp_path, remote=remote, env={"PATH": path})
     assert r.returncode == 0, r.stderr
     assert "not on your PATH" in (r.stdout + r.stderr)
+
+
+def test_an_interpreter_below_the_floor_is_refused_rather_than_used(tmp_path):
+    """The other side of raising `requires-python` to >= 3.13 (2026-09-19), and the
+    reason it is a real narrowing rather than a rename: a machine whose newest Python is
+    3.12 — Ubuntu 24.04 LTS, today — is now told so instead of getting an install that
+    fails later. The message has to name the way out, because `uv` provisions its own
+    interpreter and is the one-line fix."""
+    remote = _remote_with_tags(tmp_path, "jarvis-1.0.0")
+    # Shims FIRST on PATH so they shadow whatever the machine ships, and one per
+    # candidate the probe tries. Each exits non-zero for the version check, which is
+    # what "older than 3.13" looks like to `python_ok`. The system directories stay on
+    # PATH because the installer needs git and tar; uv and pipx are not in them, here
+    # or on a GitHub runner, so the gate has nothing else to fall back to.
+    old = tmp_path / "old"
+    old.mkdir()
+    for name in ("python3.13", "python3", "python"):
+        shim = old / name
+        shim.write_text("#!/bin/sh\nexit 1\n")
+        shim.chmod(0o755)
+
+    r = _install(tmp_path, remote=remote, env={"PATH": f"{old}:/usr/bin:/bin"})
+
+    assert r.returncode != 0, "an interpreter below the floor was accepted"
+    assert "3.13" in (r.stdout + r.stderr)
+    assert "uv" in (r.stdout + r.stderr), "the refusal must name the way out"
 
 
 def test_tells_the_user_how_to_onboard_a_project(tmp_path):

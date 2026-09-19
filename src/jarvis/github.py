@@ -219,13 +219,35 @@ def read_checks(payload: dict[str, Any]) -> tuple[dict[str, str], ...]:
     not pay for the body, the file list and the diff on every tick), but "what does this
     check say" has one answer, or the OS judges a submission by a standard it does not
     police while it waits for the merge — which is exactly issue #224.
+
+    `started_at` and `workflow` cost NOTHING to carry: `gh` answers `statusCheckRollup`
+    whole, so both were already in the payload both readers parse and neither field set
+    grows. They are what `ci.inherited` needs to tell a check that failed on THIS BRANCH
+    from one that failed because the base was broken when it ran. A legacy commit status
+    has neither, and reads as not-judgeable rather than as inherited — the safe
+    direction. Extra keys are safe for the panel: `validation.py` renders checks by the
+    three keys above and ignores the rest.
     """
     return tuple(
         {"name": str(c.get("name") or c.get("context") or ""),
          "status": str(c.get("status") or c.get("state") or ""),
-         "conclusion": str(c.get("conclusion") or c.get("state") or "")}
+         "conclusion": str(c.get("conclusion") or c.get("state") or ""),
+         "started_at": str(c.get("startedAt") or c.get("createdAt") or ""),
+         "workflow": str(c.get("workflowName") or "")}
         for c in (payload.get("statusCheckRollup") or [])
         if isinstance(c, dict))
+
+
+def red_checks(checks: tuple[dict[str, str], ...]) -> tuple[dict[str, str], ...]:
+    """The checks that say the code is wrong, WHOLE. `failing_checks` is their names.
+
+    Two callers want two different things from one predicate: the nudge wants names to
+    put in a sentence, and `ci.inherited` wants `started_at` and `workflow` to ask
+    whether the base was broken when each one ran. Splitting the predicate in two is how
+    "which checks are red" comes to have two answers — the shape of issue #224 — so it
+    has one, here, and the names are derived from it below.
+    """
+    return tuple(c for c in checks if c["conclusion"].upper() in RED_CONCLUSIONS)
 
 
 def failing_checks(checks: tuple[dict[str, str], ...]) -> tuple[str, ...]:
@@ -235,8 +257,7 @@ def failing_checks(checks: tuple[dict[str, str], ...]) -> tuple[str, ...]:
     yet, and nothing runs on this repository at all. Both must nudge nobody, which is
     why this returns what IS failing rather than a "not passing" verdict.
     """
-    return tuple(c["name"] or "(unnamed check)" for c in checks
-                 if c["conclusion"].upper() in RED_CONCLUSIONS)
+    return tuple(c["name"] or "(unnamed check)" for c in red_checks(checks))
 
 
 @dataclass(frozen=True)
@@ -292,6 +313,11 @@ class PullRequest:
     def failing(self) -> tuple[str, ...]:
         """The checks that say the code is wrong, by name. Empty is the green answer."""
         return failing_checks(self.checks)
+
+    @property
+    def red(self) -> tuple[dict[str, str], ...]:
+        """The same checks, whole — what `ci.inherited` needs. See `red_checks`."""
+        return red_checks(self.checks)
 
     @property
     def checks_green(self) -> bool:

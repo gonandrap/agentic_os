@@ -16,7 +16,7 @@ import json
 
 import pytest
 
-from jarvis import cli, github, hooks, ops
+from jarvis import cli, db, gates, github, hooks, ops
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import PR_POLL_EVERY_TICKS, Daemon
@@ -27,6 +27,7 @@ from jarvis.invariants import (
     check_project,
     true_blockers,
 )
+from jarvis.neo_store import NeoStore
 from jarvis.project_store import OPEN_STATUSES, ProjectStore
 from jarvis.timeline import build_timeline
 
@@ -956,3 +957,368 @@ def test_the_operation_contract_names_it_too(started, project):
 
     assert "[$JARVIS_WO_ID]" in contract
     assert "--pr <url>" in contract
+
+
+# -- a repair attempt the worker was never allowed to make ---------------------------
+#
+# GitHub issue #469,
+# docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md. A pending
+# gate refuses every non-read call in the worker's session (`hooks.pending_turn_block`),
+# so a nudge delivered into one dies in twenty seconds without the conflict being read.
+# All three attempts went that way and the order was stranded for ever.
+
+
+def gate(store, wo_id: str, kind: str = "pr_merge", status: str = "pending") -> dict:
+    """A privileged-action request sitting in front of a reviewer.
+
+    The command string is a placeholder rather than a real one: nothing here reads it,
+    and a literal privileged command in a test file is itself blocked by the gate
+    recogniser — which is how this very work order met issue #469's cousin.
+    """
+    return store.add_approval(wo_id, kind, f"<gated command for {PR}>", status=status)
+
+
+def argue(store, request: dict) -> dict:
+    """The worker making its case — the one door out of `awaiting_case`, and the only
+    production caller of `ProjectStore.start_review`, which is where a held request
+    gets the `pending_at` that makes it start refusing the worker's commands."""
+    neo = NeoStore()
+    try:
+        gates.queue_for_review(
+            store, neo, "proj_a", store.get_work_order(request["wo_id"]),
+            gates.GatedAction(kind=request["kind"], summary="<privileged action>",
+                              command=request["command"],
+                              matched=request["command"]),
+            request)
+    finally:
+        neo.close()
+    return store.get_approval(request["id"])
+
+
+def test_a_pending_gate_defers_the_nudge_instead_of_spending_an_attempt(
+        started, project, fake_gh, parked_worker):
+    """THE defect. The poller asked three times in four minutes and every turn died at
+    the same block, without the conflict being read once."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    gate(store, parked_worker["id"])
+
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
+        poll(started, store)
+
+    assert not store.queued_messages(parked_worker["id"])
+    assert store.pr_repair_attempts(parked_worker["id"], "conflict") == 0
+    row = store.get_work_order(parked_worker["id"])
+    assert not row["needs_attention"]          # the GATE is the item, not the conflict
+    assert true_blockers(store, row) == []
+
+
+def test_the_deferral_is_recorded_once_however_long_the_review_takes(
+        started, project, fake_gh, parked_worker):
+    """Six hours of two-minute polls is 180 rows if this is not deduped."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    request = gate(store, parked_worker["id"])
+
+    for _ in range(5):
+        poll(started, store)
+
+    deferred = [e for e in store.list_events(parked_worker["id"])
+                if e["kind"] == "pr_conflict_deferred"]
+    assert len(deferred) == 1
+    assert json.loads(deferred[0]["payload"])["approval_id"] == request["id"]
+    entries = build_timeline(store.get_work_order(parked_worker["id"]),
+                             store.list_events(parked_worker["id"]), [])
+    assert [e["label"] for e in entries
+            if e["kind"] == "pr_conflict_deferred"] == [
+        f"Merge conflict — waiting for gate {request['id']} before asking the worker"]
+
+
+def test_deciding_the_gate_lets_the_repair_start(started, project, fake_gh,
+                                                 parked_worker):
+    """Nothing was spent, so resuming is just the next tick doing its job."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    request = gate(store, parked_worker["id"])
+    poll(started, store)
+    store.decide_approval(request["id"], "approved", "go ahead", "user")
+
+    poll(started, store)
+
+    assert store.pr_repair_attempts(parked_worker["id"], "conflict") == 1
+    assert store.queued_messages(parked_worker["id"])[0]["source"] == "pr-conflict"
+
+
+def test_a_gate_the_worker_must_still_argue_does_not_defer_anything(
+        started, project, fake_gh, parked_worker):
+    """`awaiting_case` blocks the END of a turn, not the work in it — so it is not an
+    excuse. The predicate here is the one `hooks.pending_turn_block` enforces."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    gate(store, parked_worker["id"], status="awaiting_case")
+
+    poll(started, store)
+
+    assert store.pr_repair_attempts(parked_worker["id"], "conflict") == 1
+
+
+def test_a_budget_spent_entirely_behind_a_gate_is_given_back_when_it_is_decided(
+        started, project, fake_gh, parked_worker):
+    """The other half: an order already stranded when this shipped, and the race where
+    the worker files its own gate mid-repair. Three refusals, a verdict six hours
+    later, and before this nothing in the OS would ever nudge it again."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    request = gate(store, parked_worker["id"])
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):        # as the poller did before #469
+        ops.nudge_pr_repair(store, store.get_work_order(parked_worker["id"]),
+                            ops.PR_CONFLICT, base="main")
+        delivered(store, parked_worker["id"])
+    assert store.get_work_order(parked_worker["id"])["attention_reason"] == \
+        PR_CONFLICT_BLOCKER
+
+    store.decide_approval(request["id"], "approved", "go ahead", "user")
+    poll(started, store)
+
+    events = [e["kind"] for e in store.list_events(parked_worker["id"])]
+    assert "pr_conflict_rearmed" in events
+    assert store.pr_repair_attempts(parked_worker["id"], "conflict") == 1   # of 3
+    assert store.queued_messages(parked_worker["id"])[0]["source"] == "pr-conflict"
+    row = store.get_work_order(parked_worker["id"])
+    assert not row["needs_attention"]
+    assert true_blockers(store, row) == []
+
+
+def test_a_budget_the_worker_actually_spent_is_not_given_back(started, project,
+                                                              fake_gh, parked_worker):
+    """The negative control, and the one that keeps the give-up meaning something: the
+    worker was let at the conflict three times and could not fix it."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
+        poll(started, store)
+        delivered(store, parked_worker["id"])
+    request = gate(store, parked_worker["id"])          # filed AFTER the attempts
+    store.decide_approval(request["id"], "approved", "go ahead", "user")
+
+    poll(started, store)
+
+    events = [e["kind"] for e in store.list_events(parked_worker["id"])]
+    assert "pr_conflict_rearmed" not in events
+    assert store.get_work_order(parked_worker["id"])["attention_reason"] == \
+        PR_CONFLICT_BLOCKER
+
+
+def test_one_genuine_attempt_among_the_refusals_keeps_the_give_up(
+        started, project, fake_gh, parked_worker):
+    """EVERY nudge, not some of them: a partial refund would need the episode boundary
+    to be a number rather than an event, and the give-up still says something true."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    poll(started, store)                                # attempt 1: nothing in the way
+    delivered(store, parked_worker["id"])
+    request = gate(store, parked_worker["id"])
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS):
+        ops.nudge_pr_repair(store, store.get_work_order(parked_worker["id"]),
+                            ops.PR_CONFLICT, base="main")
+        delivered(store, parked_worker["id"])
+    store.decide_approval(request["id"], "approved", "go ahead", "user")
+
+    poll(started, store)
+
+    assert "pr_conflict_rearmed" not in [e["kind"] for e in
+                                         store.list_events(parked_worker["id"])]
+
+
+def test_the_refund_happens_once_and_the_loop_terminates(started, project, fake_gh,
+                                                         parked_worker):
+    """A re-armed episode gives up again for real, and cannot be re-armed a second
+    time: the guard means no nudge after the refund can go out under a gate."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    request = gate(store, parked_worker["id"])
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
+        ops.nudge_pr_repair(store, store.get_work_order(parked_worker["id"]),
+                            ops.PR_CONFLICT, base="main")
+        delivered(store, parked_worker["id"])
+    store.decide_approval(request["id"], "approved", "go ahead", "user")
+
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 2):
+        poll(started, store)
+        delivered(store, parked_worker["id"])
+
+    events = [e["kind"] for e in store.list_events(parked_worker["id"])]
+    assert events.count("pr_conflict_rearmed") == 1
+    row = store.get_work_order(parked_worker["id"])
+    assert row["attention_reason"] == PR_CONFLICT_BLOCKER      # and it means it now
+
+
+def test_a_request_nobody_ever_argued_never_blocked_anything(started, project, fake_gh,
+                                                             parked_worker):
+    """`gate_open_at` excludes a request abandoned unargued: it never reached the
+    status that refuses a worker's commands, so it excuses nothing."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    request = gate(store, parked_worker["id"], status="awaiting_case")
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
+        poll(started, store)
+        delivered(store, parked_worker["id"])
+    store.conn.execute(
+        "UPDATE approvals SET status='expired', closed_as='abandoned', decided_at=? "
+        "WHERE id=?", (db.now(), request["id"]))
+
+    poll(started, store)
+
+    assert "pr_conflict_rearmed" not in [e["kind"] for e in
+                                         store.list_events(parked_worker["id"])]
+
+
+def test_a_held_request_nobody_argues_never_refunds_anything(started, project, fake_gh,
+                                                             parked_worker):
+    """The loop this change nearly shipped, pinned shut.
+
+    One `awaiting_case` request, never argued and never decided, sitting on the work
+    order for ever. It refuses the end of a turn and nothing else, so the worker really
+    did get its three attempts and really did fail — the give-up is true and must stand.
+    An earlier `gate_open_at` counted the request anyway (open, not abandoned, no
+    verdict) and handed the whole budget back, every episode, clearing attention each
+    time: an unattended burn, which is issue #469 pointed the wrong way. Two episodes
+    here, because once is not a termination argument.
+    """
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    gate(store, parked_worker["id"], status="awaiting_case")
+
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 2):
+        poll(started, store)
+        delivered(store, parked_worker["id"])
+
+    assert store.pr_repair_attempts(parked_worker["id"], "conflict") == \
+        PR_REPAIR_MAX_ATTEMPTS
+    assert store.get_work_order(parked_worker["id"])["attention_reason"] == \
+        PR_CONFLICT_BLOCKER
+    assert "pr_conflict_rearmed" not in [e["kind"] for e in
+                                         store.list_events(parked_worker["id"])]
+
+    fake_gh.set_pr(PR, "OPEN")                    # the user resolved it by hand
+    poll(started, store)
+    conflicting(fake_gh)                          # and the base moved again
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 2):
+        poll(started, store)
+        delivered(store, parked_worker["id"])
+
+    events = [e["kind"] for e in store.list_events(parked_worker["id"])]
+    assert "pr_conflict_rearmed" not in events
+    assert events.count("pr_conflict_unresolved") == 2
+    assert store.get_work_order(parked_worker["id"])["attention_reason"] == \
+        PR_CONFLICT_BLOCKER
+
+
+def test_the_refund_is_capped_at_one_per_work_order(started, project, fake_gh,
+                                                    parked_worker):
+    """The braces, tested apart from the belt: a second episode that satisfies every
+    refund condition is still not refunded, so no predicate bug can make this loop."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    for episode in range(2):
+        request = gate(store, parked_worker["id"])
+        for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):   # as the poller did before #469
+            ops.nudge_pr_repair(store, store.get_work_order(parked_worker["id"]),
+                                ops.PR_CONFLICT, base="main")
+            delivered(store, parked_worker["id"])
+        store.decide_approval(request["id"], "approved", "go ahead", "user")
+        poll(started, store)
+        delivered(store, parked_worker["id"])
+        if episode == 0:                              # clear it, so the next is fresh
+            fake_gh.set_pr(PR, "OPEN")
+            poll(started, store)
+            conflicting(fake_gh)
+
+    events = [e["kind"] for e in store.list_events(parked_worker["id"])]
+    assert events.count("pr_conflict_rearmed") == 1
+
+
+def test_the_migration_refunds_an_order_stranded_before_this_shipped(
+        started, project, fake_gh, parked_worker):
+    """`pending_at` is a NEW column, so every row that was already stranded has none —
+    including issue #469's own work order. `_backfill_pending_at` is what refunds
+    those, and it is the one path no other test here can reach: they all file their
+    gate through the new `add_approval`, which stamps the column at birth.
+    """
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    request = gate(store, parked_worker["id"])
+    store.conn.execute("UPDATE approvals SET pending_at=NULL WHERE id=?",
+                       (request["id"],))          # exactly how the row stood on disk
+    store.conn.commit()
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):        # as the poller did before #469
+        ops.nudge_pr_repair(store, store.get_work_order(parked_worker["id"]),
+                            ops.PR_CONFLICT, base="main")
+        delivered(store, parked_worker["id"])
+    store.decide_approval(request["id"], "approved", "go ahead", "user")
+    assert store.get_approval(request["id"])["pending_at"] is None
+    store.close()
+
+    store = ProjectStore(project)                      # `_migrate` runs here
+    row = store.get_approval(request["id"])
+    assert row["pending_at"] == row["ts"]              # the filing time, exact for this
+    poll(started, store)                               # ...and the refund it unlocks
+
+    assert "pr_conflict_rearmed" in [e["kind"] for e in
+                                     store.list_events(parked_worker["id"])]
+    assert store.pr_repair_attempts(parked_worker["id"], "conflict") == 1   # of 3
+    assert not store.get_work_order(parked_worker["id"])["needs_attention"]
+
+
+def test_a_nudge_sent_before_the_case_was_made_is_a_real_attempt(
+        started, project, fake_gh, parked_worker):
+    """The near side of the `[pending_at, decided_at)` boundary. The request existed
+    when this nudge went out, but it was still `awaiting_case` and refused nothing the
+    worker needed — so that attempt was real, and one real attempt is enough to keep
+    the give-up (`test_one_genuine_attempt_among_the_refusals_keeps_the_give_up`)."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    request = gate(store, parked_worker["id"], status="awaiting_case")
+
+    poll(started, store)                               # attempt 1: held, not pending
+    delivered(store, parked_worker["id"])
+    argue(store, request)
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS):            # the rest, behind a shut gate
+        ops.nudge_pr_repair(store, store.get_work_order(parked_worker["id"]),
+                            ops.PR_CONFLICT, base="main")
+        delivered(store, parked_worker["id"])
+    store.decide_approval(request["id"], "approved", "go ahead", "user")
+
+    poll(started, store)
+
+    assert "pr_conflict_rearmed" not in [e["kind"] for e in
+                                         store.list_events(parked_worker["id"])]
+    assert store.get_work_order(parked_worker["id"])["attention_reason"] == \
+        PR_CONFLICT_BLOCKER
+
+
+def test_a_held_request_starts_blocking_the_moment_the_case_is_made(
+        started, project, fake_gh, parked_worker):
+    """The far side of the same boundary, and the only test of `start_review` writing
+    the column: argue the request first and every nudge after it is one the worker
+    could not make, so the whole budget comes back. Leave `pending_at` unwritten there
+    and it stays NULL for ever — the request would refuse the worker's commands while
+    counting as an excuse for nothing."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    request = gate(store, parked_worker["id"], status="awaiting_case")
+
+    argued = argue(store, request)
+    assert argued["status"] == "pending"
+    assert argued["pending_at"] >= argued["ts"]
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
+        ops.nudge_pr_repair(store, store.get_work_order(parked_worker["id"]),
+                            ops.PR_CONFLICT, base="main")
+        delivered(store, parked_worker["id"])
+    store.decide_approval(request["id"], "approved", "go ahead", "user")
+
+    poll(started, store)
+
+    assert "pr_conflict_rearmed" in [e["kind"] for e in
+                                     store.list_events(parked_worker["id"])]
+    assert store.pr_repair_attempts(parked_worker["id"], "conflict") == 1   # of 3

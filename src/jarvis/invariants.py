@@ -182,6 +182,35 @@ PR_REPAIR_STATUSES = ("waiting_pr_merge", "needs_review", "waiting_input", "fail
 PR_CONFLICT_REPAIR = "conflict"
 PR_CHECKS_REPAIR = "checks"
 
+#: THE THREE EVENTS OF THE INHERITED-FAILURE HEAL, named here for the reason the repair
+#: names above are: `ops` writes them, `status_label` below derives from them, and `ops`
+#: imports this module so the dependency cannot go the other way. A literal spelled at
+#: either site is a rename that silently stops the status line deriving.
+#:
+#: `pr_base_health` is written ONLY ON A TRANSITION — the base going red, or going green
+#: again. That is what lets `base_red_note` answer in ONE indexed read: the newest row is
+#: the current state, so nothing has to be compared against a second event kind.
+PR_BASE_HEALTH_EVENT = "pr_base_health"
+#: The heal itself: the OS merged the base into this branch so CI rebuilds against a base
+#: that works. Spec §4 — the recovery has to be a fact on the record, not a mystery.
+PR_BASE_UPDATED_EVENT = "pr_base_updated"
+#: GitHub refused the update. Spends the attempt for that base sha exactly as a success
+#: does, so a repeatedly-refusing pull request falls through to the worker once and stays
+#: there rather than being retried every two minutes.
+PR_BASE_UPDATE_FAILED_EVENT = "pr_base_update_failed"
+
+#: What a work order says while its base is broken. NOT an attention reason and NOT a
+#: blocker: nobody owes a decision, the OS is waiting for a build that is already
+#: running, and `true_blockers` deliberately does not derive it. It exists because the
+#: alternative is silence — a work order sitting in `waiting_pr_merge` with a red pull
+#: request and no nudge being sent looks identical to one the OS has forgotten.
+#:
+#: FREE OF ANY ELAPSED TIME, on PARKED_BLOCKER's rule, and free of the base's sha as
+#: well: this string is rendered on every listing and a label that ticked would make two
+#: consecutive renders of one unchanged work order disagree.
+BASE_RED_NOTE = ("waiting for `{base}` to go green — the base's own build is red, so "
+                 "nothing this branch pushes can pass")
+
 #: What a work order says when its pull request conflicts and the worker could not fix
 #: it in PR_REPAIR_MAX_ATTEMPTS attempts — one of the two things that make a
 #: `waiting_pr_merge` work order an attention item (spec §4). Re-derived below from the
@@ -753,6 +782,32 @@ def parallel_round_note(store: ProjectStore, wo_id: str) -> str:
     return ""
 
 
+def base_red_note(store: ProjectStore, wo_id: str) -> str:
+    """"waiting for `main` to go green", or "" when the base is not the problem.
+
+    ONE INDEXED READ, and the write side is what buys that: `pr_base_health` is recorded
+    only when the base CHANGES state, so the newest row IS the current answer and no
+    second kind has to be read to know whether it is stale. An unconditional pair of
+    reads here would cost every listing in the fleet a query per work order, every time,
+    to notice a change that almost never happened.
+
+    **Derived, never fetched.** Whether the base is red is a question for GitHub, and
+    this module may not ask it — `poll_pull_requests` is where the network lives, and an
+    invariant that shelled out to `gh` would put a subprocess behind `jarvis wo list`.
+    So the poll writes down what it learned and this reads it back, which is the same
+    division `ops.automerge_state` makes and for the same reason.
+    """
+    from . import db
+
+    rows = store.events_of_kind(wo_id, PR_BASE_HEALTH_EVENT)
+    if not rows:
+        return ""
+    payload = db.from_json(rows[-1].get("payload"), {}) or {}
+    if not payload.get("red"):
+        return ""
+    return BASE_RED_NOTE.format(base=payload.get("base") or "its base")
+
+
 def status_label(store: ProjectStore, wo: dict[str, Any],
                  fleet: Fleet | None = None) -> str:
     """How this work order's status should read to a human.
@@ -815,6 +870,16 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
         note = parallel_round_note(store, wo["id"])
         if note:
             return f"{wo['status']}{note}"
+    # WHY NOTHING IS BEING NUDGED. Below the round note, which names a thing actually in
+    # flight, and gated on carrying a pull request in a status the poll reaches — so the
+    # extra indexed read is paid by parked work orders and by nothing else. Without it a
+    # work order whose base is broken is indistinguishable from one the OS forgot: the
+    # poll deliberately spends no repair attempt in that window (spec §3), so there is no
+    # nudge, no attention item and, until this, nothing said at all.
+    if wo["status"] in PR_REPAIR_STATUSES and wo.get("pr_url"):
+        note = base_red_note(store, wo["id"])
+        if note:
+            return f"{wo['status']} — {note}"
     if wo["status"] != "pending":
         return wo["status"]
     blockers = store.unfinished_dependencies(wo["id"])
@@ -2253,6 +2318,83 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+def check_pull_request_recorded(store: ProjectStore) -> Iterator[Violation]:
+    """INV-PR-RECORDED — a settled work order that wrote code must carry its pull request.
+
+    THE GUARANTEE INV-WORK-LANDED RESTS ON. That check judges the recorded pull request
+    and nothing else, which is only safe if something else holds `pr_url` populated for
+    every order that produced code; this is that something. The two read as a chain: this
+    one says the identifier exists, that one says the work behind it reached the default
+    branch. Ruled by the user on 2026-09-18 — "if there is any code change made in an
+    order, then pr_url must not be empty, and the invariant should rely on that pr_url"
+    (docs/superpowers/specs/2026-09-18-an-order-that-wrote-code-carries-its-pull-request.md).
+
+    **THE POPULATION COMES OFF THE TIMELINE, NEVER OFF THE REPOSITORY** (Neo question
+    429). Every settlement route now writes what the order authored onto the event it
+    already writes — `ops.finish`, `ops.park_unlanded`, `finish --abandon`,
+    `Daemon._close_feature_manager` — because `landing.authored` is exact only while the
+    worktree exists, and a worktree is gone long before anyone audits. So this is a pure
+    SQL-and-JSON read, cheap enough for `INVARIANTS` rather than `SLOW_INVARIANTS`, and
+    it never asks git or `gh` anything.
+
+    The price is that it is STRUCTURALLY SILENT on anything settled before it shipped:
+    `wo-5a6b2d6d` — a planner that completed over a WIP commit on `rescue/wo-5a6b2d6d`
+    with no pull request, ever — carries no such record and is reported by nothing. The
+    user accepted that explicitly; those orders are being closed by hand, and this exists
+    to stop the next one. `landing.authored_in` keeps "nobody looked" distinct from
+    "produced nothing" so the silence is a known gap rather than an exoneration.
+
+    Three exemptions, each a decision somebody WROTE DOWN, and all three lapse the same
+    way — `work_abandoned`'s episode arithmetic retires a decision the moment the work is
+    delivered again:
+
+    * a recorded `pr_url`, which is the whole point;
+    * `finish --abandon`, the worker saying this is deliberately not being landed;
+    * `jarvis wo done`, whose `work_unlanded {closed_by: marked_done}` is the user's own
+      decision and the documented exit for a pull request that will never merge (Neo
+      question 430; `ops.mark_done` records rather than refusing, and always has).
+
+    **THE STALE `pr_url` IS OUT OF SCOPE**, and deliberately: `wo-cd73c537` records #81,
+    which merged, while #116 carries the rest of its work and is open. This predicate
+    asks whether an identifier is PRESENT, which is a fact the record holds; asking
+    whether it is CURRENT is a `gh` round trip per settled order and belongs with the
+    daemon polls that already have a network — and NEITHER OF THEM DOES IT TODAY:
+    `Daemon.poll_pull_requests` asks about the pull request an order is parked behind,
+    `Daemon.refresh_landings` about the one it recorded, and both read `pr_url` rather
+    than looking for a branch's live pull request. Filed as `bl-2aabaee8`.
+
+    Not repairable. An empty `pr_url` has two resolutions — find the pull request that
+    exists, or record that none ever will — and nothing in the database distinguishes
+    them. Discovery is what closes the gap once it can write back, and it is the daemon's.
+    """
+    from . import landing
+
+    for wo in store.list_work_orders(statuses=("completed",), include_hidden=True):
+        wo_id = wo["id"]
+        if wo.get("pr_url"):
+            continue
+        if store.work_abandoned(wo_id) or store.work_unlanded_open(
+                wo_id, closed_by="marked_done"):
+            continue
+        work = landing.latest_authorship(
+            [(float(e["ts"]), db.from_json(e["payload"], {}))
+             for kind in landing.SETTLEMENT_EVENTS
+             for e in store.events_of_kind(wo_id, kind)])
+        if work is None or not work.produced:
+            continue  # nobody looked, or it wrote nothing — see the docstring on both
+        yield Violation(
+            invariant="INV-PR-RECORDED",
+            wo_id=wo_id,
+            detail=(f"completed over {work.describe()} with no pull request recorded, "
+                    f"so nothing can say whether that work reached "
+                    f"`{work.base or 'the default branch'}`. Record the pull request "
+                    f"with `jarvis wo finish {wo_id} --summary \"...\" --pr <url>`, or "
+                    f"the decision to drop it with `--abandon \"<why>\"`."),
+            context={"branch": work.branch, "base": work.base,
+                     "commits": work.commits, "dirty": list(work.dirty[:10])},
+        )
+
+
 def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
     """INV-MANAGER-SLOTS — a project manager order must not spend a concurrency slot.
 
@@ -3112,6 +3254,9 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # same `true_blockers[0]`, so the flag goes up once
     check_blocked_work_is_surfaced,
     check_attention_has_reason,
+    check_pull_request_recorded,   # order-free: a pure timeline read that repairs
+                                   # nothing and touches no flag. NOT a SLOW_INVARIANT —
+                                   # it asks the record, never the repository
     check_manager_slots,           # a canary, not a state check: it repairs nothing and
                                    # is unaffected by the order it runs in
     check_health_sweep_produces_judgements,  # ditto: a pure read of the sweep ledger,

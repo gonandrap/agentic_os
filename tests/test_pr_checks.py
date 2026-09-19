@@ -261,7 +261,7 @@ def test_a_pull_request_with_no_checks_is_not_red(started, project, fake_gh, rev
     assert not store.queued_messages(reviewing["id"])
 
 
-def test_a_green_pull_request_costs_one_call_three_reads_and_no_write(
+def test_a_green_pull_request_costs_one_call_four_reads_and_no_write(
         started, project, fake_gh, reviewing):
     """The overwhelmingly common case stays the cheap one — and the budget is COUNTED,
     not described.
@@ -269,10 +269,17 @@ def test_a_green_pull_request_costs_one_call_three_reads_and_no_write(
     `poll_pull_requests` states this cost in its docstring, and the sentence had already
     drifted: it claimed one indexed read while the rewritten body performed several. A
     prose budget nobody executes is a comment, not a guarantee, so the statements are
-    read off the connection here. The three per pull request are one question each —
-    was this closure already reported, is a conflict episode open, is a checks episode
-    open — and a fourth appearing means somebody put a query on the path every open
-    pull request in the fleet pays for every two minutes.
+    read off the connection here. The four per pull request are one question each — was
+    this closure already reported, is a conflict episode open, is a checks episode open,
+    and is a "waiting for the base" note still up — and a fifth appearing means somebody
+    put a query on the path every open pull request in the fleet pays for every two
+    minutes.
+
+    The fourth arrived with the inherited-failure heal and was bought deliberately: a
+    pull request that goes green while its base is still broken would otherwise keep a
+    status line saying the OS is waiting for a build that no longer blocks it. It is
+    paid INSIDE `checks_green`, which is why a red or queued pull request does not pay
+    it — and no `gh run list` appears here at all, because nothing is failing.
     """
     red(fake_gh, GREEN)
     store = ProjectStore(project)
@@ -284,8 +291,9 @@ def test_a_green_pull_request_costs_one_call_three_reads_and_no_write(
 
     store.conn.set_trace_callback(None)
     assert len([c for c in fake_gh.calls if c["argv"][:2] == ["pr", "view"]]) == 1
+    assert not [c for c in fake_gh.calls if c["argv"][:2] == ["run", "list"]]
     assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
-    assert len([s for s in sql if "wo_events" in s]) == 3
+    assert len([s for s in sql if "wo_events" in s]) == 4
     # ...and the work-order query is the step's one, for the whole project, not one per
     # pull request: the row is re-read only when a clear has just taken a flag down.
     assert len([s for s in sql if "wo_events" not in s]) == 1
@@ -299,7 +307,7 @@ def test_the_automatic_merge_costs_a_project_that_has_not_opted_in_nothing(
     """The budget above is the SHIPPED one, and it must stay shipped.
 
     `validation.auto_merge` is false on every project until someone names it true, so the
-    common case has to be provably free — not "one cheap read", but the same three
+    common case has to be provably free — not "one cheap read", but the same four
     `wo_events` reads and the same one work-order query as before the feature existed.
     That is what `Daemon.auto_merge` returning on the config check buys, and asserting it
     here is what stops a later refactor moving the check below the query.
@@ -315,7 +323,7 @@ def test_the_automatic_merge_costs_a_project_that_has_not_opted_in_nothing(
     poll(started, store)
 
     store.conn.set_trace_callback(None)
-    assert len([s for s in sql if "wo_events" in s]) == 3
+    assert len([s for s in sql if "wo_events" in s]) == 4
     assert len([s for s in sql if "wo_events" not in s]) == 1
     assert not [s for s in sql if "validation_rounds" in s]
 
@@ -356,7 +364,7 @@ def test_an_opted_in_project_declares_what_the_automatic_merge_costs_it(
     assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
     assert len([s for s in sql if "validation_rounds" in s]) == 1
     assert len([s for s in sql if "assumptions" in s]) == 1
-    assert len([s for s in sql if "wo_events" in s]) == 4
+    assert len([s for s in sql if "wo_events" in s]) == 5
     assert not [s for s in sql if "approvals" in s]
 
 
@@ -381,7 +389,7 @@ def test_an_opted_in_project_pays_nothing_for_an_order_awaiting_a_person(
     poll(started, store)
 
     store.conn.set_trace_callback(None)
-    assert len([s for s in sql if "wo_events" in s]) == 3
+    assert len([s for s in sql if "wo_events" in s]) == 4
     assert not [s for s in sql if "validation_rounds" in s or "assumptions" in s]
 
 

@@ -290,6 +290,13 @@ TURN_KINDS = ("dispatch", "message", "compact")
 #: the worker's, so it is never recorded as an agent reply and never shown as one.
 COMPACT_TURN = "compact"
 
+#: Where a turn's `cost_usd` came from — see the `wo_turns.cost_source` comment. The
+#: two are not the same currency: one is the CLI's own figure, the other a list-price
+#: floor read off the transcript, and a surface that adds them owes the reader the
+#: distinction (kn-e6bb1166's ruling).
+COST_FROM_ENVELOPE = "envelope"
+COST_FROM_TRANSCRIPT = "transcript"
+
 
 def resume_spends_slot(wo: Mapping[str, Any]) -> bool:
     """Would starting a turn on this work order NOW take a `max_concurrent` slot it is
@@ -449,6 +456,16 @@ NO_TURN = -1
 ALARM_EVENT_KINDS = ("cost_alarm", "alarm_reviewed", "alarm_escalated", "alarm_advice",
                      "health_finding", "health_reviewed",
                      "remedy_proposed", "remedy_applied", "remedy_refused")
+
+# HOW A WORK ORDER CAN BE LINKED TO A TRACKER ISSUE, weakest first — the order IS the
+# precedence, and `link_issue` never demotes. The admitting set is deliberately small
+# (Neo, question 409): a count that admits passing mentions is not a priority signal.
+#
+#   cited     — the order's brief names the issue, by URL or by `#N` on the project's own
+#               repository. Someone wrote it down on purpose.
+#   assigned  — the order exists to FIX the issue (`work_orders.issue_url`).
+#   raised    — the validation panel filed the issue out of this order's own review.
+ISSUE_LINK_KINDS = ("cited", "assigned", "raised")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS work_orders (
@@ -681,6 +698,12 @@ CREATE TABLE IF NOT EXISTS validation_rounds (
     -- ordinary round, opened by a submission. Also in ADDED_COLUMNS, where the
     -- reasoning is.
     forced_reason TEXT NOT NULL DEFAULT '',
+    -- The commit this verdict has been CARRIED FORWARD to, and why, when the OS merged
+    -- the base into the branch and moved the head itself. Separate from `head_sha`,
+    -- which keeps meaning "what the seats read". Also in ADDED_COLUMNS, where the
+    -- reasoning is — this table already ships, so a live database gets it only there.
+    carried_head_sha TEXT NOT NULL DEFAULT '',
+    carried_reason TEXT NOT NULL DEFAULT '',
     CHECK ((wo_id IS NULL) <> (fo_id IS NULL))
 );
 -- PARTIAL unique indexes, NOT `UNIQUE (wo_id, fo_id, round)`. SQLite treats NULLs as
@@ -770,6 +793,13 @@ CREATE TABLE IF NOT EXISTS wo_turns (
     result TEXT,                            -- the turn's final assistant message
     error TEXT,
     cost_usd REAL,
+    -- WHICH READING WROTE `cost_usd`. 'envelope' is the CLI's own `total_cost_usd`;
+    -- 'transcript' is `usage.cost_between`, the floor derived from the session
+    -- transcript for a turn whose envelope never arrived (issue #471). NULL alongside
+    -- a cost is a row written before this column existed, and reads as 'envelope' —
+    -- the only source there was. NULL with no cost is a turn that spent nothing on
+    -- record.
+    cost_source TEXT,
     num_turns INTEGER,
     -- The turn's exact accounting, compacted from the result JSON the `claude` CLI
     -- wrote to `outfile` (see claude_cli.derive_turn_usage): cost, tokens by class
@@ -807,6 +837,38 @@ CREATE TABLE IF NOT EXISTS envelopes (
     note TEXT NOT NULL DEFAULT '',
     CHECK ((subject_wo_id IS NULL) <> (subject_fo_id IS NULL))
 );
+-- A TRACKER ISSUE THIS PROJECT IS LINKED TO, and what the OS last saw of it. Cached
+-- rather than fetched, for `ops.filed_follow_ups`'s reason: a surface that asked GitHub
+-- what state an issue is in would make `jarvis wo show` fail when the tracker is
+-- unreachable. `state` is "" until the sweep has looked once.
+CREATE TABLE IF NOT EXISTS tracked_issues (
+    issue_url TEXT PRIMARY KEY,
+    number INTEGER NOT NULL DEFAULT 0,
+    repo TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT '',
+    checked_at REAL,
+    -- The count last written to the issue as its `referenced: N` label. -1 means never,
+    -- which is not the same claim as 0 and is why the default is not 0.
+    refs_labelled INTEGER NOT NULL DEFAULT -1
+);
+-- THE RELATION THE ISSUE BODY USED TO CARRY IN PROSE ONLY. One row per (issue, unit),
+-- so the reference COUNT is a count of distinct work orders — which is the signal the
+-- user asked for — and an order that both raised and cites an issue counts once.
+CREATE TABLE IF NOT EXISTS issue_links (
+    issue_url TEXT NOT NULL,
+    unit_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    round INTEGER NOT NULL DEFAULT 0,
+    seat TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    -- When the comment naming this reference landed on the issue. NULL until the sweep
+    -- has said it out loud; the `raised` link is stamped at creation because the filing
+    -- already writes that sentence into the body.
+    announced_at REAL,
+    PRIMARY KEY (issue_url, unit_id)
+);
+CREATE INDEX IF NOT EXISTS idx_issue_links_unit ON issue_links(unit_id);
 CREATE INDEX IF NOT EXISTS idx_turns_wo ON wo_turns(wo_id, seq);
 CREATE INDEX IF NOT EXISTS idx_turns_state ON wo_turns(state);
 CREATE INDEX IF NOT EXISTS idx_wo_status ON work_orders(status);
@@ -980,6 +1042,9 @@ ADDED_COLUMNS = {
         # See the CREATE TABLE comment. NULL on every row written before turns moved into
         # their own units, which reads correctly as "the direct transport".
         "unit": "TEXT",
+        # See the CREATE TABLE comment. NULL on every row written before the transcript
+        # fallback existed, which reads correctly as "the CLI's own figure".
+        "cost_source": "TEXT",
     },
     "validation_rounds": {
         # WHICH CONFIGURATION JUDGED THIS ROUND — a different question from the work
@@ -1013,6 +1078,22 @@ ADDED_COLUMNS = {
         # written by a submission and of every round written before this column existed.
         # NOT NULL so there is one spelling of "nobody forced this" rather than two.
         "forced_reason": "TEXT NOT NULL DEFAULT ''",
+        # THE COMMIT THIS VERDICT HAS BEEN CARRIED FORWARD TO, and why. A SECOND column
+        # rather than an overwrite of `head_sha`, and that is the whole point: `head_sha`
+        # means "the commit the seats read" and must stay true on `jarvis validation
+        # show` for ever. Writing the new head over it would make that surface say five
+        # judges examined a commit none of them ever saw.
+        #
+        # Written only by `ops.carry_validated_head`, only when the OS itself moved the
+        # head by merging the base in and nothing else did — see that function for the
+        # three facts it checks. `validated_head` prefers it, so this is what an
+        # automatic merge binds to; the gate the merge still files quotes both.
+        #
+        # DEFAULT '' MEANS "NEVER CARRIED", the honest reading of every round written by
+        # a submission and of every round written before this column existed. NOT NULL
+        # so there is one spelling of "not carried" rather than two.
+        "carried_head_sha": "TEXT NOT NULL DEFAULT ''",
+        "carried_reason": "TEXT NOT NULL DEFAULT ''",
     },
     "approvals": {
         # Which SEAT attempted the command, when a subagent did. NULL means the session's
@@ -1031,6 +1112,13 @@ ADDED_COLUMNS = {
         # WHY a row landed in `expired`: 'lapsed', 'superseded' or 'abandoned' — only the
         # last is worth counting. Spec 2026-09-12 §4, §5.
         "closed_as": "TEXT NOT NULL DEFAULT ''",
+        # WHEN THIS REQUEST STARTED REFUSING THE WORKER'S COMMANDS — the moment it went
+        # `pending`, which `ts` does not record for one filed `awaiting_case` and `status`
+        # cannot recover once it is decided. NULL means never: a request nobody ever
+        # argued blocked nothing (`hooks.pending_turn_block` reads `pending` and only
+        # `pending`). The one reader is `gate_open_at`; §4 of
+        # docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md.
+        "pending_at": "REAL",
     },
     # An alarm can name a FEATURE ORDER as its subject and a health probe as its source.
     # All four are additive with defaults and no CHECK: `_migrate` runs inside
@@ -1156,6 +1244,23 @@ class ProjectStore:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
         self._backfill_alarms()
         self._backfill_abandoned_gates()
+        self._backfill_pending_at()
+
+    def _backfill_pending_at(self) -> None:
+        """Give historical rows the best `pending_at` the record can support. Spec §4.
+
+        `ts` is the filing time, so it is exact for every row filed straight into
+        `pending` (the default, and every gate a worker trips) and early by the arguing
+        time for one that was held first. Two shapes are left NULL because they provably
+        never refused anyone: a request still `awaiting_case`, and one abandoned unargued.
+        Idempotent — it only ever fills a NULL.
+        """
+        self.conn.execute(
+            """UPDATE approvals SET pending_at = ts
+               WHERE pending_at IS NULL AND status != 'awaiting_case'
+                 AND closed_as != 'abandoned'"""
+        )
+        self.conn.commit()
 
     #: The reason `gates.sweep_unargued` wrote while the TTL still recorded a DENIAL.
     #: A prefix because the minute count varies per project; nothing else ever wrote it,
@@ -1305,6 +1410,140 @@ class ProjectStore:
         rows = self.conn.execute(
             "SELECT * FROM work_orders WHERE issue_url=? ORDER BY created_at DESC",
             (issue_url,)).fetchall()
+        return db.rows_to_dicts(rows)
+
+    # -- the issue <-> work order relation ------------------------------------------
+    #
+    # Both directions answerable WITHOUT A NETWORK CALL, which is the whole of why the
+    # relation exists: the origin used to live only in the issue body's prose, so "which
+    # issues did this order raise" could only be answered by scraping GitHub and
+    # `jarvis wo show` could not answer it at all.
+
+    def link_issue(self, issue_url: str, unit_id: str, kind: str, *,
+                   round_no: int = 0, seat: str = "", announced: bool = False) -> bool:
+        """Record that `unit_id` raised, was assigned, or cites `issue_url`.
+
+        Returns True only when this is a link the project did not have — the caller's
+        signal that something new happened, and what keeps the sweep from re-announcing
+        a reference it has already commented on.
+
+        ONE ROW PER (issue, unit) AND THE KIND ONLY EVER STRENGTHENS (`ISSUE_LINK_KINDS`
+        is the order). An order whose brief cites the very issue it was dispatched to fix
+        must not count twice, and re-recording the weaker kind afterwards must not
+        overwrite the stronger one — either would corrupt the count the user reads as a
+        priority signal.
+        """
+        if kind not in ISSUE_LINK_KINDS:
+            raise ValueError(f"{kind!r} is not one of {ISSUE_LINK_KINDS}")
+        row = self.conn.execute(
+            "SELECT kind FROM issue_links WHERE issue_url=? AND unit_id=?",
+            (issue_url, unit_id)).fetchone()
+        with db.write_transaction(self.conn):
+            if row is None:
+                self.conn.execute(
+                    "INSERT INTO issue_links (issue_url, unit_id, kind, round, seat, "
+                    "created_at, announced_at) VALUES (?,?,?,?,?,?,?)",
+                    (issue_url, unit_id, kind, round_no, seat, db.now(),
+                     db.now() if announced else None))
+                return True
+            if ISSUE_LINK_KINDS.index(kind) > ISSUE_LINK_KINDS.index(row["kind"]):
+                self.conn.execute(
+                    "UPDATE issue_links SET kind=?, round=?, seat=? "
+                    "WHERE issue_url=? AND unit_id=?",
+                    (kind, round_no, seat, issue_url, unit_id))
+        return False
+
+    def record_issue(self, issue_url: str, *, number: int = 0, repo: str = "",
+                     title: str = "", state: str | None = None) -> None:
+        """Remember what the OS knows about one issue. Upsert; never unlearns.
+
+        `state=None` leaves the cached state alone, so the filing path can record an
+        issue's identity without claiming to have read its state — and a title already
+        read off GitHub is not overwritten by a blank.
+        """
+        with db.write_transaction(self.conn):
+            self.conn.execute(
+                "INSERT INTO tracked_issues (issue_url, number, repo, title, state, "
+                "checked_at) VALUES (?,?,?,?,?,?) ON CONFLICT(issue_url) DO NOTHING",
+                (issue_url, number, repo, title, state or "",
+                 db.now() if state else None))
+            if number:
+                self.conn.execute("UPDATE tracked_issues SET number=? WHERE issue_url=?",
+                                  (number, issue_url))
+            if repo:
+                self.conn.execute("UPDATE tracked_issues SET repo=? WHERE issue_url=?",
+                                  (repo, issue_url))
+            if title:
+                self.conn.execute("UPDATE tracked_issues SET title=? WHERE issue_url=?",
+                                  (title, issue_url))
+            if state:
+                self.conn.execute(
+                    "UPDATE tracked_issues SET state=?, checked_at=? WHERE issue_url=?",
+                    (state, db.now(), issue_url))
+
+    def record_issue_label(self, issue_url: str, count: int) -> None:
+        """The `referenced: N` the OS last managed to put on the issue."""
+        with db.write_transaction(self.conn):
+            self.conn.execute(
+                "UPDATE tracked_issues SET refs_labelled=? WHERE issue_url=?",
+                (count, issue_url))
+
+    def mark_issue_announced(self, issue_url: str, unit_id: str) -> None:
+        with db.write_transaction(self.conn):
+            self.conn.execute(
+                "UPDATE issue_links SET announced_at=? WHERE issue_url=? AND unit_id=?",
+                (db.now(), issue_url, unit_id))
+
+    def issue_links_of(self, unit_id: str) -> list[dict[str, Any]]:
+        """Every issue this one work order or feature order is linked to.
+
+        Joined onto the cached facts so a caller gets the issue's number, title and last
+        known state in the same read — the projection behind the consolidated list on
+        `jarvis wo show` and the work-order page.
+        """
+        rows = self.conn.execute(
+            "SELECT l.*, i.number, i.repo, i.title, i.state, i.checked_at "
+            "FROM issue_links l LEFT JOIN tracked_issues i USING (issue_url) "
+            "WHERE l.unit_id=? ORDER BY l.round, i.number", (unit_id,)).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def issue_board(self) -> list[dict[str, Any]]:
+        """Every tracked issue with its reference count, most-referenced first.
+
+        The ranking the user reads when choosing what to work on next. `refs` counts
+        DISTINCT work orders by construction — one row per (issue, unit) — so the number
+        means what the user asked it to mean.
+        """
+        rows = self.conn.execute(
+            "SELECT i.*, COUNT(l.unit_id) AS refs FROM tracked_issues i "
+            "JOIN issue_links l USING (issue_url) GROUP BY i.issue_url "
+            "ORDER BY refs DESC, i.number DESC").fetchall()
+        out = db.rows_to_dicts(rows)
+        for row in out:
+            row["units"] = [dict(r) for r in self.conn.execute(
+                "SELECT unit_id, kind, round, seat FROM issue_links WHERE issue_url=? "
+                "ORDER BY created_at", (row["issue_url"],)).fetchall()]
+        return out
+
+    def issues_to_sync(self) -> list[dict[str, Any]]:
+        """Every linked issue, with its reference count and what is still unsaid.
+
+        The sweep's whole input, in one query: `refs` is what the label should say,
+        `refs_labelled` what it does say, and `unannounced` how many references have not
+        been commented onto the issue yet. Nothing is sent while all three agree.
+        """
+        rows = self.conn.execute(
+            "SELECT i.*, COUNT(l.unit_id) AS refs, "
+            "SUM(CASE WHEN l.announced_at IS NULL THEN 1 ELSE 0 END) AS unannounced "
+            "FROM tracked_issues i JOIN issue_links l USING (issue_url) "
+            "GROUP BY i.issue_url ORDER BY i.checked_at IS NOT NULL, i.checked_at"
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def unannounced_links(self, issue_url: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM issue_links WHERE issue_url=? AND announced_at IS NULL "
+            "ORDER BY created_at", (issue_url,)).fetchall()
         return db.rows_to_dicts(rows)
 
     def work_orders_tracking_issues(self) -> list[dict[str, Any]]:
@@ -2447,7 +2686,7 @@ class ProjectStore:
         return found
 
     def _this_episode(self, wo_id: str, repair: str, kind: str) -> list[dict[str, Any]]:
-        """Events of `kind` since the last `pr_<repair>_cleared` — this EPISODE's.
+        """Events of `kind` since this EPISODE began — the last clear or re-arm.
 
         Repair state is derived from the timeline rather than kept in columns; the clear
         is the budget reset. See §4 of
@@ -2457,17 +2696,51 @@ class ProjectStore:
         because a store may not import `ops`. The two episodes are counted APART on
         purpose: a branch that conflicted twice last week has spent nothing of the red
         build's budget, and they are different problems with different fixes.
+
+        TWO EVENTS OPEN A FRESH EPISODE, not one. `pr_<repair>_rearmed` is the budget
+        given back because the attempts were never made — the worker was refused by a
+        pending gate before it could read the conflict (issue #469, §4 and §6 of
+        docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md). It
+        moves the boundary here rather than at each caller so that the attempt count,
+        the give-up and the origin all reset together and cannot disagree about which
+        episode is current.
+
+        The second read happens only once there is something to count: a pull request
+        that has never been nudged returns above it, which is what keeps the green case
+        at the cost `test_a_green_pull_request_costs_one_call_three_reads_and_no_write`
+        pins.
         """
         rows = self.events_of_kind(wo_id, kind)
         if not rows:
             return []
-        cleared = self.events_of_kind(wo_id, f"pr_{repair}_cleared")
-        since = cleared[-1]["ts"] if cleared else 0.0
+        opened = (self.events_of_kind(wo_id, f"pr_{repair}_cleared")
+                  + self.events_of_kind(wo_id, f"pr_{repair}_rearmed"))
+        since = max((e["ts"] for e in opened), default=0.0)
         return [r for r in rows if r["ts"] > since]
+
+    def pr_repair_nudges(self, wo_id: str, repair: str) -> list[dict[str, Any]]:
+        """Every ask of this episode, oldest first — the attempts themselves.
+
+        `pr_repair_attempts` is the count; this is what `ops.rearm_pr_repair` needs
+        instead, because WHEN each one went out is what says whether the worker was
+        allowed to act on it (issue #469).
+        """
+        return self._this_episode(wo_id, repair, f"pr_{repair}_nudged")
 
     def pr_repair_attempts(self, wo_id: str, repair: str) -> int:
         """How many times the OS has asked this worker to fix the SAME thing."""
-        return len(self._this_episode(wo_id, repair, f"pr_{repair}_nudged"))
+        return len(self.pr_repair_nudges(wo_id, repair))
+
+    def pr_repair_deferred(self, wo_id: str, repair: str, approval_id: int) -> bool:
+        """Has this episode already recorded that THIS gate is holding the repair up?
+
+        The dedupe behind `ops.defer_pr_repair`: the poll asks every tick for as long as
+        the review takes, and the timeline must carry the fact once, not once per tick.
+        """
+        for event in self._this_episode(wo_id, repair, f"pr_{repair}_deferred"):
+            if (db.from_json(event["payload"], {}) or {}).get("approval_id") == approval_id:
+                return True
+        return False
 
     def pr_repair_gave_up(self, wo_id: str, repair: str) -> bool:
         """Has the OS already stopped trying on this episode and said so?
@@ -2884,14 +3157,27 @@ class ProjectStore:
                     num_turns: int | None = None,
                     usage_json: str | None = None,
                     terminal_reason: str | None = None,
-                    api_error_status: int | None = None) -> dict[str, Any]:
+                    api_error_status: int | None = None,
+                    cost_source: str | None = None) -> dict[str, Any]:
+        """Settle one turn. EVERY CALLER OWES A `cost_usd`, including the failures.
+
+        This SETs the column rather than coalescing into it, so a caller that omits the
+        cost writes NULL over whatever was there and `budget.spent` — which is
+        `SUM(cost_usd)` — bills the turn nothing for ever (issue #471). A turn that ran
+        long enough to be killed spent real money; the caller with nothing from the CLI
+        falls back to the transcript (`worker_session.lost_turn_cost`) rather than
+        leaving the argument off.
+        """
         assert state in ("done", "failed"), state
+        assert cost_source in (None, COST_FROM_ENVELOPE, COST_FROM_TRANSCRIPT), \
+            cost_source
         self.conn.execute(
             """UPDATE wo_turns SET state=?, ended_at=?, result=?, error=?, cost_usd=?,
-                                   num_turns=?, usage_json=?, terminal_reason=?,
-                                   api_error_status=? WHERE id=?""",
-            (state, db.now(), result, error, cost_usd, num_turns, usage_json,
-             terminal_reason or None, api_error_status, turn_id),
+                                   cost_source=?, num_turns=?, usage_json=?,
+                                   terminal_reason=?, api_error_status=? WHERE id=?""",
+            (state, db.now(), result, error, cost_usd,
+             (cost_source or COST_FROM_ENVELOPE) if cost_usd is not None else None,
+             num_turns, usage_json, terminal_reason or None, api_error_status, turn_id),
         )
         return self.get_turn(turn_id)  # type: ignore[return-value]
 
@@ -2899,16 +3185,24 @@ class ProjectStore:
                        cost_usd: float | None = None) -> None:
         """Backfill a settled turn's recorded usage (parsed late from its outfile).
 
-        `cost_usd` travels with it because the two are one reading: a re-derived
-        envelope that left the column holding the old figure would keep `budget.spent`
-        summing numbers the bill no longer agrees with.
+        THE COST RIDES WITH IT. The envelope this re-reads carries `total_cost_usd`, and
+        repairing `usage_json` alone left rows that knew what they cost and were still
+        summed as $0.00 by the one query the enforcement runs (issue #471). Coalesced
+        rather than set: a row whose cost is already known must not be nulled by an
+        envelope that lost the field.
+
+        `cost_usd` overrides that reading for a caller that has already worked out this
+        turn's SHARE of it — `ops._turn_usage` re-deriving a row whose envelope holds the
+        resumed session's running total (issue #470). Both paths agree once the row is
+        current; they disagree exactly while it is being repaired.
         """
-        if cost_usd is None:
-            self.conn.execute("UPDATE wo_turns SET usage_json=? WHERE id=?",
-                              (usage_json, turn_id))
-            return
-        self.conn.execute("UPDATE wo_turns SET usage_json=?, cost_usd=? WHERE id=?",
-                          (usage_json, cost_usd, turn_id))
+        cost = cost_usd
+        if cost is None:
+            cost = (db.from_json(usage_json, None) or {}).get("total_cost_usd")
+        self.conn.execute(
+            "UPDATE wo_turns SET usage_json=?, cost_usd=COALESCE(?, cost_usd), "
+            "cost_source=CASE WHEN ? IS NULL THEN cost_source ELSE ? END WHERE id=?",
+            (usage_json, cost, cost, COST_FROM_ENVELOPE, turn_id))
 
     def latest_turn(self, wo_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
@@ -3238,6 +3532,19 @@ class ProjectStore:
         would come to merge code: `pending` and `failed` are not `passed`, and the
         question this asks is "was it accepted", not "was it never refused".
 
+        **`carried_head_sha` WINS OVER `head_sha` WHEN IT IS SET**, and that is the one
+        weakening of "nothing merges a commit no round judged". It is written only by
+        `ops.carry_validated_head`, only when the OS itself merged the base into the
+        branch and provably nothing else moved the head — so the commit it names differs
+        from the judged one by a base merge and no authored content. The alternative was
+        a fresh panel round per healed pull request, which spends a round number and so
+        manufactures an attention item out of a heal nobody asked for
+        (docs/superpowers/specs/2026-09-18-a-red-base-heals-itself.md §5).
+
+        Nothing else relaxes: CI must still be green on the carried commit, and the merge
+        still files its gate. Reading the two columns HERE rather than at the automerge
+        site is the same one-home rule the paragraph below states.
+
         One home for the rule, for `arbitrate`'s reason — a rule spread across three call
         sites is a rule that holds by luck (spec 2026-09-14 §5.2).
 
@@ -3252,7 +3559,18 @@ class ProjectStore:
         """
         if round_row is None or round_row["outcome"] != "passed":
             return None
-        return str(round_row["head_sha"] or "") or None
+        judged = str(round_row["head_sha"] or "")
+        if not judged:
+            # A carry can never manufacture a binding where the seats bound none: the
+            # whole licence for carrying is "this differs from what was judged by a base
+            # merge", and there is nothing to differ from. Belt to `carry_validated_head`'s
+            # braces, which refuses to write one.
+            return None
+        # `.get`, unlike the two lookups above: this column arrived after the rule did,
+        # and the callers that build a round row by hand (the decision table in
+        # `tests/test_automerge.py`) must keep meaning "never carried" rather than
+        # raising. A real row always has it — `_migrate` sees to that.
+        return str(round_row.get("carried_head_sha") or "") or judged
 
     def validation_rounds(self, *, wo_id: str | None = None,
                           fo_id: str | None = None) -> list[dict[str, Any]]:
@@ -3340,6 +3658,19 @@ class ProjectStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def carry_round_head(self, round_id: int, head_sha: str, reason: str) -> None:
+        """Bind a passed round's verdict to a commit the OS itself produced.
+
+        Writes `carried_head_sha`/`carried_reason` and NEVER touches `head_sha` — see those
+        columns. The guard that decides whether this may be called at all is
+        `ops.carry_validated_head`; this is only the write, kept dumb for the reason
+        every other writer here is: a rule enforced in two places is enforced in one and
+        copied in the other.
+        """
+        self.conn.execute(
+            "UPDATE validation_rounds SET carried_head_sha=?, carried_reason=? WHERE id=?",
+            (head_sha, reason, round_id))
+
     def record_validation_opinion(self, round_id: int, seat: str, *, reply: str = "",
                                   verdict: str = "", status: str = "ok",
                                   model: str = "", latency_ms: int = 0) -> None:
@@ -3380,12 +3711,16 @@ class ProjectStore:
                      agent_type: str | None = None,
                      status: str = "pending",
                      contested: bool = False) -> dict[str, Any]:
+        now = db.now()
         cur = self.conn.execute(
             """INSERT INTO approvals (wo_id, ts, kind, command, matched, justification,
-                                      evidence, max_uses, agent_type, status, contested)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (wo_id, db.now(), kind, command, matched, justification, evidence, max_uses,
-             agent_type, status, int(contested)),
+                                      evidence, max_uses, agent_type, status, contested,
+                                      pending_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            # `pending_at` iff it is pending from birth: an `awaiting_case` row gets one
+            # in `start_review` or never at all.
+            (wo_id, now, kind, command, matched, justification, evidence, max_uses,
+             agent_type, status, int(contested), now if status == "pending" else None),
         )
         approval_id = int(cur.lastrowid)  # type: ignore[arg-type]
         self.add_event(wo_id, "gate_requested", {
@@ -3407,8 +3742,9 @@ class ProjectStore:
         """Link the reviewer's question and open the request to review. See
         `gates.queue_for_review` — the one transition out of `awaiting_case`."""
         self.conn.execute(
-            "UPDATE approvals SET neo_question_id=?, status='pending' WHERE id=?",
-            (question_id, approval_id),
+            """UPDATE approvals SET neo_question_id=?, status='pending',
+                                    pending_at=COALESCE(pending_at, ?) WHERE id=?""",
+            (question_id, db.now(), approval_id),
         )
         return self.get_approval(approval_id)  # type: ignore[return-value]
 
@@ -3624,6 +3960,32 @@ class ProjectStore:
         Named once so a seventh status cannot reach one of them and not the other.
         """
         return self.pending_approvals(wo_id) + self.held_approvals(wo_id)
+
+    def gate_open_at(self, wo_id: str, ts: float) -> bool:
+        """Was a privileged-action gate REFUSING THIS WORKER'S COMMANDS at `ts`?
+
+        The historical form of `pending_approvals`, and it exists for one caller:
+        `ops.rearm_pr_repair` asking whether a repair attempt already spent was an
+        attempt the worker was ever allowed to make (issue #469).
+
+        SAME PREDICATE AS THE GUARD, and that matters more than any other property here:
+        `hooks.pending_turn_block` refuses a session's commands while a request is
+        `pending` and at no other time, `Daemon.heal_pull_request` defers on exactly
+        that, and this asks it of a past moment. A request still `awaiting_case` refuses
+        only the END of a turn, so it is no excuse for a nudge that failed — if this
+        counted one, a work order carrying a single held request nobody ever argued
+        would be refunded its whole budget every episode, for ever, which is the burn
+        issue #469 is about. §4 of
+        docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md.
+        """
+        for approval in self.list_approvals(wo_id):
+            pending_at = approval["pending_at"]
+            if pending_at is None or pending_at > ts:
+                continue
+            decided_at = approval["decided_at"]
+            if decided_at is None or decided_at > ts:
+                return True
+        return False
 
     def expire_approvals(self) -> int:
         """Move spent or timed-out grants to `expired` so listings tell the truth.

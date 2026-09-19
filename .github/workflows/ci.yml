@@ -6,14 +6,40 @@ on:
 
 # All three jobs are REQUIRED status checks on main (enforced by the repo ruleset
 # "protect-main"): unit tests, behavioral evals, and browser tests must pass before
-# any merge. The ruleset uses strict_required_status_checks_policy=true, so a PR
-# branch must also be up to date with main before it can merge.
+# any merge.
+#
+# ONE INTERPRETER, deliberately (2026-09-19). This matrix held 3.11, 3.12 and 3.13 and
+# ran the same suite three times, because `requires-python` said `>=3.11`. Nothing
+# justified the promise: there is not one `sys.version_info` branch in `src/` or in
+# `tests/`, and dev and production both run 3.13, so the two extra legs were the only
+# place the OS had ever been run on 3.11 or 3.12. The promise was retired rather than
+# kept: pyproject.toml now says `>=3.13`, install.sh probes for 3.13 alone, and
+# `uv.lock` was re-locked, which dropped every cp311 and cp312 wheel. Reinstating a
+# version here means reinstating it in all three, or CI is testing something the
+# installer does not offer.
+#
+# It never cost much LATENCY — the legs ran in parallel, so ~7 minutes was ~7 minutes —
+# and that is not why it went. It cost ~20 minutes of Actions compute a run to defend a
+# claim nobody was making good on. Latency does matter now for a different reason: the
+# OS holds a validation round until these checks report (`daemon._validation_ci_held`),
+# so this workflow's wall clock is on every work order's critical path.
+#
+# THE MATRIX IS KEPT WITH ONE ENTRY, and that is not a leftover. A required status check
+# is pinned BY NAME in the ruleset, and a matrix job's name carries its value — so
+# `python-version: ["3.13"]` keeps the context `unit (3.13)`, exactly what the ruleset
+# already required and exactly what every open pull request already reports. Collapsing
+# to a bare `unit` would rename the context, and then the ruleset would demand a check
+# that no branch built before the rename can ever produce: ten open pull requests,
+# unmergeable until each was rebased. Dropping a version from this list is a ruleset
+# edit (remove that context); renaming the job is a ruleset edit AND a rebase of
+# everything in flight. Adding a version needs the ruleset to require it, or it is
+# advisory only.
 jobs:
   unit:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,7 +57,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
       - run: pip install -e ".[dev]"
       - run: pytest evals -q
       - name: Upload scorecard
@@ -48,7 +74,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
       - run: pip install -e ".[dev]"
       - run: playwright install --with-deps chromium
       - run: pytest tests_browser -q

@@ -92,6 +92,12 @@ ISSUE_VERBS = (("issue", "view"), ("issue", "edit"), ("issue", "comment"),
 #: same reason: the daemon's reconcile tick must not block on a network problem.
 GH_TIMEOUT = 30
 
+#: THE ONLY HOST this OS writes an issue to. `gh` talks to github.com and every URL the
+#: OS mints (`ops.issue_url_for`, and `gh issue create`'s own output) is on it, so this
+#: is a statement of fact rather than a policy — and it is what `checked_issue_url` holds
+#: a URL out of a RECORD to, since a record's issue URL can come from a brief.
+ISSUE_HOST = "github.com"
+
 #: The ONLY shape an issue URL may have before it becomes an argument — anchored at both
 #: ends, `https://` required, which is also what makes a leading `-` unreachable so no
 #: argument can be read as a `gh` flag. `github.PR_URL_RE`'s twin.
@@ -225,13 +231,16 @@ class IssueLifecycleError(GitHubError):
 
 @dataclass(frozen=True)
 class Issue:
-    """What `gh issue view --json state,labels,number,url` says, and nothing more."""
+    """What `gh issue view --json state,labels,number,title,url` says, and nothing more."""
 
     url: str
     number: int
     #: GitHub's own enum, uppercased: OPEN or CLOSED.
     state: str
     labels: tuple[str, ...]
+    #: The issue's own headline. Cached by the reference index so a Jarvis surface can
+    #: name an issue without a network call, and empty for every caller that does not.
+    title: str = ""
 
     @property
     def closed(self) -> bool:
@@ -270,6 +279,14 @@ def checked_issue_url(url: str, repo: str | None = None) -> str:
             f"{url!r} is not an issue URL this OS will write to",
             GitHubError.URL_REFUSED)
     want = (repo or bug_repo()).lower()
+    # THE HOST COUNTS, and is checked before the repository so the message names the
+    # actual objection. A URL is `<host>/<owner>/<repo>/issues/N`, so reading only the
+    # middle two accepts the project's real owner and repository under a host nobody
+    # chose — and this function is the last thing between a URL and a `gh` write.
+    if match.group(1).lower() != ISSUE_HOST:
+        raise IssueLifecycleError(
+            f"{url!r} is on {match.group(1)}, but this OS only writes to {ISSUE_HOST}",
+            GitHubError.URL_REFUSED)
     got = f"{match.group(2)}/{match.group(3)}".lower()
     if got != want:
         raise IssueLifecycleError(
@@ -356,10 +373,15 @@ def _run(args: list[str], *, url: str, tolerate: str = "",
     return proc.stdout or ""
 
 
-def view(url: str) -> Issue:
-    """Read the issue at `url`. Raises `IssueLifecycleError` on any doubt."""
-    url = checked_issue_url(url)
-    stdout = _run(["issue", "view", url, "--json", "number,state,labels,url"], url=url)
+def view(url: str, repo: str | None = None) -> Issue:
+    """Read the issue at `url`. Raises `IssueLifecycleError` on any doubt.
+
+    `repo` is `checked_issue_url`'s: it DEFAULTS to the OS's own tracker and is named
+    explicitly by the follow-up paths, which read issues on the project under review.
+    """
+    url = checked_issue_url(url, repo)
+    stdout = _run(["issue", "view", url, "--json", "number,state,labels,title,url"],
+                  url=url)
     try:
         payload: dict[str, Any] = json.loads(stdout)
     except json.JSONDecodeError as e:
@@ -375,7 +397,7 @@ def view(url: str) -> Issue:
                    if isinstance(l, dict) and l.get("name"))
     return Issue(url=str(payload.get("url") or url),
                  number=int(payload.get("number") or issue_number(url)),
-                 state=state, labels=labels)
+                 state=state, labels=labels, title=str(payload.get("title") or ""))
 
 
 def ensure_label(label: str, repo: str | None = None) -> None:
@@ -391,23 +413,23 @@ def ensure_label(label: str, repo: str | None = None) -> None:
          url=repo, tolerate="already exists")
 
 
-def add_label(url: str, label: str) -> None:
-    _run(["issue", "edit", checked_issue_url(url), "--add-label", checked_label(label)],
-         url=url)
-
-
-def remove_label(url: str, label: str) -> None:
-    _run(["issue", "edit", checked_issue_url(url), "--remove-label",
+def add_label(url: str, label: str, repo: str | None = None) -> None:
+    _run(["issue", "edit", checked_issue_url(url, repo), "--add-label",
           checked_label(label)], url=url)
 
 
-def comment(url: str, body: str) -> None:
+def remove_label(url: str, label: str, repo: str | None = None) -> None:
+    _run(["issue", "edit", checked_issue_url(url, repo), "--remove-label",
+          checked_label(label)], url=url)
+
+
+def comment(url: str, body: str, repo: str | None = None) -> None:
     """Add a comment, with the body on stdin rather than in argv.
 
     Same reason `bugreport.create_issue` does it: a comment carries a summary and
     several links, and argv has a length limit that stdin does not.
     """
-    url = checked_issue_url(url)
+    url = checked_issue_url(url, repo)
     _run(["issue", "comment", url, "--body-file", "-"], url=url, stdin=body)
 
 
@@ -533,6 +555,91 @@ def follow_ups_filed(repo: str, unit_id: str) -> list[dict[str, Any]]:
     except ValueError:
         return []
     return [r for r in rows if isinstance(r, dict) and r.get("url")]
+
+
+# -- back-references: how many work orders have pointed at this issue ----------------
+#
+# The half of the relation that did not exist before: an issue recorded only the order
+# that CREATED it, so "three separate pieces of work have now run into this" was not a
+# fact anything could state. The count is a PRIORITY SIGNAL — the user's words — which is
+# why the admitting set is small and lives in `project_store.ISSUE_LINK_KINDS`, and why
+# over-counting would be worse than not counting at all.
+
+#: What the count is written as, both here and on the tracker. A LABEL rather than a
+#: line in the body: it shows on the issue LIST, which is where a person scanning a
+#: tracker decides what to open, and maintaining it is `set_priority_label`'s exact shape
+#: — take the stale one off, put the current one on — rather than a new write verb.
+REFERENCE_LABEL_PREFIX = "referenced: "
+
+#: Matches any reference label, whatever the number, so the stale one can be found on an
+#: issue without the OS having to remember what it last wrote there.
+REFERENCE_LABEL_RE = re.compile(r"^referenced: [0-9]+$")
+
+REFERENCE_LABEL_COLOUR = "d4c5f9"
+REFERENCE_LABEL_DESCRIPTION = "How many Jarvis work orders have pointed at this issue."
+
+
+def reference_label(count: int) -> str:
+    return f"{REFERENCE_LABEL_PREFIX}{count}"
+
+
+def set_reference_label(url: str, count: int, repo: str) -> None:
+    """Make the issue's reference label say `count`, and say it once.
+
+    THE STALE ONE COMES OFF FIRST, for `set_priority_label`'s reason: GitHub keeps every
+    label you add, so an issue that went from two references to three would carry both
+    numbers and the scan the label exists for would read the wrong one.
+
+    **IT NEVER TOUCHES A CLOSED ISSUE.** A person closing an issue is the end of it, and
+    relabelling one afterwards is the OS arguing with them — the rule `apply` already
+    holds for the work-order label, here for a label with even less claim to insist.
+    """
+    issue = view(url, repo)
+    if issue.closed:
+        return
+    want = reference_label(count)
+    for stale in issue.labels:
+        if REFERENCE_LABEL_RE.match(stale.strip().lower()) and stale.strip() != want:
+            remove_label(url, stale, repo)
+    if not issue.has(want):
+        ensure_reference_label(repo, count)
+        add_label(url, want, repo)
+
+
+def ensure_reference_label(repo: str, count: int) -> None:
+    """Define `referenced: <count>` on `repo`, so `--add-label` cannot fail over it.
+
+    THE EXACT LABEL, not a template: `gh` refuses `--add-label` for a name the repository
+    does not define (`kn-eefc35a8` fact 1), and each count is a name of its own. The
+    repository therefore accumulates one definition per number it has ever seen, which is
+    the price of the count being visible on the issue LIST — where a person scanning a
+    tracker decides what to open — and is bounded by how many work orders ever point at
+    one issue.
+    """
+    repo = checked_repo(repo)
+    _run(["label", "create", checked_label(reference_label(count)), "--repo", repo,
+          "--color", REFERENCE_LABEL_COLOUR, "--description",
+          REFERENCE_LABEL_DESCRIPTION], url=repo, tolerate="already exists")
+
+
+def reference_comment(unit_id: str, project: str, kind: str, title: str = "") -> str:
+    """What the issue says when a further work order points at it.
+
+    JARVIS OS TERMS ONLY — the work order id, the project name, and which of the three
+    ways it is linked. The tracker is public and the rule `closing_comment` states holds
+    here unchanged: whoever reads this follows the work-order id for the detail, which is
+    exactly what it is here for. The order's TITLE is included only when the caller has
+    one it is willing to publish; `desired_state`'s callers pass none.
+    """
+    how = {"raised": "raised this finding",
+           "assigned": "was dispatched to fix this",
+           "cited": "cites this issue in its brief"}.get(kind, "references this issue")
+    line = f"Jarvis work order `{unit_id}` ({project}) {how}."
+    if title:
+        line += f" — {title}"
+    return "\n".join([
+        line, "",
+        "<!-- Recorded automatically by the Jarvis issue-reference index. -->"])
 
 
 def desired_state(store: Any, wo: dict[str, Any]) -> str:

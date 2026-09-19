@@ -117,8 +117,12 @@ def test_the_packet_carries_what_a_reviewer_reads_and_a_diff_cannot_show(project
     assert pr is not None
     assert pr["title"] == "[wo-1] Do the thing"
     assert "it does the thing" in pr["body"]
+    # `started_at` and `workflow` ride along from `github.read_checks` for
+    # `ci.inherited` and cost nothing — `gh` answers `statusCheckRollup` whole, so
+    # neither field set grew. Empty here because this fixture registers neither.
     assert pr["checks"] == [{"name": "tests", "status": "COMPLETED",
-                             "conclusion": "SUCCESS"}]
+                             "conclusion": "SUCCESS", "started_at": "",
+                             "workflow": ""}]
     assert pr["base_ref"] and pr["head_ref"]
 
 
