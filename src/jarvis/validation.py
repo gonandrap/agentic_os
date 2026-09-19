@@ -870,8 +870,9 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
             # rather than stalling the round, and the row says `failed` rather than
             # `abstained` — a seat that CANNOT run is not one that timed out.
             log.error("validation seat %s cannot run: %s", seat, e)
+            # `unavailable`: `panel._round`'s marker, for its reason. See `seats.Opinion`.
             missing.append(seats.Opinion(seat=seat, raw=str(e), status="failed",
-                                         replied=False))
+                                         replied=False, unavailable=True))
 
     models = {seat: seat_model(seat, cfg) for seat in prompts}
     # WITHOUT THIS THE ROUND STILL PAYS FIVE WRITES. `run_blind` submits every seat

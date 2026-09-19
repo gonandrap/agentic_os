@@ -290,11 +290,30 @@ def test_an_unreachable_veto_seat_is_not_a_shrunken_quorum():
 
 
 def test_a_seat_this_build_does_not_ship_is_not_a_transport_fault():
-    """`failed` + `replied=False` is a seat that can never run; retrying is pointless."""
+    """A seat that can never run must not re-queue the question; retrying is pointless.
+
+    Keyed on the `unavailable` MARKER, not on the word `failed` — review round 1. The
+    real construction sites are driven in
+    `tests/test_neo_panel.py::test_the_never_shipped_seat_is_exempt_by_its_marker_not_by_its_status`
+    and `tests/test_validation_panel.py::test_a_validation_seat_this_build_does_not_ship_is_marked_unavailable`;
+    this is the predicate's own unit.
+    """
     opinions = [_ok("premise"),
                 Opinion(seat="blast", raw="no such seat", status="failed", model="",
-                        replied=False)]
+                        replied=False, unavailable=True)]
     assert panel.unreachable_veto_seats(opinions, ["premise", "blast"]) == []
+
+
+def test_the_exemption_needs_the_marker_and_not_merely_the_word_failed():
+    """The hole review round 1 found: `failed` is worn by two unrelated facts.
+
+    An unreached seat recorded `failed` WITHOUT the marker is a transport fault, and
+    must still stop the verdict. A predicate spelling out status words let this through.
+    """
+    opinions = [_ok("premise"),
+                Opinion(seat="blast", raw="boom", status="failed", model="m",
+                        replied=False)]
+    assert panel.unreachable_veto_seats(opinions, ["premise", "blast"]) == ["blast"]
 
 
 def test_an_unusable_reply_is_not_silence():
@@ -302,6 +321,13 @@ def test_an_unusable_reply_is_not_silence():
     opinions = [_ok("premise"),
                 Opinion(seat="blast", raw="{{{", status="failed", model="m")]
     assert panel.unreachable_veto_seats(opinions, ["premise", "blast"]) == []
+
+
+def test_a_veto_seat_with_no_opinion_at_all_is_unreached():
+    """`run_blind` cannot produce this today. If it ever does, a veto nobody recorded is
+    a veto nobody heard — the safe direction is to refuse the verdict, not to assume."""
+    assert panel.unreachable_veto_seats([_ok("premise")],
+                                        ["premise", "blast"]) == ["blast"]
 
 
 def test_a_silent_veto_seat_never_becomes_a_vote():

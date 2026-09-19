@@ -194,8 +194,13 @@ def _round(store: NeoStore, q: dict[str, Any], cfg: NeoConfig,
             # `failed` rather than `abstained` — a seat that CANNOT run is not one that
             # timed out.
             log.error("panel seat %s cannot run: %s", seat, e)
+            # `unavailable`, not the word `failed`: this is the ONE construction site
+            # for "no such seat in this build", and `unreachable_veto_seats` excludes it
+            # by that marker. `SeatError` comes from `parse_definition` and never from
+            # the transport, so nothing here can be a call that merely failed today —
+            # the marker is what keeps that true if a future `except` widens.
             missing.append(Opinion(seat=seat, raw=str(e), status="failed",
-                                   replied=False))
+                                   replied=False, unavailable=True))
 
     opinions = seats.run_blind(
         {seat: (system, prompt) for seat, system in systems.items()},
@@ -351,18 +356,35 @@ def unreachable_veto_seats(opinions: Sequence[Opinion],
                            roster: Sequence[str]) -> list[str]:
     """Seats that could have forced an escalation and were never reached, in roster order.
 
-    `abstained` ONLY, and the exclusion is the point. A seat with no definition in this
-    build is recorded `failed` by `_round` and is not in here: it was never reached and it
-    never will be, so treating it as a transport fault would re-queue every question to
-    exhaustion and put an unanswerable one in front of the user on a cadence. A seat that
-    replied with something unusable is not in here either — it was reached, and silence is
-    what this asks about, not sense.
+    KEYED ON `replied`, NEVER ON THE STATUS STRING. The question is "was this seat
+    reached", and `status` cannot answer it: `failed` is worn by two unrelated facts — a
+    seat that replied with unparseable output, and a seat with no definition in this
+    build — so a predicate spelling out status words is correct only for as long as
+    nobody adds a third. `replied` is the field that means what this asks (review round 1
+    of wo-3b2244d4).
+
+    Two exclusions, and both are deliberate:
+
+    * `unavailable` — no definition for the seat ships here. It was never reached and it
+      never will be, so treating it as a transport fault would re-queue every question
+      to exhaustion and put an unanswerable one in front of the user on a cadence.
+      Excluded by the sentinel its one construction site sets, not by the word `failed`.
+    * a seat that REPLIED, however unusably. It was reached; `arbitrate` and the chair
+      already own what to make of what it said. Silence is what this asks about.
+
+    A roster seat with no opinion at all counts as unreached. `run_blind` returns one
+    Opinion per prompt and `_run_seat` never raises, so it cannot happen today — and if
+    it ever does, a veto seat nobody recorded is exactly a veto nobody heard.
     """
     by_seat = {op.seat: op for op in opinions}
-    return [seat for seat in roster
-            if seat in FORCES_ESCALATE
-            and (op := by_seat.get(seat)) is not None
-            and op.status == "abstained"]
+    unreached = []
+    for seat in roster:
+        if seat not in FORCES_ESCALATE:
+            continue
+        op = by_seat.get(seat)
+        if op is None or (not op.replied and not op.unavailable):
+            unreached.append(seat)
+    return unreached
 
 
 def arbitrate(opinions: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:

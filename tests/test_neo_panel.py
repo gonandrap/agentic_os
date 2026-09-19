@@ -783,23 +783,112 @@ def test_a_failed_seat_abstains_and_the_panel_proceeds_without_it(store, fake_cl
     assert result["panel"]["route"] == "panel"
 
 
-def test_an_unreachable_veto_seat_takes_no_verdict_at_all(store, fake_claude):
+@pytest.mark.parametrize("seat", ["blast", "record"])
+def test_an_unreachable_veto_seat_takes_no_verdict_at_all(store, fake_claude, seat):
     """The user's ruling via Neo, question 436: a silent veto seat is a shrunken quorum.
 
-    `blast` owns the blast radius. Unreached, it cannot exercise its veto, so the chair
-    would synthesise a verdict the full panel might have blocked. There is no verdict
-    without it: `decide` raises, and `drain_queue` re-queues the question rather than
-    letting anything downstream act on a decision four seats short.
+    `blast` owns the blast radius and `record` owns the record. Unreached, neither can
+    exercise its veto, so the chair would synthesise a verdict the full panel might have
+    blocked. There is no verdict without them: `decide` raises, and `drain_queue`
+    re-queues the question rather than letting anything downstream act on a decision a
+    seat short.
     """
-    fake_claude.fail_seat("blast")
+    fake_claude.fail_seat(seat)
     q = claim(store, "which delimiter?")
 
-    with pytest.raises(claude_cli.ClaudeCliError, match="could not reach blast"):
+    with pytest.raises(claude_cli.ClaudeCliError, match=f"could not reach {seat}"):
         panel.decide(store, q, full())
 
     assert "chair" not in {r["seat"] for r in store.opinions(q["id"])}, (
         "the chair was asked to synthesise without the seat that may veto"
     )
+
+
+def test_an_approval_gate_is_never_settled_a_veto_seat_short(store, fake_claude):
+    """The case the rule exists for: the verdict here would CLOSE A GATE."""
+    fake_claude.fail_seat("blast")
+    q = claim(store, "may I merge this?", kind="approval")
+
+    with pytest.raises(claude_cli.ClaudeCliError, match="could not reach blast"):
+        panel.decide(store, q, full())
+
+
+def test_a_transport_fault_at_a_veto_seat_is_caught_however_it_is_recorded(
+        store, fake_claude):
+    """REVIEW ROUND 1. The predicate must key on whether the seat was REACHED, not on
+    the word its status happens to carry.
+
+    This drives the REAL `seats._run_seat` construction site with an injected
+    `ClaudeCliError` and asserts the recorded Opinion carries `replied=False` and is NOT
+    marked `unavailable` — the two facts `unreachable_veto_seats` actually reads. A
+    version keyed on `status == "abstained"` passes today and silently stops working the
+    moment that `except` records any other word.
+    """
+    fake_claude.fail_seat("blast")
+    q = claim(store, "which delimiter?")
+
+    captured: list = []
+    real_round = panel._round                                      # noqa: SLF001
+
+    def spy(*args, **kwargs):
+        ops_ = real_round(*args, **kwargs)
+        captured.extend(ops_)
+        return ops_
+
+    monkeypatch_round(panel, spy)
+    try:
+        with pytest.raises(claude_cli.ClaudeCliError):
+            panel.decide(store, q, full())
+    finally:
+        monkeypatch_round(panel, real_round)
+
+    blast = next(op for op in captured if op.seat == "blast")
+    assert blast.replied is False, "a transport fault must record the seat as unreached"
+    assert blast.unavailable is False, (
+        "a call that merely failed must not be marked 'no such seat in this build' — "
+        "that marker is what exempts a seat from the retry path for ever"
+    )
+    assert panel.unreachable_veto_seats(captured, ["premise", "record", "blast",
+                                                   "taste"]) == ["blast"]
+
+
+def test_the_never_shipped_seat_is_exempt_by_its_marker_not_by_its_status(
+        store, fake_claude, unship):
+    """The other half of round 1: the exemption must be driven by the real site too.
+
+    `_round`'s `SeatError` branch is the ONE place `unavailable` is set. A seat with no
+    markdown in this build was never reached either, but no retry will ever change that,
+    so it must NOT re-queue the question — while a seat that merely could not be called
+    must.
+    """
+    unship("blast")
+    q = claim(store, "which delimiter?")
+
+    captured: list = []
+    real_round = panel._round                                      # noqa: SLF001
+
+    def spy(*args, **kwargs):
+        ops_ = real_round(*args, **kwargs)
+        captured.extend(ops_)
+        return ops_
+
+    monkeypatch_round(panel, spy)
+    try:
+        # It does NOT raise: the round completes and the chair synthesises.
+        result = panel.decide(store, q, cfg(roster=("premise", "blast", "chair")))
+    finally:
+        monkeypatch_round(panel, real_round)
+
+    blast = next(op for op in captured if op.seat == "blast")
+    assert (blast.replied, blast.unavailable) == (False, True)
+    assert panel.unreachable_veto_seats(captured, ["premise", "blast"]) == []
+    assert result["panel"]["route"] == "panel"
+
+
+def monkeypatch_round(module, fn):
+    """Swap `panel._round`. A plain setattr, named so the two tests above read as one
+    intent rather than as two rebindings of a private."""
+    module._round = fn                                             # noqa: SLF001
 
 
 # -- arbitration, end to end through `decide` ----------------------------------------------

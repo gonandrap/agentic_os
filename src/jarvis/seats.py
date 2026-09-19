@@ -162,6 +162,17 @@ class Opinion:
     #: down a panel the other four answered: it is the CALLER that decides whether the
     #: round can be judged without it (`validation.decide`, GitHub issue #235).
     refused: claude_cli.UsageLimit | None = None
+    #: NO DEFINITION FOR THIS SEAT SHIPS IN THIS BUILD — the `SeatError` construction
+    #: sites in `panel._round` and `validation._run_seats`, and nowhere else.
+    #:
+    #: A SENTINEL RATHER THAN THE STATUS STRING, and that is the whole point of it. Two
+    #: unrelated facts are both recorded `status='failed'` — this one, and a seat that
+    #: replied with output nobody could parse — so any caller distinguishing them by that
+    #: word is one `except` clause away from being silently wrong.
+    #: `panel.unreachable_veto_seats` is the caller that must not be: it asks whether a
+    #: seat was REACHED (`replied`), and needs this to tell "never reached, and a retry
+    #: would fix it" from "never reached, and no retry ever will".
+    unavailable: bool = False
 
     @property
     def data(self) -> dict[str, Any] | None:

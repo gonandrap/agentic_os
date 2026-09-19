@@ -60,9 +60,23 @@ Ruled by the user via Neo, question 436: **B for every kind.** If any seat in
 `FORCES_ESCALATE` was never reached, there is no verdict, and `panel.decide` raises so
 `drain_queue` re-queues the question.
 
-Scoped to `abstained` — a transport fault. A seat with no definition in this build is
-recorded `failed`, and is excluded: it was never reached and never will be, so treating it
-as a fault would re-queue every question to exhaustion on a cadence.
+**The predicate keys on `replied`, never on the status string** (review round 1). The
+question is "was this seat reached", and `status` cannot answer it: `failed` is worn by
+two unrelated facts — a seat that replied unparseably (`seats._run_seat`) and a seat with
+no definition in this build (`panel._round`, `validation._run_seats`' `SeatError`
+branches) — so a predicate spelling out status words is correct only until someone adds a
+third. An `except` clause that widened to record a transport fault as `failed` would have
+silently reopened the hole this section exists to close.
+
+The never-shipped seat is therefore excluded by `Opinion.unavailable`, a sentinel set at
+those two `SeatError` construction sites and nowhere else. It was never reached and never
+will be, so treating it as a fault would re-queue every question to exhaustion on a
+cadence — but it must be exempted by a marker that means exactly that, not by a word it
+happens to share.
+
+A roster seat with no opinion at all counts as unreached. `run_blind` returns one Opinion
+per prompt and `_run_seat` never raises, so it cannot happen today; if it ever does, a
+veto nobody recorded is a veto nobody heard.
 
 ## 4. The supervisor's alarm queue
 
