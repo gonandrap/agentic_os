@@ -478,3 +478,35 @@ def test_reaping_a_conversation_records_each_turn_and_not_the_session(store, tmp
     assert [json.loads(r["usage_json"])["cache_read"] for r in rows] == \
         [own["cache_read"] for own in turns]
     assert [round(r["cost_usd"], 2) for r in rows] == [2.49, 14.41]
+
+
+def test_the_turn_file_tracks_the_session_total_and_never_the_turn(tmp_path):
+    """wo-966987af, measured per turn against its transcript with the turn's own
+    started_at/ended_at as the boundaries. Its five result JSONs report
+
+        turn  calls   this turn   session so far   `modelUsage` in the file
+           1     21       2.17M            2.17M                     2.02M
+           2    152      39.12M           41.14M                    41.14M
+           3     16       4.12M           45.26M                    45.64M
+           4     13       0.79M           46.05M                    46.43M
+           5     32       2.96M           49.01M                    49.39M
+
+    — the file tracks the SESSION column in every row. Turn 3 spent 4.12M and its file
+    says 45.64M, which is the reading `USAGE_SCHEMA_VERSION` 2 took at face value.
+    """
+    session_so_far = [2_020_000, 41_140_000, 45_640_000, 46_430_000, 49_390_000]
+    this_turn = [2_170_000, 39_120_000, 4_120_000, 790_000, 2_960_000]
+    turns = [spend(0, 0, own, 0) for own in this_turn]
+    cumulative = [spend(0, 0, total, 0) for total in session_so_far]
+
+    envelopes = derive_series(tmp_path, turns, cumulative,
+                              [2.28, 25.60, 28.88, 29.87, 32.02])
+
+    read = [e["cache_read"] for e in envelopes]
+    assert read[2] == 4_500_000, "turn 3 is its own spend, not the session's"
+    for got, measured in zip(read, this_turn):
+        assert abs(got - measured) < measured * 0.1, (read, this_turn)
+    # The identity the bill rests on: the turns sum to the session ONCE — 49.39M, not
+    # the 184.6M that summing the five files gave.
+    assert sum(read) == session_so_far[-1]
+    assert sum(e["total_cost_usd"] for e in envelopes) == pytest.approx(32.02)

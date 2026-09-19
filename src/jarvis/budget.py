@@ -9,9 +9,16 @@ runs. The whole design rests on it:
 * **The cap is PER INVOCATION, not per session.** A session that had already spent
   $0.0327 across its first turn resumed under `--max-budget-usd 0.01` and ran to
   completion, spending another $0.0072. Prior spend on the same session id does not
-  count against the flag, and `total_cost_usd` on the resumed envelope reports that
-  invocation's spend alone. THIS IS THE WHOLE REASON THIS MODULE EXISTS: the running
+  count against the flag. THIS IS THE WHOLE REASON THIS MODULE EXISTS: the running
   total is Jarvis's to keep, and each turn is handed `budget - spent so far`.
+  * The same measurement also concluded that `total_cost_usd` on the resumed envelope
+    reports that invocation's spend alone. THAT HALF IS FALSE, on every multi-turn
+    order since CLI 2.1.277: it is the RESUMED SESSION'S RUNNING BILL, as is
+    `modelUsage` (issue #470). The cap and the accounting simply do not agree about
+    which dollars they mean, and `_spend` summing the column as it was read made a $50
+    ceiling cut wo-966987af at a real $29.87 — the error growing with every turn.
+    `claude_cli.derive_turn_usage` now records the DELTA, so `wo_turns.cost_usd` is
+    this turn's spend and the sum below is the order's, once.
 * **It is checked BETWEEN API calls, so it overshoots.** A run capped at $0.001 spent
   $0.0471 — 47x — because the first call was already past the line when the check ran.
   The flag is a stop signal, not a hard limit; the bound is "one API call of overshoot",

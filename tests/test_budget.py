@@ -250,6 +250,35 @@ def test_a_ceiling_re_reads_turns_counted_as_the_whole_session(started, store,
     assert cap is not None and cap.remaining_usd == pytest.approx(3.5)
 
 
+def test_a_cap_is_not_tripped_by_the_session_running_total(started, store, tmp_path):
+    """Recorded live, turn by turn, the way a running order records them.
+
+    wo-966987af's real dollars under the $50 standing ceiling jarvis_os now carries.
+    Summing `total_cost_usd` as the envelope reports it gives $2.28 + $25.60 + $28.88 +
+    $29.87 + $32.02 = $118.65 and stops the order at turn 4, having really spent
+    $29.87 of its $50. The conversation cost $32.02 and must run to the end.
+    """
+    from jarvis import worker_session
+    from tests.test_turn_usage import running, spend, turn_file
+
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=50.0)
+    turns = [spend(0, 0, own, 0)
+             for own in (2_170_000, 39_120_000, 4_120_000, 790_000, 2_960_000)]
+    costs = [2.28, 25.60, 28.88, 29.87, 32.02]
+    for i, (own, cum, cost) in enumerate(zip(turns, running(turns), costs), start=1):
+        turn = store.create_turn(wo["id"], kind="dispatch", prompt="go")
+        out = turn_file(tmp_path, i, own=own, cumulative=cum, cost=cost)
+        store.conn.execute("UPDATE wo_turns SET outfile=?, started_at=? WHERE id=?",
+                           (str(out), time.time() - 60, turn["id"]))
+        worker_session.poll(store)
+        cap = budget.ceiling(store, None, store.get_work_order(wo["id"]))
+        assert cap is not None and cap.remaining_usd > 0, f"cut short at turn {i}"
+
+    assert budget.spent(store, None, wo["id"]).worker_usd == pytest.approx(32.02)
+    cap = budget.ceiling(store, None, store.get_work_order(wo["id"]))
+    assert cap is not None and cap.remaining_usd == pytest.approx(17.98)
+
+
 def test_no_budget_means_no_ceiling(started, store):
     wo = ops.create_work_order("proj_a", "uncapped", description="do it")
     assert store.get_work_order(wo["id"])["budget_usd"] is None
