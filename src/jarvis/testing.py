@@ -1167,7 +1167,43 @@ elif argv[:2] == ["pr", "update-branch"]:
     landed[url] = {**landed.get(url, {}), "headRefOid": moved}
     with open(merged_path, "w") as f:
         json.dump(landed, f)
+    # THE MERGE COMMIT'S PARENTAGE, recorded because the carry-forward is proved from it
+    # and not from the fact that this command was called. GitHub's updatePullRequestBranch
+    # merges the base INTO the branch, so parent 0 is the branch's previous head and
+    # parent 1 is the base. A fake that did not model this could not express the race the
+    # proof exists for: a worker pushing between the head read and the update.
+    commits_path = os.path.join(state_dir, "commits.json")
+    try:
+        with open(commits_path) as f:
+            commits = json.load(f)
+    except (OSError, ValueError):
+        commits = {}
+    commits.setdefault(moved, {"parents": [pr.get("headRefOid", ""),
+                                           os.environ.get("FAKE_GH_BASE_SHA",
+                                                          "basecommit0")]})
+    with open(commits_path, "w") as f:
+        json.dump(commits, f)
     print(f"Updated branch of pull request {url}")
+elif argv[:2] == ["api", "--method"]:
+    # `gh api --method GET repos/<o>/<r>/commits/<sha> --jq .parents[].sha`. Only the
+    # commit read the OS makes; anything else is an unhandled argv, deliberately, so a
+    # second API call cannot appear here without the fixture noticing.
+    path = argv[3] if len(argv) > 3 else ""
+    if argv[2] != "GET" or "/commits/" not in path:
+        sys.stderr.write(f"fake gh: unhandled api call {argv}\n")
+        sys.exit(2)
+    sha = path.rsplit("/", 1)[-1]
+    try:
+        with open(os.path.join(state_dir, "commits.json")) as f:
+            commits = json.load(f)
+    except (OSError, ValueError):
+        commits = {}
+    rec = commits.get(sha)
+    if rec is None:
+        sys.stderr.write("gh: Not Found (HTTP 404)\n")
+        sys.exit(1)
+    for parent in rec["parents"]:
+        print(parent)
 elif argv[:2] == ["pr", "diff"]:
     prs = roster()
     pr = prs.get(argv[2] if len(argv) > 2 else "")
@@ -1605,6 +1641,26 @@ def fake_gh(tmp_path, monkeypatch):
             """
             self.runs[branch] = list(rows)
             monkeypatch.setenv("FAKE_GH_RUNS", json.dumps(self.runs))
+
+        def set_parents(self, sha: str, parents: list[str]) -> None:
+            """Say what `gh api …/commits/<sha>` answers for a commit's parents.
+
+            What a test needs to drive the race the parentage proof exists for: a
+            worker pushing between the head read and the update means the resulting
+            merge has THAT push as its first parent, not the judged commit, and no
+            fixture that only models `update-branch`'s happy path can express it.
+
+            Registered explicitly here, so it OVERRIDES what the fake would record for
+            itself when the update runs.
+            """
+            path = gdir / "commits.json"
+            rows = json.loads(path.read_text()) if path.exists() else {}
+            rows[sha] = {"parents": list(parents)}
+            path.write_text(json.dumps(rows))
+
+        def base_sha(self, sha: str) -> None:
+            """The base commit `gh pr update-branch` merges in — parent 1 of the result."""
+            monkeypatch.setenv("FAKE_GH_BASE_SHA", sha)
 
         def refuse_update(self, message: str = "failed to update branch") -> None:
             """Make `gh pr update-branch` fail and NOTHING else — reads keep working.

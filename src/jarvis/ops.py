@@ -3237,7 +3237,8 @@ def record_base_update_failed(store: ProjectStore, wo: dict[str, Any], *, base: 
 
 
 def carry_validated_head(store: ProjectStore, wo: dict[str, Any], *, judged: str,
-                         head_after: str, base: str, base_sha: str) -> dict | None:
+                         head_after: str, base: str, base_sha: str,
+                         parents: tuple[str, ...]) -> dict | None:
     """Bind the panel's existing verdict to the commit the OS's own merge produced.
 
     **THE HEAL IS NOT DONE WHEN CI GOES GREEN; IT IS DONE WHEN THE PULL REQUEST CAN
@@ -3251,10 +3252,12 @@ def carry_validated_head(store: ProjectStore, wo: dict[str, Any], *, judged: str
 
     1. the latest round PASSED and the commit it accepted was `judged` — so there is a
        verdict, and it is the one this heal started from;
-    2. `judged` was the head the OS updated FROM — the caller reads it before the
-       update, so a worker push that beat us means `judged != head_before` and nothing
-       is carried;
-    3. `head_after` is what that update produced, read back from GitHub in the same tick.
+    2. `judged` was the head the OS updated FROM — the caller re-reads it AFTER its
+       guards and immediately before the update, so a worker push that beat us means
+       `judged != head_before` and nothing is carried;
+    3. **`head_after` IS A MERGE COMMIT WHOSE FIRST PARENT IS `judged`** — proved by
+       reading the commit back from GitHub (`ci.commit_parents`), not inferred from
+       having asked for the update.
 
     Together they say the difference between the judged commit and the new one is a
     merge of the base and nothing else: `ci.update_branch` merges (never rebases), and
@@ -3262,6 +3265,23 @@ def carry_validated_head(store: ProjectStore, wo: dict[str, Any], *, judged: str
     one, so no authored content can enter this way. Any later push moves the head off
     `head_after` and `decide` holds `sha_moved` again — correctly, because then there IS
     new authored content.
+
+    **FACT 3 IS NOT BELT AND BRACES; IT IS THE ONLY ONE THAT CANNOT BE RACED** (review
+    round 1). `gh pr merge` can pin its commit server-side with `--match-head-commit`;
+    `gh pr update-branch` has no such flag, so between reading the head and the update
+    landing there is a window in which a worker turn can end and push. Fact 2 narrows
+    that window and cannot close it. Fact 3 closes it, because it asks GitHub what the
+    resulting commit ACTUALLY merged: a head built on a worker's push has that push as
+    its first parent, not `judged`, and the carry is refused. The failure this guards
+    against is silent and falls open — it would bind the panel's verdict to code the
+    seats never read and record "no authored content changed" beside it, a false
+    justification that `automerge.decide` and the gate request would both then repeat
+    to Neo.
+
+    Exactly two parents, first one `judged`. Two because a rebuilt merge ref has the old
+    head and the base and nothing else; FIRST because that is the side the merge was
+    made ONTO, and a commit merging `judged` in as its second parent is a different
+    history with someone else's work at its root.
 
     What is NOT relaxed: CI must still pass on the carried commit (condition 6), and the
     merge still files its AUTO_MERGE gate for Neo. This changes what that request says,
@@ -3272,12 +3292,22 @@ def carry_validated_head(store: ProjectStore, wo: dict[str, Any], *, judged: str
         return None
     if ProjectStore.validated_head(row) != judged:
         return None
+    if len(parents) != 2 or parents[0] != judged:
+        log.info("%s: not carrying round %s onto %s — its parents are %s, not a merge "
+                 "of %s with the base", wo["id"], row["round"], head_after[:10],
+                 [p[:10] for p in parents] or "unreadable", judged[:10])
+        return None
     reason = (f"the OS merged `{base}` ({base_sha[:10]}) into this branch to clear a "
               f"failure inherited from a red base — no authored content changed")
     store.carry_round_head(int(row["id"]), head_after, reason)
     carried = {"round": int(row["round"]), "round_id": int(row["id"]),
                "judged_sha": judged, "carried_head_sha": head_after,
-               "base": base, "base_sha": base_sha, "reason": reason}
+               "base": base, "base_sha": base_sha, "reason": reason,
+               # THE PROOF, not a restatement of the claim: the commit's own parents as
+               # GitHub answered them. `merged_base_sha` is the base commit that
+               # actually went in, which is not necessarily `base_sha` — the base can
+               # move between the CI read and the update.
+               "parents": list(parents), "merged_base_sha": parents[1]}
     store.add_event(wo["id"], HEAD_CARRIED_EVENT, carried)
     return carried
 

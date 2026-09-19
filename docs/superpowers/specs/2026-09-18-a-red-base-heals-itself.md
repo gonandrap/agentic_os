@@ -177,13 +177,35 @@ prefers it.
 `ops.carry_validated_head` writes it only when all three hold:
 
 1. the latest round **passed** and the commit it accepted is `judged`;
-2. `judged` was the head the OS updated **from** — read before the update, so a worker
-   push that beat us means nothing is carried;
-3. `head_after` is what that update produced, read back from GitHub in the same tick.
+2. `judged` was the head the OS updated **from** — re-read *after* the guards and
+   immediately before the update, so a worker push that beat us means nothing is carried;
+3. `head_after` is a **two-parent merge whose first parent is `judged`**, proved by
+   reading the commit back from GitHub (`ci.commit_parents`).
 
 Together these say the difference between the judged commit and the new one is a merge of
 the base and nothing else. Any later push moves the head off `carried_head_sha` and
 `decide` holds `sha_moved` again — correctly, because then there *is* new authored content.
+
+**Fact 3 is not belt and braces; it is the only one that cannot be raced** (review round
+1). `gh pr merge` pins its commit server-side with `--match-head-commit`, so the automatic
+merge can make GitHub refuse if the head moved. **`gh pr update-branch` has no such
+flag** — confirmed against the CLI, its only option is `--rebase`. So between reading the
+head and the update landing there is a window in which a worker turn can end and push, and
+fact 2 narrows that window without closing it. Fact 3 closes it by asking GitHub what the
+resulting commit *actually* merged: a head built on a worker's push has that push as its
+first parent, not `judged`.
+
+First parent, not "one of the parents" — the first is the side the merge was made onto, so
+a commit taking `judged` as its *second* parent is a different history with somebody
+else's work at its root. Exactly two, because a rebuilt merge ref has the old head and the
+base and nothing else.
+
+The failure this guards against is silent and falls open. Without it the OS would bind the
+panel's verdict to code the seats never read and record "no authored content changed"
+beside it — a false justification that `automerge.decide` and the `AUTO_MERGE` gate request
+would both then repeat to Neo. An unprovable carry is therefore not a carry: if the parents
+cannot be read, the pull request stays bound to the commit the seats judged and waits for a
+person.
 
 **What is not relaxed:** CI must still pass on the carried commit (condition 6), a round
 that recorded no judged commit can never be carried onto one, and the merge still files
@@ -200,9 +222,13 @@ The heal is not one call. Per parked pull request, per tick:
      │ yes
   spent for this base sha? ──yes──▶ FALL THROUGH
      │ no
-  update the branch ──refused──▶ spend the attempt, FALL THROUGH
+  re-read the head (fact 2) ──▶ update the branch ──refused──▶ spend it, FALL THROUGH
      │
-  re-read the head → record `pr_base_updated` → carry the verdict (§5)
+  re-read the head → record `pr_base_updated`
+     │
+  read the new commit's parents ──not a merge onto `judged`──▶ no carry; it waits
+     │
+  carry the verdict (§5)
      │
   (next tick) CI green on the new head → the existing AUTO_MERGE gate → merge
 ```

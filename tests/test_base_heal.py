@@ -457,6 +457,109 @@ def test_a_worker_push_after_the_heal_is_not_carried(started, project, fake_gh):
     assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
 
 
+def test_the_head_the_carry_rests_on_is_re_read_immediately_before_the_update(
+        started, project, fake_gh):
+    """REVIEW ROUND 1. The `pr.head_oid` taken at the top of the poll loop is a stale
+    snapshot by the time the update runs: the `busy` guard and a `gh run list` with a
+    30s timeout both sit in between, and a worker turn can end and push inside that
+    window. So the head is read again AFTER the guards and immediately before the
+    update, and the call order is what says so."""
+    store, _ = parked(project)
+    fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
+    fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
+    fake_gh.updated_head(UPDATED)
+
+    poll(started, store)
+
+    order = [" ".join(c["argv"][:2]) for c in fake_gh.calls]
+    assert order[:4] == ["pr view", "run list", "pr view", "pr update-branch"]
+
+
+def test_a_push_that_beat_the_update_is_caught_by_the_commits_parents(
+        started, project, fake_gh):
+    """REVIEW ROUND 1, and the half that cannot be raced. `gh pr update-branch` has no
+    `--match-head-commit`, so narrowing the window is not closing it: a worker can still
+    push between the re-read and the update landing. The carry is therefore proved from
+    what the resulting commit ACTUALLY merged — a head built on a worker's push has that
+    push as its first parent, not the judged commit.
+
+    Without this the OS would bind the panel's verdict to code the seats never read and
+    record "no authored content changed" beside it, which `automerge.decide` and the
+    gate request would both then repeat to Neo. Silent, and it falls open.
+    """
+    opt_in(started)
+    store, wo = parked(project)
+    fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
+    fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
+    fake_gh.updated_head(UPDATED)
+    # The worker's push landed in the window, so the update merged the base into THAT.
+    raced = "0ddba11000000000000000000000000000000111"
+    fake_gh.set_parents(UPDATED, [raced, "basecommit0"])
+
+    poll(started, store)
+
+    assert fake_gh.updates == [PR]                    # healed: that part is right
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+    row = store.latest_validation_round(wo_id=wo["id"])
+    assert row["carried_head_sha"] == ""
+    assert ProjectStore.validated_head(row) == JUDGED
+
+    # ...and the pull request is HELD rather than merged, which is the direction this
+    # failure has to fall.
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=UPDATED)
+    poll(started, store)
+    assert store.list_approvals(wo["id"]) == []
+    assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
+
+
+def test_a_carry_is_refused_when_the_parents_cannot_be_read_at_all(started, project,
+                                                                   fake_gh):
+    """The proof is a network call and it can fail. An unprovable carry is not a carry:
+    the pull request stays bound to the commit the seats read and waits for a person,
+    which is worse than a carry and much better than one nobody can justify."""
+    store, wo = parked(project)
+    fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
+    fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
+    fake_gh.updated_head(UPDATED)
+    fake_gh.set_parents(UPDATED, [])          # GitHub answered, and said nothing usable
+
+    poll(started, store)
+
+    assert fake_gh.updates == [PR]
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+
+
+@pytest.mark.parametrize("parents, carried", [
+    # The shape a rebuilt merge ref has: judged first, the base second.
+    ((JUDGED, "basecommit0"), True),
+    # Judged as the SECOND parent. The first is the side the merge was made ONTO, so
+    # this is a different history with somebody else's work at its root and
+    # `git log --first-parent` would never show the reviewed branch at all.
+    (("basecommit0", JUDGED), False),
+    # Not a merge: one parent means the branch was rebased or rewritten, which
+    # `update_branch` never does and nothing else may be carried over.
+    ((JUDGED,), False),
+    # An octopus merge brought in something nobody accounted for.
+    ((JUDGED, "basecommit0", "somethingelse"), False),
+    # Unreadable.
+    ((), False),
+])
+def test_only_a_two_parent_merge_onto_the_judged_commit_may_be_carried(
+        started, project, fake_gh, parents, carried):
+    """The predicate itself, driven directly rather than through the poll — the fixture
+    cannot produce most of these through `update-branch`, because GitHub never builds
+    one that way, and "the fake cannot express it" is not a reason to leave the rule
+    untested."""
+    store, wo = parked(project)
+
+    out = ops.carry_validated_head(store, wo, judged=JUDGED, head_after=UPDATED,
+                                   base="main", base_sha="e080156", parents=parents)
+
+    assert (out is not None) is carried
+    row = store.latest_validation_round(wo_id=wo["id"])
+    assert row["carried_head_sha"] == (UPDATED if carried else "")
+
+
 def test_nothing_is_carried_when_the_head_had_already_moved_off_the_verdict(
         started, project, fake_gh):
     """Fact 2 of the carry: the commit the panel accepted must be the one this update

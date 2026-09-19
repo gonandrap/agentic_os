@@ -4505,12 +4505,25 @@ class Daemon:
                       wo["id"])
             return True, pr
 
-        # READ BEFORE THE UPDATE. `carry_validated_head`'s fact 2: the verdict may only
-        # be carried if the commit the panel accepted is the one this update is about to
-        # replace, and after the update there is no way to ask that question.
+        # RE-READ THE HEAD HERE, NOT AT THE TOP OF THE POLL (review round 1). `pr` was
+        # fetched before the `busy` guard and before a `gh run list` that may have taken
+        # 30 seconds, and a worker turn can end and push inside that window — leaving
+        # `head_before` describing a commit that is no longer the head. The verdict
+        # carry rests on that value, so a stale one would bind the panel to a push the
+        # seats never read. Cheap because it is on the heal path only, which a pull
+        # request reaches once per base recovery.
+        try:
+            pr = github.pr_view(wo["pr_url"], cwd=project.path)
+        except github.GitHubError as e:
+            log.debug("[%s] could not re-read %s before updating it: %s", project.name,
+                      wo["pr_url"], e)
+            return False, pr
+        head_before = pr.head_oid
+        # `carry_validated_head`'s fact 2: the verdict may only be carried if the commit
+        # the panel accepted is the one this update is about to replace, and after the
+        # update there is no way to ask that question.
         judged = ProjectStore.validated_head(
             store.latest_validation_round(wo_id=wo["id"])) or ""
-        head_before = pr.head_oid
         try:
             ci.update_branch(wo["pr_url"], cwd=project.path)
         except github.GitHubError as e:
@@ -4533,10 +4546,22 @@ class Daemon:
                                checks=pr.failing)
         log.info("[%s] %s was red only because %s was — rebuilt it against %s",
                  project.name, wo["pr_url"], base_ref, base_sha[:10])
-        if judged and judged == head_before:
+        if judged and judged == head_before and pr.head_oid != head_before:
+            # FACT 3, AND IT IS THE ONE THAT CANNOT BE RACED. `update-branch` has no
+            # `--match-head-commit`, so what the update merged is established by reading
+            # the commit back rather than by having asked for it. A failure here refuses
+            # the carry and leaves the pull request held, which is the direction this has
+            # to fall: `ops.carry_validated_head` states why.
+            try:
+                parents = ci.commit_parents(wo["pr_url"], pr.head_oid,
+                                            cwd=project.path)
+            except github.GitHubError as e:
+                log.info("[%s] cannot prove what %s merged, not carrying the verdict: "
+                         "%s", project.name, pr.head_oid[:10], e)
+                parents = ()
             carried = ops.carry_validated_head(store, wo, judged=judged,
                                                head_after=pr.head_oid, base=base_ref,
-                                               base_sha=base_sha)
+                                               base_sha=base_sha, parents=parents)
             if carried:
                 log.info("[%s] carried round %s's verdict from %s to %s on %s",
                          project.name, carried["round"], judged[:10],

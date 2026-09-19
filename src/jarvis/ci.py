@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .bugreport import gh_bin, gh_missing_message
-from .github import GhUnavailable, GitHubError, checked_pr_url
+from .github import PR_URL_RE, GhUnavailable, GitHubError, checked_pr_url
 
 log = logging.getLogger("jarvis.ci")
 
@@ -52,7 +52,13 @@ CI_TIMEOUT = 30
 #: is the only one — `tests/test_base_heal.py` walks this module's AST against this
 #: tuple, the way `tests/test_github_artifact.py` does for the read-only module. A second
 #: write verb has to be added in a commit that also changes that test.
-VERBS = (("run", "list"), ("pr", "update-branch"))
+#:
+#: `("api", "--method")` IS THAT SHAPE ON PURPOSE. `gh api` is the one verb here whose
+#: name does not say what it does — the same string reads a commit or opens a pull
+#: request, depending on a flag. So the method is pinned as the SECOND ARGUMENT, which
+#: makes the allowlist entry itself say the call is a GET and lets the AST test assert
+#: it: an `api` call built any other way is not in this tuple and fails the test.
+VERBS = (("run", "list"), ("api", "--method"), ("pr", "update-branch"))
 
 #: Of those, the ones that change something at GitHub. Named apart so the claim a reader
 #: wants to check — "the OS updates a branch and does nothing else here" — is one tuple
@@ -83,6 +89,10 @@ RED_RUN_CONCLUSIONS = frozenset({"failure", "timed_out", "startup_failure"})
 #: whose URL a WORKER wrote, and a name beginning with `-` sits in an argument list where
 #: `gh` would read it as a flag.
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+
+#: The same rule for a commit, one field along again: `headRefOid` is GitHub's answer
+#: about a pull request a worker named, and it reaches an API path below.
+SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
 
 @dataclass(frozen=True)
@@ -219,6 +229,40 @@ def update_branch(pr_url: str, cwd: Path | None = None) -> None:
     url = checked_pr_url(pr_url, cwd)
     _run(["pr", "update-branch", url], cwd=cwd,
          missing_hint="so Jarvis cannot rebuild a pull request against a fixed base")
+
+
+def commit_parents(pr_url: str, sha: str, cwd: Path | None = None) -> tuple[str, ...]:
+    """The parents of `sha`, in order, in the pull request's own repository.
+
+    **THE ONLY THING THAT CAN PROVE WHAT THE UPDATE ACTUALLY MERGED**, and it is needed
+    because `gh pr update-branch` has no `--expected-head-oid`. `gh pr merge` has
+    `--match-head-commit`, so the automatic merge can ask the SERVER to refuse if the
+    head moved; this command cannot, so the equivalent guarantee has to be established
+    AFTER the fact, by reading what the update produced
+    (`ops.carry_validated_head` fact 3, review round 1 of wo-fdfa51c7).
+
+    A read, and the method is pinned in the argument list rather than left to `gh`'s
+    default — see `VERBS`. Both the repository and the sha are checked before they
+    become a path: the repository comes from `checked_pr_url`, which is already bound to
+    this project's own `origin`, and the sha through `SHA_RE`.
+
+    Raises `GitHubError` on any doubt. The caller reads that as "the carry cannot be
+    justified", which leaves the pull request held rather than merged — the direction a
+    failure here has to fall.
+    """
+    url = checked_pr_url(pr_url, cwd)
+    if not SHA_RE.match(sha or ""):
+        raise GitHubError(f"{sha!r} is not a commit this may ask about",
+                          GitHubError.URL_REFUSED)
+    m = PR_URL_RE.match(url)
+    if not m:  # unreachable — `checked_pr_url` anchors on the same pattern
+        raise GitHubError(f"{url!r} is not a pull request URL",
+                          GitHubError.URL_REFUSED)
+    owner, repo = m.group(2), m.group(3)
+    stdout = _run(["api", "--method", "GET", f"repos/{owner}/{repo}/commits/{sha}",
+                   "--jq", ".parents[].sha"], cwd=cwd,
+                  missing_hint="so Jarvis cannot prove what a branch update merged")
+    return tuple(line.strip() for line in stdout.splitlines() if line.strip())
 
 
 # -- the decision, pure ---------------------------------------------------------------
