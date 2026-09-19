@@ -58,7 +58,7 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
 
 ## B. Technology
 
-6. **Python 3.11+, stdlib-first.** Core CLI has zero runtime deps (argparse + sqlite3);
+6. **Python 3.13+, stdlib-first.** Core CLI has zero runtime deps (argparse + sqlite3);
    the web UI is an optional extra (`pip install jarvis-os[ui]` → FastAPI + uvicorn +
    Jinja2). Packaged with pyproject/uv. Chosen for reproducibility (OSS goal) and
    because your stack is Python-heavy.
@@ -270,9 +270,16 @@ Every decision made autonomously while building the OS. Review each; mark ✅ ac
 
 42. **`main` is protected by a repository ruleset** (`protect-main`, active, no
     bypass actors): merges only through PRs, force-pushes and branch deletion
-    blocked, and all five CI checks required (`unit (3.11/3.12/3.13)`, `evals`,
-    `browser`). Approving-review count is 0 — requiring 1 approval would deadlock
-    a solo maintainer; flip it on when a second person joins.
+    blocked, and all three CI checks required (`unit (3.13)`, `evals`, `browser`).
+    Approving-review count is 0 — requiring 1 approval would deadlock a solo
+    maintainer; flip it on when a second person joins.
+
+    The required contexts are pinned BY NAME, and a matrix job's name carries its
+    matrix value, so the workflow and the ruleset have to move together. Narrowing to
+    3.13 on 2026-09-19 dropped `unit (3.11)` and `unit (3.12)` from both. The matrix
+    was KEPT with a single entry rather than collapsed to a bare `unit`, deliberately:
+    renaming the context would have demanded a check that no branch built before the
+    rename can produce, leaving every open pull request unmergeable until rebased.
 
 ## H. Promo video & brand system
 
