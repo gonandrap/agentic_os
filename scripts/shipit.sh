@@ -90,6 +90,15 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 #                          production still running a version from before that fix
 #   ASSUMPTIONS.md         appended by `jarvis wo assume`
 #   .claude/settings.json  the OS baseline deep-merged in by bootstrap_project()
+#   .serena/project.yml    rewritten by SERENA on every project activation — the one
+#                          entry here the OS does not write itself. Serena reserialises
+#                          the whole file from its own schema, which strips this repo's
+#                          explanatory comments and adds whatever keys its current
+#                          version has, so the tree is dirty again within seconds of
+#                          any session starting. It blocked the 0.10.11 release twice:
+#                          discarded, and regenerated before the next command ran. The
+#                          test is the same one the others meet — not an authored edit,
+#                          and not an input to a release
 #
 # Ignoring them carries no shipping risk: the release branch is cut from the
 # origin/main COMMIT, the bump+tag happen in a throwaway worktree, and production
@@ -102,7 +111,7 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 # always safe. What it could not protect was `git pull --ff-only`, which refuses on
 # a dirty OPERATION.md whenever an incoming commit touches it — which is why the OS
 # had to stop writing the file rather than the guard learn to tolerate it.
-OS_MANAGED_PATHS=(OPERATION.md ASSUMPTIONS.md .claude/settings.json)
+OS_MANAGED_PATHS=(OPERATION.md ASSUMPTIONS.md .claude/settings.json .serena/project.yml)
 
 IGNORED=(); BLOCKING=()
 while IFS= read -r p; do

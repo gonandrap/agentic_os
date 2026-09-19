@@ -47,6 +47,10 @@ def _make_repo(tmp_path: Path) -> Path:
     (repo / "ASSUMPTIONS.md").write_text("# ASSUMPTIONS\n")
     (repo / ".claude").mkdir()
     (repo / ".claude" / "settings.json").write_text('{"_jarvis": {"managed": true}}\n')
+    # Not written by the OS — rewritten by Serena on every project activation, which
+    # makes it dirty just as reliably. Tracked here for the same reason as the rest.
+    (repo / ".serena").mkdir()
+    (repo / ".serena" / "project.yml").write_text("language: python\nignored_paths: []\n")
     _git(repo, "init", "-q", "-b", "main")
     _git(repo, "config", "user.email", "t@example.com")
     _git(repo, "config", "user.name", "Test")
@@ -186,6 +190,40 @@ def test_os_managed_runtime_artifacts_do_not_block_a_release(tmp_path):
     r = _dry_run(repo, tmp_path / "prod", "0.2.0")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "jarvis-0.2.0" in r.stdout
+
+
+def test_a_serena_rewrite_of_its_own_project_file_does_not_block_a_release(tmp_path):
+    """Serena reserialises `.serena/project.yml` from its own schema on every project
+    activation — stripping this repo's comments and adding its current version's keys.
+
+    It is the one exempt path the OS does not write itself, and it earns the exemption
+    the same way: nobody authored it, and it is not an input to a release. It blocked
+    0.10.11 twice, once after being discarded, because the next command started a
+    session and Serena wrote it again — so "just revert it first" is not a workflow,
+    it is a race.
+    """
+    repo = _make_repo(tmp_path)
+    (repo / ".serena" / "project.yml").write_text(
+        "language: python\nignored_paths: []\nincluded_apis: []\n")
+    r = _dry_run(repo, tmp_path / "prod", "0.2.0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "jarvis-0.2.0" in r.stdout
+    assert ".serena/project.yml" in r.stdout, "exempted drift must still be named"
+
+
+def test_an_authored_edit_elsewhere_in_serena_still_blocks(tmp_path):
+    """The exemption is that one FILE, not the directory. A committed memory is
+    hand-written prose the repo ships, and losing one to a silent exemption is exactly
+    the risk the narrow list exists to avoid."""
+    repo = _make_repo(tmp_path)
+    (repo / ".serena" / "memories").mkdir(parents=True)
+    (repo / ".serena" / "memories" / "codebase-map.md").write_text("# map\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "memory")
+    (repo / ".serena" / "memories" / "codebase-map.md").write_text("# map\nedited\n")
+    r = _dry_run(repo, tmp_path / "prod", "0.2.0")
+    assert r.returncode != 0
+    assert "codebase-map.md" in (r.stdout + r.stderr)
 
 
 def test_ignored_os_managed_paths_are_reported_by_name(tmp_path):
