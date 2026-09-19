@@ -486,6 +486,12 @@ def _record_compaction(store: ProjectStore, project_name: str, wo_id: str,
     `agent_usage` instead, which is where the OS's own spend on a work order already
     goes: without this the saving would be reported gross, and a net figure that hides
     the cost of the remedy is the one thing this feature must not produce.
+
+    CALLED ON BOTH OUTCOMES, so `ok` goes in the payload and `timeline._describe`
+    renders the two apart. A compaction that died spent what it spent and has to stay
+    on the bill — but the conversation was NOT compacted, there is no before/after to
+    show, and an event that reads the same either way would make the saving asserted
+    rather than provable, which is the half the self-healing rule is about.
     """
     from . import agent_usage
 
@@ -500,10 +506,13 @@ def _record_compaction(store: ProjectStore, project_name: str, wo_id: str,
         done = None
     store.add_event(wo_id, "compacted", {
         "seq": turn["seq"],
-        # The CLI's own measurement of what it achieved, not an estimate of ours.
+        "ok": result.ok,
+        # The CLI's own measurement of what it achieved, not an estimate of ours. Both
+        # are None on a failure — no boundary was written, so there is nothing to read.
         "before": (done or {}).get("pre"),
         "after": (done or {}).get("post"),
         "cost_usd": result.cost_usd,
+        "error": (result.error or "")[:500] or None,
     })
 
 

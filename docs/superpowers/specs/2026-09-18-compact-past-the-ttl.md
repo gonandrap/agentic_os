@@ -128,6 +128,16 @@ of every cost surface — cannot see it at all. Recorded in `agent_usage` under 
 `compaction` when the turn is reaped, on both outcomes. Without that the reported
 saving would be gross.
 
+**A compaction that DIED spent the money and saved nothing.** The two halves separate:
+the cost stays on the bill, because the call was made and nothing else can see it; the
+timeline says `Compaction failed` with the error, because the conversation is intact
+and the next prompt still pays the re-write in full. `_record_compaction` puts `ok` in
+the payload and `timeline._describe` renders the two apart — a row reading
+"Conversation compacted" on a compaction that never happened would make the saving
+asserted rather than provable, which is exactly what the self-healing rule forbids.
+Absence of `ok` means success, for `hooks.note_compaction`'s own event, which only ever
+fires after a compaction has already happened.
+
 **The write it leaves behind looks exactly like a prefix miss.** The call after a
 compaction writes ~15k with the static head served, seconds later. `usage` would have
 called it prefix invalidation and `jarvis inspect` would have called it `ttl-expiry`:

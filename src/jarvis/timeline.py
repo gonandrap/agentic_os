@@ -234,6 +234,13 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "compacting":
         return "Compacting the conversation", p.get("reason") or ""
     if kind == "compacted":
+        # `ok` is absent on the hook's own event (`hooks.note_compaction`), which only
+        # ever fires for a compaction that already happened — so missing means true.
+        if p.get("ok") is False:
+            # The conversation is INTACT and the next prompt still pays the re-write.
+            # Saying "compacted" here would put a saving on the record that the bill
+            # will not show.
+            return "Compaction failed", str(p.get("error") or "")
         before, after = p.get("before"), p.get("after")
         if isinstance(before, int) and isinstance(after, int) and before:
             return ("Conversation compacted",

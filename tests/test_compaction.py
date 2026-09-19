@@ -314,6 +314,53 @@ def test_a_compaction_the_transport_lost_is_re_sent_verbatim(fleet, fake_claude,
     assert _turns(store, wo["id"])[-1] == (COMPACT_TURN, claude_cli.COMPACT_PROMPT)
 
 
+def test_a_compaction_that_died_does_not_read_as_one_that_happened(fleet, fake_claude,
+                                                                   settle_turns):
+    """The conversation is INTACT and the next prompt still pays the re-write, so a row
+    saying "Conversation compacted" would put a saving on the record that the bill will
+    never show — and the whole point of writing it down is that it is provable.
+
+    The cost stays, on both outcomes: the call was made and nothing else can see it.
+    """
+    from jarvis import timeline
+
+    store = fleet["store"]
+    wo = _running_wo(fleet, settle_turns)
+    ops.send_message(wo["id"], "go on")
+    _age_last_turn(store, wo["id"], usage.WRITE_TTL_SECONDS + 60)
+    fake_claude.turns_rate_limited()
+    _deliver(fleet, wo["id"])
+    assert settle_turns(store)
+    assert store.latest_turn(wo["id"])["kind"] == COMPACT_TURN, "the premise"
+
+    event = [e for e in store.list_events(wo["id"]) if e["kind"] == "compacted"][-1]
+    payload = json.loads(event["payload"])
+    assert payload["ok"] is False
+    assert payload["before"] is None and payload["after"] is None
+    label, detail = timeline._describe("compacted", payload)
+    assert label == "Compaction failed" and "limit" in detail.lower()
+
+    # …and it is still on the bill, which is the half that must survive the failure.
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        calls = [c for c in central.agent_calls(wo_id=wo["id"])
+                 if c["kind"] == "compaction"]
+    finally:
+        central.close()
+    assert calls and not calls[-1]["ok"]
+
+
+def test_a_compaction_the_os_did_not_ask_for_still_reads_as_one(fleet, settle_turns):
+    """`hooks.note_compaction`'s own event carries no `ok` — it only ever fires for a
+    compaction that already happened, so its absence must not read as a failure."""
+    from jarvis import timeline
+
+    assert timeline._describe("compacted", {"trigger": "auto"}) == (
+        "Conversation compacted", "")
+
+
 def test_a_compaction_that_cannot_be_launched_never_costs_the_message(
         fleet, settle_turns, monkeypatch):
     """The boundary was going to be paid for anyway; a work order that stops moving is
