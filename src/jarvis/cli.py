@@ -1500,11 +1500,34 @@ NO_CALL_FLAG = "NO API CALL"
 
 
 def _print_partition(unit: dict[str, Any]) -> None:
+    """The headline: both clocks, then how the wall one divides.
+
+    WALL FIRST AND NEVER DROPPED — it is the answer to "how long did this take in the
+    real world", which is the question that started this. `active` is beside it because
+    the two differ by hours on a held order, and the lines under them say who took the
+    difference, which is the sentence that makes six hours and fourteen minutes of work
+    a fact about the fleet rather than an accusation about the worker.
+    """
     part, share = unit["partition"], unit["share"]
-    print(f"  wall clock {_mins(part['wall'])}, peak context {_tok(unit['context_peak'])}")
+    held = part.get("held", 0.0)
+    clocks = f"  wall clock {_mins(part['wall'])}"
+    if held:
+        clocks += f" · active {_mins(part.get('active', part['wall']))}"
+    print(f"{clocks}, peak context {_tok(unit['context_peak'])}")
+    causes = unit.get("hold_causes") or {}
+    for cause, seconds in (unit.get("held_by") or {}).items():
+        print(f"    {seconds / part['wall'] * 100:>4.0f}%  {_mins(seconds):>8}  "
+              f"HELD by {causes.get(cause, cause)}")
     for name in PART_LABELS:
         print(f"    {share[name] * 100:>4.0f}%  {_mins(part[name]):>8}  "
               f"{PART_LABELS[name]}")
+    if held:
+        # THE RESIDUAL, AND IT IS THE POINT OF SPLITTING THE CLOCK. `idle` above is the
+        # whole gap between turns; this is what is left of it once the OS's own waiting
+        # is named. A big number here is a defect, and a small one is the report saying
+        # the hours were a hold and nothing was wasted.
+        print(f"    {'':>4}  {_mins(part.get('unexplained', 0.0)):>8}  "
+              f"of that idle, nothing on record was holding it")
 
 
 def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
@@ -1533,6 +1556,7 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
           + (f", unknown {_tok(ttl['unknown'])}" if ttl["unknown"] else ""))
 
     print()
+    causes = unit.get("hold_causes") or {}
     for turn in unit["turns"]:
         reasons = ", ".join(t["kind"] for t in turn["triggers"]) or "no prompt recorded"
         s = turn["share"]
@@ -1542,6 +1566,14 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
               f"{flag:<{len(NO_CALL_FLAG)}}  {split}  "
               f"{turn['api_calls']:>3} calls  peak {_tok(turn['context_peak']):>5}  "
               f"{reasons}")
+        # The second clock only where the two differ, on its own line and naming the
+        # cause. Most turns are not held, and an `active` column that repeated `wall`
+        # nine times out of ten would train the eye to stop reading it.
+        held_by = turn.get("held_by") or {}
+        if held_by:
+            named = ", ".join(f"{_mins(sec)} by {causes.get(c, c)}"
+                              for c, sec in held_by.items())
+            print(f"           · {_mins(turn['active'])} active — held {named}")
         for trigger in turn["triggers"]:
             print(f"           ↳ {trigger['quote']}")
 

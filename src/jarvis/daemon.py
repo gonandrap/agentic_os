@@ -49,7 +49,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import bugreport, bus, claude_cli, db, fleet, inspection, worker_session
+from . import (bugreport, bus, claude_cli, db, fleet, holds, inspection,
+               worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
@@ -3197,9 +3198,13 @@ class Daemon:
             if turn is None or turn["state"] != "running":
                 continue
             try:
-                raised = inspection.live_alarms(session_id, cfg, wo_id=wo["id"],
-                                                now=now, index=index,
-                                                dispatched=turn["started_at"])
+                raised = inspection.live_alarms(
+                    session_id, cfg, wo_id=wo["id"], now=now, index=index,
+                    dispatched=turn["started_at"],
+                    # What the OS was itself holding this order for, so a threshold
+                    # judges the time it could work rather than the time that passed.
+                    # Two indexed reads, no model — `holds.held`.
+                    spans=holds.held(store, wo["id"], now=now))
             except OSError:
                 continue  # a transcript Jarvis cannot read is not a work order in trouble
             seen = [db.from_json(e["payload"], {}) or {}

@@ -448,10 +448,21 @@ DEFAULT_INSPECT_REPORT_JOIN_FLOOR = 30
 #: there to identify the prompt rather than to reproduce it.
 DEFAULT_INSPECT_QUOTE_CHARS = 140
 
-#: A turn still running after this long is burning money now. p95 of a turn's ACTIVE time
-#: is 59 minutes, so this fires on 16% of work orders — and it sits well below
-#: `worker_session.TURN_STALL_SECONDS` (6h), which reports a different fact: hung, not
-#: expensive.
+#: A turn still running after this long is burning money now.
+#:
+#: MEASURED IN ACTIVE TIME, NOT WALL CLOCK (`holds`, and the user's ruling of
+#: 2026-09-18): wall clock minus every interval the OS's own record says the order was
+#: held. A turn that spans a spent usage window is not slow, it is obeying, and an alarm
+#: that cannot tell those apart teaches the user to ignore alarms.
+#:
+#: SIXTY SURVIVES THE CHANGE OF CLOCK, and was re-measured rather than carried over. Over
+#: this fleet's 674 transcript turns on 2026-09-18 (307 of them held for something), an
+#: hour fires on 22.7% of turns by wall clock and 13.8% by active time — so moving the
+#: denominator removes two of every five alarms without touching a turn that genuinely
+#: worked for an hour. Raising it as well would silence the ones the user does want: the
+#: false alarms were the held ones, and they are gone by construction now. It still sits
+#: well below `worker_session.TURN_STALL_SECONDS` (6h), which reports a different fact:
+#: hung, not expensive.
 DEFAULT_INSPECT_ALARM_TURN_MINUTES = 60
 
 #: A turn that has been open this long WITHOUT MAKING A SINGLE API CALL. Not a spend
@@ -463,11 +474,24 @@ DEFAULT_INSPECT_ALARM_TURN_MINUTES = 60
 #: `DEFAULT_INSPECT_ALARM_TURN_MINUTES` on purpose — a stall must be named a stall before
 #: the long-turn alarm's hour is up, or the first thing the user hears about it is a claim
 #: about money.
+#:
+#: ALSO IN ACTIVE TIME now, for the reason above it: "the work never started" is a claim
+#: about the work, and a turn the OS was holding had not been allowed to start one. The
+#: change only makes this stricter, so the number stands — re-measured on 2026-09-18 over
+#: the same 674 turns, the p99 time to first call is 80 seconds and the worst is 177, so
+#: fifteen minutes is still two orders of magnitude outside a slow start.
 DEFAULT_INSPECT_ALARM_STALLED_MINUTES = 15
 
 #: A blocking join still open after this long. THE ONLY THRESHOLD HERE THAT IS PRINCIPLED
 #: RATHER THAN EMPIRICAL: it is the 5-minute cache TTL itself, past which the prefix is
 #: certainly cold and the wait will be paid for a second time as a re-write. Fires on 2%.
+#:
+#: STAYS ON THE WALL CLOCK while the two above moved to active time, and that is the
+#: whole point of deciding per threshold rather than sweeping the file. What this
+#: measures is a cache entry ageing out, and the entry expires in real seconds whether
+#: or not the OS was allowing the order to work. It is also a JOIN — the lead agent
+#: waiting on its own subagent — which is the order's own choice and the one wait the
+#: user's ruling explicitly kept on the books.
 DEFAULT_INSPECT_ALARM_JOIN_SECONDS = 300
 
 #: One call re-sending this much of the conversation. p95 of the largest re-write per work
@@ -481,12 +505,28 @@ DEFAULT_INSPECT_ALARM_WRITE_TOKENS = 300_000
 #: going to happen to this at all". An hour rather than minutes because the ordinary
 #: settlement path moves a finished turn within one reconcile tick, so anything still
 #: sitting here an hour later is not slow, it is stopped — wo-a4bd6958 sat 7h13m.
+#:
+#: IN ACTIVE TIME TOO, which for a stopped order means "an hour in which nothing was
+#: holding it". `parked_reason` already refused to flag most held orders, but by an
+#: inventory (`SPOKEN_FOR_WAITS`) rather than by a clock — so a hold with no matching
+#: entry in that tuple still cost the user a line. Subtracting the recorded holds makes
+#: the refusal follow from the measurement instead of from a list someone has to keep
+#: complete. The hour is unchanged: it was always a claim about how long a silence has
+#: to run before it means something, and taking the OS's own waiting out of that silence
+#: only makes the claim truer.
 DEFAULT_INSPECT_ALARM_PARKED_MINUTES = 60
 
 # -- the AGGREGATE half of the re-write tax. Everything above judges one live turn;
 # these five judge a PROJECT over a cohort window of settled orders, which is the
 # standing condition no surface raised (issue 164 item 1, finding 1 of
 # docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md).
+#
+# NONE OF THESE FIVE — NOR THE TWO `cache_1h` ONES BELOW — MOVES TO ACTIVE TIME, and that
+# is a decision rather than an oversight. Every one of them judges a count of TOKENS or a
+# share of a BILL; there is no duration in any numerator for a hold to come out of. The
+# `_window_days` figures are calendar time and stay calendar time: they choose which
+# settled orders are in the cohort, and an order that spent four hours held was still
+# settled last Tuesday.
 
 #: The cohort window, in days. NOT ALL HISTORY, and that is the point (kn-1449447a (5)):
 #: the split between the two causes is drifting, and an average over everything ever
