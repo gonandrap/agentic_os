@@ -4259,6 +4259,7 @@ def feature_order_budget(fo_id: str, project_name: str | None = None) -> dict[st
     try:
         p = budget.pool(store, central, fo)
         spend = budget.feature_spent(store, central, fo)
+        live = budget.feature_in_flight(store, fo)  # display only; see `budget.spent`
         children = [
             {"wo_id": c["id"], "status": c["status"],
              "reserved_usd": c.get("budget_reserved_usd"),
@@ -4272,6 +4273,8 @@ def feature_order_budget(fo_id: str, project_name: str | None = None) -> dict[st
             "status": fo["status"], "budget_usd": fo.get("budget_usd"),
             "worker_usd": spend.worker_usd, "jarvis_usd": spend.jarvis_usd,
             "spent_usd": spend.total_usd,
+            "in_flight_usd": live,
+            "live_spent_usd": spend.total_usd + live,
             "reserved_usd": p.held_usd if p else None,
             "unreserved_usd": p.unreserved_usd if p else None,
             "children": children}
@@ -6476,6 +6479,10 @@ def _turn_row(turn: dict[str, Any], u: dict[str, Any] | None) -> dict[str, Any]:
         "seq": turn["seq"], "kind": turn["kind"], "state": turn["state"],
         "started_at": turn["started_at"], "ended_at": turn.get("ended_at"),
         "duration_s": duration, "cost_usd": turn.get("cost_usd"),
+        # Which reading billed this turn (`project_store.COST_FROM_*`). The CLI's own
+        # figure and the transcript floor are not the same currency, and a surface that
+        # shows the number owes the reader which one it is (issue #471).
+        "cost_source": turn.get("cost_source"),
         "recorded": u is not None,
         # Which message set this turn going, where one did. It is the join that lets a
         # message on the work order page show what answering it cost.
@@ -8104,6 +8111,10 @@ def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, 
     try:
         cap = budget.ceiling(store, central, wo)
         spend = budget.spent(store, central, wo_id)
+        # The turn in flight, which the enforcement's two queries cannot see and the
+        # reader can (issue #471, Neo question 469). Added for DISPLAY only, and it
+        # never reaches `cap`.
+        live = budget.in_flight(store, wo_id)
         parent_pool = None
         if wo.get("parent_id"):
             try:
@@ -8120,9 +8131,16 @@ def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, 
         "reserved_usd": wo.get("budget_reserved_usd"),
         "worker_usd": spend.worker_usd, "jarvis_usd": spend.jarvis_usd,
         "spent_usd": spend.total_usd,
+        # RECORDED plus IN FLIGHT, and the two are kept apart rather than merged: one is
+        # the CLI's own figure and governs the ceiling, the other is a list-price
+        # estimate off the live transcript and governs nothing. A surface showing
+        # `live_spent_usd` owes the reader the `~`.
+        "in_flight_usd": live,
+        "live_spent_usd": spend.total_usd + live,
         "cap_usd": cap.cap_usd if cap else None,
         "cap_source": cap.source if cap else None,
         "remaining_usd": cap.remaining_usd if cap else None,
+        "live_remaining_usd": (cap.cap_usd - spend.total_usd - live) if cap else None,
         "feature_unreserved_usd": parent_pool.unreserved_usd if parent_pool else None,
     }
 

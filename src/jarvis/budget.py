@@ -50,6 +50,7 @@ own exit code is only corroboration — see its docstring.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -90,10 +91,19 @@ class Spend:
     Claude Code's whole transcript tree: this is asked on every dispatch and on every
     reconcile tick of every order, and it has to be two indexed queries.
 
-    The two disagree with `jarvis cost` in one direction only, and it is the safe one:
-    a turn still running has not written its envelope yet, so `worker_usd` lags by at
-    most the turn in flight. A ceiling computed from a lagging total is too generous by
-    one turn, never too mean — and the next turn sees the real number.
+    WHAT THIS DOES NOT SEE, AND WHY THAT IS STILL THE RIGHT ANSWER HERE. A turn writes
+    its envelope when it ends, so a turn in flight is not in these sums at all — and a
+    turn has no time bound, so the gap is not "one turn" in any useful sense. It was
+    documented as a safe lag and it is not one: the user reading `Budget: $0.00 of
+    $30.00` beside a bill chip saying `~$3.25` was reading this query (issue #471).
+
+    The enforcement stays on it anyway, and deliberately (Neo, question 469). The real
+    ceiling is applied at LAUNCH — a turn is spawned with `--max-budget-usd = cap -
+    spent` and the CLI stops it there — so nothing is gained by re-deriving the figure
+    mid-turn, while a great deal is lost: this is asked on every reconcile tick of every
+    order, and `Daemon.settle_work_order` asks it of a RUNNING one, so a live figure here
+    would park an order and kill its worker mid-task on the strength of a list-price
+    estimate. The estimate is display-only, and `in_flight` is where it lives.
     """
 
     worker_usd: float = 0.0
@@ -118,6 +128,41 @@ def spent(store: ProjectStore, central: CentralStore | None, wo_id: str) -> Spen
     if central is not None:
         jarvis = central.wo_call_cost(wo_id)
     return Spend(worker_usd=worker, jarvis_usd=jarvis)
+
+
+def in_flight(store: ProjectStore, wo_id: str) -> float:
+    """What the turn running RIGHT NOW has spent so far — an estimate, for display only.
+
+    NEVER FOR THE ENFORCEMENT (`spent` says why, and Neo ruled it on question 469). This
+    walks Claude Code's transcript, it is priced at list prices, and it is a floor: the
+    lead agent's calls only (`usage.cost_between`). It exists so the budget line agrees
+    with the bill chip beside it instead of reporting $0.00 at an order that has been
+    burning money for an hour.
+
+    0.0 when no turn is in flight, when the order has no session, or when the transcript
+    cannot be read — every one of which means "nothing to add to the recorded total".
+    """
+    from . import usage
+
+    turn = store.latest_turn(wo_id)
+    if turn is None or turn["state"] != "running":
+        return 0.0
+    try:
+        wo = store.get_work_order(wo_id)
+    except KeyError:
+        return 0.0
+    session_id = wo.get("session_id")
+    if not session_id:
+        return 0.0
+    try:
+        return usage.cost_between(session_id, turn["started_at"], time.time())
+    except OSError:
+        return 0.0
+
+
+def feature_in_flight(store: ProjectStore, fo: dict[str, Any]) -> float:
+    """The same for a feature order's whole family — its planner and every child."""
+    return sum(in_flight(store, child["id"]) for child in _family(store, fo))
 
 
 def feature_spent(store: ProjectStore, central: CentralStore | None,

@@ -731,6 +731,35 @@ def session_calls(session_id: str, root: Path | None = None,
     return calls
 
 
+def cost_between(session_id: str, since: float, until: float,
+                 root: Path | None = None,
+                 index: dict[str, list[Path]] | None = None) -> float:
+    """List-price dollars the lead agent's API calls cost inside one turn's window.
+
+    THE FALLBACK FOR A TURN WHOSE RESULT ENVELOPE NEVER ARRIVED. A turn killed by a
+    reboot, an OOM, a `systemctl restart` or a cancel spent everything it spent and
+    wrote no `total_cost_usd`, and the column `budget.spent` sums is the only place the
+    enforcement looks (issue #471). The transcript is written as the calls land, so it
+    still holds them.
+
+    A FLOOR, NOT THE FIGURE. List prices rather than the CLI's own, and the lead agent
+    only — a subagent writes its own transcript (`session_calls`) and is not in this.
+    `wo_turns.cost_source` records which of the two readings wrote the column, so no
+    surface has to guess. Under-reporting here is the safe direction for a ceiling in
+    the way losing the whole turn is not.
+
+    The window is the same last-turn-started-by-then bucketing the bill uses, closed at
+    both ends against a turn that is still open (`until` is then "now").
+    """
+    return sum(
+        priced(call.model, input=call.input, cache_write=call.cache_write,
+               cache_read=call.cache_read, output=call.output,
+               cache_1h=call.cache_1h, cache_5m=call.cache_5m).list_cost_usd
+        for call in session_calls(session_id, root=root, index=index)
+        if since <= call.ts <= until
+    )
+
+
 def compactions_in(path: Path | str) -> list[dict[str, Any]]:
     """Every compaction in one transcript, oldest first, with what it did.
 
