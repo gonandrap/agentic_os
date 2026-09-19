@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/gonandrap/agentic_os/main/install.sh | bash
 #
 # What it does:
-#   1. Checks prerequisites (git, python3.11+ or uv, and the Claude Code CLI).
+#   1. Checks prerequisites (git, python3.13+ or uv, and the Claude Code CLI).
 #   2. Resolves the newest release tag (jarvis-X.Y.Z) on the remote — this script is
 #      fetched from main, but what it installs is always a RELEASE, never main.
 #   3. Clones that tag (shallow) into a temp dir and installs it into an isolated
@@ -103,11 +103,15 @@ say "checking prerequisites"
 have git || die "git is required (Jarvis runs every worker in a git worktree) — install git and re-run"
 ok "git $(git --version 2>/dev/null | awk '{print $3}')"
 
-# Any Python >= 3.11 will do. uv can provision one itself, so it only has to be found
-# when uv is absent.
+# Python >= 3.13, matching `requires-python` in pyproject.toml and the single interpreter
+# CI tests on. The floor was 3.11 until 2026-09-19 and NOTHING ever ran on it: dev and
+# production both run 3.13, so "supported" meant "nobody has tried it". Raising the floor
+# and testing one version is the honest version of that — see .github/workflows/ci.yml,
+# which used to run the same suite three times to keep a promise nobody had made good on.
+# uv can provision an interpreter itself, so one only has to be FOUND when uv is absent.
 PYTHON=""
-python_ok() { "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; }
-for cand in python3.13 python3.12 python3.11 python3 python; do
+python_ok() { "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 13) else 1)' 2>/dev/null; }
+for cand in python3.13 python3 python; do
   if have "$cand" && python_ok "$cand"; then PYTHON="$(command -v "$cand")"; break; fi
 done
 if have uv; then
@@ -117,9 +121,9 @@ elif [ -n "$PYTHON" ]; then
 elif have pipx; then
   ok "pipx ($(command -v pipx))"
 else
-  die "need uv, pipx, or Python 3.11+ — install one of:
+  die "need uv, pipx, or Python 3.13+ — install one of:
      uv       curl -fsSL https://astral.sh/uv/install.sh | sh
-     python   your package manager (python3.11 or newer)"
+     python   your package manager (python3.13 or newer)"
 fi
 
 if have claude; then
@@ -181,7 +185,7 @@ UNINSTALL_HINT=""
 if have uv; then
   UNINSTALL_HINT="uv tool uninstall jarvis-os"
   say "installing with uv into an isolated environment"
-  run "UV_TOOL_BIN_DIR='$BIN_DIR' uv tool install --force --python '>=3.11' '$SPEC'" \
+  run "UV_TOOL_BIN_DIR='$BIN_DIR' uv tool install --force --python '>=3.13' '$SPEC'" \
     || die "uv could not install $TAG (try 'uv self update', or re-run with --no-ui)"
 elif have pipx; then
   UNINSTALL_HINT="pipx uninstall jarvis-os"

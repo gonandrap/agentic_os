@@ -3,12 +3,13 @@ name = "jarvis-os"
 version = "0.1.1"
 description = "Jarvis — an agentic OS layer that orchestrates Claude Code sessions across your projects"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 license = { text = "MIT" }
 authors = [{ name = "Gonzalo Raposo" }]
 keywords = ["claude", "agents", "orchestration", "ai"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
 ]

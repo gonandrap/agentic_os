@@ -13,7 +13,7 @@ curl -fsSL https://raw.githubusercontent.com/gonandrap/agentic_os/main/install.s
 That installs the **latest release** into its own environment, puts `jarvis` on your
 PATH (`~/.local/bin`), and writes a starter catalog at `~/.jarvis/catalog.json`.
 Re-run it any time to upgrade — your catalog and state are never touched.
-You need Linux or macOS, `git`, Python 3.11+ (or [uv](https://docs.astral.sh/uv/)), and
+You need Linux or macOS, `git`, Python 3.13+ (or [uv](https://docs.astral.sh/uv/)), and
 the [Claude Code](https://code.claude.com) CLI installed and authenticated.
 
 **Then onboard your first project** (it must be a git repository):
