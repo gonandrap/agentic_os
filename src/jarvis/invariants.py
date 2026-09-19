@@ -182,6 +182,35 @@ PR_REPAIR_STATUSES = ("waiting_pr_merge", "needs_review", "waiting_input", "fail
 PR_CONFLICT_REPAIR = "conflict"
 PR_CHECKS_REPAIR = "checks"
 
+#: THE THREE EVENTS OF THE INHERITED-FAILURE HEAL, named here for the reason the repair
+#: names above are: `ops` writes them, `status_label` below derives from them, and `ops`
+#: imports this module so the dependency cannot go the other way. A literal spelled at
+#: either site is a rename that silently stops the status line deriving.
+#:
+#: `pr_base_health` is written ONLY ON A TRANSITION — the base going red, or going green
+#: again. That is what lets `base_red_note` answer in ONE indexed read: the newest row is
+#: the current state, so nothing has to be compared against a second event kind.
+PR_BASE_HEALTH_EVENT = "pr_base_health"
+#: The heal itself: the OS merged the base into this branch so CI rebuilds against a base
+#: that works. Spec §4 — the recovery has to be a fact on the record, not a mystery.
+PR_BASE_UPDATED_EVENT = "pr_base_updated"
+#: GitHub refused the update. Spends the attempt for that base sha exactly as a success
+#: does, so a repeatedly-refusing pull request falls through to the worker once and stays
+#: there rather than being retried every two minutes.
+PR_BASE_UPDATE_FAILED_EVENT = "pr_base_update_failed"
+
+#: What a work order says while its base is broken. NOT an attention reason and NOT a
+#: blocker: nobody owes a decision, the OS is waiting for a build that is already
+#: running, and `true_blockers` deliberately does not derive it. It exists because the
+#: alternative is silence — a work order sitting in `waiting_pr_merge` with a red pull
+#: request and no nudge being sent looks identical to one the OS has forgotten.
+#:
+#: FREE OF ANY ELAPSED TIME, on PARKED_BLOCKER's rule, and free of the base's sha as
+#: well: this string is rendered on every listing and a label that ticked would make two
+#: consecutive renders of one unchanged work order disagree.
+BASE_RED_NOTE = ("waiting for `{base}` to go green — the base's own build is red, so "
+                 "nothing this branch pushes can pass")
+
 #: What a work order says when its pull request conflicts and the worker could not fix
 #: it in PR_REPAIR_MAX_ATTEMPTS attempts — one of the two things that make a
 #: `waiting_pr_merge` work order an attention item (spec §4). Re-derived below from the
@@ -753,6 +782,32 @@ def parallel_round_note(store: ProjectStore, wo_id: str) -> str:
     return ""
 
 
+def base_red_note(store: ProjectStore, wo_id: str) -> str:
+    """"waiting for `main` to go green", or "" when the base is not the problem.
+
+    ONE INDEXED READ, and the write side is what buys that: `pr_base_health` is recorded
+    only when the base CHANGES state, so the newest row IS the current answer and no
+    second kind has to be read to know whether it is stale. An unconditional pair of
+    reads here would cost every listing in the fleet a query per work order, every time,
+    to notice a change that almost never happened.
+
+    **Derived, never fetched.** Whether the base is red is a question for GitHub, and
+    this module may not ask it — `poll_pull_requests` is where the network lives, and an
+    invariant that shelled out to `gh` would put a subprocess behind `jarvis wo list`.
+    So the poll writes down what it learned and this reads it back, which is the same
+    division `ops.automerge_state` makes and for the same reason.
+    """
+    from . import db
+
+    rows = store.events_of_kind(wo_id, PR_BASE_HEALTH_EVENT)
+    if not rows:
+        return ""
+    payload = db.from_json(rows[-1].get("payload"), {}) or {}
+    if not payload.get("red"):
+        return ""
+    return BASE_RED_NOTE.format(base=payload.get("base") or "its base")
+
+
 def status_label(store: ProjectStore, wo: dict[str, Any],
                  fleet: Fleet | None = None) -> str:
     """How this work order's status should read to a human.
@@ -815,6 +870,16 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
         note = parallel_round_note(store, wo["id"])
         if note:
             return f"{wo['status']}{note}"
+    # WHY NOTHING IS BEING NUDGED. Below the round note, which names a thing actually in
+    # flight, and gated on carrying a pull request in a status the poll reaches — so the
+    # extra indexed read is paid by parked work orders and by nothing else. Without it a
+    # work order whose base is broken is indistinguishable from one the OS forgot: the
+    # poll deliberately spends no repair attempt in that window (spec §3), so there is no
+    # nudge, no attention item and, until this, nothing said at all.
+    if wo["status"] in PR_REPAIR_STATUSES and wo.get("pr_url"):
+        note = base_red_note(store, wo["id"])
+        if note:
+            return f"{wo['status']} — {note}"
     if wo["status"] != "pending":
         return wo["status"]
     blockers = store.unfinished_dependencies(wo["id"])
