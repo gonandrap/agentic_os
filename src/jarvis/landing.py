@@ -148,7 +148,7 @@ FRESH_FOR_SECONDS = 7 * 24 * 3600
 #: backlog is draining" from "the daemon is dead".
 REFRESH_PER_SWEEP = 25
 
-#: URL userinfo — `https://x-access-token:TOKEN@github.com/...` — which is the ONLY place
+#: URL userinfo — `https://x-access-token:TOKEN@github.com/…` — which is the ONLY place
 #: a credential appears in git's text, so one pattern covers it rather than a list of
 #: message shapes. See `_scrub`.
 _CREDENTIALS_RE = re.compile(r"://[^/\s@]+@")
@@ -388,7 +388,8 @@ def _git(repo: Path, *args: str) -> str | None:
         proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
                               text=True, errors="replace", check=False)
     except OSError as exc:
-        log.warning("git %s in %s could not run: %s", " ".join(args), repo, _scrub(str(exc)))
+        log.warning("git %s in %s could not run: %s", " ".join(args), repo,
+                    _scrub(str(exc)))
         return None
     if proc.returncode != 0:
         # `_scrub` BEFORE the truncation and not after: a token sits in the URL on the
