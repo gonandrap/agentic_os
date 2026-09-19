@@ -240,6 +240,23 @@ def test_a_question_stranded_before_this_shipped_is_not_exempt(store):
     assert store.reclaim_stale()["requeued"] == [q["id"]]
 
 
+def test_a_reclaimed_question_is_claimable_at_once_and_not_held_behind_a_backoff(store):
+    """The stale cutoff IS the backoff — `reclaim_stale` must not add a second one.
+
+    `release_claim` holds a re-queued question for 60s so a queue drained every few
+    seconds cannot spend the whole ladder in one tick (issue #235). This path has no
+    such problem: the row only qualifies after fifteen minutes in `answering`. Writing
+    a `retry_after` here made `neo_tick`'s rescue-and-answer a two-tick affair.
+    """
+    q = store.ask("proj_a", "wo-1", "which delimiter?")
+    strand(store, q["id"], age_seconds=neo_store.STALE_ANSWERING_SECONDS + 60)
+
+    assert store.reclaim_stale()["requeued"] == [q["id"]]
+    assert store.get(q["id"])["retry_after"] is None
+    claimed = store.claim_next()
+    assert claimed is not None and claimed["id"] == q["id"]
+
+
 def test_the_daemon_rescues_a_stranded_question_and_answers_it(
         jarvis_home, fake_claude, catalog_file, project):
     """End to end through the real path: a row left in `answering` by a dead drain is

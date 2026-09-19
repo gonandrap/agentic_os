@@ -225,6 +225,65 @@ def test_a_seat_whose_markdown_does_not_ship_records_failed_without_stalling(
     assert result["outcome"] == "passed", "the round still reached a verdict"
 
 
+def _spy_on_recorded_opinions(monkeypatch) -> list:
+    """Every Opinion the round actually recorded, captured at `validation._record`.
+
+    The real recorder, so what is asserted is what the round built — the point of review
+    round 1 being that a hand-built Opinion proves nothing about a construction site.
+    """
+    captured: list = []
+    real = validation._record                                      # noqa: SLF001
+
+    def spy(store, round_id, project, packet_, op):
+        captured.append(op)
+        return real(store, round_id, project, packet_, op)
+
+    monkeypatch.setattr(validation, "_record", spy)
+    return captured
+
+
+def test_a_validation_seat_this_build_does_not_ship_is_marked_unavailable(
+        store, round_row, jarvis_home, fake_claude, monkeypatch, tmp_path):
+    """REVIEW ROUND 1 of wo-3b2244d4, driving the REAL construction site.
+
+    `validation.py`'s `SeatError` branch records `status='failed'`, a word it shares with
+    a seat that replied unparseably. `unavailable` is the marker that tells the two
+    apart, and it is set HERE and nowhere else — asserting it on a hand-built Opinion
+    would prove nothing about this branch.
+    """
+    seat_dir = tmp_path / "seats"
+    seat_dir.mkdir()
+    for s in ("security", "chair"):
+        (seat_dir / f"{s}.md").write_text(
+            (validation.SEAT_ASSETS / f"{s}.md").read_text())
+    monkeypatch.setattr(validation, "SEAT_ASSETS", seat_dir)
+
+    captured = _spy_on_recorded_opinions(monkeypatch)
+    validation.decide(store, round_row, packet(),
+                      cfg(roster=("security", "tester", "chair")))
+
+    tester = next(op for op in captured if op.seat == "tester")
+    assert (tester.replied, tester.unavailable) == (False, True)
+    security = next(op for op in captured if op.seat == "security")
+    assert (security.replied, security.unavailable) == (True, False)
+
+
+def test_a_validation_seat_that_could_not_be_reached_is_not_marked_unavailable(
+        store, round_row, jarvis_home, fake_claude, monkeypatch):
+    """The counterpart: a transport fault is unreached but RETRYABLE, so it must never
+    pick up the marker that exempts a seat from retrying for ever."""
+    fake_claude.fail_seat("tester", roster="validator")
+
+    captured = _spy_on_recorded_opinions(monkeypatch)
+    validation.decide(store, round_row, packet(), cfg())
+
+    tester = next(op for op in captured if op.seat == "tester")
+    assert tester.replied is False
+    assert tester.unavailable is False, (
+        "a call that merely failed was marked 'no such seat in this build'"
+    )
+
+
 # -- who outranks whom ----------------------------------------------------------------------
 
 

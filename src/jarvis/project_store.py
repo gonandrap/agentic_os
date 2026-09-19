@@ -381,6 +381,24 @@ ALARM_SOURCES = ("cost", "health")
 # `failed` sweep does not record its fingerprint as reviewed and the next tick retries.
 HEALTH_OUTCOMES = ("clear", "findings", "failed")
 
+# How long an alarm held back by a transport failure waits before it may be claimed
+# again, indexed by attempts already spent. `neo_store.RETRY_BACKOFF_SECONDS`' reasoning:
+# an un-delayed re-queue is not a retry, it is the same failure three times in a row.
+ALARM_RETRY_BACKOFF_SECONDS = (60.0, 300.0, 900.0)
+
+# How long a queued message held back by a delivery failure waits, same ladder and same
+# reason. `Daemon.deliver_messages` runs every tick.
+MESSAGE_RETRY_BACKOFF_SECONDS = ALARM_RETRY_BACKOFF_SECONDS
+
+# How many times a message may fail to reach its worker before the user is told it is
+# not getting through. GitHub issue 43: a message that vanishes must not look delivered.
+MAX_MESSAGE_DELIVERY_ATTEMPTS = 3
+
+# How many times launching a work order's first turn may fail on the transport before
+# the order is given up on, and how long it waits between tries.
+MAX_DISPATCH_ATTEMPTS = 3
+DISPATCH_RETRY_BACKOFF_SECONDS = ALARM_RETRY_BACKOFF_SECONDS
+
 # A subject-level finding judges the unit rather than a turn, so it has no `seq` to
 # carry — and `wo_alarms.seq` is NOT NULL, which `ALTER TABLE ADD COLUMN` cannot relax.
 # This is the sentinel that fills it, and every surface printing a turn number renders
@@ -790,6 +808,13 @@ CREATE INDEX IF NOT EXISTS idx_envelopes_subject ON envelopes(subject_wo_id, sub
 # existing database, so new columns must be ALTERed in on open.
 ADDED_COLUMNS = {
     "work_orders": {
+        # How many times launching this order's first turn has failed on the transport,
+        # and when it may next be claimed. A dispatch that could not reach `claude` used
+        # to set `failed` at attempts=0, which is a terminal state derived from a blip —
+        # spec docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §5. NULL /
+        # 0 on every pre-existing row, which reads as "never failed, claimable now".
+        "dispatch_attempts": "INTEGER NOT NULL DEFAULT 0",
+        "retry_after": "REAL",
         # THE DOLLAR CEILING THE USER SET on this one order, or NULL for no ceiling —
         # which is what every row written before this existed says, and what the OS does
         # by default. See src/jarvis/budget.py for what the number governs (the order's
@@ -1005,6 +1030,10 @@ ADDED_COLUMNS = {
         "remedy": "TEXT",
         "remedy_argument": "TEXT",
         "remedy_approval_id": "INTEGER",
+        # When this alarm may next be claimed, after a review call that never happened —
+        # see `release_alarm_claim`. NULL reads as "claimable now", which is every row
+        # that predates this and every alarm that has never failed.
+        "retry_after": "REAL",
     },
     # WHO WROTE THIS MESSAGE, as opposed to `source`, which is which surface filed it.
     # Additive with an EMPTY default on purpose: every row written before this column
@@ -1013,6 +1042,15 @@ ADDED_COLUMNS = {
     # docs/superpowers/specs/2026-09-11-a-gate-request-carries-the-users-words.md.
     "wo_messages": {
         "authored_by": "TEXT NOT NULL DEFAULT ''",
+        # Delivery retries. A message whose turn could not be launched used to go
+        # straight to `failed` — the user's words, silently discarded, because `claude`
+        # was unreachable for a second (GitHub issue 43's shape; spec
+        # docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §6). It now
+        # stays `queued` behind `retry_after` until the attempts are spent.
+        "attempts": "INTEGER NOT NULL DEFAULT 0",
+        "retry_after": "REAL",
+        # Why the last delivery attempt failed, for the surface that has to say so.
+        "last_error": "TEXT NOT NULL DEFAULT ''",
     },
     # WHO DECIDED AN ASSUMPTION, AND ON WHAT BASIS. Until auto-review shipped there was
     # exactly one answer — the user, through `jarvis wo review` — so a row said only
@@ -1339,6 +1377,40 @@ class ProjectStore:
                        {"dropped": dep_ids, "remaining": remaining})
         return remaining
 
+    def release_dispatch_claim(self, wo_id: str, error: str,
+                               max_attempts: int = MAX_DISPATCH_ATTEMPTS) -> str:
+        """Hand a claimed work order back after a turn that could never be launched.
+
+        `NeoStore.release_claim`'s shape once more. Returns `"pending"` (retryable, held
+        by `retry_after`) or `"failed"` (the launches are spent, and now it really is the
+        user's problem). Spec
+        docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §5.
+        """
+        row = self.conn.execute(
+            "SELECT dispatch_attempts FROM work_orders WHERE id=?", (wo_id,)).fetchone()
+        if row is None:
+            return "failed"
+        attempts = int(row["dispatch_attempts"] or 0) + 1
+        if attempts >= max_attempts:
+            self.conn.execute(
+                "UPDATE work_orders SET status='failed', dispatch_attempts=?, "
+                "retry_after=NULL, updated_at=? WHERE id=?",
+                (attempts, db.now(), wo_id))
+            return "failed"
+        delay = DISPATCH_RETRY_BACKOFF_SECONDS[
+            min(attempts - 1, len(DISPATCH_RETRY_BACKOFF_SECONDS) - 1)]
+        self.conn.execute(
+            "UPDATE work_orders SET status='pending', dispatch_attempts=?, "
+            "retry_after=?, updated_at=? WHERE id=?",
+            (attempts, db.now() + delay, db.now(), wo_id))
+        return "pending"
+
+    def clear_dispatch_attempts(self, wo_id: str) -> None:
+        """A launch that worked spends the record of the ones that did not."""
+        self.conn.execute(
+            "UPDATE work_orders SET dispatch_attempts=0, retry_after=NULL WHERE id=?",
+            (wo_id,))
+
     def claim_next_pending(self) -> dict[str, Any] | None:
         """Atomically claim the oldest claimable pending order (pending -> dispatching).
 
@@ -1356,14 +1428,21 @@ class ProjectStore:
            its children are, not one of them, so capping it against its own children
            would be capping a feature against itself.
 
-        For the overwhelming majority of work orders — no dependencies, no parent — both
-        subqueries are vacuously true and this is the query it always was.
+        3. **A dispatch that could not reach `claude` is backing off** — `retry_after`,
+           written by `release_dispatch_claim`. Without it the caller's `while` loop
+           re-claims the order it has just failed to launch, on the next iteration, and
+           spends the whole ceiling inside one tick.
+
+        For the overwhelming majority of work orders — no dependencies, no parent, never
+        a failed launch — all three subqueries are vacuously true and this is the query it
+        always was.
         """
         marks = ",".join("?" for _ in ACTIVE_STATUSES)
         cur = self.conn.execute(
             f"""UPDATE work_orders SET status='dispatching', updated_at=?
                WHERE id = (SELECT w.id FROM work_orders w
                            WHERE w.status='pending' AND w.hidden=0
+                             AND COALESCE(w.retry_after, 0) <= ?
                              AND NOT EXISTS (
                                  SELECT 1 FROM json_each(w.depends_on) dep
                                  WHERE NOT EXISTS (
@@ -1383,7 +1462,7 @@ class ProjectStore:
                              )
                            ORDER BY w.created_at LIMIT 1)
                RETURNING *"""
-            , (db.now(), DEPENDENCY_SATISFIED_STATUS, *ACTIVE_STATUSES),
+            , (db.now(), db.now(), DEPENDENCY_SATISFIED_STATUS, *ACTIVE_STATUSES),
         )
         row = cur.fetchone()
         return dict(row) if row else None
@@ -2149,15 +2228,53 @@ class ProjectStore:
         FIFO keeps the supervisor's byte-stable prompt prefix inside the cache TTL, and
         the oldest alarm is also the one closest to expiring unjudged.
         """
+        now = db.now()
         cur = self.conn.execute(
             """UPDATE wo_alarms SET status='reviewing', claimed_at=?
                WHERE id = (SELECT id FROM wo_alarms WHERE status='raised'
+                             AND COALESCE(retry_after, 0) <= ?
                            ORDER BY ts LIMIT 1)
                RETURNING *""",
-            (db.now(),),
+            (now, now),
         )
         row = cur.fetchone()
         return dict(row) if row else None
+
+    def release_alarm_claim(self, alarm_id: str, reason: str,
+                            max_attempts: int = 3) -> str:
+        """Hand a claimed alarm back after a review call that never happened.
+
+        `NeoStore.release_claim`'s twin, and deliberately the same shape — the two queues
+        fail the same way and must recover the same way. Returns `"raised"` (retryable,
+        `attempts` incremented, held by `retry_after`) or `"failed"` (spent, and now the
+        user's).
+
+        `attempts` COUNTS RETRIES GRANTED, not calls made — `reclaim_stale_alarms`'
+        reading of the same column, and the two must agree or one of them silently
+        shortens the other's ladder.
+
+        THE HOLD IS WHAT MAKES IT A RETRY. `Daemon._drain_project_alarms` claims in a
+        `while True`, so an alarm returned to `raised` with no delay is re-claimed on the
+        next iteration and burns the whole ceiling inside one tick.
+        """
+        row = self.conn.execute("SELECT attempts FROM wo_alarms WHERE id=?",
+                                (alarm_id,)).fetchone()
+        if row is None:
+            return "failed"
+        attempts = int(row["attempts"] or 0)
+        if attempts >= max_attempts:
+            self.update_alarm(
+                alarm_id, status="failed", claimed_at=None, decided_at=db.now(),
+                verdict_reason=f"{reason} (after {attempts} retries — nobody has "
+                               f"judged this)")
+            return "failed"
+        self.conn.execute(
+            "UPDATE wo_alarms SET status='raised', claimed_at=NULL, "
+            "attempts=attempts+1, retry_after=?, verdict_reason=? WHERE id=?",
+            (db.now() + ALARM_RETRY_BACKOFF_SECONDS[
+                min(attempts, len(ALARM_RETRY_BACKOFF_SECONDS) - 1)],
+             reason, alarm_id))
+        return "raised"
 
     def reclaim_stale_alarms(self, older_than: float,
                              max_attempts: int) -> dict[str, list[str]]:
@@ -2506,6 +2623,47 @@ class ProjectStore:
             "UPDATE wo_messages SET status=?, delivered_at=? WHERE id=?",
             (status, db.now() if status == "delivered" else None, msg_id),
         )
+
+    def deliverable_messages(self, wo_id: str | None = None) -> list[dict[str, Any]]:
+        """`queued_messages` minus the ones held by a delivery backoff.
+
+        A SEPARATE READER rather than a filter inside `queued_messages`, because the two
+        questions are different and one of them is an invariant's. `invariants.stuck_message`
+        asks what is waiting and must still see a held message — that is precisely the
+        message it exists to notice — while the daemon asks what it may send NOW.
+        """
+        now = db.now()
+        return [m for m in self.queued_messages(wo_id)
+                if float(m.get("retry_after") or 0.0) <= now]
+
+    def record_delivery_failure(
+            self, msg_id: int, error: str,
+            max_attempts: int = MAX_MESSAGE_DELIVERY_ATTEMPTS) -> str:
+        """One failed attempt to put a queued message into its worker's conversation.
+
+        Returns `"queued"` (held by `retry_after`, still the worker's to receive) or
+        `"failed"` (the attempts are spent and the message will not be delivered).
+
+        THE MESSAGE IS NOT THE OS'S TO DISCARD. What this replaces marked it `failed` on
+        the first `ClaudeCliError`, so a blip in the transport silently swallowed whatever
+        the user had just typed at a worker and nothing ever re-sent it.
+        """
+        row = self.conn.execute("SELECT attempts FROM wo_messages WHERE id=?",
+                                (msg_id,)).fetchone()
+        if row is None:
+            return "failed"
+        attempts = int(row["attempts"] or 0) + 1
+        if attempts >= max_attempts:
+            self.conn.execute(
+                "UPDATE wo_messages SET status='failed', attempts=?, last_error=? "
+                "WHERE id=?", (attempts, error, msg_id))
+            return "failed"
+        delay = MESSAGE_RETRY_BACKOFF_SECONDS[
+            min(attempts - 1, len(MESSAGE_RETRY_BACKOFF_SECONDS) - 1)]
+        self.conn.execute(
+            "UPDATE wo_messages SET attempts=?, retry_after=?, last_error=? WHERE id=?",
+            (attempts, db.now() + delay, error, msg_id))
+        return "queued"
 
     def list_messages(self, wo_id: str, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.conn.execute(

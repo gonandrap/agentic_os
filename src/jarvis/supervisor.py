@@ -664,13 +664,25 @@ def _failed_verdict(raw: str, reason_chars: int) -> dict[str, Any]:
             "reason": f"{UNREADABLE_PREFIX}{(raw or '')[:reason_chars]}"}
 
 
+#: `verdict_reason` on an alarm nobody could put to a model — `neo_store.UNREACHABLE_PREFIX`
+#: one layer down, and the string `_apply` keys the retry off.
+UNREACHABLE_PREFIX = "the supervisor could not be reached: "
+
+
 def _transport_failure(exc: Exception, reason_chars: int) -> dict[str, Any]:
     """A call that never happened, which `structured.request`'s `on_invalid` does NOT
     cover — `ClaudeCliError` propagates untouched by design (kn-9b18a8eb). Without this
-    the review raises out of the daemon's own thread pool."""
-    return {"decision": "escalate", "note": "", "question": "", "remedy": "",
-            "argument": "", "failed": True,
-            "reason": f"the supervisor could not be reached: {str(exc)[:reason_chars]}"}
+    the review raises out of the daemon's own thread pool.
+
+    `decision` IS EMPTY, not `escalate`. Its sibling `_failed_verdict` names one because a
+    reply nobody could read still has to fail toward the user; nothing decided this one at
+    all, and a `decision` key that reads `escalate` is a judgement in the record that no
+    model made. `_apply` routes on `unreachable` before it reads either — spec
+    docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §4.
+    """
+    return {"decision": "", "note": "", "question": "", "remedy": "",
+            "argument": "", "failed": True, "unreachable": True,
+            "reason": f"{UNREACHABLE_PREFIX}{str(exc)[:reason_chars]}"}
 
 
 def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any],
@@ -967,6 +979,16 @@ def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str
 
     alarm_id = alarm["id"]
     decided = db.now()
+    if verdict.get("unreachable"):
+        # NOT `failed`: nobody judged this, so the alarm goes back on the queue with the
+        # attempt spent rather than out of it. `failed` at attempts=0 is what left every
+        # unreachable alarm permanently unjudged — `NeoStore.release_claim`'s defect, one
+        # queue along.
+        outcome = pstore.release_alarm_claim(alarm_id, verdict["reason"],
+                                             cfg.max_review_attempts)
+        log.warning("supervisor could not be reached for %s (%s): %s",
+                    alarm_id, outcome, verdict["reason"])
+        return
     if verdict["failed"]:
         pstore.update_alarm(alarm_id, status="failed",
                             verdict_reason=verdict["reason"], decided_at=decided)

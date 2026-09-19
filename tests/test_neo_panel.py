@@ -35,6 +35,7 @@ from pathlib import Path
 
 import pytest
 
+from jarvis import claude_cli
 from jarvis import neo as neo_mod
 from jarvis import ops, panel
 from jarvis.bootstrap import ASSETS
@@ -760,20 +761,209 @@ def test_each_seat_runs_on_its_own_model_and_the_rest_fall_back_to_the_fleet_def
 def test_a_failed_seat_abstains_and_the_panel_proceeds_without_it(store, fake_claude):
     """A Neo outage must never become a fleet stall. Unlike the premise seat — which
     ROUTES, so its silence leaves nothing to route on and falls back to the single agent —
-    a seat in the middle of the round is simply absent, and absence is not consent."""
-    fake_claude.fail_seat("blast")
+    a seat in the middle of the round is simply absent, and absence is not consent.
+
+    `taste`, and it has to be `taste`: it is the one seat in the roster that can force
+    nothing, so losing it costs the decision no authority. A seat that could have VETOED
+    is a different case and is no longer allowed to be absent — see the test below and
+    docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §3.
+    """
+    fake_claude.fail_seat("taste")
     q = claim(store, "which delimiter?")
 
     result = panel.decide(store, q, full())
 
     rows = {r["seat"]: r["status"] for r in store.opinions(q["id"])}
-    assert rows == {"premise": "ok", "record": "ok", "blast": "abstained",
-                    "taste": "ok", "chair": "ok"}
+    assert rows == {"premise": "ok", "record": "ok", "blast": "ok",
+                    "taste": "abstained", "chair": "ok"}
     assert any(seat_of(c) == "chair" for c in headless(fake_claude)), (
         "the chair still ran; an abstaining seat is not a forced outcome"
     )
     assert result["escalate"] is False
     assert result["panel"]["route"] == "panel"
+
+
+@pytest.mark.parametrize("seat", ["blast", "record"])
+def test_an_unreachable_veto_seat_takes_no_verdict_at_all(store, fake_claude, seat):
+    """The user's ruling via Neo, question 436: a silent veto seat is a shrunken quorum.
+
+    `blast` owns the blast radius and `record` owns the record. Unreached, neither can
+    exercise its veto, so the chair would synthesise a verdict the full panel might have
+    blocked. There is no verdict without them: `decide` raises, and `drain_queue`
+    re-queues the question rather than letting anything downstream act on a decision a
+    seat short.
+    """
+    fake_claude.fail_seat(seat)
+    q = claim(store, "which delimiter?")
+
+    with pytest.raises(claude_cli.ClaudeCliError, match=f"could not reach {seat}"):
+        panel.decide(store, q, full())
+
+    assert "chair" not in {r["seat"] for r in store.opinions(q["id"])}, (
+        "the chair was asked to synthesise without the seat that may veto"
+    )
+
+
+def test_an_approval_gate_is_never_settled_a_veto_seat_short(store, fake_claude):
+    """The case the rule exists for: the verdict here would CLOSE A GATE."""
+    fake_claude.fail_seat("blast")
+    q = claim(store, "may I merge this?", kind="approval")
+
+    with pytest.raises(claude_cli.ClaudeCliError, match="could not reach blast"):
+        panel.decide(store, q, full())
+
+
+# -- review round 2: a veto seat the WINDOW refused ------------------------------------
+
+
+@pytest.mark.parametrize("seat", ["blast", "record"])
+def test_a_refused_veto_seat_raises_the_usage_limit_not_a_generic_outage(
+        store, fake_claude, seat):
+    """REVIEW ROUND 2. A spent window is a THIRD answer to "was this seat reached".
+
+    Raised generically it lands in `drain_queue`'s transport branch and burns all three
+    retries in twenty minutes against a window measured in hours — issue #235, the shape
+    spec §1 says never to repeat. It must carry the refusal, and with it `reset_at`.
+    """
+    fake_claude.refuse_seat(seat)
+    q = claim(store, "which delimiter?")
+
+    with pytest.raises(claude_cli.UsageLimitError) as caught:
+        panel.decide(store, q, full())
+
+    assert caught.value.limit is not None
+    assert caught.value.limit.reset_at is not None, (
+        "the held question needs the moment the window reopens, or it is guessing"
+    )
+    assert "chair" not in {r["seat"] for r in store.opinions(q["id"])}, (
+        "the chair synthesised a verdict with the veto seat absent"
+    )
+
+
+def test_a_refused_veto_seat_is_recorded_as_refused_by_the_real_seat_runner(
+        store, fake_claude):
+    """The chain under the test above, driven rather than assumed: the fake emits the
+    real result JSON, `claude_cli.usage_limit` classifies it, `_run_seat` carries it on
+    `Opinion.refused`, and `refused_veto_seats` reads THAT — not a status string."""
+    fake_claude.refuse_seat("blast")
+    q = claim(store, "which delimiter?")
+
+    captured: list = []
+    real_round = panel._round                                      # noqa: SLF001
+
+    def spy(*args, **kwargs):
+        ops_ = real_round(*args, **kwargs)
+        captured.extend(ops_)
+        return ops_
+
+    monkeypatch_round(panel, spy)
+    try:
+        with pytest.raises(claude_cli.UsageLimitError):
+            panel.decide(store, q, full())
+    finally:
+        monkeypatch_round(panel, real_round)
+
+    blast = next(op for op in captured if op.seat == "blast")
+    assert blast.refused is not None, "the refusal never reached the Opinion"
+    assert blast.unavailable is False, "a refusal is not a seat this build cannot run"
+    roster = ["premise", "record", "blast", "taste"]
+    assert [s for s, _ in panel.refused_veto_seats(captured, roster)] == ["blast"]
+    assert "blast" in panel.unreachable_veto_seats(captured, roster), (
+        "a refused seat must also read as unreached, so losing the ordering in `decide` "
+        "degrades to a slow retry rather than to a verdict taken without the veto"
+    )
+
+
+def test_a_refusal_at_a_seat_that_can_force_nothing_still_decides(store, fake_claude):
+    """The control. `taste` holds no veto, so losing it to the window costs the decision
+    no authority — and a rule that held the question for ANY refused seat would stall
+    the queue on the one seat whose silence is harmless."""
+    fake_claude.refuse_seat("taste")
+    q = claim(store, "which delimiter?")
+
+    result = panel.decide(store, q, full())
+
+    assert result["panel"]["route"] == "panel"
+    rows = {r["seat"]: r["status"] for r in store.opinions(q["id"])}
+    assert rows["taste"] == "abstained" and rows["chair"] == "ok"
+
+
+def test_a_transport_fault_at_a_veto_seat_is_caught_however_it_is_recorded(
+        store, fake_claude):
+    """REVIEW ROUND 1. The predicate must key on whether the seat was REACHED, not on
+    the word its status happens to carry.
+
+    This drives the REAL `seats._run_seat` construction site with an injected
+    `ClaudeCliError` and asserts the recorded Opinion carries `replied=False` and is NOT
+    marked `unavailable` — the two facts `unreachable_veto_seats` actually reads. A
+    version keyed on `status == "abstained"` passes today and silently stops working the
+    moment that `except` records any other word.
+    """
+    fake_claude.fail_seat("blast")
+    q = claim(store, "which delimiter?")
+
+    captured: list = []
+    real_round = panel._round                                      # noqa: SLF001
+
+    def spy(*args, **kwargs):
+        ops_ = real_round(*args, **kwargs)
+        captured.extend(ops_)
+        return ops_
+
+    monkeypatch_round(panel, spy)
+    try:
+        with pytest.raises(claude_cli.ClaudeCliError):
+            panel.decide(store, q, full())
+    finally:
+        monkeypatch_round(panel, real_round)
+
+    blast = next(op for op in captured if op.seat == "blast")
+    assert blast.replied is False, "a transport fault must record the seat as unreached"
+    assert blast.unavailable is False, (
+        "a call that merely failed must not be marked 'no such seat in this build' — "
+        "that marker is what exempts a seat from the retry path for ever"
+    )
+    assert panel.unreachable_veto_seats(captured, ["premise", "record", "blast",
+                                                   "taste"]) == ["blast"]
+
+
+def test_the_never_shipped_seat_is_exempt_by_its_marker_not_by_its_status(
+        store, fake_claude, unship):
+    """The other half of round 1: the exemption must be driven by the real site too.
+
+    `_round`'s `SeatError` branch is the ONE place `unavailable` is set. A seat with no
+    markdown in this build was never reached either, but no retry will ever change that,
+    so it must NOT re-queue the question — while a seat that merely could not be called
+    must.
+    """
+    unship("blast")
+    q = claim(store, "which delimiter?")
+
+    captured: list = []
+    real_round = panel._round                                      # noqa: SLF001
+
+    def spy(*args, **kwargs):
+        ops_ = real_round(*args, **kwargs)
+        captured.extend(ops_)
+        return ops_
+
+    monkeypatch_round(panel, spy)
+    try:
+        # It does NOT raise: the round completes and the chair synthesises.
+        result = panel.decide(store, q, cfg(roster=("premise", "blast", "chair")))
+    finally:
+        monkeypatch_round(panel, real_round)
+
+    blast = next(op for op in captured if op.seat == "blast")
+    assert (blast.replied, blast.unavailable) == (False, True)
+    assert panel.unreachable_veto_seats(captured, ["premise", "blast"]) == []
+    assert result["panel"]["route"] == "panel"
+
+
+def monkeypatch_round(module, fn):
+    """Swap `panel._round`. A plain setattr, named so the two tests above read as one
+    intent rather than as two rebindings of a private."""
+    module._round = fn                                             # noqa: SLF001
 
 
 # -- arbitration, end to end through `decide` ----------------------------------------------

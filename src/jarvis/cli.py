@@ -1041,9 +1041,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"\n📥 inbox: {st['inbox']['unacked']} unacked"
               f" ({st['inbox']['critical']} critical) — `jarvis inbox list`")
     neo = st.get("neo", {})
-    if neo.get("queued") or neo.get("unreviewed") or neo.get("escalated"):
+    if (neo.get("queued") or neo.get("unreviewed") or neo.get("escalated")
+            or neo.get("failed")):
+        # `unreachable` is its own clause and never folded into `escalated`. An
+        # escalation is a judgement Neo made; an unreachable question is one nobody
+        # made, and the whole of what question 388 cost the user was being unable to
+        # tell which they were looking at.
+        unreachable = (f"{neo['failed']} unreachable (NOT judged), "
+                       if neo.get("failed") else "")
         print(f"\n🕶 neo: {neo.get('queued', 0)} queued, "
-              f"{neo.get('escalated', 0)} escalated to you, "
+              f"{neo.get('escalated', 0)} escalated to you, {unreachable}"
               f"{neo.get('unreviewed', 0)} answers awaiting your review — `jarvis neo list`")
     if args.attention:
         return 0
@@ -2923,11 +2930,17 @@ def cmd_neo(args: argparse.Namespace) -> int:
         else:
             icon = {"queued": "⏳", "answering": "🤔", "answered": "💬",
                     "escalated": "🙋", "failed": "❌"}
+            # `failed` RENDERS AS `unreachable`, because that is what it means: Neo was
+            # never reached and judged nothing. The stored word is the status, the
+            # printed word is the fact — see `neo_store.UNREACHABLE_PREFIX`.
+            label = {"failed": "unreachable — NOT judged"}
             for q in qs:
                 review = f" [{q['review_status']}]" if q["status"] == "answered" else ""
+                held = (" · retrying" if q["status"] == "queued"
+                        and (q.get("attempts") or 0) else "")
                 print(f"{icon.get(q['status'], '•')} #{q['id']} [{q['project']}] "
-                      f"{q['wo_id']} ({q['status']}{review}, {_age(q['ts'])}) "
-                      f"{q['question'][:80]}")
+                      f"{q['wo_id']} ({label.get(q['status'], q['status'])}{review}"
+                      f"{held}, {_age(q['ts'])}) {q['question'][:80]}")
             if not qs:
                 print("nothing pending for Neo ✨")
     elif args.neo_cmd == "show":
